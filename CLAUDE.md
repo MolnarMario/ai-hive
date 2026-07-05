@@ -27,7 +27,20 @@ this file is the invariants that must survive every change.
   `_agent_dict_safe` so one un-serializable agent degrades to a minimal
   (identity + session_id + running) entry instead of aborting the entire
   session's save. Don't remove these guards or let a new save path bypass the
-  audit trail.
+  audit trail. Conversely, TRANSIENT signals must NEVER mark `dirty`:
+  `activity_changed` (busy/standby, derived from output activity — see the
+  status-badge invariant) fires every couple of seconds while an agent works,
+  so it connects to `_recompute` (refresh derived UI only), never `_touch`;
+  wiring it to a save would thrash `session.json`.
+- **The sidebar badge shows WORK, not liveness.** Each workspace row's
+  `AgentCountBadge` pulses green only when an agent `is_busy()` — a subset of
+  RUNNING derived from live OUTPUT ACTIVITY (`TerminalAgent._mark_busy` on each
+  pty/stdout burst; a `BUSY_IDLE_MS` single-shot drops back to standby when
+  output falls quiet; exit clears it in `_set_status`). Never regress "working"
+  back to `AgentStatus.RUNNING`: an interactive agent idling at its prompt stays
+  RUNNING forever, which is exactly the false-green this replaced.
+  `workspace_stats` carries the `busy` count; the badge maps busy>0→green,
+  running-but-quiet→amber, error→red, empty→dim.
 - **Single instance is enforced by a kernel mutex** (`main.py`,
   `_single_instance_guard`) and fails closed. Don't replace it with anything
   that has a probe timeout.

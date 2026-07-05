@@ -284,11 +284,12 @@ child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
 trips, the ConPTY path (interactive prompt, Ctrl+C, retention), every v2
-feature (provider flags, per-workspace numbering, the status dashboard,
+feature (provider flags, per-workspace numbering, the agent-count badge,
 explicit grids, folder changes, fonts, the shared board), v3 orchestration
 (role naming, model/effort selection, the named-pipe MCP round-trip,
 workspace scoping, immediate-save-on-mutation), the sidebar status badge
-(pulse/colour state machine + hover-only controls) and the Layout popup
+(output-activity busy detection, pulse/colour state machine, hover-only
+controls) and the Layout popup
 staying on-screen when the window is at a monitor edge, and the reliability
 set — immediate structural saves, the safety-net heartbeat, saves that are
 never silent (suppressed/payload-error logging, one bad agent can't abort the
