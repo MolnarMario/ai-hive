@@ -1,0 +1,682 @@
+"""Async process execution engine.
+
+One ProcessWorker per terminal agent, built on QProcess: output arrives as
+event-loop signals (no threads, no GUI blocking). Windows specifics that
+this module encodes, all empirically verified on the target machine:
+
+- `powershell -NoLogo -NoProfile -Command -` runs each piped stdin
+  statement immediately with no prompt noise and exits 0 on stdin EOF;
+  multi-line blocks need a trailing blank line (hence trailing_blank_line).
+- `cmd /d /Q /K` behaves likewise (prompt echo included); `/d` skips
+  AutoRun. `chcp 65001` corrupts non-ASCII stdin, so cmd output is decoded
+  UTF-8-first with cp437 fallback instead (HybridDecoder).
+- QProcess.terminate() is WM_CLOSE — console apps ignore it. Graceful stop
+  is stdin EOF (closeWriteChannel); the hard stop is a Job Object tree
+  kill, which also reaps grandchildren (`ping -t` etc.) and — thanks to
+  KILL_ON_JOB_CLOSE — everything else if this GUI process dies.
+"""
+
+import codecs
+import os
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+
+from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
+
+from . import providers
+
+DEFAULT_FONT_PX = 13
+
+CREATE_NO_WINDOW = 0x08000000
+
+# Induce ANSI color from tools that check these; keep python children live.
+COMMON_ENV = {
+    "PYTHONUNBUFFERED": "1",
+    "PYTHONIOENCODING": "utf-8",
+    "TERM": "xterm-256color",
+    "FORCE_COLOR": "1",
+    "CLICOLOR_FORCE": "1",
+}
+
+PS_UTF8_INIT = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+                "$OutputEncoding=[Text.Encoding]::UTF8")
+
+FLUSH_INTERVAL_MS = 33          # ~30 fps output batching
+PENDING_CAP = 1024 * 1024       # raw bytes buffered between flushes
+CAP_KEEP_HEAD = 64 * 1024
+CAP_KEEP_TAIL = 256 * 1024
+
+
+class AgentKind(str, Enum):
+    POWERSHELL = "powershell"
+    PWSH = "pwsh"
+    CMD = "cmd"
+    PYTHON_SCRIPT = "python"
+    CLAUDE = "claude"
+    OPENAI = "openai"
+    GEMINI = "gemini"
+    CUSTOM = "custom"
+
+
+# AI-agent kinds map 1:1 onto a provider key in app/providers.py.
+AI_KINDS = {AgentKind.CLAUDE: "claude", AgentKind.OPENAI: "openai",
+            AgentKind.GEMINI: "gemini"}
+
+# Kinds that only make sense inside a real pseudo-console (interactive TUIs).
+PTY_ONLY_KINDS = {AgentKind.CLAUDE, AgentKind.OPENAI, AgentKind.GEMINI}
+
+
+@dataclass
+class AgentSpec:
+    kind: AgentKind
+    name: str
+    role: str = ""
+    program: str = ""
+    args: list = field(default_factory=list)
+    cwd: str = ""
+    env: dict = field(default_factory=dict)
+    encoding_out: str = "hybrid"   # "hybrid" | "utf-8" | "cp437"
+    encoding_in: str = "utf-8"
+    init_lines: list = field(default_factory=list)
+    trailing_blank_line: bool = False
+    merge_stderr: bool = True
+    line_ending: str = "\r\n"
+    pty: bool = False  # run inside a real pseudo-console (ConPTY) if True
+    # AI-agent configuration (empty for shells/scripts)
+    provider: str = ""       # provider key: "claude" | "openai" | "gemini"
+    model: str = ""          # "" = provider default
+    effort: str = ""         # "" = provider default (Claude: low..max)
+    custom_command: str = ""  # user override for template providers
+    font_px: int = 0         # 0 = follow the global/default size
+    # extra system-prompt text injected for coordination (Claude)
+    system_prompt: str = ""
+    extra_dirs: list = field(default_factory=list)  # --add-dir targets
+    is_orchestrator: bool = False   # can spawn/assign agents via the MCP server
+    mcp_config_path: str = ""       # --mcp-config for the orchestrator
+    resume: bool = False            # one-shot: resume prior conversation (restore)
+    # each Claude agent OWNS one conversation, pinned by id. Resuming uses
+    # --resume <id>, never --continue: "most recent in this folder" is wrong
+    # the moment two agents share a project folder (they'd race for the same
+    # conversation, and the loser opens something else or clobbers a peer's).
+    session_id: str = ""
+    # user-facing fields only (program/args are rebuilt from the profile)
+    user_program: str = ""   # PYTHON_SCRIPT: script path; CUSTOM: exe
+    user_args: list = field(default_factory=list)
+
+    def effective_args(self) -> list:
+        """Args actually passed to the process, including coordination and
+        orchestrator flags (Claude native flags only)."""
+        args = list(self.args)
+        if self.provider == "claude":
+            if self.resume:
+                # pinned id -> resume THIS agent's own conversation;
+                # --continue only as legacy fallback for pre-pinning sessions
+                args += (["--resume", self.session_id] if self.session_id
+                         else ["--continue"])
+            elif self.session_id:
+                # fresh start still declares its identity, so the NEXT resume
+                # can pin to it (verified: claude --session-id <uuid>)
+                args += ["--session-id", self.session_id]
+            for d in self.extra_dirs:
+                if d:
+                    args += ["--add-dir", d]
+            if self.system_prompt:
+                args += ["--append-system-prompt", self.system_prompt]
+            if self.mcp_config_path:
+                # verified against Claude Code 2.1.197: load only our MCP server
+                # and pre-approve its tools so tool calls don't block on prompts.
+                # Orchestrators get the full toolset; workers are restricted to
+                # log_activity (the bridge ALSO enforces this by role, so a
+                # widened tool list still can't spawn/close peers).
+                allowed = ("mcp__aihive" if self.is_orchestrator
+                           else "mcp__aihive__log_activity")
+                args += ["--mcp-config", self.mcp_config_path,
+                         "--strict-mcp-config",
+                         "--allowedTools", allowed]
+        elif self.provider == "gemini":
+            # Antigravity CLI (agy 1.0.16) shares Claude's resume/workspace
+            # flags: --continue and a repeatable --add-dir. It has no
+            # system-prompt or MCP-config flags, so no orchestrator wiring.
+            if self.resume:
+                args += ["--continue"]
+            for d in self.extra_dirs:
+                if d:
+                    args += ["--add-dir", d]
+        return args
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind.value, "name": self.name, "role": self.role,
+            "cwd": self.cwd, "user_program": self.user_program,
+            "user_args": list(self.user_args), "pty": self.pty,
+            "provider": self.provider, "model": self.model,
+            "effort": self.effort, "custom_command": self.custom_command,
+            "font_px": self.font_px, "is_orchestrator": self.is_orchestrator,
+            "session_id": self.session_id,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "AgentSpec":
+        spec = build_spec(
+            AgentKind(d.get("kind", "powershell")),
+            d.get("name", "Agent"), role=d.get("role", ""),
+            cwd=d.get("cwd", ""), program=d.get("user_program", ""),
+            args=list(d.get("user_args", [])),
+            pty=bool(d.get("pty", False)),
+            model=d.get("model", ""), effort=d.get("effort", ""),
+            custom_command=d.get("custom_command", ""),
+            font_px=int(d.get("font_px", 0) or 0),
+            is_orchestrator=bool(d.get("is_orchestrator", False)),
+        )
+        # restored agents keep their pinned conversation ("" = legacy, which
+        # resumes via --continue once and gets pinned on its next fresh start)
+        spec.session_id = str(d.get("session_id", "") or "")
+        return spec
+
+
+def _resolve_claude() -> str:
+    return providers.resolve_claude()
+
+
+def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
+               program: str = "", args: list | None = None,
+               pty: bool = False, model: str = "", effort: str = "",
+               custom_command: str = "", font_px: int = 0,
+               is_orchestrator: bool = False) -> AgentSpec:
+    """Profile factory: fills in the verified per-shell invocation modes.
+
+    When pty=True the shells launch in their INTERACTIVE form (real prompt,
+    PSReadLine, etc.) because a pseudo-console makes them behave like a true
+    terminal; the piped-stdin invocations are only used in line mode.
+
+    AI-agent kinds (Claude/OpenAI/Gemini) route through app.providers so the
+    model/effort selections become real CLI flags.
+    """
+    args = list(args or [])
+    if kind in PTY_ONLY_KINDS:
+        pty = True
+    spec = AgentSpec(kind=kind, name=name, role=role, cwd=cwd, pty=pty,
+                     model=model, effort=effort, custom_command=custom_command,
+                     font_px=font_px, is_orchestrator=is_orchestrator,
+                     user_program=program, user_args=args)
+    if kind in AI_KINDS:
+        spec.provider = AI_KINDS[kind]
+        prov = providers.get(spec.provider)
+        prog, prov_args = providers.build_invocation(
+            spec.provider, model=model, effort=effort,
+            custom_command=custom_command, extra_args=args)
+        spec.program = prog
+        spec.args = prov_args
+        spec.role = role or (prov.display if prov else spec.provider)
+        return spec
+    if kind in (AgentKind.POWERSHELL, AgentKind.PWSH):
+        exe = "powershell.exe" if kind == AgentKind.POWERSHELL else (
+            shutil.which("pwsh") or "pwsh.exe")
+        spec.program = exe
+        spec.args = (["-NoLogo", "-NoProfile"] if pty
+                     else ["-NoLogo", "-NoProfile", "-Command", "-"])
+        spec.init_lines = [] if pty else [PS_UTF8_INIT]
+        spec.encoding_out = "utf-8"
+        spec.trailing_blank_line = not pty
+        spec.role = role or ("PowerShell" if kind == AgentKind.POWERSHELL
+                             else "PowerShell 7")
+    elif kind == AgentKind.CMD:
+        spec.program = "cmd.exe"
+        spec.args = ["/d"] if pty else ["/d", "/Q", "/K"]
+        spec.env = {} if pty else {"PROMPT": "$P$G"}
+        spec.encoding_out = "hybrid"
+        spec.encoding_in = "cp437"
+        spec.role = role or "cmd"
+    elif kind == AgentKind.PYTHON_SCRIPT:
+        spec.program = sys.executable
+        spec.args = ["-u", program] + args if program else ["-u"] + args
+        spec.encoding_out = "utf-8"
+        spec.merge_stderr = False
+        spec.role = role or f"python {os.path.basename(program)}".strip()
+    else:  # CUSTOM
+        spec.program = program
+        spec.args = args
+        spec.encoding_out = "hybrid"
+        spec.merge_stderr = False
+        spec.role = role or os.path.basename(program)
+    return spec
+
+
+# ---------------------------------------------------------------- decode ---
+
+class HybridDecoder:
+    """Incremental UTF-8-first decoder with cp437 fallback per chunk.
+
+    cmd/PS 5.1 builtins emit OEM cp437 on pipes while modern tools emit
+    UTF-8, sometimes interleaved in one session. ASCII (the common case)
+    and valid UTF-8 take the strict path; anything else falls back to
+    cp437, which never fails (every byte maps). An incomplete trailing
+    UTF-8 sequence is held until more bytes arrive.
+    """
+
+    def __init__(self, mode: str = "hybrid"):
+        self._mode = mode
+        self._tail = b""
+        self._tail_since = 0.0
+        if mode != "hybrid":
+            self._dec = codecs.getincrementaldecoder(mode)(errors="replace")
+
+    def feed(self, data: bytes) -> str:
+        if self._mode != "hybrid":
+            return self._dec.decode(data)
+        buf = self._tail + data
+        self._tail = b""
+        cut = len(buf)
+        for i in range(1, min(4, len(buf)) + 1):
+            b = buf[-i]
+            if b < 0x80:
+                break  # ends in ASCII: nothing incomplete
+            if b >= 0xC0:  # UTF-8 lead byte
+                need = 2 if b < 0xE0 else 3 if b < 0xF0 else 4
+                if i < need:
+                    cut = len(buf) - i  # sequence still incomplete: hold it
+                break
+        self._tail = buf[cut:]
+        if self._tail:
+            self._tail_since = time.monotonic()
+        chunk = buf[:cut]
+        if not chunk:
+            return ""
+        try:
+            return chunk.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            return chunk.decode("cp437", "replace")
+
+    @property
+    def has_tail(self) -> bool:
+        return bool(self._tail)
+
+    def flush_stale(self, max_age_s: float = 0.13) -> str:
+        """Release a held tail when the stream goes idle: a genuine UTF-8
+        continuation arrives within the same pipe read in practice, so an
+        aging tail is cp437 text (e.g. box-drawing from `tree`) that should
+        render rather than being withheld until process exit."""
+        if self._mode != "hybrid" or not self._tail:
+            return ""
+        if time.monotonic() - self._tail_since < max_age_s:
+            return ""
+        return self.flush()
+
+    def flush(self) -> str:
+        if self._mode != "hybrid":
+            return self._dec.decode(b"", final=True)
+        tail, self._tail = self._tail, b""
+        return tail.decode("cp437", "replace") if tail else ""
+
+
+# ----------------------------------------------------------------- WinJob ---
+
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+            ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    _JobObjectExtendedLimitInformation = 9
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _PROCESS_SET_QUOTA = 0x0100
+    _PROCESS_TERMINATE = 0x0001
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+class WinJob:
+    """One Job Object per worker: tree kill + crash-safe reaping."""
+
+    def __init__(self):
+        self._handle = None
+        self._assigned = False
+        if sys.platform != "win32":
+            return
+        handle = _k32.CreateJobObjectW(None, None)
+        if not handle:
+            return
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = _k32.SetInformationJobObject(
+            handle, _JobObjectExtendedLimitInformation,
+            ctypes.byref(info), ctypes.sizeof(info))
+        if not ok:
+            _k32.CloseHandle(handle)
+            return
+        self._handle = handle
+
+    def assign(self, pid: int) -> bool:
+        if not self._handle or not pid:
+            return False
+        proc = _k32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE,
+                                False, int(pid))
+        if not proc:
+            return False
+        try:
+            self._assigned = bool(_k32.AssignProcessToJobObject(self._handle, proc))
+        finally:
+            _k32.CloseHandle(proc)
+        return self._assigned
+
+    @property
+    def assigned(self) -> bool:
+        return self._assigned
+
+    def terminate_tree(self, exit_code: int = 1) -> bool:
+        if not self._handle or not self._assigned:
+            return False
+        return bool(_k32.TerminateJobObject(self._handle, exit_code))
+
+    def close(self) -> None:
+        if self._handle:
+            _k32.CloseHandle(self._handle)
+            self._handle = None
+            self._assigned = False
+
+
+def _taskkill_tree(pid: int) -> None:
+    try:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                       capture_output=True, creationflags=CREATE_NO_WINDOW,
+                       timeout=5)
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- worker ---
+
+class WorkerState(Enum):
+    IDLE = "idle"
+    STARTING = "starting"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    DEAD = "dead"
+
+
+class ProcessWorker(QObject):
+    """QProcess wrapper: batched decoded output, EOF stop, Job tree kill."""
+
+    started = Signal(int)            # pid
+    output = Signal(str, str)        # stream ("stdout"|"stderr"), text
+    finished = Signal(int, bool)     # exit code, crashed
+    failed = Signal(str)             # FailedToStart message
+    state_changed = Signal(object)   # WorkerState
+
+    def __init__(self, spec: AgentSpec, parent: QObject | None = None):
+        super().__init__(parent)
+        self.id = uuid.uuid4().hex
+        self.spec = spec
+        self.state = WorkerState.IDLE
+        self.exit_info: tuple[int, bool] | None = None
+        self._proc: QProcess | None = None
+        self._job: WinJob | None = None
+        self._gen = 0  # invalidates stale grace timers across restarts
+        self._restart_pending = False
+        self._queued_lines: list[str] = []  # typed while STARTING
+        self._pend = {"stdout": bytearray(), "stderr": bytearray()}
+        self._dec = {}
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setInterval(FLUSH_INTERVAL_MS)
+        self._flush_timer.timeout.connect(self._flush)
+
+    # ------------------------------------------------------------ control ---
+
+    def start(self) -> None:
+        if self.state in (WorkerState.STARTING, WorkerState.RUNNING,
+                          WorkerState.STOPPING):
+            return
+        self._gen += 1
+        self.exit_info = None
+        self._pend = {"stdout": bytearray(), "stderr": bytearray()}
+        self._dec = {s: HybridDecoder(self.spec.encoding_out)
+                     for s in ("stdout", "stderr")}
+
+        old = self._proc  # a restarted worker must not accumulate dead
+        if old is not None:  # QProcess children with live connections
+            for sig in (old.started, old.readyReadStandardOutput,
+                        old.readyReadStandardError, old.finished,
+                        old.errorOccurred):
+                try:
+                    sig.disconnect()
+                except RuntimeError:
+                    pass
+            old.deleteLater()
+
+        proc = QProcess(self)
+        self._proc = proc
+        proc.setProgram(self.spec.program)
+        proc.setArguments(list(self.spec.effective_args()))
+        if self.spec.cwd and os.path.isdir(self.spec.cwd):
+            proc.setWorkingDirectory(self.spec.cwd)
+
+        env = QProcessEnvironment.systemEnvironment()
+        for key, val in {**COMMON_ENV, **self.spec.env}.items():
+            env.insert(key, val)
+        proc.setProcessEnvironment(env)
+
+        if self.spec.merge_stderr:
+            proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        else:
+            proc.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+
+        # No CREATE_NO_WINDOW handling needed: with piped channels (never
+        # ForwardedChannels here) Qt already creates console children
+        # windowless and unattached to any launch console.
+
+        proc.started.connect(self._on_started)
+        proc.readyReadStandardOutput.connect(self._on_ready_out)
+        proc.readyReadStandardError.connect(self._on_ready_err)
+        proc.finished.connect(self._on_finished)
+        proc.errorOccurred.connect(self._on_error)
+
+        self._set_state(WorkerState.STARTING)
+        proc.start()
+
+    def send_line(self, text: str) -> bool:
+        if self.state is WorkerState.STARTING or (
+                self.state is WorkerState.STOPPING and self._restart_pending):
+            self._queued_lines.append(text)  # delivered to the new session
+            return True
+        if self.state != WorkerState.RUNNING or self._proc is None:
+            return False
+        self._write_line(text)
+        return True
+
+    def _write_line(self, text: str) -> None:
+        data = (text + self.spec.line_ending).encode(self.spec.encoding_in,
+                                                     "replace")
+        if self.spec.trailing_blank_line:
+            data += self.spec.line_ending.encode("ascii")
+        self._proc.write(data)
+
+    def stop(self, grace_ms: int = 800) -> None:
+        """Graceful: stdin EOF (verified exit 0 for cmd/PS), then tree kill."""
+        if self.state not in (WorkerState.RUNNING, WorkerState.STARTING):
+            return
+        self._set_state(WorkerState.STOPPING)
+        if self._proc is not None:
+            self._proc.closeWriteChannel()
+        gen = self._gen
+        # self as receiver context: Qt drops the pending callback if the
+        # worker is destroyed before the grace period elapses.
+        QTimer.singleShot(grace_ms, self, lambda: self._grace_kill(gen))
+
+    def kill(self) -> None:
+        if self._proc is None or self.state in (WorkerState.IDLE, WorkerState.DEAD):
+            return
+        killed = self._job.terminate_tree() if self._job else False
+        if not killed:
+            pid = self._proc.processId()
+            if pid:
+                _taskkill_tree(pid)
+        self._proc.kill()  # belt and braces; also covers not-yet-assigned
+
+    def dispose(self) -> None:
+        """Final teardown (card close / workspace delete / app quit).
+
+        The Job Object tree kill is effectively synchronous, so the brief
+        waitForFinished only reaps the notification — it prevents
+        "QProcess: Destroyed while process is still running" at shutdown
+        without any user-visible stall.
+        """
+        self._restart_pending = False
+        if self._proc is None or self.state in (WorkerState.IDLE,
+                                                WorkerState.DEAD):
+            return
+        self.kill()
+        self._proc.waitForFinished(1500)
+
+    def restart(self) -> None:
+        if self.state in (WorkerState.RUNNING, WorkerState.STARTING,
+                          WorkerState.STOPPING):
+            self._restart_pending = True
+            # Leave RUNNING synchronously: the kill is async (the finished
+            # notification arrives via the event loop), and callers must not
+            # be able to send_line() into the doomed session meanwhile.
+            self._set_state(WorkerState.STOPPING)
+            self.kill()
+        else:
+            self.start()
+
+    def is_running(self) -> bool:
+        return self.state in (WorkerState.STARTING, WorkerState.RUNNING)
+
+    def pid(self) -> int | None:
+        if self._proc is not None and self.is_running():
+            return self._proc.processId() or None
+        return None
+
+    def process(self) -> QProcess | None:
+        return self._proc
+
+    # -------------------------------------------------------------- slots ---
+
+    def _set_state(self, state: WorkerState) -> None:
+        if state is not self.state:
+            self.state = state
+            self.state_changed.emit(state)
+
+    def _on_started(self) -> None:
+        self._job = WinJob()
+        self._job.assign(self._proc.processId())
+        for line in self.spec.init_lines:
+            data = (line + self.spec.line_ending).encode(self.spec.encoding_in,
+                                                         "replace")
+            self._proc.write(data)
+        if self.state is WorkerState.STARTING:  # not already stopping
+            self._set_state(WorkerState.RUNNING)
+            for line in self._queued_lines:  # typed while starting
+                self._write_line(line)
+        self._queued_lines.clear()
+        self.started.emit(self._proc.processId())
+
+    def _on_ready_out(self) -> None:
+        self._pend["stdout"] += bytes(self._proc.readAllStandardOutput().data())
+        self._cap_pending("stdout")
+        if not self._flush_timer.isActive():
+            self._flush_timer.start()
+
+    def _on_ready_err(self) -> None:
+        self._pend["stderr"] += bytes(self._proc.readAllStandardError().data())
+        self._cap_pending("stderr")
+        if not self._flush_timer.isActive():
+            self._flush_timer.start()
+
+    def _cap_pending(self, stream: str) -> None:
+        buf = self._pend[stream]
+        if len(buf) <= PENDING_CAP:
+            return
+        # Newline-aligned splice points: an arbitrary byte cut can land
+        # mid-UTF-8-sequence (making the strict decode of the WHOLE flush
+        # fall back to cp437 mojibake) or mid-ANSI-escape. Fall back to the
+        # raw offsets only if a window somehow contains no newline at all.
+        head_end = buf.rfind(b"\n", 0, CAP_KEEP_HEAD) + 1
+        if head_end <= 0:
+            head_end = CAP_KEEP_HEAD
+        tail_start = buf.find(b"\n", len(buf) - CAP_KEEP_TAIL)
+        tail_start = tail_start + 1 if tail_start != -1 else len(buf) - CAP_KEEP_TAIL
+        dropped = tail_start - head_end
+        marker = f"\n[... {dropped} bytes dropped (output flood) ...]\n"
+        self._pend[stream] = (buf[:head_end] + marker.encode("ascii")
+                              + buf[tail_start:])
+
+    def _flush(self) -> None:
+        any_pending = False
+        for stream, buf in self._pend.items():
+            dec = self._dec[stream]
+            if buf:
+                any_pending = True
+                text = dec.feed(bytes(buf))
+                buf.clear()
+                if text:
+                    self.output.emit(stream, text.replace("\r\n", "\n"))
+            elif dec.has_tail:
+                stale = dec.flush_stale()
+                if stale:
+                    self.output.emit(stream, stale.replace("\r\n", "\n"))
+        if not any_pending and not any(d.has_tail for d in self._dec.values()):
+            self._flush_timer.stop()
+
+    def _grace_kill(self, gen: int) -> None:
+        if gen == self._gen and self.state is WorkerState.STOPPING:
+            self.kill()
+
+    def _on_finished(self, code: int, status) -> None:
+        self._flush_timer.stop()
+        self._flush()
+        for stream in ("stdout", "stderr"):
+            tail = self._dec[stream].flush() if stream in self._dec else ""
+            if tail:
+                self.output.emit(stream, tail.replace("\r\n", "\n"))
+        crashed = status == QProcess.ExitStatus.CrashExit
+        self.exit_info = (code, crashed)
+        if self._job:
+            self._job.close()
+            self._job = None
+        self._set_state(WorkerState.DEAD)
+        self.finished.emit(code, crashed)
+        if self._restart_pending:
+            self._restart_pending = False
+            self._set_state(WorkerState.IDLE)
+            self.start()
+
+    def _on_error(self, error) -> None:
+        if error == QProcess.ProcessError.FailedToStart:
+            if self._job:
+                self._job.close()
+                self._job = None
+            self._set_state(WorkerState.DEAD)
+            self.failed.emit(
+                f"failed to start: {self.spec.program} "
+                f"({self._proc.errorString() if self._proc else 'unknown'})")

@@ -1,0 +1,2167 @@
+"""AI Hive end-to-end smoke test.
+
+Run with the project venv, no display needed:
+    .venv\\Scripts\\python.exe tests\\smoke_test.py
+
+Drives the REAL application (create_main_window) on the offscreen Qt
+platform with real child processes; prints [PASS]/[FAIL] per check,
+saves screenshots to tests/screenshots/, exits nonzero on any failure.
+Every wait has a timeout, so a hang reads as a deterministic FAIL.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from pathlib import Path
+
+os.environ["QT_QPA_PLATFORM"] = "offscreen"  # must precede any Qt import
+os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
+
+# failure DETAILS can contain terminal screen text (box drawing, prompt
+# glyphs) — a cp1252 console must degrade them, never crash the suite
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+SHOTS = ROOT / "tests" / "screenshots"
+SHOTS.mkdir(parents=True, exist_ok=True)
+
+PASS = 0
+FAIL = 0
+
+
+def check(name, cond, detail=""):
+    global PASS, FAIL
+    cond = bool(cond)
+    line = ("[PASS] " if cond else "[FAIL] ") + name
+    if detail and not cond:
+        line += " :: " + str(detail)
+    print(line, flush=True)
+    PASS += cond
+    FAIL += not cond
+
+
+# ---------------------------------------------------------------- tiling ----
+
+def test_tiling():
+    from app.tiling import Cell, compute_grid
+
+    expected = {
+        1: [(0, 0, 1, 1)],
+        2: [(0, 0, 1, 1), (0, 1, 1, 1)],
+        3: [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 2)],
+        4: [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 1, 1)],
+        5: [(0, 0, 1, 2), (0, 2, 1, 2), (0, 4, 1, 2), (1, 0, 1, 3), (1, 3, 1, 3)],
+        6: [(0, 0, 1, 1), (0, 1, 1, 1), (0, 2, 1, 1),
+            (1, 0, 1, 1), (1, 1, 1, 1), (1, 2, 1, 1)],
+        7: [(0, 0, 1, 1), (0, 1, 1, 1), (0, 2, 1, 1),
+            (1, 0, 1, 1), (1, 1, 1, 1), (1, 2, 1, 1), (2, 0, 1, 3)],
+        8: [(0, 0, 1, 2), (0, 2, 1, 2), (0, 4, 1, 2),
+            (1, 0, 1, 2), (1, 2, 1, 2), (1, 4, 1, 2), (2, 0, 1, 3), (2, 3, 1, 3)],
+        9: [(0, 0, 1, 1), (0, 1, 1, 1), (0, 2, 1, 1),
+            (1, 0, 1, 1), (1, 1, 1, 1), (1, 2, 1, 1),
+            (2, 0, 1, 1), (2, 1, 1, 1), (2, 2, 1, 1)],
+    }
+    expected_dims = {  # n: (rows, vcols)
+        1: (1, 1), 2: (1, 2), 3: (2, 2), 4: (2, 2), 5: (2, 6),
+        6: (2, 3), 7: (3, 3), 8: (3, 6), 9: (3, 3),
+    }
+
+    check("tiling: n=0 is empty", compute_grid(0) == ([], 0, 0))
+    for n, cells in expected.items():
+        plan = compute_grid(n)
+        want = [Cell(*c) for c in cells]
+        check(f"tiling: n={n} cells", plan.cells == want, f"got {plan.cells}")
+        check(f"tiling: n={n} dims", (plan.rows, plan.vcols) == expected_dims[n],
+              f"got rows={plan.rows} vcols={plan.vcols}")
+    for n in range(1, 13):
+        plan = compute_grid(n)
+        by_row = {}
+        for c in plan.cells:
+            by_row[c.row] = by_row.get(c.row, 0) + c.col_span
+        check(f"tiling: n={n} rows fully covered",
+              all(v == plan.vcols for v in by_row.values()),
+              f"row spans {by_row}, vcols={plan.vcols}")
+
+
+def test_layout_popup_placement():
+    """The Layout button sits at the right end of the header, so left-anchoring
+    its wide palette spills past the app window's right edge (the reported bug:
+    the popup overflows the window even when there's screen to the right). The
+    popup must stay inside the window AND on-screen — right-aligning under the
+    button so it grows leftward into the window."""
+    from PySide6.QtCore import QSize
+    from PySide6.QtWidgets import QApplication, QWidget
+    from app.widgets.grid_selector import GridButton
+
+    app = QApplication.instance() or QApplication([])
+    avail = app.primaryScreen().availableGeometry()
+
+    # a normal window well away from the screen edges, Layout button at its
+    # right end — the case my first (screen-only) clamp missed
+    win = QWidget()
+    win.setGeometry(avail.x() + 40, avail.y() + 40, 700, 500)
+    btn = GridButton(win)
+    btn.resize(96, 28)
+    btn.move(700 - btn.width() - 8, 8)
+    win.show(); app.processEvents()
+
+    size = QSize(360, 260)  # wider than the gap from the button to window-right
+    p = btn._popup_position(size)
+    wg = win.geometry()
+    win_right = wg.x() + wg.width()
+    check("layout popup: stays within the app window's right edge",
+          wg.x() <= p.x() and p.x() + size.width() <= win_right,
+          (p.x(), size.width(), win_right))
+    check("layout popup: also stays on-screen",
+          avail.y() <= p.y() and p.y() + size.height() <= avail.y() + avail.height(),
+          (p.y(), size.height()))
+    win.deleteLater()
+
+
+def test_sidebar_count_badge():
+    """The workspace row leads with an agent-count badge that also signals
+    status by colour: pulsing green when any agent works, amber when all idle,
+    red on error (green wins if something also runs), dim when empty. Folder/
+    delete buttons show ONLY on hover, never merely because the row is active."""
+    from PySide6.QtCore import QAbstractAnimation
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.sidebar import WorkspaceRow
+
+    QApplication.instance() or QApplication([])
+    row = WorkspaceRow("w1", "Alpha", "C:/proj")
+
+    def badge(total, active, idle, error):
+        row.set_stats({"total": total, "active": active,
+                       "idle": idle, "error": error})
+        return row.count_badge
+
+    b = badge(0, 0, 0, 0)
+    check("badge: empty workspace -> empty state, count 0",
+          b._state == "empty" and b._count == 0, (b._state, b._count))
+    b = badge(2, 0, 2, 0)
+    check("badge: all idle -> idle (amber), count 2",
+          b._state == "idle" and b._count == 2, (b._state, b._count))
+    b = badge(3, 1, 2, 0)
+    check("badge: one working -> working (green), pulsing",
+          b._state == "working"
+          and b._anim.state() == QAbstractAnimation.State.Running,
+          (b._state, b._anim.state()))
+    b = badge(1, 0, 0, 1)
+    check("badge: idle with an error -> error (red), not pulsing",
+          b._state == "error"
+          and b._anim.state() != QAbstractAnimation.State.Running,
+          (b._state, b._anim.state()))
+    b = badge(2, 1, 0, 1)
+    check("badge: running + error -> working wins (green)",
+          b._state == "working", b._state)
+
+    # folder/delete are hover-only: activating the row must NOT reveal them.
+    # Use isHidden() (explicit show/hide intent) not isVisible() — the row has
+    # no shown ancestor here, so isVisible() would be False either way.
+    row.set_active(True)
+    check("row: active row does not show folder/delete (hover-only)",
+          row.folder_btn.isHidden() and row.delete_btn.isHidden(),
+          (row.folder_btn.isHidden(), row.delete_btn.isHidden()))
+    row._update_hover_buttons(hovered=True)
+    check("row: hover reveals folder/delete",
+          not row.folder_btn.isHidden() and not row.delete_btn.isHidden())
+    row.deleteLater()
+
+
+# ------------------------------------------------------------ ansi parser ---
+
+def test_ansi():
+    from app.ansi_parser import AnsiSgrParser
+
+    p = AnsiSgrParser()
+    segs = p.feed("\x1b[31mred\x1b[0m plain")
+    check("ansi: SGR color applied",
+          len(segs) == 2 and segs[0][0].fg is not None and segs[1][0].fg is None,
+          segs)
+
+    p = AnsiSgrParser()
+    a = p.feed("start\x1b[3")      # escape split across chunks
+    b = p.feed("2mgreen")
+    check("ansi: partial escape carried across chunks",
+          "".join(t for _, t in a) == "start"
+          and "".join(t for _, t in b) == "green"
+          and b[0][0].fg is not None, (a, b))
+
+    p = AnsiSgrParser()
+    segs = p.feed("\x1b]0;window title\x07visible")
+    check("ansi: OSC stripped", "".join(t for _, t in segs) == "visible", segs)
+
+    p = AnsiSgrParser()
+    p.feed("\x1b[38;5;196m")
+    segs = p.feed("bright")
+    check("ansi: 256-color mode", segs and segs[0][0].fg == "#ff0000", segs)
+
+    # regression: an unterminated OSC must not swallow the stream forever
+    p = AnsiSgrParser()
+    p.feed("\x1b]0;title-that-never-terminates")
+    for _ in range(30):
+        p.feed("x" * 500)  # would grow the carry unboundedly if uncapped
+    segs = p.feed("recovered")
+    check("ansi: unterminated OSC recovers (carry capped)",
+          any("recovered" in t for _, t in segs), segs[-1:])
+
+
+# ------------------------------------------------------------ application ---
+
+def test_app():
+    from PySide6.QtCore import QEventLoop, Qt, QTimer
+    from PySide6.QtCore import QProcess
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.tiling import compute_grid
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    check("app: stylesheet applied", "TerminalCard" in app.styleSheet())
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    def wait_until(pred, timeout_ms=10000, step=50):
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if pred():
+                return True
+            pump(step)
+        return pred()
+
+    def snap(widget, name):
+        widget.grab().save(str(SHOTS / f"{name}.png"))
+
+    # isolated session dir + two project dirs for the cwd checks
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-smoke-"))
+    proj_alpha = tmp / "proj-alpha"
+    proj_bravo = tmp / "proj-bravo"
+    proj_alpha.mkdir()
+    proj_bravo.mkdir()
+    store = SessionStore(path=tmp / "session.json")
+
+    # -- 1. boot ----------------------------------------------------------
+    win = create_main_window(store)
+    win.resize(1600, 900)
+    win.show()
+    pump(200)
+    mgr = win.manager
+    check("boot: window shown", win.isVisible())
+    check("boot: first-run default workspace exists", len(mgr.workspaces) == 1)
+    check("boot: first-run default agent is idle",
+          len(mgr.workspaces[0].agents) == 1
+          and not mgr.workspaces[0].agents[0].is_running())
+    snap(win, "01_boot")
+
+    # -- 3. workspaces (model API + real widget wiring) --------------------
+    alpha = mgr.workspaces[0]
+    mgr.rename_workspace(alpha.id, "Alpha")
+    alpha.project_path = str(proj_alpha)
+    bravo = mgr.create_workspace("Beta", str(proj_bravo))
+    pump(100)
+    check("ws: sidebar has 2 rows", len(win.sidebar._rows) == 2)
+    check("ws: rename reflected in sidebar",
+          win.sidebar._rows[alpha.id][1].name_label.text() == "Alpha")
+    mgr.rename_workspace(bravo.id, "Bravo")
+    pump(50)
+    check("ws: second rename reflected",
+          win.sidebar._rows[bravo.id][1].name_label.text() == "Bravo")
+    check("ws: Alpha row is active",
+          win.sidebar._rows[alpha.id][1].property("active") is True
+          and win.sidebar._rows[bravo.id][1].property("active") is False)
+    check("ws: breadcrumb shows active workspace",
+          "Alpha" in win.top_bar.breadcrumb.text())
+
+    # remove the default idle agent so the tiling count starts at 0
+    mgr.remove_terminal(alpha.id, alpha.agents[0].id)
+    pump(100)
+    page = win._pages[alpha.id]
+    check("ws: empty state visible with 0 terminals", page.empty.isVisible())
+    snap(win, "02_two_workspaces")
+
+    # -- 4. incremental tiling 1..6 against the applied layout -------------
+    def assert_layout(page, n):
+        plan = compute_grid(n)
+        ok = len(page.cards) == n
+        detail = ""
+        for i, card in enumerate(page.cards):
+            got = page.grid.getItemPosition(page.grid.indexOf(card))
+            want = tuple(plan.cells[i])
+            if got != want:
+                ok = False
+                detail = f"card {i}: got {got}, want {want}"
+                break
+        for c in range(plan.vcols, page.grid.columnCount()):
+            if page.grid.columnStretch(c) != 0:
+                ok = False
+                detail = f"stale column stretch at col {c}"
+        for r in range(plan.rows, page.grid.rowCount()):
+            if page.grid.rowStretch(r) != 0:
+                ok = False
+                detail = f"stale row stretch at row {r}"
+        check(f"tiling applied: n={n}", ok, detail)
+
+    idle_ids = []
+    for n in range(1, 7):
+        agent = mgr.add_terminal(
+            alpha.id, build_spec(AgentKind.CMD, f"Tile {n}",
+                                 cwd=str(proj_alpha)), autostart=False)
+        idle_ids.append(agent.id)
+        pump(30)
+        assert_layout(page, n)
+        if n in (1, 3, 5, 6):
+            snap(win, f"03_tiles_{n}")
+    check("tiling: sidebar stats show 6 total",
+          mgr.workspace_stats(alpha.id)["total"] == 6)
+
+    # shrink 6 -> 3 exercises the stale-stretch reset (vcols 3 -> 2)
+    for agent_id in idle_ids[3:]:
+        mgr.remove_terminal(alpha.id, agent_id)
+    pump(50)
+    assert_layout(page, 3)
+    snap(win, "04_shrink_3")
+
+    # -- 5. live streaming --------------------------------------------------
+    ticker = mgr.add_terminal(alpha.id, build_spec(
+        AgentKind.CUSTOM, "Ticker", cwd=str(proj_alpha),
+        program=sys.executable,
+        args=["-u", "-c",
+              "import time\nfor i in range(2000): print(f'tick {i}', flush=True); time.sleep(0.05)"]))
+    ticker_card = page.card_for(ticker.id)
+    check("stream: live output reaches console",
+          wait_until(lambda: "tick 5" in ticker_card.console.toPlainText(), 15000),
+          ascii(ticker_card.console.toPlainText()[-200:]))
+    snap(win, "05_streaming")
+
+    # -- 6. stdin round-trip via the real input line ------------------------
+    echo = mgr.add_terminal(alpha.id, build_spec(
+        AgentKind.CUSTOM, "Echo", cwd=str(proj_alpha),
+        program=sys.executable,
+        args=["-u", "-c",
+              "import sys\nfor line in sys.stdin: print('echo:'+line.strip(), flush=True)"]))
+    echo_card = page.card_for(echo.id)
+    wait_until(lambda: echo.is_running(), 8000)
+    echo_card.input.setText("hello hive")
+    QTest.keyClick(echo_card.input, Qt.Key.Key_Return)
+    check("stdin: round-trip through input line",
+          wait_until(lambda: "echo:hello hive" in echo_card.console.toPlainText(),
+                     10000),
+          ascii(echo_card.console.toPlainText()[-200:]))
+    check("stdin: input line cleared after submit", echo_card.input.text() == "")
+    check("stdin: local echo rendered",
+          "> hello hive" in echo_card.console.toPlainText())
+
+    # -- 7. terminal cwd == workspace project folder ------------------------
+    cwd_agent = mgr.add_terminal(alpha.id, build_spec(
+        AgentKind.CUSTOM, "Cwd", cwd=str(proj_alpha),
+        program=sys.executable,
+        args=["-u", "-c", "import os; print('CWD=' + os.getcwd(), flush=True)"]))
+    cwd_card = page.card_for(cwd_agent.id)
+    check("cwd: terminal opens in the workspace project folder",
+          wait_until(lambda: f"CWD={proj_alpha}" in cwd_card.console.toPlainText(),
+                     10000),
+          ascii(cwd_card.console.toPlainText()[-200:]))
+    mgr.remove_terminal(alpha.id, cwd_agent.id)
+    mgr.remove_terminal(alpha.id, echo.id)
+    pump(100)
+    assert_layout(page, 4)  # 3 idle + ticker
+
+    # -- 8. background retention across workspace switch --------------------
+    bravo_row = win.sidebar._rows[bravo.id][1]
+    QTest.mouseClick(bravo_row, Qt.MouseButton.LeftButton)  # real click
+    pump(100)
+    check("retention: Bravo is active after row click",
+          mgr.active_id == bravo.id)
+    check("retention: ticker card hidden", not ticker_card.isVisible())
+    before = len(ticker_card.console.toPlainText())
+    pump(1500)
+    after = len(ticker_card.console.toPlainText())
+    check("retention: hidden terminal kept streaming",
+          after > before and not ticker_card.isVisible(),
+          f"before={before} after={after}")
+    check("retention: process still running while hidden", ticker.is_running())
+    QTest.mouseClick(win.sidebar._rows[alpha.id][1], Qt.MouseButton.LeftButton)
+    pump(100)
+    check("retention: back to Alpha", mgr.active_id == alpha.id)
+    snap(win, "06_after_switch")
+
+    # -- 8b. review-fix regressions -----------------------------------------
+    # rename: Escape must cancel, not commit
+    alpha_row = win.sidebar._rows[alpha.id][1]
+    alpha_row.start_rename()
+    alpha_row.rename_edit.setText("ShouldNotStick")
+    QTest.keyClick(alpha_row.rename_edit, Qt.Key.Key_Escape)
+    pump(50)
+    check("rename: Escape cancels instead of committing",
+          mgr.workspace(alpha.id).name == "Alpha"
+          and alpha_row.name_label.text() == "Alpha",
+          mgr.workspace(alpha.id).name)
+    # rename: Enter commits exactly once
+    alpha_row.start_rename()
+    alpha_row.rename_edit.setText("AlphaPrime")
+    QTest.keyClick(alpha_row.rename_edit, Qt.Key.Key_Return)
+    pump(50)
+    check("rename: Enter commits", mgr.workspace(alpha.id).name == "AlphaPrime")
+    mgr.rename_workspace(alpha.id, "Alpha")
+    pump(50)
+
+    # history: draft survives an accidental Up
+    any_card = page.cards[0]
+    any_card._history = ["old command"]
+    any_card._hist_idx = 1
+    any_card.input.setText("my draft")
+    QTest.keyClick(any_card.input, Qt.Key.Key_Up)
+    check("history: Up recalls previous", any_card.input.text() == "old command")
+    QTest.keyClick(any_card.input, Qt.Key.Key_Down)
+    check("history: Down restores draft", any_card.input.text() == "my draft")
+    any_card.input.clear()
+
+    # TTY-only commands get a local hint; cls/clear clears the console
+    any_card.agent.send_command("claude")
+    check("hint: bare claude explains the line-mode limitation",
+          "can't run here" in any_card.console.toPlainText()
+          and 'Claude Code (interactive)' in any_card.console.toPlainText())
+    any_card.agent.send_command('claude -p "hello"')
+    check("hint: claude -p passes without the hint",
+          any_card.console.toPlainText().count("can't run here") == 1)
+    any_card.agent.send_command("vim notes.txt")
+    check("hint: vim flagged as full-screen app",
+          "full-screen terminal app" in any_card.console.toPlainText())
+    any_card.agent.send_command("cls")
+    check("clear: cls empties the console locally",
+          any_card.console.toPlainText() == ""
+          and len(any_card.agent.log) == 0)
+
+    # session dict carries per-terminal run state (lazy-restore correctness)
+    payload = mgr.to_session_dict()
+    alpha_terms = next(w for w in payload["workspaces"]
+                       if w["id"] == alpha.id)["terminals"]
+    check("session: per-terminal run state persisted",
+          any(t["running"] for t in alpha_terms)
+          and any(not t["running"] for t in alpha_terms), alpha_terms)
+
+    # per-workspace numbering: seeded from THIS workspace's agents, and each
+    # workspace counts independently (Feature 1)
+    mgr.add_terminal(alpha.id, build_spec(AgentKind.CMD, "Agent 7",
+                                          cwd=str(proj_alpha)), autostart=False)
+    check("naming: proposal seeded from existing agents",
+          mgr.next_agent_name(alpha.id) == "Agent 8", mgr.next_agent_name(alpha.id))
+    check("naming: other workspace resets to Agent 1",
+          mgr.next_agent_name(bravo.id) == "Agent 1", mgr.next_agent_name(bravo.id))
+    mgr.remove_terminal(alpha.id, alpha.agents[-1].id)
+    pump(50)
+
+    # -- 9. close a card via its real ✕ button ------------------------------
+    proc = ticker.worker.process()
+    QTest.mouseClick(page.card_for(ticker.id).btn_close,
+                     Qt.MouseButton.LeftButton)
+    check("close: process terminated",
+          wait_until(lambda: proc.state() == QProcess.ProcessState.NotRunning,
+                     8000))
+    pump(100)
+    check("close: card removed from page",
+          page.card_for(ticker.id) is None and len(page.cards) == 3)
+    assert_layout(page, 3)
+    snap(win, "07_after_close")
+
+    # -- 10. clean shutdown: no zombies, session saved -----------------------
+    zombie = mgr.add_terminal(alpha.id, build_spec(
+        AgentKind.CMD, "Zombie", cwd=str(proj_alpha)))
+    wait_until(lambda: zombie.is_running(), 10000)
+    zombie.send_command("ping -t 127.0.0.1")
+    wait_until(lambda: "Reply" in page.card_for(zombie.id).console.toPlainText()
+               or "127.0.0.1" in page.card_for(zombie.id).console.toPlainText(),
+               10000)
+    all_agents = mgr.all_agents()
+    win.close()
+    procs = [a.worker.process() for a in all_agents if a.worker.process()]
+    check("shutdown: every child process terminated",
+          wait_until(lambda: all(
+              p.state() == QProcess.ProcessState.NotRunning for p in procs), 6000))
+    pump(300)
+    ping = subprocess.run(["tasklist", "/FI", "IMAGENAME eq PING.EXE"],
+                          capture_output=True, text=True)
+    check("shutdown: no orphan PING.EXE (job tree kill)",
+          "PING.EXE" not in ping.stdout)
+    check("shutdown: session persisted",
+          (tmp / "session.json").exists()
+          and "Bravo" in (tmp / "session.json").read_text(encoding="utf-8"))
+
+    # -- 11. restore round-trip: lazy start honors saved run state ----------
+    win2 = create_main_window(store)
+    win2.resize(1600, 900)
+    win2.show()
+    pump(150)
+    mgr2 = win2.manager
+    alpha2 = next(w for w in mgr2.workspaces if w.name == "Alpha")
+    running_flags = [a.autostart_on_restore for a in alpha2.agents]
+    check("restore: run state loaded per agent",
+          any(running_flags) and not all(running_flags), running_flags)
+    win2.autostart_active_workspace()
+    to_start = [a for a in alpha2.agents if a.autostart_on_restore]
+    to_stay = [a for a in alpha2.agents if not a.autostart_on_restore]
+    check("restore: previously-running agents autostart",
+          wait_until(lambda: all(a.is_running() for a in to_start), 15000))
+    pump(500)
+    check("restore: stopped agents stay idle (no side-effect re-runs)",
+          all(not a.is_running() for a in to_stay))
+    win2.close()
+    procs2 = [a.worker.process() for a in mgr2.all_agents()
+              if a.worker.process()]
+    check("restore: second shutdown clean",
+          wait_until(lambda: all(
+              p.state() == QProcess.ProcessState.NotRunning for p in procs2),
+              6000))
+    pump(200)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_terminal_keys():
+    """Focused terminal maps keys to the right VT sequences (Shift+Tab etc.)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    view = TerminalView(rows=24, cols=80)
+
+    K = Qt.Key
+    cases = {
+        # (key, ctrl, shift, alt, text) -> expected VT bytes
+        "Shift+Tab cycles modes (CSI Z)": ((K.Key_Backtab, False, True, False, ""), "\x1b[Z"),
+        "Tab completes": ((K.Key_Tab, False, False, False, "\t"), "\t"),
+        "Ctrl+C interrupts": ((K.Key_C, True, False, False, ""), "\x03"),
+        "Ctrl+R reverse-search": ((K.Key_R, True, False, False, ""), "\x12"),
+        "Ctrl+D EOF": ((K.Key_D, True, False, False, ""), "\x04"),
+        "Escape": ((K.Key_Escape, False, False, False, ""), "\x1b"),
+        "Enter submits": ((K.Key_Return, False, False, False, "\r"), "\r"),
+        "Shift+Enter newlines": ((K.Key_Return, False, True, False, "\r"), "\x1b\r"),
+        "Ctrl+Enter newlines": ((K.Key_Return, True, False, False, ""), "\n"),
+        "Up arrow": ((K.Key_Up, False, False, False, ""), "\x1b[A"),
+        "Ctrl+Left word-jump": ((K.Key_Left, True, False, False, ""), "\x1b[1;5D"),
+        "Alt+key sends meta": ((K.Key_B, False, False, True, "b"), "\x1bb"),
+        "plain letter": ((K.Key_A, False, False, False, "a"), "a"),
+    }
+    for name, (args, expected) in cases.items():
+        got = view._sequence_for(*args)
+        check(f"keys: {name}", got == expected, f"got {got!r}, want {expected!r}")
+
+    check("keys: terminal refuses focus traversal (owns Tab)",
+          view.focusNextPrevChild(True) is False)
+
+
+def test_session_migration():
+    """A pre-v2 line-mode shell agent upgrades to interactive on load."""
+    from app.pty_worker import HAS_CONPTY
+    from app.workspace_manager import WorkspaceManager
+
+    legacy = {
+        "version": 1, "active": "w1",
+        "workspaces": [{
+            "id": "w1", "name": "Legacy", "project_path": os.path.expanduser("~"),
+            "terminals": [
+                {"kind": "powershell", "name": "Agent 1", "role": "",
+                 "cwd": os.path.expanduser("~"), "user_program": "",
+                 "user_args": [], "pty": False, "running": True},
+                {"kind": "custom", "name": "Script", "role": "",
+                 "cwd": os.path.expanduser("~"), "user_program": "x.exe",
+                 "user_args": [], "pty": False, "running": False},
+            ],
+        }],
+    }
+    mgr = WorkspaceManager()
+    mgr.load_session_dict(legacy)
+    agents = mgr.workspaces[0].agents
+    ps = next(a for a in agents if a.spec.kind.value == "powershell")
+    custom = next(a for a in agents if a.spec.kind.value == "custom")
+    check("migration: legacy PowerShell upgraded to interactive",
+          ps.spec.pty is HAS_CONPTY and ps.is_pty is HAS_CONPTY)
+    check("migration: non-shell agent left as-is", custom.spec.pty is False)
+    check("migration: session now persists as current version",
+          mgr.to_session_dict()["version"] >= 2)
+
+    # a current-version session with an explicit line-mode shell is respected
+    mgr2 = WorkspaceManager()
+    current = mgr.to_session_dict()
+    current["workspaces"][0]["terminals"][0]["pty"] = False  # explicit opt-out
+    mgr2.load_session_dict(current)
+    ps2 = next(a for a in mgr2.workspaces[0].agents
+               if a.spec.kind.value == "powershell")
+    check("migration: explicit line-mode in v2 session is preserved",
+          ps2.spec.pty is False)
+
+
+def test_pty():
+    """ConPTY backend through the real card + TerminalView widget."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.terminal_card import TerminalCard
+
+    if not HAS_CONPTY:
+        check("pty: pywinpty available", False, "pywinpty not installed")
+        return
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    def wait_until(pred, timeout_ms=15000, step=50):
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if pred():
+                return True
+            pump(step)
+        return pred()
+
+    home = os.path.expanduser("~")
+    spec = build_spec(AgentKind.POWERSHELL, "Pty", cwd=home, pty=True)
+    check("pty: interactive PowerShell spec is pty", spec.pty)
+    agent = TerminalAgent(spec)
+    check("pty: agent selects pty backend", agent.is_pty)
+    card = TerminalCard(agent)
+    card.resize(820, 420)
+    card.show()
+    check("pty: card hosts a TerminalView (no line console)",
+          card.terminal is not None and card.console is None)
+
+    agent.start()
+    check("pty: agent reaches running", wait_until(agent.is_running, 15000))
+    check("pty: interactive prompt renders in the grid",
+          wait_until(lambda: "PS" in card.terminal.screen_text()
+                     and ">" in card.terminal.screen_text(), 20000),
+          card.terminal.screen_text()[-160:])
+
+    agent.write("echo ('grid'+'ok')\r")
+    check("pty: typed command output appears in the grid",
+          wait_until(lambda: "gridok" in
+                     card.terminal.screen_text().replace(" ", ""), 12000))
+
+    # Ctrl+C interrupts a running loop (real signal, not available in line mode)
+    agent.write("ping -t 127.0.0.1\r")
+    wait_until(lambda: "127.0.0.1" in card.terminal.screen_text(), 15000)
+    pump(500)
+    agent.write("\x03")
+    a = card.terminal.screen_text()
+    pump(2500)
+    b = card.terminal.screen_text()
+    check("pty: Ctrl+C stopped the loop",
+          a.count("Reply") == b.count("Reply") or "PS" in b[-80:], b[-160:])
+
+    # background retention while hidden
+    agent.write("1..8 | %{ $_; Start-Sleep -Milliseconds 100 }\r")
+    pump(150)
+    card.hide()
+    before = card.terminal.screen_text()
+    pump(1300)
+    check("pty: hidden terminal kept updating",
+          card.terminal.screen_text() != before and not card.isVisible())
+
+    pid = agent.worker.pid()
+    card.detach()
+    agent.dispose()
+    check("pty: process terminated on dispose",
+          wait_until(lambda: not agent.is_running(), 6000))
+    pump(300)
+    tl = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                        capture_output=True, text=True)
+    check("pty: no orphan process after dispose", str(pid) not in tl.stdout)
+
+
+def test_v2_features():
+    """v2: providers/model/effort, per-ws numbering, stats, grid, folder,
+    fonts, and shared-board awareness — driven through the real widgets."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app import providers, ui_theme
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.tiling import Cell, explicit_grid, parse_layout
+    from app.workspace_manager import WorkspaceManager
+    from app.widgets.terminal_view import TerminalView
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def wait_until(pred, timeout_ms=10000, step=50):
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if pred():
+                return True
+            pump(step)
+        return pred()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-v2-"))
+    proj_a, proj_b = tmp / "a", tmp / "b"
+    proj_a.mkdir(); proj_b.mkdir()
+
+    # ---- providers / model / effort (#4) --------------------------------
+    prog, args = providers.build_invocation("claude", model="opus", effort="high")
+    check("v2 providers: claude --model/--effort flags",
+          args == ["--model", "opus", "--effort", "high"], args)
+    spec = build_spec(AgentKind.CLAUDE, "C", cwd=str(proj_a), model="sonnet", effort="max")
+    check("v2 providers: build_spec routes claude + pty",
+          spec.provider == "claude" and spec.pty
+          and "--model" in spec.effective_args() and "max" in spec.effective_args())
+    # template expansion must not depend on whether the CLI is installed on
+    # this machine (Codex may legitimately exist here) — detection is only
+    # asserted to be a bool, expansion is asserted exactly
+    check("v2 providers: openai template expands",
+          "gpt-5.1" in providers.build_invocation("openai", model="gpt-5.1")[1])
+    check("v2 providers: detection returns bool (env-independent)",
+          isinstance(providers.detected("openai"), bool))
+    prog, args = providers.build_invocation(
+        "openai", custom_command='"C:\\Program Files\\OpenAI\\codex.exe" --full-auto')
+    check("v2 providers: quoted Windows path unwrapped for launch",
+          prog == r"C:\Program Files\OpenAI\codex.exe" and args == ["--full-auto"],
+          (prog, args))
+    # Gemini rides the Antigravity CLI (agy): its model values are multiword
+    # display strings and MUST stay one argv entry, and its spec shares
+    # Claude's --continue resume + --add-dir board access (agy 1.0.16)
+    _, gargs = providers.build_invocation("gemini", model="Gemini 3.1 Pro (High)")
+    check("v2 providers: multiword gemini model stays ONE argument",
+          gargs == ["--model", "Gemini 3.1 Pro (High)"], gargs)
+    check("v2 providers: gemini detection returns bool (env-independent)",
+          isinstance(providers.detected("gemini"), bool))
+    gspec = build_spec(AgentKind.GEMINI, "G", cwd=str(proj_a),
+                       model="Gemini 3.5 Flash (Low)")
+    gspec.resume = True
+    gspec.extra_dirs = [str(proj_a)]
+    check("v2 providers: gemini resumes with --continue + board --add-dir",
+          gspec.provider == "gemini" and gspec.pty
+          and "--continue" in gspec.effective_args()
+          and "--add-dir" in gspec.effective_args())
+    check("v2 providers: resume providers = claude + gemini",
+          set(providers.RESUME_PROVIDERS) == {"claude", "gemini"})
+
+    # ---- explicit grid (#7) ---------------------------------------------
+    ep = explicit_grid(2, 2, 2)
+    check("v2 grid: 2x2/2 agents fills TL,TR + 2 empty",
+          ep.agent_cells == [Cell(0, 0, 1, 1), Cell(0, 1, 1, 1)]
+          and len(ep.empty_cells) == 2)
+    check("v2 grid: over-capacity auto-grows rows",
+          explicit_grid(2, 2, 5).rows == 3)
+    # layout strings read WIDTH x HEIGHT (like screen resolutions): "3x1" is
+    # three cards side by side, "1x3" three stacked. Parsing them rows-first
+    # made every non-square layout apply TRANSPOSED vs its palette diagram.
+    check("v2 grid: parse_layout is width x height",
+          parse_layout("auto") is None
+          and parse_layout("3x2") == (2, 3)      # 3 across, 2 down
+          and parse_layout("3x1") == (1, 3)      # horizontal strip
+          and parse_layout("1x3") == (3, 1))     # vertical stack
+    from app.widgets.grid_selector import LAYOUTS
+    mismatched = [(s, r, c, parse_layout(s))
+                  for (_lbl, s, r, c) in LAYOUTS
+                  if s != "auto" and parse_layout(s) != (r, c)]
+    check("v2 grid: every palette swatch matches its applied layout (WYSIWYG)",
+          not mismatched, mismatched)
+    offered = {s for _lbl, s, _r, _c in LAYOUTS}
+    check("v2 grid: 3x1 and 1x3 both offered",
+          {"3x1", "1x3"} <= offered, offered)
+
+    # ---- font (#5) ------------------------------------------------------
+    tv = TerminalView(rows=20, cols=60)
+    base = tv.font_size()
+    tv.set_font_size(base + 4)
+    check("v2 font: TerminalView.set_font_size changes size", tv.font_size() == base + 4)
+
+    # ---- through the real app: numbering, stats, folder, board ----------
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.resize(1500, 900)
+    win.show()
+    pump(150)
+    mgr = win.manager
+    wa = mgr.workspaces[0]
+    mgr.rename_workspace(wa.id, "Alpha")
+    mgr.set_workspace_path(wa.id, str(proj_a))
+    wb = mgr.create_workspace("Beta", str(proj_b))
+
+    # per-workspace numbering (#1)
+    mgr.remove_terminal(wa.id, wa.agents[0].id)
+    mgr.add_terminal(wa.id, build_spec(AgentKind.CMD, mgr.next_agent_name(wa.id),
+                                       cwd=str(proj_a)), autostart=False)
+    check("v2 numbering: Alpha next is Agent 2", mgr.next_agent_name(wa.id) == "Agent 2")
+    check("v2 numbering: Beta resets to Agent 1", mgr.next_agent_name(wb.id) == "Agent 1")
+
+    # dashboard stats (#2) reach the sidebar row's count badge
+    row = win.sidebar._rows[wa.id][1]
+    check("v2 dashboard: count badge shows the agent tally",
+          row.count_badge._count == 1, row.count_badge._count)
+    check("v2 dashboard: one idle agent -> idle (amber) state",
+          row.count_badge._state == "idle", row.count_badge._state)
+
+    # folder change (#3) updates model + new agents' cwd
+    win.manager.set_workspace_path(wa.id, str(proj_b))
+    na = mgr.add_terminal(wa.id, build_spec(AgentKind.CMD, "X", cwd=""), autostart=False)
+    check("v2 folder: new agent inherits changed path", na.spec.cwd == str(proj_b))
+    win.manager.set_workspace_path(wa.id, str(proj_a))
+
+    # grid layout persists + applies (#7) through the page
+    page = win._pages[wa.id]
+    page.set_layout("3x2")
+    check("v2 grid: page applies fixed layout with empty slots",
+          len(page._empty_slots) >= 1)
+    win.manager.set_layout(wa.id, "3x2")
+    check("v2 grid: layout persisted", mgr.to_session_dict()["workspaces"][0]["layout"] == "3x2"
+          if mgr.workspaces[0].id == wa.id else True)
+
+    # shared board (#8): a Claude agent creates the board with a roster
+    cl = mgr.add_terminal(wa.id, build_spec(AgentKind.CLAUDE, "Claude", cwd=str(proj_a)),
+                          autostart=False)
+    board = proj_a / ".aihive" / "board.md"
+    check("v2 board: Claude agent creates shared board", board.is_file())
+    check("v2 board: launch injects --add-dir + system prompt",
+          "--add-dir" in cl.spec.effective_args()
+          and "--append-system-prompt" in cl.spec.effective_args())
+    cl.set_task("wiring auth")
+    pump(30)
+    check("v2 board: current task written to roster",
+          "wiring auth" in board.read_text(encoding="utf-8"))
+    check("v2 board: Beta workspace stays isolated",
+          not (proj_b / ".aihive" / "board.md").is_file()
+          or "Claude" not in (proj_b / ".aihive" / "board.md").read_text(encoding="utf-8"))
+
+    # activity panel (#8) opens and lists the roster
+    win._toggle_activity(wa.id)
+    check("v2 activity: panel opens", win.activity_panel.is_open())
+    check("v2 activity: roster lists agents", len(win.activity_panel._items) >= 1)
+    win._toggle_activity(wa.id)
+    pump(250)  # let the conceal animation finish
+    check("v2 activity: panel closes", not win.activity_panel.is_open())
+
+    win.close()
+    pump(200)
+    ui_theme.CONSOLE_FONT_PX = ui_theme.DEFAULT_CONSOLE_PX
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_v2_review_fixes():
+    """Regressions for the confirmed v2 review findings."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app import ui_theme
+    from app.coordination import git_changed_files
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-v2fix-"))
+    pa, pb = tmp / "a", tmp / "b"
+    pa.mkdir(); pb.mkdir()
+
+    # git on a non-repo returns [] fast (islice-capped, short timeout)
+    check("fix git: non-repo returns empty", git_changed_files(str(pa)) == [])
+
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.resize(1500, 900)
+    win.show()
+    pump(120)
+    mgr = win.manager
+    wa = mgr.workspaces[0]
+    mgr.set_workspace_path(wa.id, str(pa))
+    mgr.remove_terminal(wa.id, wa.agents[0].id)
+
+    # --- set_workspace_path repoints existing Claude agent + scaffolds board ---
+    cl = mgr.add_terminal(wa.id, build_spec(AgentKind.CLAUDE, "Claude", cwd=str(pa)),
+                          autostart=False)
+    mgr.set_workspace_path(wa.id, str(pb))
+    check("fix path: existing agent cwd follows new folder", cl.spec.cwd == str(pb))
+    check("fix path: coordination re-injected to new board",
+          any(str(pb) in d for d in cl.spec.extra_dirs), cl.spec.extra_dirs)
+    check("fix path: new board scaffolded immediately",
+          (pb / ".aihive" / "board.md").is_file())
+
+    # --- line-mode per-agent font uses a per-widget stylesheet (QSS-proof) ---
+    line = mgr.add_terminal(wa.id, build_spec(AgentKind.CMD, "Line", cwd=str(pb), pty=False),
+                            autostart=False)
+    lcard = win._pages[wa.id].card_for(line.id)
+    lcard._font_delta(+3)
+    want = ui_theme.CONSOLE_FONT_PX + 3
+    check("fix font: line card applies per-widget stylesheet",
+          f"{want}px" in lcard.console.styleSheet(), lcard.console.styleSheet())
+    check("fix font: current_font_px reflects override", lcard.current_font_px() == want)
+    # a global font change must NOT wipe the per-agent override
+    win._change_global_font(-1)
+    check("fix font: global change preserves line override",
+          f"{want}px" in lcard.console.styleSheet(), lcard.console.styleSheet())
+
+    # --- activity button sync across workspace switch ---
+    wb = mgr.create_workspace("B", str(pb))
+    win._toggle_activity(wa.id)
+    check("fix activity: A button lit when open on A",
+          win._pages[wa.id].activity_btn.isChecked())
+    mgr.set_active(wb.id)
+    pump(30)
+    check("fix activity: A button cleared after switching away",
+          not win._pages[wa.id].activity_btn.isChecked()
+          and win._pages[wb.id].activity_btn.isChecked())
+    win._toggle_activity(wb.id)
+    pump(30)
+    check("fix activity: all buttons cleared when closed",
+          not win._pages[wa.id].activity_btn.isChecked()
+          and not win._pages[wb.id].activity_btn.isChecked())
+
+    # --- layoutChanged from the model drives the page ---
+    mgr.set_layout(wa.id, "2x2")
+    check("fix layout: model set_layout updates the page",
+          win._pages[wa.id]._layout == "2x2")
+
+    win.close()
+    pump(200)
+    ui_theme.CONSOLE_FONT_PX = ui_theme.DEFAULT_CONSOLE_PX
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_v3_features():
+    """v3: private-CSI/underline fix, clipboard, orchestration primitives,
+    persistent-agent badges, and the named-pipe orchestrator bridge."""
+    import threading
+
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    from app import orchestration, providers
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AssignmentState, TerminalAgent
+    from app.widgets.terminal_view import TerminalView
+    from app.workspace_manager import WorkspaceManager
+    from main import setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def wait_until(pred, timeout_ms=10000, step=50):
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if pred():
+                return True
+            pump(step)
+        return pred()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-v3-"))
+
+    # --- #7 the underline root-cause fix (private CSI stripped) ---
+    tv = TerminalView(rows=4, cols=30)
+    tv.feed("\x1b[>4;2m\x1b[38;2;255;193;7mGOLD")  # modifyOtherKeys + truecolor
+    cell = next(tv.screen.buffer[0][c] for c in range(30)
+                if tv.screen.buffer[0][c].data.strip())
+    check("v3 render: modifyOtherKeys no longer forces underline",
+          not cell.underscore and cell.fg == "ffc107")
+
+    # --- #1 clipboard: selection + paste on the terminal ---
+    tv2 = TerminalView(rows=4, cols=30)
+    tv2.feed("hello world")
+    tv2._sel_anchor, tv2._sel_end = (0, 0), (0, 4)
+    check("v3 clipboard: selection text", tv2.selected_text() == "hello", tv2.selected_text())
+
+    # --- #5 model selection + #4 roles (pure) ---
+    check("v3 model: trivial to haiku", orchestration.select_model_effort("fix a typo") == ("haiku", "low"))
+    check("v3 model: architecture to opus", orchestration.select_model_effort("design the auth architecture") == ("opus", "high"))
+    check("v3 model: explicit override wins",
+          orchestration.resolve_model_effort("x", model="opus", effort="max") == ("opus", "max"))
+    check("v3 roles: infer testing", orchestration.infer_role("add pytest coverage") == "Testing Agent")
+    _, a = providers.build_invocation("claude", effort="ultracode")
+    check("v3 ultracode: never a launch flag", "--effort" not in a)
+
+    # --- orchestration primitives via a fast line-mode echo agent ---
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("W", str(tmp))
+    echo = mgr.add_terminal(ws.id, build_spec(
+        AgentKind.CUSTOM, "Echo", cwd=str(tmp), program=sys.executable,
+        args=["-u", "-c", "import sys\nfor l in sys.stdin: print('did:'+l.strip(),flush=True)"]),
+        autostart=True)
+    seen = []
+    echo.output_segment.connect(lambda s, t: seen.append(t))
+    wait_until(lambda: echo.is_running(), 8000)
+    mgr.assign_task(ws.id, echo.id, "build the parser")
+    check("v3 assign: WORKING + delivered", echo.assignment is AssignmentState.WORKING
+          and wait_until(lambda: any("did:build the parser" in t for t in seen), 8000))
+    mgr.set_assignment_state(echo.id, AssignmentState.COMPLETED)
+    check("v3 assign: set_assignment_state", echo.assignment is AssignmentState.COMPLETED)
+    check("v3 roles: collision numbering",
+          mgr.assign_role_name(ws.id, echo.spec.name) == f"{echo.spec.name} 2")
+    mgr.reassign_agent(echo.id, "now write the tests")
+    check("v3 reassign: delivered to existing session",
+          wait_until(lambda: any("did:now write the tests" in t for t in seen), 8000))
+
+    # --- #3/#8 orchestrator bridge over the real named pipe ---
+    from app.orchestrator_bridge import OrchestratorBridge, HAS_QTNETWORK
+    if HAS_QTNETWORK:
+        from app import mcp_server
+        bridge = OrchestratorBridge(mgr, active_ws=lambda: ws.id)
+        check("v3 bridge: named pipe listening", bridge.start())
+        os.environ["AIHIVE_PIPE"] = bridge.pipe_name
+        res = {}
+        ev = threading.Event()
+
+        def rpc():
+            try:
+                res["list"] = mcp_server._rpc("list_agents", {})
+                res["state"] = mcp_server._rpc(
+                    "set_agent_state", {"agent_id": echo.id, "state": "idle"})
+            except Exception as e:
+                res["err"] = repr(e)
+            finally:
+                ev.set()
+
+        threading.Thread(target=rpc, daemon=True).start()
+        wait_until(ev.is_set, 15000)
+        check("v3 bridge: MCP client + pipe RPC round-trip",
+              "err" not in res and res.get("list", {}).get("agents"), res.get("err"))
+        check("v3 bridge: set_agent_state over pipe",
+              res.get("state", {}).get("state") == "idle")
+        bridge.stop()
+
+    echo.dispose()
+    pump(200)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_persistence_resume():
+    """Agents survive an abrupt kill (immediate save) and running Claude agents
+    resume on reopen (--continue) — the regression behind the lost-agent bug."""
+    import json as _json
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-persist-"))
+    sp = tmp / "s.json"
+    store = SessionStore(path=sp)
+    win = create_main_window(store)
+    win.show()
+    pump(120)
+    ws = win.manager.workspaces[0]
+    win.manager.add_terminal(ws.id, build_spec(AgentKind.CMD, "KeepMe", cwd=str(tmp)),
+                             autostart=False)
+    # read disk WITHOUT closing or waiting for the debounce — models a kill
+    on_disk = _json.loads(sp.read_text(encoding="utf-8"))
+    names = [t["name"] for t in on_disk["workspaces"][0]["terminals"]]
+    check("persist: agent saved immediately (survives a kill)", "KeepMe" in names, names)
+    win.close(); pump(120)
+
+    # a Claude agent that was running resumes with --continue on reopen
+    store.save({"version": 3, "active": "w", "workspaces": [{
+        "id": "w", "name": "R", "project_path": str(tmp), "layout": "auto",
+        "terminals": [{"kind": "claude", "name": "Coder", "role": "Claude Code",
+                       "cwd": str(tmp), "user_program": "", "user_args": [],
+                       "pty": True, "provider": "claude", "model": "", "effort": "",
+                       "custom_command": "", "font_px": 0, "is_orchestrator": False,
+                       "running": True, "task": "x", "assignment": "working",
+                       "auto_created": True}]}]})
+    win2 = create_main_window(store)
+    win2.show(); pump(120)
+    ag = win2.manager.workspaces[0].agents[0]
+    check("persist: running Claude agent resumes (--continue)",
+          ag.spec.resume and "--continue" in ag.spec.effective_args())
+    win2.close(); pump(120)
+
+    # a UTF-8 BOM must NOT make a valid session look corrupt (the bug that
+    # wiped workspaces when the file was edited by a BOM-adding tool)
+    bomp = tmp / "bom.json"
+    payload = {"version": 3, "active": "b", "workspaces": [
+        {"id": "b", "name": "BomWs", "project_path": str(tmp), "layout": "auto",
+         "terminals": []}]}
+    bomp.write_bytes(b"\xef\xbb\xbf" + _json.dumps(payload).encode("utf-8"))
+    loaded = SessionStore(path=bomp).load()
+    check("persist: BOM-prefixed session still loads (not wiped)",
+          [w["name"] for w in loaded.get("workspaces", [])] == ["BomWs"], loaded)
+
+    # sticky auto-resume intent: an auto-created agent (orchestrator/worker) that
+    # died keeps its "resume on next open" flag so it never silently goes dormant
+    # (the bug where the Hiragana Orchestrator vanished after its process failed)
+    win3 = create_main_window(SessionStore(path=tmp / "sticky.json"))
+    win3.show(); pump(120)
+    ws3 = win3.manager.workspaces[0]
+    auto = win3.manager.add_terminal(
+        ws3.id, build_spec(AgentKind.CLAUDE, "Orchestrator", cwd=str(tmp),
+                           pty=True, is_orchestrator=True), autostart=False)
+    auto.auto_created = True
+    auto.autostart_on_restore = True   # was meant to be running
+    manual = win3.manager.add_terminal(
+        ws3.id, build_spec(AgentKind.CMD, "Manual", cwd=str(tmp)), autostart=False)
+    dumped = {t["name"]: t["running"]
+              for t in win3.manager.to_session_dict()["workspaces"][0]["terminals"]}
+    check("persist: dead auto-agent keeps resume intent (running=True)",
+          dumped.get("Orchestrator") is True, dumped)
+    check("persist: idle user agent is not force-resumed (running=False)",
+          dumped.get("Manual") is False, dumped)
+    win3.close(); pump(120)
+
+    # A save must NEVER fail silently. Three holes closed after a live incident
+    # where a workspace's agents existed in the running window but never on disk
+    # and NOTHING appeared in session.log:
+    #  (a) saves suppressed while _closing were silent (a failed-quit zombie
+    #      accepts new work forever, logging nothing)
+    #  (b) an exception BUILDING the payload bypassed store.save's SAVE-FAIL log
+    #  (c) nothing re-saved a state that a missed/suppressed signal had stranded
+    sp4 = tmp / "guard.json"
+    store4 = SessionStore(path=sp4)
+    win4 = create_main_window(store4)
+    win4.show(); pump(120)
+    logp = sp4.with_suffix(".log")
+    ws4 = win4.manager.workspaces[0]
+
+    # (a) a suppressed save leaves a forensic breadcrumb, not silence
+    win4._closing = True
+    win4._save_now()
+    win4._closing = False
+    log_txt = logp.read_text(encoding="utf-8") if logp.exists() else ""
+    check("persist: suppressed save is logged, never silent",
+          "SAVE-SKIP closing" in log_txt, log_txt[-200:])
+
+    # (b) a payload-build exception is logged as SAVE-FAIL (was: vanished)
+    boom = win4._session_payload
+    win4._session_payload = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    win4._save_session()
+    win4._session_payload = boom
+    log_txt = logp.read_text(encoding="utf-8")
+    check("persist: payload-build error logged as SAVE-FAIL (not silent)",
+          "SAVE-FAIL payload" in log_txt, log_txt[-200:])
+
+    # (c) the heartbeat rescues a structural change that a suppressed save
+    #     stranded — models the live incident exactly
+    win4._closing = True                       # suppress the add's own save
+    win4.manager.add_terminal(
+        ws4.id, build_spec(AgentKind.CMD, "Rescued", cwd=str(tmp)),
+        autostart=False)
+    win4._closing = False
+    disk_before = _json.loads(sp4.read_text(encoding="utf-8"))
+    names_before = [t["name"] for t in disk_before["workspaces"][0]["terminals"]]
+    check("persist: suppressed add is NOT yet on disk (setup)",
+          "Rescued" not in names_before, names_before)
+    win4._heartbeat_save()                     # safety net catches divergence
+    disk_after = _json.loads(sp4.read_text(encoding="utf-8"))
+    names_after = [t["name"] for t in disk_after["workspaces"][0]["terminals"]]
+    check("persist: heartbeat re-saves stranded state (bounds worst-case loss)",
+          "Rescued" in names_after, names_after)
+    win4.close(); pump(120)
+
+    # one un-serializable agent must NOT drop every other agent from the save
+    # (the whole-session throw that stranded a folder's agents with no log line)
+    from app.workspace_manager import WorkspaceManager
+    mgr5 = WorkspaceManager()
+    ws5 = mgr5.create_workspace("WS5", str(tmp))
+    good = mgr5.add_terminal(ws5.id, build_spec(AgentKind.CMD, "Good", cwd=str(tmp)),
+                             autostart=False)
+    bad = mgr5.add_terminal(ws5.id, build_spec(AgentKind.CMD, "Bad", cwd=str(tmp)),
+                            autostart=False)
+    saved_assignment = bad.assignment
+    bad.assignment = object()                  # .value now raises -> would throw
+    terms = mgr5.to_session_dict()["workspaces"][0]["terminals"]
+    bad.assignment = saved_assignment          # restore before teardown/GC
+    names5 = [t["name"] for t in terms]
+    check("persist: bad agent cannot abort the whole save (good survives)",
+          "Good" in names5 and len(terms) >= 1, names5)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_scrollback():
+    """Wheel scrollback must survive continuous TUI repaints. The old code used
+    pyte's prev_page/next_page, but HistoryScreen snaps to the bottom on ANY
+    subsequent screen event — Claude Code repaints many times a second, so the
+    view was yanked back instantly ('scroll doesn't work'). Now scrollback is a
+    view offset that pyte never sees."""
+    import re
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    v = TerminalView(rows=10, cols=40)
+    for i in range(50):
+        v.feed(f"scroll-{i}\r\n")
+    check("scroll: history accumulates", len(v.screen.history.top) >= 30,
+          len(v.screen.history.top))
+    check("scroll: live view shows the tail", "scroll-49" in v.visible_text())
+
+    v.scroll_by(15)
+    seen = v.visible_text()
+    check("scroll: wheel-up reveals older lines", "scroll-26" in seen, seen)
+    check("scroll: tail off-screen while scrolled", "scroll-49" not in seen)
+
+    # the regression: new output must NOT snap the view back (old prev_page
+    # behavior); the view stays anchored to the content being read
+    for i in range(50, 56):
+        v.feed(f"scroll-{i}\r\n")
+    after = v.visible_text()
+    check("scroll: new output does not snap view back", "scroll-26" in after,
+          after)
+    check("scroll: offset grew to stay content-anchored", v.scroll_offset() > 15,
+          v.scroll_offset())
+
+    # copying while scrolled back copies what's on screen (history), not live
+    v.select_all()
+    check("scroll: copy sees scrolled-back content",
+          "scroll-26" in v.selected_text())
+    v._sel_anchor = v._sel_end = None
+
+    # typing any key snaps back to live
+    v.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_A,
+                              Qt.KeyboardModifier.NoModifier, "a"))
+    check("scroll: keystroke snaps back to live", v.scroll_offset() == 0)
+    check("scroll: live tail visible again", "scroll-55" in v.visible_text())
+
+    # Shift+PageUp/PageDown page the view without touching the app
+    got = []
+    v.keyInput.connect(got.append)
+    v.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_PageUp,
+                              Qt.KeyboardModifier.ShiftModifier, ""))
+    check("scroll: Shift+PageUp pages back", v.scroll_offset() == 9,
+          v.scroll_offset())
+    check("scroll: paging sends nothing to the pty", got == [], got)
+    v.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_PageDown,
+                              Qt.KeyboardModifier.ShiftModifier, ""))
+    check("scroll: Shift+PageDown pages forward", v.scroll_offset() == 0)
+
+    # bounds: can't scroll past the oldest line or below the live screen
+    v.scroll_by(99999)
+    check("scroll: clamped at oldest history line",
+          v.scroll_offset() == len(v.screen.history.top))
+    v.scroll_by(-99999)
+    check("scroll: clamped at live bottom", v.scroll_offset() == 0)
+
+    # ---- wheel routing for fullscreen apps (the Claude Code case) ----
+    # Claude Code v2 enters the ALTERNATE SCREEN and enables mouse tracking
+    # (?1049h ?1000/1002/1003h ?1006h, verified against v2.1.197): there is no
+    # terminal scrollback there — the wheel must be FORWARDED so the app
+    # scrolls its own transcript. That's why history-offset scrolling alone
+    # read as 'scroll still not working' in Claude terminals.
+    from PySide6.QtCore import QPoint, QPointF
+    from PySide6.QtGui import QWheelEvent
+
+    def wheel(view, dy):
+        return QWheelEvent(QPointF(50, 30), QPointF(50, 30), QPoint(0, 0),
+                           QPoint(0, dy), Qt.MouseButton.NoButton,
+                           Qt.KeyboardModifier.NoModifier,
+                           Qt.ScrollPhase.NoScrollPhase, False)
+
+    sent = []
+    v2 = TerminalView(rows=10, cols=40)
+    v2.keyInput.connect(sent.append)
+
+    # altscreen WITHOUT mouse tracking (vim/less): wheel -> arrow keys
+    v2.feed("\x1b[?1049h")
+    v2.wheelEvent(wheel(v2, 120))
+    check("scroll: altscreen wheel-up sends arrow keys",
+          sent and sent[-1] == "\x1b[A" * 3, sent[-1:])
+    v2.wheelEvent(wheel(v2, -120))
+    check("scroll: altscreen wheel-down sends down arrows",
+          sent[-1] == "\x1b[B" * 3, sent[-1:])
+
+    # DECCKM application cursor keys switch the arrow encoding
+    v2.feed("\x1b[?1h")
+    v2.wheelEvent(wheel(v2, 120))
+    check("scroll: DECCKM arrows use SS3 form", sent[-1] == "\x1bOA" * 3,
+          sent[-1:])
+    v2.feed("\x1b[?1l")
+
+    # mouse tracking + SGR (Claude Code): wheel -> SGR mouse reports
+    v2.feed("\x1b[?1000;1006h")
+    v2.wheelEvent(wheel(v2, 120))
+    check("scroll: tracked wheel sends SGR mouse reports",
+          re.fullmatch(r"(?:\x1b\[<64;\d+;\d+M){3}", sent[-1]) is not None,
+          repr(sent[-1]))
+    v2.wheelEvent(wheel(v2, -120))
+    check("scroll: SGR wheel-down uses button 65",
+          sent[-1].startswith("\x1b[<65;"), repr(sent[-1]))
+
+    # leaving altscreen + tracking restores history-offset scrolling
+    v2.feed("\x1b[?1000;1006l\x1b[?1049l")
+    for i in range(30):
+        v2.feed(f"back-{i}\r\n")
+    before = len(sent)
+    v2.wheelEvent(wheel(v2, 120))
+    check("scroll: normal buffer scrolls locally again (nothing sent)",
+          len(sent) == before and v2.scroll_offset() == 3,
+          (len(sent) - before, v2.scroll_offset()))
+
+    # focus reporting (?1004): Claude Code wants focus in/out events
+    v2.feed("\x1b[?1004h")
+    sent.clear()
+    from PySide6.QtGui import QFocusEvent
+    v2.focusInEvent(QFocusEvent(QEvent.Type.FocusIn))
+    v2.focusOutEvent(QFocusEvent(QEvent.Type.FocusOut))
+    check("scroll: focus reporting forwards ESC[I / ESC[O",
+          sent == ["\x1b[I", "\x1b[O"], sent)
+
+
+def test_themes():
+    """Winamp-style skin registry: apply_theme rewrites Palette/ANSI/fonts in
+    place (so all Palette.X reads follow the skin), Scriptorium Dark stays the
+    shipped palette, build_qss reflects the active theme, and the choice
+    persists across a save/restore."""
+    from PySide6.QtWidgets import QApplication
+    from app import ui_theme
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    check("themes: registry has the expected skins",
+          set(ui_theme.THEMES) == {"scriptorium-dark", "illuminated-manuscript",
+                                   "obsidian", "adeptus-mechanicus"},
+          list(ui_theme.THEMES))
+    check("themes: ids match their keys and names are unique",
+          all(k == t.id for k, t in ui_theme.THEMES.items())
+          and len({t.name for t in ui_theme.THEMES.values()})
+          == len(ui_theme.THEMES))
+
+    # apply_theme mutates the SAME Palette/ANSI_16 objects in place
+    ansi_obj = ui_theme.ANSI_16
+    ui_theme.apply_theme("scriptorium-dark")
+    check("themes: Scriptorium Dark keeps the shipped palette",
+          ui_theme.Palette.BG_ROOT == "#12100c"
+          and ui_theme.Palette.ACCENT_GOLD == "#c9a227")
+    dark_qss = ui_theme.build_qss()
+    ui_theme.apply_theme("illuminated-manuscript")
+    check("themes: apply_theme mutates Palette in place (same refs update)",
+          ui_theme.Palette.BG_ROOT == "#e6d7b1"
+          and ui_theme.Palette.CARDHEAD_FG == "#f0d777")
+    check("themes: ANSI_16 is refreshed in the SAME list object",
+          ui_theme.ANSI_16 is ansi_obj and ui_theme.ANSI_16[0] == "#5a4636")
+    ms_qss = ui_theme.build_qss()
+    check("themes: build_qss reflects the active skin",
+          "#e6d7b1" in ms_qss and "#e6d7b1" not in dark_qss
+          and "#12100c" in dark_qss)
+    check("themes: unknown id falls back to default",
+          ui_theme.apply_theme("nope").id == ui_theme.DEFAULT_THEME_ID)
+
+    # persistence: a saved theme restores and drives the dropdown
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-theme-"))
+    store = SessionStore(path=tmp / "s.json")
+    store.save({"version": 3, "active": "w", "workspaces": [
+        {"id": "w", "name": "W", "project_path": str(tmp), "layout": "auto",
+         "terminals": []}], "ui": {"theme": "illuminated-manuscript"}})
+    win = create_main_window(store)
+    check("themes: saved skin restored on launch",
+          win._theme_id == "illuminated-manuscript"
+          and ui_theme.Palette.BG_ROOT == "#e6d7b1")
+    check("themes: dropdown reflects the restored skin",
+          win.top_bar.theme_select.currentData() == "illuminated-manuscript")
+    # Phase B ornament: the illuminated page border shows + opens root margins
+    # only for the manuscript skin; hidden and flush for the others
+    # isHidden(), not isVisible(): the window isn't shown in this headless test,
+    # so isVisible() is always False; isHidden() reflects the explicit setVisible
+    check("themes: manuscript shows the illuminated border",
+          not win._page_border.isHidden()
+          and win._root_layout.contentsMargins().top() > 0)
+    win._change_theme("obsidian")
+    check("themes: live switch updates palette + dropdown",
+          ui_theme.Palette.BG_ROOT == "#0f1117"
+          and win.top_bar.theme_select.currentData() == "obsidian")
+    check("themes: non-manuscript skin hides the border (flush)",
+          win._page_border.isHidden()
+          and win._root_layout.contentsMargins().top() == 0)
+    check("themes: switch is written to the session payload",
+          win._session_payload()["ui"]["theme"] == "obsidian")
+    win.close()
+
+    # the ornament widgets paint without error under both illuminated and
+    # plain themes (exercises the QSvgRenderer + QPainter paths)
+    from app.widgets.ornaments import DropCap, LogoRoundel, PageBorder
+    for tid in ("illuminated-manuscript", "adeptus-mechanicus", "scriptorium-dark"):
+        ui_theme.apply_theme(tid)
+        for W in (DropCap, LogoRoundel, PageBorder):
+            w = W("A") if W is DropCap else W()
+            w.resize(200, 160)
+            w.grab()  # runs paintEvent; raises if the paint path is broken
+            w.deleteLater()
+    check("themes: ornament widgets paint under every skin", True)
+
+    # CONTRAST GUARANTEE (chrome): every skin's text tokens must clearly read
+    # on their own backgrounds — the fix behind the white-on-vellum report.
+    from PySide6.QtGui import QColor
+    from app.widgets.terminal_view import (contrast_ratio, legible_color,
+                                           LEGIBLE_TARGET)
+    fails = []
+    for t in ui_theme.THEMES.values():
+        pairs = [  # (fg, bg, min-ratio, label)
+            (t.text, t.bg_panel, 4.5, "text/panel"),
+            (t.text, t.bg_card, 4.5, "text/card"),
+            (t.text, t.bg_root, 4.5, "text/root"),
+            (t.console_fg, t.bg_console, 4.5, "console"),
+            (t.cardhead_fg, t.bg_cardhead, 4.5, "cardhead"),
+            (t.appname_fg, t.bg_panel, 4.0, "appname"),
+            (t.input_echo, t.bg_input, 4.0, "input-echo"),
+            (t.text_dim, t.bg_panel, 3.0, "text_dim"),
+            (t.cardhead_sub, t.bg_cardhead, 3.0, "cardhead_sub"),
+            (t.selection_fg, t.selection, 3.0, "selection"),
+        ]
+        for fg, bg, mn, label in pairs:
+            r = contrast_ratio(QColor(fg), QColor(bg))
+            if r < mn:
+                fails.append(f"{t.id}:{label}={r:.2f}<{mn}")
+    check("themes: all chrome text meets contrast in every skin", not fails, fails)
+
+    # CONTRAST GUARANTEE (terminal): whatever color a child emits, the glyph is
+    # forced readable on its actual background (the invisible-Claude-on-vellum
+    # bug); text that is already readable is left untouched.
+    vellum, ink = QColor("#fbf4df"), QColor("#0d0d0d")
+    check("legible: white-on-vellum rescued to readable",
+          contrast_ratio(legible_color(QColor("#ffffff"), vellum), vellum)
+          >= LEGIBLE_TARGET - 0.05)
+    check("legible: light-grey-on-vellum rescued to readable",
+          contrast_ratio(legible_color(QColor("#c9d1d9"), vellum), vellum)
+          >= LEGIBLE_TARGET - 0.05)
+    check("legible: dark-on-dark rescued to readable",
+          contrast_ratio(legible_color(QColor("#222222"), ink), ink)
+          >= LEGIBLE_TARGET - 0.05)
+    already = QColor("#c9d1d9")
+    check("legible: already-readable text is left unchanged",
+          legible_color(already, ink) == already)
+    check("legible: hue is preserved when rescuing (blue stays blueish)",
+          legible_color(QColor("#88bbff"), vellum).hue()
+          in range(QColor("#88bbff").hue() - 25, QColor("#88bbff").hue() + 25))
+
+    ui_theme.apply_theme("scriptorium-dark")  # leave the default active
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_review_fixes():
+    """Regressions for the Codex-review findings: single-instance mutex guard
+    (fail closed), orchestration state autosave, workspace-scoped orchestrator
+    tools, immediate save on orchestrator mutations, quoted-path command
+    parsing, and the session save-audit log."""
+    import json as _json
+    from PySide6.QtWidgets import QApplication
+
+    from app.orchestrator_bridge import OrchestratorBridge, _RpcError
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import AssignmentState
+    from app.workspace_manager import WorkspaceManager
+    from main import _single_instance_guard
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-review-"))
+
+    # --- single-instance guard: kernel mutex, second acquisition refused ---
+    # (own mutex name: the REAL app may legitimately be running during a
+    # test run, and colliding with its lock is not this test's business)
+    mtx = f"Local\\ai-hive-test-{os.getpid()}"
+    first = _single_instance_guard(mtx)
+    check("guard: first instance acquires the mutex", bool(first))
+    second = _single_instance_guard(mtx)
+    check("guard: second instance is refused (fail closed)", second is None)
+    if sys.platform == "win32" and first:
+        import ctypes
+        ctypes.windll.kernel32.CloseHandle(first)  # release for the real app
+
+    # --- orchestration state changes mark the session dirty ---
+    mgr = WorkspaceManager()
+    ws_a = mgr.create_workspace("ScopeA", project_path=str(tmp))
+    ws_b = mgr.create_workspace("ScopeB", project_path=str(tmp))
+    a1 = mgr.add_terminal(ws_a.id, build_spec(AgentKind.CMD, "Agent 1",
+                                              cwd=str(tmp)), autostart=False)
+    b1 = mgr.add_terminal(ws_b.id, build_spec(AgentKind.CMD, "Agent 1",
+                                              cwd=str(tmp)), autostart=False)
+    dirty_count = {"n": 0}
+    mgr.dirty.connect(lambda: dirty_count.__setitem__("n", dirty_count["n"] + 1))
+    a1.set_task("write the docs")
+    check("autosave: task change marks dirty", dirty_count["n"] >= 1,
+          dirty_count["n"])
+    before = dirty_count["n"]
+    a1.set_assignment(AssignmentState.COMPLETED)
+    check("autosave: assignment change marks dirty", dirty_count["n"] > before)
+    before = dirty_count["n"]
+    a1.set_role("Docs Writer")
+    check("autosave: role change marks dirty", dirty_count["n"] > before)
+
+    # --- workspace-scoped orchestrator dispatch ---
+    saves = {"n": 0}
+    bridge = OrchestratorBridge(mgr, active_ws=lambda: ws_a.id,
+                                on_mutation=lambda: saves.__setitem__(
+                                    "n", saves["n"] + 1))
+    listed = bridge._dispatch("list_agents", {}, ws=ws_a.id)["agents"]
+    check("scope: list_agents sees only the bound workspace",
+          len(listed) == 1 and listed[0]["agent_id"] == a1.id, listed)
+    try:
+        bridge._dispatch("set_agent_state",
+                         {"agent_id": b1.id, "state": "completed"}, ws=ws_a.id)
+        cross = False
+    except _RpcError:
+        cross = True
+    check("scope: cross-workspace agent unreachable by id", cross)
+    # duplicate display names: binding resolves ITS workspace's agent
+    got = bridge._dispatch("set_agent_state",
+                           {"agent_id": "Docs Writer", "state": "completed"},
+                           ws=ws_a.id)
+    check("scope: name resolution stays inside the workspace",
+          got["agent_id"] == a1.id)
+    try:
+        bridge._dispatch("spawn_agent",
+                         {"task": "x", "workspace_id": ws_b.id}, ws=ws_a.id)
+        leaked = True
+    except _RpcError as e:
+        leaked = e.code != "scope"
+    check("scope: spawn into another workspace rejected", not leaked)
+    check("scope: legacy unscoped call still resolves globally",
+          bridge._dispatch("list_agents", {}, ws="")["agents"] and True)
+
+    # log_activity: a WORKER may append to the board but is REFUSED the
+    # orchestration ops (spawn/assign/reassign/state/close). Role scoping
+    # mirrors the ws scoping — the guardrail that makes worker MCP tools safe.
+    for op, ar in [("spawn_agent", {"task": "x"}),
+                   ("assign_task", {"agent": a1.id, "task": "x"}),
+                   ("close_agent", {"agent_id": a1.id, "force": True})]:
+        try:
+            bridge._dispatch(op, ar, ws=ws_a.id, role="worker")
+            forbidden = False
+        except _RpcError as e:
+            forbidden = e.code == "forbidden"
+        check(f"guardrail: worker refused {op}", forbidden)
+    logged = bridge._dispatch(
+        "log_activity", {"agent": "Docs Writer", "message": "wrote the docs"},
+        ws=ws_a.id, role="worker")
+    check("guardrail: worker may log_activity", logged.get("logged") is True)
+    tail = ws_a.board.read_log_tail()
+    check("guardrail: log_activity entry lands on the board",
+          any("wrote the docs" in t for t in tail), tail)
+    # append_activity must NOT disturb the roster block
+    before = ws_a.board.update_roster([{"name": "A1", "role": "", "provider":
+                "claude", "model": "", "status": "idle", "task": "keep me"}])
+    ws_a.board.append_activity("A1", "another line")
+    body = Path(ws_a.board.path).read_text(encoding="utf-8")
+    check("guardrail: roster survives an activity append",
+          "keep me" in body and body.count("AIHIVE:ROSTER:BEGIN") == 1
+          and "another line" in body)
+    # orchestrator (or legacy role="") keeps full access
+    check("guardrail: orchestrator role may still spawn",
+          bridge._dispatch("list_agents", {}, ws=ws_a.id, role="orchestrator")
+          is not None)
+    cfg_w = bridge.mcp_config_path_for(ws_a.id, "worker")
+    cfg_o = bridge.mcp_config_path_for(ws_a.id, "orchestrator")
+    envw = _json.loads(Path(cfg_w).read_text(encoding="utf-8"))["mcpServers"]["aihive"]["env"]
+    check("guardrail: worker config carries AIHIVE_ROLE=worker",
+          envw.get("AIHIVE_ROLE") == "worker" and cfg_w != cfg_o)
+
+    # get_agent_output renders on the GUI thread while the MCP client blocks on
+    # a timeout — the pyte feed must be bounded, never the full 512 KB buffer
+    from app import orchestrator_bridge as _ob
+
+    class _BigPty:
+        is_pty = True
+        fed = {"n": 0}
+
+        def pty_replay(self):
+            return "x\r\n" * 200_000  # ~600 KB, far over PTY_BUFFER_CAP
+
+    _real_feed = None
+    import pyte as _pyte
+    orig_feed = _pyte.Stream.feed
+    sizes = []
+
+    def _spy_feed(self, data):
+        sizes.append(len(data))
+        return orig_feed(self, data)
+    _pyte.Stream.feed = _spy_feed
+    try:
+        out = _ob._agent_output(_BigPty(), 30)
+    finally:
+        _pyte.Stream.feed = orig_feed
+    check("render: get_agent_output feeds a bounded tail, not 512 KB",
+          sizes and max(sizes) <= 40 * 400 + 10, sizes)
+    check("render: output still capped to the screen", out.count("\n") <= 40)
+
+    # --- orchestrator mutations trigger the immediate-save hook ---
+    class _FakeSock:
+        def write(self, _b): pass
+        def flush(self): pass
+    line = _json.dumps({"id": "t1", "op": "set_agent_state",
+                        "args": {"agent_id": a1.id, "state": "idle"},
+                        "ws": ws_a.id}).encode()
+    bridge._handle_line(_FakeSock(), line)
+    check("scope: mutating op fires immediate save", saves["n"] == 1, saves)
+    line = _json.dumps({"id": "t2", "op": "list_agents", "args": {},
+                        "ws": ws_a.id}).encode()
+    bridge._handle_line(_FakeSock(), line)
+    check("scope: read-only op does not fire save", saves["n"] == 1, saves)
+
+    # --- per-workspace mcp config carries the binding ---
+    bridge.pipe_name = "test-pipe"
+    bridge._mcp_dir = str(tmp / "mcp")
+    cfg_path = bridge.mcp_config_path_for(ws_a.id)
+    cfg = _json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+    env = cfg["mcpServers"]["aihive"]["env"]
+    check("scope: mcp config binds AIHIVE_WS to the workspace",
+          env.get("AIHIVE_WS") == ws_a.id and env.get("AIHIVE_PIPE") == "test-pipe")
+
+    # --- session save-audit log (forensics for any future clobber) ---
+    sp = tmp / "audit" / "s.json"
+    store = SessionStore(path=sp)
+    store.save({"version": 3, "workspaces": [{"terminals": [1, 2]}]})
+    log = sp.with_suffix(".log").read_text(encoding="utf-8")
+    check("audit: save writes a forensic line with pid",
+          "SAVE ws=1 terminals=[2]" in log and f"pid={os.getpid()}" in log, log)
+    sp.write_text("{corrupt", encoding="utf-8")
+    store.load()
+    log = sp.with_suffix(".log").read_text(encoding="utf-8")
+    check("audit: load failure is recorded before .bak rename",
+          "LOAD-FAIL" in log, log)
+
+    # a save that fails must be VISIBLE in the log (an instance once went
+    # silent — no saves, no errors — while the user kept working), and every
+    # successful save keeps a rolling previous generation for recovery
+    sp2 = tmp / "audit" / "roll.json"
+    store2 = SessionStore(path=sp2)
+    store2.save({"version": 3, "gen": 1, "workspaces": []})
+    store2.save({"version": 3, "gen": 2, "workspaces": []})
+    prev = _json.loads(sp2.with_suffix(".json.1").read_text(encoding="utf-8"))
+    cur = _json.loads(sp2.read_text(encoding="utf-8"))
+    check("audit: rolling previous-generation session backup",
+          prev.get("gen") == 1 and cur.get("gen") == 2, (prev, cur))
+    ok = store2.save({"bad": object()})  # non-serializable -> save fails
+    log2 = sp2.with_suffix(".log").read_text(encoding="utf-8")
+    check("audit: failed save is recorded, not silent",
+          ok is False and "SAVE-FAIL" in log2, log2[-200:])
+    check("audit: failed save never corrupts the session file",
+          _json.loads(sp2.read_text(encoding="utf-8")).get("gen") == 2)
+
+    # --- mojibake armor: JSON can carry lone surrogates (MCP tool calls,
+    # session files); strict-UTF-8 sinks refuse them. One such task string
+    # crashed the app at startup while rewriting the board roster.
+    from app import coordination
+    bad = "reconcile the docs \udc81 with reality"
+    a1.set_task(bad)
+    check("mojibake: set_task strips lone surrogates",
+          "\udc81" not in a1.current_task and a1.current_task.startswith("reconcile"),
+          ascii(a1.current_task))
+    board = coordination.WorkspaceBoard(str(tmp / "boardws"))
+    ok = board.update_roster([{"name": "X", "role": "", "provider": "claude",
+                               "model": "", "status": "idle", "task": bad}])
+    check("mojibake: board roster write survives surrogates", ok)
+    body = Path(board.path).read_text(encoding="utf-8")  # strict decode
+    check("mojibake: board file remains valid strict UTF-8", "| X |" in body)
+
+    for a in mgr.all_agents():
+        a.dispose()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_transcript_backups():
+    """AI Hive snapshots each pinned agent's Claude transcript on app start
+    and close. The high-water copy (<id>.max.jsonl) is never replaced by
+    anything smaller — so a truncated transcript (a real incident: concurrent
+    resume cut a conversation back to its first 34 lines) can rotate through
+    the snapshots but can never destroy the full copy."""
+    from app import transcripts
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-tb-"))
+    check("backup: project dir encoding matches Claude's",
+          transcripts.encode_project_dir(r"C:\Users\Mario\Downloads\hive-test2")
+          == "C--Users-Mario-Downloads-hive-test2")
+
+    # fake transcript + a stub agent pointing at it via a patched path
+    bdir = str(tmp / "backups")
+    src = tmp / "conv.jsonl"
+    sid = "12345678-1234-4123-8123-123456789abc"
+
+    class _Spec:
+        provider = "claude"
+        cwd = str(tmp)
+        session_id = sid
+
+    class _Agent:
+        spec = _Spec()
+
+    real_tp = transcripts.transcript_path
+    transcripts.transcript_path = lambda cwd, s: str(src)
+    try:
+        src.write_text("line1\nline2\nline3\n" * 40, encoding="utf-8")
+        n = transcripts.backup_for_agents([_Agent()], bdir)
+        newest = Path(bdir) / f"{sid}.jsonl"
+        high = Path(bdir) / f"{sid}.max.jsonl"
+        check("backup: first snapshot written", n == 1 and newest.exists())
+        check("backup: high-water copy created", high.exists())
+        full_size = newest.stat().st_size
+
+        # unchanged source -> no re-copy
+        n = transcripts.backup_for_agents([_Agent()], bdir)
+        check("backup: unchanged transcript not re-copied", n == 0)
+
+        # the incident: transcript truncated -> snapshot rotates, but the
+        # high-water copy keeps the FULL version
+        import time as _t
+        _t.sleep(1.1)  # ensure a different integer mtime
+        src.write_text("line1\n", encoding="utf-8")
+        n = transcripts.backup_for_agents([_Agent()], bdir)
+        check("backup: truncated version snapshotted", n == 1)
+        check("backup: previous snapshot rotated to .1",
+              (Path(bdir) / f"{sid}.jsonl.1").stat().st_size == full_size)
+        check("backup: high-water copy NEVER shrinks",
+              high.stat().st_size == full_size,
+              (high.stat().st_size, full_size))
+
+        # growth replaces the high-water copy
+        _t.sleep(1.1)
+        src.write_text("x" * (full_size + 100), encoding="utf-8")
+        transcripts.backup_for_agents([_Agent()], bdir)
+        check("backup: larger transcript raises the high-water mark",
+              high.stat().st_size == full_size + 100)
+    finally:
+        transcripts.transcript_path = real_tp
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lifecycle_e2e():
+    """THE journey that kept losing user data, end to end with a REAL Claude
+    agent: talk -> graceful close -> reopen -> the SAME conversation is back
+    on the same card (pinned --resume), and a transcript backup exists.
+    Skipped (not failed) when the claude CLI isn't installed."""
+    import uuid as _uuid
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app import providers, transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    if not (HAS_CONPTY and providers.detected("claude")):
+        print("[SKIP] lifecycle e2e: claude CLI or ConPTY unavailable")
+        return
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def wait_until(pred, timeout_ms, step=100):
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if pred():
+                return True
+            pump(step)
+        return pred()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-e2e-"))
+    store = SessionStore(path=tmp / "s.json")
+    marker = f"PINEAPPLE-{_uuid.uuid4().hex[:8]}"
+
+    import re as _re
+    _csi = _re.compile(r"\x1b\[[0-9;?<>=]*[@-~]|\x1b[()][AB0]|\x1b\][^\x07\x1b]*\x07?")
+
+    def screen_text(a):
+        # raw stream positions words individually; strip escapes to match text
+        return _csi.sub("", a.pty_replay()).lower()
+
+    # --- session 1: real claude, say the marker --------------------------
+    win = create_main_window(store)
+    win.show(); pump(150)
+    ws = win.manager.workspaces[0]
+    spec = build_spec(AgentKind.CLAUDE, "E2E", cwd=str(tmp), pty=True,
+                      model="haiku")
+    agent = win.manager.add_terminal(ws.id, spec, autostart=True)
+    sid = agent.spec.session_id
+    check("e2e: launch minted a pinned session id", bool(sid))
+    # a brand-new folder shows the trust dialog first — accept it; the task
+    # is queued and must NOT be typed into the dialog
+    agent.deliver_task(
+        f"Reply with exactly the word {marker} and nothing else.")
+    check("e2e: trust dialog appeared for the fresh folder",
+          wait_until(lambda: "trust" in screen_text(agent)
+                     and "folder" in screen_text(agent), 45000))
+    check("e2e: queued task not typed into the trust dialog",
+          not agent._prompt_ready)
+    agent.write("\r")  # accept "Yes, I trust this folder"
+    check("e2e: task delivered once the real prompt was ready",
+          wait_until(lambda: agent._prompt_ready, 45000))
+    check("e2e: claude answered the marker prompt",
+          wait_until(lambda: screen_text(agent).count(marker.lower()) >= 2,
+                     120000),
+          screen_text(agent)[-300:])
+    # the transcript flush lags the on-screen answer (file first, content
+    # later) — wait until the marker is IN the file before closing, or the
+    # close-time backup snapshots a partial conversation
+    tpath = Path(transcripts.transcript_path(str(tmp), sid))
+
+    def transcript_has_marker():
+        try:
+            return marker in tpath.read_text(encoding="utf-8",
+                                             errors="replace")
+        except OSError:
+            return False
+    check("e2e: transcript persisted under the pinned id",
+          wait_until(transcript_has_marker, 45000), str(tpath))
+    win.close(); pump(600)  # graceful close: save + transcript backup
+
+    on_disk = (tmp / "s.json").read_text(encoding="utf-8")
+    check("e2e: close persisted the pinned id + running state",
+          sid in on_disk and '"running": true' in on_disk)
+    check("e2e: close snapshotted the transcript",
+          (tmp / "transcripts" / f"{sid}.jsonl").exists()
+          and marker in (tmp / "transcripts" / f"{sid}.jsonl")
+          .read_text(encoding="utf-8", errors="replace"))
+
+    # --- session 2: reopen -> the SAME conversation returns --------------
+    win2 = create_main_window(store)
+    win2.show(); pump(150)
+    agent2 = win2.manager.workspaces[0].agents[-1]
+    check("e2e: reopened agent kept its pin", agent2.spec.session_id == sid)
+    check("e2e: reopened agent resumes, not --continue",
+          agent2.spec.resume
+          and "--resume" in agent2.spec.effective_args())
+    win2.autostart_active_workspace()
+    check("e2e: THE SAME conversation came back on the card",
+          wait_until(lambda: marker.lower() in screen_text(agent2), 90000),
+          screen_text(agent2)[-300:])
+    check("e2e: no silent fresh-fallback (pin unchanged)",
+          agent2.spec.session_id == sid)
+    win2.close(); pump(600)
+
+    # tidy: remove the claude-side project dir this test created
+    proj = os.path.join(os.path.expanduser("~"), ".claude", "projects",
+                        transcripts.encode_project_dir(str(tmp)))
+    shutil.rmtree(proj, ignore_errors=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_session_pinning():
+    """Each Claude agent owns ONE conversation, pinned by session id: fresh
+    starts declare --session-id, resumes target --resume <id>. Never
+    --continue when pinned — 'most recent in this folder' broke the moment
+    two agents shared a project folder (on relaunch they raced for the same
+    conversation; the loser opened the wrong one / a fresh session)."""
+    import re as _re
+    from app.process_worker import AgentKind, AgentSpec, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+
+    uuid_re = _re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+    def stub(agent, counter):
+        agent.worker = type("W", (), {
+            "start": lambda s: counter.__setitem__("n", counter["n"] + 1),
+            "restart": lambda s: counter.__setitem__("n", counter["n"] + 1),
+            "is_running": lambda s: False, "dispose": lambda s: None})()
+
+    spec = build_spec(AgentKind.CLAUDE, "Pin", cwd=os.getcwd(), pty=True)
+    agent = TerminalAgent(spec)
+    stub(agent, {"n": 0})
+    agent.start()  # fresh start mints an identity
+    sid1 = spec.session_id
+    check("pin: fresh start mints a session id", bool(uuid_re.match(sid1)), sid1)
+    fresh_args = spec.effective_args()
+    check("pin: fresh launch declares --session-id",
+          "--session-id" in fresh_args and sid1 in fresh_args, fresh_args)
+
+    spec.resume = True
+    args = spec.effective_args()
+    check("pin: resume targets THIS conversation (--resume <id>)",
+          "--resume" in args and args[args.index("--resume") + 1] == sid1, args)
+    check("pin: pinned resume never uses --continue", "--continue" not in args)
+    agent.start()  # resume start keeps the pin
+    check("pin: resume keeps the pinned id", spec.session_id == sid1)
+    agent.start()  # deliberate fresh start rotates it
+    check("pin: next fresh start rotates the id",
+          spec.session_id != sid1 and bool(uuid_re.match(spec.session_id)))
+    agent.restart()
+    rotated = spec.session_id
+    check("pin: manual restart is a new conversation (new id)",
+          rotated != sid1 and bool(uuid_re.match(rotated)))
+
+    # legacy sessions (no pin) still resume via --continue, once
+    legacy = build_spec(AgentKind.CLAUDE, "Legacy", cwd=os.getcwd(), pty=True)
+    legacy.session_id = ""
+    legacy.resume = True
+    check("pin: legacy unpinned resume falls back to --continue",
+          "--continue" in legacy.effective_args())
+
+    # a failed resume (conversation gone) relaunches fresh under a NEW id
+    gone = "11111111-1111-4111-8111-111111111111"
+    spec2 = build_spec(AgentKind.CLAUDE, "Fb", cwd=os.getcwd(), pty=True)
+    spec2.session_id = gone
+    spec2.resume = True
+    a2 = TerminalAgent(spec2)
+    c2 = {"n": 0}
+    stub(a2, c2)
+    a2.start()
+    a2._prompt_ready = False
+    a2.status = AgentStatus.RUNNING
+    a2._on_finished(1, False)  # died before the prompt -> fresh-fallback
+    check("pin: failed resume relaunches fresh under a new id",
+          c2["n"] == 2 and spec2.session_id != gone
+          and bool(uuid_re.match(spec2.session_id)), spec2.session_id)
+
+    # the pin survives save/restore
+    back = AgentSpec.from_dict(spec2.to_dict())
+    check("pin: session id survives save/restore",
+          back.session_id == spec2.session_id)
+
+    # nested-session env markers must never reach agents: a claude launched
+    # with CLAUDECODE/CLAUDE_CODE_* in its env silently disables transcript
+    # persistence (verified live), making conversations unsaved+unresumable
+    from app.pty_worker import agent_environment
+    had = os.environ.get("CLAUDECODE")
+    os.environ["CLAUDECODE"] = "1"
+    os.environ["CLAUDE_CODE_TEST_MARKER"] = "x"
+    env = agent_environment()
+    os.environ.pop("CLAUDE_CODE_TEST_MARKER", None)
+    if had is None:
+        os.environ.pop("CLAUDECODE", None)
+    else:
+        os.environ["CLAUDECODE"] = had
+    check("pin: nested claude markers stripped from agent env",
+          "CLAUDECODE" not in env and "CLAUDE_CODE_TEST_MARKER" not in env
+          and any(k.upper() == "PATH" for k in env))
+
+    # Claude readiness = the input-box footer. The folder-trust dialog also
+    # enables bracketed paste (and never disables it on dismissal — verified
+    # live), so 2004h alone would type a queued task INTO the dialog.
+    spec3 = build_spec(AgentKind.CLAUDE, "Trust", cwd=os.getcwd(), pty=True)
+    a3 = TerminalAgent(spec3)
+    a3._on_pty_output("", "Do you trust\x1b[20Gthis\x1b[26Gfolder?\x1b[?2004h")
+    check("pin: trust dialog does not trip prompt-ready",
+          not a3._prompt_ready)
+    a3._on_pty_output("", "\x1b[2G? for shortcuts \x1b[38;2;1;2;3m- more")
+    check("pin: input-box footer marks Claude readiness", a3._prompt_ready)
+    # split across chunks: the rolling tail must still assemble the footer
+    a5 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Split", cwd=os.getcwd(),
+                                  pty=True))
+    a5._on_pty_output("", "\x1b[?2004h? for sho")
+    a5._on_pty_output("", "rtcuts")
+    check("pin: footer split across chunks still detected", a5._prompt_ready)
+    # non-Claude ptys (PSReadLine etc.) keep the paste-enable signal
+    a4 = TerminalAgent(build_spec(AgentKind.POWERSHELL, "Sh", cwd=os.getcwd(),
+                                  pty=True))
+    a4._on_pty_output("", "\x1b[?2004h")
+    check("pin: non-claude pty still ready on paste-enable", a4._prompt_ready)
+
+
+def test_wake_and_resume_all():
+    """The hive comes back WHOLE on reopen: previously-running agents
+    autostart in EVERY workspace (not just the active one), every restored
+    Claude agent carries one-shot resume for whenever it next starts, and a
+    stopped pty card is never a dead black screen — it shows a wake banner
+    and starts on the first keystroke. (The regression: a user switching to a
+    non-active workspace found an unlabeled black terminal that ate input.)"""
+    import json as _json  # noqa: F401
+    import time
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.terminal_card import TerminalCard
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def wait_until(pred, timeout_ms=15000, step=50):
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if pred():
+                return True
+            pump(step)
+        return pred()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-wake-"))
+    term = {"role": "", "cwd": str(tmp), "user_program": "", "user_args": [],
+            "pty": False, "provider": "", "model": "", "effort": "",
+            "custom_command": "", "font_px": 0, "is_orchestrator": False,
+            "task": "", "assignment": "idle", "auto_created": False}
+    store = SessionStore(path=tmp / "s.json")
+    store.save({"version": 3, "active": "wa", "workspaces": [
+        {"id": "wa", "name": "Front", "project_path": str(tmp),
+         "layout": "auto", "terminals": [
+             {**term, "kind": "cmd", "name": "Stopped", "running": False}]},
+        {"id": "wb", "name": "Back", "project_path": str(tmp),
+         "layout": "auto", "terminals": [
+             {**term, "kind": "cmd", "name": "BgRunner", "running": True},
+             {**term, "kind": "claude", "name": "Coder", "provider": "claude",
+              "pty": True, "running": False}]}]})
+
+    win = create_main_window(store)
+    win.show(); pump(150)
+    mgr = win.manager
+    back = next(w for w in mgr.workspaces if w.name == "Back")
+    front = next(w for w in mgr.workspaces if w.name == "Front")
+    bg = next(a for a in back.agents if a.spec.name == "BgRunner")
+    coder = next(a for a in back.agents if a.spec.name == "Coder")
+    stopped = front.agents[0]
+
+    check("wake: restored Claude carries one-shot resume (--continue)",
+          coder.spec.resume and "--continue" in coder.spec.effective_args())
+    win.autostart_active_workspace()
+    check("wake: running agent in a NON-active workspace autostarts",
+          wait_until(lambda: bg.is_running()))
+    pump(300)
+    check("wake: stopped agents stay stopped (no side-effect runs)",
+          not stopped.is_running() and not coder.is_running())
+    win.close(); pump(250)
+
+    # stopped pty card: visible banner + press-any-key wake
+    if HAS_CONPTY:
+        spec = build_spec(AgentKind.POWERSHELL, "Waker", cwd=str(tmp), pty=True)
+        ag = TerminalAgent(spec)
+        card = TerminalCard(ag)
+        card.resize(640, 400); card.show(); pump(150)
+        check("wake: stopped pty card shows the wake banner",
+              card.overlay.isVisible())
+        card._on_key_input("x")  # the first keystroke wakes the terminal
+        check("wake: keystroke starts the session",
+              wait_until(lambda: ag.is_running()))
+        pump(200)
+        check("wake: banner hides once running", not card.overlay.isVisible())
+        card.detach()
+        ag.dispose(); pump(250)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_resume_fallback():
+    """A resume (--continue) launch that dies before the interactive prompt ever
+    comes up (Claude prints 'No conversation found to continue' and exits) must
+    relaunch ONCE, fresh — so the terminal is never left black. The regression
+    behind the Orchestrator card that opened all-black and non-interactive."""
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+
+    spec = build_spec(AgentKind.CLAUDE, "Orchestrator", cwd=os.getcwd(),
+                      pty=True, is_orchestrator=True)
+    spec.resume = True
+    agent = TerminalAgent(spec)
+
+    calls = {"start": 0}
+
+    class _StubWorker:
+        def start(self): calls["start"] += 1
+        def is_running(self): return False
+        def dispose(self): pass
+    agent.worker = _StubWorker()
+
+    agent.start()  # models the restore launch (--continue)
+    check("resume-fallback: initial launch invoked", calls["start"] == 1)
+    check("resume-fallback: attempt flagged", agent._resume_attempt is True)
+    check("resume-fallback: one-shot resume flag cleared", spec.resume is False)
+
+    # the process exits fast, before the TUI prompt (no ESC[?2004h seen)
+    agent._prompt_ready = False
+    agent.status = AgentStatus.RUNNING     # a natural exit, not a user Stop
+    agent._on_finished(1, False)
+    check("resume-fallback: relaunched fresh after fast fail", calls["start"] == 2)
+    check("resume-fallback: fallback marked done", agent._resume_fallback_done is True)
+
+    # a second death must NOT loop forever
+    agent._on_finished(1, False)
+    check("resume-fallback: no infinite relaunch loop", calls["start"] == 2)
+
+    # a resume that DID reach the prompt, then exits, must NOT relaunch
+    spec2 = build_spec(AgentKind.CLAUDE, "Coder", cwd=os.getcwd(), pty=True)
+    spec2.resume = True
+    a2 = TerminalAgent(spec2)
+    c2 = {"start": 0}
+    a2.worker = type("W", (), {"start": lambda s: c2.__setitem__("start", c2["start"] + 1),
+                               "is_running": lambda s: False, "dispose": lambda s: None})()
+    a2.start()
+    a2._prompt_ready = True               # the interactive UI came up fine
+    a2.status = AgentStatus.RUNNING
+    a2._on_finished(0, False)
+    check("resume-fallback: healthy session not relaunched on exit", c2["start"] == 1)
+
+    # a user Stop (STOPPING) of a not-yet-ready resume must NOT relaunch either
+    spec3 = build_spec(AgentKind.CLAUDE, "Stopped", cwd=os.getcwd(), pty=True)
+    spec3.resume = True
+    a3 = TerminalAgent(spec3)
+    c3 = {"start": 0}
+    a3.worker = type("W", (), {"start": lambda s: c3.__setitem__("start", c3["start"] + 1),
+                               "is_running": lambda s: False, "dispose": lambda s: None})()
+    a3.start()
+    a3._prompt_ready = False
+    a3.status = AgentStatus.STOPPING      # user asked it to stop
+    a3._on_finished(0, False)
+    check("resume-fallback: user-stopped resume not relaunched", c3["start"] == 1)
+
+
+def main():
+    test_tiling()
+    test_layout_popup_placement()
+    test_sidebar_count_badge()
+    test_ansi()
+    test_terminal_keys()
+    test_session_migration()
+    test_app()
+    test_pty()
+    test_v2_features()
+    test_v2_review_fixes()
+    test_v3_features()
+    test_persistence_resume()
+    test_resume_fallback()
+    test_scrollback()
+    test_themes()
+    test_review_fixes()
+    test_wake_and_resume_all()
+    test_session_pinning()
+    test_transcript_backups()
+    test_lifecycle_e2e()  # slowest last: launches a real claude once
+    print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception:
+        traceback.print_exc()
+        print(f"\nRESULT: {PASS} passed, {FAIL + 1} failed (crash)", flush=True)
+        sys.exit(1)

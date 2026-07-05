@@ -1,0 +1,173 @@
+"""AI-agent provider registry.
+
+Each provider maps to a CLI. Claude Code is fully wired — its real
+`--model` / `--effort` flags (verified on this machine: effort tokens are
+low|medium|high|xhigh|max; model aliases include opus|sonnet|haiku|fable).
+Other providers are editable command templates that only launch once their
+CLI is installed; until then the dialog shows them as "not detected".
+
+This module is Qt-free (pure data + os/shutil helpers) so the model layer
+and headless tests can use it without a GUI.
+"""
+
+import os
+import shlex
+import shutil
+from dataclasses import dataclass, field
+
+DEFAULT_MODEL = ""   # empty = omit the flag, use the CLI's own default
+DEFAULT_EFFORT = ""
+
+
+@dataclass(frozen=True)
+class Provider:
+    key: str
+    display: str
+    exe_names: tuple            # for shutil.which detection
+    models: tuple              # ((label, value), ...); value "" = default
+    efforts: tuple = ()        # effort tokens (Claude only); "" prepended = default
+    native_flags: bool = False  # True → --model/--effort (Claude); else template
+    base_cmd: str = ""         # template providers, e.g. "codex"
+    model_flag: str = ""       # template, e.g. "--model {model}" / "-m {model}"
+    fallback_paths: tuple = ()  # known install paths (env vars expanded) —
+    # the app may run with a PATH older than the CLI's install
+    note: str = ""
+
+
+# providers whose CLI can resume its previous conversation with --continue
+# (claude verified 2.1.197; agy verified 1.0.16)
+RESUME_PROVIDERS = ("claude", "gemini")
+
+
+CLAUDE_MODELS = (
+    ("Default", ""), ("Opus", "opus"), ("Sonnet", "sonnet"),
+    ("Haiku", "haiku"), ("Fable", "fable"),
+)
+CLAUDE_EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
+
+PROVIDERS: dict[str, Provider] = {
+    "claude": Provider(
+        key="claude", display="Claude Code", exe_names=("claude",),
+        models=CLAUDE_MODELS, efforts=CLAUDE_EFFORTS, native_flags=True,
+        note="Anthropic Claude Code — full interactive agent."),
+    "openai": Provider(
+        key="openai", display="OpenAI (Codex CLI)", exe_names=("codex",),
+        models=(("Default", ""), ("gpt-5.1", "gpt-5.1"), ("gpt-5.1-codex", "gpt-5.1-codex")),
+        base_cmd="codex", model_flag="--model {model}",
+        note="Requires the OpenAI Codex CLI (`codex`) on PATH."),
+    "gemini": Provider(
+        key="gemini", display="Gemini (Antigravity CLI)",
+        exe_names=("agy", "gemini"),
+        # values are the CLI's own display strings — verified against
+        # `agy models` + a live `-p --model` round-trip (agy 1.0.16)
+        models=(("Default", ""),
+                ("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (High)"),
+                ("Gemini 3.1 Pro (Low)", "Gemini 3.1 Pro (Low)"),
+                ("Gemini 3.5 Flash (High)", "Gemini 3.5 Flash (High)"),
+                ("Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Medium)"),
+                ("Gemini 3.5 Flash (Low)", "Gemini 3.5 Flash (Low)"),
+                ("Claude Sonnet 4.6 (Thinking)", "Claude Sonnet 4.6 (Thinking)"),
+                ("Claude Opus 4.6 (Thinking)", "Claude Opus 4.6 (Thinking)"),
+                ("GPT-OSS 120B (Medium)", "GPT-OSS 120B (Medium)")),
+        base_cmd="agy", model_flag="--model {model}",
+        fallback_paths=(r"%LOCALAPPDATA%\agy\bin\agy.exe",),
+        note="Google Antigravity CLI (`agy`) — Gemini 3.x agent."),
+}
+
+AI_PROVIDER_KEYS = tuple(PROVIDERS.keys())
+
+
+def get(key: str) -> Provider | None:
+    return PROVIDERS.get(key)
+
+
+def resolve_claude() -> str:
+    found = shutil.which("claude")
+    if found:
+        return found
+    guess = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""),
+        r"Microsoft\WinGet\Packages"
+        r"\Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe"
+        r"\claude.exe")
+    return guess if os.path.isfile(guess) else "claude.exe"
+
+
+def resolve_program(key: str) -> str:
+    if key == "claude":
+        return resolve_claude()
+    p = PROVIDERS.get(key)
+    if p is None:
+        return ""
+    for exe in p.exe_names:
+        found = shutil.which(exe)
+        if found:
+            return found
+    # the app process may hold a PATH from before the CLI was installed —
+    # known install locations still resolve it
+    for guess in p.fallback_paths:
+        path = os.path.expandvars(guess)
+        if os.path.isfile(path):
+            return path
+    return p.base_cmd or p.exe_names[0]
+
+
+def detected(key: str) -> bool:
+    if key == "claude":
+        prog = resolve_claude()
+        return bool(shutil.which("claude")) or os.path.isfile(prog)
+    p = PROVIDERS.get(key)
+    if p is None:
+        return False
+    if any(shutil.which(e) for e in p.exe_names):
+        return True
+    return any(os.path.isfile(os.path.expandvars(g)) for g in p.fallback_paths)
+
+
+def build_invocation(key: str, model: str = "", effort: str = "",
+                     custom_command: str = "", extra_args=None) -> tuple[str, list]:
+    """Return (program, args) for an AI provider.
+
+    custom_command (if given) overrides the built-in template/base for
+    template providers, so users can wire their own CLI invocation.
+    """
+    extra_args = list(extra_args or [])
+    p = PROVIDERS.get(key)
+    if p is None:
+        return "", extra_args
+
+    if p.native_flags:  # Claude: real flags
+        program = resolve_program(key)
+        args = []
+        if model:
+            args += ["--model", model]
+        # defense in depth: 'ultracode' (and any non-CLI token) is NOT a valid
+        # --effort value — it's an in-session mode — so it must never launch
+        if effort and effort in p.efforts and effort:
+            args += ["--effort", effort]
+        return program, args + extra_args
+
+    # template provider (OpenAI/Gemini/custom)
+    if custom_command.strip():
+        tokens = _split_command(custom_command)
+        program = tokens[0] if tokens else resolve_program(key)
+        args = tokens[1:]
+    else:
+        program = resolve_program(key)
+        args = []
+        if model and p.model_flag:
+            # substitute AFTER splitting the template: a multiword model value
+            # ("Gemini 3.1 Pro (High)") must stay ONE argument, not four
+            args += [t.format(model=model)
+                     for t in _split_command(p.model_flag)]
+    return program, args + extra_args
+
+
+def _split_command(command: str) -> list:
+    """Windows-aware command split. shlex(posix=False) keeps the surrounding
+    quotes on tokens like "C:\\Program Files\\x\\y.exe", which then fails as a
+    program path — strip them (a token that is fully quoted has no other
+    quotes inside on Windows)."""
+    tokens = shlex.split(command, posix=False)
+    return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t
+            for t in tokens]

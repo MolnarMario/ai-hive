@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment (recreate with requirements.txt)
+.venv/
+venv/
+
+# AI Hive runtime state: the per-workspace shared board is generated at run
+# time; the session/transcripts live under %APPDATA%\AIHive, never in the repo
+.aihive/
+
+# Machine-specific Windows shortcut (the portable AI Hive.bat is committed)
+*.lnk
+
+# Test artifacts
+tests/screenshots/
+
+# Design-handoff sources and dev scratch shots (not needed to build/run)
+*.zip
+Screenshot*.png
+contrast-problem.png
+jank-image.png
+
+# OS / editor cruft
+Thumbs.db
+Desktop.ini
+*.swp
+.idea/
+.vscode/
