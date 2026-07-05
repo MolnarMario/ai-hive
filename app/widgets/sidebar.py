@@ -93,15 +93,18 @@ class WorkspaceRow(QFrame):
 
     def set_stats(self, stats: dict) -> None:
         self._last_stats = dict(stats)
-        a, i, e = stats.get("active", 0), stats.get("idle", 0), stats.get("error", 0)
+        busy = stats.get("busy", 0)      # actively streaming output = working
+        running = stats.get("active", 0)  # process alive (may be idle at prompt)
+        e = stats.get("error", 0)
         total = stats.get("total", 0)
-        # green wins if anything is running; red only when idle-with-errors
+        # green pulses ONLY when an agent is actually working; a running-but-
+        # quiet agent (standby) reads amber. Green wins over a stale error.
         state = ("empty" if total == 0
-                 else "working" if a > 0
+                 else "working" if busy > 0
                  else "error" if e > 0
                  else "idle")
         self.count_badge.set_state(total, state)
-        tip = f"{total} agent(s): {a} active, {i} idle, {e} error"
+        tip = f"{total} agent(s): {busy} working, {running} running, {e} error"
         self.setToolTip(f"{tip}\n{self._folder}" if self._folder else tip)
 
     # ------------------------------------------------------------ rename ---

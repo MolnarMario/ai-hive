@@ -92,8 +92,12 @@ class WorkspaceManager(QObject):
         agents = ws.agents if ws else []
         active = sum(1 for a in agents if a.status in _ACTIVE)
         error = sum(1 for a in agents if a.status in _ERROR)
+        # "busy" = actively streaming output (truly working), a subset of the
+        # RUNNING agents — this is what the sidebar badge pulses green on, so an
+        # agent merely idling at its prompt reads as standby, not working
+        busy = sum(1 for a in agents if a.is_busy())
         return {"total": len(agents), "active": active, "error": error,
-                "idle": len(agents) - active - error}
+                "busy": busy, "idle": len(agents) - active - error}
 
     def next_agent_name(self, ws_id: str) -> str:
         """Per-workspace numbering: each workspace counts Agent 1, 2, 3…"""
@@ -328,6 +332,9 @@ class WorkspaceManager(QObject):
         agent.assignment_changed.connect(lambda *_: self._touch(wid))
         agent.role_changed.connect(lambda *_: self._touch(wid))
         agent.font_changed.connect(lambda *_: self.dirty.emit())
+        # busy/standby is TRANSIENT (not persisted): refresh the badge only,
+        # never mark dirty — otherwise every output burst would thrash saves
+        agent.activity_changed.connect(lambda *_: self._recompute(wid))
 
     def _touch(self, ws_id: str) -> None:
         """Recompute derived state AND mark the session dirty (persisted

@@ -139,19 +139,20 @@ def test_sidebar_count_badge():
     QApplication.instance() or QApplication([])
     row = WorkspaceRow("w1", "Alpha", "C:/proj")
 
-    def badge(total, active, idle, error):
-        row.set_stats({"total": total, "active": active,
-                       "idle": idle, "error": error})
+    def badge(total, running, busy, error):
+        row.set_stats({"total": total, "active": running, "busy": busy,
+                       "error": error, "idle": total - running})
         return row.count_badge
 
     b = badge(0, 0, 0, 0)
     check("badge: empty workspace -> empty state, count 0",
           b._state == "empty" and b._count == 0, (b._state, b._count))
-    b = badge(2, 0, 2, 0)
-    check("badge: all idle -> idle (amber), count 2",
-          b._state == "idle" and b._count == 2, (b._state, b._count))
-    b = badge(3, 1, 2, 0)
-    check("badge: one working -> working (green), pulsing",
+    # THE fix: 3 agents running but none producing output => standby, not green
+    b = badge(3, 3, 0, 0)
+    check("badge: running but not busy -> idle (amber), count 3",
+          b._state == "idle" and b._count == 3, (b._state, b._count))
+    b = badge(3, 3, 1, 0)
+    check("badge: one busy -> working (green), pulsing",
           b._state == "working"
           and b._anim.state() == QAbstractAnimation.State.Running,
           (b._state, b._anim.state()))
@@ -160,8 +161,8 @@ def test_sidebar_count_badge():
           b._state == "error"
           and b._anim.state() != QAbstractAnimation.State.Running,
           (b._state, b._anim.state()))
-    b = badge(2, 1, 0, 1)
-    check("badge: running + error -> working wins (green)",
+    b = badge(2, 2, 1, 1)
+    check("badge: busy + error -> working wins (green)",
           b._state == "working", b._state)
 
     # folder/delete are hover-only: activating the row must NOT reveal them.
@@ -175,6 +176,30 @@ def test_sidebar_count_badge():
     check("row: hover reveals folder/delete",
           not row.folder_btn.isHidden() and not row.delete_btn.isHidden())
     row.deleteLater()
+
+
+def test_agent_busy_activity():
+    """is_busy() tracks OUTPUT ACTIVITY, not process-alive: an interactive
+    agent idling at its prompt is running but NOT busy, so the sidebar badge
+    can't falsely pulse green (the reported bug). Output marks it busy; a quiet
+    spell — or exit — drops it back to standby."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.process_worker import AgentKind, build_spec
+
+    QApplication.instance() or QApplication([])
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Busy", cwd="."))
+    a.status = AgentStatus.RUNNING  # pretend the process is up (no real child)
+    check("busy: running but no output yet -> standby", not a.is_busy())
+    a._on_pty_output("", "generating tokens...")
+    check("busy: streaming output -> busy (working)", a.is_busy())
+    a._on_idle_timeout()  # simulate the quiet window elapsing
+    check("busy: output goes quiet -> back to standby", not a.is_busy())
+    a._on_pty_output("", "more output")
+    check("busy: output resumes -> busy again", a.is_busy())
+    a._set_status(AgentStatus.EXITED_OK)  # exit clears busy at once
+    check("busy: process exit clears busy immediately", not a.is_busy())
+    a.dispose()
 
 
 # ------------------------------------------------------------ ansi parser ---
@@ -2137,6 +2162,7 @@ def main():
     test_tiling()
     test_layout_popup_placement()
     test_sidebar_count_badge()
+    test_agent_busy_activity()
     test_ansi()
     test_terminal_keys()
     test_session_migration()

@@ -64,6 +64,14 @@ TUI_PROGRAMS = {"vim", "vi", "nano", "htop", "top", "less", "ssh"}
 
 PTY_BUFFER_CAP = 512 * 1024  # raw VT tail kept for fresh-card replay
 
+# "Busy" = the agent is actively streaming output (thinking, generating,
+# running a command). An interactive process (Claude at its prompt, an idle
+# shell) stays RUNNING indefinitely without doing anything, so process-alive is
+# NOT a work signal — recent output is. If nothing streams for this long the
+# agent is treated as standing by. Claude's working spinner ticks about once a
+# second, so this window comfortably spans the gaps between token bursts.
+BUSY_IDLE_MS = 2000
+
 # strips escape sequences so on-screen TEXT can be matched: the raw stream
 # positions words individually ("trust\x1b[20Gthis\x1b[25Gfolder"), so a
 # phrase can never be matched against raw bytes
@@ -79,6 +87,7 @@ class TerminalAgent(QObject):
     assignment_changed = Signal(object)  # AssignmentState
     role_changed = Signal(str)          # dynamic role/display name
     cleared = Signal()                  # console was cleared locally
+    activity_changed = Signal(bool)     # busy (streaming output) vs standby
 
     def __init__(self, spec: AgentSpec, parent: QObject | None = None):
         super().__init__(parent)
@@ -99,6 +108,13 @@ class TerminalAgent(QObject):
         self._resume_attempt = False  # last start() launched with --continue
         self._resume_fallback_done = False  # already retried fresh once
         self._disposing = False       # teardown in progress (suppress retry)
+        self._busy = False            # actively streaming output right now
+        # single-shot: (re)armed on each output burst; firing = output went
+        # quiet, so the agent has dropped back to standby
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setSingleShot(True)
+        self._idle_timer.setInterval(BUSY_IDLE_MS)
+        self._idle_timer.timeout.connect(self._on_idle_timeout)
         if self.is_pty:
             self.worker = PtyWorker(spec, parent=self)
             self.worker.output.connect(self._on_pty_output)
@@ -275,6 +291,27 @@ class TerminalAgent(QObject):
     def is_running(self) -> bool:
         return self.worker.is_running()
 
+    def is_busy(self) -> bool:
+        """True while the agent is actively producing output — the accurate
+        'working' signal, as opposed to is_running() which stays True for an
+        interactive process idling at its prompt."""
+        return self._busy
+
+    def _mark_busy(self) -> None:
+        # only a live agent can be working; guard on status (not worker state)
+        # so this is unit-testable without a real child process
+        if self.status not in (AgentStatus.RUNNING, AgentStatus.STARTING):
+            return
+        if not self._busy:
+            self._busy = True
+            self.activity_changed.emit(True)
+        self._idle_timer.start()  # (re)arm; fires once output falls quiet
+
+    def _on_idle_timeout(self) -> None:
+        if self._busy:
+            self._busy = False
+            self.activity_changed.emit(False)
+
     # -------------------------------------------------------------- slots ---
 
     def _emit(self, stream: str, text: str) -> None:
@@ -282,9 +319,11 @@ class TerminalAgent(QObject):
         self.output_segment.emit(stream, text)
 
     def _on_output(self, stream: str, text: str) -> None:
+        self._mark_busy()  # real process output => the agent is working
         self._emit(stream, text)
 
     def _on_pty_output(self, _stream: str, text: str) -> None:
+        self._mark_busy()  # streaming VT output => the agent is working
         # keep a bounded raw tail so a freshly created card can rebuild the
         # screen; the live TerminalView is fed directly via the signal
         self._pty_buffer.append(text)
@@ -316,6 +355,13 @@ class TerminalAgent(QObject):
     def _set_status(self, status: AgentStatus) -> None:
         if status is not self.status:
             self.status = status
+            # leaving the live states ends any "working" pulse immediately,
+            # even if the idle timer hasn't fired yet (stop/crash/exit)
+            if status not in (AgentStatus.RUNNING, AgentStatus.STARTING) \
+                    and self._busy:
+                self._busy = False
+                self._idle_timer.stop()
+                self.activity_changed.emit(False)
             self.status_changed.emit(status)
 
     def _on_worker_state(self, state: WorkerState) -> None:
