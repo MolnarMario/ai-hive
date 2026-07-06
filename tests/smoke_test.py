@@ -2414,17 +2414,16 @@ def test_session_recovery():
     stale_only = AgentInfo("k", "C:/proj", C, 9000.0)  # nothing since start
     check("recover: a transcript written before this run is never adopted",
           resolve_live_ids([stale_only], lister=lambda c: dict(files)) == {})
-    # two agents share a folder: the drifting one adopts its own NEW
-    # conversation, never the peer's pinned (still-active) one
+    # two agents share a folder: the filesystem can't say which agent owns
+    # which transcript (a resume touches them all at launch), so a multi-agent
+    # folder is left EXACTLY as launched -- NEVER auto-reshuffled. Mis-
+    # attribution swapped two live conversations and pushed a good chat onto an
+    # empty /recap stub (a real, thrice-repeated incident).
     two = {A: 1000.0, B: 5000.0, D: 3000.0}
-    a1 = AgentInfo("a1", "C:/proj", A, 500.0)  # stale pin, wrote D since
-    a2 = AgentInfo("a2", "C:/proj", B, 500.0)  # healthy on the newer B
-    res = resolve_live_ids([a1, a2], lister=lambda c: dict(two))
-    check("recover: drifting agent adopts its own new conversation",
-          res.get("a1") == D, res)
-    check("recover: a peer on a newer conversation is left untouched",
-          "a2" not in res, res)
-    check("recover: adoption never lands on a sibling's pin", res.get("a1") != B)
+    a1 = AgentInfo("a1", "C:/proj", A, 500.0)
+    a2 = AgentInfo("a2", "C:/proj", B, 500.0)
+    check("recover: a multi-agent folder is never auto-reshuffled",
+          resolve_live_ids([a1, a2], lister=lambda c: dict(two)) == {})
 
     # a substantial pinned conversation must NOT be demoted to a fresh empty
     # stub, even though the stub was written more recently (the left-card-came-
@@ -2442,28 +2441,20 @@ def test_session_recovery():
           resolve_live_ids([keeps], lister=lambda c: dict(demote),
                            sizer=lambda c, s: sz2.get(s, 0)) == {"k": D})
 
-    # THE INCIDENT: one agent /resumed into an existing conversation (X) while
-    # an IDLE sibling's OLDER pin also correlated to X. Both claimed X, and the
-    # old conflict rule DROPPED BOTH -- so the switched agent reopened on its
-    # empty launch id (the "new empty session" loss). X must be awarded to the
-    # switcher, identified by its tiny stub launch pin; the idle sibling still
-    # anchored to a substantial conversation keeps its own pin.
-    S = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"  # switcher's stub launch pin
-    X = "ffffffff-ffff-ffff-ffff-ffffffffffff"  # the conversation resumed into
-    inc = {S: 600.0, C: 1000.0, X: 3000.0}      # C = idle sibling's big pin
-    sw = AgentInfo("sw", "C:/proj", S, 500.0)      # fresh agent, switched to X
-    idle = AgentInfo("idle", "C:/proj", C, 500.0)  # idle on its big conversation
-    sizes = {S: 2_000, C: 1_000_000, X: 700_000}
-    res2 = resolve_live_ids([sw, idle], lister=lambda c: dict(inc),
-                            sizer=lambda c, sid: sizes.get(sid, 0))
-    check("recover: switched agent (stub pin) wins the contested conversation",
-          res2.get("sw") == X, res2)
-    check("recover: idle sibling on a substantial pin keeps its own pin",
-          "idle" not in res2, res2)
-    res3 = resolve_live_ids([sw, idle], lister=lambda c: dict(inc),
-                            sizer=lambda c, sid: 2_000)  # equal (stub) anchors
-    check("recover: equally-weak anchors stay ambiguous and are dropped",
-          res3 == {}, res3)
+    # THE INCIDENT (three times over): two agents in one folder, and mtime
+    # correlation swapped them -- one agent's substantial conversation got
+    # pushed onto the other's empty /recap stub, orphaning a 9 MB chat. With two
+    # agents present NOTHING is auto-repointed, however tempting the transcripts
+    # look: a hot conversation, a tiny stub, a stale pin -- all left alone.
+    S = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"  # a stub launch pin
+    X = "ffffffff-ffff-ffff-ffff-ffffffffffff"  # a hot conversation
+    inc = {S: 600.0, C: 1000.0, X: 3000.0}
+    sw = AgentInfo("sw", "C:/proj", S, 500.0)
+    idle = AgentInfo("idle", "C:/proj", C, 500.0)
+    check("recover: two-agent folder untouched even with a hot transcript",
+          resolve_live_ids([sw, idle], lister=lambda c: dict(inc),
+                           sizer=lambda c, sid: {S: 2_000, C: 1_000_000,
+                                                 X: 700_000}.get(sid, 0)) == {})
 
     # -- verify-before-resume at start(), against a real temp ~/.claude ----
     def stub(agent):
@@ -2541,34 +2532,50 @@ def test_session_recovery():
               session_sync.best_recovery_id(str(big_cwd)) == A)
         shutil.rmtree(big_cwd, ignore_errors=True)
 
-        # -- manager surface: sibling lookup + a running-agent repoint -----
+        # -- manager surface: sibling lookup, multi-agent safety, lone track --
         mgr = WorkspaceManager()
         ws = mgr.create_workspace("Rec", project_path=str(cwd))
         s_peer = build_spec(AgentKind.CLAUDE, "Peer", cwd=str(cwd), pty=True)
         s_peer.session_id = D
         peer = mgr.add_terminal(ws.id, s_peer, autostart=False)
         s_drift = build_spec(AgentKind.CLAUDE, "Drift", cwd=str(cwd), pty=True)
-        s_drift.session_id = C  # stale; its real convo (A) is on disk, newer
+        s_drift.session_id = C
         drifter = mgr.add_terminal(ws.id, s_drift, autostart=False)
         check("recover: manager reports a folder-mate's pinned id",
               mgr.sibling_session_ids(drifter) == {D})
-        # make the drifter look like a running agent that has been writing A
         for ag in (peer, drifter):
             ag.worker = type("W", (), {"is_running": lambda s: True})()
-            ag._session_started = 0.0
-        drifter._session_started = 1.0
-        os.utime(proj / f"{A}.jsonl", (10.0, 10.0))   # A written during the run
-        os.utime(proj / f"{D}.jsonl", (10.0, 10.0))   # peer's, but it's the pin
+            ag._session_started = 1.0
+        os.utime(proj / f"{A}.jsonl", (10.0, 10.0))  # a newer transcript appears
+        changed_multi = mgr.sync_live_sessions()
+        check("recover: sync NEVER reshuffles a multi-agent folder",
+              changed_multi == [] and s_drift.session_id == C
+              and s_peer.session_id == D, (changed_multi, s_drift.session_id))
+
+        # a LONE agent in its folder IS tracked -- the unambiguous, safe case:
+        # it follows the conversation it is actually writing
+        solo_cwd = Path(tempfile.mkdtemp(prefix="ai-hive-solo-"))
+        sproj = home / ".claude" / "projects" / (
+            session_sync.transcripts.encode_project_dir(str(solo_cwd)))
+        sproj.mkdir(parents=True)
+        (sproj / f"{A}.jsonl").write_text("x" * 50000, encoding="utf-8")  # real
+        os.utime(sproj / f"{A}.jsonl", (10.0, 10.0))
+        ws2 = mgr.create_workspace("Solo", project_path=str(solo_cwd))
+        s_solo = build_spec(AgentKind.CLAUDE, "Solo", cwd=str(solo_cwd), pty=True)
+        s_solo.session_id = C  # its real conversation A is on disk, newer
+        solo = mgr.add_terminal(ws2.id, s_solo, autostart=False)
+        solo.worker = type("W", (), {"is_running": lambda s: True})()
+        solo._session_started = 1.0
         dirty = {"n": 0}
         mgr.dirty.connect(lambda: dirty.__setitem__("n", dirty["n"] + 1))
-        changed = mgr.sync_live_sessions()
-        check("recover: manager repoints a drifted running agent to its convo",
-              s_drift.session_id == A and any(c[0] == drifter.id for c in changed),
-              (s_drift.session_id, changed))
-        check("recover: the peer's pin is untouched by the sync",
-              s_peer.session_id == D)
+        changed_solo = mgr.sync_live_sessions()
+        check("recover: a lone agent is tracked to its live conversation",
+              s_solo.session_id == A
+              and any(c[0] == solo.id for c in changed_solo),
+              (s_solo.session_id, changed_solo))
         check("recover: a pin change marks the session dirty (persisted)",
               dirty["n"] >= 1)
+        shutil.rmtree(solo_cwd, ignore_errors=True)
     finally:
         if old_home is None:
             os.environ.pop("HOME", None)

@@ -137,29 +137,33 @@ this file is the invariants that must survive every change.
   of the afternoon one; a never-used id errored on a black terminal). Two
   defenses, both reading the filesystem truth (Claude writes exactly one
   `<id>.jsonl` per conversation under `~/.claude/projects/<encoded-cwd>/`):
-  (1) `WorkspaceManager.sync_live_sessions` reconciles each RUNNING agent's
-  pin to the transcript it is actually writing — run on a timer
+  (1) `WorkspaceManager.sync_live_sessions` reconciles a RUNNING agent's pin to
+  the transcript it is actually writing — run on a timer
   (`MainWindow._sync_live_sessions`, `SESSION_SYNC_MS`) AND once in
   `closeEvent` BEFORE the final save, so the last-moment switch is what
   persists; it emits `dirty` only when a pin genuinely changes (never thrash
   saves). (2) `TerminalAgent._recover_missing_resume_target` (gated by the
   one-shot `_verify_resume_target`, set only on RESTORE in `main.py`) verifies
   the pinned transcript exists before `--resume`; if not, it resumes the
-  folder's most recent real conversation instead. BOTH exclude sibling agents'
-  pins (`sibling_session_ids`) — recovering onto a peer's transcript is the
-  concurrent-resume truncation this whole subsystem guards against. Adoption
-  requires the transcript to be newer than the agent's process-start
-  (`_session_started`), so a pre-existing unrelated conversation or a fresh
-  unused id is never wrongly grabbed. When two agents in one folder both
-  correlate to the SAME switched-to transcript (an idle sibling's older pin
-  also matches the conversation another agent just `/resume`d into),
-  `resolve_live_ids` must NOT drop both (the old behavior — it silently
-  disabled sync for every multi-agent folder, so a switched agent reopened on
-  its empty launch id: a real loss). It awards the transcript to the agent
-  whose own pin is the weakest anchor (smallest/stub launch id via
-  `transcript_size` — the one that actually abandoned its launch conversation),
-  leaving a sibling still anchored to a substantial conversation alone; only a
-  genuine tie (equally weak anchors) is dropped.
+  folder's most recent real conversation instead. Adoption requires the
+  transcript to be newer than the agent's process-start (`_session_started`),
+  so a pre-existing unrelated conversation or a fresh unused id is never
+  wrongly grabbed, and a near-empty STUB (`_STUB_BYTES` — a fresh `/recap`
+  session, a glitched resume) can NEVER displace a real conversation (that
+  stranded a 9 MB chat on a blank card). CRITICAL: `resolve_live_ids` tracks
+  ONLY single-agent folders. In a folder with two-plus agents the filesystem
+  cannot say which agent owns which transcript (a resume touches them all at
+  launch), so mtime correlation GUESSES — and a wrong guess SWAPS two live
+  conversations or orphans one onto a stub. That misfired three times in one
+  session (a good conversation pushed onto an empty `/recap` stub while its
+  real chat sat un-pinned), so multi-agent folders are left EXACTLY as
+  launched/restored — never auto-reshuffled. The only place a multi-agent
+  folder is touched is `_recover_missing_resume_target`, and only when a pin
+  points at a MISSING transcript; it excludes sibling pins
+  (`sibling_session_ids`) so recovery never lands on a peer's conversation
+  (the concurrent-resume truncation guard). Do NOT re-add mtime-based
+  reassignment for multi-agent folders, however clever the tie-break — the
+  filesystem simply lacks the signal.
 - **Gemini rides the Antigravity CLI** (`agy`, verified 1.0.16; installed at
   `%LOCALAPPDATA%\agy\bin\agy.exe`, which providers.py falls back to when the
   app's PATH predates the install). `--model` takes the MULTIWORD display

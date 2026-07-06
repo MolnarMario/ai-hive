@@ -180,21 +180,27 @@ def resolve_live_ids(agents, lister=list_transcripts,
     {key: corrected_session_id} for those whose pinned id no longer matches
     the transcript they are really writing.
 
-    Conservative by construction — it only ever proposes a transcript that:
-      * is NOT the agent's own pin (nothing to do) and NOT any sibling's pin
-        in the same folder (never steal another agent's conversation);
+    ONLY tracks folders with a SINGLE Claude agent, where "the transcript being
+    written" is unambiguous. In a folder with two or more agents the filesystem
+    cannot say WHICH agent owns WHICH transcript — a resume touches them all at
+    launch, so mtime correlation guesses, and a wrong guess SWAPS two live
+    conversations or strands one on an empty stub. That happened repeatedly
+    (a good conversation got pushed onto a fresh /recap session while its real
+    chat sat un-pinned on disk), so multi-agent folders are deliberately left
+    exactly as launched/restored. A genuinely BROKEN pin (a missing transcript)
+    is still repaired at resume time by `_recover_missing_resume_target`, which
+    excludes sibling pins and avoids stubs — the only place multi-agent folders
+    are touched, and only when a pin points at nothing.
+
+    For the single-agent case it proposes a transcript that:
+      * is NOT the agent's own pin (nothing to do);
       * was modified DURING this agent's current run (mtime >= start - slack),
         so a pre-existing unrelated conversation is never adopted, and a
         freshly-minted-but-unused id is left alone until it actually gets used;
-      * is newer than the agent's pinned transcript (or the pin is missing).
-    When several agents in one folder claim the SAME transcript (one switched
-    to it via /resume while an idle sibling's older pin also correlates to it),
-    it is awarded to the agent whose own pin is the weakest anchor -- the
-    smallest/stub launch id, i.e. the one that actually abandoned its launch
-    conversation. An idle sibling still anchored to a substantial conversation
-    of its own does not steal the switch. Only a genuine tie (equally weak
-    anchors) stays ambiguous and is dropped. Worst case it changes nothing and
-    the app behaves exactly as before.
+      * is newer than the agent's pinned transcript (or the pin is missing);
+      * is not a near-empty STUB while the current pin is a real conversation
+        (a fresh chat must earn the pin by accumulating content first).
+    Worst case it changes nothing and the app behaves exactly as before.
     """
     groups = defaultdict(list)
     for a in agents:
@@ -202,54 +208,29 @@ def resolve_live_ids(agents, lister=list_transcripts,
 
     updates: dict = {}
     for group in groups.values():
-        files = lister(group[0].cwd)
+        if len(group) != 1:
+            continue  # multi-agent folder: correlation is unsafe (see above)
+        a = group[0]
+        if not a.started_at:
+            continue  # unknown start time -> can't correlate safely
+        files = lister(a.cwd)
         if not files:
             continue
-        pins = {a.pinned_id for a in group if a.pinned_id}
-        proposal: dict = {}
-        for a in group:
-            if not a.started_at:
-                continue  # unknown start time -> can't correlate safely
-            siblings = pins - {a.pinned_id}
-            best = None  # (mtime, sid)
-            for sid, mt in files.items():
-                if sid == a.pinned_id or sid in siblings:
-                    continue
-                if mt < a.started_at - _START_SLACK:
-                    continue  # written before this run — not ours
-                if best is None or mt > best[0]:
-                    best = (mt, sid)
-            if best is None:
+        best = None  # (mtime, sid)
+        for sid, mt in files.items():
+            if sid == a.pinned_id:
                 continue
-            pin_mt = files.get(a.pinned_id)
-            if pin_mt is None or best[0] > pin_mt:
-                # never abandon a real conversation for a near-empty stub: a
-                # fresh/reset chat must accumulate content before it earns the
-                # pin, or a stray empty session strands the substantial one
-                if (sizer(a.cwd, best[1]) < _STUB_BYTES
-                        <= sizer(a.cwd, a.pinned_id)):
-                    continue
-                proposal[a.key] = best[1]
-        # resolve conflicts: when several agents claim one transcript, award it
-        # to the agent with the WEAKEST anchor (smallest pin -- the abandoned
-        # stub launch id of the agent that actually switched), not an idle
-        # sibling still holding a substantial conversation. A true tie (equally
-        # weak anchors) is genuinely ambiguous and dropped.
-        agent_by_key = {a.key: a for a in group}
-        by_target = defaultdict(list)
-        for key, sid in proposal.items():
-            by_target[sid].append(key)
-        for sid, keys in by_target.items():
-            if len(keys) == 1:
-                updates[keys[0]] = sid
+            if mt < a.started_at - _START_SLACK:
+                continue  # written before this run — not ours
+            if best is None or mt > best[0]:
+                best = (mt, sid)
+        if best is None:
+            continue
+        pin_mt = files.get(a.pinned_id)
+        if pin_mt is None or best[0] > pin_mt:
+            # never abandon a real conversation for a near-empty stub
+            if (sizer(a.cwd, best[1]) < _STUB_BYTES
+                    <= sizer(a.cwd, a.pinned_id)):
                 continue
-            ranked = sorted(
-                keys, key=lambda k: sizer(agent_by_key[k].cwd,
-                                          agent_by_key[k].pinned_id))
-            weakest, runner_up = ranked[0], ranked[1]
-            if (sizer(agent_by_key[weakest].cwd, agent_by_key[weakest].pinned_id)
-                    < sizer(agent_by_key[runner_up].cwd,
-                            agent_by_key[runner_up].pinned_id)):
-                updates[weakest] = sid  # unique stub -> that agent switched
-            # else: equally weak anchors -> ambiguous, leave both pins as-is
+            updates[a.key] = best[1]
     return updates
