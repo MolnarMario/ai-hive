@@ -7,6 +7,7 @@ rebuilding a view can never touch the process.
 """
 
 import re
+import time
 import uuid
 from collections import deque
 from enum import Enum
@@ -107,6 +108,17 @@ class TerminalAgent(QObject):
         self._pending_task = None     # task queued until the TUI is ready
         self._resume_attempt = False  # last start() launched with --continue
         self._resume_fallback_done = False  # already retried fresh once
+        # set by the restore path (main.py): the NEXT resume start should
+        # verify its pinned conversation still exists and recover if not.
+        # One-shot, consumed alongside `resume`, so a plain unit-test start()
+        # or a manual restart never touches the filesystem.
+        self._verify_resume_target = False
+        # walltime of the current process launch; lets session_sync tell which
+        # transcript was written DURING this run when reconciling a drifted pin
+        self._session_started = 0.0
+        # resolves sibling agents' pinned ids in this cwd (set by the manager),
+        # so recovery never lands on a peer's conversation
+        self._sibling_sessions = None
         self._disposing = False       # teardown in progress (suppress retry)
         self._busy = False            # actively streaming output right now
         # single-shot: (re)armed on each output burst; firing = output went
@@ -136,9 +148,37 @@ class TerminalAgent(QObject):
         # existing transcript); a resume keeps its pin
         if self.spec.provider == "claude" and not self.spec.resume:
             self.spec.session_id = str(uuid.uuid4())
+        elif (self.spec.provider == "claude" and self.spec.resume
+              and self._verify_resume_target):
+            self._recover_missing_resume_target()
+        self._session_started = time.time()
         self.worker.start()
-        # resume is a one-shot restore aid: a manual restart later is fresh
+        # resume + verify are one-shot restore aids: a manual restart later is
+        # a deliberate fresh session
         self.spec.resume = False
+        self._verify_resume_target = False
+
+    def _recover_missing_resume_target(self) -> None:
+        """Before a restore-resume, make sure the pinned conversation still
+        exists on disk. If it doesn't (a stale id, or a fresh id an earlier
+        fallback minted but never used — the case that made `--resume` error
+        with a black terminal), resume the most recent REAL conversation in
+        this folder instead; if the folder has none, leave the resume as-is
+        and let the fast-fail fallback start it fresh. Excludes sibling
+        agents' conversations so two agents sharing a folder never resume the
+        same transcript (that once truncated one)."""
+        from . import session_sync
+        if session_sync.transcript_exists(self.spec.cwd, self.spec.session_id):
+            return
+        if not session_sync.list_transcripts(self.spec.cwd):
+            return  # unused folder: nothing to recover; fallback handles it
+        exclude = set(self._sibling_sessions() if self._sibling_sessions else ())
+        exclude.add(self.spec.session_id)
+        candidate = session_sync.best_recovery_id(self.spec.cwd, exclude=exclude)
+        if candidate:
+            self.notice("— pinned conversation missing; recovering the most "
+                        "recent one in this folder —")
+            self.spec.session_id = candidate
 
     def stop(self) -> None:
         if self.worker.is_running():
@@ -153,6 +193,7 @@ class TerminalAgent(QObject):
         self._ready_tail = ""
         if self.spec.provider == "claude":  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
+        self._session_started = time.time()
         if self.is_pty:
             self._pty_buffer = []
             self._pty_bytes = 0

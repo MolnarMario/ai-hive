@@ -127,6 +127,39 @@ this file is the invariants that must survive every change.
   opened the wrong one, and concurrent resumes of one session destroyed a
   transcript). `--resume <id>` keeps the same id (no fork) unless
   `--fork-session` is passed.
+- **The pin must TRACK the live conversation, not just the launch id**
+  (`app/session_sync.py`). AI Hive only knows the id it put on the command
+  line, but the live id can DRIFT out from under it: the user runs `/resume`
+  in the TUI and switches conversations, a session forks (usage-limit
+  recovery), or a fresh id is minted that never gets a transcript. A stale pin
+  then resumes the WRONG conversation on reopen, or dies on `--resume
+  <missing>` (both happened live — a closed morning thread came back instead
+  of the afternoon one; a never-used id errored on a black terminal). Two
+  defenses, both reading the filesystem truth (Claude writes exactly one
+  `<id>.jsonl` per conversation under `~/.claude/projects/<encoded-cwd>/`):
+  (1) `WorkspaceManager.sync_live_sessions` reconciles each RUNNING agent's
+  pin to the transcript it is actually writing — run on a timer
+  (`MainWindow._sync_live_sessions`, `SESSION_SYNC_MS`) AND once in
+  `closeEvent` BEFORE the final save, so the last-moment switch is what
+  persists; it emits `dirty` only when a pin genuinely changes (never thrash
+  saves). (2) `TerminalAgent._recover_missing_resume_target` (gated by the
+  one-shot `_verify_resume_target`, set only on RESTORE in `main.py`) verifies
+  the pinned transcript exists before `--resume`; if not, it resumes the
+  folder's most recent real conversation instead. BOTH exclude sibling agents'
+  pins (`sibling_session_ids`) — recovering onto a peer's transcript is the
+  concurrent-resume truncation this whole subsystem guards against. Adoption
+  requires the transcript to be newer than the agent's process-start
+  (`_session_started`), so a pre-existing unrelated conversation or a fresh
+  unused id is never wrongly grabbed. When two agents in one folder both
+  correlate to the SAME switched-to transcript (an idle sibling's older pin
+  also matches the conversation another agent just `/resume`d into),
+  `resolve_live_ids` must NOT drop both (the old behavior — it silently
+  disabled sync for every multi-agent folder, so a switched agent reopened on
+  its empty launch id: a real loss). It awards the transcript to the agent
+  whose own pin is the weakest anchor (smallest/stub launch id via
+  `transcript_size` — the one that actually abandoned its launch conversation),
+  leaving a sibling still anchored to a substantial conversation alone; only a
+  genuine tie (equally weak anchors) is dropped.
 - **Gemini rides the Antigravity CLI** (`agy`, verified 1.0.16; installed at
   `%LOCALAPPDATA%\agy\bin\agy.exe`, which providers.py falls back to when the
   app's PATH predates the install). `--model` takes the MULTIWORD display

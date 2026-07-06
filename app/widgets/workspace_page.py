@@ -63,6 +63,7 @@ class WorkspacePage(QWidget):
     openFolderRequested = Signal(str)   # ws_id
     changePathRequested = Signal(str)   # ws_id
     activityToggled = Signal(str)       # ws_id (wired in Phase 6)
+    mapRequested = Signal(str)          # ws_id (open the Agent/File Map window)
 
     def __init__(self, workspace: Workspace, parent=None):
         super().__init__(parent)
@@ -137,6 +138,9 @@ class WorkspacePage(QWidget):
         self.open_btn = tool("Open folder", "Open this workspace's folder")
         self.change_btn = tool("Change…", "Change the workspace folder")
         self.grid_button = GridButton(header)
+        self.map_btn = tool("◆ Map", "Show the agent / file map (who is "
+                                     "working on which files)")
+        self.map_btn.setObjectName("MapToggle")
         self.activity_btn = tool("❦ Activity", "Show the workspace activity board")
         self.activity_btn.setObjectName("ActivityToggle")
         self.activity_btn.setCheckable(True)
@@ -147,6 +151,7 @@ class WorkspacePage(QWidget):
         hl.addWidget(self.change_btn)
         hl.addSpacing(8)
         hl.addWidget(self.grid_button)
+        hl.addWidget(self.map_btn)
         hl.addWidget(self.activity_btn)
 
         self.open_btn.clicked.connect(
@@ -154,6 +159,8 @@ class WorkspacePage(QWidget):
         self.change_btn.clicked.connect(
             lambda: self.changePathRequested.emit(self.workspace.id))
         self.grid_button.layoutChosen.connect(self._on_layout_chosen)
+        self.map_btn.clicked.connect(
+            lambda: self.mapRequested.emit(self.workspace.id))
         # clicked (not toggled) so programmatic setChecked never re-fires
         self.activity_btn.clicked.connect(
             lambda: self.activityToggled.emit(self.workspace.id))

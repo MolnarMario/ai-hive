@@ -592,6 +592,204 @@ def test_terminal_keys():
     check("keys: terminal refuses focus traversal (owns Tab)",
           view.focusNextPrevChild(True) is False)
 
+    # Windows-editor shortcuts: Ctrl+A highlights the input line (Backspace/Del
+    # clears it), Ctrl+Shift+A selects all, Ctrl+C smart-copies, and Ctrl+C with
+    # no selection still sends the interrupt.
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QGuiApplication, QKeyEvent
+
+    def press(k, ctrl=False, shift=False):
+        mods = Qt.KeyboardModifier.NoModifier
+        if ctrl:
+            mods |= Qt.KeyboardModifier.ControlModifier
+        if shift:
+            mods |= Qt.KeyboardModifier.ShiftModifier
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, k, mods, ""))
+
+    # Claude's input box opens with a '>' prompt, and transcript can butt right
+    # against it (no blank line). Ctrl+A must stop AT the prompt row, never
+    # climb into the transcript above -- the over-highlight regression.
+    view.feed("recap line one\r\nrecap line two\r\n> my prompt")
+    sent = []
+    view.keyInput.connect(sent.append)
+    press(K.Key_A, ctrl=True)
+    check("keys: Ctrl+A highlights the input line",
+          view.selected_text() == "> my prompt", view.selected_text())
+    check("keys: Ctrl+A stops at the '>' prompt, not the transcript above",
+          "recap" not in view.selected_text(), view.selected_text())
+    check("keys: Ctrl+A is visual-only (nothing to the pty)", sent == [], sent)
+    press(K.Key_Backspace)
+    check("keys: Backspace on the highlight clears input via double-Esc",
+          sent == ["\x1b\x1b"], sent)
+    check("keys: clearing drops the highlight", view.selected_text() == "")
+    sent.clear()
+    press(K.Key_Backspace)
+    check("keys: plain Backspace (no highlight) forwards to the child (0x7f)",
+          sent == ["\x7f"], sent)
+
+    # a multi-line prompt (the '>' first line + continuation) highlights in full
+    # but still excludes the output above it
+    mv = TerminalView(rows=24, cols=80)
+    mv.feed("output above\r\n> line one\r\nline two")
+    mv.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, K.Key_A,
+                               Qt.KeyboardModifier.ControlModifier, ""))
+    msel = mv.selected_text()
+    check("keys: Ctrl+A spans a multi-line prompt",
+          "line one" in msel and "line two" in msel and "\n" in msel, msel)
+    check("keys: multi-line Ctrl+A excludes the output above",
+          "output above" not in msel, msel)
+
+    # Ctrl+Shift+A selects all; Ctrl+C then copies it and sends nothing to pty
+    sent.clear()
+    press(K.Key_A, ctrl=True, shift=True)
+    check("keys: Ctrl+Shift+A selects all (incl. transcript)",
+          "recap line one" in view.selected_text(), view.selected_text())
+    check("keys: Ctrl+Shift+A sends nothing to the pty", sent == [], sent)
+    sent.clear()
+    QGuiApplication.clipboard().clear()
+    press(K.Key_C, ctrl=True)
+    check("keys: Ctrl+C copies the selection",
+          "recap line one" in QGuiApplication.clipboard().text(),
+          QGuiApplication.clipboard().text())
+    check("keys: Ctrl+C-copy sends nothing to the pty", sent == [], sent)
+    check("keys: Ctrl+C clears selection so next Ctrl+C interrupts",
+          view.selected_text() == "")
+
+    # with the selection gone, Ctrl+C is the interrupt again
+    sent.clear()
+    press(K.Key_C, ctrl=True)
+    check("keys: Ctrl+C with no selection interrupts (0x03)",
+          sent == ["\x03"], sent)
+
+
+def test_terminal_image_paste():
+    """A clipboard image is spilled to a temp PNG and its path is pasted.
+
+    Native-Windows Claude can't take a raw clipboard image; it reads images by
+    path. So pasting an image must write a file and paste the path, while a
+    text clipboard still pastes text unchanged."""
+    import os
+
+    from PySide6.QtGui import QGuiApplication, QImage
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    v = TerminalView(rows=10, cols=40)
+
+    img = QImage(4, 4, QImage.Format.Format_RGB32)
+    img.fill(0xFFFF0000)
+    QGuiApplication.clipboard().setImage(img)
+    if not QGuiApplication.clipboard().mimeData().hasImage():
+        check("image-paste: SKIP (offscreen clipboard has no image support)", True)
+        return
+
+    sent = []
+    v.keyInput.connect(sent.append)
+    v.paste_clipboard()
+    check("image-paste: emitted exactly one paste", len(sent) == 1, sent)
+    pasted = sent[0].strip('"') if sent else ""
+    check("image-paste: pasted a .png path", pasted.lower().endswith(".png"), pasted)
+    check("image-paste: the PNG was actually written on disk",
+          os.path.isfile(pasted), pasted)
+    check("image-paste: file lands in the aihive-paste temp dir",
+          "aihive-paste" in pasted, pasted)
+
+    # a text clipboard still pastes text, never a file path
+    QGuiApplication.clipboard().setText("plain text")
+    sent.clear()
+    v.paste_clipboard()
+    check("image-paste: text clipboard still pastes text",
+          sent == ["plain text"], sent)
+
+    try:
+        os.remove(pasted)
+    except OSError:
+        pass
+
+
+def test_terminal_mouse_words_links():
+    """Double-click selects a word; middle-click classifies URLs / files."""
+    import os
+
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                            TerminalView)
+
+    QApplication.instance() or QApplication([])
+    v = TerminalView(rows=10, cols=80)
+    v.feed("the quick brown fox")
+
+    # word run is whitespace-delimited; a blank cell has no word
+    check("mouse: _word_at finds the word range", v._word_at(0, 11) == (10, 14),
+          v._word_at(0, 11))
+    check("mouse: _word_at on a space is None", v._word_at(0, 9) is None)
+
+    # a real double-click event selects that word, ready for Ctrl+C
+    def pos(row, col):
+        return QPointF(CELL_PAD_X + (col + 0.5) * v._cell_w,
+                       CELL_PAD_Y + (row + 0.5) * v._cell_h)
+    v.mouseDoubleClickEvent(QMouseEvent(
+        QEvent.Type.MouseButtonDblClick, pos(0, 11),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    check("mouse: double-click selects the word", v.selected_text() == "brown",
+          v.selected_text())
+
+    # link classification
+    check("mouse: https URL classified", v._classify_link("https://example.com/x")
+          == ("url", "https://example.com/x"))
+    check("mouse: www URL gets an http scheme",
+          v._classify_link("www.example.com/y") == ("url", "http://www.example.com/y"))
+    check("mouse: wrapping paren/comma stripped from a URL",
+          v._classify_link("(https://example.com),")[1] == "https://example.com")
+    check("mouse: a bare word is not a link", v._classify_link("brown") is None)
+    check("mouse: a relative path is not opened (no base dir)",
+          v._classify_link("app/foo.py") is None)
+
+    this = os.path.abspath(__file__)
+    check("mouse: an existing absolute file is classified",
+          v._classify_link(this) == ("file", this), v._classify_link(this))
+    check("mouse: a file:line[:col] suffix is stripped",
+          v._classify_link(this + ":42:7") == ("file", this))
+    check("mouse: a nonexistent absolute path is None",
+          v._classify_link(os.path.join(os.path.dirname(this), "nope_xyz.zzz")) is None)
+
+    # _link_at reads the token straight off the painted line
+    v2 = TerminalView(rows=6, cols=80)
+    v2.feed("see https://example.com/docs for details")
+    check("mouse: _link_at picks up the URL under the pointer",
+          v2._link_at(0, 8) == ("url", "https://example.com/docs"), v2._link_at(0, 8))
+
+    # hover: link cols underline + hand cursor; a plain word does neither
+    check("mouse: _link_range_at spans the hovered URL",
+          v2._link_range_at(0, 8) == (4, 27), v2._link_range_at(0, 8))
+    check("mouse: _link_range_at is None over plain text",
+          v2._link_range_at(0, 30) is None, v2._link_range_at(0, 30))
+
+    def move(view, row, col):
+        from PySide6.QtCore import QEvent, QPointF
+        from PySide6.QtGui import QMouseEvent
+        p = QPointF(CELL_PAD_X + (col + 0.5) * view._cell_w,
+                    CELL_PAD_Y + (row + 0.5) * view._cell_h)
+        view.mouseMoveEvent(QMouseEvent(
+            QEvent.Type.MouseMove, p, Qt.MouseButton.NoButton,
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+
+    move(v2, 0, 8)  # over the URL
+    check("mouse: hovering a link sets the hover span",
+          v2._hover_link == (0, 4, 27), v2._hover_link)
+    check("mouse: hovering a link shows the hand cursor",
+          v2.cursor().shape() == Qt.CursorShape.PointingHandCursor)
+    move(v2, 0, 30)  # over plain text
+    check("mouse: leaving a link clears the hover", v2._hover_link is None)
+    check("mouse: cursor reverts to I-beam off a link",
+          v2.cursor().shape() == Qt.CursorShape.IBeamCursor)
+
 
 def test_session_migration():
     """A pre-v2 line-mode shell agent upgrades to interactive on load."""
@@ -1781,6 +1979,185 @@ def test_transcript_backups():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_agent_file_map():
+    """The Agent/File Map visualizer: (1) the transcript parser attributes
+    edited vs read files and detects Task sub-agents while skipping malformed
+    lines; (2) the window builds its node model (private + shared files) and
+    paints headlessly; (3) the workspace-header button opens the window."""
+    import json as _json
+
+    from app import file_activity, transcripts
+    from app.terminal_agent import AgentStatus
+    from app.widgets.agent_file_map import AgentFileMapWindow
+    from app.workspace_manager import Workspace
+
+    def line(name, **inp):
+        return _json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": name, "input": inp}]}})
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-map-"))
+    conv_a = tmp / "a.jsonl"
+    conv_b = tmp / "b.jsonl"
+    shared_fp = str(tmp / "shared.py")
+    only_a_fp = str(tmp / "only_a.py")
+    only_b_fp = str(tmp / "only_b.py")
+    conv_a.write_text("\n".join([
+        line("Edit", file_path=shared_fp),
+        line("Read", file_path=only_a_fp),
+        line("Read", file_path=only_a_fp),           # repeat -> deduped
+        line("Agent", subagent_type="Explore", description="scan the code"),
+        "{ this is not valid json",                  # malformed -> skipped
+    ]) + "\n", encoding="utf-8")
+    conv_b.write_text("\n".join([
+        line("Write", file_path=shared_fp),          # shared, edited by B too
+        line("Edit", file_path=only_b_fp),
+    ]) + "\n", encoding="utf-8")
+
+    # -- 1. parser --------------------------------------------------------
+    act = file_activity.parse_transcript(str(conv_a))
+    check("map: parser skips malformed line without crashing", act is not None)
+    check("map: edited file detected", any(
+        f.edited and f.basename == "shared.py" for f in act.files.values()))
+    check("map: read-only file detected", len(act.read_only_files()) == 1
+          and act.read_only_files()[0].basename == "only_a.py")
+    check("map: repeated read deduped to one entry",
+          [f.basename for f in act.files.values()].count("only_a.py") == 1)
+    check("map: Task/Agent sub-agent captured",
+          len(act.subagents) == 1 and act.subagents[0].subagent_type == "Explore")
+    check("map: missing transcript -> empty activity (no raise)",
+          file_activity.parse_transcript(str(tmp / "nope.jsonl")).files == {})
+
+    # stub agents whose transcript_path maps to the fixtures above
+    class _Spec:
+        def __init__(self, name, sid):
+            self.name = name; self.role = ""; self.provider = "claude"
+            self.cwd = str(tmp); self.session_id = sid
+
+    class _Agent:
+        def __init__(self, name, sid):
+            self.spec = _Spec(name, sid); self.status = AgentStatus.RUNNING
+        def is_busy(self): return False
+        def is_running(self): return True
+
+    real_tp = transcripts.transcript_path
+    transcripts.transcript_path = lambda cwd, sid: (
+        str(conv_a) if sid == "aaa" else str(conv_b))
+    try:
+        act_agent = file_activity.activity_for_agent(_Agent("Agent 1", "aaa"))
+        check("map: activity_for_agent parses a Claude agent's transcript",
+              act_agent is not None and len(act_agent.files) == 2)
+
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance() or QApplication([])
+        ws = Workspace(id="mapws", name="Map WS", project_path=str(tmp),
+                       agents=[_Agent("Agent 1", "aaa"), _Agent("Agent 2", "bbb")])
+
+        # -- 2. window model + paint -------------------------------------
+        win = AgentFileMapWindow()
+        win.set_workspace(ws)
+        canvas = win.canvas
+        check("map: two agent hubs in the model", len(canvas._agents) == 2)
+        check("map: shared.py placed in the shared band",
+              len(canvas._shared) == 1
+              and canvas._shared[0].basename == "shared.py")
+        a1 = next(a for a in canvas._agents if a.name == "Agent 1")
+        check("map: Agent 1 private files exclude the shared one",
+              [f.basename for f in a1.private] == ["only_a.py"])
+        check("map: Agent 1 shows its sub-agent satellite", len(a1.subs) == 1)
+        check("map: canvas paints headlessly without error",
+              not win.canvas.grab().isNull())
+
+        # -- interactions ------------------------------------------------
+        from PySide6.QtCore import QPointF
+        from app.widgets import agent_file_map as afm
+        canvas = win.canvas
+        a1v = next(a for a in canvas._agents if a.name == "Agent 1")
+        # drag: an override placement survives the next model refresh
+        canvas._overrides["bubble|" + afm._aid(a1v)] = QPointF(640, 500)
+        win.refresh()
+        a1v = next(a for a in win.canvas._agents if a.name == "Agent 1")
+        check("map: dragged position persists across refresh",
+              a1v.center.x() == 640 and a1v.center.y() == 500)
+        # hit-testing resolves the node under a scene point
+        check("map: hit-test finds the agent hub at its center",
+              canvas._hit(a1v.center)[0] == "agent")
+        f1 = a1v.private[0]
+        check("map: hit-test finds a file square", canvas._hit(f1.center)[0] == "file")
+        # zoom changes the scale and grows the scrollable canvas
+        before = canvas.minimumSize().width()
+        canvas._set_scale(2.0)
+        check("map: Ctrl+wheel zoom scales the canvas",
+              canvas._scale == 2.0 and canvas.minimumSize().width() > before)
+        # clicking an agent relays agentActivated up with the workspace id
+        relayed = []
+        win.agentActivated.connect(lambda w, a: relayed.append((w, a)))
+        win._on_agent_activated("agent-7")
+        check("map: agent click relays (ws_id, agent_id) to the app",
+              relayed == [("mapws", "agent-7")])
+        # switching workspace resets manual placement
+        canvas.reset_view()
+        check("map: reset_view clears manual overrides", canvas._overrides == {})
+
+        # -- tree view + opaque hubs + open-with --------------------------
+        from PySide6.QtGui import QColor
+        from app.widgets.agent_file_map import _open_with, _opaque_tint
+        win._toggle_view()
+        check("map: toggles to tree view", canvas.mode() == "tree")
+        # agents must be draggable in tree view too (a dragged position, stored
+        # under the tree-namespaced key, must survive relayout — the reported
+        # "can't drag the agents" bug was tree ignoring overrides)
+        tav = canvas._agents[0]
+        canvas._overrides["tree|" + afm._aid(tav)] = QPointF(700, 320)
+        canvas._relayout()
+        tav = canvas._agents[0]
+        check("map: agents are draggable in tree view",
+              tav.center.x() == 700 and tav.center.y() == 320)
+        rows = canvas._tree_rows
+        check("map: tree view builds a folder+file hierarchy",
+              any(r.is_dir for r in rows) and any(not r.is_dir for r in rows))
+        check("map: tree view lists a touched file as a row",
+              any((not r.is_dir) and r.file and r.file.basename == "shared.py"
+                  for r in rows))
+        check("map: tree view still hit-tests file rows", len(canvas._hit_files) >= 1)
+        check("map: tree view paints without error", not canvas.grab().isNull())
+        win._toggle_view()
+        check("map: toggles back to bubble view", canvas.mode() == "bubble")
+        check("map: agent hub fill is opaque",
+              _opaque_tint(QColor(0, 255, 0)).alpha() == 255)
+        _open_with(str(tmp / "nope.py"))   # missing file -> must not raise
+        check("map: open-with no-ops safely on a missing file", True)
+
+        # regression: a file whose name collides with a folder name once threw
+        # in the tree builder, and because the throw landed on the toggle's slot
+        # (after the mode flip, before repaint) the view silently FROZE — the
+        # "clicking Tree does nothing" bug. The builder must never raise.
+        from app.widgets.agent_file_map import _build_tree_rows, _FileVis
+        collide = [_FileVis(path=r"C:\proj\a\mod", basename="mod", edited=True),
+                   _FileVis(path=r"C:\proj\a\mod\sub.py", basename="sub.py", edited=False),
+                   _FileVis(path=r"C:\proj\z\other.py", basename="other.py", edited=True)]
+        try:
+            crows = _build_tree_rows(collide)
+            crash = False
+        except Exception:
+            crash, crows = True, []
+        check("map: tree builder survives file/folder name collision",
+              not crash and len(crows) >= 3)
+        win.close()
+
+        # -- 3. header button wiring -------------------------------------
+        from app.widgets.workspace_page import WorkspacePage
+        page = WorkspacePage(ws)
+        fired = []
+        page.mapRequested.connect(fired.append)
+        page.map_btn.click()
+        check("map: header button emits mapRequested with the ws id",
+              fired == ["mapws"])
+        page.deleteLater()
+    finally:
+        transcripts.transcript_path = real_tp
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_lifecycle_e2e():
     """THE journey that kept losing user data, end to end with a REAL Claude
     agent: talk -> graceful close -> reopen -> the SAME conversation is back
@@ -2008,6 +2385,300 @@ def test_session_pinning():
     check("pin: non-claude pty still ready on paste-enable", a4._prompt_ready)
 
 
+def test_session_recovery():
+    """A Claude agent's pinned session id must track the conversation it is
+    REALLY writing, and a resume whose pinned transcript is gone must recover
+    the folder's most recent one rather than error on a black terminal.
+    Regression for two live incidents: a stale pin brought back a closed
+    morning thread instead of the afternoon one, and a fresh never-used id
+    made `--resume` fail on reopen."""
+    from app import session_sync
+    from app.session_sync import AgentInfo, resolve_live_ids
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+    from app.workspace_manager import WorkspaceManager
+
+    A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    C = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+    D = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+
+    # -- reconciliation logic (pure, filesystem injected) ------------------
+    files = {A: 1000.0, B: 2000.0}
+    drift = AgentInfo("k", "C:/proj", A, 500.0)  # pinned old, B written since
+    check("recover: drift to the conversation the agent is really writing",
+          resolve_live_ids([drift], lister=lambda c: dict(files)) == {"k": B})
+    live = AgentInfo("k", "C:/proj", B, 500.0)
+    check("recover: pinned to the live conversation is a no-op",
+          resolve_live_ids([live], lister=lambda c: dict(files)) == {})
+    stale_only = AgentInfo("k", "C:/proj", C, 9000.0)  # nothing since start
+    check("recover: a transcript written before this run is never adopted",
+          resolve_live_ids([stale_only], lister=lambda c: dict(files)) == {})
+    # two agents share a folder: the drifting one adopts its own NEW
+    # conversation, never the peer's pinned (still-active) one
+    two = {A: 1000.0, B: 5000.0, D: 3000.0}
+    a1 = AgentInfo("a1", "C:/proj", A, 500.0)  # stale pin, wrote D since
+    a2 = AgentInfo("a2", "C:/proj", B, 500.0)  # healthy on the newer B
+    res = resolve_live_ids([a1, a2], lister=lambda c: dict(two))
+    check("recover: drifting agent adopts its own new conversation",
+          res.get("a1") == D, res)
+    check("recover: a peer on a newer conversation is left untouched",
+          "a2" not in res, res)
+    check("recover: adoption never lands on a sibling's pin", res.get("a1") != B)
+
+    # a substantial pinned conversation must NOT be demoted to a fresh empty
+    # stub, even though the stub was written more recently (the left-card-came-
+    # back-blank incident: a stray /recap-only session stranded a 10 MB chat)
+    big, stub = 50000, 300  # bytes
+    sz = {A: big, D: stub}
+    demote = {A: 1000.0, D: 2000.0}  # D newer but empty
+    keeps = AgentInfo("k", "C:/proj", A, 500.0)
+    check("recover: a real conversation is never demoted to an empty stub",
+          resolve_live_ids([keeps], lister=lambda c: dict(demote),
+                           sizer=lambda c, s: sz.get(s, 0)) == {})
+    # but when the current pin is ITSELF a stub, following the newer one is fine
+    sz2 = {A: stub, D: stub + 10}
+    check("recover: a stub pin still follows the newer conversation",
+          resolve_live_ids([keeps], lister=lambda c: dict(demote),
+                           sizer=lambda c, s: sz2.get(s, 0)) == {"k": D})
+
+    # THE INCIDENT: one agent /resumed into an existing conversation (X) while
+    # an IDLE sibling's OLDER pin also correlated to X. Both claimed X, and the
+    # old conflict rule DROPPED BOTH -- so the switched agent reopened on its
+    # empty launch id (the "new empty session" loss). X must be awarded to the
+    # switcher, identified by its tiny stub launch pin; the idle sibling still
+    # anchored to a substantial conversation keeps its own pin.
+    S = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"  # switcher's stub launch pin
+    X = "ffffffff-ffff-ffff-ffff-ffffffffffff"  # the conversation resumed into
+    inc = {S: 600.0, C: 1000.0, X: 3000.0}      # C = idle sibling's big pin
+    sw = AgentInfo("sw", "C:/proj", S, 500.0)      # fresh agent, switched to X
+    idle = AgentInfo("idle", "C:/proj", C, 500.0)  # idle on its big conversation
+    sizes = {S: 2_000, C: 1_000_000, X: 700_000}
+    res2 = resolve_live_ids([sw, idle], lister=lambda c: dict(inc),
+                            sizer=lambda c, sid: sizes.get(sid, 0))
+    check("recover: switched agent (stub pin) wins the contested conversation",
+          res2.get("sw") == X, res2)
+    check("recover: idle sibling on a substantial pin keeps its own pin",
+          "idle" not in res2, res2)
+    res3 = resolve_live_ids([sw, idle], lister=lambda c: dict(inc),
+                            sizer=lambda c, sid: 2_000)  # equal (stub) anchors
+    check("recover: equally-weak anchors stay ambiguous and are dropped",
+          res3 == {}, res3)
+
+    # -- verify-before-resume at start(), against a real temp ~/.claude ----
+    def stub(agent):
+        agent.worker = type("W", (), {
+            "start": lambda s: None, "restart": lambda s: None,
+            "is_running": lambda s: False, "dispose": lambda s: None})()
+
+    home = Path(tempfile.mkdtemp(prefix="ai-hive-home-"))
+    cwd = Path(tempfile.mkdtemp(prefix="ai-hive-cwd-"))
+    proj = home / ".claude" / "projects" / (
+        session_sync.transcripts.encode_project_dir(str(cwd)))
+    proj.mkdir(parents=True)
+    (proj / f"{D}.jsonl").write_text("{}\n", encoding="utf-8")  # the real convo
+    old_home, old_up = os.environ.get("HOME"), os.environ.get("USERPROFILE")
+    os.environ["HOME"] = os.environ["USERPROFILE"] = str(home)
+    try:
+        # pinned id was never written -> recover the folder's real conversation
+        spec = build_spec(AgentKind.CLAUDE, "Rec", cwd=str(cwd), pty=True)
+        spec.session_id, spec.resume = C, True
+        a = TerminalAgent(spec)
+        a._verify_resume_target = True
+        stub(a)
+        a.start()
+        check("recover: resume of a missing pin recovers the real conversation",
+              spec.session_id == D, spec.session_id)
+        check("recover: the recovered launch still resumes (not fresh)",
+              a._resume_attempt is True)
+
+        # pinned id that DOES exist is left exactly as-is
+        spec2 = build_spec(AgentKind.CLAUDE, "Keep", cwd=str(cwd), pty=True)
+        spec2.session_id, spec2.resume = D, True
+        a_keep = TerminalAgent(spec2)
+        a_keep._verify_resume_target = True
+        stub(a_keep)
+        a_keep.start()
+        check("recover: an existing pinned conversation is never disturbed",
+              spec2.session_id == D)
+
+        # a sibling's conversation is off-limits: recover the OTHER one
+        (proj / f"{A}.jsonl").write_text("{}\n", encoding="utf-8")
+        spec3 = build_spec(AgentKind.CLAUDE, "Sib", cwd=str(cwd), pty=True)
+        spec3.session_id, spec3.resume = C, True
+        a_sib = TerminalAgent(spec3)
+        a_sib._verify_resume_target = True
+        a_sib._sibling_sessions = lambda: {D}  # D belongs to a peer here
+        stub(a_sib)
+        a_sib.start()
+        check("recover: recovery skips a sibling's live conversation",
+              spec3.session_id == A and spec3.session_id != D, spec3.session_id)
+
+        # an unused folder: leave the resume alone (the fast-fail fallback,
+        # not us, decides), so behavior is unchanged where there's nothing
+        empty_cwd = Path(tempfile.mkdtemp(prefix="ai-hive-empty-"))
+        spec4 = build_spec(AgentKind.CLAUDE, "New", cwd=str(empty_cwd), pty=True)
+        spec4.session_id, spec4.resume = C, True
+        a_new = TerminalAgent(spec4)
+        a_new._verify_resume_target = True
+        stub(a_new)
+        a_new.start()
+        check("recover: unused folder leaves the pin for the fresh-fallback",
+              spec4.session_id == C and a_new._resume_attempt is True)
+        shutil.rmtree(empty_cwd, ignore_errors=True)
+
+        # recovery prefers a SUBSTANTIAL conversation over a newer empty stub,
+        # so a stray fresh session never wins the resume
+        big_cwd = Path(tempfile.mkdtemp(prefix="ai-hive-big-"))
+        bproj = home / ".claude" / "projects" / (
+            session_sync.transcripts.encode_project_dir(str(big_cwd)))
+        bproj.mkdir(parents=True)
+        (bproj / f"{A}.jsonl").write_text("x" * 50000, encoding="utf-8")  # real
+        (bproj / f"{B}.jsonl").write_text("{}\n", encoding="utf-8")       # stub
+        os.utime(bproj / f"{A}.jsonl", (100.0, 100.0))   # older
+        os.utime(bproj / f"{B}.jsonl", (200.0, 200.0))   # newer, but empty
+        check("recover: a newer empty stub never beats a real conversation",
+              session_sync.best_recovery_id(str(big_cwd)) == A)
+        shutil.rmtree(big_cwd, ignore_errors=True)
+
+        # -- manager surface: sibling lookup + a running-agent repoint -----
+        mgr = WorkspaceManager()
+        ws = mgr.create_workspace("Rec", project_path=str(cwd))
+        s_peer = build_spec(AgentKind.CLAUDE, "Peer", cwd=str(cwd), pty=True)
+        s_peer.session_id = D
+        peer = mgr.add_terminal(ws.id, s_peer, autostart=False)
+        s_drift = build_spec(AgentKind.CLAUDE, "Drift", cwd=str(cwd), pty=True)
+        s_drift.session_id = C  # stale; its real convo (A) is on disk, newer
+        drifter = mgr.add_terminal(ws.id, s_drift, autostart=False)
+        check("recover: manager reports a folder-mate's pinned id",
+              mgr.sibling_session_ids(drifter) == {D})
+        # make the drifter look like a running agent that has been writing A
+        for ag in (peer, drifter):
+            ag.worker = type("W", (), {"is_running": lambda s: True})()
+            ag._session_started = 0.0
+        drifter._session_started = 1.0
+        os.utime(proj / f"{A}.jsonl", (10.0, 10.0))   # A written during the run
+        os.utime(proj / f"{D}.jsonl", (10.0, 10.0))   # peer's, but it's the pin
+        dirty = {"n": 0}
+        mgr.dirty.connect(lambda: dirty.__setitem__("n", dirty["n"] + 1))
+        changed = mgr.sync_live_sessions()
+        check("recover: manager repoints a drifted running agent to its convo",
+              s_drift.session_id == A and any(c[0] == drifter.id for c in changed),
+              (s_drift.session_id, changed))
+        check("recover: the peer's pin is untouched by the sync",
+              s_peer.session_id == D)
+        check("recover: a pin change marks the session dirty (persisted)",
+              dirty["n"] >= 1)
+    finally:
+        if old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = old_home
+        if old_up is None:
+            os.environ.pop("USERPROFILE", None)
+        else:
+            os.environ["USERPROFILE"] = old_up
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(cwd, ignore_errors=True)
+
+
+def test_resume_picker():
+    """The New-Agent dialog offers resumable Claude conversations from the
+    workspace folder, excludes any a running agent still holds, and pins the
+    chosen one so it launches with --resume <id>."""
+    import json
+    import uuid
+
+    from PySide6.QtWidgets import QApplication
+
+    from app import session_sync
+    from app.widgets.main_window import AddTerminalDialog
+
+    QApplication.instance() or QApplication([])
+
+    # -- _first_user_text: first REAL user message; wrappers/tool lines skipped
+    d = Path(tempfile.mkdtemp(prefix="ai-hive-resume-"))
+
+    def convo(name, entries):
+        p = d / name
+        p.write_text("\n".join(json.dumps(x) for x in entries) + "\n",
+                     encoding="utf-8")
+        return str(p)
+
+    real = convo("real.jsonl", [
+        {"type": "user", "message": {"role": "user",
+         "content": "<command-name>/clear</command-name>"}},   # wrapper -> skip
+        {"type": "user", "message": {"role": "user",
+         "content": "fix the parser bug"}}])
+    blocks = convo("blocks.jsonl", [
+        {"type": "user", "message": {"content": [
+            {"type": "text", "text": "add dark mode"}]}}])
+    empty = convo("empty.jsonl", [{"type": "system", "subtype": "init"}])
+    check("resume: first user text (string content)",
+          session_sync._first_user_text(real) == "fix the parser bug")
+    check("resume: first user text (block content)",
+          session_sync._first_user_text(blocks) == "add dark mode")
+    check("resume: no user message -> empty preview",
+          session_sync._first_user_text(empty) == "")
+    shutil.rmtree(d, ignore_errors=True)
+
+    # -- conversation_previews + the dialog, against a temp ~/.claude ----------
+    home = Path(tempfile.mkdtemp(prefix="ai-hive-rhome-"))
+    cwd = Path(tempfile.mkdtemp(prefix="ai-hive-rcwd-"))
+    proj = home / ".claude" / "projects" / (
+        session_sync.transcripts.encode_project_dir(str(cwd)))
+    proj.mkdir(parents=True)
+    A, B, BUSY = (str(uuid.UUID(int=1)), str(uuid.UUID(int=2)),
+                  str(uuid.UUID(int=3)))
+    (proj / f"{A}.jsonl").write_text(json.dumps(
+        {"type": "user", "message": {"role": "user",
+         "content": "resume me please"}}) + "\n", encoding="utf-8")
+    (proj / f"{B}.jsonl").write_text("{}\n", encoding="utf-8")  # stub
+    (proj / f"{BUSY}.jsonl").write_text(json.dumps(
+        {"type": "user", "message": {"role": "user",
+         "content": "in use"}}) + "\n", encoding="utf-8")
+    os.utime(proj / f"{A}.jsonl", (300, 300))     # newest
+    os.utime(proj / f"{B}.jsonl", (200, 200))
+    os.utime(proj / f"{BUSY}.jsonl", (100, 100))
+    old_home, old_up = os.environ.get("HOME"), os.environ.get("USERPROFILE")
+    os.environ["HOME"] = os.environ["USERPROFILE"] = str(home)
+    try:
+        previews = session_sync.conversation_previews(str(cwd))
+        check("resume: previews sorted newest-first",
+              [c.session_id for c in previews] == [A, B, BUSY], previews)
+        check("resume: preview text parsed off the transcript",
+              previews[0].preview == "resume me please", previews[0])
+
+        dlg = AddTerminalDialog("Agent 9", cwd=str(cwd), busy_ids={BUSY})
+        ids = [dlg.resume_combo.itemData(i)
+               for i in range(dlg.resume_combo.count())]
+        check("resume: Claude picker offers New + folder conversations",
+              ids and ids[0] == "" and A in ids and B in ids, ids)
+        check("resume: a running agent's conversation is excluded",
+              BUSY not in ids, ids)
+        check("resume: picker is shown for Claude with conversations",
+              not dlg.resume_combo.isHidden())
+
+        dlg.resume_combo.setCurrentIndex(ids.index(A))
+        spec = dlg.result_spec(cwd=str(cwd))
+        check("resume: chosen conversation pins the spec (--resume <id>)",
+              spec.resume and spec.session_id == A
+              and spec.effective_args()[-2:] == ["--resume", A], spec)
+
+        dlg.resume_combo.setCurrentIndex(0)  # 'New conversation'
+        fresh = dlg.result_spec(cwd=str(cwd))
+        check("resume: 'New conversation' starts fresh (no resume)",
+              not fresh.resume and not fresh.session_id)
+    finally:
+        for k, v in (("HOME", old_home), ("USERPROFILE", old_up)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(cwd, ignore_errors=True)
+
+
 def test_wake_and_resume_all():
     """The hive comes back WHOLE on reopen: previously-running agents
     autostart in EVERY workspace (not just the active one), every restored
@@ -2165,6 +2836,8 @@ def main():
     test_agent_busy_activity()
     test_ansi()
     test_terminal_keys()
+    test_terminal_image_paste()
+    test_terminal_mouse_words_links()
     test_session_migration()
     test_app()
     test_pty()
@@ -2178,7 +2851,10 @@ def main():
     test_review_fixes()
     test_wake_and_resume_all()
     test_session_pinning()
+    test_session_recovery()
+    test_resume_picker()
     test_transcript_backups()
+    test_agent_file_map()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0

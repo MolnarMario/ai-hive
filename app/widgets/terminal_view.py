@@ -20,6 +20,35 @@ from DECSET private modes in the stream, which pyte itself ignores):
    constantly-repainting apps would yank the view back instantly. The offset
    stays anchored to content while new output streams in; any keystroke snaps
    back live. Shift+PageUp/PageDown page; Ctrl+wheel zooms the font.
+
+Editing shortcuts follow Windows conventions rather than pure terminal
+semantics: Ctrl+C copies the selection (falling back to the 0x03 interrupt
+when nothing is selected), Ctrl+V pastes (a clipboard IMAGE is spilled to a
+temp PNG and its path pasted, since Claude Code reads images by path and a
+native-Windows child can't take a raw clipboard image), Ctrl+Shift+A selects
+all painted text. Ctrl+A highlights the text you're typing (best-effort: the
+contiguous block of non-blank rows around the cursor, so wrapped/multi-line
+input highlights in full, like Cursor / the Claude desktop input box) and
+Backspace/Del on that highlight clears the child's ENTIRE input via
+double-Escape (0x1b 0x1b, Claude Code's clear-prompt gesture, which unlike its
+line-local Ctrl+A/Ctrl+K empties multi-line input too). The highlight is
+anchored at Claude's '>' prompt row so it never climbs into the transcript;
+lacking the child's real buffer it's still inference from painted rows, so it
+falls back to the cursor row when no prompt glyph is found. (Home still jumps
+to line start via 0x1b[H.)
+Ctrl+Z/Ctrl+Y are NOT undo/redo -- a terminal keeps no local edit buffer, so
+they forward their control bytes (0x1a/0x19) to the child, which owns line
+editing.
+
+Mouse: double-click selects the whitespace-delimited word under the pointer
+(then Ctrl+C copies it); middle-click (scroll-wheel click) opens a URL or an
+existing ABSOLUTE local file path under the pointer via the OS default handler
+(_link_at/_classify_link/_open_target). Hovering such a link underlines it (in
+the accent color) and switches to a hand cursor so it reads as clickable; the
+scan runs only when the pointer changes cells (it can stat the filesystem). Deleting a selected word from the
+keyboard is NOT wired: the terminal can't edit a specific span of the child's
+buffer -- clear the whole input with Ctrl+A then Backspace, or use the
+program's own Ctrl+W (delete previous word).
 """
 
 import re
@@ -43,6 +72,11 @@ _NAMED = {
     "brightmagenta": ANSI_16[13], "brightcyan": ANSI_16[14],
     "brightwhite": ANSI_16[15],
 }
+
+# First glyph of an input-box line, used by Ctrl+A to find where the prompt
+# you're typing into begins (so the highlight stops there, not up in the
+# transcript). Claude Code draws '>'; '❯' covers common shell/other prompts.
+_INPUT_PROMPTS = (">", "❯")
 
 _KEY_SEQUENCES = {
     Qt.Key.Key_Return: "\r", Qt.Key.Key_Enter: "\r",
@@ -148,11 +182,15 @@ class TerminalView(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setCursor(Qt.CursorShape.IBeamCursor)
+        self.setMouseTracking(True)  # hover (no button) to highlight links
 
         self._esc_carry = ""  # trailing partial escape between feed() calls
         self._scroll_offset = 0  # lines scrolled back into history (0 = live)
         self._sel_anchor = None  # (row, col) selection start, in screen coords
         self._sel_end = None     # (row, col) selection end
+        self._input_selected = False  # Ctrl+A input-line highlight is active
+        self._hover_link = None  # (row, c0, c1) of a link under the pointer
+        self._hover_cell = None  # last hovered (row, col), to skip re-scans
         self._bracketed_paste = False  # tracked from the stream (pyte ignores 2004)
         self._alt_screen = False       # ?1049/?1047/?47 — app owns the screen
         self._mouse_tracking = False   # ?1000/?1002/?1003 — app wants mouse
@@ -368,14 +406,54 @@ class TerminalView(QWidget):
             event.accept()
             return
 
-        # clipboard: Ctrl+V or Ctrl+Shift+V paste; Ctrl+Shift+C copies the
-        # selection (plain Ctrl+C stays the interrupt signal, as in a terminal)
+        # Ctrl+A highlights the text you're typing (best-effort: from Claude's
+        # '>' prompt row down to the cursor, so wrapped/multi-line input
+        # highlights in full but the transcript above is never grabbed). It
+        # sends NOTHING to the child -- it's a visual mark that pairs with
+        # Backspace/Del below. A terminal can't know the child's true buffer.
+        if ctrl and not shift and key == Qt.Key.Key_A:
+            self._select_input_line()
+            event.accept()
+            return
+        # With that highlight active, Backspace/Del clears the child's entire
+        # input via double-Escape (Claude Code's "clear prompt" gesture; see
+        # _clear_input_selection). Any other real key just dismisses the
+        # highlight, then is handled normally -- as an editor drops its
+        # selection on the next keypress. Bare modifiers don't dismiss (so
+        # Ctrl+A then a chorded combo still works).
+        if self._input_selected and key not in (
+                Qt.Key.Key_Control, Qt.Key.Key_Shift,
+                Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+            if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+                self._clear_input_selection(send=True)
+                event.accept()
+                return
+            self._clear_input_selection(send=False)
+
+        # clipboard / editing shortcuts, Windows-editor style. These win over
+        # the terminal control byte the same combo would otherwise send.
+        # Ctrl+V / Ctrl+Shift+V paste.
         if ctrl and key == Qt.Key.Key_V:
             self.paste_clipboard()
             event.accept()
             return
-        if ctrl and shift and key == Qt.Key.Key_C:
-            self.copy_selection()
+        # Ctrl+C copies when there is a selection, else falls through to the
+        # interrupt (0x03) so cancelling a running task still works with nothing
+        # selected. Copying clears the selection (as Windows Terminal does) so
+        # the *next* Ctrl+C reaches the process. Ctrl+Shift+C always copies.
+        if ctrl and key == Qt.Key.Key_C:
+            if shift or self._selection_range() is not None:
+                self.copy_selection()
+                self._sel_anchor = self._sel_end = None
+                self.update()
+                event.accept()
+                return
+            # no selection: fall through -> _sequence_for emits 0x03 (interrupt)
+        # Ctrl+Shift+A selects ALL painted text (screen + scrollback) for
+        # copying -- distinct from Ctrl+A above, which highlights only the input
+        # line. (Home still jumps to line start: it emits 0x1b[H.)
+        if ctrl and shift and key == Qt.Key.Key_A:
+            self.select_all()
             event.accept()
             return
 
@@ -466,18 +544,66 @@ class TerminalView(QWidget):
         return row, col
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            # scroll-wheel click opens a URL / local file under the pointer
+            row, col = self._cell_at(event.position())
+            target = self._link_at(row, col)
+            if target:
+                self._open_target(target)
+                event.accept()
+                return
         if event.button() == Qt.MouseButton.LeftButton:
             self.setFocus()
+            self._input_selected = False  # a mouse drag is a copy selection
             self._sel_anchor = self._cell_at(event.position())
             self._sel_end = self._sel_anchor
             self.update()
         super().mousePressEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        # double-click selects the word (non-whitespace run) under the pointer,
+        # ready to copy (Ctrl+C) -- like any editor/terminal
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setFocus()
+            row, col = self._cell_at(event.position())
+            rng = self._word_at(row, col)
+            if rng:
+                self._input_selected = False  # a copy selection, not the Ctrl+A mark
+                self._sel_anchor = (row, rng[0])
+                self._sel_end = (row, rng[1])
+                self.update()
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.MouseButton.LeftButton and self._sel_anchor:
             self._sel_end = self._cell_at(event.position())
             self.update()
+            super().mouseMoveEvent(event)
+            return
+        # hover (no drag): underline + hand-cursor a link under the pointer, so
+        # it's obviously clickable. Only re-scan when the cell changes -- a scan
+        # can stat the filesystem (path existence), so it must not run per pixel.
+        cell = self._cell_at(event.position())
+        if cell != self._hover_cell:
+            self._hover_cell = cell
+            rng = self._link_range_at(*cell)
+            hover = (cell[0], rng[0], rng[1]) if rng else None
+            if hover != self._hover_link:
+                self._hover_link = hover
+                self.setCursor(Qt.CursorShape.PointingHandCursor if hover
+                               else Qt.CursorShape.IBeamCursor)
+                self.update()
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        if self._hover_link is not None:
+            self._hover_link = None
+            self.setCursor(Qt.CursorShape.IBeamCursor)
+            self.update()
+        self._hover_cell = None
+        super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
         # a plain click (no drag) clears the selection
@@ -485,6 +611,82 @@ class TerminalView(QWidget):
             self._sel_anchor = self._sel_end = None
             self.update()
         super().mouseReleaseEvent(event)
+
+    def _word_at(self, row: int, col: int):
+        """(c0, c1) inclusive of the non-whitespace run at (row, col), or None
+        if that cell is blank. A 'word' here is whitespace-delimited, so a path
+        or URL selects whole."""
+        hist, off = self._view_state()
+        line = self._visible_line(row, hist, off)
+        cols = self.screen.columns
+        if col >= cols or line[col].data in ("", " "):
+            return None
+        c0 = col
+        while c0 > 0 and line[c0 - 1].data not in ("", " "):
+            c0 -= 1
+        c1 = col
+        while c1 + 1 < cols and line[c1 + 1].data not in ("", " "):
+            c1 += 1
+        return c0, c1
+
+    def _link_at(self, row: int, col: int):
+        """('url'|'file', target) for a clickable token at (row, col), else
+        None. Reuses the double-click word run as the token."""
+        rng = self._word_at(row, col)
+        if not rng:
+            return None
+        hist, off = self._view_state()
+        line = self._visible_line(row, hist, off)
+        token = "".join(line[c].data for c in range(rng[0], rng[1] + 1))
+        return self._classify_link(token)
+
+    def _link_range_at(self, row: int, col: int):
+        """(c0, c1) of a clickable link token at (row, col), or None -- the
+        column span the hover underline paints over."""
+        rng = self._word_at(row, col)
+        if not rng:
+            return None
+        hist, off = self._view_state()
+        line = self._visible_line(row, hist, off)
+        token = "".join(line[c].data for c in range(rng[0], rng[1] + 1))
+        return rng if self._classify_link(token) else None
+
+    @staticmethod
+    def _classify_link(token: str):
+        """Classify a token as an openable URL or an existing local file.
+        Trims wrapping quotes/brackets and a trailing :line[:col] ref (Claude
+        prints file:line). Only ABSOLUTE paths are opened -- a relative path
+        has no reliable base here. Returns ('url'|'file', value) or None."""
+        import os
+
+        t = token.strip().strip("'\"()[]{}<>,;")
+        if not t:
+            return None
+        if re.match(r"(?i)^(https?|ftp|file)://\S", t):
+            return ("url", t)
+        if re.match(r"(?i)^www\.\S+\.\S", t):
+            return ("url", "http://" + t)
+        path = re.sub(r":\d+(:\d+)?$", "", t)  # drop a file:line[:col] suffix
+        path = os.path.expanduser(path)
+        if os.path.isabs(path):
+            try:
+                if os.path.exists(path):
+                    return ("file", os.path.abspath(path))
+            except OSError:
+                return None
+        return None
+
+    def _open_target(self, target) -> None:
+        """Open a classified link with the OS default handler (user-initiated
+        via a middle-click, like following a hyperlink)."""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        kind, value = target
+        if kind == "url":
+            QDesktopServices.openUrl(QUrl(value))
+        else:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(value))
 
     def _selection_range(self):
         """Normalized ((r0,c0),(r1,c1)) with start <= end, or None."""
@@ -514,16 +716,93 @@ class TerminalView(QWidget):
             QGuiApplication.clipboard().setText(text)
 
     def select_all(self) -> None:
+        self._input_selected = False
         self._sel_anchor = (0, 0)
         self._sel_end = (self.screen.lines - 1, self.screen.columns - 1)
         self.update()
 
+    def _row_content(self, r: int) -> tuple[int, int]:
+        """(first, last) non-blank columns on screen row r, or (-1, -1)."""
+        row = self.screen.buffer[r]
+        first = last = -1
+        for c in range(self.screen.columns):
+            if row[c].data not in ("", " "):
+                first = c if first < 0 else first
+                last = c
+        return first, last
+
+    def _select_input_line(self) -> None:
+        """Best-effort highlight of the text you're typing. Claude Code's input
+        box opens with a prompt glyph ('>'), so we anchor the TOP of the
+        selection at the nearest prompt row at/above the cursor and run down to
+        the cursor row -- a wrapped/multi-line prompt highlights in full WITHOUT
+        climbing into the transcript above it (the over-reach that happened when
+        output butts straight against the box). If no prompt glyph is found
+        before a blank line or the top of the screen, we fall back to the
+        cursor's row only: better to under-reach than to grab output. A terminal
+        can't see the child's real buffer, so this is inference from painted
+        rows. Purely a view mark; Backspace/Del acts on it via
+        _clear_input_selection. A blank cursor row selects nothing."""
+        self._snap_to_bottom()  # cursor.y is a live-screen row; align the view
+        buf = self.screen.buffer
+        cy = self.screen.cursor.y
+        if self._row_content(cy) == (-1, -1):
+            self._clear_input_selection(send=False)
+            return
+        top = cy  # conservative default if we never find a prompt row
+        r = cy
+        while r >= 0:
+            first, _ = self._row_content(r)
+            if first < 0:
+                break  # blank line: the input box doesn't extend past it
+            if buf[r][first].data in _INPUT_PROMPTS:
+                top = r  # the input box's first line -- stop, never go higher
+                break
+            r -= 1
+        self._sel_anchor = (top, 0)
+        self._sel_end = (cy, self._row_content(cy)[1])
+        self._input_selected = True
+        self.update()
+
+    def _clear_input_selection(self, send: bool) -> None:
+        """Drop the Ctrl+A input highlight. With send=True (Backspace/Del on the
+        highlight) also clear the child's ENTIRE input via double-Escape
+        (0x1b 0x1b) -- Claude Code's documented "clear the prompt" gesture,
+        which empties single, wrapped, AND explicit multi-line input in one go
+        (its Ctrl+A/Ctrl+K are only line-local, so they can't). This is tuned
+        for Claude Code; a plain shell clears its line differently."""
+        had = self._input_selected
+        self._input_selected = False
+        self._sel_anchor = self._sel_end = None
+        if send and had:
+            self._snap_to_bottom()
+            self.keyInput.emit("\x1b\x1b")
+        self.update()
+
     def paste_clipboard(self) -> None:
-        text = QGuiApplication.clipboard().text()
+        cb = QGuiApplication.clipboard()
+        md = cb.mimeData()
+        # An image on the clipboard has no text, so it can't ride the pty as
+        # bytes -- and a native-Windows Claude can't read a raw clipboard image
+        # either (only WSL's Alt+V does, and it needs WSLg). Claude Code DOES
+        # read images by file path on every platform, so we spill the image to
+        # a temp PNG and paste its path: this automates the documented
+        # "save it to disk, then reference the file" workaround. Prefer text
+        # when the clipboard carries both (a copied file can expose both).
+        if md is not None and md.hasImage() and not md.hasText():
+            path = self._spill_clipboard_image(cb.image())
+            if path:
+                # quote only when needed -- a bare path is what Claude's
+                # image-path detection expects; spaces would split the token
+                self._paste_text(f'"{path}"' if " " in path else path)
+            return
+        text = cb.text()
         if not text:
             return
+        self._paste_text(text.replace("\r\n", "\r").replace("\n", "\r"))
+
+    def _paste_text(self, text: str) -> None:
         self._snap_to_bottom()
-        text = text.replace("\r\n", "\r").replace("\n", "\r")
         # bracketed paste (if the app enabled mode 2004, e.g. Claude Code) so a
         # multi-line/large paste is delivered as one block, not line-by-line
         if self._bracketed_paste:
@@ -531,10 +810,34 @@ class TerminalView(QWidget):
         else:
             self.keyInput.emit(text)
 
+    def _spill_clipboard_image(self, image) -> str:
+        """Write a clipboard QImage to a temp PNG and return its path (or "").
+
+        Qt decodes the OS clipboard bitmap (incl. Snipping-Tool DIBs) into a
+        QImage, so saving as PNG sidesteps the BMP-format breakage that dogs
+        the WSL path. Any failure degrades to "" -> nothing pasted (never an
+        exception into the key handler)."""
+        if image is None or image.isNull():
+            return ""
+        import os
+        import tempfile
+        import uuid
+        folder = os.path.join(tempfile.gettempdir(), "aihive-paste")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, uuid.uuid4().hex + ".png")
+            if not image.save(path, "PNG"):
+                return ""
+        except OSError:
+            return ""
+        return path
+
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         has_sel = self._selection_range() is not None
-        can_paste = bool(QGuiApplication.clipboard().text())
+        cb = QGuiApplication.clipboard()
+        md = cb.mimeData()
+        can_paste = bool(cb.text()) or (md is not None and md.hasImage())
         act_copy = menu.addAction("Copy")
         act_copy.setEnabled(has_sel)
         act_paste = menu.addAction("Paste")
@@ -628,6 +931,16 @@ class TerminalView(QWidget):
                     painter.setPen(legible_color(fg, bg))
                     painter.drawText(int(x), int(y + self._ascent), text)
                 col = run_end
+
+        # hover: underline the link under the pointer (paired with the hand
+        # cursor from mouseMoveEvent) so URLs / file paths read as clickable
+        if self._hover_link is not None:
+            hr, hc0, hc1 = self._hover_link
+            lx = CELL_PAD_X + hc0 * cw
+            ly = CELL_PAD_Y + hr * ch
+            painter.fillRect(int(lx), int(ly + ch - 2),
+                             int((hc1 - hc0 + 1) * cw), 2,
+                             QColor(Palette.ACCENT_ORANGE))
 
         cursor = self.screen.cursor
         if not cursor.hidden and off == 0:  # cursor lives on the live screen

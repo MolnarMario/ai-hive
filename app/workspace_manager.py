@@ -15,6 +15,8 @@ from PySide6.QtCore import QObject, Signal
 
 from . import coordination
 from . import orchestration
+from . import session_sync
+from . import transcripts
 from .process_worker import AgentKind, AgentSpec, build_spec
 from .pty_worker import HAS_CONPTY
 from .terminal_agent import AgentStatus, AssignmentState, TerminalAgent
@@ -332,6 +334,9 @@ class WorkspaceManager(QObject):
         agent.assignment_changed.connect(lambda *_: self._touch(wid))
         agent.role_changed.connect(lambda *_: self._touch(wid))
         agent.font_changed.connect(lambda *_: self.dirty.emit())
+        # recovery (verify-before-resume) must never land on a peer's
+        # conversation, so give the agent a live view of its folder-mates' pins
+        agent._sibling_sessions = lambda a=agent: self.sibling_session_ids(a)
         # busy/standby is TRANSIENT (not persisted): refresh the badge only,
         # never mark dirty — otherwise every output burst would thrash saves
         agent.activity_changed.connect(lambda *_: self._recompute(wid))
@@ -341,6 +346,50 @@ class WorkspaceManager(QObject):
         fields changed)."""
         self._recompute(ws_id)
         self.dirty.emit()
+
+    # ------------------------------------------------- live-session sync ---
+
+    def sibling_session_ids(self, agent: TerminalAgent) -> set:
+        """Pinned conversation ids of OTHER Claude agents sharing this agent's
+        folder. Recovery must never resume onto one of these — two agents on
+        one transcript race and can truncate it (a real past incident)."""
+        enc = transcripts.encode_project_dir(agent.spec.cwd)
+        out = set()
+        for a in self.all_agents():
+            if (a is not agent and a.spec.provider == "claude"
+                    and a.spec.session_id
+                    and transcripts.encode_project_dir(a.spec.cwd) == enc):
+                out.add(a.spec.session_id)
+        return out
+
+    def sync_live_sessions(self) -> list:
+        """Reconcile each running Claude agent's pinned session id with the
+        transcript it is actually writing, so a conversation the user switched
+        to (via /resume, a fork, usage-limit recovery) is what comes back on
+        reopen — not the id AI Hive happened to launch with. Marks the session
+        dirty when a pin changes. Returns [(agent_id, old_id, new_id)] for the
+        caller to audit. Cheap and best-effort (a scandir per active folder)."""
+        infos = [
+            session_sync.AgentInfo(key=a.id, cwd=a.spec.cwd,
+                                   pinned_id=a.spec.session_id,
+                                   started_at=a._session_started)
+            for a in self.all_agents()
+            if a.spec.provider == "claude" and a.is_running()
+            and a.spec.session_id
+        ]
+        if not infos:
+            return []
+        updates = session_sync.resolve_live_ids(infos)
+        changed = []
+        if updates:
+            for a in self.all_agents():
+                new = updates.get(a.id)
+                if new and new != a.spec.session_id:
+                    changed.append((a.id, a.spec.session_id, new))
+                    a.spec.session_id = new
+            if changed:
+                self.dirty.emit()
+        return changed
 
     def _apply_coordination(self, ws: Workspace, agent: TerminalAgent) -> None:
         """Give AI agents access to the shared workspace board (peer
