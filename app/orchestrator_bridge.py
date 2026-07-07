@@ -48,6 +48,11 @@ _MUTATING_OPS = {"spawn_agent", "assign_task", "reassign_agent",
 _ORCHESTRATOR_ONLY_OPS = {"spawn_agent", "assign_task", "reassign_agent",
                           "set_agent_state", "close_agent"}
 
+# A single RPC request is a short JSON line; cap the per-connection accumulation
+# so a client that opens the pipe and streams bytes without a newline can't grow
+# GUI memory without bound.
+_MAX_REQUEST_BYTES = 1 << 20  # 1 MiB
+
 
 def _appdata_dir() -> str:
     base = QStandardPaths.writableLocation(
@@ -155,11 +160,24 @@ class OrchestratorBridge(QObject):
             sock.disconnected.connect(lambda s=sock: self._buffers.pop(s, None))
 
     def _on_ready(self, sock) -> None:
-        self._buffers[sock] += bytes(sock.readAll().data())
-        while b"\n" in self._buffers[sock]:
-            line, _, rest = self._buffers[sock].partition(b"\n")
-            self._buffers[sock] = bytearray(rest)
+        buf = self._buffers.get(sock)
+        if buf is None:
+            return
+        buf += bytes(sock.readAll().data())
+        while b"\n" in buf:
+            line, _, rest = buf.partition(b"\n")
+            buf = bytearray(rest)
+            self._buffers[sock] = buf
             self._handle_line(sock, bytes(line))
+        # A request is tiny (a JSON line). A client that streams bytes without a
+        # newline must not grow this buffer without bound inside the GUI — drop
+        # it once the pending fragment is implausibly large.
+        if len(buf) > _MAX_REQUEST_BYTES:
+            self._buffers.pop(sock, None)
+            try:
+                sock.abort()
+            except Exception:
+                pass
 
     def _handle_line(self, sock, line: bytes) -> None:
         try:

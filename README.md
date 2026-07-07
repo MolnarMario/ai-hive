@@ -156,9 +156,11 @@ error dialog instead of silently closing. Packaging to a distributable
   or swap each other's conversations) — falling back to a fresh launch
   instead of a dead card if there's nothing to resume. The pin **tracks the
   live conversation**: if you switch conversations inside a terminal (`/resume`
-  in the TUI, a fork), AI Hive notices which transcript the agent is actually
-  writing and re-pins to it, so reopen brings back *that* conversation — and a
-  pinned id whose transcript has gone missing recovers the folder's most
+  or `/clear` in the TUI, a fork), the agent *reports its own new conversation
+  id back to AI Hive* through a `SessionStart` hook, so reopen brings back
+  *exactly* the conversation that was on each card — reliably, even when two
+  agents share one folder (which the filesystem alone can't disambiguate). A
+  pinned id whose transcript has gone missing still recovers the folder's most
   recent one instead of erroring. No more manually hunting for a lost chat.
   Agents that were *stopped* stay stopped, but never as a black screen: the
   card shows a **wake banner** and the first keystroke (or `▶`) starts it —
@@ -300,10 +302,11 @@ Hard-won rules, each with a regression test:
   aware for multi-line); `Ctrl+Shift+C` also copies; and a right-click
   Copy/Paste/Select-all menu. **Mouse**: double-click selects the
   whitespace-delimited word under the pointer (then `Ctrl+C` copies it);
-  **middle-click (scroll-wheel click)** opens a URL or an existing absolute
-  local file path under the pointer with the OS default handler — and hovering
-  such a link underlines it and shows a hand cursor so it's obviously
-  clickable. **Image
+  **Ctrl+click** (or a middle/scroll-wheel click) opens a URL or an existing
+  absolute local file path under the pointer with the OS default handler —
+  hovering such a link underlines it and shows a hand cursor so it's obviously
+  clickable. (`Ctrl`+left-click is primary — the left button always registers,
+  while the middle button is often eaten by the OS autoscroll.) **Image
   paste**: a `Ctrl+V` with an image on the
   clipboard is spilled to a temp PNG and its path pasted, because Claude Code
   reads images by path and a native-Windows child can't take a raw clipboard
@@ -335,7 +338,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-406 checks drive the real app headlessly (offscreen Qt platform) with real
+441 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -374,6 +377,8 @@ app/
   mcp_server.py            stdlib MCP stdio server the Claude CLI spawns
   session_store.py         atomic JSON persistence (AppData) + save-audit log
   transcripts.py           Claude-transcript snapshots (start/close, high-water)
+  session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
+  session_hook.py          SessionStart hook: the child reports its live conversation id
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
@@ -382,7 +387,7 @@ app/
                            popup), activity_panel, agent_file_map (bubble
                            diagram), ornaments (drop-caps / dividers / the
                            workspace count-badge)
-tests/smoke_test.py        headless end-to-end suite (406 checks)
+tests/smoke_test.py        headless end-to-end suite (441 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

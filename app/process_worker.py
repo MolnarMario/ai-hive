@@ -98,6 +98,11 @@ class AgentSpec:
     extra_dirs: list = field(default_factory=list)  # --add-dir targets
     is_orchestrator: bool = False   # can spawn/assign agents via the MCP server
     mcp_config_path: str = ""       # --mcp-config for the orchestrator
+    # --settings file carrying the shared SessionStart hook that reports this
+    # agent's LIVE conversation id back to AI Hive (app/session_hook.py). Like
+    # mcp_config_path it is a per-run path, armed before start and re-armed on
+    # restore, and is NEVER persisted (not in to_dict).
+    settings_path: str = ""
     resume: bool = False            # one-shot: resume prior conversation (restore)
     # each Claude agent OWNS one conversation, pinned by id. Resuming uses
     # --resume <id>, never --continue: "most recent in this folder" is wrong
@@ -125,6 +130,11 @@ class AgentSpec:
             for d in self.extra_dirs:
                 if d:
                     args += ["--add-dir", d]
+            if self.settings_path:
+                # inject the SessionStart hook without touching the user's
+                # global config; Claude merges hooks across sources, so this is
+                # additive (verified against 2.1.197).
+                args += ["--settings", self.settings_path]
             if self.system_prompt:
                 args += ["--append-system-prompt", self.system_prompt]
             if self.mcp_config_path:

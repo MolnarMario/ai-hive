@@ -41,16 +41,19 @@ they forward their control bytes (0x1a/0x19) to the child, which owns line
 editing.
 
 Mouse: double-click selects the whitespace-delimited word under the pointer
-(then Ctrl+C copies it); middle-click (scroll-wheel click) opens a URL or an
-existing ABSOLUTE local file path under the pointer via the OS default handler
-(_link_at/_classify_link/_open_target). Hovering such a link underlines it (in
-the accent color) and switches to a hand cursor so it reads as clickable; the
-scan runs only when the pointer changes cells (it can stat the filesystem). Deleting a selected word from the
+(then Ctrl+C copies it); Ctrl+click (or middle/scroll-wheel click) opens a URL
+or an existing ABSOLUTE local file path under the pointer via the OS default
+handler (_link_at/_classify_link/_open_target). Ctrl+LEFT-click is primary --
+the left button always delivers, while the middle button is often eaten by the
+OS (autoscroll). Hovering such a link underlines it (in the accent color) and
+switches to a hand cursor so it reads as clickable; the scan runs only when the
+pointer changes cells (it can stat the filesystem). Deleting a selected word from the
 keyboard is NOT wired: the terminal can't edit a specific span of the child's
 buffer -- clear the whole input with Ctrl+A then Backspace, or use the
 program's own Ctrl+W (delete previous word).
 """
 
+import collections
 import re
 
 import pyte
@@ -106,6 +109,39 @@ _MODIFIED_ARROWS = {
 HISTORY_LINES = 2000
 CELL_PAD_X = 6   # left/right inner padding (real terminals aren't flush)
 CELL_PAD_Y = 4   # top/bottom inner padding
+
+
+class _CountingDeque(collections.deque):
+    """A deque that remembers how many items were ever appended. pyte pushes
+    each scrolled-off line to history.top via append; once the deque saturates
+    (append-then-evict), len() stops growing, so a scrolled-back view would
+    drift because feed() can't see that lines still scrolled by. `pushed` keeps
+    counting past saturation, giving feed() the true growth to anchor against.
+    (AI Hive never triggers pyte paging — scrollback is a view offset — so only
+    `append` matters; appendleft/pop from prev_page never occur.)"""
+
+    def __init__(self, iterable=(), maxlen=None):
+        super().__init__(iterable, maxlen=maxlen)
+        self.pushed = 0
+
+    def append(self, x):
+        self.pushed += 1
+        super().append(x)
+
+
+def _new_history_screen(cols: int, rows: int):
+    """A pyte HistoryScreen whose history.top counts total pushes, so feed()
+    can anchor a scrolled-back view even after history saturates. Best-effort:
+    on any pyte-shape mismatch, return a plain HistoryScreen and let feed() fall
+    back to the length delta."""
+    screen = pyte.HistoryScreen(cols, rows, history=HISTORY_LINES, ratio=0.25)
+    try:
+        top = screen.history.top
+        screen.history = screen.history._replace(
+            top=_CountingDeque(top, maxlen=top.maxlen))
+    except Exception:
+        pass
+    return screen
 
 # legibility guarantee: a child process (Claude Code, etc.) emits fg colors
 # tuned for a DARK terminal. On a light-background theme those land near-
@@ -166,6 +202,12 @@ _PRIVATE_CSI_RE = re.compile(r"\x1b\[[<>=][0-9;:]*[@-~]")
 # A trailing, not-yet-complete escape held until the next chunk completes it.
 _TRAILING_PARTIAL_RE = re.compile(
     r"\x1b(?:\[[0-9;:<>=?]*|\][^\x07\x1b]*)?\Z")
+# Upper bound on a carried partial escape. A real escape (even a long OSC title)
+# is well under this; a "partial" past it is an unterminated/binary run (e.g. an
+# OSC with no BEL/ST while a child dumps binary) — carrying it would swallow the
+# whole stream into _esc_carry forever and freeze the screen. Mirrors
+# ansi_parser.MAX_CARRY.
+_MAX_ESC_CARRY = 4096
 # DECSET/DECRST private modes (CSI ? Pm h/l). pyte ignores these, but they
 # decide how the wheel must behave (altscreen / mouse tracking / paste mode).
 _PRIVATE_MODE_RE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
@@ -206,8 +248,7 @@ class TerminalView(QWidget):
         self._cell_h = metrics.height()
         self._ascent = metrics.ascent()
 
-        self.screen = pyte.HistoryScreen(cols, rows, history=HISTORY_LINES,
-                                         ratio=0.25)
+        self.screen = _new_history_screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
 
         self._resize_timer = QTimer(self)
@@ -227,9 +268,11 @@ class TerminalView(QWidget):
         data = self._esc_carry + data
         self._esc_carry = ""
         m = _TRAILING_PARTIAL_RE.search(data)
-        if m and m.group(0):
+        if m and m.group(0) and len(m.group(0)) <= _MAX_ESC_CARRY:
             self._esc_carry = m.group(0)
             data = data[: m.start()]
+        # else: an over-long "partial" is an unterminated/binary run — feed it
+        # to pyte as-is rather than re-prepending it every chunk (unbounded).
         data = _PRIVATE_CSI_RE.sub("", data)
         # pyte ignores DECSET/DECRST private modes; track the ones that change
         # OUR behavior (paste wrapping, wheel routing, arrow-key encoding)
@@ -250,21 +293,30 @@ class TerminalView(QWidget):
                     self._app_cursor_keys = on
                 elif tok == "1004":
                     self._focus_reporting = on
-        hist_before = len(self.screen.history.top)
+        top_before = self.screen.history.top
+        pushed_before = getattr(top_before, "pushed", None)
+        hist_before = len(top_before)
         self.stream.feed(data)
         # while scrolled back, stay anchored to the CONTENT being read: new
-        # lines entering history grow the offset so the view doesn't slide
+        # lines entering history grow the offset so the view doesn't slide.
+        # Use the true push count (not the deque length) so the anchor holds
+        # even after history saturates — once full, append-then-evict pins len()
+        # and the naive delta reads 0, which let the view drift a line per line.
         if self._scroll_offset:
-            grown = len(self.screen.history.top) - hist_before
+            top_after = self.screen.history.top
+            pushed_after = getattr(top_after, "pushed", None)
+            if pushed_before is not None and pushed_after is not None:
+                grown = pushed_after - pushed_before
+            else:
+                grown = len(top_after) - hist_before
             if grown > 0:
                 self._scroll_offset = min(self._scroll_offset + grown,
-                                          len(self.screen.history.top))
+                                          len(top_after))
         self.update()
 
     def reset(self) -> None:
         rows, cols = self.screen.lines, self.screen.columns
-        self.screen = pyte.HistoryScreen(cols, rows, history=HISTORY_LINES,
-                                         ratio=0.25)
+        self.screen = _new_history_screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
         self._scroll_offset = 0
         self._bracketed_paste = False
@@ -544,8 +596,14 @@ class TerminalView(QWidget):
         return row, col
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.MiddleButton:
-            # scroll-wheel click opens a URL / local file under the pointer
+        # Ctrl+click (or a scroll-wheel/middle click) opens a URL / local file
+        # under the pointer. Ctrl+LEFT-click is the primary, VS-Code-style
+        # gesture: the left button always delivers, whereas the middle button
+        # is often swallowed by the OS (autoscroll) and never reaches us.
+        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        opens_link = (event.button() == Qt.MouseButton.MiddleButton
+                      or (event.button() == Qt.MouseButton.LeftButton and ctrl))
+        if opens_link:
             row, col = self._cell_at(event.position())
             target = self._link_at(row, col)
             if target:
@@ -678,15 +736,22 @@ class TerminalView(QWidget):
 
     def _open_target(self, target) -> None:
         """Open a classified link with the OS default handler (user-initiated
-        via a middle-click, like following a hyperlink)."""
+        via Ctrl/middle-click, like following a hyperlink). Falls back to the
+        Windows shell (os.startfile) when Qt's handler reports failure -- Qt
+        returns False for some file associations, which would otherwise make a
+        click look dead."""
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QDesktopServices
 
         kind, value = target
-        if kind == "url":
-            QDesktopServices.openUrl(QUrl(value))
-        else:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(value))
+        url = QUrl(value) if kind == "url" else QUrl.fromLocalFile(value)
+        if QDesktopServices.openUrl(url):
+            return
+        try:  # Windows-only shell open; harmless no-op elsewhere
+            import os
+            os.startfile(value)  # noqa: S606 - value is a vetted URL/abs path
+        except (OSError, AttributeError):
+            pass
 
     def _selection_range(self):
         """Normalized ((r0,c0),(r1,c1)) with start <= end, or None."""

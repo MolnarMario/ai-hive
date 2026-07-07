@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
 
 from .. import __version__
 from .. import providers
+from .. import session_hook
 from .. import ui_theme
 from ..process_worker import (AI_KINDS, PTY_ONLY_KINDS, AgentKind, build_spec)
 from ..pty_worker import HAS_CONPTY
@@ -451,6 +452,24 @@ class MainWindow(QMainWindow):
             manager, active_ws=lambda: self.manager.active_id, parent=self,
             on_mutation=self._save_now)
         self.bridge.start()
+        # shared SessionStart-hook plumbing: ONE settings file (injected into
+        # every Claude agent via --settings) + ONE mapping file the child hooks
+        # append their live conversation id to, keyed by AIHIVE_AGENT_ID. This
+        # is what lets an in-TUI /resume or /clear be captured authoritatively,
+        # including in multi-agent folders. Written BEFORE any agent is armed or
+        # started; reset each run because agent ids are minted fresh per run.
+        session_dir = self.store.path.parent
+        self._hook_settings_path = str(session_dir / "aihive_session_hook.json")
+        self._session_map_path = str(session_dir / "live_sessions.jsonl")
+        try:
+            session_hook.write_settings_file(self._hook_settings_path,
+                                             self._session_map_path)
+            session_hook.reset_map(self._session_map_path)
+        except OSError as e:
+            self.store.audit(f"HOOK-SETUP-FAIL {type(e).__name__}: {e}")
+            self._hook_settings_path = ""  # degrade: fall back to fs correlation
+        self.manager.session_map_path = self._session_map_path
+        manager.save_now = self._save_now  # immediate persistence for spawn_worker
         manager.arm_agent = self._arm_agent_mcp  # arm new agents before they start
         self._rearm_agent_configs()  # restored claude agents re-acquire MCP tools
 
@@ -464,20 +483,36 @@ class MainWindow(QMainWindow):
         self._session_sync_timer.start()
 
     def _arm_agent_mcp(self, ws, agent) -> None:
-        """Give a Claude agent its per-workspace MCP config, scoped by role:
-        orchestrators get the full toolset, every other Claude agent gets a
-        worker config (log_activity only, enforced by role in the bridge).
-        mcp_config_path isn't persisted (the pipe name changes each run), so
-        this runs for new agents (via manager.arm_agent) and restored ones
-        (via _rearm_agent_configs)."""
-        if not self.bridge.enabled or agent.spec.provider != "claude":
+        """Arm a Claude agent's per-run launch config before it starts (and
+        again on restore, via _rearm_agent_configs — none of this is persisted).
+
+        Two things, both keyed off the agent being Claude:
+          * the SessionStart hook that reports the agent's LIVE conversation id
+            back to AI Hive (via --settings + a per-agent AIHIVE_AGENT_ID). This
+            is INDEPENDENT of the orchestrator bridge — every Claude agent gets
+            it, so conversation tracking works even with the bridge disabled.
+          * the per-workspace MCP config, scoped by role (orchestrators get the
+            full toolset, every other Claude agent a worker config —
+            log_activity only, enforced by role in the bridge)."""
+        if agent.spec.provider != "claude":
+            return
+        if self._hook_settings_path:
+            agent.spec.settings_path = self._hook_settings_path
+            # AIHIVE_AGENT_ID == TerminalAgent.id, the same key sync_live_sessions
+            # matches on, so a hook line maps straight back to this agent.
+            agent.spec.env["AIHIVE_AGENT_ID"] = agent.id
+        if not self.bridge.enabled:
             return
         role = "orchestrator" if agent.spec.is_orchestrator else "worker"
         agent.spec.mcp_config_path = self.bridge.mcp_config_path_for(ws.id, role)
 
     def _rearm_agent_configs(self) -> None:
-        if not self.bridge.enabled:
-            return
+        # Re-arm EVERY restored Claude agent. Must NOT bail when the bridge is
+        # disabled: the SessionStart hook (settings_path + AIHIVE_AGENT_ID) is
+        # independent of the orchestrator bridge, and _arm_agent_mcp already
+        # self-gates the MCP-config part on bridge.enabled. Bailing here would
+        # leave restored agents with no live-conversation tracking exactly when
+        # the bridge is unavailable — the case the hook most needs to cover.
         for ws in self.manager.workspaces:
             for agent in ws.agents:
                 self._arm_agent_mcp(ws, agent)

@@ -59,6 +59,13 @@ AgentInfo = namedtuple("AgentInfo", "key cwd pinned_id started_at")
 Conversation = namedtuple("Conversation", "session_id mtime preview size")
 
 
+def is_session_id(value: str) -> bool:
+    """True when `value` is a Claude session id (a UUID). Used to sanity-check a
+    hook-reported id before pinning to it, so a garbled mapping line can never
+    become a bogus --resume target."""
+    return bool(value) and bool(_ID_RE.match(value))
+
+
 def _first_user_text(path: str, max_scan: int = 300) -> str:
     """First human message in a Claude transcript, collapsed to one line, for
     a resume-picker label. Skips system/command wrappers (lines whose text

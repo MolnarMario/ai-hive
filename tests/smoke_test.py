@@ -790,6 +790,35 @@ def test_terminal_mouse_words_links():
     check("mouse: cursor reverts to I-beam off a link",
           v2.cursor().shape() == Qt.CursorShape.IBeamCursor)
 
+    # Ctrl+left-click a link opens it (route to _open_target, without actually
+    # launching a browser); a plain left-click selects instead of opening
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+    opened = []
+    v2._open_target = opened.append
+
+    def click(row, col, ctrl=False, button=Qt.MouseButton.LeftButton):
+        p = QPointF(CELL_PAD_X + (col + 0.5) * v2._cell_w,
+                    CELL_PAD_Y + (row + 0.5) * v2._cell_h)
+        mods = (Qt.KeyboardModifier.ControlModifier if ctrl
+                else Qt.KeyboardModifier.NoModifier)
+        v2.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, p,
+                                       button, button, mods))
+
+    click(0, 8, ctrl=True)  # Ctrl+left-click ON the URL
+    check("mouse: Ctrl+click opens the link under the pointer",
+          opened == [("url", "https://example.com/docs")], opened)
+    opened.clear()
+    click(0, 8, ctrl=False)  # plain left-click does NOT open
+    check("mouse: plain left-click does not open a link", opened == [], opened)
+    opened.clear()
+    click(0, 30, ctrl=True)  # Ctrl+click on plain text -> nothing to open
+    check("mouse: Ctrl+click off a link opens nothing", opened == [], opened)
+    opened.clear()
+    click(0, 8, button=Qt.MouseButton.MiddleButton)  # middle-click still works
+    check("mouse: middle-click still opens the link",
+          opened == [("url", "https://example.com/docs")], opened)
+
 
 def test_session_migration():
     """A pre-v2 line-mode shell agent upgrades to interactive on load."""
@@ -2589,6 +2618,363 @@ def test_session_recovery():
         shutil.rmtree(cwd, ignore_errors=True)
 
 
+def test_session_hook_tracking():
+    """The AUTHORITATIVE live-id path: a Claude SessionStart hook reports each
+    agent's real current conversation (keyed by AIHIVE_AGENT_ID), so an in-TUI
+    /resume or /clear is captured even in a MULTI-AGENT folder -- the case the
+    filesystem cannot disambiguate and which mtime correlation must refuse.
+    Regression for the whole class of close/reopen conversation loss.
+
+    The live end-to-end (a real claude firing the hook on an in-TUI switch) was
+    proven against Claude 2.1.197 during development; here we lock in the
+    plumbing and the reconciliation logic with an injected mapping file."""
+    import json
+    from app import session_hook, session_sync
+    from app.process_worker import AgentKind, build_spec
+    from app.workspace_manager import WorkspaceManager
+
+    A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"  # agent 1 launch pin
+    B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"  # agent 2 launch pin
+    N1 = "11111111-1111-1111-1111-111111111111"  # agent 1 switched-to convo
+    N2 = "22222222-2222-2222-2222-222222222222"  # agent 2 switched-to convo
+
+    d = Path(tempfile.mkdtemp(prefix="ai-hive-hook-"))
+    settings_path = str(d / "aihive_session_hook.json")
+    map_path = str(d / "live_sessions.jsonl")
+
+    # -- settings file carries a SessionStart hook pointing at the map --------
+    session_hook.write_settings_file(settings_path, map_path)
+    s = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+    hook_cmd = s.get("hooks", {}).get("SessionStart", [{}])[0].get(
+        "hooks", [{}])[0].get("command", "")
+    check("hook: --settings file defines a SessionStart command hook",
+          "SessionStart" in s.get("hooks", {}) and "session_hook.py" in hook_cmd
+          and map_path in hook_cmd, hook_cmd)
+    # CRITICAL: the matcher must EXCLUDE 'startup'. A startup firing is
+    # redundant (the launch id already equals the pin) AND perturbs the TUI's
+    # launch settle so a freshly-spawned agent drops its first task-submit Enter
+    # and silently never runs the task (verified live). Only in-TUI switches.
+    matcher = s["hooks"]["SessionStart"][0].get("matcher", "")
+    check("hook: matcher fires on in-TUI switches but NOT startup",
+          "startup" not in matcher and "resume" in matcher and "clear" in matcher,
+          matcher)
+    # only 'hooks' is present, so --settings adds ours without clobbering the
+    # user's other settings (Claude merges hooks across sources -- verified live)
+    check("hook: settings file touches ONLY the hooks key",
+          list(s.keys()) == ["hooks"], list(s.keys()))
+
+    # -- reset + append + read round-trip, keyed by agent id ------------------
+    def write_hook_line(agent_id, session_id):
+        old = os.environ.get(session_hook.AGENT_ID_ENV)
+        os.environ[session_hook.AGENT_ID_ENV] = agent_id
+        try:
+            session_hook._append_record(map_path, {
+                "session_id": session_id, "transcript_path": f"{session_id}.jsonl",
+                "cwd": str(d), "source": "resume",
+                "hook_event_name": "SessionStart"})
+        finally:
+            if old is None:
+                os.environ.pop(session_hook.AGENT_ID_ENV, None)
+            else:
+                os.environ[session_hook.AGENT_ID_ENV] = old
+
+    session_hook.reset_map(map_path)
+    check("hook: reset truncates the mapping file",
+          session_hook.read_live_map(map_path) == {})
+    write_hook_line("AG1", A)      # startup lines
+    write_hook_line("AG2", B)
+    write_hook_line("AG1", N1)     # AG1 switched conversations in-TUI
+    live = session_hook.read_live_map(map_path)
+    check("hook: read_live_map returns each agent's LATEST reported id",
+          live["AG1"]["session_id"] == N1 and live["AG2"]["session_id"] == B,
+          {k: v["session_id"] for k, v in live.items()})
+
+    # -- THE multi-agent case: two agents share ONE folder, and the hook lets
+    #    each pin follow its OWN switch with NO guessing and NO swap ----------
+    mgr = WorkspaceManager()
+    mgr.session_map_path = map_path
+    ws = mgr.create_workspace("Hook", project_path=str(d))
+    s1 = build_spec(AgentKind.CLAUDE, "A1", cwd=str(d), pty=True)
+    s1.session_id = A
+    a1 = mgr.add_terminal(ws.id, s1, autostart=False)
+    s2 = build_spec(AgentKind.CLAUDE, "A2", cwd=str(d), pty=True)
+    s2.session_id = B
+    a2 = mgr.add_terminal(ws.id, s2, autostart=False)
+    for ag in (a1, a2):
+        ag.worker = type("W", (), {"is_running": lambda s: True})()
+        ag._session_started = 1.0
+
+    # rewrite the map so each agent's LIVE id is keyed by its real agent id
+    session_hook.reset_map(map_path)
+    write_hook_line(a1.id, N1)   # agent 1 switched to N1
+    write_hook_line(a2.id, N2)   # agent 2 switched to N2
+    dirty = {"n": 0}
+    mgr.dirty.connect(lambda: dirty.__setitem__("n", dirty["n"] + 1))
+    changed = mgr.sync_live_sessions()
+    check("hook: multi-agent folder IS tracked when the child reports its id",
+          s1.session_id == N1 and s2.session_id == N2,
+          (s1.session_id, s2.session_id))
+    check("hook: each agent follows its OWN conversation (no swap/orphan)",
+          {c[0]: c[2] for c in changed} == {a1.id: N1, a2.id: N2},
+          changed)
+    check("hook: an authoritative pin change marks the session dirty",
+          dirty["n"] >= 1)
+
+    # a second sync with the SAME map is a no-op (pins already match) ----------
+    check("hook: re-sync with unchanged map changes nothing",
+          mgr.sync_live_sessions() == [])
+
+    # a garbled reported id is ignored -- never becomes a bogus --resume target
+    session_hook.reset_map(map_path)
+    write_hook_line(a1.id, "not-a-valid-uuid")
+    write_hook_line(a2.id, N2)  # unchanged
+    check("hook: an invalid reported id is refused",
+          mgr.sync_live_sessions() == [] and s1.session_id == N1)
+
+    # an agent the hook has NOT reported in a multi-agent folder is left alone:
+    # the filesystem fallback still refuses to guess who owns what
+    session_hook.reset_map(map_path)          # nobody reported
+    check("hook: no hook report + multi-agent folder -> untouched (no guess)",
+          mgr.sync_live_sessions() == []
+          and s1.session_id == N1 and s2.session_id == N2)
+
+    # THE SUBTLE one: when one agent is hook-covered and its switch left a hot
+    # transcript on disk, its UNCOVERED folder-mate must NOT be mtime-stolen
+    # onto that transcript. The fallback must see BOTH agents (a multi-agent
+    # folder) and refuse to guess -- dropping the covered agent from the mtime
+    # pass would make the sibling look solo and grab the wrong conversation.
+    s1.session_id, s2.session_id = A, B  # reset pins for this scenario
+    old_home, old_up = os.environ.get("HOME"), os.environ.get("USERPROFILE")
+    home = Path(tempfile.mkdtemp(prefix="ai-hive-hookhome-"))
+    os.environ["HOME"] = os.environ["USERPROFILE"] = str(home)
+    try:
+        proj = home / ".claude" / "projects" / (
+            session_sync.transcripts.encode_project_dir(str(d)))
+        proj.mkdir(parents=True)
+        (proj / f"{N1}.jsonl").write_text("x" * 50000, encoding="utf-8")  # a1 switch
+        (proj / f"{B}.jsonl").write_text("x" * 50000, encoding="utf-8")   # a2 own
+        os.utime(proj / f"{B}.jsonl", (10.0, 10.0))       # older
+        os.utime(proj / f"{N1}.jsonl", (9999.0, 9999.0))  # newest -> mtime bait
+        session_hook.reset_map(map_path)
+        write_hook_line(a1.id, N1)   # only agent 1 reports (covered)
+        changed = mgr.sync_live_sessions()
+        check("hook: a covered agent's hot transcript never mtime-steals a sibling",
+              s2.session_id == B, (s2.session_id, changed))
+        check("hook: the covered agent still tracks its own reported id",
+              s1.session_id == N1)
+    finally:
+        for _k, _v in (("HOME", old_home), ("USERPROFILE", old_up)):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+        shutil.rmtree(home, ignore_errors=True)
+
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_session_hook_arming():
+    """Every Claude agent is armed with the shared SessionStart hook BEFORE it
+    starts (and re-armed on restore): --settings points at the shared hook file
+    and AIHIVE_AGENT_ID == the agent id sync_live_sessions matches on. Non-Claude
+    agents are never armed. Runs a real (offscreen) MainWindow like the e2e."""
+    from PySide6.QtWidgets import QApplication
+    from app import session_hook
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-arm-"))
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)  # first-run: Workspace 1 + a PowerShell agent
+    try:
+        # the shared hook plumbing is written into the session dir at startup
+        check("arm: shared hook settings file written at startup",
+              (tmp / "aihive_session_hook.json").is_file())
+        check("arm: shared mapping file created at startup",
+              (tmp / "live_sessions.jsonl").is_file())
+
+        ws = win.manager.workspaces[0]
+        # the first-run PowerShell agent must NOT be armed (not a Claude agent)
+        ps = ws.agents[0]
+        check("arm: a non-Claude agent gets no hook settings",
+              not ps.spec.settings_path
+              and session_hook.AGENT_ID_ENV not in ps.spec.env)
+
+        # a Claude agent, added the normal way (arm_agent runs in add_terminal)
+        spec = build_spec(AgentKind.CLAUDE, "Armed", cwd=str(tmp), pty=True)
+        agent = win.manager.add_terminal(ws.id, spec, autostart=False)
+        check("arm: a Claude agent gets --settings for the shared hook file",
+              agent.spec.settings_path == win._hook_settings_path
+              and "--settings" in agent.spec.effective_args())
+        check("arm: AIHIVE_AGENT_ID == the agent id (maps a hook line back)",
+              agent.spec.env.get(session_hook.AGENT_ID_ENV) == agent.id)
+    finally:
+        win.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_review_hardening_fixes():
+    """Regressions for the six defects a whole-app code review surfaced:
+      #1 the SessionStart hook is re-armed on restore even when the orchestrator
+         bridge is disabled (the hook is bridge-independent);
+      #2 terminal_view.feed caps _esc_carry so an unterminated OSC can't swallow
+         the stream / grow memory without bound;
+      #3 the orchestrator pipe drops a client that streams bytes with no newline;
+      #4 the 350 ms task-submit Enter is generation-guarded so a restart in the
+         window can't fire a stray CR into a fresh TUI;
+      #5 a scrolled-back terminal view stays anchored after history saturates;
+      #6 spawn_worker persists task/assignment immediately (no debounce loss)."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import session_hook
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import AssignmentState, TerminalAgent
+    from app.workspace_manager import WorkspaceManager
+    from app.widgets.terminal_view import (TerminalView, HISTORY_LINES,
+                                           _CountingDeque, _MAX_ESC_CARRY)
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def stub_worker():
+        writes = []
+        w = type("W", (), {
+            "write": lambda s, d: (writes.append(d), True)[1],
+            "is_running": lambda s: True, "start": lambda s: None,
+            "restart": lambda s: None, "dispose": lambda s: None,
+            "send_line": lambda s, t: True})()
+        return w, writes
+
+    # -- #1: hook re-armed on restore even with the bridge disabled -----------
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-harden-"))
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    try:
+        ws = win.manager.workspaces[0]
+        spec = build_spec(AgentKind.CLAUDE, "Restored", cwd=str(tmp), pty=True)
+        agent = win.manager.add_terminal(ws.id, spec, autostart=False)
+        win.bridge.enabled = False          # simulate no Qt network / listen fail
+        agent.spec.settings_path = ""        # simulate an un-armed restored agent
+        agent.spec.env.pop(session_hook.AGENT_ID_ENV, None)
+        win._rearm_agent_configs()
+        check("harden: hook re-armed on restore even when the bridge is disabled",
+              agent.spec.settings_path == win._hook_settings_path
+              and agent.spec.env.get(session_hook.AGENT_ID_ENV) == agent.id)
+    finally:
+        win.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # -- #2: _esc_carry is bounded -------------------------------------------
+    v = TerminalView()
+    v.feed("\x1b[")  # a short, genuine partial escape is carried
+    check("harden: a short partial escape is still carried",
+          v._esc_carry == "\x1b[")
+    v.feed("m")      # completes it
+    v._esc_carry = ""
+    v.feed("\x1b]0;" + "A" * (_MAX_ESC_CARRY + 100))  # unterminated OSC
+    check("harden: an over-long unterminated OSC is not carried unbounded",
+          len(v._esc_carry) <= _MAX_ESC_CARRY)
+    v.feed("B" * 8000)
+    check("harden: esc_carry stays bounded across chunks",
+          len(v._esc_carry) <= _MAX_ESC_CARRY)
+
+    # -- #3: oversized no-newline pipe request is dropped ---------------------
+    from app.orchestrator_bridge import OrchestratorBridge, _MAX_REQUEST_BYTES
+    br_mgr = WorkspaceManager()
+    bridge = OrchestratorBridge(br_mgr, active_ws=lambda: "", parent=None)
+
+    class _FakeBA:
+        def __init__(self, d): self._d = d
+        def data(self): return self._d
+
+    class _FakeSock:
+        def __init__(self, chunk): self._chunk = chunk; self.aborted = False
+        def readAll(self):
+            d, self._chunk = self._chunk, b""
+            return _FakeBA(d)
+        def abort(self): self.aborted = True
+
+    sock = _FakeSock(b"x" * (_MAX_REQUEST_BYTES + 16))  # no newline, runaway
+    bridge._buffers[sock] = bytearray()
+    bridge._on_ready(sock)
+    check("harden: an oversized newline-less pipe request is dropped",
+          sock.aborted and sock not in bridge._buffers)
+
+    # -- #4: task-submit Enter is generation-guarded --------------------------
+    spec4 = build_spec(AgentKind.CLAUDE, "Submit", cwd=str(Path(tempfile.gettempdir())),
+                       pty=True)
+    a4 = TerminalAgent(spec4)
+    w, writes = stub_worker()
+    a4.worker = w
+    a4._prompt_ready = True
+    a4._write_task_to_pty("hello")   # schedules the delayed Enter
+    pump(500)
+    check("harden: the task-submit Enter fires in the normal case",
+          "\r" in writes)
+    writes.clear()
+    a4._prompt_ready = True
+    a4._write_task_to_pty("world")   # schedule again...
+    a4.restart()                      # ...then restart inside the 350 ms window
+    pump(500)
+    check("harden: a restart in the submit window suppresses the stray Enter",
+          "\r" not in writes)
+
+    # -- #5: scrolled-back view stays anchored past the history cap -----------
+    v5 = TerminalView()
+    for i in range(HISTORY_LINES + 200):
+        v5.feed(f"line{i}\r\n")
+    top = v5.screen.history.top
+    check("harden: terminal history uses the counting deque",
+          isinstance(top, _CountingDeque))
+    check("harden: history saturated at the cap (the drift-prone case)",
+          len(top) == HISTORY_LINES)
+    v5._scroll_offset = 40           # user scrolled back
+    pushed_before = top.pushed
+    v5.feed("A\r\nB\r\nC\r\n")       # more lines scroll into a full history
+    grown = v5.screen.history.top.pushed - pushed_before
+    check("harden: scrolled-back offset tracks pushes even after saturation",
+          grown >= 1 and v5._scroll_offset == 40 + grown,
+          (grown, v5._scroll_offset))
+
+    # -- #6: spawn_worker persists immediately (no debounce loss window) ------
+    tmp6 = Path(tempfile.mkdtemp(prefix="ai-hive-spawn-"))
+    mgr = WorkspaceManager()
+    saves = {"n": 0}
+    mgr.save_now = lambda: saves.__setitem__("n", saves["n"] + 1)
+    ws6 = mgr.create_workspace("W", project_path=str(tmp6))
+
+    def fake_add(ws_id, spec, autostart=True):  # avoid launching a real claude
+        a = TerminalAgent(spec)
+        sw, _ = stub_worker()
+        sw.is_running = lambda: False  # so deliver_task queues instead of typing
+        a.worker = sw
+        ws6.agents.append(a)
+        return a
+
+    mgr.add_terminal = fake_add
+    spawned = mgr.spawn_worker(ws6.id, "do the thing", role="coder")
+    check("harden: spawn_worker persists immediately via save_now",
+          saves["n"] >= 1)
+    check("harden: the spawned worker has its task + assignment set",
+          spawned.current_task == "do the thing"
+          and spawned.assignment == AssignmentState.WORKING)
+    mgr2 = WorkspaceManager()   # fallback: no save_now -> debounced dirty
+    dirty2 = {"n": 0}
+    mgr2.dirty.connect(lambda: dirty2.__setitem__("n", dirty2["n"] + 1))
+    mgr2._persist_now()
+    check("harden: _persist_now falls back to dirty when no save_now is wired",
+          dirty2["n"] >= 1)
+    shutil.rmtree(tmp6, ignore_errors=True)
+
+
 def test_resume_picker():
     """The New-Agent dialog offers resumable Claude conversations from the
     workspace folder, excludes any a running agent still holds, and pins the
@@ -2859,6 +3245,9 @@ def main():
     test_wake_and_resume_all()
     test_session_pinning()
     test_session_recovery()
+    test_session_hook_tracking()
+    test_session_hook_arming()
+    test_review_hardening_fixes()
     test_resume_picker()
     test_transcript_backups()
     test_agent_file_map()

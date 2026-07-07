@@ -120,6 +120,9 @@ class TerminalAgent(QObject):
         # so recovery never lands on a peer's conversation
         self._sibling_sessions = None
         self._disposing = False       # teardown in progress (suppress retry)
+        # bumped on every (re)start so a queued task-submit Enter from a prior
+        # session is never delivered into a fresh, not-yet-ready TUI
+        self._submit_gen = 0
         self._busy = False            # actively streaming output right now
         # single-shot: (re)armed on each output burst; firing = output went
         # quiet, so the agent has dropped back to standby
@@ -142,6 +145,7 @@ class TerminalAgent(QObject):
     def start(self) -> None:
         self._prompt_ready = False  # re-armed for the fresh TUI
         self._ready_tail = ""
+        self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         # a NON-resume start is a new conversation, so it gets a new pinned
         # identity (rotating also avoids --session-id colliding with an
@@ -191,6 +195,7 @@ class TerminalAgent(QObject):
     def restart(self) -> None:
         self._prompt_ready = False
         self._ready_tail = ""
+        self._submit_gen += 1  # invalidate any pending task-submit Enter
         if self.spec.provider == "claude":  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
         self._session_started = time.time()
@@ -290,8 +295,15 @@ class TerminalAgent(QObject):
         # submit AFTER a beat: a CR arriving in the same input burst as the
         # text reads as part of a paste (verified live against Claude Code) —
         # it inserts a newline into the input box instead of submitting, and
-        # the task never runs
-        QTimer.singleShot(350, lambda: self.worker.is_running()
+        # the task never runs. Guard on the submit generation so a restart inside
+        # the 350 ms window (which bumps _submit_gen) can't fire this stray CR
+        # into a fresh session. We deliberately do NOT also gate on _prompt_ready:
+        # in the normal path it is always True here, and adding it only risks
+        # suppressing a legitimate submit on this timing-sensitive path — the
+        # generation check alone fully covers the restart race.
+        gen = self._submit_gen
+        QTimer.singleShot(350, lambda: self._submit_gen == gen
+                          and self.worker.is_running()
                           and self.worker.write("\r"))
 
     def send_command(self, text: str) -> None:

@@ -164,6 +164,38 @@ this file is the invariants that must survive every change.
   (the concurrent-resume truncation guard). Do NOT re-add mtime-based
   reassignment for multi-agent folders, however clever the tie-break — the
   filesystem simply lacks the signal.
+- **The AUTHORITATIVE live-id signal is a `SessionStart` hook** — the child
+  reports its own conversation id, which is the ONLY thing that makes
+  multi-agent folders reliable (the filesystem can't attribute a transcript to
+  an agent; the child can). `app/session_hook.py` is a Qt-free, stdlib-only
+  script Claude runs on `SessionStart`; it appends `{agent_id, session_id,
+  transcript_path, source, ts}` to a shared mapping file. AI Hive injects it
+  into EVERY Claude agent via `--settings <shared file>` (verified live: a
+  `hooks` section in a `--settings` file is honored AND is ADDITIVE with the
+  user's own hooks — theirs still fire, never clobbered) plus a per-agent
+  `AIHIVE_AGENT_ID` env var (== `TerminalAgent.id`, the SAME key
+  `sync_live_sessions` matches on). Both are armed in
+  `MainWindow._arm_agent_mcp` (independent of the orchestrator bridge — every
+  Claude agent gets the hook) and are TRANSIENT like `mcp_config_path`
+  (`AgentSpec.settings_path` / `spec.env`, never persisted, re-armed on
+  restore). The shared settings + mapping files are written once per run in
+  `MainWindow.__init__` (map reset each run — agent ids are minted fresh, so
+  cross-run lines can never match). `sync_live_sessions` now consults the hook
+  map FIRST (authoritative, per-agent, works for ANY agent count) and only
+  falls back to the single-agent mtime path for agents the hook hasn't
+  reported. `pty_worker.PtyWorker.start` layers `spec.env` on top of the
+  sanitized `agent_environment()` so `AIHIVE_AGENT_ID` reaches the child (the
+  PTY path previously ignored `spec.env`). CRITICAL, do NOT undo: the matcher
+  is `"resume|clear|compact"` — it deliberately EXCLUDES `startup`. Including
+  `startup` perturbs the TUI's launch settle just enough that a freshly-spawned
+  agent's FIRST task-submit Enter is dropped and the task silently never runs
+  (verified live — cost hours to isolate). The startup id is redundant anyway
+  (it always equals the id AI Hive just put on the command line), so excluding
+  it loses nothing and keeps launch timing pristine while still capturing every
+  IN-TUI switch. Keep the hook synchronous; `async:true` does NOT fix the
+  startup perturbation (it isn't a blocking issue) and only adds read-timing
+  slop. This is the primary defense; the two filesystem defenses above remain
+  as fallbacks (single-agent tracking, missing-pin recovery).
 - **Gemini rides the Antigravity CLI** (`agy`, verified 1.0.16; installed at
   `%LOCALAPPDATA%\agy\bin\agy.exe`, which providers.py falls back to when the
   app's PATH predates the install). `--model` takes the MULTIWORD display
