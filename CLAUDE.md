@@ -127,6 +127,75 @@ this file is the invariants that must survive every change.
   opened the wrong one, and concurrent resumes of one session destroyed a
   transcript). `--resume <id>` keeps the same id (no fork) unless
   `--fork-session` is passed.
+- **The pin must TRACK the live conversation, not just the launch id**
+  (`app/session_sync.py`). AI Hive only knows the id it put on the command
+  line, but the live id can DRIFT out from under it: the user runs `/resume`
+  in the TUI and switches conversations, a session forks (usage-limit
+  recovery), or a fresh id is minted that never gets a transcript. A stale pin
+  then resumes the WRONG conversation on reopen, or dies on `--resume
+  <missing>` (both happened live — a closed morning thread came back instead
+  of the afternoon one; a never-used id errored on a black terminal). Two
+  defenses, both reading the filesystem truth (Claude writes exactly one
+  `<id>.jsonl` per conversation under `~/.claude/projects/<encoded-cwd>/`):
+  (1) `WorkspaceManager.sync_live_sessions` reconciles a RUNNING agent's pin to
+  the transcript it is actually writing — run on a timer
+  (`MainWindow._sync_live_sessions`, `SESSION_SYNC_MS`) AND once in
+  `closeEvent` BEFORE the final save, so the last-moment switch is what
+  persists; it emits `dirty` only when a pin genuinely changes (never thrash
+  saves). (2) `TerminalAgent._recover_missing_resume_target` (gated by the
+  one-shot `_verify_resume_target`, set only on RESTORE in `main.py`) verifies
+  the pinned transcript exists before `--resume`; if not, it resumes the
+  folder's most recent real conversation instead. Adoption requires the
+  transcript to be newer than the agent's process-start (`_session_started`),
+  so a pre-existing unrelated conversation or a fresh unused id is never
+  wrongly grabbed, and a near-empty STUB (`_STUB_BYTES` — a fresh `/recap`
+  session, a glitched resume) can NEVER displace a real conversation (that
+  stranded a 9 MB chat on a blank card). CRITICAL: `resolve_live_ids` tracks
+  ONLY single-agent folders. In a folder with two-plus agents the filesystem
+  cannot say which agent owns which transcript (a resume touches them all at
+  launch), so mtime correlation GUESSES — and a wrong guess SWAPS two live
+  conversations or orphans one onto a stub. That misfired three times in one
+  session (a good conversation pushed onto an empty `/recap` stub while its
+  real chat sat un-pinned), so multi-agent folders are left EXACTLY as
+  launched/restored — never auto-reshuffled. The only place a multi-agent
+  folder is touched is `_recover_missing_resume_target`, and only when a pin
+  points at a MISSING transcript; it excludes sibling pins
+  (`sibling_session_ids`) so recovery never lands on a peer's conversation
+  (the concurrent-resume truncation guard). Do NOT re-add mtime-based
+  reassignment for multi-agent folders, however clever the tie-break — the
+  filesystem simply lacks the signal.
+- **The AUTHORITATIVE live-id signal is a `SessionStart` hook** — the child
+  reports its own conversation id, which is the ONLY thing that makes
+  multi-agent folders reliable (the filesystem can't attribute a transcript to
+  an agent; the child can). `app/session_hook.py` is a Qt-free, stdlib-only
+  script Claude runs on `SessionStart`; it appends `{agent_id, session_id,
+  transcript_path, source, ts}` to a shared mapping file. AI Hive injects it
+  into EVERY Claude agent via `--settings <shared file>` (verified live: a
+  `hooks` section in a `--settings` file is honored AND is ADDITIVE with the
+  user's own hooks — theirs still fire, never clobbered) plus a per-agent
+  `AIHIVE_AGENT_ID` env var (== `TerminalAgent.id`, the SAME key
+  `sync_live_sessions` matches on). Both are armed in
+  `MainWindow._arm_agent_mcp` (independent of the orchestrator bridge — every
+  Claude agent gets the hook) and are TRANSIENT like `mcp_config_path`
+  (`AgentSpec.settings_path` / `spec.env`, never persisted, re-armed on
+  restore). The shared settings + mapping files are written once per run in
+  `MainWindow.__init__` (map reset each run — agent ids are minted fresh, so
+  cross-run lines can never match). `sync_live_sessions` now consults the hook
+  map FIRST (authoritative, per-agent, works for ANY agent count) and only
+  falls back to the single-agent mtime path for agents the hook hasn't
+  reported. `pty_worker.PtyWorker.start` layers `spec.env` on top of the
+  sanitized `agent_environment()` so `AIHIVE_AGENT_ID` reaches the child (the
+  PTY path previously ignored `spec.env`). CRITICAL, do NOT undo: the matcher
+  is `"resume|clear|compact"` — it deliberately EXCLUDES `startup`. Including
+  `startup` perturbs the TUI's launch settle just enough that a freshly-spawned
+  agent's FIRST task-submit Enter is dropped and the task silently never runs
+  (verified live — cost hours to isolate). The startup id is redundant anyway
+  (it always equals the id AI Hive just put on the command line), so excluding
+  it loses nothing and keeps launch timing pristine while still capturing every
+  IN-TUI switch. Keep the hook synchronous; `async:true` does NOT fix the
+  startup perturbation (it isn't a blocking issue) and only adds read-timing
+  slop. This is the primary defense; the two filesystem defenses above remain
+  as fallbacks (single-agent tracking, missing-pin recovery).
 - **Gemini rides the Antigravity CLI** (`agy`, verified 1.0.16; installed at
   `%LOCALAPPDATA%\agy\bin\agy.exe`, which providers.py falls back to when the
   app's PATH predates the install). `--model` takes the MULTIWORD display

@@ -121,10 +121,16 @@ class PtyWorker(QObject):
 
         argv = [self.spec.program] + list(self.spec.effective_args())
         cmd = argv if len(argv) > 1 else argv[0]
+        # spec.env carries per-agent launch markers (e.g. AIHIVE_AGENT_ID, which
+        # attributes SessionStart-hook output to this exact agent). agent_env
+        # strips the nested-session markers FIRST; spec.env is layered on top.
+        env = agent_environment()
+        if self.spec.env:
+            env.update(self.spec.env)
         try:
             self._proc = PtyProcess.spawn(
                 cmd, dimensions=(self.rows, self.cols),
-                cwd=self.spec.cwd or None, env=agent_environment())
+                cwd=self.spec.cwd or None, env=env)
         except Exception as exc:  # FileNotFoundError, WinError, ...
             self._proc = None
             self._set_state(WorkerState.DEAD)

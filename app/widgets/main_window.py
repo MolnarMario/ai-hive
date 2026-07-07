@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
 
 from .. import __version__
 from .. import providers
+from .. import session_hook
 from .. import ui_theme
 from ..process_worker import (AI_KINDS, PTY_ONLY_KINDS, AgentKind, build_spec)
 from ..pty_worker import HAS_CONPTY
@@ -24,6 +25,7 @@ from ..workspace_manager import Workspace, WorkspaceManager
 from .. import coordination
 from ..orchestrator_bridge import OrchestratorBridge
 from .activity_panel import ActivityPanel
+from .agent_file_map import AgentFileMapWindow
 from .ornaments import LogoRoundel, PageBorder
 from .sidebar import SIDEBAR_WIDTH, Sidebar
 
@@ -33,6 +35,10 @@ from .workspace_page import WorkspacePage
 
 SAVE_DEBOUNCE_MS = 800
 HEARTBEAT_SAVE_MS = 20000  # safety-net autosave: caps worst-case loss to ~20s
+# how often to reconcile each Claude agent's pinned session id with the
+# transcript it is really writing, so a conversation the user switched to
+# (via /resume, a fork) is what comes back on reopen — not a stale pin
+SESSION_SYNC_MS = 5000
 
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [
@@ -145,11 +151,15 @@ class AddTerminalDialog(QDialog):
     result_spec(); headless tests build specs directly.
     """
 
-    def __init__(self, default_name: str, parent=None, orchestrator_ok=False):
+    def __init__(self, default_name: str, parent=None, orchestrator_ok=False,
+                 cwd: str = "", busy_ids=()):
         super().__init__(parent)
         self.setWindowTitle("New Agent")
         self.setMinimumWidth(420)
         self._orchestrator_ok = orchestrator_ok
+        self._cwd = cwd
+        self._busy_ids = set(busy_ids)  # conversations a running agent holds
+        self._resume_loaded = False
 
         form = QFormLayout()
         self.name_edit = QLineEdit(default_name, self)
@@ -170,6 +180,11 @@ class AddTerminalDialog(QDialog):
         self.provider_note.setWordWrap(True)
         self.model_combo = QComboBox(self)
         self.effort_combo = QComboBox(self)
+        # resume an existing conversation from this workspace folder (Claude)
+        self.resume_combo = QComboBox(self)
+        self.resume_combo.setToolTip(
+            "Start this Claude agent by resuming a past conversation from this "
+            "workspace's folder, instead of a fresh one.")
         self.command_edit = QLineEdit(self)
         self.command_edit.setPlaceholderText("full launch command (editable)")
 
@@ -199,6 +214,8 @@ class AddTerminalDialog(QDialog):
         form.addRow(self._model_label, self.model_combo)
         self._effort_label = QLabel("Effort", self)
         form.addRow(self._effort_label, self.effort_combo)
+        self._resume_label = QLabel("Conversation", self)
+        form.addRow(self._resume_label, self.resume_combo)
         self._cmd_label = QLabel("Command", self)
         form.addRow(self._cmd_label, self.command_edit)
         self._prog_label = QLabel("Program", self)
@@ -215,6 +232,7 @@ class AddTerminalDialog(QDialog):
 
         self._ai_widgets = (self._model_label, self.model_combo,
                             self._effort_label, self.effort_combo)
+        self._resume_widgets = (self._resume_label, self.resume_combo)
         self._script_widgets = (self._prog_label, self.program_edit,
                                 self.browse_btn, self._args_label, self.args_edit)
 
@@ -265,8 +283,16 @@ class AddTerminalDialog(QDialog):
         self.provider_note.setVisible(is_ai)
         self._cmd_label.setVisible(False)
         self.command_edit.setVisible(False)
-        for w in self._ai_widgets:
+        for w in self._ai_widgets + self._resume_widgets:
             w.setVisible(False)
+
+        # resume picker: Claude-only, shown only when the folder has a
+        # resumable conversation that isn't already held by a running agent
+        if kind == AgentKind.CLAUDE:
+            self._ensure_resume_loaded()
+            if self.resume_combo.count() > 1:
+                for w in self._resume_widgets:
+                    w.setVisible(True)
 
         if is_ai:
             prov = providers.get(AI_KINDS[kind])
@@ -315,6 +341,29 @@ class AddTerminalDialog(QDialog):
             item = model.item(self.effort_combo.count() - 1)
             item.setEnabled(False)  # visible but non-selectable
 
+    def _ensure_resume_loaded(self) -> None:
+        """Populate the resume picker once: 'New conversation' plus every past
+        conversation in this workspace's folder (newest first), skipping any a
+        running agent still holds (resuming that would race/truncate it)."""
+        if self._resume_loaded:
+            return
+        self._resume_loaded = True
+        self.resume_combo.clear()
+        self.resume_combo.addItem("New conversation", "")
+        if not self._cwd:
+            return
+        import time
+
+        from app import session_sync
+        for conv in session_sync.conversation_previews(self._cwd):
+            if conv.session_id in self._busy_ids:
+                continue  # in use by a running agent — unsafe to double-resume
+            when = time.strftime("%b %d %H:%M", time.localtime(conv.mtime))
+            preview = conv.preview or "(empty session)"
+            if len(preview) > 48:
+                preview = preview[:47] + "…"
+            self.resume_combo.addItem(f"{when}  ·  {preview}", conv.session_id)
+
     def _validate(self) -> None:
         ok = True
         if self._needs_program():
@@ -345,10 +394,17 @@ class AddTerminalDialog(QDialog):
                       if not self.command_edit.isHidden() else "")
             extra = QProcess.splitCommand(self.args_edit.text().strip()) \
                 if not self.args_edit.isHidden() else []
-            return build_spec(kind, name, cwd=cwd, model=model, effort=effort,
+            spec = build_spec(kind, name, cwd=cwd, model=model, effort=effort,
                               custom_command=custom, args=extra,
                               is_orchestrator=(not self.orch_check.isHidden()
                                                and self.orch_check.isChecked()))
+            # resume a chosen past conversation: pin it and launch --resume <id>
+            resume_id = (self.resume_combo.currentData()
+                         if not self.resume_combo.isHidden() else "")
+            if resume_id:
+                spec.session_id = resume_id
+                spec.resume = True
+            return spec
         program = self.program_edit.text().strip()
         args = QProcess.splitCommand(self.args_edit.text().strip())
         pty = self.pty_check.isChecked() and HAS_CONPTY
@@ -365,6 +421,7 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
 
         self._pages: dict[str, WorkspacePage] = {}
+        self._map_window: AgentFileMapWindow | None = None  # lazy, reused
         self._focused_card: TerminalCard | None = None
         self._closing = False
         self._ready = False  # suppress save-storms during initial load
@@ -382,6 +439,11 @@ class MainWindow(QMainWindow):
         self._heartbeat_timer.setInterval(HEARTBEAT_SAVE_MS)
         self._heartbeat_timer.timeout.connect(self._heartbeat_save)
 
+        # keep pinned session ids tracking the live conversations
+        self._session_sync_timer = QTimer(self)
+        self._session_sync_timer.setInterval(SESSION_SYNC_MS)
+        self._session_sync_timer.timeout.connect(self._sync_live_sessions)
+
         # orchestrator control channel (named-pipe RPC → this GUI). Additive
         # and guarded: if it can't listen, the app runs exactly as before.
         # on_mutation: orchestrator mutations persist immediately — a debounce
@@ -390,6 +452,24 @@ class MainWindow(QMainWindow):
             manager, active_ws=lambda: self.manager.active_id, parent=self,
             on_mutation=self._save_now)
         self.bridge.start()
+        # shared SessionStart-hook plumbing: ONE settings file (injected into
+        # every Claude agent via --settings) + ONE mapping file the child hooks
+        # append their live conversation id to, keyed by AIHIVE_AGENT_ID. This
+        # is what lets an in-TUI /resume or /clear be captured authoritatively,
+        # including in multi-agent folders. Written BEFORE any agent is armed or
+        # started; reset each run because agent ids are minted fresh per run.
+        session_dir = self.store.path.parent
+        self._hook_settings_path = str(session_dir / "aihive_session_hook.json")
+        self._session_map_path = str(session_dir / "live_sessions.jsonl")
+        try:
+            session_hook.write_settings_file(self._hook_settings_path,
+                                             self._session_map_path)
+            session_hook.reset_map(self._session_map_path)
+        except OSError as e:
+            self.store.audit(f"HOOK-SETUP-FAIL {type(e).__name__}: {e}")
+            self._hook_settings_path = ""  # degrade: fall back to fs correlation
+        self.manager.session_map_path = self._session_map_path
+        manager.save_now = self._save_now  # immediate persistence for spawn_worker
         manager.arm_agent = self._arm_agent_mcp  # arm new agents before they start
         self._rearm_agent_configs()  # restored claude agents re-acquire MCP tools
 
@@ -400,22 +480,39 @@ class MainWindow(QMainWindow):
         self._apply_page_border()   # frame matches the restored skin
         self._ready = True  # from here on, structural changes save immediately
         self._heartbeat_timer.start()
+        self._session_sync_timer.start()
 
     def _arm_agent_mcp(self, ws, agent) -> None:
-        """Give a Claude agent its per-workspace MCP config, scoped by role:
-        orchestrators get the full toolset, every other Claude agent gets a
-        worker config (log_activity only, enforced by role in the bridge).
-        mcp_config_path isn't persisted (the pipe name changes each run), so
-        this runs for new agents (via manager.arm_agent) and restored ones
-        (via _rearm_agent_configs)."""
-        if not self.bridge.enabled or agent.spec.provider != "claude":
+        """Arm a Claude agent's per-run launch config before it starts (and
+        again on restore, via _rearm_agent_configs — none of this is persisted).
+
+        Two things, both keyed off the agent being Claude:
+          * the SessionStart hook that reports the agent's LIVE conversation id
+            back to AI Hive (via --settings + a per-agent AIHIVE_AGENT_ID). This
+            is INDEPENDENT of the orchestrator bridge — every Claude agent gets
+            it, so conversation tracking works even with the bridge disabled.
+          * the per-workspace MCP config, scoped by role (orchestrators get the
+            full toolset, every other Claude agent a worker config —
+            log_activity only, enforced by role in the bridge)."""
+        if agent.spec.provider != "claude":
+            return
+        if self._hook_settings_path:
+            agent.spec.settings_path = self._hook_settings_path
+            # AIHIVE_AGENT_ID == TerminalAgent.id, the same key sync_live_sessions
+            # matches on, so a hook line maps straight back to this agent.
+            agent.spec.env["AIHIVE_AGENT_ID"] = agent.id
+        if not self.bridge.enabled:
             return
         role = "orchestrator" if agent.spec.is_orchestrator else "worker"
         agent.spec.mcp_config_path = self.bridge.mcp_config_path_for(ws.id, role)
 
     def _rearm_agent_configs(self) -> None:
-        if not self.bridge.enabled:
-            return
+        # Re-arm EVERY restored Claude agent. Must NOT bail when the bridge is
+        # disabled: the SessionStart hook (settings_path + AIHIVE_AGENT_ID) is
+        # independent of the orchestrator bridge, and _arm_agent_mcp already
+        # self-gates the MCP-config part on bridge.enabled. Bailing here would
+        # leave restored agents with no live-conversation tracking exactly when
+        # the bridge is unavailable — the case the hook most needs to cover.
         for ws in self.manager.workspaces:
             for agent in ws.agents:
                 self._arm_agent_mcp(ws, agent)
@@ -609,6 +706,7 @@ class MainWindow(QMainWindow):
         page.openFolderRequested.connect(self._open_workspace_folder)
         page.changePathRequested.connect(self._change_workspace_folder)
         page.activityToggled.connect(self._toggle_activity)
+        page.mapRequested.connect(self._open_agent_map)
         page.reassignRequested.connect(self._on_reassign_agent)
         self._pages[ws.id] = page
         self.stack.addWidget(page)
@@ -617,6 +715,9 @@ class MainWindow(QMainWindow):
         self.sidebar.set_stats(ws.id, self.manager.workspace_stats(ws.id))
 
     def _on_workspace_removed(self, ws_id: str) -> None:
+        if (self._map_window is not None
+                and getattr(self._map_window._workspace, "id", None) == ws_id):
+            self._map_window.close()   # don't keep mapping a deleted workspace
         page = self._pages.pop(ws_id, None)
         if page is not None:
             for card in list(page.cards):
@@ -645,6 +746,10 @@ class MainWindow(QMainWindow):
         # keep the activity panel following the active workspace
         if self.activity_panel.is_open() and ws is not None:
             self.activity_panel.set_workspace(ws)
+        # the agent/file map (if open) tracks the active workspace too
+        if (self._map_window is not None and self._map_window.isVisible()
+                and ws is not None):
+            self._map_window.set_workspace(ws)
         self._sync_activity_buttons()
 
     # ------------------------------------------------------- activity panel ---
@@ -668,6 +773,38 @@ class MainWindow(QMainWindow):
             self.activity_panel.reveal()
             self._activity_timer.start()
         self._sync_activity_buttons()
+
+    # --------------------------------------------------------- agent map ---
+
+    def _open_agent_map(self, ws_id: str) -> None:
+        ws = self.manager.workspace(ws_id)
+        if ws is None:
+            return
+        if self._map_window is None:   # lazy, parented so theme switch repaints it
+            self._map_window = AgentFileMapWindow(self)
+            self._map_window.agentActivated.connect(self._focus_agent_from_map)
+        self._map_window.set_workspace(ws)
+        self._map_window.show()
+        self._map_window.raise_()
+        self._map_window.activateWindow()
+
+    def _focus_agent_from_map(self, ws_id: str, agent_id: str) -> None:
+        """Clicking an agent hub in the map jumps to its terminal card: switch
+        to its workspace, scroll the card into view, and focus it."""
+        if not agent_id:
+            return
+        self.manager.set_active(ws_id)
+        page = self._pages.get(ws_id)
+        if page is None:
+            return
+        card = page.card_for(agent_id)
+        if card is None:
+            return
+        page.scroll.ensureWidgetVisible(card)
+        target = card.terminal or card
+        target.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.raise_()
+        self.activateWindow()
 
     def _on_stats_for_activity(self, ws_id: str, _stats: dict) -> None:
         # cheap refresh only (roster + log); the blocking git scan stays on the
@@ -781,8 +918,13 @@ class MainWindow(QMainWindow):
         if ws is None:
             return
         # per-workspace numbering: each workspace counts Agent 1, 2, 3…
+        # busy_ids: conversations a running agent already holds — never offer
+        # them for resume (two agents on one transcript race/truncate it)
+        busy_ids = {a.spec.session_id for a in ws.agents
+                    if a.is_running() and a.spec.session_id}
         dialog = AddTerminalDialog(self.manager.next_agent_name(ws.id), self,
-                                   orchestrator_ok=self.bridge.enabled)
+                                   orchestrator_ok=self.bridge.enabled,
+                                   cwd=ws.project_path, busy_ids=busy_ids)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         spec = dialog.result_spec(cwd=ws.project_path)
@@ -968,12 +1110,31 @@ class MainWindow(QMainWindow):
             if self.store.save(payload):
                 self._last_saved_json = current
 
+    def _sync_live_sessions(self) -> None:
+        """Reconcile pinned session ids with the transcripts agents are really
+        writing, then persist any change (debounced). This is what makes the
+        RIGHT conversation come back on reopen even after the user switched
+        conversations inside a terminal."""
+        if self._closing or not self._ready:
+            return
+        # a pin change emits `dirty`, which schedules the (debounced) save;
+        # when nothing drifted this is a cheap no-op that never touches disk
+        for agent_id, old, new in self.manager.sync_live_sessions():
+            self.store.audit(f"SESSION-SYNC agent={agent_id} {old} -> {new}")
+
     # -------------------------------------------------------------- close ---
 
     def closeEvent(self, event) -> None:
         self._closing = True
         self._save_timer.stop()
         self._heartbeat_timer.stop()
+        self._session_sync_timer.stop()
+        # capture any last-moment conversation switch BEFORE the final save, so
+        # reopen resumes what was actually on screen — not a stale pin. Agents
+        # are still alive here (processes are killed further down), so their
+        # transcripts on disk are current.
+        for agent_id, old, new in self.manager.sync_live_sessions():
+            self.store.audit(f"SESSION-SYNC agent={agent_id} {old} -> {new}")
         self._save_session()  # persist FIRST: teardown can never lose state
         from .. import transcripts  # snapshot the day's conversations
         transcripts.backup_for_agents(

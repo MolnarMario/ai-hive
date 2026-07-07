@@ -15,6 +15,9 @@ from PySide6.QtCore import QObject, Signal
 
 from . import coordination
 from . import orchestration
+from . import session_hook
+from . import session_sync
+from . import transcripts
 from .process_worker import AgentKind, AgentSpec, build_spec
 from .pty_worker import HAS_CONPTY
 from .terminal_agent import AgentStatus, AssignmentState, TerminalAgent
@@ -64,6 +67,21 @@ class WorkspaceManager(QObject):
         # optional hook (set by MainWindow): arm an agent's MCP config before
         # it starts, so workers launch able to log_activity. callable(ws, agent)
         self.arm_agent = None
+        # path to the shared SessionStart-hook mapping file (set by MainWindow);
+        # sync_live_sessions reads it for the authoritative live conversation id
+        self.session_map_path = ""
+        # optional immediate-save hook (set by MainWindow to _save_now): for
+        # mutations that must persist NOW rather than on the dirty debounce
+        self.save_now = None
+
+    def _persist_now(self) -> None:
+        """Persist immediately if a hook is wired, else fall back to the
+        debounced dirty save. Used where a debounce window would be a loss
+        window (a hard kill before the heartbeat)."""
+        if self.save_now is not None:
+            self.save_now()
+        else:
+            self.dirty.emit()
 
     # ------------------------------------------------------------- reads ---
 
@@ -276,9 +294,11 @@ class WorkspaceManager(QObject):
         agent.auto_created = auto_created
         agent.set_assignment(AssignmentState.AWAITING)
         agent.deliver_task(task)  # queued until the TUI is prompt-ready
-        # add_terminal's immediate save fired BEFORE auto_created/assignment/
-        # task were set above — mark dirty so they persist too
-        self.dirty.emit()
+        # add_terminal's immediate structural save fired BEFORE auto_created/
+        # assignment/task were set above — persist NOW (not on the debounce) so
+        # a hard kill before the heartbeat can't resurrect this worker with no
+        # task and let it go dormant.
+        self._persist_now()
         return agent
 
     def assign_task(self, ws_id: str, agent_id: str, task: str,
@@ -332,6 +352,9 @@ class WorkspaceManager(QObject):
         agent.assignment_changed.connect(lambda *_: self._touch(wid))
         agent.role_changed.connect(lambda *_: self._touch(wid))
         agent.font_changed.connect(lambda *_: self.dirty.emit())
+        # recovery (verify-before-resume) must never land on a peer's
+        # conversation, so give the agent a live view of its folder-mates' pins
+        agent._sibling_sessions = lambda a=agent: self.sibling_session_ids(a)
         # busy/standby is TRANSIENT (not persisted): refresh the badge only,
         # never mark dirty — otherwise every output burst would thrash saves
         agent.activity_changed.connect(lambda *_: self._recompute(wid))
@@ -341,6 +364,87 @@ class WorkspaceManager(QObject):
         fields changed)."""
         self._recompute(ws_id)
         self.dirty.emit()
+
+    # ------------------------------------------------- live-session sync ---
+
+    def sibling_session_ids(self, agent: TerminalAgent) -> set:
+        """Pinned conversation ids of OTHER Claude agents sharing this agent's
+        folder. Recovery must never resume onto one of these — two agents on
+        one transcript race and can truncate it (a real past incident)."""
+        enc = transcripts.encode_project_dir(agent.spec.cwd)
+        out = set()
+        for a in self.all_agents():
+            if (a is not agent and a.spec.provider == "claude"
+                    and a.spec.session_id
+                    and transcripts.encode_project_dir(a.spec.cwd) == enc):
+                out.add(a.spec.session_id)
+        return out
+
+    def sync_live_sessions(self) -> list:
+        """Reconcile each running Claude agent's pinned session id with the
+        conversation it is ACTUALLY on, so a conversation the user switched to
+        (via /resume or /clear inside the TUI, a fork, usage-limit recovery) is
+        what comes back on reopen — not the id AI Hive happened to launch with.
+        Marks the session dirty when a pin changes. Returns
+        [(agent_id, old_id, new_id)] for the caller to audit.
+
+        Two signals, in priority order:
+          1. AUTHORITATIVE — the SessionStart hook (app/session_hook.py) has the
+             child report its own live id, keyed by AIHIVE_AGENT_ID, so it is
+             correct for ANY number of agents per folder (the filesystem cannot
+             disambiguate two agents sharing a folder — see resolve_live_ids).
+          2. FALLBACK — filesystem mtime correlation, but ONLY for single-agent
+             folders and ONLY for agents the hook has not (yet) reported (a
+             legacy agent, or before the first hook fires). Never reshuffles a
+             multi-agent folder; that guessing swapped live conversations."""
+        running = [a for a in self.all_agents()
+                   if a.spec.provider == "claude" and a.is_running()
+                   and a.spec.session_id]
+        if not running:
+            return []
+        changed = []
+        covered = set()
+
+        # 1. authoritative hook-reported ids
+        live_map = (session_hook.read_live_map(self.session_map_path)
+                    if self.session_map_path else {})
+        for a in running:
+            rec = live_map.get(a.id)
+            if not rec:
+                continue
+            covered.add(a.id)  # the child spoke for itself; trust it, not mtime
+            new = rec.get("session_id")
+            if (new and new != a.spec.session_id
+                    and session_sync.is_session_id(new)):
+                changed.append((a.id, a.spec.session_id, new))
+                a.spec.session_id = new
+
+        # 2. filesystem fallback for agents the hook hasn't reported. Pass ALL
+        # running agents (not just the uncovered ones) so resolve_live_ids sees
+        # the TRUE folder composition and still refuses to guess in a
+        # multi-agent folder: dropping a hook-covered agent from this list would
+        # make its folder-mate look solo and get mtime-mis-pinned onto the
+        # transcript the covered agent just switched to. We simply don't APPLY a
+        # mtime update to an agent the hook already spoke for authoritatively.
+        infos = [
+            session_sync.AgentInfo(key=a.id, cwd=a.spec.cwd,
+                                   pinned_id=a.spec.session_id,
+                                   started_at=a._session_started)
+            for a in running
+        ]
+        updates = session_sync.resolve_live_ids(infos)
+        by_id = {a.id: a for a in running}
+        for aid, new in updates.items():
+            if aid in covered:
+                continue  # hook is authoritative for this agent; never override
+            a = by_id.get(aid)
+            if a and new and new != a.spec.session_id:
+                changed.append((aid, a.spec.session_id, new))
+                a.spec.session_id = new
+
+        if changed:
+            self.dirty.emit()
+        return changed
 
     def _apply_coordination(self, ws: Workspace, agent: TerminalAgent) -> None:
         """Give AI agents access to the shared workspace board (peer

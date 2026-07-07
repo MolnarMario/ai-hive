@@ -42,6 +42,25 @@ workspaces keep executing — switching never pauses anything.
   Scoped per workspace; workspaces stay isolated.
 - **Per-workspace agent numbering** — each workspace counts Agent 1, 2, 3…
   independently.
+- **Agent/File Map** — a **◆ Map** button in the workspace header opens a
+  separate, resizable window that draws a bubble diagram of the workspace:
+  each agent is a round node and every file it has touched is a square node,
+  with **solid gold edges for files it edited** and **thin dashed edges for
+  files it only read**. Files touched by more than one agent are drawn once in
+  a shared band linked to each owner, and Claude **sub-agents** (spawned via the
+  Task tool) appear as small satellites ringing their parent. Attribution comes
+  from parsing each Claude agent's own conversation transcript, so it is exact
+  per-agent — the first per-terminal file view AI Hive has had. It live-refreshes
+  while open, and it's **interactive**: drag any node to rearrange (placement
+  persists across refreshes), drag empty space to pan, Ctrl+wheel (or +/−/0) to
+  zoom, **single-click an agent to jump to its terminal card**, and double-click
+  a file to open it (right-click for **Open with…** / Reveal in folder / Copy
+  path). A header toggle switches between the **Bubble** view and a **Tree**
+  view — a VSCode-style file hierarchy (folders/subfolders) on the left with
+  curved connectors from each agent to the files it touched. Agent bubbles are
+  opaque and each Task sub-agent is labeled with its type. (Sub-agent file work
+  and non-Claude agents can't be attributed — those nodes show without file
+  edges; see below.)
 - **Themes (Winamp-style skins)** — a dropdown in the top bar swaps the whole
   chrome palette live: **Scriptorium (Dark)** (the shipped warm-parchment/gold
   look), **Illuminated Manuscript** (light vellum, ultramarine running-heads,
@@ -97,7 +116,11 @@ error dialog instead of silently closing. Packaging to a distributable
   Gemini/Antigravity with its model list; OpenAI as an editable command
   template), **shells** (PowerShell, cmd), and **scripts** (Python, custom);
   tick "Full terminal" for a ConPTY-backed interactive session (auto-on for
-  AI agents).
+  AI agents). For a Claude agent, a **Conversation** dropdown lists the
+  workspace folder's past conversations (newest first, with a preview) so you
+  can **resume one** instead of starting fresh — it launches with `--resume
+  <id>`. Conversations a running agent already holds are omitted (resuming one
+  twice would race/truncate it).
 - **Grid layouts** — the **Layout** button in the workspace header opens a
   visual picker (Auto, 1×1 … 4×3; names read width × height, and the diagram
   on each swatch is the exact shape applied). A fixed layout fills agents left→right /
@@ -113,8 +136,9 @@ error dialog instead of silently closing. Packaging to a distributable
 - **App shortcuts use `Ctrl+Shift+…`** (T = new terminal, N = new workspace,
   B = toggle sidebar) so every plain `Ctrl`/`Alt` key, `Tab`, and `Shift+Tab`
   goes straight to the focused terminal — click a full-terminal card and
-  `Shift+Tab` cycles Claude Code's modes, `Ctrl+C` interrupts, `Ctrl+R`
-  reverse-searches, arrows/`Tab` complete, exactly as in a real terminal.
+  `Shift+Tab` cycles Claude Code's modes, `Ctrl+C` interrupts (when nothing is
+  selected; otherwise it copies), `Ctrl+R` reverse-searches, arrows/`Tab`
+  complete, exactly as in a real terminal.
 - **Card controls** — `▶` start, `■` graceful stop (stdin EOF), `⟳` restart
   (fresh session), `✕` close. Type into the bottom input line to send a
   command to that terminal; `↑`/`↓` recall history; `cls`/`clear` clears
@@ -130,7 +154,14 @@ error dialog instead of silently closing. Packaging to a distributable
   each Claude agent resumes **its own pinned conversation** (`--resume
   <session-id>` — so two agents sharing a project folder can never race for
   or swap each other's conversations) — falling back to a fresh launch
-  instead of a dead card if there's nothing to resume.
+  instead of a dead card if there's nothing to resume. The pin **tracks the
+  live conversation**: if you switch conversations inside a terminal (`/resume`
+  or `/clear` in the TUI, a fork), the agent *reports its own new conversation
+  id back to AI Hive* through a `SessionStart` hook, so reopen brings back
+  *exactly* the conversation that was on each card — reliably, even when two
+  agents share one folder (which the filesystem alone can't disambiguate). A
+  pinned id whose transcript has gone missing still recovers the folder's most
+  recent one instead of erroring. No more manually hunting for a lost chat.
   Agents that were *stopped* stay stopped, but never as a black screen: the
   card shows a **wake banner** and the first keystroke (or `▶`) starts it —
   a woken Claude agent also reclaims its conversation.
@@ -194,7 +225,11 @@ the log tail, and a best-effort `git status` view. Awareness is **scoped to
 the workspace** (the board lives in its folder); different workspaces are
 isolated. File-modification attribution is self-reported by agents in the log
 plus the repo-wide git view — the app does not attribute individual OS file
-writes to a specific terminal.
+writes to a specific terminal. For a precise per-agent view, the **Agent/File
+Map** (the ◆ Map button) parses each Claude agent's own transcript to show
+exactly which files that agent read and edited; this is transcript-derived, not
+OS-level, so it covers Claude agents (not Gemini/OpenAI/shells) and cannot see
+inside a Claude Task sub-agent (those files roll up to the parent).
 
 ## Reliability & persistence guarantees
 
@@ -260,9 +295,33 @@ Hard-won rules, each with a regression test:
 - **Full-terminal (ConPTY) cards** render a real terminal via a pyte screen:
   interactive Claude Code, vim, PSReadLine, spinners, and Ctrl+C all work.
   Keystrokes go straight to the child; the input box is replaced by the live
-  screen. **Clipboard**: `Ctrl+V` / `Ctrl+Shift+V` paste (bracketed-paste aware
-  for multi-line), drag to select + `Ctrl+Shift+C` to copy, and a right-click
-  Copy/Paste/Select-all menu. Keyboard-protocol escapes that pyte mis-parses
+  screen. **Clipboard** (Windows-editor style): `Ctrl+C` copies the selection
+  or, with nothing selected, sends the interrupt (0x03) — copying clears the
+  selection so the next `Ctrl+C` interrupts; `Ctrl+Shift+A` selects all painted
+  text (screen + scrollback); `Ctrl+V` / `Ctrl+Shift+V` paste (bracketed-paste
+  aware for multi-line); `Ctrl+Shift+C` also copies; and a right-click
+  Copy/Paste/Select-all menu. **Mouse**: double-click selects the
+  whitespace-delimited word under the pointer (then `Ctrl+C` copies it);
+  **Ctrl+click** (or a middle/scroll-wheel click) opens a URL or an existing
+  absolute local file path under the pointer with the OS default handler —
+  hovering such a link underlines it and shows a hand cursor so it's obviously
+  clickable. (`Ctrl`+left-click is primary — the left button always registers,
+  while the middle button is often eaten by the OS autoscroll.) **Image
+  paste**: a `Ctrl+V` with an image on the
+  clipboard is spilled to a temp PNG and its path pasted, because Claude Code
+  reads images by path and a native-Windows child can't take a raw clipboard
+  image (that's WSL-only, via Claude's `Alt+V`). `Ctrl+A` highlights the text
+  you're typing (best-effort — from Claude's `>` prompt row down to the cursor,
+  so a wrapped/multi-line prompt highlights in full, like Cursor or the Claude
+  desktop input box, without climbing into the transcript above) and
+  `Backspace`/`Del` on that highlight clears the child's entire input via
+  double-Escape (`0x1b 0x1b`, Claude Code's clear-prompt gesture, which —
+  unlike its line-local `Ctrl+A`/`Ctrl+K` — empties multi-line input too). The
+  terminal can't see the child's real input buffer, so it's inference from
+  painted rows: no `>` found means it falls back to the cursor row (`Home`
+  still jumps to line start). `Ctrl+Z`/`Ctrl+Y` are not
+  undo/redo — a terminal keeps no local edit buffer, so they forward to the
+  child, which owns line editing. Keyboard-protocol escapes that pyte mis-parses
   (e.g. xterm modifyOtherKeys) are filtered so text renders clean, not
   underlined.
 - **Line-console cards** stay line-oriented: full-screen TUIs won't render in
@@ -279,7 +338,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-314 checks drive the real app headlessly (offscreen Qt platform) with real
+441 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -289,7 +348,10 @@ explicit grids, folder changes, fonts, the shared board), v3 orchestration
 (role naming, model/effort selection, the named-pipe MCP round-trip,
 workspace scoping, immediate-save-on-mutation), the sidebar status badge
 (output-activity busy detection, pulse/colour state machine, hover-only
-controls) and the Layout popup
+controls), the Agent/File Map visualizer (transcript parsing for edited-vs-read
+attribution, sub-agent detection, shared-file grouping, headless paint, header-
+button wiring, and the drag/zoom/hit-test/click-to-focus interactions) and the
+Layout popup
 staying on-screen when the window is at a monitor edge, and the reliability
 set — immediate structural saves, the safety-net heartbeat, saves that are
 never silent (suppressed/payload-error logging, one bad agent can't abort the
@@ -315,13 +377,17 @@ app/
   mcp_server.py            stdlib MCP stdio server the Claude CLI spawns
   session_store.py         atomic JSON persistence (AppData) + save-audit log
   transcripts.py           Claude-transcript snapshots (start/close, high-water)
+  session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
+  session_hook.py          SessionStart hook: the child reports its live conversation id
+  file_activity.py         per-agent file attribution from transcripts (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
   widgets/                 main_window, sidebar, workspace_page, terminal_card,
                            terminal_view (pyte grid), grid_selector (on-screen
-                           popup), activity_panel, ornaments (drop-caps /
-                           dividers / the workspace count-badge)
-tests/smoke_test.py        headless end-to-end suite (314 checks)
+                           popup), activity_panel, agent_file_map (bubble
+                           diagram), ornaments (drop-caps / dividers / the
+                           workspace count-badge)
+tests/smoke_test.py        headless end-to-end suite (441 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

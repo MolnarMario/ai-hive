@@ -129,6 +129,10 @@ def create_main_window(store: SessionStore | None = None) -> MainWindow:
                 # restart after that is a deliberate fresh session.
                 if agent.spec.provider in RESUME_PROVIDERS:
                     agent.spec.resume = True
+                    # this resume is a RESTORE: verify the pinned conversation
+                    # still exists and recover it if a stale/never-used id
+                    # would otherwise make --resume error on a dead terminal
+                    agent._verify_resume_target = True
                 if agent.autostart_on_restore:
                     agent.notice("— resuming previous session… —")
                 else:
