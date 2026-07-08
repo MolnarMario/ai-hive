@@ -12,7 +12,9 @@ workspaces keep executing — switching never pauses anything.
 ## What's here (v2 highlights)
 
 - **AI-agent creation** — pick a provider (Claude fully wired with **model** +
-  **effort** dropdowns → real `--model`/`--effort` flags; **Gemini via the
+  **effort** + **mode** dropdowns → real `--model`/`--effort`/`--permission-mode`
+  flags; the **mode** picker is the Shift+Tab permission modes — Normal (default),
+  Accept edits, Plan, Bypass permissions — so an agent can start pre-set; **Gemini via the
   Antigravity CLI** (`agy`) with its full model list incl. Gemini 3.x, and
   `--continue` resume + shared-board `--add-dir`, verified against agy 1.0.16;
   OpenAI as an editable command template until its CLI is installed). Shells
@@ -24,13 +26,30 @@ workspaces keep executing — switching never pauses anything.
   and each swatch's diagram is exactly the shape you get. Optimized for
   wide monitors.
 - **Workspace status badge** — each sidebar row leads with a badge showing its
-  agent count that doubles as a status light: it **pulses green** while an agent
+  agent count that doubles as a status light: it stays **green** while agents
+  are alive and healthy (running, no errors) and **pulses amber** while an agent
   is actually **working** (streaming output — thinking, generating, running a
-  command), not merely alive, so an interactive agent idling at its prompt reads
-  as **amber** standby rather than a false green. It turns **red** on error and
-  dims when empty (the working/running/error breakdown is in the row's hover
-  tooltip). The folder/delete controls stay hidden until you hover the row, so
-  the workspace name keeps the space.
+  command), so working reads as motion rather than resting green. It turns
+  **red** on error and dims when empty (the working/running/error breakdown is
+  in the row's hover tooltip). A matching **sweeping-arc spinner** with the live
+  working count appears at the row's right edge while any agent is working and
+  vanishes when all are idle. The folder/delete controls stay hidden until you
+  hover the row (opening to the left of the spinner), so the workspace name
+  keeps the space.
+- **Organize the sidebar** — drag workspaces up/down to reorder them, and group
+  related ones under **categories** ("Work dev", "Game dev", …) with the 🗂
+  button. Categories are collapsible headers you can drag above/below other
+  categories or loose workspaces; drop a workspace onto a header to file it in,
+  or back out to un-file it. The whole layout (order + categories + collapse
+  state) persists across restarts.
+- **Agent dropdown + "?" waiting alerts** — click a row's count badge to drop
+  down its agents with each one's status and current task; click any agent to
+  jump straight to its terminal card (switching workspace first if needed). When
+  an agent is actually **waiting for you** — a permission prompt or an
+  interactive question — a "?" lights up on the row (next to the working count)
+  and beside that agent in the dropdown, so you can spot and answer it without
+  hunting through terminals. Suppressed for agents launched in bypass-permissions
+  mode (which never prompt).
 - **First-class folders** — every workspace header shows its path with
   **Open folder** and **Change…** buttons; agents launch rooted there.
 - **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ in the
@@ -43,24 +62,26 @@ workspaces keep executing — switching never pauses anything.
 - **Per-workspace agent numbering** — each workspace counts Agent 1, 2, 3…
   independently.
 - **Agent/File Map** — a **◆ Map** button in the workspace header opens a
-  separate, resizable window that draws a bubble diagram of the workspace:
-  each agent is a round node and every file it has touched is a square node,
-  with **solid gold edges for files it edited** and **thin dashed edges for
-  files it only read**. Files touched by more than one agent are drawn once in
-  a shared band linked to each owner, and Claude **sub-agents** (spawned via the
-  Task tool) appear as small satellites ringing their parent. Attribution comes
-  from parsing each Claude agent's own conversation transcript, so it is exact
-  per-agent — the first per-terminal file view AI Hive has had. It live-refreshes
-  while open, and it's **interactive**: drag any node to rearrange (placement
-  persists across refreshes), drag empty space to pan, Ctrl+wheel (or +/−/0) to
-  zoom, **single-click an agent to jump to its terminal card**, and double-click
-  a file to open it (right-click for **Open with…** / Reveal in folder / Copy
-  path). A header toggle switches between the **Bubble** view and a **Tree**
-  view — a VSCode-style file hierarchy (folders/subfolders) on the left with
-  curved connectors from each agent to the files it touched. Agent bubbles are
-  opaque and each Task sub-agent is labeled with its type. (Sub-agent file work
-  and non-Claude agents can't be attributed — those nodes show without file
-  edges; see below.)
+  separate, resizable window that draws a **Tree** view of the workspace: a
+  VSCode-style file hierarchy (folders/subfolders) on the left, the agents as
+  round bubbles on the right **vertically centered** against the tree, and
+  curved connectors from each agent to the file rows it touched — **solid gold
+  for files it edited** and **thin dashed for files it only read**. A file
+  touched by more than one agent is a single row with a connector to each owner,
+  and Claude **sub-agents** (spawned via the Task tool) appear as small
+  satellites ringing their parent. Attribution comes from parsing each Claude
+  agent's own conversation transcript, so it is exact per-agent — the first
+  per-terminal file view AI Hive has had. It live-refreshes while open, and it's
+  **interactive**: drag an agent to rearrange it (placement persists across
+  refreshes; the file tree is structural), drag empty space to pan, Ctrl+wheel
+  (or +/−/0) to zoom, **single-click an agent to jump to its terminal card**,
+  and double-click a file to open it (right-click for **Open with…** / Reveal
+  in folder / Copy path). Header **Write** / **Read** toggles hide the edited or
+  read-only lines independently, for when you only care about one kind of
+  activity (the legend greys the hidden kind). Agent bubbles are opaque and each
+  Task sub-agent is labeled with its type.
+  (Sub-agent file work and non-Claude agents can't be attributed — those nodes
+  show without file edges; see below.)
 - **Themes (Winamp-style skins)** — a dropdown in the top bar swaps the whole
   chrome palette live: **Scriptorium (Dark)** (the shipped warm-parchment/gold
   look), **Illuminated Manuscript** (light vellum, ultramarine running-heads,
@@ -112,7 +133,8 @@ error dialog instead of silently closing. Packaging to a distributable
   Double-click a row to rename, `✕` deletes (confirmation appears only when
   terminals are running). `☰` / `Ctrl+Shift+B` collapses the sidebar.
 - **Agents** — `+ Terminal` (or `Ctrl+Shift+T`), or click any empty grid slot.
-  The dialog groups **AI agents** (Claude with model + effort dropdowns;
+  The dialog groups **AI agents** (Claude with model + effort + mode dropdowns —
+  the **mode** picker chooses the Shift+Tab permission mode the agent starts in;
   Gemini/Antigravity with its model list; OpenAI as an editable command
   template), **shells** (PowerShell, cmd), and **scripts** (Python, custom);
   tick "Full terminal" for a ConPTY-backed interactive session (auto-on for
@@ -300,9 +322,13 @@ Hard-won rules, each with a regression test:
   selection so the next `Ctrl+C` interrupts; `Ctrl+Shift+A` selects all painted
   text (screen + scrollback); `Ctrl+V` / `Ctrl+Shift+V` paste (bracketed-paste
   aware for multi-line); `Ctrl+Shift+C` also copies; and a right-click
-  Copy/Paste/Select-all menu. **Mouse**: double-click selects the
-  whitespace-delimited word under the pointer (then `Ctrl+C` copies it);
-  **Ctrl+click** (or a middle/scroll-wheel click) opens a URL or an existing
+  Copy/Paste/Select-all menu. **Mouse**: a plain left-click **places the input
+  caret** where you clicked (AI Hive sends the child the right run of
+  Left/Right arrows — exact on the caret's own line), so you can jump into your
+  typed text without arrow-key walking; a drag selects instead and never moves
+  the caret. Double-click selects the whitespace-delimited word under the
+  pointer (then `Ctrl+C` copies it); **Ctrl+click** (or a middle/scroll-wheel
+  click) opens a URL or an existing
   absolute local file path under the pointer with the OS default handler —
   hovering such a link underlines it and shows a hand cursor so it's obviously
   clickable. (`Ctrl`+left-click is primary — the left button always registers,
@@ -338,7 +364,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-441 checks drive the real app headlessly (offscreen Qt platform) with real
+510 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -346,9 +372,16 @@ trips, the ConPTY path (interactive prompt, Ctrl+C, retention), every v2
 feature (provider flags, per-workspace numbering, the agent-count badge,
 explicit grids, folder changes, fonts, the shared board), v3 orchestration
 (role naming, model/effort selection, the named-pipe MCP round-trip,
-workspace scoping, immediate-save-on-mutation), the sidebar status badge
+workspace scoping, immediate-save-on-mutation), inline agent rename in the
+card header (double-click; a custom name survives orchestrator retasks) plus
+a per-agent task summary beside the name, the sidebar status badge
 (output-activity busy detection, pulse/colour state machine, hover-only
-controls), the Agent/File Map visualizer (transcript parsing for edited-vs-read
+controls), sidebar drag-reorder + collapsible categories (create/rename/delete,
+drag workspaces in/out, single-level membership persisted across a v4 session
+round-trip with v3 migration), the count-badge agent dropdown + click-to-reveal,
+and the waiting-for-input "?" detection (settled-screen prompt/question scrape,
+gated on the idle timer, suppressed under bypassPermissions), the Agent/File Map
+visualizer (transcript parsing for edited-vs-read
 attribution, sub-agent detection, shared-file grouping, headless paint, header-
 button wiring, and the drag/zoom/hit-test/click-to-focus interactions) and the
 Layout popup
@@ -382,12 +415,13 @@ app/
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
-  widgets/                 main_window, sidebar, workspace_page, terminal_card,
-                           terminal_view (pyte grid), grid_selector (on-screen
-                           popup), activity_panel, agent_file_map (bubble
-                           diagram), ornaments (drop-caps / dividers / the
-                           workspace count-badge)
-tests/smoke_test.py        headless end-to-end suite (441 checks)
+  widgets/                 main_window, sidebar (drag-reorder + categories),
+                           agent_dropdown (count-badge agent list + "?"),
+                           workspace_page, terminal_card, terminal_view (pyte
+                           grid), grid_selector (on-screen popup), activity_panel,
+                           agent_file_map (tree diagram), ornaments (drop-caps /
+                           dividers / count-badge + working-count spinner)
+tests/smoke_test.py        headless end-to-end suite (510 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

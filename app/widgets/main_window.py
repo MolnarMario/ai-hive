@@ -25,6 +25,7 @@ from ..workspace_manager import Workspace, WorkspaceManager
 from .. import coordination
 from ..orchestrator_bridge import OrchestratorBridge
 from .activity_panel import ActivityPanel
+from .agent_dropdown import AgentDropdown, position_popup
 from .agent_file_map import AgentFileMapWindow
 from .ornaments import LogoRoundel, PageBorder
 from .sidebar import SIDEBAR_WIDTH, Sidebar
@@ -180,6 +181,13 @@ class AddTerminalDialog(QDialog):
         self.provider_note.setWordWrap(True)
         self.model_combo = QComboBox(self)
         self.effort_combo = QComboBox(self)
+        # startup permission mode — the modes the Claude TUI cycles through
+        # with Shift+Tab (Claude only). Default omits the flag = today's behavior.
+        self.mode_combo = QComboBox(self)
+        self.mode_combo.setToolTip(
+            "Which permission mode this Claude agent starts in — the same modes "
+            "you flip through with Shift+Tab in the terminal. 'Normal' is the "
+            "current default; the agent can still switch modes once running.")
         # resume an existing conversation from this workspace folder (Claude)
         self.resume_combo = QComboBox(self)
         self.resume_combo.setToolTip(
@@ -214,6 +222,8 @@ class AddTerminalDialog(QDialog):
         form.addRow(self._model_label, self.model_combo)
         self._effort_label = QLabel("Effort", self)
         form.addRow(self._effort_label, self.effort_combo)
+        self._mode_label = QLabel("Mode", self)
+        form.addRow(self._mode_label, self.mode_combo)
         self._resume_label = QLabel("Conversation", self)
         form.addRow(self._resume_label, self.resume_combo)
         self._cmd_label = QLabel("Command", self)
@@ -232,6 +242,8 @@ class AddTerminalDialog(QDialog):
 
         self._ai_widgets = (self._model_label, self.model_combo,
                             self._effort_label, self.effort_combo)
+        # Claude-only, so kept out of _ai_widgets (which is every AI provider)
+        self._mode_widgets = (self._mode_label, self.mode_combo)
         self._resume_widgets = (self._resume_label, self.resume_combo)
         self._script_widgets = (self._prog_label, self.program_edit,
                                 self.browse_btn, self._args_label, self.args_edit)
@@ -283,12 +295,16 @@ class AddTerminalDialog(QDialog):
         self.provider_note.setVisible(is_ai)
         self._cmd_label.setVisible(False)
         self.command_edit.setVisible(False)
-        for w in self._ai_widgets + self._resume_widgets:
+        for w in self._ai_widgets + self._mode_widgets + self._resume_widgets:
             w.setVisible(False)
 
         # resume picker: Claude-only, shown only when the folder has a
         # resumable conversation that isn't already held by a running agent
         if kind == AgentKind.CLAUDE:
+            # startup permission mode (Shift+Tab modes) — Claude only
+            self._populate_modes(providers.get("claude"))
+            for w in self._mode_widgets:
+                w.setVisible(True)
             self._ensure_resume_loaded()
             if self.resume_combo.count() > 1:
                 for w in self._resume_widgets:
@@ -341,6 +357,13 @@ class AddTerminalDialog(QDialog):
             item = model.item(self.effort_combo.count() - 1)
             item.setEnabled(False)  # visible but non-selectable
 
+    def _populate_modes(self, prov) -> None:
+        # populate once so a user's choice survives toggling Type away and back
+        if self.mode_combo.count() or prov is None:
+            return
+        for label, value in prov.permission_modes:
+            self.mode_combo.addItem(label, value)  # index 0 = "" = default
+
     def _ensure_resume_loaded(self) -> None:
         """Populate the resume picker once: 'New conversation' plus every past
         conversation in this workspace's folder (newest first), skipping any a
@@ -390,11 +413,14 @@ class AddTerminalDialog(QDialog):
             model = self.model_combo.currentData() or ""
             effort = (self.effort_combo.currentData() or ""
                       if not self.effort_combo.isHidden() else "")
+            mode = (self.mode_combo.currentData() or ""
+                    if not self.mode_combo.isHidden() else "")
             custom = (self.command_edit.text().strip()
                       if not self.command_edit.isHidden() else "")
             extra = QProcess.splitCommand(self.args_edit.text().strip()) \
                 if not self.args_edit.isHidden() else []
             spec = build_spec(kind, name, cwd=cwd, model=model, effort=effort,
+                              permission_mode=mode,
                               custom_command=custom, args=extra,
                               is_orchestrator=(not self.orch_check.isHidden()
                                                and self.orch_check.isChecked()))
@@ -586,6 +612,10 @@ class MainWindow(QMainWindow):
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
         self.sidebar.deleteRequested.connect(self._confirm_delete_workspace)
         self.sidebar.openFolderRequested.connect(self._open_workspace_folder)
+        self.sidebar.agentsRequested.connect(self._open_agent_dropdown)
+        # the sidebar owns the live layout; the manager persists whatever it
+        # reports (order + categories) and re-sequences its workspace list
+        self.sidebar.layoutChanged.connect(self.manager.apply_sidebar_layout)
 
         # Ctrl+Shift+* so plain Ctrl/Alt keys stay free for the focused
         # terminal (Claude Code, shells, readline all need them).
@@ -622,6 +652,11 @@ class MainWindow(QMainWindow):
             for agent in ws.agents:
                 self._pages[ws.id].add_agent(agent)
             self.sidebar.set_stats(ws.id, self.manager.workspace_stats(ws.id))
+        # arrange rows into the restored order + categories (rows were appended
+        # top-level as each workspace was added above)
+        self.sidebar.apply_layout(self.manager.sidebar_layout())
+        for ws in self.manager.workspaces:   # re-apply stats after the rebuild
+            self.sidebar.set_stats(ws.id, self.manager.workspace_stats(ws.id))
         active = self.manager.active_id
         if active:
             self._on_active_changed(active)
@@ -646,6 +681,8 @@ class MainWindow(QMainWindow):
         mgr.terminalRemoved.connect(lambda *_: self._save_now())
         mgr.workspaceAdded.connect(lambda *_: self._save_now())
         mgr.workspaceRemoved.connect(lambda *_: self._save_now())
+        # reordering/categorizing is a structural layout change -> save now
+        mgr.sidebarLayoutChanged.connect(lambda *_: self._save_now())
 
     def _restore_ui_state(self, session: dict) -> None:
         ui = session.get("ui", {})
@@ -789,8 +826,12 @@ class MainWindow(QMainWindow):
         self._map_window.activateWindow()
 
     def _focus_agent_from_map(self, ws_id: str, agent_id: str) -> None:
-        """Clicking an agent hub in the map jumps to its terminal card: switch
-        to its workspace, scroll the card into view, and focus it."""
+        self._reveal_agent(ws_id, agent_id)
+
+    def _reveal_agent(self, ws_id: str, agent_id: str) -> None:
+        """The single 'click an agent -> reveal its card' primitive (used by the
+        Agent/File Map and the sidebar agent dropdown): switch to the agent's
+        workspace, scroll its terminal card into view, and focus it."""
         if not agent_id:
             return
         self.manager.set_active(ws_id)
@@ -805,6 +846,20 @@ class MainWindow(QMainWindow):
         target.setFocus(Qt.FocusReason.OtherFocusReason)
         self.raise_()
         self.activateWindow()
+
+    def _open_agent_dropdown(self, ws_id: str) -> None:
+        """Show the agent dropdown anchored under a workspace row's count badge:
+        the workspace's agents with status + task + a '?' when one is waiting.
+        Opening it does NOT switch workspaces; clicking an agent reveals it."""
+        ws = self.manager.workspace(ws_id)
+        if ws is None:
+            return
+        dd = AgentDropdown(ws_id, list(ws.agents), self)
+        dd.agentActivated.connect(self._reveal_agent)
+        badge = self.sidebar.badge_for(ws_id)
+        dd.adjustSize()
+        dd.move(position_popup(badge or self.sidebar, dd.size()))
+        dd.show()
 
     def _on_stats_for_activity(self, ws_id: str, _stats: dict) -> None:
         # cheap refresh only (roster + log); the blocking git scan stays on the

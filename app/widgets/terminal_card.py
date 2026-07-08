@@ -10,7 +10,7 @@ agent signals can't fire into a dead widget.
 import re
 
 from PySide6.QtCore import QEvent, Qt, Signal
-from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QColor, QFontMetrics, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit,
                                QPlainTextEdit, QToolButton, QVBoxLayout)
 
@@ -58,6 +58,8 @@ class TerminalCard(QFrame):
         self._parsers: dict[str, AnsiSgrParser] = {}
         self._fmt_cache: dict = {}
         self._cr_pending = False
+        self._renaming = False  # inline title-edit in progress
+        self._task_full = ""    # untruncated current-task, for the elided summary
         self._follow = True  # sticky auto-scroll (survives resizes/retiles)
         self._history: list[str] = []
         self._hist_idx = 0
@@ -76,6 +78,7 @@ class TerminalCard(QFrame):
             self._replay_log()
         self._on_status(agent.status)
         self._on_assignment(agent.assignment)
+        self._on_task(agent.current_task)
 
     # ----------------------------------------------------------------- ui ---
 
@@ -95,18 +98,32 @@ class TerminalCard(QFrame):
         self.glyph.setObjectName("StatusGlyph")
         self.title = QLabel(self.agent.spec.name, header)
         self.title.setObjectName("CardTitle")
+        self.title.setToolTip("Double-click to rename")
+        self.title.setCursor(Qt.CursorShape.PointingHandCursor)
+        # hidden inline editor swapped in on double-click (see start_rename);
+        # mirrors the workspace-row rename UX in sidebar.py
+        self.title_edit = QLineEdit(self.agent.spec.name, header)
+        self.title_edit.setObjectName("CardTitleEdit")
+        self.title_edit.hide()
         self.role = QLabel(f"— {self.agent.spec.role}" if self.agent.spec.role
                            else "", header)
         self.role.setObjectName("CardRole")
         self.badge = QLabel("", header)   # assignment lifecycle badge
         self.badge.setObjectName("CardBadge")
         self.badge.hide()
+        # one-line summary of what this agent is working on (its current task),
+        # so several agents in a workspace are tellable apart at a glance
+        # without reading each terminal. Elided to fit; full text on hover.
+        self.task_summary = QLabel("", header)
+        self.task_summary.setObjectName("CardTaskSummary")
         hl.addWidget(self.glyph)
         hl.addWidget(self.title)
+        hl.addWidget(self.title_edit)
         hl.addWidget(self.role)
         hl.addSpacing(6)
         hl.addWidget(self.badge)
-        hl.addStretch(1)
+        hl.addSpacing(6)
+        hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
 
         def tool(text, obj_name, tip):
             b = QToolButton(header)
@@ -169,6 +186,11 @@ class TerminalCard(QFrame):
         self.agent.status_changed.connect(self._on_status)
         self.agent.assignment_changed.connect(self._on_assignment)
         self.agent.role_changed.connect(self._on_role)
+        self.agent.name_changed.connect(self._on_name)
+        self.agent.task_changed.connect(self._on_task)
+        self.title.installEventFilter(self)        # double-click to rename
+        self.title_edit.installEventFilter(self)   # Esc cancels, focus-out commits
+        self.title_edit.returnPressed.connect(self._commit_rename)
         self.btn_start.clicked.connect(self.agent.start)
         self.btn_stop.clicked.connect(self.agent.stop)
         self.btn_restart.clicked.connect(self.agent.restart)
@@ -198,7 +220,9 @@ class TerminalCard(QFrame):
         """Unhook from the agent before the card widget is deleted."""
         pairs = [(self.agent.status_changed, self._on_status),
                  (self.agent.assignment_changed, self._on_assignment),
-                 (self.agent.role_changed, self._on_role)]
+                 (self.agent.role_changed, self._on_role),
+                 (self.agent.name_changed, self._on_name),
+                 (self.agent.task_changed, self._on_task)]
         if self.is_pty:
             pairs.append((self.agent.pty_output, self._on_pty_output))
         else:
@@ -237,10 +261,68 @@ class TerminalCard(QFrame):
         self.btn_close.setToolTip(
             "Close terminal (agents never close on their own — you decide)")
 
-    def _on_role(self, name: str) -> None:
-        self.title.setText(name)
+    def _on_role(self, _name: str) -> None:
+        # the title tracks spec.name (which set_role leaves alone once the user
+        # has manually renamed); only the role sublabel follows the emitted role
+        self.title.setText(self.agent.spec.name)
         self.role.setText(f"— {self.agent.spec.role}" if self.agent.spec.role
                           else "")
+
+    def _on_name(self, name: str) -> None:
+        self.title.setText(name)
+
+    def _on_task(self, text: str) -> None:
+        # collapse to a single line: a task summary shares the header row, so a
+        # newline would blow up the fixed-height header
+        self._task_full = " ".join((text or "").split())
+        self.task_summary.setToolTip(self._task_full)
+        self.task_summary.setVisible(bool(self._task_full))
+        self._elide_task()
+
+    def _elide_task(self) -> None:
+        if not self._task_full:
+            self.task_summary.clear()
+            return
+        avail = self.task_summary.width() - 4
+        if avail > 8:
+            fm = QFontMetrics(self.task_summary.font())
+            self.task_summary.setText(
+                fm.elidedText(self._task_full, Qt.TextElideMode.ElideRight, avail))
+        else:
+            # width not settled yet (e.g. before first layout): char fallback so
+            # the summary is never blank when there IS a task
+            self.task_summary.setText(
+                self._task_full[:48] + ("…" if len(self._task_full) > 48 else ""))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide_task()  # re-fit the summary to the new header width
+
+    # -------------------------------------------------------- inline rename ---
+
+    def start_rename(self) -> None:
+        self._renaming = True
+        self.title_edit.setText(self.title.text())
+        self.title.hide()
+        self.title_edit.show()
+        self.title_edit.setFocus()
+        self.title_edit.selectAll()
+
+    def _commit_rename(self) -> None:
+        # re-entrancy guard: _end_rename()'s hide() delivers a synchronous
+        # FocusOut that routes right back here (see WorkspaceRow). Without it,
+        # Escape would commit instead of cancel and Enter would commit twice.
+        if not self._renaming:
+            return
+        name = self.title_edit.text().strip()
+        self._end_rename()
+        if name and name != self.title.text():
+            self.agent.set_name(name)  # model persists via name_changed -> _touch
+
+    def _end_rename(self) -> None:
+        self._renaming = False
+        self.title_edit.hide()
+        self.title.show()
 
     # ------------------------------------------------------- per-agent font ---
 
@@ -280,6 +362,21 @@ class TerminalCard(QFrame):
     # ------------------------------------------------------------- events ---
 
     def eventFilter(self, obj, event):
+        if obj is self.title:
+            if event.type() == QEvent.Type.MouseButtonDblClick:
+                self.start_rename()
+                return True
+            return super().eventFilter(obj, event)
+        if obj is self.title_edit:
+            if (event.type() == QEvent.Type.KeyPress
+                    and event.key() == Qt.Key.Key_Escape):
+                self._end_rename()  # true cancel
+                return True
+            if event.type() == QEvent.Type.FocusOut:
+                # a context-menu popup is not a real focus loss
+                if event.reason() != Qt.FocusReason.PopupFocusReason:
+                    self._commit_rename()
+            return super().eventFilter(obj, event)
         if event.type() == QEvent.Type.FocusIn:
             self.focusGained.emit(self)
         elif event.type() == QEvent.Type.KeyPress:

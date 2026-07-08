@@ -7,7 +7,7 @@ the design handoff's inline data-URIs.
 """
 
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
-                            QRectF, Qt, QVariantAnimation)
+                            QRectF, Qt, QVariantAnimation, Signal)
 from PySide6.QtGui import (QColor, QFont, QLinearGradient, QPainter, QPen,
                            QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
@@ -219,16 +219,20 @@ class DropCap(QWidget):
 
 class AgentCountBadge(QWidget):
     """A workspace's agent tally: a rounded badge showing how many agents are
-    open, colour-coded by state — pulsing green while any agent is working,
-    amber when all are idle, red on error, dim when empty. Colours are read
-    from the live `Palette` at paint time so the badge tracks every skin (no
-    per-skin QSS needed). The pulse runs ONLY in the working state; every other
-    state is static, so idle rows cost nothing."""
+    open, colour-coded by state — pulsing amber while any agent is working,
+    green when all are idle (running, no errors), red on error, dim when empty.
+    Colours are read from the live `Palette` at paint time so the badge tracks
+    every skin (no per-skin QSS needed). The pulse runs ONLY in the working
+    state; every other state is static, so idle rows cost nothing. Clicking it
+    emits `clicked` (the row opens its agent dropdown; the click is consumed so
+    it never bubbles up to select/switch the workspace)."""
+
+    clicked = Signal()
 
     # resolved per-paint — Palette attrs are rewritten in place on skin switch
     _STATE_COLOR = {
-        "working": lambda: Palette.GREEN,
-        "idle": lambda: Palette.YELLOW,
+        "working": lambda: Palette.YELLOW,
+        "idle": lambda: Palette.GREEN,
         "error": lambda: Palette.RED,
         "empty": lambda: Palette.TEXT_DIM,
     }
@@ -236,6 +240,8 @@ class AgentCountBadge(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(30, 30)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Show this workspace's agents")
         self._count = 0
         self._state = "empty"
         self._pulse = 0.0  # 0..1 breathing factor while working
@@ -266,6 +272,15 @@ class AgentCountBadge(QWidget):
         self._pulse = float(value or 0.0)
         self.update()
 
+    def mousePressEvent(self, event):
+        # consume the press so it never reaches the row (which would select /
+        # switch the workspace); a bare click opens the agent dropdown instead
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -286,6 +301,76 @@ class AgentCountBadge(QWidget):
         p.setFont(f)
         p.setPen(color)
         p.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(self._count))
+        p.end()
+
+
+class WorkspaceSpinner(QWidget):
+    """A sweeping-arc throbber with the live WORKING (busy) count at its centre,
+    pinned to the right edge of a workspace row. Hidden whenever nothing is
+    working (count 0) so the row's right edge stays clear for the hover
+    folder/delete buttons; while working it spins in the amber 'working' colour.
+    Colour is read from the live `Palette` at paint time, so it tracks every
+    skin, and the animation runs ONLY while count > 0 — a resting row is free."""
+
+    _SPAN = 270 * 16  # arc sweep, in 1/16-degree units (QPainter.drawArc)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(26, 26)
+        self.setVisible(False)
+        self._count = 0
+        self._angle = 0.0  # rotating arc start angle (degrees)
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(360.0)
+        self._anim.setDuration(1000)
+        self._anim.setLoopCount(-1)
+        self._anim.setEasingCurve(QEasingCurve.Type.Linear)
+        self._anim.valueChanged.connect(self._on_spin)
+
+    def set_count(self, count: int) -> None:
+        count = max(0, int(count))
+        if count == self._count:
+            return
+        self._count = count
+        if count > 0:
+            self.setVisible(True)
+            if self._anim.state() != QAbstractAnimation.State.Running:
+                self._anim.start()
+        else:
+            self._anim.stop()
+            self.setVisible(False)
+        self.update()
+
+    def _on_spin(self, value):
+        self._angle = float(value or 0.0)
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor(Palette.YELLOW)
+        rect = QRectF(3, 3, self.width() - 6, self.height() - 6)
+        # faint full-ring track so the sweep reads as motion against it
+        track = QColor(color)
+        track.setAlpha(48)
+        pen = QPen(track)
+        pen.setWidthF(2.0)
+        p.setPen(pen)
+        p.drawArc(rect, 0, 360 * 16)
+        # the sweeping arc, rotating clockwise from -_angle
+        arc = QPen(color)
+        arc.setWidthF(2.4)
+        arc.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(arc)
+        p.drawArc(rect, int(-self._angle * 16), -self._SPAN)
+        # working count, bold, centred
+        f = QFont()
+        f.setPixelSize(11)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(color)
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, str(self._count))
         p.end()
 
 

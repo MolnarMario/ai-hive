@@ -129,11 +129,14 @@ def test_layout_popup_placement():
 
 def test_sidebar_count_badge():
     """The workspace row leads with an agent-count badge that also signals
-    status by colour: pulsing green when any agent works, amber when all idle,
-    red on error (green wins if something also runs), dim when empty. Folder/
-    delete buttons show ONLY on hover, never merely because the row is active."""
+    status by colour: green when agents are alive but idle, pulsing amber when
+    any agent works (amber wins if something also errors), red on error, dim
+    when empty. A right-edge spinner mirrors the working count (hidden at 0).
+    Folder/delete show ONLY on hover, never merely because the row is active."""
     from PySide6.QtCore import QAbstractAnimation
     from PySide6.QtWidgets import QApplication
+    from app.widgets.ornaments import AgentCountBadge
+    from app.ui_theme import Palette
     from app.widgets.sidebar import WorkspaceRow
 
     QApplication.instance() or QApplication([])
@@ -147,12 +150,12 @@ def test_sidebar_count_badge():
     b = badge(0, 0, 0, 0)
     check("badge: empty workspace -> empty state, count 0",
           b._state == "empty" and b._count == 0, (b._state, b._count))
-    # THE fix: 3 agents running but none producing output => standby, not green
+    # 3 agents running but none producing output => idle/standby (now GREEN)
     b = badge(3, 3, 0, 0)
-    check("badge: running but not busy -> idle (amber), count 3",
+    check("badge: running but not busy -> idle (green), count 3",
           b._state == "idle" and b._count == 3, (b._state, b._count))
     b = badge(3, 3, 1, 0)
-    check("badge: one busy -> working (green), pulsing",
+    check("badge: one busy -> working (amber), pulsing",
           b._state == "working"
           and b._anim.state() == QAbstractAnimation.State.Running,
           (b._state, b._anim.state()))
@@ -162,8 +165,30 @@ def test_sidebar_count_badge():
           and b._anim.state() != QAbstractAnimation.State.Running,
           (b._state, b._anim.state()))
     b = badge(2, 2, 1, 1)
-    check("badge: busy + error -> working wins (green)",
+    check("badge: busy + error -> working wins (amber)",
           b._state == "working", b._state)
+
+    # lock the flipped colour mapping: idle=green, working=amber/yellow
+    check("badge: idle maps to GREEN, working maps to YELLOW (amber)",
+          AgentCountBadge._STATE_COLOR["idle"]() == Palette.GREEN
+          and AgentCountBadge._STATE_COLOR["working"]() == Palette.YELLOW,
+          (AgentCountBadge._STATE_COLOR["idle"](),
+           AgentCountBadge._STATE_COLOR["working"]()))
+
+    # right-edge spinner: hidden + stopped at 0 working, shown + spinning + count
+    # when working (isHidden() reflects explicit show/hide intent, ancestor-free)
+    badge(3, 3, 0, 0)
+    check("spinner: no agents working -> hidden, animation stopped",
+          row.work_spinner.isHidden() and row.work_spinner._count == 0
+          and row.work_spinner._anim.state()
+          != QAbstractAnimation.State.Running,
+          (row.work_spinner.isHidden(), row.work_spinner._count))
+    badge(3, 3, 2, 0)
+    check("spinner: 2 agents working -> shown, count 2, spinning",
+          not row.work_spinner.isHidden() and row.work_spinner._count == 2
+          and row.work_spinner._anim.state()
+          == QAbstractAnimation.State.Running,
+          (row.work_spinner.isHidden(), row.work_spinner._count))
 
     # folder/delete are hover-only: activating the row must NOT reveal them.
     # Use isHidden() (explicit show/hide intent) not isVisible() — the row has
@@ -175,7 +200,309 @@ def test_sidebar_count_badge():
     row._update_hover_buttons(hovered=True)
     check("row: hover reveals folder/delete",
           not row.folder_btn.isHidden() and not row.delete_btn.isHidden())
+
+    # "?" waiting indicator: hidden when nobody waits, shown otherwise; clicking
+    # it opens the agent dropdown (agentsRequested)
+    row.set_stats({"total": 3, "active": 3, "busy": 1, "error": 0,
+                   "waiting": 0, "idle": 2})
+    check("q-badge: nobody waiting -> hidden", row.q_badge.isHidden())
+    row.set_stats({"total": 3, "active": 3, "busy": 1, "error": 0,
+                   "waiting": 2, "idle": 2})
+    check("q-badge: an agent waiting -> shown", not row.q_badge.isHidden())
+    asked = []
+    row.agentsRequested.connect(asked.append)
+    row.q_badge.click()
+    check("q-badge: click asks for the agent list (open dropdown)",
+          asked == ["w1"], asked)
     row.deleteLater()
+
+
+def test_agent_waiting():
+    """A settled Claude prompt/question flags the agent as waiting-for-input;
+    fresh output clears it, idle-at-prompt does not flag, exit clears it, and
+    bypassPermissions suppresses it."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.process_worker import AgentKind, build_spec
+
+    QApplication.instance() or QApplication([])
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Ask", cwd="."))
+    a.status = AgentStatus.RUNNING
+    events = []
+    a.waiting_changed.connect(events.append)
+
+    prompt = ("\x1b[1mDo you want to make this edit to app.py?\x1b[0m\r\n"
+              " \x1b[2m1.\x1b[0m Yes\r\n"
+              " 2. Yes, and don't ask again this session\r\n"
+              " 3. No, and tell Claude what to do differently\r\n"
+              "\x1b[7m> 1. Yes\x1b[0m\r\n? for shortcuts")
+    a._on_pty_output("pty", prompt)
+    check("waiting: not flagged while output is still fresh (busy)",
+          not a.is_waiting())
+    a._on_idle_timeout()                 # simulate the 2 s settle
+    check("waiting: settled permission prompt -> waiting + signal",
+          a.is_waiting() and events and events[-1] is True,
+          (a.is_waiting(), events))
+
+    a._on_pty_output("pty", "Bash(ls) running...\r\n")   # movement resumes
+    check("waiting: fresh output clears the waiting state", not a.is_waiting())
+
+    a._screen_tail = "esc to interrupt\n? for shortcuts"  # idle at prompt
+    a._on_idle_timeout()
+    check("waiting: idle-at-prompt (no question) is NOT waiting",
+          not a.is_waiting())
+
+    a._screen_tail = ("which approach?\r\n 1. rewrite it\r\n 2. patch it\r\n"
+                      " 3. leave as-is\r\n> 1. rewrite it")
+    a._on_idle_timeout()
+    check("waiting: an option menu (2+ numbered options) flags waiting",
+          a.is_waiting())
+
+    a._set_status(AgentStatus.EXITED_OK)
+    check("waiting: exit clears the waiting state", not a.is_waiting())
+
+    b = TerminalAgent(build_spec(AgentKind.CLAUDE, "Bypass", cwd="."))
+    b.spec.permission_mode = "bypassPermissions"
+    b.status = AgentStatus.RUNNING
+    b._screen_tail = "Do you want to proceed?\r\n 1. Yes\r\n 2. No"
+    b._on_idle_timeout()
+    check("waiting: bypassPermissions suppresses the prompt '?'",
+          not b.is_waiting())
+
+
+def test_sidebar_reorder():
+    """Drag-reorder: the sidebar's drop handler re-sequences its node model and
+    emits the new top-to-bottom ws-id order; a rebuild keeps every row."""
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.sidebar import Sidebar
+
+    QApplication.instance() or QApplication([])
+    sb = Sidebar()
+    sb.add_row("a", "Alpha", "A")
+    sb.add_row("b", "Bravo", "B")
+    sb.add_row("c", "Charlie", "C")
+    seen = []
+    sb.reordered.connect(lambda ids: seen.append(list(ids)))
+
+    check("reorder: initial order a,b,c",
+          sb._ws_node_ids() == ["a", "b", "c"], sb._ws_node_ids())
+    sb._on_node_dropped("workspace", "c", "a", "above")   # c above a
+    check("reorder: c dropped above a -> c,a,b",
+          sb._ws_node_ids() == ["c", "a", "b"], sb._ws_node_ids())
+    check("reorder: reordered signal carried the new order",
+          seen and seen[-1] == ["c", "a", "b"], seen)
+    sb._on_node_dropped("workspace", "c", "b", "below")   # c below b
+    check("reorder: c dropped below b -> a,b,c",
+          sb._ws_node_ids() == ["a", "b", "c"], sb._ws_node_ids())
+    check("reorder: rebuild kept all three rows",
+          set(sb._ws_widgets) == {"a", "b", "c"}, set(sb._ws_widgets))
+    order_before = sb._ws_node_ids()
+    sb._on_node_dropped("workspace", "b", "b", "below")   # dropped on itself
+    check("reorder: dropping a row on itself is a no-op",
+          sb._ws_node_ids() == order_before, sb._ws_node_ids())
+    sb.deleteLater()
+
+
+def test_manager_reorder_persist():
+    """WorkspaceManager.reorder_workspaces re-sequences workspaces, fires
+    sidebarLayoutChanged, and the order survives a session round-trip."""
+    from PySide6.QtWidgets import QApplication
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-reorder-"))
+    mgr = WorkspaceManager()
+    a = mgr.create_workspace("Alpha", str(tmp))
+    b = mgr.create_workspace("Bravo", str(tmp))
+    c = mgr.create_workspace("Charlie", str(tmp))
+    fired = []
+    mgr.sidebarLayoutChanged.connect(lambda: fired.append(True))
+
+    mgr.reorder_workspaces([c.id, a.id, b.id])
+    check("mgr reorder: workspaces now c,a,b",
+          [w.id for w in mgr.workspaces] == [c.id, a.id, b.id])
+    check("mgr reorder: sidebarLayoutChanged fired", bool(fired))
+
+    data = mgr.to_session_dict()
+    check("mgr reorder: session persists the new order",
+          [w["id"] for w in data["workspaces"]] == [c.id, a.id, b.id])
+    mgr2 = WorkspaceManager()
+    mgr2.load_session_dict(data)
+    check("mgr reorder: reload keeps c,a,b order",
+          [w.id for w in mgr2.workspaces] == [c.id, a.id, b.id])
+
+
+def test_sidebar_categories():
+    """Categories: create one, drag workspaces into/out of it, collapse it, and
+    delete it (its workspaces spill back out in place)."""
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.sidebar import Sidebar
+
+    QApplication.instance() or QApplication([])
+    sb = Sidebar()
+    for i in ("a", "b", "c"):
+        sb.add_row(i, i.upper(), i)
+    emits = []
+    sb.layoutChanged.connect(lambda nodes: emits.append(nodes))
+
+    cid = sb._add_category("Work")
+    check("cat: category node created", sb._cat_node(cid) is not None)
+    sb._on_node_dropped("workspace", "a", cid, "on")
+    sb._on_node_dropped("workspace", "b", cid, "on")
+    check("cat: a,b are children of the category",
+          sb._cat_node(cid)["children"] == ["a", "b"],
+          sb._cat_node(cid)["children"])
+    check("cat: c stays top-level; all three still present",
+          sb._ws_node_ids() == ["c", "a", "b"], sb._ws_node_ids())
+
+    sb._on_node_dropped("workspace", "a", "c", "above")  # a back out
+    check("cat: a moved out; category keeps only b",
+          sb._cat_node(cid)["children"] == ["b"],
+          sb._cat_node(cid)["children"])
+
+    sb._on_cat_toggled(cid)
+    check("cat: toggle collapses the category",
+          sb._cat_node(cid)["collapsed"] is True)
+
+    sb._on_cat_deleted(cid)
+    check("cat: delete removes category; child b spills back out",
+          sb._cat_node(cid) is None and set(sb._ws_node_ids()) == {"a", "b", "c"},
+          sb._ws_node_ids())
+    check("cat: layoutChanged fired on each structural change", len(emits) >= 5)
+    sb.deleteLater()
+
+
+def test_manager_categories_persist():
+    """A category layout (collapse state + membership + order) survives a v4
+    session round-trip, and a v3 session migrates to all-uncategorized."""
+    from PySide6.QtWidgets import QApplication
+    from app.workspace_manager import WorkspaceManager, SESSION_VERSION
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-cat-"))
+    mgr = WorkspaceManager()
+    a = mgr.create_workspace("Alpha", str(tmp))
+    b = mgr.create_workspace("Bravo", str(tmp))
+    c = mgr.create_workspace("Charlie", str(tmp))
+    mgr.apply_sidebar_layout([
+        {"type": "workspace", "id": a.id},
+        {"type": "category", "id": "cat1", "name": "Work",
+         "collapsed": True, "children": [c.id, b.id]},
+    ])
+    check("cat persist: flattened order is a, c, b",
+          [w.id for w in mgr.workspaces] == [a.id, c.id, b.id])
+
+    data = mgr.to_session_dict()
+    check("cat persist: session version is 4", data["version"] == SESSION_VERSION)
+    check("cat persist: sidebar key holds the category",
+          any(n["type"] == "category" and n["children"] == [c.id, b.id]
+              for n in data["sidebar"]), data["sidebar"])
+
+    mgr2 = WorkspaceManager()
+    mgr2.load_session_dict(data)
+    lay = mgr2.sidebar_layout()
+    cat = next((n for n in lay if n["type"] == "category"), None)
+    check("cat persist: reload restores the category + collapse + children",
+          cat is not None and cat["collapsed"] is True
+          and cat["children"] == [c.id, b.id], cat)
+    check("cat persist: reload keeps flattened order a, c, b",
+          [w.id for w in mgr2.workspaces] == [a.id, c.id, b.id])
+
+    # a v3 session (no "sidebar" key) migrates to all-uncategorized in order
+    v3 = {"version": 3, "active": "",
+          "workspaces": [{"id": "x", "name": "X", "project_path": str(tmp),
+                          "layout": "auto", "terminals": []},
+                         {"id": "y", "name": "Y", "project_path": str(tmp),
+                          "layout": "auto", "terminals": []}]}
+    mgr3 = WorkspaceManager()
+    mgr3.load_session_dict(v3)
+    check("cat persist: v3 migrates to uncategorized in load order",
+          [n["id"] for n in mgr3.sidebar_layout()] == ["x", "y"]
+          and all(n["type"] == "workspace" for n in mgr3.sidebar_layout()))
+
+
+def test_agent_dropdown():
+    """The count badge opens an agent dropdown (without switching workspaces);
+    the dropdown lists the workspace's agents and relays a click as
+    (ws_id, agent_id) for the reveal."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.sidebar import WorkspaceRow
+    from app.widgets.agent_dropdown import AgentDropdown
+    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.process_worker import AgentKind, build_spec
+
+    QApplication.instance() or QApplication([])
+
+    # A) clicking the badge asks for agents but does NOT select the workspace
+    row = WorkspaceRow("w1", "Alpha", "p")
+    asked, selected = [], []
+    row.agentsRequested.connect(asked.append)
+    row.selected.connect(selected.append)
+    row.count_badge.clicked.emit()
+    check("dropdown: badge click asks for the agent list", asked == ["w1"], asked)
+    check("dropdown: badge click did NOT select/switch the workspace",
+          selected == [], selected)
+    row.deleteLater()
+
+    # B) the dropdown lists agents; a row click relays (ws_id, agent_id)
+    a1 = TerminalAgent(build_spec(AgentKind.CLAUDE, "One", cwd="."))
+    a2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Two", cwd="."))
+    a1.status = AgentStatus.RUNNING
+    a1.current_task = "refactoring the parser"
+    dd = AgentDropdown("w1", [a1, a2])
+    check("dropdown: one row per workspace agent", len(dd._rows) == 2,
+          len(dd._rows))
+    check("dropdown: row shows the agent name",
+          dd._rows[0].name.text() == "One", dd._rows[0].name.text())
+    relayed = []
+    dd.agentActivated.connect(lambda w, a: relayed.append((w, a)))
+    QTest.mouseClick(dd._rows[0], Qt.MouseButton.LeftButton)
+    check("dropdown: clicking a row relays (ws_id, agent_id)",
+          relayed == [("w1", a1.id)], relayed)
+    dd.deleteLater()
+    a1.deleteLater()
+    a2.deleteLater()
+
+
+def test_reveal_agent():
+    """_reveal_agent (shared by the map + the dropdown) switches to the agent's
+    workspace and finds its terminal card."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.session_store import SessionStore
+    from app.process_worker import AgentKind, build_spec
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-reveal-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    pump(150)
+    mgr = win.manager
+    ws1 = mgr.workspaces[0]
+    ws2 = mgr.create_workspace("Two", str(tmp))
+    a2 = mgr.add_terminal(ws2.id, build_spec(AgentKind.CMD, "Agent X",
+                                             cwd=str(tmp)), autostart=False)
+    pump(120)
+    mgr.set_active(ws1.id)
+    pump(60)
+    check("reveal: precondition active is ws1", mgr.active_id == ws1.id)
+    win._reveal_agent(ws2.id, a2.id)
+    pump(80)
+    check("reveal: switched to the agent's workspace", mgr.active_id == ws2.id)
+    check("reveal: the agent's card was located",
+          win._pages[ws2.id].card_for(a2.id) is not None)
+    win.close()
 
 
 def test_agent_busy_activity():
@@ -445,6 +772,45 @@ def test_app():
     check("rename: Enter commits", mgr.workspace(alpha.id).name == "AlphaPrime")
     mgr.rename_workspace(alpha.id, "Alpha")
     pump(50)
+
+    # card header: inline agent-name rename (mirrors the workspace-row UX)
+    rc = page.cards[0]
+    orig_name = rc.agent.spec.name
+    orig_role = rc.agent.spec.role
+    QTest.mouseDClick(rc.title, Qt.MouseButton.LeftButton)
+    check("card rename: double-click opens the editor",
+          rc._renaming and rc.title_edit.isVisible())
+    # Escape cancels without changing the name
+    rc.title_edit.setText("NopeName")
+    QTest.keyClick(rc.title_edit, Qt.Key.Key_Escape)
+    pump(50)
+    check("card rename: Escape cancels",
+          not rc._renaming and rc.agent.spec.name == orig_name
+          and rc.title.text() == orig_name, rc.agent.spec.name)
+    # Enter commits: set_name updates the name+title, role stays, name is custom
+    rc.start_rename()
+    rc.title_edit.setText("MyCoder")
+    QTest.keyClick(rc.title_edit, Qt.Key.Key_Return)
+    pump(50)
+    check("card rename: Enter commits the new name",
+          rc.agent.spec.name == "MyCoder" and rc.title.text() == "MyCoder"
+          and rc.agent.spec.role == orig_role and rc.agent.spec.custom_name,
+          f"name={rc.agent.spec.name} role={rc.agent.spec.role}")
+
+    # task summary: the header shows what the agent is working on (its task) to
+    # the right of the name, so several agents are tellable apart at a glance
+    long_task = "Refactor the authentication module and add integration tests"
+    rc.agent.set_task(long_task)
+    pump(20)
+    check("task summary: header shows the current task",
+          rc.task_summary.isVisible()
+          and rc.task_summary.toolTip() == long_task
+          and rc.task_summary.text().startswith("Refactor"),
+          rc.task_summary.text())
+    rc.agent.set_task("")
+    pump(20)
+    check("task summary: hidden when there is no task",
+          not rc.task_summary.isVisible())
 
     # history: draft survives an accidental Up
     any_card = page.cards[0]
@@ -818,6 +1184,35 @@ def test_terminal_mouse_words_links():
     click(0, 8, button=Qt.MouseButton.MiddleButton)  # middle-click still works
     check("mouse: middle-click still opens the link",
           opened == [("url", "https://example.com/docs")], opened)
+
+    # plain left-click places the caret: send Left/Right arrows to the child so
+    # its input cursor lands on the clicked column (exact on the caret's line)
+    v3 = TerminalView(rows=6, cols=80)
+    v3.feed("hello")                      # child caret ends at column 5, row 0
+    moves = []
+    v3.keyInput.connect(moves.append)
+
+    def caret_click(row, col):
+        p = QPointF(CELL_PAD_X + (col + 0.5) * v3._cell_w,
+                    CELL_PAD_Y + (row + 0.5) * v3._cell_h)
+        a = (p, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+             Qt.KeyboardModifier.NoModifier)
+        v3.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, *a))
+        v3.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, *a))
+
+    caret_click(0, 2)   # 3 columns left of the caret
+    check("mouse: click left of the caret sends Left arrows",
+          moves == ["\x1b[D" * 3], moves)
+    moves.clear()
+    caret_click(0, 7)   # 2 columns right of the caret (pty is inert in-test)
+    check("mouse: click right of the caret sends Right arrows",
+          moves == ["\x1b[C" * 2], moves)
+    moves.clear()
+    caret_click(3, 4)   # a row that isn't the caret's line
+    check("mouse: click off the caret's line never nudges it", moves == [], moves)
+    moves.clear()
+    caret_click(0, 5)   # exactly on the caret -> nothing to send
+    check("mouse: click on the caret sends nothing", moves == [], moves)
 
 
 def test_session_migration():
@@ -1211,7 +1606,7 @@ def test_v3_features():
     from PySide6.QtCore import QEventLoop, QTimer
 
     from app import orchestration, providers
-    from app.process_worker import AgentKind, build_spec
+    from app.process_worker import AgentKind, AgentSpec, build_spec
     from app.terminal_agent import AssignmentState, TerminalAgent
     from app.widgets.terminal_view import TerminalView
     from app.workspace_manager import WorkspaceManager
@@ -1255,6 +1650,24 @@ def test_v3_features():
     check("v3 roles: infer testing", orchestration.infer_role("add pytest coverage") == "Testing Agent")
     _, a = providers.build_invocation("claude", effort="ultracode")
     check("v3 ultracode: never a launch flag", "--effort" not in a)
+
+    # --- permission mode (Shift+Tab modes) startup flag (Claude) ------------
+    _, pm_default = providers.build_invocation("claude")
+    check("perm-mode: default omits the flag (today's behavior)",
+          "--permission-mode" not in pm_default, pm_default)
+    _, pm_plan = providers.build_invocation("claude", permission_mode="plan")
+    check("perm-mode: chosen mode becomes --permission-mode <mode>",
+          pm_plan == ["--permission-mode", "plan"], pm_plan)
+    _, pm_bad = providers.build_invocation("claude", permission_mode="bogus")
+    check("perm-mode: an unknown mode never reaches the CLI",
+          "--permission-mode" not in pm_bad, pm_bad)
+    pm_spec = build_spec(AgentKind.CLAUDE, "PM", cwd=str(tmp),
+                         permission_mode="acceptEdits")
+    check("perm-mode: build_spec bakes it into args + persists round-trip",
+          "--permission-mode" in pm_spec.effective_args()
+          and "acceptEdits" in pm_spec.effective_args()
+          and AgentSpec.from_dict(pm_spec.to_dict()).permission_mode
+          == "acceptEdits", pm_spec.to_dict())
 
     # --- orchestration primitives via a fast line-mode echo agent ---
     mgr = WorkspaceManager()
@@ -1731,7 +2144,7 @@ def test_review_fixes():
     from PySide6.QtWidgets import QApplication
 
     from app.orchestrator_bridge import OrchestratorBridge, _RpcError
-    from app.process_worker import AgentKind, build_spec
+    from app.process_worker import AgentKind, AgentSpec, build_spec
     from app.session_store import SessionStore
     from app.terminal_agent import AssignmentState
     from app.workspace_manager import WorkspaceManager
@@ -1771,6 +2184,47 @@ def test_review_fixes():
     before = dirty_count["n"]
     a1.set_role("Docs Writer")
     check("autosave: role change marks dirty", dirty_count["n"] > before)
+
+    # --- manual rename (set_name) decouples the display name from the role ---
+    # isolated in its own workspace so it never disturbs the scope tests below,
+    # which resolve a1/b1 by their names.
+    ws_c = mgr.create_workspace("ScopeC", project_path=str(tmp))
+    r1 = mgr.add_terminal(ws_c.id, build_spec(AgentKind.CMD, "Agent 1",
+                                              cwd=str(tmp)), autostart=False)
+    r1.set_role("Docs Writer")
+    names_seen = []
+    r1.name_changed.connect(lambda n: names_seen.append(n))
+    before = dirty_count["n"]
+    r1.set_name("Scribe")
+    check("rename: set_name changes only the display name",
+          r1.spec.name == "Scribe" and r1.spec.role == "Docs Writer",
+          f"name={r1.spec.name} role={r1.spec.role}")
+    check("rename: set_name flags the name custom", r1.spec.custom_name)
+    check("rename: set_name emits name_changed", names_seen == ["Scribe"],
+          names_seen)
+    check("rename: set_name marks dirty", dirty_count["n"] > before)
+    # a later orchestrator retask updates the role but NEVER the custom name
+    r1.set_role("Backend Architect")
+    check("rename: set_role keeps a custom name, updates the role",
+          r1.spec.name == "Scribe" and r1.spec.role == "Backend Architect",
+          f"name={r1.spec.name} role={r1.spec.role}")
+    # a NON-custom agent still renames both (no regression to the old coupling)
+    r2 = mgr.add_terminal(ws_c.id, build_spec(AgentKind.CMD, "Agent 2",
+                                              cwd=str(tmp)), autostart=False)
+    r2.set_role("Tester")
+    check("rename: set_role renames both when name is not custom",
+          r2.spec.name == "Tester" and r2.spec.role == "Tester"
+          and not r2.spec.custom_name,
+          f"name={r2.spec.name} custom={r2.spec.custom_name}")
+    # persistence round-trip: custom_name survives to_dict/from_dict
+    restored = AgentSpec.from_dict(r1.spec.to_dict())
+    check("rename: custom_name round-trips through to_dict/from_dict",
+          restored.name == "Scribe" and restored.custom_name is True,
+          f"name={restored.name} custom={restored.custom_name}")
+    # degraded save path keeps the flag too (a malformed agent must not lose it)
+    safe = mgr._agent_dict_safe(r1)
+    check("rename: custom_name present for serialize", "custom_name" in safe)
+    mgr.remove_workspace(ws_c.id)
 
     # --- workspace-scoped orchestrator dispatch ---
     saves = {"n": 0}
@@ -2011,8 +2465,9 @@ def test_transcript_backups():
 def test_agent_file_map():
     """The Agent/File Map visualizer: (1) the transcript parser attributes
     edited vs read files and detects Task sub-agents while skipping malformed
-    lines; (2) the window builds its node model (private + shared files) and
-    paints headlessly; (3) the workspace-header button opens the window."""
+    lines; (2) the window builds its Tree-view node model (file hierarchy +
+    agent hubs + owner connectors) and paints headlessly; (3) the workspace-
+    header button opens the window. Tree is the ONLY view (Bubble was removed)."""
     import json as _json
 
     from app import file_activity, transcripts
@@ -2081,37 +2536,45 @@ def test_agent_file_map():
         ws = Workspace(id="mapws", name="Map WS", project_path=str(tmp),
                        agents=[_Agent("Agent 1", "aaa"), _Agent("Agent 2", "bbb")])
 
-        # -- 2. window model + paint -------------------------------------
+        # -- 2. window model + paint (Tree is the only view) ------------
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QColor
+        from app.widgets import agent_file_map as afm
+        from app.widgets.agent_file_map import _open_with, _opaque_tint
         win = AgentFileMapWindow()
         win.set_workspace(ws)
         canvas = win.canvas
         check("map: two agent hubs in the model", len(canvas._agents) == 2)
-        check("map: shared.py placed in the shared band",
-              len(canvas._shared) == 1
-              and canvas._shared[0].basename == "shared.py")
         a1 = next(a for a in canvas._agents if a.name == "Agent 1")
-        check("map: Agent 1 private files exclude the shared one",
-              [f.basename for f in a1.private] == ["only_a.py"])
         check("map: Agent 1 shows its sub-agent satellite", len(a1.subs) == 1)
+        # tree view builds a folder+file hierarchy from the union of touched files
+        rows = canvas._tree_rows
+        check("map: tree builds a folder+file hierarchy",
+              any(r.is_dir for r in rows) and any(not r.is_dir for r in rows))
+        shared_row = next((r for r in rows if not r.is_dir and r.file
+                           and r.file.basename == "shared.py"), None)
+        check("map: a shared file is one row with an owner per agent",
+              shared_row is not None and len(shared_row.file.owners) == 2)
+        check("map: only_a.py appears as its own row",
+              any((not r.is_dir) and r.file and r.file.basename == "only_a.py"
+                  for r in rows))
         check("map: canvas paints headlessly without error",
-              not win.canvas.grab().isNull())
+              not canvas.grab().isNull())
 
-        # -- interactions ------------------------------------------------
-        from PySide6.QtCore import QPointF
-        from app.widgets import agent_file_map as afm
-        canvas = win.canvas
+        # -- interactions (agents drag; the file tree is structural) -----
         a1v = next(a for a in canvas._agents if a.name == "Agent 1")
         # drag: an override placement survives the next model refresh
-        canvas._overrides["bubble|" + afm._aid(a1v)] = QPointF(640, 500)
+        canvas._overrides[afm._aid(a1v)] = QPointF(700, 320)
         win.refresh()
         a1v = next(a for a in win.canvas._agents if a.name == "Agent 1")
-        check("map: dragged position persists across refresh",
-              a1v.center.x() == 640 and a1v.center.y() == 500)
-        # hit-testing resolves the node under a scene point
+        check("map: dragged agent position persists across refresh",
+              a1v.center.x() == 700 and a1v.center.y() == 320)
         check("map: hit-test finds the agent hub at its center",
               canvas._hit(a1v.center)[0] == "agent")
-        f1 = a1v.private[0]
-        check("map: hit-test finds a file square", canvas._hit(f1.center)[0] == "file")
+        shared_row = next(r for r in canvas._tree_rows if not r.is_dir
+                          and r.file and r.file.basename == "shared.py")
+        check("map: hit-test finds a file row",
+              canvas._hit(shared_row.rect.center())[0] == "file")
         # zoom changes the scale and grows the scrollable canvas
         before = canvas.minimumSize().width()
         canvas._set_scale(2.0)
@@ -2126,31 +2589,6 @@ def test_agent_file_map():
         # switching workspace resets manual placement
         canvas.reset_view()
         check("map: reset_view clears manual overrides", canvas._overrides == {})
-
-        # -- tree view + opaque hubs + open-with --------------------------
-        from PySide6.QtGui import QColor
-        from app.widgets.agent_file_map import _open_with, _opaque_tint
-        win._toggle_view()
-        check("map: toggles to tree view", canvas.mode() == "tree")
-        # agents must be draggable in tree view too (a dragged position, stored
-        # under the tree-namespaced key, must survive relayout — the reported
-        # "can't drag the agents" bug was tree ignoring overrides)
-        tav = canvas._agents[0]
-        canvas._overrides["tree|" + afm._aid(tav)] = QPointF(700, 320)
-        canvas._relayout()
-        tav = canvas._agents[0]
-        check("map: agents are draggable in tree view",
-              tav.center.x() == 700 and tav.center.y() == 320)
-        rows = canvas._tree_rows
-        check("map: tree view builds a folder+file hierarchy",
-              any(r.is_dir for r in rows) and any(not r.is_dir for r in rows))
-        check("map: tree view lists a touched file as a row",
-              any((not r.is_dir) and r.file and r.file.basename == "shared.py"
-                  for r in rows))
-        check("map: tree view still hit-tests file rows", len(canvas._hit_files) >= 1)
-        check("map: tree view paints without error", not canvas.grab().isNull())
-        win._toggle_view()
-        check("map: toggles back to bubble view", canvas.mode() == "bubble")
         check("map: agent hub fill is opaque",
               _opaque_tint(QColor(0, 255, 0)).alpha() == 255)
         _open_with(str(tmp / "nope.py"))   # missing file -> must not raise
@@ -2171,7 +2609,46 @@ def test_agent_file_map():
             crash, crows = True, []
         check("map: tree builder survives file/folder name collision",
               not crash and len(crows) >= 3)
+
+        # -- Write/Read line filters (header toggles) ---------------------
+        check("map: edges default to both edited+read visible",
+              canvas._show_edited and canvas._show_read)
+        win.read_btn.setChecked(False)
+        check("map: unchecking Read hides read-only edges only",
+              canvas._show_read is False and canvas._show_edited is True
+              and canvas._edge_visible(True) and not canvas._edge_visible(False))
+        win.write_btn.setChecked(False)
+        check("map: unchecking Write hides edited edges too (independent)",
+              not canvas._edge_visible(True) and not canvas._edge_visible(False))
+        check("map: canvas still paints with lines filtered off",
+              not canvas.grab().isNull())
+        win.read_btn.setChecked(True); win.write_btn.setChecked(True)
+        check("map: re-checking restores both line kinds",
+              canvas._edge_visible(True) and canvas._edge_visible(False))
         win.close()
+
+        # -- tree agents are vertically centered (middle-right) -----------
+        from app.widgets.agent_file_map import AgentFileMapCanvas, _AgentVis
+        c2 = AgentFileMapCanvas()
+        many = [_FileVis(path=os.path.join(str(tmp), "pkg", f"f{i}.py"),
+                         basename=f"f{i}.py", edited=(i % 2 == 0),
+                         owners=[(0, i % 2 == 0)]) for i in range(16)]
+        avs2 = [_AgentVis(agent_id="x", name="A", role="", state="idle",
+                          is_claude=True, truncated=False),
+                _AgentVis(agent_id="y", name="B", role="", state="idle",
+                          is_claude=True, truncated=False)]
+        c2.set_model(avs2, many)
+        ys = sorted(a.center.y() for a in c2._agents)
+        tree_bottom = afm._TREE_TOP + len(c2._tree_rows) * afm._TREE_ROW
+        mid_agents = (ys[0] + ys[-1]) / 2
+        mid_tree = (afm._TREE_TOP + tree_bottom) / 2
+        check("map: tree agents are vertically centered, not pinned top-right",
+              abs(mid_agents - mid_tree) < 1.0
+              and ys[0] > afm._TREE_TOP + afm._HUB_R + 10)
+        step = ys[1] - ys[0]
+        check("map: stacked agent bubbles do not overlap (gap > hub diameter)",
+              step > 2 * afm._HUB_R)
+        c2.deleteLater()
 
         # -- 3. header button wiring -------------------------------------
         from app.widgets.workspace_page import WorkspacePage
@@ -3062,6 +3539,21 @@ def test_resume_picker():
         fresh = dlg.result_spec(cwd=str(cwd))
         check("resume: 'New conversation' starts fresh (no resume)",
               not fresh.resume and not fresh.session_id)
+
+        # -- permission-mode (Shift+Tab) picker: Claude-only, default = Normal
+        mode_vals = [dlg.mode_combo.itemData(i)
+                     for i in range(dlg.mode_combo.count())]
+        check("perm-mode: dialog offers the Shift+Tab modes for Claude",
+              not dlg.mode_combo.isHidden() and mode_vals[0] == ""
+              and "acceptEdits" in mode_vals and "plan" in mode_vals, mode_vals)
+        check("perm-mode: default selection carries no flag",
+              dlg.result_spec(cwd=str(cwd)).permission_mode == "")
+        dlg.mode_combo.setCurrentIndex(mode_vals.index("plan"))
+        pm_dlg_spec = dlg.result_spec(cwd=str(cwd))
+        check("perm-mode: chosen mode flows into the spec",
+              pm_dlg_spec.permission_mode == "plan"
+              and pm_dlg_spec.effective_args()[-2:] == ["--permission-mode", "plan"],
+              pm_dlg_spec.effective_args())
     finally:
         for k, v in (("HOME", old_home), ("USERPROFILE", old_up)):
             if v is None:
@@ -3226,6 +3718,13 @@ def main():
     test_tiling()
     test_layout_popup_placement()
     test_sidebar_count_badge()
+    test_agent_waiting()
+    test_sidebar_reorder()
+    test_manager_reorder_persist()
+    test_sidebar_categories()
+    test_manager_categories_persist()
+    test_agent_dropdown()
+    test_reveal_agent()
     test_agent_busy_activity()
     test_ansi()
     test_terminal_keys()

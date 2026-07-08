@@ -76,6 +76,9 @@ class AgentSpec:
     kind: AgentKind
     name: str
     role: str = ""
+    # user manually renamed the display name: an orchestrator retask
+    # (set_role) then updates only the role, never clobbers the chosen name
+    custom_name: bool = False
     program: str = ""
     args: list = field(default_factory=list)
     cwd: str = ""
@@ -91,6 +94,10 @@ class AgentSpec:
     provider: str = ""       # provider key: "claude" | "openai" | "gemini"
     model: str = ""          # "" = provider default
     effort: str = ""         # "" = provider default (Claude: low..max)
+    # Claude startup permission mode (a Shift+Tab mode). "" = omit the flag =
+    # the CLI's own default (today's behavior). Baked into `args` by build_spec
+    # via providers.build_invocation, like model/effort.
+    permission_mode: str = ""
     custom_command: str = ""  # user override for template providers
     font_px: int = 0         # 0 = follow the global/default size
     # extra system-prompt text injected for coordination (Claude)
@@ -162,10 +169,12 @@ class AgentSpec:
     def to_dict(self) -> dict:
         return {
             "kind": self.kind.value, "name": self.name, "role": self.role,
+            "custom_name": self.custom_name,
             "cwd": self.cwd, "user_program": self.user_program,
             "user_args": list(self.user_args), "pty": self.pty,
             "provider": self.provider, "model": self.model,
-            "effort": self.effort, "custom_command": self.custom_command,
+            "effort": self.effort, "permission_mode": self.permission_mode,
+            "custom_command": self.custom_command,
             "font_px": self.font_px, "is_orchestrator": self.is_orchestrator,
             "session_id": self.session_id,
         }
@@ -179,6 +188,7 @@ class AgentSpec:
             args=list(d.get("user_args", [])),
             pty=bool(d.get("pty", False)),
             model=d.get("model", ""), effort=d.get("effort", ""),
+            permission_mode=d.get("permission_mode", ""),
             custom_command=d.get("custom_command", ""),
             font_px=int(d.get("font_px", 0) or 0),
             is_orchestrator=bool(d.get("is_orchestrator", False)),
@@ -186,6 +196,7 @@ class AgentSpec:
         # restored agents keep their pinned conversation ("" = legacy, which
         # resumes via --continue once and gets pinned on its next fresh start)
         spec.session_id = str(d.get("session_id", "") or "")
+        spec.custom_name = bool(d.get("custom_name", False))
         return spec
 
 
@@ -197,7 +208,8 @@ def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
                program: str = "", args: list | None = None,
                pty: bool = False, model: str = "", effort: str = "",
                custom_command: str = "", font_px: int = 0,
-               is_orchestrator: bool = False) -> AgentSpec:
+               is_orchestrator: bool = False,
+               permission_mode: str = "") -> AgentSpec:
     """Profile factory: fills in the verified per-shell invocation modes.
 
     When pty=True the shells launch in their INTERACTIVE form (real prompt,
@@ -211,7 +223,8 @@ def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
     if kind in PTY_ONLY_KINDS:
         pty = True
     spec = AgentSpec(kind=kind, name=name, role=role, cwd=cwd, pty=pty,
-                     model=model, effort=effort, custom_command=custom_command,
+                     model=model, effort=effort, permission_mode=permission_mode,
+                     custom_command=custom_command,
                      font_px=font_px, is_orchestrator=is_orchestrator,
                      user_program=program, user_args=args)
     if kind in AI_KINDS:
@@ -219,7 +232,8 @@ def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
         prov = providers.get(spec.provider)
         prog, prov_args = providers.build_invocation(
             spec.provider, model=model, effort=effort,
-            custom_command=custom_command, extra_args=args)
+            custom_command=custom_command, extra_args=args,
+            permission_mode=permission_mode)
         spec.program = prog
         spec.args = prov_args
         spec.role = role or (prov.display if prov else spec.provider)

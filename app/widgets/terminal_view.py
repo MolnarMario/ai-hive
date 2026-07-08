@@ -40,8 +40,12 @@ Ctrl+Z/Ctrl+Y are NOT undo/redo -- a terminal keeps no local edit buffer, so
 they forward their control bytes (0x1a/0x19) to the child, which owns line
 editing.
 
-Mouse: double-click selects the whitespace-delimited word under the pointer
-(then Ctrl+C copies it); Ctrl+click (or middle/scroll-wheel click) opens a URL
+Mouse: a plain left-click places the input caret where you clicked, by sending
+the child the right number of Left/Right arrows (exact on the caret's own line;
+a terminal can't set the child's cursor directly). A drag selects text instead
+and never moves the caret. Double-click selects the whitespace-delimited word
+under the pointer (then Ctrl+C copies it); Ctrl+click (or middle/scroll-wheel
+click) opens a URL
 or an existing ABSOLUTE local file path under the pointer via the OS default
 handler (_link_at/_classify_link/_open_target). Ctrl+LEFT-click is primary --
 the left button always delivers, while the middle button is often eaten by the
@@ -664,11 +668,34 @@ class TerminalView(QWidget):
         super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        # a plain click (no drag) clears the selection
-        if self._sel_anchor == self._sel_end:
+        # a plain click (no drag): place the input caret where you clicked, then
+        # drop the (empty) selection. A drag leaves a real selection to copy and
+        # never moves the caret.
+        if self._sel_anchor is not None and self._sel_anchor == self._sel_end:
+            if event.button() == Qt.MouseButton.LeftButton \
+                    and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                self._reposition_cursor(*self._sel_anchor)
             self._sel_anchor = self._sel_end = None
             self.update()
         super().mouseReleaseEvent(event)
+
+    def _reposition_cursor(self, row: int, col: int) -> None:
+        """Move the CHILD's input caret to (row, col) by sending arrow keys --
+        a terminal can't set the child's cursor directly. Non-destructive and
+        self-clamping (readline stops at the input's start/end). Exact on the
+        single line the caret is on (each Left/Right == one column on an
+        unwrapped line); only that row is handled, so clicking output rows or a
+        scrolled-back view never nudges the prompt."""
+        if self._scroll_offset:
+            return  # caret only meaningful on the live screen
+        if row != self.screen.cursor.y:
+            return  # only the caret's own line maps 1:1 to Left/Right
+        delta = col - self.screen.cursor.x
+        if not delta:
+            return
+        final = "C" if delta > 0 else "D"  # Right / Left
+        seq = ("\x1bO" if self._app_cursor_keys else "\x1b[") + final
+        self.keyInput.emit(seq * abs(delta))
 
     def _word_at(self, row: int, col: int):
         """(c0, c1) inclusive of the non-whitespace run at (row, col), or None

@@ -1,14 +1,17 @@
 """Agent / File Map: an interactive diagram of who is working on what.
 
-A separate, resizable top-level window (movable to another monitor) with TWO
-toggleable views of the active workspace:
+A separate, resizable top-level window (movable to another monitor) that draws a
+single **Tree** view of the active workspace: a VSCode-style file hierarchy
+(folders/subfolders) on the left, the agents as bubbles on the right VERTICALLY
+CENTERED against the tree (a "middle-right" overview so connectors fan both up
+and down, not all down from a top-corner cluster), and curved connectors from
+each agent to the file rows it touched — solid/gold for files it EDITED,
+thin/dashed for files it only READ.
 
-  - **Bubble** view: each agent is a round node and every file it touched is a
-    square node, edges between them — solid/gold for files it EDITED, thin/dashed
-    for files it only READ. Files touched by 2+ agents sit once in a shared band.
-  - **Tree** view: a VSCode-style file hierarchy (folders/subfolders) on the
-    left, the agents as bubbles on the right, and curved connectors from each
-    agent to the file rows it touched (same edited/read styling).
+The header **Write** / **Read** toggles hide the edited or read-only edges
+independently — for when you only care about one kind of activity. It is a
+paint-only filter (the file rows stay put; just their connectors vanish), and
+the legend greys the hidden kind so the state reads at a glance.
 
 Data comes from `file_activity.activity_for_agent`, which reads each Claude
 agent's pinned transcript (the only reliable per-agent file attribution AI Hive
@@ -17,10 +20,11 @@ satellite nodes on their parent hub (labeled with their type), but with NO file
 edges: their file ops are not recorded in any transcript AI Hive can read (files
 roll up to the parent). Non-Claude agents appear as hubs with no files.
 
-Interactions: drag a node to rearrange it (Bubble view; placement persists
-across the live refresh), drag empty space to pan, Ctrl+wheel or +/-/0 to zoom,
-single-click an agent to jump to its terminal card, double-click a file to open
-it, right-click a file for Open / Open with… / Reveal in folder / Copy path.
+Interactions: drag an agent (or its sub-agent satellites) to rearrange it
+(placement persists across the live refresh; the file tree is structural and not
+movable), drag empty space to pan, Ctrl+wheel or +/-/0 to zoom, single-click an
+agent to jump to its terminal card, double-click a file to open it, right-click
+a file for Open / Open with… / Reveal in folder / Copy path.
 
 The window is a TRANSIENT view: it only reads model state and must never mark
 the session dirty. Custom painting reads `Palette.*` at paint time so it follows
@@ -46,17 +50,10 @@ from ..ui_theme import Palette
 
 _ERROR = {AgentStatus.EXITED_ERR, AgentStatus.CRASHED, AgentStatus.FAILED}
 
-# --- bubble-view geometry (scene coords; the paint transform applies zoom) ---
+# --- geometry (scene coords; the paint transform applies zoom) ---
 _M = 30
-_COL_W = 220
 _HUB_R = 38
 _SUB_R = 13
-_FILE_W = 158
-_FILE_H = 30
-_HUB_Y = 108
-_FILE_TOP = 190
-_ROW_H = 42
-_SHARED_GAP = 46
 
 # --- tree-view geometry ---
 _TREE_LEFT = 20
@@ -76,11 +73,6 @@ class _FileVis:
     basename: str
     edited: bool
     owners: list = field(default_factory=list)   # [(agent_index, edited)]
-    center: QPointF = None
-
-    def rect(self) -> QRectF:
-        c = self.center
-        return QRectF(c.x() - _FILE_W / 2, c.y() - _FILE_H / 2, _FILE_W, _FILE_H)
 
 
 @dataclass
@@ -91,7 +83,6 @@ class _AgentVis:
     state: str
     is_claude: bool
     truncated: bool
-    private: list = field(default_factory=list)   # list[_FileVis]  (bubble view)
     subs: list = field(default_factory=list)      # list[(type, desc)]
     center: QPointF = None
     sub_pts: list = field(default_factory=list)
@@ -131,15 +122,17 @@ class AgentFileMapCanvas(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._agents: list[_AgentVis] = []
-        self._shared: list[_FileVis] = []
-        self._files_all: list[_FileVis] = []   # union of touched files (tree view)
-        self._mode = "bubble"
+        self._files_all: list[_FileVis] = []   # union of touched files
+        # line filters: hide edited ("write") or read-only edges independently,
+        # for when you only care about one kind of activity
+        self._show_edited = True
+        self._show_read = True
         self._empty_msg = ""
         self._scale = 1.0
         self._overrides: dict[str, QPointF] = {}
         self._scroll = None
         self._tree_rows: list[_TreeRow] = []
-        # generic hit lists, rebuilt each layout (mode-independent interaction)
+        # hit lists, rebuilt each layout
         self._hit_agents: list = []   # (center, radius, agent_vis)
         self._hit_subs: list = []     # (center, radius, (av, j))
         self._hit_files: list = []    # (rect, file_vis)
@@ -157,101 +150,37 @@ class AgentFileMapCanvas(QWidget):
     def set_scroll(self, scroll) -> None:
         self._scroll = scroll
 
-    def set_mode(self, mode: str) -> None:
-        if mode not in ("bubble", "tree") or mode == self._mode:
-            return
-        self._mode = mode
-        try:
-            self._relayout()
-        finally:
-            self.update()   # ALWAYS repaint, even if layout somehow raised —
-            # otherwise a layout throw on the toggle's slot freezes the view
+    def set_line_visibility(self, edited=None, read=None) -> None:
+        """Toggle whether edited ("write") and/or read-only edges are drawn.
+        Purely a paint concern — the model and layout are unchanged, so a
+        hidden line's file row stays put; only the connector disappears."""
+        if edited is not None:
+            self._show_edited = bool(edited)
+        if read is not None:
+            self._show_read = bool(read)
+        self.update()
 
-    def mode(self) -> str:
-        return self._mode
+    def _edge_visible(self, edited: bool) -> bool:
+        return self._show_edited if edited else self._show_read
 
     def reset_view(self) -> None:
         self._overrides = {}
         self._scale = 1.0
 
-    def set_model(self, agents, shared, files_all=None, empty_msg="") -> None:
+    def set_model(self, agents, files_all=None, empty_msg="") -> None:
         self._agents = agents
-        self._shared = shared
         self._files_all = files_all or []
         self._empty_msg = empty_msg
         try:
             self._relayout()
         finally:
-            self.update()
+            self.update()   # ALWAYS repaint, even if layout somehow raised
 
     # ------------------------------------------------------------- layout ---
 
     def _relayout(self) -> None:
         self._hit_agents, self._hit_subs, self._hit_files = [], [], []
         self._tree_rows = []
-        if self._mode == "tree":
-            self._relayout_tree()
-        else:
-            self._relayout_bubble()
-
-    def _resolve(self, nid, default):
-        # overrides are namespaced per view: dragging in Bubble and dragging in
-        # Tree are remembered independently (their coordinate spaces differ)
-        return self._overrides.get(f"{self._mode}|{nid}", default)
-
-    def _register_hits(self, files=True) -> None:
-        for av in self._agents:
-            self._hit_agents.append((av.center, _HUB_R, av))
-            for j, sp in enumerate(av.sub_pts):
-                self._hit_subs.append((sp, _SUB_R, (av, j)))
-
-    def _relayout_bubble(self) -> None:
-        n = len(self._agents)
-        max_rows = max((len(a.private) for a in self._agents), default=0)
-        content_w = max(_M * 2 + n * _COL_W, 520)
-        for i, av in enumerate(self._agents):
-            dx = _M + _COL_W / 2 + i * _COL_W
-            av.center = self._resolve(_aid(av), QPointF(dx, float(_HUB_Y)))
-            for r, fv in enumerate(av.private):
-                dfy = _FILE_TOP + _FILE_H / 2 + r * _ROW_H
-                fv.center = self._resolve(_fid(fv.path), QPointF(dx, dfy))
-                self._hit_files.append((fv.rect(), fv))
-            av.sub_pts = self._sub_defaults(av)
-            for j in range(len(av.subs)):
-                av.sub_pts[j] = self._resolve(_sid(av, j), av.sub_pts[j])
-        base = (_FILE_TOP + max_rows * _ROW_H) + _SHARED_GAP
-        for j, sv in enumerate(self._shared):
-            dfy = base + _FILE_H / 2 + j * _ROW_H
-            sv.center = self._resolve(_fid(sv.path), QPointF(content_w / 2, dfy))
-            self._hit_files.append((sv.rect(), sv))
-        self._register_hits()
-        self._resize_bubble()
-
-    def _sub_defaults(self, av) -> list:
-        c, k = av.center, len(av.subs)
-        pts, span = [], min(1.6, 0.5 * len(av.subs))
-        start, reach = -math.pi / 2 - span / 2, _HUB_R + 34
-        for j in range(k):
-            ang = start + (span * (j / (k - 1)) if k > 1 else span / 2)
-            pts.append(QPointF(c.x() + reach * math.cos(ang),
-                               c.y() + reach * math.sin(ang)))
-        return pts
-
-    def _resize_bubble(self) -> None:
-        xs, ys = [], []
-        for av in self._agents:
-            xs.append(av.center.x() + _HUB_R); ys.append(av.center.y() + _HUB_R)
-            for p in av.sub_pts:
-                xs.append(p.x() + _SUB_R); ys.append(p.y() + _SUB_R + 12)
-            for fv in av.private:
-                xs.append(fv.center.x() + _FILE_W / 2)
-                ys.append(fv.center.y() + _FILE_H / 2)
-        for sv in self._shared:
-            xs.append(sv.center.x() + _FILE_W / 2)
-            ys.append(sv.center.y() + _FILE_H / 2)
-        self._apply_size((max(xs) if xs else 500), (max(ys) if ys else 400))
-
-    def _relayout_tree(self) -> None:
         rows = _build_tree_rows(self._files_all)
         for i, row in enumerate(rows):
             y = _TREE_TOP + i * _TREE_ROW
@@ -263,10 +192,21 @@ class AgentFileMapCanvas(QWidget):
         self._tree_rows = rows
         tree_bottom = _TREE_TOP + len(rows) * _TREE_ROW
 
+        # Agents sit in a column on the right, but VERTICALLY CENTERED against
+        # the tree's extent (a "middle-right" overview) rather than pinned to the
+        # top — so connectors fan out both up and down instead of all diving down
+        # from a top-corner cluster. The stack keeps a fixed inter-hub step (the
+        # gap accounts for the hub, its caption, and any sub-agent satellites, so
+        # bubbles never overlap); it only slides down to the middle. If the stack
+        # is taller than the tree it stays clamped at the top and grows downward.
         agents_x = _TREE_W + _AGENT_GAP + _HUB_R
-        step = 2 * _HUB_R + 44
+        step = 2 * _HUB_R + 60
+        n = len(self._agents)
+        floor_y = _TREE_TOP + _HUB_R + 10
+        block = (n - 1) * step
+        start_y = max(floor_y, (_TREE_TOP + tree_bottom) / 2 - block / 2)
         for i, av in enumerate(self._agents):
-            default = QPointF(float(agents_x), _TREE_TOP + _HUB_R + 10 + i * step)
+            default = QPointF(float(agents_x), start_y + i * step)
             av.center = self._resolve(_aid(av), default)   # honor drag placement
             av.sub_pts = self._sub_defaults(av)
             for j in range(len(av.subs)):
@@ -275,6 +215,25 @@ class AgentFileMapCanvas(QWidget):
         agents_bottom = (self._agents[-1].center.y() + _HUB_R
                          if self._agents else _TREE_TOP)
         self._apply_size(agents_x + _HUB_R, max(tree_bottom, agents_bottom))
+
+    def _resolve(self, nid, default):
+        return self._overrides.get(nid, default)
+
+    def _register_hits(self) -> None:
+        for av in self._agents:
+            self._hit_agents.append((av.center, _HUB_R, av))
+            for j, sp in enumerate(av.sub_pts):
+                self._hit_subs.append((sp, _SUB_R, (av, j)))
+
+    def _sub_defaults(self, av) -> list:
+        c, k = av.center, len(av.subs)
+        pts, span = [], min(1.6, 0.5 * len(av.subs))
+        start, reach = -math.pi / 2 - span / 2, _HUB_R + 34
+        for j in range(k):
+            ang = start + (span * (j / (k - 1)) if k > 1 else span / 2)
+            pts.append(QPointF(c.x() + reach * math.cos(ang),
+                               c.y() + reach * math.sin(ang)))
+        return pts
 
     def _apply_size(self, w, h) -> None:
         self.setMinimumSize(int((w + _M) * self._scale), int((h + _M) * self._scale))
@@ -293,29 +252,8 @@ class AgentFileMapCanvas(QWidget):
             return
         self._draw_legend(p)
         p.scale(self._scale, self._scale)
-        if self._mode == "tree":
-            self._paint_tree(p)
-        else:
-            self._paint_bubble(p)
+        self._paint_tree(p)
         p.end()
-
-    def _paint_bubble(self, p) -> None:
-        for av in self._agents:
-            for fv in av.private:
-                self._draw_edge(p, av.center, fv.center, fv.edited)
-        for sv in self._shared:
-            for (idx, edited) in sv.owners:
-                if 0 <= idx < len(self._agents):
-                    self._draw_edge(p, self._agents[idx].center, sv.center, edited)
-        for av in self._agents:
-            for fv in av.private:
-                self._draw_file(p, fv.rect(), fv.basename, fv.edited)
-        for sv in self._shared:
-            self._draw_file(p, sv.rect(), sv.basename, any(e for _, e in sv.owners))
-        for av in self._agents:
-            self._draw_subs(p, av)
-        for av in self._agents:
-            self._draw_hub(p, av)
 
     def _paint_tree(self, p) -> None:
         if not self._tree_rows:   # agents but no attributed files yet
@@ -330,7 +268,7 @@ class AgentFileMapCanvas(QWidget):
             if row.is_dir or row.file is None:
                 continue
             for (idx, edited) in row.file.owners:
-                if 0 <= idx < len(self._agents):
+                if self._edge_visible(edited) and 0 <= idx < len(self._agents):
                     start = self._agents[idx].center - QPointF(_HUB_R, 0)
                     self._draw_curve(p, start, row.anchor, edited)
         # the file hierarchy
@@ -367,11 +305,6 @@ class AgentFileMapCanvas(QWidget):
         for av in self._agents:
             self._draw_hub(p, av)
 
-    def _draw_edge(self, p, a, b, edited) -> None:
-        p.setPen(_edge_pen(edited))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawLine(a, b)
-
     def _draw_curve(self, p, a, b, edited) -> None:
         # a smooth S-curve from the agent (right) to the file anchor (left)
         path = QPainterPath(a)
@@ -380,19 +313,6 @@ class AgentFileMapCanvas(QWidget):
         p.setPen(_edge_pen(edited))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
-
-    def _draw_file(self, p, rect, basename, edited) -> None:
-        p.setBrush(QColor(Palette.BG_CARD))
-        border = QColor(Palette.ACCENT_GOLD if edited else Palette.BORDER)
-        pen = QPen(border); pen.setWidthF(1.6 if edited else 1.0)
-        p.setPen(pen)
-        p.drawRoundedRect(rect, 5, 5)
-        p.setPen(QColor(Palette.TEXT if edited else Palette.TEXT_DIM))
-        f = QFont(); f.setPixelSize(11); f.setBold(edited); p.setFont(f)
-        fm = QFontMetrics(f)
-        p.drawText(rect, Qt.AlignmentFlag.AlignCenter,
-                   fm.elidedText(basename, Qt.TextElideMode.ElideMiddle,
-                                 int(rect.width() - 12)))
 
     def _draw_hub(self, p, av) -> None:
         c, r = av.center, _HUB_R
@@ -437,15 +357,21 @@ class AgentFileMapCanvas(QWidget):
                        fm.elidedText(label, Qt.TextElideMode.ElideRight, 66))
 
     def _draw_legend(self, p) -> None:
+        # a hidden line-type is greyed in the legend so the toggle state reads
+        # at a glance ("off" == faint, not merely absent)
         x, y = 14, 12
         f = QFont(); f.setPixelSize(10); p.setFont(f)
-        pen = QPen(QColor(Palette.ACCENT_GOLD)); pen.setWidthF(2.2); p.setPen(pen)
+        edited_c = QColor(Palette.ACCENT_GOLD if self._show_edited
+                          else Palette.TEXT_FAINT)
+        pen = QPen(edited_c); pen.setWidthF(2.2); p.setPen(pen)
         p.drawLine(QPointF(x, y + 6), QPointF(x + 26, y + 6))
-        p.setPen(QColor(Palette.TEXT_DIM)); p.drawText(QPointF(x + 32, y + 10), "edited")
-        pen = QPen(QColor(Palette.TEXT_DIM)); pen.setWidthF(1.3)
+        p.setPen(QColor(Palette.TEXT_DIM if self._show_edited else Palette.TEXT_FAINT))
+        p.drawText(QPointF(x + 32, y + 10), "edited")
+        read_c = QColor(Palette.TEXT_DIM if self._show_read else Palette.TEXT_FAINT)
+        pen = QPen(read_c); pen.setWidthF(1.3)
         pen.setStyle(Qt.PenStyle.DashLine); p.setPen(pen)
         p.drawLine(QPointF(x + 84, y + 6), QPointF(x + 110, y + 6))
-        p.setPen(QColor(Palette.TEXT_DIM)); p.drawText(QPointF(x + 116, y + 10), "read")
+        p.setPen(read_c); p.drawText(QPointF(x + 116, y + 10), "read")
 
     # ---------------------------------------------------------- hit-test ---
 
@@ -468,9 +394,7 @@ class AgentFileMapCanvas(QWidget):
     def _hit_id(self, kind, obj, extra=None):
         if kind == "agent":
             return _aid(obj)
-        if kind == "sub":
-            return _sid(obj, extra)
-        return _fid(obj.path)
+        return _sid(obj, extra)   # "sub"
 
     def _node_center(self, hit) -> QPointF:
         if hit[0] == "sub":
@@ -487,12 +411,10 @@ class AgentFileMapCanvas(QWidget):
         self._moved = False
         hit = self._hit(self._scene(event.position()))
         kind = hit[0] if hit else None
-        # agents + sub-agents drag in EITHER view; file squares only in the
-        # free-form bubble view (tree file rows are structural, not movable)
-        draggable = hit is not None and (self._mode == "bubble"
-                                         or kind in ("agent", "sub"))
-        if draggable:
-            self._drag_id = f"{self._mode}|{self._hit_id(*hit)}"
+        # agents + their sub-agent satellites drag; the file tree is structural
+        # (its rows are not movable — only hit for tooltip / open / context menu)
+        if kind in ("agent", "sub"):
+            self._drag_id = self._hit_id(*hit)
             self._drag_grab = self._scene(event.position()) - self._node_center(hit)
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
         elif hit is None and self._scroll is not None:
@@ -533,7 +455,7 @@ class AgentFileMapCanvas(QWidget):
             self.setCursor(Qt.CursorShape.OpenHandCursor)
 
     def mouseReleaseEvent(self, event):
-        was_click, drag_id, panning = (not self._moved, self._drag_id, self._panning)
+        was_click, panning = (not self._moved, self._panning)
         self._drag_id = self._drag_grab = self._press_pos = self._pan_start = None
         self._panning = False
         self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -597,7 +519,7 @@ def _build_tree_rows(files) -> list:
 
     Bulletproof: real projects contain awkward shapes (an extension-less file
     sharing a name with a folder, mixed drives, relative paths) that must never
-    raise — a throw here happens on the toggle's slot and silently freezes the
+    raise — a throw here would land on the layout slot and silently freeze the
     view. Anything unexpected degrades to a FLAT file list."""
     if not files:
         return []
@@ -684,10 +606,6 @@ def _sid(av, j) -> str:
     return f"sub:{av.name}:{j}"
 
 
-def _fid(path: str) -> str:
-    return "file:" + path.replace("\\", "/").lower()
-
-
 def _dist(a: QPointF, b: QPointF) -> float:
     return math.hypot(a.x() - b.x(), a.y() - b.y())
 
@@ -730,6 +648,9 @@ class AgentFileMapWindow(QWidget):
     REFRESH_MS = 2000
     agentActivated = Signal(str, str)   # ws_id, agent_id
 
+    _HINT = ("Write/Read toggle lines · click agent → its card · "
+             "double-click file → open · drag agent to move · Ctrl+wheel zoom")
+
     def __init__(self, parent=None):
         super().__init__(parent, Qt.WindowType.Window)
         self.setObjectName("AgentFileMapWindow")
@@ -750,19 +671,26 @@ class AgentFileMapWindow(QWidget):
         hl.setSpacing(8)
         self.title = QLabel("Agent / File Map", header)
         self.title.setObjectName("HeaderPath")
-        self.hint = QLabel("drag to move · Ctrl+wheel zoom · click agent → its "
-                           "card · double-click file → open", header)
+        self.hint = QLabel(self._HINT, header)
         self.hint.setObjectName("HeaderPath")
-        self.view_btn = QPushButton("▤ Tree view", header)
-        self.view_btn.setObjectName("MapViewToggle")
-        self.view_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.view_btn.clicked.connect(self._toggle_view)
+        # line filters: hide edited / read-only edges independently
+        self.write_btn = QPushButton("✎ Write", header)
+        self.write_btn.setObjectName("MapWriteToggle")
+        self.write_btn.setToolTip("Show lines to files agents EDITED")
+        self.read_btn = QPushButton("↴ Read", header)
+        self.read_btn.setObjectName("MapReadToggle")
+        self.read_btn.setToolTip("Show lines to files agents only READ")
+        for b in (self.write_btn, self.read_btn):
+            b.setCheckable(True)
+            b.setChecked(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
         refresh = QPushButton("↻ Refresh", header)
         refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         refresh.clicked.connect(self.refresh)
         hl.addWidget(self.title)
         hl.addWidget(self.hint, 1)
-        hl.addWidget(self.view_btn)
+        hl.addWidget(self.write_btn)
+        hl.addWidget(self.read_btn)
         hl.addWidget(refresh)
         root.addWidget(header)
 
@@ -770,6 +698,11 @@ class AgentFileMapWindow(QWidget):
         self.scroll.setWidgetResizable(True)
         self.canvas = AgentFileMapCanvas(self.scroll)
         self.canvas.set_scroll(self.scroll)
+        # wire the filters AFTER the canvas exists (toggled can fire on setup)
+        self.write_btn.toggled.connect(
+            lambda on: self.canvas.set_line_visibility(edited=on))
+        self.read_btn.toggled.connect(
+            lambda on: self.canvas.set_line_visibility(read=on))
         self.canvas.agentActivated.connect(self._on_agent_activated)
         self.scroll.setWidget(self.canvas)
         root.addWidget(self.scroll, 1)
@@ -777,16 +710,6 @@ class AgentFileMapWindow(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(self.REFRESH_MS)
         self._timer.timeout.connect(self.refresh)
-
-    def _toggle_view(self) -> None:
-        tree = self.canvas.mode() != "tree"
-        self.canvas.set_mode("tree" if tree else "bubble")
-        self.view_btn.setText("◉ Bubble view" if tree else "▤ Tree view")
-        self.hint.setText(
-            "click agent → its card · double-click file → open · Ctrl+wheel zoom"
-            if tree else
-            "drag to move · Ctrl+wheel zoom · click agent → its card · "
-            "double-click file → open")
 
     def _on_agent_activated(self, agent_id: str) -> None:
         if self._ws_id:
@@ -808,30 +731,23 @@ class AgentFileMapWindow(QWidget):
         ws = self._workspace
         agents = list(getattr(ws, "agents", []) or []) if ws else []
         if not agents:
-            self.canvas.set_model([], [], [], empty_msg=(
+            self.canvas.set_model([], [], empty_msg=(
                 "No agents in this workspace yet." if ws else "No workspace."))
             return
 
         acts = [(a, file_activity.activity_for_agent(a)) for a in agents]
+        # every touched file, with the (agent_index, edited) owners that touched
+        # it — a file touched by 2+ agents simply carries multiple owners and so
+        # gets a connector from each (no separate "shared band" any more)
         key_owners = defaultdict(list)
         for idx, (_agent, act) in enumerate(acts):
             if not act:
                 continue
             for k, fa in act.files.items():
                 key_owners[k].append((idx, fa))
-        shared_keys = {k for k, owners in key_owners.items()
-                       if len({i for i, _ in owners}) > 1}
 
         avs: list[_AgentVis] = []
         for agent, act in acts:
-            private = []
-            if act:
-                for k, fa in act.files.items():
-                    if k in shared_keys:
-                        continue
-                    private.append(_FileVis(path=fa.path, basename=fa.basename,
-                                            edited=fa.edited))
-                private.sort(key=lambda f: (not f.edited, f.basename.lower()))
             spec = agent.spec
             avs.append(_AgentVis(
                 agent_id=getattr(agent, "id", ""),
@@ -840,24 +756,19 @@ class AgentFileMapWindow(QWidget):
                 state=_agent_state(agent),
                 is_claude=(spec.provider == "claude"),
                 truncated=bool(act and act.truncated),
-                private=private,
                 subs=[(s.subagent_type, s.description)
                       for s in (act.subagents if act else [])]))
 
-        shared: list[_FileVis] = []
         files_all: list[_FileVis] = []
         for k in sorted(key_owners):
             owners = key_owners[k]
             rep = owners[0][1]
             owner_pairs = [(idx, fa.edited) for idx, fa in owners]
             any_edit = any(e for _, e in owner_pairs)
-            fv = _FileVis(path=rep.path, basename=rep.basename, edited=any_edit,
-                          owners=owner_pairs)
-            files_all.append(fv)
-            if k in shared_keys:
-                shared.append(fv)
+            files_all.append(_FileVis(path=rep.path, basename=rep.basename,
+                                      edited=any_edit, owners=owner_pairs))
 
-        self.canvas.set_model(avs, shared, files_all)
+        self.canvas.set_model(avs, files_all)
 
     def showEvent(self, event):
         super().showEvent(event)

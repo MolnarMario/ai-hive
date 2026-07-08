@@ -23,7 +23,7 @@ from .pty_worker import HAS_CONPTY
 from .terminal_agent import AgentStatus, AssignmentState, TerminalAgent
 
 MAX_AGENTS_PER_WORKSPACE = 12
-SESSION_VERSION = 3  # v3: provider/model/effort, per-agent font, grid layout
+SESSION_VERSION = 4  # v4: sidebar layout (workspace order + categories)
 DEFAULT_LAYOUT = "auto"
 
 # Shell kinds whose pre-v2 (line-mode-default) instances are upgraded to
@@ -58,11 +58,15 @@ class WorkspaceManager(QObject):
     workspaceStatsChanged = Signal(str, dict)  # ws_id, {total,active,idle,error}
     workspacePathChanged = Signal(str, str)  # ws_id, new project_path
     layoutChanged = Signal(str, str)         # ws_id, layout
+    sidebarLayoutChanged = Signal()          # workspace order / categories
     dirty = Signal()                         # any persistable mutation
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
         self._workspaces: list[Workspace] = []
+        # sidebar layout: ordered top-level nodes (workspaces + categories with
+        # workspace children). Empty => all-uncategorized in _workspaces order.
+        self._sidebar_nodes: list[dict] = []
         self._active_id: str = ""
         # optional hook (set by MainWindow): arm an agent's MCP config before
         # it starts, so workers launch able to log_activity. callable(ws, agent)
@@ -114,8 +118,12 @@ class WorkspaceManager(QObject):
         # RUNNING agents — this is what the sidebar badge pulses green on, so an
         # agent merely idling at its prompt reads as standby, not working
         busy = sum(1 for a in agents if a.is_busy())
+        # "waiting" = settled on a prompt/question awaiting the user (a subset,
+        # drives the row's "?" indicator); transient like busy, never persisted
+        waiting = sum(1 for a in agents if a.is_waiting())
         return {"total": len(agents), "active": active, "error": error,
-                "busy": busy, "idle": len(agents) - active - error}
+                "busy": busy, "waiting": waiting,
+                "idle": len(agents) - active - error}
 
     def next_agent_name(self, ws_id: str) -> str:
         """Per-workspace numbering: each workspace counts Agent 1, 2, 3…"""
@@ -235,6 +243,72 @@ class WorkspaceManager(QObject):
         self.activeChanged.emit(ws_id)
         self.dirty.emit()
 
+    def reorder_workspaces(self, ordered_ids: list) -> None:
+        """Re-sequence workspaces to match the sidebar's new top-to-bottom
+        order. Order is persisted implicitly by list position in
+        `to_session_dict`; ids not present keep their relative tail order."""
+        rank = {wid: i for i, wid in enumerate(ordered_ids)}
+        before = [w.id for w in self._workspaces]
+        self._workspaces.sort(key=lambda w: rank.get(w.id, len(rank)))
+        if [w.id for w in self._workspaces] != before:
+            self.sidebarLayoutChanged.emit()
+
+    # -------------------------------------------------- sidebar layout ---
+
+    def _normalize_layout(self, nodes: list) -> list:
+        """Validate a sidebar layout against live workspaces: drop unknown ids,
+        de-dupe, and append any unplaced workspace uncategorized at the end."""
+        known = {w.id for w in self._workspaces}
+        seen: set[str] = set()
+        out: list[dict] = []
+        for n in nodes or []:
+            if not isinstance(n, dict):
+                continue
+            if n.get("type") == "workspace":
+                wid = n.get("id")
+                if wid in known and wid not in seen:
+                    seen.add(wid)
+                    out.append({"type": "workspace", "id": wid})
+            elif n.get("type") == "category":
+                kids = [c for c in n.get("children", [])
+                        if c in known and c not in seen]
+                seen.update(kids)
+                out.append({"type": "category",
+                            "id": n.get("id") or uuid.uuid4().hex,
+                            "name": str(n.get("name", "Category")),
+                            "collapsed": bool(n.get("collapsed", False)),
+                            "children": kids})
+        for w in self._workspaces:
+            if w.id not in seen:
+                out.append({"type": "workspace", "id": w.id})
+        return out
+
+    @staticmethod
+    def _flatten_ws_ids(nodes: list) -> list:
+        ids: list[str] = []
+        for n in nodes:
+            if n["type"] == "workspace":
+                ids.append(n["id"])
+            elif n["type"] == "category":
+                ids.extend(n.get("children", []))
+        return ids
+
+    def sidebar_layout(self) -> list:
+        """The effective sidebar layout (normalized). Defaults to all
+        workspaces uncategorized in their current order when none is stored."""
+        return self._normalize_layout(self._sidebar_nodes)
+
+    def apply_sidebar_layout(self, nodes: list, emit: bool = True) -> None:
+        """Adopt a new sidebar layout (order + categories) from the sidebar,
+        re-sequencing workspaces to its flattened display order."""
+        norm = self._normalize_layout(nodes)
+        self._sidebar_nodes = norm
+        flat = self._flatten_ws_ids(norm)
+        rank = {wid: i for i, wid in enumerate(flat)}
+        self._workspaces.sort(key=lambda w: rank.get(w.id, len(rank)))
+        if emit:
+            self.sidebarLayoutChanged.emit()
+
     def add_terminal(self, ws_id: str, spec: AgentSpec,
                      autostart: bool = True) -> TerminalAgent | None:
         ws = self.workspace(ws_id)
@@ -351,6 +425,7 @@ class WorkspaceManager(QObject):
         agent.task_changed.connect(lambda *_: self._touch(wid))
         agent.assignment_changed.connect(lambda *_: self._touch(wid))
         agent.role_changed.connect(lambda *_: self._touch(wid))
+        agent.name_changed.connect(lambda *_: self._touch(wid))
         agent.font_changed.connect(lambda *_: self.dirty.emit())
         # recovery (verify-before-resume) must never land on a peer's
         # conversation, so give the agent a live view of its folder-mates' pins
@@ -358,6 +433,8 @@ class WorkspaceManager(QObject):
         # busy/standby is TRANSIENT (not persisted): refresh the badge only,
         # never mark dirty — otherwise every output burst would thrash saves
         agent.activity_changed.connect(lambda *_: self._recompute(wid))
+        # waiting-for-input is likewise transient (drives the "?" indicator)
+        agent.waiting_changed.connect(lambda *_: self._recompute(wid))
 
     def _touch(self, ws_id: str) -> None:
         """Recompute derived state AND mark the session dirty (persisted
@@ -514,6 +591,7 @@ class WorkspaceManager(QObject):
                 spec = a.spec
                 return {"kind": getattr(spec, "kind", ""),
                         "name": getattr(spec, "name", "Agent"),
+                        "custom_name": getattr(spec, "custom_name", False),
                         "cwd": getattr(spec, "cwd", ""),
                         "provider": getattr(spec, "provider", ""),
                         "session_id": getattr(spec, "session_id", ""),
@@ -525,6 +603,7 @@ class WorkspaceManager(QObject):
         return {
             "version": SESSION_VERSION,
             "active": self._active_id,
+            "sidebar": self.sidebar_layout(),   # order + categories (v4)
             "workspaces": [
                 {
                     "id": w.id,
@@ -545,8 +624,10 @@ class WorkspaceManager(QObject):
         if not data or not isinstance(data, dict):
             return
         # one-time upgrade of pre-v2 shell agents (saved as line-mode when
-        # that was the default) to interactive terminals
-        migrate_shells = data.get("version", 1) < SESSION_VERSION and HAS_CONPTY
+        # that was the default) to interactive terminals. Pinned to version < 3
+        # (its original threshold) so later SESSION_VERSION bumps never
+        # re-trigger it and flip a user's deliberately line-mode shell to pty.
+        migrate_shells = data.get("version", 1) < 3 and HAS_CONPTY
         for wd in data.get("workspaces", []):
             path = wd.get("project_path", "")
             if not path or not os.path.isdir(path):
@@ -580,6 +661,11 @@ class WorkspaceManager(QObject):
                 self.terminalAdded.emit(ws.id, agent)
             self.terminalCountChanged.emit(ws.id, len(ws.agents))
             self._recompute(ws.id)
+        # restore the sidebar layout (order + categories); absent on <v4 -> all
+        # workspaces stay uncategorized in load order (normalize appends them)
+        sidebar = data.get("sidebar")
+        if isinstance(sidebar, list):
+            self.apply_sidebar_layout(sidebar, emit=False)
         active = data.get("active", "")
         if self.workspace(active) is not None:
             self.set_active(active)

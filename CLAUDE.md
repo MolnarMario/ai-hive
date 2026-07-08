@@ -33,14 +33,41 @@ this file is the invariants that must survive every change.
   so it connects to `_recompute` (refresh derived UI only), never `_touch`;
   wiring it to a save would thrash `session.json`.
 - **The sidebar badge shows WORK, not liveness.** Each workspace row's
-  `AgentCountBadge` pulses green only when an agent `is_busy()` — a subset of
+  `AgentCountBadge` pulses amber only when an agent `is_busy()` — a subset of
   RUNNING derived from live OUTPUT ACTIVITY (`TerminalAgent._mark_busy` on each
   pty/stdout burst; a `BUSY_IDLE_MS` single-shot drops back to standby when
   output falls quiet; exit clears it in `_set_status`). Never regress "working"
   back to `AgentStatus.RUNNING`: an interactive agent idling at its prompt stays
-  RUNNING forever, which is exactly the false-green this replaced.
-  `workspace_stats` carries the `busy` count; the badge maps busy>0→green,
-  running-but-quiet→amber, error→red, empty→dim.
+  RUNNING forever, which is exactly the false-badge this replaced.
+  `workspace_stats` carries the `busy` count; the badge maps busy>0→amber
+  (pulsing), running-but-quiet→green, error→red, empty→dim. The row ALSO carries
+  a right-edge sweeping-arc `WorkspaceSpinner` (pinned far-right so hover
+  buttons open to its left) whose centre number is the working count; it is
+  hidden and its animation stopped whenever `busy==0`, so a resting row is free.
+  A "?" badge (`#WsQ`) shows when `waiting>0` — an agent has settled on a
+  prompt/question awaiting the user. `waiting` is a THIRD transient signal
+  (`TerminalAgent.is_waiting`/`waiting_changed`), wired to `_recompute` like
+  `activity_changed` and NEVER to a save. It's a heuristic scrape of the settled
+  screen (`_screen_tail` + `_NUM_OPTION_RE`/`_WAIT_PHRASES`), evaluated ONLY on
+  the idle-timer settle (never mid-render) and cleared by any fresh output;
+  suppressed under `bypassPermissions` (that mode shows no prompts). Clicking the
+  count badge OR the "?" opens the `AgentDropdown` (agents + status + task + per-
+  agent "?"); clicking an agent calls `MainWindow._reveal_agent` (switch ws +
+  scroll+focus its card — the same primitive the Agent/File Map uses). The badge
+  click is CONSUMED so it never bubbles to row-select/switch.
+- **The sidebar is a model-driven tree** (`widgets/sidebar.py`): `_nodes` is the
+  ordered top-level list (workspaces + single-level `category` nodes with
+  workspace children); drag-and-drop never moves Qt items (that strands the rich
+  `setItemWidget` rows) — a drop mutates `_nodes` and `rebuild()`s, and every
+  structural change emits `layoutChanged` → `WorkspaceManager.apply_sidebar_layout`
+  (which re-sequences `_workspaces` + persists). Categories don't nest. The
+  layout persists under the session `"sidebar"` key at `SESSION_VERSION = 4`;
+  restore applies it in `load_session_dict` and `_adopt_existing_model`
+  (`sidebar.apply_layout`). Normalization is the safety net: unknown ids drop,
+  unplaced workspaces append uncategorized — so a stale/partial layout never
+  loses a workspace. NOTE the shell-migration gate was pinned to `version < 3`
+  (its original threshold) so future `SESSION_VERSION` bumps never re-flip a
+  user's line-mode shells.
 - **Single instance is enforced by a kernel mutex** (`main.py`,
   `_single_instance_guard`) and fails closed. Don't replace it with anything
   that has a probe timeout.

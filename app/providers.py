@@ -26,6 +26,11 @@ class Provider:
     exe_names: tuple            # for shutil.which detection
     models: tuple              # ((label, value), ...); value "" = default
     efforts: tuple = ()        # effort tokens (Claude only); "" prepended = default
+    # ((label, value), ...) startup permission modes (Claude only). value "" =
+    # launch with no --permission-mode flag (the CLI's own default), which is
+    # exactly today's behavior. These mirror the modes the interactive TUI
+    # cycles through with Shift+Tab, so a spawned agent can start pre-set.
+    permission_modes: tuple = ()
     native_flags: bool = False  # True → --model/--effort (Claude); else template
     base_cmd: str = ""         # template providers, e.g. "codex"
     model_flag: str = ""       # template, e.g. "--model {model}" / "-m {model}"
@@ -44,11 +49,26 @@ CLAUDE_MODELS = (
     ("Haiku", "haiku"), ("Fable", "fable"),
 )
 CLAUDE_EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
+# The startup permission modes the interactive TUI cycles through with
+# Shift+Tab. "" launches with NO --permission-mode flag (the CLI's own default,
+# i.e. today's behavior) and is the dialog default. acceptEdits/plan are the
+# other two steps of the ordinary Shift+Tab cycle; bypassPermissions is the
+# opt-in mode that only appears in the cycle once launched with it. (Verified
+# against `claude --permission-mode` choices on 2.1.x: acceptEdits, auto,
+# bypassPermissions, manual, dontAsk, plan — note there is NO "default" token,
+# so "Normal" must OMIT the flag rather than pass one.)
+CLAUDE_PERMISSION_MODES = (
+    ("Normal", ""),
+    ("Accept edits (auto-approve file edits)", "acceptEdits"),
+    ("Plan mode (read-only until you approve)", "plan"),
+    ("Bypass permissions (skip all prompts)", "bypassPermissions"),
+)
 
 PROVIDERS: dict[str, Provider] = {
     "claude": Provider(
         key="claude", display="Claude Code", exe_names=("claude",),
-        models=CLAUDE_MODELS, efforts=CLAUDE_EFFORTS, native_flags=True,
+        models=CLAUDE_MODELS, efforts=CLAUDE_EFFORTS,
+        permission_modes=CLAUDE_PERMISSION_MODES, native_flags=True,
         note="Anthropic Claude Code — full interactive agent."),
     "openai": Provider(
         key="openai", display="OpenAI (Codex CLI)", exe_names=("codex",),
@@ -125,11 +145,14 @@ def detected(key: str) -> bool:
 
 
 def build_invocation(key: str, model: str = "", effort: str = "",
-                     custom_command: str = "", extra_args=None) -> tuple[str, list]:
+                     custom_command: str = "", extra_args=None,
+                     permission_mode: str = "") -> tuple[str, list]:
     """Return (program, args) for an AI provider.
 
     custom_command (if given) overrides the built-in template/base for
     template providers, so users can wire their own CLI invocation.
+    permission_mode (Claude only) is a Shift+Tab startup mode; "" omits the
+    flag (the CLI default).
     """
     extra_args = list(extra_args or [])
     p = PROVIDERS.get(key)
@@ -145,6 +168,12 @@ def build_invocation(key: str, model: str = "", effort: str = "",
         # --effort value — it's an in-session mode — so it must never launch
         if effort and effort in p.efforts and effort:
             args += ["--effort", effort]
+        # only ever pass a mode the provider actually declares (the "" default
+        # is not a launch token — it means "omit the flag"), so a stale or
+        # bogus value can never reach the CLI as an invalid --permission-mode
+        valid_modes = {v for _, v in p.permission_modes if v}
+        if permission_mode and permission_mode in valid_modes:
+            args += ["--permission-mode", permission_mode]
         return program, args + extra_args
 
     # template provider (OpenAI/Gemini/custom)

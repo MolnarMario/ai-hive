@@ -78,6 +78,17 @@ BUSY_IDLE_MS = 2000
 # phrase can never be matched against raw bytes
 _CSI_RE = re.compile(r"\x1b\[[0-9;?<>=]*[@-~]|\x1b[()][AB0]|\x1b\][^\x07\x1b]*\x07?")
 
+# --- "waiting for the user" detection (Claude prompts/questions) ---
+# Claude emits no machine-readable "I'm waiting" event, so we scrape the settled
+# screen (gated on the idle timer so a half-drawn frame never trips it). A
+# numbered-option box (`1. Yes` / `2. No, and tell Claude…`) is the strong
+# structural signal shared by permission prompts AND AskUserQuestion menus; a
+# "do you want / would you like / proceed?" phrase confirms a single-option box.
+# Heuristic and non-blocking: a missed exotic prompt just doesn't light up.
+_NUM_OPTION_RE = re.compile(r"(?m)^\s*[>❯❱]?\s*\d+\.\s+\S")
+_WAIT_PHRASES = ("do you want", "would you like", "proceed?",
+                 "yes, and", "no, and tell", "don't ask again")
+
 
 class TerminalAgent(QObject):
     output_segment = Signal(str, str)   # stream, text (line mode)
@@ -87,8 +98,10 @@ class TerminalAgent(QObject):
     font_changed = Signal(int)          # per-agent console font px
     assignment_changed = Signal(object)  # AssignmentState
     role_changed = Signal(str)          # dynamic role/display name
+    name_changed = Signal(str)          # user manual display-name rename
     cleared = Signal()                  # console was cleared locally
     activity_changed = Signal(bool)     # busy (streaming output) vs standby
+    waiting_changed = Signal(bool)      # waiting for the user (prompt/question)
 
     def __init__(self, spec: AgentSpec, parent: QObject | None = None):
         super().__init__(parent)
@@ -124,6 +137,8 @@ class TerminalAgent(QObject):
         # session is never delivered into a fresh, not-yet-ready TUI
         self._submit_gen = 0
         self._busy = False            # actively streaming output right now
+        self._waiting = False         # settled on a prompt/question for the user
+        self._screen_tail = ""        # rolling escape-stripped output tail
         # single-shot: (re)armed on each output burst; firing = output went
         # quiet, so the agent has dropped back to standby
         self._idle_timer = QTimer(self)
@@ -145,6 +160,8 @@ class TerminalAgent(QObject):
     def start(self) -> None:
         self._prompt_ready = False  # re-armed for the fresh TUI
         self._ready_tail = ""
+        self._screen_tail = ""
+        self._set_waiting(False)
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         # a NON-resume start is a new conversation, so it gets a new pinned
@@ -195,6 +212,8 @@ class TerminalAgent(QObject):
     def restart(self) -> None:
         self._prompt_ready = False
         self._ready_tail = ""
+        self._screen_tail = ""
+        self._set_waiting(False)
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         if self.spec.provider == "claude":  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
@@ -241,12 +260,30 @@ class TerminalAgent(QObject):
             self.assignment = state
             self.assignment_changed.emit(state)
 
-    def set_role(self, name: str) -> None:
-        """Dynamic role-based rename (Backend Architect, Testing Agent, …)."""
+    def set_name(self, name: str) -> None:
+        """User-facing rename of the display NAME only (role untouched). Marks
+        the name custom so an orchestrator retask (set_role) never clobbers it."""
         name = sanitize_text(name or "").strip()
         if name and name != self.spec.name:
             self.spec.name = name
-            self.spec.role = name
+            self.spec.custom_name = True
+            self.name_changed.emit(name)
+
+    def set_role(self, name: str) -> None:
+        """Dynamic role-based rename (Backend Architect, Testing Agent, …).
+
+        Always updates the role label. The display NAME follows the role only
+        while it hasn't been manually set — once the user renames the agent
+        (custom_name), a retask updates the role sublabel but leaves the name."""
+        name = sanitize_text(name or "").strip()
+        if not name:
+            return
+        changed = name != self.spec.role
+        self.spec.role = name
+        if not self.spec.custom_name and name != self.spec.name:
+            self.spec.name = name
+            changed = True
+        if changed:
             self.role_changed.emit(name)
 
     def set_font(self, px: int) -> None:
@@ -350,11 +387,23 @@ class TerminalAgent(QObject):
         interactive process idling at its prompt."""
         return self._busy
 
+    def is_waiting(self) -> bool:
+        """True when the agent has settled on a prompt/question awaiting the
+        user (a permission prompt or an interactive option menu). Derived from
+        the settled screen; any fresh output clears it."""
+        return self._waiting
+
+    def _set_waiting(self, waiting: bool) -> None:
+        if waiting != self._waiting:
+            self._waiting = waiting
+            self.waiting_changed.emit(waiting)
+
     def _mark_busy(self) -> None:
         # only a live agent can be working; guard on status (not worker state)
         # so this is unit-testable without a real child process
         if self.status not in (AgentStatus.RUNNING, AgentStatus.STARTING):
             return
+        self._set_waiting(False)  # producing output => not waiting on the user
         if not self._busy:
             self._busy = True
             self.activity_changed.emit(True)
@@ -364,6 +413,23 @@ class TerminalAgent(QObject):
         if self._busy:
             self._busy = False
             self.activity_changed.emit(False)
+        # the screen has settled (2 s quiet) — is it a prompt awaiting the user?
+        self._set_waiting(self._screen_waiting())
+
+    def _screen_waiting(self) -> bool:
+        # ground-truth on the drawn box; suppress for a mode that shows no
+        # prompts. bypassPermissions skips ALL prompts; other modes (incl.
+        # acceptEdits) still surface questions, so only bypass is suppressed.
+        if self.spec.provider != "claude":
+            return False
+        if getattr(self.spec, "permission_mode", "") == "bypassPermissions":
+            return False
+        region = "\n".join(self._screen_tail.lower().splitlines()[-18:])
+        if not region:
+            return False
+        n_opts = len(_NUM_OPTION_RE.findall(region))
+        has_phrase = any(p in region for p in _WAIT_PHRASES)
+        return n_opts >= 2 or (n_opts >= 1 and has_phrase)
 
     # -------------------------------------------------------------- slots ---
 
@@ -383,6 +449,9 @@ class TerminalAgent(QObject):
         self._pty_bytes += len(text)
         while self._pty_bytes > PTY_BUFFER_CAP and len(self._pty_buffer) > 1:
             self._pty_bytes -= len(self._pty_buffer.pop(0))
+        # rolling escape-stripped tail for waiting-for-input detection (the idle
+        # timer scans it once output settles — see _screen_waiting)
+        self._screen_tail = (self._screen_tail + _CSI_RE.sub("", text))[-4000:]
         # readiness to receive a task. For Claude the ONLY reliable signal is
         # the input-box footer ("? for shortcuts"): the folder-trust dialog
         # also enables bracketed paste (and does NOT disable it on dismissal
@@ -410,11 +479,12 @@ class TerminalAgent(QObject):
             self.status = status
             # leaving the live states ends any "working" pulse immediately,
             # even if the idle timer hasn't fired yet (stop/crash/exit)
-            if status not in (AgentStatus.RUNNING, AgentStatus.STARTING) \
-                    and self._busy:
-                self._busy = False
+            if status not in (AgentStatus.RUNNING, AgentStatus.STARTING):
                 self._idle_timer.stop()
-                self.activity_changed.emit(False)
+                if self._busy:
+                    self._busy = False
+                    self.activity_changed.emit(False)
+                self._set_waiting(False)  # a dead/stopped agent isn't waiting
             self.status_changed.emit(status)
 
     def _on_worker_state(self, state: WorkerState) -> None:
