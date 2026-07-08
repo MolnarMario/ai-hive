@@ -40,16 +40,25 @@ workspaces keep executing — switching never pauses anything.
   related ones under **categories** ("Work dev", "Game dev", …) with the 🗂
   button. Categories are collapsible headers you can drag above/below other
   categories or loose workspaces; drop a workspace onto a header to file it in,
-  or back out to un-file it. The whole layout (order + categories + collapse
-  state) persists across restarts.
-- **Agent dropdown + "?" waiting alerts** — click a row's count badge to drop
-  down its agents with each one's status and current task; click any agent to
-  jump straight to its terminal card (switching workspace first if needed). When
-  an agent is actually **waiting for you** — a permission prompt or an
-  interactive question — a "?" lights up on the row (next to the working count)
-  and beside that agent in the dropdown, so you can spot and answer it without
-  hunting through terminals. Suppressed for agents launched in bypass-permissions
-  mode (which never prompt).
+  or back out to un-file it. A category and its members are wrapped in a tinted
+  container that grows and shrinks with what's expanded (the category's
+  workspaces, and a workspace's agents), so membership is unambiguous at a
+  glance. The whole layout (order + categories + collapse state) persists across
+  restarts.
+- **Inline agent list + "?" waiting alerts** — click a row's count badge to
+  **expand its agents inline**, folder-tree style — each agent's name on the
+  left with a one-line **summary** beside it. The summary is the agent's
+  assigned task, or, when none is set, **Claude Code's own AI conversation
+  title** read live from the transcript (the same short summary you see in
+  `/resume`) — so you can tell at a glance what each agent is working on without
+  reading its terminal. The same summary shows in the terminal card header.
+  Click any agent to jump straight
+  to its terminal card (switching workspace first if needed). When an agent is
+  actually **waiting for you** — a permission prompt or an interactive
+  question — a "?" lights up on the row (next to the working count) and beside
+  that agent in the expanded list, so you can spot and answer it without hunting
+  through terminals. Suppressed for agents launched in bypass-permissions mode
+  (which never prompt).
 - **First-class folders** — every workspace header shows its path with
   **Open folder** and **Change…** buttons; agents launch rooted there.
 - **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ in the
@@ -364,7 +373,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-510 checks drive the real app headlessly (offscreen Qt platform) with real
+553 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -374,13 +383,18 @@ explicit grids, folder changes, fonts, the shared board), v3 orchestration
 (role naming, model/effort selection, the named-pipe MCP round-trip,
 workspace scoping, immediate-save-on-mutation), inline agent rename in the
 card header (double-click; a custom name survives orchestrator retasks) plus
-a per-agent task summary beside the name, the sidebar status badge
+a per-agent task summary beside the name, the per-card maximize/restore toggle
+(solo one agent full-area without touching any sibling's process, then restore
+the exact prior tiling) and the context-window usage badge beside the summary
+("N% of 1M/200K", read from the transcript's last usage record — transient,
+never persisted), the sidebar status badge
 (output-activity busy detection, pulse/colour state machine, hover-only
 controls), sidebar drag-reorder + collapsible categories (create/rename/delete,
 drag workspaces in/out, single-level membership persisted across a v4 session
-round-trip with v3 migration), the count-badge agent dropdown + click-to-reveal,
-and the waiting-for-input "?" detection (settled-screen prompt/question scrape,
-gated on the idle timer, suppressed under bypassPermissions), the Agent/File Map
+round-trip with v3 migration), the count-badge inline agent list +
+click-to-reveal, and the waiting-for-input "?" detection (settled-screen
+prompt/question scrape, gated on the idle timer, suppressed under
+bypassPermissions), the Agent/File Map
 visualizer (transcript parsing for edited-vs-read
 attribution, sub-agent detection, shared-file grouping, headless paint, header-
 button wiring, and the drag/zoom/hit-test/click-to-focus interactions) and the
@@ -415,13 +429,13 @@ app/
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
-  widgets/                 main_window, sidebar (drag-reorder + categories),
-                           agent_dropdown (count-badge agent list + "?"),
-                           workspace_page, terminal_card, terminal_view (pyte
-                           grid), grid_selector (on-screen popup), activity_panel,
-                           agent_file_map (tree diagram), ornaments (drop-caps /
-                           dividers / count-badge + working-count spinner)
-tests/smoke_test.py        headless end-to-end suite (510 checks)
+  widgets/                 main_window, sidebar (drag-reorder + categories +
+                           inline agent list w/ "?"), workspace_page,
+                           terminal_card, terminal_view (pyte grid), grid_selector
+                           (on-screen popup), activity_panel, agent_file_map (tree
+                           diagram), ornaments (drop-caps / dividers / count-badge
+                           + working-count spinner)
+tests/smoke_test.py        headless end-to-end suite (553 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

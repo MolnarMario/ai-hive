@@ -51,10 +51,23 @@ this file is the invariants that must survive every change.
   screen (`_screen_tail` + `_NUM_OPTION_RE`/`_WAIT_PHRASES`), evaluated ONLY on
   the idle-timer settle (never mid-render) and cleared by any fresh output;
   suppressed under `bypassPermissions` (that mode shows no prompts). Clicking the
-  count badge OR the "?" opens the `AgentDropdown` (agents + status + task + per-
-  agent "?"); clicking an agent calls `MainWindow._reveal_agent` (switch ws +
-  scroll+focus its card — the same primitive the Agent/File Map uses). The badge
-  click is CONSUMED so it never bubbles to row-select/switch.
+  count badge OR the "?" toggles an INLINE agent expansion in the sidebar tree
+  (`_toggle_agents` → `_expanded_ws`; agent child rows built from
+  `sidebar.agents_provider`, folder-tree style — name left, summary beside,
+  per-agent "?"), refreshed live by `_sync_expanded` on a timer while any
+  workspace is expanded. The per-agent SUMMARY (`TerminalAgent.summary()`, shown
+  here AND in the card header) is the assigned `current_task` if set, else
+  Claude Code's own AI conversation title — the `{"type":"ai-title","aiTitle"}`
+  record Claude appends to the transcript as it evolves (the same text `/resume`
+  shows), read via `transcripts.latest_ai_title` (mtime-cached) and adopted by
+  `WorkspaceManager.refresh_ai_titles` on the session-sync timer.
+  `set_ai_title`/`_ai_title` are TRANSIENT (never persisted) and only emit
+  `summary_changed` when the DISPLAYED summary actually changes (task always
+  wins), so a title poll never thrashes the UI or a save. NOT a floating popup (the user explicitly wanted it
+  part of the sidebar, not overlapping content). Clicking an agent row emits
+  `Sidebar.agentActivated` → `MainWindow._reveal_agent` (switch ws + scroll+focus
+  its card — the same primitive the Agent/File Map uses). The badge click is
+  CONSUMED so it never bubbles to row-select/switch.
 - **The sidebar is a model-driven tree** (`widgets/sidebar.py`): `_nodes` is the
   ordered top-level list (workspaces + single-level `category` nodes with
   workspace children); drag-and-drop never moves Qt items (that strands the rich
@@ -65,7 +78,11 @@ this file is the invariants that must survive every change.
   restore applies it in `load_session_dict` and `_adopt_existing_model`
   (`sidebar.apply_layout`). Normalization is the safety net: unknown ids drop,
   unplaced workspaces append uncategorized — so a stale/partial layout never
-  loses a workspace. NOTE the shell-migration gate was pinned to `version < 3`
+  loses a workspace. A category + its visible members are wrapped in a tinted
+  group box painted in `_SidebarTree.drawRow` (per-row, keyed on
+  `_row_category`), so it grows/shrinks automatically with any expand/collapse
+  (category→workspaces, workspace→agents) — no separate container widget.
+  NOTE the shell-migration gate was pinned to `version < 3`
   (its original threshold) so future `SESSION_VERSION` bumps never re-flip a
   user's line-mode shells.
 - **Single instance is enforced by a kernel mutex** (`main.py`,

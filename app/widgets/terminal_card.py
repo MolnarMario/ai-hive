@@ -44,6 +44,7 @@ class TerminalCard(QFrame):
     closeRequested = Signal(str)     # agent id
     focusGained = Signal(object)     # self
     reassignRequested = Signal(str)  # agent id (retask a completed/idle agent)
+    maximizeRequested = Signal(object)  # self (toggle solo view of this card)
 
     def __init__(self, agent: TerminalAgent, parent=None):
         super().__init__(parent)
@@ -78,7 +79,8 @@ class TerminalCard(QFrame):
             self._replay_log()
         self._on_status(agent.status)
         self._on_assignment(agent.assignment)
-        self._on_task(agent.current_task)
+        self._on_task()
+        self._on_tokens(agent.token_badge())
 
     # ----------------------------------------------------------------- ui ---
 
@@ -116,6 +118,12 @@ class TerminalCard(QFrame):
         # without reading each terminal. Elided to fit; full text on hover.
         self.task_summary = QLabel("", header)
         self.task_summary.setObjectName("CardTaskSummary")
+        # compact context-window usage (e.g. "20% of 1M"), right after the
+        # summary snippet — hidden until the transcript reports usage (Claude
+        # only). Fixed content, so no stretch: the summary keeps the slack.
+        self.token_label = QLabel("", header)
+        self.token_label.setObjectName("CardTokens")
+        self.token_label.hide()
         hl.addWidget(self.glyph)
         hl.addWidget(self.title)
         hl.addWidget(self.title_edit)
@@ -124,6 +132,7 @@ class TerminalCard(QFrame):
         hl.addWidget(self.badge)
         hl.addSpacing(6)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
+        hl.addWidget(self.token_label)
 
         def tool(text, obj_name, tip):
             b = QToolButton(header)
@@ -143,6 +152,9 @@ class TerminalCard(QFrame):
         self.btn_restart = tool("⟳", "CardRestart", "Restart (kill + fresh session)")
         self.btn_reassign = tool("⇄", "CardReassign",
                                  "Assign / reassign a task to this agent")
+        # solo/restore this card in the workspace grid — a pure view toggle;
+        # never touches sibling processes (see WorkspacePage.toggle_solo)
+        self.btn_max = tool("⤢", "CardMaximize", "Maximize (focus this agent)")
         self.btn_close = tool("✕", "CardClose", "Close terminal")
 
         root.addWidget(header)
@@ -188,6 +200,8 @@ class TerminalCard(QFrame):
         self.agent.role_changed.connect(self._on_role)
         self.agent.name_changed.connect(self._on_name)
         self.agent.task_changed.connect(self._on_task)
+        self.agent.summary_changed.connect(self._on_task)  # incl. live AI title
+        self.agent.tokens_changed.connect(self._on_tokens)
         self.title.installEventFilter(self)        # double-click to rename
         self.title_edit.installEventFilter(self)   # Esc cancels, focus-out commits
         self.title_edit.returnPressed.connect(self._commit_rename)
@@ -196,6 +210,7 @@ class TerminalCard(QFrame):
         self.btn_restart.clicked.connect(self.agent.restart)
         self.btn_reassign.clicked.connect(
             lambda: self.reassignRequested.emit(self.agent.id))
+        self.btn_max.clicked.connect(lambda: self.maximizeRequested.emit(self))
         self.btn_close.clicked.connect(self._on_close_clicked)
         self.btn_font_dec.clicked.connect(lambda: self._font_delta(-1))
         self.btn_font_inc.clicked.connect(lambda: self._font_delta(+1))
@@ -271,13 +286,29 @@ class TerminalCard(QFrame):
     def _on_name(self, name: str) -> None:
         self.title.setText(name)
 
-    def _on_task(self, text: str) -> None:
-        # collapse to a single line: a task summary shares the header row, so a
-        # newline would blow up the fixed-height header
+    def _on_task(self, *_ignore) -> None:
+        # show the agent's summary — its assigned task, else Claude's live AI
+        # conversation title. Collapse to a single line: the summary shares the
+        # fixed-height header row, so a newline would blow it up.
+        text = self.agent.summary() if hasattr(self.agent, "summary") \
+            else (self.agent.current_task or "")
         self._task_full = " ".join((text or "").split())
         self.task_summary.setToolTip(self._task_full)
-        self.task_summary.setVisible(bool(self._task_full))
+        # keep the summary label ALWAYS in the layout (it carries the header's
+        # stretch): if it's hidden when empty, the stretch vanishes and the
+        # status glyph absorbs the slack, shoving the agent name to the middle.
         self._elide_task()
+
+    def _on_tokens(self, badge: str = "") -> None:
+        # context-window usage badge beside the summary; hidden when empty so a
+        # fresh or non-Claude agent shows nothing (never a misleading "0%")
+        if badge:
+            self.token_label.setText(badge)
+            self.token_label.setToolTip(
+                f"Context window: {badge} used by this conversation")
+        else:
+            self.token_label.clear()
+        self.token_label.setVisible(bool(badge))
 
     def _elide_task(self) -> None:
         if not self._task_full:
@@ -420,6 +451,13 @@ class TerminalCard(QFrame):
         if self.property("focused") != focused:
             self.setProperty("focused", focused)
             repolish(self)
+
+    def set_maximized(self, on: bool) -> None:
+        # the SAME button toggles between Maximize and Restore down — the page
+        # owns the actual solo state; this only reflects it in the glyph/tooltip
+        self.btn_max.setText("⤡" if on else "⤢")
+        self.btn_max.setToolTip("Restore down" if on
+                                else "Maximize (focus this agent)")
 
     def _on_close_clicked(self) -> None:
         self.closeRequested.emit(self.agent.id)

@@ -73,6 +73,10 @@ class WorkspacePage(QWidget):
         self._layout = workspace.layout or "auto"
         self._hist_rows = 0
         self._hist_vcols = 0
+        # transient solo view: when set, _retile shows ONLY this card full-area
+        # and hides its siblings (view only — their processes keep running).
+        # Never persisted; restore is free (layout is derived from cards+layout).
+        self._solo_card: "TerminalCard | None" = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -201,7 +205,11 @@ class WorkspacePage(QWidget):
         card.closeRequested.connect(self.closeRequested)
         card.focusGained.connect(self.focusGained)
         card.reassignRequested.connect(self.reassignRequested)
+        card.maximizeRequested.connect(self.toggle_solo)
         self.cards.append(card)
+        # a freshly added agent must never be born invisible behind a maximized
+        # sibling — adding one exits solo so the new card is seen
+        self._exit_solo()
         self._retile()
         self._update_empty_state()
         return card
@@ -212,6 +220,10 @@ class WorkspacePage(QWidget):
             return
         card.detach()
         self.cards.remove(card)
+        # closing the maximized card auto-restores the tiling (never strand a
+        # blank workspace pinned to a card that no longer exists)
+        if card is self._solo_card:
+            self._exit_solo()
         card.setParent(None)
         card.deleteLater()
         self._retile()
@@ -222,6 +234,21 @@ class WorkspacePage(QWidget):
 
     def running_count(self) -> int:
         return sum(1 for c in self.cards if c.agent.is_running())
+
+    def toggle_solo(self, card: "TerminalCard") -> None:
+        # maximize this card (or restore if it's already the soloed one). Pure
+        # view change: siblings are only hidden, their agents keep running.
+        self._solo_card = None if self._solo_card is card else card
+        for c in self.cards:
+            c.set_maximized(c is self._solo_card)
+        self._retile()
+
+    def _exit_solo(self) -> None:
+        if self._solo_card is None:
+            return
+        self._solo_card = None
+        for c in self.cards:
+            c.set_maximized(False)
 
     # ------------------------------------------------------------ tiling ---
 
@@ -237,7 +264,14 @@ class WorkspacePage(QWidget):
             while self.grid.count():
                 self.grid.takeAt(0)  # detaches items; agent cards survive
             parsed = parse_layout(self._layout)
-            if parsed is None:  # AUTO
+            if self._solo_card is not None and self._solo_card in self.cards:
+                # SOLO: one card fills the whole area, siblings hidden (their
+                # processes are untouched). Wins over both AUTO and FIXED.
+                for card in self.cards:
+                    card.setVisible(card is self._solo_card)
+                self.grid.addWidget(self._solo_card, 0, 0, 1, 1)
+                rows, vcols = 1, 1
+            elif parsed is None:  # AUTO
                 plan = compute_grid(n)
                 for card, cell in zip(self.cards, plan.cells):
                     self.grid.addWidget(card, cell.row, cell.col,

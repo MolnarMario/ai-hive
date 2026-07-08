@@ -102,6 +102,8 @@ class TerminalAgent(QObject):
     cleared = Signal()                  # console was cleared locally
     activity_changed = Signal(bool)     # busy (streaming output) vs standby
     waiting_changed = Signal(bool)      # waiting for the user (prompt/question)
+    summary_changed = Signal(str)       # displayed summary (task or AI title)
+    tokens_changed = Signal(str)        # context-usage badge text ("" = hide)
 
     def __init__(self, spec: AgentSpec, parent: QObject | None = None):
         super().__init__(parent)
@@ -110,6 +112,9 @@ class TerminalAgent(QObject):
         self.is_pty = bool(spec.pty)
         self.status = AgentStatus.IDLE
         self.current_task = ""              # user/agent-set, feeds the board
+        self._ai_title = ""                 # Claude's live conversation title
+        self._token_used = 0                # last-turn context occupancy (tokens)
+        self._token_window = 0              # sized context window for the model
         self.assignment = AssignmentState.IDLE  # orchestration lifecycle
         self.auto_created = False           # spawned by the orchestrator (#9)
         self.autostart_on_restore = False  # set from persisted run state
@@ -252,8 +257,52 @@ class TerminalAgent(QObject):
         # sinks (board file, pty pipe) refuse to encode
         text = sanitize_text(text).strip()
         if text != self.current_task:
+            before = self.summary()
             self.current_task = text
             self.task_changed.emit(text)
+            if self.summary() != before:
+                self.summary_changed.emit(self.summary())
+
+    def summary(self) -> str:
+        """One-line 'what this agent is working on': the assigned task if set,
+        otherwise Claude Code's own AI-generated conversation title (the same
+        summary shown in `/resume`, read from the live transcript)."""
+        return self.current_task or self._ai_title
+
+    def set_ai_title(self, text: str) -> None:
+        """Adopt Claude's latest AI conversation title (from the transcript).
+        Transient — never persisted; refreshed by the manager's poll."""
+        text = sanitize_text(text or "").strip()
+        if text == self._ai_title:
+            return
+        before = self.summary()
+        self._ai_title = text
+        if self.summary() != before:   # only when the DISPLAYED summary changes
+            self.summary_changed.emit(self.summary())
+
+    def set_token_usage(self, used: int, window: int) -> None:
+        """Adopt the latest context-window occupancy read from the transcript.
+        Transient — never persisted, never marks the session dirty (like the AI
+        title); emits only when the DISPLAYED badge text actually changes."""
+        if used == self._token_used and window == self._token_window:
+            return
+        before = self.token_badge()
+        self._token_used = max(0, int(used))
+        self._token_window = max(0, int(window))
+        if self.token_badge() != before:
+            self.tokens_changed.emit(self.token_badge())
+
+    def token_badge(self) -> str:
+        """Compact context-usage string for the card header, e.g. "20% of 1M".
+        "" when there is no usage data yet (fresh / non-Claude agent)."""
+        if self._token_used <= 0 or self._token_window <= 0:
+            return ""
+        pct = min(100, round(self._token_used * 100 / self._token_window))
+        if self._token_window >= 1_000_000:
+            win = f"{self._token_window // 1_000_000}M"
+        else:
+            win = f"{self._token_window // 1000}K"
+        return f"{pct}% of {win}"
 
     def set_assignment(self, state) -> None:
         if state is not self.assignment:

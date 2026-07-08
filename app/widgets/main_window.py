@@ -25,7 +25,6 @@ from ..workspace_manager import Workspace, WorkspaceManager
 from .. import coordination
 from ..orchestrator_bridge import OrchestratorBridge
 from .activity_panel import ActivityPanel
-from .agent_dropdown import AgentDropdown, position_popup
 from .agent_file_map import AgentFileMapWindow
 from .ornaments import LogoRoundel, PageBorder
 from .sidebar import SIDEBAR_WIDTH, Sidebar
@@ -612,7 +611,10 @@ class MainWindow(QMainWindow):
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
         self.sidebar.deleteRequested.connect(self._confirm_delete_workspace)
         self.sidebar.openFolderRequested.connect(self._open_workspace_folder)
-        self.sidebar.agentsRequested.connect(self._open_agent_dropdown)
+        # inline agent list: the sidebar expands agents under a workspace and
+        # reveals a clicked agent's card (no overlapping popup)
+        self.sidebar.agents_provider = self._agents_for_ws
+        self.sidebar.agentActivated.connect(self._reveal_agent)
         # the sidebar owns the live layout; the manager persists whatever it
         # reports (order + categories) and re-sequences its workspace list
         self.sidebar.layoutChanged.connect(self.manager.apply_sidebar_layout)
@@ -847,19 +849,11 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
-    def _open_agent_dropdown(self, ws_id: str) -> None:
-        """Show the agent dropdown anchored under a workspace row's count badge:
-        the workspace's agents with status + task + a '?' when one is waiting.
-        Opening it does NOT switch workspaces; clicking an agent reveals it."""
+    def _agents_for_ws(self, ws_id: str) -> list:
+        """Live agents for a workspace — the sidebar's provider for its inline
+        agent expansion (clicking the count badge lists them under the row)."""
         ws = self.manager.workspace(ws_id)
-        if ws is None:
-            return
-        dd = AgentDropdown(ws_id, list(ws.agents), self)
-        dd.agentActivated.connect(self._reveal_agent)
-        badge = self.sidebar.badge_for(ws_id)
-        dd.adjustSize()
-        dd.move(position_popup(badge or self.sidebar, dd.size()))
-        dd.show()
+        return list(ws.agents) if ws is not None else []
 
     def _on_stats_for_activity(self, ws_id: str, _stats: dict) -> None:
         # cheap refresh only (roster + log); the blocking git scan stays on the
@@ -1176,6 +1170,9 @@ class MainWindow(QMainWindow):
         # when nothing drifted this is a cheap no-op that never touches disk
         for agent_id, old, new in self.manager.sync_live_sessions():
             self.store.audit(f"SESSION-SYNC agent={agent_id} {old} -> {new}")
+        # same tick: refresh each agent's summary from Claude's live AI title
+        # (transient; drives the card header + sidebar agent list, never saves)
+        self.manager.refresh_ai_titles()
 
     # -------------------------------------------------------------- close ---
 

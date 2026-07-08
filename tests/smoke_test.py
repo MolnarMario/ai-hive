@@ -421,49 +421,236 @@ def test_manager_categories_persist():
           and all(n["type"] == "workspace" for n in mgr3.sidebar_layout()))
 
 
-def test_agent_dropdown():
-    """The count badge opens an agent dropdown (without switching workspaces);
-    the dropdown lists the workspace's agents and relays a click as
-    (ws_id, agent_id) for the reveal."""
+def test_category_container():
+    """The category container (a tinted box behind a category + its members)
+    keys off row-group membership: the header and its child workspaces belong to
+    the group; a top-level workspace outside does not. It paints headlessly."""
+    from PySide6.QtGui import QPixmap
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.sidebar import Sidebar
+
+    QApplication.instance() or QApplication([])
+    sb = Sidebar()
+    sb.resize(240, 220)
+    sb.add_row("top", "Standalone", "p")
+    sb.add_row("w", "Web", "p")
+    cid = sb._add_category("Work")
+    sb._cat_widgets[cid]._end_rename()
+    sb._on_node_dropped("workspace", "w", cid, "on")
+    tree = sb.tree
+    cat_idx = tree.indexFromItem(sb._cat_items[cid])
+    w_idx = tree.indexFromItem(sb._ws_items["w"])
+    top_idx = tree.indexFromItem(sb._ws_items["top"])
+    check("container: category header is its own group + header",
+          tree._row_category(cat_idx) == cid
+          and tree._is_category_header(cat_idx))
+    check("container: a workspace filed in the category joins the group",
+          tree._row_category(w_idx) == cid, tree._row_category(w_idx))
+    check("container: a top-level workspace is in NO category group",
+          tree._row_category(top_idx) == "", tree._row_category(top_idx))
+    sb.show()
+    QApplication.processEvents()
+    pm = QPixmap(sb.size())
+    sb.render(pm)   # drawRow container painting must not raise
+    check("container: sidebar with a category paints headlessly", True)
+    sb.deleteLater()
+
+
+def test_agent_inline_expansion():
+    """Clicking a workspace's count badge expands its agents INLINE in the
+    sidebar (folder-tree style, not a popup): each agent shows its name on the
+    left with the task summary beside it and a "?" when waiting; clicking an
+    agent relays (ws_id, agent_id) to reveal it; clicking the badge again
+    collapses. Expanding must not select/switch the workspace."""
     from PySide6.QtCore import Qt
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
-    from app.widgets.sidebar import WorkspaceRow
-    from app.widgets.agent_dropdown import AgentDropdown
+    from app.widgets.sidebar import Sidebar
     from app.terminal_agent import TerminalAgent, AgentStatus
     from app.process_worker import AgentKind, build_spec
 
     QApplication.instance() or QApplication([])
-
-    # A) clicking the badge asks for agents but does NOT select the workspace
-    row = WorkspaceRow("w1", "Alpha", "p")
-    asked, selected = [], []
-    row.agentsRequested.connect(asked.append)
-    row.selected.connect(selected.append)
-    row.count_badge.clicked.emit()
-    check("dropdown: badge click asks for the agent list", asked == ["w1"], asked)
-    check("dropdown: badge click did NOT select/switch the workspace",
-          selected == [], selected)
-    row.deleteLater()
-
-    # B) the dropdown lists agents; a row click relays (ws_id, agent_id)
-    a1 = TerminalAgent(build_spec(AgentKind.CLAUDE, "One", cwd="."))
-    a2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Two", cwd="."))
+    a1 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Backend", cwd="."))
+    a2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Frontend", cwd="."))
     a1.status = AgentStatus.RUNNING
-    a1.current_task = "refactoring the parser"
-    dd = AgentDropdown("w1", [a1, a2])
-    check("dropdown: one row per workspace agent", len(dd._rows) == 2,
-          len(dd._rows))
-    check("dropdown: row shows the agent name",
-          dd._rows[0].name.text() == "One", dd._rows[0].name.text())
+    a1.current_task = "implementing the payments webhook"
+    sb = Sidebar()
+    sb.resize(230, 300)
+    roster = {"w1": [a1, a2]}
+    sb.agents_provider = lambda ws_id: roster.get(ws_id, [])
+    sb.add_row("w1", "Alpha", "p")
+
+    asked, selected = [], []
+    sb.agentsRequested.connect(asked.append)
+    sb._ws_widgets["w1"].selected.connect(selected.append)
+    sb._ws_widgets["w1"].count_badge.clicked.emit()      # expand
+    check("inline: badge click asks for the agent list", asked == ["w1"], asked)
+    check("inline: badge click did NOT select/switch the workspace",
+          selected == [], selected)
+    check("inline: workspace expanded", "w1" in sb._expanded_ws)
+    check("inline: one inline agent row per agent (keyed by id)",
+          set(sb._agent_rows) == {a1.id, a2.id}, set(sb._agent_rows))
+    check("inline: agent name shown on the left",
+          sb._agent_rows[a1.id].name.text() == "Backend",
+          sb._agent_rows[a1.id].name.text())
+    check("inline: task summary shown beside the name when present",
+          sb._agent_rows[a1.id].summary.text() != ""
+          and sb._agent_rows[a2.id].summary.text() == "",
+          (sb._agent_rows[a1.id].summary.text(),
+           sb._agent_rows[a2.id].summary.text()))
+
     relayed = []
-    dd.agentActivated.connect(lambda w, a: relayed.append((w, a)))
-    QTest.mouseClick(dd._rows[0], Qt.MouseButton.LeftButton)
-    check("dropdown: clicking a row relays (ws_id, agent_id)",
+    sb.agentActivated.connect(lambda w, ag: relayed.append((w, ag)))
+    QTest.mouseClick(sb._agent_rows[a1.id], Qt.MouseButton.LeftButton)
+    check("inline: clicking an agent relays (ws_id, agent_id)",
           relayed == [("w1", a1.id)], relayed)
-    dd.deleteLater()
+
+    # closing an agent must update the inline list (the earlier check missed
+    # removals). set_stats fires on terminal add/remove -> immediate sync.
+    roster["w1"] = [a2]
+    sb.set_stats("w1", {"total": 1, "active": 1, "busy": 0, "error": 0,
+                        "waiting": 0, "idle": 1})
+    check("inline: removing an agent drops its row immediately",
+          set(sb._agent_rows) == {a2.id}, set(sb._agent_rows))
+    # adding one back is reflected too (via the live timer sync)
+    roster["w1"] = [a2, a1]
+    sb._sync_expanded()
+    check("inline: adding an agent re-shows it",
+          set(sb._agent_rows) == {a1.id, a2.id}, set(sb._agent_rows))
+
+    sb._ws_widgets["w1"].count_badge.clicked.emit()      # collapse
+    check("inline: badge click again collapses the agent list",
+          "w1" not in sb._expanded_ws and not sb._agent_rows,
+          (sb._expanded_ws, list(sb._agent_rows)))
+    sb.deleteLater()
     a1.deleteLater()
     a2.deleteLater()
+
+
+def test_ai_title_summary():
+    """The per-agent summary is the assigned task, else Claude's latest
+    AI-generated conversation title read from the transcript (the same title
+    shown in /resume). latest-title parsing takes the LAST ai-title record and
+    re-reads when the file changes; task always wins over the AI title."""
+    import json as _json
+    from PySide6.QtWidgets import QApplication
+    from app import transcripts
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+
+    QApplication.instance() or QApplication([])
+
+    # --- transcript parsing: latest ai-title wins, refreshes on change ---
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-title-"))
+    tpath = tmp / "conv.jsonl"
+    recs = [{"type": "user", "text": "hi"},
+            {"type": "ai-title", "aiTitle": "First guess", "sessionId": "s"},
+            {"type": "assistant", "text": "working"},
+            {"type": "ai-title", "aiTitle": "Recolor the badge", "sessionId": "s"}]
+    tpath.write_text("\n".join(_json.dumps(r) for r in recs) + "\n",
+                     encoding="utf-8")
+    check("ai-title: returns the LAST title record",
+          transcripts._read_latest_ai_title(str(tpath)) == "Recolor the badge",
+          transcripts._read_latest_ai_title(str(tpath)))
+    with open(tpath, "a", encoding="utf-8") as fh:   # conversation evolves
+        fh.write(_json.dumps({"type": "ai-title", "aiTitle": "Add the spinner",
+                              "sessionId": "s"}) + "\n")
+    check("ai-title: re-reads when the transcript changes",
+          transcripts._read_latest_ai_title(str(tpath)) == "Add the spinner")
+    check("ai-title: missing file -> empty string",
+          transcripts._read_latest_ai_title(str(tmp / "nope.jsonl")) == "")
+
+    # --- summary precedence on the agent ---
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd="."))
+    seen = []
+    a.summary_changed.connect(seen.append)
+    check("summary: empty with no task and no title", a.summary() == "")
+    a.set_ai_title("Recolor the badge")
+    check("summary: falls back to the AI title", a.summary() == "Recolor the badge"
+          and seen[-1] == "Recolor the badge", (a.summary(), seen))
+    a.set_task("Fix the parser")
+    check("summary: assigned task overrides the AI title",
+          a.summary() == "Fix the parser" and seen[-1] == "Fix the parser")
+    n = len(seen)
+    a.set_ai_title("A newer title")   # title changes but task still wins
+    check("summary: no signal when the DISPLAYED summary is unchanged",
+          a.summary() == "Fix the parser" and len(seen) == n, (a.summary(), seen))
+    a.set_task("")                    # task cleared -> falls back to AI title
+    check("summary: clearing the task reveals the AI title",
+          a.summary() == "A newer title" and seen[-1] == "A newer title",
+          (a.summary(), seen))
+    a.deleteLater()
+
+
+def test_token_usage_badge():
+    """The card header shows a compact context-window usage badge (e.g.
+    "20% of 1M") read from the transcript's last assistant usage record.
+    Transient like the AI title: computed from input+cache+output tokens,
+    sized to the model's window, sidechains skipped, never persisted."""
+    import json as _json
+    from PySide6.QtWidgets import QApplication
+    from app import transcripts
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+
+    QApplication.instance() or QApplication([])
+
+    # --- context-window sizing per model ---
+    check("tokens: opus-4.x sized to the 1M window",
+          transcripts.context_window_for("claude-opus-4-8") == 1_000_000)
+    check("tokens: unknown model falls back to 200K",
+          transcripts.context_window_for("some-old-model") == 200_000)
+
+    # --- transcript parsing: last main-turn usage, sidechains skipped ---
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-tokens-"))
+    tpath = tmp / "conv.jsonl"
+
+    def _asst(inp, cc, cr, out, model="claude-opus-4-8", side=False):
+        return {"type": "assistant", "isSidechain": side,
+                "message": {"model": model, "role": "assistant",
+                            "usage": {"input_tokens": inp,
+                                      "cache_creation_input_tokens": cc,
+                                      "cache_read_input_tokens": cr,
+                                      "output_tokens": out}}}
+
+    recs = [{"type": "user", "text": "hi"},
+            _asst(10, 0, 100, 50),                 # early main turn
+            _asst(5, 0, 999999, 5, side=True),     # sub-agent: must be ignored
+            _asst(100, 900, 199000, 1000)]         # latest main turn -> 201000
+    tpath.write_text("\n".join(_json.dumps(r) for r in recs) + "\n",
+                     encoding="utf-8")
+    used, window = transcripts._read_latest_token_usage(str(tpath))
+    check("tokens: sums the LAST main-conversation usage record",
+          used == 201000, used)
+    check("tokens: sidechain usage never wins", used == 201000)
+    check("tokens: window bumped to 1M when a turn exceeds 200K",
+          window == 1_000_000, window)
+    check("tokens: missing file -> (0, 0)",
+          transcripts._read_latest_token_usage(str(tmp / "nope.jsonl")) == (0, 0))
+
+    # re-reads when the transcript grows
+    with open(tpath, "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps(_asst(1, 0, 299999, 0)) + "\n")  # -> 300000
+    used2, _ = transcripts._read_latest_token_usage(str(tpath))
+    check("tokens: re-reads when the transcript changes", used2 == 300000, used2)
+
+    # --- agent badge formatting + transient emission ---
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd="."))
+    seen = []
+    a.tokens_changed.connect(seen.append)
+    check("tokens: badge empty before any usage", a.token_badge() == "")
+    a.set_token_usage(200_000, 1_000_000)
+    check("tokens: badge formats as '20% of 1M'",
+          a.token_badge() == "20% of 1M" and seen[-1] == "20% of 1M",
+          (a.token_badge(), seen))
+    a.set_token_usage(50_000, 200_000)
+    check("tokens: 200K window renders as 'K'", a.token_badge() == "25% of 200K")
+    n = len(seen)
+    a.set_token_usage(50_000, 200_000)   # unchanged -> no re-emit
+    check("tokens: no signal when usage is unchanged", len(seen) == n)
+    a.set_token_usage(0, 0)              # cleared -> badge hidden again
+    check("tokens: clearing usage empties the badge", a.token_badge() == "")
+    a.deleteLater()
 
 
 def test_reveal_agent():
@@ -689,6 +876,73 @@ def test_app():
     assert_layout(page, 3)
     snap(win, "04_shrink_3")
 
+    # -- 4b. maximize / restore a single card (solo view) ------------------
+    # solo is a transient VIEW toggle: it must never persist or touch siblings'
+    # processes, and restoring must reproduce the prior tiling verbatim. Every
+    # branch below leaves the original 3 idle cards intact for section 5.
+    solo_dirty = {"n": 0}
+    _solo_conn = mgr.dirty.connect(
+        lambda: solo_dirty.__setitem__("n", solo_dirty["n"] + 1))
+    page.toggle_solo(page.cards[0])
+    pump(30)
+    max_pos = page.grid.getItemPosition(page.grid.indexOf(page.cards[0]))
+    check("maximize: soloed card spans full grid at (0,0)",
+          page.cards[0].isVisible() and max_pos == (0, 0, 1, 1), max_pos)
+    check("maximize: sibling cards hidden (processes untouched)",
+          not page.cards[1].isVisible() and not page.cards[2].isVisible())
+    check("maximize: button shows Restore glyph",
+          page.cards[0].btn_max.text() == "⤡")
+    check("maximize: no stale row/col stretch while soloed",
+          page.grid.columnStretch(1) == 0 and page.grid.rowStretch(1) == 0)
+    snap(win, "04b_maximized")
+
+    page.toggle_solo(page.cards[0])   # restore
+    pump(30)
+    assert_layout(page, 3)            # exact prior arrangement reproduced
+    check("restore: all cards visible again",
+          all(c.isVisible() for c in page.cards))
+    check("restore: button shows Maximize glyph",
+          page.cards[0].btn_max.text() == "⤢")
+    check("maximize: solo toggling never marks the session dirty",
+          solo_dirty["n"] == 0, solo_dirty["n"])
+    mgr.dirty.disconnect(_solo_conn)
+
+    # adding an agent while maximized exits solo so the new card is visible
+    page.toggle_solo(page.cards[0])
+    pump(20)
+    solo_tmp = mgr.add_terminal(
+        alpha.id, build_spec(AgentKind.CMD, "Solo Tmp",
+                             cwd=str(proj_alpha)), autostart=False)
+    pump(30)
+    tmp_card = page.card_for(solo_tmp.id)
+    check("maximize: adding an agent exits solo",
+          page._solo_card is None and tmp_card.isVisible())
+
+    # closing the maximized card auto-restores (never strands a blank area);
+    # close the throwaway card so section 5 still sees the original 3 idle cards
+    page.toggle_solo(tmp_card)
+    pump(20)
+    mgr.remove_terminal(alpha.id, solo_tmp.id)
+    pump(30)
+    check("maximize: closing the soloed card exits solo",
+          page._solo_card is None)
+    assert_layout(page, 3)
+
+    # -- 4c. context-usage badge renders on the card header ----------------
+    tok_card = page.cards[0]
+    check("tokens: card badge hidden before any usage",
+          not tok_card.token_label.isVisible())
+    tok_card.agent.set_token_usage(200_000, 1_000_000)
+    pump(20)
+    check("tokens: card badge shows the percentage",
+          tok_card.token_label.isVisible()
+          and tok_card.token_label.text() == "20% of 1M",
+          tok_card.token_label.text())
+    tok_card.agent.set_token_usage(0, 0)   # reset so nothing leaks downstream
+    pump(20)
+    check("tokens: card badge hides again when usage clears",
+          not tok_card.token_label.isVisible())
+
     # -- 5. live streaming --------------------------------------------------
     ticker = mgr.add_terminal(alpha.id, build_spec(
         AgentKind.CUSTOM, "Ticker", cwd=str(proj_alpha),
@@ -809,8 +1063,10 @@ def test_app():
           rc.task_summary.text())
     rc.agent.set_task("")
     pump(20)
-    check("task summary: hidden when there is no task",
-          not rc.task_summary.isVisible())
+    # the label stays in the layout (it carries the header's stretch, keeping
+    # the name left-aligned) but shows NO text when there is no task
+    check("task summary: blank when there is no task",
+          rc.task_summary.text() == "", rc.task_summary.text())
 
     # history: draft survives an accidental Up
     any_card = page.cards[0]
@@ -3723,7 +3979,10 @@ def main():
     test_manager_reorder_persist()
     test_sidebar_categories()
     test_manager_categories_persist()
-    test_agent_dropdown()
+    test_category_container()
+    test_agent_inline_expansion()
+    test_ai_title_summary()
+    test_token_usage_badge()
     test_reveal_agent()
     test_agent_busy_activity()
     test_ansi()

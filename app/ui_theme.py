@@ -335,6 +335,16 @@ WorkspaceRow[active="true"] {{
     padding: 1px 4px; color: {p.ACCENT_GOLD}; font-size: 13px;
 }}
 #AddCatBtn:hover {{ background: {p.BG_HOVER}; border-color: {p.BORDER}; }}
+/* the primary "add workspace" action — a bold, evident gold "+" in a pill */
+#AddWsBtn {{
+    color: {p.ACCENT_GOLD}; font-size: 18px; font-weight: 800;
+    background: {p.BG_ACTIVE}; border: 1px solid {p.BORDER};
+    border-radius: 4px; padding: 0 8px; min-width: 16px;
+}}
+#AddWsBtn:hover {{
+    background: {p.BG_HOVER}; border-color: {p.ACCENT_GOLD};
+    color: {p.ACCENT_GOLD};
+}}
 #WsCategory {{
     background: transparent; border: none;
     border-top: 1px solid {p.BORDER};
@@ -346,7 +356,7 @@ WorkspaceRow[active="true"] {{
 }}
 #CatCaret:hover {{ color: {p.ACCENT_GOLD}; }}
 #CatName {{
-    font-family: {DISPLAY_FONT}; font-size: 11px; letter-spacing: 1px;
+    font-family: {DISPLAY_FONT}; font-size: 15px; letter-spacing: 1px;
     font-weight: 700; color: {p.ACCENT_GOLD};
 }}
 #CatCount {{
@@ -354,25 +364,19 @@ WorkspaceRow[active="true"] {{
     background: {p.BG_ACTIVE}; border-radius: 7px; padding: 0 5px;
 }}
 
-/* agent dropdown (opens from a workspace row's count badge) */
-#AgentDropdown {{
-    background: {p.BG_PANEL}; border: 1px solid {p.BORDER}; border-radius: 6px;
+/* inline agent rows (a workspace expanded to list its agents, folder-tree
+   style): the name sits at the left with its task summary beside it */
+#WsAgentRow {{
+    background: transparent; border-left: 2px solid transparent;
 }}
-#AgentDropHeader {{
-    color: {p.ACCENT_GOLD}; font-family: {DISPLAY_FONT}; font-size: 10px;
-    letter-spacing: 2px; font-weight: 700; padding: 7px 10px 5px 10px;
+#WsAgentRow:hover {{ background: {p.BG_HOVER}; }}
+#WsAgentRow[waiting="true"] {{
+    background: rgba(217,178,74,0.12); border-left: 2px solid {p.YELLOW};
 }}
-#AgentDropRow {{
-    background: transparent; border-top: 1px solid {p.BORDER};
-    border-left: 2px solid transparent;
-}}
-#AgentDropRow:hover {{ background: {p.BG_HOVER}; }}
-#AgentDropRow[waiting="true"] {{
-    background: rgba(217,178,74,0.14); border-left: 2px solid {p.YELLOW};
-}}
-#AgentDropName {{ font-family: {BODY_FONT}; font-size: 13px; font-weight: 600; }}
-#AgentDropTask {{ color: {p.TEXT_DIM}; font-size: 11px; }}
-#AgentDropQ {{ color: {p.YELLOW}; font-size: 15px; font-weight: 800; }}
+#WsAgentDot {{ font-size: 10px; }}
+#WsAgentName {{ font-family: {BODY_FONT}; font-size: 13px; font-weight: 600; }}
+#WsAgentTask {{ color: {p.TEXT_DIM}; font-size: 13px; }}
+#WsAgentQ {{ color: {p.YELLOW}; font-size: 14px; font-weight: 800; }}
 
 /* ----------------------------------------------------- terminal card --- */
 TerminalCard {{
@@ -399,7 +403,11 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     color: {p.CARDHEAD_FG};
 }}
 #CardRole {{ color: {p.CARDHEAD_SUB}; font-size: 11px; }}
-#CardTaskSummary {{ color: {p.CARDHEAD_SUB}; font-size: 11px; font-style: italic; }}
+#CardTaskSummary {{ color: {p.CARDHEAD_SUB}; font-size: 13px; font-style: italic; }}
+#CardTokens {{
+    color: {p.CARDHEAD_SUB}; font-size: 10px; font-weight: 700;
+    padding: 0px 4px;
+}}
 #CardBadge {{
     border-radius: 8px; padding: 1px 8px; font-size: 10px; font-weight: 700;
     background: {p.BG_HOVER}; color: {p.TEXT_DIM};
@@ -444,11 +452,11 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 /* compact single-glyph buttons live in the ultramarine running-head, so they
    take the head's subtitle color, not the body text color */
 #CardStart, #CardStop, #CardRestart, #CardClose, #WsDelete,
-#CardFontDec, #CardFontInc, #CardReassign {{
+#CardFontDec, #CardFontInc, #CardReassign, #CardMaximize {{
     padding: 1px 4px; font-size: 11px; color: {p.CARDHEAD_SUB};
 }}
 #CardStart:hover, #CardStop:hover, #CardRestart:hover, #CardFontDec:hover,
-#CardFontInc:hover, #CardReassign:hover {{ color: {p.CARDHEAD_FG}; }}
+#CardFontInc:hover, #CardReassign:hover, #CardMaximize:hover {{ color: {p.CARDHEAD_FG}; }}
 #WsDelete {{ color: {p.TEXT_DIM}; }}
 #CardReassign:hover {{ border-color: {p.ACCENT_GOLD}; }}
 #GlobalFontBtn {{

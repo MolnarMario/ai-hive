@@ -457,6 +457,25 @@ class WorkspaceManager(QObject):
                 out.add(a.spec.session_id)
         return out
 
+    def refresh_ai_titles(self) -> None:
+        """Pull each running Claude agent's latest AI conversation title AND its
+        context-window occupancy from the live transcript and adopt both as
+        transient card state (`set_ai_title` / `set_token_usage` never persist).
+        Cheap: both readers re-read only when the transcript changed. Reads
+        spec.session_id, which sync keeps pointed at the conversation the agent
+        is actually writing."""
+        for w in self._workspaces:
+            for a in w.agents:
+                spec = a.spec
+                if spec.provider != "claude" or not a.is_running():
+                    continue
+                title = transcripts.latest_ai_title(spec.cwd, spec.session_id)
+                if title:
+                    a.set_ai_title(title)
+                used, window = transcripts.latest_token_usage(
+                    spec.cwd, spec.session_id)
+                a.set_token_usage(used, window)
+
     def sync_live_sessions(self) -> list:
         """Reconcile each running Claude agent's pinned session id with the
         conversation it is ACTUALLY on, so a conversation the user switched to

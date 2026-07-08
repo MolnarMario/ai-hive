@@ -14,19 +14,22 @@ view can't), and the tree resolves the drop target + position.
 import uuid
 
 from PySide6.QtCore import (QEasingCurve, QEvent, QMimeData, QPoint,
-                            QPropertyAnimation, QSize, Qt, Signal)
-from PySide6.QtGui import QDrag, QPixmap
+                            QPropertyAnimation, QRect, QSize, Qt, QTimer,
+                            Signal)
+from PySide6.QtGui import QColor, QDrag, QFontMetrics, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
                                QHBoxLayout, QLabel, QLineEdit, QSizePolicy,
                                QToolButton, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
-from ..ui_theme import repolish
+from ..ui_theme import Palette, repolish
+from .activity_panel import _ICON
 from .ornaments import AgentCountBadge, OrnamentDivider, WorkspaceSpinner
 
 SIDEBAR_WIDTH = 230
 ROW_HEIGHT = 44
 CAT_HEIGHT = 32
+AGENT_HEIGHT = 34
 
 # drag payload: b"workspace:<id>" or b"category:<id>"
 NODE_MIME = "application/x-aihive-sidebar-node"
@@ -456,6 +459,127 @@ class _SidebarTree(QTreeWidget):
         event.acceptProposedAction()
         self.nodeDropped.emit(kind, node_id, target_id, position)
 
+    # ---- category container: a tinted box behind a category + its visible ----
+    # descendants (workspaces, and their agents when expanded). Composed per
+    # row in drawRow, so it grows/shrinks automatically with any expand/collapse.
+
+    def _row_category(self, index) -> str:
+        """The id of the top-level category this row belongs to, or "" if the
+        row isn't inside a category."""
+        item = self.itemFromIndex(index)
+        if item is None:
+            return ""
+        top = item
+        while top.parent() is not None:
+            top = top.parent()
+        info = top.data(0, Qt.ItemDataRole.UserRole) or {}
+        return info.get("id", "") if info.get("type") == "category" else ""
+
+    def _is_category_header(self, index) -> bool:
+        item = self.itemFromIndex(index)
+        return (item is not None and item.parent() is None
+                and (item.data(0, Qt.ItemDataRole.UserRole)
+                     or {}).get("type") == "category")
+
+    def drawRow(self, painter, option, index):
+        cat = self._row_category(index)
+        if cat:
+            r = option.rect
+            x0, x1 = 3, self.viewport().width() - 3
+            fill = QColor(Palette.ACCENT_GOLD)
+            fill.setAlpha(16)
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            painter.fillRect(QRect(x0, r.top(), x1 - x0, r.height()), fill)
+            bar = QColor(Palette.ACCENT_GOLD)
+            bar.setAlpha(130)
+            painter.fillRect(QRect(x0, r.top(), 2, r.height()), bar)
+            edge = QColor(Palette.ACCENT_GOLD)
+            edge.setAlpha(80)
+            painter.setPen(QPen(edge, 1))
+            painter.drawLine(x1, r.top(), x1, r.bottom())
+            if self._is_category_header(index):
+                painter.drawLine(x0, r.top(), x1, r.top())
+            below = self.indexBelow(index)          # last visible row of group?
+            if not below.isValid() or self._row_category(below) != cat:
+                painter.drawLine(x0, r.bottom(), x1, r.bottom())
+            painter.restore()
+        super().drawRow(painter, option, index)
+
+
+class AgentRow(QFrame):
+    """One agent shown inline under its workspace (folder-tree style): a status
+    dot, the agent's NAME on the left, its current-task SUMMARY beside the name,
+    and a "?" when it's waiting for the user. Clicking it reveals the card."""
+
+    activated = Signal(str, str)   # ws_id, agent_id
+
+    def __init__(self, ws_id: str, agent, parent=None):
+        super().__init__(parent)
+        self.setObjectName("WsAgentRow")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ws_id = ws_id
+        self.agent_id = agent.id
+        self._full = ""     # untruncated summary, re-elided to the live width
+        self.setFixedHeight(AGENT_HEIGHT)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 3, 10, 3)
+        lay.setSpacing(6)
+        self.dot = QLabel(self)
+        self.dot.setObjectName("WsAgentDot")
+        self.name = QLabel(self)
+        self.name.setObjectName("WsAgentName")
+        self.summary = QLabel(self)
+        self.summary.setObjectName("WsAgentTask")
+        self.q = QLabel("?", self)
+        self.q.setObjectName("WsAgentQ")
+        self.q.setToolTip("Waiting for your input")
+        self.q.hide()
+        lay.addWidget(self.dot)
+        lay.addWidget(self.name)
+        lay.addWidget(self.summary, 1)
+        lay.addWidget(self.q)
+        self.refresh(agent)
+
+    def refresh(self, agent) -> None:
+        self.dot.setText(_ICON.get(agent.status, "⚪"))
+        self.name.setText(agent.spec.name)
+        waiting = bool(getattr(agent, "is_waiting", lambda: False)())
+        self.q.setVisible(waiting)
+        self.setProperty("waiting", waiting)
+        # summary = assigned task, else Claude's live AI conversation title
+        get = getattr(agent, "summary", None)
+        self._full = (get() if callable(get) else agent.current_task or "").strip()
+        self.summary.setToolTip(self._full)
+        self._elide()
+
+    def _elide(self) -> None:
+        # fit to the summary label's ACTUAL width (it has the layout's stretch,
+        # so it fills whatever the row/sidebar width allows — no wasted space);
+        # re-runs on resize so it always spans to the true right edge
+        w = self.summary.contentsRect().width()
+        if not self._full:
+            self.summary.clear()
+            return
+        if w > 8:
+            fm = QFontMetrics(self.summary.font())
+            self.summary.setText(
+                fm.elidedText(self._full, Qt.TextElideMode.ElideRight, w))
+        else:   # width not settled yet (pre-layout) — show something meaningful
+            self.summary.setText(self._full)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.activated.emit(self.ws_id, self.agent_id)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
 
 class Sidebar(QFrame):
     addRequested = Signal()
@@ -465,6 +589,7 @@ class Sidebar(QFrame):
     deleteRequested = Signal(str)
     openFolderRequested = Signal(str)
     agentsRequested = Signal(str)            # ws_id (count badge clicked; M3)
+    agentActivated = Signal(str, str)        # ws_id, agent_id (reveal its card)
     reordered = Signal(list)                 # flattened ws-id order (M1)
     layoutChanged = Signal(list)             # full node model: order+categories
 
@@ -486,6 +611,16 @@ class Sidebar(QFrame):
         self._ws_items: dict[str, QTreeWidgetItem] = {}
         self._cat_widgets: dict[str, CategoryRow] = {}
         self._cat_items: dict[str, QTreeWidgetItem] = {}
+        # inline agent expansion: which workspaces show their agents as child
+        # rows, and the live agent-row widgets (rebuilt). agents_provider is set
+        # by MainWindow to fetch a workspace's live agents on demand.
+        self.agents_provider = None
+        self._expanded_ws: set[str] = set()
+        self._agent_rows: dict[str, AgentRow] = {}
+        self._rendered_agents: dict[str, list] = {}   # ws_id -> agent ids shown
+        self._agent_timer = QTimer(self)
+        self._agent_timer.setInterval(600)
+        self._agent_timer.timeout.connect(self._sync_expanded)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 8, 0, 0)
@@ -500,7 +635,7 @@ class Sidebar(QFrame):
         self.count_label.setObjectName("WsCount")
         self.add_cat_btn = QToolButton(header)
         self.add_cat_btn.setObjectName("AddCatBtn")
-        self.add_cat_btn.setText("🗂")
+        self.add_cat_btn.setText("📦")
         self.add_cat_btn.setToolTip("Add category (group related workspaces)")
         self.add_cat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # lambda: clicked() passes a `checked` bool that must not shadow `name`
@@ -559,6 +694,7 @@ class Sidebar(QFrame):
         if ws_id not in self._ws_data:
             return
         self._ws_data.pop(ws_id, None)
+        self._expanded_ws.discard(ws_id)
         # drop from top level and from any category's children
         self._nodes = [n for n in self._nodes
                        if not (n["type"] == "workspace" and n["id"] == ws_id)]
@@ -588,6 +724,11 @@ class Sidebar(QFrame):
         w = self._ws_widgets.get(ws_id)
         if w is not None:
             w.set_stats(stats)
+        # if this workspace is expanded, keep its inline agent list in sync the
+        # instant an agent is added/removed (stats fire on terminal add/remove)
+        if (ws_id in self._expanded_ws
+                and self._agent_ids(ws_id) != self._rendered_agents.get(ws_id, [])):
+            self.rebuild()
 
     def set_active_row(self, ws_id: str) -> None:
         self._active_id = ws_id
@@ -614,6 +755,8 @@ class Sidebar(QFrame):
         self._ws_items = {}
         self._cat_widgets = {}
         self._cat_items = {}
+        self._agent_rows = {}
+        self._rendered_agents = {}
         root = self.tree.invisibleRootItem()
         for node in self._nodes:
             if node["type"] == "workspace":
@@ -654,13 +797,72 @@ class Sidebar(QFrame):
         row.renameCommitted.connect(self.renameRequested)
         row.deleteRequested.connect(self.deleteRequested)
         row.openFolderRequested.connect(self.openFolderRequested)
-        row.agentsRequested.connect(self.agentsRequested)
+        row.agentsRequested.connect(self._toggle_agents)  # inline expand/close
         self.tree.setItemWidget(item, 0, row)
         self._ws_widgets[ws_id] = row
         self._ws_items[ws_id] = item
         if data.get("stats"):
             row.set_stats(data["stats"])
         row.set_active(ws_id == self._active_id)
+        if ws_id in self._expanded_ws:      # show its agents as child rows
+            self._add_agent_rows(ws_id, item)
+            item.setExpanded(True)
+
+    def _add_agent_rows(self, ws_id: str, ws_item: QTreeWidgetItem) -> None:
+        agents = self.agents_provider(ws_id) if self.agents_provider else []
+        for agent in agents:
+            child = QTreeWidgetItem(ws_item)
+            child.setData(0, Qt.ItemDataRole.UserRole,
+                          {"type": "agent", "id": agent.id})
+            child.setSizeHint(0, QSize(SIDEBAR_WIDTH, AGENT_HEIGHT))
+            arow = AgentRow(ws_id, agent)
+            arow.activated.connect(self.agentActivated)
+            self.tree.setItemWidget(child, 0, arow)
+            self._agent_rows[agent.id] = arow
+        self._rendered_agents[ws_id] = [a.id for a in agents]
+
+    def _agent_ids(self, ws_id: str) -> list:
+        agents = self.agents_provider(ws_id) if self.agents_provider else []
+        return [a.id for a in agents]
+
+    def _toggle_agents(self, ws_id: str) -> None:
+        """Expand/collapse a workspace's agent list inline (folder-tree style).
+        Also emitted for external listeners via agentsRequested."""
+        self.agentsRequested.emit(ws_id)
+        if ws_id in self._expanded_ws:
+            self._expanded_ws.discard(ws_id)
+        else:
+            self._expanded_ws.add(ws_id)
+        self.rebuild()
+        if self._expanded_ws:
+            self._agent_timer.start()
+        else:
+            self._agent_timer.stop()
+
+    def _sync_expanded(self) -> None:
+        """Keep expanded agent rows live (status / summary / "?"); rebuild only
+        if an expanded workspace's agent set changed (add/remove/reorder)."""
+        if not self._expanded_ws or self.agents_provider is None:
+            self._agent_timer.stop()
+            return
+        for ws_id in list(self._expanded_ws):
+            agents = self.agents_provider(ws_id) or []
+            # compare to what is CURRENTLY rendered for this ws (catches both
+            # additions and removals — an earlier check missed removals)
+            if [a.id for a in agents] != self._rendered_agents.get(ws_id, []):
+                self.rebuild()
+                return
+            for agent in agents:
+                row = self._agent_rows.get(agent.id)
+                if row is None:
+                    continue
+                try:
+                    row.refresh(agent)
+                    row.style().unpolish(row)
+                    row.style().polish(row)
+                except RuntimeError:
+                    self.rebuild()
+                    return
 
     def _update_count(self) -> None:
         self.count_label.setText(str(len(self._ws_data)))
