@@ -45,6 +45,7 @@ class TerminalCard(QFrame):
     focusGained = Signal(object)     # self
     reassignRequested = Signal(str)  # agent id (retask a completed/idle agent)
     maximizeRequested = Signal(object)  # self (toggle solo view of this card)
+    fileActivated = Signal(str)      # abs path Ctrl+clicked in the conversation
 
     def __init__(self, agent: TerminalAgent, parent=None):
         super().__init__(parent)
@@ -91,10 +92,10 @@ class TerminalCard(QFrame):
 
         header = QFrame(self)
         header.setObjectName("CardHeader")
-        header.setFixedHeight(32)
+        header.setFixedHeight(38)   # room for the larger 14px glyph buttons
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(8, 0, 4, 0)
-        hl.setSpacing(6)
+        hl.setContentsMargins(8, 0, 6, 0)
+        hl.setSpacing(7)
 
         self.glyph = QLabel("●", header)
         self.glyph.setObjectName("StatusGlyph")
@@ -219,6 +220,10 @@ class TerminalCard(QFrame):
             self.agent.pty_output.connect(self._on_pty_output)
             self.terminal.keyInput.connect(self._on_key_input)
             self.terminal.sizeChanged.connect(self.agent.resize)
+            # relative paths in the output resolve against the agent's cwd, and
+            # Ctrl+clicking a file bubbles up so the app can reveal it
+            self.terminal.set_base_dir(getattr(self.agent.spec, "cwd", "") or "")
+            self.terminal.fileActivated.connect(self.fileActivated)
             self.terminal.installEventFilter(self)
             return
 

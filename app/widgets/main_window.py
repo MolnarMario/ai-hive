@@ -6,8 +6,8 @@ Every dialog lives here so the model API stays headless-testable.
 
 import os
 
-from PySide6.QtCore import QProcess, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtCore import QProcess, Qt, QTimer, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QLabel, QLineEdit, QMainWindow, QMessageBox,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QToolButton, QVBoxLayout, QWidget)
 
 from .. import __version__
+from .. import fsopen
 from .. import providers
 from .. import session_hook
 from .. import ui_theme
@@ -615,6 +616,11 @@ class MainWindow(QMainWindow):
         # reveals a clicked agent's card (no overlapping popup)
         self.sidebar.agents_provider = self._agents_for_ws
         self.sidebar.agentActivated.connect(self._reveal_agent)
+        # inline file explorer: the sidebar resolves a ws to its root folder,
+        # opens files with the OS default app, and its open/closed set persists
+        self.sidebar.files_root_provider = self._project_path_for_ws
+        self.sidebar.fileActivated.connect(self._on_sidebar_file_activated)
+        self.sidebar.filesToggled.connect(self._schedule_save)
         # the sidebar owns the live layout; the manager persists whatever it
         # reports (order + categories) and re-sequences its workspace list
         self.sidebar.layoutChanged.connect(self.manager.apply_sidebar_layout)
@@ -729,6 +735,9 @@ class MainWindow(QMainWindow):
                         card.terminal.set_font_size(px)
                     elif not card.is_pty and card.agent.spec.font_px:
                         card.reapply_font()
+        # re-open the file trees that were open last session (sidebar rows are
+        # already built by _adopt_existing_model; unknown ids are dropped)
+        self.sidebar.set_open_file_trees(ui.get("file_trees_open", []))
 
     # ------------------------------------------------------- model events ---
 
@@ -747,6 +756,7 @@ class MainWindow(QMainWindow):
         page.activityToggled.connect(self._toggle_activity)
         page.mapRequested.connect(self._open_agent_map)
         page.reassignRequested.connect(self._on_reassign_agent)
+        page.fileActivated.connect(self._reveal_file_in_tree)
         self._pages[ws.id] = page
         self.stack.addWidget(page)
         self.sidebar.add_row(ws.id, ws.name, os.path.basename(ws.project_path)
@@ -855,6 +865,25 @@ class MainWindow(QMainWindow):
         ws = self.manager.workspace(ws_id)
         return list(ws.agents) if ws is not None else []
 
+    def _project_path_for_ws(self, ws_id: str) -> str:
+        """Root folder for a workspace — the sidebar file explorer's provider
+        (it scandirs this to build the inline tree)."""
+        ws = self.manager.workspace(ws_id)
+        return ws.project_path if ws is not None else ""
+
+    def _on_sidebar_file_activated(self, ws_id: str, path: str) -> None:
+        """A file row was clicked in the sidebar tree: open it with the OS
+        default program and highlight it in place."""
+        fsopen.open_path(path)
+        self.sidebar.reveal_file(ws_id, path)
+
+    def _reveal_file_in_tree(self, ws_id: str, path: str) -> None:
+        """A file path was Ctrl+clicked in a conversation (already opened by the
+        terminal). If that workspace's file tree is open, scroll to + highlight
+        the file — the file<->conversation bridge. No-ops when the tree is
+        closed (reveal only when the explorer is showing)."""
+        self.sidebar.reveal_file(ws_id, path)
+
     def _on_stats_for_activity(self, ws_id: str, _stats: dict) -> None:
         # cheap refresh only (roster + log); the blocking git scan stays on the
         # slow poll timer, never on this high-frequency status-change path
@@ -916,6 +945,12 @@ class MainWindow(QMainWindow):
         if page is not None:
             page.set_path_text(path)
         self.sidebar.set_row_folder(ws_id, os.path.basename(path) or path)
+        # the file explorer re-roots at the new folder (drop stale sub-expansion)
+        self.sidebar.reset_file_tree(ws_id)
+        for card in (page.cards if page is not None else []):
+            if card.is_pty:
+                card.terminal.set_base_dir(getattr(card.agent.spec, "cwd", "")
+                                           or path)
         # the board moved folders — repoint the panel if it's showing this ws
         if self.activity_panel.is_open() and ws_id == self.manager.active_id:
             ws = self.manager.workspace(ws_id)
@@ -927,7 +962,7 @@ class MainWindow(QMainWindow):
     def _open_workspace_folder(self, ws_id: str) -> None:
         ws = self.manager.workspace(ws_id)
         if ws and os.path.isdir(ws.project_path):
-            QDesktopServices.openUrl(QUrl.fromLocalFile(ws.project_path))
+            fsopen.open_path(ws.project_path)
         elif ws:
             QMessageBox.warning(self, "AI Hive",
                                 f"Folder not found:\n{ws.project_path}")
@@ -1121,6 +1156,9 @@ class MainWindow(QMainWindow):
             "console_font_px": ui_theme.CONSOLE_FONT_PX,
             "theme": self._theme_id,
             "window": {"w": w, "h": h, "maximized": self.isMaximized()},
+            # which workspaces have their inline file tree open (per-folder
+            # expansion + highlight are transient, not persisted)
+            "file_trees_open": self.sidebar.open_file_trees(),
         }
         return data
 

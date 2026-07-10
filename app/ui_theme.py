@@ -320,6 +320,12 @@ WorkspaceRow[active="true"] {{
 }}
 #WsFolderBtn:hover {{ background: {p.BG_HOVER}; color: {p.ACCENT_BLUE};
                      border-color: {p.BORDER}; }}
+#WsTreeBtn {{
+    background: transparent; border: 1px solid transparent; border-radius: 3px;
+    padding: 2px 5px; color: {p.TEXT_DIM}; font-size: 12px;
+}}
+#WsTreeBtn:hover {{ background: {p.BG_HOVER}; color: {p.ACCENT_GOLD};
+                   border-color: {p.BORDER}; }}
 #WsList::branch {{ background: transparent; border: none; }}
 #WsQ {{
     background: rgba(217,178,74,0.18); color: {p.YELLOW};
@@ -377,6 +383,23 @@ WorkspaceRow[active="true"] {{
 #WsAgentName {{ font-family: {BODY_FONT}; font-size: 13px; font-weight: 600; }}
 #WsAgentTask {{ color: {p.TEXT_DIM}; font-size: 13px; }}
 #WsAgentQ {{ color: {p.YELLOW}; font-size: 14px; font-weight: 800; }}
+
+/* inline file explorer rows (a workspace expanded to its VS Code-style file
+   tree): a type/folder icon + the name; the revealed row (a file jumped to from
+   a conversation Ctrl+click) gets a gold-tinted highlight */
+#WsTreeRow {{
+    background: transparent; border-left: 2px solid transparent;
+}}
+#WsTreeRow:hover {{ background: {p.BG_HOVER}; }}
+#WsTreeRow[revealed="true"] {{
+    background: rgba(217,178,74,0.20); border-left: 2px solid {p.ACCENT_GOLD};
+}}
+#WsTreeCaret {{ color: {p.TEXT_DIM}; font-size: 10px; }}
+#WsTreeIcon {{ font-size: 11px; }}
+#WsTreeName {{ font-family: {BODY_FONT}; font-size: 12px; color: {p.TEXT}; }}
+#WsTreeRow[dir="true"] #WsTreeName {{ font-weight: 600; }}
+#WsTreeMore {{ color: {p.TEXT_FAINT}; font-size: 11px; font-style: italic;
+              padding-left: 24px; }}
 
 /* ----------------------------------------------------- terminal card --- */
 TerminalCard {{
@@ -453,10 +476,15 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
    take the head's subtitle color, not the body text color */
 #CardStart, #CardStop, #CardRestart, #CardClose, #WsDelete,
 #CardFontDec, #CardFontInc, #CardReassign, #CardMaximize {{
-    padding: 1px 4px; font-size: 11px; color: {p.CARDHEAD_SUB};
+    padding: 3px 6px; font-size: 14px; color: {p.CARDHEAD_SUB};
 }}
 #CardStart:hover, #CardStop:hover, #CardRestart:hover, #CardFontDec:hover,
 #CardFontInc:hover, #CardReassign:hover, #CardMaximize:hover {{ color: {p.CARDHEAD_FG}; }}
+/* the A-/A+ font steppers read better a hair smaller than the glyph icons;
+   the maximize/restore glyph a hair larger (later rules win on equal id
+   specificity) */
+#CardFontDec, #CardFontInc {{ font-size: 12px; font-weight: 700; }}
+#CardMaximize {{ font-size: 16px; }}
 #WsDelete {{ color: {p.TEXT_DIM}; }}
 #CardReassign:hover {{ border-color: {p.ACCENT_GOLD}; }}
 #GlobalFontBtn {{

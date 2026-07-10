@@ -59,6 +59,18 @@ workspaces keep executing — switching never pauses anything.
   that agent in the expanded list, so you can spot and answer it without hunting
   through terminals. Suppressed for agents launched in bypass-permissions mode
   (which never prompt).
+- **Inline file explorer** — hover a workspace row and click the **▸ files**
+  toggle to expand a **VS Code-style file tree** right under it: folders and
+  files of the project root, each with a **type icon**, lazily populated as you
+  open folders and live-refreshed as files change on disk. Click a file to open
+  it with your OS default program. The tree lives inside the same sidebar (and
+  inside a category's tinted container when the workspace is grouped); which
+  workspaces have it open persists across restarts.
+- **Conversation ↔ files bridge** — **Ctrl+click a file path in a Claude
+  reply** to open it with the OS default program — absolute paths *and*
+  repo-relative ones like `app/widgets/sidebar.py` (resolved against the agent's
+  folder). If that workspace's file tree is open, the clicked file is also
+  scrolled to and **highlighted** in it, so you can see where it lives.
 - **First-class folders** — every workspace header shows its path with
   **Open folder** and **Change…** buttons; agents launch rooted there.
 - **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ in the
@@ -84,8 +96,10 @@ workspaces keep executing — switching never pauses anything.
   **interactive**: drag an agent to rearrange it (placement persists across
   refreshes; the file tree is structural), drag empty space to pan, Ctrl+wheel
   (or +/−/0) to zoom, **single-click an agent to jump to its terminal card**,
-  and double-click a file to open it (right-click for **Open with…** / Reveal
-  in folder / Copy path). Header **Write** / **Read** toggles hide the edited or
+  and **double-click a file to open it with the OS default program** (each file
+  row is prefixed with a **type icon** — image / code / config / doc / … — keyed
+  on its extension; right-click for **Open with…** / Reveal in folder / Copy
+  path). Header **Write** / **Read** toggles hide the edited or
   read-only lines independently, for when you only care about one kind of
   activity (the legend greys the hidden kind). Agent bubbles are opaque and each
   Task sub-agent is labeled with its type.
@@ -373,7 +387,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-553 checks drive the real app headlessly (offscreen Qt platform) with real
+587 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -430,12 +444,15 @@ app/
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
   widgets/                 main_window, sidebar (drag-reorder + categories +
-                           inline agent list w/ "?"), workspace_page,
-                           terminal_card, terminal_view (pyte grid), grid_selector
+                           inline agent list w/ "?" + inline file explorer),
+                           workspace_page, terminal_card, terminal_view (pyte grid;
+                           Ctrl+click paths open + reveal), grid_selector
                            (on-screen popup), activity_panel, agent_file_map (tree
                            diagram), ornaments (drop-caps / dividers / count-badge
                            + working-count spinner)
-tests/smoke_test.py        headless end-to-end suite (553 checks)
+  fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
+  filetypes.py             file-type icon map (shared by map + file explorer)
+tests/smoke_test.py        headless end-to-end suite (587 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

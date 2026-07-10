@@ -45,11 +45,15 @@ the child the right number of Left/Right arrows (exact on the caret's own line;
 a terminal can't set the child's cursor directly). A drag selects text instead
 and never moves the caret. Double-click selects the whitespace-delimited word
 under the pointer (then Ctrl+C copies it); Ctrl+click (or middle/scroll-wheel
-click) opens a URL
-or an existing ABSOLUTE local file path under the pointer via the OS default
-handler (_link_at/_classify_link/_open_target). Ctrl+LEFT-click is primary --
-the left button always delivers, while the middle button is often eaten by the
-OS (autoscroll). Hovering such a link underlines it (in the accent color) and
+click) opens a URL or an existing local file path under the pointer via the OS
+default handler (_link_at/_classify_link/_open_target). File paths may be
+ABSOLUTE, or RELATIVE to the agent's working directory when that base dir has
+been supplied via set_base_dir() -- so a repo-relative path Claude prints
+(app/widgets/sidebar.py) is clickable too; opening a file also emits
+fileActivated(abspath) so the app can reveal it in the sidebar file tree.
+Ctrl+LEFT-click is primary -- the left button always delivers, while the middle
+button is often eaten by the OS (autoscroll). Hovering such a link underlines it
+(in the accent color) and
 switches to a hand cursor so it reads as clickable; the scan runs only when the
 pointer changes cells (it can stat the filesystem). Deleting a selected word from the
 keyboard is NOT wired: the terminal can't edit a specific span of the child's
@@ -220,6 +224,7 @@ _PRIVATE_MODE_RE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
 class TerminalView(QWidget):
     keyInput = Signal(str)        # VT byte sequence for the PTY
     sizeChanged = Signal(int, int)  # rows, cols
+    fileActivated = Signal(str)   # absolute path Ctrl+clicked in the conversation
 
     def __init__(self, rows: int = 30, cols: int = 100, parent=None,
                  font_px: int = 0):
@@ -230,6 +235,9 @@ class TerminalView(QWidget):
         self.setCursor(Qt.CursorShape.IBeamCursor)
         self.setMouseTracking(True)  # hover (no button) to highlight links
 
+        # base directory for resolving RELATIVE paths clicked in the output
+        # (the agent's cwd == its workspace project_path); set via set_base_dir
+        self._base_dir = ""
         self._esc_carry = ""  # trailing partial escape between feed() calls
         self._scroll_offset = 0  # lines scrolled back into history (0 = live)
         self._sel_anchor = None  # (row, col) selection start, in screen coords
@@ -612,6 +620,8 @@ class TerminalView(QWidget):
             target = self._link_at(row, col)
             if target:
                 self._open_target(target)
+                if target[0] == "file":   # let the app reveal it in the sidebar
+                    self.fileActivated.emit(target[1])
                 event.accept()
                 return
         if event.button() == Qt.MouseButton.LeftButton:
@@ -736,12 +746,13 @@ class TerminalView(QWidget):
         token = "".join(line[c].data for c in range(rng[0], rng[1] + 1))
         return rng if self._classify_link(token) else None
 
-    @staticmethod
-    def _classify_link(token: str):
+    def _classify_link(self, token: str):
         """Classify a token as an openable URL or an existing local file.
         Trims wrapping quotes/brackets and a trailing :line[:col] ref (Claude
-        prints file:line). Only ABSOLUTE paths are opened -- a relative path
-        has no reliable base here. Returns ('url'|'file', value) or None."""
+        prints file:line). Absolute paths are checked directly; a RELATIVE path
+        is resolved against `self._base_dir` (the agent's cwd) when one is set --
+        that is the common case, since Claude prints repo-relative paths like
+        'app/widgets/sidebar.py'. Returns ('url'|'file', value) or None."""
         import os
 
         t = token.strip().strip("'\"()[]{}<>,;")
@@ -753,32 +764,36 @@ class TerminalView(QWidget):
             return ("url", "http://" + t)
         path = re.sub(r":\d+(:\d+)?$", "", t)  # drop a file:line[:col] suffix
         path = os.path.expanduser(path)
-        if os.path.isabs(path):
-            try:
+        try:
+            if os.path.isabs(path):
                 if os.path.exists(path):
                     return ("file", os.path.abspath(path))
-            except OSError:
-                return None
+            elif self._base_dir:              # resolve relative to the agent cwd
+                cand = os.path.join(self._base_dir, path)
+                if os.path.exists(cand):
+                    return ("file", os.path.abspath(cand))
+        except OSError:
+            return None
         return None
+
+    def set_base_dir(self, path: str) -> None:
+        """Set the directory relative paths in the output resolve against (the
+        agent's working directory). Empty disables relative-path opening."""
+        self._base_dir = path or ""
 
     def _open_target(self, target) -> None:
         """Open a classified link with the OS default handler (user-initiated
-        via Ctrl/middle-click, like following a hyperlink). Falls back to the
-        Windows shell (os.startfile) when Qt's handler reports failure -- Qt
-        returns False for some file associations, which would otherwise make a
-        click look dead."""
-        from PySide6.QtCore import QUrl
-        from PySide6.QtGui import QDesktopServices
+        via Ctrl/middle-click, like following a hyperlink). URLs go to the
+        browser; files go through the shared fsopen helper (Qt openUrl with an
+        os.startfile fallback -- Qt returns False for some file associations,
+        which would otherwise make a click look dead)."""
+        from .. import fsopen
 
         kind, value = target
-        url = QUrl(value) if kind == "url" else QUrl.fromLocalFile(value)
-        if QDesktopServices.openUrl(url):
-            return
-        try:  # Windows-only shell open; harmless no-op elsewhere
-            import os
-            os.startfile(value)  # noqa: S606 - value is a vetted URL/abs path
-        except (OSError, AttributeError):
-            pass
+        if kind == "url":
+            fsopen.open_url(value)
+        else:
+            fsopen.open_path(value)
 
     def _selection_range(self):
         """Normalized ((r0,c0),(r1,c1)) with start <= end, or None."""

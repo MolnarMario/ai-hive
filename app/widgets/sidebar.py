@@ -1,5 +1,5 @@
 """Sidebar: the WORKSPACES panel — rows, badges, inline rename, collapse,
-drag-reorder, and (M2) collapsible categories.
+drag-reorder, (M2) collapsible categories, and an inline file explorer.
 
 The panel is a model-driven `QTreeWidget`: `Sidebar._nodes` is the ordered list
 of top-level nodes (workspaces and, in M2, categories with workspace children),
@@ -9,19 +9,35 @@ Drag-and-drop never moves Qt items directly (that would strand the rich
 keeps ordering, category membership, and persistence driven by a single source
 of truth. Rows themselves initiate the `QDrag` (they cover the viewport, so the
 view can't), and the tree resolves the drop target + position.
+
+Two things expand INLINE under a workspace row as child items (folder-tree
+style), each toggled by a hover control and both rebuilt from state — never by
+moving items: the AGENT list (count-badge / "?" click → `_expanded_ws`) and the
+FILE explorer (the ▸ toggle → `_expanded_files`). The file explorer is a lazy,
+VS Code-style tree: `_add_file_rows`/`_add_dir_children` scandir the workspace
+root (`files_root_provider`) and recurse only into directories the user has
+opened (`_expanded_dirs`, relative paths). A `QFileSystemWatcher` on the visible
+dirs refreshes it when files change on disk. `reveal_file` scrolls to +
+highlights a file (used when a path is Ctrl+clicked in a conversation). The
+coarse per-workspace open/closed set persists (`filesToggled` → the session
+"ui" blob); per-directory expansion + the reveal highlight are transient like
+the agent expansion — in-memory, rebuild-only, never marking the session dirty.
 """
 
+import os
 import uuid
 
-from PySide6.QtCore import (QEasingCurve, QEvent, QMimeData, QPoint,
-                            QPropertyAnimation, QRect, QSize, Qt, QTimer,
+from PySide6.QtCore import (QEasingCurve, QEvent, QFileSystemWatcher, QMimeData,
+                            QPoint, QPropertyAnimation, QRect, QSize, Qt, QTimer,
                             Signal)
-from PySide6.QtGui import QColor, QDrag, QFontMetrics, QPainter, QPen, QPixmap
+from PySide6.QtGui import (QColor, QDrag, QFont, QFontMetrics, QPainter, QPen,
+                           QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
                                QHBoxLayout, QLabel, QLineEdit, QSizePolicy,
                                QToolButton, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
+from ..filetypes import EMOJI_FONT, FOLDER_ICON, FOLDER_OPEN_ICON, file_icon
 from ..ui_theme import Palette, repolish
 from .activity_panel import _ICON
 from .ornaments import AgentCountBadge, OrnamentDivider, WorkspaceSpinner
@@ -30,6 +46,10 @@ SIDEBAR_WIDTH = 230
 ROW_HEIGHT = 44
 CAT_HEIGHT = 32
 AGENT_HEIGHT = 34
+TREE_ROW_HEIGHT = 24
+# soft cap on entries shown per directory — a huge folder (node_modules) would
+# otherwise stall paint; the overflow collapses to a muted "… N more" row
+FILE_TREE_CAP = 800
 
 # drag payload: b"workspace:<id>" or b"category:<id>"
 NODE_MIME = "application/x-aihive-sidebar-node"
@@ -44,6 +64,7 @@ class WorkspaceRow(QFrame):
     deleteRequested = Signal(str)       # ws_id
     openFolderRequested = Signal(str)   # ws_id
     agentsRequested = Signal(str)       # ws_id (count-badge clicked; M3)
+    filesRequested = Signal(str)        # ws_id (file-tree toggle clicked)
 
     def __init__(self, ws_id: str, name: str, folder: str, parent=None):
         super().__init__(parent)
@@ -77,6 +98,18 @@ class WorkspaceRow(QFrame):
         self.rename_edit.hide()
         text_col.addWidget(self.name_label)
         text_col.addWidget(self.rename_edit)
+
+        # inline file-tree toggle (a caret that turns as the tree opens) — a
+        # SEPARATE control from folder_btn: this expands the file explorer under
+        # the row, folder_btn opens the folder in the OS file manager
+        self.tree_btn = QToolButton(self)
+        self.tree_btn.setObjectName("WsTreeBtn")
+        self.tree_btn.setText("▸")
+        self.tree_btn.setToolTip("Show files")
+        self.tree_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.tree_btn.hide()
+        self.tree_btn.clicked.connect(
+            lambda: self.filesRequested.emit(self.ws_id))
 
         self.folder_btn = QToolButton(self)
         self.folder_btn.setObjectName("WsFolderBtn")
@@ -115,6 +148,7 @@ class WorkspaceRow(QFrame):
 
         lay.addWidget(self.count_badge)
         lay.addLayout(text_col, 1)
+        lay.addWidget(self.tree_btn)
         lay.addWidget(self.folder_btn)
         lay.addWidget(self.delete_btn)
         lay.addWidget(self.q_badge)
@@ -240,12 +274,18 @@ class WorkspaceRow(QFrame):
         self._update_hover_buttons(hovered=False)
         super().leaveEvent(event)
 
+    def set_files_open(self, is_open: bool) -> None:
+        """Reflect the file-tree open state in the toggle caret (▾ open / ▸)."""
+        self.tree_btn.setText("▾" if is_open else "▸")
+        self.tree_btn.setToolTip("Hide files" if is_open else "Show files")
+
     def _update_hover_buttons(self, hovered: bool) -> None:
-        # folder/delete appear ONLY while hovering the row (not on the active
-        # row) so the workspace name keeps the full width the rest of the time;
-        # the count badge carries the workspace's status at all times
+        # tree/folder/delete appear ONLY while hovering the row (not on the
+        # active row) so the workspace name keeps the full width the rest of the
+        # time; the count badge carries the workspace's status at all times
         self.delete_btn.setVisible(hovered)
         self.folder_btn.setVisible(hovered)
+        self.tree_btn.setVisible(hovered)
 
 
 class CategoryRow(QFrame):
@@ -581,6 +621,75 @@ class AgentRow(QFrame):
         super().mousePressEvent(event)
 
 
+class TreeEntryRow(QFrame):
+    """One entry in a workspace's inline file explorer (VS Code style): a small
+    type icon (folder / file-by-extension) and the name. A directory row shows a
+    disclosure caret and toggles its children on click; a file row opens the
+    file on click. Modeled on AgentRow — same folder-tree look, same click-to-act
+    interaction. Nesting/indentation comes from the QTreeWidget item depth."""
+
+    dirToggled = Signal(str, str)      # ws_id, relpath (expand/collapse)
+    fileActivated = Signal(str, str)   # ws_id, abspath (open it)
+
+    def __init__(self, ws_id, rel, name, abspath, is_dir, is_open, parent=None):
+        super().__init__(parent)
+        self.setObjectName("WsTreeRow")
+        self.setProperty("dir", bool(is_dir))
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ws_id = ws_id
+        self.rel = rel
+        self.abspath = abspath
+        self.is_dir = is_dir
+        self._full = name
+        self.setFixedHeight(TREE_ROW_HEIGHT)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 1, 8, 1)
+        lay.setSpacing(4)
+        # caret column: a fixed width kept even for files so names line up
+        self.caret = QLabel(self)
+        self.caret.setObjectName("WsTreeCaret")
+        self.caret.setFixedWidth(10)
+        if is_dir:
+            self.caret.setText("▾" if is_open else "▸")  # ▾ / ▸
+        self.glyph = QLabel(self)
+        self.glyph.setObjectName("WsTreeIcon")
+        ef = QFont(EMOJI_FONT)
+        ef.setPixelSize(11)
+        self.glyph.setFont(ef)
+        self.glyph.setText((FOLDER_OPEN_ICON if is_open else FOLDER_ICON)
+                           if is_dir else file_icon(name))
+        self.name = QLabel(self)
+        self.name.setObjectName("WsTreeName")
+        lay.addWidget(self.caret)
+        lay.addWidget(self.glyph)
+        lay.addWidget(self.name, 1)
+        self._elide()
+
+    def _elide(self) -> None:
+        w = self.name.contentsRect().width()
+        if w > 8:
+            fm = QFontMetrics(self.name.font())
+            self.name.setText(
+                fm.elidedText(self._full, Qt.TextElideMode.ElideMiddle, w))
+        else:
+            self.name.setText(self._full)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self.is_dir:
+                self.dirToggled.emit(self.ws_id, self.rel)
+            else:
+                self.fileActivated.emit(self.ws_id, self.abspath)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class Sidebar(QFrame):
     addRequested = Signal()
     addCategoryRequested = Signal()          # M2
@@ -592,6 +701,9 @@ class Sidebar(QFrame):
     agentActivated = Signal(str, str)        # ws_id, agent_id (reveal its card)
     reordered = Signal(list)                 # flattened ws-id order (M1)
     layoutChanged = Signal(list)             # full node model: order+categories
+    filesRequested = Signal(str)             # ws_id (file-tree toggle clicked)
+    filesToggled = Signal()                  # a file tree opened/closed (persist)
+    fileActivated = Signal(str, str)         # ws_id, abs path (open the file)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -621,6 +733,26 @@ class Sidebar(QFrame):
         self._agent_timer = QTimer(self)
         self._agent_timer.setInterval(600)
         self._agent_timer.timeout.connect(self._sync_expanded)
+        # inline FILE explorer (VS Code style, transient like agent expansion):
+        # which workspaces show their file tree, and which directories within
+        # each are expanded (workspace-relative paths). files_root_provider is
+        # set by MainWindow to resolve a ws_id -> its project_path root. The
+        # per-directory expansion + the reveal highlight are purely in-memory
+        # (never persisted, never dirty); only the coarse open/closed set is
+        # persisted (via filesToggled -> the "ui" blob).
+        self.files_root_provider = None
+        self._expanded_files: set[str] = set()
+        self._expanded_dirs: dict[str, set] = {}      # ws_id -> {relpath, ...}
+        self._file_items: dict[tuple, QTreeWidgetItem] = {}  # (ws_id, abs)->item
+        self._file_rows: dict[tuple, TreeEntryRow] = {}
+        self._revealed: tuple | None = None           # (ws_id, abs) highlighted
+        self._watched_dirs: list[str] = []            # visible dirs, per rebuild
+        self._fs_watcher = QFileSystemWatcher(self)
+        self._fs_watcher.directoryChanged.connect(lambda _p: self._fs_debounce.start())
+        self._fs_debounce = QTimer(self)              # coalesce burst FS events
+        self._fs_debounce.setInterval(300)
+        self._fs_debounce.setSingleShot(True)
+        self._fs_debounce.timeout.connect(self.rebuild)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 8, 0, 0)
@@ -757,6 +889,9 @@ class Sidebar(QFrame):
         self._cat_items = {}
         self._agent_rows = {}
         self._rendered_agents = {}
+        self._file_items = {}
+        self._file_rows = {}
+        self._watched_dirs = []
         root = self.tree.invisibleRootItem()
         for node in self._nodes:
             if node["type"] == "workspace":
@@ -764,6 +899,8 @@ class Sidebar(QFrame):
             elif node["type"] == "category":
                 self._add_cat_item(node)
         self._update_count()
+        self._rewatch()
+        self._reapply_reveal()
 
     def _add_cat_item(self, node: dict) -> None:
         cid = node["id"]
@@ -798,6 +935,8 @@ class Sidebar(QFrame):
         row.deleteRequested.connect(self.deleteRequested)
         row.openFolderRequested.connect(self.openFolderRequested)
         row.agentsRequested.connect(self._toggle_agents)  # inline expand/close
+        row.filesRequested.connect(self._toggle_files)    # inline file tree
+        row.set_files_open(ws_id in self._expanded_files)
         self.tree.setItemWidget(item, 0, row)
         self._ws_widgets[ws_id] = row
         self._ws_items[ws_id] = item
@@ -806,6 +945,9 @@ class Sidebar(QFrame):
         row.set_active(ws_id == self._active_id)
         if ws_id in self._expanded_ws:      # show its agents as child rows
             self._add_agent_rows(ws_id, item)
+            item.setExpanded(True)
+        if ws_id in self._expanded_files:   # show its file tree as child rows
+            self._add_file_rows(ws_id, item)
             item.setExpanded(True)
 
     def _add_agent_rows(self, ws_id: str, ws_item: QTreeWidgetItem) -> None:
@@ -838,6 +980,152 @@ class Sidebar(QFrame):
             self._agent_timer.start()
         else:
             self._agent_timer.stop()
+
+    # -------------------------------------------------- inline file explorer ---
+
+    def _toggle_files(self, ws_id: str) -> None:
+        """Expand/collapse a workspace's inline file tree. This is a deliberate,
+        low-frequency user action, so it persists (via filesToggled). The
+        per-directory expansion below it is transient and never persisted."""
+        self.filesRequested.emit(ws_id)
+        if ws_id in self._expanded_files:
+            self._expanded_files.discard(ws_id)
+            self._expanded_dirs.pop(ws_id, None)
+        else:
+            self._expanded_files.add(ws_id)
+        self.rebuild()
+        self.filesToggled.emit()
+
+    def _on_dir_toggled(self, ws_id: str, rel: str) -> None:
+        """Expand/collapse one directory inside a file tree (transient)."""
+        dirs = self._expanded_dirs.setdefault(ws_id, set())
+        dirs.discard(rel) if rel in dirs else dirs.add(rel)
+        self.rebuild()
+
+    def _add_file_rows(self, ws_id: str, ws_item: QTreeWidgetItem) -> None:
+        root = (self.files_root_provider(ws_id)
+                if self.files_root_provider else None)
+        if not root or not os.path.isdir(root):
+            return
+        self._watched_dirs.append(root)
+        self._add_dir_children(ws_id, ws_item, root, "")
+
+    def _add_dir_children(self, ws_id, parent_item, dir_path, rel_prefix) -> None:
+        """Populate one directory level; recurse only into expanded subdirs
+        (lazy, VS Code style). Guarded so a permission error never breaks the
+        rebuild path. Directories sort before files, case-insensitive."""
+        try:
+            with os.scandir(dir_path) as it:
+                entries = list(it)
+        except OSError:
+            return
+
+        def is_dir(e):
+            try:
+                return e.is_dir()
+            except OSError:
+                return False
+
+        dirs = sorted((e for e in entries if is_dir(e)),
+                      key=lambda e: e.name.lower())
+        files = sorted((e for e in entries if not is_dir(e)),
+                       key=lambda e: e.name.lower())
+        ordered = dirs + files
+        expanded = self._expanded_dirs.get(ws_id, set())
+        for e in ordered[:FILE_TREE_CAP]:
+            entry_is_dir = is_dir(e)
+            rel = f"{rel_prefix}/{e.name}" if rel_prefix else e.name
+            abspath = os.path.abspath(e.path)
+            is_open = entry_is_dir and rel in expanded
+            child = QTreeWidgetItem(parent_item)
+            child.setData(0, Qt.ItemDataRole.UserRole,
+                          {"type": "dir" if entry_is_dir else "file",
+                           "path": abspath})
+            child.setSizeHint(0, QSize(SIDEBAR_WIDTH, TREE_ROW_HEIGHT))
+            trow = TreeEntryRow(ws_id, rel, e.name, abspath, entry_is_dir, is_open)
+            if entry_is_dir:
+                trow.dirToggled.connect(self._on_dir_toggled)
+            else:
+                trow.fileActivated.connect(self.fileActivated)
+            self.tree.setItemWidget(child, 0, trow)
+            self._file_items[(ws_id, abspath)] = child
+            self._file_rows[(ws_id, abspath)] = trow
+            if is_open:
+                self._watched_dirs.append(abspath)
+                self._add_dir_children(ws_id, child, abspath, rel)
+                child.setExpanded(True)
+        if len(ordered) > FILE_TREE_CAP:
+            more = QTreeWidgetItem(parent_item)
+            more.setSizeHint(0, QSize(SIDEBAR_WIDTH, TREE_ROW_HEIGHT))
+            lbl = QLabel(f"… {len(ordered) - FILE_TREE_CAP} more")
+            lbl.setObjectName("WsTreeMore")
+            self.tree.setItemWidget(more, 0, lbl)
+
+    def _rewatch(self) -> None:
+        """Point the filesystem watcher at exactly the directories currently
+        visible in open file trees, so external add/delete refreshes the view."""
+        existing = self._fs_watcher.directories()
+        if existing:
+            self._fs_watcher.removePaths(existing)
+        if self._watched_dirs:
+            self._fs_watcher.addPaths(self._watched_dirs)
+
+    def reveal_file(self, ws_id: str, abspath: str) -> None:
+        """Scroll to + highlight a file in its workspace's tree. No-ops unless
+        that tree is already open (respecting 'reveal only when the explorer is
+        showing'); expands every ancestor directory to bring it into view. All
+        transient — never marks the session dirty."""
+        if ws_id not in self._expanded_files:
+            return
+        root = (self.files_root_provider(ws_id)
+                if self.files_root_provider else None)
+        if not root:
+            return
+        try:
+            rel = os.path.relpath(abspath, root)
+        except ValueError:            # different drive — not under this root
+            return
+        rel = rel.replace("\\", "/")
+        if rel.startswith("../") or rel == "..":
+            return                    # outside the workspace root
+        parts = rel.split("/")
+        dirs = self._expanded_dirs.setdefault(ws_id, set())
+        acc = ""
+        for p in parts[:-1]:
+            acc = f"{acc}/{p}" if acc else p
+            dirs.add(acc)
+        self._revealed = (ws_id, os.path.abspath(abspath))
+        self.rebuild()               # reapplies the highlight for _revealed
+        item = self._file_items.get(self._revealed)
+        if item is not None:
+            self.tree.scrollToItem(item)
+
+    def _reapply_reveal(self) -> None:
+        """Re-mark the revealed row after a rebuild (the widgets are recreated).
+        A revealed file that is no longer visible simply isn't highlighted."""
+        if not self._revealed:
+            return
+        row = self._file_rows.get(self._revealed)
+        if row is not None:
+            row.setProperty("revealed", True)
+            repolish(row)
+
+    def reset_file_tree(self, ws_id: str) -> None:
+        """Drop a workspace's per-directory expansion (e.g. its root folder
+        changed) and rebuild if its tree is currently open."""
+        self._expanded_dirs.pop(ws_id, None)
+        if ws_id in self._expanded_files:
+            self.rebuild()
+
+    def open_file_trees(self) -> list:
+        """The ws-ids whose file tree is open (for persistence)."""
+        return sorted(self._expanded_files)
+
+    def set_open_file_trees(self, ids) -> None:
+        """Restore which workspaces show their file tree (session restore).
+        Intersected with known workspaces so a stale id is dropped."""
+        self._expanded_files = {i for i in (ids or []) if i in self._ws_data}
+        self.rebuild()
 
     def _sync_expanded(self) -> None:
         """Keep expanded agent rows live (status / summary / "?"); rebuild only

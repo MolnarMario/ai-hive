@@ -64,6 +64,7 @@ class WorkspacePage(QWidget):
     changePathRequested = Signal(str)   # ws_id
     activityToggled = Signal(str)       # ws_id (wired in Phase 6)
     mapRequested = Signal(str)          # ws_id (open the Agent/File Map window)
+    fileActivated = Signal(str, str)    # ws_id, abs path (Ctrl+clicked in a card)
 
     def __init__(self, workspace: Workspace, parent=None):
         super().__init__(parent)
@@ -206,6 +207,8 @@ class WorkspacePage(QWidget):
         card.focusGained.connect(self.focusGained)
         card.reassignRequested.connect(self.reassignRequested)
         card.maximizeRequested.connect(self.toggle_solo)
+        card.fileActivated.connect(
+            lambda p: self.fileActivated.emit(self.workspace.id, p))
         self.cards.append(card)
         # a freshly added agent must never be born invisible behind a maximized
         # sibling — adding one exits solo so the new card is seen

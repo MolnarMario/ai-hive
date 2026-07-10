@@ -527,6 +527,181 @@ def test_agent_inline_expansion():
     a2.deleteLater()
 
 
+def test_fsopen_helpers():
+    """The shared OS-open helpers must no-op safely on a missing path (never
+    raise, never launch anything)."""
+    import os
+    import tempfile
+    import app.fsopen as fsopen
+    missing = os.path.join(tempfile.gettempdir(), "aihive_no_such_file_9271.xyz")
+    check("fsopen: open_path on a missing file no-ops (False)",
+          fsopen.open_path(missing) is False)
+    check("fsopen: open_path on empty path no-ops (False)",
+          fsopen.open_path("") is False)
+    fsopen.open_with(missing)          # must not raise
+    fsopen.reveal_in_folder(missing)   # must not raise
+    check("fsopen: open_with / reveal_in_folder no-op on missing path", True)
+
+
+def test_filetypes_icons():
+    """File-type icons map by extension; folder icon is distinct; unknown/no
+    extension falls back to the generic document icon."""
+    from app import filetypes as ft
+    check("filetypes: image extensions share one icon",
+          ft.file_icon("a.PNG") == ft.file_icon("b.jpg") != ft.DEFAULT_ICON)
+    check("filetypes: python has its own icon (not generic code)",
+          ft.file_icon("m.py") not in (ft.DEFAULT_ICON, ft.file_icon("x.js")))
+    check("filetypes: unknown / no extension -> generic icon",
+          ft.file_icon("weird.zzz") == ft.DEFAULT_ICON
+          and ft.file_icon("Makefile") == ft.DEFAULT_ICON)
+    check("filetypes: folder icon is distinct from any file icon",
+          ft.FOLDER_ICON not in ft.FILE_ICONS.values()
+          and ft.FOLDER_ICON != ft.DEFAULT_ICON)
+
+
+def test_terminal_relative_link():
+    """Ctrl+click a path in a conversation opens it: absolute paths work, and a
+    RELATIVE path resolves against the agent cwd set via set_base_dir (the
+    common case, since Claude prints repo-relative paths). Opening a file emits
+    fileActivated(abspath) so the app can reveal it in the sidebar tree."""
+    import os
+    import tempfile
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y, TerminalView)
+    QApplication.instance() or QApplication([])
+
+    base = tempfile.mkdtemp(prefix="aihive_link_")
+    os.makedirs(os.path.join(base, "app", "widgets"), exist_ok=True)
+    rel = os.path.join("app", "widgets", "sidebar.py")
+    absf = os.path.join(base, rel)
+    with open(absf, "w", encoding="utf-8") as fh:
+        fh.write("x = 1\n")
+
+    tv = TerminalView(rows=6, cols=80)
+    tv.resize(700, 200)
+    # no base dir yet -> a relative path is NOT openable
+    check("link: relative path is not classified without a base dir",
+          tv._classify_link("app/widgets/sidebar.py") is None)
+    tv.set_base_dir(base)
+    check("link: relative path resolves against the base dir",
+          tv._classify_link("app/widgets/sidebar.py")
+          == ("file", os.path.abspath(absf)))
+    check("link: relative path + :line[:col] suffix still resolves",
+          tv._classify_link("app/widgets/sidebar.py:42:7")
+          == ("file", os.path.abspath(absf)))
+    check("link: absolute existing path still classifies as a file",
+          tv._classify_link(absf) == ("file", os.path.abspath(absf)))
+    check("link: a URL still classifies as a url",
+          tv._classify_link("https://example.com")[0] == "url")
+    check("link: a non-existent relative path is not openable",
+          tv._classify_link("does/not/exist.py") is None)
+
+    # Ctrl+left-click over the path emits fileActivated (open suppressed so the
+    # test never launches a program)
+    tv._open_target = lambda *_a, **_k: None
+    tv.feed("app/widgets/sidebar.py\r\n")
+    got = []
+    tv.fileActivated.connect(got.append)
+    x = CELL_PAD_X + int(3 * tv._cell_w)   # a cell inside the path token
+    y = CELL_PAD_Y + int(0 * tv._cell_h) + 1
+    ev = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(x, y),
+                     Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.ControlModifier)
+    tv.mousePressEvent(ev)
+    check("link: Ctrl+click a path emits fileActivated(abspath)",
+          got == [os.path.abspath(absf)], got)
+    tv.deleteLater()
+
+
+def test_sidebar_file_tree():
+    """The sidebar's inline file explorer: the ▸ toggle expands a lazily-built
+    file/folder tree under the workspace row; clicking a folder expands it;
+    clicking a file emits fileActivated; reveal_file scrolls to + highlights a
+    file (and no-ops when the tree is closed); the open/closed set round-trips
+    for persistence. All of it is transient except the open/closed set."""
+    import os
+    import tempfile
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.sidebar import Sidebar, TreeEntryRow
+    QApplication.instance() or QApplication([])
+
+    root = tempfile.mkdtemp(prefix="aihive_tree_")
+    os.makedirs(os.path.join(root, "pkg", "sub"), exist_ok=True)
+    open(os.path.join(root, "readme.md"), "w").close()
+    open(os.path.join(root, "pkg", "mod.py"), "w").close()
+    deep = os.path.join(root, "pkg", "sub", "deep.py")
+    open(deep, "w").close()
+
+    sb = Sidebar()
+    sb.resize(230, 400)
+    sb.files_root_provider = lambda ws_id: root if ws_id == "w1" else ""
+    sb.add_row("w1", "Alpha", "p")
+
+    def tree_rows():
+        return [r for r in sb._file_rows.values()]
+
+    check("tree: closed by default (no file rows)", not tree_rows())
+    toggled = []
+    sb.filesToggled.connect(lambda: toggled.append(1))
+    sb._ws_widgets["w1"].tree_btn.clicked.emit()      # open
+    check("tree: toggle opens the file tree", "w1" in sb._expanded_files)
+    check("tree: open emits filesToggled (persist trigger)", toggled == [1])
+    names = {r.name.text() or r._full for r in sb._file_rows.values()}
+    check("tree: top-level entries are listed (dirs + files)",
+          any(r.is_dir and r._full == "pkg" for r in sb._file_rows.values())
+          and any(not r.is_dir and r._full == "readme.md"
+                  for r in sb._file_rows.values()))
+    check("tree: nested dir NOT populated until expanded",
+          not any(r._full == "mod.py" for r in sb._file_rows.values()))
+
+    # expand the "pkg" directory
+    sb._on_dir_toggled("w1", "pkg")
+    check("tree: expanding a dir lists its children",
+          any(r._full == "mod.py" for r in sb._file_rows.values()))
+    check("tree: grandchild still hidden (lazy)",
+          not any(r._full == "deep.py" for r in sb._file_rows.values()))
+
+    # clicking a file row emits fileActivated(ws_id, abspath)
+    fired = []
+    sb.fileActivated.connect(lambda w, p: fired.append((w, p)))
+    modrow = next(r for r in sb._file_rows.values() if r._full == "mod.py")
+    from PySide6.QtTest import QTest
+    from PySide6.QtCore import Qt as _Qt
+    QTest.mouseClick(modrow, _Qt.MouseButton.LeftButton)
+    check("tree: clicking a file emits fileActivated(ws_id, abspath)",
+          fired == [("w1", os.path.abspath(os.path.join(root, "pkg", "mod.py")))],
+          fired)
+
+    # reveal_file expands ancestors + highlights, even a deep file
+    sb.reveal_file("w1", deep)
+    drow = next((r for r in sb._file_rows.values() if r._full == "deep.py"), None)
+    check("tree: reveal_file expands ancestors to show the file", drow is not None)
+    check("tree: revealed row is highlighted",
+          drow is not None and bool(drow.property("revealed")))
+
+    # persistence round-trip
+    check("tree: open_file_trees reports the open set",
+          sb.open_file_trees() == ["w1"])
+    sb.set_open_file_trees([])
+    check("tree: set_open_file_trees([]) closes it",
+          "w1" not in sb._expanded_files and not sb._file_rows)
+    sb.set_open_file_trees(["w1", "ghost"])   # unknown id dropped
+    check("tree: set_open_file_trees restores known ids, drops unknown",
+          sb._expanded_files == {"w1"})
+
+    # closing drops the per-directory expansion (transient)
+    sb._ws_widgets["w1"].tree_btn.clicked.emit()      # close
+    check("tree: closing clears expansion + rows",
+          "w1" not in sb._expanded_files
+          and not sb._expanded_dirs.get("w1")
+          and not sb._file_rows)
+    check("tree: reveal_file no-ops when the tree is closed (no raise)",
+          sb.reveal_file("w1", deep) is None)
+    sb.deleteLater()
+
+
 def test_ai_title_summary():
     """The per-agent summary is the assigned task, else Claude's latest
     AI-generated conversation title read from the transcript (the same title
@@ -2795,8 +2970,9 @@ def test_agent_file_map():
         # -- 2. window model + paint (Tree is the only view) ------------
         from PySide6.QtCore import QPointF
         from PySide6.QtGui import QColor
+        from app.fsopen import open_with as _open_with
         from app.widgets import agent_file_map as afm
-        from app.widgets.agent_file_map import _open_with, _opaque_tint
+        from app.widgets.agent_file_map import _opaque_tint
         win = AgentFileMapWindow()
         win.set_workspace(ws)
         canvas = win.canvas
@@ -2816,6 +2992,23 @@ def test_agent_file_map():
                   for r in rows))
         check("map: canvas paints headlessly without error",
               not canvas.grab().isNull())
+
+        # -- file-type icons (a glyph before each filename by extension) --
+        from app.filetypes import DEFAULT_ICON as _DEFAULT_ICON
+        from app.filetypes import file_icon as _file_icon
+        check("map: image extension maps to a distinct icon",
+              _file_icon("photo.PNG") == _file_icon("x.jpg")
+              and _file_icon("photo.PNG") != _DEFAULT_ICON)
+        check("map: code extensions share the code icon",
+              _file_icon("a.js") == _file_icon("b.rs") != _DEFAULT_ICON)
+        check("map: python has its own icon distinct from generic code",
+              _file_icon("m.py") not in (_DEFAULT_ICON, _file_icon("a.js")))
+        check("map: config/doc/image icons are all distinct kinds",
+              len({_file_icon("c.json"), _file_icon("d.md"),
+                   _file_icon("i.png"), _file_icon("s.css")}) == 4)
+        check("map: unknown extension falls back to the generic icon",
+              _file_icon("weird.zzz") == _DEFAULT_ICON
+              and _file_icon("NoExtension") == _DEFAULT_ICON)
 
         # -- interactions (agents drag; the file tree is structural) -----
         a1v = next(a for a in canvas._agents if a.name == "Agent 1")
@@ -4009,6 +4202,10 @@ def main():
     test_resume_picker()
     test_transcript_backups()
     test_agent_file_map()
+    test_fsopen_helpers()
+    test_filetypes_icons()
+    test_terminal_relative_link()
+    test_sidebar_file_tree()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0

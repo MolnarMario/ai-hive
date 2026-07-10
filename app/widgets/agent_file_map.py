@@ -6,7 +6,8 @@ single **Tree** view of the active workspace: a VSCode-style file hierarchy
 CENTERED against the tree (a "middle-right" overview so connectors fan both up
 and down, not all down from a top-corner cluster), and curved connectors from
 each agent to the file rows it touched — solid/gold for files it EDITED,
-thin/dashed for files it only READ.
+thin/dashed for files it only READ. Each file row is prefixed with a small
+type icon (image / code / config / doc / …) keyed on its extension.
 
 The header **Write** / **Read** toggles hide the edited or read-only edges
 independently — for when you only care about one kind of activity. It is a
@@ -23,8 +24,9 @@ roll up to the parent). Non-Claude agents appear as hubs with no files.
 Interactions: drag an agent (or its sub-agent satellites) to rearrange it
 (placement persists across the live refresh; the file tree is structural and not
 movable), drag empty space to pan, Ctrl+wheel or +/-/0 to zoom, single-click an
-agent to jump to its terminal card, double-click a file to open it, right-click
-a file for Open / Open with… / Reveal in folder / Copy path.
+agent to jump to its terminal card, double-click a file to open it with the OS
+default program, right-click a file for Open / Open with… / Reveal in folder /
+Copy path.
 
 The window is a TRANSIENT view: it only reads model state and must never mark
 the session dirty. Custom painting reads `Palette.*` at paint time so it follows
@@ -33,18 +35,20 @@ the active skin; MainWindow._change_theme repaints it (it is parented there).
 
 import math
 import os
-import subprocess
 from collections import defaultdict
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics,
-                           QPainter, QPainterPath, QPen)
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import (QColor, QFont, QFontMetrics, QPainter, QPainterPath,
+                           QPen)
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QMenu,
                                QPushButton, QScrollArea, QToolTip, QVBoxLayout,
                                QWidget)
 
-from .. import file_activity
+from .. import file_activity, fsopen
+from ..filetypes import DEFAULT_ICON as _DEFAULT_ICON
+from ..filetypes import EMOJI_FONT as _EMOJI_FONT
+from ..filetypes import file_icon as _file_icon
 from ..terminal_agent import AgentStatus
 from ..ui_theme import Palette
 
@@ -65,6 +69,10 @@ _AGENT_GAP = 96        # gap between the tree column and the agents column
 
 _MIN_SCALE, _MAX_SCALE = 0.4, 3.0
 _DRAG_SLOP = 4
+
+# File-type icons + the OS "open" helpers now live in app.filetypes / app.fsopen
+# (shared with the sidebar file explorer); imported at module top as _file_icon /
+# _EMOJI_FONT / _DEFAULT_ICON and fsopen.* respectively.
 
 
 @dataclass
@@ -287,9 +295,14 @@ class AgentFileMapCanvas(QWidget):
                 f.setBold(False); p.setFont(f)
             else:
                 edited = row.file.edited
-                p.setBrush(QColor(Palette.ACCENT_GOLD if edited else Palette.BORDER))
-                p.setPen(Qt.PenStyle.NoPen)
-                p.drawRoundedRect(QRectF(tx, cy - 5, 10, 10), 2, 2)  # file glyph
+                # file-type icon (emoji) so the kind reads at a glance; the pen
+                # colour is the monochrome-fallback tint (edited=bright)
+                p.setPen(QColor(Palette.TEXT if edited else Palette.TEXT_DIM))
+                fi = QFont(_EMOJI_FONT); fi.setPixelSize(13); p.setFont(fi)
+                p.drawText(QRectF(tx - 1, cy - 8, 16, 16),
+                           Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                           _file_icon(row.name))
+                p.setFont(f)
                 p.setPen(QColor(Palette.TEXT if edited else Palette.TEXT_DIM))
                 f.setBold(edited); p.setFont(f)
                 p.drawText(QPointF(tx + 18, cy + 4),
@@ -467,7 +480,7 @@ class AgentFileMapCanvas(QWidget):
     def mouseDoubleClickEvent(self, event):
         hit = self._hit(self._scene(event.position()))
         if hit and hit[0] == "file":
-            _open_file(hit[1].path)
+            fsopen.open_path(hit[1].path)
 
     def contextMenuEvent(self, event):
         hit = self._hit(self._scene(event.position()))
@@ -475,9 +488,9 @@ class AgentFileMapCanvas(QWidget):
             return
         path = hit[1].path
         menu = QMenu(self)
-        menu.addAction("Open", lambda: _open_file(path))
-        menu.addAction("Open with…", lambda: _open_with(path))
-        menu.addAction("Reveal in folder", lambda: _reveal_file(path))
+        menu.addAction("Open", lambda: fsopen.open_path(path))
+        menu.addAction("Open with…", lambda: fsopen.open_with(path))
+        menu.addAction("Reveal in folder", lambda: fsopen.reveal_in_folder(path))
         menu.addAction("Copy path", lambda: QApplication.clipboard().setText(path))
         menu.exec(event.globalPos())
 
@@ -608,37 +621,6 @@ def _sid(av, j) -> str:
 
 def _dist(a: QPointF, b: QPointF) -> float:
     return math.hypot(a.x() - b.x(), a.y() - b.y())
-
-
-def _open_file(path: str) -> None:
-    if os.path.exists(path):
-        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-
-
-def _open_with(path: str) -> None:
-    """Windows shell 'Open with…' picker so the user can choose the program."""
-    if not os.path.exists(path):
-        return
-    try:
-        if os.name == "nt":
-            subprocess.Popen(["rundll32.exe", "shell32.dll,OpenAs_RunDLL",
-                              os.path.normpath(path)])
-        else:
-            _open_file(path)
-    except OSError:
-        pass
-
-
-def _reveal_file(path: str) -> None:
-    if not os.path.exists(path):
-        return
-    try:
-        if os.name == "nt":
-            subprocess.Popen(["explorer", f"/select,{os.path.normpath(path)}"])
-        else:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
-    except OSError:
-        pass
 
 
 class AgentFileMapWindow(QWidget):

@@ -21,6 +21,8 @@ import sys
 import threading
 import uuid
 
+from . import __version__  # single source of truth (app/__init__.py); Qt-free
+
 PROTOCOL_VERSION = "2025-11-25"
 
 
@@ -176,7 +178,7 @@ def _handle(req: dict):
         _send({"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": params.get("protocolVersion", PROTOCOL_VERSION),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "aihive", "version": "1.0.0"}}})
+            "serverInfo": {"name": "aihive", "version": __version__}}})
     elif method == "notifications/initialized":
         pass  # notification, no response
     elif method == "tools/list":
