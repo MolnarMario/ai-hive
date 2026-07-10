@@ -71,6 +71,11 @@ workspaces keep executing — switching never pauses anything.
   repo-relative ones like `app/widgets/sidebar.py` (resolved against the agent's
   folder). If that workspace's file tree is open, the clicked file is also
   scrolled to and **highlighted** in it, so you can see where it lives.
+- **Search the sidebar** — a 🔍 next to the category button expands an input
+  that covers the WORKSPACES title/count; as you type it **highlights every
+  match** across workspace names, agent names, and agent summaries, and
+  auto-expands a workspace to reveal a matching agent. Esc (or clicking 🔍
+  again) closes it and restores what was expanded before.
 - **First-class folders** — every workspace header shows its path with
   **Open folder** and **Change…** buttons; agents launch rooted there.
 - **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ in the
@@ -387,7 +392,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-587 checks drive the real app headlessly (offscreen Qt platform) with real
+597 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -452,7 +457,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (587 checks)
+tests/smoke_test.py        headless end-to-end suite (597 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

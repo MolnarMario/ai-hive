@@ -702,6 +702,76 @@ def test_sidebar_file_tree():
     sb.deleteLater()
 
 
+def test_sidebar_search():
+    """The header search: the magnifier reveals an overlay field over the
+    title+count; typing highlights matching workspaces, agents, and agent
+    summaries (auto-expanding a workspace to reveal a matching agent); Esc /
+    toggling closes it and restores the pre-search expansion. All transient."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.sidebar import Sidebar
+    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.process_worker import AgentKind, build_spec
+    QApplication.instance() or QApplication([])
+    a1 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Backend", cwd="."))
+    a1.status = AgentStatus.RUNNING
+    a1.current_task = "implement the payments webhook"
+    a2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Frontend", cwd="."))
+    sb = Sidebar()
+    sb.resize(230, 400)
+    sb.agents_provider = lambda w: {"w1": [a1, a2]}.get(w, [])
+    sb.add_row("w1", "Alpha Project", "p")
+    sb.add_row("w2", "Beta", "p")
+
+    check("search: hidden until toggled",
+          sb.search_edit.isHidden() and not sb._search_active)
+    sb._toggle_search()
+    check("search: toggle opens the field + hides the title/count",
+          sb._search_active and not sb.search_edit.isHidden()
+          and sb.title.isHidden() and sb.count_label.isHidden())
+
+    sb.search_edit.setText("alpha")
+    check("search: workspace NAME match highlights that workspace",
+          sb._search_ws_hits == {"w1"}
+          and bool(sb._ws_widgets["w1"].property("search_hit"))
+          and not bool(sb._ws_widgets["w2"].property("search_hit")))
+
+    sb.search_edit.setText("webhook")   # matches a1's summary only
+    check("search: agent SUMMARY match highlights the agent + expands its ws",
+          sb._search_agent_hits == {a1.id} and "w1" in sb._expanded_ws
+          and bool(sb._agent_rows[a1.id].property("search_hit"))
+          and not bool(sb._agent_rows[a2.id].property("search_hit")))
+    check("search: the matching agent's workspace is highlighted too",
+          bool(sb._ws_widgets["w1"].property("search_hit")))
+
+    sb.search_edit.setText("Frontend")  # matches a2 by name
+    check("search: agent NAME match highlights the right agent",
+          sb._search_agent_hits == {a2.id})
+
+    sb.search_edit.setText("zzz-no-match")
+    check("search: no match clears all highlights",
+          sb._search_ws_hits == set() and sb._search_agent_hits == set())
+
+    esc = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                    Qt.KeyboardModifier.NoModifier)
+    sb.eventFilter(sb.search_edit, esc)
+    check("search: Esc closes the field + restores the header",
+          not sb._search_active and sb.search_edit.isHidden()
+          and not sb.title.isHidden() and sb._expanded_ws == set())
+
+    # a pre-search expansion is preserved across a whole search session
+    sb._expanded_ws = {"w1"}
+    sb._toggle_search()
+    sb.search_edit.setText("beta")       # matches w2 by name, no agent match
+    check("search: does not collapse a pre-expanded workspace",
+          "w1" in sb._expanded_ws)
+    sb._toggle_search()                  # close
+    check("search: closing restores exactly the pre-search expansion",
+          sb._expanded_ws == {"w1"})
+    sb.deleteLater()
+
+
 def test_ai_title_summary():
     """The per-agent summary is the assigned task, else Claude's latest
     AI-generated conversation title read from the transcript (the same title
@@ -4206,6 +4276,7 @@ def main():
     test_filetypes_icons()
     test_terminal_relative_link()
     test_sidebar_file_tree()
+    test_sidebar_search()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0
