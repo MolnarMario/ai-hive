@@ -9,8 +9,9 @@ agent signals can't fire into a dead widget.
 
 import re
 
-from PySide6.QtCore import QEvent, Qt, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, Signal
+from PySide6.QtGui import (QColor, QDrag, QFontMetrics, QPainter, QPixmap,
+                           QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit,
                                QPlainTextEdit, QToolButton, QVBoxLayout)
 
@@ -38,6 +39,51 @@ _ENDED = (AgentStatus.EXITED_OK, AgentStatus.EXITED_ERR,
 
 INPUT_STYLE = CharStyle(fg=Palette.INPUT_ECHO, bold=True)
 SYSTEM_STYLE = CharStyle(fg=Palette.SYSTEM_MSG, italic=True)
+
+# drag payload for reordering agent cards within a workspace (started by
+# _CardHeader, resolved by WorkspacePage's drop handling)
+CARD_REORDER_MIME = "application/x-aihive-card-reorder"
+
+
+class _CardHeader(QFrame):
+    """The card's title bar — and its drag handle. A left-drag from EMPTY
+    header space past a small threshold starts a reorder drag; the buttons
+    consume their own presses, so they never drag, while the labels
+    (name/model/summary/usage) don't consume presses, so the whole strip except
+    the buttons is grabbable — exactly the area the user asked to drag from.
+    A plain click (no movement) is left alone, so double-click-to-rename on the
+    title still works."""
+
+    _SLOP = 8
+
+    def __init__(self, card, parent=None):
+        super().__init__(parent)
+        self._card = card
+        self._press = None
+        # an open-hand over the empty strip hints it's a drag handle; the child
+        # buttons/title set their own cursors, so only the grabbable area shows it
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press = event.position().toPoint()
+            event.accept()   # take the implicit grab so we see the moves
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._press is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+                and (event.position().toPoint() - self._press).manhattanLength()
+                > self._SLOP):
+            self._press = None
+            self._card._begin_reorder_drag()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._press = None
+        super().mouseReleaseEvent(event)
 
 
 class TerminalCard(QFrame):
@@ -90,8 +136,9 @@ class TerminalCard(QFrame):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        header = QFrame(self)
+        header = self.header = _CardHeader(self, self)
         header.setObjectName("CardHeader")
+        header.setToolTip("Drag to reorder this agent in the workspace")
         header.setFixedHeight(38)   # room for the larger 14px glyph buttons
         hl = QHBoxLayout(header)
         hl.setContentsMargins(8, 0, 6, 0)
@@ -235,6 +282,27 @@ class TerminalCard(QFrame):
         sb = self.console.verticalScrollBar()
         sb.valueChanged.connect(self._on_scroll_value)
         sb.rangeChanged.connect(self._on_scroll_range)
+
+    def _begin_reorder_drag(self) -> None:
+        """Start a drag the WorkspacePage turns into a card reorder. Carries the
+        agent id and a translucent snapshot of the card as the drag pixmap."""
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(CARD_REORDER_MIME, self.agent.id.encode("utf-8"))
+        drag.setMimeData(mime)
+        pm = self.grab()
+        if not pm.isNull():
+            pm = pm.scaledToWidth(min(pm.width(), 280),
+                                  Qt.TransformationMode.SmoothTransformation)
+            ghost = QPixmap(pm.size())
+            ghost.fill(Qt.GlobalColor.transparent)
+            p = QPainter(ghost)
+            p.setOpacity(0.72)
+            p.drawPixmap(0, 0, pm)
+            p.end()
+            drag.setPixmap(ghost)
+            drag.setHotSpot(QPoint(pm.width() // 2, 16))
+        drag.exec(Qt.DropAction.MoveAction)
 
     def detach(self) -> None:
         """Unhook from the agent before the card widget is deleted."""

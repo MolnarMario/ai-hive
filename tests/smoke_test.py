@@ -332,6 +332,121 @@ def test_manager_reorder_persist():
           [w.id for w in mgr2.workspaces] == [c.id, a.id, b.id])
 
 
+def test_agent_card_reorder():
+    """Drag-to-reorder agent cards within a workspace: WorkspacePage._reorder_to
+    re-sequences cards + emits reorderCommitted, _drop_index maps a cursor to an
+    insertion index, the header gesture starts a drag only past a threshold, the
+    drag is gated off in solo / single-card, and WorkspaceManager.reorder_agents
+    re-sequences + persists the agent order."""
+    from PySide6.QtCore import QEvent, QPointF, QRect, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.workspace_page import WorkspacePage
+    from app.widgets.terminal_card import CARD_REORDER_MIME
+    from app.workspace_manager import WorkspaceManager, Workspace
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    QApplication.instance() or QApplication([])
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-cardreorder-"))
+    ws = Workspace(id="w1", name="WS", project_path=str(tmp))
+    for nm in ("A", "B", "C"):
+        ws.agents.append(TerminalAgent(build_spec(AgentKind.CLAUDE, nm,
+                                                  cwd=str(tmp))))
+    page = WorkspacePage(ws)
+    for a in ws.agents:
+        page.add_agent(a)
+    names = lambda: [c.agent.spec.name for c in page.cards]
+    check("reorder: cards start in A,B,C order", names() == ["A", "B", "C"])
+
+    committed = []
+    page.reorderCommitted.connect(lambda wid, ids: committed.append((wid, ids)))
+    page._reorder_to(page.cards[0], 2)   # move A to the end
+    check("reorder: moving A to index 2 yields B,C,A", names() == ["B", "C", "A"])
+    check("reorder: reorderCommitted emits (ws_id, new id order)",
+          committed and committed[0][0] == "w1"
+          and committed[0][1] == [c.agent.id for c in page.cards])
+
+    committed.clear()
+    page._reorder_to(page.cards[1], 1)   # already at index 1 → no change
+    check("reorder: a no-op move does not re-emit", committed == [])
+
+    # _drop_index maps a cursor (grid-host coords) to an insertion index in
+    # reading order; drive it with hand-set geometries (headless has no layout)
+    page._drag_card = None
+    # cards clamp to a 300x180 minimum, so lay the synthetic row out above that
+    for i, c in enumerate(page.cards):
+        c.setGeometry(QRect(i * 300, 0, 300, 180))   # centers at 150, 450, 750
+    check("reorder: cursor before the first card -> index 0",
+          page._drop_index(QPointF(20, 90).toPoint()) == 0)
+    check("reorder: cursor over the 2nd card's right half -> index 2",
+          page._drop_index(QPointF(500, 90).toPoint()) == 2)
+    check("reorder: cursor past the last card -> index 3 (append)",
+          page._drop_index(QPointF(900, 90).toPoint()) == 3)
+
+    # gating: not our mime / solo / single card must be rejected
+    class _Mime:
+        def __init__(self, ok): self._ok = ok
+        def hasFormat(self, f): return self._ok and f == CARD_REORDER_MIME
+    class _Evt:
+        def __init__(self, ok): self._m = _Mime(ok)
+        def mimeData(self): return self._m
+    check("reorder: a foreign drag is not reorderable",
+          not page._reorderable(_Evt(False)))
+    check("reorder: reorderable with 2+ cards, not soloed",
+          page._reorderable(_Evt(True)))
+    page._solo_card = page.cards[0]
+    check("reorder: disabled while a card is maximized (solo)",
+          not page._reorderable(_Evt(True)))
+    page._solo_card = None
+
+    # header gesture: a drag past the slop starts a reorder; a tiny move doesn't
+    card = page.cards[0]
+    fired = []
+    card._begin_reorder_drag = lambda: fired.append(1)   # avoid blocking QDrag
+    hdr = card.header
+    press = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(40, 10),
+                        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                        Qt.KeyboardModifier.NoModifier)
+    move_big = QMouseEvent(QEvent.Type.MouseMove, QPointF(80, 12),
+                           Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier)
+    hdr.mousePressEvent(press)
+    hdr.mouseMoveEvent(move_big)
+    check("reorder: header drag past threshold starts the reorder drag",
+          fired == [1])
+    fired.clear()
+    move_tiny = QMouseEvent(QEvent.Type.MouseMove, QPointF(43, 11),
+                            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+                            Qt.KeyboardModifier.NoModifier)
+    hdr.mousePressEvent(press)
+    hdr.mouseMoveEvent(move_tiny)
+    check("reorder: a sub-threshold move does NOT drag (click/rename safe)",
+          fired == [])
+
+    # manager side: reorder_agents re-sequences ws.agents + marks dirty, and the
+    # new order is what serializes (persistence is by list position)
+    mgr = WorkspaceManager()
+    w = mgr.create_workspace("WS", str(tmp))
+    ags = [TerminalAgent(build_spec(AgentKind.CLAUDE, n, cwd=str(tmp)))
+           for n in ("A", "B", "C")]
+    w.agents.extend(ags)
+    dirty = []
+    mgr.dirty.connect(lambda: dirty.append(1))
+    mgr.reorder_agents(w.id, [ags[2].id, ags[0].id, ags[1].id])
+    check("mgr reorder_agents: ws.agents now C,A,B",
+          [a.spec.name for a in w.agents] == ["C", "A", "B"])
+    check("mgr reorder_agents: marked the session dirty", bool(dirty))
+    data = mgr.to_session_dict()
+    terms = data["workspaces"][0]["terminals"]
+    check("mgr reorder_agents: serialized order matches (persist by position)",
+          [t["name"] for t in terms] == ["C", "A", "B"])
+    dirty.clear()
+    mgr.reorder_agents(w.id, [ags[2].id, ags[0].id, ags[1].id])  # same order
+    check("mgr reorder_agents: an unchanged order does not re-dirty",
+          dirty == [])
+
+
 def test_sidebar_categories():
     """Categories: create one, drag workspaces into/out of it, collapse it, and
     delete it (its workspaces spill back out in place)."""
@@ -4240,6 +4355,7 @@ def main():
     test_agent_waiting()
     test_sidebar_reorder()
     test_manager_reorder_persist()
+    test_agent_card_reorder()
     test_sidebar_categories()
     test_manager_categories_persist()
     test_category_container()

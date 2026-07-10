@@ -25,6 +25,11 @@ workspaces keep executing — switching never pauses anything.
   **width × height** like screen resolutions ("3×1" = three side by side),
   and each swatch's diagram is exactly the shape you get. Optimized for
   wide monitors.
+- **Drag to reorder agents** — grab a card by an empty part of its **header
+  bar** (where the name / model / summary / usage sit — not the buttons) and
+  drag it; a **gold insertion bar** shows exactly where it will land, and on
+  drop the cards **snap into place** with a short animation. The new order
+  persists with the workspace.
 - **Workspace status badge** — each sidebar row leads with a badge showing its
   agent count that doubles as a status light: it stays **green** while agents
   are alive and healthy (running, no errors) and **pulses amber** while an agent
@@ -392,7 +397,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-597 checks drive the real app headlessly (offscreen Qt platform) with real
+613 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -457,7 +462,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (597 checks)
+tests/smoke_test.py        headless end-to-end suite (613 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

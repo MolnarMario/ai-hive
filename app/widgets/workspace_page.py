@@ -12,18 +12,32 @@ Two layout modes:
 Retiling never destroys agent cards: the persistent QGridLayout is drained
 with takeAt() and cards are re-seated, preserving process/scroll/console
 state (no restart). Empty-slot placeholders are stateless and recreated.
+
+Cards are drag-reorderable: dragging from a card's header (see _CardHeader in
+terminal_card) starts a QDrag the grid host (_ReorderGrid) accepts. While
+dragging, a gold insertion bar (_DropIndicator) shows exactly where the card
+will land (_drop_index maps the cursor to an insertion index in reading order,
+so it works for any grid shape). On drop the `cards` list is re-sequenced,
+_retile() places everything, and _animate_reflow tweens each moved card from
+its old cell to its new one for a snap-into-place feel — cosmetic only, the
+final positions come from the layout. The new order is emitted via
+reorderCommitted → WorkspaceManager.reorder_agents, which re-sequences
+ws.agents (persisted by list position) and marks the session dirty.
 """
 
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtCore import (QAbstractAnimation, QEasingCurve,
+                            QParallelAnimationGroup, QPropertyAnimation, QRect,
+                            QSize, Qt, Signal)
+from PySide6.QtGui import QColor, QFontMetrics, QPainter
 from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel,
                                QScrollArea, QToolButton, QVBoxLayout, QWidget)
 
 from ..terminal_agent import TerminalAgent
 from ..tiling import compute_grid, explicit_grid, parse_layout
+from ..ui_theme import Palette
 from ..workspace_manager import Workspace
 from .grid_selector import GridButton
-from .terminal_card import TerminalCard
+from .terminal_card import CARD_REORDER_MIME, TerminalCard
 
 
 class EmptySlot(QFrame):
@@ -54,6 +68,46 @@ class EmptySlot(QFrame):
         super().mousePressEvent(event)
 
 
+class _DropIndicator(QWidget):
+    """A gold insertion bar painted between cards to show exactly where a
+    dragged card will land. Transparent to mouse so it never eats drop events."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.hide()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(Palette.ACCENT_GOLD))
+        p.drawRoundedRect(self.rect(), 2, 2)
+
+
+class _ReorderGrid(QWidget):
+    """The grid host that holds the agent cards; it accepts card-reorder drops
+    and forwards the drag events to its WorkspacePage (which owns the card
+    order + the drop indicator)."""
+
+    def __init__(self, page, parent=None):
+        super().__init__(parent)
+        self._page = page
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        self._page._drag_enter(event)
+
+    def dragMoveEvent(self, event):
+        self._page._drag_move(event)
+
+    def dragLeaveEvent(self, event):
+        self._page._drag_leave(event)
+
+    def dropEvent(self, event):
+        self._page._drop(event)
+
+
 class WorkspacePage(QWidget):
     closeRequested = Signal(str)        # agent id
     focusGained = Signal(object)        # TerminalCard
@@ -65,6 +119,7 @@ class WorkspacePage(QWidget):
     activityToggled = Signal(str)       # ws_id (wired in Phase 6)
     mapRequested = Signal(str)          # ws_id (open the Agent/File Map window)
     fileActivated = Signal(str, str)    # ws_id, abs path (Ctrl+clicked in a card)
+    reorderCommitted = Signal(str, list)  # ws_id, new ordered agent ids
 
     def __init__(self, workspace: Workspace, parent=None):
         super().__init__(parent)
@@ -78,6 +133,11 @@ class WorkspacePage(QWidget):
         # and hides its siblings (view only — their processes keep running).
         # Never persisted; restore is free (layout is derived from cards+layout).
         self._solo_card: "TerminalCard | None" = None
+        # drag-to-reorder state (transient): the card being dragged, the point
+        # it was dropped at (start of the snap animation), and a handle on the
+        # in-flight reflow animation so it isn't garbage-collected mid-flight.
+        self._drag_card: "TerminalCard | None" = None
+        self._reflow_anim = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -101,12 +161,14 @@ class WorkspacePage(QWidget):
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.scroll = QScrollArea(self.body)
         self.scroll.setWidgetResizable(True)
-        self.grid_host = QWidget(self.scroll)
+        self.grid_host = _ReorderGrid(self, self.scroll)
         self.grid_host.setObjectName("GridHost")
         self.grid = QGridLayout(self.grid_host)
         self.grid.setSpacing(8)
         self.grid.setContentsMargins(10, 10, 10, 10)
         self.scroll.setWidget(self.grid_host)
+        # gold insertion bar shown over the grid while a card is being dragged
+        self._drop_indicator = _DropIndicator(self.grid_host)
         body_lay.addWidget(self.empty, 1)
         body_lay.addWidget(self.scroll, 1)
         root.addWidget(self.body, 1)
@@ -252,6 +314,124 @@ class WorkspacePage(QWidget):
         self._solo_card = None
         for c in self.cards:
             c.set_maximized(False)
+
+    # --------------------------------------------------- drag-to-reorder ---
+
+    def _card_by_id(self, agent_id: str) -> "TerminalCard | None":
+        return next((c for c in self.cards if c.agent.id == agent_id), None)
+
+    def _reorderable(self, event) -> bool:
+        # only our own card-reorder drags, and never while soloed (one visible
+        # card) or with fewer than two cards to shuffle
+        return (event.mimeData().hasFormat(CARD_REORDER_MIME)
+                and self._solo_card is None and len(self.cards) > 1)
+
+    def _drag_enter(self, event) -> None:
+        if not self._reorderable(event):
+            return
+        aid = bytes(event.mimeData().data(CARD_REORDER_MIME)).decode("utf-8")
+        self._drag_card = self._card_by_id(aid)
+        if self._drag_card is None:      # a drag from another workspace's card
+            return
+        event.acceptProposedAction()
+        self._position_indicator(self._drop_index(event.position().toPoint()))
+
+    def _drag_move(self, event) -> None:
+        if self._drag_card is None or not self._reorderable(event):
+            return
+        event.acceptProposedAction()
+        self._position_indicator(self._drop_index(event.position().toPoint()))
+
+    def _drag_leave(self, event) -> None:
+        self._drop_indicator.hide()
+
+    def _drop(self, event) -> None:
+        if self._drag_card is None:
+            self._drop_indicator.hide()
+            return
+        self._drop_indicator.hide()
+        idx = self._drop_index(event.position().toPoint())
+        card = self._drag_card
+        self._drag_card = None
+        event.acceptProposedAction()
+        self._reorder_to(card, idx)
+
+    def _drop_index(self, pos) -> int:
+        """Insertion index (among the cards OTHER than the dragged one) for a
+        cursor at `pos` in grid-host coordinates. A card counts as 'before' the
+        cursor when the cursor is below its row, or within its row band and to
+        its right — reading order, so it works for any grid shape."""
+        idx = 0
+        for c in self.cards:
+            if c is self._drag_card:
+                continue
+            g = c.geometry()
+            cy, half = g.center().y(), g.height() / 2
+            below_row = pos.y() > cy + half
+            same_row = abs(pos.y() - cy) <= half
+            if below_row or (same_row and pos.x() > g.center().x()):
+                idx += 1
+        return idx
+
+    def _position_indicator(self, idx: int) -> None:
+        """Show the gold insertion bar at the boundary for insertion `idx`
+        (left edge of the card that would be pushed right, or after the last)."""
+        others = [c for c in self.cards if c is not self._drag_card]
+        if not others:
+            self._drop_indicator.hide()
+            return
+        idx = max(0, min(idx, len(others)))
+        if idx < len(others):
+            g = others[idx].geometry()
+            x = g.left() - 5
+            y, h = g.top(), g.height()
+        else:                                   # after the last card
+            g = others[-1].geometry()
+            x = g.right() + 1
+            y, h = g.top(), g.height()
+        self._drop_indicator.setGeometry(int(x), int(y), 4, int(h))
+        self._drop_indicator.show()
+        self._drop_indicator.raise_()
+
+    def _reorder_to(self, card: "TerminalCard", idx: int) -> None:
+        """Move `card` to insertion index `idx`, re-tile, animate the reflow,
+        and persist the new order. No-ops if the order is unchanged."""
+        others = [c for c in self.cards if c is not card]
+        idx = max(0, min(idx, len(others)))
+        new = others[:idx] + [card] + others[idx:]
+        if [c.agent.id for c in new] == [c.agent.id for c in self.cards]:
+            return
+        old_geoms = {c: QRect(c.geometry()) for c in self.cards}
+        self.cards = new
+        self._retile()
+        self.grid.activate()          # finalize geometries + clear the layout's
+        #                               dirty flag, so the queued LayoutRequest
+        #                               won't override the animation below
+        self._animate_reflow(old_geoms)
+        self.reorderCommitted.emit(self.workspace.id,
+                                   [c.agent.id for c in self.cards])
+
+    def _animate_reflow(self, old_geoms: dict) -> None:
+        """Tween every card that moved from its old cell to its new one — the
+        'snap into place' feel. Purely cosmetic: the cards are already at their
+        correct final geometries (from _retile); this only eases them there."""
+        group = QParallelAnimationGroup(self)
+        for c in self.cards:
+            new_g = QRect(c.geometry())
+            old_g = old_geoms.get(c)
+            if old_g is None or old_g == new_g:
+                continue
+            c.setGeometry(old_g)
+            a = QPropertyAnimation(c, b"geometry", group)
+            a.setDuration(180)
+            a.setStartValue(old_g)
+            a.setEndValue(new_g)
+            a.setEasingCurve(QEasingCurve.Type.OutCubic)
+        if group.animationCount() == 0:
+            group.deleteLater()
+            return
+        self._reflow_anim = group     # hold a ref (else GC'd mid-flight)
+        group.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
 
     # ------------------------------------------------------------ tiling ---
 

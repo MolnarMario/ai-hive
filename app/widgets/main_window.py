@@ -757,6 +757,7 @@ class MainWindow(QMainWindow):
         page.mapRequested.connect(self._open_agent_map)
         page.reassignRequested.connect(self._on_reassign_agent)
         page.fileActivated.connect(self._reveal_file_in_tree)
+        page.reorderCommitted.connect(self.manager.reorder_agents)
         self._pages[ws.id] = page
         self.stack.addWidget(page)
         self.sidebar.add_row(ws.id, ws.name, os.path.basename(ws.project_path)
