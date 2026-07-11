@@ -332,6 +332,121 @@ def test_manager_reorder_persist():
           [w.id for w in mgr2.workspaces] == [c.id, a.id, b.id])
 
 
+def test_agent_card_reorder():
+    """Drag-to-reorder agent cards within a workspace: WorkspacePage._reorder_to
+    re-sequences cards + emits reorderCommitted, _drop_index maps a cursor to an
+    insertion index, the header gesture starts a drag only past a threshold, the
+    drag is gated off in solo / single-card, and WorkspaceManager.reorder_agents
+    re-sequences + persists the agent order."""
+    from PySide6.QtCore import QEvent, QPointF, QRect, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.workspace_page import WorkspacePage
+    from app.widgets.terminal_card import CARD_REORDER_MIME
+    from app.workspace_manager import WorkspaceManager, Workspace
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    QApplication.instance() or QApplication([])
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-cardreorder-"))
+    ws = Workspace(id="w1", name="WS", project_path=str(tmp))
+    for nm in ("A", "B", "C"):
+        ws.agents.append(TerminalAgent(build_spec(AgentKind.CLAUDE, nm,
+                                                  cwd=str(tmp))))
+    page = WorkspacePage(ws)
+    for a in ws.agents:
+        page.add_agent(a)
+    names = lambda: [c.agent.spec.name for c in page.cards]
+    check("reorder: cards start in A,B,C order", names() == ["A", "B", "C"])
+
+    committed = []
+    page.reorderCommitted.connect(lambda wid, ids: committed.append((wid, ids)))
+    page._reorder_to(page.cards[0], 2)   # move A to the end
+    check("reorder: moving A to index 2 yields B,C,A", names() == ["B", "C", "A"])
+    check("reorder: reorderCommitted emits (ws_id, new id order)",
+          committed and committed[0][0] == "w1"
+          and committed[0][1] == [c.agent.id for c in page.cards])
+
+    committed.clear()
+    page._reorder_to(page.cards[1], 1)   # already at index 1 → no change
+    check("reorder: a no-op move does not re-emit", committed == [])
+
+    # _drop_index maps a cursor (grid-host coords) to an insertion index in
+    # reading order; drive it with hand-set geometries (headless has no layout)
+    page._drag_card = None
+    # cards clamp to a 300x180 minimum, so lay the synthetic row out above that
+    for i, c in enumerate(page.cards):
+        c.setGeometry(QRect(i * 300, 0, 300, 180))   # centers at 150, 450, 750
+    check("reorder: cursor before the first card -> index 0",
+          page._drop_index(QPointF(20, 90).toPoint()) == 0)
+    check("reorder: cursor over the 2nd card's right half -> index 2",
+          page._drop_index(QPointF(500, 90).toPoint()) == 2)
+    check("reorder: cursor past the last card -> index 3 (append)",
+          page._drop_index(QPointF(900, 90).toPoint()) == 3)
+
+    # gating: not our mime / solo / single card must be rejected
+    class _Mime:
+        def __init__(self, ok): self._ok = ok
+        def hasFormat(self, f): return self._ok and f == CARD_REORDER_MIME
+    class _Evt:
+        def __init__(self, ok): self._m = _Mime(ok)
+        def mimeData(self): return self._m
+    check("reorder: a foreign drag is not reorderable",
+          not page._reorderable(_Evt(False)))
+    check("reorder: reorderable with 2+ cards, not soloed",
+          page._reorderable(_Evt(True)))
+    page._solo_card = page.cards[0]
+    check("reorder: disabled while a card is maximized (solo)",
+          not page._reorderable(_Evt(True)))
+    page._solo_card = None
+
+    # header gesture: a drag past the slop starts a reorder; a tiny move doesn't
+    card = page.cards[0]
+    fired = []
+    card._begin_reorder_drag = lambda: fired.append(1)   # avoid blocking QDrag
+    hdr = card.header
+    press = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(40, 10),
+                        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                        Qt.KeyboardModifier.NoModifier)
+    move_big = QMouseEvent(QEvent.Type.MouseMove, QPointF(80, 12),
+                           Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier)
+    hdr.mousePressEvent(press)
+    hdr.mouseMoveEvent(move_big)
+    check("reorder: header drag past threshold starts the reorder drag",
+          fired == [1])
+    fired.clear()
+    move_tiny = QMouseEvent(QEvent.Type.MouseMove, QPointF(43, 11),
+                            Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton,
+                            Qt.KeyboardModifier.NoModifier)
+    hdr.mousePressEvent(press)
+    hdr.mouseMoveEvent(move_tiny)
+    check("reorder: a sub-threshold move does NOT drag (click/rename safe)",
+          fired == [])
+
+    # manager side: reorder_agents re-sequences ws.agents + marks dirty, and the
+    # new order is what serializes (persistence is by list position)
+    mgr = WorkspaceManager()
+    w = mgr.create_workspace("WS", str(tmp))
+    ags = [TerminalAgent(build_spec(AgentKind.CLAUDE, n, cwd=str(tmp)))
+           for n in ("A", "B", "C")]
+    w.agents.extend(ags)
+    dirty = []
+    mgr.dirty.connect(lambda: dirty.append(1))
+    mgr.reorder_agents(w.id, [ags[2].id, ags[0].id, ags[1].id])
+    check("mgr reorder_agents: ws.agents now C,A,B",
+          [a.spec.name for a in w.agents] == ["C", "A", "B"])
+    check("mgr reorder_agents: marked the session dirty", bool(dirty))
+    data = mgr.to_session_dict()
+    terms = data["workspaces"][0]["terminals"]
+    check("mgr reorder_agents: serialized order matches (persist by position)",
+          [t["name"] for t in terms] == ["C", "A", "B"])
+    dirty.clear()
+    mgr.reorder_agents(w.id, [ags[2].id, ags[0].id, ags[1].id])  # same order
+    check("mgr reorder_agents: an unchanged order does not re-dirty",
+          dirty == [])
+
+
 def test_sidebar_categories():
     """Categories: create one, drag workspaces into/out of it, collapse it, and
     delete it (its workspaces spill back out in place)."""
@@ -635,6 +750,59 @@ def test_terminal_relative_link():
     tv.deleteLater()
 
 
+def test_terminal_link_underline():
+    """Every clickable URL/path on the visible screen is scanned + underlined
+    (not just the hovered one), so links stand out in the body text; the scan
+    is content-guarded (no rescan when nothing changed); hover reads the cached
+    spans; plain words are pre-filtered out (no filesystem stat)."""
+    import os
+    import tempfile
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import TerminalView
+    QApplication.instance() or QApplication([])
+
+    base = tempfile.mkdtemp(prefix="aihive_ul_")
+    os.makedirs(os.path.join(base, "app", "widgets"), exist_ok=True)
+    open(os.path.join(base, "app", "widgets", "sidebar.py"), "w").close()
+
+    tv = TerminalView(rows=6, cols=90)
+    tv.resize(820, 220)
+    tv.set_base_dir(base)
+    tv.feed("See https://example.com and app/widgets/sidebar.py here\r\n")
+    tv.grab()   # force a paint -> content-guarded rescan
+
+    hist, off = tv._view_state()
+    tokens = ["".join(tv._visible_line(r, hist, off)[i].data
+                      for i in range(c0, c1 + 1))
+              for (r, c0, c1) in tv._link_spans]
+    check("underline: both a URL and a relative path are scanned as links",
+          any(t.startswith("https://example.com") for t in tokens)
+          and any(t.endswith("sidebar.py") for t in tokens)
+          and len(tv._link_spans) == 2)
+    check("underline: plain words are pre-filtered (no fs stat)",
+          not tv._maybe_link("here") and not tv._maybe_link("and"))
+
+    # the scan is content-guarded: same content -> same cached span object
+    sig_before = tv._link_sig
+    spans_obj = tv._link_spans
+    tv.grab()
+    check("underline: no rescan when the screen content is unchanged",
+          tv._link_sig == sig_before and tv._link_spans is spans_obj)
+
+    # hover reads the cached spans (no filesystem work): a cell inside a link
+    # resolves to its span; a blank cell resolves to nothing
+    r, c0, c1 = tv._link_spans[0]
+    check("underline: _span_at finds the link under a cell", tv._span_at(r, c0) == (c0, c1))
+    check("underline: _span_at is None off any link", tv._span_at(r, c1 + 1) is None)
+
+    # new content re-scans (the URL is gone, so no links remain)
+    tv.feed("\x1b[2J\x1b[Hjust plain text now\r\n")
+    tv.grab()
+    check("underline: rescans when content changes (links cleared)",
+          tv._link_spans == [])
+    tv.deleteLater()
+
+
 def test_sidebar_file_tree():
     """The sidebar's inline file explorer: the ▸ toggle expands a lazily-built
     file/folder tree under the workspace row; clicking a folder expands it;
@@ -719,6 +887,76 @@ def test_sidebar_file_tree():
           and not sb._file_rows)
     check("tree: reveal_file no-ops when the tree is closed (no raise)",
           sb.reveal_file("w1", deep) is None)
+    sb.deleteLater()
+
+
+def test_sidebar_search():
+    """The header search: the magnifier reveals an overlay field over the
+    title+count; typing highlights matching workspaces, agents, and agent
+    summaries (auto-expanding a workspace to reveal a matching agent); Esc /
+    toggling closes it and restores the pre-search expansion. All transient."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.sidebar import Sidebar
+    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.process_worker import AgentKind, build_spec
+    QApplication.instance() or QApplication([])
+    a1 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Backend", cwd="."))
+    a1.status = AgentStatus.RUNNING
+    a1.current_task = "implement the payments webhook"
+    a2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Frontend", cwd="."))
+    sb = Sidebar()
+    sb.resize(230, 400)
+    sb.agents_provider = lambda w: {"w1": [a1, a2]}.get(w, [])
+    sb.add_row("w1", "Alpha Project", "p")
+    sb.add_row("w2", "Beta", "p")
+
+    check("search: hidden until toggled",
+          sb.search_edit.isHidden() and not sb._search_active)
+    sb._toggle_search()
+    check("search: toggle opens the field + hides the title/count",
+          sb._search_active and not sb.search_edit.isHidden()
+          and sb.title.isHidden() and sb.count_label.isHidden())
+
+    sb.search_edit.setText("alpha")
+    check("search: workspace NAME match highlights that workspace",
+          sb._search_ws_hits == {"w1"}
+          and bool(sb._ws_widgets["w1"].property("search_hit"))
+          and not bool(sb._ws_widgets["w2"].property("search_hit")))
+
+    sb.search_edit.setText("webhook")   # matches a1's summary only
+    check("search: agent SUMMARY match highlights the agent + expands its ws",
+          sb._search_agent_hits == {a1.id} and "w1" in sb._expanded_ws
+          and bool(sb._agent_rows[a1.id].property("search_hit"))
+          and not bool(sb._agent_rows[a2.id].property("search_hit")))
+    check("search: the matching agent's workspace is highlighted too",
+          bool(sb._ws_widgets["w1"].property("search_hit")))
+
+    sb.search_edit.setText("Frontend")  # matches a2 by name
+    check("search: agent NAME match highlights the right agent",
+          sb._search_agent_hits == {a2.id})
+
+    sb.search_edit.setText("zzz-no-match")
+    check("search: no match clears all highlights",
+          sb._search_ws_hits == set() and sb._search_agent_hits == set())
+
+    esc = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                    Qt.KeyboardModifier.NoModifier)
+    sb.eventFilter(sb.search_edit, esc)
+    check("search: Esc closes the field + restores the header",
+          not sb._search_active and sb.search_edit.isHidden()
+          and not sb.title.isHidden() and sb._expanded_ws == set())
+
+    # a pre-search expansion is preserved across a whole search session
+    sb._expanded_ws = {"w1"}
+    sb._toggle_search()
+    sb.search_edit.setText("beta")       # matches w2 by name, no agent match
+    check("search: does not collapse a pre-expanded workspace",
+          "w1" in sb._expanded_ws)
+    sb._toggle_search()                  # close
+    check("search: closing restores exactly the pre-search expansion",
+          sb._expanded_ws == {"w1"})
     sb.deleteLater()
 
 
@@ -1579,14 +1817,15 @@ def test_terminal_mouse_words_links():
     # _link_at reads the token straight off the painted line
     v2 = TerminalView(rows=6, cols=80)
     v2.feed("see https://example.com/docs for details")
+    v2.grab()   # paint once so the full-screen link scan caches the spans
     check("mouse: _link_at picks up the URL under the pointer",
           v2._link_at(0, 8) == ("url", "https://example.com/docs"), v2._link_at(0, 8))
 
-    # hover: link cols underline + hand cursor; a plain word does neither
-    check("mouse: _link_range_at spans the hovered URL",
-          v2._link_range_at(0, 8) == (4, 27), v2._link_range_at(0, 8))
-    check("mouse: _link_range_at is None over plain text",
-          v2._link_range_at(0, 30) is None, v2._link_range_at(0, 30))
+    # every link is underlined (scanned up front); hover reads the cached span
+    check("mouse: _span_at spans the scanned URL",
+          v2._span_at(0, 8) == (4, 27), v2._span_at(0, 8))
+    check("mouse: _span_at is None over plain text",
+          v2._span_at(0, 30) is None, v2._span_at(0, 30))
 
     def move(view, row, col):
         from PySide6.QtCore import QEvent, QPointF
@@ -4316,6 +4555,7 @@ def main():
     test_agent_waiting()
     test_sidebar_reorder()
     test_manager_reorder_persist()
+    test_agent_card_reorder()
     test_sidebar_categories()
     test_manager_categories_persist()
     test_category_container()
@@ -4352,7 +4592,9 @@ def main():
     test_fsopen_helpers()
     test_filetypes_icons()
     test_terminal_relative_link()
+    test_terminal_link_underline()
     test_sidebar_file_tree()
+    test_sidebar_search()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0

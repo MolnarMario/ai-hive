@@ -253,6 +253,21 @@ class WorkspaceManager(QObject):
         if [w.id for w in self._workspaces] != before:
             self.sidebarLayoutChanged.emit()
 
+    def reorder_agents(self, ws_id: str, ordered_ids: list) -> None:
+        """Re-sequence a workspace's agents to match a drag-reorder of its
+        cards. Agent order is persisted implicitly by list position in
+        `to_session_dict` (and restored in that order), so this just re-sorts
+        `ws.agents` and marks the session dirty. Ids not present keep their
+        relative tail order — a robust no-loss reconcile like reorder_workspaces."""
+        ws = self.workspace(ws_id)
+        if ws is None:
+            return
+        rank = {aid: i for i, aid in enumerate(ordered_ids)}
+        before = [a.id for a in ws.agents]
+        ws.agents.sort(key=lambda a: rank.get(a.id, len(rank)))
+        if [a.id for a in ws.agents] != before:
+            self.dirty.emit()
+
     # -------------------------------------------------- sidebar layout ---
 
     def _normalize_layout(self, nodes: list) -> list:

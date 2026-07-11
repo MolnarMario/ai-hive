@@ -22,6 +22,14 @@ highlights a file (used when a path is Ctrl+clicked in a conversation). The
 coarse per-workspace open/closed set persists (`filesToggled` → the session
 "ui" blob); per-directory expansion + the reveal highlight are transient like
 the agent expansion — in-memory, rebuild-only, never marking the session dirty.
+
+The header also has a SEARCH toggle (magnifier next to "add category"): clicking
+it reveals an overlay `QLineEdit` positioned by hand over the WORKSPACES title +
+count (`_position_search`), and each keystroke recomputes highlight sets
+(`_apply_search`) — a workspace matches on its name or on any agent's
+name/summary (`_agent_haystack`), a matching agent's workspace is auto-expanded
+to reveal it, and matches get a `search_hit` tint (`set_search_hit`). Search is
+transient too: it saves/restores the pre-search expansion and never persists.
 """
 
 import os
@@ -51,6 +59,16 @@ TREE_ROW_HEIGHT = 24
 # soft cap on entries shown per directory — a huge folder (node_modules) would
 # otherwise stall paint; the overflow collapses to a muted "… N more" row
 FILE_TREE_CAP = 800
+
+
+def _agent_haystack(agent) -> str:
+    """Lowercased 'name + summary' text for sidebar search matching. The summary
+    is the agent's live one-liner (assigned task, else its AI conversation
+    title) — the same text shown beside the name in the inline agent list."""
+    name = getattr(getattr(agent, "spec", None), "name", "") or ""
+    get = getattr(agent, "summary", None)
+    summary = (get() if callable(get) else getattr(agent, "current_task", "")) or ""
+    return f"{name} {summary}".lower()
 
 # drag payload: b"workspace:<id>" or b"category:<id>"
 NODE_MIME = "application/x-aihive-sidebar-node"
@@ -167,6 +185,12 @@ class WorkspaceRow(QFrame):
             self.setProperty("active", active)
             repolish(self)
         self._update_hover_buttons(hovered=self.underMouse())
+
+    def set_search_hit(self, hit: bool) -> None:
+        """Tint the row when it matches the active sidebar search."""
+        if bool(self.property("search_hit")) != bool(hit):
+            self.setProperty("search_hit", bool(hit))
+            repolish(self)
 
     def set_name(self, name: str) -> None:
         self.name_label.setText(name)
@@ -603,6 +627,12 @@ class AgentRow(QFrame):
         self.summary.setToolTip(self._full)
         self._elide()
 
+    def set_search_hit(self, hit: bool) -> None:
+        """Tint the agent row when it matches the active sidebar search."""
+        if bool(self.property("search_hit")) != bool(hit):
+            self.setProperty("search_hit", bool(hit))
+            repolish(self)
+
     def _elide(self) -> None:
         # fit to the summary label's ACTUAL width (it has the layout's stretch,
         # so it fills whatever the row/sidebar width allows — no wasted space);
@@ -762,6 +792,15 @@ class Sidebar(QFrame):
         self._fs_debounce.setInterval(300)
         self._fs_debounce.setSingleShot(True)
         self._fs_debounce.timeout.connect(self.rebuild)
+        # search: transient filter/highlight over workspaces + their agents.
+        # While active it may auto-expand workspaces that have agent matches so
+        # the hits are visible; the prior expansion is saved and restored on
+        # close. None of this persists or marks the session dirty.
+        self._search_active = False
+        self._search_query = ""
+        self._search_saved_expanded: set | None = None
+        self._search_ws_hits: set = set()      # ws_ids to highlight
+        self._search_agent_hits: set = set()   # agent ids to highlight
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 8, 0, 0)
@@ -770,10 +809,20 @@ class Sidebar(QFrame):
         header = QWidget(self)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(12, 0, 8, 0)
-        title = QLabel("WORKSPACES", header)
-        title.setObjectName("SidebarTitle")
+        self.header = header
+        self.title = QLabel("WORKSPACES", header)
+        self.title.setObjectName("SidebarTitle")
         self.count_label = QLabel("0", header)
         self.count_label.setObjectName("WsCount")
+        # search: a magnifier next to "add category"; clicking it expands an
+        # input that OVERLAYS everything to its left (the title + count) and
+        # live-highlights matching workspaces, agents, and agent summaries
+        self.search_btn = QToolButton(header)
+        self.search_btn.setObjectName("SearchBtn")
+        self.search_btn.setText("🔍")
+        self.search_btn.setToolTip("Search workspaces & agents")
+        self.search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.search_btn.clicked.connect(lambda: self._toggle_search())
         self.add_cat_btn = QToolButton(header)
         self.add_cat_btn.setObjectName("AddCatBtn")
         self.add_cat_btn.setText("📦")
@@ -787,11 +836,20 @@ class Sidebar(QFrame):
         self.add_btn.setToolTip("Add workspace (choose a project folder)")
         self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.add_btn.clicked.connect(self.addRequested)
-        hl.addWidget(title)
+        hl.addWidget(self.title)
         hl.addWidget(self.count_label)
         hl.addStretch(1)
+        hl.addWidget(self.search_btn)
         hl.addWidget(self.add_cat_btn)
         hl.addWidget(self.add_btn)
+        # overlay search field: a child of the header positioned by hand (NOT in
+        # the layout) so it can cover the title/count region exactly when shown
+        self.search_edit = QLineEdit(header)
+        self.search_edit.setObjectName("SidebarSearch")
+        self.search_edit.setPlaceholderText("Search workspaces & agents…")
+        self.search_edit.hide()
+        self.search_edit.textChanged.connect(self._on_search_text)
+        self.search_edit.installEventFilter(self)
 
         self.tree = _SidebarTree(self)
         self.tree.setObjectName("WsList")
@@ -804,6 +862,94 @@ class Sidebar(QFrame):
         self._anim = QPropertyAnimation(self, b"maximumWidth", self)
         self._anim.setDuration(160)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    # -------------------------------------------------------------- search ---
+
+    def _toggle_search(self) -> None:
+        self._close_search() if self._search_active else self._open_search()
+
+    def _open_search(self) -> None:
+        """Reveal the overlay search field over the title/count region."""
+        self._search_active = True
+        self._search_saved_expanded = set(self._expanded_ws)
+        self.title.hide()
+        self.count_label.hide()
+        self.search_edit.show()
+        self._position_search()
+        self.search_edit.raise_()
+        self.search_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def _close_search(self) -> None:
+        """Hide the search field, clear the filter, and restore the header +
+        the workspace expansion that was in effect before searching."""
+        if not self._search_active:
+            return
+        self._search_active = False        # so the clear() below no-ops
+        self.search_edit.hide()
+        self.search_edit.clear()
+        self.title.show()
+        self.count_label.show()
+        self._search_query = ""
+        self._search_ws_hits = set()
+        self._search_agent_hits = set()
+        self._expanded_ws = self._search_saved_expanded or set()
+        self._search_saved_expanded = None
+        self.rebuild()
+        self._agent_timer.start() if self._expanded_ws else self._agent_timer.stop()
+
+    def _position_search(self) -> None:
+        """Size the overlay to span from the left edge to the search button —
+        covering the WORKSPACES title and count exactly."""
+        if not self._search_active:
+            return
+        left = 10
+        right = self.search_btn.x() - 4
+        h = self.header.height()
+        self.search_edit.setGeometry(left, 3, max(40, right - left), max(18, h - 6))
+
+    def _on_search_text(self, text: str) -> None:
+        if not self._search_active:
+            return
+        self._search_query = text.strip().lower()
+        self._apply_search()
+
+    def _apply_search(self) -> None:
+        """Recompute the highlight sets from the query and rebuild. A workspace
+        matches on its name OR on any of its agents (name/summary); a matching
+        agent's workspace is auto-expanded so the hit is visible. Empty query
+        clears highlights but keeps the field open."""
+        q = self._search_query
+        ws_hits, agent_hits = set(), set()
+        expand = set(self._search_saved_expanded or set())
+        if q:
+            for ws_id in self._ws_data:
+                name = (self._ws_data[ws_id].get("name") or "").lower()
+                hit_here = q in name
+                agents = self.agents_provider(ws_id) if self.agents_provider else []
+                for a in (agents or []):
+                    if q in _agent_haystack(a):
+                        agent_hits.add(a.id)
+                        expand.add(ws_id)     # reveal the matching agent
+                        hit_here = True
+                if hit_here:
+                    ws_hits.add(ws_id)
+        self._search_ws_hits = ws_hits
+        self._search_agent_hits = agent_hits
+        self._expanded_ws = expand
+        self.rebuild()
+        self._agent_timer.start() if self._expanded_ws else self._agent_timer.stop()
+
+    def eventFilter(self, obj, event):
+        # Esc in the search box closes it and clears the filter
+        if obj is self.search_edit and event.type() == QEvent.Type.KeyPress \
+                and event.key() == Qt.Key.Key_Escape:
+            self._close_search()
+            return True
+        return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_search()   # keep the overlay aligned as the rail resizes
 
     # ------------------------------------------------------------- model ---
 
@@ -952,6 +1098,7 @@ class Sidebar(QFrame):
         if data.get("stats"):
             row.set_stats(data["stats"])
         row.set_active(ws_id == self._active_id)
+        row.set_search_hit(ws_id in self._search_ws_hits)
         if ws_id in self._expanded_ws:      # show its agents as child rows
             self._add_agent_rows(ws_id, item)
             item.setExpanded(True)
@@ -968,6 +1115,7 @@ class Sidebar(QFrame):
             child.setSizeHint(0, QSize(SIDEBAR_WIDTH, AGENT_HEIGHT))
             arow = AgentRow(ws_id, agent)
             arow.activated.connect(self.agentActivated)
+            arow.set_search_hit(agent.id in self._search_agent_hits)
             self.tree.setItemWidget(child, 0, arow)
             self._agent_rows[agent.id] = arow
         self._rendered_agents[ws_id] = [a.id for a in agents]

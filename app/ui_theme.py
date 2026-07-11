@@ -354,6 +354,10 @@ WorkspaceRow[active="true"] {{
     background: {p.BG_ACTIVE};
     border-left: 3px solid {p.ACCENT_GOLD};
 }}
+WorkspaceRow[search_hit="true"] {{
+    background: rgba(217,178,74,0.20);
+    border-left: 3px solid {p.ACCENT_GOLD};
+}}
 #WsName {{ font-family: {BODY_FONT}; font-size: 16px; font-weight: 600; }}
 #WsRenameEdit {{
     background: {p.BG_INPUT}; border: 1px solid {p.ACCENT_BLUE};
@@ -379,6 +383,19 @@ WorkspaceRow[active="true"] {{
     max-width: 18px; min-height: 18px; max-height: 18px;
 }}
 #WsQ:hover {{ background: rgba(217,178,74,0.34); }}
+
+/* sidebar search: the magnifier toggle + the overlay input it reveals */
+#SearchBtn {{
+    background: transparent; border: 1px solid transparent; border-radius: 3px;
+    padding: 1px 4px; color: {p.TEXT_DIM}; font-size: 13px;
+}}
+#SearchBtn:hover {{ background: {p.BG_HOVER}; color: {p.ACCENT_GOLD};
+                   border-color: {p.BORDER}; }}
+#SidebarSearch {{
+    background: {p.BG_INPUT}; border: 1px solid {p.ACCENT_GOLD};
+    border-radius: 3px; padding: 1px 6px; color: {p.TEXT};
+    font-family: {BODY_FONT}; font-size: 13px;
+}}
 
 /* category headers (collapsible workspace groups) */
 #AddCatBtn {{
@@ -423,6 +440,9 @@ WorkspaceRow[active="true"] {{
 #WsAgentRow:hover {{ background: {p.BG_HOVER}; }}
 #WsAgentRow[waiting="true"] {{
     background: rgba(217,178,74,0.12); border-left: 2px solid {p.YELLOW};
+}}
+#WsAgentRow[search_hit="true"] {{
+    background: rgba(217,178,74,0.22); border-left: 2px solid {p.ACCENT_GOLD};
 }}
 #WsAgentDot {{ font-size: 10px; }}
 #WsAgentName {{ font-family: {BODY_FONT}; font-size: 13px; font-weight: 600; }}
