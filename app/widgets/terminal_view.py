@@ -1152,24 +1152,24 @@ class TerminalView(QWidget):
                 col = run_end
 
         # every clickable URL/path is underlined so you can spot links in the
-        # body text at a glance (a soft 1px accent line); the hovered one is
-        # emphasized below with a solid 2px line + the hand cursor.
+        # body text at a glance (a soft 3px accent line); the hovered one is
+        # emphasized below with a solid 4px line + the hand cursor.
         if self._link_spans:
             soft = QColor(Palette.ACCENT_ORANGE)
             soft.setAlpha(140)
             for (lr, lc0, lc1) in self._link_spans:
                 lx = CELL_PAD_X + lc0 * cw
                 ly = CELL_PAD_Y + lr * ch
-                painter.fillRect(int(lx), int(ly + ch - 2),
-                                 int((lc1 - lc0 + 1) * cw), 1, soft)
+                painter.fillRect(int(lx), int(ly + ch - 3),
+                                 int((lc1 - lc0 + 1) * cw), 3, soft)
         # hover: emphasize the link under the pointer (paired with the hand
         # cursor from mouseMoveEvent) so it reads as the one you'd open
         if self._hover_link is not None:
             hr, hc0, hc1 = self._hover_link
             lx = CELL_PAD_X + hc0 * cw
             ly = CELL_PAD_Y + hr * ch
-            painter.fillRect(int(lx), int(ly + ch - 2),
-                             int((hc1 - hc0 + 1) * cw), 2,
+            painter.fillRect(int(lx), int(ly + ch - 4),
+                             int((hc1 - hc0 + 1) * cw), 4,
                              QColor(Palette.ACCENT_ORANGE))
 
         cursor = self.screen.cursor
