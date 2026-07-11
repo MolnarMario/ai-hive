@@ -270,6 +270,87 @@ def test_agent_waiting():
           not b.is_waiting())
 
 
+def test_notification_chime():
+    """The notification chime: the synthesiser writes a valid WAV, and the
+    manager announces the RISING edge of an agent's waiting state via
+    agentWaiting (so the UI can ring) without ever marking the session dirty.
+    Playback itself is a non-blocking, degrade-to-silent no-op — not exercised
+    here so the headless suite stays quiet."""
+    import wave as _wave
+    from PySide6.QtWidgets import QApplication
+    from app import chime
+    from app.terminal_agent import AgentStatus
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+
+    QApplication.instance() or QApplication([])
+
+    # --- synthesiser: a real, playable 16-bit mono WAV lands in temp ---
+    path = chime._ensure_chime()
+    check("chime: WAV synthesised to a temp file", path and os.path.exists(path))
+    with _wave.open(path, "rb") as w:
+        params_ok = (w.getnchannels() == 1 and w.getsampwidth() == 2
+                     and w.getframerate() == chime._SAMPLE_RATE
+                     and w.getnframes() > 0)
+    check("chime: WAV is 16-bit mono at the expected rate with frames",
+          params_ok)
+    check("chime: available() reflects winsound presence (True on Windows)",
+          chime.available() == (chime.winsound is not None))
+
+    # --- manager announces the waiting rising edge, transient (no dirty) ---
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-chime-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Chime", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Ask",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+    rings = []
+    dirtied = []
+    mgr.agentWaiting.connect(lambda wid, aid: rings.append((wid, aid)))
+    mgr.dirty.connect(lambda: dirtied.append(True))
+
+    agent._screen_tail = ("which approach?\r\n 1. rewrite it\r\n 2. patch it\r\n"
+                          " 3. leave as-is\r\n> 1. rewrite it")
+    agent._on_idle_timeout()   # settle -> waiting rising edge
+    check("chime: agentWaiting emitted with (ws_id, agent_id) on rising edge",
+          rings == [(ws.id, agent.id)], rings)
+    check("chime: waiting rising edge never marks the session dirty",
+          not dirtied, dirtied)
+
+    # fresh output clears waiting; re-settling on the SAME prompt fires again
+    agent._on_pty_output("pty", "Bash(ls) running...\r\n")
+    check("chime: fresh output clears waiting", not agent.is_waiting())
+    agent._on_idle_timeout()
+    check("chime: re-entering waiting rings again (edge, not level)",
+          len(rings) == 2, rings)
+
+
+def test_chime_persistence():
+    """The top-bar chime toggle flips its glyph + emits soundToggled, and the
+    on/off preference round-trips through the session ui state."""
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.main_window import TopBar
+
+    QApplication.instance() or QApplication([])
+    bar = TopBar()
+    check("chime toggle: defaults to ON (bell glyph)",
+          bar._sound_on and bar.sound_btn.text() == "\U0001F514")
+    emitted = []
+    bar.soundToggled.connect(emitted.append)
+    bar.sound_btn.click()
+    check("chime toggle: click mutes + emits False + shows muted glyph",
+          emitted == [False] and not bar._sound_on
+          and bar.sound_btn.text() == "\U0001F515", (emitted, bar._sound_on))
+    bar.sound_btn.click()
+    check("chime toggle: click again re-enables + emits True",
+          emitted == [False, True] and bar._sound_on, emitted)
+    # set_sound_enabled reflects state WITHOUT re-emitting (restore path)
+    bar.set_sound_enabled(False)
+    check("chime toggle: set_sound_enabled updates glyph, no emit",
+          not bar._sound_on and emitted == [False, True])
+    bar.deleteLater()
+
+
 def test_sidebar_reorder():
     """Drag-reorder: the sidebar's drop handler re-sequences its node model and
     emits the new top-to-bottom ws-id order; a rebuild keeps every row."""
@@ -4553,6 +4634,8 @@ def main():
     test_layout_popup_placement()
     test_sidebar_count_badge()
     test_agent_waiting()
+    test_notification_chime()
+    test_chime_persistence()
     test_sidebar_reorder()
     test_manager_reorder_persist()
     test_agent_card_reorder()

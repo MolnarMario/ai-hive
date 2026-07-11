@@ -46,11 +46,20 @@ this file is the invariants that must survive every change.
   hidden and its animation stopped whenever `busy==0`, so a resting row is free.
   A "?" badge (`#WsQ`) shows when `waiting>0` — an agent has settled on a
   prompt/question awaiting the user. `waiting` is a THIRD transient signal
-  (`TerminalAgent.is_waiting`/`waiting_changed`), wired to `_recompute` like
-  `activity_changed` and NEVER to a save. It's a heuristic scrape of the settled
+  (`TerminalAgent.is_waiting`/`waiting_changed`), wired to
+  `WorkspaceManager._on_agent_waiting` (which `_recompute`s like
+  `activity_changed` and NEVER saves). It's a heuristic scrape of the settled
   screen (`_screen_tail` + `_NUM_OPTION_RE`/`_WAIT_PHRASES`), evaluated ONLY on
   the idle-timer settle (never mid-render) and cleared by any fresh output;
-  suppressed under `bypassPermissions` (that mode shows no prompts). Clicking the
+  suppressed under `bypassPermissions` (that mode shows no prompts). On the
+  RISING edge (standby→waiting) `_on_agent_waiting` also emits
+  `WorkspaceManager.agentWaiting(ws_id, agent_id)`, which `MainWindow` turns
+  into a soft notification bell (`app/chime.py` — Qt-free WAV synth, async
+  `winsound` playback, degrades to a silent no-op off-Windows) so the user
+  hears an agent needs them from another workspace. The chime is level-vs-edge
+  correct (re-entering waiting rings again; staying waiting does not) and
+  mutable via the top-bar 🔔 toggle, persisted transiently in
+  `session["ui"]["sound_enabled"]` (never a `dirty` mutation). Clicking the
   count badge OR the "?" toggles an INLINE agent expansion in the sidebar tree
   (`_toggle_agents` → `_expanded_ws`; agent child rows built from
   `sidebar.agents_provider`, folder-tree style — name left, summary beside,

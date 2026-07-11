@@ -557,6 +557,11 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     padding: 2px 7px; color: {p.TEXT_DIM}; font-weight: 700;
 }}
 #GlobalFontBtn:hover {{ border-color: {p.ACCENT_BLUE}; color: {p.TEXT}; }}
+#SoundToggle {{
+    background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
+    padding: 2px 6px; color: {p.TEXT}; font-size: 14px;
+}}
+#SoundToggle:hover {{ border-color: {p.ACCENT_GOLD}; }}
 #CardClose:hover, #WsDelete:hover {{ color: {p.RED}; border-color: {p.RED}; }}
 QPushButton {{
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};

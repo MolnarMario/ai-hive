@@ -59,6 +59,10 @@ class WorkspaceManager(QObject):
     workspacePathChanged = Signal(str, str)  # ws_id, new project_path
     layoutChanged = Signal(str, str)         # ws_id, layout
     sidebarLayoutChanged = Signal()          # workspace order / categories
+    # rising edge of an agent's waiting-for-user state (standby -> waiting):
+    # the "?" just appeared on its row. Transient, never persisted — the UI
+    # uses it purely to sound the notification chime.
+    agentWaiting = Signal(str, str)          # ws_id, agent_id
     dirty = Signal()                         # any persistable mutation
 
     def __init__(self, parent: QObject | None = None):
@@ -448,8 +452,20 @@ class WorkspaceManager(QObject):
         # busy/standby is TRANSIENT (not persisted): refresh the badge only,
         # never mark dirty — otherwise every output burst would thrash saves
         agent.activity_changed.connect(lambda *_: self._recompute(wid))
-        # waiting-for-input is likewise transient (drives the "?" indicator)
-        agent.waiting_changed.connect(lambda *_: self._recompute(wid))
+        # waiting-for-input is likewise transient (drives the "?" indicator):
+        # refresh the badge AND announce the rising edge so the UI can chime
+        agent.waiting_changed.connect(
+            lambda waiting, wid=wid, aid=agent.id:
+            self._on_agent_waiting(wid, aid, waiting))
+
+    def _on_agent_waiting(self, ws_id: str, agent_id: str,
+                          waiting: bool) -> None:
+        """Refresh derived badge state, and on the RISING edge announce that an
+        agent just started waiting for the user (so the UI can chime). Never
+        marks dirty — waiting is transient, like busy/standby."""
+        self._recompute(ws_id)
+        if waiting:
+            self.agentWaiting.emit(ws_id, agent_id)
 
     def _touch(self, ws_id: str) -> None:
         """Recompute derived state AND mark the session dirty (persisted

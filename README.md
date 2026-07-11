@@ -65,7 +65,11 @@ workspaces keep executing — switching never pauses anything.
   question — a "?" lights up on the row (next to the working count) and beside
   that agent in the expanded list, so you can spot and answer it without hunting
   through terminals. Suppressed for agents launched in bypass-permissions mode
-  (which never prompt).
+  (which never prompt). A soft **notification chime** rings the moment that "?"
+  appears (the standby→waiting rising edge), so you notice an agent needs you
+  even while you're heads-down in another workspace — handy when agents you sent
+  into plan mode come back with questions. Toggle it with the **🔔 button** in
+  the top bar (persists across restarts).
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
@@ -405,7 +409,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-640 checks drive the real app headlessly (offscreen Qt platform) with real
+651 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -426,7 +430,9 @@ drag workspaces in/out, single-level membership persisted across a v4 session
 round-trip with v3 migration), the count-badge inline agent list +
 click-to-reveal, and the waiting-for-input "?" detection (settled-screen
 prompt/question scrape, gated on the idle timer, suppressed under
-bypassPermissions), the Agent/File Map
+bypassPermissions) plus the notification chime it triggers (WAV synthesis,
+the manager's waiting rising-edge `agentWaiting` signal, and the top-bar
+mute toggle persisted in the ui state), the Agent/File Map
 visualizer (transcript parsing for edited-vs-read
 attribution, sub-agent detection, shared-file grouping, headless paint, header-
 button wiring, and the drag/zoom/hit-test/click-to-focus interactions) and the
@@ -458,6 +464,7 @@ app/
   transcripts.py           Claude-transcript snapshots (start/close, high-water)
   session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
   session_hook.py          SessionStart hook: the child reports its live conversation id
+  chime.py                 notification bell (WAV synth + async play, Qt-free) for the "?" alert
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
@@ -470,7 +477,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (640 checks)
+tests/smoke_test.py        headless end-to-end suite (651 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

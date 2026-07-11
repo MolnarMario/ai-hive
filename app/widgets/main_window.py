@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QToolButton, QVBoxLayout, QWidget)
 
 from .. import __version__
+from .. import chime
 from .. import fsopen
 from .. import providers
 from .. import session_hook
@@ -65,6 +66,7 @@ class TopBar(QFrame):
     sidebarToggleClicked = Signal()
     globalFontDelta = Signal(int)
     themeChanged = Signal(str)   # theme id
+    soundToggled = Signal(bool)  # notification chime enabled/muted
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -109,6 +111,15 @@ class TopBar(QFrame):
         self.font_dec_btn = font_btn("A−", "Decrease font size (all agents)", -1)
         self.font_inc_btn = font_btn("A+", "Increase font size (all agents)", +1)
 
+        # notification-chime mute toggle: rings when an agent raises "?"
+        # (settles on a question). Reflects state via its glyph (🔔/🔕).
+        self._sound_on = True
+        self.sound_btn = QToolButton(self)
+        self.sound_btn.setObjectName("SoundToggle")
+        self.sound_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sound_btn.clicked.connect(self._on_sound_clicked)
+        self._refresh_sound_btn()
+
         # skin selector (Winamp-style): swaps the whole chrome palette live
         self.theme_select = QComboBox(self)
         self.theme_select.setObjectName("ThemeSelect")
@@ -131,7 +142,24 @@ class TopBar(QFrame):
         lay.addWidget(self.font_dec_btn)
         lay.addWidget(self.font_inc_btn)
         lay.addSpacing(8)
+        lay.addWidget(self.sound_btn)
+        lay.addSpacing(8)
         lay.addWidget(self.add_terminal_btn)
+
+    def _on_sound_clicked(self) -> None:
+        self.set_sound_enabled(not self._sound_on)
+        self.soundToggled.emit(self._sound_on)
+
+    def set_sound_enabled(self, on: bool) -> None:
+        """Reflect the chime on/off state in the button (no signal emitted)."""
+        self._sound_on = bool(on)
+        self._refresh_sound_btn()
+
+    def _refresh_sound_btn(self) -> None:
+        self.sound_btn.setText("🔔" if self._sound_on else "🔕")
+        self.sound_btn.setToolTip(
+            "Notification chime: ON — click to mute" if self._sound_on
+            else "Notification chime: OFF — click to enable")
 
     def set_theme(self, theme_id: str) -> None:
         """Reflect the active theme in the dropdown without re-emitting."""
@@ -454,6 +482,7 @@ class MainWindow(QMainWindow):
         self._ready = False  # suppress save-storms during initial load
         self._last_saved_json = None  # what last reached disk (heartbeat guard)
         self._theme_id = ui_theme.ACTIVE_THEME.id  # active skin (persisted)
+        self._sound_enabled = True  # notification chime on "?" (persisted)
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -608,6 +637,7 @@ class MainWindow(QMainWindow):
         self.top_bar.sidebarToggleClicked.connect(self._toggle_sidebar)
         self.top_bar.globalFontDelta.connect(self._change_global_font)
         self.top_bar.themeChanged.connect(self._change_theme)
+        self.top_bar.soundToggled.connect(self._on_sound_toggled)
         self.sidebar.addRequested.connect(self._on_add_workspace_clicked)
         self.sidebar.workspaceSelected.connect(self.manager.set_active)
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
@@ -682,6 +712,8 @@ class MainWindow(QMainWindow):
         mgr.workspaceStatsChanged.connect(self._on_stats_for_activity)
         mgr.workspacePathChanged.connect(self._on_workspace_path_changed)
         mgr.layoutChanged.connect(self._on_layout_changed)
+        # an agent just settled on a question ("?" appeared) -> sound the chime
+        mgr.agentWaiting.connect(self._on_agent_waiting)
         mgr.dirty.connect(self._schedule_save)
         # structural changes (add/remove agent or workspace) save IMMEDIATELY,
         # not on the 800 ms debounce — so an abrupt process kill can never lose
@@ -692,6 +724,19 @@ class MainWindow(QMainWindow):
         mgr.workspaceRemoved.connect(lambda *_: self._save_now())
         # reordering/categorizing is a structural layout change -> save now
         mgr.sidebarLayoutChanged.connect(lambda *_: self._save_now())
+
+    def _on_agent_waiting(self, ws_id: str, agent_id: str) -> None:
+        """An agent just raised its "?" (settled on a prompt/question). Ring the
+        notification chime so the user notices even from another workspace —
+        unless they've muted it. Non-blocking; a silent no-op if unavailable."""
+        if self._sound_enabled:
+            chime.play()
+
+    def _on_sound_toggled(self, enabled: bool) -> None:
+        """User flipped the top-bar chime toggle. Persist the preference (via
+        the debounced save) so it survives a restart."""
+        self._sound_enabled = bool(enabled)
+        self._schedule_save()
 
     def _restore_ui_state(self, session: dict) -> None:
         ui = session.get("ui", {})
@@ -708,6 +753,9 @@ class MainWindow(QMainWindow):
                     app.property("chromeFamily") or "Segoe UI",
                     ui_theme.CONSOLE_FONT_PX))
         self.top_bar.set_theme(self._theme_id)
+        # notification chime preference (default ON if never saved)
+        self._sound_enabled = bool(ui.get("sound_enabled", True))
+        self.top_bar.set_sound_enabled(self._sound_enabled)
         win = ui.get("window", {})
         if win.get("w") and win.get("h"):
             self.resize(int(win["w"]), int(win["h"]))
@@ -1157,6 +1205,7 @@ class MainWindow(QMainWindow):
             "sidebar_width": self._sidebar_saved_width,
             "console_font_px": ui_theme.CONSOLE_FONT_PX,
             "theme": self._theme_id,
+            "sound_enabled": self._sound_enabled,
             "window": {"w": w, "h": h, "maximized": self.isMaximized()},
             # which workspaces have their inline file tree open (per-folder
             # expansion + highlight are transient, not persisted)
