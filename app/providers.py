@@ -40,8 +40,8 @@ class Provider:
 
 
 # providers whose CLI can resume its previous conversation with --continue
-# (claude verified 2.1.197; agy verified 1.0.16)
-RESUME_PROVIDERS = ("claude", "gemini")
+# (claude verified 2.1.197; agy verified 1.0.16; grok verified 0.2.93)
+RESUME_PROVIDERS = ("claude", "gemini", "grok")
 
 
 CLAUDE_MODELS = (
@@ -92,6 +92,17 @@ PROVIDERS: dict[str, Provider] = {
         base_cmd="agy", model_flag="--model {model}",
         fallback_paths=(r"%LOCALAPPDATA%\agy\bin\agy.exe",),
         note="Google Antigravity CLI (`agy`) — Gemini 3.x agent."),
+    "grok": Provider(
+        key="grok", display="Grok (xAI CLI)", exe_names=("grok",),
+        # `grok models` reports one entry for this account (grok-build, the
+        # default); more may appear per plan. "" omits -m and uses the CLI's
+        # own default. Model IDs are single tokens, so -m {model} is one arg.
+        models=(("Default", ""), ("grok-build", "grok-build")),
+        base_cmd="grok", model_flag="-m {model}",
+        # the xAI installer drops grok.exe under the user profile, which may not
+        # be on the app's PATH (verified: %USERPROFILE%\.grok\bin\grok.exe)
+        fallback_paths=(r"%USERPROFILE%\.grok\bin\grok.exe",),
+        note="xAI Grok CLI (`grok`) — interactive Grok agent."),
 }
 
 AI_PROVIDER_KEYS = tuple(PROVIDERS.keys())

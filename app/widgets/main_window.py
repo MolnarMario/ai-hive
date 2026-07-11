@@ -47,6 +47,7 @@ KIND_GROUPS = [
         ("Claude Code", AgentKind.CLAUDE),
         ("OpenAI (Codex CLI)", AgentKind.OPENAI),
         ("Gemini CLI", AgentKind.GEMINI),
+        ("Grok CLI", AgentKind.GROK),
     ]),
     ("Shells", [
         ("PowerShell", AgentKind.POWERSHELL),

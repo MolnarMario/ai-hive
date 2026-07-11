@@ -10,6 +10,8 @@ with no per-call-site changes. Callers then rebuild the QSS and repolish.
 Adding a skin = adding one `Theme(...)` to `THEMES`. Nothing else.
 """
 
+import os
+import tempfile
 from dataclasses import dataclass, field
 
 
@@ -250,9 +252,52 @@ def apply_theme(theme_id: str) -> Theme:
 apply_theme(DEFAULT_THEME_ID)   # populate Palette at import
 
 
+def _rel_luma(hex_color: str) -> float:
+    """WCAG relative luminance of a #rrggbb / #rgb color (0=black, 1=white).
+    Pure-python so ui_theme stays Qt-free."""
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    lin = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+
+def _check_icon_path(fill_hex: str) -> str:
+    """Write a checkmark SVG whose stroke contrasts with `fill_hex` (the checked
+    indicator's fill) and return a forward-slashed file path, or "" on failure.
+
+    Qt's stylesheet `image:` renders a file/qsvg url but NOT a `data:` URI
+    (verified empirically), so the glyph has to live on disk. It's tiny and
+    rewritten per theme. The stroke is black or white -- whichever CONTRASTS
+    MORE with the fill (WCAG ratio; the crossover sits near luma 0.18, so most
+    accents take the black tick) -- so the check stays legible on ANY skin's
+    accent fill."""
+    lum = _rel_luma(fill_hex)
+    stroke = "#101010" if (lum + 0.05) / 0.05 >= 1.05 / (lum + 0.05) else "#ffffff"
+    svg = ("<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16' "
+           "viewBox='0 0 16 16'><path d='M3.6 8.4 L6.5 11.4 L12.5 4.6' "
+           f"fill='none' stroke='{stroke}' stroke-width='2.2' "
+           "stroke-linecap='round' stroke-linejoin='round'/></svg>")
+    try:
+        d = os.path.join(tempfile.gettempdir(), "aihive-theme")
+        os.makedirs(d, exist_ok=True)
+        # name by the fill so switching skins never reads a stale color
+        path = os.path.join(d, f"check-{fill_hex.lstrip('#')}.svg")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(svg)
+        return path.replace("\\", "/")
+    except OSError:
+        return ""
+
+
 def build_qss(chrome_family: str = "Segoe UI", console_px: int | None = None) -> str:
     p = Palette
     cpx = int(console_px if console_px else CONSOLE_FONT_PX)
+    # checked-indicator glyph (written to disk; see _check_icon_path). Empty
+    # string if the write failed -- the accent fill alone still reads as checked.
+    _check_icon = _check_icon_path(p.ACCENT_GOLD)
+    check_img = f'image: url("{_check_icon}");' if _check_icon else ""
     return f"""
 * {{
     font-family: "{chrome_family}";
@@ -316,13 +361,13 @@ WorkspaceRow[active="true"] {{
 }}
 #WsFolderBtn {{
     background: transparent; border: 1px solid transparent; border-radius: 3px;
-    padding: 2px 5px; color: {p.TEXT_DIM};
+    padding: 2px 6px; color: {p.TEXT}; font-size: 17px; font-weight: 900;
 }}
 #WsFolderBtn:hover {{ background: {p.BG_HOVER}; color: {p.ACCENT_BLUE};
                      border-color: {p.BORDER}; }}
 #WsTreeBtn {{
     background: transparent; border: 1px solid transparent; border-radius: 3px;
-    padding: 2px 5px; color: {p.TEXT_DIM}; font-size: 12px;
+    padding: 2px 4px; color: {p.TEXT}; font-size: 15px; font-weight: 900;
 }}
 #WsTreeBtn:hover {{ background: {p.BG_HOVER}; color: {p.ACCENT_GOLD};
                    border-color: {p.BORDER}; }}
@@ -485,7 +530,7 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
    specificity) */
 #CardFontDec, #CardFontInc {{ font-size: 12px; font-weight: 700; }}
 #CardMaximize {{ font-size: 16px; }}
-#WsDelete {{ color: {p.TEXT_DIM}; }}
+#WsDelete {{ color: {p.TEXT}; font-size: 17px; font-weight: 900; }}
 #CardReassign:hover {{ border-color: {p.ACCENT_GOLD}; }}
 #GlobalFontBtn {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
@@ -519,6 +564,25 @@ QComboBox QAbstractItemView {{
 }}
 QDialog, QMessageBox, QFileDialog {{ background: {p.BG_PANEL}; }}
 QLabel {{ background: transparent; }}
+/* Checkboxes: the platform default draws a near-invisible tick. Give it a
+   clear box (empty = input surface, checked = accent-filled) and a
+   contrast-picked check glyph (black on light accents, white on dark) so the
+   tick is obvious on every skin. */
+QCheckBox {{ background: transparent; spacing: 7px; }}
+QCheckBox::indicator {{
+    width: 16px; height: 16px; border-radius: 3px;
+    border: 1px solid {p.BORDER}; background: {p.BG_INPUT};
+}}
+QCheckBox::indicator:hover {{ border-color: {p.ACCENT_GOLD}; }}
+QCheckBox::indicator:checked {{
+    background: {p.ACCENT_GOLD}; border: 1px solid {p.ACCENT_GOLD};
+    {check_img}
+}}
+QCheckBox::indicator:checked:hover {{ border-color: {p.ACCENT_GOLD}; }}
+QCheckBox::indicator:disabled {{
+    background: {p.BG_HOVER}; border-color: {p.BORDER};
+}}
+QCheckBox:disabled {{ color: {p.TEXT_FAINT}; }}
 
 /* -------------------------------------------------------- scrollbars --- */
 QScrollBar:vertical {{

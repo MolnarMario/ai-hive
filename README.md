@@ -17,7 +17,9 @@ workspaces keep executing — switching never pauses anything.
   Accept edits, Plan, Bypass permissions — so an agent can start pre-set; **Gemini via the
   Antigravity CLI** (`agy`) with its full model list incl. Gemini 3.x, and
   `--continue` resume + shared-board `--add-dir`, verified against agy 1.0.16;
-  OpenAI as an editable command template until its CLI is installed). Shells
+  **Grok via the xAI CLI** (`grok`) with `-m` model selection + `--continue`
+  resume, verified against grok 0.2.93; OpenAI as an editable command template
+  until its CLI is installed). Shells
   and Python scripts are also first-class agent types.
 - **One-click grid layouts** — a visual selector (Auto, 1×1 … 4×3, including
   the 3×1 strip and 1×3 stack) applies instantly and preserves agent state;
@@ -158,8 +160,9 @@ error dialog instead of silently closing. Packaging to a distributable
 - **Agents** — `+ Terminal` (or `Ctrl+Shift+T`), or click any empty grid slot.
   The dialog groups **AI agents** (Claude with model + effort + mode dropdowns —
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;
-  Gemini/Antigravity with its model list; OpenAI as an editable command
-  template), **shells** (PowerShell, cmd), and **scripts** (Python, custom);
+  Gemini/Antigravity with its model list; Grok via the xAI CLI; OpenAI as an
+  editable command template), **shells** (PowerShell, cmd), and **scripts**
+  (Python, custom);
   tick "Full terminal" for a ConPTY-backed interactive session (auto-on for
   AI agents). For a Claude agent, a **Conversation** dropdown lists the
   workspace folder's past conversations (newest first, with a preview) so you
@@ -350,7 +353,10 @@ Hard-won rules, each with a regression test:
   Left/Right arrows — exact on the caret's own line), so you can jump into your
   typed text without arrow-key walking; a drag selects instead and never moves
   the caret. Double-click selects the whitespace-delimited word under the
-  pointer (then `Ctrl+C` copies it); **Ctrl+click** (or a middle/scroll-wheel
+  pointer — an editable selection: `Ctrl+C` copies it, `Ctrl+X` cuts it, and
+  `Backspace`/`Del` deletes it (cut/delete drive the child's caret + Backspace,
+  so they act on a selection on the input line; off it the key just drops the
+  selection). **Ctrl+click** (or a middle/scroll-wheel
   click) opens a URL or an existing
   absolute local file path under the pointer with the OS default handler —
   hovering such a link underlines it and shows a hand cursor so it's obviously
@@ -387,7 +393,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-587 checks drive the real app headlessly (offscreen Qt platform) with real
+608 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -427,7 +433,7 @@ main.py                    entry point + create_main_window() factory
 app/
   tiling.py                pure grid math: compute_grid + explicit_grid
   ansi_parser.py           stateful SGR parser (line-console rendering)
-  providers.py             AI provider registry (Claude + Gemini/agy wired; OpenAI template)
+  providers.py             AI provider registry (Claude + Gemini/agy + Grok wired; OpenAI template)
   coordination.py          per-workspace shared board (.aihive/board.md)
   orchestration.py         task → role + task → model/effort heuristics (Qt-free)
   process_worker.py        QProcess engine, HybridDecoder, WinJob (line mode)
@@ -452,7 +458,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (587 checks)
+tests/smoke_test.py        headless end-to-end suite (608 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

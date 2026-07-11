@@ -55,10 +55,14 @@ Ctrl+LEFT-click is primary -- the left button always delivers, while the middle
 button is often eaten by the OS (autoscroll). Hovering such a link underlines it
 (in the accent color) and
 switches to a hand cursor so it reads as clickable; the scan runs only when the
-pointer changes cells (it can stat the filesystem). Deleting a selected word from the
-keyboard is NOT wired: the terminal can't edit a specific span of the child's
-buffer -- clear the whole input with Ctrl+A then Backspace, or use the
-program's own Ctrl+W (delete previous word).
+pointer changes cells (it can stat the filesystem). A mouse selection (double-
+click word or drag) is EDITABLE like any editor selection: Ctrl+C copies it,
+Ctrl+X cuts it, and Backspace/Del deletes it. Deletion/cut works only when the
+selection lies on the input line (the child's caret can be driven there with
+arrows + Backspace, exactly as click-to-position does); off the input line
+those keys simply drop the selection and touch nothing (the terminal can't edit
+an arbitrary span of the child's buffer). To empty the whole prompt at once, use
+Ctrl+A then Backspace (the clear-prompt gesture above).
 """
 
 import collections
@@ -494,6 +498,21 @@ class TerminalView(QWidget):
                 return
             self._clear_input_selection(send=False)
 
+        # A MOUSE selection (double-click word / drag) behaves like an editor
+        # selection: Backspace/Del deletes it. Deletion only reaches a selection
+        # on the input line (see _delete_selection); off the input line we still
+        # swallow the key and just drop the selection, so a stray Backspace can
+        # never corrupt output/scrollback or nudge the caret. Ctrl+X (cut) is
+        # handled with the clipboard shortcuts below.
+        if (not self._input_selected and self._selection_range() is not None
+                and key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete)
+                and not ctrl and not alt):
+            self._delete_selection()
+            self._sel_anchor = self._sel_end = None
+            self.update()
+            event.accept()
+            return
+
         # clipboard / editing shortcuts, Windows-editor style. These win over
         # the terminal control byte the same combo would otherwise send.
         # Ctrl+V / Ctrl+Shift+V paste.
@@ -513,6 +532,17 @@ class TerminalView(QWidget):
                 event.accept()
                 return
             # no selection: fall through -> _sequence_for emits 0x03 (interrupt)
+        # Ctrl+X cuts: copy the selection, then delete it from the input line
+        # (deletion no-ops off the input line, but the copy still lands). With
+        # nothing selected it falls through to the 0x18 control byte.
+        if ctrl and not shift and key == Qt.Key.Key_X \
+                and self._selection_range() is not None:
+            self.copy_selection()
+            self._delete_selection()
+            self._sel_anchor = self._sel_end = None
+            self.update()
+            event.accept()
+            return
         # Ctrl+Shift+A selects ALL painted text (screen + scrollback) for
         # copying -- distinct from Ctrl+A above, which highlights only the input
         # line. (Home still jumps to line start: it emits 0x1b[H.)
@@ -706,6 +736,30 @@ class TerminalView(QWidget):
         final = "C" if delta > 0 else "D"  # Right / Left
         seq = ("\x1bO" if self._app_cursor_keys else "\x1b[") + final
         self.keyInput.emit(seq * abs(delta))
+
+    def _delete_selection(self) -> bool:
+        """Delete a mouse selection by driving the child's caret + Backspace --
+        a terminal can't edit a span of the child's buffer directly. Only a
+        SINGLE-ROW selection on the caret's own live-screen line maps 1:1 to
+        keystrokes (the same constraint as _reposition_cursor: on an unwrapped
+        line each column == one Left/Right == one input char, past the prompt).
+        A multi-row selection, an output/scrollback region, or a scrolled-back
+        view can't be deleted safely, so we leave the child untouched and
+        return False. Otherwise we park the caret just past the selection and
+        Backspace over it, and return True."""
+        rng = self._selection_range()
+        if rng is None:
+            return False
+        (r0, c0), (r1, c1) = rng
+        if self._scroll_offset or r0 != r1 or r0 != self.screen.cursor.y:
+            return False
+        count = c1 - c0 + 1
+        if count <= 0:
+            return False
+        self._snap_to_bottom()
+        self._reposition_cursor(r0, c1 + 1)   # caret to just after the span
+        self.keyInput.emit("\x7f" * count)    # then Backspace over it
+        return True
 
     def _word_at(self, row: int, col: int):
         """(c0, c1) inclusive of the non-whitespace run at (row, col), or None

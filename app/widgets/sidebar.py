@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
                                QVBoxLayout, QWidget)
 
 from ..filetypes import EMOJI_FONT, FOLDER_ICON, FOLDER_OPEN_ICON, file_icon
+from ..terminal_agent import AgentStatus
 from ..ui_theme import Palette, repolish
 from .activity_panel import _ICON
 from .ornaments import AgentCountBadge, OrnamentDivider, WorkspaceSpinner
@@ -101,19 +102,21 @@ class WorkspaceRow(QFrame):
 
         # inline file-tree toggle (a caret that turns as the tree opens) — a
         # SEPARATE control from folder_btn: this expands the file explorer under
-        # the row, folder_btn opens the folder in the OS file manager
+        # the row, folder_btn opens the folder in the OS file manager. Unlike the
+        # hover-only folder/delete buttons, this caret is ALWAYS visible (it sits
+        # between the count badge and the name) so the file explorer is a
+        # first-class, discoverable affordance rather than a hover surprise.
         self.tree_btn = QToolButton(self)
         self.tree_btn.setObjectName("WsTreeBtn")
         self.tree_btn.setText("▸")
         self.tree_btn.setToolTip("Show files")
         self.tree_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.tree_btn.hide()
         self.tree_btn.clicked.connect(
             lambda: self.filesRequested.emit(self.ws_id))
 
         self.folder_btn = QToolButton(self)
         self.folder_btn.setObjectName("WsFolderBtn")
-        self.folder_btn.setText("🗀")
+        self.folder_btn.setText("📁")  # filled folder reads far better than 🗀
         self.folder_btn.setToolTip("Open workspace folder")
         self.folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.folder_btn.hide()
@@ -122,7 +125,7 @@ class WorkspaceRow(QFrame):
 
         self.delete_btn = QToolButton(self)
         self.delete_btn.setObjectName("WsDelete")
-        self.delete_btn.setText("✕")
+        self.delete_btn.setText("✖")  # heavy multiplication x — thicker than ✕
         self.delete_btn.setToolTip("Delete workspace")
         self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.delete_btn.hide()
@@ -147,8 +150,8 @@ class WorkspaceRow(QFrame):
         self.work_spinner.setObjectName("WsSpinner")
 
         lay.addWidget(self.count_badge)
+        lay.addWidget(self.tree_btn)      # always-visible file-explorer caret
         lay.addLayout(text_col, 1)
-        lay.addWidget(self.tree_btn)
         lay.addWidget(self.folder_btn)
         lay.addWidget(self.delete_btn)
         lay.addWidget(self.q_badge)
@@ -280,12 +283,12 @@ class WorkspaceRow(QFrame):
         self.tree_btn.setToolTip("Hide files" if is_open else "Show files")
 
     def _update_hover_buttons(self, hovered: bool) -> None:
-        # tree/folder/delete appear ONLY while hovering the row (not on the
-        # active row) so the workspace name keeps the full width the rest of the
-        # time; the count badge carries the workspace's status at all times
+        # folder/delete appear ONLY while hovering the row (not on the active
+        # row) so the workspace name keeps the full width the rest of the time;
+        # the count badge carries the workspace's status at all times, and the
+        # file-explorer caret (tree_btn) is always visible up front by the name
         self.delete_btn.setVisible(hovered)
         self.folder_btn.setVisible(hovered)
-        self.tree_btn.setVisible(hovered)
 
 
 class CategoryRow(QFrame):
@@ -333,7 +336,7 @@ class CategoryRow(QFrame):
 
         self.delete_btn = QToolButton(self)
         self.delete_btn.setObjectName("WsDelete")
-        self.delete_btn.setText("✕")
+        self.delete_btn.setText("✖")  # heavy multiplication x — thicker than ✕
         self.delete_btn.setToolTip("Delete category (its workspaces move out)")
         self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.delete_btn.hide()
@@ -583,7 +586,13 @@ class AgentRow(QFrame):
         self.refresh(agent)
 
     def refresh(self, agent) -> None:
-        self.dot.setText(_ICON.get(agent.status, "⚪"))
+        # WORK, not liveness (mirrors the sidebar workspace badge): a RUNNING
+        # agent that is actively producing output (is_busy) shows amber; a
+        # RUNNING-but-quiet agent stays green. Other statuses map as usual.
+        busy = bool(getattr(agent, "is_busy", lambda: False)())
+        icon = "🟡" if (busy and agent.status == AgentStatus.RUNNING) \
+            else _ICON.get(agent.status, "⚪")
+        self.dot.setText(icon)
         self.name.setText(agent.spec.name)
         waiting = bool(getattr(agent, "is_waiting", lambda: False)())
         self.q.setVisible(waiting)

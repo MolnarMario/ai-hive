@@ -60,15 +60,17 @@ class AgentKind(str, Enum):
     CLAUDE = "claude"
     OPENAI = "openai"
     GEMINI = "gemini"
+    GROK = "grok"
     CUSTOM = "custom"
 
 
 # AI-agent kinds map 1:1 onto a provider key in app/providers.py.
 AI_KINDS = {AgentKind.CLAUDE: "claude", AgentKind.OPENAI: "openai",
-            AgentKind.GEMINI: "gemini"}
+            AgentKind.GEMINI: "gemini", AgentKind.GROK: "grok"}
 
 # Kinds that only make sense inside a real pseudo-console (interactive TUIs).
-PTY_ONLY_KINDS = {AgentKind.CLAUDE, AgentKind.OPENAI, AgentKind.GEMINI}
+PTY_ONLY_KINDS = {AgentKind.CLAUDE, AgentKind.OPENAI, AgentKind.GEMINI,
+                  AgentKind.GROK}
 
 
 @dataclass
@@ -91,7 +93,7 @@ class AgentSpec:
     line_ending: str = "\r\n"
     pty: bool = False  # run inside a real pseudo-console (ConPTY) if True
     # AI-agent configuration (empty for shells/scripts)
-    provider: str = ""       # provider key: "claude" | "openai" | "gemini"
+    provider: str = ""       # provider key: "claude"|"openai"|"gemini"|"grok"
     model: str = ""          # "" = provider default
     effort: str = ""         # "" = provider default (Claude: low..max)
     # Claude startup permission mode (a Shift+Tab mode). "" = omit the flag =
@@ -164,6 +166,13 @@ class AgentSpec:
             for d in self.extra_dirs:
                 if d:
                     args += ["--add-dir", d]
+        elif self.provider == "grok":
+            # xAI Grok CLI (grok 0.2.93) resumes the folder's most recent
+            # session with --continue (verified). It exposes --cwd rather than
+            # a repeatable --add-dir, and has no system-prompt flag, so no
+            # orchestrator wiring — like Gemini it's an interactive agent only.
+            if self.resume:
+                args += ["--continue"]
         return args
 
     def to_dict(self) -> dict:
@@ -216,8 +225,8 @@ def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
     PSReadLine, etc.) because a pseudo-console makes them behave like a true
     terminal; the piped-stdin invocations are only used in line mode.
 
-    AI-agent kinds (Claude/OpenAI/Gemini) route through app.providers so the
-    model/effort selections become real CLI flags.
+    AI-agent kinds (Claude/OpenAI/Gemini/Grok) route through app.providers so
+    the model/effort selections become real CLI flags.
     """
     args = list(args or [])
     if kind in PTY_ONLY_KINDS:

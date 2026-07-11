@@ -499,6 +499,26 @@ def test_agent_inline_expansion():
           (sb._agent_rows[a1.id].summary.text(),
            sb._agent_rows[a2.id].summary.text()))
 
+    # the row's status dot shows WORK, not liveness (mirrors the workspace
+    # badge): a RUNNING-but-quiet agent is green; actively producing output
+    # flips it amber; exit clears amber regardless of busy.
+    check("inline: RUNNING-but-quiet agent dot is green",
+          sb._agent_rows[a1.id].dot.text() == "🟢",
+          sb._agent_rows[a1.id].dot.text())
+    a1._busy = True
+    sb._agent_rows[a1.id].refresh(a1)
+    check("inline: a busy (working) agent dot is amber",
+          sb._agent_rows[a1.id].dot.text() == "🟡",
+          sb._agent_rows[a1.id].dot.text())
+    a1.status = AgentStatus.EXITED_OK
+    sb._agent_rows[a1.id].refresh(a1)
+    check("inline: busy flag never overrides a non-RUNNING status",
+          sb._agent_rows[a1.id].dot.text() == "⚪",
+          sb._agent_rows[a1.id].dot.text())
+    a1.status = AgentStatus.RUNNING
+    a1._busy = False
+    sb._agent_rows[a1.id].refresh(a1)
+
     relayed = []
     sb.agentActivated.connect(lambda w, ag: relayed.append((w, ag)))
     QTest.mouseClick(sb._agent_rows[a1.id], Qt.MouseButton.LeftButton)
@@ -1646,6 +1666,88 @@ def test_terminal_mouse_words_links():
     check("mouse: click on the caret sends nothing", moves == [], moves)
 
 
+def test_terminal_selection_edit():
+    """A mouse selection (double-click word / drag) is editable like an editor
+    selection: Backspace/Del deletes it, Ctrl+X cuts it, Ctrl+C copies it.
+    Delete/cut drive the child's caret + Backspace, so they act ONLY on a
+    single-row selection on the caret's live-screen line; off the input line
+    the key is swallowed and only the selection is dropped."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QGuiApplication, QKeyEvent, QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                            TerminalView)
+
+    QApplication.instance() or QApplication([])
+    K = Qt.Key
+
+    def dbl(view, row, col):
+        p = QPointF(CELL_PAD_X + (col + 0.5) * view._cell_w,
+                    CELL_PAD_Y + (row + 0.5) * view._cell_h)
+        view.mouseDoubleClickEvent(QMouseEvent(
+            QEvent.Type.MouseButtonDblClick, p, Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+
+    def press(view, k, ctrl=False, shift=False):
+        mods = Qt.KeyboardModifier.NoModifier
+        if ctrl:
+            mods |= Qt.KeyboardModifier.ControlModifier
+        if shift:
+            mods |= Qt.KeyboardModifier.ShiftModifier
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, k, mods, ""))
+
+    # "hello world": child caret ends at column 11. Double-click "hello".
+    v = TerminalView(rows=6, cols=80)
+    v.feed("hello world")
+    sent = []
+    v.keyInput.connect(sent.append)
+    dbl(v, 0, 2)
+    check("seledit: double-click selects the word", v.selected_text() == "hello",
+          v.selected_text())
+    press(v, K.Key_Backspace)
+    # caret parks just past the span (col 5): 6 Left arrows from col 11, then
+    # Backspace over the 5 selected chars
+    check("seledit: Backspace deletes the selection (arrows + backspaces)",
+          sent == ["\x1b[D" * 6, "\x7f" * 5], sent)
+    check("seledit: deleting drops the selection", v.selected_text() == "")
+
+    # Ctrl+X cuts: the word lands on the clipboard AND is deleted from input
+    v2 = TerminalView(rows=6, cols=80)
+    v2.feed("hello world")
+    sent2 = []
+    v2.keyInput.connect(sent2.append)
+    QGuiApplication.clipboard().clear()
+    dbl(v2, 0, 8)   # "world" (cols 6-10)
+    press(v2, K.Key_X, ctrl=True)
+    check("seledit: Ctrl+X copies the selection to the clipboard",
+          QGuiApplication.clipboard().text() == "world",
+          QGuiApplication.clipboard().text())
+    # caret parks just past "world" (col 11 == caret): 0 arrows, 5 backspaces
+    check("seledit: Ctrl+X deletes the cut span", sent2 == ["\x7f" * 5], sent2)
+    check("seledit: Ctrl+X drops the selection", v2.selected_text() == "")
+
+    # Ctrl+X with NOTHING selected falls through to the 0x18 control byte
+    sent2.clear()
+    press(v2, K.Key_X, ctrl=True)
+    check("seledit: Ctrl+X with no selection forwards 0x18",
+          sent2 == ["\x18"], sent2)
+
+    # a selection OFF the caret's line can't be edited: the key is swallowed
+    # (no child bytes, no caret nudge) and only the selection is dropped
+    v3 = TerminalView(rows=6, cols=80)
+    v3.feed("aaa\r\nbbb")            # caret now on row 1
+    sent3 = []
+    v3.keyInput.connect(sent3.append)
+    dbl(v3, 0, 1)                    # "aaa" on row 0, not the caret's row
+    check("seledit: word on another row is selected", v3.selected_text() == "aaa",
+          v3.selected_text())
+    press(v3, K.Key_Backspace)
+    check("seledit: Backspace off the input line sends nothing", sent3 == [], sent3)
+    check("seledit: off-line Backspace still clears the selection",
+          v3.selected_text() == "")
+
+
 def test_session_migration():
     """A pre-v2 line-mode shell agent upgrades to interactive on load."""
     from app.pty_worker import HAS_CONPTY
@@ -1838,8 +1940,34 @@ def test_v2_features():
           gspec.provider == "gemini" and gspec.pty
           and "--continue" in gspec.effective_args()
           and "--add-dir" in gspec.effective_args())
-    check("v2 providers: resume providers = claude + gemini",
-          set(providers.RESUME_PROVIDERS) == {"claude", "gemini"})
+    check("v2 providers: resume providers = claude + gemini + grok",
+          set(providers.RESUME_PROVIDERS) == {"claude", "gemini", "grok"})
+
+    # Grok rides the xAI CLI (grok 0.2.93): single-token model ids expand
+    # through -m, it's a template provider (no MCP/system-prompt wiring), and
+    # its spec resumes with --continue like Claude/Gemini.
+    _, xargs = providers.build_invocation("grok", model="grok-build")
+    check("v2 providers: grok template expands -m {model}",
+          xargs == ["-m", "grok-build"], xargs)
+    _, xdef = providers.build_invocation("grok", model="")
+    check("v2 providers: grok default omits -m flag", xdef == [], xdef)
+    check("v2 providers: grok detection returns bool (env-independent)",
+          isinstance(providers.detected("grok"), bool))
+    check("v2 providers: grok is a template provider (no native flags)",
+          providers.get("grok").native_flags is False)
+    xspec = build_spec(AgentKind.GROK, "X", cwd=str(proj_a), model="grok-build")
+    check("v2 providers: build_spec routes grok + pty",
+          xspec.provider == "grok" and xspec.pty
+          and "-m" in xspec.effective_args())
+    xspec.resume = True
+    check("v2 providers: grok resumes with --continue",
+          "--continue" in xspec.effective_args())
+    # grok has no --add-dir (it uses --cwd), so extra_dirs must never leak in
+    xspec2 = build_spec(AgentKind.GROK, "X2", cwd=str(proj_a))
+    xspec2.resume = True
+    xspec2.extra_dirs = [str(proj_a)]
+    check("v2 providers: grok never emits --add-dir",
+          "--add-dir" not in xspec2.effective_args())
 
     # ---- explicit grid (#7) ---------------------------------------------
     ep = explicit_grid(2, 2, 2)
@@ -2541,6 +2669,24 @@ def test_themes():
             if r < mn:
                 fails.append(f"{t.id}:{label}={r:.2f}<{mn}")
     check("themes: all chrome text meets contrast in every skin", not fails, fails)
+
+    # the checked-checkbox tick must be clearly visible on the accent fill in
+    # every skin (the near-invisible-default-tick report). _check_icon_path
+    # picks black/white for max contrast; assert the chosen tick clears the 3:1
+    # graphical-contrast target on each accent.
+    ck_fails = []
+    for t in ui_theme.THEMES.values():
+        path = ui_theme._check_icon_path(t.accent_gold)
+        if not path or not os.path.isfile(path):
+            ck_fails.append(f"{t.id}:no-icon")
+            continue
+        with open(path, encoding="utf-8") as f:
+            stroke = f.read().split("stroke='")[1].split("'")[0]
+        r = contrast_ratio(QColor(stroke), QColor(t.accent_gold))
+        if r < 3.0:
+            ck_fails.append(f"{t.id}:tick={r:.2f}")
+    check("themes: checkbox tick contrasts with its accent fill", not ck_fails,
+          ck_fails)
 
     # CONTRAST GUARANTEE (terminal): whatever color a child emits, the glyph is
     # forced readable on its actual background (the invisible-Claude-on-vellum
@@ -4182,6 +4328,7 @@ def main():
     test_terminal_keys()
     test_terminal_image_paste()
     test_terminal_mouse_words_links()
+    test_terminal_selection_edit()
     test_session_migration()
     test_app()
     test_pty()
