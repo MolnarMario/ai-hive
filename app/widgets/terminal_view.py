@@ -52,10 +52,14 @@ been supplied via set_base_dir() -- so a repo-relative path Claude prints
 (app/widgets/sidebar.py) is clickable too; opening a file also emits
 fileActivated(abspath) so the app can reveal it in the sidebar file tree.
 Ctrl+LEFT-click is primary -- the left button always delivers, while the middle
-button is often eaten by the OS (autoscroll). Hovering such a link underlines it
-(in the accent color) and
-switches to a hand cursor so it reads as clickable; the scan runs only when the
-pointer changes cells (it can stat the filesystem). Deleting a selected word from the
+button is often eaten by the OS (autoscroll). EVERY such link on the visible
+screen is underlined (a soft accent line) so URLs/paths stand out in the body
+text without hovering; hovering one emphasizes it (solid line) and switches to a
+hand cursor so it reads as the one you'd open. The full-screen scan
+(_rescan_links) can stat the filesystem, so it runs only when the visible
+content changes (guarded by a per-row-text signature in paintEvent), never per
+repaint; hover then reads the cached spans (_span_at) with no filesystem work.
+Deleting a selected word from the
 keyboard is NOT wired: the terminal can't edit a specific span of the child's
 buffer -- clear the whole input with Ctrl+A then Backspace, or use the
 program's own Ctrl+W (delete previous word).
@@ -245,6 +249,12 @@ class TerminalView(QWidget):
         self._input_selected = False  # Ctrl+A input-line highlight is active
         self._hover_link = None  # (row, c0, c1) of a link under the pointer
         self._hover_cell = None  # last hovered (row, col), to skip re-scans
+        # every clickable URL/path on the visible screen, so they read as links
+        # (underlined) even before you hover. Rescanned only when the visible
+        # content changes (a cheap signature guards it) — never per repaint,
+        # because classifying a token can stat the filesystem.
+        self._link_spans: list[tuple[int, int, int]] = []  # (row, c0, c1)
+        self._link_sig = None
         self._bracketed_paste = False  # tracked from the stream (pyte ignores 2004)
         self._alt_screen = False       # ?1049/?1047/?47 — app owns the screen
         self._mouse_tracking = False   # ?1000/?1002/?1003 — app wants mouse
@@ -654,13 +664,13 @@ class TerminalView(QWidget):
             self.update()
             super().mouseMoveEvent(event)
             return
-        # hover (no drag): underline + hand-cursor a link under the pointer, so
-        # it's obviously clickable. Only re-scan when the cell changes -- a scan
-        # can stat the filesystem (path existence), so it must not run per pixel.
+        # hover (no drag): every link is already underlined; hovering one just
+        # emphasizes it and shows the hand cursor. Look it up in the cached scan
+        # (no filesystem work here), only re-checking when the cell changes.
         cell = self._cell_at(event.position())
         if cell != self._hover_cell:
             self._hover_cell = cell
-            rng = self._link_range_at(*cell)
+            rng = self._span_at(*cell)
             hover = (cell[0], rng[0], rng[1]) if rng else None
             if hover != self._hover_link:
                 self._hover_link = hover
@@ -735,16 +745,52 @@ class TerminalView(QWidget):
         token = "".join(line[c].data for c in range(rng[0], rng[1] + 1))
         return self._classify_link(token)
 
-    def _link_range_at(self, row: int, col: int):
-        """(c0, c1) of a clickable link token at (row, col), or None -- the
-        column span the hover underline paints over."""
-        rng = self._word_at(row, col)
-        if not rng:
-            return None
-        hist, off = self._view_state()
-        line = self._visible_line(row, hist, off)
-        token = "".join(line[c].data for c in range(rng[0], rng[1] + 1))
-        return rng if self._classify_link(token) else None
+    @staticmethod
+    def _maybe_link(token: str) -> bool:
+        """Cheap pre-filter for the full-screen scan: could this whitespace-run
+        possibly be a link? Keeps the scan from stat()ing the filesystem for
+        every plain word — only URL-ish or path-ish tokens reach _classify_link."""
+        t = token.strip("'\"()[]{}<>,;")
+        if not t:
+            return False
+        if t.lower().startswith(("http://", "https://", "ftp://", "file://",
+                                 "www.")):
+            return True
+        # path-ish: a separator, a home '~', or a name.ext[:line[:col]] tail
+        return ("/" in t or "\\" in t or t.startswith("~")
+                or bool(re.search(r"\.\w{1,8}(:\d+){0,2}$", t)))
+
+    def _span_at(self, row: int, col: int):
+        """(c0, c1) of the clickable span covering (row, col), from the cached
+        scan — so hover does no filesystem work and always agrees with the
+        underlines that are already painted."""
+        for (r, c0, c1) in self._link_spans:
+            if r == row and c0 <= col <= c1:
+                return (c0, c1)
+        return None
+
+    def _rescan_links(self, lines) -> None:
+        """Recompute every clickable span on the visible screen. Called only
+        when the content signature changed (see paintEvent), never per repaint.
+        Tokenizes each row on whitespace, pre-filters, then classifies, recording
+        the raw token span so it can be underlined."""
+        cols = self.screen.columns
+        spans: list[tuple[int, int, int]] = []
+        for row in range(min(self.screen.lines, len(lines))):
+            line = lines[row]
+            col = 0
+            while col < cols:
+                if line[col].data in ("", " "):
+                    col += 1
+                    continue
+                c0 = col
+                while col < cols and line[col].data not in ("", " "):
+                    col += 1
+                c1 = col - 1
+                token = "".join(line[i].data for i in range(c0, c1 + 1))
+                if self._maybe_link(token) and self._classify_link(token):
+                    spans.append((row, c0, c1))
+        self._link_spans = spans
 
     def _classify_link(self, token: str):
         """Classify a token as an openable URL or an existing local file.
@@ -980,6 +1026,19 @@ class TerminalView(QWidget):
         hist, off = self._view_state()
         cw, ch = self._cell_w, self._cell_h
 
+        # snapshot the visible lines once (used for both rendering and the link
+        # scan). Rescan clickable spans only when the content actually changed —
+        # a cheap per-row-text signature guards the (filesystem-touching) scan.
+        lines = [self._visible_line(row, hist, off)
+                 for row in range(self.screen.lines)]
+        _cols = self.screen.columns
+        sig = (off, _cols,
+               tuple("".join((ln[c].data or "") for c in range(_cols))
+                     for ln in lines))
+        if sig != self._link_sig:
+            self._link_sig = sig
+            self._rescan_links(lines)
+
         # selection highlight (drawn under the text)
         rng = self._selection_range()
         if rng is not None:
@@ -993,7 +1052,7 @@ class TerminalView(QWidget):
                     int(CELL_PAD_X + sc * cw), int(CELL_PAD_Y + r * ch),
                     int((ec - sc + 1) * cw), int(ch) + 1, sel)
         for row in range(self.screen.lines):
-            line = self._visible_line(row, hist, off)
+            line = lines[row]
             y = CELL_PAD_Y + row * ch
             col = 0
             while col < self.screen.columns:
@@ -1039,8 +1098,19 @@ class TerminalView(QWidget):
                     painter.drawText(int(x), int(y + self._ascent), text)
                 col = run_end
 
-        # hover: underline the link under the pointer (paired with the hand
-        # cursor from mouseMoveEvent) so URLs / file paths read as clickable
+        # every clickable URL/path is underlined so you can spot links in the
+        # body text at a glance (a soft 1px accent line); the hovered one is
+        # emphasized below with a solid 2px line + the hand cursor.
+        if self._link_spans:
+            soft = QColor(Palette.ACCENT_ORANGE)
+            soft.setAlpha(140)
+            for (lr, lc0, lc1) in self._link_spans:
+                lx = CELL_PAD_X + lc0 * cw
+                ly = CELL_PAD_Y + lr * ch
+                painter.fillRect(int(lx), int(ly + ch - 2),
+                                 int((lc1 - lc0 + 1) * cw), 1, soft)
+        # hover: emphasize the link under the pointer (paired with the hand
+        # cursor from mouseMoveEvent) so it reads as the one you'd open
         if self._hover_link is not None:
             hr, hc0, hc1 = self._hover_link
             lx = CELL_PAD_X + hc0 * cw

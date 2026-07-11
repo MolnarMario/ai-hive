@@ -730,6 +730,59 @@ def test_terminal_relative_link():
     tv.deleteLater()
 
 
+def test_terminal_link_underline():
+    """Every clickable URL/path on the visible screen is scanned + underlined
+    (not just the hovered one), so links stand out in the body text; the scan
+    is content-guarded (no rescan when nothing changed); hover reads the cached
+    spans; plain words are pre-filtered out (no filesystem stat)."""
+    import os
+    import tempfile
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import TerminalView
+    QApplication.instance() or QApplication([])
+
+    base = tempfile.mkdtemp(prefix="aihive_ul_")
+    os.makedirs(os.path.join(base, "app", "widgets"), exist_ok=True)
+    open(os.path.join(base, "app", "widgets", "sidebar.py"), "w").close()
+
+    tv = TerminalView(rows=6, cols=90)
+    tv.resize(820, 220)
+    tv.set_base_dir(base)
+    tv.feed("See https://example.com and app/widgets/sidebar.py here\r\n")
+    tv.grab()   # force a paint -> content-guarded rescan
+
+    hist, off = tv._view_state()
+    tokens = ["".join(tv._visible_line(r, hist, off)[i].data
+                      for i in range(c0, c1 + 1))
+              for (r, c0, c1) in tv._link_spans]
+    check("underline: both a URL and a relative path are scanned as links",
+          any(t.startswith("https://example.com") for t in tokens)
+          and any(t.endswith("sidebar.py") for t in tokens)
+          and len(tv._link_spans) == 2)
+    check("underline: plain words are pre-filtered (no fs stat)",
+          not tv._maybe_link("here") and not tv._maybe_link("and"))
+
+    # the scan is content-guarded: same content -> same cached span object
+    sig_before = tv._link_sig
+    spans_obj = tv._link_spans
+    tv.grab()
+    check("underline: no rescan when the screen content is unchanged",
+          tv._link_sig == sig_before and tv._link_spans is spans_obj)
+
+    # hover reads the cached spans (no filesystem work): a cell inside a link
+    # resolves to its span; a blank cell resolves to nothing
+    r, c0, c1 = tv._link_spans[0]
+    check("underline: _span_at finds the link under a cell", tv._span_at(r, c0) == (c0, c1))
+    check("underline: _span_at is None off any link", tv._span_at(r, c1 + 1) is None)
+
+    # new content re-scans (the URL is gone, so no links remain)
+    tv.feed("\x1b[2J\x1b[Hjust plain text now\r\n")
+    tv.grab()
+    check("underline: rescans when content changes (links cleared)",
+          tv._link_spans == [])
+    tv.deleteLater()
+
+
 def test_sidebar_file_tree():
     """The sidebar's inline file explorer: the ▸ toggle expands a lazily-built
     file/folder tree under the workspace row; clicking a folder expands it;
@@ -1744,14 +1797,15 @@ def test_terminal_mouse_words_links():
     # _link_at reads the token straight off the painted line
     v2 = TerminalView(rows=6, cols=80)
     v2.feed("see https://example.com/docs for details")
+    v2.grab()   # paint once so the full-screen link scan caches the spans
     check("mouse: _link_at picks up the URL under the pointer",
           v2._link_at(0, 8) == ("url", "https://example.com/docs"), v2._link_at(0, 8))
 
-    # hover: link cols underline + hand cursor; a plain word does neither
-    check("mouse: _link_range_at spans the hovered URL",
-          v2._link_range_at(0, 8) == (4, 27), v2._link_range_at(0, 8))
-    check("mouse: _link_range_at is None over plain text",
-          v2._link_range_at(0, 30) is None, v2._link_range_at(0, 30))
+    # every link is underlined (scanned up front); hover reads the cached span
+    check("mouse: _span_at spans the scanned URL",
+          v2._span_at(0, 8) == (4, 27), v2._span_at(0, 8))
+    check("mouse: _span_at is None over plain text",
+          v2._span_at(0, 30) is None, v2._span_at(0, 30))
 
     def move(view, row, col):
         from PySide6.QtCore import QEvent, QPointF
@@ -4391,6 +4445,7 @@ def main():
     test_fsopen_helpers()
     test_filetypes_icons()
     test_terminal_relative_link()
+    test_terminal_link_underline()
     test_sidebar_file_tree()
     test_sidebar_search()
     test_lifecycle_e2e()  # slowest last: launches a real claude once

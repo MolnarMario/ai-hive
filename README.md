@@ -71,11 +71,13 @@ workspaces keep executing — switching never pauses anything.
   it with your OS default program. The tree lives inside the same sidebar (and
   inside a category's tinted container when the workspace is grouped); which
   workspaces have it open persists across restarts.
-- **Conversation ↔ files bridge** — **Ctrl+click a file path in a Claude
-  reply** to open it with the OS default program — absolute paths *and*
-  repo-relative ones like `app/widgets/sidebar.py` (resolved against the agent's
-  folder). If that workspace's file tree is open, the clicked file is also
-  scrolled to and **highlighted** in it, so you can see where it lives.
+- **Conversation ↔ files bridge** — URLs and file paths in an agent's output
+  are **underlined** so you can spot them in the body text at a glance; hover
+  turns the cursor into a hand and emphasizes the link, and **Ctrl+click** opens
+  it with the OS default program — absolute paths *and* repo-relative ones like
+  `app/widgets/sidebar.py` (resolved against the agent's folder). If that
+  workspace's file tree is open, the clicked file is also scrolled to and
+  **highlighted** in it, so you can see where it lives.
 - **Search the sidebar** — a 🔍 next to the category button expands an input
   that covers the WORKSPACES title/count; as you type it **highlights every
   match** across workspace names, agent names, and agent summaries, and
@@ -397,7 +399,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-613 checks drive the real app headlessly (offscreen Qt platform) with real
+619 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -462,7 +464,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (613 checks)
+tests/smoke_test.py        headless end-to-end suite (619 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
