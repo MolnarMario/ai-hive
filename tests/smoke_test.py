@@ -258,6 +258,17 @@ def test_agent_waiting():
     check("waiting: an option menu (2+ numbered options) flags waiting",
           a.is_waiting())
 
+    # regression: an agent's OWN prose with a numbered list (and even a
+    # question / "proceed?"-style phrasing) but NO selection caret must NOT
+    # flag waiting — this false-fired the "?" + chime on ordinary output
+    a._on_pty_output("pty", "working...\r\n")   # clear, then settle on prose
+    a._screen_tail = ("Do you want the summary? here's what I did:\r\n"
+                      " 1. committed the change\r\n 2. pushed to main\r\n"
+                      " 3. merged and closed the PRs\r\nall done.")
+    a._on_idle_timeout()
+    check("waiting: a plain numbered list (no selection caret) is NOT waiting",
+          not a.is_waiting())
+
     a._set_status(AgentStatus.EXITED_OK)
     check("waiting: exit clears the waiting state", not a.is_waiting())
 
@@ -1762,6 +1773,29 @@ def test_terminal_keys():
     press(K.Key_Backspace)
     check("keys: plain Backspace (no highlight) forwards to the child (0x7f)",
           sent == ["\x7f"], sent)
+
+    # Typing a printable character over the Ctrl+A highlight REPLACES the input,
+    # like any editor: the child's prompt is cleared (double-Esc) THEN the typed
+    # character is sent, so it becomes the fresh input rather than appending.
+    def type_char(ch):
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, K.Key_X,
+                                     Qt.KeyboardModifier.NoModifier, ch))
+    view.feed("recap line one\r\n> my prompt")
+    press(K.Key_A, ctrl=True)
+    check("keys: Ctrl+A re-highlights the input", view.selected_text() == "> my prompt")
+    sent.clear()
+    type_char("x")
+    check("keys: typing over the highlight clears then sends the char",
+          sent == ["\x1b\x1b", "x"], sent)
+    check("keys: typing over the highlight drops the highlight",
+          view.selected_text() == "")
+
+    # a navigation key over the highlight only collapses it -- no clear, no char
+    press(K.Key_A, ctrl=True)
+    sent.clear()
+    press(K.Key_Left)
+    check("keys: arrow over the highlight collapses it without clearing",
+          "\x1b\x1b" not in sent and view.selected_text() == "", sent)
 
     # a multi-line prompt (the '>' first line + continuation) highlights in full
     # but still excludes the output above it

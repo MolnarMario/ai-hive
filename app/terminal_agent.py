@@ -81,13 +81,18 @@ _CSI_RE = re.compile(r"\x1b\[[0-9;?<>=]*[@-~]|\x1b[()][AB0]|\x1b\][^\x07\x1b]*\x
 # --- "waiting for the user" detection (Claude prompts/questions) ---
 # Claude emits no machine-readable "I'm waiting" event, so we scrape the settled
 # screen (gated on the idle timer so a half-drawn frame never trips it). A
-# numbered-option box (`1. Yes` / `2. No, and tell Claude…`) is the strong
-# structural signal shared by permission prompts AND AskUserQuestion menus; a
-# "do you want / would you like / proceed?" phrase confirms a single-option box.
-# Heuristic and non-blocking: a missed exotic prompt just doesn't light up.
-_NUM_OPTION_RE = re.compile(r"(?m)^\s*[>❯❱]?\s*\d+\.\s+\S")
-_WAIT_PHRASES = ("do you want", "would you like", "proceed?",
-                 "yes, and", "no, and tell", "don't ask again")
+# A real interactive menu (permission prompt OR AskUserQuestion) is TWO things
+# together: a numbered-option list (`1. Yes` / `2. No…`) AND a SELECTION CARET
+# (`❯`/`>`) drawn on the currently-highlighted option. The caret is the
+# discriminator: an agent's OWN prose routinely contains numbered lists and
+# "do you want…/proceed?" phrasing, but never a selection caret in front of a
+# numbered option — so keying off the caret stops the "?"/chime from
+# false-firing on ordinary output (which it did). Heuristic and non-blocking: a
+# missed exotic prompt just doesn't light up.
+_NUM_OPTION_RE = re.compile(r"(?m)^\s*[>❯❱│┃|]*\s*\d+\.\s+\S")
+# a numbered option with a selection caret in front (optionally past box
+# borders) — the highlighted row of a live menu, absent from plain prose lists
+_OPTION_CARET_RE = re.compile(r"(?m)^[\s│┃|]*[>❯❱]\s*\d+\.\s+\S")
 
 
 class TerminalAgent(QObject):
@@ -473,12 +478,15 @@ class TerminalAgent(QObject):
             return False
         if getattr(self.spec, "permission_mode", "") == "bypassPermissions":
             return False
-        region = "\n".join(self._screen_tail.lower().splitlines()[-18:])
+        region = "\n".join(self._screen_tail.splitlines()[-18:])
         if not region:
             return False
+        # a live menu = 2+ numbered options AND a selection caret on one of
+        # them. Requiring the caret is what keeps the agent's own numbered
+        # prose (which has no caret) from lighting the "?" and ringing the bell.
         n_opts = len(_NUM_OPTION_RE.findall(region))
-        has_phrase = any(p in region for p in _WAIT_PHRASES)
-        return n_opts >= 2 or (n_opts >= 1 and has_phrase)
+        has_caret = bool(_OPTION_CARET_RE.search(region))
+        return has_caret and n_opts >= 2
 
     # -------------------------------------------------------------- slots ---
 

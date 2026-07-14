@@ -49,9 +49,15 @@ this file is the invariants that must survive every change.
   (`TerminalAgent.is_waiting`/`waiting_changed`), wired to
   `WorkspaceManager._on_agent_waiting` (which `_recompute`s like
   `activity_changed` and NEVER saves). It's a heuristic scrape of the settled
-  screen (`_screen_tail` + `_NUM_OPTION_RE`/`_WAIT_PHRASES`), evaluated ONLY on
-  the idle-timer settle (never mid-render) and cleared by any fresh output;
-  suppressed under `bypassPermissions` (that mode shows no prompts). On the
+  screen (`_screen_tail` + `_NUM_OPTION_RE` + `_OPTION_CARET_RE`), evaluated
+  ONLY on the idle-timer settle (never mid-render) and cleared by any fresh
+  output; suppressed under `bypassPermissions` (that mode shows no prompts).
+  CRITICAL: it requires BOTH 2+ numbered options AND a SELECTION CARET (`❯`/`>`)
+  in front of one — the caret is the discriminator. Keying off numbered options
+  alone (or a "do you want/proceed?" phrase) false-fired the "?"/chime on an
+  agent's OWN prose, which routinely has numbered lists and questions but never
+  a selection caret before a numbered option. Do NOT relax the caret
+  requirement back to phrase/plain-list matching. On the
   RISING edge (standby→waiting) `_on_agent_waiting` also emits
   `WorkspaceManager.agentWaiting(ws_id, agent_id)`, which `MainWindow` turns
   into a soft notification bell (`app/chime.py` — Qt-free WAV synth, async
