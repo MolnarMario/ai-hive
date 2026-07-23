@@ -73,6 +73,14 @@ PTY_BUFFER_CAP = 512 * 1024  # raw VT tail kept for fresh-card replay
 # second, so this window comfortably spans the gaps between token bursts.
 BUSY_IDLE_MS = 2000
 
+# The pty echoes the user's OWN keystrokes straight back as output — but that
+# echo is not the agent working. Output arriving within this window of the last
+# keystroke the user sent is treated as echo and does NOT light the "working"
+# pulse (typing at an idle prompt made the sidebar row animate as if the agent
+# were thinking). Genuine work outlasts the window, so a submitted prompt still
+# pulses a beat later. Seconds, compared against time.time().
+INPUT_ECHO_S = 0.8
+
 # strips escape sequences so on-screen TEXT can be matched: the raw stream
 # positions words individually ("trust\x1b[20Gthis\x1b[25Gfolder"), so a
 # phrase can never be matched against raw bytes
@@ -147,7 +155,20 @@ class TerminalAgent(QObject):
         # session is never delivered into a fresh, not-yet-ready TUI
         self._submit_gen = 0
         self._busy = False            # actively streaming output right now
-        self._waiting = False         # settled on a prompt/question for the user
+        self._last_output_ts = 0.0    # walltime of the last output burst
+        self._last_input_ts = 0.0     # walltime the user last sent keystrokes
+        # "waiting for the user" is the OR of three independent sources (see
+        # _emit_waiting): _scrape_waiting (the settled screen shows a numbered
+        # menu + selection caret — a permission prompt), _tool_waiting (an
+        # AskUserQuestion/ExitPlanMode prompt is open, reported by a Claude
+        # PreToolUse hook — the scrape CANNOT see these; confirmed no
+        # Notification fires either), and _turn_waiting (the agent ended a turn
+        # on a plain free-text question, reported by the Stop hook). _waiting is
+        # the emitted effective value.
+        self._scrape_waiting = False
+        self._tool_waiting = False
+        self._turn_waiting = False
+        self._waiting = False
         self._screen_tail = ""        # rolling escape-stripped output tail
         # single-shot: (re)armed on each output burst; firing = output went
         # quiet, so the agent has dropped back to standby
@@ -171,7 +192,7 @@ class TerminalAgent(QObject):
         self._prompt_ready = False  # re-armed for the fresh TUI
         self._ready_tail = ""
         self._screen_tail = ""
-        self._set_waiting(False)
+        self._reset_waiting()
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         # a NON-resume start is a new conversation, so it gets a new pinned
@@ -223,7 +244,7 @@ class TerminalAgent(QObject):
         self._prompt_ready = False
         self._ready_tail = ""
         self._screen_tail = ""
-        self._set_waiting(False)
+        self._reset_waiting()
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         if self.spec.provider == "claude":  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
@@ -238,6 +259,10 @@ class TerminalAgent(QObject):
     # ---- pty-mode I/O (keystrokes / resize come straight from the view) ---
 
     def write(self, data: str) -> bool:
+        # remember when the USER last typed, so _mark_busy can tell the pty's
+        # echo of that typing apart from genuine agent output — echo must not
+        # light the "working" pulse (see _mark_busy / INPUT_ECHO_S).
+        self._last_input_ts = time.time()
         return self.worker.write(data)
 
     def resize(self, rows: int, cols: int) -> None:
@@ -442,33 +467,82 @@ class TerminalAgent(QObject):
         return self._busy
 
     def is_waiting(self) -> bool:
-        """True when the agent has settled on a prompt/question awaiting the
-        user (a permission prompt or an interactive option menu). Derived from
-        the settled screen; any fresh output clears it."""
+        """True when the agent needs the user: it has settled on a numbered
+        prompt, an interactive AskUserQuestion/ExitPlanMode prompt is open, or
+        it ended a turn on a free-text question. The OR of three sources — see
+        _emit_waiting."""
         return self._waiting
 
-    def _set_waiting(self, waiting: bool) -> None:
-        if waiting != self._waiting:
-            self._waiting = waiting
-            self.waiting_changed.emit(waiting)
+    def _emit_waiting(self) -> None:
+        """Recompute the effective waiting state from its three sources and emit
+        only on a genuine change. No single source is complete: the screen
+        scrape misses AskUserQuestion (no numbered+caret menu) and plain
+        questions; the hook edges miss classic permission menus. Together they
+        cover every 'needs the user' case."""
+        eff = self._scrape_waiting or self._tool_waiting or self._turn_waiting
+        if eff != self._waiting:
+            self._waiting = eff
+            self.waiting_changed.emit(eff)
+
+    def set_tool_waiting(self, waiting: bool) -> None:
+        """Authoritative Claude-hook edge: a PreToolUse for AskUserQuestion/
+        ExitPlanMode opened an interactive prompt (True), or a PostToolUse/Stop
+        for the same closed it (False). STICKY against output — the tool draws
+        its own UI, so an output burst must NOT clear it (that is exactly why the
+        screen scrape alone missed these); only the matching hook clears it."""
+        if waiting != self._tool_waiting:
+            self._tool_waiting = waiting
+            self._emit_waiting()
+
+    def set_turn_waiting(self, waiting: bool) -> None:
+        """Authoritative Claude-hook edge: the agent ended a turn on a free-text
+        question (Stop hook, last message ends with '?'). Unlike a tool prompt
+        this clears on the next output burst (the user engaged / the agent
+        resumed), as well as on a following non-question turn end."""
+        if waiting != self._turn_waiting:
+            self._turn_waiting = waiting
+            self._emit_waiting()
+
+    def _reset_waiting(self) -> None:
+        """Clear every waiting source (start/restart/exit) and emit if needed."""
+        self._scrape_waiting = False
+        self._tool_waiting = False
+        self._turn_waiting = False
+        self._emit_waiting()
 
     def _mark_busy(self) -> None:
         # only a live agent can be working; guard on status (not worker state)
         # so this is unit-testable without a real child process
         if self.status not in (AgentStatus.RUNNING, AgentStatus.STARTING):
             return
-        self._set_waiting(False)  # producing output => not waiting on the user
-        if not self._busy:
-            self._busy = True
-            self.activity_changed.emit(True)
-        self._idle_timer.start()  # (re)arm; fires once output falls quiet
+        now = time.time()
+        self._last_output_ts = now
+        # producing output => not waiting on a scrape menu, and any free-text
+        # turn-question is resolved (the user engaged / the agent resumed). A
+        # tool prompt (AskUserQuestion) renders its OWN output, so _tool_waiting
+        # is deliberately NOT cleared here — only its PostToolUse/Stop hook does.
+        self._scrape_waiting = False
+        self._turn_waiting = False
+        self._emit_waiting()
+        # Local echo of the user's own typing comes straight back through the
+        # pty as output, but it is NOT the agent working. If this burst lands
+        # within the echo window of the last keystroke the user sent, don't
+        # light the "working" pulse for it (and don't re-arm the idle timer, so
+        # a pulse left over from real work still drops on schedule instead of
+        # being held alive by the typing). Genuine work outlasts the window.
+        if now - self._last_input_ts >= INPUT_ECHO_S:
+            if not self._busy:
+                self._busy = True
+                self.activity_changed.emit(True)
+            self._idle_timer.start()  # (re)arm; fires once output falls quiet
 
     def _on_idle_timeout(self) -> None:
         if self._busy:
             self._busy = False
             self.activity_changed.emit(False)
         # the screen has settled (2 s quiet) — is it a prompt awaiting the user?
-        self._set_waiting(self._screen_waiting())
+        self._scrape_waiting = self._screen_waiting()
+        self._emit_waiting()
 
     def _screen_waiting(self) -> bool:
         # ground-truth on the drawn box; suppress for a mode that shows no
@@ -541,7 +615,7 @@ class TerminalAgent(QObject):
                 if self._busy:
                     self._busy = False
                     self.activity_changed.emit(False)
-                self._set_waiting(False)  # a dead/stopped agent isn't waiting
+                self._reset_waiting()  # a dead/stopped agent isn't waiting
             self.status_changed.emit(status)
 
     def _on_worker_state(self, state: WorkerState) -> None:

@@ -362,6 +362,262 @@ def test_chime_persistence():
     bar.deleteLater()
 
 
+def test_hook_prompt_events():
+    """The Claude-hook script is the AUTHORITATIVE 'needs the user' signal for
+    the prompts the screen scrape cannot see. Verify: the shared settings file
+    carries PreToolUse/PostToolUse/Stop hooks with the right matchers; the
+    dispatch turns each event into the right edge record (AskUserQuestion/
+    ExitPlanMode -> tool set/clear; Stop -> tool clear + turn set/clear on the
+    'ends with ?' test; a non-waiting tool is ignored); and the incremental
+    reader consumes only complete lines and advances its offset."""
+    import json as _json
+    from app import session_hook as sh
+
+    tmpd = Path(tempfile.mkdtemp(prefix="ai-hive-hook-"))
+    settings = str(tmpd / "settings.json")
+    mapping = str(tmpd / "map.jsonl")
+    events = str(tmpd / "events.jsonl")
+
+    # --- settings file: the new hooks are present + correctly scoped ---
+    sh.write_settings_file(settings, mapping, events, python_exe="py")
+    with open(settings, encoding="utf-8") as fh:
+        hooks = _json.load(fh)["hooks"]
+    check("hook: PreToolUse matches AskUserQuestion|ExitPlanMode",
+          hooks["PreToolUse"][0]["matcher"] == "AskUserQuestion|ExitPlanMode")
+    check("hook: PostToolUse matches the same waiting tools",
+          hooks["PostToolUse"][0]["matcher"] == "AskUserQuestion|ExitPlanMode")
+    check("hook: Stop hook present (turn-end / free-text question)",
+          "Stop" in hooks and hooks["Stop"][0]["hooks"])
+    check("hook: the command carries BOTH the map and events paths",
+          events in hooks["PreToolUse"][0]["hooks"][0]["command"])
+    # SessionStart is unchanged and still excludes `startup` (launch-timing)
+    check("hook: SessionStart still matches only resume|clear|compact",
+          hooks["SessionStart"][0]["matcher"] == "resume|clear|compact")
+    # omitting events_path degrades to SessionStart-only (back-compat)
+    sh.write_settings_file(settings, mapping, python_exe="py")
+    with open(settings, encoding="utf-8") as fh:
+        only = _json.load(fh)["hooks"]
+    check("hook: no events path -> SessionStart-only (no prompt hooks)",
+          set(only) == {"SessionStart"})
+
+    # --- dispatch: one payload -> the right edge record(s) ---
+    os.environ[sh.AGENT_ID_ENV] = "agent-xyz"
+    try:
+        def dispatch(payload):
+            sh._dispatch(mapping, events, payload)
+
+        sh.reset_events(events)
+        dispatch({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion"})
+        dispatch({"hook_event_name": "PreToolUse", "tool_name": "Bash"})  # ignored
+        dispatch({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion"})
+        dispatch({"hook_event_name": "PreToolUse", "tool_name": "ExitPlanMode"})
+        dispatch({"hook_event_name": "Stop",
+                  "last_assistant_message": "Which of these do you prefer?"})
+        dispatch({"hook_event_name": "Stop",
+                  "last_assistant_message": "All done and pushed."})
+
+        recs, off = sh.read_prompt_events(events, 0)
+        kinds = [r["kind"] for r in recs]
+        check("hook: AskUserQuestion PreToolUse -> tool_set (Bash ignored)",
+              kinds[0] == sh.EV_TOOL_SET and sh.EV_TOOL_SET not in kinds[1:2],
+              kinds)
+        check("hook: every record is attributed to the env agent id",
+              all(r["agent_id"] == "agent-xyz" for r in recs))
+        check("hook: PostToolUse -> tool_clear",
+              sh.EV_TOOL_CLEAR in kinds)
+        check("hook: ExitPlanMode PreToolUse -> tool_set",
+              kinds.count(sh.EV_TOOL_SET) == 2)
+        # Stop on a question: tool_clear THEN turn_set; on a statement: turn_clear
+        check("hook: Stop ending in '?' -> tool_clear + turn_set",
+              sh.EV_TURN_SET in kinds
+              and kinds.index(sh.EV_TOOL_CLEAR) < kinds.index(sh.EV_TURN_SET))
+        check("hook: Stop ending in a statement -> turn_clear (not set)",
+              sh.EV_TURN_CLEAR in kinds)
+
+        # --- incremental read: offset advances, no line re-delivered ---
+        recs2, off2 = sh.read_prompt_events(events, off)
+        check("hook: reading again from the offset yields nothing new",
+              recs2 == [] and off2 == off, (recs2, off2, off))
+        # a half-written trailing line is NOT consumed until it completes
+        with open(events, "a", encoding="utf-8") as fh:
+            fh.write('{"agent_id":"agent-xyz","kind":"tool_set"')  # no newline
+        recs3, off3 = sh.read_prompt_events(events, off)
+        check("hook: a partial trailing line is held back until newline arrives",
+              recs3 == [] and off3 == off)
+        with open(events, "a", encoding="utf-8") as fh:
+            fh.write(',"ts":1}\n')  # complete it
+        recs4, off4 = sh.read_prompt_events(events, off)
+        check("hook: the completed line is delivered exactly once",
+              len(recs4) == 1 and recs4[0]["kind"] == sh.EV_TOOL_SET
+              and off4 > off)
+    finally:
+        os.environ.pop(sh.AGENT_ID_ENV, None)
+
+    # _ends_with_question tolerates trailing wrapping punctuation
+    check("hook: question detector strips trailing quotes/parens",
+          sh._ends_with_question('Do you want that?"')
+          and sh._ends_with_question("Shall I proceed?)")
+          and not sh._ends_with_question("Done.")
+          and not sh._ends_with_question("I asked: why? Then I fixed it."))
+
+
+def test_agent_hook_waiting():
+    """TerminalAgent combines three waiting sources. The hook-driven ones catch
+    what the screen scrape cannot: a tool prompt (AskUserQuestion/ExitPlanMode)
+    stays flagged THROUGH its own output (sticky), while a free-text turn
+    question clears the moment fresh output arrives (the user engaged)."""
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+
+    QApplication.instance() or QApplication([])
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Ask", cwd="."))
+    a.status = AgentStatus.RUNNING
+    events = []
+    a.waiting_changed.connect(events.append)
+
+    # tool prompt: set by the hook, and NOT cleared by the tool's own UI output
+    a.set_tool_waiting(True)
+    check("agent-hook: tool prompt flags waiting + emits True",
+          a.is_waiting() and events and events[-1] is True)
+    a._on_pty_output("pty", "rendering the question box...\r\n")
+    check("agent-hook: a tool prompt survives its own output (sticky)",
+          a.is_waiting())
+    a.set_tool_waiting(False)
+    check("agent-hook: PostToolUse clear drops waiting", not a.is_waiting())
+
+    # free-text turn question: cleared by the next output burst
+    a.set_turn_waiting(True)
+    check("agent-hook: a free-text turn question flags waiting", a.is_waiting())
+    a._on_pty_output("pty", "sure, doing it now...\r\n")
+    check("agent-hook: fresh output clears a turn question (user engaged)",
+          not a.is_waiting())
+
+    # a tool prompt OR-ed with the scrape: clearing one leaves the other
+    a.set_tool_waiting(True)
+    a._screen_tail = ("which?\r\n 1. a\r\n 2. b\r\n> 1. a")
+    a._on_idle_timeout()  # scrape also True now
+    a.set_tool_waiting(False)
+    check("agent-hook: clearing the tool source leaves scrape-waiting intact",
+          a.is_waiting())
+
+    a._set_status(AgentStatus.EXITED_OK)
+    check("agent-hook: exit resets every waiting source", not a.is_waiting())
+
+
+def test_manager_prompt_events_sync():
+    """End-to-end: the manager reads the hook events file incrementally and
+    drives each agent's waiting state, ringing the chime on the rising edge.
+    This is the regression for the reported miss: an AskUserQuestion prompt
+    (which renders no numbered menu) now lights the '?' and rings. A stale
+    turn-question edge is ignored while the agent is already producing output."""
+    from PySide6.QtWidgets import QApplication
+    from app import session_hook as sh
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-psync-"))
+    events = str(tmp / "events.jsonl")
+    sh.reset_events(events)
+    mgr = WorkspaceManager()
+    mgr.prompt_events_path = events
+    ws = mgr.create_workspace("Sync", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Ask",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+    rings = []
+    dirtied = []
+    mgr.agentWaiting.connect(lambda wid, aid: rings.append((wid, aid)))
+    mgr.dirty.connect(lambda: dirtied.append(True))
+
+    def emit(kind):
+        os.environ[sh.AGENT_ID_ENV] = agent.id
+        try:
+            sh._append_event(events, kind)
+        finally:
+            os.environ.pop(sh.AGENT_ID_ENV, None)
+
+    # AskUserQuestion opens -> tool_set line -> agent waits + chime rings
+    emit(sh.EV_TOOL_SET)
+    mgr.sync_prompt_events()
+    check("psync: AskUserQuestion (tool_set) lights '?' + rings the chime",
+          agent.is_waiting() and rings == [(ws.id, agent.id)], (rings,))
+    check("psync: the hook waiting edge never marks the session dirty",
+          not dirtied, dirtied)
+
+    # the tool's own render must NOT drop it (sticky), then PostToolUse clears
+    agent._on_pty_output("pty", "question box...\r\n")
+    check("psync: tool prompt survives its own output through the manager",
+          agent.is_waiting())
+    emit(sh.EV_TOOL_CLEAR)
+    mgr.sync_prompt_events()
+    check("psync: PostToolUse (tool_clear) drops waiting", not agent.is_waiting())
+
+    # a turn_set that arrives while the agent is BUSY is stale -> ignored
+    agent._busy = True
+    emit(sh.EV_TURN_SET)
+    mgr.sync_prompt_events()
+    check("psync: a turn question is ignored while the agent is busy (stale)",
+          not agent.is_waiting())
+    # once quiet, a fresh turn question is honored
+    agent._busy = False
+    emit(sh.EV_TURN_SET)
+    mgr.sync_prompt_events()
+    check("psync: a turn question while idle flags waiting + rings again",
+          agent.is_waiting() and len(rings) == 2, (rings,))
+
+    # nothing new on the next poll (edges applied exactly once)
+    before = len(rings)
+    mgr.sync_prompt_events()
+    check("psync: re-polling with no new lines is a no-op",
+          agent.is_waiting() and len(rings) == before)
+
+
+def test_input_echo_not_busy():
+    """The pty echoes the user's OWN keystrokes back as output; that echo must
+    NOT light the sidebar 'working' pulse (typing at an idle prompt made the row
+    animate as if the agent were thinking). Genuine agent output still does."""
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+
+    QApplication.instance() or QApplication([])
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Echo", cwd="."))
+    a.status = AgentStatus.RUNNING
+    acts = []
+    a.activity_changed.connect(acts.append)
+
+    # write() records the user-input time even though the unstarted worker no-ops
+    before = a._last_input_ts
+    a.write("h")
+    check("echo: write() records the user-input timestamp",
+          a._last_input_ts > before)
+
+    # keystroke echo (output right after the user typed) does NOT flag busy
+    a.write("i")
+    a._on_pty_output("pty", "i")   # the pty echoing the typed char back
+    check("echo: typing at the prompt does NOT flag the agent busy",
+          not a.is_busy() and acts == [], acts)
+
+    # genuine agent output (no recent keystroke) DOES flag busy + emits
+    a._last_input_ts = 0.0   # as if the user hasn't typed in a long while
+    a._on_pty_output("pty", "Thinking... running the task\r\n")
+    check("echo: real agent output (no recent input) flags busy + emits",
+          a.is_busy() and acts == [True], acts)
+
+    # a keystroke arriving mid-work does not DROP an already-lit pulse here...
+    a.write("x")
+    a._on_pty_output("pty", "x")
+    check("echo: an echo burst leaves an existing pulse untouched",
+          a.is_busy() and acts == [True], acts)
+    # ...but the idle timer (armed by the last REAL output, not the echo) still
+    # drops it once output truly falls quiet
+    a._on_idle_timeout()
+    check("echo: the pulse drops when output settles", not a.is_busy())
+
+
 def test_sidebar_reorder():
     """Drag-reorder: the sidebar's drop handler re-sequences its node model and
     emits the new top-to-bottom ws-id order; a rebuild keeps every row."""
@@ -1797,6 +2053,37 @@ def test_terminal_keys():
     check("keys: arrow over the highlight collapses it without clearing",
           "\x1b\x1b" not in sent and view.selected_text() == "", sent)
 
+    # Ctrl+C over the Ctrl+A highlight COPIES the input rather than falling
+    # through to the 0x03 interrupt (which cleared the child's input -- the
+    # reported "Ctrl+C deletes my text instead of copying" bug).
+    view.feed("recap\r\n> copy me")
+    press(K.Key_A, ctrl=True)
+    check("keys: Ctrl+A re-highlights for the copy case",
+          view.selected_text() == "> copy me", view.selected_text())
+    sent.clear()
+    QGuiApplication.clipboard().clear()
+    press(K.Key_C, ctrl=True)
+    check("keys: Ctrl+C over the highlight copies it",
+          QGuiApplication.clipboard().text() == "> copy me",
+          QGuiApplication.clipboard().text())
+    check("keys: Ctrl+C over the highlight sends NO interrupt (no 0x03)",
+          "\x03" not in sent, sent)
+    check("keys: Ctrl+C over the highlight drops the highlight",
+          view.selected_text() == "")
+
+    # Ctrl+X over the highlight copies too, THEN clears the child's input (the
+    # double-Esc clear-prompt gesture) -- a cut.
+    view.feed("recap\r\n> cut me")
+    press(K.Key_A, ctrl=True)
+    sent.clear()
+    QGuiApplication.clipboard().clear()
+    press(K.Key_X, ctrl=True)
+    check("keys: Ctrl+X over the highlight copies it",
+          QGuiApplication.clipboard().text() == "> cut me",
+          QGuiApplication.clipboard().text())
+    check("keys: Ctrl+X over the highlight clears input (double-Esc)",
+          sent == ["\x1b\x1b"], sent)
+
     # a multi-line prompt (the '>' first line + continuation) highlights in full
     # but still excludes the output above it
     mv = TerminalView(rows=24, cols=80)
@@ -2018,6 +2305,52 @@ def test_terminal_mouse_words_links():
     moves.clear()
     caret_click(0, 5)   # exactly on the caret -> nothing to send
     check("mouse: click on the caret sends nothing", moves == [], moves)
+
+    # Multi-line prompt: clicking a DIFFERENT line of the input box repositions
+    # the caret best-effort -- Up/Down to the row, then Left/Right to the
+    # predicted landing column. Previously any off-caret-row click did nothing.
+    v4 = TerminalView(rows=8, cols=80)
+    v4.feed("> line one\r\nline two")   # prompt row 0, caret row 1 col 8
+    m2 = []
+    v4.keyInput.connect(m2.append)
+
+    def caret_click4(row, col):
+        p = QPointF(CELL_PAD_X + (col + 0.5) * v4._cell_w,
+                    CELL_PAD_Y + (row + 0.5) * v4._cell_h)
+        a = (p, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+             Qt.KeyboardModifier.NoModifier)
+        v4.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, *a))
+        v4.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, *a))
+
+    caret_click4(0, 2)   # up one row (caret col 8 -> land col 8), left to col 2
+    check("mouse: click a line above moves up then left",
+          m2 == ["\x1b[A", "\x1b[D" * 6], m2)
+    m2.clear()
+    caret_click4(0, 40)  # past the row's end -> clamp to line end (col 10)
+    check("mouse: click past a line's end clamps to its content",
+          m2 == ["\x1b[A", "\x1b[C" * 2], m2)
+    m2.clear()
+    caret_click4(6, 4)   # a row outside the input box -> untouched
+    check("mouse: click outside the input box never nudges the caret",
+          m2 == [], m2)
+    m2.clear()
+    caret_click4(1, 3)   # the caret's own row is still exact (col 8 -> 3)
+    check("mouse: click on the caret's own multi-line row stays exact",
+          m2 == ["\x1b[D" * 5], m2)
+
+    # moving DOWN a row: put the child's caret on the top line (feed real CUU),
+    # then click a lower line of a 3-line prompt.
+    v5 = TerminalView(rows=8, cols=80)
+    v5.feed("> a\r\nbb\r\nccc\x1b[2A")   # 3 lines, caret pushed up to row 0
+    m3 = []
+    v5.keyInput.connect(m3.append)
+    p = QPointF(CELL_PAD_X + 1.5 * v5._cell_w, CELL_PAD_Y + 2.5 * v5._cell_h)
+    a = (p, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+         Qt.KeyboardModifier.NoModifier)
+    v5.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, *a))
+    v5.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, *a))
+    check("mouse: click a line below moves down then corrects the column",
+          m3 == ["\x1b[B" * 2, "\x1b[D" * 2], m3)
 
 
 def test_terminal_selection_edit():
@@ -4670,6 +5003,10 @@ def main():
     test_agent_waiting()
     test_notification_chime()
     test_chime_persistence()
+    test_hook_prompt_events()
+    test_agent_hook_waiting()
+    test_manager_prompt_events_sync()
+    test_input_echo_not_busy()
     test_sidebar_reorder()
     test_manager_reorder_persist()
     test_agent_card_reorder()

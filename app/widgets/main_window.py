@@ -42,6 +42,11 @@ HEARTBEAT_SAVE_MS = 20000  # safety-net autosave: caps worst-case loss to ~20s
 # (via /resume, a fork) is what comes back on reopen — not a stale pin
 SESSION_SYNC_MS = 5000
 
+# how often to apply the Claude hooks' "needs the user" edges (drives the "?"
+# badge + chime). Faster than the session sync so a chime feels prompt; the poll
+# is a cheap incremental read of a small append-only file.
+PROMPT_SYNC_MS = 750
+
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [
     ("AI agents", [
@@ -500,6 +505,11 @@ class MainWindow(QMainWindow):
         self._session_sync_timer.setInterval(SESSION_SYNC_MS)
         self._session_sync_timer.timeout.connect(self._sync_live_sessions)
 
+        # apply the Claude hooks' "needs the user" edges (the "?"/chime signal)
+        self._prompt_sync_timer = QTimer(self)
+        self._prompt_sync_timer.setInterval(PROMPT_SYNC_MS)
+        self._prompt_sync_timer.timeout.connect(self.manager.sync_prompt_events)
+
         # orchestrator control channel (named-pipe RPC → this GUI). Additive
         # and guarded: if it can't listen, the app runs exactly as before.
         # on_mutation: orchestrator mutations persist immediately — a debounce
@@ -517,14 +527,18 @@ class MainWindow(QMainWindow):
         session_dir = self.store.path.parent
         self._hook_settings_path = str(session_dir / "aihive_session_hook.json")
         self._session_map_path = str(session_dir / "live_sessions.jsonl")
+        self._prompt_events_path = str(session_dir / "prompt_events.jsonl")
         try:
             session_hook.write_settings_file(self._hook_settings_path,
-                                             self._session_map_path)
+                                             self._session_map_path,
+                                             self._prompt_events_path)
             session_hook.reset_map(self._session_map_path)
+            session_hook.reset_events(self._prompt_events_path)
         except OSError as e:
             self.store.audit(f"HOOK-SETUP-FAIL {type(e).__name__}: {e}")
             self._hook_settings_path = ""  # degrade: fall back to fs correlation
         self.manager.session_map_path = self._session_map_path
+        self.manager.prompt_events_path = self._prompt_events_path
         manager.save_now = self._save_now  # immediate persistence for spawn_worker
         manager.arm_agent = self._arm_agent_mcp  # arm new agents before they start
         self._rearm_agent_configs()  # restored claude agents re-acquire MCP tools
@@ -537,6 +551,7 @@ class MainWindow(QMainWindow):
         self._ready = True  # from here on, structural changes save immediately
         self._heartbeat_timer.start()
         self._session_sync_timer.start()
+        self._prompt_sync_timer.start()
 
     def _arm_agent_mcp(self, ws, agent) -> None:
         """Arm a Claude agent's per-run launch config before it starts (and
@@ -1270,6 +1285,7 @@ class MainWindow(QMainWindow):
         self._save_timer.stop()
         self._heartbeat_timer.stop()
         self._session_sync_timer.stop()
+        self._prompt_sync_timer.stop()
         # capture any last-moment conversation switch BEFORE the final save, so
         # reopen resumes what was actually on screen — not a stale pin. Agents
         # are still alive here (processes are killed further down), so their
