@@ -366,9 +366,10 @@ Hard-won rules, each with a regression test:
   aware for multi-line); `Ctrl+Shift+C` also copies; and a right-click
   Copy/Paste/Select-all menu. **Mouse**: a plain left-click **places the input
   caret** where you clicked (AI Hive sends the child the right run of
-  Left/Right arrows — exact on the caret's own line), so you can jump into your
-  typed text without arrow-key walking; a drag selects instead and never moves
-  the caret. Double-click selects the whitespace-delimited word under the
+  arrow keys — exact on the caret's own line, and best-effort on another line of
+  a multi-line prompt (Up/Down to the row, then Left/Right to the predicted
+  landing column) — so you can jump into your typed text without arrow-key
+  walking; a drag selects instead and never moves the caret. Double-click selects the whitespace-delimited word under the
   pointer — an editable selection: `Ctrl+C` copies it, `Ctrl+X` cuts it, and
   `Backspace`/`Del` deletes it (cut/delete drive the child's caret + Backspace,
   so they act on a selection on the input line; off it the key just drops the
@@ -387,7 +388,9 @@ Hard-won rules, each with a regression test:
   desktop input box, without climbing into the transcript above) and
   `Backspace`/`Del` on that highlight clears the child's entire input via
   double-Escape (`0x1b 0x1b`, Claude Code's clear-prompt gesture, which —
-  unlike its line-local `Ctrl+A`/`Ctrl+K` — empties multi-line input too). The
+  unlike its line-local `Ctrl+A`/`Ctrl+K` — empties multi-line input too), while
+  `Ctrl+C` copies the highlighted input (and `Ctrl+X` copies then clears) rather
+  than falling through to the interrupt. The
   terminal can't see the child's real input buffer, so it's inference from
   painted rows: no `>` found means it falls back to the cursor row (`Home`
   still jumps to line start). `Ctrl+Z`/`Ctrl+Y` are not
@@ -409,7 +412,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-651 checks drive the real app headlessly (offscreen Qt platform) with real
+701 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -477,7 +480,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (651 checks)
+tests/smoke_test.py        headless end-to-end suite (701 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

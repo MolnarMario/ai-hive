@@ -31,7 +31,13 @@ contiguous block of non-blank rows around the cursor, so wrapped/multi-line
 input highlights in full, like Cursor / the Claude desktop input box) and
 Backspace/Del on that highlight clears the child's ENTIRE input via
 double-Escape (0x1b 0x1b, Claude Code's clear-prompt gesture, which unlike its
-line-local Ctrl+A/Ctrl+K empties multi-line input too). The highlight is
+line-local Ctrl+A/Ctrl+K empties multi-line input too). Typing a printable
+character over the highlight REPLACES the input the same way: the prompt is
+cleared first, then the character is sent as the fresh input (navigation keys
+just drop the highlight, as an editor collapses a selection). Ctrl+C over the
+highlight COPIES it (Ctrl+X copies then clears) -- the highlight is a real
+selection, so it must reach the clipboard rather than fall through to the 0x03
+interrupt, which would clear the child's input instead. The highlight is
 anchored at Claude's '>' prompt row so it never climbs into the transcript;
 lacking the child's real buffer it's still inference from painted rows, so it
 falls back to the cursor row when no prompt glyph is found. (Home still jumps
@@ -41,9 +47,12 @@ they forward their control bytes (0x1a/0x19) to the child, which owns line
 editing.
 
 Mouse: a plain left-click places the input caret where you clicked, by sending
-the child the right number of Left/Right arrows (exact on the caret's own line;
-a terminal can't set the child's cursor directly). A drag selects text instead
-and never moves the caret. Double-click selects the whitespace-delimited word
+the child arrow keys (a terminal can't set the child's cursor directly): exact
+on the caret's own line (Left/Right by the column delta), and best-effort on
+another line of a multi-line prompt (Up/Down to the row, then Left/Right to the
+predicted landing column -- see _reposition_cursor). Only rows inside the input
+box are touched, so clicking the transcript never nudges the prompt. A drag
+selects text instead and never moves the caret. Double-click selects the whitespace-delimited word
 under the pointer (then Ctrl+C copies it); Ctrl+click (or middle/scroll-wheel
 click) opens a URL or an existing local file path under the pointer via the OS
 default handler (_link_at/_classify_link/_open_target). File paths may be
@@ -501,11 +510,33 @@ class TerminalView(QWidget):
         if self._input_selected and key not in (
                 Qt.Key.Key_Control, Qt.Key.Key_Shift,
                 Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+            # Ctrl+C / Ctrl+X copy the highlighted input FIRST -- the Ctrl+A mark
+            # is a real selection, so copying it is what the user means. Without
+            # this, Ctrl+C dropped the highlight here and fell through to the
+            # 0x03 interrupt below, which CLEARS the child's input: the text was
+            # deleted instead of copied (the reported bug). Ctrl+X also empties
+            # the prompt (the double-Esc clear, like Backspace); Ctrl+C leaves
+            # the text in place, the way any editor does.
+            if ctrl and key in (Qt.Key.Key_C, Qt.Key.Key_X):
+                self.copy_selection()
+                self._clear_input_selection(send=(key == Qt.Key.Key_X))
+                event.accept()
+                return
             if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
                 self._clear_input_selection(send=True)
                 event.accept()
                 return
-            self._clear_input_selection(send=False)
+            # Typing a printable character over the highlight REPLACES the
+            # input, like any editor: clear the child's whole prompt (the same
+            # double-Escape gesture) first, then FALL THROUGH so the character
+            # itself is sent and becomes the fresh input. Control/navigation
+            # keys (arrows, Enter, Ctrl-combos) instead just drop the highlight,
+            # the way an editor collapses a selection without deleting it.
+            if event.text() and event.text().isprintable() and not ctrl and not alt:
+                self._clear_input_selection(send=True)
+                # fall through -> _sequence_for emits the typed character below
+            else:
+                self._clear_input_selection(send=False)
 
         # A MOUSE selection (double-click word / drag) behaves like an editor
         # selection: Backspace/Del deletes it. Deletion only reaches a selection
@@ -728,23 +759,81 @@ class TerminalView(QWidget):
             self.update()
         super().mouseReleaseEvent(event)
 
+    def _emit_arrows(self, final: str, count: int) -> None:
+        """Send `count` copies of one arrow key (final 'A'/'B'/'C'/'D' == Up/
+        Down/Right/Left), honouring the child's cursor-key mode (DECCKM)."""
+        if count <= 0:
+            return
+        seq = ("\x1bO" if self._app_cursor_keys else "\x1b[") + final
+        self.keyInput.emit(seq * count)
+
+    def _input_block_span(self):
+        """(top, bottom) live-screen rows of the contiguous input box, or None.
+        `top` is the nearest '>'/'❯' prompt row at/above the caret (as
+        _select_input_line finds it -- when there is no prompt glyph it stays on
+        the caret's own row, so a promptless transcript above is never absorbed);
+        `bottom` is the last non-blank row of the contiguous block at/below the
+        caret. Bounds multi-line click-to-position so a click on the transcript
+        or on blank space below the box never drives the child's caret."""
+        buf = self.screen.buffer
+        cy = self.screen.cursor.y
+        if self._row_content(cy) == (-1, -1):
+            return None
+        top = cy
+        r = cy
+        while r >= 0:
+            first, _ = self._row_content(r)
+            if first < 0:
+                break  # blank line: the input box doesn't extend past it
+            if buf[r][first].data in _INPUT_PROMPTS:
+                top = r  # the box's first line -- stop, never climb higher
+                break
+            r -= 1
+        bottom = cy
+        r = cy + 1
+        while r < self.screen.lines:
+            if self._row_content(r) == (-1, -1):
+                break
+            bottom = r
+            r += 1
+        return top, bottom
+
     def _reposition_cursor(self, row: int, col: int) -> None:
         """Move the CHILD's input caret to (row, col) by sending arrow keys --
         a terminal can't set the child's cursor directly. Non-destructive and
-        self-clamping (readline stops at the input's start/end). Exact on the
-        single line the caret is on (each Left/Right == one column on an
-        unwrapped line); only that row is handled, so clicking output rows or a
-        scrolled-back view never nudges the prompt."""
+        self-clamping (readline stops at the input's start/end), so a
+        mispredicted landing is at worst a few columns off, never data loss.
+
+        On the caret's OWN row it is exact: each Left/Right == one column on an
+        unwrapped line. On ANOTHER row of a multi-line prompt it is best-effort:
+        Up/Down move by one visual row carrying the caret's "goal column" (its
+        current column, which the editor clamps to the target line's length), so
+        we PREDICT the landing column from the painted row and correct with
+        Left/Right. Only rows inside the input box (_input_block_span) are
+        touched, so clicking the transcript or a scrolled-back view -- or any row
+        outside the box -- never nudges the prompt."""
         if self._scroll_offset:
             return  # caret only meaningful on the live screen
-        if row != self.screen.cursor.y:
-            return  # only the caret's own line maps 1:1 to Left/Right
-        delta = col - self.screen.cursor.x
-        if not delta:
+        cy = self.screen.cursor.y
+        cx = self.screen.cursor.x
+        if row == cy:
+            self._emit_arrows("C" if col > cx else "D", abs(col - cx))
             return
-        final = "C" if delta > 0 else "D"  # Right / Left
-        seq = ("\x1bO" if self._app_cursor_keys else "\x1b[") + final
-        self.keyInput.emit(seq * abs(delta))
+        span = self._input_block_span()
+        if span is None or not (span[0] <= row <= span[1]):
+            return  # off the input box: leave the child's caret alone
+        # 1. vertical: Up/Down carry the goal column (cx), clamped to the target
+        #    line's end. Consecutive presses keep the same goal, so N moves land
+        #    on `row` at min(cx, line-end).
+        self._emit_arrows("B" if row > cy else "A", abs(row - cy))
+        # 2. predict that landing, then correct horizontally on the target row.
+        #    Clamp the requested column into the row's content so the Left/Right
+        #    run can't spill onto an adjacent line.
+        _, last = self._row_content(row)
+        line_end = last + 1 if last >= 0 else 0
+        landing = min(cx, line_end)
+        target = max(0, min(col, line_end))
+        self._emit_arrows("C" if target > landing else "D", abs(target - landing))
 
     def _delete_selection(self) -> bool:
         """Delete a mouse selection by driving the child's caret + Backspace --

@@ -78,6 +78,13 @@ class WorkspaceManager(QObject):
         # path to the shared SessionStart-hook mapping file (set by MainWindow);
         # sync_live_sessions reads it for the authoritative live conversation id
         self.session_map_path = ""
+        # path to the shared prompt-events file (set by MainWindow); the Claude
+        # PreToolUse/PostToolUse/Stop hooks append "needs the user" EDGES here,
+        # which sync_prompt_events reads incrementally to drive each agent's
+        # waiting state (the "?" badge + chime). _prompt_offset marks how far we
+        # have consumed, so a stale edge is never re-applied after a local clear.
+        self.prompt_events_path = ""
+        self._prompt_offset = 0
         # optional immediate-save hook (set by MainWindow to _save_now): for
         # mutations that must persist NOW rather than on the dirty debounce
         self.save_now = None
@@ -466,6 +473,37 @@ class WorkspaceManager(QObject):
         self._recompute(ws_id)
         if waiting:
             self.agentWaiting.emit(ws_id, agent_id)
+
+    def sync_prompt_events(self) -> None:
+        """Apply new "needs the user" edges the Claude hooks appended since the
+        last poll, driving each agent's authoritative waiting state. Read
+        incrementally (edges, not a level to reconcile) so a stale line is never
+        re-applied after a local output-clear. Best-effort: any error leaves the
+        offset untouched and simply retries next tick.
+
+        A turn_set (free-text question) is IGNORED while the agent is actively
+        producing output — that means the question was already answered and the
+        agent has resumed, so the edge is stale (the user answered faster than
+        we polled). Tool prompts have no such guard: they legitimately render
+        output while still open."""
+        if not self.prompt_events_path:
+            return
+        records, self._prompt_offset = session_hook.read_prompt_events(
+            self.prompt_events_path, self._prompt_offset)
+        for rec in records:
+            agent = self.resolve_agent(rec.get("agent_id", ""))
+            if agent is None:
+                continue
+            kind = rec.get("kind")
+            if kind == session_hook.EV_TOOL_SET:
+                agent.set_tool_waiting(True)
+            elif kind == session_hook.EV_TOOL_CLEAR:
+                agent.set_tool_waiting(False)
+            elif kind == session_hook.EV_TURN_SET:
+                if not agent.is_busy():
+                    agent.set_turn_waiting(True)
+            elif kind == session_hook.EV_TURN_CLEAR:
+                agent.set_turn_waiting(False)
 
     def _touch(self, ws_id: str) -> None:
         """Recompute derived state AND mark the session dirty (persisted

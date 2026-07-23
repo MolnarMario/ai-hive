@@ -36,7 +36,16 @@ this file is the invariants that must survive every change.
   `AgentCountBadge` pulses amber only when an agent `is_busy()` — a subset of
   RUNNING derived from live OUTPUT ACTIVITY (`TerminalAgent._mark_busy` on each
   pty/stdout burst; a `BUSY_IDLE_MS` single-shot drops back to standby when
-  output falls quiet; exit clears it in `_set_status`). Never regress "working"
+  output falls quiet; exit clears it in `_set_status`). CRITICAL: the pty echoes
+  the user's OWN keystrokes back as output, and that echo is NOT work —
+  `_mark_busy` IGNORES a burst landing within `INPUT_ECHO_S` of the last
+  keystroke the user sent (`TerminalAgent.write` stamps `_last_input_ts`), and
+  also skips the idle-timer re-arm for it so a pulse left over from real work
+  still drops on schedule rather than being held alive by typing. Without this,
+  typing at an idle prompt animated the sidebar row as if the agent were
+  thinking. Task delivery (`_write_task_to_pty` → `worker.write`) deliberately
+  does NOT stamp `_last_input_ts`, so a delivered task's work still pulses. Never
+  regress "working"
   back to `AgentStatus.RUNNING`: an interactive agent idling at its prompt stays
   RUNNING forever, which is exactly the false-badge this replaced.
   `workspace_stats` carries the `busy` count; the badge maps busy>0→amber
@@ -48,16 +57,40 @@ this file is the invariants that must survive every change.
   prompt/question awaiting the user. `waiting` is a THIRD transient signal
   (`TerminalAgent.is_waiting`/`waiting_changed`), wired to
   `WorkspaceManager._on_agent_waiting` (which `_recompute`s like
-  `activity_changed` and NEVER saves). It's a heuristic scrape of the settled
-  screen (`_screen_tail` + `_NUM_OPTION_RE` + `_OPTION_CARET_RE`), evaluated
-  ONLY on the idle-timer settle (never mid-render) and cleared by any fresh
-  output; suppressed under `bypassPermissions` (that mode shows no prompts).
-  CRITICAL: it requires BOTH 2+ numbered options AND a SELECTION CARET (`❯`/`>`)
-  in front of one — the caret is the discriminator. Keying off numbered options
-  alone (or a "do you want/proceed?" phrase) false-fired the "?"/chime on an
-  agent's OWN prose, which routinely has numbered lists and questions but never
-  a selection caret before a numbered option. Do NOT relax the caret
-  requirement back to phrase/plain-list matching. On the
+  `activity_changed` and NEVER saves). `is_waiting()` is the OR of THREE
+  sources (`_emit_waiting`), because no single one is complete:
+  (1) `_scrape_waiting` — the legacy heuristic scrape of the settled screen
+  (`_screen_tail` + `_NUM_OPTION_RE` + `_OPTION_CARET_RE`), evaluated ONLY on the
+  idle-timer settle (never mid-render), cleared by any fresh output, suppressed
+  under `bypassPermissions`. CRITICAL: it requires BOTH 2+ numbered options AND a
+  SELECTION CARET (`❯`/`>`) in front of one — the caret is the discriminator.
+  Keying off numbered options alone (or a "do you want/proceed?" phrase)
+  false-fired the "?"/chime on an agent's OWN prose, which routinely has numbered
+  lists and questions but never a selection caret before a numbered option. Do
+  NOT relax the caret requirement back to phrase/plain-list matching. This scrape
+  is now the FALLBACK — it catches classic permission menus but is BLIND to
+  `AskUserQuestion` (which renders no numbered+caret menu), plain free-text
+  questions, and plan approval. Those are covered by two AUTHORITATIVE
+  Claude-hook edges (the scrape literally cannot see them, and — verified,
+  claude-code#59908 — `AskUserQuestion` fires NO Notification hook either, so a
+  hook on the tool NAME is the only signal): (2) `_tool_waiting` — set by a
+  `PreToolUse` hook on `AskUserQuestion|ExitPlanMode` (fires BEFORE the UI
+  renders, so it never races the output-based busy marker) and cleared by the
+  matching `PostToolUse` (or a `Stop`, which covers the user cancelling the
+  prompt); it is STICKY against output because the tool draws its own UI, so
+  `_mark_busy` must NOT clear it. (3) `_turn_waiting` — set by the `Stop` hook
+  when the agent's `last_assistant_message` ends on a question, cleared by the
+  next output burst (the user engaged). These edges ride the SAME shared
+  `--settings`/`AIHIVE_AGENT_ID` hook plumbing as the SessionStart tracker
+  (`app/session_hook.py` now dispatches ALL events); the hook APPENDS edges to a
+  separate `prompt_events.jsonl`, and `WorkspaceManager.sync_prompt_events`
+  (on `MainWindow._prompt_sync_timer`, `PROMPT_SYNC_MS`) reads it INCREMENTALLY
+  (by byte offset) so an edge is applied exactly once and a stale line is never
+  re-applied after a local clear. A `turn_set` arriving while the agent
+  `is_busy()` is stale (answered before we polled) and is dropped. Do NOT add a
+  `UserPromptSubmit` or `startup`-matched hook — both perturb the launch/first-
+  task-submit timing the SessionStart invariant guards; the chosen hooks all
+  fire mid-session. On the
   RISING edge (standby→waiting) `_on_agent_waiting` also emits
   `WorkspaceManager.agentWaiting(ws_id, agent_id)`, which `MainWindow` turns
   into a soft notification bell (`app/chime.py` — Qt-free WAV synth, async
