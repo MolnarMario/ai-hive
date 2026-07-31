@@ -46,7 +46,16 @@ Ctrl+Z/Ctrl+Y are NOT undo/redo -- a terminal keeps no local edit buffer, so
 they forward their control bytes (0x1a/0x19) to the child, which owns line
 editing.
 
-Mouse: a plain left-click places the input caret where you clicked, by sending
+Mouse: when the child app requested mouse tracking (?1000/1002/1003 -- Claude
+Code enables all of these), a plain left-click is FORWARDED to the child as a
+mouse report (SGR 1006 if negotiated, else legacy X10), so its clickable menus
+(AskUserQuestion, plan approval, permission prompts) respond to the pointer just
+as in a real terminal. This is essential: swallowing the click for local
+caret-repositioning injected stray arrow keys into those modal menus and made
+the question VANISH with no way to answer it. Shift is the escape hatch (xterm
+convention) -- Shift+click/drag selects text locally on the alternate screen,
+the only way to copy from a fullscreen app. When mouse tracking is OFF (a normal
+shell prompt), a plain left-click places the input caret where you clicked, by sending
 the child arrow keys (a terminal can't set the child's cursor directly): exact
 on the caret's own line (Left/Right by the column delta), and best-effort on
 another line of a multi-line prompt (Up/Down to the row, then Left/Right to the
@@ -259,6 +268,8 @@ class TerminalView(QWidget):
         self._sel_anchor = None  # (row, col) selection start, in screen coords
         self._sel_end = None     # (row, col) selection end
         self._input_selected = False  # Ctrl+A input-line highlight is active
+        self._mouse_btn_report = None  # button code forwarded on press (mouse-
+        #                                tracking apps), pending its release
         self._hover_link = None  # (row, c0, c1) of a link under the pointer
         self._hover_cell = None  # last hovered (row, col), to skip re-scans
         # every clickable URL/path on the visible screen, so they read as links
@@ -663,6 +674,18 @@ class TerminalView(QWidget):
         return ("\x1b[M" + chr(32 + btn)
                 + chr(32 + min(col + 1, 222)) + chr(32 + min(row + 1, 222)))
 
+    def _mouse_button_report(self, code: int, row: int, col: int,
+                             press: bool) -> str:
+        """One mouse BUTTON event in the encoding the app negotiated. `code` is
+        0/1/2 for left/middle/right. SGR (1006) distinguishes press ('M') from
+        release ('m') and carries the real button on both; legacy X10 encodes a
+        release as button 3 with no way to say which button came up."""
+        if self._mouse_sgr:  # SGR 1006 — modern, unambiguous
+            return f"\x1b[<{code};{col + 1};{row + 1}{'M' if press else 'm'}"
+        b = code if press else 3
+        return ("\x1b[M" + chr(32 + b)
+                + chr(32 + min(col + 1, 222)) + chr(32 + min(row + 1, 222)))
+
     def _snap_to_bottom(self) -> None:
         if self._scroll_offset:
             self._scroll_offset = 0
@@ -694,6 +717,24 @@ class TerminalView(QWidget):
                     self.fileActivated.emit(target[1])
                 event.accept()
                 return
+        # When the child app asked for mouse tracking (Claude Code's clickable
+        # menus — AskUserQuestion, plan approval, permission prompts — do), a
+        # plain left-click is FORWARDED as a mouse report so the app selects the
+        # thing under the pointer, exactly as in a real terminal. Without this the
+        # click fell through to local caret-repositioning (_reposition_cursor),
+        # which injected stray arrow keys into the modal menu — corrupting or
+        # dismissing it so the question vanished with no way to answer it. Shift
+        # is the escape hatch (xterm convention): Shift+click/drag still selects
+        # text locally for copy, the only way to select on the alternate screen.
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        if (event.button() == Qt.MouseButton.LeftButton and self._mouse_tracking
+                and not ctrl and not shift):
+            self.setFocus()
+            row, col = self._cell_at(event.position())
+            self._mouse_btn_report = 0
+            self.keyInput.emit(self._mouse_button_report(0, row, col, True))
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self.setFocus()
             self._input_selected = False  # a mouse drag is a copy selection
@@ -705,6 +746,18 @@ class TerminalView(QWidget):
     def mouseDoubleClickEvent(self, event):
         # double-click selects the word (non-whitespace run) under the pointer,
         # ready to copy (Ctrl+C) -- like any editor/terminal
+        # On a mouse-tracking app, a double-click is another forwarded click, not
+        # a local word-select (its matching release forwards in mouseReleaseEvent).
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+        if (event.button() == Qt.MouseButton.LeftButton and self._mouse_tracking
+                and not ctrl and not shift):
+            self.setFocus()
+            row, col = self._cell_at(event.position())
+            self._mouse_btn_report = 0
+            self.keyInput.emit(self._mouse_button_report(0, row, col, True))
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             self.setFocus()
             row, col = self._cell_at(event.position())
@@ -748,6 +801,17 @@ class TerminalView(QWidget):
         super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        # release of a click we FORWARDED (mouse-tracking app): report the button
+        # up at the release cell and stop — never fall through to local caret
+        # repositioning, which is what corrupted the modal menu in the first place.
+        if (self._mouse_btn_report is not None
+                and event.button() == Qt.MouseButton.LeftButton):
+            row, col = self._cell_at(event.position())
+            self.keyInput.emit(
+                self._mouse_button_report(self._mouse_btn_report, row, col, False))
+            self._mouse_btn_report = None
+            event.accept()
+            return
         # a plain click (no drag): place the input caret where you clicked, then
         # drop the (empty) selection. A drag leaves a real selection to copy and
         # never moves the caret.

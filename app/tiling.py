@@ -29,14 +29,31 @@ class ExplicitPlan(NamedTuple):
     cols: int
 
 
+def _balanced_dims(n: int, prefer_wide: bool) -> tuple[int, int]:
+    """A squarish rows×cols that holds n cells. `prefer_wide` puts the longer
+    side on the columns (wider-than-tall); otherwise on the rows. floor(sqrt)
+    is the short side so 3→3x1, 4→2x2, 5→3x2, 7→4x2, 9→3x3 (wide)."""
+    short = max(1, int(sqrt(n)))         # floor(sqrt(n))
+    long = ceil(n / short)
+    return (short, long) if prefer_wide else (long, short)
+
+
 def explicit_grid(rows: int, cols: int, n: int) -> ExplicitPlan:
     """A fixed rows×cols grid. Agents fill left→right then top→bottom; unused
-    slots stay empty. Auto-grows rows so no agent is ever hidden when n
-    exceeds the requested capacity."""
+    slots stay empty.
+
+    When n exceeds the requested capacity the grid REBALANCES to a squarish
+    shape instead of just stacking extra rows onto the original column count.
+    Growing rows alone made a strip sprout an ugly sparse row: a 2×1 that
+    gained a third agent became 2×2 (two over one) rather than the natural
+    3×1, and a 3×1 gaining a fourth became 3×2 rather than a tidy 2×2. The
+    rebalance is orientation-biased — a grid that was wider-than-tall grows
+    wider, a taller one grows taller — so a deliberate vertical stack (1×2,
+    1×3) is never flipped horizontal on overflow."""
     cols = max(1, cols)
     rows = max(1, rows)
     if n > rows * cols:
-        rows = ceil(n / cols)
+        rows, cols = _balanced_dims(n, prefer_wide=cols >= rows)
     total = rows * cols
     cells = [Cell(i // cols, i % cols, 1, 1) for i in range(total)]
     return ExplicitPlan(cells[:n], cells[n:], rows, cols)

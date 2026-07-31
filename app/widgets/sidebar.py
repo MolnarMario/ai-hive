@@ -553,15 +553,21 @@ class _SidebarTree(QTreeWidget):
         if cat:
             r = option.rect
             x0, x1 = 3, self.viewport().width() - 3
-            fill = QColor(Palette.ACCENT_GOLD)
+            # The group box is NEUTRAL, not accent-tinted: the theme accent is
+            # reserved for the SELECTED workspace (see ui_theme's active-row
+            # QSS), so a categorized row can never be mistaken for the current
+            # one. TEXT_DIM is the theme's muted neutral, so the box still fits
+            # each skin (warm gray on parchment, cool slate on Obsidian, ...).
+            group = QColor(Palette.TEXT_DIM)
+            fill = QColor(group)
             fill.setAlpha(16)
             painter.save()
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
             painter.fillRect(QRect(x0, r.top(), x1 - x0, r.height()), fill)
-            bar = QColor(Palette.ACCENT_GOLD)
+            bar = QColor(group)
             bar.setAlpha(130)
             painter.fillRect(QRect(x0, r.top(), 2, r.height()), bar)
-            edge = QColor(Palette.ACCENT_GOLD)
+            edge = QColor(group)
             edge.setAlpha(80)
             painter.setPen(QPen(edge, 1))
             painter.drawLine(x1, r.top(), x1, r.bottom())

@@ -350,10 +350,15 @@ WorkspaceRow {{
     border-left: 2px solid transparent;
 }}
 WorkspaceRow:hover {{ background: {p.BG_HOVER}; }}
+/* The SELECTED workspace owns the theme accent: a thick bright bar and an
+   accent-colored, bolder name. Nothing else in the sidebar wears the accent
+   as a fill (category groups are neutral — see sidebar.drawRow), so the
+   current workspace is unmistakable even when other rows are grouped. */
 WorkspaceRow[active="true"] {{
     background: {p.BG_ACTIVE};
-    border-left: 3px solid {p.ACCENT_GOLD};
+    border-left: 4px solid {p.ACCENT_GOLD};
 }}
+WorkspaceRow[active="true"] #WsName {{ color: {p.ACCENT_GOLD}; font-weight: 700; }}
 WorkspaceRow[search_hit="true"] {{
     background: rgba(217,178,74,0.20);
     border-left: 3px solid {p.ACCENT_GOLD};
