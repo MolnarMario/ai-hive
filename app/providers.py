@@ -72,7 +72,13 @@ PROVIDERS: dict[str, Provider] = {
         note="Anthropic Claude Code — full interactive agent."),
     "openai": Provider(
         key="openai", display="OpenAI (Codex CLI)", exe_names=("codex",),
-        models=(("Default", ""), ("gpt-5.1", "gpt-5.1"), ("gpt-5.1-codex", "gpt-5.1-codex")),
+        models=(("Default", ""),
+                ("GPT-5.6 Sol", "gpt-5.6-sol"),
+                ("GPT-5.6 Terra", "gpt-5.6-terra"),
+                ("GPT-5.6 Luna", "gpt-5.6-luna"),
+                # Keep prior choices available for restored or pinned agents.
+                ("GPT-5.1", "gpt-5.1"),
+                ("GPT-5.1 Codex", "gpt-5.1-codex")),
         base_cmd="codex", model_flag="--model {model}",
         note="Requires the OpenAI Codex CLI (`codex`) on PATH."),
     "gemini": Provider(

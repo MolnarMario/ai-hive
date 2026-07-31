@@ -2353,6 +2353,106 @@ def test_terminal_mouse_words_links():
           m3 == ["\x1b[B" * 2, "\x1b[D" * 2], m3)
 
 
+def test_terminal_mouse_tracking_click():
+    """When the child app requested mouse tracking (Claude Code holds it on for
+    its whole session), a stationary left CLICK is forwarded as a mouse report so
+    the app selects the option under the pointer -- NOT swallowed for local caret
+    repositioning, which injected stray arrows into modal menus (AskUserQuestion
+    / plan approval) and made the question vanish unanswered. But a DRAG (or a
+    double-click) is a local text SELECTION and is never forwarded, so the
+    transcript stays copyable even while the child holds mouse tracking on."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                            TerminalView)
+
+    QApplication.instance() or QApplication([])
+    v = TerminalView(rows=8, cols=80)
+    # the app enables mouse tracking + SGR encoding (exactly what Claude does)
+    v.feed("\x1b[?1000h\x1b[?1006h")
+    # put selectable text on screen row 3 (1-based row 4): "hello world"
+    v.feed("\x1b[4;1Hhello world")
+    check("mouse-track: DECSET turned on tracking", v._mouse_tracking)
+    check("mouse-track: DECSET turned on SGR encoding", v._mouse_sgr)
+
+    out = []
+    v.keyInput.connect(out.append)
+
+    def pos(row, col):
+        return QPointF(CELL_PAD_X + (col + 0.5) * v._cell_w,
+                       CELL_PAD_Y + (row + 0.5) * v._cell_h)
+
+    def click(row, col, mods=Qt.KeyboardModifier.NoModifier):
+        a = (pos(row, col), Qt.MouseButton.LeftButton,
+             Qt.MouseButton.LeftButton, mods)
+        v.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, *a))
+        v.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, *a))
+
+    # a stationary click at row 3, col 5 -> deferred, then forwarded on release
+    # as SGR press+release (1-based coords), no arrows
+    click(3, 5)
+    check("mouse-track: stationary left-click forwards SGR press+release",
+          out == ["\x1b[<0;6;4M", "\x1b[<0;6;4m"], out)
+    check("mouse-track: forwarding clears the pending-forward state",
+          v._pending_fwd is None)
+    out.clear()
+
+    # a DRAG selects text locally and forwards NOTHING -- this is the regression
+    # guard: forwarding on press used to make every drag a mouse report so the
+    # transcript never selected. Press at "hello", drag across it, release.
+    a0 = (pos(3, 0), Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+          Qt.KeyboardModifier.NoModifier)
+    v.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, *a0))
+    v.mouseMoveEvent(QMouseEvent(
+        QEvent.Type.MouseMove, pos(3, 4), Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+    v.mouseReleaseEvent(QMouseEvent(
+        QEvent.Type.MouseButtonRelease, pos(3, 4), Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+    check("mouse-track: drag selects locally, forwards no report", out == [], out)
+    check("mouse-track: drag while tracking still yields a copyable selection",
+          v.selected_text() == "hello", repr(v.selected_text()))
+    check("mouse-track: drag left no pending forward", v._pending_fwd is None)
+    out.clear()
+
+    # a double-click word-selects locally (a selection gesture), forwards nothing
+    v.mouseDoubleClickEvent(QMouseEvent(
+        QEvent.Type.MouseButtonDblClick, pos(3, 8),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    v.mouseReleaseEvent(QMouseEvent(
+        QEvent.Type.MouseButtonRelease, pos(3, 8),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    check("mouse-track: double-click word-selects locally, forwards nothing",
+          out == [] and v.selected_text() == "world", (out, v.selected_text()))
+    out.clear()
+
+    # Shift is the escape hatch: Shift+click selects locally, forwards nothing
+    click(3, 5, mods=Qt.KeyboardModifier.ShiftModifier)
+    check("mouse-track: Shift+click selects locally, forwards no report",
+          out == [], out)
+    out.clear()
+
+    # legacy X10 encoding (no ?1006): press byte = 32+button, release = 32+3
+    v2 = TerminalView(rows=8, cols=80)
+    v2.feed("\x1b[?1000h")
+    check("mouse-track: X10 tracking on, SGR off",
+          v2._mouse_tracking and not v2._mouse_sgr)
+    out2 = []
+    v2.keyInput.connect(out2.append)
+    a = (QPointF(CELL_PAD_X + 5.5 * v2._cell_w, CELL_PAD_Y + 3.5 * v2._cell_h),
+         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+         Qt.KeyboardModifier.NoModifier)
+    v2.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, *a))
+    v2.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, *a))
+    check("mouse-track: X10 stationary click forwards press(0) then release(3)",
+          out2 == ["\x1b[M" + chr(32) + chr(38) + chr(36),
+                   "\x1b[M" + chr(35) + chr(38) + chr(36)], out2)
+
+
 def test_terminal_selection_edit():
     """A mouse selection (double-click word / drag) is editable like an editor
     selection: Backspace/Del deletes it, Ctrl+X cuts it, Ctrl+C copies it.
@@ -2661,8 +2761,21 @@ def test_v2_features():
     check("v2 grid: 2x2/2 agents fills TL,TR + 2 empty",
           ep.agent_cells == [Cell(0, 0, 1, 1), Cell(0, 1, 1, 1)]
           and len(ep.empty_cells) == 2)
-    check("v2 grid: over-capacity auto-grows rows",
-          explicit_grid(2, 2, 5).rows == 3)
+    check("v2 grid: over-capacity rebalances squarish (2x2/5 -> 3 cols x 2 rows)",
+          explicit_grid(2, 2, 5).rows == 2 and explicit_grid(2, 2, 5).cols == 3)
+    # overflow of a horizontal strip must widen/wrap naturally, not stack a
+    # sparse extra row (the reported bug): 2x1 + a 3rd agent -> 3x1 (not 2x2),
+    # 3x1 + a 4th -> 2x2 (not 3x2).
+    e21 = explicit_grid(1, 2, 3)     # was 2x1, now 3 agents
+    check("v2 grid: 2x1 + 3rd agent -> 3x1 (not 2x2)",
+          (e21.rows, e21.cols) == (1, 3) and len(e21.empty_cells) == 0)
+    e31 = explicit_grid(1, 3, 4)     # was 3x1, now 4 agents
+    check("v2 grid: 3x1 + 4th agent -> 2x2 (not 3x2)",
+          (e31.rows, e31.cols) == (2, 2) and len(e31.empty_cells) == 0)
+    # a deliberate vertical stack stays vertical on overflow (orientation bias)
+    e12 = explicit_grid(2, 1, 3)     # was 1x2, now 3 agents
+    check("v2 grid: 1x2 + 3rd agent stays vertical -> 1x3",
+          (e12.rows, e12.cols) == (3, 1))
     # layout strings read WIDTH x HEIGHT (like screen resolutions): "3x1" is
     # three cards side by side, "1x3" three stacked. Parsing them rows-first
     # made every non-square layout apply TRANSPOSED vs its palette diagram.
@@ -5022,6 +5135,7 @@ def main():
     test_terminal_keys()
     test_terminal_image_paste()
     test_terminal_mouse_words_links()
+    test_terminal_mouse_tracking_click()
     test_terminal_selection_edit()
     test_session_migration()
     test_app()
