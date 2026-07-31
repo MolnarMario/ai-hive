@@ -2354,11 +2354,13 @@ def test_terminal_mouse_words_links():
 
 
 def test_terminal_mouse_tracking_click():
-    """When the child app requested mouse tracking (Claude Code's clickable
-    menus do), a plain left-click is forwarded as a mouse report so the app
-    selects the option under the pointer -- NOT swallowed for local caret
+    """When the child app requested mouse tracking (Claude Code holds it on for
+    its whole session), a stationary left CLICK is forwarded as a mouse report so
+    the app selects the option under the pointer -- NOT swallowed for local caret
     repositioning, which injected stray arrows into modal menus (AskUserQuestion
-    / plan approval) and made the question vanish unanswered."""
+    / plan approval) and made the question vanish unanswered. But a DRAG (or a
+    double-click) is a local text SELECTION and is never forwarded, so the
+    transcript stays copyable even while the child holds mouse tracking on."""
     from PySide6.QtCore import QEvent, QPointF, Qt
     from PySide6.QtGui import QMouseEvent
     from PySide6.QtWidgets import QApplication
@@ -2370,6 +2372,8 @@ def test_terminal_mouse_tracking_click():
     v = TerminalView(rows=8, cols=80)
     # the app enables mouse tracking + SGR encoding (exactly what Claude does)
     v.feed("\x1b[?1000h\x1b[?1006h")
+    # put selectable text on screen row 3 (1-based row 4): "hello world"
+    v.feed("\x1b[4;1Hhello world")
     check("mouse-track: DECSET turned on tracking", v._mouse_tracking)
     check("mouse-track: DECSET turned on SGR encoding", v._mouse_sgr)
 
@@ -2386,25 +2390,44 @@ def test_terminal_mouse_tracking_click():
         v.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, *a))
         v.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, *a))
 
-    # click at row 3, col 5 -> SGR press then release (1-based coords), no arrows
+    # a stationary click at row 3, col 5 -> deferred, then forwarded on release
+    # as SGR press+release (1-based coords), no arrows
     click(3, 5)
-    check("mouse-track: left-click forwards SGR press+release, no arrows",
+    check("mouse-track: stationary left-click forwards SGR press+release",
           out == ["\x1b[<0;6;4M", "\x1b[<0;6;4m"], out)
-    check("mouse-track: forwarding clears the pending-button state",
-          v._mouse_btn_report is None)
+    check("mouse-track: forwarding clears the pending-forward state",
+          v._pending_fwd is None)
     out.clear()
 
-    # a double-click is another forwarded click, never a local word-select
+    # a DRAG selects text locally and forwards NOTHING -- this is the regression
+    # guard: forwarding on press used to make every drag a mouse report so the
+    # transcript never selected. Press at "hello", drag across it, release.
+    a0 = (pos(3, 0), Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+          Qt.KeyboardModifier.NoModifier)
+    v.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, *a0))
+    v.mouseMoveEvent(QMouseEvent(
+        QEvent.Type.MouseMove, pos(3, 4), Qt.MouseButton.NoButton,
+        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+    v.mouseReleaseEvent(QMouseEvent(
+        QEvent.Type.MouseButtonRelease, pos(3, 4), Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+    check("mouse-track: drag selects locally, forwards no report", out == [], out)
+    check("mouse-track: drag while tracking still yields a copyable selection",
+          v.selected_text() == "hello", repr(v.selected_text()))
+    check("mouse-track: drag left no pending forward", v._pending_fwd is None)
+    out.clear()
+
+    # a double-click word-selects locally (a selection gesture), forwards nothing
     v.mouseDoubleClickEvent(QMouseEvent(
-        QEvent.Type.MouseButtonDblClick, pos(2, 1),
+        QEvent.Type.MouseButtonDblClick, pos(3, 8),
         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
         Qt.KeyboardModifier.NoModifier))
     v.mouseReleaseEvent(QMouseEvent(
-        QEvent.Type.MouseButtonRelease, pos(2, 1),
+        QEvent.Type.MouseButtonRelease, pos(3, 8),
         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
         Qt.KeyboardModifier.NoModifier))
-    check("mouse-track: double-click forwards a click, not a word-select",
-          out == ["\x1b[<0;2;3M", "\x1b[<0;2;3m"] and not v.selected_text(), out)
+    check("mouse-track: double-click word-selects locally, forwards nothing",
+          out == [] and v.selected_text() == "world", (out, v.selected_text()))
     out.clear()
 
     # Shift is the escape hatch: Shift+click selects locally, forwards nothing
@@ -2425,7 +2448,7 @@ def test_terminal_mouse_tracking_click():
          Qt.KeyboardModifier.NoModifier)
     v2.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, *a))
     v2.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, *a))
-    check("mouse-track: X10 left-click forwards press(0) then release(3)",
+    check("mouse-track: X10 stationary click forwards press(0) then release(3)",
           out2 == ["\x1b[M" + chr(32) + chr(38) + chr(36),
                    "\x1b[M" + chr(35) + chr(38) + chr(36)], out2)
 
