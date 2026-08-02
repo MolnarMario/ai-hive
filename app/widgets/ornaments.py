@@ -8,8 +8,8 @@ the design handoff's inline data-URIs.
 
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
                             QRectF, Qt, QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QFont, QLinearGradient, QPainter, QPen,
-                           QPixmap, QRadialGradient)
+from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient,
+                           QPainter, QPen, QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QWidget
 
@@ -371,6 +371,188 @@ class WorkspaceSpinner(QWidget):
         p.setFont(f)
         p.setPen(color)
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, str(self._count))
+        p.end()
+
+
+class PlanUsageBadge(QWidget):
+    """The top-bar readout of the Claude account's plan usage:
+
+        (o) 21% used, resets in 1h20m at 14:49
+
+    A percent ring plus one line, in the order the user asked for — countdown
+    first ("how long have I got"), wall-clock second, both in LOCAL time.
+
+    Painted rather than styled, for the same reason as `AgentCountBadge`: the
+    colour has to switch on utilization (green -> amber -> red) AND track the
+    active skin, and per-state QSS would fight the theme registry. Reading
+    `Palette` at paint time gives both for free.
+
+    The widget is a pure VIEW — it never fetches. `MainWindow` polls off-thread
+    and pushes readings in via `set_usage`; a click emits `refreshRequested`,
+    which is the whole refresh affordance (no extra button in the chrome).
+    """
+
+    refreshRequested = Signal()
+
+    _RING = 15          # ring diameter
+    _PAD = 8            # horizontal padding inside the pill
+    _GAP = 7            # ring -> text gap
+
+    # utilization thresholds. Deliberately generous: amber is a nudge, red is
+    # "wrap up", because being cut off mid-task is the thing we're avoiding.
+    _AMBER, _RED = 60.0, 85.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(24)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._usage = None          # claude_usage.Usage | None
+        self._limit = None          # the headline Limit
+        self._text = ""
+        self._stale = False         # showing an older reading than we'd like
+        self._label = False         # prefix the window name (multi-limit plans)
+        self._refresh_text()
+
+    # -- data in ---------------------------------------------------------
+    def set_usage(self, usage) -> None:
+        """Adopt a reading. `None`, or a reading with no limits, hides the
+        badge — an API-key user or a logged-out machine has nothing to show and
+        should not be given an empty pill to wonder about."""
+        from .. import claude_usage
+
+        self._usage = usage
+        self._limit = claude_usage.headline(usage)
+        if self._limit is None:
+            self.setVisible(False)
+            return
+        # only name the window when the plan actually has more than one, so a
+        # Pro account (five_hour alone) stays uncluttered
+        self._label = len(usage.limits) > 1
+        self._stale = bool(usage.error) or usage.source == "cache"
+        self.setVisible(True)
+        self._refresh_text()
+
+    def has_reading(self) -> bool:
+        """True once a usable reading has arrived — the top bar consults this
+        so un-hiding never shows an empty pill."""
+        return self._limit is not None
+
+    def mark_stale(self, stale: bool = True) -> None:
+        """A poll failed but we still have a previous reading: keep showing it,
+        greyed, rather than blanking a number the user is watching."""
+        if stale != self._stale:
+            self._stale = bool(stale)
+            self.update()
+
+    def tick(self) -> None:
+        """Re-render the countdown from the clock alone (no network). Repaints
+        only when the visible string actually changes, so the 30 s tick costs
+        nothing while the minute digit is unchanged."""
+        self._refresh_text()
+
+    # -- rendering -------------------------------------------------------
+    def _refresh_text(self) -> None:
+        from .. import claude_usage
+
+        text = ("" if self._limit is None
+                else claude_usage.format_limit(self._limit, with_label=self._label))
+        tip = self._build_tooltip()
+        if text == self._text:
+            self.setToolTip(tip)   # age keeps moving even when the line doesn't
+            return
+        self._text = text
+        self.setToolTip(tip)
+        # measure with the SAME font paintEvent draws with, not the widget's
+        # QSS font — otherwise the pill is sized for text of a different size
+        fm = QFontMetrics(self._text_font())
+        self.setFixedWidth(self._PAD * 2 + self._RING + self._GAP
+                           + fm.horizontalAdvance(text))
+        self.update()
+
+    @staticmethod
+    def _text_font() -> QFont:
+        f = QFont()
+        f.setPixelSize(11)
+        return f
+
+    def _build_tooltip(self) -> str:
+        from .. import claude_usage
+        import time as _time
+
+        if self._usage is None or self._limit is None:
+            return "Claude plan usage"
+        lines = []
+        if self._usage.plan:
+            lines.append(f"Claude {self._usage.plan.capitalize()} plan")
+        for lim in self._usage.limits:
+            lines.append(f"{lim.label}: "
+                         + claude_usage.format_limit(lim))
+        if self._usage.fetched_at:
+            age = claude_usage.format_since(_time.time() - self._usage.fetched_at)
+            src = " (cached by Claude)" if self._usage.source == "cache" else ""
+            lines.append(f"Updated {age}{src}")
+        if self._usage.error:
+            lines.append(f"Last refresh failed: {self._usage.error}")
+        lines.append("Click to refresh")
+        return "\n".join(lines)
+
+    def _color(self) -> QColor:
+        if self._stale or self._limit is None:
+            return QColor(Palette.TEXT_DIM)
+        pct = self._limit.percent
+        if pct >= self._RED:
+            return QColor(Palette.RED)
+        if pct >= self._AMBER:
+            return QColor(Palette.YELLOW)
+        return QColor(Palette.GREEN)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.refreshRequested.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        if self._limit is None:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = self._color()
+        rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
+        fill = QColor(color)
+        fill.setAlpha(30)
+        p.setBrush(fill)
+        border = QColor(color)
+        border.setAlpha(140)
+        pen = QPen(border)
+        pen.setWidthF(1.2)
+        p.setPen(pen)
+        p.drawRoundedRect(rect, 6, 6)
+        # percent ring: faint full track + a filled sweep from 12 o'clock
+        top = (self.height() - self._RING) / 2.0
+        ring = QRectF(self._PAD, top, self._RING, self._RING)
+        track = QColor(color)
+        track.setAlpha(55)
+        tp = QPen(track)
+        tp.setWidthF(2.2)
+        p.setPen(tp)
+        p.drawArc(ring, 0, 360 * 16)
+        span = int(max(0.0, min(100.0, self._limit.percent)) / 100.0 * 360 * 16)
+        if span:
+            ap = QPen(color)
+            ap.setWidthF(2.2)
+            ap.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(ap)
+            p.drawArc(ring, 90 * 16, -span)   # clockwise from 12 o'clock
+        p.setFont(self._text_font())
+        p.setPen(color)
+        text_x = self._PAD + self._RING + self._GAP
+        p.drawText(QRectF(text_x, 0, self.width() - text_x - self._PAD,
+                          self.height()),
+                   int(Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter),
+                   self._text)
         p.end()
 
 

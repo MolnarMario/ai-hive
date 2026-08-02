@@ -70,6 +70,20 @@ workspaces keep executing — switching never pauses anything.
   even while you're heads-down in another workspace — handy when agents you sent
   into plan mode come back with questions. Toggle it with the **🔔 button** in
   the top bar (persists across restarts).
+- **Plan usage readout** — a top-bar badge, left of the theme picker, showing
+  how much of your Claude plan you've burned and when it comes back:
+  `21% used, resets in 1h20m at 14:49` — countdown first, then the wall-clock
+  time in your own timezone. A percent ring turns amber past 60% and red past
+  85%, so you see a wall coming instead of hitting it mid-task. **Click it to
+  refresh**; hover for every limit window, your plan, and how old the reading
+  is. The number comes from the same place the CLI's `/usage` gets it, read
+  once a minute in the background — nothing is logged or persisted, it's a live
+  readout only. When a limit is actually spent it reads **`limit reached,
+  resets in …`**, and the window raises `planLimitReached` / `planLimitCleared`
+  signals (with the reset time) so other features can act on being cut off —
+  e.g. relaunching blocked agents unattended the moment the limit resets.
+  Right-click the top bar to hide the readout; it hides itself when there's no
+  Claude login.
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
@@ -436,7 +450,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-722 checks drive the real app headlessly (offscreen Qt platform) with real
+766 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -504,7 +518,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (722 checks)
+tests/smoke_test.py        headless end-to-end suite (766 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

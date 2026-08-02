@@ -5,17 +5,20 @@ Every dialog lives here so the model API stays headless-testable.
 """
 
 import os
+import threading
 
 from PySide6.QtCore import QProcess, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
-                               QLabel, QLineEdit, QMainWindow, QMessageBox,
-                               QPushButton, QSplitter, QStackedWidget,
-                               QToolButton, QVBoxLayout, QWidget)
+                               QLabel, QLineEdit, QMainWindow, QMenu,
+                               QMessageBox, QPushButton, QSplitter,
+                               QStackedWidget, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from .. import __version__
 from .. import chime
+from .. import claude_usage
 from .. import fsopen
 from .. import providers
 from .. import session_hook
@@ -28,7 +31,7 @@ from .. import coordination
 from ..orchestrator_bridge import OrchestratorBridge
 from .activity_panel import ActivityPanel
 from .agent_file_map import AgentFileMapWindow
-from .ornaments import LogoRoundel, PageBorder
+from .ornaments import LogoRoundel, PageBorder, PlanUsageBadge
 from .sidebar import SIDEBAR_WIDTH, Sidebar
 
 SIDEBAR_MIN, SIDEBAR_MAX = 170, 700  # drag bounds (ultrawide-friendly)
@@ -46,6 +49,17 @@ SESSION_SYNC_MS = 5000
 # badge + chime). Faster than the session sync so a chime feels prompt; the poll
 # is a cheap incremental read of a small append-only file.
 PROMPT_SYNC_MS = 750
+
+# how often to re-read the Claude account's plan usage from the API. One small
+# HTTPS GET; a minute is well inside the resolution of a 5-hour window.
+USAGE_POLL_MS = 60000
+# how often the readout re-renders its countdown from the clock alone (no
+# network). Repaints only when the displayed string changes.
+USAGE_TICK_MS = 20000
+# once a limit is spent, re-poll this soon after its stated reset so the
+# "limit cleared" edge fires promptly (an unattended relaunch shouldn't wait
+# out a whole poll interval at 4am), plus a small cushion for clock skew.
+USAGE_RESET_GRACE_MS = 8000
 
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [
@@ -72,6 +86,8 @@ class TopBar(QFrame):
     globalFontDelta = Signal(int)
     themeChanged = Signal(str)   # theme id
     soundToggled = Signal(bool)  # notification chime enabled/muted
+    usageVisibilityToggled = Signal(bool)  # show/hide the plan-usage readout
+    usageRefreshRequested = Signal()       # user clicked the readout
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -125,6 +141,14 @@ class TopBar(QFrame):
         self.sound_btn.clicked.connect(self._on_sound_clicked)
         self._refresh_sound_btn()
 
+        # Claude plan usage: "21% used, resets in 1h20m at 14:49". Hidden until
+        # a reading arrives (and permanently when there's no Claude login), and
+        # hideable from the top bar's context menu.
+        self.usage_badge = PlanUsageBadge(self)
+        self.usage_badge.setVisible(False)
+        self.usage_badge.refreshRequested.connect(self.usageRefreshRequested)
+        self._usage_wanted = True   # the user's show/hide preference
+
         # skin selector (Winamp-style): swaps the whole chrome palette live
         self.theme_select = QComboBox(self)
         self.theme_select.setObjectName("ThemeSelect")
@@ -142,6 +166,8 @@ class TopBar(QFrame):
         lay.addSpacing(12)
         lay.addWidget(self.breadcrumb)
         lay.addStretch(1)
+        lay.addWidget(self.usage_badge)
+        lay.addSpacing(8)
         lay.addWidget(self.theme_select)
         lay.addSpacing(8)
         lay.addWidget(self.font_dec_btn)
@@ -165,6 +191,35 @@ class TopBar(QFrame):
         self.sound_btn.setToolTip(
             "Notification chime: ON — click to mute" if self._sound_on
             else "Notification chime: OFF — click to enable")
+
+    def set_usage(self, usage) -> None:
+        """Push a plan-usage reading into the badge (no-op while hidden by the
+        user, so a poll can't resurrect a readout they switched off)."""
+        self.usage_badge.set_usage(usage)
+        if not self._usage_wanted:
+            self.usage_badge.setVisible(False)
+
+    def set_usage_visible(self, on: bool) -> None:
+        """Reflect the show/hide preference (no signal emitted)."""
+        self._usage_wanted = bool(on)
+        self.usage_badge.setVisible(self._usage_wanted
+                                    and self.usage_badge.has_reading())
+
+    def usage_visible(self) -> bool:
+        return self._usage_wanted
+
+    def contextMenuEvent(self, event):
+        """Right-click anywhere on the bar: toggle the plan-usage readout.
+
+        A context-menu item rather than another button — the bar is already
+        busy, and this is a set-once preference, not something you flip often.
+        """
+        menu = QMenu(self)
+        act = menu.addAction("Show plan usage")
+        act.setCheckable(True)
+        act.setChecked(self._usage_wanted)
+        act.toggled.connect(self.usageVisibilityToggled)
+        menu.exec(event.globalPos())
 
     def set_theme(self, theme_id: str) -> None:
         """Reflect the active theme in the dropdown without re-emitting."""
@@ -457,6 +512,20 @@ class AddTerminalDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    # Plan-usage edges, for features that need to ACT on the account being cut
+    # off rather than just display it (e.g. relaunching agents that died on a
+    # limit, unattended, once it resets). Both are EDGE-triggered and
+    # level-correct, like the chime: `planLimitReached` fires once on
+    # headroom -> spent and carries the claude_usage.Limit (so `.resets_at`
+    # says when it frees up); `planLimitCleared` fires once on the way back.
+    # `plan_usage()` exposes the latest full reading for polling-style callers.
+    planLimitReached = Signal(object)   # claude_usage.Limit
+    planLimitCleared = Signal()
+    # private: carries a reading from the fetch thread back to the GUI thread.
+    # Qt marshals a cross-thread emit through the event loop, so everything the
+    # slot touches (widgets, timers) stays on the main thread.
+    _usageReady = Signal(object)
+
     def __init__(self, manager: WorkspaceManager, store: SessionStore,
                  session: dict | None = None):
         super().__init__()
@@ -494,6 +563,27 @@ class MainWindow(QMainWindow):
         self._prompt_sync_timer = QTimer(self)
         self._prompt_sync_timer.setInterval(PROMPT_SYNC_MS)
         self._prompt_sync_timer.timeout.connect(self.manager.sync_prompt_events)
+
+        # ---- Claude plan usage (top-bar readout + limit-reached edges) ----
+        # PURELY TRANSIENT: a reading refreshes the badge and may emit the
+        # plan-limit edges, but it must NEVER mark the session dirty — the same
+        # rule as activity_changed/waiting_changed. This polls every minute
+        # forever; wiring it to a save would rewrite session.json 60x an hour.
+        self._usage = None            # latest claude_usage.Usage
+        self._usage_visible = True    # user preference (persisted)
+        self._usage_inflight = False  # one request at a time, never stack
+        self._plan_blocked = False    # edge state for planLimitReached/Cleared
+        self._usage_timer = QTimer(self)
+        self._usage_timer.setInterval(USAGE_POLL_MS)
+        self._usage_timer.timeout.connect(self._poll_usage)
+        self._usage_tick_timer = QTimer(self)
+        self._usage_tick_timer.setInterval(USAGE_TICK_MS)
+        self._usage_tick_timer.timeout.connect(self._tick_usage)
+        # fires just after a spent limit's stated reset, so the "cleared" edge
+        # doesn't wait out a full poll interval
+        self._usage_reset_timer = QTimer(self)
+        self._usage_reset_timer.setSingleShot(True)
+        self._usage_reset_timer.timeout.connect(self._poll_usage)
 
         # shared-board control channel (named-pipe RPC → this GUI): relays each
         # agent's log_activity note onto its workspace board. Additive and
@@ -635,6 +725,12 @@ class MainWindow(QMainWindow):
         self.top_bar.globalFontDelta.connect(self._change_global_font)
         self.top_bar.themeChanged.connect(self._change_theme)
         self.top_bar.soundToggled.connect(self._on_sound_toggled)
+        self.top_bar.usageVisibilityToggled.connect(self._on_usage_visibility)
+        self.top_bar.usageRefreshRequested.connect(self._poll_usage)
+        # QueuedConnection is the point: the fetch thread emits, and the slot
+        # runs on the GUI thread where touching widgets/timers is legal
+        self._usageReady.connect(self._on_usage_ready,
+                                 Qt.ConnectionType.QueuedConnection)
         self.sidebar.addRequested.connect(self._on_add_workspace_clicked)
         self.sidebar.workspaceSelected.connect(self.manager.set_active)
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
@@ -729,6 +825,108 @@ class MainWindow(QMainWindow):
         if self._sound_enabled:
             chime.play()
 
+    # ---------------------------------------------------- plan usage ------
+    def plan_usage(self):
+        """The latest plan-usage reading (`claude_usage.Usage`), or None before
+        the first one lands. Public: this plus `planLimitReached` /
+        `planLimitCleared` is the API other features hook into — `.blocked`
+        says whether the account is cut off, `.resets_at` says until when."""
+        return self._usage
+
+    def start_usage_polling(self) -> None:
+        """Begin polling the account's plan usage. OPT-IN, called by main.py
+        only — exactly like `quit_on_close`, and for the same reason: the smoke
+        suite constructs many windows per process and must never touch the
+        network (or the user's real account). Tests drive `_on_usage_ready`
+        with synthetic readings instead.
+
+        Seeds from Claude's own on-disk cache for an instant first paint, then
+        goes and gets a live reading. The cache is often stale (observed 1.5
+        days out of date), so it is only ever a placeholder until the fetch
+        lands."""
+        cached = claude_usage.read_cached()
+        if cached is not None:
+            self._apply_usage(cached)
+        self._usage_timer.start()
+        self._usage_tick_timer.start()
+        self._poll_usage()
+
+    def _poll_usage(self) -> None:
+        """Kick a fetch on a daemon thread (the pty_worker/mcp_server pattern).
+
+        `_usage_inflight` is the guard that matters: a hung request must never
+        let the minute timer stack threads behind it."""
+        if self._closing or self._usage_inflight:
+            return
+        self._usage_inflight = True
+
+        def worker():
+            reading = claude_usage.fetch()
+            self._usageReady.emit(reading)   # queued -> GUI thread
+
+        threading.Thread(target=worker, daemon=True,
+                         name="aihive-usage").start()
+
+    def _on_usage_ready(self, reading) -> None:
+        self._usage_inflight = False
+        if self._closing:
+            return
+        if reading is not None and reading.ok:
+            self._apply_usage(reading)
+            return
+        # A failed poll keeps the last good number on screen, greyed, rather
+        # than blanking a figure the user is watching. Only a machine with no
+        # Claude login at all (no-auth) has nothing to show, ever.
+        if reading is not None and reading.error == "no-auth" and self._usage is None:
+            self.top_bar.usage_badge.setVisible(False)
+            self._usage_timer.stop()
+            self._usage_tick_timer.stop()
+            return
+        self.top_bar.usage_badge.mark_stale(True)
+
+    def _apply_usage(self, reading) -> None:
+        """Adopt a reading: refresh the badge and fire the plan-limit edges.
+
+        NEVER marks the session dirty — see the transient-signal rule in
+        CLAUDE.md. This runs every minute for the life of the process.
+        """
+        self._usage = reading
+        self.top_bar.set_usage(reading)
+        blocked = reading.blocked
+        if blocked is not None and not self._plan_blocked:
+            self._plan_blocked = True
+            self.planLimitReached.emit(blocked)
+        elif blocked is None and self._plan_blocked:
+            self._plan_blocked = False
+            self.planLimitCleared.emit()
+        self._arm_reset_poll(blocked)
+
+    def _arm_reset_poll(self, blocked) -> None:
+        """While cut off, schedule one extra poll just after the stated reset
+        so `planLimitCleared` fires within seconds of the window reopening —
+        an unattended relaunch at 4am shouldn't wait out the minute timer."""
+        if blocked is None or blocked.resets_at is None:
+            self._usage_reset_timer.stop()
+            return
+        import time
+        delay = int((blocked.resets_at - time.time()) * 1000) + USAGE_RESET_GRACE_MS
+        # QTimer takes a 32-bit interval; a far-future reset is covered by the
+        # ordinary minute poll, so only arm when it's genuinely near.
+        if 0 < delay <= 6 * 3600 * 1000:
+            self._usage_reset_timer.start(delay)
+        else:
+            self._usage_reset_timer.stop()
+
+    def _tick_usage(self) -> None:
+        """Re-render the countdown from the clock alone — no network."""
+        self.top_bar.usage_badge.tick()
+
+    def _on_usage_visibility(self, on: bool) -> None:
+        """User toggled the readout from the top bar's context menu."""
+        self._usage_visible = bool(on)
+        self.top_bar.set_usage_visible(self._usage_visible)
+        self._schedule_save()   # a UI preference, like sound_enabled
+
     def _on_sound_toggled(self, enabled: bool) -> None:
         """User flipped the top-bar chime toggle. Persist the preference (via
         the debounced save) so it survives a restart."""
@@ -753,6 +951,11 @@ class MainWindow(QMainWindow):
         # notification chime preference (default ON if never saved)
         self._sound_enabled = bool(ui.get("sound_enabled", True))
         self.top_bar.set_sound_enabled(self._sound_enabled)
+        # plan-usage readout preference (default ON if never saved). A new key
+        # inside "ui" read with a default is backward compatible, so this needs
+        # no SESSION_VERSION bump — same as sound_enabled before it.
+        self._usage_visible = bool(ui.get("usage_visible", True))
+        self.top_bar.set_usage_visible(self._usage_visible)
         win = ui.get("window", {})
         if win.get("w") and win.get("h"):
             self.resize(int(win["w"]), int(win["h"]))
@@ -1196,6 +1399,7 @@ class MainWindow(QMainWindow):
             "console_font_px": ui_theme.CONSOLE_FONT_PX,
             "theme": self._theme_id,
             "sound_enabled": self._sound_enabled,
+            "usage_visible": self._usage_visible,
             "window": {"w": w, "h": h, "maximized": self.isMaximized()},
             # which workspaces have their inline file tree open (per-folder
             # expansion + highlight are transient, not persisted)
@@ -1261,6 +1465,9 @@ class MainWindow(QMainWindow):
         self._heartbeat_timer.stop()
         self._session_sync_timer.stop()
         self._prompt_sync_timer.stop()
+        self._usage_timer.stop()
+        self._usage_tick_timer.stop()
+        self._usage_reset_timer.stop()
         # capture any last-moment conversation switch BEFORE the final save, so
         # reopen resumes what was actually on screen — not a stale pin. Agents
         # are still alive here (processes are killed further down), so their

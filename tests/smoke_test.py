@@ -5178,6 +5178,231 @@ def test_resume_fallback():
     check("resume-fallback: user-stopped resume not relaunched", c3["start"] == 1)
 
 
+def test_plan_usage():
+    """The top-bar Claude plan-usage readout: parsing, the badge line, the
+    limit-reached edges other features hook into, and the two rules that keep
+    it cheap — a reading NEVER marks the session dirty, and polling is opt-in
+    so this suite never touches the network or the user's real account."""
+    import json as _json
+    import time as _time
+    from PySide6.QtWidgets import QApplication
+    from app import claude_usage as cu
+
+    QApplication.instance() or QApplication([])
+    now = _time.time()
+
+    def limit(key, pct, resets=None):
+        return cu.Limit(key=key, label=cu._LABELS[key], short=cu._SHORT[key],
+                        percent=pct, resets_at=resets)
+
+    # --- parsing the real payload shape (captured from /api/oauth/usage) ---
+    payload = {
+        "five_hour": {"utilization": 21.0,
+                      "resets_at": "2026-08-02T12:29:59.983234+00:00",
+                      "limit_dollars": None},
+        "seven_day": None,               # Pro has no weekly window
+        "seven_day_opus": None,
+        "extra_usage": {"is_enabled": False},
+        "limits": [{"kind": "session", "percent": 21}],
+    }
+    lims = cu.parse_utilization(payload)
+    check("plan-usage: parses five_hour utilization", len(lims) == 1
+          and lims[0].key == "five_hour" and lims[0].percent == 21.0)
+    check("plan-usage: resets_at parsed to epoch seconds",
+          abs(lims[0].resets_at - 1785673799.983234) < 1.0)
+    check("plan-usage: null windows skipped, not reported as 0%",
+          all(l.key != "seven_day" for l in lims))
+    check("plan-usage: garbage payload yields no limits",
+          cu.parse_utilization({"five_hour": "nonsense"}) == ()
+          and cu.parse_utilization({}) == ())
+    check("plan-usage: epoch resets_at also accepted",
+          cu.parse_utilization(
+              {"five_hour": {"utilization": 5, "resets_at": 1785673799}}
+          )[0].resets_at == 1785673799.0)
+
+    # --- headline picks the most-constrained window ---
+    multi = cu.Usage(limits=(limit("five_hour", 21.0), limit("seven_day", 64.0)))
+    check("plan-usage: headline is the highest-utilization window",
+          cu.headline(multi).key == "seven_day")
+    check("plan-usage: headline of an empty reading is None",
+          cu.headline(cu.Usage()) is None and cu.headline(None) is None)
+
+    # --- the badge line: countdown FIRST, then wall-clock, in local time ---
+    line = cu.format_limit(limit("five_hour", 21.0, now + 4800), now=now)
+    check("plan-usage: line reads '21% used, resets in 1h20m at HH:MM'",
+          line.startswith("21% used, resets in 1h20m at ")
+          and len(line.split(" at ")[1]) == 5, line)
+    check("plan-usage: local wall-clock, not UTC",
+          line.endswith(_time.strftime("%H:%M", _time.localtime(now + 4800))))
+    check("plan-usage: window named only when the plan has several",
+          cu.format_limit(limit("seven_day", 64.0, now + 600), now=now,
+                          with_label=True).startswith("7d 64% used"))
+    check("plan-usage: a spent window spells out 'limit reached'",
+          cu.format_limit(limit("five_hour", 100.0, now + 600),
+                          now=now).startswith("limit reached, resets in 10m"))
+    check("plan-usage: no reset time degrades to the bare percent",
+          cu.format_limit(limit("five_hour", 21.0)) == "21% used")
+    check("plan-usage: countdown formats scale",
+          (cu.format_countdown(4800), cu.format_countdown(600),
+           cu.format_countdown(30)) == ("1h20m", "10m", "30s"))
+    check("plan-usage: age formats scale",
+          (cu.format_since(2), cu.format_since(42), cu.format_since(180),
+           cu.format_since(7200)) == ("just now", "42s ago", "3m ago", "2h ago"))
+
+    # --- blocked/resets_at: the hook other features build on ---
+    spent = cu.Usage(limits=(limit("five_hour", 100.0, now + 900),))
+    check("plan-usage: blocked reports the spent window",
+          spent.blocked is not None and spent.blocked.key == "five_hour")
+    check("plan-usage: blocked carries when it frees up",
+          spent.resets_at == now + 900)
+    check("plan-usage: headroom means not blocked",
+          cu.Usage(limits=(limit("five_hour", 99.0, now),)).blocked is None)
+
+    # --- credentials are read-only, and a dead token never hits the wire ---
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-usage-"))
+    creds = tmp / ".credentials.json"
+    creds.write_text(_json.dumps({"claudeAiOauth": {
+        "accessToken": "not-a-real-token", "subscriptionType": "pro",
+        "expiresAt": int((now - 3600) * 1000)}}), encoding="utf-8")
+    before = creds.read_bytes()
+    old_env = os.environ.get("CLAUDE_CONFIG_DIR")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(tmp)
+    try:
+        expired = cu.fetch()
+        check("plan-usage: expired token short-circuits (no request)",
+              expired.error == "expired" and not expired.limits)
+        check("plan-usage: credentials file never rewritten",
+              creds.read_bytes() == before)
+        creds.unlink()
+        check("plan-usage: missing credentials report no-auth, never raise",
+              cu.fetch().error == "no-auth")
+        check("plan-usage: missing cache returns None, never raises",
+              cu.read_cached() is None)
+        # --- the on-disk cache is parsed by the very same parser ---
+        (tmp / ".claude.json").write_text(_json.dumps({
+            "cachedUsageUtilization": {"fetchedAtMs": int((now - 90) * 1000),
+                                       "utilization": payload}}),
+            encoding="utf-8")
+        cached = cu.read_cached()
+        check("plan-usage: cache seed parsed, marked as cached",
+              cached is not None and cached.source == "cache"
+              and cached.limits[0].percent == 21.0)
+        check("plan-usage: cache keeps Claude's timestamp, not now",
+              abs(cached.fetched_at - (now - 90)) < 2.0)
+    finally:
+        if old_env is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = old_env
+
+    # --- window wiring: badge, edges, persistence ---
+    from main import create_main_window, setup_application
+    from app.session_store import SessionStore
+    app = QApplication.instance()
+    setup_application(app)
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    app.processEvents()
+    badge = win.top_bar.usage_badge
+
+    check("plan-usage: polling is opt-in, so the suite never fetches",
+          not win._usage_timer.isActive() and win.plan_usage() is None)
+    check("plan-usage: badge hidden until a reading arrives",
+          not badge.isVisible() and not badge.has_reading())
+
+    good = cu.Usage(limits=(limit("five_hour", 21.0, now + 4800),),
+                    fetched_at=now, plan="pro")
+    win._on_usage_ready(good)
+    app.processEvents()
+    check("plan-usage: reading shows the badge with the full line",
+          badge.isVisible() and badge._text.startswith("21% used, resets in"))
+    check("plan-usage: tooltip carries plan, every window, and the age",
+          "Pro plan" in badge.toolTip() and "Current session" in badge.toolTip()
+          and "Updated" in badge.toolTip())
+    check("plan-usage: plan_usage() exposes the reading",
+          win.plan_usage() is good)
+
+    # a reading is TRANSIENT: it must never schedule a save (this polls every
+    # minute forever; wiring it to dirty would thrash session.json)
+    win._save_timer.stop()
+    win._on_usage_ready(cu.Usage(limits=(limit("five_hour", 22.0, now + 4700),),
+                                 fetched_at=now, plan="pro"))
+    check("plan-usage: a reading never marks the session dirty",
+          not win._save_timer.isActive())
+
+    # edges: rising once, level-stable, falling once
+    seen = {"hit": 0, "clear": 0, "limit": None}
+    win.planLimitReached.connect(
+        lambda l: seen.update(hit=seen["hit"] + 1, limit=l))
+    win.planLimitCleared.connect(lambda: seen.update(clear=seen["clear"] + 1))
+    blocked = cu.Usage(limits=(limit("five_hour", 100.0, now + 120),),
+                       fetched_at=now, plan="pro")
+    win._on_usage_ready(blocked)
+    win._on_usage_ready(blocked)          # level, not a new edge
+    check("plan-usage: planLimitReached fires once on the rising edge",
+          seen["hit"] == 1 and seen["clear"] == 0)
+    check("plan-usage: the edge carries the reset time",
+          seen["limit"] is not None and seen["limit"].resets_at == now + 120)
+    check("plan-usage: blocked badge reads 'limit reached'",
+          badge._text.startswith("limit reached, resets in"))
+    check("plan-usage: an extra poll is armed for just after the reset",
+          win._usage_reset_timer.isActive()
+          and win._usage_reset_timer.remainingTime() > 120000)
+    win._on_usage_ready(good)
+    check("plan-usage: planLimitCleared fires once on the falling edge",
+          seen["clear"] == 1 and seen["hit"] == 1)
+    check("plan-usage: reset poll disarmed once there is headroom",
+          not win._usage_reset_timer.isActive())
+    # a weekly window can reset days out; that is the minute poll's job, not a
+    # multi-day QTimer (whose interval is 32-bit anyway)
+    win._on_usage_ready(cu.Usage(limits=(limit("seven_day", 100.0,
+                                               now + 3 * 86400),),
+                                 fetched_at=now, plan="max"))
+    check("plan-usage: a far-off reset is left to the ordinary poll",
+          not win._usage_reset_timer.isActive())
+    win._on_usage_ready(good)
+
+    # a failed poll keeps the last good number on screen, greyed
+    win._on_usage_ready(cu.Usage(error="urlerror"))
+    check("plan-usage: a failed poll keeps the last number, marked stale",
+          badge._text.startswith("21% used") and badge._stale)
+
+    # visibility preference persists; toggling it IS a save (a UI preference)
+    win._on_usage_visibility(False)
+    app.processEvents()
+    check("plan-usage: hiding removes the badge but keeps polling",
+          not badge.isVisible())
+    check("plan-usage: a later reading cannot resurrect a hidden badge",
+          (win._on_usage_ready(good), app.processEvents(),
+           not badge.isVisible())[-1])
+    payload_ui = win._session_payload()["ui"]
+    check("plan-usage: preference persisted under ui.usage_visible",
+          payload_ui["usage_visible"] is False)
+    win.close()
+
+    win2 = create_main_window(store)
+    win2.show()
+    app.processEvents()
+    check("plan-usage: preference restored on reopen",
+          win2.top_bar.usage_visible() is False)
+    check("plan-usage: default is ON when never saved",
+          create_main_window(
+              SessionStore(path=tmp / "fresh.json")).top_bar.usage_visible())
+    win2.close()
+
+    # no Claude login at all: hide for good rather than show an empty pill
+    win3 = create_main_window(SessionStore(path=tmp / "noauth.json"))
+    win3.show()
+    win3._usage_timer.start()
+    win3._on_usage_ready(cu.Usage(error="no-auth"))
+    app.processEvents()
+    check("plan-usage: no-auth hides the badge and stops polling",
+          not win3.top_bar.usage_badge.isVisible()
+          and not win3._usage_timer.isActive())
+    win3.close()
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
@@ -5233,6 +5458,7 @@ def main():
     test_terminal_link_underline()
     test_sidebar_file_tree()
     test_sidebar_search()
+    test_plan_usage()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0

@@ -179,6 +179,43 @@ this file is the invariants that must survive every change.
   starts fresh instead — never use `-p` to test resume. Effort tokens:
   low|medium|high|xhigh|max. Claude Code enters the alternate screen and
   enables mouse tracking (?1049h, ?1000/1002/1003h, ?1006h, ?1004h, ?2004h).
+- **Plan usage is a LIVE READOUT and a HOOK POINT, never history**
+  (`app/claude_usage.py`, Qt-free/stdlib-only like `chime.py`). The number comes
+  from `GET /api/oauth/usage` with the account's OAuth bearer token — the same
+  call the TUI's `/usage` makes ("fetchUtilization: GET /api/oauth/usage" is in
+  the binary). There is NO CLI path (no `claude usage` subcommand), and the
+  `statusLine` route — whose stdin payload also carries
+  `rate_limits.five_hour.used_percentage` — is deliberately REJECTED: it would
+  run a subprocess inside every agent's TUI render loop, exactly the launch-
+  timing perturbation the SessionStart `startup` invariant above is about.
+  `~/.claude.json` → `cachedUsageUtilization` carries the IDENTICAL shape (one
+  `parse_utilization` serves both) but is only a cold-start seed / offline
+  fallback — the CLI rewrites it opportunistically and it goes stale for days
+  (observed 1.5 days and 10 points out of date), so it must never be the primary
+  source. TOKEN HANDLING IS READ-ONLY: re-read `.credentials.json` per call
+  (running agents keep it rotated for us), short-circuit on a past `expiresAt`
+  instead of putting a dead credential on the wire, and NEVER refresh (that
+  races the CLI's own refresh), write, log, or persist it. `fetch()` never
+  raises — every failure becomes a `Usage` with `error` set, and a failed poll
+  KEEPS the last good number on screen (greyed) rather than blanking a figure
+  the user is reading; only `no-auth` with no prior reading hides the badge for
+  good. CRITICAL, same rule as `activity_changed`/`waiting_changed`: a reading
+  is TRANSIENT and must NEVER mark `dirty` — `_apply_usage` runs every minute
+  for the life of the process, so wiring it to a save would rewrite
+  `session.json` 60x an hour (only the `ui.usage_visible` preference saves, via
+  `_schedule_save`). Polling is OPT-IN — `main.py` calls
+  `MainWindow.start_usage_polling()` exactly like it sets `quit_on_close`,
+  because the smoke suite shares `create_main_window` and must never touch the
+  network or the user's real account; tests drive `_on_usage_ready` with
+  synthetic readings. The BLOCKED state (`Usage.blocked`, utilization >= 100 —
+  derived from the number, NOT from the payload's server-side `severity`
+  string) is the machine-readable half: `MainWindow.planLimitReached(Limit)` /
+  `planLimitCleared()` are edge-triggered and level-correct like the chime, and
+  `plan_usage()` exposes the latest reading, so features that ACT on being cut
+  off (e.g. relaunching blocked agents unattended when the limit resets) hook
+  those instead of scraping a terminal. While blocked, `_arm_reset_poll`
+  schedules one extra poll just after the stated reset so the cleared edge
+  fires within seconds at 4am rather than waiting out the minute timer.
 - **Theming is a skin registry** (`app/ui_theme.py`): each skin is a `Theme`
   in `THEMES`; `apply_theme(id)` rewrites the module-level `Palette` attrs,
   the `ANSI_16` list (IN PLACE — same object), and the font globals, so every

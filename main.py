@@ -178,6 +178,9 @@ def main() -> int:
     setup_application(app)
     window = create_main_window()
     window.quit_on_close = True  # closed window == dead process, always
+    # opt in to the plan-usage readout here, not in the factory: the smoke
+    # suite shares create_main_window and must never hit the network
+    window.start_usage_polling()
     window.show()
     window.autostart_active_workspace()
     return app.exec()
