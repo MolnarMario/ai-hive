@@ -675,7 +675,14 @@ class TerminalAgent(QObject):
         """
         if self.spec.provider != "claude" or self._limit_blocked:
             return
-        region = "\n".join(self._screen_tail.splitlines()[-18:])
+        # Deliberately a WIDER region than _screen_waiting's last 18 lines.
+        # That bound is right for a selection menu, which is anchored just
+        # above the input box; the limit banner is NOT bottom-anchored — the
+        # options menu (upgrade / team / extra usage / cancel), the input box
+        # and the footer all render below it, so 18 lines can push the banner
+        # out of view on a full frame. _LIMIT_HIT_RE is specific enough to
+        # search a wider window safely.
+        region = "\n".join(self._screen_tail.splitlines()[-40:])
         if not region or not _LIMIT_HIT_RE.search(region):
             return
         self._limit_blocked = True

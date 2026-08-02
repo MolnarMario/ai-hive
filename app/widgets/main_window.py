@@ -1010,8 +1010,14 @@ class MainWindow(QMainWindow):
         if self._closing or not self._ready or not self._auto_continue:
             return
         now = time.time()
+        # A latched agent whose banner carried NO parseable time has no due
+        # date, and must NOT be treated as due now — `or 0` would have made it
+        # instantly eligible and fired a pointless "Continue" into an agent
+        # that is still cut off (and then cleared the latch, so the real reset
+        # would have been missed). Those fall back to the API edge.
         self._resume_blocked_agents(
-            due=lambda a: (a.limit_resets_at() or 0) <= now)
+            due=lambda a: a.limit_resets_at() is not None
+            and a.limit_resets_at() <= now)
 
     def _resume_blocked_agents(self, due=None) -> None:
         """The plan limit reset — put the agents it cut off back to work.

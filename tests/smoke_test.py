@@ -5598,6 +5598,31 @@ def test_auto_continue_on_limit_reset():
     check("auto-continue: the watchdog resumes it with NO usage reading at all",
           "Continue" in sent(late))
 
+    # a banner with no parseable time has no due date -- it must NOT count as
+    # "due now", which would fire a pointless Continue into a still-blocked
+    # agent and then drop the latch, missing the real reset
+    writes.clear()
+    timeless = mk("Timeless")
+    settle(timeless, "You've hit your session limit\n")
+    ws.agents.append(timeless)
+    check("auto-continue: a banner with no time still latches the cut-off",
+          timeless.is_limit_blocked() and timeless.limit_resets_at() is None)
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: an unknown reset time is NOT treated as due now",
+          sent(timeless) == "" and timeless.is_limit_blocked())
+
+    # the banner is not bottom-anchored: its options menu, the input box and
+    # the footer all render below it, so the scrape window must be wider than
+    # the selection-menu scrape's 18 lines
+    deep = mk("Deep")
+    settle(deep, BANNER + "\n".join(
+        ["  1. Upgrade", "  2. Team plan", "  3. Extra usage", "  4. Cancel"]
+        + [f"filler {i}" for i in range(14)]
+        + ["│ > │", "  ? for shortcuts"]))
+    check("auto-continue: the banner is found above a full frame of menu/input",
+          deep.is_limit_blocked())
+
     win._on_auto_continue(False)   # what the reopen below must find
     win.close()
 
