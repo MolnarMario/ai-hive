@@ -1,6 +1,6 @@
 # AI Hive — Multi-Agent Control Center
 
-A desktop app for orchestrating many terminal agents side by side, styled as
+A desktop app for running many terminal agents side by side, styled as
 "a medieval scribe's workshop for software engineers" — warm parchment-toned
 chrome with illuminated gold initials over clean, dark, high-density terminals.
 Workspaces live in a collapsible sidebar; each is tied to a project folder and
@@ -236,43 +236,38 @@ error dialog instead of silently closing. Packaging to a distributable
   badge shows how far back you are; any keystroke snaps back live).
   `Shift+PgUp/PgDn` page; `Ctrl+wheel` zooms the font.
 
-## Orchestration (v3)
+## Task assignment & the shared board
 
-Turn a workspace into a coordinated team, not just parallel terminals:
+A workspace is a coordinated team, not just parallel terminals — but **every
+agent is a full, visible, interactive terminal you drive yourself.** There is no
+hidden "orchestrator" agent spawning or directing others behind the scenes;
+agents coordinate only by leaving notes on a shared board (see *Shared agent
+awareness* below).
 
-- **Shared activity log** — every agent (orchestrator AND workers) can post a
-  one-line note to the workspace board via a `log_activity` MCP tool; AI Hive
-  serializes those writes through the GUI so concurrent agents can't clobber
-  each other's entries. Workers are scoped to `log_activity` only (an
-  `AIHIVE_ROLE` guardrail refuses them spawn/retask/close), so peer awareness
-  is safe to hand every agent.
-- **Orchestrator agent** — when adding a Claude agent, tick **"Orchestrator"**.
-  It launches with the AI Hive MCP tools (`--mcp-config` + `--strict-mcp-config`
-  + pre-approved `mcp__aihive` tools, so no permission prompts) and can:
-  `spawn_agent` (create a worker with a role + task — it appears in the grid),
-  `assign_task` / `reassign_agent` (task a new or existing idle/completed
-  worker — typed into its live session, preserving context), `list_agents`,
-  `get_agent_output`, `set_agent_state`, and a soft `close_agent`. The channel
-  is a Windows named pipe (QLocalServer, zero new deps); the MCP server
-  (`app/mcp_server.py`) is stdlib-only. If it can't start, the app runs exactly
-  as before.
-- **Workspace-scoped tools** — every orchestrator is *bound to the workspace it
-  was created in*: its mcp config carries the workspace id (`AIHIVE_WS`), which
-  is echoed with every tool call and enforced GUI-side. It cannot list, retask,
-  or close agents in any other workspace, and name lookups (`"Agent 1"`) can
-  never match a same-named agent elsewhere. Every orchestrator mutation also
-  saves the session immediately.
-- **Dynamic role names** — agents are auto-named for their task (Backend
-  Architect, Database Engineer, Testing Agent, …) and rename as tasks change.
-- **Intelligent model/effort** — each task auto-selects a model + effort
+- **Shared activity log** — every Claude agent can post a one-line note to the
+  workspace board via a single `log_activity` MCP tool; AI Hive serializes those
+  writes through the GUI so concurrent agents can't clobber each other's
+  entries. That one tool (`--mcp-config` + `--strict-mcp-config` + a
+  pre-approved `mcp__aihive__log_activity`, so no permission prompts) is the
+  *only* thing an agent can call — agents post notes, they never spawn, retask,
+  or close each other. The channel is a Windows named pipe (QLocalServer, zero
+  new deps); the MCP server (`app/mcp_server.py`) is stdlib-only. If it can't
+  start, the app runs exactly as before (agents just can't post notes).
+- **Workspace-scoped** — each agent's mcp config carries its workspace id
+  (`AIHIVE_WS`), echoed with every call and enforced GUI-side, so a note always
+  lands on the right workspace's board and never crosses into another's.
+- **Dynamic role names** — when you reassign a card, the agent is auto-named for
+  its task (Backend Architect, Database Engineer, Testing Agent, …) and renames
+  as the task changes.
+- **Intelligent model/effort** — a reassigned task auto-selects a model + effort
   (trivial → Haiku/low, mid → Sonnet/medium, architecture → Opus/high); never
   auto-uses top-tier/max. Explicit picks always override. **Ultracode** appears
   in the effort dropdown but greyed out — it's an in-session mode you enable
   with `/effort ultracode` in a supporting model's terminal.
-- **Persistent agents (#9)** — auto-created agents **never** auto-close. A
-  completed worker stays in the grid with a **Completed / Working / Awaiting
-  Assignment** badge and a **⇄ Reassign** button, so you can review its work,
-  continue the conversation, or retask it. Only you close an agent.
+- **Persistent agents** — agents **never** auto-close. A completed agent stays
+  in the grid with a **Completed / Working / Awaiting Assignment** badge and a
+  **⇄ Reassign** button, so you can review its work, continue the conversation,
+  or retask it. Only you close an agent.
 - **Reassign anywhere** — the ⇄ button on any card assigns a fresh task
   (role/model adapt) without losing the session.
 
@@ -287,7 +282,24 @@ for peer awareness and post their own updates — so they can see what others
 are doing and avoid duplicate work. The **Activity** panel shows the roster,
 the log tail, and a best-effort `git status` view. Awareness is **scoped to
 the workspace** (the board lives in its folder); different workspaces are
-isolated. File-modification attribution is self-reported by agents in the log
+isolated.
+
+**What the board is (and isn't).** The board shares the *roster* and the *terse
+one-line notes* agents choose to log — **not** the text of your conversations.
+One agent cannot read another's chat; it sees only what landed on the board (or
+what changed on disk). So when a second agent seems to "know what you're working
+on," it picked that up from the roster line, a logged note, or the shared files
+— not from your dialogue with the first agent.
+
+**Versus two plain terminals in one folder.** Two raw CLI sessions in the same
+directory already share the *files* on disk (edit a file in one, the other sees
+it). What they do **not** get is any shared notes, any live roster, any sense of
+what the other is *doing*, or the auto-injected "read the board / log your
+activity" convention — and neither reads the other's conversation. AI Hive adds
+exactly that layer on top of the filesystem: it creates and maintains
+`board.md`, auto-`--add-dir`s it into every Claude agent with the etiquette
+system prompt, gives each a race-safe `log_activity` tool, and keeps the roster
+reflecting live state. File-modification attribution is self-reported by agents in the log
 plus the repo-wide git view — the app does not attribute individual OS file
 writes to a specific terminal. For a precise per-agent view, the **Agent/File
 Map** (the ◆ Map button) parses each Claude agent's own transcript to show
@@ -302,8 +314,8 @@ Hard-won rules, each with a regression test:
 - **Nothing structural is ever only-in-memory.** Adding or removing an agent
   or workspace saves the session *immediately* — a crash or force-kill cannot
   lose a just-created agent. Metadata changes (task, assignment, role, run
-  state, fonts) mark the session dirty and save on a short debounce; every
-  orchestrator mutation saves immediately. A periodic **safety-net autosave**
+  state, fonts) mark the session dirty and save on a short debounce. A
+  periodic **safety-net autosave**
   re-writes only when the live state has diverged from disk, so even a missed
   signal or a suppressed save can strand work for at most a few seconds.
 - **A save is never silent.** Suppressed saves (e.g. during close) and errors
@@ -369,10 +381,16 @@ Hard-won rules, each with a regression test:
   arrow keys — exact on the caret's own line, and best-effort on another line of
   a multi-line prompt (Up/Down to the row, then Left/Right to the predicted
   landing column) — so you can jump into your typed text without arrow-key
-  walking; a drag selects instead and never moves the caret. Double-click selects the whitespace-delimited word under the
-  pointer — an editable selection: `Ctrl+C` copies it, `Ctrl+X` cuts it, and
-  `Backspace`/`Del` deletes it (cut/delete drive the child's caret + Backspace,
-  so they act on a selection on the input line; off it the key just drops the
+  walking; a drag selects instead and never moves the caret. Double-click selects
+  the whitespace-delimited word under the pointer, **Shift+click** extends the
+  selection, and a **triple-click** selects the whole line. You can also select
+  from the **keyboard** like a desktop text area: **Shift+Arrow/Home/End** grows
+  the selection (**Ctrl** adds word granularity) without sending anything to the
+  child, and a plain arrow collapses it. Any selection — mouse or keyboard — is
+  editable: `Ctrl+C` copies it, `Ctrl+X` cuts it, and `Backspace`/`Del` deletes
+  it (cut/delete drive the child's caret + Backspace, so they act on a selection
+  anywhere inside the live input box — single **or** multi-row/wrapped, the
+  leading `> ` prompt never touched; off the input box the key just drops the
   selection). **Ctrl+click** (or a middle/scroll-wheel
   click) opens a URL or an existing
   absolute local file path under the pointer with the OS default handler —
@@ -393,9 +411,15 @@ Hard-won rules, each with a regression test:
   than falling through to the interrupt. The
   terminal can't see the child's real input buffer, so it's inference from
   painted rows: no `>` found means it falls back to the cursor row (`Home`
-  still jumps to line start). `Ctrl+Z`/`Ctrl+Y` are not
-  undo/redo — a terminal keeps no local edit buffer, so they forward to the
-  child, which owns line editing. Keyboard-protocol escapes that pyte mis-parses
+  still jumps to line start). `Ctrl+Z`/`Ctrl+Y` (and `Ctrl+Shift+Z`) are an
+  **approximate undo/redo**: a terminal keeps no local edit buffer, so this is a
+  coarse "restore previous input" built from snapshots of the inferred input
+  text (whole-prompt granularity, debounced into one step per typing burst) —
+  undo clears the prompt and re-pastes the prior snapshot, a submit forgets the
+  history, and an empty stack falls through to the old control bytes. (A true
+  per-keystroke undo would need a local composer, which would bypass Claude's own
+  `/`-slash, `@`-mention, and history UI — so this stays an approximation.)
+  Keyboard-protocol escapes that pyte mis-parses
   (e.g. xterm modifyOtherKeys) are filtered so text renders clean, not
   underlined.
 - **Line-console cards** stay line-oriented: full-screen TUIs won't render in
@@ -412,16 +436,16 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-715 checks drive the real app headlessly (offscreen Qt platform) with real
+722 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
 trips, the ConPTY path (interactive prompt, Ctrl+C, retention), every v2
 feature (provider flags, per-workspace numbering, the agent-count badge,
-explicit grids, folder changes, fonts, the shared board), v3 orchestration
-(role naming, model/effort selection, the named-pipe MCP round-trip,
-workspace scoping, immediate-save-on-mutation), inline agent rename in the
-card header (double-click; a custom name survives orchestrator retasks) plus
+explicit grids, folder changes, fonts, the shared board), task assignment
+(role naming, model/effort selection, the named-pipe `log_activity` MCP
+round-trip, workspace-scoped board notes), inline agent rename in the
+card header (double-click; a custom name survives a retask) plus
 a per-agent task summary beside the name, the per-card maximize/restore toggle
 (solo one agent full-area without touching any sibling's process, then restore
 the exact prior tiling) and the context-window usage badge beside the summary
@@ -461,8 +485,8 @@ app/
   pty_worker.py            ConPTY engine via pywinpty (full-terminal mode)
   terminal_agent.py        per-terminal model (worker + log/buffer + lifecycle)
   workspace_manager.py     model layer: workspaces, agents, spawn/assign/reassign
-  orchestrator_bridge.py   named-pipe RPC server (GUI side), workspace-scoped
-  mcp_server.py            stdlib MCP stdio server the Claude CLI spawns
+  orchestrator_bridge.py   named-pipe RPC server (GUI side) for board log_activity
+  mcp_server.py            stdlib MCP stdio server (log_activity) the Claude CLI spawns
   session_store.py         atomic JSON persistence (AppData) + save-audit log
   transcripts.py           Claude-transcript snapshots (start/close, high-water)
   session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
@@ -480,7 +504,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (715 checks)
+tests/smoke_test.py        headless end-to-end suite (722 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

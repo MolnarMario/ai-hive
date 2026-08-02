@@ -128,8 +128,8 @@ class TerminalAgent(QObject):
         self._ai_title = ""                 # Claude's live conversation title
         self._token_used = 0                # last-turn context occupancy (tokens)
         self._token_window = 0              # sized context window for the model
-        self.assignment = AssignmentState.IDLE  # orchestration lifecycle
-        self.auto_created = False           # spawned by the orchestrator (#9)
+        self.assignment = AssignmentState.IDLE  # task-assignment lifecycle
+        self.auto_created = False           # created with a task via spawn_worker
         self.autostart_on_restore = False  # set from persisted run state
         self.log: deque = deque(maxlen=LOG_CAP)  # line-mode segments
         self._pty_buffer: list[str] = []         # pty raw tail (for replay)
@@ -341,7 +341,7 @@ class TerminalAgent(QObject):
 
     def set_name(self, name: str) -> None:
         """User-facing rename of the display NAME only (role untouched). Marks
-        the name custom so an orchestrator retask (set_role) never clobbers it."""
+        the name custom so a retask (set_role) never clobbers it."""
         name = sanitize_text(name or "").strip()
         if name and name != self.spec.name:
             self.spec.name = name
@@ -382,7 +382,7 @@ class TerminalAgent(QObject):
         }
 
     def deliver_task(self, text: str) -> None:
-        """Give this agent a task to work on (orchestrator/reassign path).
+        """Give this agent a task to work on (spawn_worker/reassign path).
 
         For a pty agent (Claude Code) the task is delivered only once the TUI
         is prompt-ready (we watch its output stream for bracketed-paste-enable,

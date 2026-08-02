@@ -186,12 +186,11 @@ class AddTerminalDialog(QDialog):
     result_spec(); headless tests build specs directly.
     """
 
-    def __init__(self, default_name: str, parent=None, orchestrator_ok=False,
+    def __init__(self, default_name: str, parent=None,
                  cwd: str = "", busy_ids=()):
         super().__init__(parent)
         self.setWindowTitle("New Agent")
         self.setMinimumWidth(420)
-        self._orchestrator_ok = orchestrator_ok
         self._cwd = cwd
         self._busy_ids = set(busy_ids)  # conversations a running agent holds
         self._resume_loaded = False
@@ -267,12 +266,6 @@ class AddTerminalDialog(QDialog):
         self._args_label = QLabel("Args", self)
         form.addRow(self._args_label, self.args_edit)
         form.addRow("", self.pty_check)
-        self.orch_check = QCheckBox(
-            "Orchestrator (can spawn & assign other agents)", self)
-        self.orch_check.setToolTip(
-            "Launch this Claude agent with the AI Hive MCP tools so it can "
-            "create, task and coordinate a team of worker agents.")
-        form.addRow("", self.orch_check)
 
         self._ai_widgets = (self._model_label, self.model_combo,
                             self._effort_label, self.effort_combo)
@@ -318,12 +311,6 @@ class AddTerminalDialog(QDialog):
 
         for w in self._script_widgets:
             w.setVisible(needs_program)
-
-        # orchestrator option only for Claude, and only when the bridge is up
-        self.orch_check.setVisible(
-            self._orchestrator_ok and kind == AgentKind.CLAUDE)
-        if not (self._orchestrator_ok and kind == AgentKind.CLAUDE):
-            self.orch_check.setChecked(False)
 
         # AI provider fields
         self.provider_note.setVisible(is_ai)
@@ -455,9 +442,7 @@ class AddTerminalDialog(QDialog):
                 if not self.args_edit.isHidden() else []
             spec = build_spec(kind, name, cwd=cwd, model=model, effort=effort,
                               permission_mode=mode,
-                              custom_command=custom, args=extra,
-                              is_orchestrator=(not self.orch_check.isHidden()
-                                               and self.orch_check.isChecked()))
+                              custom_command=custom, args=extra)
             # resume a chosen past conversation: pin it and launch --resume <id>
             resume_id = (self.resume_combo.currentData()
                          if not self.resume_combo.isHidden() else "")
@@ -510,13 +495,12 @@ class MainWindow(QMainWindow):
         self._prompt_sync_timer.setInterval(PROMPT_SYNC_MS)
         self._prompt_sync_timer.timeout.connect(self.manager.sync_prompt_events)
 
-        # orchestrator control channel (named-pipe RPC → this GUI). Additive
-        # and guarded: if it can't listen, the app runs exactly as before.
-        # on_mutation: orchestrator mutations persist immediately — a debounce
-        # window is a loss window if the process is killed.
+        # shared-board control channel (named-pipe RPC → this GUI): relays each
+        # agent's log_activity note onto its workspace board. Additive and
+        # guarded: if it can't listen, the app runs exactly as before (agents
+        # simply can't post board notes).
         self.bridge = OrchestratorBridge(
-            manager, active_ws=lambda: self.manager.active_id, parent=self,
-            on_mutation=self._save_now)
+            manager, active_ws=lambda: self.manager.active_id, parent=self)
         self.bridge.start()
         # shared SessionStart-hook plumbing: ONE settings file (injected into
         # every Claude agent via --settings) + ONE mapping file the child hooks
@@ -560,11 +544,10 @@ class MainWindow(QMainWindow):
         Two things, both keyed off the agent being Claude:
           * the SessionStart hook that reports the agent's LIVE conversation id
             back to AI Hive (via --settings + a per-agent AIHIVE_AGENT_ID). This
-            is INDEPENDENT of the orchestrator bridge — every Claude agent gets
-            it, so conversation tracking works even with the bridge disabled.
-          * the per-workspace MCP config, scoped by role (orchestrators get the
-            full toolset, every other Claude agent a worker config —
-            log_activity only, enforced by role in the bridge)."""
+            is INDEPENDENT of the board bridge — every Claude agent gets it, so
+            conversation tracking works even with the bridge disabled.
+          * the per-workspace MCP config giving the agent the board's
+            log_activity tool (nothing more)."""
         if agent.spec.provider != "claude":
             return
         if self._hook_settings_path:
@@ -574,13 +557,12 @@ class MainWindow(QMainWindow):
             agent.spec.env["AIHIVE_AGENT_ID"] = agent.id
         if not self.bridge.enabled:
             return
-        role = "orchestrator" if agent.spec.is_orchestrator else "worker"
-        agent.spec.mcp_config_path = self.bridge.mcp_config_path_for(ws.id, role)
+        agent.spec.mcp_config_path = self.bridge.mcp_config_path_for(ws.id)
 
     def _rearm_agent_configs(self) -> None:
         # Re-arm EVERY restored Claude agent. Must NOT bail when the bridge is
         # disabled: the SessionStart hook (settings_path + AIHIVE_AGENT_ID) is
-        # independent of the orchestrator bridge, and _arm_agent_mcp already
+        # independent of the board bridge, and _arm_agent_mcp already
         # self-gates the MCP-config part on bridge.enabled. Bailing here would
         # leave restored agents with no live-conversation tracking exactly when
         # the bridge is unavailable — the case the hook most needs to cover.
@@ -1072,17 +1054,10 @@ class MainWindow(QMainWindow):
         busy_ids = {a.spec.session_id for a in ws.agents
                     if a.is_running() and a.spec.session_id}
         dialog = AddTerminalDialog(self.manager.next_agent_name(ws.id), self,
-                                   orchestrator_ok=self.bridge.enabled,
                                    cwd=ws.project_path, busy_ids=busy_ids)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         spec = dialog.result_spec(cwd=ws.project_path)
-        if spec.is_orchestrator and self.bridge.enabled:
-            spec.name = "Orchestrator" if spec.name.startswith("Agent") else spec.name
-            spec.role = spec.role or "Orchestrator"
-            # coordination prompt + board --add-dir + the role-scoped mcp
-            # config are all applied inside add_terminal (_apply_coordination
-            # + manager.arm_agent), so nothing else to wire here
         if self.manager.add_terminal(ws.id, spec) is None:
             QMessageBox.warning(self, "AI Hive",
                                 "This workspace is at its agent limit.")

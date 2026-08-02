@@ -42,9 +42,19 @@ anchored at Claude's '>' prompt row so it never climbs into the transcript;
 lacking the child's real buffer it's still inference from painted rows, so it
 falls back to the cursor row when no prompt glyph is found. (Home still jumps
 to line start via 0x1b[H.)
-Ctrl+Z/Ctrl+Y are NOT undo/redo -- a terminal keeps no local edit buffer, so
-they forward their control bytes (0x1a/0x19) to the child, which owns line
-editing.
+Ctrl+Z/Ctrl+Y (and Ctrl+Shift+Z) are an APPROXIMATE local undo/redo. A terminal
+keeps no local edit buffer, so this can't be a real per-keystroke history; it is
+a coarse "restore previous input" built from snapshots of the INFERRED input
+text (the painted input-box rows, debounced into one step per typing burst).
+Undo clears the prompt (double-Escape) and re-pastes the prior snapshot. Its
+limits are inherent: granularity is the whole prompt, not a character; a very
+long horizontally-scrolled input truncates in the snapshot; restore leaves the
+caret at the end; and a submit (bare Enter) forgets the history so it never
+bleeds a sent message into a fresh prompt. When the undo/redo stack is empty,
+Ctrl+Z/Ctrl+Y fall through to their old control bytes (0x1a/0x19) so nothing is
+lost for the child. (See _undo/_redo; the user chose this over a local composer,
+which would be exact but would bypass Claude's own /slash, @-mention, and history
+UI.)
 
 Mouse: when the child app requested mouse tracking (?1000/1002/1003 -- Claude
 Code enables all of these for its WHOLE session, not just while a menu is up),
@@ -85,23 +95,33 @@ hand cursor so it reads as the one you'd open. The full-screen scan
 (_rescan_links) can stat the filesystem, so it runs only when the visible
 content changes (guarded by a per-row-text signature in paintEvent), never per
 repaint; hover then reads the cached spans (_span_at) with no filesystem work.
-A mouse selection (double-click word or drag) is EDITABLE like any editor
-selection: Ctrl+C copies it, Ctrl+X cuts it, and Backspace/Del deletes it.
-Deletion/cut works only when the selection lies on the input line (the child's
-caret can be driven there with arrows + Backspace, exactly as click-to-position
-does); off the input line those keys simply drop the selection and touch nothing
-(the terminal can't edit an arbitrary span of the child's buffer). To empty the
-whole prompt at once, use Ctrl+A then Backspace (the clear-prompt gesture above).
+A selection can also be built from the KEYBOARD, like a desktop text area:
+Shift+Arrow/Home/End grows a local copy selection (Ctrl adds word granularity),
+sending NOTHING to the child -- it's a visual overlay that feeds copy/cut, so it
+works regardless of wrapping (_extend_kbd_selection). A plain (unshifted) arrow
+collapses it, then forwards to move the child's caret. Shift+click EXTENDS the
+current selection to the clicked cell; a TRIPLE-click selects the whole line.
+A selection (mouse OR keyboard) is EDITABLE like any editor selection: Ctrl+C
+copies it, Ctrl+X cuts it, and Backspace/Del deletes it. Deletion/cut drive the
+child's caret to the selection end + Backspace over it, so they act on any
+selection INSIDE the live input box -- single OR multi-row/wrapped (the box maps
+to the child's logical line, one Backspace per row transition; the leading '> '
+prompt is never counted). Fail-closed: a selection that escapes the input box
+(output/scrollback) or a scrolled-back view drops the selection and touches
+nothing -- inference from painted rows must never corrupt what it can't be sure
+of. To empty the whole prompt at once, use Ctrl+A then Backspace (the
+clear-prompt gesture above).
 """
 
 import collections
 import re
+import time
 
 import pyte
 from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
                            QPainter)
-from PySide6.QtWidgets import QMenu, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import ui_theme
 from ..ui_theme import ANSI_16, Palette
@@ -146,6 +166,12 @@ _MODIFIED_ARROWS = {
     Qt.Key.Key_Right: "C", Qt.Key.Key_Left: "D",
     Qt.Key.Key_Home: "H", Qt.Key.Key_End: "F",
 }
+
+# Caret-movement keys. With Shift they drive a LOCAL copy selection instead of
+# reaching the child (keyboard text-selection, like a desktop text area); a
+# plain (unshifted) one collapses any such selection first, then forwards.
+_NAV_KEYS = (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up,
+             Qt.Key.Key_Down, Qt.Key.Key_Home, Qt.Key.Key_End)
 
 HISTORY_LINES = 2000
 CELL_PAD_X = 6   # left/right inner padding (real terminals aren't flush)
@@ -276,6 +302,20 @@ class TerminalView(QWidget):
         self._sel_anchor = None  # (row, col) selection start, in screen coords
         self._sel_end = None     # (row, col) selection end
         self._input_selected = False  # Ctrl+A input-line highlight is active
+        # Keyboard-driven selection (Shift+Arrow/Home/End, Ctrl for word) reuses
+        # _sel_anchor/_sel_end -- purely a local copy overlay, no child bytes.
+        # Triple-click (whole-line select) needs the last double-click's
+        # time+cell to recognise the third press.
+        self._last_dbl_ts = 0.0
+        self._last_dbl_cell = None
+        # Approximate whole-input undo/redo: a bounded stack of snapshots of the
+        # INFERRED input text (the painted input-box rows). Coarse by nature --
+        # granularity is the whole prompt, not per-keystroke; it only sees what
+        # is painted; and restore re-pastes, leaving the caret at the end. See
+        # _undo/_redo and the module docstring.
+        self._undo_stack: list[str] = []
+        self._redo_stack: list[str] = []
+        self._undo_last = ""
         self._pending_fwd = None       # (row, col) of a press on a mouse-tracking
         #   app that is NOT YET forwarded: held until release so we can tell a
         #   click (forward it) from a drag (select locally). None = not pending.
@@ -309,6 +349,13 @@ class TerminalView(QWidget):
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(120)
         self._resize_timer.timeout.connect(self._apply_resize)
+
+        # debounce that coalesces a typing burst into ONE undo snapshot (see
+        # _snapshot_input / _kick_snapshot)
+        self._snap_timer = QTimer(self)
+        self._snap_timer.setSingleShot(True)
+        self._snap_timer.setInterval(600)
+        self._snap_timer.timeout.connect(self._snapshot_input)
 
     # -------------------------------------------------------------- data ---
 
@@ -379,6 +426,7 @@ class TerminalView(QWidget):
         self._mouse_sgr = False
         self._app_cursor_keys = False
         self._focus_reporting = False
+        self._reset_undo()
         self.update()
 
     def screen_text(self) -> str:
@@ -488,8 +536,14 @@ class TerminalView(QWidget):
             alt = bool(mods & Qt.KeyboardModifier.AltModifier)
             shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
             key = e.key()
+            # Shift+navigation (and Ctrl+Shift+arrow for word) is our keyboard
+            # text-selection gesture; Ctrl+Shift+Z is redo -- claim them so an
+            # app-level QShortcut can't swallow them before keyPressEvent.
+            nav = key in _NAV_KEYS
             if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab) \
-                    or (ctrl and not shift) or (alt and not shift):
+                    or (ctrl and not shift) or (alt and not shift) \
+                    or (shift and nav) \
+                    or (ctrl and shift and key == Qt.Key.Key_Z):
                 e.accept()
                 return True
         return super().event(e)
@@ -611,10 +665,49 @@ class TerminalView(QWidget):
             event.accept()
             return
 
+        # Ctrl+Z / Ctrl+Y (and Ctrl+Shift+Z) = APPROXIMATE local undo/redo of the
+        # inferred input text (see _undo/_redo + the module docstring). When the
+        # stack is empty, undo/Ctrl+Y fall THROUGH so the old passthrough control
+        # byte (0x1a/0x19) still reaches the child; Ctrl+Shift+Z is a new binding
+        # with no legacy meaning, so it is simply swallowed when there is nothing
+        # to redo.
+        if ctrl and not shift and key == Qt.Key.Key_Z:
+            if self._undo():
+                event.accept()
+                return
+        elif ctrl and key == Qt.Key.Key_Y:
+            if self._redo():
+                event.accept()
+                return
+        elif ctrl and shift and key == Qt.Key.Key_Z:
+            self._redo()
+            event.accept()
+            return
+
+        # Shift+navigation builds/extends a LOCAL copy selection (no bytes to the
+        # child), like a desktop text area; Ctrl adds word granularity. A plain
+        # (unshifted) nav key collapses any such selection, then forwards below.
+        if shift and not alt and key in _NAV_KEYS:
+            self._extend_kbd_selection(key, word=ctrl)
+            event.accept()
+            return
+        if (not shift and key in _NAV_KEYS and not self._input_selected
+                and self._selection_range() is not None):
+            self._sel_anchor = self._sel_end = None
+            self.update()
+            # fall through -> the key still forwards to move the child's caret
+
         seq = self._sequence_for(key, ctrl, shift, alt, event.text())
         if seq:
             self._snap_to_bottom()
             self.keyInput.emit(seq)
+            # keep the undo snapshot cadence: a submit (bare Enter) ends this
+            # input's history; other edit keys (re)arm the coalescing snapshot.
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) \
+                    and not (shift or ctrl or alt):
+                self._reset_undo()
+            else:
+                self._kick_snapshot(key, event.text())
             event.accept()
         else:
             super().keyPressEvent(event)
@@ -749,8 +842,21 @@ class TerminalView(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self.setFocus()
             self._input_selected = False  # a mouse drag is a copy selection
-            self._sel_anchor = self._cell_at(event.position())
-            self._sel_end = self._sel_anchor
+            cell = self._cell_at(event.position())
+            if shift and self._sel_anchor is not None:
+                self._sel_end = cell          # Shift+click EXTENDS the selection
+            elif (self._last_dbl_cell == cell
+                    and time.monotonic() - self._last_dbl_ts
+                    <= QApplication.doubleClickInterval() / 1000.0):
+                # TRIPLE-click (a press right after a double-click at the same
+                # cell) selects the whole line
+                first, last = self._row_content(cell[0])
+                self._sel_anchor = (cell[0], 0)
+                self._sel_end = (cell[0], last if last >= 0 else 0)
+                self._last_dbl_cell = None
+            else:
+                self._sel_anchor = cell
+                self._sel_end = cell
             self.update()
         super().mousePressEvent(event)
 
@@ -765,6 +871,10 @@ class TerminalView(QWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             self.setFocus()
             row, col = self._cell_at(event.position())
+            # remember this double-click so a following press at the same cell
+            # is recognised as a TRIPLE-click (whole-line select, mousePressEvent)
+            self._last_dbl_ts = time.monotonic()
+            self._last_dbl_cell = (row, col)
             rng = self._word_at(row, col)
             if rng:
                 self._input_selected = False  # a copy selection, not the Ctrl+A mark
@@ -915,28 +1025,104 @@ class TerminalView(QWidget):
         self._emit_arrows("C" if target > landing else "D", abs(target - landing))
 
     def _delete_selection(self) -> bool:
-        """Delete a mouse selection by driving the child's caret + Backspace --
-        a terminal can't edit a span of the child's buffer directly. Only a
-        SINGLE-ROW selection on the caret's own live-screen line maps 1:1 to
-        keystrokes (the same constraint as _reposition_cursor: on an unwrapped
-        line each column == one Left/Right == one input char, past the prompt).
-        A multi-row selection, an output/scrollback region, or a scrolled-back
-        view can't be deleted safely, so we leave the child untouched and
-        return False. Otherwise we park the caret just past the selection and
-        Backspace over it, and return True."""
+        """Delete a selection by driving the child's caret to its end, then
+        Backspacing over it -- a terminal can't edit a span of the child's
+        buffer directly. Works for a selection anywhere INSIDE the live input
+        box (single OR multi-row/wrapped): the box's rows map to the child's
+        logical line, so the character count is the painted cells across the
+        span plus one Backspace per row transition (each soft-wrap / explicit
+        newline is one editable char). Fail-closed: a scrolled-back view or a
+        selection that escapes the input box (output/scrollback) is left
+        untouched and returns False -- inference from painted rows must never
+        corrupt what it can't be sure of. The leading prompt run ('> ') on the
+        box's first row is never counted as deletable input."""
         rng = self._selection_range()
-        if rng is None:
+        if rng is None or self._scroll_offset:
             return False
         (r0, c0), (r1, c1) = rng
-        if self._scroll_offset or r0 != r1 or r0 != self.screen.cursor.y:
-            return False
-        count = c1 - c0 + 1
+        span = self._input_block_span()
+        if span is None or not (span[0] <= r0 and r1 <= span[1]):
+            return False  # selection escapes the input box
+        buf = self.screen.buffer
+        count = 0
+        for r in range(r0, r1 + 1):
+            first, last = self._row_content(r)
+            if last >= 0:
+                start = c0 if r == r0 else 0
+                end = min(c1 if r == r1 else last, last)
+                # don't count the box's leading '> ' prompt as input
+                if r == span[0] and buf[r][first].data in _INPUT_PROMPTS:
+                    pstart = first + 1
+                    while pstart <= last and buf[r][pstart].data in ("", " "):
+                        pstart += 1
+                    start = max(start, pstart)
+                if end >= start:
+                    count += end - start + 1
+            if r < r1:
+                count += 1  # the wrap/newline joining this row to the next
         if count <= 0:
             return False
         self._snap_to_bottom()
-        self._reposition_cursor(r0, c1 + 1)   # caret to just after the span
+        self._reposition_cursor(r1, c1 + 1)   # caret to just past the span end
         self.keyInput.emit("\x7f" * count)    # then Backspace over it
         return True
+
+    def _extend_kbd_selection(self, key, word: bool) -> None:
+        """Grow the LOCAL copy selection by one cell (or one word with Ctrl)
+        from the keyboard, WITHOUT sending anything to the child -- keyboard
+        text-selection, exactly like a desktop text area. Anchors at the child
+        caret on first use; the moving end is _sel_end. Purely visual, so it
+        works regardless of wrapping and feeds copy/cut just like the mouse
+        selection."""
+        self._snap_to_bottom()
+        self._input_selected = False
+        rows, cols = self.screen.lines, self.screen.columns
+        if self._sel_anchor is None or self._sel_end is None:
+            start = (self.screen.cursor.y, self.screen.cursor.x)
+            self._sel_anchor = start
+            self._sel_end = start
+        r, c = self._sel_end
+        if key == Qt.Key.Key_Left:
+            c = self._word_col(r, c, -1) if word else c - 1
+        elif key == Qt.Key.Key_Right:
+            c = self._word_col(r, c, +1) if word else c + 1
+        elif key == Qt.Key.Key_Up:
+            r -= 1
+        elif key == Qt.Key.Key_Down:
+            r += 1
+        elif key == Qt.Key.Key_Home:
+            c = 0
+        elif key == Qt.Key.Key_End:
+            c = self._row_content(r)[1]
+            if c < 0:
+                c = 0
+        self._sel_end = (max(0, min(rows - 1, r)), max(0, min(cols - 1, c)))
+        self.update()
+
+    def _word_col(self, r: int, c: int, direction: int) -> int:
+        """Column one word away from (r, c) in `direction` (+1 right / -1 left),
+        for Ctrl+Shift+Arrow selection. Same whitespace-run notion as the
+        double-click word select (_word_at)."""
+        hist, off = self._view_state()
+        line = self._visible_line(r, hist, off)
+        cols = self.screen.columns
+
+        def blank(i):
+            return i < 0 or i >= cols or line[i].data in ("", " ")
+
+        i = c
+        if direction > 0:
+            while i < cols and not blank(i):   # skip the current word
+                i += 1
+            while i < cols and blank(i):       # then the gap -> next word start
+                i += 1
+            return min(i, cols - 1)
+        i -= 1
+        while i >= 0 and blank(i):             # skip the gap to the left
+            i -= 1
+        while i > 0 and not blank(i - 1):      # then to the word's start
+            i -= 1
+        return max(i, 0)
 
     def _word_at(self, row: int, col: int):
         """(c0, c1) inclusive of the non-whitespace run at (row, col), or None
@@ -1152,6 +1338,100 @@ class TerminalView(QWidget):
             self._snap_to_bottom()
             self.keyInput.emit("\x1b\x1b")
         self.update()
+
+    # ------------------------------------------------- approximate undo ---
+    # A terminal keeps no local edit buffer, so this can't be a real per-
+    # keystroke undo. It is a COARSE, best-effort "restore previous input"
+    # built from snapshots of the INFERRED input text (the painted input-box
+    # rows). Limits, by construction: granularity is the whole prompt, not a
+    # character; the snapshot only sees what is painted (a very long,
+    # horizontally-scrolled input truncates); restore re-pastes and leaves the
+    # caret at the end; and it can interact oddly with Claude's own Up-arrow
+    # history. The user opted into this approximation over a local composer.
+
+    def _input_text(self) -> str:
+        """The inferred current input: the painted input-box rows joined, with
+        the leading '> ' prompt stripped. Empty when the caret isn't in an
+        input box."""
+        span = self._input_block_span()
+        if span is None:
+            return ""
+        top, bottom = span
+        buf = self.screen.buffer
+        out = []
+        for r in range(top, bottom + 1):
+            first, last = self._row_content(r)
+            if last < 0:
+                out.append("")
+                continue
+            start = first
+            if r == top and buf[r][first].data in _INPUT_PROMPTS:
+                start = first + 1
+                while start <= last and buf[r][start].data in ("", " "):
+                    start += 1
+            out.append("".join(buf[r][c].data for c in range(start, last + 1)))
+        return "\n".join(out).strip("\n")
+
+    def _kick_snapshot(self, key, text: str) -> None:
+        """(Re)arm the coalescing snapshot after an edit keystroke, so a typing
+        burst collapses into ONE undo step."""
+        if (text and text.isprintable()) or key in (
+                Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+            self._snap_timer.start()
+
+    def _snapshot_input(self) -> None:
+        """Push the PREVIOUS input onto the undo stack when the input changed --
+        the coalesced unit for one undo step."""
+        cur = self._input_text()
+        if cur != self._undo_last:
+            self._undo_stack.append(self._undo_last)
+            if len(self._undo_stack) > 50:
+                self._undo_stack.pop(0)
+            self._redo_stack.clear()
+            self._undo_last = cur
+
+    def _reset_undo(self) -> None:
+        """Forget the edit history -- called on submit (bare Enter) and reset,
+        so undo never bleeds a previous message into a fresh prompt."""
+        self._snap_timer.stop()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._undo_last = ""
+
+    def _apply_input_text(self, text: str) -> None:
+        """Replace the child's whole input with `text`: clear the prompt, then
+        paste it (bracketed if the child enabled it). Coarse -- the caret ends
+        at the end of the pasted text."""
+        self._snap_to_bottom()
+        self.keyInput.emit("\x1b\x1b")   # clear-prompt gesture
+        if text:
+            self._paste_text(text)
+
+    def _undo(self) -> bool:
+        """Restore the previous input snapshot. Returns False (so the caller
+        forwards the 0x1a control byte instead) when there is nothing to undo."""
+        if self._snap_timer.isActive():   # flush a pending coalesced edit first
+            self._snap_timer.stop()
+            self._snapshot_input()
+        if not self._undo_stack:
+            return False
+        self._redo_stack.append(self._input_text())
+        target = self._undo_stack.pop()
+        self._apply_input_text(target)
+        self._undo_last = target
+        return True
+
+    def _redo(self) -> bool:
+        """Re-apply the most recently undone snapshot. Returns False when there
+        is nothing to redo."""
+        if not self._redo_stack:
+            return False
+        self._snap_timer.stop()
+        self._undo_stack.append(self._input_text())
+        target = self._redo_stack.pop()
+        self._apply_input_text(target)
+        self._undo_last = target
+        return True
 
     def paste_clipboard(self) -> None:
         cb = QGuiApplication.clipboard()

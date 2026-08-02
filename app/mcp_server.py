@@ -1,4 +1,4 @@
-"""AI Hive MCP server — the orchestrator's control channel.
+"""AI Hive MCP server — the shared-board activity channel.
 
 A stdlib-only MCP stdio server the Claude CLI spawns via --mcp-config. It speaks
 newline-delimited JSON-RPC 2.0 on its own stdio (protocol contract verified
@@ -8,11 +8,16 @@ tool call over a Windows named pipe to the running AI Hive GUI
 (app.orchestrator_bridge). MUST NOT import PySide6 — it is a lightweight child
 of the CLI.
 
+The server exposes a single tool, `log_activity`, so every Claude agent can post
+a terse one-line note to its workspace's shared coordination board. (There is no
+orchestration here — agents don't spawn or direct each other; the board is a
+peer-awareness scratchpad, nothing more.)
+
 Run as:  python -m app.mcp_server   (with AIHIVE_PIPE in env, set by the
 bridge-generated mcp config; falls back to %LOCALAPPDATA%/AIHive/orchestrator.json).
-AIHIVE_WS (same config) is the workspace this orchestrator is BOUND to — it is
-echoed with every RPC and enforced by the GUI, scoping all tools to that
-workspace.
+AIHIVE_WS (same config) is the workspace this agent is BOUND to — it is echoed
+with every RPC and enforced by the GUI, so a note always lands on the right
+workspace's board.
 """
 
 import json
@@ -29,60 +34,6 @@ PROTOCOL_VERSION = "2025-11-25"
 # ---------------------------------------------------------------- tools ----
 
 TOOLS = [
-    {"name": "spawn_agent",
-     "description": "Create a NEW worker agent in the workspace and give it a "
-                    "task. It appears immediately in the grid and stays visible "
-                    "until the user closes it. Omit model/effort to auto-select "
-                    "by task (trivial→haiku, mid→sonnet, architecture→opus). "
-                    "Prefer reassign_agent to reuse an idle/completed agent "
-                    "before spawning a new one.",
-     "inputSchema": {"type": "object", "properties": {
-         "role": {"type": "string", "description": "role/title, e.g. 'Backend Architect'; also the agent's name"},
-         "task": {"type": "string", "description": "the task to work on"},
-         "model": {"type": "string", "enum": ["", "opus", "sonnet", "haiku", "fable"]},
-         "effort": {"type": "string", "enum": ["", "low", "medium", "high", "xhigh", "max"]},
-         "workspace_id": {"type": "string", "description": "optional; default = active workspace"}},
-         "required": ["task"]}},
-    {"name": "assign_task",
-     "description": "Send a task to an EXISTING agent (by id or display name). "
-                    "The agent's role/name adapt to the task.",
-     "inputSchema": {"type": "object", "properties": {
-         "agent": {"type": "string"}, "task": {"type": "string"},
-         "role": {"type": "string"}}, "required": ["agent", "task"]}},
-    {"name": "reassign_agent",
-     "description": "Retask an idle/completed agent, preserving its session "
-                    "(the task is typed into its existing terminal — no restart, "
-                    "no context loss).",
-     "inputSchema": {"type": "object", "properties": {
-         "agent_id": {"type": "string"}, "task": {"type": "string"},
-         "role": {"type": "string"}}, "required": ["agent_id", "task"]}},
-    {"name": "set_agent_state",
-     "description": "Mark an agent's lifecycle state. Use 'completed' when its "
-                    "task is done (the card stays visible with a Completed badge; "
-                    "agents never auto-close).",
-     "inputSchema": {"type": "object", "properties": {
-         "agent_id": {"type": "string"},
-         "state": {"type": "string", "enum": ["working", "completed", "idle", "awaiting"]}},
-         "required": ["agent_id", "state"]}},
-    {"name": "list_agents",
-     "description": "Snapshot of every agent (id, name, role, model, status, "
-                    "assignment, task). Use this to see what the team is doing.",
-     "inputSchema": {"type": "object", "properties": {
-         "workspace_id": {"type": "string"}}}},
-    {"name": "get_agent_output",
-     "description": "Recent terminal output for an agent (best-effort screen "
-                    "snapshot). Prefer the shared board for structured progress.",
-     "inputSchema": {"type": "object", "properties": {
-         "agent_id": {"type": "string"},
-         "lines": {"type": "integer", "default": 80, "maximum": 400}},
-         "required": ["agent_id"]}},
-    {"name": "close_agent",
-     "description": "Soft-close (mark Completed, keep the card) by default. "
-                    "Only force=true removes the agent — the user normally "
-                    "decides when agents disappear.",
-     "inputSchema": {"type": "object", "properties": {
-         "agent_id": {"type": "string"}, "force": {"type": "boolean", "default": False}},
-         "required": ["agent_id"]}},
     {"name": "log_activity",
      "description": "Record a terse one-line activity note on the workspace's "
                     "shared board (the ## Activity log). Use this to tell peers "
@@ -125,14 +76,12 @@ def _rpc(op: str, args: dict, timeout: float = 20.0) -> dict:
     def worker():
         try:
             with open(path, "r+b", buffering=0) as pipe:
-                # AIHIVE_WS + AIHIVE_ROLE (set in this server's env by its
-                # per-workspace mcp config) bind every op to the launching
-                # workspace and role — the GUI enforces both; this is just the
-                # identity channel
+                # AIHIVE_WS (set in this server's env by its per-workspace mcp
+                # config) binds the note to the launching workspace's board —
+                # this is just the identity channel.
                 req = json.dumps({"id": uuid.uuid4().hex, "op": op,
                                   "args": args,
-                                  "ws": os.environ.get("AIHIVE_WS", ""),
-                                  "role": os.environ.get("AIHIVE_ROLE", "")})
+                                  "ws": os.environ.get("AIHIVE_WS", "")})
                 pipe.write((req + "\n").encode("utf-8"))
                 buf = bytearray()
                 while b"\n" not in buf:

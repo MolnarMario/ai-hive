@@ -371,9 +371,10 @@ class WorkspaceManager(QObject):
         self.dirty.emit()
         agent.deleteLater()
 
-    # ----------------------------------------------------- orchestration ---
-    # Both the UI (card buttons / dialogs) and the MCP orchestrator call these
-    # same methods, so behavior is identical with or without the orchestrator.
+    # -------------------------------------------------- task assignment ---
+    # The UI card buttons / dialogs drive these (e.g. the card "Reassign"
+    # action -> reassign_agent). They pick a role-based name + model/effort
+    # for a task via app.orchestration's heuristics.
 
     def spawn_worker(self, ws_id: str, task: str, role: str = "",
                      model: str = "", effort: str = "",
@@ -622,15 +623,10 @@ class WorkspaceManager(QObject):
             return
         agent.spec.extra_dirs = [ws.board.dir]
         if agent.spec.provider == "claude":
-            # role-aware: orchestrators get the team-management prompt, workers
-            # the peer-etiquette prompt (must not clobber an orchestrator's
-            # prompt with the worker one)
-            if agent.spec.is_orchestrator:
-                agent.spec.system_prompt = coordination.orchestrator_prompt_text(
-                    ws.name, ws.board.path)
-            else:
-                agent.spec.system_prompt = coordination.system_prompt_text(
-                    ws.name, agent.spec.name, ws.board.path)
+            # every Claude agent gets the peer-etiquette prompt: read the board
+            # before starting work, and log_activity as it goes
+            agent.spec.system_prompt = coordination.system_prompt_text(
+                ws.name, agent.spec.name, ws.board.path)
 
     def _recompute(self, ws_id: str) -> None:
         ws = self.workspace(ws_id)

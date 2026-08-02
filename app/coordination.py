@@ -42,25 +42,6 @@ def system_prompt_text(workspace_name: str, agent_name: str,
         f"can't clobber each other's entries.")
 
 
-def orchestrator_prompt_text(workspace_name: str, board_path: str) -> str:
-    return (
-        f"You are the ORCHESTRATOR for the AI Hive \"{workspace_name}\" "
-        f"workspace. You manage a team of worker agents through the `aihive` "
-        f"MCP tools: spawn_agent (create a worker with a role + task; omit "
-        f"model/effort to auto-select — use the cheapest model that fits, do "
-        f"NOT use top models for trivial work), assign_task / reassign_agent "
-        f"(retask an existing idle or completed worker — PREFER reusing a "
-        f"completed/idle agent over spawning a new one, since there is a cap "
-        f"and agents are never auto-closed), list_agents (see the whole team), "
-        f"get_agent_output (peek at a worker), set_agent_state (mark a worker "
-        f"'completed' when its task is done — its card stays visible for the "
-        f"user), and close_agent (soft by default; only force-close on request). "
-        f"Break the user's goal into tasks, assign them to well-named "
-        f"role-based agents, watch the shared board at {board_path}, and keep "
-        f"the user informed. You decide models/effort per task to balance "
-        f"quality, speed and cost.")
-
-
 def sanitize_text(text: str) -> str:
     """Drop lone UTF-16 surrogates from a string. JSON (session files, MCP
     tool calls) legally carries them, but strict UTF-8 files and pipes REFUSE
