@@ -6,6 +6,7 @@ Every dialog lives here so the model API stays headless-testable.
 
 import os
 import threading
+import time
 
 from PySide6.QtCore import QProcess, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -72,6 +73,12 @@ AUTO_CONTINUE_STAGGER_MS = 2000
 # What gets typed. Short on purpose: the agent still holds the whole
 # conversation, so it needs a go-ahead, not a restatement of the work.
 AUTO_CONTINUE_TEXT = "Continue"
+# How often to check whether a cut-off agent's OWN stated reset time has
+# passed. This is the network-free trigger and the one that actually has to be
+# reliable: the usage endpoint 429s intermittently and its "cleared" edge can
+# be missed entirely, which is exactly how a night's work was lost. Pure
+# in-memory comparison, so a minute costs nothing.
+LIMIT_WATCH_MS = 60000
 
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [
@@ -476,7 +483,6 @@ class AddTerminalDialog(QDialog):
         self.resume_combo.addItem("New conversation", "")
         if not self._cwd:
             return
-        import time
 
         from app import session_sync
         for conv in session_sync.conversation_previews(self._cwd):
@@ -599,6 +605,7 @@ class MainWindow(QMainWindow):
         self._usage_inflight = False  # one request at a time, never stack
         self._plan_blocked = False    # edge state for planLimitReached/Cleared
         self._auto_continue = True    # user preference (persisted)
+        self._usage_backoff = 0       # consecutive 429s -> exponential poll gap
         self._usage_timer = QTimer(self)
         self._usage_timer.setInterval(USAGE_POLL_MS)
         self._usage_timer.timeout.connect(self._poll_usage)
@@ -610,6 +617,12 @@ class MainWindow(QMainWindow):
         self._usage_reset_timer = QTimer(self)
         self._usage_reset_timer.setSingleShot(True)
         self._usage_reset_timer.timeout.connect(self._poll_usage)
+        # the network-free auto-continue trigger: resume a cut-off agent once
+        # the reset time ITS OWN banner stated has passed, whatever the API is
+        # doing (or not doing)
+        self._limit_watch_timer = QTimer(self)
+        self._limit_watch_timer.setInterval(LIMIT_WATCH_MS)
+        self._limit_watch_timer.timeout.connect(self._check_limit_resets)
 
         # shared-board control channel (named-pipe RPC → this GUI): relays each
         # agent's log_activity note onto its workspace board. Additive and
@@ -652,6 +665,7 @@ class MainWindow(QMainWindow):
         self._heartbeat_timer.start()
         self._session_sync_timer.start()
         self._prompt_sync_timer.start()
+        self._limit_watch_timer.start()
 
     def _arm_agent_mcp(self, ws, agent) -> None:
         """Arm a Claude agent's per-run launch config before it starts (and
@@ -913,6 +927,8 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         if reading is not None and reading.ok:
+            self._usage_backoff = 0
+            self._usage_timer.setInterval(USAGE_POLL_MS)
             self._apply_usage(reading)
             return
         # A failed poll keeps the last good number on screen, greyed, rather
@@ -923,6 +939,14 @@ class MainWindow(QMainWindow):
             self._usage_timer.stop()
             self._usage_tick_timer.stop()
             return
+        # The endpoint rate-limits (observed: two 429s in a row, then a 200).
+        # Backing off matters beyond politeness — a minute timer that keeps
+        # firing into a 429 is how the app can go hours without ever seeing the
+        # blocked state, which is what the plan-limit edges are derived from.
+        # The auto-continue watchdog is deliberately independent of all this.
+        if reading is not None and reading.error == "http 429":
+            self._usage_backoff = min(self._usage_backoff + 1, 4)
+            self._usage_timer.setInterval(USAGE_POLL_MS * (2 ** self._usage_backoff))
         self.top_bar.usage_badge.mark_stale(True)
 
     def _apply_usage(self, reading) -> None:
@@ -949,7 +973,6 @@ class MainWindow(QMainWindow):
         if blocked is None or blocked.resets_at is None:
             self._usage_reset_timer.stop()
             return
-        import time
         delay = int((blocked.resets_at - time.time()) * 1000) + USAGE_RESET_GRACE_MS
         # QTimer takes a 32-bit interval; a far-future reset is covered by the
         # ordinary minute poll, so only arm when it's genuinely near.
@@ -973,26 +996,47 @@ class MainWindow(QMainWindow):
         self._auto_continue = bool(on)
         self._schedule_save()   # a UI preference, like sound_enabled
 
-    def _resume_blocked_agents(self) -> None:
-        """The plan limit just reset — put the agents it cut off back to work.
+    def _check_limit_resets(self) -> None:
+        """Network-free trigger: resume any cut-off agent whose OWN banner said
+        the limit would be back by now.
 
-        Wired to `planLimitCleared`, whose `_arm_reset_poll` cushion means this
-        lands within seconds of the window reopening rather than up to a minute
-        late. That promptness is the point: the first message after a window
-        expires is what STARTS the next 5-hour window, so resuming at 4am also
-        means the clock has rolled over by morning.
+        This is the RELIABLE half, and it exists because the API half isn't:
+        the usage endpoint 429s intermittently, and its "cleared" edge only
+        fires if this same process also observed the blocked state first — so a
+        restart, a bad poll, or a missed edge silently costs a whole night. The
+        banner states its reset time in local clock time, latched when it was
+        drawn, so this needs neither the network nor process continuity.
+        """
+        if self._closing or not self._ready or not self._auto_continue:
+            return
+        now = time.time()
+        self._resume_blocked_agents(
+            due=lambda a: (a.limit_resets_at() or 0) <= now)
 
-        Only agents still parked on the limit banner are touched
-        (`is_limit_blocked`) — the reading that fired this edge is account-wide
-        and cannot say who was mid-turn. An agent that is busy again, waiting on
-        some other prompt, or was never cut off is left alone.
+    def _resume_blocked_agents(self, due=None) -> None:
+        """The plan limit reset — put the agents it cut off back to work.
+
+        Two triggers land here. `planLimitCleared` (no `due` filter) means the
+        ACCOUNT is provably clear, so every latched agent goes; its
+        `_arm_reset_poll` cushion makes that land within seconds of the window
+        reopening. `_check_limit_resets` passes a `due` predicate so only agents
+        whose own stated reset has passed are touched. Promptness is the point
+        either way: the first message after a window expires is what STARTS the
+        next 5-hour window, so resuming at 4am also means the clock has rolled
+        over by morning.
+
+        Only agents LATCHED as cut off are touched (`is_limit_blocked`, set when
+        the banner was drawn) — the account-wide reading cannot say who was
+        mid-turn. An agent that is busy again, or was never cut off, is left
+        alone.
         """
         if self._closing or not self._ready or not self._auto_continue:
             return
         blocked = [a for a in self.manager.all_agents()
                    if a.spec.provider == "claude" and a.is_pty
                    and a.is_running() and not a.is_busy()
-                   and a.is_limit_blocked()]
+                   and a.is_limit_blocked()
+                   and (due is None or due(a))]
         for i, agent in enumerate(blocked):
             # Stagger, then Esc, then type. The Esc closes the limit's options
             # menu (upgrade / extra usage / cancel) that is sitting over the
@@ -1014,6 +1058,9 @@ class MainWindow(QMainWindow):
                 return
             if not agent.nudge(AUTO_CONTINUE_TEXT):
                 return
+            # drop the latch so the watchdog doesn't nudge it every minute; a
+            # fresh cut-off re-latches on the next settle
+            agent.clear_limit_block()
             # audit trail: on the card, and on the workspace board. The board
             # write goes through the same serialized append the log_activity
             # tool uses, so it can't interleave with an agent's own note.
@@ -1568,6 +1615,7 @@ class MainWindow(QMainWindow):
         self._heartbeat_timer.stop()
         self._session_sync_timer.stop()
         self._prompt_sync_timer.stop()
+        self._limit_watch_timer.stop()
         self._usage_timer.stop()
         self._usage_tick_timer.stop()
         self._usage_reset_timer.stop()

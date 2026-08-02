@@ -220,13 +220,29 @@ this file is the invariants that must survive every change.
   (`MainWindow._resume_blocked_agents`, wired to `planLimitCleared`). The usage
   reading is ACCOUNT-wide — it knows the plan is out and until when, but never
   WHICH agents were mid-turn — so attribution comes from
-  `TerminalAgent.is_limit_blocked()`, a `_LIMIT_HIT_RE` scrape of the settled
-  screen. That scrape is evaluated ONLY at the reset edge, never on a timer:
-  an agent that was cut off is still parked on the banner (nothing has redrawn
-  it), so one look at the right moment is both sufficient and cheaper than
-  per-settle state. `_LIMIT_HIT_RE` matches ONLY the exhausted banner
+  `TerminalAgent.is_limit_blocked()`, a LATCH set by `_scrape_limit` on the
+  idle-timer settle — the same "frame is current" moment `_screen_waiting`
+  uses — and cleared only by start/restart or `clear_limit_block()` after a
+  resume. Do NOT "simplify" this back to scraping at the reset edge instead
+  (it was written that way first and cost a full night's unattended work):
+  `_screen_tail` is a 4000-char ROLLING buffer and Claude's TUI keeps redrawing
+  its input box while parked, so hours later the banner has been evicted and
+  the tail holds only the bottom of a frame — the re-scrape matched nothing and
+  resumed nobody. `_LIMIT_HIT_RE` matches ONLY the exhausted banner
   (`You've hit your … limit`), never `Approaching …` / `You've used N% …` —
   those mean the agent is still WORKING and nudging it would interrupt it.
+  TWO triggers land in `_resume_blocked_agents`, and the second is the one that
+  must be reliable: (1) `planLimitCleared` resumes every latched agent (the
+  ACCOUNT is provably clear); (2) `_check_limit_resets` on `LIMIT_WATCH_MS`
+  resumes an agent once the reset time ITS OWN banner stated
+  (`limit_resets_at`, parsed by `parse_reset_clock`) has passed. The API edge
+  alone is NOT sufficient — it fires only if the SAME process also observed the
+  blocked state first, and `/api/oauth/usage` 429s intermittently (observed:
+  two in a row, then a 200), so a restart or a few bad polls silently skips the
+  resume entirely. The watchdog needs neither the network nor process
+  continuity. Relatedly `_on_usage_ready` backs the poll off exponentially on
+  429 (`_usage_backoff`) — a minute timer firing into a rate limit is how the
+  app can go hours never seeing `blocked` at all.
   Delivery is Esc (close the limit's options menu) then the text a beat later
   (`AUTO_CONTINUE_ESC_MS`), agents staggered by `AUTO_CONTINUE_STAGGER_MS` so
   they don't all pile into the freshly reopened window. CRITICAL: the text goes

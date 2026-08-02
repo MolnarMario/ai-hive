@@ -93,8 +93,12 @@ workspaces keep executing — switching never pauses anything.
   window expires is what STARTS the next 5-hour window, resuming at 4am also
   means the clock has already rolled over by the time you sit down. Each resumed
   card shows a `— plan limit reset; auto-continued —` line and the workspace
-  board gets a note. On by default; right-click the top bar to turn it off. (The
-  app has to be running at reset time — a closed window is a dead process.)
+  board gets a note. On by default; right-click the top bar to turn it off. The
+  cut-off is recorded the moment the banner appears, along with the reset time
+  the banner itself states, so the resume doesn't depend on the usage API being
+  reachable — it fires from the agent's own stated reset even if the account
+  readout is rate-limited. (The app has to be running at reset time — a closed
+  window is a dead process.)
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
@@ -461,7 +465,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-788 checks drive the real app headlessly (offscreen Qt platform) with real
+798 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round

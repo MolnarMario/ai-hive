@@ -104,21 +104,60 @@ _OPTION_CARET_RE = re.compile(r"(?m)^[\s│┃|]*[>❯❱]\s*\d+\.\s+\S")
 
 # --- "this agent was cut off by the plan limit" detection ---
 # WHICH agents to resume when the window reopens. The plan-usage reading
-# (app/claude_usage.py) is ACCOUNT-wide — it says the account is out, never
-# which agents were mid-turn — so attribution has to come from the screen.
-# An agent that was cut off is still SHOWING the banner when the limit resets
-# (it is stuck; nothing has redrawn it), which is why this is only ever
-# evaluated at that one moment rather than on every settle.
+# (app/claude_usage.py) is ACCOUNT-wide — it says the account is out and until
+# when, never which agents were mid-turn — so attribution has to come from the
+# screen, and it must be LATCHED THE MOMENT THE BANNER IS DRAWN.
+# Do NOT go back and scrape at reset time instead (the original mistake, which
+# cost a whole night's unattended work): `_screen_tail` is a 4000-char ROLLING
+# buffer, and Claude's TUI keeps redrawing its input box and footer while
+# parked, so after an hour or two of idling the banner has been evicted and the
+# tail holds only the bottom of a frame. The settle point below is the only
+# moment the frame is current — the same reason `_screen_waiting` works.
 # Matches ONLY the exhausted banner (`You've hit your session limit · resets
-# 4:40am`), never the `Approaching …` / `You've used 62% of your …` warnings —
+# 8:30pm`), never the `Approaching …` / `You've used 62% of your …` warnings —
 # those mean the agent is still working, and nudging it would interrupt it.
 # Verified against claude.exe 2.1.220, which renders these from the templates
 # `You've hit your ${label}` with {five_hour:"session limit",
-# seven_day:"weekly limit"}. Presence only: the reset TIME comes from the usage
-# endpoint, so a reworded banner costs at most this one pattern.
+# seven_day:"weekly limit"}.
 _LIMIT_HIT_RE = re.compile(r"you['’]ve hit your\s+"
                            r"(?:session|weekly|usage|opus|sonnet)\s+limit",
                            re.I)
+# The banner states its own reset time ("· resets 8:30pm (Europe/Bucharest)"),
+# already in LOCAL time. This is the second, network-free trigger: it survives
+# a usage-endpoint 429, a missed API edge, and an app restart, none of which
+# the account-wide reading does. The timezone suffix is ignored on purpose —
+# the clock shown is the user's own.
+_LIMIT_RESET_RE = re.compile(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+                             re.I)
+
+
+def parse_reset_clock(text: str, now: float | None = None) -> float | None:
+    """Epoch seconds of the NEXT occurrence of the wall clock in a limit
+    banner, or None when there is no time in it.
+
+    A bare clock time has no date, so it resolves to today if that moment is
+    still ahead and tomorrow otherwise — the rollover that matters, since the
+    banner is usually read late at night about a small-hours reset.
+    """
+    m = _LIMIT_RESET_RE.search(text or "")
+    if not m:
+        return None
+    hour, minute, ampm = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+    if ampm:
+        ampm = ampm.lower()
+        if hour == 12:
+            hour = 0
+        if ampm == "pm":
+            hour += 12
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    now = time.time() if now is None else now
+    lt = time.localtime(now)
+    target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hour, minute, 0,
+                          0, 0, -1))
+    if target <= now:
+        target += 86400
+    return target
 
 
 class TerminalAgent(QObject):
@@ -175,6 +214,10 @@ class TerminalAgent(QObject):
         self._busy = False            # actively streaming output right now
         self._last_output_ts = 0.0    # walltime of the last output burst
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
+        # latched "the plan limit cut this agent off" + the reset time its own
+        # banner stated. Transient like the waiting flags — never persisted.
+        self._limit_blocked = False
+        self._limit_resets_at: float | None = None
         # "waiting for the user" is the OR of three independent sources (see
         # _emit_waiting): _scrape_waiting (the settled screen shows a numbered
         # menu + selection caret — a permission prompt), _tool_waiting (an
@@ -211,6 +254,7 @@ class TerminalAgent(QObject):
         self._ready_tail = ""
         self._screen_tail = ""
         self._reset_waiting()
+        self.clear_limit_block()
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         # a NON-resume start is a new conversation, so it gets a new pinned
@@ -263,6 +307,7 @@ class TerminalAgent(QObject):
         self._ready_tail = ""
         self._screen_tail = ""
         self._reset_waiting()
+        self.clear_limit_block()
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         if self.spec.provider == "claude":  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
@@ -584,6 +629,9 @@ class TerminalAgent(QObject):
         # the screen has settled (2 s quiet) — is it a prompt awaiting the user?
         self._scrape_waiting = self._screen_waiting()
         self._emit_waiting()
+        # ...and is this the plan-limit banner? Latch it NOW, while the frame is
+        # current; by reset time the rolling tail no longer holds it.
+        self._scrape_limit()
 
     def _screen_waiting(self) -> bool:
         # ground-truth on the drawn box; suppress for a mode that shows no
@@ -604,20 +652,39 @@ class TerminalAgent(QObject):
         return has_caret and n_opts >= 2
 
     def is_limit_blocked(self) -> bool:
-        """True when this agent's screen is showing the plan-limit banner —
-        i.e. THIS agent is one of the ones that got cut off.
+        """True when this agent was cut off by the plan limit and hasn't been
+        resumed yet. LATCHED when the banner was drawn (see _scrape_limit), not
+        re-derived on demand — by reset time the banner is long gone from the
+        rolling screen tail. Says WHICH agents to resume, which the
+        account-wide usage reading cannot know."""
+        return self._limit_blocked
 
-        Deliberately stateless and unsignalled: the caller (the auto-continue
-        on `MainWindow.planLimitCleared`) asks exactly once, at the moment the
-        window reopens, when a cut-off agent is still parked on the banner.
-        The account-wide reading in `app/claude_usage.py` says WHETHER the
-        plan is out and until when; this says WHICH agents to resume, which
-        the endpoint cannot know. See _LIMIT_HIT_RE.
+    def limit_resets_at(self) -> float | None:
+        """Epoch seconds the banner said this agent's limit resets, or None if
+        it didn't say. The network-free half of the auto-continue trigger."""
+        return self._limit_resets_at
+
+    def _scrape_limit(self) -> None:
+        """Latch the plan-limit banner from the SETTLED screen (idle-timer
+        only, never mid-render — a half-drawn frame must not trip it).
+
+        Sticky once set: the agent is parked and its own redraws must not clear
+        it, which is exactly what a rolling-buffer re-scrape got wrong. It is
+        cleared explicitly instead — on start/restart, and by
+        `clear_limit_block` once we've resumed it.
         """
-        if self.spec.provider != "claude":
-            return False
+        if self.spec.provider != "claude" or self._limit_blocked:
+            return
         region = "\n".join(self._screen_tail.splitlines()[-18:])
-        return bool(region) and bool(_LIMIT_HIT_RE.search(region))
+        if not region or not _LIMIT_HIT_RE.search(region):
+            return
+        self._limit_blocked = True
+        self._limit_resets_at = parse_reset_clock(region)
+
+    def clear_limit_block(self) -> None:
+        """Forget the latched cut-off (we resumed it, or it restarted)."""
+        self._limit_blocked = False
+        self._limit_resets_at = None
 
     # -------------------------------------------------------------- slots ---
 

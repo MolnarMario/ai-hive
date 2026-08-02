@@ -5446,25 +5446,67 @@ def test_auto_continue_on_limit_reset():
         return a
 
     writes: dict = {}
+
+    def settle(agent, screen):
+        """Feed a settled screen through the real idle-timer path."""
+        agent._screen_tail = screen
+        agent._on_idle_timeout()
+
     a = mk()
+    settle(a, "")
     check("auto-continue: a clean screen is not limit-blocked",
           not a.is_limit_blocked())
-    a._screen_tail = "Approaching session limit \xb7 resets 4:40am\n"
+    settle(a, "Approaching session limit \xb7 resets 4:40am\n")
     check("auto-continue: an 'Approaching' warning is NOT a cut-off",
           not a.is_limit_blocked())
-    a._screen_tail = "You've used 62% of your session limit \xb7 resets 4:40am\n"
+    settle(a, "You've used 62% of your session limit \xb7 resets 4:40am\n")
     check("auto-continue: a 'You've used N%' warning is NOT a cut-off",
           not a.is_limit_blocked())
-    a._screen_tail = BANNER
+    settle(a, BANNER)
     check("auto-continue: the exhausted banner IS a cut-off",
           a.is_limit_blocked())
-    a._screen_tail = "You’ve hit your weekly limit \xb7 resets Tue\n"
+    check("auto-continue: the banner's own reset time is latched with it",
+          a.limit_resets_at() is not None)
+
+    # THE REGRESSION that cost a night's work: the banner is latched when it is
+    # DRAWN, because _screen_tail is a rolling buffer — by reset time the agent
+    # has idled for hours and its own redraws have evicted the banner. A
+    # re-scrape at that point sees only the bottom of a frame and resumes
+    # nobody.
+    settle(a, "\xe2\x94\x82 > \xe2\x94\x82\n  ? for shortcuts\n")
+    check("auto-continue: the latch SURVIVES the banner scrolling out of the "
+          "rolling screen tail", a.is_limit_blocked())
+    a.clear_limit_block()
+    check("auto-continue: clearing the latch forgets the reset time too",
+          not a.is_limit_blocked() and a.limit_resets_at() is None)
+
+    curly = mk()
+    settle(curly, "You’ve hit your weekly limit \xb7 resets 3am\n")
     check("auto-continue: curly apostrophe + weekly window also detected",
-          a.is_limit_blocked())
+          curly.is_limit_blocked())
     non_claude = mk(name="Shell", provider="cmd", pty=True)
-    non_claude._screen_tail = BANNER
+    settle(non_claude, BANNER)
     check("auto-continue: a non-Claude agent is never limit-blocked",
           not non_claude.is_limit_blocked())
+
+    # --- the banner's clock -> the next occurrence of that wall time ---------
+    from app.terminal_agent import parse_reset_clock
+    base = _time.mktime((2026, 8, 2, 23, 50, 0, 0, 0, -1))   # 23:50 local
+    at = parse_reset_clock("\xb7 resets 4:40am (Europe/Bucharest)", base)
+    lt = _time.localtime(at)
+    check("auto-continue: a small-hours reset read late at night rolls over "
+          "to tomorrow",
+          (lt.tm_hour, lt.tm_min) == (4, 40) and at > base
+          and at - base < 6 * 3600)
+    noon = _time.mktime((2026, 8, 2, 12, 0, 0, 0, 0, -1))
+    lt2 = _time.localtime(parse_reset_clock("resets 8:30pm", noon))
+    check("auto-continue: pm is read as afternoon, same day",
+          (lt2.tm_hour, lt2.tm_min) == (20, 30))
+    lt3 = _time.localtime(parse_reset_clock("resets 12:15am", noon))
+    check("auto-continue: 12:15am is after midnight, not noon",
+          (lt3.tm_hour, lt3.tm_min) == (0, 15))
+    check("auto-continue: a banner with no time yields no reset",
+          parse_reset_clock("You've hit your session limit") is None)
 
     # --- nudge() must not disturb any PERSISTED metadata --------------------
     n = mk()
@@ -5492,10 +5534,10 @@ def test_auto_continue_on_limit_reset():
     ws = mgr.workspaces[0]
 
     cut_off, busy, fine = mk("CutOff"), mk("Busy"), mk("Fine")
-    cut_off._screen_tail = BANNER
-    busy._screen_tail = BANNER
+    settle(cut_off, BANNER)
+    settle(busy, BANNER)
     busy._busy = True                    # already moving again
-    fine._screen_tail = "all done\n"     # was never cut off
+    settle(fine, "all done\n")           # was never cut off
     ws.agents.extend([cut_off, busy, fine])
 
     win._resume_blocked_agents()
@@ -5524,6 +5566,7 @@ def test_auto_continue_on_limit_reset():
     # the real trigger is the plan-limit falling edge, not a timer
     writes.clear()
     win._on_auto_continue(True)
+    settle(cut_off, BANNER)        # cut off again in the next window
     win._plan_blocked = True
     win._on_usage_ready(cu.Usage(
         limits=(cu.Limit(key="five_hour", label=cu._LABELS["five_hour"],
@@ -5533,6 +5576,28 @@ def test_auto_continue_on_limit_reset():
     pump(AUTO_CONTINUE_SETTLE_MS)
     check("auto-continue: the planLimitCleared edge resumes cut-off agents",
           "Continue" in sent(cut_off))
+    check("auto-continue: a resumed agent drops its latch (no re-nudging every "
+          "minute)", not cut_off.is_limit_blocked())
+
+    # --- the network-free watchdog: the banner's own reset time -------------
+    # The API edge is NOT enough on its own. It only fires if this same process
+    # also saw the blocked state first, and the endpoint 429s intermittently --
+    # a missed edge silently costs a whole night, which is what happened live.
+    writes.clear()
+    late = mk("Late")
+    settle(late, BANNER)
+    ws.agents.append(late)
+    late._limit_resets_at = now + 3600          # not due yet
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: an agent whose reset is still in the future waits",
+          sent(late) == "" and late.is_limit_blocked())
+    late._limit_resets_at = now - 60            # its stated reset has passed
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: the watchdog resumes it with NO usage reading at all",
+          "Continue" in sent(late))
+
     win._on_auto_continue(False)   # what the reopen below must find
     win.close()
 
@@ -5554,8 +5619,8 @@ def test_auto_continue_on_limit_reset():
         win3.show(); pump(50)
         w3 = win3.manager.workspaces[0]
         quiet, loud = mk("Quiet"), mk("Loud")
-        quiet._screen_tail = BANNER
-        loud._screen_tail = "1. Yes\n❯ 2. No\n"
+        settle(quiet, BANNER)
+        settle(loud, "1. Yes\n❯ 2. No\n")
         w3.agents.extend([quiet, loud])
         win3._on_agent_waiting(w3.id, quiet.id)
         check("auto-continue: a limit-blocked agent does not ring the chime",
