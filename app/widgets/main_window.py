@@ -61,6 +61,18 @@ USAGE_TICK_MS = 20000
 # out a whole poll interval at 4am), plus a small cushion for clock skew.
 USAGE_RESET_GRACE_MS = 8000
 
+# --- auto-continue after a plan-limit reset ---
+# Beat between closing the limit's options menu and typing into the prompt
+# underneath it: the menu tears down on the next render, and typing into the
+# frame before that would land in the dying menu instead of the input box.
+AUTO_CONTINUE_ESC_MS = 400
+# Gap between successive agents. They all unblock on the same edge, so without
+# this they would submit simultaneously into a window that just reopened.
+AUTO_CONTINUE_STAGGER_MS = 2000
+# What gets typed. Short on purpose: the agent still holds the whole
+# conversation, so it needs a go-ahead, not a restatement of the work.
+AUTO_CONTINUE_TEXT = "Continue"
+
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [
     ("AI agents", [
@@ -87,6 +99,7 @@ class TopBar(QFrame):
     themeChanged = Signal(str)   # theme id
     soundToggled = Signal(bool)  # notification chime enabled/muted
     usageVisibilityToggled = Signal(bool)  # show/hide the plan-usage readout
+    autoContinueToggled = Signal(bool)     # resume cut-off agents at the reset
     usageRefreshRequested = Signal()       # user clicked the readout
 
     def __init__(self, parent=None):
@@ -148,6 +161,7 @@ class TopBar(QFrame):
         self.usage_badge.setVisible(False)
         self.usage_badge.refreshRequested.connect(self.usageRefreshRequested)
         self._usage_wanted = True   # the user's show/hide preference
+        self._auto_continue = True  # resume cut-off agents at the reset
 
         # skin selector (Winamp-style): swaps the whole chrome palette live
         self.theme_select = QComboBox(self)
@@ -208,17 +222,28 @@ class TopBar(QFrame):
     def usage_visible(self) -> bool:
         return self._usage_wanted
 
-    def contextMenuEvent(self, event):
-        """Right-click anywhere on the bar: toggle the plan-usage readout.
+    def set_auto_continue(self, on: bool) -> None:
+        """Reflect the auto-continue preference (no signal emitted)."""
+        self._auto_continue = bool(on)
 
-        A context-menu item rather than another button — the bar is already
-        busy, and this is a set-once preference, not something you flip often.
+    def auto_continue(self) -> bool:
+        return self._auto_continue
+
+    def contextMenuEvent(self, event):
+        """Right-click anywhere on the bar: the plan-usage preferences.
+
+        Context-menu items rather than more buttons — the bar is already busy,
+        and these are set-once preferences, not things you flip often.
         """
         menu = QMenu(self)
         act = menu.addAction("Show plan usage")
         act.setCheckable(True)
         act.setChecked(self._usage_wanted)
         act.toggled.connect(self.usageVisibilityToggled)
+        cont = menu.addAction("Auto-continue agents when the limit resets")
+        cont.setCheckable(True)
+        cont.setChecked(self._auto_continue)
+        cont.toggled.connect(self.autoContinueToggled)
         menu.exec(event.globalPos())
 
     def set_theme(self, theme_id: str) -> None:
@@ -573,6 +598,7 @@ class MainWindow(QMainWindow):
         self._usage_visible = True    # user preference (persisted)
         self._usage_inflight = False  # one request at a time, never stack
         self._plan_blocked = False    # edge state for planLimitReached/Cleared
+        self._auto_continue = True    # user preference (persisted)
         self._usage_timer = QTimer(self)
         self._usage_timer.setInterval(USAGE_POLL_MS)
         self._usage_timer.timeout.connect(self._poll_usage)
@@ -726,6 +752,9 @@ class MainWindow(QMainWindow):
         self.top_bar.themeChanged.connect(self._change_theme)
         self.top_bar.soundToggled.connect(self._on_sound_toggled)
         self.top_bar.usageVisibilityToggled.connect(self._on_usage_visibility)
+        self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
+        # resume whoever the limit cut off, the moment the window reopens
+        self.planLimitCleared.connect(self._resume_blocked_agents)
         self.top_bar.usageRefreshRequested.connect(self._poll_usage)
         # QueuedConnection is the point: the fetch thread emits, and the slot
         # runs on the GUI thread where touching widgets/timers is legal
@@ -821,9 +850,21 @@ class MainWindow(QMainWindow):
     def _on_agent_waiting(self, ws_id: str, agent_id: str) -> None:
         """An agent just raised its "?" (settled on a prompt/question). Ring the
         notification chime so the user notices even from another workspace —
-        unless they've muted it. Non-blocking; a silent no-op if unavailable."""
-        if self._sound_enabled:
-            chime.play()
+        unless they've muted it. Non-blocking; a silent no-op if unavailable.
+
+        One exception: an agent parked on the plan-limit banner raises "?" too
+        (that banner comes with a numbered options menu, which is exactly what
+        the scrape looks for), but it is not a question the user can answer —
+        the only cure is time. Ringing for it would wake someone at 4am for
+        nothing, and auto-continue is about to handle it unattended anyway, so
+        the badge still lights but the bell stays quiet.
+        """
+        if not self._sound_enabled:
+            return
+        agent = self.manager.agent(ws_id, agent_id)
+        if agent is not None and agent.is_limit_blocked():
+            return
+        chime.play()
 
     # ---------------------------------------------------- plan usage ------
     def plan_usage(self):
@@ -927,6 +968,65 @@ class MainWindow(QMainWindow):
         self.top_bar.set_usage_visible(self._usage_visible)
         self._schedule_save()   # a UI preference, like sound_enabled
 
+    def _on_auto_continue(self, on: bool) -> None:
+        """User toggled auto-continue from the top bar's context menu."""
+        self._auto_continue = bool(on)
+        self._schedule_save()   # a UI preference, like sound_enabled
+
+    def _resume_blocked_agents(self) -> None:
+        """The plan limit just reset — put the agents it cut off back to work.
+
+        Wired to `planLimitCleared`, whose `_arm_reset_poll` cushion means this
+        lands within seconds of the window reopening rather than up to a minute
+        late. That promptness is the point: the first message after a window
+        expires is what STARTS the next 5-hour window, so resuming at 4am also
+        means the clock has rolled over by morning.
+
+        Only agents still parked on the limit banner are touched
+        (`is_limit_blocked`) — the reading that fired this edge is account-wide
+        and cannot say who was mid-turn. An agent that is busy again, waiting on
+        some other prompt, or was never cut off is left alone.
+        """
+        if self._closing or not self._ready or not self._auto_continue:
+            return
+        blocked = [a for a in self.manager.all_agents()
+                   if a.spec.provider == "claude" and a.is_pty
+                   and a.is_running() and not a.is_busy()
+                   and a.is_limit_blocked()]
+        for i, agent in enumerate(blocked):
+            # Stagger, then Esc, then type. The Esc closes the limit's options
+            # menu (upgrade / extra usage / cancel) that is sitting over the
+            # prompt; `write` is right for it (it stamps _last_input_ts, so the
+            # pty's echo of the keystroke doesn't fake a "working" pulse),
+            # whereas the text itself goes through `nudge` -> _write_task_to_pty,
+            # which deliberately does NOT stamp, so the resumed work DOES pulse.
+            QTimer.singleShot(i * AUTO_CONTINUE_STAGGER_MS,
+                              lambda a=agent: self._auto_continue_agent(a))
+
+    def _auto_continue_agent(self, agent) -> None:
+        """Dismiss the limit prompt, then submit the go-ahead a beat later."""
+        if self._closing or not agent.is_running():
+            return
+        agent.write("\x1b")
+
+        def send():
+            if self._closing or not agent.is_running():
+                return
+            if not agent.nudge(AUTO_CONTINUE_TEXT):
+                return
+            # audit trail: on the card, and on the workspace board. The board
+            # write goes through the same serialized append the log_activity
+            # tool uses, so it can't interleave with an agent's own note.
+            agent.notice("— plan limit reset; auto-continued —")
+            ws = self.manager.workspace_of(agent.id)
+            if ws is not None and ws.board is not None:
+                ws.board.append_activity(
+                    "AI Hive",
+                    f"auto-continued {agent.spec.name} after the plan limit "
+                    f"reset")
+
+        QTimer.singleShot(AUTO_CONTINUE_ESC_MS, send)
+
     def _on_sound_toggled(self, enabled: bool) -> None:
         """User flipped the top-bar chime toggle. Persist the preference (via
         the debounced save) so it survives a restart."""
@@ -956,6 +1056,8 @@ class MainWindow(QMainWindow):
         # no SESSION_VERSION bump — same as sound_enabled before it.
         self._usage_visible = bool(ui.get("usage_visible", True))
         self.top_bar.set_usage_visible(self._usage_visible)
+        self._auto_continue = bool(ui.get("auto_continue", True))
+        self.top_bar.set_auto_continue(self._auto_continue)
         win = ui.get("window", {})
         if win.get("w") and win.get("h"):
             self.resize(int(win["w"]), int(win["h"]))
@@ -1400,6 +1502,7 @@ class MainWindow(QMainWindow):
             "theme": self._theme_id,
             "sound_enabled": self._sound_enabled,
             "usage_visible": self._usage_visible,
+            "auto_continue": self._auto_continue,
             "window": {"w": w, "h": h, "maximized": self.isMaximized()},
             # which workspaces have their inline file tree open (per-folder
             # expansion + highlight are transient, not persisted)

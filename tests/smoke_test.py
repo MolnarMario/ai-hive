@@ -5403,6 +5403,171 @@ def test_plan_usage():
     win3.close()
 
 
+def test_auto_continue_on_limit_reset():
+    """When the plan limit resets, the agents it CUT OFF go back to work by
+    themselves: Esc to close the limit's options menu, then "Continue".
+
+    The point is unattended overnight recovery — and, because the first message
+    after a window expires is what starts the next one, resuming at 4am also
+    rolls the 5-hour clock over before morning. Guards matter as much as the
+    action: the account-wide reading that fires the edge cannot say WHICH agents
+    were mid-turn, so anything not parked on the limit banner is left alone."""
+    import time as _time
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import claude_usage as cu
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import TerminalAgent
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    now = _time.time()
+
+    # long enough to cover the Esc->type beat plus the delayed submit CR
+    AUTO_CONTINUE_SETTLE_MS = 1200
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    BANNER = ("You've hit your session limit \xb7 resets 4:40am "
+              "(Europe/Bucharest)\n")
+
+    # --- the per-agent "I was cut off" scrape -------------------------------
+    def mk(name="Coder", provider="claude", pty=True):
+        spec = build_spec(AgentKind.CLAUDE if provider == "claude"
+                          else AgentKind.CMD, name, cwd=os.getcwd(), pty=pty)
+        a = TerminalAgent(spec)
+        a.worker = type("W", (), {
+            "is_running": lambda s: True,
+            "write": lambda s, d: (writes.setdefault(id(s), []).append(d), True)[1],
+            "start": lambda s: None, "dispose": lambda s: None})()
+        a._prompt_ready = True
+        return a
+
+    writes: dict = {}
+    a = mk()
+    check("auto-continue: a clean screen is not limit-blocked",
+          not a.is_limit_blocked())
+    a._screen_tail = "Approaching session limit \xb7 resets 4:40am\n"
+    check("auto-continue: an 'Approaching' warning is NOT a cut-off",
+          not a.is_limit_blocked())
+    a._screen_tail = "You've used 62% of your session limit \xb7 resets 4:40am\n"
+    check("auto-continue: a 'You've used N%' warning is NOT a cut-off",
+          not a.is_limit_blocked())
+    a._screen_tail = BANNER
+    check("auto-continue: the exhausted banner IS a cut-off",
+          a.is_limit_blocked())
+    a._screen_tail = "You’ve hit your weekly limit \xb7 resets Tue\n"
+    check("auto-continue: curly apostrophe + weekly window also detected",
+          a.is_limit_blocked())
+    non_claude = mk(name="Shell", provider="cmd", pty=True)
+    non_claude._screen_tail = BANNER
+    check("auto-continue: a non-Claude agent is never limit-blocked",
+          not non_claude.is_limit_blocked())
+
+    # --- nudge() must not disturb any PERSISTED metadata --------------------
+    n = mk()
+    n.set_task("write the parser")
+    before = (n.current_task, n.assignment, n.spec.role)
+    check("auto-continue: nudge() delivers when the prompt is ready",
+          n.nudge("Continue") is True)
+    check("auto-continue: nudge() leaves task/assignment/role untouched",
+          (n.current_task, n.assignment, n.spec.role) == before)
+    check("auto-continue: nudge() typed the text",
+          "Continue" in "".join(writes.get(id(n.worker), [])))
+    check("auto-continue: nudge() does not stamp the user-input clock "
+          "(resumed work still pulses the sidebar)",
+          n._last_input_ts == 0.0)
+    n._prompt_ready = False
+    check("auto-continue: nudge() refuses when the TUI isn't prompt-ready",
+          n.nudge("Continue") is False)
+
+    # --- the wiring: planLimitCleared -> resume the blocked ones ------------
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-autocont-"))
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.show(); pump(50)
+    mgr = win.manager
+    ws = mgr.workspaces[0]
+
+    cut_off, busy, fine = mk("CutOff"), mk("Busy"), mk("Fine")
+    cut_off._screen_tail = BANNER
+    busy._screen_tail = BANNER
+    busy._busy = True                    # already moving again
+    fine._screen_tail = "all done\n"     # was never cut off
+    ws.agents.extend([cut_off, busy, fine])
+
+    win._resume_blocked_agents()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    sent = lambda ag: "".join(writes.get(id(ag.worker), []))
+    check("auto-continue: the cut-off agent got Esc then Continue",
+          sent(cut_off).startswith("\x1b") and "Continue" in sent(cut_off))
+    check("auto-continue: an agent that is busy again is left alone",
+          sent(busy) == "")
+    check("auto-continue: an agent that was never cut off is left alone",
+          sent(fine) == "")
+    check("auto-continue: the card carries an audit notice",
+          any("auto-continued" in t for _s, t in cut_off.log))
+
+    # the toggle actually gates it
+    writes.clear()
+    win._on_auto_continue(False)
+    win._resume_blocked_agents()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: nothing is typed while the toggle is off",
+          sent(cut_off) == "")
+    payload_ui = win._session_payload()["ui"]
+    check("auto-continue: preference persisted under ui.auto_continue",
+          payload_ui["auto_continue"] is False)
+
+    # the real trigger is the plan-limit falling edge, not a timer
+    writes.clear()
+    win._on_auto_continue(True)
+    win._plan_blocked = True
+    win._on_usage_ready(cu.Usage(
+        limits=(cu.Limit(key="five_hour", label=cu._LABELS["five_hour"],
+                         short=cu._SHORT["five_hour"], percent=12.0,
+                         resets_at=now + 4700),),
+        fetched_at=now, plan="pro"))
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: the planLimitCleared edge resumes cut-off agents",
+          "Continue" in sent(cut_off))
+    win._on_auto_continue(False)   # what the reopen below must find
+    win.close()
+
+    win2 = create_main_window(store)
+    win2.show(); pump(50)
+    check("auto-continue: preference restored on reopen",
+          win2.top_bar.auto_continue() is False)
+    check("auto-continue: default is ON when never saved",
+          create_main_window(
+              SessionStore(path=tmp / "fresh.json")).top_bar.auto_continue())
+    win2.close()
+
+    # the limit banner must NOT ring the chime — nothing the sleeper can answer
+    rung = {"n": 0}
+    import app.chime as _chime
+    real_play, _chime.play = _chime.play, lambda: rung.__setitem__("n", rung["n"] + 1)
+    try:
+        win3 = create_main_window(SessionStore(path=tmp / "chime.json"))
+        win3.show(); pump(50)
+        w3 = win3.manager.workspaces[0]
+        quiet, loud = mk("Quiet"), mk("Loud")
+        quiet._screen_tail = BANNER
+        loud._screen_tail = "1. Yes\n❯ 2. No\n"
+        w3.agents.extend([quiet, loud])
+        win3._on_agent_waiting(w3.id, quiet.id)
+        check("auto-continue: a limit-blocked agent does not ring the chime",
+              rung["n"] == 0)
+        win3._on_agent_waiting(w3.id, loud.id)
+        check("auto-continue: an ordinary prompt still rings the chime",
+              rung["n"] == 1)
+        win3.close()
+    finally:
+        _chime.play = real_play
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
@@ -5459,6 +5624,7 @@ def main():
     test_sidebar_file_tree()
     test_sidebar_search()
     test_plan_usage()
+    test_auto_continue_on_limit_reset()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0

@@ -84,6 +84,17 @@ workspaces keep executing — switching never pauses anything.
   e.g. relaunching blocked agents unattended the moment the limit resets.
   Right-click the top bar to hide the readout; it hides itself when there's no
   Claude login.
+- **Auto-continue when the limit resets** — leave the hive running overnight and
+  the agents a spent limit cut off put themselves back to work the moment the
+  window reopens: AI Hive closes the limit's options menu and types `Continue`
+  into each one, staggered so they don't all pile into a fresh window. Only
+  agents actually parked on the limit banner are touched — one still working, or
+  stopped for any other reason, is left alone. Because the first message after a
+  window expires is what STARTS the next 5-hour window, resuming at 4am also
+  means the clock has already rolled over by the time you sit down. Each resumed
+  card shows a `— plan limit reset; auto-continued —` line and the workspace
+  board gets a note. On by default; right-click the top bar to turn it off. (The
+  app has to be running at reset time — a closed window is a dead process.)
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
@@ -450,7 +461,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-766 checks drive the real app headlessly (offscreen Qt platform) with real
+788 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round

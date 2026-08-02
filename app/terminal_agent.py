@@ -102,6 +102,24 @@ _NUM_OPTION_RE = re.compile(r"(?m)^\s*[>❯❱│┃|]*\s*\d+\.\s+\S")
 # borders) — the highlighted row of a live menu, absent from plain prose lists
 _OPTION_CARET_RE = re.compile(r"(?m)^[\s│┃|]*[>❯❱]\s*\d+\.\s+\S")
 
+# --- "this agent was cut off by the plan limit" detection ---
+# WHICH agents to resume when the window reopens. The plan-usage reading
+# (app/claude_usage.py) is ACCOUNT-wide — it says the account is out, never
+# which agents were mid-turn — so attribution has to come from the screen.
+# An agent that was cut off is still SHOWING the banner when the limit resets
+# (it is stuck; nothing has redrawn it), which is why this is only ever
+# evaluated at that one moment rather than on every settle.
+# Matches ONLY the exhausted banner (`You've hit your session limit · resets
+# 4:40am`), never the `Approaching …` / `You've used 62% of your …` warnings —
+# those mean the agent is still working, and nudging it would interrupt it.
+# Verified against claude.exe 2.1.220, which renders these from the templates
+# `You've hit your ${label}` with {five_hour:"session limit",
+# seven_day:"weekly limit"}. Presence only: the reset TIME comes from the usage
+# endpoint, so a reworded banner costs at most this one pattern.
+_LIMIT_HIT_RE = re.compile(r"you['’]ve hit your\s+"
+                           r"(?:session|weekly|usage|opus|sonnet)\s+limit",
+                           re.I)
+
 
 class TerminalAgent(QObject):
     output_segment = Signal(str, str)   # stream, text (line mode)
@@ -402,6 +420,29 @@ class TerminalAgent(QObject):
         else:
             self._pending_task = text  # flushed when the prompt is ready
 
+    def nudge(self, text: str) -> bool:
+        """Type `text` at the agent's prompt and submit it, WITHOUT touching any
+        persisted metadata. Returns False when the agent can't take it.
+
+        The difference from `deliver_task` is the whole point: that path is for
+        ASSIGNING work, so it overwrites `current_task`, flips the assignment to
+        WORKING and re-infers the role from the text. A nudge is a message
+        inside work the agent already has (the auto-continue after a plan-limit
+        reset), so none of that may change — `current_task` in particular is
+        persisted and shown in the sidebar and on the board.
+
+        Unlike `write`, this does NOT stamp `_last_input_ts`: the resumed work's
+        output must still light the sidebar's "working" pulse, exactly as a
+        delivered task's does.
+        """
+        text = sanitize_text(text or "").strip()
+        if not text or not self.is_pty:
+            return False
+        if not (self._prompt_ready and self.worker.is_running()):
+            return False
+        self._write_task_to_pty(text)
+        return True
+
     def _write_task_to_pty(self, text: str) -> None:
         body = text.replace("\r\n", "\r").replace("\n", "\r")
         if "\r" in body:  # multi-line: bracketed paste, then submit
@@ -561,6 +602,22 @@ class TerminalAgent(QObject):
         n_opts = len(_NUM_OPTION_RE.findall(region))
         has_caret = bool(_OPTION_CARET_RE.search(region))
         return has_caret and n_opts >= 2
+
+    def is_limit_blocked(self) -> bool:
+        """True when this agent's screen is showing the plan-limit banner —
+        i.e. THIS agent is one of the ones that got cut off.
+
+        Deliberately stateless and unsignalled: the caller (the auto-continue
+        on `MainWindow.planLimitCleared`) asks exactly once, at the moment the
+        window reopens, when a cut-off agent is still parked on the banner.
+        The account-wide reading in `app/claude_usage.py` says WHETHER the
+        plan is out and until when; this says WHICH agents to resume, which
+        the endpoint cannot know. See _LIMIT_HIT_RE.
+        """
+        if self.spec.provider != "claude":
+            return False
+        region = "\n".join(self._screen_tail.splitlines()[-18:])
+        return bool(region) and bool(_LIMIT_HIT_RE.search(region))
 
     # -------------------------------------------------------------- slots ---
 

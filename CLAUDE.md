@@ -216,6 +216,34 @@ this file is the invariants that must survive every change.
   those instead of scraping a terminal. While blocked, `_arm_reset_poll`
   schedules one extra poll just after the stated reset so the cleared edge
   fires within seconds at 4am rather than waiting out the minute timer.
+- **Auto-continue consumes that edge; the SCREEN says who to resume**
+  (`MainWindow._resume_blocked_agents`, wired to `planLimitCleared`). The usage
+  reading is ACCOUNT-wide — it knows the plan is out and until when, but never
+  WHICH agents were mid-turn — so attribution comes from
+  `TerminalAgent.is_limit_blocked()`, a `_LIMIT_HIT_RE` scrape of the settled
+  screen. That scrape is evaluated ONLY at the reset edge, never on a timer:
+  an agent that was cut off is still parked on the banner (nothing has redrawn
+  it), so one look at the right moment is both sufficient and cheaper than
+  per-settle state. `_LIMIT_HIT_RE` matches ONLY the exhausted banner
+  (`You've hit your … limit`), never `Approaching …` / `You've used N% …` —
+  those mean the agent is still WORKING and nudging it would interrupt it.
+  Delivery is Esc (close the limit's options menu) then the text a beat later
+  (`AUTO_CONTINUE_ESC_MS`), agents staggered by `AUTO_CONTINUE_STAGGER_MS` so
+  they don't all pile into the freshly reopened window. CRITICAL: the text goes
+  through `TerminalAgent.nudge`, NEVER `deliver_task` — `deliver_task` is the
+  ASSIGN path and would overwrite `current_task` (persisted, shown in the
+  sidebar and on the board), flip the assignment to WORKING and re-infer the
+  role. `nudge` also deliberately does NOT stamp `_last_input_ts` (unlike
+  `write`, which the Esc correctly uses), so the resumed work still pulses the
+  sidebar instead of being mistaken for the user's own typing. Only the
+  `ui.auto_continue` preference saves (via `_schedule_save`, like
+  `usage_visible`); nothing about the resume itself touches session state. One
+  consequence to keep in mind: this is a LIVE Qt edge, so it only works while
+  the app is open — a closed window is a dead process. Related: an agent parked
+  on the limit banner raises the "?" (the banner carries a numbered options
+  menu, exactly what `_screen_waiting` looks for) but must NOT ring the chime —
+  it is not a question the user can answer, and it would wake them at 4am for
+  something auto-continue is about to handle.
 - **Theming is a skin registry** (`app/ui_theme.py`): each skin is a `Theme`
   in `THEMES`; `apply_theme(id)` rewrites the module-level `Palette` attrs,
   the `ANSI_16` list (IN PLACE — same object), and the font globals, so every
