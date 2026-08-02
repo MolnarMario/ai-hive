@@ -13,8 +13,7 @@ this file is the invariants that must survive every change.
   the Windows Job Object (`KILL_ON_JOB_CLOSE`) so grandchildren die too.
 - **Persistence is sacred.** Structural changes (add/remove agent/workspace)
   save immediately; persisted-metadata changes (task/assignment/role/status/
-  font) must emit `dirty`; orchestrator mutations save immediately via the
-  bridge's `on_mutation` hook. If you add a persisted field, wire its mutation
+  font) must emit `dirty`. If you add a persisted field, wire its mutation
   path to a save AND add a restore in `load_session_dict` AND bump/migrate
   `SESSION_VERSION` if the shape changes. Backstops (added after a live loss
   where a folder's agents lived only in memory and NOTHING hit `session.log`):
@@ -151,17 +150,24 @@ this file is the invariants that must survive every change.
   in it is silently lost (this happened for over an hour of real use). The
   test suite must NOT set this flag: it opens/closes many windows per
   process.
-- **Orchestrator tools are workspace-scoped AND role-scoped.** The mcp config
-  binds `AIHIVE_WS` + `AIHIVE_ROLE`; the bridge enforces both in `_dispatch`.
-  Workers get a config exposing only `log_activity` (`--allowedTools
-  mcp__aihive__log_activity`) AND the bridge refuses `_ORCHESTRATOR_ONLY_OPS`
-  for role=="worker" — never rely on the tool list alone; keep the bridge
-  guard. Any new bridge op must resolve agents via `_resolve_scoped`, be added
-  to `_MUTATING_OPS` if it writes SESSION state (board writes don't), and be
-  added to `_ORCHESTRATOR_ONLY_OPS` if only orchestrators may call it. Agents
-  are armed with their config in `add_terminal` (via `manager.arm_agent`,
-  set by MainWindow) BEFORE they start, and re-armed on restore
-  (`_rearm_agent_configs`) — `mcp_config_path` is never persisted.
+- **The board `log_activity` tool is the ONLY agent→GUI op, and it is
+  workspace-scoped.** There is NO orchestrator: agents cannot spawn, retask, or
+  close each other — they only post one-line notes to their workspace board.
+  (This was deliberately removed; a Claude agent already spawns sub-agents only
+  in its own HEADLESS `Task` way, and the user wanted visible, self-driven
+  terminals, not a middleman agent directing others.) Each agent's mcp config
+  binds `AIHIVE_WS` (echoed with every RPC), so a note always lands on the
+  right workspace's board; the bridge exposes exactly one op (`log_activity`)
+  and rejects anything else as `bad_args`. Every Claude agent gets the same
+  config (`--allowedTools mcp__aihive__log_activity`, pre-approved so the call
+  never prompts) — there is no per-role config anymore. If you add a bridge op,
+  scope it by `ws` and add it to the docstring; board writes never touch SESSION
+  state so they do NOT trigger a save. Agents are armed with their config in
+  `add_terminal` (via `manager.arm_agent`, set by MainWindow) BEFORE they
+  start, and re-armed on restore (`_rearm_agent_configs`) — `mcp_config_path`
+  is never persisted. `OrchestratorBridge`/`orchestrator_bridge.py`/
+  `mcp_server.py` keep their historical names but are now just the board
+  channel.
 - **pyte quirks are handled in `terminal_view.feed()`** — private-marker CSI
   stripping, partial-escape carry, DECSET mode tracking. Scrollback is a view
   offset, never pyte paging (`prev_page` snaps back on any event). The wheel
@@ -267,7 +273,7 @@ this file is the invariants that must survive every change.
   user's own hooks — theirs still fire, never clobbered) plus a per-agent
   `AIHIVE_AGENT_ID` env var (== `TerminalAgent.id`, the SAME key
   `sync_live_sessions` matches on). Both are armed in
-  `MainWindow._arm_agent_mcp` (independent of the orchestrator bridge — every
+  `MainWindow._arm_agent_mcp` (independent of the board bridge — every
   Claude agent gets the hook) and are TRANSIENT like `mcp_config_path`
   (`AgentSpec.settings_path` / `spec.env`, never persisted, re-armed on
   restore). The shared settings + mapping files are written once per run in
@@ -293,8 +299,8 @@ this file is the invariants that must survive every change.
   app's PATH predates the install). `--model` takes the MULTIWORD display
   strings from `agy models` (e.g. "Gemini 3.1 Pro (High)") — they must stay
   one argv entry; `--continue` resumes and `--add-dir` is repeatable, like
-  Claude; there is NO system-prompt or MCP-config flag, so Gemini agents
-  can't be orchestrators.
+  Claude; there is NO system-prompt or MCP-config flag, so Gemini agents get
+  no board `log_activity` tool (they still see the board via `--add-dir`).
 
 ## Verifying changes
 

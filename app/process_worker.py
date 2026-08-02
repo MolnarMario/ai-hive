@@ -78,8 +78,8 @@ class AgentSpec:
     kind: AgentKind
     name: str
     role: str = ""
-    # user manually renamed the display name: an orchestrator retask
-    # (set_role) then updates only the role, never clobbers the chosen name
+    # user manually renamed the display name: a retask (set_role) then updates
+    # only the role, never clobbers the chosen name
     custom_name: bool = False
     program: str = ""
     args: list = field(default_factory=list)
@@ -105,8 +105,7 @@ class AgentSpec:
     # extra system-prompt text injected for coordination (Claude)
     system_prompt: str = ""
     extra_dirs: list = field(default_factory=list)  # --add-dir targets
-    is_orchestrator: bool = False   # can spawn/assign agents via the MCP server
-    mcp_config_path: str = ""       # --mcp-config for the orchestrator
+    mcp_config_path: str = ""       # --mcp-config for the board log_activity tool
     # --settings file carrying the shared SessionStart hook that reports this
     # agent's LIVE conversation id back to AI Hive (app/session_hook.py). Like
     # mcp_config_path it is a per-run path, armed before start and re-armed on
@@ -123,8 +122,8 @@ class AgentSpec:
     user_args: list = field(default_factory=list)
 
     def effective_args(self) -> list:
-        """Args actually passed to the process, including coordination and
-        orchestrator flags (Claude native flags only)."""
+        """Args actually passed to the process, including coordination flags
+        (Claude native flags only)."""
         args = list(self.args)
         if self.provider == "claude":
             if self.resume:
@@ -148,19 +147,16 @@ class AgentSpec:
                 args += ["--append-system-prompt", self.system_prompt]
             if self.mcp_config_path:
                 # verified against Claude Code 2.1.197: load only our MCP server
-                # and pre-approve its tools so tool calls don't block on prompts.
-                # Orchestrators get the full toolset; workers are restricted to
-                # log_activity (the bridge ALSO enforces this by role, so a
-                # widened tool list still can't spawn/close peers).
-                allowed = ("mcp__aihive" if self.is_orchestrator
-                           else "mcp__aihive__log_activity")
+                # and pre-approve its single tool so the call doesn't block on a
+                # prompt. Every Claude agent gets exactly log_activity — enough
+                # to post to the shared board, nothing more.
                 args += ["--mcp-config", self.mcp_config_path,
                          "--strict-mcp-config",
-                         "--allowedTools", allowed]
+                         "--allowedTools", "mcp__aihive__log_activity"]
         elif self.provider == "gemini":
             # Antigravity CLI (agy 1.0.16) shares Claude's resume/workspace
             # flags: --continue and a repeatable --add-dir. It has no
-            # system-prompt or MCP-config flags, so no orchestrator wiring.
+            # system-prompt or MCP-config flags, so no board wiring.
             if self.resume:
                 args += ["--continue"]
             for d in self.extra_dirs:
@@ -170,7 +166,7 @@ class AgentSpec:
             # xAI Grok CLI (grok 0.2.93) resumes the folder's most recent
             # session with --continue (verified). It exposes --cwd rather than
             # a repeatable --add-dir, and has no system-prompt flag, so no
-            # orchestrator wiring — like Gemini it's an interactive agent only.
+            # board wiring — like Gemini it's an interactive agent only.
             if self.resume:
                 args += ["--continue"]
         return args
@@ -184,7 +180,7 @@ class AgentSpec:
             "provider": self.provider, "model": self.model,
             "effort": self.effort, "permission_mode": self.permission_mode,
             "custom_command": self.custom_command,
-            "font_px": self.font_px, "is_orchestrator": self.is_orchestrator,
+            "font_px": self.font_px,
             "session_id": self.session_id,
         }
 
@@ -200,7 +196,6 @@ class AgentSpec:
             permission_mode=d.get("permission_mode", ""),
             custom_command=d.get("custom_command", ""),
             font_px=int(d.get("font_px", 0) or 0),
-            is_orchestrator=bool(d.get("is_orchestrator", False)),
         )
         # restored agents keep their pinned conversation ("" = legacy, which
         # resumes via --continue once and gets pinned on its next fresh start)
@@ -217,7 +212,6 @@ def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
                program: str = "", args: list | None = None,
                pty: bool = False, model: str = "", effort: str = "",
                custom_command: str = "", font_px: int = 0,
-               is_orchestrator: bool = False,
                permission_mode: str = "") -> AgentSpec:
     """Profile factory: fills in the verified per-shell invocation modes.
 
@@ -234,7 +228,7 @@ def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
     spec = AgentSpec(kind=kind, name=name, role=role, cwd=cwd, pty=pty,
                      model=model, effort=effort, permission_mode=permission_mode,
                      custom_command=custom_command,
-                     font_px=font_px, is_orchestrator=is_orchestrator,
+                     font_px=font_px,
                      user_program=program, user_args=args)
     if kind in AI_KINDS:
         spec.provider = AI_KINDS[kind]

@@ -2535,6 +2535,144 @@ def test_terminal_selection_edit():
           v3.selected_text() == "")
 
 
+def test_terminal_input_editor():
+    """Desktop-text-area conveniences layered on the passthrough terminal:
+    keyboard text-selection (Shift+Arrow/Home/End, Ctrl for word), Shift+click
+    extend, triple-click line-select, multi-row selection delete inside the
+    input box, and an approximate whole-input undo/redo on Ctrl+Z/Y."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QKeyEvent, QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                            TerminalView)
+
+    QApplication.instance() or QApplication([])
+    K = Qt.Key
+
+    def press(view, k, ctrl=False, shift=False, text=""):
+        mods = Qt.KeyboardModifier.NoModifier
+        if ctrl:
+            mods |= Qt.KeyboardModifier.ControlModifier
+        if shift:
+            mods |= Qt.KeyboardModifier.ShiftModifier
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, k, mods, text))
+
+    def pos(row, col):
+        return QPointF(CELL_PAD_X + (col + 0.5) * view._cell_w,
+                       CELL_PAD_Y + (row + 0.5) * view._cell_h)
+
+    def mpress(view, row, col, shift=False):
+        mods = (Qt.KeyboardModifier.ShiftModifier if shift
+                else Qt.KeyboardModifier.NoModifier)
+        view.mousePressEvent(QMouseEvent(
+            QEvent.Type.MouseButtonPress, pos(row, col),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, mods))
+
+    def mdbl(view, row, col):
+        view.mouseDoubleClickEvent(QMouseEvent(
+            QEvent.Type.MouseButtonDblClick, pos(row, col),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+
+    # --- keyboard selection: Ctrl+Shift+Left word-selects "world", no bytes ---
+    view = TerminalView(rows=6, cols=80)
+    view.feed("hello world")            # child caret at col 11
+    sent = []
+    view.keyInput.connect(sent.append)
+    press(view, K.Key_Left, ctrl=True, shift=True)
+    check("kbdsel: Ctrl+Shift+Left selects the word 'world'",
+          view.selected_text() == "world", view.selected_text())
+    check("kbdsel: building a selection sends nothing to the child",
+          sent == [], sent)
+    # a plain (unshifted) arrow collapses the selection, then forwards
+    press(view, K.Key_Left)
+    check("kbdsel: plain arrow collapses the selection",
+          view._selection_range() is None)
+    check("kbdsel: the collapsing arrow still forwards to the child",
+          sent == ["\x1b[D"], sent)
+
+    # --- Shift+click extends; triple-click selects the whole line -------------
+    view = TerminalView(rows=6, cols=80)
+    view.feed("hello world")
+    mpress(view, 0, 0)                  # anchor at col 0
+    mpress(view, 0, 5, shift=True)      # Shift+click extends to col 5
+    check("kbdsel: Shift+click extends the selection",
+          view.selected_text() == "hello", view.selected_text())
+
+    view = TerminalView(rows=6, cols=80)
+    view.feed("aaa bbb ccc")
+    mdbl(view, 0, 1)                    # double-click primes the triple
+    mpress(view, 0, 1)                  # third press at the same cell
+    check("kbdsel: triple-click selects the whole line",
+          view.selected_text() == "aaa bbb ccc", view.selected_text())
+
+    # --- multi-row delete inside the input box -------------------------------
+    view = TerminalView(rows=6, cols=80)
+    view.feed("> line one\r\nline two")  # 2-row input box, caret row1 col8
+    out = []
+    view.keyInput.connect(out.append)
+    view._sel_anchor = (0, 2)            # just after the '> ' prompt
+    view._sel_end = (1, 7)              # last char of "line two"
+    view._delete_selection()
+    # "line one"(8) + one newline + "line two"(8) = 17 backspaces; caret already
+    # sits at the selection end (row1 col8) so no arrows are emitted
+    check("multidel: multi-row input selection backspaces the whole span",
+          out == ["\x7f" * 17], out)
+
+    # a selection that escapes the input box (output row) touches nothing
+    view = TerminalView(rows=6, cols=80)
+    view.feed("output line\r\n> prompt")  # row0 output, row1 input box
+    out = []
+    view.keyInput.connect(out.append)
+    view._sel_anchor = (0, 0)
+    view._sel_end = (0, 5)
+    check("multidel: off-input-box selection returns False",
+          view._delete_selection() is False)
+    check("multidel: off-input-box delete sends nothing", out == [], out)
+
+    # --- approximate undo / redo --------------------------------------------
+    view = TerminalView(rows=6, cols=80)
+    view.feed("> ")                     # empty prompt
+    out = []
+    view.keyInput.connect(out.append)
+    view.feed("hi")                     # child echoes the typed input -> "> hi"
+    view._snapshot_input()              # the debounced burst snapshot fires
+    check("undo: a typed burst snapshots the prior (empty) input",
+          view._undo_stack == [""] and view._undo_last == "hi",
+          (view._undo_stack, view._undo_last))
+    press(view, K.Key_Z, ctrl=True)     # undo -> restore ""
+    check("undo: Ctrl+Z clears the prompt (empty restore = just the clear)",
+          out == ["\x1b\x1b"], out)
+    check("undo: undo pushes the current input onto the redo stack",
+          view._redo_stack == ["hi"], view._redo_stack)
+    out.clear()
+    press(view, K.Key_Y, ctrl=True)     # redo -> restore "hi"
+    check("undo: Ctrl+Y re-applies the undone input (clear + paste)",
+          out == ["\x1b\x1b", "hi"], out)
+
+    # empty stacks fall through to the legacy control bytes
+    view = TerminalView(rows=6, cols=80)
+    view.feed("> ")
+    out = []
+    view.keyInput.connect(out.append)
+    press(view, K.Key_Z, ctrl=True)
+    check("undo: Ctrl+Z with nothing to undo forwards 0x1a", out == ["\x1a"], out)
+    out.clear()
+    press(view, K.Key_Y, ctrl=True)
+    check("undo: Ctrl+Y with nothing to redo forwards 0x19", out == ["\x19"], out)
+
+    # a submit (bare Enter) forgets the history so undo never crosses messages
+    view = TerminalView(rows=6, cols=80)
+    view.feed("> hi")
+    view._snapshot_input()
+    view._undo_stack.append("stale")   # pretend prior history exists
+    press(view, K.Key_Return)
+    check("undo: submit resets the undo/redo history",
+          view._undo_stack == [] and view._undo_last == "",
+          (view._undo_stack, view._undo_last))
+
+
 def test_session_migration():
     """A pre-v2 line-mode shell agent upgrades to interactive on load."""
     from app.pty_worker import HAS_CONPTY
@@ -2957,8 +3095,8 @@ def test_v2_review_fixes():
 
 
 def test_v3_features():
-    """v3: private-CSI/underline fix, clipboard, orchestration primitives,
-    persistent-agent badges, and the named-pipe orchestrator bridge."""
+    """v3: private-CSI/underline fix, clipboard, task-assignment primitives,
+    persistent-agent badges, and the named-pipe board bridge."""
     import threading
 
     from PySide6.QtWidgets import QApplication
@@ -3028,7 +3166,7 @@ def test_v3_features():
           and AgentSpec.from_dict(pm_spec.to_dict()).permission_mode
           == "acceptEdits", pm_spec.to_dict())
 
-    # --- orchestration primitives via a fast line-mode echo agent ---
+    # --- task-assignment primitives via a fast line-mode echo agent ---
     mgr = WorkspaceManager()
     ws = mgr.create_workspace("W", str(tmp))
     echo = mgr.add_terminal(ws.id, build_spec(
@@ -3049,21 +3187,22 @@ def test_v3_features():
     check("v3 reassign: delivered to existing session",
           wait_until(lambda: any("did:now write the tests" in t for t in seen), 8000))
 
-    # --- #3/#8 orchestrator bridge over the real named pipe ---
+    # --- #3/#8 board bridge over the real named pipe: log_activity round-trips
     from app.orchestrator_bridge import OrchestratorBridge, HAS_QTNETWORK
     if HAS_QTNETWORK:
         from app import mcp_server
         bridge = OrchestratorBridge(mgr, active_ws=lambda: ws.id)
         check("v3 bridge: named pipe listening", bridge.start())
         os.environ["AIHIVE_PIPE"] = bridge.pipe_name
+        os.environ["AIHIVE_WS"] = ws.id
         res = {}
         ev = threading.Event()
 
         def rpc():
             try:
-                res["list"] = mcp_server._rpc("list_agents", {})
-                res["state"] = mcp_server._rpc(
-                    "set_agent_state", {"agent_id": echo.id, "state": "idle"})
+                res["log"] = mcp_server._rpc(
+                    "log_activity",
+                    {"agent": "Echo", "message": "wired the parser"})
             except Exception as e:
                 res["err"] = repr(e)
             finally:
@@ -3072,10 +3211,12 @@ def test_v3_features():
         threading.Thread(target=rpc, daemon=True).start()
         wait_until(ev.is_set, 15000)
         check("v3 bridge: MCP client + pipe RPC round-trip",
-              "err" not in res and res.get("list", {}).get("agents"), res.get("err"))
-        check("v3 bridge: set_agent_state over pipe",
-              res.get("state", {}).get("state") == "idle")
+              "err" not in res and res.get("log", {}).get("logged") is True,
+              res.get("err"))
+        check("v3 bridge: log_activity note lands on the board",
+              "wired the parser" in "\n".join(ws.board.read_log_tail()))
         bridge.stop()
+        os.environ.pop("AIHIVE_WS", None)
 
     echo.dispose()
     pump(200)
@@ -3141,15 +3282,16 @@ def test_persistence_resume():
     check("persist: BOM-prefixed session still loads (not wiped)",
           [w["name"] for w in loaded.get("workspaces", [])] == ["BomWs"], loaded)
 
-    # sticky auto-resume intent: an auto-created agent (orchestrator/worker) that
-    # died keeps its "resume on next open" flag so it never silently goes dormant
-    # (the bug where the Hiragana Orchestrator vanished after its process failed)
+    # sticky auto-resume intent: an auto-created agent (spawned with a task via
+    # spawn_worker) that died keeps its "resume on next open" flag so it never
+    # silently goes dormant (the bug where a task-spawned agent vanished after
+    # its process failed)
     win3 = create_main_window(SessionStore(path=tmp / "sticky.json"))
     win3.show(); pump(120)
     ws3 = win3.manager.workspaces[0]
     auto = win3.manager.add_terminal(
-        ws3.id, build_spec(AgentKind.CLAUDE, "Orchestrator", cwd=str(tmp),
-                           pty=True, is_orchestrator=True), autostart=False)
+        ws3.id, build_spec(AgentKind.CLAUDE, "Auto Worker", cwd=str(tmp),
+                           pty=True), autostart=False)
     auto.auto_created = True
     auto.autostart_on_restore = True   # was meant to be running
     manual = win3.manager.add_terminal(
@@ -3157,7 +3299,7 @@ def test_persistence_resume():
     dumped = {t["name"]: t["running"]
               for t in win3.manager.to_session_dict()["workspaces"][0]["terminals"]}
     check("persist: dead auto-agent keeps resume intent (running=True)",
-          dumped.get("Orchestrator") is True, dumped)
+          dumped.get("Auto Worker") is True, dumped)
     check("persist: idle user agent is not force-resumed (running=False)",
           dumped.get("Manual") is False, dumped)
     win3.close(); pump(120)
@@ -3514,9 +3656,9 @@ def test_themes():
 
 def test_review_fixes():
     """Regressions for the Codex-review findings: single-instance mutex guard
-    (fail closed), orchestration state autosave, workspace-scoped orchestrator
-    tools, immediate save on orchestrator mutations, quoted-path command
-    parsing, and the session save-audit log."""
+    (fail closed), task-assignment state autosave, workspace-bound board
+    log_activity, quoted-path command parsing, and the session save-audit
+    log."""
     import json as _json
     from PySide6.QtWidgets import QApplication
 
@@ -3542,7 +3684,7 @@ def test_review_fixes():
         import ctypes
         ctypes.windll.kernel32.CloseHandle(first)  # release for the real app
 
-    # --- orchestration state changes mark the session dirty ---
+    # --- task-assignment state changes mark the session dirty ---
     mgr = WorkspaceManager()
     ws_a = mgr.create_workspace("ScopeA", project_path=str(tmp))
     ws_b = mgr.create_workspace("ScopeB", project_path=str(tmp))
@@ -3580,7 +3722,7 @@ def test_review_fixes():
     check("rename: set_name emits name_changed", names_seen == ["Scribe"],
           names_seen)
     check("rename: set_name marks dirty", dirty_count["n"] > before)
-    # a later orchestrator retask updates the role but NEVER the custom name
+    # a later retask (set_role) updates the role but NEVER the custom name
     r1.set_role("Backend Architect")
     check("rename: set_role keeps a custom name, updates the role",
           r1.spec.name == "Scribe" and r1.spec.role == "Backend Architect",
@@ -3603,124 +3745,51 @@ def test_review_fixes():
     check("rename: custom_name present for serialize", "custom_name" in safe)
     mgr.remove_workspace(ws_c.id)
 
-    # --- workspace-scoped orchestrator dispatch ---
-    saves = {"n": 0}
-    bridge = OrchestratorBridge(mgr, active_ws=lambda: ws_a.id,
-                                on_mutation=lambda: saves.__setitem__(
-                                    "n", saves["n"] + 1))
-    listed = bridge._dispatch("list_agents", {}, ws=ws_a.id)["agents"]
-    check("scope: list_agents sees only the bound workspace",
-          len(listed) == 1 and listed[0]["agent_id"] == a1.id, listed)
-    try:
-        bridge._dispatch("set_agent_state",
-                         {"agent_id": b1.id, "state": "completed"}, ws=ws_a.id)
-        cross = False
-    except _RpcError:
-        cross = True
-    check("scope: cross-workspace agent unreachable by id", cross)
-    # duplicate display names: binding resolves ITS workspace's agent
-    got = bridge._dispatch("set_agent_state",
-                           {"agent_id": "Docs Writer", "state": "completed"},
-                           ws=ws_a.id)
-    check("scope: name resolution stays inside the workspace",
-          got["agent_id"] == a1.id)
-    try:
-        bridge._dispatch("spawn_agent",
-                         {"task": "x", "workspace_id": ws_b.id}, ws=ws_a.id)
-        leaked = True
-    except _RpcError as e:
-        leaked = e.code != "scope"
-    check("scope: spawn into another workspace rejected", not leaked)
-    check("scope: legacy unscoped call still resolves globally",
-          bridge._dispatch("list_agents", {}, ws="")["agents"] and True)
-
-    # log_activity: a WORKER may append to the board but is REFUSED the
-    # orchestration ops (spawn/assign/reassign/state/close). Role scoping
-    # mirrors the ws scoping — the guardrail that makes worker MCP tools safe.
-    for op, ar in [("spawn_agent", {"task": "x"}),
-                   ("assign_task", {"agent": a1.id, "task": "x"}),
-                   ("close_agent", {"agent_id": a1.id, "force": True})]:
-        try:
-            bridge._dispatch(op, ar, ws=ws_a.id, role="worker")
-            forbidden = False
-        except _RpcError as e:
-            forbidden = e.code == "forbidden"
-        check(f"guardrail: worker refused {op}", forbidden)
+    # --- workspace-bound board log_activity via the bridge dispatch ---
+    bridge = OrchestratorBridge(mgr, active_ws=lambda: ws_a.id)
     logged = bridge._dispatch(
         "log_activity", {"agent": "Docs Writer", "message": "wrote the docs"},
-        ws=ws_a.id, role="worker")
-    check("guardrail: worker may log_activity", logged.get("logged") is True)
+        ws=ws_a.id)
+    check("board: agent may log_activity", logged.get("logged") is True)
+    check("board: log_activity binds to the caller's workspace",
+          logged.get("workspace_id") == ws_a.id)
     tail = ws_a.board.read_log_tail()
-    check("guardrail: log_activity entry lands on the board",
+    check("board: log_activity entry lands on the board",
           any("wrote the docs" in t for t in tail), tail)
+    # a note for one workspace never crosses onto another's board (distinct
+    # project folders => distinct board.md files)
+    ws_d = mgr.create_workspace("ScopeD", project_path=str(tmp / "d"))
+    bridge._dispatch("log_activity", {"agent": "X", "message": "note for D"},
+                     ws=ws_d.id)
+    check("board: a note lands only on its own workspace board",
+          not any("note for D" in t for t in ws_a.board.read_log_tail())
+          and any("note for D" in t for t in ws_d.board.read_log_tail()))
+    # the removed orchestration ops are simply unknown now
+    try:
+        bridge._dispatch("spawn_agent", {"task": "x"}, ws=ws_a.id)
+        unknown_ok = False
+    except _RpcError as e:
+        unknown_ok = e.code == "bad_args"
+    check("board: removed orchestration ops are unknown", unknown_ok)
     # append_activity must NOT disturb the roster block
-    before = ws_a.board.update_roster([{"name": "A1", "role": "", "provider":
+    ws_a.board.update_roster([{"name": "A1", "role": "", "provider":
                 "claude", "model": "", "status": "idle", "task": "keep me"}])
     ws_a.board.append_activity("A1", "another line")
     body = Path(ws_a.board.path).read_text(encoding="utf-8")
-    check("guardrail: roster survives an activity append",
+    check("board: roster survives an activity append",
           "keep me" in body and body.count("AIHIVE:ROSTER:BEGIN") == 1
           and "another line" in body)
-    # orchestrator (or legacy role="") keeps full access
-    check("guardrail: orchestrator role may still spawn",
-          bridge._dispatch("list_agents", {}, ws=ws_a.id, role="orchestrator")
-          is not None)
-    cfg_w = bridge.mcp_config_path_for(ws_a.id, "worker")
-    cfg_o = bridge.mcp_config_path_for(ws_a.id, "orchestrator")
-    envw = _json.loads(Path(cfg_w).read_text(encoding="utf-8"))["mcpServers"]["aihive"]["env"]
-    check("guardrail: worker config carries AIHIVE_ROLE=worker",
-          envw.get("AIHIVE_ROLE") == "worker" and cfg_w != cfg_o)
 
-    # get_agent_output renders on the GUI thread while the MCP client blocks on
-    # a timeout — the pyte feed must be bounded, never the full 512 KB buffer
-    from app import orchestrator_bridge as _ob
-
-    class _BigPty:
-        is_pty = True
-        fed = {"n": 0}
-
-        def pty_replay(self):
-            return "x\r\n" * 200_000  # ~600 KB, far over PTY_BUFFER_CAP
-
-    _real_feed = None
-    import pyte as _pyte
-    orig_feed = _pyte.Stream.feed
-    sizes = []
-
-    def _spy_feed(self, data):
-        sizes.append(len(data))
-        return orig_feed(self, data)
-    _pyte.Stream.feed = _spy_feed
-    try:
-        out = _ob._agent_output(_BigPty(), 30)
-    finally:
-        _pyte.Stream.feed = orig_feed
-    check("render: get_agent_output feeds a bounded tail, not 512 KB",
-          sizes and max(sizes) <= 40 * 400 + 10, sizes)
-    check("render: output still capped to the screen", out.count("\n") <= 40)
-
-    # --- orchestrator mutations trigger the immediate-save hook ---
-    class _FakeSock:
-        def write(self, _b): pass
-        def flush(self): pass
-    line = _json.dumps({"id": "t1", "op": "set_agent_state",
-                        "args": {"agent_id": a1.id, "state": "idle"},
-                        "ws": ws_a.id}).encode()
-    bridge._handle_line(_FakeSock(), line)
-    check("scope: mutating op fires immediate save", saves["n"] == 1, saves)
-    line = _json.dumps({"id": "t2", "op": "list_agents", "args": {},
-                        "ws": ws_a.id}).encode()
-    bridge._handle_line(_FakeSock(), line)
-    check("scope: read-only op does not fire save", saves["n"] == 1, saves)
-
-    # --- per-workspace mcp config carries the binding ---
+    # --- per-workspace mcp config carries the binding (WS only, no role) ---
     bridge.pipe_name = "test-pipe"
     bridge._mcp_dir = str(tmp / "mcp")
     cfg_path = bridge.mcp_config_path_for(ws_a.id)
     cfg = _json.loads(Path(cfg_path).read_text(encoding="utf-8"))
     env = cfg["mcpServers"]["aihive"]["env"]
-    check("scope: mcp config binds AIHIVE_WS to the workspace",
+    check("board: mcp config binds AIHIVE_WS to the workspace",
           env.get("AIHIVE_WS") == ws_a.id and env.get("AIHIVE_PIPE") == "test-pipe")
+    check("board: mcp config no longer carries a role",
+          "AIHIVE_ROLE" not in env)
 
     # --- session save-audit log (forensics for any future clobber) ---
     sp = tmp / "audit" / "s.json"
@@ -5049,12 +5118,12 @@ def test_resume_fallback():
     """A resume (--continue) launch that dies before the interactive prompt ever
     comes up (Claude prints 'No conversation found to continue' and exits) must
     relaunch ONCE, fresh — so the terminal is never left black. The regression
-    behind the Orchestrator card that opened all-black and non-interactive."""
+    behind a resumed Claude card that opened all-black and non-interactive."""
     from app.process_worker import AgentKind, build_spec
     from app.terminal_agent import AgentStatus, TerminalAgent
 
-    spec = build_spec(AgentKind.CLAUDE, "Orchestrator", cwd=os.getcwd(),
-                      pty=True, is_orchestrator=True)
+    spec = build_spec(AgentKind.CLAUDE, "Resumed", cwd=os.getcwd(),
+                      pty=True)
     spec.resume = True
     agent = TerminalAgent(spec)
 
@@ -5137,6 +5206,7 @@ def main():
     test_terminal_mouse_words_links()
     test_terminal_mouse_tracking_click()
     test_terminal_selection_edit()
+    test_terminal_input_editor()
     test_session_migration()
     test_app()
     test_pty()
