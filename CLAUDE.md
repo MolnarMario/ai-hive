@@ -234,9 +234,16 @@ this file is the invariants that must survive every change.
   `_screen_tail` is a 4000-char ROLLING buffer and Claude's TUI keeps redrawing
   its input box while parked, so hours later the banner has been evicted and
   the tail holds only the bottom of a frame — the re-scrape matched nothing and
-  resumed nobody. `_LIMIT_HIT_RE` matches ONLY the exhausted banner
-  (`You've hit your … limit`), never `Approaching …` / `You've used N% …` —
-  those mean the agent is still WORKING and nudging it would interrupt it.
+  resumed nobody. The patterns live in Qt-free `app/limit_banner.py` because
+  `transcripts` matches the SAME thing off disk. Two signals, and which one you
+  use matters: `LIMIT_MENU_RE` ("Stop and wait for limit to reset") is the
+  interactive menu, so it PERSISTS for as long as the agent is stuck —
+  `recheck_limit` must key on it ALONE, since the banner is scrollback that
+  lingers after a successful resume and would report "still blocked" forever.
+  `LIMIT_HIT_RE` matches ONLY the exhausted banner, never `Approaching …` /
+  `You've used N% …` (those mean the agent is still WORKING and nudging it
+  would interrupt it); it is the weaker live signal but the ONLY one a
+  transcript records.
   TWO triggers land in `_resume_blocked_agents`, and the second is the one that
   must be reliable: (1) `planLimitCleared` resumes every latched agent (the
   ACCOUNT is provably clear); (2) `_check_limit_resets` on `LIMIT_WATCH_MS`
@@ -257,15 +264,44 @@ this file is the invariants that must survive every change.
   sidebar and on the board), flip the assignment to WORKING and re-infer the
   role. `nudge` also deliberately does NOT stamp `_last_input_ts` (unlike
   `write`, which the Esc correctly uses), so the resumed work still pulses the
-  sidebar instead of being mistaken for the user's own typing. Only the
-  `ui.auto_continue` preference saves (via `_schedule_save`, like
-  `usage_visible`); nothing about the resume itself touches session state. One
-  consequence to keep in mind: this is a LIVE Qt edge, so it only works while
-  the app is open — a closed window is a dead process. Related: an agent parked
-  on the limit banner raises the "?" (the banner carries a numbered options
-  menu, exactly what `_screen_waiting` looks for) but must NOT ring the chime —
-  it is not a question the user can answer, and it would wake them at 4am for
-  something auto-continue is about to handle.
+  sidebar instead of being mistaken for the user's own typing. A nudge is then
+  VERIFIED, not assumed (`recheck_limit` after `AUTO_CONTINUE_VERIFY_MS`), with
+  bounded retries (`LIMIT_RETRY_S`, `LIMIT_MAX_TRIES`): a resume can land while
+  the window is still shut, and clearing the latch on the nudge itself — as
+  this first did — burns the only attempt and parks the agent for good. A
+  `nudge` refused because the TUI isn't ready must NOT consume an attempt.
+  Related: an agent parked on the limit raises the "?" (its menu is exactly
+  what `_screen_waiting` looks for) but must NOT ring the chime — it is not a
+  question the user can answer, and it would wake them at 4am for something
+  auto-continue is about to handle.
+- **The OTHER half of recovery reads the TRANSCRIPT, because the screen lies
+  after a restart** (`MainWindow.recover_blocked_at_startup`, `⏯` toggle). A
+  restarted agent redraws a REPLAYED conversation, which `_scrape_limit`
+  correctly ignores as history — so the live latch can never see a cut-off that
+  happened before this run. `transcripts.ended_on_limit` supplies it instead:
+  the LAST assistant record being the banner means the conversation stopped
+  there ("last" is the safety — anything said afterwards means it carried on).
+  CRITICAL: the banner's clock is BARE ("resets 3am"), so the reset MUST be
+  anchored to the record's own timestamp (`limit_banner.banner_reset_at`);
+  resolving it against the current clock lands on the NEXT 3am and stalls the
+  agent a full day. Startup recovery only ARMS (`mark_limit_blocked`) —
+  delivery stays with the single watchdog, so a freshly launched TUI is waited
+  out rather than poked. It skips agents that aren't running (a card left
+  stopped stays stopped; starting it would spend quota the user didn't ask
+  for) and cut-offs older than `STARTUP_RECOVERY_MAX_AGE_S`. Each latch records
+  its ORIGIN (`limit_from_startup`) and is gated by the toggle that owns it —
+  `ui.startup_recovery` for disk-recovered, `ui.auto_continue` for live — so
+  switching one off can never strand a latch the other created. Both are
+  ordinary UI preferences that save via `_schedule_save` (like `usage_visible`);
+  the latch itself is NEVER persisted — the transcript is the durable record,
+  and a persisted flag would go stale. `recover_blocked_at_startup` is OPT-IN
+  from `main.py` (after `autostart_active_workspace`, since it only considers
+  RUNNING agents) exactly like `start_usage_polling`: it reads the user's real
+  transcripts and types into real agents, which the smoke suite must never do.
+  The whole path is audited to `session.log` via `_limit_audit`
+  (`STARTUP-SCAN`/`STARTUP-SKIP`/`BLOCKED`/`NUDGE`/`WAIT`/`RESUMED`/
+  `STILL-BLOCKED`) — this feature failed silently TWICE and both causes had to
+  be reconstructed from transcript timestamps hours later; do not remove it.
 - **Theming is a skin registry** (`app/ui_theme.py`): each skin is a `Theme`
   in `THEMES`; `apply_theme(id)` rewrites the module-level `Palette` attrs,
   the `ANSI_16` list (IN PLACE — same object), and the font globals, so every

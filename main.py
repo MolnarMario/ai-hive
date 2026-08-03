@@ -183,6 +183,12 @@ def main() -> int:
     window.start_usage_polling()
     window.show()
     window.autostart_active_workspace()
+    # ...then look for agents a spent plan limit stopped BEFORE this run and
+    # arm them to be resumed. Must follow the autostart above: it only
+    # considers agents that are actually running, and it reads the user's real
+    # transcripts, so like the usage poll it is opted into here rather than in
+    # the factory the smoke suite shares.
+    window.recover_blocked_at_startup()
     return app.exec()
 
 

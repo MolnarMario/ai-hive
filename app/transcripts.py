@@ -23,6 +23,9 @@ import json
 import os
 import re
 import shutil
+from datetime import datetime
+
+from . import limit_banner
 
 _ENCODE_RE = re.compile(r"[^A-Za-z0-9]")
 
@@ -33,6 +36,9 @@ _TITLE_CACHE: dict[str, tuple[float, int, str]] = {}
 
 # cache for latest_token_usage: transcript path -> (mtime, size, used, window).
 _USAGE_CACHE: dict[str, tuple[float, int, int, int]] = {}
+
+# cache for ended_on_limit: path -> (mtime, size, (cut_off, written, resets)).
+_LIMIT_CACHE: dict[str, tuple[float, int, tuple[bool, float, float]]] = {}
 
 
 def context_window_for(model: str) -> int:
@@ -97,6 +103,88 @@ def _read_latest_ai_title(path: str) -> str:
         return cached[2] if cached else ""
     _TITLE_CACHE[path] = (st.st_mtime, st.st_size, title)
     return title
+
+
+def ended_on_limit(cwd: str, session_id: str) -> tuple[bool, float, float]:
+    """Did this conversation STOP because the plan limit ran out?
+
+    Returns (cut_off, written_at_epoch, resets_at_epoch) — `resets_at` is 0.0
+    when the banner named no time. The durable record of a cut-off: after a
+    restart the live screen shows a REPLAYED conversation, but the transcript
+    still ends exactly where the limit stopped it, which is how both live
+    failures of this feature were ultimately diagnosed.
+
+    The test is that the LAST assistant message is the limit banner. "Last" is
+    what makes it safe: if the agent said anything afterwards it plainly
+    carried on, so it is not sitting cut off and must be left alone.
+
+    The reset time is resolved HERE, against the record's own timestamp, since
+    this is the only place both halves are in hand — the banner's clock is bare
+    ("resets 3am") and anchoring it to the current time instead would land a
+    day late. Cached by (mtime,size); never raises.
+    """
+    if not session_id or not cwd:
+        return (False, 0.0, 0.0)
+    return _read_ended_on_limit(transcript_path(cwd, session_id))
+
+
+def _read_ended_on_limit(path: str) -> tuple[bool, float, float]:
+    empty = (False, 0.0, 0.0)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return empty
+    cached = _LIMIT_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2]
+    hit, when, resets = False, 0.0, 0.0
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if '"assistant"' not in line:   # cheap prefilter
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue  # a partial last line while Claude is writing
+                if rec.get("type") != "assistant" or rec.get("isSidechain"):
+                    continue
+                text = _message_text(rec)
+                # every assistant turn overwrites the verdict, so only the LAST
+                # one counts -- a banner followed by real output is history
+                hit = bool(limit_banner.LIMIT_HIT_RE.search(text))
+                if hit:
+                    when = _record_epoch(rec)
+                    resets = limit_banner.banner_reset_at(text, when) or 0.0
+                else:
+                    when, resets = 0.0, 0.0
+    except OSError:
+        return cached[2] if cached else empty
+    result = (hit, when, resets)
+    _LIMIT_CACHE[path] = (st.st_mtime, st.st_size, result)
+    return result
+
+
+def _message_text(rec: dict) -> str:
+    """Flatten an assistant record's content to plain text."""
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("text"))
+    return ""
+
+
+def _record_epoch(rec: dict) -> float:
+    """A transcript record's ISO-8601 UTC timestamp as epoch seconds."""
+    ts = rec.get("timestamp")
+    if not isinstance(ts, str):
+        return 0.0
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def latest_token_usage(cwd: str, session_id: str) -> tuple[int, int]:

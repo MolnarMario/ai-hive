@@ -84,21 +84,31 @@ workspaces keep executing — switching never pauses anything.
   e.g. relaunching blocked agents unattended the moment the limit resets.
   Right-click the top bar to hide the readout; it hides itself when there's no
   Claude login.
-- **Auto-continue when the limit resets** — leave the hive running overnight and
-  the agents a spent limit cut off put themselves back to work the moment the
-  window reopens: AI Hive closes the limit's options menu and types `Continue`
-  into each one, staggered so they don't all pile into a fresh window. Only
-  agents actually parked on the limit banner are touched — one still working, or
-  stopped for any other reason, is left alone. Because the first message after a
-  window expires is what STARTS the next 5-hour window, resuming at 4am also
-  means the clock has already rolled over by the time you sit down. Each resumed
-  card shows a `— plan limit reset; auto-continued —` line and the workspace
-  board gets a note. On by default; right-click the top bar to turn it off. The
-  cut-off is recorded the moment the banner appears, along with the reset time
-  the banner itself states, so the resume doesn't depend on the usage API being
-  reachable — it fires from the agent's own stated reset even if the account
-  readout is rate-limited. (The app has to be running at reset time — a closed
-  window is a dead process.)
+- **Auto-recovery from a spent plan limit** — two switches sit next to the usage
+  readout, both on by default, both persisted, each with a tooltip spelling out
+  what it does:
+  - **⏯ Recover at startup** — when AI Hive opens, it looks across every
+    workspace for agents whose work stopped because the limit ran out, and
+    continues them. It reads each agent's conversation on disk rather than the
+    screen, so it works after a full reboot, not just an app restart. Strictly
+    gated: an agent whose conversation doesn't *end* on the limit message is
+    left alone (said anything since, and it plainly carried on), a card you left
+    stopped stays stopped, and a cut-off older than 12 hours isn't revived.
+  - **⏰ Resume on limit reset** — while the hive is running, agents cut off
+    mid-work go back to work the moment the window reopens.
+
+  Either way AI Hive closes the limit's options menu and types `Continue`,
+  staggered so agents don't all pile into a fresh window, then **verifies** —
+  the menu disappearing is how it knows the resume took, and it retries if not.
+  Because the first message after a window expires is what STARTS the next
+  5-hour window, resuming at 4am also means the clock has already rolled over by
+  the time you sit down. The cut-off is recorded the instant it appears, along
+  with the reset time the limit itself stated, so recovery doesn't depend on the
+  usage API being reachable — it fires from the agent's own stated reset even
+  when the account readout is rate-limited. Every step is logged to
+  `session.log` (`BLOCKED` / `NUDGE` / `RESUMED` / `STILL-BLOCKED`), each resumed
+  card shows a `— plan limit reset; auto-continued —` line, and the workspace
+  board gets a note.
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
@@ -465,7 +475,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-808 checks drive the real app headlessly (offscreen Qt platform) with real
+826 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round

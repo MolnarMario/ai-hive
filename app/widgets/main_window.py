@@ -23,6 +23,7 @@ from .. import claude_usage
 from .. import fsopen
 from .. import providers
 from .. import session_hook
+from .. import transcripts
 from .. import ui_theme
 from ..process_worker import (AI_KINDS, PTY_ONLY_KINDS, AgentKind, build_spec)
 from ..pty_worker import HAS_CONPTY
@@ -87,6 +88,10 @@ AUTO_CONTINUE_VERIFY_MS = 20000
 # enough — but it must not become a Continue every minute forever either.
 LIMIT_RETRY_S = 300
 LIMIT_MAX_TRIES = 4
+# How far back startup recovery will reach. Covers an overnight cut-off and a
+# same-day reopen, without reviving a conversation abandoned last week just
+# because the app was opened to look at something else.
+STARTUP_RECOVERY_MAX_AGE_S = 12 * 3600
 
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [
@@ -115,6 +120,7 @@ class TopBar(QFrame):
     soundToggled = Signal(bool)  # notification chime enabled/muted
     usageVisibilityToggled = Signal(bool)  # show/hide the plan-usage readout
     autoContinueToggled = Signal(bool)     # resume cut-off agents at the reset
+    startupRecoveryToggled = Signal(bool)  # recover cut-off agents on startup
     usageRefreshRequested = Signal()       # user clicked the readout
 
     def __init__(self, parent=None):
@@ -176,7 +182,24 @@ class TopBar(QFrame):
         self.usage_badge.setVisible(False)
         self.usage_badge.refreshRequested.connect(self.usageRefreshRequested)
         self._usage_wanted = True   # the user's show/hide preference
-        self._auto_continue = True  # resume cut-off agents at the reset
+
+        # The two auto-recovery switches, beside the readout they belong to.
+        # Both act on agents the plan limit cut off; they differ only in WHEN
+        # the cut-off is discovered — on opening the app, or while it runs.
+        # Deliberately buttons rather than context-menu items: these decide
+        # whether unattended work resumes, so their state has to be visible at
+        # a glance. Glyph carries the state, tooltip carries the meaning.
+        self._startup_recovery = True
+        self._auto_continue = True
+        self.recover_btn = QToolButton(self)
+        self.recover_btn.setObjectName("RecoveryToggle")
+        self.recover_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.recover_btn.clicked.connect(self._on_recover_clicked)
+        self.resume_btn = QToolButton(self)
+        self.resume_btn.setObjectName("RecoveryToggle")
+        self.resume_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.resume_btn.clicked.connect(self._on_resume_clicked)
+        self._refresh_recovery_btns()
 
         # skin selector (Winamp-style): swaps the whole chrome palette live
         self.theme_select = QComboBox(self)
@@ -196,6 +219,9 @@ class TopBar(QFrame):
         lay.addWidget(self.breadcrumb)
         lay.addStretch(1)
         lay.addWidget(self.usage_badge)
+        lay.addSpacing(4)
+        lay.addWidget(self.recover_btn)
+        lay.addWidget(self.resume_btn)
         lay.addSpacing(8)
         lay.addWidget(self.theme_select)
         lay.addSpacing(8)
@@ -221,6 +247,55 @@ class TopBar(QFrame):
             "Notification chime: ON — click to mute" if self._sound_on
             else "Notification chime: OFF — click to enable")
 
+    def _on_recover_clicked(self) -> None:
+        self.set_startup_recovery(not self._startup_recovery)
+        self.startupRecoveryToggled.emit(self._startup_recovery)
+
+    def _on_resume_clicked(self) -> None:
+        self.set_auto_continue(not self._auto_continue)
+        self.autoContinueToggled.emit(self._auto_continue)
+
+    def set_startup_recovery(self, on: bool) -> None:
+        """Reflect the startup-recovery preference (no signal emitted)."""
+        self._startup_recovery = bool(on)
+        self._refresh_recovery_btns()
+
+    def startup_recovery(self) -> bool:
+        return self._startup_recovery
+
+    def set_auto_continue(self, on: bool) -> None:
+        """Reflect the resume-on-reset preference (no signal emitted)."""
+        self._auto_continue = bool(on)
+        self._refresh_recovery_btns()
+
+    def auto_continue(self) -> bool:
+        return self._auto_continue
+
+    def _refresh_recovery_btns(self) -> None:
+        # `checked` drives the QSS: lit in the accent when armed, dimmed when
+        # off, so "will my work resume by itself?" is answerable at a glance.
+        # NOT a power symbol on the first one — that reads as "shut down".
+        self.recover_btn.setCheckable(True)
+        self.recover_btn.setChecked(self._startup_recovery)
+        self.recover_btn.setText("⏯")
+        self.recover_btn.setToolTip(
+            "Recover at startup: ON — when AI Hive opens, agents whose work "
+            "stopped because the plan limit ran out are continued "
+            "automatically.\nClick to turn off."
+            if self._startup_recovery else
+            "Recover at startup: OFF — agents left stuck on a spent plan "
+            "limit stay stopped when AI Hive opens.\nClick to turn on.")
+        self.resume_btn.setCheckable(True)
+        self.resume_btn.setChecked(self._auto_continue)
+        self.resume_btn.setText("⏰")
+        self.resume_btn.setToolTip(
+            "Resume on limit reset: ON — while AI Hive is running, agents cut "
+            "off mid-work by the plan limit are continued the moment the "
+            "limit resets.\nClick to turn off."
+            if self._auto_continue else
+            "Resume on limit reset: OFF — agents cut off by the plan limit "
+            "wait for you.\nClick to turn on.")
+
     def set_usage(self, usage) -> None:
         """Push a plan-usage reading into the badge (no-op while hidden by the
         user, so a poll can't resurrect a readout they switched off)."""
@@ -237,28 +312,27 @@ class TopBar(QFrame):
     def usage_visible(self) -> bool:
         return self._usage_wanted
 
-    def set_auto_continue(self, on: bool) -> None:
-        """Reflect the auto-continue preference (no signal emitted)."""
-        self._auto_continue = bool(on)
-
-    def auto_continue(self) -> bool:
-        return self._auto_continue
+    def set_recovery_available(self, on: bool) -> None:
+        """Show/hide both recovery toggles. They act only on Claude agents cut
+        off by a plan limit, so with no Claude login there is nothing for them
+        to do — hide them with the readout rather than offer dead switches."""
+        self.recover_btn.setVisible(bool(on))
+        self.resume_btn.setVisible(bool(on))
 
     def contextMenuEvent(self, event):
-        """Right-click anywhere on the bar: the plan-usage preferences.
+        """Right-click anywhere on the bar: toggle the plan-usage readout.
 
-        Context-menu items rather than more buttons — the bar is already busy,
-        and these are set-once preferences, not things you flip often.
+        A context-menu item rather than another button — the bar is already
+        busy, and this is a set-once preference. The two RECOVERY switches are
+        deliberately NOT here: they decide whether unattended work resumes, so
+        they get visible buttons instead (and each setting has exactly one
+        control, never two that can disagree).
         """
         menu = QMenu(self)
         act = menu.addAction("Show plan usage")
         act.setCheckable(True)
         act.setChecked(self._usage_wanted)
         act.toggled.connect(self.usageVisibilityToggled)
-        cont = menu.addAction("Auto-continue agents when the limit resets")
-        cont.setCheckable(True)
-        cont.setChecked(self._auto_continue)
-        cont.toggled.connect(self.autoContinueToggled)
         menu.exec(event.globalPos())
 
     def set_theme(self, theme_id: str) -> None:
@@ -613,6 +687,7 @@ class MainWindow(QMainWindow):
         self._usage_inflight = False  # one request at a time, never stack
         self._plan_blocked = False    # edge state for planLimitReached/Cleared
         self._auto_continue = True    # user preference (persisted)
+        self._startup_recovery = True  # user preference (persisted)
         self._usage_backoff = 0       # consecutive 429s -> exponential poll gap
         self._usage_timer = QTimer(self)
         self._usage_timer.setInterval(USAGE_POLL_MS)
@@ -775,6 +850,7 @@ class MainWindow(QMainWindow):
         self.top_bar.soundToggled.connect(self._on_sound_toggled)
         self.top_bar.usageVisibilityToggled.connect(self._on_usage_visibility)
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
+        self.top_bar.startupRecoveryToggled.connect(self._on_startup_recovery)
         # resume whoever the limit cut off, the moment the window reopens
         self.planLimitCleared.connect(self._resume_blocked_agents)
         self.manager.agentLimitBlocked.connect(self._on_agent_limit_blocked)
@@ -945,6 +1021,9 @@ class MainWindow(QMainWindow):
         # Claude login at all (no-auth) has nothing to show, ever.
         if reading is not None and reading.error == "no-auth" and self._usage is None:
             self.top_bar.usage_badge.setVisible(False)
+            # no Claude account => no plan limit to recover from; don't leave
+            # two switches on the bar that can never do anything
+            self.top_bar.set_recovery_available(False)
             self._usage_timer.stop()
             self._usage_tick_timer.stop()
             return
@@ -1001,9 +1080,59 @@ class MainWindow(QMainWindow):
         self._schedule_save()   # a UI preference, like sound_enabled
 
     def _on_auto_continue(self, on: bool) -> None:
-        """User toggled auto-continue from the top bar's context menu."""
+        """User toggled resume-on-limit-reset from the top bar."""
         self._auto_continue = bool(on)
         self._schedule_save()   # a UI preference, like sound_enabled
+
+    def _on_startup_recovery(self, on: bool) -> None:
+        """User toggled recover-at-startup from the top bar."""
+        self._startup_recovery = bool(on)
+        self._schedule_save()   # a UI preference, like sound_enabled
+
+    def recover_blocked_at_startup(self) -> int:
+        """Find agents the plan limit stopped BEFORE this run, and arm them to
+        be resumed. Returns how many were armed.
+
+        OPT-IN and called from main.py only, exactly like `start_usage_polling`
+        and `quit_on_close`: the smoke suite shares `create_main_window` and
+        must never type into a real agent or read the user's real transcripts.
+
+        The live latch cannot see these — after a restart each agent's screen
+        shows a REPLAYED conversation, which `_scrape_limit` deliberately
+        ignores as history. The transcript is the durable record instead: it
+        still ends exactly where the limit stopped it.
+
+        This only ARMS them. Delivery stays with the one watchdog
+        (`_check_limit_resets`), so there is a single resume path to get right
+        — including waiting for a freshly launched TUI to become prompt-ready.
+        """
+        if not self._startup_recovery:
+            return 0
+        now = time.time()
+        armed = 0
+        for agent in self.manager.all_agents():
+            spec = agent.spec
+            if spec.provider != "claude" or not agent.is_pty:
+                continue
+            # A card the user left stopped stays stopped: this resumes work, it
+            # does not launch processes they didn't ask for (and each one would
+            # spend quota).
+            if not agent.is_running() or agent.is_limit_blocked():
+                continue
+            cut_off, written_at, resets_at = transcripts.ended_on_limit(
+                spec.cwd, spec.session_id)
+            # The gate the user asked for: no stoppage message, no action.
+            if not cut_off or not written_at:
+                continue
+            if now - written_at > STARTUP_RECOVERY_MAX_AGE_S:
+                self._limit_audit(f"STARTUP-SKIP agent={spec.name} (stale, "
+                                  f"{int((now - written_at) / 3600)}h old)")
+                continue
+            agent.mark_limit_blocked(resets_at or None, from_startup=True)
+            armed += 1
+        if armed:
+            self._limit_audit(f"STARTUP-SCAN armed={armed}")
+        return armed
 
     def _limit_audit(self, message: str) -> None:
         """Forensic line in session.log for the auto-continue path.
@@ -1039,7 +1168,7 @@ class MainWindow(QMainWindow):
         banner states its reset time in local clock time, latched when it was
         drawn, so this needs neither the network nor process continuity.
         """
-        if self._closing or not self._ready or not self._auto_continue:
+        if self._closing or not self._ready:
             return
         now = time.time()
         # A latched agent whose banner carried NO parseable time has no due
@@ -1063,17 +1192,23 @@ class MainWindow(QMainWindow):
         next 5-hour window, so resuming at 4am also means the clock has rolled
         over by morning.
 
-        Only agents LATCHED as cut off are touched (`is_limit_blocked`, set when
-        the banner was drawn) — the account-wide reading cannot say who was
-        mid-turn. An agent that is busy again, or was never cut off, is left
-        alone.
+        Only agents LATCHED as cut off are touched (`is_limit_blocked`) — the
+        account-wide reading cannot say who was mid-turn. An agent that is busy
+        again, or was never cut off, is left alone.
+
+        Each latch is gated by the toggle that OWNS it: one recovered from disk
+        at startup answers to `startup_recovery`, one seen live answers to
+        `auto_continue`. That keeps the two switches genuinely independent —
+        turning one off can never strand a latch the other created.
         """
-        if self._closing or not self._ready or not self._auto_continue:
+        if self._closing or not self._ready:
             return
         blocked = [a for a in self.manager.all_agents()
                    if a.spec.provider == "claude" and a.is_pty
                    and a.is_running() and not a.is_busy()
                    and a.is_limit_blocked()
+                   and (self._startup_recovery if a.limit_from_startup()
+                        else self._auto_continue)
                    and a.limit_retry_ready(LIMIT_RETRY_S, LIMIT_MAX_TRIES)
                    and (due is None or due(a))]
         for i, agent in enumerate(blocked):
@@ -1089,6 +1224,13 @@ class MainWindow(QMainWindow):
     def _auto_continue_agent(self, agent) -> None:
         """Dismiss the limit prompt, then submit the go-ahead a beat later."""
         if self._closing or not agent.is_running():
+            return
+        # An agent recovered at startup may still be booting its TUI. Don't
+        # poke a launching terminal with stray Esc keys every minute — just
+        # wait. `nudge` would refuse anyway, and a refusal costs no attempt, so
+        # the watchdog picks it up as soon as the prompt is live.
+        if not agent.prompt_ready():
+            self._limit_audit(f"WAIT agent={agent.spec.name} (TUI not ready)")
             return
         agent.write("\x1b")
 
@@ -1160,6 +1302,8 @@ class MainWindow(QMainWindow):
         self.top_bar.set_usage_visible(self._usage_visible)
         self._auto_continue = bool(ui.get("auto_continue", True))
         self.top_bar.set_auto_continue(self._auto_continue)
+        self._startup_recovery = bool(ui.get("startup_recovery", True))
+        self.top_bar.set_startup_recovery(self._startup_recovery)
         win = ui.get("window", {})
         if win.get("w") and win.get("h"):
             self.resize(int(win["w"]), int(win["h"]))
@@ -1605,6 +1749,7 @@ class MainWindow(QMainWindow):
             "sound_enabled": self._sound_enabled,
             "usage_visible": self._usage_visible,
             "auto_continue": self._auto_continue,
+            "startup_recovery": self._startup_recovery,
             "window": {"w": w, "h": h, "maximized": self.isMaximized()},
             # which workspaces have their inline file tree open (per-folder
             # expansion + highlight are transient, not persisted)

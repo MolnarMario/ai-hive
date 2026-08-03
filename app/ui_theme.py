@@ -567,6 +567,17 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     padding: 2px 6px; color: {p.TEXT}; font-size: 14px;
 }}
 #SoundToggle:hover {{ border-color: {p.ACCENT_GOLD}; }}
+/* the two auto-recovery switches beside the plan-usage readout. Armed reads
+   as lit (accent border + full-strength glyph), off reads as faint, so
+   "will my work resume by itself?" is answerable without hovering. */
+#RecoveryToggle {{
+    background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
+    padding: 2px 6px; color: {p.TEXT_FAINT}; font-size: 14px;
+}}
+#RecoveryToggle:checked {{
+    color: {p.ACCENT_GOLD}; border-color: {p.ACCENT_GOLD};
+}}
+#RecoveryToggle:hover {{ border-color: {p.ACCENT_BLUE}; }}
 #CardClose:hover, #WsDelete:hover {{ color: {p.RED}; border-color: {p.RED}; }}
 QPushButton {{
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};

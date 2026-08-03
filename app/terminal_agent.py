@@ -105,59 +105,20 @@ _OPTION_CARET_RE = re.compile(r"(?m)^[\s│┃|]*[>❯❱]\s*\d+\.\s+\S")
 # --- "this agent was cut off by the plan limit" detection ---
 # WHICH agents to resume when the window reopens. The plan-usage reading
 # (app/claude_usage.py) is ACCOUNT-wide — it says the account is out and until
-# when, never which agents were mid-turn — so attribution has to come from the
-# screen, and it must be LATCHED THE MOMENT THE BANNER IS DRAWN.
-# Do NOT go back and scrape at reset time instead (the original mistake, which
-# cost a whole night's unattended work): `_screen_tail` is a 4000-char ROLLING
-# buffer, and Claude's TUI keeps redrawing its input box and footer while
-# parked, so after an hour or two of idling the banner has been evicted and the
-# tail holds only the bottom of a frame. The settle point below is the only
-# moment the frame is current — the same reason `_screen_waiting` works.
-# Matches ONLY the exhausted banner (`You've hit your session limit · resets
-# 8:30pm`), never the `Approaching …` / `You've used 62% of your …` warnings —
-# those mean the agent is still working, and nudging it would interrupt it.
-# Verified against claude.exe 2.1.220, which renders these from the templates
-# `You've hit your ${label}` with {five_hour:"session limit",
-# seven_day:"weekly limit"}.
-_LIMIT_HIT_RE = re.compile(r"you['’]ve hit your\s+"
-                           r"(?:session|weekly|usage|opus|sonnet)\s+limit",
-                           re.I)
-# The banner states its own reset time ("· resets 8:30pm (Europe/Bucharest)"),
-# already in LOCAL time. This is the second, network-free trigger: it survives
-# a usage-endpoint 429, a missed API edge, and an app restart, none of which
-# the account-wide reading does. The timezone suffix is ignored on purpose —
-# the clock shown is the user's own.
-_LIMIT_RESET_RE = re.compile(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
-                             re.I)
-
-
-def parse_reset_clock(text: str, now: float | None = None) -> float | None:
-    """Epoch seconds of the NEXT occurrence of the wall clock in a limit
-    banner, or None when there is no time in it.
-
-    A bare clock time has no date, so it resolves to today if that moment is
-    still ahead and tomorrow otherwise — the rollover that matters, since the
-    banner is usually read late at night about a small-hours reset.
-    """
-    m = _LIMIT_RESET_RE.search(text or "")
-    if not m:
-        return None
-    hour, minute, ampm = int(m.group(1)), int(m.group(2) or 0), m.group(3)
-    if ampm:
-        ampm = ampm.lower()
-        if hour == 12:
-            hour = 0
-        if ampm == "pm":
-            hour += 12
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None
-    now = time.time() if now is None else now
-    lt = time.localtime(now)
-    target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hour, minute, 0,
-                          0, 0, -1))
-    if target <= now:
-        target += 86400
-    return target
+# when, never which agents were mid-turn — so attribution comes from the
+# screen, LATCHED THE MOMENT THE CUT-OFF IS DRAWN. The patterns themselves live
+# in `limit_banner` because `transcripts` (Qt-free) must match the same thing
+# off disk; see that module for which signal is authoritative and why.
+#
+# Two hard-won rules, both from live misses:
+#  * Latch on the OUTPUT BURST, not on the idle-timer settle. The cut-off lands
+#    right after the user submits a prompt — exactly when `_mark_busy` treats
+#    output as keystroke echo and skips arming that timer — and a silently
+#    parked agent then emits nothing more to arm it, so the settle never comes.
+#  * Never re-derive it later from `_screen_tail`: that is a 4000-char ROLLING
+#    buffer, and hours of idle redraws evict the banner entirely.
+from .limit_banner import (LIMIT_HIT_RE, LIMIT_MENU_RE,  # noqa: F401
+                           banner_reset_at, is_limit_screen, parse_reset_clock)
 
 
 class TerminalAgent(QObject):
@@ -221,6 +182,7 @@ class TerminalAgent(QObject):
         self._limit_resets_at: float | None = None
         self._limit_tries = 0          # resume attempts since the cut-off
         self._limit_last_try = 0.0
+        self._limit_from_startup = False   # recovered from disk vs seen live
         # "waiting for the user" is the OR of three independent sources (see
         # _emit_waiting): _scrape_waiting (the settled screen shows a numbered
         # menu + selection caret — a permission prompt), _tool_waiting (an
@@ -699,17 +661,47 @@ class TerminalAgent(QObject):
             return
         # Deliberately a WIDER region than _screen_waiting's last 18 lines.
         # That bound is right for a selection menu, which is anchored just
-        # above the input box; the limit banner is NOT bottom-anchored — the
-        # options menu (upgrade / team / extra usage / cancel), the input box
-        # and the footer all render below it, so 18 lines can push the banner
-        # out of view on a full frame. _LIMIT_HIT_RE is specific enough to
-        # search a wider window safely.
+        # above the input box; the banner is NOT bottom-anchored — the options
+        # menu, the input box and the footer all render below it, so 18 lines
+        # can push it out of view on a full frame. Both patterns are specific
+        # enough to search a wider window safely.
         region = "\n".join(self._screen_tail.splitlines()[-40:])
-        if not region or not _LIMIT_HIT_RE.search(region):
+        if not is_limit_screen(region):
             return
         self._limit_blocked = True
+        # The reset clock lives in the banner, not the menu, so it may be
+        # absent (the banner can have scrolled while the menu is still up).
+        # None simply means "no network-free due time" — the watchdog then
+        # leaves this one to the plan-usage edge rather than guessing.
         self._limit_resets_at = parse_reset_clock(region)
+        self._limit_from_startup = False
         self.limit_blocked_changed.emit(True)
+
+    def mark_limit_blocked(self, resets_at: float | None,
+                           from_startup: bool = True) -> None:
+        """Seed the latch from OUTSIDE the live screen — startup recovery,
+        which reconstructs the cut-off from the transcript on disk because the
+        screen shows a replayed conversation rather than a live banner.
+
+        `from_startup` records which toggle owns this latch, so the two
+        preferences stay independent: a cut-off found at startup is resumed
+        only if startup recovery is on, one observed live only if
+        resume-on-reset is on.
+        """
+        if self._limit_blocked:
+            return
+        self._limit_blocked = True
+        self._limit_resets_at = resets_at
+        self._limit_from_startup = bool(from_startup)
+        self.limit_blocked_changed.emit(True)
+
+    def limit_from_startup(self) -> bool:
+        """True when this latch was recovered from disk rather than seen live."""
+        return self._limit_from_startup
+
+    def prompt_ready(self) -> bool:
+        """True once the TUI's input prompt is live and will accept typing."""
+        return self._prompt_ready
 
     def clear_limit_block(self) -> None:
         """Forget the latched cut-off (it resumed, or it restarted)."""
@@ -717,6 +709,7 @@ class TerminalAgent(QObject):
         self._limit_resets_at = None
         self._limit_tries = 0
         self._limit_last_try = 0.0
+        self._limit_from_startup = False
 
     def note_limit_attempt(self) -> None:
         """Record that we just tried to resume this agent."""
@@ -737,13 +730,18 @@ class TerminalAgent(QObject):
                 or time.time() - self._limit_last_try >= retry_after_s)
 
     def recheck_limit(self) -> bool:
-        """After a resume attempt, re-derive the latch from the CURRENT screen:
-        the banner is gone once the agent is genuinely going again. Returns
-        True while it is still parked on it (so the caller can retry)."""
+        """After a resume attempt: is the agent STILL parked? True means retry.
+
+        Keys on the MENU alone, deliberately — it is the interactive element
+        that actually blocks input, so it is present exactly while the agent is
+        stuck and gone the moment it is going again. The banner must NOT be
+        used here: it is scrollback, so it lingers in the tail well after a
+        successful resume and would report a false "still blocked" forever.
+        """
         if not self._limit_blocked:
             return False
         region = "\n".join(self._screen_tail.splitlines()[-40:])
-        if region and _LIMIT_HIT_RE.search(region):
+        if region and LIMIT_MENU_RE.search(region):
             return True
         self.clear_limit_block()
         return False

@@ -5432,6 +5432,15 @@ def test_auto_continue_on_limit_reset():
 
     BANNER = ("You've hit your session limit \xb7 resets 4:40am "
               "(Europe/Bucharest)\n")
+    # what Claude actually parks the agent on. Unlike the banner (ordinary
+    # scrollback, which the rolling tail evicts) this MENU stays up for as long
+    # as the agent is stuck, so it is the primary live signal and the "did it
+    # resume?" test.
+    MENU = ("What do you want to do?\n"
+            "> 1. Stop and wait for limit to reset\n"
+            "  2. Upgrade your plan\n"
+            "Enter to confirm \xb7 Esc to cancel\n")
+    PARKED = BANNER + MENU
 
     # --- the per-agent "I was cut off" scrape -------------------------------
     def mk(name="Coder", provider="claude", pty=True):
@@ -5467,6 +5476,13 @@ def test_auto_continue_on_limit_reset():
           a.is_limit_blocked())
     check("auto-continue: the banner's own reset time is latched with it",
           a.limit_resets_at() is not None)
+
+    # the menu alone is enough — it is what survives on screen when the banner
+    # above it has scrolled out of the rolling tail
+    menu_only = mk("MenuOnly")
+    settle(menu_only, MENU)
+    check("auto-continue: the parked-on menu alone IS a cut-off",
+          menu_only.is_limit_blocked())
 
     # THE REGRESSION that cost a night's work: the banner is latched when it is
     # DRAWN, because _screen_tail is a rolling buffer — by reset time the agent
@@ -5607,12 +5623,16 @@ def test_auto_continue_on_limit_reset():
           cut_off.is_limit_blocked())
     check("auto-continue: a nudged agent is not re-nudged a minute later",
           not cut_off.limit_retry_ready(300, 4))
-    check("auto-continue: still parked -> stays latched for a retry",
+    cut_off._screen_tail = PARKED           # menu still up: it didn't take
+    check("auto-continue: still parked on the menu -> stays latched for a retry",
           cut_off.recheck_limit() is True)
-    settle(cut_off, "│ > │\n  ? for shortcuts\n")   # banner gone: it's going
-    check("auto-continue: banner gone on recheck -> latch cleared",
-          cut_off.recheck_limit() is False
-          and not cut_off.is_limit_blocked())
+    # The banner LINGERS in the tail after a successful resume, so verification
+    # must key on the menu alone — using the banner would report a false
+    # "still blocked" forever and burn every retry.
+    cut_off._screen_tail = BANNER + "\nWorking on it...\n  ? for shortcuts\n"
+    check("auto-continue: menu gone -> resumed, even with the banner still in "
+          "the scrollback",
+          cut_off.recheck_limit() is False and not cut_off.is_limit_blocked())
     check("auto-continue: attempts reset with the latch",
           cut_off.limit_attempts() == 0)
 
@@ -5695,6 +5715,169 @@ def test_auto_continue_on_limit_reset():
         _chime.play = real_play
 
 
+def test_startup_limit_recovery():
+    """Agents the plan limit stopped BEFORE the app opened are found and armed.
+
+    The live latch cannot see these: after a restart each agent's screen shows
+    a REPLAYED conversation, which _scrape_limit deliberately ignores as
+    history. The transcript is the durable record — it still ends exactly where
+    the limit stopped it. The gate the user asked for is strict: no stoppage
+    message, no action."""
+    import json as _json
+    import time as _time
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import limit_banner, transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.main_window import STARTUP_RECOVERY_MAX_AGE_S
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-startup-rec-"))
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def iso(epoch):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(epoch))
+
+    def write_transcript(cwd, sid, records):
+        d = Path(transcripts.transcript_path(cwd, sid)).parent
+        d.mkdir(parents=True, exist_ok=True)
+        with open(transcripts.transcript_path(cwd, sid), "w",
+                  encoding="utf-8") as fh:
+            for r in records:
+                fh.write(_json.dumps(r) + "\n")
+
+    def assistant(text, at):
+        return {"type": "assistant", "timestamp": iso(at),
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    now = _time.time()
+    cwd = str(tmp)
+    BANNER = "You've hit your session limit \xb7 resets 3am (Europe/Bucharest)"
+
+    # --- reading the durable record -----------------------------------------
+    cut_at = _time.mktime((2026, 8, 3, 2, 42, 0, 0, 0, -1))
+    write_transcript(cwd, "sid-cut", [assistant("working", cut_at - 600),
+                                      assistant(BANNER, cut_at)])
+    hit, when, resets = transcripts.ended_on_limit(cwd, "sid-cut")
+    check("startup-recovery: a transcript ending on the banner is a cut-off",
+          hit and abs(when - cut_at) < 2)
+    lt = _time.localtime(resets)
+    check("startup-recovery: the reset is anchored to WHEN THE BANNER WAS "
+          "WRITTEN, not to now (02:42 + 'resets 3am' -> 03:00 THAT day)",
+          (lt.tm_hour, lt.tm_min) == (3, 0) and 0 < resets - cut_at < 3600)
+
+    # the same banner resolved against a later clock lands a full day out --
+    # the bug this anchoring exists to prevent
+    naive = limit_banner.parse_reset_clock(BANNER, cut_at + 6 * 3600)
+    check("startup-recovery: un-anchored parsing would stall a day",
+          naive - resets > 80000)
+
+    write_transcript(cwd, "sid-went-on", [assistant(BANNER, cut_at),
+                                          assistant("carrying on", cut_at + 60)])
+    hit2, _, _ = transcripts.ended_on_limit(cwd, "sid-went-on")
+    check("startup-recovery: a banner followed by real output is history, "
+          "not a cut-off", not hit2)
+    check("startup-recovery: no transcript at all is not a cut-off",
+          transcripts.ended_on_limit(cwd, "sid-missing")[0] is False)
+
+    # --- arming from it ------------------------------------------------------
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.show(); pump(50)
+    ws = win.manager.workspaces[0]
+
+    def agent_for(name, sid):
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=cwd, pty=True)
+        spec.session_id = sid
+        a = TerminalAgent(spec)
+        a.worker = type("W", (), {"is_running": lambda s: True,
+                                  "write": lambda s, d: True,
+                                  "start": lambda s: None,
+                                  "dispose": lambda s: None})()
+        a._prompt_ready = True
+        ws.agents.append(a)
+        return a
+
+    cut = agent_for("Cut", "sid-cut")
+    went_on = agent_for("WentOn", "sid-went-on")
+    check("startup-recovery: armed exactly the cut-off agent",
+          win.recover_blocked_at_startup() == 1)
+    check("startup-recovery: the cut-off agent is latched, with its reset time",
+          cut.is_limit_blocked() and cut.limit_resets_at() is not None)
+    check("startup-recovery: the latch is marked as coming from startup",
+          cut.limit_from_startup() is True)
+    check("startup-recovery: an agent without the stoppage message is untouched",
+          not went_on.is_limit_blocked())
+
+    # a card left stopped stays stopped -- this resumes work, it does not
+    # launch processes (each one would spend quota)
+    stopped = agent_for("Stopped", "sid-cut")
+    stopped.worker = type("W", (), {"is_running": lambda s: False,
+                                    "write": lambda s, d: True,
+                                    "start": lambda s: None,
+                                    "dispose": lambda s: None})()
+    win.recover_blocked_at_startup()
+    check("startup-recovery: a stopped agent is left stopped",
+          not stopped.is_limit_blocked())
+
+    # staleness bound: don't revive work abandoned days ago just because the
+    # app was opened
+    old_at = now - STARTUP_RECOVERY_MAX_AGE_S - 3600
+    write_transcript(cwd, "sid-old", [assistant(BANNER, old_at)])
+    old = agent_for("Old", "sid-old")
+    win.recover_blocked_at_startup()
+    check("startup-recovery: a cut-off older than the age bound is skipped",
+          not old.is_limit_blocked())
+
+    # --- the toggle owns its own latches ------------------------------------
+    win._startup_recovery = False
+    fresh = agent_for("Fresh", "sid-cut")
+    check("startup-recovery: scanning is skipped entirely while the toggle is "
+          "off", win.recover_blocked_at_startup() == 0
+          and not fresh.is_limit_blocked())
+
+    # a startup latch must NOT be resumed by the OTHER toggle
+    writes = []
+    cut.worker = type("W", (), {
+        "is_running": lambda s: True,
+        "write": lambda s, d: (writes.append(d), True)[1],
+        "start": lambda s: None, "dispose": lambda s: None})()
+    cut._limit_resets_at = now - 60
+    win._auto_continue = True          # the other switch is on...
+    win._check_limit_resets()          # ...and must not act on a startup latch
+    pump(1200)
+    check("startup-recovery: resume-on-reset does NOT resume a startup latch",
+          writes == [])
+    win._startup_recovery = True
+    win._check_limit_resets()
+    pump(1200)
+    check("startup-recovery: its own toggle DOES resume it",
+          any("Continue" in d for d in writes))
+
+    # --- both preferences persist -------------------------------------------
+    win._on_startup_recovery(False)
+    win._on_auto_continue(True)
+    ui = win._session_payload()["ui"]
+    check("startup-recovery: preference persisted under ui.startup_recovery",
+          ui["startup_recovery"] is False and ui["auto_continue"] is True)
+    win.close()
+
+    win2 = create_main_window(store)
+    win2.show(); pump(50)
+    check("startup-recovery: both toggles restore independently",
+          win2.top_bar.startup_recovery() is False
+          and win2.top_bar.auto_continue() is True)
+    check("startup-recovery: defaults are ON when never saved",
+          create_main_window(
+              SessionStore(path=tmp / "fresh.json")).top_bar.startup_recovery())
+    win2.close()
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
@@ -5752,6 +5935,7 @@ def main():
     test_sidebar_search()
     test_plan_usage()
     test_auto_continue_on_limit_reset()
+    test_startup_limit_recovery()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0
