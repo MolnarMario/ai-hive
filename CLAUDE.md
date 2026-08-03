@@ -134,6 +134,22 @@ this file is the invariants that must survive every change.
   offset, never pyte paging (`prev_page` snaps back on any event). The wheel
   has three regimes (mouse-tracking forward / altscreen arrows / history
   offset) — keep all three working.
+- **Block Elements are drawn GEOMETRICALLY, never by the font**
+  (`terminal_view._BLOCK_RECTS`/`_BLOCK_SHADES`/`_paint_block`). Consolas has
+  no QUADRANT glyphs (U+2596-259F), so Qt silently falls back to Segoe UI
+  Symbol at a 12px advance in a 7px cell — and since `paintEvent` batches a
+  run of cells into ONE `drawText`, letting Qt lay it out, that single glyph
+  drags the whole rest of the row sideways. Claude Code's welcome mascot is
+  full blocks plus quadrants, so its rows sheared apart and its corners came
+  out notched (the fallback ink is also the wrong shape for the cell). Even
+  in-font, Consolas' full block is 6.7px of ink in a 7.0px advance, striping
+  solid artwork with background hairlines. So: fill exact rects on the shared
+  rounded grid from `cell_bounds`, which derives BOTH edges of a cell from the
+  same expression — cell N's right edge is bit-identical to cell N+1's left,
+  which is what makes the fills tile at any fractional cell size. The general
+  rule behind it: a glyph whose advance isn't the cell width (`_is_grid_glyph`
+  — also true of `✳`, `⏸`) is drawn ALONE at its own cell so it can never
+  shear its row; ordinary text still goes out in one `drawText`.
 - **Claude CLI facts** (verified 2.1.197): interactive `--continue`/`--resume
   <id>` hard-exit when there is no matching conversation (handled by the
   fresh-fallback in `TerminalAgent._on_finished`); headless `-p` silently
