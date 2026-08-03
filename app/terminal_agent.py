@@ -97,6 +97,21 @@ _CSI_RE = re.compile(r"\x1b\[[0-9;?<>=]*[@-~]|\x1b[()][AB0]|\x1b\][^\x07\x1b]*\x
 # numbered option — so keying off the caret stops the "?"/chime from
 # false-firing on ordinary output (which it did). Heuristic and non-blocking: a
 # missed exotic prompt just doesn't light up.
+# Claude's input-box footer rotates through several hints; ANY of them means
+# the prompt is live and will accept typing. Only "? for shortcuts" was matched
+# originally, which made readiness a coin-flip on whatever the rotation happened
+# to be showing (a restored agent sat "not ready" indefinitely — see
+# _on_pty_output). Kept lowercase; matched against the lowered tail. Chosen to
+# be footer-specific rather than words an agent might write in ordinary prose,
+# since a false positive here would deliver a task into a dialog.
+_CLAUDE_READY_HINTS = (
+    "? for shortcuts",
+    "shift+tab to cycle",
+    "for agents",
+    "auto mode on",
+    "ctrl+t to show tasks",
+)
+
 _NUM_OPTION_RE = re.compile(r"(?m)^\s*[>❯❱│┃|]*\s*\d+\.\s+\S")
 # a numbered option with a selection caret in front (optionally past box
 # borders) — the highlighted row of a live menu, absent from plain prose lists
@@ -771,19 +786,29 @@ class TerminalAgent(QObject):
         # for why this must not wait for the idle-timer settle
         if not self._limit_blocked:
             self._scrape_limit()
-        # readiness to receive a task. For Claude the ONLY reliable signal is
-        # the input-box footer ("? for shortcuts"): the folder-trust dialog
-        # also enables bracketed paste (and does NOT disable it on dismissal
-        # — both verified live), so 2004h alone would deliver the task into
-        # the dialog. The footer renders exactly when the prompt is truly
-        # interactive, including after trust dialogs and resume replays.
-        # Other TUIs (pty PowerShell via PSReadLine, agy) keep the
-        # paste-enable signal.
+        # readiness to receive a task. For Claude the signal is the input-box
+        # footer: the folder-trust dialog also enables bracketed paste (and
+        # does NOT disable it on dismissal — both verified live), so 2004h
+        # alone would deliver the task into the dialog. The footer renders
+        # exactly when the prompt is truly interactive, including after trust
+        # dialogs and resume replays. Other TUIs (pty PowerShell via
+        # PSReadLine, agy) keep the paste-enable signal.
+        #
+        # CRITICAL: match the whole footer-hint FAMILY, not just "? for
+        # shortcuts". That hint is only ONE member of a rotating set — the
+        # footer may instead be showing "auto mode on(shift+tab to cycle) ...
+        # <- for agents" — so keying on it alone leaves an agent permanently
+        # "not ready" whenever the rotation sits elsewhere. Verified live: a
+        # restored agent parked on a spent plan limit sat un-nudged through
+        # repeated watchdog ticks for exactly this reason, and a task
+        # delivered to it would have hung in _pending_task forever too. If a
+        # future CLI renames these, this tuple is the one place to fix.
         if not self._prompt_ready:
             if self.spec.provider == "claude":
                 self._ready_tail = (self._ready_tail
                                     + _CSI_RE.sub("", text))[-600:]
-                ready = "? for shortcuts" in self._ready_tail.lower()
+                tail = self._ready_tail.lower()
+                ready = any(h in tail for h in _CLAUDE_READY_HINTS)
             else:
                 ready = "\x1b[?2004h" in text
             if ready:

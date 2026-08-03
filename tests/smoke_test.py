@@ -5510,6 +5510,25 @@ def test_auto_continue_on_limit_reset():
     check("auto-continue: the same banner once live DOES latch",
           replay.is_limit_blocked())
 
+    # Prompt readiness must accept the WHOLE rotating footer-hint family, not
+    # just "? for shortcuts". Keying on that one member left a restored agent
+    # permanently "not ready" -- the watchdog logged WAIT every minute and
+    # never nudged it (verified live), and a delivered task would have hung in
+    # _pending_task just as long.
+    for hint in ("? for shortcuts",
+                 "auto mode on(shift+tab to cycle) \xb7 ctrl+t to show tasks "
+                 "\xb7 ← for agents"):
+        r = mk("Ready")
+        r._prompt_ready = False
+        r._on_pty_output("pty", "\x1b[?2004h" + hint + "\n")
+        check(f"auto-continue: footer hint {hint.split(chr(183))[0][:24]!r} "
+              f"marks the prompt ready", r.prompt_ready())
+    notready = mk("NotReady")
+    notready._prompt_ready = False
+    notready._on_pty_output("pty", "Do you trust the files in this folder?\n")
+    check("auto-continue: the trust dialog is NOT mistaken for a live prompt",
+          not notready.prompt_ready())
+
     # the latch must not wait for the idle-timer settle: the banner arrives
     # right after the user hits Enter, which is exactly when _mark_busy treats
     # output as keystroke echo and never arms that timer (a live miss)
