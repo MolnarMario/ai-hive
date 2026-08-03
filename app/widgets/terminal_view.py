@@ -279,6 +279,60 @@ _MAX_ESC_CARRY = 4096
 # decide how the wheel must behave (altscreen / mouse tracking / paste mode).
 _PRIVATE_MODE_RE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
 
+# Block Elements (U+2580-U+259F) are drawn GEOMETRICALLY rather than handed to
+# the font, the way every real terminal (Windows Terminal, kitty, alacritty)
+# does it. Three reasons, all observed live on Claude Code's welcome mascot —
+# which is built from full blocks plus QUADRANTS (U+2598/259B/259C/259D):
+#   1. Consolas has no quadrant glyphs at all. Qt silently falls back to
+#      Segoe UI Symbol, whose advance is 12px where the cell is 7 — and since
+#      paintEvent batches a run of cells into ONE drawText, that one glyph
+#      shoves the whole rest of the row ~5px right. The mascot's rows sheared
+#      against each other.
+#   2. The fallback glyph is also the wrong SHAPE for the cell (12.3x12.5 ink
+#      in a 7x15 box, different baseline), so a "quarter" never meets the
+#      neighbouring full block's edge — corners came out notched.
+#   3. Even where Consolas DOES have the glyph, its full-block ink is 6.7px
+#      wide inside a 7.0px advance, leaving a ~0.3px unpainted hairline at
+#      every cell boundary that antialiased into visible stripes through
+#      solid artwork.
+# Filling exact grid rects fixes all three and is font-independent, so it
+# survives a theme font change. Values are fractions of the cell (x0,y0,x1,y1)
+# with the origin top-left; see the Unicode chart for the eighths.
+_BLOCK_RECTS = {
+    "▀": ((0, 0, 1, 1 / 2),),            # upper half
+    "▁": ((0, 7 / 8, 1, 1),),            # lower one eighth
+    "▂": ((0, 3 / 4, 1, 1),),            # lower one quarter
+    "▃": ((0, 5 / 8, 1, 1),),            # lower three eighths
+    "▄": ((0, 1 / 2, 1, 1),),            # lower half
+    "▅": ((0, 3 / 8, 1, 1),),            # lower five eighths
+    "▆": ((0, 1 / 4, 1, 1),),            # lower three quarters
+    "▇": ((0, 1 / 8, 1, 1),),            # lower seven eighths
+    "█": ((0, 0, 1, 1),),                # full block
+    "▉": ((0, 0, 7 / 8, 1),),            # left seven eighths
+    "▊": ((0, 0, 3 / 4, 1),),            # left three quarters
+    "▋": ((0, 0, 5 / 8, 1),),            # left five eighths
+    "▌": ((0, 0, 1 / 2, 1),),            # left half
+    "▍": ((0, 0, 3 / 8, 1),),            # left three eighths
+    "▎": ((0, 0, 1 / 4, 1),),            # left one quarter
+    "▏": ((0, 0, 1 / 8, 1),),            # left one eighth
+    "▐": ((1 / 2, 0, 1, 1),),            # right half
+    "▔": ((0, 0, 1, 1 / 8),),            # upper one eighth
+    "▕": ((7 / 8, 0, 1, 1),),            # right one eighth
+    "▖": ((0, 1 / 2, 1 / 2, 1),),        # quadrant lower left
+    "▗": ((1 / 2, 1 / 2, 1, 1),),        # quadrant lower right
+    "▘": ((0, 0, 1 / 2, 1 / 2),),        # quadrant upper left
+    "▙": ((0, 0, 1 / 2, 1 / 2), (0, 1 / 2, 1, 1)),      # UL+LL+LR
+    "▚": ((0, 0, 1 / 2, 1 / 2), (1 / 2, 1 / 2, 1, 1)),  # UL+LR
+    "▛": ((0, 0, 1, 1 / 2), (0, 1 / 2, 1 / 2, 1)),      # UL+UR+LL
+    "▜": ((0, 0, 1, 1 / 2), (1 / 2, 1 / 2, 1, 1)),      # UL+UR+LR
+    "▝": ((1 / 2, 0, 1, 1 / 2),),        # quadrant upper right
+    "▞": ((1 / 2, 0, 1, 1 / 2), (0, 1 / 2, 1 / 2, 1)),  # UR+LL
+    "▟": ((1 / 2, 0, 1, 1 / 2), (0, 1 / 2, 1, 1)),      # UR+LL+LR
+}
+# The three shade blocks are the same full cell at partial opacity — drawing
+# them as a stipple would moire against the cell grid at small font sizes.
+_BLOCK_SHADES = {"░": 0.25, "▒": 0.50, "▓": 0.75}
+
 
 class TerminalView(QWidget):
     keyInput = Signal(str)        # VT byte sequence for the PTY
@@ -341,6 +395,9 @@ class TerminalView(QWidget):
         self._cell_w = metrics.horizontalAdvance("M")
         self._cell_h = metrics.height()
         self._ascent = metrics.ascent()
+        # char -> "does this glyph advance exactly one cell?", memoized per
+        # font size (see _is_grid_glyph). Cleared whenever the font changes.
+        self._grid_glyph_cache: dict[str, bool] = {}
 
         self.screen = _new_history_screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
@@ -484,6 +541,7 @@ class TerminalView(QWidget):
         self._cell_w = metrics.horizontalAdvance("M")
         self._cell_h = metrics.height()
         self._ascent = metrics.ascent()
+        self._grid_glyph_cache.clear()  # advances are per font size
         # recompute rows/cols for the new cell size and resize the pty
         self._apply_resize()
         self.update()
@@ -1518,6 +1576,50 @@ class TerminalView(QWidget):
             return QColor("#" + value)
         return QColor(default)
 
+    def cell_bounds(self, col: int, row: int) -> tuple[int, int, int, int]:
+        """Device-pixel (x0, y0, x1, y1) of one cell, ROUNDED on the shared
+        grid so cell N's right edge is bit-identical to cell N+1's left edge.
+        Deriving both edges from the same rounded expression is what makes
+        adjacent block glyphs tile with no seam and no overlap — computing a
+        width instead (round(w) per cell) accumulates error across a row."""
+        return (round(CELL_PAD_X + col * self._cell_w),
+                round(CELL_PAD_Y + row * self._cell_h),
+                round(CELL_PAD_X + (col + 1) * self._cell_w),
+                round(CELL_PAD_Y + (row + 1) * self._cell_h))
+
+    def _is_grid_glyph(self, data: str) -> bool:
+        """True when this character advances exactly one cell in the terminal
+        font. A character the font LACKS is resolved by Qt's fallback to some
+        other family whose advance is its own (Segoe UI Symbol renders the
+        quadrant blocks 12px wide where the cell is 7). Since paintEvent draws
+        a whole run with one drawText, letting Qt lay it out, such a glyph
+        would drag every following character in the run off the grid — so the
+        caller draws it ALONE at its own cell instead."""
+        if data.isascii():  # the overwhelmingly common case, always in-font
+            return True
+        cached = self._grid_glyph_cache.get(data)
+        if cached is None:
+            adv = QFontMetricsF(self._font).horizontalAdvance(data)
+            cached = abs(adv - self._cell_w) < 0.01
+            self._grid_glyph_cache[data] = cached
+        return cached
+
+    def _paint_block(self, painter, data: str, col: int, row: int,
+                     color: QColor) -> None:
+        """Draw one Block Element as filled rects on the cell grid."""
+        x0, y0, x1, y1 = self.cell_bounds(col, row)
+        shade = _BLOCK_SHADES.get(data)
+        if shade is not None:
+            tint = QColor(color)
+            tint.setAlphaF(color.alphaF() * shade)
+            painter.fillRect(x0, y0, x1 - x0, y1 - y0, tint)
+            return
+        w, h = x1 - x0, y1 - y0
+        for (fx0, fy0, fx1, fy1) in _BLOCK_RECTS[data]:
+            rx0, rx1 = x0 + round(fx0 * w), x0 + round(fx1 * w)
+            ry0, ry1 = y0 + round(fy0 * h), y0 + round(fy1 * h)
+            painter.fillRect(rx0, ry0, rx1 - rx0, ry1 - ry0, color)
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
@@ -1578,11 +1680,13 @@ class TerminalView(QWidget):
                 if char.reverse:
                     fg, bg = bg, fg
 
-                x = CELL_PAD_X + col * cw
-                width = (run_end - col) * cw
                 if bg != QColor(Palette.BG_CONSOLE):
-                    painter.fillRect(int(x), int(y), int(width) + 1,
-                                     int(ch) + 1, bg)
+                    # on the SAME rounded grid the block glyphs use, so a
+                    # coloured backdrop meets its neighbours exactly (this is
+                    # what sits behind Claude's welcome mascot)
+                    bx0, by0, _, by1 = self.cell_bounds(col, row)
+                    bx1 = self.cell_bounds(run_end - 1, row)[2]
+                    painter.fillRect(bx0, by0, bx1 - bx0, by1 - by0, bg)
                 if text.strip():
                     font = QFont(self._font)
                     if char.bold:
@@ -1595,8 +1699,33 @@ class TerminalView(QWidget):
                     # guarantee the glyph is readable on its real background,
                     # whatever color the child emitted (dark-tuned on a light
                     # theme, or vice versa)
-                    painter.setPen(legible_color(fg, bg))
-                    painter.drawText(int(x), int(y + self._ascent), text)
+                    ink = legible_color(fg, bg)
+                    painter.setPen(ink)
+                    # Split the run into grid-safe pieces. Block Elements are
+                    # painted geometrically; a glyph the font lacks is drawn on
+                    # its own so its fallback advance can't shear the row (see
+                    # _BLOCK_RECTS / _is_grid_glyph). Ordinary text — virtually
+                    # every run — still goes out in ONE drawText.
+                    i = col
+                    while i < run_end:
+                        data = line[i].data or " "
+                        if data in _BLOCK_RECTS or data in _BLOCK_SHADES:
+                            self._paint_block(painter, data, i, row, ink)
+                            i += 1
+                            continue
+                        j = i
+                        while j < run_end:
+                            nd = line[j].data or " "
+                            if (nd in _BLOCK_RECTS or nd in _BLOCK_SHADES
+                                    or not self._is_grid_glyph(nd)):
+                                break
+                            j += 1
+                        if j == i:  # a lone off-grid glyph, placed by hand
+                            j = i + 1
+                        painter.drawText(
+                            int(CELL_PAD_X + i * cw), int(y + self._ascent),
+                            "".join(line[k].data or " " for k in range(i, j)))
+                        i = j
                 col = run_end
 
         # every clickable URL/path is underlined so you can spot links in the

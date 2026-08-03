@@ -1098,6 +1098,151 @@ def test_terminal_relative_link():
     tv.deleteLater()
 
 
+def test_terminal_block_glyphs():
+    """Block Elements (U+2580-U+259F) are painted GEOMETRICALLY on the cell
+    grid, not handed to the font.
+
+    Regression for Claude Code's welcome mascot rendering visibly broken. The
+    mascot is full blocks plus QUADRANTS (U+2598/259B/259C/259D), and Consolas
+    has no quadrant glyphs: Qt fell back to Segoe UI Symbol, whose advance is
+    12px where the cell is 7. Because paintEvent batches a run of cells into
+    one drawText, that single glyph dragged the rest of the row ~5px right and
+    the mascot's rows sheared apart; the fallback ink was also the wrong shape
+    for the cell, notching every corner. Separately, Consolas' own full block
+    is 6.7px of ink in a 7.0px advance, leaving a hairline of background at
+    each cell boundary that striped solid artwork.
+
+    So: exact fills on a shared rounded grid (no seam, no overlap, no drift),
+    and any glyph the font lacks is drawn ALONE so it cannot shear its row."""
+    from PySide6.QtGui import QColor
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import (CELL_PAD_X, _BLOCK_RECTS,
+                                           _BLOCK_SHADES, TerminalView)
+    QApplication.instance() or QApplication([])
+
+    tv = TerminalView(rows=8, cols=40)
+    tv.resize(500, 220)
+
+    # --- the grid: adjacent cells must share an edge exactly ---------------
+    check("blocks: cells tile horizontally with no seam or overlap",
+          all(tv.cell_bounds(c, 0)[2] == tv.cell_bounds(c + 1, 0)[0]
+              for c in range(39)))
+    check("blocks: cells tile vertically with no seam or overlap",
+          all(tv.cell_bounds(0, r)[3] == tv.cell_bounds(0, r + 1)[1]
+              for r in range(7)))
+    # a fractional cell width is the case that breaks a width-per-cell scheme
+    # (rounding error accumulates across the row) - deriving both edges from
+    # the same expression cannot drift
+    tv._cell_w, tv._cell_h = 7.4, 15.6
+    check("blocks: fractional cell size tiles seamlessly and never drifts",
+          all(tv.cell_bounds(c, 0)[2] == tv.cell_bounds(c + 1, 0)[0]
+              for c in range(39))
+          and tv.cell_bounds(39, 0)[2] == round(CELL_PAD_X + 40 * 7.4))
+    tv.deleteLater()
+
+    # --- pixel coverage ----------------------------------------------------
+    FG = QColor(255, 255, 255).rgb()   # white: max contrast, never re-tinted
+
+    def render(text, cols=12, rows=4):
+        v = TerminalView(rows=rows, cols=cols)
+        v.resize(260, 120)
+        v.feed("\x1b[38;2;255;255;255m" + text)
+        return v, v.grab().toImage()
+
+    def lit(img, v, col, row, u, w):
+        """Is the cell's fractional point (u, w) painted foreground?"""
+        x0, y0, x1, y1 = v.cell_bounds(col, row)
+        return QColor(img.pixel(x0 + int((x1 - x0) * u),
+                                y0 + int((y1 - y0) * w))).rgb() == FG
+
+    # full block: every pixel of the cell, and no gap where two blocks meet
+    v, img = render("███")
+    x0, y0, _, y1 = v.cell_bounds(0, 0)
+    x1 = v.cell_bounds(2, 0)[2]
+    check("blocks: full block fills its cell edge to edge (no hairline seam)",
+          all(QColor(img.pixel(x, y)).rgb() == FG
+              for x in range(x0, x1) for y in range(y0, y1)))
+    v.deleteLater()
+
+    # halves and quadrants: boundaries at 1/2 round cleanly, so assert the
+    # exact quarter-by-quarter mask the Unicode chart specifies
+    QUARTERS = ((0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75))
+    exact = []
+    for data in ("▀", "▄", "▌", "▐", "▖", "▗",
+                 "▘", "▙", "▚", "▛", "▜", "▝",
+                 "▞", "▟", "█"):
+        v, img = render(data)
+        for (u, w) in QUARTERS:
+            want = any(fx0 <= u < fx1 and fy0 <= w < fy1
+                       for (fx0, fy0, fx1, fy1) in _BLOCK_RECTS[data])
+            if lit(img, v, 0, 0, u, w) != want:
+                exact.append((hex(ord(data)), u, w))
+        v.deleteLater()
+    check("blocks: every half/quadrant covers exactly its quarters of the cell",
+          not exact, exact)
+
+    # eighth blocks: ink on the correct side, nothing on the opposite half
+    eighths = []
+    for data, inside, outside in (("▁", (0.5, 0.97), (0.5, 0.25)),
+                                  ("▔", (0.5, 0.02), (0.5, 0.75)),
+                                  ("▏", (0.02, 0.5), (0.75, 0.5)),
+                                  ("▕", (0.97, 0.5), (0.25, 0.5))):
+        v, img = render(data)
+        if not lit(img, v, 0, 0, *inside) or lit(img, v, 0, 0, *outside):
+            eighths.append(hex(ord(data)))
+        v.deleteLater()
+    check("blocks: eighth blocks hug their own edge of the cell", not eighths,
+          eighths)
+
+    # shades are the full cell at partial opacity - present but not solid
+    v, img = render("░▒▓")
+    shades = [QColor(img.pixel(*[(v.cell_bounds(c, 0)[0]
+                                  + v.cell_bounds(c, 0)[2]) // 2,
+                                 (v.cell_bounds(c, 0)[1]
+                                  + v.cell_bounds(c, 0)[3]) // 2])).lightness()
+              for c in range(3)]
+    check("blocks: the three shades render at increasing density",
+          shades[0] < shades[1] < shades[2] < QColor(FG).lightness(), shades)
+    check("blocks: shade table covers exactly the three shade codepoints",
+          set(_BLOCK_SHADES) == {"░", "▒", "▓"})
+    check("blocks: geometry table covers the rest of U+2580-U+259F",
+          set(_BLOCK_RECTS) | set(_BLOCK_SHADES)
+          == {chr(c) for c in range(0x2580, 0x25A0)})
+    v.deleteLater()
+
+    # vertical neighbours must meet: lower half over upper half is solid
+    v, img = render("▄\r\n▀")
+    bx0, _, bx1, seam = v.cell_bounds(0, 0)
+    check("blocks: a lower half over an upper half leaves no horizontal seam",
+          all(QColor(img.pixel(x, y)).rgb() == FG
+              for x in range(bx0, bx1) for y in range(seam - 2, seam + 2)))
+    v.deleteLater()
+
+    # --- shear guard: an off-grid glyph must not move its neighbours -------
+    v = TerminalView(rows=4, cols=12)
+    check("blocks: an ASCII glyph is grid-safe", v._is_grid_glyph("M"))
+    off = [c for c in "▘▛✳⏸"
+           if not v._is_grid_glyph(c)]
+    check("blocks: glyphs missing from the terminal font are flagged off-grid",
+          off, "none of the probes fell back - font coverage changed?")
+    v.deleteLater()
+
+    # the mascot itself: legs sit on exact cell boundaries, body is solid
+    v, img = render("▝▜█████▛▘"
+                    "\r\n  ▘▘ ▝▝", cols=14)
+    body_x0, body_y0, _, body_y1 = v.cell_bounds(2, 0)
+    body_x1 = v.cell_bounds(6, 0)[2]
+    check("blocks: mascot body renders solid (no shear gaps, no stripes)",
+          all(QColor(img.pixel(x, y)).rgb() == FG
+              for x in range(body_x0, body_x1)
+              for y in range(body_y0, body_y1)))
+    legs = [c for c in range(14)
+            if lit(img, v, c, 1, 0.25, 0.25) or lit(img, v, c, 1, 0.75, 0.25)]
+    check("blocks: mascot legs land on their own cells (no fallback drift)",
+          legs == [2, 3, 5, 6], legs)
+    v.deleteLater()
+
+
 def test_terminal_link_underline():
     """Every clickable URL/path on the visible screen is scanned + underlined
     (not just the hovered one), so links stand out in the body text; the scan
@@ -5987,6 +6132,7 @@ def main():
     test_fsopen_helpers()
     test_filetypes_icons()
     test_terminal_relative_link()
+    test_terminal_block_glyphs()
     test_terminal_link_underline()
     test_sidebar_file_tree()
     test_sidebar_search()
