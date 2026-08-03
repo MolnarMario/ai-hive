@@ -54,11 +54,39 @@ _LIMIT_RESET_RE = re.compile(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
                              re.I)
 
 
-def is_limit_screen(text: str) -> bool:
-    """True when `text` shows a plan-limit cut-off (menu or banner)."""
+# Claude's banner is a SHORT injected message ("You've hit your session limit -
+# resets 3am (Europe/Bucharest)" is ~61 chars). Anything long containing those
+# words is an agent TALKING ABOUT the limit, not being stopped by it — which is
+# not hypothetical: an agent working on this very feature quoted the banner in
+# its own output and was armed for a resume it never needed. A real cut-off is
+# always its own short line.
+_BANNER_MAX_CHARS = 200
+
+
+def banner_in(text: str) -> bool:
+    """True when `text` contains the banner AS a banner — a short line that
+    OPENS with it — not prose that merely mentions it mid-sentence.
+
+    Anchoring at the start of the line is the real discriminator: Claude's
+    banner is injected as its own line, while an agent discussing the limit
+    embeds the same words in a sentence. The length cap is a second guard for
+    the case where prose happens to begin with the phrase.
+    """
     if not text:
         return False
-    return bool(LIMIT_MENU_RE.search(text) or LIMIT_HIT_RE.search(text))
+    for line in text.splitlines():
+        # drop leading whitespace and any box-drawing gutter the TUI draws
+        line = line.lstrip(" \t│┃|>❯").strip()
+        if len(line) <= _BANNER_MAX_CHARS and LIMIT_HIT_RE.match(line):
+            return True
+    return False
+
+
+def is_limit_screen(text: str) -> bool:
+    """True when `text` shows a plan-limit cut-off (menu, or a real banner)."""
+    if not text:
+        return False
+    return bool(LIMIT_MENU_RE.search(text)) or banner_in(text)
 
 
 def parse_reset_clock(text: str, now: float | None = None) -> float | None:

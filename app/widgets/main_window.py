@@ -88,6 +88,11 @@ AUTO_CONTINUE_VERIFY_MS = 20000
 # enough — but it must not become a Continue every minute forever either.
 LIMIT_RETRY_S = 300
 LIMIT_MAX_TRIES = 4
+# Backstop for a cut-off whose reset time nothing could supply — neither the
+# screen nor the usage API. A 5-hour window cannot outlast this, so waiting it
+# out is always eventually right, and it guarantees a latch can never become
+# permanent for want of a timestamp.
+LIMIT_UNKNOWN_WAIT_S = 5 * 3600 + 600
 # How far back startup recovery will reach. Sized for the real pattern it
 # serves: work started during one day, the limit spent, and the machine not
 # touched again until well into the NEXT day. Still finite, so a conversation
@@ -1154,6 +1159,15 @@ class MainWindow(QMainWindow):
         agent = self.manager.agent(ws_id, agent_id)
         if agent is None:
             return
+        # The menu carries no clock and the banner that does may have scrolled
+        # out of the searched region, so a latch can arrive with no due time —
+        # which strands the network-free watchdog and leaves only the flaky
+        # usage API. The ACCOUNT reading knows when the window reopens even
+        # when the screen doesn't, so borrow it.
+        if agent.limit_resets_at() is None:
+            usage = self.plan_usage()
+            if usage is not None:
+                agent.set_limit_reset(usage.resets_at)
         at = agent.limit_resets_at()
         when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(at)) if at
                 else "unknown")
@@ -1173,14 +1187,26 @@ class MainWindow(QMainWindow):
         if self._closing or not self._ready:
             return
         now = time.time()
-        # A latched agent whose banner carried NO parseable time has no due
-        # date, and must NOT be treated as due now — `or 0` would have made it
-        # instantly eligible and fired a pointless "Continue" into an agent
-        # that is still cut off (and then cleared the latch, so the real reset
-        # would have been missed). Those fall back to the API edge.
-        self._resume_blocked_agents(
-            due=lambda a: a.limit_resets_at() is not None
-            and a.limit_resets_at() <= now)
+        # Late-fill a due time for anything still lacking one (the account
+        # reading may only have arrived after the cut-off was latched).
+        usage = self.plan_usage()
+        if usage is not None and usage.resets_at:
+            for a in self.manager.all_agents():
+                if a.is_limit_blocked() and a.limit_resets_at() is None:
+                    a.set_limit_reset(usage.resets_at)
+
+        def due(a):
+            at = a.limit_resets_at()
+            if at is not None:
+                return at <= now
+            # Still no clock from anywhere — screen silent, API unreachable.
+            # A latch must never become permanent for want of a timestamp
+            # (observed live: `resets=unknown` at 05:10 sat untouched for five
+            # hours), so fall back to the longest a window can possibly last.
+            return (a.limit_latched_at()
+                    and now - a.limit_latched_at() >= LIMIT_UNKNOWN_WAIT_S)
+
+        self._resume_blocked_agents(due=due)
 
     def _resume_blocked_agents(self, due=None) -> None:
         """The plan limit reset — put the agents it cut off back to work.
@@ -1254,11 +1280,24 @@ class MainWindow(QMainWindow):
             def verify():
                 if self._closing:
                     return
-                if agent.recheck_limit():
-                    self._limit_audit(f"STILL-BLOCKED agent={agent.spec.name} "
-                                      f"try={agent.limit_attempts()}")
-                else:
+                # Two independent proofs, because the menu alone is NOT one:
+                # Esc removes it whether or not the agent went anywhere, so
+                # "menu gone" once reported RESUMED for an agent that never
+                # produced another line. The conversation on disk is the real
+                # evidence — if it STILL ends on the banner, nothing happened.
+                menu_gone = not agent.recheck_limit()
+                stuck, _, _ = transcripts.ended_on_limit(
+                    agent.spec.cwd, agent.spec.session_id)
+                if menu_gone and not stuck:
                     self._limit_audit(f"RESUMED agent={agent.spec.name}")
+                    return
+                # keep the latch so the watchdog tries again
+                agent.mark_limit_blocked(agent.limit_resets_at(),
+                                         from_startup=agent.limit_from_startup())
+                self._limit_audit(
+                    f"STILL-BLOCKED agent={agent.spec.name} "
+                    f"try={agent.limit_attempts()} "
+                    f"(menu_gone={menu_gone} transcript_stuck={stuck})")
             QTimer.singleShot(AUTO_CONTINUE_VERIFY_MS, verify)
             # audit trail: on the card, and on the workspace board. The board
             # write goes through the same serialized append the log_activity

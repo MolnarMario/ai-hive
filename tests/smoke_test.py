@@ -5484,6 +5484,31 @@ def test_auto_continue_on_limit_reset():
     check("auto-continue: the parked-on menu alone IS a cut-off",
           menu_only.is_limit_blocked())
 
+    # An agent WRITING ABOUT the limit is not stopped by it. Observed live: an
+    # agent working on this feature quoted the banner in its own output and was
+    # armed for a resume it never needed. A real banner is a short line of its
+    # own; prose that mentions it is not.
+    talker = mk("Talker")
+    settle(talker,
+           "The sign an agent shows looks like this: " + BANNER.strip()
+           + " -- and that phrase is what we match against the screen "
+             "buffer to work out that it stopped.\n")
+    check("auto-continue: an agent QUOTING the banner in prose is not a "
+          "cut-off", not talker.is_limit_blocked())
+
+    # a cut-off with no clock anywhere must still be resumable -- `unknown`
+    # once stranded an agent for five hours
+    noclock = mk("NoClock")
+    settle(noclock, MENU)                       # the menu carries no time
+    check("auto-continue: a menu-only cut-off has no reset time of its own",
+          noclock.limit_resets_at() is None)
+    noclock.set_limit_reset(now + 1800)         # ...supplied by the account
+    check("auto-continue: a reset time can be supplied from the account "
+          "reading", noclock.limit_resets_at() == now + 1800)
+    noclock.set_limit_reset(now + 9999)
+    check("auto-continue: a known reset time is never overwritten",
+          noclock.limit_resets_at() == now + 1800)
+
     # THE REGRESSION that cost a night's work: the banner is latched when it is
     # DRAWN, because _screen_tail is a rolling buffer — by reset time the agent
     # has idled for hours and its own redraws have evicted the banner. A
@@ -5687,6 +5712,19 @@ def test_auto_continue_on_limit_reset():
     pump(AUTO_CONTINUE_SETTLE_MS)
     check("auto-continue: an unknown reset time is NOT treated as due now",
           sent(timeless) == "" and timeless.is_limit_blocked())
+
+    # ...but it must not wait FOREVER either. With no clock from the screen and
+    # none from the API, fall back to the longest a window can last, so a latch
+    # can never become permanent for want of a timestamp.
+    from app.widgets.main_window import LIMIT_UNKNOWN_WAIT_S
+    timeless._limit_at = now - LIMIT_UNKNOWN_WAIT_S - 60
+    timeless._limit_resets_at = None             # nothing supplied a clock
+    saved_usage, win._usage = win._usage, None   # not even the account
+    win._check_limit_resets()
+    win._usage = saved_usage
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: a clockless cut-off is resumed once no window could "
+          "still be open", "Continue" in sent(timeless))
 
     # the banner is not bottom-anchored: its options menu, the input box and
     # the footer all render below it, so the scrape window must be wider than

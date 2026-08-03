@@ -97,6 +97,11 @@ _CSI_RE = re.compile(r"\x1b\[[0-9;?<>=]*[@-~]|\x1b[()][AB0]|\x1b\][^\x07\x1b]*\x
 # numbered option — so keying off the caret stops the "?"/chime from
 # false-firing on ordinary output (which it did). Heuristic and non-blocking: a
 # missed exotic prompt just doesn't light up.
+_NUM_OPTION_RE = re.compile(r"(?m)^\s*[>❯❱│┃|]*\s*\d+\.\s+\S")
+# a numbered option with a selection caret in front (optionally past box
+# borders) — the highlighted row of a live menu, absent from plain prose lists
+_OPTION_CARET_RE = re.compile(r"(?m)^[\s│┃|]*[>❯❱]\s*\d+\.\s+\S")
+
 # Claude's input-box footer rotates through several hints; ANY of them means
 # the prompt is live and will accept typing. Only "? for shortcuts" was matched
 # originally, which made readiness a coin-flip on whatever the rotation happened
@@ -111,11 +116,6 @@ _CLAUDE_READY_HINTS = (
     "auto mode on",
     "ctrl+t to show tasks",
 )
-
-_NUM_OPTION_RE = re.compile(r"(?m)^\s*[>❯❱│┃|]*\s*\d+\.\s+\S")
-# a numbered option with a selection caret in front (optionally past box
-# borders) — the highlighted row of a live menu, absent from plain prose lists
-_OPTION_CARET_RE = re.compile(r"(?m)^[\s│┃|]*[>❯❱]\s*\d+\.\s+\S")
 
 # --- "this agent was cut off by the plan limit" detection ---
 # WHICH agents to resume when the window reopens. The plan-usage reading
@@ -198,6 +198,7 @@ class TerminalAgent(QObject):
         self._limit_tries = 0          # resume attempts since the cut-off
         self._limit_last_try = 0.0
         self._limit_from_startup = False   # recovered from disk vs seen live
+        self._limit_at = 0.0               # when the cut-off was noticed
         # "waiting for the user" is the OR of three independent sources (see
         # _emit_waiting): _scrape_waiting (the settled screen shows a numbered
         # menu + selection caret — a permission prompt), _tool_waiting (an
@@ -684,6 +685,7 @@ class TerminalAgent(QObject):
         if not is_limit_screen(region):
             return
         self._limit_blocked = True
+        self._limit_at = time.time()
         # The reset clock lives in the banner, not the menu, so it may be
         # absent (the banner can have scrolled while the menu is still up).
         # None simply means "no network-free due time" — the watchdog then
@@ -706,6 +708,7 @@ class TerminalAgent(QObject):
         if self._limit_blocked:
             return
         self._limit_blocked = True
+        self._limit_at = time.time()
         self._limit_resets_at = resets_at
         self._limit_from_startup = bool(from_startup)
         self.limit_blocked_changed.emit(True)
@@ -713,6 +716,25 @@ class TerminalAgent(QObject):
     def limit_from_startup(self) -> bool:
         """True when this latch was recovered from disk rather than seen live."""
         return self._limit_from_startup
+
+    def limit_latched_at(self) -> float:
+        """When this cut-off was noticed (epoch). Backstop for a latch whose
+        reset time is unknown — a 5-hour window cannot outlast it forever."""
+        return self._limit_at
+
+    def set_limit_reset(self, at: float | None) -> None:
+        """Supply a reset time the SCREEN could not give.
+
+        The menu ("Stop and wait for limit to reset") carries no clock, and the
+        banner that does may have scrolled out of the region we search — so a
+        latch can end up with no due time, which strands the network-free
+        watchdog and leaves only the flaky usage API to trigger it. Observed
+        live: an agent cut off at 05:10 with `resets=unknown` sat for five
+        hours. The account-level reading knows the answer even when the screen
+        doesn't, so it is filled in from there.
+        """
+        if self._limit_blocked and self._limit_resets_at is None and at:
+            self._limit_resets_at = at
 
     def prompt_ready(self) -> bool:
         """True once the TUI's input prompt is live and will accept typing."""
@@ -725,6 +747,7 @@ class TerminalAgent(QObject):
         self._limit_tries = 0
         self._limit_last_try = 0.0
         self._limit_from_startup = False
+        self._limit_at = 0.0
 
     def note_limit_attempt(self) -> None:
         """Record that we just tried to resume this agent."""

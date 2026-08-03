@@ -152,7 +152,11 @@ def _read_ended_on_limit(path: str) -> tuple[bool, float, float]:
                 text = _message_text(rec)
                 # every assistant turn overwrites the verdict, so only the LAST
                 # one counts -- a banner followed by real output is history
-                hit = bool(limit_banner.LIMIT_HIT_RE.search(text))
+                # `banner_in`, not a bare regex search: an agent that merely
+                # WROTE ABOUT the limit would otherwise be armed for a resume
+                # it never needed (observed live on an agent working on this
+                # feature). A real cut-off is a short injected line.
+                hit = limit_banner.banner_in(text)
                 if hit:
                     when = _record_epoch(rec)
                     resets = limit_banner.banner_reset_at(text, when) or 0.0
