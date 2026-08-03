@@ -79,6 +79,14 @@ AUTO_CONTINUE_TEXT = "Continue"
 # be missed entirely, which is exactly how a night's work was lost. Pure
 # in-memory comparison, so a minute costs nothing.
 LIMIT_WATCH_MS = 60000
+# How long after a nudge to check whether the agent actually got going. Long
+# enough for the TUI to redraw without the banner, short enough that a failed
+# attempt is retried while it still matters.
+AUTO_CONTINUE_VERIFY_MS = 20000
+# A resume can land while the window is still shut, so one attempt is not
+# enough — but it must not become a Continue every minute forever either.
+LIMIT_RETRY_S = 300
+LIMIT_MAX_TRIES = 4
 
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [
@@ -769,6 +777,7 @@ class MainWindow(QMainWindow):
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
         # resume whoever the limit cut off, the moment the window reopens
         self.planLimitCleared.connect(self._resume_blocked_agents)
+        self.manager.agentLimitBlocked.connect(self._on_agent_limit_blocked)
         self.top_bar.usageRefreshRequested.connect(self._poll_usage)
         # QueuedConnection is the point: the fetch thread emits, and the slot
         # runs on the GUI thread where touching widgets/timers is legal
@@ -996,6 +1005,29 @@ class MainWindow(QMainWindow):
         self._auto_continue = bool(on)
         self._schedule_save()   # a UI preference, like sound_enabled
 
+    def _limit_audit(self, message: str) -> None:
+        """Forensic line in session.log for the auto-continue path.
+
+        Not decoration: this feature has now failed silently twice, and both
+        times the cause had to be reconstructed hours later from transcript
+        timestamps and inference. A latch that never fired and a latch that
+        fired into a still-closed window look identical from outside; these
+        lines tell them apart in seconds.
+        """
+        try:
+            self.store.audit(f"LIMIT {message}")
+        except Exception:
+            pass    # forensics must never break the feature they observe
+
+    def _on_agent_limit_blocked(self, ws_id: str, agent_id: str) -> None:
+        agent = self.manager.agent(ws_id, agent_id)
+        if agent is None:
+            return
+        at = agent.limit_resets_at()
+        when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(at)) if at
+                else "unknown")
+        self._limit_audit(f"BLOCKED agent={agent.spec.name} resets={when}")
+
     def _check_limit_resets(self) -> None:
         """Network-free trigger: resume any cut-off agent whose OWN banner said
         the limit would be back by now.
@@ -1042,6 +1074,7 @@ class MainWindow(QMainWindow):
                    if a.spec.provider == "claude" and a.is_pty
                    and a.is_running() and not a.is_busy()
                    and a.is_limit_blocked()
+                   and a.limit_retry_ready(LIMIT_RETRY_S, LIMIT_MAX_TRIES)
                    and (due is None or due(a))]
         for i, agent in enumerate(blocked):
             # Stagger, then Esc, then type. The Esc closes the limit's options
@@ -1063,10 +1096,26 @@ class MainWindow(QMainWindow):
             if self._closing or not agent.is_running():
                 return
             if not agent.nudge(AUTO_CONTINUE_TEXT):
+                self._limit_audit(f"NUDGE-SKIP agent={agent.spec.name} "
+                                  f"(prompt not ready)")
                 return
-            # drop the latch so the watchdog doesn't nudge it every minute; a
-            # fresh cut-off re-latches on the next settle
-            agent.clear_limit_block()
+            agent.note_limit_attempt()
+            self._limit_audit(f"NUDGE agent={agent.spec.name} "
+                              f"try={agent.limit_attempts()}")
+            # Verify rather than assume. A nudge can land while the window is
+            # still shut (clock skew, or a reset not exactly on the stated
+            # minute); clearing the latch here — as this first did — burned the
+            # single attempt and left the agent parked for good. The banner is
+            # gone once it is genuinely going again.
+            def verify():
+                if self._closing:
+                    return
+                if agent.recheck_limit():
+                    self._limit_audit(f"STILL-BLOCKED agent={agent.spec.name} "
+                                      f"try={agent.limit_attempts()}")
+                else:
+                    self._limit_audit(f"RESUMED agent={agent.spec.name}")
+            QTimer.singleShot(AUTO_CONTINUE_VERIFY_MS, verify)
             # audit trail: on the card, and on the workspace board. The board
             # write goes through the same serialized append the log_activity
             # tool uses, so it can't interleave with an agent's own note.

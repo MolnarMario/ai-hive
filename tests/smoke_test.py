@@ -5480,6 +5480,29 @@ def test_auto_continue_on_limit_reset():
     check("auto-continue: clearing the latch forgets the reset time too",
           not a.is_limit_blocked() and a.limit_resets_at() is None)
 
+    # a --resume replay redraws the OLD conversation, banner and all; that is
+    # history, not a live cut-off, and latching it would schedule a phantom
+    # Continue. The input-box footer ends the replay, so pre-prompt output is
+    # excluded.
+    replay = mk()
+    replay._prompt_ready = False
+    replay._on_pty_output("pty", BANNER)
+    check("auto-continue: a banner replayed before the prompt is ready is "
+          "history, not a cut-off", not replay.is_limit_blocked())
+    replay._prompt_ready = True
+    replay._on_pty_output("pty", BANNER)
+    check("auto-continue: the same banner once live DOES latch",
+          replay.is_limit_blocked())
+
+    # the latch must not wait for the idle-timer settle: the banner arrives
+    # right after the user hits Enter, which is exactly when _mark_busy treats
+    # output as keystroke echo and never arms that timer (a live miss)
+    burst = mk()
+    burst.write("hi")                 # stamps _last_input_ts -> echo window
+    burst._on_pty_output("pty", BANNER)
+    check("auto-continue: latched straight off the output burst, with no "
+          "idle-timer settle", burst.is_limit_blocked())
+
     curly = mk()
     settle(curly, "You’ve hit your weekly limit \xb7 resets 3am\n")
     check("auto-continue: curly apostrophe + weekly window also detected",
@@ -5566,7 +5589,8 @@ def test_auto_continue_on_limit_reset():
     # the real trigger is the plan-limit falling edge, not a timer
     writes.clear()
     win._on_auto_continue(True)
-    settle(cut_off, BANNER)        # cut off again in the next window
+    cut_off.clear_limit_block()    # a FRESH cut-off in the next window
+    settle(cut_off, BANNER)
     win._plan_blocked = True
     win._on_usage_ready(cu.Usage(
         limits=(cu.Limit(key="five_hour", label=cu._LABELS["five_hour"],
@@ -5576,8 +5600,21 @@ def test_auto_continue_on_limit_reset():
     pump(AUTO_CONTINUE_SETTLE_MS)
     check("auto-continue: the planLimitCleared edge resumes cut-off agents",
           "Continue" in sent(cut_off))
-    check("auto-continue: a resumed agent drops its latch (no re-nudging every "
-          "minute)", not cut_off.is_limit_blocked())
+    # The latch is NOT dropped on the nudge itself: a resume can land while the
+    # window is still shut, and clearing here burned the only attempt and left
+    # the agent parked for good. It clears on VERIFICATION instead.
+    check("auto-continue: the latch survives the nudge, pending verification",
+          cut_off.is_limit_blocked())
+    check("auto-continue: a nudged agent is not re-nudged a minute later",
+          not cut_off.limit_retry_ready(300, 4))
+    check("auto-continue: still parked -> stays latched for a retry",
+          cut_off.recheck_limit() is True)
+    settle(cut_off, "│ > │\n  ? for shortcuts\n")   # banner gone: it's going
+    check("auto-continue: banner gone on recheck -> latch cleared",
+          cut_off.recheck_limit() is False
+          and not cut_off.is_limit_blocked())
+    check("auto-continue: attempts reset with the latch",
+          cut_off.limit_attempts() == 0)
 
     # --- the network-free watchdog: the banner's own reset time -------------
     # The API edge is NOT enough on its own. It only fires if this same process

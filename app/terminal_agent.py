@@ -174,6 +174,7 @@ class TerminalAgent(QObject):
     waiting_changed = Signal(bool)      # waiting for the user (prompt/question)
     summary_changed = Signal(str)       # displayed summary (task or AI title)
     tokens_changed = Signal(str)        # context-usage badge text ("" = hide)
+    limit_blocked_changed = Signal(bool)  # cut off by the plan limit (latched)
 
     def __init__(self, spec: AgentSpec, parent: QObject | None = None):
         super().__init__(parent)
@@ -218,6 +219,8 @@ class TerminalAgent(QObject):
         # banner stated. Transient like the waiting flags — never persisted.
         self._limit_blocked = False
         self._limit_resets_at: float | None = None
+        self._limit_tries = 0          # resume attempts since the cut-off
+        self._limit_last_try = 0.0
         # "waiting for the user" is the OR of three independent sources (see
         # _emit_waiting): _scrape_waiting (the settled screen shows a numbered
         # menu + selection caret — a permission prompt), _tool_waiting (an
@@ -665,15 +668,34 @@ class TerminalAgent(QObject):
         return self._limit_resets_at
 
     def _scrape_limit(self) -> None:
-        """Latch the plan-limit banner from the SETTLED screen (idle-timer
-        only, never mid-render — a half-drawn frame must not trip it).
+        """Latch the plan-limit banner off the screen tail.
+
+        Called on EVERY output burst, not only on the idle-timer settle. The
+        settle gate is right for `_screen_waiting` (a half-drawn menu is
+        ambiguous), but it is wrong here and cost a second live miss: the
+        banner lands immediately after the user submits a prompt, which is
+        exactly when `_mark_busy` treats output as keystroke echo and SKIPS
+        arming the idle timer — and once the agent parks silently there is no
+        further output to arm it, so the settle never comes and the cut-off is
+        never seen. "You've hit your … limit" is unambiguous the moment it
+        appears, so it needs no settle.
 
         Sticky once set: the agent is parked and its own redraws must not clear
-        it, which is exactly what a rolling-buffer re-scrape got wrong. It is
-        cleared explicitly instead — on start/restart, and by
-        `clear_limit_block` once we've resumed it.
+        it, which is what a rolling-buffer re-scrape got wrong. It is cleared
+        explicitly instead — on start/restart, and by `clear_limit_block` once
+        the agent has genuinely resumed.
         """
         if self.spec.provider != "claude" or self._limit_blocked:
+            return
+        # Only a LIVE cut-off counts. On `--resume` Claude redraws the whole
+        # prior conversation, so a banner from a previous session scrolls past
+        # as history — latching that would schedule a phantom Continue for the
+        # next time that clock came round. The input-box footer marks the end
+        # of the replay, and a real cut-off can only happen after it, so
+        # gating on prompt-readiness separates the two exactly. (This is
+        # checked before _on_pty_output sets the flag, so the burst that ends
+        # the replay is itself excluded.)
+        if not self._prompt_ready:
             return
         # Deliberately a WIDER region than _screen_waiting's last 18 lines.
         # That bound is right for a selection menu, which is anchored just
@@ -687,11 +709,44 @@ class TerminalAgent(QObject):
             return
         self._limit_blocked = True
         self._limit_resets_at = parse_reset_clock(region)
+        self.limit_blocked_changed.emit(True)
 
     def clear_limit_block(self) -> None:
-        """Forget the latched cut-off (we resumed it, or it restarted)."""
+        """Forget the latched cut-off (it resumed, or it restarted)."""
         self._limit_blocked = False
         self._limit_resets_at = None
+        self._limit_tries = 0
+        self._limit_last_try = 0.0
+
+    def note_limit_attempt(self) -> None:
+        """Record that we just tried to resume this agent."""
+        self._limit_tries += 1
+        self._limit_last_try = time.time()
+
+    def limit_attempts(self) -> int:
+        return self._limit_tries
+
+    def limit_retry_ready(self, retry_after_s: float, max_tries: int) -> bool:
+        """Whether a resume may be (re)tried now. A nudge can land while the
+        window is still shut — clock skew, or a reset that isn't exactly on the
+        stated minute — so one attempt is not enough; but it must not become a
+        Continue every 60 s forever either."""
+        if self._limit_tries >= max_tries:
+            return False
+        return (self._limit_tries == 0
+                or time.time() - self._limit_last_try >= retry_after_s)
+
+    def recheck_limit(self) -> bool:
+        """After a resume attempt, re-derive the latch from the CURRENT screen:
+        the banner is gone once the agent is genuinely going again. Returns
+        True while it is still parked on it (so the caller can retry)."""
+        if not self._limit_blocked:
+            return False
+        region = "\n".join(self._screen_tail.splitlines()[-40:])
+        if region and _LIMIT_HIT_RE.search(region):
+            return True
+        self.clear_limit_block()
+        return False
 
     # -------------------------------------------------------------- slots ---
 
@@ -714,6 +769,10 @@ class TerminalAgent(QObject):
         # rolling escape-stripped tail for waiting-for-input detection (the idle
         # timer scans it once output settles — see _screen_waiting)
         self._screen_tail = (self._screen_tail + _CSI_RE.sub("", text))[-4000:]
+        # latch a plan-limit cut-off the INSTANT it is drawn — see _scrape_limit
+        # for why this must not wait for the idle-timer settle
+        if not self._limit_blocked:
+            self._scrape_limit()
         # readiness to receive a task. For Claude the ONLY reliable signal is
         # the input-box footer ("? for shortcuts"): the folder-trust dialog
         # also enables bracketed paste (and does NOT disable it on dismissal
