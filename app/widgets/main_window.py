@@ -88,10 +88,12 @@ AUTO_CONTINUE_VERIFY_MS = 20000
 # enough — but it must not become a Continue every minute forever either.
 LIMIT_RETRY_S = 300
 LIMIT_MAX_TRIES = 4
-# How far back startup recovery will reach. Covers an overnight cut-off and a
-# same-day reopen, without reviving a conversation abandoned last week just
-# because the app was opened to look at something else.
-STARTUP_RECOVERY_MAX_AGE_S = 12 * 3600
+# How far back startup recovery will reach. Sized for the real pattern it
+# serves: work started during one day, the limit spent, and the machine not
+# touched again until well into the NEXT day. Still finite, so a conversation
+# abandoned last week isn't revived just because the app was opened to look at
+# something else.
+STARTUP_RECOVERY_MAX_AGE_S = 36 * 3600
 
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [

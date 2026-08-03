@@ -93,7 +93,9 @@ workspaces keep executing — switching never pauses anything.
     screen, so it works after a full reboot, not just an app restart. Strictly
     gated: an agent whose conversation doesn't *end* on the limit message is
     left alone (said anything since, and it plainly carried on), a card you left
-    stopped stays stopped, and a cut-off older than 12 hours isn't revived.
+    stopped stays stopped, and a cut-off older than 36 hours isn't revived — so
+    work you left mid-afternoon is still picked up when you get back to the
+    machine late the following day.
   - **⏰ Resume on limit reset** — while the hive is running, agents cut off
     mid-work go back to work the moment the window reopens.
 
