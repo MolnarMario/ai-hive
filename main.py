@@ -45,9 +45,20 @@ from app.workspace_manager import WorkspaceManager
 
 
 def _app_icon():
-    """Render the hive hexagon into an icon (taskbar / window chrome)."""
+    """Window/taskbar icon: the bundled multi-resolution .ico (see
+    generate_app_icon.py) so the SAME glyph appears in the title bar, the
+    taskbar while running, and — once the shortcut's IconLocation points at
+    it too — the pinned taskbar slot. Falls back to a single runtime-painted
+    pixmap if the asset hasn't been generated yet."""
+    from PySide6.QtGui import QIcon
+
+    ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "app", "assets", "icons", "app_icon.ico")
+    if os.path.isfile(ico_path):
+        return QIcon(ico_path)
+
     from PySide6.QtCore import QRectF
-    from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+    from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
 
     from app.ui_theme import Palette
 
@@ -166,7 +177,77 @@ def _single_instance_guard(
     return handle  # held (never closed) for the life of this process
 
 
+def _set_app_user_model_id() -> None:
+    """Give the process its own AppUserModelID (AUMID) instead of inheriting
+    the shared 'python'/'pythonw' one. Windows taskbar pinning/grouping keys
+    off this id: without an explicit one, a pinned shortcut and the running
+    process don't reliably match, so launching opens a SEPARATE unmerged
+    taskbar icon (to the left of the pinned one) instead of attaching to the
+    pinned slot the way Chrome/Claude do (they set this at install time).
+    Must run before any window is created — first thing in main()."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "AIHive.DesktopApp")
+    except Exception:
+        pass
+
+
+def _register_relaunch_properties(hwnd: int) -> None:
+    """Stamp the main window with its own relaunch command/icon/name via the
+    Windows property store, so ANY future 'Pin to taskbar' — including one
+    done by right-clicking the running window, which is how a user actually
+    pins it — captures the right thing.
+
+    Without this, Windows builds a pin by inspecting the OWNING PROCESS
+    image directly. Since Python 3.13's venv `pythonw.exe` is a lightweight
+    redirector that re-execs the base interpreter as a CHILD process, the
+    window's owning process is the BASE interpreter with no arguments —
+    Windows pinned a shortcut straight to `pythonw.exe` with no `main.py`
+    argument and no icon (verified live: it produced a 'Python.lnk' pin that
+    doesn't even relaunch AI Hive, and periodically got shown INSTEAD of the
+    live window's icon, which is what made the taskbar icon appear to
+    randomly revert to the generic Python icon mid-session even though the
+    live window's own HICON never changed). Setting these RelaunchCommand/
+    RelaunchIconResource/RelaunchDisplayNameResource properties gives
+    Windows an explicit answer instead of guessing from process ancestry —
+    the same mechanism installed apps like Chrome set up at install time.
+    Best-effort: requires pywin32 and Vista+ shell APIs, never fatal."""
+    if sys.platform != "win32":
+        return
+    try:
+        from win32com.propsys import propsys
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        venv_pythonw = os.path.join(base_dir, ".venv", "Scripts", "pythonw.exe")
+        icon_path = os.path.join(base_dir, "app", "assets", "icons",
+                                 "app_icon.ico")
+        if not os.path.isfile(venv_pythonw):
+            return  # not the documented launch layout; nothing safe to set
+
+        main_py = os.path.join(base_dir, "main.py")
+        relaunch_command = f'"{venv_pythonw}" "{main_py}"'
+        relaunch_icon = f"{icon_path},0" if os.path.isfile(icon_path) else \
+            f"{venv_pythonw},0"
+
+        store = propsys.SHGetPropertyStoreForWindow(hwnd)
+        for name, value in (
+            ("System.AppUserModel.ID", "AIHive.DesktopApp"),
+            ("System.AppUserModel.RelaunchCommand", relaunch_command),
+            ("System.AppUserModel.RelaunchDisplayNameResource", "AI Hive"),
+            ("System.AppUserModel.RelaunchIconResource", relaunch_icon),
+        ):
+            key = propsys.PSGetPropertyKeyFromName(name)
+            store.SetValue(key, propsys.PROPVARIANTType(value))
+        store.Commit()
+    except Exception:
+        pass
+
+
 def main() -> int:
+    _set_app_user_model_id()
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
@@ -179,6 +260,7 @@ def main() -> int:
     window = create_main_window()
     window.quit_on_close = True  # closed window == dead process, always
     window.show()
+    _register_relaunch_properties(int(window.winId()))
     window.autostart_active_workspace()
     return app.exec()
 
