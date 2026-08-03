@@ -220,10 +220,16 @@ this file is the invariants that must survive every change.
   (`MainWindow._resume_blocked_agents`, wired to `planLimitCleared`). The usage
   reading is ACCOUNT-wide — it knows the plan is out and until when, but never
   WHICH agents were mid-turn — so attribution comes from
-  `TerminalAgent.is_limit_blocked()`, a LATCH set by `_scrape_limit` on the
-  idle-timer settle — the same "frame is current" moment `_screen_waiting`
-  uses — and cleared only by start/restart or `clear_limit_block()` after a
-  resume. Do NOT "simplify" this back to scraping at the reset edge instead
+  `TerminalAgent.is_limit_blocked()`, a LATCH set by `_scrape_limit` on EVERY
+  output burst (`_on_pty_output`), gated on `_prompt_ready` so a `--resume`
+  replay of an OLD banner is read as history, not a live cut-off. Do NOT move
+  this back behind the idle-timer settle like `_screen_waiting`: the banner
+  lands right after the user submits a prompt, which is exactly when
+  `_mark_busy` treats output as keystroke echo and never arms that timer — and
+  a silently parked agent then produces nothing more to arm it, so the settle
+  never comes (this cost a second live miss). A half-drawn menu is ambiguous;
+  "You've hit your … limit" is not. Do NOT "simplify" this back to scraping at
+  the reset edge either
   (it was written that way first and cost a full night's unattended work):
   `_screen_tail` is a 4000-char ROLLING buffer and Claude's TUI keeps redrawing
   its input box while parked, so hours later the banner has been evicted and
