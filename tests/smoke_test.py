@@ -57,7 +57,7 @@ def test_tiling():
     expected = {
         1: [(0, 0, 1, 1)],
         2: [(0, 0, 1, 1), (0, 1, 1, 1)],
-        3: [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 2)],
+        3: [(0, 0, 1, 1), (0, 1, 1, 1), (0, 2, 1, 1)],
         4: [(0, 0, 1, 1), (0, 1, 1, 1), (1, 0, 1, 1), (1, 1, 1, 1)],
         5: [(0, 0, 1, 2), (0, 2, 1, 2), (0, 4, 1, 2), (1, 0, 1, 3), (1, 3, 1, 3)],
         6: [(0, 0, 1, 1), (0, 1, 1, 1), (0, 2, 1, 1),
@@ -71,7 +71,7 @@ def test_tiling():
             (2, 0, 1, 1), (2, 1, 1, 1), (2, 2, 1, 1)],
     }
     expected_dims = {  # n: (rows, vcols)
-        1: (1, 1), 2: (1, 2), 3: (2, 2), 4: (2, 2), 5: (2, 6),
+        1: (1, 1), 2: (1, 2), 3: (1, 3), 4: (2, 2), 5: (2, 6),
         6: (2, 3), 7: (3, 3), 8: (3, 6), 9: (3, 3),
     }
 
@@ -90,6 +90,21 @@ def test_tiling():
         check(f"tiling: n={n} rows fully covered",
               all(v == plan.vcols for v in by_row.values()),
               f"row spans {by_row}, vcols={plan.vcols}")
+
+    # Regression: a third terminal in an AUTO workspace must land beside the
+    # other two (3x1), not as a full-width straggler under a 2-card row. The
+    # 2026-07-31 rebalance only covered FIXED grids, so an auto workspace kept
+    # producing the lopsided "2 over 1" (reported live on a real workspace).
+    p3 = compute_grid(3)
+    check("tiling: auto n=3 is one row of three",
+          p3.rows == 1 and p3.vcols == 3
+          and [c.row for c in p3.cells] == [0, 0, 0]
+          and [c.col_span for c in p3.cells] == [1, 1, 1],
+          f"got {p3}")
+    from app.tiling import explicit_grid as _eg
+    check("tiling: auto n=3 matches the fixed-grid overflow shape",
+          (p3.rows, p3.vcols) == (_eg(1, 2, 3).rows, _eg(1, 2, 3).cols),
+          f"auto {(p3.rows, p3.vcols)} vs fixed {_eg(1, 2, 3)[2:]}")
 
 
 def test_layout_popup_placement():

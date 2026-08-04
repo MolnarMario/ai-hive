@@ -231,7 +231,7 @@ error dialog instead of silently closing. Packaging to a distributable
   on each swatch is the exact shape applied). A fixed layout fills agents left→right /
   top→bottom and shows clickable "＋ New agent" slots in the rest; changing
   layout is instant and never restarts an agent. Auto tiles to the count
-  (1 full, 2 side-by-side, 3–4 = 2×2, 5–6 = 3×2, …). Line and full-terminal
+  (1 full, 2 side-by-side, 3 = 3×1, 4 = 2×2, 5–6 = 3×2, …). Line and full-terminal
   cards share the same grid.
 - **Folder & activity** — the workspace header shows the project path with
   **Open folder** / **Change…**; **Activity** opens a panel with the live
@@ -477,7 +477,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-847 checks drive the real app headlessly (offscreen Qt platform) with real
+849 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -545,7 +545,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (847 checks)
+tests/smoke_test.py        headless end-to-end suite (849 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
