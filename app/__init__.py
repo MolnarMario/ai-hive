@@ -5,4 +5,4 @@
 # never hard-code it elsewhere. Pre-1.0 (0.x.y) while the app is not yet ready
 # to go live: bump y for fixes/small changes, x for notable features; 1.0.0 is
 # reserved for the first public-ready release.
-__version__ = "0.10.0"
+__version__ = "0.11.0"

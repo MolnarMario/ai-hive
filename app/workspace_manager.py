@@ -63,6 +63,7 @@ class WorkspaceManager(QObject):
     # the "?" just appeared on its row. Transient, never persisted — the UI
     # uses it purely to sound the notification chime.
     agentWaiting = Signal(str, str)          # ws_id, agent_id
+    agentLimitBlocked = Signal(str, str)     # ws_id, agent_id (plan cut-off)
     dirty = Signal()                         # any persistable mutation
 
     def __init__(self, parent: QObject | None = None):
@@ -465,6 +466,12 @@ class WorkspaceManager(QObject):
         agent.waiting_changed.connect(
             lambda waiting, wid=wid, aid=agent.id:
             self._on_agent_waiting(wid, aid, waiting))
+        # cut off by the plan limit — also transient, but announced so the
+        # window can record it. Auto-continue depends on this having been seen,
+        # so it must leave a forensic trace: twice now the feature failed
+        # silently and the cause had to be reconstructed from transcripts.
+        agent.limit_blocked_changed.connect(
+            lambda _b, wid=wid, aid=agent.id: self.agentLimitBlocked.emit(wid, aid))
 
     def _on_agent_waiting(self, ws_id: str, agent_id: str,
                           waiting: bool) -> None:

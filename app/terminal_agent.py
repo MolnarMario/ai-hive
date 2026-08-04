@@ -102,6 +102,39 @@ _NUM_OPTION_RE = re.compile(r"(?m)^\s*[>❯❱│┃|]*\s*\d+\.\s+\S")
 # borders) — the highlighted row of a live menu, absent from plain prose lists
 _OPTION_CARET_RE = re.compile(r"(?m)^[\s│┃|]*[>❯❱]\s*\d+\.\s+\S")
 
+# Claude's input-box footer rotates through several hints; ANY of them means
+# the prompt is live and will accept typing. Only "? for shortcuts" was matched
+# originally, which made readiness a coin-flip on whatever the rotation happened
+# to be showing (a restored agent sat "not ready" indefinitely — see
+# _on_pty_output). Kept lowercase; matched against the lowered tail. Chosen to
+# be footer-specific rather than words an agent might write in ordinary prose,
+# since a false positive here would deliver a task into a dialog.
+_CLAUDE_READY_HINTS = (
+    "? for shortcuts",
+    "shift+tab to cycle",
+    "for agents",
+    "auto mode on",
+    "ctrl+t to show tasks",
+)
+
+# --- "this agent was cut off by the plan limit" detection ---
+# WHICH agents to resume when the window reopens. The plan-usage reading
+# (app/claude_usage.py) is ACCOUNT-wide — it says the account is out and until
+# when, never which agents were mid-turn — so attribution comes from the
+# screen, LATCHED THE MOMENT THE CUT-OFF IS DRAWN. The patterns themselves live
+# in `limit_banner` because `transcripts` (Qt-free) must match the same thing
+# off disk; see that module for which signal is authoritative and why.
+#
+# Two hard-won rules, both from live misses:
+#  * Latch on the OUTPUT BURST, not on the idle-timer settle. The cut-off lands
+#    right after the user submits a prompt — exactly when `_mark_busy` treats
+#    output as keystroke echo and skips arming that timer — and a silently
+#    parked agent then emits nothing more to arm it, so the settle never comes.
+#  * Never re-derive it later from `_screen_tail`: that is a 4000-char ROLLING
+#    buffer, and hours of idle redraws evict the banner entirely.
+from .limit_banner import (LIMIT_HIT_RE, LIMIT_MENU_RE,  # noqa: F401
+                           banner_reset_at, is_limit_screen, parse_reset_clock)
+
 
 class TerminalAgent(QObject):
     output_segment = Signal(str, str)   # stream, text (line mode)
@@ -117,6 +150,7 @@ class TerminalAgent(QObject):
     waiting_changed = Signal(bool)      # waiting for the user (prompt/question)
     summary_changed = Signal(str)       # displayed summary (task or AI title)
     tokens_changed = Signal(str)        # context-usage badge text ("" = hide)
+    limit_blocked_changed = Signal(bool)  # cut off by the plan limit (latched)
 
     def __init__(self, spec: AgentSpec, parent: QObject | None = None):
         super().__init__(parent)
@@ -157,6 +191,14 @@ class TerminalAgent(QObject):
         self._busy = False            # actively streaming output right now
         self._last_output_ts = 0.0    # walltime of the last output burst
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
+        # latched "the plan limit cut this agent off" + the reset time its own
+        # banner stated. Transient like the waiting flags — never persisted.
+        self._limit_blocked = False
+        self._limit_resets_at: float | None = None
+        self._limit_tries = 0          # resume attempts since the cut-off
+        self._limit_last_try = 0.0
+        self._limit_from_startup = False   # recovered from disk vs seen live
+        self._limit_at = 0.0               # when the cut-off was noticed
         # "waiting for the user" is the OR of three independent sources (see
         # _emit_waiting): _scrape_waiting (the settled screen shows a numbered
         # menu + selection caret — a permission prompt), _tool_waiting (an
@@ -193,6 +235,7 @@ class TerminalAgent(QObject):
         self._ready_tail = ""
         self._screen_tail = ""
         self._reset_waiting()
+        self.clear_limit_block()
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         # a NON-resume start is a new conversation, so it gets a new pinned
@@ -245,6 +288,7 @@ class TerminalAgent(QObject):
         self._ready_tail = ""
         self._screen_tail = ""
         self._reset_waiting()
+        self.clear_limit_block()
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         if self.spec.provider == "claude":  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
@@ -402,6 +446,29 @@ class TerminalAgent(QObject):
         else:
             self._pending_task = text  # flushed when the prompt is ready
 
+    def nudge(self, text: str) -> bool:
+        """Type `text` at the agent's prompt and submit it, WITHOUT touching any
+        persisted metadata. Returns False when the agent can't take it.
+
+        The difference from `deliver_task` is the whole point: that path is for
+        ASSIGNING work, so it overwrites `current_task`, flips the assignment to
+        WORKING and re-infers the role from the text. A nudge is a message
+        inside work the agent already has (the auto-continue after a plan-limit
+        reset), so none of that may change — `current_task` in particular is
+        persisted and shown in the sidebar and on the board.
+
+        Unlike `write`, this does NOT stamp `_last_input_ts`: the resumed work's
+        output must still light the sidebar's "working" pulse, exactly as a
+        delivered task's does.
+        """
+        text = sanitize_text(text or "").strip()
+        if not text or not self.is_pty:
+            return False
+        if not (self._prompt_ready and self.worker.is_running()):
+            return False
+        self._write_task_to_pty(text)
+        return True
+
     def _write_task_to_pty(self, text: str) -> None:
         body = text.replace("\r\n", "\r").replace("\n", "\r")
         if "\r" in body:  # multi-line: bracketed paste, then submit
@@ -543,6 +610,9 @@ class TerminalAgent(QObject):
         # the screen has settled (2 s quiet) — is it a prompt awaiting the user?
         self._scrape_waiting = self._screen_waiting()
         self._emit_waiting()
+        # ...and is this the plan-limit banner? Latch it NOW, while the frame is
+        # current; by reset time the rolling tail no longer holds it.
+        self._scrape_limit()
 
     def _screen_waiting(self) -> bool:
         # ground-truth on the drawn box; suppress for a mode that shows no
@@ -561,6 +631,158 @@ class TerminalAgent(QObject):
         n_opts = len(_NUM_OPTION_RE.findall(region))
         has_caret = bool(_OPTION_CARET_RE.search(region))
         return has_caret and n_opts >= 2
+
+    def is_limit_blocked(self) -> bool:
+        """True when this agent was cut off by the plan limit and hasn't been
+        resumed yet. LATCHED when the banner was drawn (see _scrape_limit), not
+        re-derived on demand — by reset time the banner is long gone from the
+        rolling screen tail. Says WHICH agents to resume, which the
+        account-wide usage reading cannot know."""
+        return self._limit_blocked
+
+    def limit_resets_at(self) -> float | None:
+        """Epoch seconds the banner said this agent's limit resets, or None if
+        it didn't say. The network-free half of the auto-continue trigger."""
+        return self._limit_resets_at
+
+    def _scrape_limit(self) -> None:
+        """Latch the plan-limit banner off the screen tail.
+
+        Called on EVERY output burst, not only on the idle-timer settle. The
+        settle gate is right for `_screen_waiting` (a half-drawn menu is
+        ambiguous), but it is wrong here and cost a second live miss: the
+        banner lands immediately after the user submits a prompt, which is
+        exactly when `_mark_busy` treats output as keystroke echo and SKIPS
+        arming the idle timer — and once the agent parks silently there is no
+        further output to arm it, so the settle never comes and the cut-off is
+        never seen. "You've hit your … limit" is unambiguous the moment it
+        appears, so it needs no settle.
+
+        Sticky once set: the agent is parked and its own redraws must not clear
+        it, which is what a rolling-buffer re-scrape got wrong. It is cleared
+        explicitly instead — on start/restart, and by `clear_limit_block` once
+        the agent has genuinely resumed.
+        """
+        if self.spec.provider != "claude" or self._limit_blocked:
+            return
+        # Only a LIVE cut-off counts. On `--resume` Claude redraws the whole
+        # prior conversation, so a banner from a previous session scrolls past
+        # as history — latching that would schedule a phantom Continue for the
+        # next time that clock came round. The input-box footer marks the end
+        # of the replay, and a real cut-off can only happen after it, so
+        # gating on prompt-readiness separates the two exactly. (This is
+        # checked before _on_pty_output sets the flag, so the burst that ends
+        # the replay is itself excluded.)
+        if not self._prompt_ready:
+            return
+        # Deliberately a WIDER region than _screen_waiting's last 18 lines.
+        # That bound is right for a selection menu, which is anchored just
+        # above the input box; the banner is NOT bottom-anchored — the options
+        # menu, the input box and the footer all render below it, so 18 lines
+        # can push it out of view on a full frame. Both patterns are specific
+        # enough to search a wider window safely.
+        region = "\n".join(self._screen_tail.splitlines()[-40:])
+        if not is_limit_screen(region):
+            return
+        self._limit_blocked = True
+        self._limit_at = time.time()
+        # The reset clock lives in the banner, not the menu, so it may be
+        # absent (the banner can have scrolled while the menu is still up).
+        # None simply means "no network-free due time" — the watchdog then
+        # leaves this one to the plan-usage edge rather than guessing.
+        self._limit_resets_at = parse_reset_clock(region)
+        self._limit_from_startup = False
+        self.limit_blocked_changed.emit(True)
+
+    def mark_limit_blocked(self, resets_at: float | None,
+                           from_startup: bool = True) -> None:
+        """Seed the latch from OUTSIDE the live screen — startup recovery,
+        which reconstructs the cut-off from the transcript on disk because the
+        screen shows a replayed conversation rather than a live banner.
+
+        `from_startup` records which toggle owns this latch, so the two
+        preferences stay independent: a cut-off found at startup is resumed
+        only if startup recovery is on, one observed live only if
+        resume-on-reset is on.
+        """
+        if self._limit_blocked:
+            return
+        self._limit_blocked = True
+        self._limit_at = time.time()
+        self._limit_resets_at = resets_at
+        self._limit_from_startup = bool(from_startup)
+        self.limit_blocked_changed.emit(True)
+
+    def limit_from_startup(self) -> bool:
+        """True when this latch was recovered from disk rather than seen live."""
+        return self._limit_from_startup
+
+    def limit_latched_at(self) -> float:
+        """When this cut-off was noticed (epoch). Backstop for a latch whose
+        reset time is unknown — a 5-hour window cannot outlast it forever."""
+        return self._limit_at
+
+    def set_limit_reset(self, at: float | None) -> None:
+        """Supply a reset time the SCREEN could not give.
+
+        The menu ("Stop and wait for limit to reset") carries no clock, and the
+        banner that does may have scrolled out of the region we search — so a
+        latch can end up with no due time, which strands the network-free
+        watchdog and leaves only the flaky usage API to trigger it. Observed
+        live: an agent cut off at 05:10 with `resets=unknown` sat for five
+        hours. The account-level reading knows the answer even when the screen
+        doesn't, so it is filled in from there.
+        """
+        if self._limit_blocked and self._limit_resets_at is None and at:
+            self._limit_resets_at = at
+
+    def prompt_ready(self) -> bool:
+        """True once the TUI's input prompt is live and will accept typing."""
+        return self._prompt_ready
+
+    def clear_limit_block(self) -> None:
+        """Forget the latched cut-off (it resumed, or it restarted)."""
+        self._limit_blocked = False
+        self._limit_resets_at = None
+        self._limit_tries = 0
+        self._limit_last_try = 0.0
+        self._limit_from_startup = False
+        self._limit_at = 0.0
+
+    def note_limit_attempt(self) -> None:
+        """Record that we just tried to resume this agent."""
+        self._limit_tries += 1
+        self._limit_last_try = time.time()
+
+    def limit_attempts(self) -> int:
+        return self._limit_tries
+
+    def limit_retry_ready(self, retry_after_s: float, max_tries: int) -> bool:
+        """Whether a resume may be (re)tried now. A nudge can land while the
+        window is still shut — clock skew, or a reset that isn't exactly on the
+        stated minute — so one attempt is not enough; but it must not become a
+        Continue every 60 s forever either."""
+        if self._limit_tries >= max_tries:
+            return False
+        return (self._limit_tries == 0
+                or time.time() - self._limit_last_try >= retry_after_s)
+
+    def recheck_limit(self) -> bool:
+        """After a resume attempt: is the agent STILL parked? True means retry.
+
+        Keys on the MENU alone, deliberately — it is the interactive element
+        that actually blocks input, so it is present exactly while the agent is
+        stuck and gone the moment it is going again. The banner must NOT be
+        used here: it is scrollback, so it lingers in the tail well after a
+        successful resume and would report a false "still blocked" forever.
+        """
+        if not self._limit_blocked:
+            return False
+        region = "\n".join(self._screen_tail.splitlines()[-40:])
+        if region and LIMIT_MENU_RE.search(region):
+            return True
+        self.clear_limit_block()
+        return False
 
     # -------------------------------------------------------------- slots ---
 
@@ -583,19 +805,33 @@ class TerminalAgent(QObject):
         # rolling escape-stripped tail for waiting-for-input detection (the idle
         # timer scans it once output settles — see _screen_waiting)
         self._screen_tail = (self._screen_tail + _CSI_RE.sub("", text))[-4000:]
-        # readiness to receive a task. For Claude the ONLY reliable signal is
-        # the input-box footer ("? for shortcuts"): the folder-trust dialog
-        # also enables bracketed paste (and does NOT disable it on dismissal
-        # — both verified live), so 2004h alone would deliver the task into
-        # the dialog. The footer renders exactly when the prompt is truly
-        # interactive, including after trust dialogs and resume replays.
-        # Other TUIs (pty PowerShell via PSReadLine, agy) keep the
-        # paste-enable signal.
+        # latch a plan-limit cut-off the INSTANT it is drawn — see _scrape_limit
+        # for why this must not wait for the idle-timer settle
+        if not self._limit_blocked:
+            self._scrape_limit()
+        # readiness to receive a task. For Claude the signal is the input-box
+        # footer: the folder-trust dialog also enables bracketed paste (and
+        # does NOT disable it on dismissal — both verified live), so 2004h
+        # alone would deliver the task into the dialog. The footer renders
+        # exactly when the prompt is truly interactive, including after trust
+        # dialogs and resume replays. Other TUIs (pty PowerShell via
+        # PSReadLine, agy) keep the paste-enable signal.
+        #
+        # CRITICAL: match the whole footer-hint FAMILY, not just "? for
+        # shortcuts". That hint is only ONE member of a rotating set — the
+        # footer may instead be showing "auto mode on(shift+tab to cycle) ...
+        # <- for agents" — so keying on it alone leaves an agent permanently
+        # "not ready" whenever the rotation sits elsewhere. Verified live: a
+        # restored agent parked on a spent plan limit sat un-nudged through
+        # repeated watchdog ticks for exactly this reason, and a task
+        # delivered to it would have hung in _pending_task forever too. If a
+        # future CLI renames these, this tuple is the one place to fix.
         if not self._prompt_ready:
             if self.spec.provider == "claude":
                 self._ready_tail = (self._ready_tail
                                     + _CSI_RE.sub("", text))[-600:]
-                ready = "? for shortcuts" in self._ready_tail.lower()
+                tail = self._ready_tail.lower()
+                ready = any(h in tail for h in _CLAUDE_READY_HINTS)
             else:
                 ready = "\x1b[?2004h" in text
             if ready:

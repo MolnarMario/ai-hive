@@ -173,12 +173,174 @@ this file is the invariants that must survive every change.
   offset, never pyte paging (`prev_page` snaps back on any event). The wheel
   has three regimes (mouse-tracking forward / altscreen arrows / history
   offset) — keep all three working.
+- **Block Elements are drawn GEOMETRICALLY, never by the font**
+  (`terminal_view._BLOCK_RECTS`/`_BLOCK_SHADES`/`_paint_block`). Consolas has
+  no QUADRANT glyphs (U+2596-259F), so Qt silently falls back to Segoe UI
+  Symbol at a 12px advance in a 7px cell — and since `paintEvent` batches a
+  run of cells into ONE `drawText`, letting Qt lay it out, that single glyph
+  drags the whole rest of the row sideways. Claude Code's welcome mascot is
+  full blocks plus quadrants, so its rows sheared apart and its corners came
+  out notched (the fallback ink is also the wrong shape for the cell). Even
+  in-font, Consolas' full block is 6.7px of ink in a 7.0px advance, striping
+  solid artwork with background hairlines. So: fill exact rects on the shared
+  rounded grid from `cell_bounds`, which derives BOTH edges of a cell from the
+  same expression — cell N's right edge is bit-identical to cell N+1's left,
+  which is what makes the fills tile at any fractional cell size. The general
+  rule behind it: a glyph whose advance isn't the cell width (`_is_grid_glyph`
+  — also true of `✳`, `⏸`) is drawn ALONE at its own cell so it can never
+  shear its row; ordinary text still goes out in one `drawText`.
 - **Claude CLI facts** (verified 2.1.197): interactive `--continue`/`--resume
   <id>` hard-exit when there is no matching conversation (handled by the
   fresh-fallback in `TerminalAgent._on_finished`); headless `-p` silently
   starts fresh instead — never use `-p` to test resume. Effort tokens:
   low|medium|high|xhigh|max. Claude Code enters the alternate screen and
   enables mouse tracking (?1049h, ?1000/1002/1003h, ?1006h, ?1004h, ?2004h).
+- **Model aliases resolve CLIENT-SIDE, in the installed CLI binary — not on
+  the server.** The app passes bare aliases (`--model opus|sonnet|haiku|fable`,
+  `providers.py:CLAUDE_MODELS`), never a dated model id, so it does NOT pin a
+  version. But the `claude.exe` binary expands the alias to a concrete model id
+  from a table baked into THAT build. So an alias only knows the models its CLI
+  version shipped with: a stale CLI made every "Opus" agent launch Opus 4.8
+  long after Opus 5 (`claude-opus-5`, released 2026-07-24) was out, because
+  2.1.218's binary had no `opus-5` string in it. "Stuck on an old model" is
+  therefore a stale-CLI symptom, NOT app hardcoding — the fix is upgrading the
+  CLI, after which the same alias resolves to the newer model with zero app
+  change. To verify what an alias will resolve to WITHOUT launching, grep the
+  binary: `grep -c "opus-5" "<WinGet Packages>\...\claude.exe"` (0 = that build
+  doesn't know the model). Adding an explicit-id entry to `CLAUDE_MODELS`
+  (e.g. `("Opus 5","claude-opus-5")`) pins past the alias, but a too-old CLI
+  may reject an unknown `--model <id>`, so the upgrade is still the real fix.
+- **A CLI upgrade CANNOT apply while AI Hive has live agents.** Every running
+  agent is a `claude.exe` child, and Windows cannot replace a running `.exe`,
+  so `winget upgrade Anthropic.ClaudeCode` silently no-ops (or reports success
+  while the binary is unchanged) whenever the app — or a zombie instance
+  holding the single-instance mutex — still has agents alive. To update: fully
+  close AI Hive (or reboot), confirm `Get-Process claude` returns nothing, THEN
+  upgrade. This is a direct consequence of the Job-Object process model (agents
+  are kept alive by design); it is expected, not a bug.
+- **Plan usage is a LIVE READOUT and a HOOK POINT, never history**
+  (`app/claude_usage.py`, Qt-free/stdlib-only like `chime.py`). The number comes
+  from `GET /api/oauth/usage` with the account's OAuth bearer token — the same
+  call the TUI's `/usage` makes ("fetchUtilization: GET /api/oauth/usage" is in
+  the binary). There is NO CLI path (no `claude usage` subcommand), and the
+  `statusLine` route — whose stdin payload also carries
+  `rate_limits.five_hour.used_percentage` — is deliberately REJECTED: it would
+  run a subprocess inside every agent's TUI render loop, exactly the launch-
+  timing perturbation the SessionStart `startup` invariant above is about.
+  `~/.claude.json` → `cachedUsageUtilization` carries the IDENTICAL shape (one
+  `parse_utilization` serves both) but is only a cold-start seed / offline
+  fallback — the CLI rewrites it opportunistically and it goes stale for days
+  (observed 1.5 days and 10 points out of date), so it must never be the primary
+  source. TOKEN HANDLING IS READ-ONLY: re-read `.credentials.json` per call
+  (running agents keep it rotated for us), short-circuit on a past `expiresAt`
+  instead of putting a dead credential on the wire, and NEVER refresh (that
+  races the CLI's own refresh), write, log, or persist it. `fetch()` never
+  raises — every failure becomes a `Usage` with `error` set, and a failed poll
+  KEEPS the last good number on screen (greyed) rather than blanking a figure
+  the user is reading; only `no-auth` with no prior reading hides the badge for
+  good. CRITICAL, same rule as `activity_changed`/`waiting_changed`: a reading
+  is TRANSIENT and must NEVER mark `dirty` — `_apply_usage` runs every minute
+  for the life of the process, so wiring it to a save would rewrite
+  `session.json` 60x an hour (only the `ui.usage_visible` preference saves, via
+  `_schedule_save`). Polling is OPT-IN — `main.py` calls
+  `MainWindow.start_usage_polling()` exactly like it sets `quit_on_close`,
+  because the smoke suite shares `create_main_window` and must never touch the
+  network or the user's real account; tests drive `_on_usage_ready` with
+  synthetic readings. The BLOCKED state (`Usage.blocked`, utilization >= 100 —
+  derived from the number, NOT from the payload's server-side `severity`
+  string) is the machine-readable half: `MainWindow.planLimitReached(Limit)` /
+  `planLimitCleared()` are edge-triggered and level-correct like the chime, and
+  `plan_usage()` exposes the latest reading, so features that ACT on being cut
+  off (e.g. relaunching blocked agents unattended when the limit resets) hook
+  those instead of scraping a terminal. While blocked, `_arm_reset_poll`
+  schedules one extra poll just after the stated reset so the cleared edge
+  fires within seconds at 4am rather than waiting out the minute timer.
+- **Auto-continue consumes that edge; the SCREEN says who to resume**
+  (`MainWindow._resume_blocked_agents`, wired to `planLimitCleared`). The usage
+  reading is ACCOUNT-wide — it knows the plan is out and until when, but never
+  WHICH agents were mid-turn — so attribution comes from
+  `TerminalAgent.is_limit_blocked()`, a LATCH set by `_scrape_limit` on EVERY
+  output burst (`_on_pty_output`), gated on `_prompt_ready` so a `--resume`
+  replay of an OLD banner is read as history, not a live cut-off. Do NOT move
+  this back behind the idle-timer settle like `_screen_waiting`: the banner
+  lands right after the user submits a prompt, which is exactly when
+  `_mark_busy` treats output as keystroke echo and never arms that timer — and
+  a silently parked agent then produces nothing more to arm it, so the settle
+  never comes (this cost a second live miss). A half-drawn menu is ambiguous;
+  "You've hit your … limit" is not. Do NOT "simplify" this back to scraping at
+  the reset edge either
+  (it was written that way first and cost a full night's unattended work):
+  `_screen_tail` is a 4000-char ROLLING buffer and Claude's TUI keeps redrawing
+  its input box while parked, so hours later the banner has been evicted and
+  the tail holds only the bottom of a frame — the re-scrape matched nothing and
+  resumed nobody. The patterns live in Qt-free `app/limit_banner.py` because
+  `transcripts` matches the SAME thing off disk. Two signals, and which one you
+  use matters: `LIMIT_MENU_RE` ("Stop and wait for limit to reset") is the
+  interactive menu, so it PERSISTS for as long as the agent is stuck —
+  `recheck_limit` must key on it ALONE, since the banner is scrollback that
+  lingers after a successful resume and would report "still blocked" forever.
+  `LIMIT_HIT_RE` matches ONLY the exhausted banner, never `Approaching …` /
+  `You've used N% …` (those mean the agent is still WORKING and nudging it
+  would interrupt it); it is the weaker live signal but the ONLY one a
+  transcript records.
+  TWO triggers land in `_resume_blocked_agents`, and the second is the one that
+  must be reliable: (1) `planLimitCleared` resumes every latched agent (the
+  ACCOUNT is provably clear); (2) `_check_limit_resets` on `LIMIT_WATCH_MS`
+  resumes an agent once the reset time ITS OWN banner stated
+  (`limit_resets_at`, parsed by `parse_reset_clock`) has passed. The API edge
+  alone is NOT sufficient — it fires only if the SAME process also observed the
+  blocked state first, and `/api/oauth/usage` 429s intermittently (observed:
+  two in a row, then a 200), so a restart or a few bad polls silently skips the
+  resume entirely. The watchdog needs neither the network nor process
+  continuity. Relatedly `_on_usage_ready` backs the poll off exponentially on
+  429 (`_usage_backoff`) — a minute timer firing into a rate limit is how the
+  app can go hours never seeing `blocked` at all.
+  Delivery is Esc (close the limit's options menu) then the text a beat later
+  (`AUTO_CONTINUE_ESC_MS`), agents staggered by `AUTO_CONTINUE_STAGGER_MS` so
+  they don't all pile into the freshly reopened window. CRITICAL: the text goes
+  through `TerminalAgent.nudge`, NEVER `deliver_task` — `deliver_task` is the
+  ASSIGN path and would overwrite `current_task` (persisted, shown in the
+  sidebar and on the board), flip the assignment to WORKING and re-infer the
+  role. `nudge` also deliberately does NOT stamp `_last_input_ts` (unlike
+  `write`, which the Esc correctly uses), so the resumed work still pulses the
+  sidebar instead of being mistaken for the user's own typing. A nudge is then
+  VERIFIED, not assumed (`recheck_limit` after `AUTO_CONTINUE_VERIFY_MS`), with
+  bounded retries (`LIMIT_RETRY_S`, `LIMIT_MAX_TRIES`): a resume can land while
+  the window is still shut, and clearing the latch on the nudge itself — as
+  this first did — burns the only attempt and parks the agent for good. A
+  `nudge` refused because the TUI isn't ready must NOT consume an attempt.
+  Related: an agent parked on the limit raises the "?" (its menu is exactly
+  what `_screen_waiting` looks for) but must NOT ring the chime — it is not a
+  question the user can answer, and it would wake them at 4am for something
+  auto-continue is about to handle.
+- **The OTHER half of recovery reads the TRANSCRIPT, because the screen lies
+  after a restart** (`MainWindow.recover_blocked_at_startup`, `⏯` toggle). A
+  restarted agent redraws a REPLAYED conversation, which `_scrape_limit`
+  correctly ignores as history — so the live latch can never see a cut-off that
+  happened before this run. `transcripts.ended_on_limit` supplies it instead:
+  the LAST assistant record being the banner means the conversation stopped
+  there ("last" is the safety — anything said afterwards means it carried on).
+  CRITICAL: the banner's clock is BARE ("resets 3am"), so the reset MUST be
+  anchored to the record's own timestamp (`limit_banner.banner_reset_at`);
+  resolving it against the current clock lands on the NEXT 3am and stalls the
+  agent a full day. Startup recovery only ARMS (`mark_limit_blocked`) —
+  delivery stays with the single watchdog, so a freshly launched TUI is waited
+  out rather than poked. It skips agents that aren't running (a card left
+  stopped stays stopped; starting it would spend quota the user didn't ask
+  for) and cut-offs older than `STARTUP_RECOVERY_MAX_AGE_S`. Each latch records
+  its ORIGIN (`limit_from_startup`) and is gated by the toggle that owns it —
+  `ui.startup_recovery` for disk-recovered, `ui.auto_continue` for live — so
+  switching one off can never strand a latch the other created. Both are
+  ordinary UI preferences that save via `_schedule_save` (like `usage_visible`);
+  the latch itself is NEVER persisted — the transcript is the durable record,
+  and a persisted flag would go stale. `recover_blocked_at_startup` is OPT-IN
+  from `main.py` (after `autostart_active_workspace`, since it only considers
+  RUNNING agents) exactly like `start_usage_polling`: it reads the user's real
+  transcripts and types into real agents, which the smoke suite must never do.
+  The whole path is audited to `session.log` via `_limit_audit`
+  (`STARTUP-SCAN`/`STARTUP-SKIP`/`BLOCKED`/`NUDGE`/`WAIT`/`RESUMED`/
+  `STILL-BLOCKED`) — this feature failed silently TWICE and both causes had to
+  be reconstructed from transcript timestamps hours later; do not remove it.
 - **Theming is a skin registry** (`app/ui_theme.py`): each skin is a `Theme`
   in `THEMES`; `apply_theme(id)` rewrites the module-level `Palette` attrs,
   the `ANSI_16` list (IN PLACE — same object), and the font globals, so every

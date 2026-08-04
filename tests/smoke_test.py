@@ -1098,6 +1098,151 @@ def test_terminal_relative_link():
     tv.deleteLater()
 
 
+def test_terminal_block_glyphs():
+    """Block Elements (U+2580-U+259F) are painted GEOMETRICALLY on the cell
+    grid, not handed to the font.
+
+    Regression for Claude Code's welcome mascot rendering visibly broken. The
+    mascot is full blocks plus QUADRANTS (U+2598/259B/259C/259D), and Consolas
+    has no quadrant glyphs: Qt fell back to Segoe UI Symbol, whose advance is
+    12px where the cell is 7. Because paintEvent batches a run of cells into
+    one drawText, that single glyph dragged the rest of the row ~5px right and
+    the mascot's rows sheared apart; the fallback ink was also the wrong shape
+    for the cell, notching every corner. Separately, Consolas' own full block
+    is 6.7px of ink in a 7.0px advance, leaving a hairline of background at
+    each cell boundary that striped solid artwork.
+
+    So: exact fills on a shared rounded grid (no seam, no overlap, no drift),
+    and any glyph the font lacks is drawn ALONE so it cannot shear its row."""
+    from PySide6.QtGui import QColor
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import (CELL_PAD_X, _BLOCK_RECTS,
+                                           _BLOCK_SHADES, TerminalView)
+    QApplication.instance() or QApplication([])
+
+    tv = TerminalView(rows=8, cols=40)
+    tv.resize(500, 220)
+
+    # --- the grid: adjacent cells must share an edge exactly ---------------
+    check("blocks: cells tile horizontally with no seam or overlap",
+          all(tv.cell_bounds(c, 0)[2] == tv.cell_bounds(c + 1, 0)[0]
+              for c in range(39)))
+    check("blocks: cells tile vertically with no seam or overlap",
+          all(tv.cell_bounds(0, r)[3] == tv.cell_bounds(0, r + 1)[1]
+              for r in range(7)))
+    # a fractional cell width is the case that breaks a width-per-cell scheme
+    # (rounding error accumulates across the row) - deriving both edges from
+    # the same expression cannot drift
+    tv._cell_w, tv._cell_h = 7.4, 15.6
+    check("blocks: fractional cell size tiles seamlessly and never drifts",
+          all(tv.cell_bounds(c, 0)[2] == tv.cell_bounds(c + 1, 0)[0]
+              for c in range(39))
+          and tv.cell_bounds(39, 0)[2] == round(CELL_PAD_X + 40 * 7.4))
+    tv.deleteLater()
+
+    # --- pixel coverage ----------------------------------------------------
+    FG = QColor(255, 255, 255).rgb()   # white: max contrast, never re-tinted
+
+    def render(text, cols=12, rows=4):
+        v = TerminalView(rows=rows, cols=cols)
+        v.resize(260, 120)
+        v.feed("\x1b[38;2;255;255;255m" + text)
+        return v, v.grab().toImage()
+
+    def lit(img, v, col, row, u, w):
+        """Is the cell's fractional point (u, w) painted foreground?"""
+        x0, y0, x1, y1 = v.cell_bounds(col, row)
+        return QColor(img.pixel(x0 + int((x1 - x0) * u),
+                                y0 + int((y1 - y0) * w))).rgb() == FG
+
+    # full block: every pixel of the cell, and no gap where two blocks meet
+    v, img = render("███")
+    x0, y0, _, y1 = v.cell_bounds(0, 0)
+    x1 = v.cell_bounds(2, 0)[2]
+    check("blocks: full block fills its cell edge to edge (no hairline seam)",
+          all(QColor(img.pixel(x, y)).rgb() == FG
+              for x in range(x0, x1) for y in range(y0, y1)))
+    v.deleteLater()
+
+    # halves and quadrants: boundaries at 1/2 round cleanly, so assert the
+    # exact quarter-by-quarter mask the Unicode chart specifies
+    QUARTERS = ((0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75))
+    exact = []
+    for data in ("▀", "▄", "▌", "▐", "▖", "▗",
+                 "▘", "▙", "▚", "▛", "▜", "▝",
+                 "▞", "▟", "█"):
+        v, img = render(data)
+        for (u, w) in QUARTERS:
+            want = any(fx0 <= u < fx1 and fy0 <= w < fy1
+                       for (fx0, fy0, fx1, fy1) in _BLOCK_RECTS[data])
+            if lit(img, v, 0, 0, u, w) != want:
+                exact.append((hex(ord(data)), u, w))
+        v.deleteLater()
+    check("blocks: every half/quadrant covers exactly its quarters of the cell",
+          not exact, exact)
+
+    # eighth blocks: ink on the correct side, nothing on the opposite half
+    eighths = []
+    for data, inside, outside in (("▁", (0.5, 0.97), (0.5, 0.25)),
+                                  ("▔", (0.5, 0.02), (0.5, 0.75)),
+                                  ("▏", (0.02, 0.5), (0.75, 0.5)),
+                                  ("▕", (0.97, 0.5), (0.25, 0.5))):
+        v, img = render(data)
+        if not lit(img, v, 0, 0, *inside) or lit(img, v, 0, 0, *outside):
+            eighths.append(hex(ord(data)))
+        v.deleteLater()
+    check("blocks: eighth blocks hug their own edge of the cell", not eighths,
+          eighths)
+
+    # shades are the full cell at partial opacity - present but not solid
+    v, img = render("░▒▓")
+    shades = [QColor(img.pixel(*[(v.cell_bounds(c, 0)[0]
+                                  + v.cell_bounds(c, 0)[2]) // 2,
+                                 (v.cell_bounds(c, 0)[1]
+                                  + v.cell_bounds(c, 0)[3]) // 2])).lightness()
+              for c in range(3)]
+    check("blocks: the three shades render at increasing density",
+          shades[0] < shades[1] < shades[2] < QColor(FG).lightness(), shades)
+    check("blocks: shade table covers exactly the three shade codepoints",
+          set(_BLOCK_SHADES) == {"░", "▒", "▓"})
+    check("blocks: geometry table covers the rest of U+2580-U+259F",
+          set(_BLOCK_RECTS) | set(_BLOCK_SHADES)
+          == {chr(c) for c in range(0x2580, 0x25A0)})
+    v.deleteLater()
+
+    # vertical neighbours must meet: lower half over upper half is solid
+    v, img = render("▄\r\n▀")
+    bx0, _, bx1, seam = v.cell_bounds(0, 0)
+    check("blocks: a lower half over an upper half leaves no horizontal seam",
+          all(QColor(img.pixel(x, y)).rgb() == FG
+              for x in range(bx0, bx1) for y in range(seam - 2, seam + 2)))
+    v.deleteLater()
+
+    # --- shear guard: an off-grid glyph must not move its neighbours -------
+    v = TerminalView(rows=4, cols=12)
+    check("blocks: an ASCII glyph is grid-safe", v._is_grid_glyph("M"))
+    off = [c for c in "▘▛✳⏸"
+           if not v._is_grid_glyph(c)]
+    check("blocks: glyphs missing from the terminal font are flagged off-grid",
+          off, "none of the probes fell back - font coverage changed?")
+    v.deleteLater()
+
+    # the mascot itself: legs sit on exact cell boundaries, body is solid
+    v, img = render("▝▜█████▛▘"
+                    "\r\n  ▘▘ ▝▝", cols=14)
+    body_x0, body_y0, _, body_y1 = v.cell_bounds(2, 0)
+    body_x1 = v.cell_bounds(6, 0)[2]
+    check("blocks: mascot body renders solid (no shear gaps, no stripes)",
+          all(QColor(img.pixel(x, y)).rgb() == FG
+              for x in range(body_x0, body_x1)
+              for y in range(body_y0, body_y1)))
+    legs = [c for c in range(14)
+            if lit(img, v, c, 1, 0.25, 0.25) or lit(img, v, c, 1, 0.75, 0.25)]
+    check("blocks: mascot legs land on their own cells (no fallback drift)",
+          legs == [2, 3, 5, 6], legs)
+    v.deleteLater()
+
+
 def test_terminal_link_underline():
     """Every clickable URL/path on the visible screen is scanned + underlined
     (not just the hovered one), so links stand out in the body text; the scan
@@ -5178,6 +5323,763 @@ def test_resume_fallback():
     check("resume-fallback: user-stopped resume not relaunched", c3["start"] == 1)
 
 
+def test_plan_usage():
+    """The top-bar Claude plan-usage readout: parsing, the badge line, the
+    limit-reached edges other features hook into, and the two rules that keep
+    it cheap — a reading NEVER marks the session dirty, and polling is opt-in
+    so this suite never touches the network or the user's real account."""
+    import json as _json
+    import time as _time
+    from PySide6.QtWidgets import QApplication
+    from app import claude_usage as cu
+
+    QApplication.instance() or QApplication([])
+    now = _time.time()
+
+    def limit(key, pct, resets=None):
+        return cu.Limit(key=key, label=cu._LABELS[key], short=cu._SHORT[key],
+                        percent=pct, resets_at=resets)
+
+    # --- parsing the real payload shape (captured from /api/oauth/usage) ---
+    payload = {
+        "five_hour": {"utilization": 21.0,
+                      "resets_at": "2026-08-02T12:29:59.983234+00:00",
+                      "limit_dollars": None},
+        "seven_day": None,               # Pro has no weekly window
+        "seven_day_opus": None,
+        "extra_usage": {"is_enabled": False},
+        "limits": [{"kind": "session", "percent": 21}],
+    }
+    lims = cu.parse_utilization(payload)
+    check("plan-usage: parses five_hour utilization", len(lims) == 1
+          and lims[0].key == "five_hour" and lims[0].percent == 21.0)
+    check("plan-usage: resets_at parsed to epoch seconds",
+          abs(lims[0].resets_at - 1785673799.983234) < 1.0)
+    check("plan-usage: null windows skipped, not reported as 0%",
+          all(l.key != "seven_day" for l in lims))
+    check("plan-usage: garbage payload yields no limits",
+          cu.parse_utilization({"five_hour": "nonsense"}) == ()
+          and cu.parse_utilization({}) == ())
+    check("plan-usage: epoch resets_at also accepted",
+          cu.parse_utilization(
+              {"five_hour": {"utilization": 5, "resets_at": 1785673799}}
+          )[0].resets_at == 1785673799.0)
+
+    # --- headline picks the most-constrained window ---
+    multi = cu.Usage(limits=(limit("five_hour", 21.0), limit("seven_day", 64.0)))
+    check("plan-usage: headline is the highest-utilization window",
+          cu.headline(multi).key == "seven_day")
+    check("plan-usage: headline of an empty reading is None",
+          cu.headline(cu.Usage()) is None and cu.headline(None) is None)
+
+    # --- the badge line: countdown FIRST, then wall-clock, in local time ---
+    line = cu.format_limit(limit("five_hour", 21.0, now + 4800), now=now)
+    check("plan-usage: line reads '21% used, resets in 1h20m at HH:MM'",
+          line.startswith("21% used, resets in 1h20m at ")
+          and len(line.split(" at ")[1]) == 5, line)
+    check("plan-usage: local wall-clock, not UTC",
+          line.endswith(_time.strftime("%H:%M", _time.localtime(now + 4800))))
+    check("plan-usage: window named only when the plan has several",
+          cu.format_limit(limit("seven_day", 64.0, now + 600), now=now,
+                          with_label=True).startswith("7d 64% used"))
+    check("plan-usage: a spent window spells out 'limit reached'",
+          cu.format_limit(limit("five_hour", 100.0, now + 600),
+                          now=now).startswith("limit reached, resets in 10m"))
+    check("plan-usage: no reset time degrades to the bare percent",
+          cu.format_limit(limit("five_hour", 21.0)) == "21% used")
+    check("plan-usage: countdown formats scale",
+          (cu.format_countdown(4800), cu.format_countdown(600),
+           cu.format_countdown(30)) == ("1h20m", "10m", "30s"))
+    check("plan-usage: age formats scale",
+          (cu.format_since(2), cu.format_since(42), cu.format_since(180),
+           cu.format_since(7200)) == ("just now", "42s ago", "3m ago", "2h ago"))
+
+    # --- blocked/resets_at: the hook other features build on ---
+    spent = cu.Usage(limits=(limit("five_hour", 100.0, now + 900),))
+    check("plan-usage: blocked reports the spent window",
+          spent.blocked is not None and spent.blocked.key == "five_hour")
+    check("plan-usage: blocked carries when it frees up",
+          spent.resets_at == now + 900)
+    check("plan-usage: headroom means not blocked",
+          cu.Usage(limits=(limit("five_hour", 99.0, now),)).blocked is None)
+
+    # --- credentials are read-only, and a dead token never hits the wire ---
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-usage-"))
+    creds = tmp / ".credentials.json"
+    creds.write_text(_json.dumps({"claudeAiOauth": {
+        "accessToken": "not-a-real-token", "subscriptionType": "pro",
+        "expiresAt": int((now - 3600) * 1000)}}), encoding="utf-8")
+    before = creds.read_bytes()
+    old_env = os.environ.get("CLAUDE_CONFIG_DIR")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(tmp)
+    try:
+        expired = cu.fetch()
+        check("plan-usage: expired token short-circuits (no request)",
+              expired.error == "expired" and not expired.limits)
+        check("plan-usage: credentials file never rewritten",
+              creds.read_bytes() == before)
+        creds.unlink()
+        check("plan-usage: missing credentials report no-auth, never raise",
+              cu.fetch().error == "no-auth")
+        check("plan-usage: missing cache returns None, never raises",
+              cu.read_cached() is None)
+        # --- the on-disk cache is parsed by the very same parser ---
+        (tmp / ".claude.json").write_text(_json.dumps({
+            "cachedUsageUtilization": {"fetchedAtMs": int((now - 90) * 1000),
+                                       "utilization": payload}}),
+            encoding="utf-8")
+        cached = cu.read_cached()
+        check("plan-usage: cache seed parsed, marked as cached",
+              cached is not None and cached.source == "cache"
+              and cached.limits[0].percent == 21.0)
+        check("plan-usage: cache keeps Claude's timestamp, not now",
+              abs(cached.fetched_at - (now - 90)) < 2.0)
+    finally:
+        if old_env is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = old_env
+
+    # --- window wiring: badge, edges, persistence ---
+    from main import create_main_window, setup_application
+    from app.session_store import SessionStore
+    app = QApplication.instance()
+    setup_application(app)
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    app.processEvents()
+    badge = win.top_bar.usage_badge
+
+    check("plan-usage: polling is opt-in, so the suite never fetches",
+          not win._usage_timer.isActive() and win.plan_usage() is None)
+    check("plan-usage: badge hidden until a reading arrives",
+          not badge.isVisible() and not badge.has_reading())
+
+    good = cu.Usage(limits=(limit("five_hour", 21.0, now + 4800),),
+                    fetched_at=now, plan="pro")
+    win._on_usage_ready(good)
+    app.processEvents()
+    check("plan-usage: reading shows the badge with the full line",
+          badge.isVisible() and badge._text.startswith("21% used, resets in"))
+    check("plan-usage: tooltip carries plan, every window, and the age",
+          "Pro plan" in badge.toolTip() and "Current session" in badge.toolTip()
+          and "Updated" in badge.toolTip())
+    check("plan-usage: plan_usage() exposes the reading",
+          win.plan_usage() is good)
+
+    # a reading is TRANSIENT: it must never schedule a save (this polls every
+    # minute forever; wiring it to dirty would thrash session.json)
+    win._save_timer.stop()
+    win._on_usage_ready(cu.Usage(limits=(limit("five_hour", 22.0, now + 4700),),
+                                 fetched_at=now, plan="pro"))
+    check("plan-usage: a reading never marks the session dirty",
+          not win._save_timer.isActive())
+
+    # edges: rising once, level-stable, falling once
+    seen = {"hit": 0, "clear": 0, "limit": None}
+    win.planLimitReached.connect(
+        lambda l: seen.update(hit=seen["hit"] + 1, limit=l))
+    win.planLimitCleared.connect(lambda: seen.update(clear=seen["clear"] + 1))
+    blocked = cu.Usage(limits=(limit("five_hour", 100.0, now + 120),),
+                       fetched_at=now, plan="pro")
+    win._on_usage_ready(blocked)
+    win._on_usage_ready(blocked)          # level, not a new edge
+    check("plan-usage: planLimitReached fires once on the rising edge",
+          seen["hit"] == 1 and seen["clear"] == 0)
+    check("plan-usage: the edge carries the reset time",
+          seen["limit"] is not None and seen["limit"].resets_at == now + 120)
+    check("plan-usage: blocked badge reads 'limit reached'",
+          badge._text.startswith("limit reached, resets in"))
+    check("plan-usage: an extra poll is armed for just after the reset",
+          win._usage_reset_timer.isActive()
+          and win._usage_reset_timer.remainingTime() > 120000)
+    win._on_usage_ready(good)
+    check("plan-usage: planLimitCleared fires once on the falling edge",
+          seen["clear"] == 1 and seen["hit"] == 1)
+    check("plan-usage: reset poll disarmed once there is headroom",
+          not win._usage_reset_timer.isActive())
+    # a weekly window can reset days out; that is the minute poll's job, not a
+    # multi-day QTimer (whose interval is 32-bit anyway)
+    win._on_usage_ready(cu.Usage(limits=(limit("seven_day", 100.0,
+                                               now + 3 * 86400),),
+                                 fetched_at=now, plan="max"))
+    check("plan-usage: a far-off reset is left to the ordinary poll",
+          not win._usage_reset_timer.isActive())
+    win._on_usage_ready(good)
+
+    # a failed poll keeps the last good number on screen, greyed
+    win._on_usage_ready(cu.Usage(error="urlerror"))
+    check("plan-usage: a failed poll keeps the last number, marked stale",
+          badge._text.startswith("21% used") and badge._stale)
+
+    # visibility preference persists; toggling it IS a save (a UI preference)
+    win._on_usage_visibility(False)
+    app.processEvents()
+    check("plan-usage: hiding removes the badge but keeps polling",
+          not badge.isVisible())
+    check("plan-usage: a later reading cannot resurrect a hidden badge",
+          (win._on_usage_ready(good), app.processEvents(),
+           not badge.isVisible())[-1])
+    payload_ui = win._session_payload()["ui"]
+    check("plan-usage: preference persisted under ui.usage_visible",
+          payload_ui["usage_visible"] is False)
+    win.close()
+
+    win2 = create_main_window(store)
+    win2.show()
+    app.processEvents()
+    check("plan-usage: preference restored on reopen",
+          win2.top_bar.usage_visible() is False)
+    check("plan-usage: default is ON when never saved",
+          create_main_window(
+              SessionStore(path=tmp / "fresh.json")).top_bar.usage_visible())
+    win2.close()
+
+    # no Claude login at all: hide for good rather than show an empty pill
+    win3 = create_main_window(SessionStore(path=tmp / "noauth.json"))
+    win3.show()
+    win3._usage_timer.start()
+    win3._on_usage_ready(cu.Usage(error="no-auth"))
+    app.processEvents()
+    check("plan-usage: no-auth hides the badge and stops polling",
+          not win3.top_bar.usage_badge.isVisible()
+          and not win3._usage_timer.isActive())
+    win3.close()
+
+
+def test_auto_continue_on_limit_reset():
+    """When the plan limit resets, the agents it CUT OFF go back to work by
+    themselves: Esc to close the limit's options menu, then "Continue".
+
+    The point is unattended overnight recovery — and, because the first message
+    after a window expires is what starts the next one, resuming at 4am also
+    rolls the 5-hour clock over before morning. Guards matter as much as the
+    action: the account-wide reading that fires the edge cannot say WHICH agents
+    were mid-turn, so anything not parked on the limit banner is left alone."""
+    import time as _time
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import claude_usage as cu
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import TerminalAgent
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    now = _time.time()
+
+    # long enough to cover the Esc->type beat plus the delayed submit CR
+    AUTO_CONTINUE_SETTLE_MS = 1200
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    BANNER = ("You've hit your session limit \xb7 resets 4:40am "
+              "(Europe/Bucharest)\n")
+    # what Claude actually parks the agent on. Unlike the banner (ordinary
+    # scrollback, which the rolling tail evicts) this MENU stays up for as long
+    # as the agent is stuck, so it is the primary live signal and the "did it
+    # resume?" test.
+    MENU = ("What do you want to do?\n"
+            "> 1. Stop and wait for limit to reset\n"
+            "  2. Upgrade your plan\n"
+            "Enter to confirm \xb7 Esc to cancel\n")
+    PARKED = BANNER + MENU
+
+    # --- the per-agent "I was cut off" scrape -------------------------------
+    def mk(name="Coder", provider="claude", pty=True):
+        spec = build_spec(AgentKind.CLAUDE if provider == "claude"
+                          else AgentKind.CMD, name, cwd=os.getcwd(), pty=pty)
+        a = TerminalAgent(spec)
+        a.worker = type("W", (), {
+            "is_running": lambda s: True,
+            "write": lambda s, d: (writes.setdefault(id(s), []).append(d), True)[1],
+            "start": lambda s: None, "dispose": lambda s: None})()
+        a._prompt_ready = True
+        return a
+
+    writes: dict = {}
+
+    def settle(agent, screen):
+        """Feed a settled screen through the real idle-timer path."""
+        agent._screen_tail = screen
+        agent._on_idle_timeout()
+
+    a = mk()
+    settle(a, "")
+    check("auto-continue: a clean screen is not limit-blocked",
+          not a.is_limit_blocked())
+    settle(a, "Approaching session limit \xb7 resets 4:40am\n")
+    check("auto-continue: an 'Approaching' warning is NOT a cut-off",
+          not a.is_limit_blocked())
+    settle(a, "You've used 62% of your session limit \xb7 resets 4:40am\n")
+    check("auto-continue: a 'You've used N%' warning is NOT a cut-off",
+          not a.is_limit_blocked())
+    settle(a, BANNER)
+    check("auto-continue: the exhausted banner IS a cut-off",
+          a.is_limit_blocked())
+    check("auto-continue: the banner's own reset time is latched with it",
+          a.limit_resets_at() is not None)
+
+    # the menu alone is enough — it is what survives on screen when the banner
+    # above it has scrolled out of the rolling tail
+    menu_only = mk("MenuOnly")
+    settle(menu_only, MENU)
+    check("auto-continue: the parked-on menu alone IS a cut-off",
+          menu_only.is_limit_blocked())
+
+    # An agent WRITING ABOUT the limit is not stopped by it. Observed live: an
+    # agent working on this feature quoted the banner in its own output and was
+    # armed for a resume it never needed. A real banner is a short line of its
+    # own; prose that mentions it is not.
+    talker = mk("Talker")
+    settle(talker,
+           "The sign an agent shows looks like this: " + BANNER.strip()
+           + " -- and that phrase is what we match against the screen "
+             "buffer to work out that it stopped.\n")
+    check("auto-continue: an agent QUOTING the banner in prose is not a "
+          "cut-off", not talker.is_limit_blocked())
+
+    # a cut-off with no clock anywhere must still be resumable -- `unknown`
+    # once stranded an agent for five hours
+    noclock = mk("NoClock")
+    settle(noclock, MENU)                       # the menu carries no time
+    check("auto-continue: a menu-only cut-off has no reset time of its own",
+          noclock.limit_resets_at() is None)
+    noclock.set_limit_reset(now + 1800)         # ...supplied by the account
+    check("auto-continue: a reset time can be supplied from the account "
+          "reading", noclock.limit_resets_at() == now + 1800)
+    noclock.set_limit_reset(now + 9999)
+    check("auto-continue: a known reset time is never overwritten",
+          noclock.limit_resets_at() == now + 1800)
+
+    # THE REGRESSION that cost a night's work: the banner is latched when it is
+    # DRAWN, because _screen_tail is a rolling buffer — by reset time the agent
+    # has idled for hours and its own redraws have evicted the banner. A
+    # re-scrape at that point sees only the bottom of a frame and resumes
+    # nobody.
+    settle(a, "\xe2\x94\x82 > \xe2\x94\x82\n  ? for shortcuts\n")
+    check("auto-continue: the latch SURVIVES the banner scrolling out of the "
+          "rolling screen tail", a.is_limit_blocked())
+    a.clear_limit_block()
+    check("auto-continue: clearing the latch forgets the reset time too",
+          not a.is_limit_blocked() and a.limit_resets_at() is None)
+
+    # a --resume replay redraws the OLD conversation, banner and all; that is
+    # history, not a live cut-off, and latching it would schedule a phantom
+    # Continue. The input-box footer ends the replay, so pre-prompt output is
+    # excluded.
+    replay = mk()
+    replay._prompt_ready = False
+    replay._on_pty_output("pty", BANNER)
+    check("auto-continue: a banner replayed before the prompt is ready is "
+          "history, not a cut-off", not replay.is_limit_blocked())
+    replay._prompt_ready = True
+    replay._on_pty_output("pty", BANNER)
+    check("auto-continue: the same banner once live DOES latch",
+          replay.is_limit_blocked())
+
+    # Prompt readiness must accept the WHOLE rotating footer-hint family, not
+    # just "? for shortcuts". Keying on that one member left a restored agent
+    # permanently "not ready" -- the watchdog logged WAIT every minute and
+    # never nudged it (verified live), and a delivered task would have hung in
+    # _pending_task just as long.
+    for hint in ("? for shortcuts",
+                 "auto mode on(shift+tab to cycle) \xb7 ctrl+t to show tasks "
+                 "\xb7 ← for agents"):
+        r = mk("Ready")
+        r._prompt_ready = False
+        r._on_pty_output("pty", "\x1b[?2004h" + hint + "\n")
+        check(f"auto-continue: footer hint {hint.split(chr(183))[0][:24]!r} "
+              f"marks the prompt ready", r.prompt_ready())
+    notready = mk("NotReady")
+    notready._prompt_ready = False
+    notready._on_pty_output("pty", "Do you trust the files in this folder?\n")
+    check("auto-continue: the trust dialog is NOT mistaken for a live prompt",
+          not notready.prompt_ready())
+
+    # the latch must not wait for the idle-timer settle: the banner arrives
+    # right after the user hits Enter, which is exactly when _mark_busy treats
+    # output as keystroke echo and never arms that timer (a live miss)
+    burst = mk()
+    burst.write("hi")                 # stamps _last_input_ts -> echo window
+    burst._on_pty_output("pty", BANNER)
+    check("auto-continue: latched straight off the output burst, with no "
+          "idle-timer settle", burst.is_limit_blocked())
+
+    curly = mk()
+    settle(curly, "You’ve hit your weekly limit \xb7 resets 3am\n")
+    check("auto-continue: curly apostrophe + weekly window also detected",
+          curly.is_limit_blocked())
+    non_claude = mk(name="Shell", provider="cmd", pty=True)
+    settle(non_claude, BANNER)
+    check("auto-continue: a non-Claude agent is never limit-blocked",
+          not non_claude.is_limit_blocked())
+
+    # --- the banner's clock -> the next occurrence of that wall time ---------
+    from app.terminal_agent import parse_reset_clock
+    base = _time.mktime((2026, 8, 2, 23, 50, 0, 0, 0, -1))   # 23:50 local
+    at = parse_reset_clock("\xb7 resets 4:40am (Europe/Bucharest)", base)
+    lt = _time.localtime(at)
+    check("auto-continue: a small-hours reset read late at night rolls over "
+          "to tomorrow",
+          (lt.tm_hour, lt.tm_min) == (4, 40) and at > base
+          and at - base < 6 * 3600)
+    noon = _time.mktime((2026, 8, 2, 12, 0, 0, 0, 0, -1))
+    lt2 = _time.localtime(parse_reset_clock("resets 8:30pm", noon))
+    check("auto-continue: pm is read as afternoon, same day",
+          (lt2.tm_hour, lt2.tm_min) == (20, 30))
+    lt3 = _time.localtime(parse_reset_clock("resets 12:15am", noon))
+    check("auto-continue: 12:15am is after midnight, not noon",
+          (lt3.tm_hour, lt3.tm_min) == (0, 15))
+    check("auto-continue: a banner with no time yields no reset",
+          parse_reset_clock("You've hit your session limit") is None)
+
+    # --- nudge() must not disturb any PERSISTED metadata --------------------
+    n = mk()
+    n.set_task("write the parser")
+    before = (n.current_task, n.assignment, n.spec.role)
+    check("auto-continue: nudge() delivers when the prompt is ready",
+          n.nudge("Continue") is True)
+    check("auto-continue: nudge() leaves task/assignment/role untouched",
+          (n.current_task, n.assignment, n.spec.role) == before)
+    check("auto-continue: nudge() typed the text",
+          "Continue" in "".join(writes.get(id(n.worker), [])))
+    check("auto-continue: nudge() does not stamp the user-input clock "
+          "(resumed work still pulses the sidebar)",
+          n._last_input_ts == 0.0)
+    n._prompt_ready = False
+    check("auto-continue: nudge() refuses when the TUI isn't prompt-ready",
+          n.nudge("Continue") is False)
+
+    # --- the wiring: planLimitCleared -> resume the blocked ones ------------
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-autocont-"))
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.show(); pump(50)
+    mgr = win.manager
+    ws = mgr.workspaces[0]
+
+    cut_off, busy, fine = mk("CutOff"), mk("Busy"), mk("Fine")
+    settle(cut_off, BANNER)
+    settle(busy, BANNER)
+    busy._busy = True                    # already moving again
+    settle(fine, "all done\n")           # was never cut off
+    ws.agents.extend([cut_off, busy, fine])
+
+    win._resume_blocked_agents()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    sent = lambda ag: "".join(writes.get(id(ag.worker), []))
+    check("auto-continue: the cut-off agent got Esc then Continue",
+          sent(cut_off).startswith("\x1b") and "Continue" in sent(cut_off))
+    check("auto-continue: an agent that is busy again is left alone",
+          sent(busy) == "")
+    check("auto-continue: an agent that was never cut off is left alone",
+          sent(fine) == "")
+    check("auto-continue: the card carries an audit notice",
+          any("auto-continued" in t for _s, t in cut_off.log))
+
+    # the toggle actually gates it
+    writes.clear()
+    win._on_auto_continue(False)
+    win._resume_blocked_agents()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: nothing is typed while the toggle is off",
+          sent(cut_off) == "")
+    payload_ui = win._session_payload()["ui"]
+    check("auto-continue: preference persisted under ui.auto_continue",
+          payload_ui["auto_continue"] is False)
+
+    # the real trigger is the plan-limit falling edge, not a timer
+    writes.clear()
+    win._on_auto_continue(True)
+    cut_off.clear_limit_block()    # a FRESH cut-off in the next window
+    settle(cut_off, BANNER)
+    win._plan_blocked = True
+    win._on_usage_ready(cu.Usage(
+        limits=(cu.Limit(key="five_hour", label=cu._LABELS["five_hour"],
+                         short=cu._SHORT["five_hour"], percent=12.0,
+                         resets_at=now + 4700),),
+        fetched_at=now, plan="pro"))
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: the planLimitCleared edge resumes cut-off agents",
+          "Continue" in sent(cut_off))
+    # The latch is NOT dropped on the nudge itself: a resume can land while the
+    # window is still shut, and clearing here burned the only attempt and left
+    # the agent parked for good. It clears on VERIFICATION instead.
+    check("auto-continue: the latch survives the nudge, pending verification",
+          cut_off.is_limit_blocked())
+    check("auto-continue: a nudged agent is not re-nudged a minute later",
+          not cut_off.limit_retry_ready(300, 4))
+    cut_off._screen_tail = PARKED           # menu still up: it didn't take
+    check("auto-continue: still parked on the menu -> stays latched for a retry",
+          cut_off.recheck_limit() is True)
+    # The banner LINGERS in the tail after a successful resume, so verification
+    # must key on the menu alone — using the banner would report a false
+    # "still blocked" forever and burn every retry.
+    cut_off._screen_tail = BANNER + "\nWorking on it...\n  ? for shortcuts\n"
+    check("auto-continue: menu gone -> resumed, even with the banner still in "
+          "the scrollback",
+          cut_off.recheck_limit() is False and not cut_off.is_limit_blocked())
+    check("auto-continue: attempts reset with the latch",
+          cut_off.limit_attempts() == 0)
+
+    # --- the network-free watchdog: the banner's own reset time -------------
+    # The API edge is NOT enough on its own. It only fires if this same process
+    # also saw the blocked state first, and the endpoint 429s intermittently --
+    # a missed edge silently costs a whole night, which is what happened live.
+    writes.clear()
+    late = mk("Late")
+    settle(late, BANNER)
+    ws.agents.append(late)
+    late._limit_resets_at = now + 3600          # not due yet
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: an agent whose reset is still in the future waits",
+          sent(late) == "" and late.is_limit_blocked())
+    late._limit_resets_at = now - 60            # its stated reset has passed
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: the watchdog resumes it with NO usage reading at all",
+          "Continue" in sent(late))
+
+    # a banner with no parseable time has no due date -- it must NOT count as
+    # "due now", which would fire a pointless Continue into a still-blocked
+    # agent and then drop the latch, missing the real reset
+    writes.clear()
+    timeless = mk("Timeless")
+    settle(timeless, "You've hit your session limit\n")
+    ws.agents.append(timeless)
+    check("auto-continue: a banner with no time still latches the cut-off",
+          timeless.is_limit_blocked() and timeless.limit_resets_at() is None)
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: an unknown reset time is NOT treated as due now",
+          sent(timeless) == "" and timeless.is_limit_blocked())
+
+    # ...but it must not wait FOREVER either. With no clock from the screen and
+    # none from the API, fall back to the longest a window can last, so a latch
+    # can never become permanent for want of a timestamp.
+    from app.widgets.main_window import LIMIT_UNKNOWN_WAIT_S
+    timeless._limit_at = now - LIMIT_UNKNOWN_WAIT_S - 60
+    timeless._limit_resets_at = None             # nothing supplied a clock
+    saved_usage, win._usage = win._usage, None   # not even the account
+    win._check_limit_resets()
+    win._usage = saved_usage
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: a clockless cut-off is resumed once no window could "
+          "still be open", "Continue" in sent(timeless))
+
+    # the banner is not bottom-anchored: its options menu, the input box and
+    # the footer all render below it, so the scrape window must be wider than
+    # the selection-menu scrape's 18 lines
+    deep = mk("Deep")
+    settle(deep, BANNER + "\n".join(
+        ["  1. Upgrade", "  2. Team plan", "  3. Extra usage", "  4. Cancel"]
+        + [f"filler {i}" for i in range(14)]
+        + ["│ > │", "  ? for shortcuts"]))
+    check("auto-continue: the banner is found above a full frame of menu/input",
+          deep.is_limit_blocked())
+
+    win._on_auto_continue(False)   # what the reopen below must find
+    win.close()
+
+    win2 = create_main_window(store)
+    win2.show(); pump(50)
+    check("auto-continue: preference restored on reopen",
+          win2.top_bar.auto_continue() is False)
+    check("auto-continue: default is ON when never saved",
+          create_main_window(
+              SessionStore(path=tmp / "fresh.json")).top_bar.auto_continue())
+    win2.close()
+
+    # the limit banner must NOT ring the chime — nothing the sleeper can answer
+    rung = {"n": 0}
+    import app.chime as _chime
+    real_play, _chime.play = _chime.play, lambda: rung.__setitem__("n", rung["n"] + 1)
+    try:
+        win3 = create_main_window(SessionStore(path=tmp / "chime.json"))
+        win3.show(); pump(50)
+        w3 = win3.manager.workspaces[0]
+        quiet, loud = mk("Quiet"), mk("Loud")
+        settle(quiet, BANNER)
+        settle(loud, "1. Yes\n❯ 2. No\n")
+        w3.agents.extend([quiet, loud])
+        win3._on_agent_waiting(w3.id, quiet.id)
+        check("auto-continue: a limit-blocked agent does not ring the chime",
+              rung["n"] == 0)
+        win3._on_agent_waiting(w3.id, loud.id)
+        check("auto-continue: an ordinary prompt still rings the chime",
+              rung["n"] == 1)
+        win3.close()
+    finally:
+        _chime.play = real_play
+
+
+def test_startup_limit_recovery():
+    """Agents the plan limit stopped BEFORE the app opened are found and armed.
+
+    The live latch cannot see these: after a restart each agent's screen shows
+    a REPLAYED conversation, which _scrape_limit deliberately ignores as
+    history. The transcript is the durable record — it still ends exactly where
+    the limit stopped it. The gate the user asked for is strict: no stoppage
+    message, no action."""
+    import json as _json
+    import time as _time
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import limit_banner, transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.main_window import STARTUP_RECOVERY_MAX_AGE_S
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-startup-rec-"))
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def iso(epoch):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(epoch))
+
+    def write_transcript(cwd, sid, records):
+        d = Path(transcripts.transcript_path(cwd, sid)).parent
+        d.mkdir(parents=True, exist_ok=True)
+        with open(transcripts.transcript_path(cwd, sid), "w",
+                  encoding="utf-8") as fh:
+            for r in records:
+                fh.write(_json.dumps(r) + "\n")
+
+    def assistant(text, at):
+        return {"type": "assistant", "timestamp": iso(at),
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    now = _time.time()
+    cwd = str(tmp)
+    BANNER = "You've hit your session limit \xb7 resets 3am (Europe/Bucharest)"
+
+    # --- reading the durable record -----------------------------------------
+    cut_at = _time.mktime((2026, 8, 3, 2, 42, 0, 0, 0, -1))
+    write_transcript(cwd, "sid-cut", [assistant("working", cut_at - 600),
+                                      assistant(BANNER, cut_at)])
+    hit, when, resets = transcripts.ended_on_limit(cwd, "sid-cut")
+    check("startup-recovery: a transcript ending on the banner is a cut-off",
+          hit and abs(when - cut_at) < 2)
+    lt = _time.localtime(resets)
+    check("startup-recovery: the reset is anchored to WHEN THE BANNER WAS "
+          "WRITTEN, not to now (02:42 + 'resets 3am' -> 03:00 THAT day)",
+          (lt.tm_hour, lt.tm_min) == (3, 0) and 0 < resets - cut_at < 3600)
+
+    # the same banner resolved against a later clock lands a full day out --
+    # the bug this anchoring exists to prevent
+    naive = limit_banner.parse_reset_clock(BANNER, cut_at + 6 * 3600)
+    check("startup-recovery: un-anchored parsing would stall a day",
+          naive - resets > 80000)
+
+    write_transcript(cwd, "sid-went-on", [assistant(BANNER, cut_at),
+                                          assistant("carrying on", cut_at + 60)])
+    hit2, _, _ = transcripts.ended_on_limit(cwd, "sid-went-on")
+    check("startup-recovery: a banner followed by real output is history, "
+          "not a cut-off", not hit2)
+    check("startup-recovery: no transcript at all is not a cut-off",
+          transcripts.ended_on_limit(cwd, "sid-missing")[0] is False)
+
+    # --- arming from it ------------------------------------------------------
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.show(); pump(50)
+    ws = win.manager.workspaces[0]
+
+    def agent_for(name, sid):
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=cwd, pty=True)
+        spec.session_id = sid
+        a = TerminalAgent(spec)
+        a.worker = type("W", (), {"is_running": lambda s: True,
+                                  "write": lambda s, d: True,
+                                  "start": lambda s: None,
+                                  "dispose": lambda s: None})()
+        a._prompt_ready = True
+        ws.agents.append(a)
+        return a
+
+    cut = agent_for("Cut", "sid-cut")
+    went_on = agent_for("WentOn", "sid-went-on")
+    check("startup-recovery: armed exactly the cut-off agent",
+          win.recover_blocked_at_startup() == 1)
+    check("startup-recovery: the cut-off agent is latched, with its reset time",
+          cut.is_limit_blocked() and cut.limit_resets_at() is not None)
+    check("startup-recovery: the latch is marked as coming from startup",
+          cut.limit_from_startup() is True)
+    check("startup-recovery: an agent without the stoppage message is untouched",
+          not went_on.is_limit_blocked())
+
+    # a card left stopped stays stopped -- this resumes work, it does not
+    # launch processes (each one would spend quota)
+    stopped = agent_for("Stopped", "sid-cut")
+    stopped.worker = type("W", (), {"is_running": lambda s: False,
+                                    "write": lambda s, d: True,
+                                    "start": lambda s: None,
+                                    "dispose": lambda s: None})()
+    win.recover_blocked_at_startup()
+    check("startup-recovery: a stopped agent is left stopped",
+          not stopped.is_limit_blocked())
+
+    # staleness bound: don't revive work abandoned days ago just because the
+    # app was opened
+    old_at = now - STARTUP_RECOVERY_MAX_AGE_S - 3600
+    write_transcript(cwd, "sid-old", [assistant(BANNER, old_at)])
+    old = agent_for("Old", "sid-old")
+    win.recover_blocked_at_startup()
+    check("startup-recovery: a cut-off older than the age bound is skipped",
+          not old.is_limit_blocked())
+
+    # --- the toggle owns its own latches ------------------------------------
+    win._startup_recovery = False
+    fresh = agent_for("Fresh", "sid-cut")
+    check("startup-recovery: scanning is skipped entirely while the toggle is "
+          "off", win.recover_blocked_at_startup() == 0
+          and not fresh.is_limit_blocked())
+
+    # a startup latch must NOT be resumed by the OTHER toggle
+    writes = []
+    cut.worker = type("W", (), {
+        "is_running": lambda s: True,
+        "write": lambda s, d: (writes.append(d), True)[1],
+        "start": lambda s: None, "dispose": lambda s: None})()
+    cut._limit_resets_at = now - 60
+    win._auto_continue = True          # the other switch is on...
+    win._check_limit_resets()          # ...and must not act on a startup latch
+    pump(1200)
+    check("startup-recovery: resume-on-reset does NOT resume a startup latch",
+          writes == [])
+    win._startup_recovery = True
+    win._check_limit_resets()
+    pump(1200)
+    check("startup-recovery: its own toggle DOES resume it",
+          any("Continue" in d for d in writes))
+
+    # --- both preferences persist -------------------------------------------
+    win._on_startup_recovery(False)
+    win._on_auto_continue(True)
+    ui = win._session_payload()["ui"]
+    check("startup-recovery: preference persisted under ui.startup_recovery",
+          ui["startup_recovery"] is False and ui["auto_continue"] is True)
+    win.close()
+
+    win2 = create_main_window(store)
+    win2.show(); pump(50)
+    check("startup-recovery: both toggles restore independently",
+          win2.top_bar.startup_recovery() is False
+          and win2.top_bar.auto_continue() is True)
+    check("startup-recovery: defaults are ON when never saved",
+          create_main_window(
+              SessionStore(path=tmp / "fresh.json")).top_bar.startup_recovery())
+    win2.close()
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
@@ -5230,9 +6132,13 @@ def main():
     test_fsopen_helpers()
     test_filetypes_icons()
     test_terminal_relative_link()
+    test_terminal_block_glyphs()
     test_terminal_link_underline()
     test_sidebar_file_tree()
     test_sidebar_search()
+    test_plan_usage()
+    test_auto_continue_on_limit_reset()
+    test_startup_limit_recovery()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0
