@@ -195,6 +195,29 @@ this file is the invariants that must survive every change.
   starts fresh instead — never use `-p` to test resume. Effort tokens:
   low|medium|high|xhigh|max. Claude Code enters the alternate screen and
   enables mouse tracking (?1049h, ?1000/1002/1003h, ?1006h, ?1004h, ?2004h).
+- **Model aliases resolve CLIENT-SIDE, in the installed CLI binary — not on
+  the server.** The app passes bare aliases (`--model opus|sonnet|haiku|fable`,
+  `providers.py:CLAUDE_MODELS`), never a dated model id, so it does NOT pin a
+  version. But the `claude.exe` binary expands the alias to a concrete model id
+  from a table baked into THAT build. So an alias only knows the models its CLI
+  version shipped with: a stale CLI made every "Opus" agent launch Opus 4.8
+  long after Opus 5 (`claude-opus-5`, released 2026-07-24) was out, because
+  2.1.218's binary had no `opus-5` string in it. "Stuck on an old model" is
+  therefore a stale-CLI symptom, NOT app hardcoding — the fix is upgrading the
+  CLI, after which the same alias resolves to the newer model with zero app
+  change. To verify what an alias will resolve to WITHOUT launching, grep the
+  binary: `grep -c "opus-5" "<WinGet Packages>\...\claude.exe"` (0 = that build
+  doesn't know the model). Adding an explicit-id entry to `CLAUDE_MODELS`
+  (e.g. `("Opus 5","claude-opus-5")`) pins past the alias, but a too-old CLI
+  may reject an unknown `--model <id>`, so the upgrade is still the real fix.
+- **A CLI upgrade CANNOT apply while AI Hive has live agents.** Every running
+  agent is a `claude.exe` child, and Windows cannot replace a running `.exe`,
+  so `winget upgrade Anthropic.ClaudeCode` silently no-ops (or reports success
+  while the binary is unchanged) whenever the app — or a zombie instance
+  holding the single-instance mutex — still has agents alive. To update: fully
+  close AI Hive (or reboot), confirm `Get-Process claude` returns nothing, THEN
+  upgrade. This is a direct consequence of the Job-Object process model (agents
+  are kept alive by design); it is expected, not a bug.
 - **Plan usage is a LIVE READOUT and a HOOK POINT, never history**
   (`app/claude_usage.py`, Qt-free/stdlib-only like `chime.py`). The number comes
   from `GET /api/oauth/usage` with the account's OAuth bearer token — the same
