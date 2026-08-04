@@ -310,11 +310,20 @@ class TopBar(QFrame):
         if not self._usage_wanted:
             self.usage_badge.setVisible(False)
 
+    def note_usage_error(self, error: str) -> None:
+        """A poll failed with no earlier reading to fall back on: show the
+        can't-read pill rather than nothing at all. Still honours the user's
+        show/hide preference — an error is not a reason to force the readout
+        back onto a bar they cleared."""
+        self.usage_badge.mark_unreadable(error)
+        if not self._usage_wanted:
+            self.usage_badge.setVisible(False)
+
     def set_usage_visible(self, on: bool) -> None:
         """Reflect the show/hide preference (no signal emitted)."""
         self._usage_wanted = bool(on)
         self.usage_badge.setVisible(self._usage_wanted
-                                    and self.usage_badge.has_reading())
+                                    and self.usage_badge.has_content())
 
     def usage_visible(self) -> bool:
         return self._usage_wanted
@@ -861,7 +870,7 @@ class MainWindow(QMainWindow):
         # resume whoever the limit cut off, the moment the window reopens
         self.planLimitCleared.connect(self._resume_blocked_agents)
         self.manager.agentLimitBlocked.connect(self._on_agent_limit_blocked)
-        self.top_bar.usageRefreshRequested.connect(self._poll_usage)
+        self.top_bar.usageRefreshRequested.connect(self._on_usage_refresh)
         # QueuedConnection is the point: the fetch thread emits, and the slot
         # runs on the GUI thread where touching widgets/timers is legal
         self._usageReady.connect(self._on_usage_ready,
@@ -1014,6 +1023,17 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True,
                          name="aihive-usage").start()
 
+    def _on_usage_refresh(self) -> None:
+        """The user clicked the readout. Clear any 429 backoff first: they are
+        asking now, and leaving the timer parked at sixteen minutes would make
+        a successful manual refresh look like it fixed nothing when the next
+        automatic poll failed to arrive."""
+        self._usage_backoff = 0
+        self._usage_timer.setInterval(USAGE_POLL_MS)
+        if self._usage_timer.isActive():
+            self._usage_timer.start()      # restart the interval from now
+        self._poll_usage()
+
     def _on_usage_ready(self, reading) -> None:
         self._usage_inflight = False
         if self._closing:
@@ -1042,6 +1062,17 @@ class MainWindow(QMainWindow):
         if reading is not None and reading.error == "http 429":
             self._usage_backoff = min(self._usage_backoff + 1, 4)
             self._usage_timer.setInterval(USAGE_POLL_MS * (2 ** self._usage_backoff))
+        if self._usage is None:
+            # Nothing to grey out: there has never been a reading this run, and
+            # since CLI 2.1.220 stopped writing `cachedUsageUtilization` there
+            # is no on-disk seed to cover the gap either. Say the number is
+            # unreadable instead of leaving a hole in the bar — a readout that
+            # silently vanishes is indistinguishable from a deleted feature
+            # (reported as exactly that), and the backoff can keep it away for
+            # sixteen minutes at a stretch.
+            self.top_bar.note_usage_error(
+                reading.error if reading is not None else "unknown")
+            return
         self.top_bar.usage_badge.mark_stale(True)
 
     def _apply_usage(self, reading) -> None:

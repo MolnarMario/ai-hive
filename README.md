@@ -83,7 +83,11 @@ workspaces keep executing — switching never pauses anything.
   signals (with the reset time) so other features can act on being cut off —
   e.g. relaunching blocked agents unattended the moment the limit resets.
   Right-click the top bar to hide the readout; it hides itself when there's no
-  Claude login.
+  Claude login. If the number can't be fetched at all — the endpoint
+  rate-limits, and there's no longer an on-disk figure to fall back on — the
+  badge says **`! usage limit unreadable — click to refresh`** rather than
+  quietly disappearing, and clicking it retries immediately instead of waiting
+  out the backoff.
 - **Auto-recovery from a spent plan limit** — two switches sit next to the usage
   readout, both on by default, both persisted, each with a tooltip spelling out
   what it does:
@@ -477,7 +481,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-849 checks drive the real app headlessly (offscreen Qt platform) with real
+858 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -545,7 +549,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (849 checks)
+tests/smoke_test.py        headless end-to-end suite (858 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

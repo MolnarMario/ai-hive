@@ -5562,6 +5562,50 @@ def test_plan_usage():
           and not win3._usage_timer.isActive())
     win3.close()
 
+    # A poll that fails with NO earlier reading used to leave a hole in the bar
+    # — reported live as "did you delete the usage readout?" after a restart hit
+    # an http 429 (and CLI 2.1.220 no longer writes the cachedUsageUtilization
+    # seed that used to paint a number instantly). It must say so instead.
+    win4 = create_main_window(SessionStore(path=tmp / "unreadable.json"))
+    win4.show()
+    win4._usage_timer.start()
+    b4 = win4.top_bar.usage_badge
+    win4._on_usage_ready(cu.Usage(error="http 429"))
+    app.processEvents()
+    check("plan-usage: a failure with no reading shows the can't-read pill",
+          b4.isVisible() and "unreadable" in b4._text
+          and "click to refresh" in b4._text)
+    check("plan-usage: the can't-read pill is not mistaken for a reading",
+          not b4.has_reading() and b4.has_content()
+          and win4.plan_usage() is None)
+    check("plan-usage: its tooltip names the failure and the way out",
+          "http 429" in b4.toolTip() and "Click to try again" in b4.toolTip())
+    check("plan-usage: the can't-read pill paints without a limit to draw",
+          not b4.grab().isNull())
+    check("plan-usage: polling continues (only no-auth is terminal)",
+          win4._usage_timer.isActive())
+    # a click is the user asking NOW: it must not be left parked behind the
+    # backoff a run of 429s just wound up to
+    check("plan-usage: repeated 429s back the poll off",
+          win4._usage_timer.interval() > 60000)
+    win4._on_usage_refresh()
+    check("plan-usage: a manual refresh clears the 429 backoff",
+          win4._usage_backoff == 0 and win4._usage_timer.interval() == 60000)
+    # and a real number supersedes the error pill entirely
+    win4._on_usage_ready(good)
+    app.processEvents()
+    check("plan-usage: a later reading replaces the can't-read pill",
+          b4.isVisible() and b4.has_reading()
+          and b4._text.startswith("21% used") and not b4._unreadable)
+    # an error is not a reason to force the readout back onto a bar the user
+    # deliberately cleared
+    win4._on_usage_visibility(False)
+    win4.top_bar.note_usage_error("http 429")
+    app.processEvents()
+    check("plan-usage: a hidden readout stays hidden when a poll fails",
+          not b4.isVisible())
+    win4.close()
+
 
 def test_auto_continue_on_limit_reset():
     """When the plan limit resets, the agents it CUT OFF go back to work by

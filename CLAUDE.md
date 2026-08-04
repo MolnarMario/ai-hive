@@ -238,7 +238,16 @@ this file is the invariants that must survive every change.
   raises — every failure becomes a `Usage` with `error` set, and a failed poll
   KEEPS the last good number on screen (greyed) rather than blanking a figure
   the user is reading; only `no-auth` with no prior reading hides the badge for
-  good. CRITICAL, same rule as `activity_changed`/`waiting_changed`: a reading
+  good. A failure with NO reading to grey out shows the CAN'T-READ PILL
+  (`PlanUsageBadge.mark_unreadable`, "usage limit unreadable — click to
+  refresh") — the badge must never just disappear, which is indistinguishable
+  from the feature having been deleted (reported as exactly that after a
+  restart met an `http 429`; CLI 2.1.220 no longer writes the
+  `cachedUsageUtilization` seed that used to paint a number instantly, so the
+  gap is now reachable on any cold start). Visibility is therefore gated on
+  `has_content()`, NOT `has_reading()`, and a click resets `_usage_backoff`
+  (`_on_usage_refresh`) so the user asking now isn't parked behind a 16-minute
+  retry gap. CRITICAL, same rule as `activity_changed`/`waiting_changed`: a reading
   is TRANSIENT and must NEVER mark `dirty` — `_apply_usage` runs every minute
   for the life of the process, so wiring it to a save would rewrite
   `session.json` 60x an hour (only the `ui.usage_visible` preference saves, via
