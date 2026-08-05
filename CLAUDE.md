@@ -238,7 +238,16 @@ this file is the invariants that must survive every change.
   raises — every failure becomes a `Usage` with `error` set, and a failed poll
   KEEPS the last good number on screen (greyed) rather than blanking a figure
   the user is reading; only `no-auth` with no prior reading hides the badge for
-  good. CRITICAL, same rule as `activity_changed`/`waiting_changed`: a reading
+  good. A failure with NO reading to grey out shows the CAN'T-READ PILL
+  (`PlanUsageBadge.mark_unreadable`, "usage limit unreadable — click to
+  refresh") — the badge must never just disappear, which is indistinguishable
+  from the feature having been deleted (reported as exactly that after a
+  restart met an `http 429`; CLI 2.1.220 no longer writes the
+  `cachedUsageUtilization` seed that used to paint a number instantly, so the
+  gap is now reachable on any cold start). Visibility is therefore gated on
+  `has_content()`, NOT `has_reading()`, and a click resets `_usage_backoff`
+  (`_on_usage_refresh`) so the user asking now isn't parked behind a 16-minute
+  retry gap. CRITICAL, same rule as `activity_changed`/`waiting_changed`: a reading
   is TRANSIENT and must NEVER mark `dirty` — `_apply_usage` runs every minute
   for the life of the process, so wiring it to a save would rewrite
   `session.json` 60x an hour (only the `ui.usage_visible` preference saves, via
@@ -283,6 +292,20 @@ this file is the invariants that must survive every change.
   `You've used N% …` (those mean the agent is still WORKING and nudging it
   would interrupt it); it is the weaker live signal but the ONLY one a
   transcript records.
+  CRITICAL, the other half of that asymmetry: a BANNER ON ITS OWN IS NOT PROOF
+  OF A LIVE CUT-OFF. It is ordinary output that stays in view — and is redrawn
+  with every frame — long after the agent has been resumed off it, so once
+  `recheck_limit` cleared the latch the very next burst re-latched on the SAME
+  line, and `parse_reset_clock` dated it 24 h out because its clock had just
+  passed. A phantom latch mutes that agent's "?" chime (limit-blocked agents
+  deliberately don't ring) and later types a stray `Continue` into an agent that
+  is working fine — twice on 2026-08-04, once 13 s after a verified RESUMED.
+  So `_scrape_limit` latches a banner with NO MENU only when the line DIFFERS
+  from `_limit_last_banner`, the one that produced the previous latch;
+  successive 5-hour windows never end at the same wall time, and a genuine
+  cut-off renders its menu directly below the banner (hence in view whenever the
+  banner is), so this suppresses only the echo. `_limit_last_banner` therefore
+  SURVIVES `clear_limit_block` and is reset by `start`/`restart` alone.
   TWO triggers land in `_resume_blocked_agents`, and the second is the one that
   must be reliable: (1) `planLimitCleared` resumes every latched agent (the
   ACCOUNT is provably clear); (2) `_check_limit_resets` on `LIMIT_WATCH_MS`
@@ -297,7 +320,14 @@ this file is the invariants that must survive every change.
   app can go hours never seeing `blocked` at all.
   Delivery is Esc (close the limit's options menu) then the text a beat later
   (`AUTO_CONTINUE_ESC_MS`), agents staggered by `AUTO_CONTINUE_STAGGER_MS` so
-  they don't all pile into the freshly reopened window. CRITICAL: the text goes
+  they don't all pile into the freshly reopened window. Because BOTH triggers
+  can fire within the same second (the reset poll is armed for exactly then),
+  a scheduled-but-undelivered resume must be visible to the second pass:
+  `MainWindow._resume_pending` claims the agent id at SCHEDULE time and
+  releases it only once `note_limit_attempt` has run — `limit_retry_ready`
+  alone cannot do this, since the attempt is recorded up to a full stagger
+  after the trigger, which is how three of four agents got `Continue` typed
+  twice at 05:30 on 2026-08-04. CRITICAL: the text goes
   through `TerminalAgent.nudge`, NEVER `deliver_task` — `deliver_task` is the
   ASSIGN path and would overwrite `current_task` (persisted, shown in the
   sidebar and on the board), flip the assignment to WORKING and re-infer the
@@ -325,22 +355,70 @@ this file is the invariants that must survive every change.
   resolving it against the current clock lands on the NEXT 3am and stalls the
   agent a full day. Startup recovery only ARMS (`mark_limit_blocked`) —
   delivery stays with the single watchdog, so a freshly launched TUI is waited
-  out rather than poked. It skips agents that aren't running (a card left
-  stopped stays stopped; starting it would spend quota the user didn't ask
-  for) and cut-offs older than `STARTUP_RECOVERY_MAX_AGE_S`. Each latch records
+  out rather than poked. It scans EVERY agent in every workspace, running or
+  not, and files every cut-off it finds; two rules then decide what it acts on.
+  (1) It STARTS a stopped card whose transcript shows a cut-off — it was the
+  LIMIT that stopped that agent, not the user, so leaving it alone drops
+  exactly the work this exists to rescue. It must set `spec.resume` first:
+  `start()` mints a fresh session id for a non-resume launch, which would open
+  an empty conversation and abandon the transcript that proved the cut-off.
+  This is a deliberate reversal of the older "a card left stopped stays
+  stopped" rule. (2) It acts only on the MOST RECENT window
+  (`limit_ledger.latest_window`), never on an age bound — a bound asks how OLD
+  a cut-off is when what decides is whether it was the LAST thing that
+  happened, and the old 36 h `STARTUP_RECOVERY_MAX_AGE_S` had begun silently
+  skipping real cut-offs. Agents stopped by one window all state the same reset
+  clock, so they group; a cut-off the ledger already CLOSED is never revived
+  (without which an abandoned conversation whose transcript still ends on the
+  banner would be resumed afresh on every launch). Each latch records
   its ORIGIN (`limit_from_startup`) and is gated by the toggle that owns it —
   `ui.startup_recovery` for disk-recovered, `ui.auto_continue` for live — so
   switching one off can never strand a latch the other created. Both are
   ordinary UI preferences that save via `_schedule_save` (like `usage_visible`);
   the latch itself is NEVER persisted — the transcript is the durable record,
   and a persisted flag would go stale. `recover_blocked_at_startup` is OPT-IN
-  from `main.py` (after `autostart_active_workspace`, since it only considers
-  RUNNING agents) exactly like `start_usage_polling`: it reads the user's real
-  transcripts and types into real agents, which the smoke suite must never do.
+  from `main.py` (after `autostart_active_workspace`, so the ordinary restore
+  runs first and this only starts the stragglers) exactly like
+  `start_usage_polling`: it reads the user's real transcripts and types into
+  real agents, which the smoke suite must never do.
   The whole path is audited to `session.log` via `_limit_audit`
-  (`STARTUP-SCAN`/`STARTUP-SKIP`/`BLOCKED`/`NUDGE`/`WAIT`/`RESUMED`/
-  `STILL-BLOCKED`) — this feature failed silently TWICE and both causes had to
-  be reconstructed from transcript timestamps hours later; do not remove it.
+  (`STARTUP-SCAN`/`STARTUP-SKIP`/`STARTUP-START`/`BLOCKED`/`NUDGE`/`WAIT`/
+  `PHANTOM`/`RESUMED`/`STILL-BLOCKED`/`GAVE-UP`) — this feature failed silently
+  TWICE and both causes had to be reconstructed from transcript timestamps
+  hours later; do not remove it.
+- **The cut-off itself is a HISTORICAL FACT and is kept** (`app/limit_ledger.py`,
+  Qt-free/stdlib-only, `<session-dir>/limit_events.jsonl`). Every other piece
+  of this feature is transient on purpose, which left nothing able to answer
+  "what was interrupted last night, and did it recover" after a restart. The
+  ledger is append-only (an append cannot corrupt what is already there, and it
+  is written exactly when things are going wrong), records one `cut_off` per
+  episode with workspace, agent, task, LOCAL timestamp, window and reset time,
+  and closes it with a `resumed`/`failed`/`dismissed` outcome. It is NOT
+  session state — nothing here goes in `session.json`, so the "a latch is never
+  persisted" rule stands. CRITICAL, the identity: `TerminalAgent.id` is a fresh
+  uuid on every load and display names aren't unique, so a cut-off is keyed on
+  (cwd, session_id, RESET time) — `limit_ledger.key_of`. The reset is the one
+  number both sources resolve identically (the live screen parses the banner as
+  it is drawn; the startup scan parses the same banner off disk anchored to its
+  own timestamp), whereas the two NOTICE times never agree, so keying on those
+  would file one cut-off twice and re-resume work already recovered.
+- **Two agreeing sources before anything is typed.** The screen latch says an
+  agent was cut off; `transcripts.limit_cut_off` must not contradict it at
+  nudge time (checked THEN, not at latch time — the banner may not be flushed
+  the instant it is drawn, but by reset time it certainly is). That function is
+  deliberately TRI-STATE: only a transcript that demonstrably CARRIED ON refutes
+  the latch (`PHANTOM` → `dismissed`), while one that cannot be read — a
+  drifted pin, an unflushed conversation — is no evidence either way and must
+  never strand a genuine cut-off. `ended_on_limit` collapses both to False,
+  which is right only for a caller wanting positive evidence.
+  A reset read off the SCREEN also gets `LIMIT_RESET_GRACE_S` of slack (the
+  banner names a minute, not an instant, and a nudge into a still-shut window
+  spends one of very few retries); a reset from the ACCOUNT reading needs none,
+  since headroom means the window is provably open. And a `weekly` window
+  (`limit_banner.banner_window`) is NOT readable off the screen at all — its
+  banner prints a bare wall clock for a reset that can be days out, which
+  `parse_reset_clock` can only ever resolve to the next occurrence, so a weekly
+  cut-off ignores its clock and waits for the account reading.
 - **Theming is a skin registry** (`app/ui_theme.py`): each skin is a `Theme`
   in `THEMES`; `apply_theme(id)` rewrites the module-level `Palette` attrs,
   the `ANSI_16` list (IN PLACE — same object), and the font globals, so every

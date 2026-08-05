@@ -390,6 +390,15 @@ class PlanUsageBadge(QWidget):
     The widget is a pure VIEW — it never fetches. `MainWindow` polls off-thread
     and pushes readings in via `set_usage`; a click emits `refreshRequested`,
     which is the whole refresh affordance (no extra button in the chrome).
+
+    When a poll fails and there is NO earlier number to grey out, the pill says
+    so (`mark_unreadable`) instead of vanishing. Disappearing silently reads as
+    "the feature was removed" — it was reported as exactly that after a restart
+    that hit an `http 429` with no seed on disk to fall back on (Claude's own
+    `cachedUsageUtilization` is gone from `~/.claude.json` as of CLI 2.1.220, so
+    the instant first paint that used to cover this no longer happens). The
+    error pill keeps the click-to-refresh affordance, which is the one useful
+    thing a user can do about it.
     """
 
     refreshRequested = Signal()
@@ -411,6 +420,7 @@ class PlanUsageBadge(QWidget):
         self._text = ""
         self._stale = False         # showing an older reading than we'd like
         self._label = False         # prefix the window name (multi-limit plans)
+        self._unreadable = ""       # last error, when we have NO reading at all
         self._refresh_text()
 
     # -- data in ---------------------------------------------------------
@@ -422,6 +432,7 @@ class PlanUsageBadge(QWidget):
 
         self._usage = usage
         self._limit = claude_usage.headline(usage)
+        self._unreadable = ""       # a real number supersedes the error pill
         if self._limit is None:
             self.setVisible(False)
             return
@@ -436,6 +447,22 @@ class PlanUsageBadge(QWidget):
         """True once a usable reading has arrived — the top bar consults this
         so un-hiding never shows an empty pill."""
         return self._limit is not None
+
+    def has_content(self) -> bool:
+        """True when there is anything worth showing — a reading OR the
+        can't-read pill. This, not `has_reading`, gates visibility: the error
+        state is content too, and hiding it is what made the readout look
+        deleted."""
+        return self._limit is not None or bool(self._unreadable)
+
+    def mark_unreadable(self, error: str = "") -> None:
+        """No reading at all and the last poll failed: say so, in place, rather
+        than leave a gap in the bar. Never overrides a real number — the caller
+        only reaches here while `has_reading()` is False."""
+        self._unreadable = str(error) or "unavailable"
+        self._stale = True
+        self.setVisible(True)
+        self._refresh_text()
 
     def mark_stale(self, stale: bool = True) -> None:
         """A poll failed but we still have a previous reading: keep showing it,
@@ -454,8 +481,12 @@ class PlanUsageBadge(QWidget):
     def _refresh_text(self) -> None:
         from .. import claude_usage
 
-        text = ("" if self._limit is None
-                else claude_usage.format_limit(self._limit, with_label=self._label))
+        if self._limit is not None:
+            text = claude_usage.format_limit(self._limit, with_label=self._label)
+        elif self._unreadable:
+            text = "usage limit unreadable — click to refresh"
+        else:
+            text = ""
         tip = self._build_tooltip()
         if text == self._text:
             self.setToolTip(tip)   # age keeps moving even when the line doesn't
@@ -479,6 +510,11 @@ class PlanUsageBadge(QWidget):
         from .. import claude_usage
         import time as _time
 
+        if self._limit is None and self._unreadable:
+            return ("Claude plan usage could not be read.\n"
+                    f"Last attempt failed: {self._unreadable}\n"
+                    "The endpoint rate-limits; retries back off automatically.\n"
+                    "Click to try again now.")
         if self._usage is None or self._limit is None:
             return "Claude plan usage"
         lines = []
@@ -514,7 +550,7 @@ class PlanUsageBadge(QWidget):
         super().mousePressEvent(event)
 
     def paintEvent(self, event):
-        if self._limit is None:
+        if self._limit is None and not self._unreadable:
             return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -538,7 +574,18 @@ class PlanUsageBadge(QWidget):
         tp.setWidthF(2.2)
         p.setPen(tp)
         p.drawArc(ring, 0, 360 * 16)
-        span = int(max(0.0, min(100.0, self._limit.percent)) / 100.0 * 360 * 16)
+        if self._limit is None:
+            # can't-read state: an empty track with a "!" where the sweep goes,
+            # so the pill reads as a warning at a glance and not as 0% used.
+            bang = self._text_font()
+            bang.setBold(True)
+            p.setFont(bang)
+            p.setPen(color)
+            p.drawText(ring, int(Qt.AlignmentFlag.AlignCenter), "!")
+            span = 0
+        else:
+            span = int(max(0.0, min(100.0, self._limit.percent))
+                       / 100.0 * 360 * 16)
         if span:
             ap = QPen(color)
             ap.setWidthF(2.2)

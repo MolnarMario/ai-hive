@@ -37,8 +37,8 @@ _TITLE_CACHE: dict[str, tuple[float, int, str]] = {}
 # cache for latest_token_usage: transcript path -> (mtime, size, used, window).
 _USAGE_CACHE: dict[str, tuple[float, int, int, int]] = {}
 
-# cache for ended_on_limit: path -> (mtime, size, (cut_off, written, resets)).
-_LIMIT_CACHE: dict[str, tuple[float, int, tuple[bool, float, float]]] = {}
+# cache for limit_cut_off: path -> (mtime, size, verdict dict).
+_LIMIT_CACHE: dict[str, tuple[float, int, dict]] = {}
 
 
 def context_window_for(model: str) -> int:
@@ -123,21 +123,45 @@ def ended_on_limit(cwd: str, session_id: str) -> tuple[bool, float, float]:
     ("resets 3am") and anchoring it to the current time instead would land a
     day late. Cached by (mtime,size); never raises.
     """
-    if not session_id or not cwd:
+    info = limit_cut_off(cwd, session_id)
+    if not info or not info["cut_off"]:
         return (False, 0.0, 0.0)
-    return _read_ended_on_limit(transcript_path(cwd, session_id))
+    return (True, info["at"], info["resets_at"])
 
 
-def _read_ended_on_limit(path: str) -> tuple[bool, float, float]:
-    empty = (False, 0.0, 0.0)
+def limit_cut_off(cwd: str, session_id: str) -> dict | None:
+    """The same verdict as `ended_on_limit`, but TRI-STATE and detailed.
+
+    Returns None when there is no readable transcript at all, and otherwise
+    `{"cut_off", "at", "resets_at", "banner", "window"}`.
+
+    The distinction between "the conversation carried on" and "there is no
+    conversation to read" is what makes this safe to act on. A caller using it
+    to CONTRADICT a live screen latch must only drop the latch on the former:
+    a pin that has drifted, or a transcript Claude has not flushed yet, reads
+    as absent — and treating that as "not cut off" would strand a genuinely
+    parked agent. `ended_on_limit` collapses both to False, which is right for
+    a caller that only wants positive evidence.
+
+    The banner text and its window come back too, because a cut-off's identity
+    (which window stopped it, and when that window reopens) cannot be
+    reconstructed from a bool. Cached by (mtime,size); never raises.
+    """
+    if not session_id or not cwd:
+        return None
+    return _read_limit_cut_off(transcript_path(cwd, session_id))
+
+
+def _read_limit_cut_off(path: str) -> dict | None:
     try:
         st = os.stat(path)
     except OSError:
-        return empty
+        return None
     cached = _LIMIT_CACHE.get(path)
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
         return cached[2]
-    hit, when, resets = False, 0.0, 0.0
+    found = {"cut_off": False, "at": 0.0, "resets_at": 0.0,
+             "banner": "", "window": ""}
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -152,21 +176,25 @@ def _read_ended_on_limit(path: str) -> tuple[bool, float, float]:
                 text = _message_text(rec)
                 # every assistant turn overwrites the verdict, so only the LAST
                 # one counts -- a banner followed by real output is history
-                # `banner_in`, not a bare regex search: an agent that merely
+                # `banner_line`, not a bare regex search: an agent that merely
                 # WROTE ABOUT the limit would otherwise be armed for a resume
                 # it never needed (observed live on an agent working on this
                 # feature). A real cut-off is a short injected line.
-                hit = limit_banner.banner_in(text)
-                if hit:
+                banner = limit_banner.banner_line(text)
+                if banner:
                     when = _record_epoch(rec)
-                    resets = limit_banner.banner_reset_at(text, when) or 0.0
+                    found = {
+                        "cut_off": True, "at": when, "banner": banner,
+                        "window": limit_banner.banner_window(banner),
+                        "resets_at": (limit_banner.banner_reset_at(text, when)
+                                      or 0.0)}
                 else:
-                    when, resets = 0.0, 0.0
+                    found = {"cut_off": False, "at": 0.0, "resets_at": 0.0,
+                             "banner": "", "window": ""}
     except OSError:
-        return cached[2] if cached else empty
-    result = (hit, when, resets)
-    _LIMIT_CACHE[path] = (st.st_mtime, st.st_size, result)
-    return result
+        return cached[2] if cached else None
+    _LIMIT_CACHE[path] = (st.st_mtime, st.st_size, found)
+    return found
 
 
 def _message_text(rec: dict) -> str:

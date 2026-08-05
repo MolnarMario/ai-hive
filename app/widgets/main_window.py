@@ -21,6 +21,7 @@ from .. import __version__
 from .. import chime
 from .. import claude_usage
 from .. import fsopen
+from .. import limit_ledger
 from .. import providers
 from .. import session_hook
 from .. import transcripts
@@ -71,9 +72,12 @@ AUTO_CONTINUE_ESC_MS = 400
 # Gap between successive agents. They all unblock on the same edge, so without
 # this they would submit simultaneously into a window that just reopened.
 AUTO_CONTINUE_STAGGER_MS = 2000
-# What gets typed. Short on purpose: the agent still holds the whole
-# conversation, so it needs a go-ahead, not a restatement of the work.
-AUTO_CONTINUE_TEXT = "Continue"
+# What gets typed. Still one short line — the agent holds the whole
+# conversation, so it needs a go-ahead, not a restatement of the work — but it
+# NAMES the reason: a bare "Continue" landing hours after the last exchange is
+# ambiguous, and saying the limit reset removes the ambiguity for free.
+AUTO_CONTINUE_TEXT = ("The usage limit has reset. Continue the task you were "
+                      "working on.")
 # How often to check whether a cut-off agent's OWN stated reset time has
 # passed. This is the network-free trigger and the one that actually has to be
 # reliable: the usage endpoint 429s intermittently and its "cleared" edge can
@@ -88,6 +92,12 @@ AUTO_CONTINUE_VERIFY_MS = 20000
 # enough — but it must not become a Continue every minute forever either.
 LIMIT_RETRY_S = 300
 LIMIT_MAX_TRIES = 4
+# Slack past a reset time READ OFF THE SCREEN before acting on it. The account
+# does not free up on the exact second its banner named — the clock is printed
+# to the minute, the server rounds, and a nudge into a still-shut window costs
+# one of the few retries above. The account READING needs no such slack: when
+# it reports headroom the window is provably open already.
+LIMIT_RESET_GRACE_S = 120
 # Backstop for a cut-off whose reset time nothing could supply — neither the
 # screen nor the usage API. A 5-hour window cannot outlast this, so waiting it
 # out is always eventually right, and it guarantees a latch can never become
@@ -98,7 +108,11 @@ LIMIT_UNKNOWN_WAIT_S = 5 * 3600 + 600
 # touched again until well into the NEXT day. Still finite, so a conversation
 # abandoned last week isn't revived just because the app was opened to look at
 # something else.
-STARTUP_RECOVERY_MAX_AGE_S = 36 * 3600
+# (There is deliberately NO age bound on startup recovery. One asks the wrong
+# question — how OLD a cut-off is — when what decides whether to act is whether
+# it was the LAST thing that happened. `limit_ledger.latest_window` answers
+# that instead, and a fixed bound had already begun silently skipping real
+# cut-offs.)
 
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [
@@ -195,9 +209,16 @@ class TopBar(QFrame):
         # the cut-off is discovered — on opening the app, or while it runs.
         # Deliberately buttons rather than context-menu items: these decide
         # whether unattended work resumes, so their state has to be visible at
-        # a glance. Glyph carries the state, tooltip carries the meaning.
+        # a glance. A caption names what they're for (a bare pair of icon
+        # buttons reads as decoration), and each carries its own LED
+        # (🟢 armed / ⚫ off) alongside the accent-lit checked state, so
+        # "will my work resume by itself?" survives even a glance too quick
+        # to register border color.
         self._startup_recovery = True
         self._auto_continue = True
+        self.recovery_label = QLabel(
+            "Auto-restart agents who ran out of usage on:", self)
+        self.recovery_label.setObjectName("RecoveryLabel")
         self.recover_btn = QToolButton(self)
         self.recover_btn.setObjectName("RecoveryToggle")
         self.recover_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -226,7 +247,9 @@ class TopBar(QFrame):
         lay.addWidget(self.breadcrumb)
         lay.addStretch(1)
         lay.addWidget(self.usage_badge)
-        lay.addSpacing(4)
+        lay.addSpacing(10)
+        lay.addWidget(self.recovery_label)
+        lay.addSpacing(6)
         lay.addWidget(self.recover_btn)
         lay.addWidget(self.resume_btn)
         lay.addSpacing(8)
@@ -280,11 +303,13 @@ class TopBar(QFrame):
 
     def _refresh_recovery_btns(self) -> None:
         # `checked` drives the QSS: lit in the accent when armed, dimmed when
-        # off, so "will my work resume by itself?" is answerable at a glance.
-        # NOT a power symbol on the first one — that reads as "shut down".
+        # off. The LED (🟢/⚫) repeats that same state as its own glyph, so
+        # "will my work resume by itself?" is answerable even without
+        # registering the border color.
         self.recover_btn.setCheckable(True)
         self.recover_btn.setChecked(self._startup_recovery)
-        self.recover_btn.setText("⏯")
+        led = "\U0001F7E2" if self._startup_recovery else "⚫"
+        self.recover_btn.setText(f"{led} App start-up⏻")
         self.recover_btn.setToolTip(
             "Recover at startup: ON — when AI Hive opens, agents whose work "
             "stopped because the plan limit ran out are continued "
@@ -294,7 +319,8 @@ class TopBar(QFrame):
             "limit stay stopped when AI Hive opens.\nClick to turn on.")
         self.resume_btn.setCheckable(True)
         self.resume_btn.setChecked(self._auto_continue)
-        self.resume_btn.setText("⏰")
+        led = "\U0001F7E2" if self._auto_continue else "⚫"
+        self.resume_btn.setText(f"{led} Usage reset\U0001F504")
         self.resume_btn.setToolTip(
             "Resume on limit reset: ON — while AI Hive is running, agents cut "
             "off mid-work by the plan limit are continued the moment the "
@@ -310,19 +336,30 @@ class TopBar(QFrame):
         if not self._usage_wanted:
             self.usage_badge.setVisible(False)
 
+    def note_usage_error(self, error: str) -> None:
+        """A poll failed with no earlier reading to fall back on: show the
+        can't-read pill rather than nothing at all. Still honours the user's
+        show/hide preference — an error is not a reason to force the readout
+        back onto a bar they cleared."""
+        self.usage_badge.mark_unreadable(error)
+        if not self._usage_wanted:
+            self.usage_badge.setVisible(False)
+
     def set_usage_visible(self, on: bool) -> None:
         """Reflect the show/hide preference (no signal emitted)."""
         self._usage_wanted = bool(on)
         self.usage_badge.setVisible(self._usage_wanted
-                                    and self.usage_badge.has_reading())
+                                    and self.usage_badge.has_content())
 
     def usage_visible(self) -> bool:
         return self._usage_wanted
 
     def set_recovery_available(self, on: bool) -> None:
-        """Show/hide both recovery toggles. They act only on Claude agents cut
-        off by a plan limit, so with no Claude login there is nothing for them
-        to do — hide them with the readout rather than offer dead switches."""
+        """Show/hide both recovery toggles (and their caption). They act only
+        on Claude agents cut off by a plan limit, so with no Claude login
+        there is nothing for them to do — hide them with the readout rather
+        than offer dead switches."""
+        self.recovery_label.setVisible(bool(on))
         self.recover_btn.setVisible(bool(on))
         self.resume_btn.setVisible(bool(on))
 
@@ -693,6 +730,19 @@ class MainWindow(QMainWindow):
         self._usage_visible = True    # user preference (persisted)
         self._usage_inflight = False  # one request at a time, never stack
         self._plan_blocked = False    # edge state for planLimitReached/Cleared
+        # agent ids with a resume SCHEDULED but not yet delivered. The attempt
+        # counter only advances when the nudge actually goes out, up to
+        # (stagger * index + esc) ms later, so without this a second trigger
+        # arriving inside that window sees everyone downstream of the first
+        # agent as un-attempted and schedules them all over again — observed
+        # live on 2026-08-04, when the API's cleared edge and the minute
+        # watchdog both fired at 05:30 and typed Continue twice into three of
+        # four agents (burning half their retry budget and dropping a stray
+        # message into freshly started work).
+        self._resume_pending: set[str] = set()
+        # ledger keys already filed this run, so one cut-off is written once
+        # however many times its latch is (re)raised
+        self._ledger_seen: set[tuple] = set()
         self._auto_continue = True    # user preference (persisted)
         self._startup_recovery = True  # user preference (persisted)
         self._usage_backoff = 0       # consecutive 429s -> exponential poll gap
@@ -861,7 +911,7 @@ class MainWindow(QMainWindow):
         # resume whoever the limit cut off, the moment the window reopens
         self.planLimitCleared.connect(self._resume_blocked_agents)
         self.manager.agentLimitBlocked.connect(self._on_agent_limit_blocked)
-        self.top_bar.usageRefreshRequested.connect(self._poll_usage)
+        self.top_bar.usageRefreshRequested.connect(self._on_usage_refresh)
         # QueuedConnection is the point: the fetch thread emits, and the slot
         # runs on the GUI thread where touching widgets/timers is legal
         self._usageReady.connect(self._on_usage_ready,
@@ -1014,6 +1064,17 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True,
                          name="aihive-usage").start()
 
+    def _on_usage_refresh(self) -> None:
+        """The user clicked the readout. Clear any 429 backoff first: they are
+        asking now, and leaving the timer parked at sixteen minutes would make
+        a successful manual refresh look like it fixed nothing when the next
+        automatic poll failed to arrive."""
+        self._usage_backoff = 0
+        self._usage_timer.setInterval(USAGE_POLL_MS)
+        if self._usage_timer.isActive():
+            self._usage_timer.start()      # restart the interval from now
+        self._poll_usage()
+
     def _on_usage_ready(self, reading) -> None:
         self._usage_inflight = False
         if self._closing:
@@ -1042,6 +1103,17 @@ class MainWindow(QMainWindow):
         if reading is not None and reading.error == "http 429":
             self._usage_backoff = min(self._usage_backoff + 1, 4)
             self._usage_timer.setInterval(USAGE_POLL_MS * (2 ** self._usage_backoff))
+        if self._usage is None:
+            # Nothing to grey out: there has never been a reading this run, and
+            # since CLI 2.1.220 stopped writing `cachedUsageUtilization` there
+            # is no on-disk seed to cover the gap either. Say the number is
+            # unreadable instead of leaving a hole in the bar — a readout that
+            # silently vanishes is indistinguishable from a deleted feature
+            # (reported as exactly that), and the backoff can keep it away for
+            # sixteen minutes at a stretch.
+            self.top_bar.note_usage_error(
+                reading.error if reading is not None else "unknown")
+            return
         self.top_bar.usage_badge.mark_stale(True)
 
     def _apply_usage(self, reading) -> None:
@@ -1115,31 +1187,120 @@ class MainWindow(QMainWindow):
         """
         if not self._startup_recovery:
             return 0
-        now = time.time()
-        armed = 0
+        # 1. LOOK EVERYWHERE. Every agent in every workspace is examined,
+        #    running or not, and every cut-off found is filed — the record is
+        #    supposed to be complete even where the action is selective.
+        found: list[tuple] = []           # (agent, record)
         for agent in self.manager.all_agents():
             spec = agent.spec
             if spec.provider != "claude" or not agent.is_pty:
                 continue
-            # A card the user left stopped stays stopped: this resumes work, it
-            # does not launch processes they didn't ask for (and each one would
-            # spend quota).
-            if not agent.is_running() or agent.is_limit_blocked():
+            if agent.is_limit_blocked():
+                continue        # already latched live; nothing to reconstruct
+            info = transcripts.limit_cut_off(spec.cwd, spec.session_id)
+            # The gate: no stoppage message, no action.
+            if not info or not info["cut_off"] or not info["at"]:
                 continue
-            cut_off, written_at, resets_at = transcripts.ended_on_limit(
-                spec.cwd, spec.session_id)
-            # The gate the user asked for: no stoppage message, no action.
-            if not cut_off or not written_at:
+            record = self._ledger_cut_off(agent, info["at"],
+                                          info["resets_at"], info["window"],
+                                          info["banner"], source="transcript")
+            found.append((agent, record))
+        if not found:
+            return 0
+
+        # 2. ACT ON THE MOST RECENT WINDOW ONLY. Agents stopped by one window
+        #    all state the same reset clock, so they group; anything from an
+        #    earlier window is history that has already had its chance.
+        newest = limit_ledger.latest_window([r for _a, r in found])
+        newest_keys = {tuple(r["key"]) for r in newest}
+        closed = limit_ledger.closed_keys(
+            limit_ledger.read_all(self._ledger_dir()))
+
+        armed = 0
+        for agent, record in found:
+            key = tuple(record["key"])
+            name = agent.spec.name
+            if key not in newest_keys:
+                self._limit_audit(f"STARTUP-SKIP agent={name} (an earlier "
+                                  f"window, cut off {record['at_local']})")
                 continue
-            if now - written_at > STARTUP_RECOVERY_MAX_AGE_S:
-                self._limit_audit(f"STARTUP-SKIP agent={spec.name} (stale, "
-                                  f"{int((now - written_at) / 3600)}h old)")
+            # Already resolved in an earlier run — resumed, or given up on.
+            # Without this the same abandoned conversation would be revived on
+            # every launch for as long as its transcript ends on the banner.
+            if key in closed:
+                self._limit_audit(f"STARTUP-SKIP agent={name} "
+                                  f"(already resolved)")
                 continue
-            agent.mark_limit_blocked(resets_at or None, from_startup=True)
+            # A card the user left stopped IS started here: it was stopped BY
+            # THE LIMIT, not by the user, so leaving it alone would silently
+            # drop exactly the work this feature exists to rescue. Only agents
+            # with a corroborated cut-off get this — never a blanket autostart.
+            if not agent.is_running():
+                # It MUST come back as a resume. `start()` mints a fresh
+                # session id for a non-resume launch, which would open an empty
+                # conversation and abandon the very transcript that proved the
+                # cut-off — and `spec.resume` has already been consumed if the
+                # user stopped this card during an earlier run. We have just
+                # read that transcript, so resuming it is known-good.
+                agent.spec.resume = True
+                self._limit_audit(f"STARTUP-START agent={name}")
+                agent.start()
+            agent.mark_limit_blocked(record["reset_at"] or None,
+                                     from_startup=True,
+                                     cut_off_at=record["at"],
+                                     window=record["window"],
+                                     banner=record["banner"])
             armed += 1
-        if armed:
-            self._limit_audit(f"STARTUP-SCAN armed={armed}")
+        self._limit_audit(f"STARTUP-SCAN found={len(found)} armed={armed}")
         return armed
+
+    # ------------------------------------------------- the cut-off ledger ---
+    def _ledger_dir(self) -> str:
+        """Where `limit_events.jsonl` lives — beside session.json, so a cut-off
+        record travels with the session it belongs to."""
+        try:
+            return str(self.store.path.parent)
+        except Exception:
+            return ""
+
+    def _ledger_cut_off(self, agent, at: float, reset_at: float,
+                        window: str, banner: str, source: str) -> dict:
+        """File one cut-off in the durable ledger and return the record.
+
+        Always returns a usable record even when the write fails, because the
+        caller navigates by its `key`; a failed write is audited, never raised
+        (the ledger observes the recovery, it must not be able to break it).
+        """
+        ws = self.manager.workspace_of(agent.id)
+        spec = agent.spec
+        record = limit_ledger.record_cut_off(
+            self._ledger_dir(), cwd=spec.cwd, session_id=spec.session_id,
+            at=at, reset_at=reset_at or 0.0,
+            ws_id=(ws.id if ws else ""), ws_name=(ws.name if ws else ""),
+            agent_name=spec.name, task=agent.current_task or "",
+            window=window, banner=banner, source=source)
+        if record is not None:
+            self._ledger_seen.add(tuple(record["key"]))
+        if record is None:
+            self._limit_audit(f"LEDGER-FAIL agent={spec.name}")
+            record = {"key": limit_ledger.key_of(spec.cwd, spec.session_id,
+                                                 reset_at or 0.0, at),
+                      "at": at, "at_local": limit_ledger.local_stamp(at),
+                      "reset_at": reset_at or 0.0, "window": window,
+                      "banner": banner}
+        return record
+
+    def _ledger_key(self, agent) -> list:
+        """The ledger identity of the cut-off this agent is currently latched
+        on — see `limit_ledger.key_of` for why it is not the agent's id."""
+        return limit_ledger.key_of(agent.spec.cwd, agent.spec.session_id,
+                                   agent.limit_resets_at() or 0.0,
+                                   agent.limit_cut_off_at())
+
+    def _ledger_outcome(self, agent, outcome: str, detail: str = "") -> None:
+        limit_ledger.record_outcome(self._ledger_dir(), self._ledger_key(agent),
+                                    outcome, tries=agent.limit_attempts(),
+                                    detail=detail)
 
     def _limit_audit(self, message: str) -> None:
         """Forensic line in session.log for the auto-continue path.
@@ -1172,6 +1333,14 @@ class MainWindow(QMainWindow):
         when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(at)) if at
                 else "unknown")
         self._limit_audit(f"BLOCKED agent={agent.spec.name} resets={when}")
+        # File it durably. Skipped when this cut-off is already on record: the
+        # startup scan files before it arms, and a failed verify re-latches the
+        # same cut-off, so this signal fires more than once per episode.
+        key = tuple(self._ledger_key(agent))
+        if key not in self._ledger_seen:
+            self._ledger_cut_off(agent, agent.limit_cut_off_at(), at or 0.0,
+                                 agent.limit_window(),
+                                 agent.limit_banner_text(), source="live")
 
     def _check_limit_resets(self) -> None:
         """Network-free trigger: resume any cut-off agent whose OWN banner said
@@ -1195,10 +1364,23 @@ class MainWindow(QMainWindow):
                 if a.is_limit_blocked() and a.limit_resets_at() is None:
                     a.set_limit_reset(usage.resets_at)
 
+        account_clear = usage is not None and usage.blocked is None
+
         def due(a):
+            # A WEEKLY window is not readable off the screen: its banner prints
+            # a bare wall clock ("resets 8pm") for a reset that can be days
+            # away, and `parse_reset_clock` can only ever resolve that to the
+            # next 8pm. Acting on it would nudge days early, every day. The
+            # account reading is the only thing that knows, so a weekly cut-off
+            # waits for it and ignores the clock entirely.
+            if a.limit_window() == "weekly":
+                return account_clear
             at = a.limit_resets_at()
             if at is not None:
-                return at <= now
+                # ...and even a session clock gets slack: the banner names a
+                # minute, not an instant, and a nudge into a window that is
+                # still shut spends one of very few retries.
+                return at + LIMIT_RESET_GRACE_S <= now
             # Still no clock from anywhere — screen silent, API unreachable.
             # A latch must never become permanent for want of a timestamp
             # (observed live: `resets=unknown` at 05:10 sat untouched for five
@@ -1238,8 +1420,12 @@ class MainWindow(QMainWindow):
                    and (self._startup_recovery if a.limit_from_startup()
                         else self._auto_continue)
                    and a.limit_retry_ready(LIMIT_RETRY_S, LIMIT_MAX_TRIES)
+                   and a.id not in self._resume_pending
                    and (due is None or due(a))]
         for i, agent in enumerate(blocked):
+            # claimed BEFORE the stagger, because the attempt itself is only
+            # recorded when the nudge goes out — see `_resume_pending`
+            self._resume_pending.add(agent.id)
             # Stagger, then Esc, then type. The Esc closes the limit's options
             # menu (upgrade / extra usage / cancel) that is sitting over the
             # prompt; `write` is right for it (it stamps _last_input_ts, so the
@@ -1252,24 +1438,50 @@ class MainWindow(QMainWindow):
     def _auto_continue_agent(self, agent) -> None:
         """Dismiss the limit prompt, then submit the go-ahead a beat later."""
         if self._closing or not agent.is_running():
+            self._resume_pending.discard(agent.id)
             return
         # An agent recovered at startup may still be booting its TUI. Don't
         # poke a launching terminal with stray Esc keys every minute — just
         # wait. `nudge` would refuse anyway, and a refusal costs no attempt, so
         # the watchdog picks it up as soon as the prompt is live.
         if not agent.prompt_ready():
+            self._resume_pending.discard(agent.id)
             self._limit_audit(f"WAIT agent={agent.spec.name} (TUI not ready)")
+            return
+        # TWO AGREEING SOURCES before anything is typed. The screen said this
+        # agent was cut off; the conversation on disk has to still end there.
+        # A banner stays in view (and is redrawn) long after the agent moved
+        # on, so the screen alone can be describing history — and a stray
+        # "Continue" into an agent that is working fine is both an
+        # interruption and real quota spent. TRI-STATE on purpose: only a
+        # transcript that demonstrably CARRIED ON refutes the latch; one that
+        # cannot be read (a drifted pin, a conversation Claude hasn't flushed)
+        # is no evidence either way and must not strand a genuine cut-off.
+        info = transcripts.limit_cut_off(agent.spec.cwd, agent.spec.session_id)
+        if info is not None and not info["cut_off"]:
+            self._limit_audit(f"PHANTOM agent={agent.spec.name} (the "
+                              f"conversation carried on past the banner)")
+            self._ledger_outcome(agent, limit_ledger.DISMISSED,
+                                 detail="transcript carried on")
+            agent.clear_limit_block()
+            self._resume_pending.discard(agent.id)
             return
         agent.write("\x1b")
 
         def send():
             if self._closing or not agent.is_running():
+                self._resume_pending.discard(agent.id)
                 return
             if not agent.nudge(AUTO_CONTINUE_TEXT):
+                self._resume_pending.discard(agent.id)
                 self._limit_audit(f"NUDGE-SKIP agent={agent.spec.name} "
                                   f"(prompt not ready)")
                 return
             agent.note_limit_attempt()
+            # released only now: from here the attempt counter is what keeps a
+            # second trigger away (`limit_retry_ready`), so the claim and the
+            # count are never both absent
+            self._resume_pending.discard(agent.id)
             self._limit_audit(f"NUDGE agent={agent.spec.name} "
                               f"try={agent.limit_attempts()}")
             # Verify rather than assume. A nudge can land while the window is
@@ -1280,6 +1492,14 @@ class MainWindow(QMainWindow):
             def verify():
                 if self._closing:
                     return
+                # capture the cut-off's identity before recheck_limit can clear
+                # it — the ledger entry has to close the SAME record the cut-off
+                # opened, whichever way this goes
+                key = self._ledger_key(agent)
+                cut_at, window = agent.limit_cut_off_at(), agent.limit_window()
+                banner, resets = agent.limit_banner_text(), agent.limit_resets_at()
+                from_startup = agent.limit_from_startup()
+                tries = agent.limit_attempts()
                 # Two independent proofs, because the menu alone is NOT one:
                 # Esc removes it whether or not the agent went anywhere, so
                 # "menu gone" once reported RESUMED for an agent that never
@@ -1290,14 +1510,27 @@ class MainWindow(QMainWindow):
                     agent.spec.cwd, agent.spec.session_id)
                 if menu_gone and not stuck:
                     self._limit_audit(f"RESUMED agent={agent.spec.name}")
+                    limit_ledger.record_outcome(
+                        self._ledger_dir(), key, limit_ledger.RESUMED,
+                        tries=tries)
                     return
-                # keep the latch so the watchdog tries again
-                agent.mark_limit_blocked(agent.limit_resets_at(),
-                                         from_startup=agent.limit_from_startup())
+                # keep the latch so the watchdog tries again, carrying the
+                # cut-off's identity so the retry stays the SAME episode
+                agent.mark_limit_blocked(resets, from_startup=from_startup,
+                                         cut_off_at=cut_at, window=window,
+                                         banner=banner)
                 self._limit_audit(
                     f"STILL-BLOCKED agent={agent.spec.name} "
-                    f"try={agent.limit_attempts()} "
+                    f"try={tries} "
                     f"(menu_gone={menu_gone} transcript_stuck={stuck})")
+                if tries >= LIMIT_MAX_TRIES:
+                    # out of retries: close the record so a later run doesn't
+                    # inherit a cut-off this one already gave up on
+                    self._limit_audit(f"GAVE-UP agent={agent.spec.name} "
+                                      f"after {tries} tries")
+                    limit_ledger.record_outcome(
+                        self._ledger_dir(), key, limit_ledger.FAILED,
+                        tries=tries)
             QTimer.singleShot(AUTO_CONTINUE_VERIFY_MS, verify)
             # audit trail: on the card, and on the workspace board. The board
             # write goes through the same serialized append the log_activity

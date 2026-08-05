@@ -41,8 +41,12 @@ LIMIT_MENU_RE = re.compile(r"stop\s+and\s+wait\s+for\s+limit\s+to\s+reset",
 
 # The banner — secondary on screen (it scrolls), but it is what the transcript
 # records, so it is the startup-recovery signal.
+# The window name is CAPTURED, not just matched: "session" carries a bare clock
+# that is always within 24 h, but a "weekly" window can be days out and its
+# banner still prints only a wall time — so the two cannot be trusted equally.
+# See `banner_window`.
 LIMIT_HIT_RE = re.compile(r"you['’]ve hit your\s+"
-                          r"(?:session|weekly|usage|opus|sonnet)\s+limit",
+                          r"(session|weekly|usage|opus|sonnet)\s+limit",
                           re.I)
 
 # The banner states its own reset time ("- resets 8:30pm (Europe/Bucharest)"),
@@ -63,23 +67,57 @@ _LIMIT_RESET_RE = re.compile(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
 _BANNER_MAX_CHARS = 200
 
 
-def banner_in(text: str) -> bool:
-    """True when `text` contains the banner AS a banner — a short line that
-    OPENS with it — not prose that merely mentions it mid-sentence.
+def banner_line(text: str) -> str:
+    """The banner line itself, normalized, or "" when `text` holds none.
 
     Anchoring at the start of the line is the real discriminator: Claude's
     banner is injected as its own line, while an agent discussing the limit
     embeds the same words in a sentence. The length cap is a second guard for
     the case where prose happens to begin with the phrase.
+
+    Returning the LINE rather than a bool is what lets a caller tell one
+    cut-off from another: the banner names its own reset clock, and successive
+    5-hour windows never end at the same wall time, so the text doubles as the
+    identity of the cut-off that produced it. `terminal_agent._scrape_limit`
+    uses that to ignore the banner still sitting on screen after a resume.
+
+    The LAST match wins: when an old banner and a fresh one are both in view,
+    the newest is the one describing the current state.
     """
+    found = ""
     if not text:
-        return False
+        return found
     for line in text.splitlines():
         # drop leading whitespace and any box-drawing gutter the TUI draws
         line = line.lstrip(" \t│┃|>❯").strip()
         if len(line) <= _BANNER_MAX_CHARS and LIMIT_HIT_RE.match(line):
-            return True
-    return False
+            found = line
+    return found
+
+
+def banner_in(text: str) -> bool:
+    """True when `text` contains the banner AS a banner — a short line that
+    OPENS with it — not prose that merely mentions it mid-sentence."""
+    return bool(banner_line(text))
+
+
+def banner_window(text: str) -> str:
+    """Which limit window the banner names — "session" / "weekly" / "opus" /
+    "sonnet" / "usage" — or "" when `text` holds no banner.
+
+    Worth carrying because the two kinds of window are NOT equally readable off
+    the screen. A session banner's bare "resets 3am" is unambiguous: the next
+    3am is at most 24 h away, which is the only thing `parse_reset_clock` can
+    resolve. A WEEKLY banner prints the same bare clock for a reset that may be
+    days out, so resolving it the same way lands early — by up to a week. A
+    caller acting on a weekly cut-off must therefore wait for the account
+    reading rather than trusting the clock on screen.
+    """
+    line = banner_line(text)
+    if not line:
+        return ""
+    m = LIMIT_HIT_RE.match(line)
+    return m.group(1).lower() if m else ""
 
 
 def is_limit_screen(text: str) -> bool:

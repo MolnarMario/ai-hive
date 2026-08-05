@@ -609,9 +609,15 @@ class AgentRow(QFrame):
         self.q.setObjectName("WsAgentQ")
         self.q.setToolTip("Waiting for your input")
         self.q.hide()
+        # the usage limit stopped this agent — same marker as the card header,
+        # so an interrupted agent is findable from a collapsed workspace
+        self.limit_mark = QLabel("⏳", self)
+        self.limit_mark.setObjectName("WsAgentLimit")
+        self.limit_mark.hide()
         lay.addWidget(self.dot)
         lay.addWidget(self.name)
         lay.addWidget(self.summary, 1)
+        lay.addWidget(self.limit_mark)
         lay.addWidget(self.q)
         self.refresh(agent)
 
@@ -627,6 +633,14 @@ class AgentRow(QFrame):
         waiting = bool(getattr(agent, "is_waiting", lambda: False)())
         self.q.setVisible(waiting)
         self.setProperty("waiting", waiting)
+        # cut off by the usage limit: refreshed on the same poll as the rest of
+        # the row, so the tooltip follows the recovery (reset time filled in
+        # from the account reading, retries counted) without its own timer
+        blocked = bool(getattr(agent, "is_limit_blocked", lambda: False)())
+        self.limit_mark.setVisible(blocked)
+        if blocked:
+            self.limit_mark.setToolTip(
+                getattr(agent, "limit_summary", lambda: "")())
         # summary = assigned task, else Claude's live AI conversation title
         get = getattr(agent, "summary", None)
         self._full = (get() if callable(get) else agent.current_task or "").strip()

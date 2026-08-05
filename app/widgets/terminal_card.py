@@ -161,6 +161,14 @@ class TerminalCard(QFrame):
         self.badge = QLabel("", header)   # assignment lifecycle badge
         self.badge.setObjectName("CardBadge")
         self.badge.hide()
+        # "the usage limit stopped this agent" marker. Visible for as long as
+        # the cut-off is latched, so an interrupted agent is identifiable at a
+        # glance instead of by reading its terminal — and so an auto-continue
+        # that is about to happen is visible BEFORE it happens. Transient, like
+        # the latch behind it.
+        self.limit_mark = QLabel("⏳", header)   # hourglass
+        self.limit_mark.setObjectName("CardLimitMark")
+        self.limit_mark.hide()
         # one-line summary of what this agent is working on (its current task),
         # so several agents in a workspace are tellable apart at a glance
         # without reading each terminal. Elided to fit; full text on hover.
@@ -178,6 +186,7 @@ class TerminalCard(QFrame):
         hl.addWidget(self.role)
         hl.addSpacing(6)
         hl.addWidget(self.badge)
+        hl.addWidget(self.limit_mark)
         hl.addSpacing(6)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
         hl.addWidget(self.token_label)
@@ -250,6 +259,8 @@ class TerminalCard(QFrame):
         self.agent.task_changed.connect(self._on_task)
         self.agent.summary_changed.connect(self._on_task)  # incl. live AI title
         self.agent.tokens_changed.connect(self._on_tokens)
+        self.agent.limit_blocked_changed.connect(self._on_limit_blocked)
+        self._on_limit_blocked(self.agent.is_limit_blocked())
         self.title.installEventFilter(self)        # double-click to rename
         self.title_edit.installEventFilter(self)   # Esc cancels, focus-out commits
         self.title_edit.returnPressed.connect(self._commit_rename)
@@ -371,6 +382,14 @@ class TerminalCard(QFrame):
         # stretch): if it's hidden when empty, the stretch vanishes and the
         # status glyph absorbs the slack, shoving the agent name to the middle.
         self._elide_task()
+
+    def _on_limit_blocked(self, blocked: bool) -> None:
+        """Show/hide the 'the usage limit stopped this agent' marker. The
+        tooltip is rebuilt each time because the agent's state moves under it
+        (a reset time arrives from the account reading; retries accumulate)."""
+        self.limit_mark.setVisible(bool(blocked))
+        if blocked:
+            self.limit_mark.setToolTip(self.agent.limit_summary())
 
     def _on_tokens(self, badge: str = "") -> None:
         # context-window usage badge beside the summary; hidden when empty so a

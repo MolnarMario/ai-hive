@@ -84,7 +84,15 @@ def compute_grid(n: int) -> GridPlan:
     """Tile n cards into a squarish, wider-than-tall grid.
 
     cols = ceil(sqrt(n)), rows = ceil(n / cols):
-    1 -> 1x1, 2 -> 2x1, 3-4 -> 2x2, 5-6 -> 3x2, 7-9 -> 3x3, 10 -> 4x3 ...
+    1 -> 1x1, 2 -> 2x1, 4 -> 2x2, 5-6 -> 3x2, 7-9 -> 3x3, 10 -> 4x3 ...
+
+    EXCEPT n<=3, which stays a single row (3 -> 3x1). ceil(sqrt(3)) = 2 puts
+    two cards on top and stretches the third full-width underneath — a lopsided
+    "2 over 1" nobody wants from a third terminal, and the opposite of what the
+    same count produces on a FIXED grid, where `explicit_grid`'s overflow
+    rebalance already turns 2x1 + a third agent into 3x1. Three side-by-side is
+    also still a usable terminal width; four is where a single row stops being
+    one, hence the cutoff.
 
     Cards in a partial final row stretch to share the full width. Even
     stretching with integer spans requires laying out on lcm(cols, last)
@@ -93,7 +101,7 @@ def compute_grid(n: int) -> GridPlan:
     if n <= 0:
         return GridPlan([], 0, 0)
 
-    cols = ceil(sqrt(n))
+    cols = n if n <= 3 else ceil(sqrt(n))
     rows = ceil(n / cols)
     last = n - (rows - 1) * cols  # cards in the final row, 1..cols
     vcols = lcm(cols, last)

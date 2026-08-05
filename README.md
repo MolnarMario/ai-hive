@@ -83,7 +83,11 @@ workspaces keep executing — switching never pauses anything.
   signals (with the reset time) so other features can act on being cut off —
   e.g. relaunching blocked agents unattended the moment the limit resets.
   Right-click the top bar to hide the readout; it hides itself when there's no
-  Claude login.
+  Claude login. If the number can't be fetched at all — the endpoint
+  rate-limits, and there's no longer an on-disk figure to fall back on — the
+  badge says **`! usage limit unreadable — click to refresh`** rather than
+  quietly disappearing, and clicking it retries immediately instead of waiting
+  out the backoff.
 - **Auto-recovery from a spent plan limit** — two switches sit next to the usage
   readout, both on by default, both persisted, each with a tooltip spelling out
   what it does:
@@ -231,7 +235,7 @@ error dialog instead of silently closing. Packaging to a distributable
   on each swatch is the exact shape applied). A fixed layout fills agents left→right /
   top→bottom and shows clickable "＋ New agent" slots in the rest; changing
   layout is instant and never restarts an agent. Auto tiles to the count
-  (1 full, 2 side-by-side, 3–4 = 2×2, 5–6 = 3×2, …). Line and full-terminal
+  (1 full, 2 side-by-side, 3 = 3×1, 4 = 2×2, 5–6 = 3×2, …). Line and full-terminal
   cards share the same grid.
 - **Folder & activity** — the workspace header shows the project path with
   **Open folder** / **Change…**; **Activity** opens a panel with the live
@@ -477,7 +481,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-847 checks drive the real app headlessly (offscreen Qt platform) with real
+896 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -533,6 +537,9 @@ app/
   session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
   session_hook.py          SessionStart hook: the child reports its live conversation id
   chime.py                 notification bell (WAV synth + async play, Qt-free) for the "?" alert
+  claude_usage.py          live plan-usage reading (/api/oauth/usage) + limit edges (Qt-free)
+  limit_banner.py          recognising a usage cut-off + when it resets (Qt-free, shared)
+  limit_ledger.py          durable record of cut-offs: who, when, and how it ended (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
@@ -545,7 +552,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (847 checks)
+tests/smoke_test.py        headless end-to-end suite (896 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
