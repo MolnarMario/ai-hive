@@ -53,9 +53,26 @@ SESSION_SYNC_MS = 5000
 # is a cheap incremental read of a small append-only file.
 PROMPT_SYNC_MS = 750
 
+# how often to re-read each running Claude agent's current model/effort from its
+# transcript, so the card header follows a /model or /effort typed in the
+# terminal. Deliberately its own timer rather than the 5s session sync: that
+# tick does full-file title/usage scans, while this one is a stat per agent
+# while nothing changed, and a tail-only read when it did.
+MODEL_SYNC_MS = 1500
+
 # how often to re-read the Claude account's plan usage from the API. One small
 # HTTPS GET; a minute is well inside the resolution of a 5-hour window.
 USAGE_POLL_MS = 60000
+# ...except in the danger zone, where a minute is NOT fine: from this
+# utilization on, agents that are actively streaming can spend the rest of the
+# window in well under a poll interval, and everything that reacts to being cut
+# off (planLimitReached, the reset poll it arms, the ledger) only starts once a
+# reading reports it. So poll faster - but ONLY while both halves hold (nearly
+# spent AND at least one agent working), which keeps the fast rate to short
+# bursts at the end of a window instead of a permanently tripled request rate.
+# 20s is three requests a minute at the very worst; the ordinary rate is one.
+USAGE_URGENT_POLL_MS = 20000
+USAGE_URGENT_PCT = 90.0
 # how often the readout re-renders its countdown from the clock alone (no
 # network). Repaints only when the displayed string changes.
 USAGE_TICK_MS = 20000
@@ -274,8 +291,8 @@ class TopBar(QFrame):
     def _refresh_sound_btn(self) -> None:
         self.sound_btn.setText("🔔" if self._sound_on else "🔕")
         self.sound_btn.setToolTip(
-            "Notification chime: ON — click to mute" if self._sound_on
-            else "Notification chime: OFF — click to enable")
+            "Notification chime: ON, click to mute" if self._sound_on
+            else "Notification chime: OFF, click to enable")
 
     def _on_recover_clicked(self) -> None:
         self.set_startup_recovery(not self._startup_recovery)
@@ -311,22 +328,22 @@ class TopBar(QFrame):
         led = "\U0001F7E2" if self._startup_recovery else "⚫"
         self.recover_btn.setText(f"{led} App start-up⏻")
         self.recover_btn.setToolTip(
-            "Recover at startup: ON — when AI Hive opens, agents whose work "
+            "Recover at startup: ON. When AI Hive opens, agents whose work "
             "stopped because the plan limit ran out are continued "
             "automatically.\nClick to turn off."
             if self._startup_recovery else
-            "Recover at startup: OFF — agents left stuck on a spent plan "
+            "Recover at startup: OFF. Agents left stuck on a spent plan "
             "limit stay stopped when AI Hive opens.\nClick to turn on.")
         self.resume_btn.setCheckable(True)
         self.resume_btn.setChecked(self._auto_continue)
         led = "\U0001F7E2" if self._auto_continue else "⚫"
         self.resume_btn.setText(f"{led} Usage reset\U0001F504")
         self.resume_btn.setToolTip(
-            "Resume on limit reset: ON — while AI Hive is running, agents cut "
+            "Resume on limit reset: ON. While AI Hive is running, agents cut "
             "off mid-work by the plan limit are continued the moment the "
             "limit resets.\nClick to turn off."
             if self._auto_continue else
-            "Resume on limit reset: OFF — agents cut off by the plan limit "
+            "Resume on limit reset: OFF. Agents cut off by the plan limit "
             "wait for you.\nClick to turn on.")
 
     def set_usage(self, usage) -> None:
@@ -431,7 +448,7 @@ class AddTerminalDialog(QDialog):
         # with Shift+Tab (Claude only). Default omits the flag = today's behavior.
         self.mode_combo = QComboBox(self)
         self.mode_combo.setToolTip(
-            "Which permission mode this Claude agent starts in — the same modes "
+            "Which permission mode this Claude agent starts in: the same modes "
             "you flip through with Shift+Tab in the terminal. 'Normal' is the "
             "current default; the agent can still switch modes once running.")
         # resume an existing conversation from this workspace folder (Claude)
@@ -453,7 +470,7 @@ class AddTerminalDialog(QDialog):
         self.args_edit.setPlaceholderText("extra arguments (optional)")
 
         self.pty_check = QCheckBox(
-            "Full terminal (interactive — TUIs, colors, Ctrl+C)", self)
+            "Full terminal (interactive: TUIs, colors, Ctrl+C)", self)
         self.pty_check.setToolTip(
             "Run inside a real pseudo-console (ConPTY). Uncheck for a "
             "lightweight line-only console.")
@@ -561,7 +578,7 @@ class AddTerminalDialog(QDialog):
                 if not self.command_edit.text().strip() and prov.base_cmd:
                     tmpl = prov.base_cmd + (" " + prov.model_flag if prov.model_flag else "")
                     self.command_edit.setPlaceholderText(tmpl + "  (edit to taste)")
-            status = "✓ detected" if detected else "⚠ CLI not detected — install it or edit the command"
+            status = "✓ detected" if detected else "⚠ CLI not detected; install it or edit the command"
             self.provider_note.setText(f"{prov.note}\n{status}")
 
         # AI agents are always interactive (ConPTY); shells/scripts choose
@@ -586,7 +603,7 @@ class AddTerminalDialog(QDialog):
         # out, so users know to enable it manually in the terminal.
         if prov.native_flags:
             self.effort_combo.addItem(
-                "Ultracode (activate manually in terminal — model-dependent)", None)
+                "Ultracode (activate manually in terminal, model-dependent)", None)
             model = self.effort_combo.model()
             item = model.item(self.effort_combo.count() - 1)
             item.setEnabled(False)  # visible but non-selectable
@@ -721,6 +738,12 @@ class MainWindow(QMainWindow):
         self._prompt_sync_timer.setInterval(PROMPT_SYNC_MS)
         self._prompt_sync_timer.timeout.connect(self.manager.sync_prompt_events)
 
+        # keep the header's model/effort label on what the agent is really
+        # running (transient: this never saves)
+        self._model_sync_timer = QTimer(self)
+        self._model_sync_timer.setInterval(MODEL_SYNC_MS)
+        self._model_sync_timer.timeout.connect(self.manager.refresh_model_effort)
+
         # ---- Claude plan usage (top-bar readout + limit-reached edges) ----
         # PURELY TRANSIENT: a reading refreshes the badge and may emit the
         # plan-limit edges, but it must NEVER mark the session dirty — the same
@@ -805,6 +828,7 @@ class MainWindow(QMainWindow):
         self._heartbeat_timer.start()
         self._session_sync_timer.start()
         self._prompt_sync_timer.start()
+        self._model_sync_timer.start()
         self._limit_watch_timer.start()
 
     def _arm_agent_mcp(self, ws, agent) -> None:
@@ -1064,13 +1088,52 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True,
                          name="aihive-usage").start()
 
+    def _usage_poll_interval(self) -> int:
+        """The poll gap the current situation asks for, BEFORE any 429 backoff.
+
+        A minute is the right ordinary rate: a 5-hour window moves slowly and
+        the readout is a number on a bar. It is the wrong rate for the end of a
+        window with work under way - several agents streaming can burn the last
+        few percent in far less than a minute, and nothing in the app learns it
+        is cut off until a READING says so (the plan-limit edge, the reset poll
+        it arms, the ledger entry all hang off `_apply_usage`). A minute of
+        blindness there is a minute of agents parked on a banner nobody noticed.
+
+        Both halves are required, which is what keeps this cheap. Under
+        URGENT_PCT there is nothing imminent to catch; with every agent idle
+        the number is not moving at all, so a faster poll would only ask the
+        same question more often. And once a window is actually SPENT the fast
+        rate stops again: `_arm_reset_poll` already schedules a poll for the
+        moment it reopens, so hammering the endpoint through the outage adds
+        nothing. Worst case is therefore three requests a minute, only in the
+        last stretch of a window, only while agents are working.
+        """
+        limit = claude_usage.headline(self._usage)
+        if limit is None or not (USAGE_URGENT_PCT <= limit.percent
+                                 < claude_usage.EXHAUSTED_PCT):
+            return USAGE_POLL_MS
+        if not any(a.is_busy() for a in self.manager.all_agents()):
+            return USAGE_POLL_MS
+        return USAGE_URGENT_POLL_MS
+
+    def _retune_usage_poll(self) -> None:
+        """Apply `_usage_poll_interval` (times any backoff) to the timer.
+
+        Only when it CHANGES: `QTimer.setInterval` restarts a running timer, so
+        calling this unconditionally from the tick would keep resetting the
+        countdown and the poll would never come round at all.
+        """
+        want = self._usage_poll_interval() * (2 ** self._usage_backoff)
+        if want != self._usage_timer.interval():
+            self._usage_timer.setInterval(want)
+
     def _on_usage_refresh(self) -> None:
         """The user clicked the readout. Clear any 429 backoff first: they are
         asking now, and leaving the timer parked at sixteen minutes would make
         a successful manual refresh look like it fixed nothing when the next
         automatic poll failed to arrive."""
         self._usage_backoff = 0
-        self._usage_timer.setInterval(USAGE_POLL_MS)
+        self._retune_usage_poll()
         if self._usage_timer.isActive():
             self._usage_timer.start()      # restart the interval from now
         self._poll_usage()
@@ -1081,8 +1144,9 @@ class MainWindow(QMainWindow):
             return
         if reading is not None and reading.ok:
             self._usage_backoff = 0
-            self._usage_timer.setInterval(USAGE_POLL_MS)
             self._apply_usage(reading)
+            # after adopting it, so the new percentage decides the next gap
+            self._retune_usage_poll()
             return
         # A failed poll keeps the last good number on screen, greyed, rather
         # than blanking a figure the user is watching. Only a machine with no
@@ -1102,7 +1166,10 @@ class MainWindow(QMainWindow):
         # The auto-continue watchdog is deliberately independent of all this.
         if reading is not None and reading.error == "http 429":
             self._usage_backoff = min(self._usage_backoff + 1, 4)
-            self._usage_timer.setInterval(USAGE_POLL_MS * (2 ** self._usage_backoff))
+            # the backoff multiplies whatever the situation asks for, so it
+            # still wins over the urgent rate: being rate-limited is precisely
+            # when polling harder is counterproductive
+            self._retune_usage_poll()
         if self._usage is None:
             # Nothing to grey out: there has never been a reading this run, and
             # since CLI 2.1.220 stopped writing `cachedUsageUtilization` there
@@ -1149,8 +1216,17 @@ class MainWindow(QMainWindow):
             self._usage_reset_timer.stop()
 
     def _tick_usage(self) -> None:
-        """Re-render the countdown from the clock alone — no network."""
+        """Re-render the countdown from the clock alone — no network.
+
+        Also the place the poll gap follows the WORK: whether agents are busy
+        changes constantly, and `activity_changed` fires every couple of
+        seconds per agent, so this cheap 20s sweep is where that half of
+        `_usage_poll_interval` is re-evaluated rather than off a signal that
+        would retune (and so restart the poll timer) far more often than the
+        number can move.
+        """
         self.top_bar.usage_badge.tick()
+        self._retune_usage_poll()
 
     def _on_usage_visibility(self, on: bool) -> None:
         """User toggled the readout from the top bar's context menu."""
@@ -1535,7 +1611,7 @@ class MainWindow(QMainWindow):
             # audit trail: on the card, and on the workspace board. The board
             # write goes through the same serialized append the log_activity
             # tool uses, so it can't interleave with an agent's own note.
-            agent.notice("— plan limit reset; auto-continued —")
+            agent.notice("[plan limit reset; auto-continued]")
             ws = self.manager.workspace_of(agent.id)
             if ws is not None and ws.board is not None:
                 ws.board.append_activity(
@@ -2089,6 +2165,7 @@ class MainWindow(QMainWindow):
         self._heartbeat_timer.stop()
         self._session_sync_timer.stop()
         self._prompt_sync_timer.stop()
+        self._model_sync_timer.stop()
         self._limit_watch_timer.stop()
         self._usage_timer.stop()
         self._usage_tick_timer.stop()

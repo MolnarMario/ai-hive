@@ -58,7 +58,13 @@ workspaces keep executing — switching never pauses anything.
   assigned task, or, when none is set, **Claude Code's own AI conversation
   title** read live from the transcript (the same short summary you see in
   `/resume`) — so you can tell at a glance what each agent is working on without
-  reading its terminal. The same summary shows in the terminal card header.
+  reading its terminal. The same summary shows in the terminal card header,
+  where it fits itself to whatever width the row leaves (full text on hover).
+- **Live model + effort on every card** — the header says what the agent is
+  *actually* running, e.g. `Opus 5 · high`, right of its role. Both are yours to
+  change from inside the terminal with `/model` and `/effort`, so the readout
+  follows the live conversation rather than the flags the agent launched with,
+  and updates a second or two after you pick.
   Click any agent to jump straight
   to its terminal card (switching workspace first if needed). When an agent is
   actually **waiting for you** — a permission prompt or an interactive
@@ -78,7 +84,12 @@ workspaces keep executing — switching never pauses anything.
   refresh**; hover for every limit window, your plan, and how old the reading
   is. The number comes from the same place the CLI's `/usage` gets it, read
   once a minute in the background — nothing is logged or persisted, it's a live
-  readout only. When a limit is actually spent it reads **`limit reached,
+  readout only. Past 90% *with agents actually working* it refreshes every 20
+  seconds instead: that's the stretch where several busy agents can spend the
+  rest of the window between two ordinary polls, and the recovery features only
+  learn you're cut off from a reading. Idle agents, a window under 90%, or one
+  already spent all go back to the slow rate, so the endpoint is never polled
+  hard for long. When a limit is actually spent it reads **`limit reached,
   resets in …`**, and the window raises `planLimitReached` / `planLimitCleared`
   signals (with the reset time) so other features can act on being cut off —
   e.g. relaunching blocked agents unattended the moment the limit resets.
@@ -114,7 +125,12 @@ workspaces keep executing — switching never pauses anything.
   when the account readout is rate-limited. Every step is logged to
   `session.log` (`BLOCKED` / `NUDGE` / `RESUMED` / `STILL-BLOCKED`), each resumed
   card shows a `— plan limit reset; auto-continued —` line, and the workspace
-  board gets a note.
+  board gets a note. A stopped agent is also visible at a glance, everywhere,
+  live: an **⏳ hourglass** sits in the card header and next to the agent in
+  the sidebar's expanded workspace dropdown, and the workspace row itself
+  carries an **⏳N** badge counting how many of its agents are currently
+  stuck — all three clear the instant that agent resumes, whether that was
+  auto-continue or you restarting it yourself.
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
@@ -248,10 +264,12 @@ error dialog instead of silently closing. Packaging to a distributable
   `Shift+Tab` cycles Claude Code's modes, `Ctrl+C` interrupts (when nothing is
   selected; otherwise it copies), `Ctrl+R` reverse-searches, arrows/`Tab`
   complete, exactly as in a real terminal.
-- **Card controls** — `▶` start, `■` graceful stop (stdin EOF), `⟳` restart
-  (fresh session), `✕` close. Type into the bottom input line to send a
-  command to that terminal; `↑`/`↓` recall history; `cls`/`clear` clears
-  the console locally.
+- **Card controls** — the header keeps only what you reach for: `A−`/`A+`
+  font, `⤢` maximize, `✕` close. **Right-click the header** for Start,
+  Stop (stdin EOF), Restart (fresh session) and Assign / reassign; those four
+  are rare and deliberate, and the width they used to hold now goes to the
+  summary. Type into the bottom input line to send a command to that terminal;
+  `↑`/`↓` recall history; `cls`/`clear` clears the console locally.
 - **PowerShell quirks to know** — there is no prompt line by design, and
   bare `cd` prints nothing in PowerShell (use `pwd` to see where you are).
   Typing a TTY-only program (`claude`, `vim`, `htop`, …) prints a hint
@@ -272,7 +290,7 @@ error dialog instead of silently closing. Packaging to a distributable
   pinned id whose transcript has gone missing still recovers the folder's most
   recent one instead of erroring. No more manually hunting for a lost chat.
   Agents that were *stopped* stay stopped, but never as a black screen: the
-  card shows a **wake banner** and the first keystroke (or `▶`) starts it —
+  card shows a **wake banner** and the first keystroke starts it —
   a woken Claude agent also reclaims its conversation.
 - **Scrolling** — in a full terminal the wheel does what a real terminal does:
   fullscreen apps that request mouse events (Claude Code) receive the wheel
@@ -310,11 +328,11 @@ awareness* below).
   in the effort dropdown but greyed out — it's an in-session mode you enable
   with `/effort ultracode` in a supporting model's terminal.
 - **Persistent agents** — agents **never** auto-close. A completed agent stays
-  in the grid with a **Completed / Working / Awaiting Assignment** badge and a
-  **⇄ Reassign** button, so you can review its work, continue the conversation,
-  or retask it. Only you close an agent.
-- **Reassign anywhere** — the ⇄ button on any card assigns a fresh task
-  (role/model adapt) without losing the session.
+  in the grid so you can review its work, continue the conversation, or retask
+  it. Only you close an agent.
+- **Reassign anywhere** — right-click any card header and pick **Assign /
+  reassign a task** to hand it fresh work (role/model adapt) without losing
+  the session.
 
 ## Shared agent awareness
 
@@ -468,7 +486,8 @@ Hard-won rules, each with a regression test:
   (e.g. xterm modifyOtherKeys) are filtered so text renders clean, not
   underlined.
 - **Line-console cards** stay line-oriented: full-screen TUIs won't render in
-  them, and there's no per-command Ctrl+C (use `■` Stop / `⟳` Restart, or
+  them, and there's no per-command Ctrl+C (right-click the header for Stop or
+  Restart, or
   switch that agent to full-terminal mode). Bare `cd` prints nothing in
   PowerShell — that's PowerShell, not the app.
 - Windows-first: developed and tested on Windows 11. On non-Windows,
@@ -481,7 +500,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-896 checks drive the real app headlessly (offscreen Qt platform) with real
+951 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -495,7 +514,10 @@ a per-agent task summary beside the name, the per-card maximize/restore toggle
 (solo one agent full-area without touching any sibling's process, then restore
 the exact prior tiling) and the context-window usage badge beside the summary
 ("N% of 1M/200K", read from the transcript's last usage record — transient,
-never persisted), the sidebar status badge
+never persisted), the live model/effort readout beside the agent's role
+(normalising `claude-opus-5` to "Opus 5", merging the last turn's model with a
+mid-session `/model` or `/effort` pick, transient and never persisted) and the
+self-fitting header summary that uses every free pixel, the sidebar status badge
 (output-activity busy detection, pulse/colour state machine, hover-only
 controls), sidebar drag-reorder + collapsible categories (create/rename/delete,
 drag workspaces in/out, single-level membership persisted across a v4 session
@@ -552,7 +574,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (896 checks)
+tests/smoke_test.py        headless end-to-end suite (951 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

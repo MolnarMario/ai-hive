@@ -10,16 +10,17 @@ agent signals can't fire into a dead widget.
 import re
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, Signal
-from PySide6.QtGui import (QColor, QDrag, QFontMetrics, QPainter, QPixmap,
+from PySide6.QtGui import (QAction, QColor, QDrag, QPainter, QPixmap,
                            QTextCharFormat, QTextCursor)
-from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QPlainTextEdit, QToolButton, QVBoxLayout)
 
 from .. import ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
-from ..terminal_agent import (ASSIGNMENT_LABEL, STREAM_INPUT, STREAM_SYSTEM,
-                              AgentStatus, AssignmentState, TerminalAgent)
+from ..terminal_agent import (STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
+                              TerminalAgent)
 from ..ui_theme import Palette, repolish
+from .ornaments import ElidingLabel
 
 _LINE_BREAKS = re.compile(r"[\r\n]")
 
@@ -46,13 +47,15 @@ CARD_REORDER_MIME = "application/x-aihive-card-reorder"
 
 
 class _CardHeader(QFrame):
-    """The card's title bar — and its drag handle. A left-drag from EMPTY
-    header space past a small threshold starts a reorder drag; the buttons
-    consume their own presses, so they never drag, while the labels
-    (name/model/summary/usage) don't consume presses, so the whole strip except
-    the buttons is grabbable — exactly the area the user asked to drag from.
-    A plain click (no movement) is left alone, so double-click-to-rename on the
-    title still works."""
+    """The card's title bar, which doubles as its drag handle and carries the
+    card's action menu. A left-drag from EMPTY header space past a small
+    threshold starts a reorder drag; the buttons consume their own presses, so
+    they never drag, while the labels (name/model/summary/usage) don't consume
+    presses, so the whole strip except the buttons is grabbable — exactly the
+    area the user asked to drag from. A plain click (no movement) is left
+    alone, so double-click-to-rename on the title still works. A RIGHT-click
+    opens start/stop/restart/assign: those are rare, deliberate actions, and
+    the four buttons they used to occupy were worth more as summary space."""
 
     _SLOP = 8
 
@@ -85,6 +88,10 @@ class _CardHeader(QFrame):
         self._press = None
         super().mouseReleaseEvent(event)
 
+    def contextMenuEvent(self, event):
+        self._card.show_actions_menu(event.globalPos())
+        event.accept()
+
 
 class TerminalCard(QFrame):
     closeRequested = Signal(str)     # agent id
@@ -107,7 +114,7 @@ class TerminalCard(QFrame):
         self._fmt_cache: dict = {}
         self._cr_pending = False
         self._renaming = False  # inline title-edit in progress
-        self._task_full = ""    # untruncated current-task, for the elided summary
+        self._task_full = ""    # untruncated current-task (the label elides it)
         self._follow = True  # sticky auto-scroll (survives resizes/retiles)
         self._history: list[str] = []
         self._hist_idx = 0
@@ -128,6 +135,7 @@ class TerminalCard(QFrame):
         self._on_assignment(agent.assignment)
         self._on_task()
         self._on_tokens(agent.token_badge())
+        self._on_model(agent.model_badge())
 
     # ----------------------------------------------------------------- ui ---
 
@@ -138,7 +146,7 @@ class TerminalCard(QFrame):
 
         header = self.header = _CardHeader(self, self)
         header.setObjectName("CardHeader")
-        header.setToolTip("Drag to reorder this agent in the workspace")
+        header.setToolTip("Drag to reorder this agent, right-click for actions")
         header.setFixedHeight(38)   # room for the larger 14px glyph buttons
         hl = QHBoxLayout(header)
         hl.setContentsMargins(8, 0, 6, 0)
@@ -155,12 +163,15 @@ class TerminalCard(QFrame):
         self.title_edit = QLineEdit(self.agent.spec.name, header)
         self.title_edit.setObjectName("CardTitleEdit")
         self.title_edit.hide()
-        self.role = QLabel(f"— {self.agent.spec.role}" if self.agent.spec.role
-                           else "", header)
+        self.role = QLabel(self.agent.spec.role or "", header)
         self.role.setObjectName("CardRole")
-        self.badge = QLabel("", header)   # assignment lifecycle badge
-        self.badge.setObjectName("CardBadge")
-        self.badge.hide()
+        # what the agent is RUNNING ON right now. The user can change both from
+        # inside the terminal (/model, /effort), so this follows the live
+        # conversation rather than the launch flags; hidden when unknown, which
+        # is every non-AI shell.
+        self.model_label = QLabel("", header)
+        self.model_label.setObjectName("CardModel")
+        self.model_label.hide()
         # "the usage limit stopped this agent" marker. Visible for as long as
         # the cut-off is latched, so an interrupted agent is identifiable at a
         # glance instead of by reading its terminal — and so an auto-continue
@@ -171,8 +182,10 @@ class TerminalCard(QFrame):
         self.limit_mark.hide()
         # one-line summary of what this agent is working on (its current task),
         # so several agents in a workspace are tellable apart at a glance
-        # without reading each terminal. Elided to fit; full text on hover.
-        self.task_summary = QLabel("", header)
+        # without reading each terminal. It takes every pixel the fixed chrome
+        # beside it leaves and elides only what genuinely doesn't fit; the full
+        # text is always on hover.
+        self.task_summary = ElidingLabel(header)
         self.task_summary.setObjectName("CardTaskSummary")
         # compact context-window usage (e.g. "20% of 1M"), right after the
         # summary snippet — hidden until the transcript reports usage (Claude
@@ -184,10 +197,9 @@ class TerminalCard(QFrame):
         hl.addWidget(self.title)
         hl.addWidget(self.title_edit)
         hl.addWidget(self.role)
+        hl.addWidget(self.model_label)
         hl.addSpacing(6)
-        hl.addWidget(self.badge)
         hl.addWidget(self.limit_mark)
-        hl.addSpacing(6)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
         hl.addWidget(self.token_label)
 
@@ -200,15 +212,12 @@ class TerminalCard(QFrame):
             hl.addWidget(b)
             return b
 
+        # Only the buttons worth their width live here. Start / Stop / Restart /
+        # Assign moved to the header's right-click menu: the terminal itself is
+        # how this app is driven (any keystroke wakes a stopped card), so those
+        # four were spending ~130px of every header on actions nobody clicks.
         self.btn_font_dec = tool("A−", "CardFontDec", "Smaller font (Ctrl+-)")
         self.btn_font_inc = tool("A+", "CardFontInc", "Larger font (Ctrl+=)")
-        self.btn_start = tool("▶", "CardStart", "Start")
-        stop_tip = ("Stop (Ctrl+C, then terminate)" if self.is_pty
-                    else "Stop (graceful, stdin EOF)")
-        self.btn_stop = tool("■", "CardStop", stop_tip)
-        self.btn_restart = tool("⟳", "CardRestart", "Restart (kill + fresh session)")
-        self.btn_reassign = tool("⇄", "CardReassign",
-                                 "Assign / reassign a task to this agent")
         # solo/restore this card in the workspace grid — a pure view toggle;
         # never touches sibling processes (see WorkspacePage.toggle_solo)
         self.btn_max = tool("⤢", "CardMaximize", "Maximize (focus this agent)")
@@ -225,7 +234,7 @@ class TerminalCard(QFrame):
             # a stopped terminal must NEVER read as a dead black screen: a
             # visible banner says so, and any keystroke starts the session
             self.overlay = QLabel("terminal not running\n"
-                                  "press any key — or ▶ — to start",
+                                  "press any key to start",
                                   self.terminal)
             self.overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.overlay.setStyleSheet(
@@ -259,16 +268,12 @@ class TerminalCard(QFrame):
         self.agent.task_changed.connect(self._on_task)
         self.agent.summary_changed.connect(self._on_task)  # incl. live AI title
         self.agent.tokens_changed.connect(self._on_tokens)
+        self.agent.model_changed.connect(self._on_model)
         self.agent.limit_blocked_changed.connect(self._on_limit_blocked)
         self._on_limit_blocked(self.agent.is_limit_blocked())
         self.title.installEventFilter(self)        # double-click to rename
         self.title_edit.installEventFilter(self)   # Esc cancels, focus-out commits
         self.title_edit.returnPressed.connect(self._commit_rename)
-        self.btn_start.clicked.connect(self.agent.start)
-        self.btn_stop.clicked.connect(self.agent.stop)
-        self.btn_restart.clicked.connect(self.agent.restart)
-        self.btn_reassign.clicked.connect(
-            lambda: self.reassignRequested.emit(self.agent.id))
         self.btn_max.clicked.connect(lambda: self.maximizeRequested.emit(self))
         self.btn_close.clicked.connect(self._on_close_clicked)
         self.btn_font_dec.clicked.connect(lambda: self._font_delta(-1))
@@ -293,6 +298,37 @@ class TerminalCard(QFrame):
         sb = self.console.verticalScrollBar()
         sb.valueChanged.connect(self._on_scroll_value)
         sb.rangeChanged.connect(self._on_scroll_range)
+
+    def show_actions_menu(self, global_pos) -> None:
+        """The card's lifecycle actions, opened by right-clicking the header.
+        These used to be four permanent header buttons; the menu keeps every one
+        of them reachable while giving the row back to the summary. Enablement
+        follows the same status rules the buttons used."""
+        status = self.agent.status
+        running = status in (AgentStatus.STARTING, AgentStatus.RUNNING)
+        menu = QMenu(self)
+        act_start = QAction("Start", menu)
+        act_start.triggered.connect(self.agent.start)
+        act_start.setEnabled(status is AgentStatus.IDLE or status in _ENDED)
+        act_stop = QAction("Stop (Ctrl+C, then terminate)" if self.is_pty
+                           else "Stop (graceful, stdin EOF)", menu)
+        act_stop.triggered.connect(self.agent.stop)
+        act_stop.setEnabled(running)
+        act_restart = QAction("Restart (kill + fresh session)", menu)
+        act_restart.triggered.connect(self.agent.restart)
+        act_assign = QAction("Assign / reassign a task…", menu)
+        act_assign.triggered.connect(
+            lambda: self.reassignRequested.emit(self.agent.id))
+        for act in (act_start, act_stop, act_restart, act_assign):
+            menu.addAction(act)
+        menu.addSeparator()
+        act_max = QAction("Maximize (focus this agent)", menu)
+        act_max.triggered.connect(lambda: self.maximizeRequested.emit(self))
+        menu.addAction(act_max)
+        act_close = QAction("Close terminal", menu)
+        act_close.triggered.connect(self._on_close_clicked)
+        menu.addAction(act_close)
+        menu.exec(global_pos)
 
     def _begin_reorder_drag(self) -> None:
         """Start a drag the WorkspacePage turns into a card reorder. Carries the
@@ -321,7 +357,11 @@ class TerminalCard(QFrame):
                  (self.agent.assignment_changed, self._on_assignment),
                  (self.agent.role_changed, self._on_role),
                  (self.agent.name_changed, self._on_name),
-                 (self.agent.task_changed, self._on_task)]
+                 (self.agent.task_changed, self._on_task),
+                 (self.agent.summary_changed, self._on_task),
+                 (self.agent.tokens_changed, self._on_tokens),
+                 (self.agent.model_changed, self._on_model),
+                 (self.agent.limit_blocked_changed, self._on_limit_blocked)]
         if self.is_pty:
             pairs.append((self.agent.pty_output, self._on_pty_output))
         else:
@@ -345,43 +385,33 @@ class TerminalCard(QFrame):
             self.agent.start()  # the waking keystroke is deliberately eaten
 
     def _on_assignment(self, state) -> None:
-        # persistent lifecycle badge; auto-created agents never auto-close, so
-        # a completed agent stays visible with a clear "Completed" badge
-        label = ASSIGNMENT_LABEL.get(state, "")
-        show = state in (AssignmentState.WORKING, AssignmentState.COMPLETED,
-                         AssignmentState.AWAITING)
-        self.badge.setText(label)
-        self.badge.setVisible(show)
-        key = {AssignmentState.WORKING: "working",
-               AssignmentState.COMPLETED: "completed",
-               AssignmentState.AWAITING: "awaiting"}.get(state, "")
-        self.badge.setProperty("state", key)
-        repolish(self.badge)
+        # The lifecycle state is no longer painted as a header badge: what an
+        # agent is doing is plain from its terminal, and the badge cost the
+        # summary its width. The state itself still drives the model (and the
+        # sidebar), so nothing is lost from the record.
         self.btn_close.setToolTip(
-            "Close terminal (agents never close on their own — you decide)")
+            "Close terminal (agents never close on their own, you decide)")
 
     def _on_role(self, _name: str) -> None:
         # the title tracks spec.name (which set_role leaves alone once the user
         # has manually renamed); only the role sublabel follows the emitted role
         self.title.setText(self.agent.spec.name)
-        self.role.setText(f"— {self.agent.spec.role}" if self.agent.spec.role
-                          else "")
+        self.role.setText(self.agent.spec.role or "")
 
     def _on_name(self, name: str) -> None:
         self.title.setText(name)
 
     def _on_task(self, *_ignore) -> None:
         # show the agent's summary — its assigned task, else Claude's live AI
-        # conversation title. Collapse to a single line: the summary shares the
-        # fixed-height header row, so a newline would blow it up.
+        # conversation title. The label collapses it to one line, fits it to
+        # whatever width the header leaves and keeps the full text on hover.
+        # It stays IN the layout even when empty (it carries the header's
+        # stretch): hidden, the stretch vanishes and the status glyph absorbs
+        # the slack, shoving the agent name to the middle.
         text = self.agent.summary() if hasattr(self.agent, "summary") \
             else (self.agent.current_task or "")
-        self._task_full = " ".join((text or "").split())
-        self.task_summary.setToolTip(self._task_full)
-        # keep the summary label ALWAYS in the layout (it carries the header's
-        # stretch): if it's hidden when empty, the stretch vanishes and the
-        # status glyph absorbs the slack, shoving the agent name to the middle.
-        self._elide_task()
+        self.task_summary.set_full_text(text or "")
+        self._task_full = self.task_summary.full_text()
 
     def _on_limit_blocked(self, blocked: bool) -> None:
         """Show/hide the 'the usage limit stopped this agent' marker. The
@@ -402,24 +432,20 @@ class TerminalCard(QFrame):
             self.token_label.clear()
         self.token_label.setVisible(bool(badge))
 
-    def _elide_task(self) -> None:
-        if not self._task_full:
-            self.task_summary.clear()
-            return
-        avail = self.task_summary.width() - 4
-        if avail > 8:
-            fm = QFontMetrics(self.task_summary.font())
-            self.task_summary.setText(
-                fm.elidedText(self._task_full, Qt.TextElideMode.ElideRight, avail))
+    def _on_model(self, badge: str = "") -> None:
+        # "Opus 5 · high", tracking /model and /effort inside the terminal.
+        # Hidden when empty so a plain shell shows nothing (never a guess).
+        if badge:
+            model, effort = self.agent.live_model()
+            tip = f"Model: {model}"
+            if effort:
+                tip += f"\nEffort: {effort}"
+            self.model_label.setText(badge)
+            self.model_label.setToolTip(
+                tip + "\nFollows /model and /effort in this terminal")
         else:
-            # width not settled yet (e.g. before first layout): char fallback so
-            # the summary is never blank when there IS a task
-            self.task_summary.setText(
-                self._task_full[:48] + ("…" if len(self._task_full) > 48 else ""))
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._elide_task()  # re-fit the summary to the new header width
+            self.model_label.clear()
+        self.model_label.setVisible(bool(badge))
 
     # -------------------------------------------------------- inline rename ---
 
@@ -579,9 +605,6 @@ class TerminalCard(QFrame):
         self.glyph.setProperty("state", _GLYPH_STATE.get(status, "idle"))
         repolish(self.glyph)
         running = status in (AgentStatus.STARTING, AgentStatus.RUNNING)
-        self.btn_start.setEnabled(status is AgentStatus.IDLE
-                                  or status in _ENDED)
-        self.btn_stop.setEnabled(running)
         exit_info = self.agent.worker.exit_info
         tip = f"{status.value}"
         if exit_info and not running:

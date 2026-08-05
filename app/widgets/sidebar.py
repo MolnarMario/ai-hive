@@ -49,7 +49,8 @@ from ..filetypes import EMOJI_FONT, FOLDER_ICON, FOLDER_OPEN_ICON, file_icon
 from ..terminal_agent import AgentStatus
 from ..ui_theme import Palette, repolish
 from .activity_panel import _ICON
-from .ornaments import AgentCountBadge, OrnamentDivider, WorkspaceSpinner
+from .ornaments import (AgentCountBadge, ElidingLabel, OrnamentDivider,
+                        WorkspaceSpinner)
 
 SIDEBAR_WIDTH = 230
 ROW_HEIGHT = 44
@@ -162,6 +163,18 @@ class WorkspaceRow(QFrame):
         self.q_badge.clicked.connect(
             lambda: self.agentsRequested.emit(self.ws_id))
 
+        # hourglass + count: agent(s) here were cut off by the plan usage limit
+        # and haven't resumed yet (manually or via auto-continue). Same click
+        # target as the "?" badge — open the dropdown so the user can see WHICH
+        # agent and jump to it. Text carries the count since more than one
+        # agent can be stuck on the same window.
+        self.limit_badge = QToolButton(self)
+        self.limit_badge.setObjectName("WsLimit")
+        self.limit_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.limit_badge.hide()
+        self.limit_badge.clicked.connect(
+            lambda: self.agentsRequested.emit(self.ws_id))
+
         # a sweeping-arc throbber with the WORKING count; pinned far-right, so
         # the hover folder/delete buttons appear to its LEFT (see layout order)
         self.work_spinner = WorkspaceSpinner(self)
@@ -172,6 +185,7 @@ class WorkspaceRow(QFrame):
         lay.addLayout(text_col, 1)
         lay.addWidget(self.folder_btn)
         lay.addWidget(self.delete_btn)
+        lay.addWidget(self.limit_badge)
         lay.addWidget(self.q_badge)
         lay.addWidget(self.work_spinner)
 
@@ -220,9 +234,19 @@ class WorkspaceRow(QFrame):
         self.q_badge.setVisible(waiting > 0)
         if waiting > 0:
             self.q_badge.setToolTip(
-                f"{waiting} agent(s) waiting for your input — click to see who")
+                f"{waiting} agent(s) waiting for your input, click to see who")
+        # the hourglass + count shows agent(s) cut off by the plan usage limit
+        # and not yet resumed; hidden the instant the count drops back to 0
+        # (a resume, manual or auto-continue), same live wiring as "?" above
+        blocked = stats.get("limit_blocked", 0)
+        self.limit_badge.setVisible(blocked > 0)
+        if blocked > 0:
+            self.limit_badge.setText(f"⏳{blocked}")
+            self.limit_badge.setToolTip(
+                f"{blocked} agent(s) stopped by the usage limit, "
+                "click to see who")
         tip = (f"{total} agent(s): {busy} working, {running} running, "
-               f"{e} error, {waiting} waiting")
+               f"{e} error, {waiting} waiting, {blocked} limit-stopped")
         self.setToolTip(f"{tip}\n{self._folder}" if self._folder else tip)
 
     # ------------------------------------------------------------ rename ---
@@ -603,7 +627,9 @@ class AgentRow(QFrame):
         self.dot.setObjectName("WsAgentDot")
         self.name = QLabel(self)
         self.name.setObjectName("WsAgentName")
-        self.summary = QLabel(self)
+        # shares the card header's eliding label: fits itself to whatever width
+        # the row leaves, keeps the whole summary on hover
+        self.summary = ElidingLabel(self)
         self.summary.setObjectName("WsAgentTask")
         self.q = QLabel("?", self)
         self.q.setObjectName("WsAgentQ")
@@ -644,33 +670,13 @@ class AgentRow(QFrame):
         # summary = assigned task, else Claude's live AI conversation title
         get = getattr(agent, "summary", None)
         self._full = (get() if callable(get) else agent.current_task or "").strip()
-        self.summary.setToolTip(self._full)
-        self._elide()
+        self.summary.set_full_text(self._full)
 
     def set_search_hit(self, hit: bool) -> None:
         """Tint the agent row when it matches the active sidebar search."""
         if bool(self.property("search_hit")) != bool(hit):
             self.setProperty("search_hit", bool(hit))
             repolish(self)
-
-    def _elide(self) -> None:
-        # fit to the summary label's ACTUAL width (it has the layout's stretch,
-        # so it fills whatever the row/sidebar width allows — no wasted space);
-        # re-runs on resize so it always spans to the true right edge
-        w = self.summary.contentsRect().width()
-        if not self._full:
-            self.summary.clear()
-            return
-        if w > 8:
-            fm = QFontMetrics(self.summary.font())
-            self.summary.setText(
-                fm.elidedText(self._full, Qt.TextElideMode.ElideRight, w))
-        else:   # width not settled yet (pre-layout) — show something meaningful
-            self.summary.setText(self._full)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._elide()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:

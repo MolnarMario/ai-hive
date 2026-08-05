@@ -10,6 +10,7 @@ This module is Qt-free (pure data + os/shutil helpers) so the model layer
 and headless tests can use it without a GUI.
 """
 
+import json
 import os
 import shlex
 import shutil
@@ -17,6 +18,9 @@ from dataclasses import dataclass, field
 
 DEFAULT_MODEL = ""   # empty = omit the flag, use the CLI's own default
 DEFAULT_EFFORT = ""
+
+# cache for user_default_model: (mtime, size, model)
+_USER_MODEL_CACHE: tuple = (0.0, -1, "")
 
 
 @dataclass(frozen=True)
@@ -69,7 +73,7 @@ PROVIDERS: dict[str, Provider] = {
         key="claude", display="Claude Code", exe_names=("claude",),
         models=CLAUDE_MODELS, efforts=CLAUDE_EFFORTS,
         permission_modes=CLAUDE_PERMISSION_MODES, native_flags=True,
-        note="Anthropic Claude Code — full interactive agent."),
+        note="Anthropic Claude Code: full interactive agent."),
     "openai": Provider(
         key="openai", display="OpenAI (Codex CLI)", exe_names=("codex",),
         models=(("Default", ""),
@@ -97,7 +101,7 @@ PROVIDERS: dict[str, Provider] = {
                 ("GPT-OSS 120B (Medium)", "GPT-OSS 120B (Medium)")),
         base_cmd="agy", model_flag="--model {model}",
         fallback_paths=(r"%LOCALAPPDATA%\agy\bin\agy.exe",),
-        note="Google Antigravity CLI (`agy`) — Gemini 3.x agent."),
+        note="Google Antigravity CLI (`agy`): Gemini 3.x agent."),
     "grok": Provider(
         key="grok", display="Grok (xAI CLI)", exe_names=("grok",),
         # `grok models` reports one entry for this account (grok-build, the
@@ -108,7 +112,7 @@ PROVIDERS: dict[str, Provider] = {
         # the xAI installer drops grok.exe under the user profile, which may not
         # be on the app's PATH (verified: %USERPROFILE%\.grok\bin\grok.exe)
         fallback_paths=(r"%USERPROFILE%\.grok\bin\grok.exe",),
-        note="xAI Grok CLI (`grok`) — interactive Grok agent."),
+        note="xAI Grok CLI (`grok`): interactive Grok agent."),
 }
 
 AI_PROVIDER_KEYS = tuple(PROVIDERS.keys())
@@ -128,6 +132,33 @@ def resolve_claude() -> str:
         r"\Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe"
         r"\claude.exe")
     return guess if os.path.isfile(guess) else "claude.exe"
+
+
+def user_default_model() -> str:
+    """The model the Claude CLI will pick when AI Hive passes no --model, i.e.
+    the user's own `~/.claude/settings.json` "model" setting (what `/model`
+    writes when it says "saved as your default"). Only a COLD-START seed for
+    the card's model label: once the conversation has a transcript, the
+    transcript is the truth. "" when unset/unreadable. Cheap to call (cached by
+    mtime+size); never raises."""
+    global _USER_MODEL_CACHE
+    path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    if _USER_MODEL_CACHE[0] == st.st_mtime and _USER_MODEL_CACHE[1] == st.st_size:
+        return _USER_MODEL_CACHE[2]
+    model = ""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("model"), str):
+            model = data["model"].strip()
+    except (OSError, ValueError):
+        return _USER_MODEL_CACHE[2]
+    _USER_MODEL_CACHE = (st.st_mtime, st.st_size, model)
+    return model
 
 
 def resolve_program(key: str) -> str:

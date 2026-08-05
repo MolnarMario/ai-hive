@@ -155,7 +155,7 @@ class WorkspacePage(QWidget):
             "This workspace has no agents.\n\n"
             "＋ Terminal (Ctrl+Shift+T) adds one, or pick a grid layout.\n"
             "Agents in your other workspaces are untouched and still\n"
-            "running — see the workspace list in the sidebar.",
+            "running; see the workspace list in the sidebar.",
             self.body)
         self.empty.setObjectName("EmptyState")
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)

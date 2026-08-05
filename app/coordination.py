@@ -37,7 +37,7 @@ def system_prompt_text(workspace_name: str, agent_name: str,
         f"already done, so you avoid duplicating their work. When you start a "
         f"task, finish one, or change an important file, record it by calling "
         f"the `log_activity` MCP tool with a terse one-line message (e.g. "
-        f"\"implementing auth in login.py\"). Do NOT edit board.md directly — "
+        f"\"implementing auth in login.py\"). Do NOT edit board.md directly; "
         f"AI Hive serializes those writes through the tool so concurrent agents "
         f"can't clobber each other's entries.")
 
@@ -79,7 +79,7 @@ class WorkspaceBoard:
             return False
 
     def _scaffold(self) -> str:
-        return (f"# AI Hive — workspace coordination board\n\n"
+        return (f"# AI Hive: workspace coordination board\n\n"
                 f"{ROSTER_BEGIN}\n{ROSTER_END}\n\n"
                 f"{LOG_HEADER}\n\n_Agents append their activity below._\n")
 
@@ -115,7 +115,7 @@ class WorkspaceBoard:
         for r in rows:
             icon = _STATUS_ICON.get(r.get("status", ""), "⚪")
             model = r.get("model") or r.get("provider") or ""
-            task = (r.get("task") or "").replace("|", "/") or "—"
+            task = (r.get("task") or "").replace("|", "/") or "-"
             lines.append(f"| {r.get('name','?')} | {r.get('role','')} | "
                          f"{model} | {icon} {r.get('status','')} | {task} |")
         return "\n".join(lines)

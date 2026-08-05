@@ -7,11 +7,11 @@ the design handoff's inline data-URIs.
 """
 
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
-                            QRectF, Qt, QVariantAnimation, Signal)
+                            QRectF, Qt, QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient,
                            QPainter, QPen, QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QLabel, QSizePolicy, QWidget
 
 from .. import ui_theme
 from ..ui_theme import Palette
@@ -484,7 +484,7 @@ class PlanUsageBadge(QWidget):
         if self._limit is not None:
             text = claude_usage.format_limit(self._limit, with_label=self._label)
         elif self._unreadable:
-            text = "usage limit unreadable — click to refresh"
+            text = "usage limit unreadable, click to refresh"
         else:
             text = ""
         tip = self._build_tooltip()
@@ -775,6 +775,69 @@ class PageBorder(QWidget):
         aq = _pixmap(_AQUILA, 150, 48)
         p.drawPixmap(int(px + (pw - 150) / 2), int(plaque.top() + 3), aq)
         p.end()
+
+
+class ElidingLabel(QLabel):
+    """A one-line label that always shows as much of its text as the space it
+    was actually given allows, and keeps the whole text in its tooltip.
+
+    Two things make it reliable where hand-rolled elision was not. It re-fits in
+    its OWN resizeEvent, so it never has to guess whether the parent has laid
+    out yet: setting the text before the first layout used to leave a card
+    stranded on a short character-count fallback for the rest of its life, in a
+    header with hundreds of free pixels. And it reports a minimal width hint
+    (the policy below), so its own natural width can never push its neighbours
+    around: with a layout stretch it simply receives every pixel the fixed
+    chrome beside it did not take."""
+
+    def __init__(self, parent=None, min_chars: int = 0):
+        super().__init__(parent)
+        self._full = ""
+        self._min_chars = min_chars   # >0 keeps a floor under the shrink
+        self.setSizePolicy(QSizePolicy.Policy.Ignored,
+                           QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+
+    def full_text(self) -> str:
+        return self._full
+
+    def set_full_text(self, text: str) -> None:
+        """Set the text to display and elide it to the current width. The
+        tooltip carries the untruncated string."""
+        text = " ".join((text or "").split())   # a newline would grow the row
+        self._full = text
+        self.setToolTip(text)
+        self._refit()
+        if text:
+            # width may still be settling (first layout, a retile in flight):
+            # re-fit once the event loop has caught up, which is cheap and
+            # makes the truncation match the final geometry
+            QTimer.singleShot(0, self._refit)
+
+    def minimumSizeHint(self):
+        hint = super().minimumSizeHint()
+        if self._min_chars:
+            fm = QFontMetrics(self.font())
+            hint.setWidth(min(hint.width(), fm.averageCharWidth() * self._min_chars))
+        else:
+            hint.setWidth(0)
+        return hint
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refit()
+
+    def _refit(self) -> None:
+        if not self._full:
+            self.clear()
+            return
+        avail = self.contentsRect().width()
+        if avail <= 8:
+            self.setText("")   # no room at all; the tooltip still has the text
+            return
+        fm = QFontMetrics(self.font())
+        self.setText(fm.elidedText(self._full, Qt.TextElideMode.ElideRight,
+                                   avail))
 
 
 class OrnamentDivider(QWidget):

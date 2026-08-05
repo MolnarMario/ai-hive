@@ -145,10 +145,9 @@ def create_main_window(store: SessionStore | None = None) -> MainWindow:
                     # would otherwise make --resume error on a dead terminal
                     agent._verify_resume_target = True
                 if agent.autostart_on_restore:
-                    agent.notice("— resuming previous session… —")
+                    agent.notice("[resuming previous session…]")
                 else:
-                    agent.notice("— session restored — press any key "
-                                 "or Start (▶) —")
+                    agent.notice("[session restored; press any key to start]")
     return window
 
 

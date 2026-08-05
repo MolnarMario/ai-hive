@@ -264,6 +264,24 @@ this file is the invariants that must survive every change.
   those instead of scraping a terminal. While blocked, `_arm_reset_poll`
   schedules one extra poll just after the stated reset so the cleared edge
   fires within seconds at 4am rather than waiting out the minute timer.
+  The POLL GAP IS ADAPTIVE, and both halves of the condition matter
+  (`_usage_poll_interval`/`_retune_usage_poll`): the base is
+  `USAGE_POLL_MS` (60s), but a headline window at/over `USAGE_URGENT_PCT` (90)
+  *while at least one agent `is_busy()`* drops to `USAGE_URGENT_POLL_MS` (20s),
+  because several agents streaming can spend the last few percent in far less
+  than a minute and NOTHING in the app knows it is cut off until a READING says
+  so. Under 90 there is nothing imminent; with every agent idle the number
+  isn't moving, so a faster poll would only re-ask the same question; and a
+  window already at 100 goes back to the slow rate because `_arm_reset_poll`
+  already covers the reopening. So the fast rate is short bursts at the end of
+  a window, never a permanently tripled request rate. The 429 backoff
+  MULTIPLIES whatever the situation asks for, so it still wins. Retuning
+  happens on each reading and on the countdown tick (`_tick_usage`, 20s) rather
+  than off `activity_changed` — that fires every couple of seconds per agent,
+  and `QTimer.setInterval` RESTARTS a running timer, so a retune per busy
+  flicker would reset the countdown forever and the poll would never fire at
+  all; `_retune_usage_poll` therefore only touches the timer when the interval
+  actually changes.
 - **Auto-continue consumes that edge; the SCREEN says who to resume**
   (`MainWindow._resume_blocked_agents`, wired to `planLimitCleared`). The usage
   reading is ACCOUNT-wide — it knows the plan is out and until when, but never
@@ -343,6 +361,28 @@ this file is the invariants that must survive every change.
   what `_screen_waiting` looks for) but must NOT ring the chime — it is not a
   question the user can answer, and it would wake them at 4am for something
   auto-continue is about to handle.
+- **A cut-off agent is visible everywhere, live, via one ⏳ hourglass motif** —
+  the card header (`#CardLimitMark`), the sidebar's inline agent-dropdown row
+  (`AgentRow.limit_mark`, `#WsAgentLimit`), and a workspace-row count badge
+  (`WorkspaceRow.limit_badge`, `#WsLimit`, text `⏳N`) that mirrors the "?"
+  badge's live wiring and is hidden at `N==0`. The three paths read the SAME
+  state two different ways: `AgentRow.refresh()` and the workspace badge are
+  POLLED (`agent.is_limit_blocked()` / `workspace_stats()["limit_blocked"]`,
+  the latter a plain count like `busy`/`waiting`), while the card header is
+  purely SIGNAL-driven off `limit_blocked_changed`. That split is exactly why
+  `clear_limit_block()` MUST emit the falling edge (`limit_blocked_changed(
+  False)`, guarded on `was_blocked` so `start()`/`restart()` calling it
+  unconditionally on an already-clear agent stays silent): a poll always
+  catches a resume on its next tick, but a signal-only consumer that only ever
+  saw `emit(True)` (the pre-fix state) never learns the agent came back, and
+  the hourglass sits there stale forever after a real auto-continue or manual
+  restart — this was a live-reported bug, not hypothetical. `workspace_stats`'s
+  `limit_blocked` count and its `_recompute` refresh on BOTH edges too — do not
+  special-case it to the rising edge only. `WorkspaceManager.agentLimitBlocked`
+  is the one exception, and deliberately so: it stays rising-edge-only because
+  it feeds the ledger/audit trail (`_on_agent_limit_blocked`), which records
+  the cut-off happening, not its resolution — firing it on the falling edge
+  too would file a phantom second "BLOCKED" entry on every resume.
 - **The OTHER half of recovery reads the TRANSCRIPT, because the screen lies
   after a restart** (`MainWindow.recover_blocked_at_startup`, `⏯` toggle). A
   restarted agent redraws a REPLAYED conversation, which `_scrape_limit`
@@ -445,6 +485,54 @@ this file is the invariants that must survive every change.
   that rule is the defense against transcript truncation (a real incident).
   If you add a new launch path, call `transcripts.backup_for_agents` before
   any Claude agent starts.
+- **The model/effort on the card is a LIVE READING, never the launch flags**
+  (`transcripts.latest_model_effort` → `WorkspaceManager.refresh_model_effort`
+  → `TerminalAgent.set_live_model` → the header's `#CardModel` chip, polled on
+  `MainWindow._model_sync_timer`/`MODEL_SYNC_MS`). `spec.model`/`spec.effort`
+  are what the agent LAUNCHED with: they are persisted, they rebuild the
+  command line through `providers.build_invocation`, and they go stale the
+  moment the user types `/model` or `/effort` in the TUI, which is normal use.
+  So they seed the display (`_seed_model`, falling back to the user's own
+  `~/.claude/settings.json` model when the agent launched on "Default") and are
+  NEVER written back to from a reading. The transcript carries BOTH signals and
+  both are needed: every assistant record has `message.model` + a TOP-LEVEL
+  `effort` (ground truth, but only as of the last turn), and a `/model`
+  or `/effort` pick appends a `<local-command-stdout>Set model to …` user
+  record the instant it happens — which is the only thing that shows an IDLE
+  agent's switch without waiting for another turn. Merge them in FILE ORDER,
+  last one wins; skip `isSidechain` (a sub-agent runs its own model) and the
+  `<synthetic>` pseudo-model. Do NOT scrape the screen for this (`_screen_tail`
+  is a 4000-char rolling buffer — the same trap the limit-banner invariant
+  documents) and do NOT add a hook: a `/model` typed at an idle prompt fires
+  none, and the hook plumbing is exactly what the SessionStart `startup`
+  invariant says not to perturb. CRITICAL, same rule as `activity_changed` and
+  the plan usage reading: this is TRANSIENT. It polls every 1.5s for the life
+  of the process, so `set_live_model` must never mark `dirty`, and it emits
+  `model_changed` only when the DISPLAYED badge string changes. An EMPTY
+  reading is ignored rather than blanking a good label (a fresh conversation
+  has no evidence yet). The reader is tail-only (`_MODEL_TAIL_BYTES`) with a
+  full-scan fallback and an (mtime,size) cache, because unlike
+  `refresh_ai_titles` it runs several times a second.
+- **The card header is summary-first** (`widgets/terminal_card.py`): the
+  one-line summary carries the layout stretch and is an `ornaments.ElidingLabel`
+  — it re-fits in its OWN `resizeEvent` and reports a zero-width hint
+  (`QSizePolicy.Ignored`), so it takes every pixel the fixed chrome leaves and
+  can never be pushed around by its neighbours. Do NOT go back to eliding
+  against a parent-supplied width with a character-count fallback: `_on_task`
+  runs in the CONSTRUCTOR, before any real width exists, which left restored
+  cards stranded on a 48-character truncation in a header with hundreds of free
+  pixels. The same label serves the sidebar's agent rows. Start/Stop/Restart/
+  Assign are NOT header buttons (they cost ~130px of every header for actions
+  the terminal itself replaces); they live in the header's right-click menu
+  (`show_actions_menu`), which is also where `reassignRequested` is emitted
+  from — the signal and its `WorkspacePage`/`MainWindow` wiring are unchanged.
+  The assignment badge is gone from the header too (the terminal says what the
+  agent is doing); `AssignmentState` still drives the model and the board.
+- **No em dash in text the user sees.** Labels, tooltips, dialog copy, terminal
+  notices and the board markdown use other punctuation or a rephrase; a smoke
+  check (`test_no_em_dashes_in_visible_text`) parses every module and fails on
+  an em dash in any NON-docstring string literal. Comments and docstrings are
+  prose for us, not for the reader, and are deliberately out of scope.
 - **Agents launch with a SANITIZED env** (`pty_worker.agent_environment`):
   `CLAUDECODE`/`CLAUDE_CODE_*` markers are stripped — a claude that inherits
   them believes it is nested inside another claude session and SILENTLY

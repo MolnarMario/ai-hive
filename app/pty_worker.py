@@ -111,7 +111,7 @@ class PtyWorker(QObject):
             return
         if not HAS_CONPTY:
             self._set_state(WorkerState.DEAD)
-            self.failed.emit("pywinpty is not installed — full-terminal "
+            self.failed.emit("pywinpty is not installed, so full-terminal "
                              "mode unavailable")
             return
         self._gen += 1
