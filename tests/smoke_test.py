@@ -229,6 +229,30 @@ def test_sidebar_count_badge():
     row.q_badge.click()
     check("q-badge: click asks for the agent list (open dropdown)",
           asked == ["w1"], asked)
+
+    # hourglass + count: agent(s) stopped by the plan usage limit, not yet
+    # resumed. Hidden at 0 (mirrors "?"); shown with the count once positive,
+    # and must disappear again the instant the count drops back to 0 (a
+    # resume, manual or auto-continue) -- this is signal-driven, not polled.
+    row.set_stats({"total": 3, "active": 3, "busy": 1, "error": 0,
+                   "waiting": 0, "limit_blocked": 0, "idle": 2})
+    check("limit-badge: nobody blocked -> hidden", row.limit_badge.isHidden())
+    row.set_stats({"total": 3, "active": 3, "busy": 1, "error": 0,
+                   "waiting": 0, "limit_blocked": 2, "idle": 2})
+    check("limit-badge: 2 agents blocked -> shown with the count",
+          not row.limit_badge.isHidden()
+          and row.limit_badge.text() == "⏳2", row.limit_badge.text())
+    row.set_stats({"total": 3, "active": 3, "busy": 1, "error": 0,
+                   "waiting": 0, "limit_blocked": 0, "idle": 2})
+    check("limit-badge: back to 0 -> hidden again (live, not stuck on)",
+          row.limit_badge.isHidden())
+    asked2 = []
+    row.agentsRequested.connect(asked2.append)
+    row.set_stats({"total": 1, "active": 1, "busy": 0, "error": 0,
+                   "waiting": 0, "limit_blocked": 1, "idle": 1})
+    row.limit_badge.click()
+    check("limit-badge: click asks for the agent list (open dropdown)",
+          asked2 == ["w1"], asked2)
     row.deleteLater()
 
 
@@ -349,6 +373,51 @@ def test_notification_chime():
     agent._on_idle_timeout()
     check("chime: re-entering waiting rings again (edge, not level)",
           len(rings) == 2, rings)
+
+
+def test_limit_blocked_workspace_stats():
+    """workspace_stats()'s limit_blocked count -- and the workspaceStatsChanged
+    signal it rides on -- must update LIVE on both edges (an agent gets cut off
+    AND an agent resumes), not just the rising one: the sidebar's hourglass
+    badge is signal-driven, not polled, exactly like the "?" badge. Separately,
+    agentLimitBlocked (which feeds the cut-off ledger/audit trail) stays
+    rising-edge-only -- it records the cut-off itself, not its resolution."""
+    from PySide6.QtWidgets import QApplication
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-limitstats-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("LimitStats", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Stuck",
+                                               cwd=str(tmp)), autostart=False)
+    check("limit stats: nobody blocked yet",
+          mgr.workspace_stats(ws.id)["limit_blocked"] == 0)
+
+    stats_events = []
+    blocked_events = []
+    mgr.workspaceStatsChanged.connect(
+        lambda wid, s: stats_events.append(dict(s)) if wid == ws.id else None)
+    mgr.agentLimitBlocked.connect(lambda wid, aid: blocked_events.append((wid, aid)))
+
+    agent.mark_limit_blocked(None, from_startup=False)
+    check("limit stats: count is 1 once an agent is latched",
+          mgr.workspace_stats(ws.id)["limit_blocked"] == 1)
+    check("limit stats: workspaceStatsChanged fired live with the new count",
+          stats_events and stats_events[-1]["limit_blocked"] == 1, stats_events)
+    check("limit stats: agentLimitBlocked announced the rising edge",
+          blocked_events == [(ws.id, agent.id)], blocked_events)
+
+    agent.clear_limit_block()
+    check("limit stats: count drops back to 0 the instant the agent resumes",
+          mgr.workspace_stats(ws.id)["limit_blocked"] == 0)
+    check("limit stats: workspaceStatsChanged fired again on the falling "
+          "edge too (the sidebar badge must not be stuck on)",
+          stats_events[-1]["limit_blocked"] == 0, stats_events)
+    check("limit stats: agentLimitBlocked does NOT fire on the falling edge "
+          "(it feeds the cut-off ledger, not the resolution)",
+          blocked_events == [(ws.id, agent.id)], blocked_events)
 
 
 def test_chime_persistence():
@@ -1785,6 +1854,54 @@ def test_live_model_effort():
     card.close(); card2.close()
     a.deleteLater(); b.deleteLater()
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_limit_blocked_live_ui():
+    """The card header's hourglass and the sidebar's inline agent-row hourglass
+    both say "stopped by the usage limit" -- and both must clear the instant
+    the agent resumes (auto-continue or a manual restart), not sit there
+    stale. The card is signal-driven (limit_blocked_changed), the sidebar
+    AgentRow is polled (refresh() reads is_limit_blocked() directly) -- this
+    exercises both paths end to end through the real clear_limit_block()."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard
+    from app.widgets.sidebar import AgentRow
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Stuck", cwd="."))
+    card = TerminalCard(a)
+    card.resize(900, 300); card.show(); pump(60)
+    check("limit UI: hourglass hidden before any cut-off",
+          not card.limit_mark.isVisible())
+
+    a.mark_limit_blocked(None, from_startup=False)
+    pump(30)
+    check("limit UI: card hourglass shows once the agent latches blocked",
+          card.limit_mark.isVisible())
+
+    row = AgentRow("w1", a)
+    check("limit UI: a freshly built sidebar agent row also shows it",
+          not row.limit_mark.isHidden())
+
+    a.clear_limit_block()
+    pump(30)
+    check("limit UI: card hourglass disappears LIVE on resume (the bug this "
+          "fixes: clear_limit_block used to never emit the falling edge)",
+          not card.limit_mark.isVisible())
+    row.refresh(a)
+    check("limit UI: sidebar agent row also clears on its next poll",
+          row.limit_mark.isHidden())
+
+    card.detach(); card.close()
+    row.deleteLater()
+    a.deleteLater()
 
 
 def test_no_em_dashes_in_visible_text():
@@ -5748,6 +5865,52 @@ def test_plan_usage():
           not win._usage_reset_timer.isActive())
     win._on_usage_ready(good)
 
+    # --- the danger zone: nearly spent AND work under way => poll faster ---
+    # A minute of blindness at 95% is a minute of agents parked on a banner
+    # nobody noticed, because every reaction to a cut-off starts from a READING.
+    from app.widgets.main_window import USAGE_POLL_MS, USAGE_URGENT_POLL_MS
+    from app.process_worker import AgentKind, build_spec
+    hot = cu.Usage(limits=(limit("five_hour", 95.0, now + 600),),
+                   fetched_at=now, plan="pro")
+    win._on_usage_ready(hot)
+    check("plan-usage: nearly spent but nobody working stays on the slow poll",
+          win._usage_timer.interval() == USAGE_POLL_MS)
+
+    ws_hot = win.manager.create_workspace("usage-hot", str(tmp))
+    agent_hot = win.manager.add_terminal(
+        ws_hot.id, build_spec(AgentKind.CMD, "Hot", cwd=str(tmp)),
+        autostart=False)
+    agent_hot._busy = True            # what _mark_busy sets on an output burst
+    check("plan-usage: nearly spent + an agent working polls faster",
+          (win._on_usage_ready(hot),
+           win._usage_timer.interval() == USAGE_URGENT_POLL_MS)[-1])
+    check("plan-usage: the tick follows the work without a fetch",
+          (setattr(agent_hot, "_busy", False), win._tick_usage(),
+           win._usage_timer.interval() == USAGE_POLL_MS)[-1])
+    agent_hot._busy = True
+    win._tick_usage()
+    check("plan-usage: below the urgent mark the work doesn't matter",
+          (win._on_usage_ready(good),
+           win._usage_timer.interval() == USAGE_POLL_MS)[-1])
+    # a spent window is the reset poll's job, not a reason to hammer the endpoint
+    win._on_usage_ready(cu.Usage(limits=(limit("five_hour", 100.0, now + 120),),
+                                 fetched_at=now, plan="pro"))
+    check("plan-usage: an already-spent window drops back to the slow poll",
+          win._usage_timer.interval() == USAGE_POLL_MS)
+    # and being rate-limited must still win over the urgent rate
+    win._on_usage_ready(hot)
+    win._on_usage_ready(cu.Usage(error="http 429"))
+    check("plan-usage: a 429 backs off even in the danger zone",
+          win._usage_timer.interval() > USAGE_URGENT_POLL_MS
+          and win._usage_backoff == 1)
+    win._on_usage_ready(hot)
+    check("plan-usage: a good reading clears the backoff back to urgent",
+          win._usage_timer.interval() == USAGE_URGENT_POLL_MS)
+    agent_hot._busy = False
+    win.manager.remove_workspace(ws_hot.id)
+    win._on_usage_ready(good)
+    win._save_timer.stop()
+
     # a failed poll keeps the last good number on screen, greyed
     win._on_usage_ready(cu.Usage(error="urlerror"))
     check("plan-usage: a failed poll keeps the last number, marked stale",
@@ -6031,9 +6194,20 @@ def test_auto_continue_on_limit_reset():
     settle(a, "\xe2\x94\x82 > \xe2\x94\x82\n  ? for shortcuts\n")
     check("auto-continue: the latch SURVIVES the banner scrolling out of the "
           "rolling screen tail", a.is_limit_blocked())
+    # the card header's hourglass and the sidebar's blocked-count badge are
+    # both signal-driven, not polled -- clearing the latch must emit the
+    # FALLING edge or the marker sits there forever after a real resume
+    edge_events = []
+    a.limit_blocked_changed.connect(edge_events.append)
     a.clear_limit_block()
     check("auto-continue: clearing the latch forgets the reset time too",
           not a.is_limit_blocked() and a.limit_resets_at() is None)
+    check("auto-continue: clearing the latch emits limit_blocked_changed(False)",
+          edge_events == [False], edge_events)
+    edge_events.clear()
+    a.clear_limit_block()   # start()/restart() call this unconditionally
+    check("auto-continue: clearing an already-clear latch stays silent "
+          "(never blocked -> nothing changed)", edge_events == [], edge_events)
 
     # a --resume replay redraws the OLD conversation, banner and all; that is
     # history, not a live cut-off, and latching it would schedule a phantom
@@ -6672,6 +6846,7 @@ def main():
     test_sidebar_count_badge()
     test_agent_waiting()
     test_notification_chime()
+    test_limit_blocked_workspace_stats()
     test_chime_persistence()
     test_hook_prompt_events()
     test_agent_hook_waiting()
@@ -6687,6 +6862,7 @@ def main():
     test_ai_title_summary()
     test_token_usage_badge()
     test_live_model_effort()
+    test_limit_blocked_live_ui()
     test_no_em_dashes_in_visible_text()
     test_reveal_agent()
     test_agent_busy_activity()

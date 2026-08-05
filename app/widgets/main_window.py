@@ -63,6 +63,16 @@ MODEL_SYNC_MS = 1500
 # how often to re-read the Claude account's plan usage from the API. One small
 # HTTPS GET; a minute is well inside the resolution of a 5-hour window.
 USAGE_POLL_MS = 60000
+# ...except in the danger zone, where a minute is NOT fine: from this
+# utilization on, agents that are actively streaming can spend the rest of the
+# window in well under a poll interval, and everything that reacts to being cut
+# off (planLimitReached, the reset poll it arms, the ledger) only starts once a
+# reading reports it. So poll faster - but ONLY while both halves hold (nearly
+# spent AND at least one agent working), which keeps the fast rate to short
+# bursts at the end of a window instead of a permanently tripled request rate.
+# 20s is three requests a minute at the very worst; the ordinary rate is one.
+USAGE_URGENT_POLL_MS = 20000
+USAGE_URGENT_PCT = 90.0
 # how often the readout re-renders its countdown from the clock alone (no
 # network). Repaints only when the displayed string changes.
 USAGE_TICK_MS = 20000
@@ -1078,13 +1088,52 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True,
                          name="aihive-usage").start()
 
+    def _usage_poll_interval(self) -> int:
+        """The poll gap the current situation asks for, BEFORE any 429 backoff.
+
+        A minute is the right ordinary rate: a 5-hour window moves slowly and
+        the readout is a number on a bar. It is the wrong rate for the end of a
+        window with work under way - several agents streaming can burn the last
+        few percent in far less than a minute, and nothing in the app learns it
+        is cut off until a READING says so (the plan-limit edge, the reset poll
+        it arms, the ledger entry all hang off `_apply_usage`). A minute of
+        blindness there is a minute of agents parked on a banner nobody noticed.
+
+        Both halves are required, which is what keeps this cheap. Under
+        URGENT_PCT there is nothing imminent to catch; with every agent idle
+        the number is not moving at all, so a faster poll would only ask the
+        same question more often. And once a window is actually SPENT the fast
+        rate stops again: `_arm_reset_poll` already schedules a poll for the
+        moment it reopens, so hammering the endpoint through the outage adds
+        nothing. Worst case is therefore three requests a minute, only in the
+        last stretch of a window, only while agents are working.
+        """
+        limit = claude_usage.headline(self._usage)
+        if limit is None or not (USAGE_URGENT_PCT <= limit.percent
+                                 < claude_usage.EXHAUSTED_PCT):
+            return USAGE_POLL_MS
+        if not any(a.is_busy() for a in self.manager.all_agents()):
+            return USAGE_POLL_MS
+        return USAGE_URGENT_POLL_MS
+
+    def _retune_usage_poll(self) -> None:
+        """Apply `_usage_poll_interval` (times any backoff) to the timer.
+
+        Only when it CHANGES: `QTimer.setInterval` restarts a running timer, so
+        calling this unconditionally from the tick would keep resetting the
+        countdown and the poll would never come round at all.
+        """
+        want = self._usage_poll_interval() * (2 ** self._usage_backoff)
+        if want != self._usage_timer.interval():
+            self._usage_timer.setInterval(want)
+
     def _on_usage_refresh(self) -> None:
         """The user clicked the readout. Clear any 429 backoff first: they are
         asking now, and leaving the timer parked at sixteen minutes would make
         a successful manual refresh look like it fixed nothing when the next
         automatic poll failed to arrive."""
         self._usage_backoff = 0
-        self._usage_timer.setInterval(USAGE_POLL_MS)
+        self._retune_usage_poll()
         if self._usage_timer.isActive():
             self._usage_timer.start()      # restart the interval from now
         self._poll_usage()
@@ -1095,8 +1144,9 @@ class MainWindow(QMainWindow):
             return
         if reading is not None and reading.ok:
             self._usage_backoff = 0
-            self._usage_timer.setInterval(USAGE_POLL_MS)
             self._apply_usage(reading)
+            # after adopting it, so the new percentage decides the next gap
+            self._retune_usage_poll()
             return
         # A failed poll keeps the last good number on screen, greyed, rather
         # than blanking a figure the user is watching. Only a machine with no
@@ -1116,7 +1166,10 @@ class MainWindow(QMainWindow):
         # The auto-continue watchdog is deliberately independent of all this.
         if reading is not None and reading.error == "http 429":
             self._usage_backoff = min(self._usage_backoff + 1, 4)
-            self._usage_timer.setInterval(USAGE_POLL_MS * (2 ** self._usage_backoff))
+            # the backoff multiplies whatever the situation asks for, so it
+            # still wins over the urgent rate: being rate-limited is precisely
+            # when polling harder is counterproductive
+            self._retune_usage_poll()
         if self._usage is None:
             # Nothing to grey out: there has never been a reading this run, and
             # since CLI 2.1.220 stopped writing `cachedUsageUtilization` there
@@ -1163,8 +1216,17 @@ class MainWindow(QMainWindow):
             self._usage_reset_timer.stop()
 
     def _tick_usage(self) -> None:
-        """Re-render the countdown from the clock alone — no network."""
+        """Re-render the countdown from the clock alone — no network.
+
+        Also the place the poll gap follows the WORK: whether agents are busy
+        changes constantly, and `activity_changed` fires every couple of
+        seconds per agent, so this cheap 20s sweep is where that half of
+        `_usage_poll_interval` is re-evaluated rather than off a signal that
+        would retune (and so restart the poll timer) far more often than the
+        number can move.
+        """
         self.top_bar.usage_badge.tick()
+        self._retune_usage_poll()
 
     def _on_usage_visibility(self, on: bool) -> None:
         """User toggled the readout from the top bar's context menu."""

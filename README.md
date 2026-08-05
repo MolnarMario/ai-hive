@@ -84,7 +84,12 @@ workspaces keep executing — switching never pauses anything.
   refresh**; hover for every limit window, your plan, and how old the reading
   is. The number comes from the same place the CLI's `/usage` gets it, read
   once a minute in the background — nothing is logged or persisted, it's a live
-  readout only. When a limit is actually spent it reads **`limit reached,
+  readout only. Past 90% *with agents actually working* it refreshes every 20
+  seconds instead: that's the stretch where several busy agents can spend the
+  rest of the window between two ordinary polls, and the recovery features only
+  learn you're cut off from a reading. Idle agents, a window under 90%, or one
+  already spent all go back to the slow rate, so the endpoint is never polled
+  hard for long. When a limit is actually spent it reads **`limit reached,
   resets in …`**, and the window raises `planLimitReached` / `planLimitCleared`
   signals (with the reset time) so other features can act on being cut off —
   e.g. relaunching blocked agents unattended the moment the limit resets.
@@ -120,7 +125,12 @@ workspaces keep executing — switching never pauses anything.
   when the account readout is rate-limited. Every step is logged to
   `session.log` (`BLOCKED` / `NUDGE` / `RESUMED` / `STILL-BLOCKED`), each resumed
   card shows a `— plan limit reset; auto-continued —` line, and the workspace
-  board gets a note.
+  board gets a note. A stopped agent is also visible at a glance, everywhere,
+  live: an **⏳ hourglass** sits in the card header and next to the agent in
+  the sidebar's expanded workspace dropdown, and the workspace row itself
+  carries an **⏳N** badge counting how many of its agents are currently
+  stuck — all three clear the instant that agent resumes, whether that was
+  auto-continue or you restarting it yourself.
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
@@ -490,7 +500,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-926 checks drive the real app headlessly (offscreen Qt platform) with real
+951 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -564,7 +574,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (926 checks)
+tests/smoke_test.py        headless end-to-end suite (951 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
