@@ -45,17 +45,22 @@ from app.workspace_manager import WorkspaceManager
 
 
 def _app_icon():
-    """Window/taskbar icon: the bundled multi-resolution .ico (see
-    generate_app_icon.py) so the SAME glyph appears in the title bar, the
-    taskbar while running, and — once the shortcut's IconLocation points at
-    it too — the pinned taskbar slot. Falls back to a single runtime-painted
-    pixmap if the asset hasn't been generated yet."""
+    """Window/taskbar icon: the bundled multi-resolution .ico (baked from
+    app/assets/icons/app_logo.png by generate_app_icon.py) so the SAME
+    artwork appears in the title bar, the taskbar while running, and — once
+    the shortcut's IconLocation points at it too — the pinned taskbar slot.
+    Falls back to the raw source PNG, then a runtime-painted placeholder, if
+    the .ico asset hasn't been (re)generated yet."""
     from PySide6.QtGui import QIcon
 
-    ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "app", "assets", "icons", "app_icon.ico")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    ico_path = os.path.join(base_dir, "app", "assets", "icons", "app_icon.ico")
     if os.path.isfile(ico_path):
         return QIcon(ico_path)
+
+    logo_path = os.path.join(base_dir, "app", "assets", "icons", "app_logo.png")
+    if os.path.isfile(logo_path):
+        return QIcon(logo_path)
 
     from PySide6.QtCore import QRectF
     from PySide6.QtGui import QColor, QFont, QPainter, QPixmap

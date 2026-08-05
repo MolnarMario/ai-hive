@@ -4089,6 +4089,41 @@ def test_themes():
             w.deleteLater()
     check("themes: ornament widgets paint under every skin", True)
 
+    # SHAPED-ICON GUARANTEE. The artwork is exported flat on a near-black
+    # ground; shipping that unkeyed put a hard black square in the title bar,
+    # the taskbar, Alt+Tab and the Start tile (all of which can be light), and
+    # the same bitmap backs LogoRoundel, where it read as a cold black tile on
+    # the warm panel. generate_app_icon.py keys the ground out and trims to the
+    # mark, so both assets must arrive with see-through corners; a future flat
+    # re-export that skipped that step would fail here rather than quietly
+    # reinstating the square.
+    from PySide6.QtGui import QImage
+    icons = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "app", "assets", "icons")
+    shaped, opaque_corner = [], []
+    for asset in ("app_logo.png", "app_icon.ico"):
+        img = QImage(os.path.join(icons, asset))
+        if img.isNull():
+            opaque_corner.append(f"{asset}: missing")
+            continue
+        w, h = img.width(), img.height()
+        alphas = [img.pixelColor(x, y).alpha() for x, y in
+                  ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1))]
+        (shaped if not any(alphas) else opaque_corner).append(
+            f"{asset}: {alphas}")
+        # and the mark itself has to still be there — a key that ate the
+        # artwork would also leave the corners clear. A RATIO, because the
+        # .ico hands QImage whichever single frame it likes (a 16px one here),
+        # so an absolute sample count would only measure that choice.
+        step_x, step_y = max(1, w // 40), max(1, h // 40)
+        pts = [(x, y) for y in range(0, h, step_y) for x in range(0, w, step_x)]
+        ink = sum(1 for x, y in pts if img.pixelColor(x, y).alpha() > 200)
+        if ink < len(pts) * 0.25:
+            opaque_corner.append(
+                f"{asset}: only {ink}/{len(pts)} samples are opaque")
+    check("themes: shipped icon assets are shaped, not opaque squares",
+          len(shaped) == 2 and not opaque_corner, opaque_corner)
+
     # CONTRAST GUARANTEE (chrome): every skin's text tokens must clearly read
     # on their own backgrounds — the fix behind the white-on-vellum report.
     from PySide6.QtGui import QColor
