@@ -388,6 +388,17 @@ WorkspaceRow[search_hit="true"] {{
     max-width: 18px; min-height: 18px; max-height: 18px;
 }}
 #WsQ:hover {{ background: rgba(217,178,74,0.34); }}
+/* hourglass + count: agent(s) stopped by the plan usage limit, not yet
+   resumed. Gold like #WsAgentLimit/#CardLimitMark (the agent is fine, only
+   waiting for the window), never the error red. Wider than #WsQ's fixed pill
+   since the label carries a count, not a single glyph. */
+#WsLimit {{
+    background: rgba(217,178,74,0.18); color: {p.ACCENT_GOLD};
+    border: 1px solid {p.ACCENT_GOLD}; border-radius: 9px;
+    font-weight: 800; font-size: 11px; padding: 0 5px; min-width: 18px;
+    min-height: 18px; max-height: 18px;
+}}
+#WsLimit:hover {{ background: rgba(217,178,74,0.34); }}
 
 /* sidebar search: the magnifier toggle + the overlay input it reveals */
 #SearchBtn {{

@@ -133,8 +133,12 @@ class WorkspaceManager(QObject):
         # "waiting" = settled on a prompt/question awaiting the user (a subset,
         # drives the row's "?" indicator); transient like busy, never persisted
         waiting = sum(1 for a in agents if a.is_waiting())
+        # "limit_blocked" = cut off by the plan usage limit and not yet resumed
+        # (auto-continue or manual); drives the row's hourglass count, mirroring
+        # the "?" indicator above
+        limit_blocked = sum(1 for a in agents if a.is_limit_blocked())
         return {"total": len(agents), "active": active, "error": error,
-                "busy": busy, "waiting": waiting,
+                "busy": busy, "waiting": waiting, "limit_blocked": limit_blocked,
                 "idle": len(agents) - active - error}
 
     def next_agent_name(self, ws_id: str) -> str:
@@ -471,7 +475,20 @@ class WorkspaceManager(QObject):
         # so it must leave a forensic trace: twice now the feature failed
         # silently and the cause had to be reconstructed from transcripts.
         agent.limit_blocked_changed.connect(
-            lambda _b, wid=wid, aid=agent.id: self.agentLimitBlocked.emit(wid, aid))
+            lambda blocked, wid=wid, aid=agent.id:
+            self._on_agent_limit_blocked_changed(wid, aid, blocked))
+
+    def _on_agent_limit_blocked_changed(self, ws_id: str, agent_id: str,
+                                        blocked: bool) -> None:
+        """Refresh the derived hourglass count on EVERY edge (like
+        `_on_agent_waiting`'s `_recompute`) so the sidebar badge disappears the
+        instant an agent resumes, not just when it first gets cut off. The
+        RISING edge alone is forwarded to `agentLimitBlocked` — that signal
+        feeds the ledger/audit trail, which records the cut-off itself, not
+        its resolution."""
+        self._recompute(ws_id)
+        if blocked:
+            self.agentLimitBlocked.emit(ws_id, agent_id)
 
     def _on_agent_waiting(self, ws_id: str, agent_id: str,
                           waiting: bool) -> None:

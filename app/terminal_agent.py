@@ -895,7 +895,15 @@ class TerminalAgent(QObject):
         stopping the banner still on screen from instantly re-latching the
         agent we just resumed. It is reset by `start`/`restart` alone, where
         the screen genuinely starts over.
+
+        Emits the FALLING edge (guarded, so start()/restart() calling this
+        on an agent that was never blocked stays silent) — the card header's
+        hourglass and the sidebar's blocked-count badge are both signal-driven,
+        not polled, and without this emit they never noticed a resume; the
+        marker used to sit there forever after auto-continue or a manual
+        restart had already put the agent back to work.
         """
+        was_blocked = self._limit_blocked
         self._limit_blocked = False
         self._limit_resets_at = None
         self._limit_tries = 0
@@ -905,6 +913,8 @@ class TerminalAgent(QObject):
         self._limit_cut_off_at = 0.0
         self._limit_window = ""
         self._limit_banner = ""
+        if was_blocked:
+            self.limit_blocked_changed.emit(False)
 
     def note_limit_attempt(self) -> None:
         """Record that we just tried to resume this agent."""
