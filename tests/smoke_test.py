@@ -5607,6 +5607,84 @@ def test_plan_usage():
     win4.close()
 
 
+def test_limit_ledger():
+    """The durable record of cut-offs: who was stopped, when, and how it ended.
+
+    Everything else about a cut-off is transient by design, so this file is the
+    only thing that can answer "what happened last night" after a restart — and
+    it is what decides, on the next launch, whether a cut-off still needs
+    acting on."""
+    import time as _time
+    from app import limit_ledger as L
+
+    tmp = str(Path(tempfile.mkdtemp(prefix="ai-hive-ledger-")))
+    now = _time.time()
+
+    check("ledger: an absent file reads as no records, never raises",
+          L.read_all(tmp) == [] and L.open_cut_offs(tmp) == [])
+
+    rec = L.record_cut_off(tmp, cwd="C:/proj", session_id="sid-a", at=now,
+                           reset_at=now + 3600, ws_id="w1", ws_name="Hive",
+                           agent_name="Agent 5", task="fix the parser",
+                           window="session", banner="You've hit...",
+                           source="live")
+    stored = L.read_all(tmp)[0]
+    check("ledger: a cut-off round-trips with workspace, agent, task and window",
+          stored["ws_name"] == "Hive" and stored["agent_name"] == "Agent 5"
+          and stored["task"] == "fix the parser"
+          and stored["window"] == "session")
+    check("ledger: it carries a readable LOCAL date and time, not just an epoch",
+          stored["at_local"][:2] == "20" and ":" in stored["at_local"]
+          and stored["reset_local"])
+
+    # THE identity problem: TerminalAgent.id is a fresh uuid on every load, so
+    # a cut-off has to be named by things that survive the restart this file
+    # exists for -- the folder, the pinned conversation, and which window
+    # stopped it.
+    same = L.key_of("C:/proj", "sid-a", now + 3600, now + 5)
+    check("ledger: the key is stable across runs (agent ids are not)",
+          same == rec["key"])
+    later = L.key_of("C:/proj", "sid-a", now + 3600 + 5 * 3600, now + 5 * 3600)
+    check("ledger: a LATER cut-off of the same conversation is a new record",
+          later != rec["key"])
+    clockless = L.key_of("C:/proj", "sid-a", 0.0, now)
+    check("ledger: a banner with no clock still yields a usable key",
+          clockless[2] and clockless != rec["key"])
+
+    check("ledger: a fresh cut-off is open", len(L.open_cut_offs(tmp)) == 1)
+    L.record_cut_off(tmp, cwd="C:/proj", session_id="sid-a", at=now + 3,
+                     reset_at=now + 3600, source="transcript")
+    check("ledger: the same cut-off filed twice (seen live, then read off "
+          "disk) is ONE open record", len(L.open_cut_offs(tmp)) == 1)
+    L.record_outcome(tmp, rec["key"], L.RESUMED, tries=1)
+    check("ledger: an outcome closes it for good",
+          L.open_cut_offs(tmp) == []
+          and tuple(rec["key"]) in L.closed_keys(L.read_all(tmp)))
+
+    # written at the moment the app may be killed, so a half-line is expected
+    with open(L.path_for(tmp), "a", encoding="utf-8") as fh:
+        fh.write('{"event":"cut_off","at":  \n')
+    check("ledger: a torn last line is skipped, not fatal",
+          len(L.read_all(tmp)) == 3)
+
+    # --- grouping: which cut-offs belong to the MOST RECENT window ----------
+    def cut(at, reset):
+        return {"event": L.CUT_OFF, "at": at, "reset_at": reset}
+
+    old, new1, new2 = cut(now - 6 * 3600, now - 3600), \
+        cut(now - 600, now + 1800), cut(now - 900, now + 1800 + 20)
+    group = L.latest_window([old, new1, new2])
+    check("ledger: agents stopped by one window group by their shared reset",
+          group == [new1, new2] or group == [new2, new1])
+    check("ledger: an earlier window is not in the group", old not in group)
+    check("ledger: no cut-offs means no group", L.latest_window([]) == [])
+    # a clockless cut-off can still be the newest one, so the anchor is WHEN it
+    # happened -- never the reset it failed to state
+    bare_new, bare_old = cut(now, 0.0), cut(now - 20 * 3600, 0.0)
+    check("ledger: clockless cut-offs group by how far apart they were",
+          L.latest_window([bare_old, bare_new]) == [bare_new])
+
+
 def test_auto_continue_on_limit_reset():
     """When the plan limit resets, the agents it CUT OFF go back to work by
     themselves: Esc to close the limit's options menu, then "Continue".
@@ -5620,9 +5698,11 @@ def test_auto_continue_on_limit_reset():
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
     from app import claude_usage as cu
+    from app import limit_ledger
     from app.process_worker import AgentKind, build_spec
     from app.session_store import SessionStore
     from app.terminal_agent import TerminalAgent
+    from app.widgets.main_window import AUTO_CONTINUE_TEXT
     from main import create_main_window
 
     app = QApplication.instance() or QApplication([])
@@ -5636,6 +5716,11 @@ def test_auto_continue_on_limit_reset():
 
     BANNER = ("You've hit your session limit \xb7 resets 4:40am "
               "(Europe/Bucharest)\n")
+    # the NEXT window's cut-off. Its clock differs because successive 5-hour
+    # windows never end at the same wall time -- which is what makes the banner
+    # line the identity of a particular cut-off (see _scrape_limit).
+    NEXT_BANNER = ("You've hit your session limit \xb7 resets 9:40am "
+                   "(Europe/Bucharest)\n")
     # what Claude actually parks the agent on. Unlike the banner (ordinary
     # scrollback, which the rolling tail evicts) this MENU stays up for as long
     # as the agent is stuck, so it is the primary live signal and the "did it
@@ -5854,7 +5939,7 @@ def test_auto_continue_on_limit_reset():
     writes.clear()
     win._on_auto_continue(True)
     cut_off.clear_limit_block()    # a FRESH cut-off in the next window
-    settle(cut_off, BANNER)
+    settle(cut_off, NEXT_BANNER)   # ...which states the next window's clock
     win._plan_blocked = True
     win._on_usage_ready(cu.Usage(
         limits=(cu.Limit(key="five_hour", label=cu._LABELS["five_hour"],
@@ -5897,11 +5982,46 @@ def test_auto_continue_on_limit_reset():
     pump(AUTO_CONTINUE_SETTLE_MS)
     check("auto-continue: an agent whose reset is still in the future waits",
           sent(late) == "" and late.is_limit_blocked())
-    late._limit_resets_at = now - 60            # its stated reset has passed
+    # a reset read OFF THE SCREEN gets slack before it is acted on: the banner
+    # names a minute, not an instant, and a nudge into a window that is still
+    # shut spends one of very few retries
+    from app.widgets.main_window import LIMIT_RESET_GRACE_S
+    late._limit_resets_at = now - 30             # just past, inside the grace
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: a reset that has only just passed waits out the grace",
+          sent(late) == "" and late.is_limit_blocked())
+    late._limit_resets_at = now - LIMIT_RESET_GRACE_S - 60   # grace elapsed
     win._check_limit_resets()
     pump(AUTO_CONTINUE_SETTLE_MS)
     check("auto-continue: the watchdog resumes it with NO usage reading at all",
-          "Continue" in sent(late))
+          AUTO_CONTINUE_TEXT in sent(late))
+
+    # a WEEKLY window is not readable off the screen: its banner prints a bare
+    # wall clock for a reset that can be days out, so acting on that clock
+    # would nudge days early. It waits for the account reading instead.
+    writes.clear()
+    weekly = mk("Weekly")
+    settle(weekly, "You've hit your weekly limit \xb7 resets 4:40am\n")
+    ws.agents.append(weekly)
+    check("auto-continue: the weekly window is identified from its banner",
+          weekly.limit_window() == "weekly")
+    weekly._limit_resets_at = now - 2 * LIMIT_RESET_GRACE_S   # clock says go
+    saved_usage, win._usage = win._usage, None                # ...API silent
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: a weekly cut-off is NOT resumed on its bare clock",
+          sent(weekly) == "" and weekly.is_limit_blocked())
+    win._usage = cu.Usage(                                   # account is clear
+        limits=(cu.Limit(key="seven_day", label=cu._LABELS["seven_day"],
+                         short=cu._SHORT["seven_day"], percent=8.0,
+                         resets_at=now + 90000),),
+        fetched_at=now, plan="max")
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: ...but IS once the account reading says it cleared",
+          AUTO_CONTINUE_TEXT in sent(weekly))
+    win._usage = saved_usage
 
     # a banner with no parseable time has no due date -- it must NOT count as
     # "due now", which would fire a pointless Continue into a still-blocked
@@ -5940,6 +6060,134 @@ def test_auto_continue_on_limit_reset():
         + ["│ > │", "  ? for shortcuts"]))
     check("auto-continue: the banner is found above a full frame of menu/input",
           deep.is_limit_blocked())
+
+    # --- the banner still on screen must not re-latch a RESUMED agent -------
+    # Observed live on 2026-08-04: an agent was re-BLOCKED 13 s after RESUMED,
+    # and another five hours after its resume, both with a reset time exactly
+    # 24 h ahead -- the signature of parse_reset_clock re-reading a banner whose
+    # clock had already passed. The banner is ordinary output that stays in view
+    # (and is redrawn with every frame), so clearing the latch let the next
+    # burst latch the very same line again. That muted the agent's "?" chime and
+    # later typed a stray Continue into an agent that was working fine.
+    relatch = mk("Relatch")
+    settle(relatch, PARKED)
+    check("auto-continue: the parked agent latches in the first place",
+          relatch.is_limit_blocked())
+    relatch._screen_tail = BANNER + "\nWorking on it...\n  ? for shortcuts\n"
+    check("auto-continue: menu gone -> the resume is verified",
+          relatch.recheck_limit() is False)
+    relatch._on_pty_output("pty", BANNER + "still working\n")
+    check("auto-continue: the SAME banner lingering after a resume does NOT "
+          "re-latch the agent", not relatch.is_limit_blocked())
+    relatch._on_pty_output("pty", NEXT_BANNER)
+    check("auto-continue: the NEXT window's banner (a different clock) does "
+          "latch", relatch.is_limit_blocked())
+
+    # the guard is the missing MENU, not the text alone: a genuine cut-off
+    # renders its menu directly below the banner, so an identical line WITH the
+    # menu is a real new cut-off (the same wall clock can come round again on a
+    # weekly window) and must still latch.
+    same = mk("SameClock")
+    settle(same, PARKED)
+    same.clear_limit_block()
+    same._on_pty_output("pty", PARKED)
+    check("auto-continue: an identical banner accompanied by the parked-on "
+          "menu IS a new cut-off", same.is_limit_blocked())
+    # ...and a restart starts the screen over, so nothing is an echo any more
+    restarted = mk("Restarted")
+    settle(restarted, BANNER)
+    restarted.clear_limit_block()
+    restarted._limit_last_banner = ""    # what start()/restart() do
+    restarted._on_pty_output("pty", BANNER)
+    check("auto-continue: a (re)start forgets the echo guard",
+          restarted.is_limit_blocked())
+
+    # --- the two triggers must not double-nudge -----------------------------
+    # The attempt counter only advances when the nudge actually goes out, up to
+    # a full stagger later, so a second trigger inside that window re-scheduled
+    # everyone downstream of the first agent: on 2026-08-04 the API's cleared
+    # edge and the minute watchdog both fired at 05:30 and typed Continue TWICE
+    # into three of four agents.
+    from app.widgets.main_window import AUTO_CONTINUE_STAGGER_MS
+    writes.clear()
+    dup = mk("Dup")
+    settle(dup, BANNER)
+    ws.agents.append(dup)
+    win._on_auto_continue(True)
+    win._resume_blocked_agents()          # the planLimitCleared edge...
+    win._resume_blocked_agents()          # ...racing the minute watchdog
+    # long enough that a duplicate would land even a full stagger behind
+    pump(AUTO_CONTINUE_SETTLE_MS + AUTO_CONTINUE_STAGGER_MS)
+    check("auto-continue: two overlapping triggers nudge each agent ONCE",
+          sent(dup).count("Continue") == 1 and dup.limit_attempts() == 1)
+    check("auto-continue: the claim is released once the nudge has gone out",
+          dup.id not in win._resume_pending)
+
+    # --- a latch the TRANSCRIPT refutes is dropped, not nudged --------------
+    # The screen said this agent was cut off; the conversation on disk says it
+    # carried on. A banner stays in view (and is redrawn) long after the agent
+    # moved on, so the screen alone can be describing history -- and a stray
+    # "Continue" into an agent that is working is both an interruption and real
+    # quota spent.
+    import json as _json
+    from app import transcripts as _tr
+
+    def write_convo(cwd_, sid, records):
+        """A real Claude transcript for `cwd_`/`sid` (records = [(text, at)])."""
+        path = _tr.transcript_path(cwd_, sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for text, at in records:
+                fh.write(_json.dumps({
+                    "type": "assistant",
+                    "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
+                                                _time.gmtime(at)),
+                    "message": {"content": [{"type": "text",
+                                             "text": text}]}}) + "\n")
+
+    writes.clear()
+    ph_cwd = str(tmp / "phantom")
+    phantom = mk("Phantom")
+    phantom.spec.cwd, phantom.spec.session_id = ph_cwd, "sid-moved-on"
+    write_convo(ph_cwd, "sid-moved-on",
+                [(BANNER.strip(), now - 7200), ("carried on", now - 3600)])
+    settle(phantom, BANNER)
+    ws.agents.append(phantom)
+    win._resume_blocked_agents()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: a latch the transcript refutes is dropped, never "
+          "nudged", sent(phantom) == "" and not phantom.is_limit_blocked())
+    check("auto-continue: the dismissal is recorded as an outcome",
+          any(r.get("event") == limit_ledger.DISMISSED
+              for r in limit_ledger.read_all(str(tmp))))
+
+    # ...but a transcript that cannot be READ is no evidence either way. A
+    # drifted pin, or a conversation Claude has not flushed, must never strand
+    # a genuinely parked agent.
+    writes.clear()
+    unknown = mk("Unknown")
+    unknown.spec.cwd, unknown.spec.session_id = ph_cwd, "sid-no-such-file"
+    settle(unknown, BANNER)
+    ws.agents.append(unknown)
+    win._resume_blocked_agents()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: an unreadable transcript does not veto the latch",
+          AUTO_CONTINUE_TEXT in sent(unknown))
+
+    # --- the cut-off is visible on the card ---------------------------------
+    marked = mk("Marked")
+    settle(marked, BANNER)
+    check("auto-continue: an interrupted agent describes its cut-off",
+          "usage limit" in marked.limit_summary()
+          and "resets" in marked.limit_summary())
+    check("auto-continue: ...and says a resume is pending",
+          "waiting to auto-continue" in marked.limit_summary())
+    marked.note_limit_attempt()
+    check("auto-continue: ...then how many resumes have been tried",
+          "tried 1x" in marked.limit_summary())
+    marked.clear_limit_block()
+    check("auto-continue: an agent that is not cut off describes nothing",
+          marked.limit_summary() == "")
 
     win._on_auto_continue(False)   # what the reopen below must find
     win.close()
@@ -5988,11 +6236,10 @@ def test_startup_limit_recovery():
     import time as _time
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
-    from app import limit_banner, transcripts
+    from app import limit_banner, limit_ledger, transcripts
     from app.process_worker import AgentKind, build_spec
     from app.session_store import SessionStore
     from app.terminal_agent import TerminalAgent
-    from app.widgets.main_window import STARTUP_RECOVERY_MAX_AGE_S
     from main import create_main_window
 
     app = QApplication.instance() or QApplication([])
@@ -6016,12 +6263,28 @@ def test_startup_limit_recovery():
         return {"type": "assistant", "timestamp": iso(at),
                 "message": {"content": [{"type": "text", "text": text}]}}
 
+    def limit_banner_key(cwd_, sid, at):
+        """The ledger identity of a cut-off written at `at` -- keyed on the
+        window's RESET, the one number the live screen and the transcript both
+        resolve identically."""
+        reset = limit_banner.banner_reset_at(BANNER, at) or 0.0
+        return limit_ledger.key_of(cwd_, sid, reset, at)
+
     now = _time.time()
     cwd = str(tmp)
     BANNER = "You've hit your session limit \xb7 resets 3am (Europe/Bucharest)"
 
     # --- reading the durable record -----------------------------------------
-    cut_at = _time.mktime((2026, 8, 3, 2, 42, 0, 0, 0, -1))
+    # The MOST RECENT 02:42 local: the wall time matters (it is what makes
+    # "resets 3am" land 18 minutes later, the anchoring this test is about) but
+    # the DATE must not. Pinned to a fixed calendar day this test passed for a
+    # while and then began failing on its own, once that day fell outside
+    # STARTUP_RECOVERY_MAX_AGE_S and recovery correctly skipped it as stale.
+    _lt = _time.localtime(now)
+    cut_at = _time.mktime((_lt.tm_year, _lt.tm_mon, _lt.tm_mday,
+                           2, 42, 0, 0, 0, -1))
+    if cut_at > now:
+        cut_at -= 86400
     write_transcript(cwd, "sid-cut", [assistant("working", cut_at - 600),
                                       assistant(BANNER, cut_at)])
     hit, when, resets = transcripts.ended_on_limit(cwd, "sid-cut")
@@ -6075,25 +6338,64 @@ def test_startup_limit_recovery():
     check("startup-recovery: an agent without the stoppage message is untouched",
           not went_on.is_limit_blocked())
 
-    # a card left stopped stays stopped -- this resumes work, it does not
-    # launch processes (each one would spend quota)
+    # A card left stopped is STARTED here, unlike an ordinary restore: it was
+    # the limit that stopped this agent, not the user, so leaving it alone
+    # would drop exactly the work this feature exists to rescue. It must come
+    # back as a RESUME -- a fresh start would mint a new session id and abandon
+    # the transcript that proved the cut-off.
     stopped = agent_for("Stopped", "sid-cut")
+    started = []
     stopped.worker = type("W", (), {"is_running": lambda s: False,
                                     "write": lambda s, d: True,
-                                    "start": lambda s: None,
+                                    "start": lambda s: started.append(1),
                                     "dispose": lambda s: None})()
     win.recover_blocked_at_startup()
-    check("startup-recovery: a stopped agent is left stopped",
-          not stopped.is_limit_blocked())
+    check("startup-recovery: an agent the LIMIT stopped is started, not left "
+          "stopped", stopped.is_limit_blocked() and started == [1])
+    check("startup-recovery: it is started as a resume, keeping its pinned "
+          "conversation", stopped.spec.session_id == "sid-cut")
 
-    # staleness bound: don't revive work abandoned days ago just because the
-    # app was opened
-    old_at = now - STARTUP_RECOVERY_MAX_AGE_S - 3600
-    write_transcript(cwd, "sid-old", [assistant(BANNER, old_at)])
-    old = agent_for("Old", "sid-old")
+    # --- only the most recent window is acted on ----------------------------
+    # This replaced a fixed age bound, which asked the wrong question (how OLD
+    # is this) instead of the one that decides (was it the LAST thing that
+    # happened) -- and had begun silently skipping real cut-offs once its
+    # 36-hour window elapsed. Agents stopped by one window all state the same
+    # reset clock, so they group; an earlier window is recorded, not revived.
+    older_at, newer_at = now - 30 * 3600, now - 2 * 3600
+    write_transcript(cwd, "sid-win-old", [assistant(BANNER, older_at)])
+    write_transcript(cwd, "sid-win-new", [assistant(BANNER, newer_at)])
+    w_old = agent_for("WinOld", "sid-win-old")
+    w_new = agent_for("WinNew", "sid-win-new")
     win.recover_blocked_at_startup()
-    check("startup-recovery: a cut-off older than the age bound is skipped",
-          not old.is_limit_blocked())
+    check("startup-recovery: the most recent window is armed",
+          w_new.is_limit_blocked())
+    check("startup-recovery: an earlier window is left alone",
+          not w_old.is_limit_blocked())
+
+    # ...but it IS recorded: the ledger is complete even where the action is
+    # selective, because the record is what the next feature reads
+    entries = limit_ledger.read_all(str(tmp))
+    filed = {r.get("session_id") for r in entries
+             if r.get("event") == limit_ledger.CUT_OFF}
+    check("startup-recovery: every cut-off found is filed in the ledger, "
+          "including the ones not acted on",
+          {"sid-cut", "sid-win-old", "sid-win-new"} <= filed)
+    newest = next(r for r in entries if r.get("session_id") == "sid-win-new")
+    check("startup-recovery: the record names workspace, agent and local time",
+          newest["ws_name"] and newest["agent_name"] == "WinNew"
+          and newest["at_local"][:4].isdigit()
+          and abs(newest["at"] - newer_at) < 2)
+
+    # a cut-off already resolved in an EARLIER run is never revived: without
+    # this an abandoned conversation whose transcript still ends on the banner
+    # would be resumed afresh on every launch
+    limit_ledger.record_outcome(
+        str(tmp), limit_banner_key(cwd, "sid-win-new", newer_at),
+        limit_ledger.RESUMED, tries=1)
+    again = agent_for("Again", "sid-win-new")
+    win.recover_blocked_at_startup()
+    check("startup-recovery: a cut-off already resolved is not revived",
+          not again.is_limit_blocked())
 
     # --- the toggle owns its own latches ------------------------------------
     win._startup_recovery = False
@@ -6108,7 +6410,7 @@ def test_startup_limit_recovery():
         "is_running": lambda s: True,
         "write": lambda s, d: (writes.append(d), True)[1],
         "start": lambda s: None, "dispose": lambda s: None})()
-    cut._limit_resets_at = now - 60
+    cut._limit_resets_at = now - 3600  # its reset is well past the grace
     win._auto_continue = True          # the other switch is on...
     win._check_limit_resets()          # ...and must not act on a startup latch
     pump(1200)
@@ -6196,6 +6498,7 @@ def main():
     test_sidebar_file_tree()
     test_sidebar_search()
     test_plan_usage()
+    test_limit_ledger()
     test_auto_continue_on_limit_reset()
     test_startup_limit_recovery()
     test_lifecycle_e2e()  # slowest last: launches a real claude once

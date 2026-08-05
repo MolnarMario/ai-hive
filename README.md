@@ -481,7 +481,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-858 checks drive the real app headlessly (offscreen Qt platform) with real
+896 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -537,6 +537,9 @@ app/
   session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
   session_hook.py          SessionStart hook: the child reports its live conversation id
   chime.py                 notification bell (WAV synth + async play, Qt-free) for the "?" alert
+  claude_usage.py          live plan-usage reading (/api/oauth/usage) + limit edges (Qt-free)
+  limit_banner.py          recognising a usage cut-off + when it resets (Qt-free, shared)
+  limit_ledger.py          durable record of cut-offs: who, when, and how it ended (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
@@ -549,7 +552,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (858 checks)
+tests/smoke_test.py        headless end-to-end suite (896 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

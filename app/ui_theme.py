@@ -453,6 +453,9 @@ WorkspaceRow[search_hit="true"] {{
 #WsAgentName {{ font-family: {BODY_FONT}; font-size: 13px; font-weight: 600; }}
 #WsAgentTask {{ color: {p.TEXT_DIM}; font-size: 13px; }}
 #WsAgentQ {{ color: {p.YELLOW}; font-size: 14px; font-weight: 800; }}
+/* cut off by the usage limit — amber like the "?", but deliberately NOT the
+   error red: the agent is fine, it is only waiting for the window to reopen */
+#WsAgentLimit {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
 
 /* inline file explorer rows (a workspace expanded to its VS Code-style file
    tree): a type/folder icon + the name; the revealed row (a file jumped to from
@@ -508,6 +511,7 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 #CardBadge[state="working"] {{ background: rgba(95,174,107,0.20); color: {p.GREEN}; }}
 #CardBadge[state="completed"] {{ background: rgba(201,162,39,0.22); color: {p.ACCENT_GOLD}; }}
 #CardBadge[state="awaiting"] {{ background: rgba(217,178,74,0.18); color: {p.YELLOW}; }}
+#CardLimitMark {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
 #Console {{
     background: {p.BG_CONSOLE};
     border: none;
@@ -567,9 +571,13 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     padding: 2px 6px; color: {p.TEXT}; font-size: 14px;
 }}
 #SoundToggle:hover {{ border-color: {p.ACCENT_GOLD}; }}
+/* caption naming the two auto-recovery switches below, so the LED pair
+   doesn't read as unlabeled decoration */
+#RecoveryLabel {{ color: {p.TEXT_DIM}; font-size: 12px; }}
 /* the two auto-recovery switches beside the plan-usage readout. Armed reads
-   as lit (accent border + full-strength glyph), off reads as faint, so
-   "will my work resume by itself?" is answerable without hovering. */
+   as lit (accent border + full-strength glyph + green LED), off reads as
+   faint with a dark LED, so "will my work resume by itself?" is answerable
+   without hovering. */
 #RecoveryToggle {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 2px 6px; color: {p.TEXT_FAINT}; font-size: 14px;
@@ -577,7 +585,9 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 #RecoveryToggle:checked {{
     color: {p.ACCENT_GOLD}; border-color: {p.ACCENT_GOLD};
 }}
-#RecoveryToggle:hover {{ border-color: {p.ACCENT_BLUE}; }}
+#RecoveryToggle:hover {{
+    background: {p.BG_HOVER}; border-color: {p.ACCENT_BLUE}; color: {p.TEXT};
+}}
 #CardClose:hover, #WsDelete:hover {{ color: {p.RED}; border-color: {p.RED}; }}
 QPushButton {{
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};

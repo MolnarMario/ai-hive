@@ -132,8 +132,13 @@ _CLAUDE_READY_HINTS = (
 #    parked agent then emits nothing more to arm it, so the settle never comes.
 #  * Never re-derive it later from `_screen_tail`: that is a 4000-char ROLLING
 #    buffer, and hours of idle redraws evict the banner entirely.
+#  * The banner is not evidence that the cut-off is HAPPENING NOW, only that
+#    one happened. It stays on screen (and is re-emitted by every frame
+#    repaint) long after a resume, so it must never re-latch an agent that has
+#    already been resumed off it — see `_scrape_limit`.
 from .limit_banner import (LIMIT_HIT_RE, LIMIT_MENU_RE,  # noqa: F401
-                           banner_reset_at, is_limit_screen, parse_reset_clock)
+                           banner_line, banner_reset_at, banner_window,
+                           is_limit_screen, parse_reset_clock)
 
 
 class TerminalAgent(QObject):
@@ -198,7 +203,17 @@ class TerminalAgent(QObject):
         self._limit_tries = 0          # resume attempts since the cut-off
         self._limit_last_try = 0.0
         self._limit_from_startup = False   # recovered from disk vs seen live
-        self._limit_at = 0.0               # when the cut-off was noticed
+        self._limit_at = 0.0               # when the cut-off was NOTICED
+        # ...and when it actually HAPPENED, which is not the same thing: a
+        # cut-off reconstructed from the transcript at startup happened hours
+        # before this process existed. The ledger records the real time.
+        self._limit_cut_off_at = 0.0
+        self._limit_window = ""            # "session" / "weekly" / ...
+        self._limit_banner = ""            # the banner line itself
+        # the banner line that produced the last latch — the identity of that
+        # cut-off, kept ACROSS clear_limit_block so the same line still on
+        # screen can't re-latch the agent we just resumed (see _scrape_limit)
+        self._limit_last_banner = ""
         # "waiting for the user" is the OR of three independent sources (see
         # _emit_waiting): _scrape_waiting (the settled screen shows a numbered
         # menu + selection caret — a permission prompt), _tool_waiting (an
@@ -236,6 +251,7 @@ class TerminalAgent(QObject):
         self._screen_tail = ""
         self._reset_waiting()
         self.clear_limit_block()
+        self._limit_last_banner = ""   # a new screen: nothing is an echo yet
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         # a NON-resume start is a new conversation, so it gets a new pinned
@@ -289,6 +305,7 @@ class TerminalAgent(QObject):
         self._screen_tail = ""
         self._reset_waiting()
         self.clear_limit_block()
+        self._limit_last_banner = ""   # a new screen: nothing is an echo yet
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         if self.spec.provider == "claude":  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
@@ -682,10 +699,34 @@ class TerminalAgent(QObject):
         # can push it out of view on a full frame. Both patterns are specific
         # enough to search a wider window safely.
         region = "\n".join(self._screen_tail.splitlines()[-40:])
-        if not is_limit_screen(region):
-            return
+        menu = bool(LIMIT_MENU_RE.search(region))
+        banner = banner_line(region)
+        if not menu:
+            # A BANNER ON ITS OWN IS NOT PROOF OF A LIVE CUT-OFF. It is ordinary
+            # output that stays in view — and is re-emitted by every frame
+            # repaint — long after the agent has been resumed off it, so the
+            # moment `recheck_limit` clears the latch the very next burst
+            # re-latched on the SAME historical line. Worse, `parse_reset_clock`
+            # then dated it a full day out (its clock had just passed), which
+            # muted the agent's "?" chime for a day and later typed a stray
+            # Continue into an agent that was working fine. Observed twice on
+            # 2026-08-04: re-BLOCKED 13 s after RESUMED, and again five hours
+            # later, both with `resets` exactly 24 h ahead of the latch.
+            #
+            # The menu is the discriminator, exactly as in `recheck_limit`: it
+            # is torn down on the resume, and on a genuine cut-off it renders
+            # directly BELOW the banner, so it is in view whenever the banner
+            # is. A new cut-off also states a different clock — successive
+            # 5-hour windows never end at the same wall time — so an identical
+            # line with no menu can only be the echo of one we already handled.
+            if not banner or banner == self._limit_last_banner:
+                return
         self._limit_blocked = True
         self._limit_at = time.time()
+        self._limit_cut_off_at = self._limit_at   # seen as it happened
+        self._limit_last_banner = banner
+        self._limit_banner = banner
+        self._limit_window = banner_window(banner)
         # The reset clock lives in the banner, not the menu, so it may be
         # absent (the banner can have scrolled while the menu is still up).
         # None simply means "no network-free due time" — the watchdog then
@@ -695,7 +736,9 @@ class TerminalAgent(QObject):
         self.limit_blocked_changed.emit(True)
 
     def mark_limit_blocked(self, resets_at: float | None,
-                           from_startup: bool = True) -> None:
+                           from_startup: bool = True,
+                           cut_off_at: float = 0.0, window: str = "",
+                           banner: str = "") -> None:
         """Seed the latch from OUTSIDE the live screen — startup recovery,
         which reconstructs the cut-off from the transcript on disk because the
         screen shows a replayed conversation rather than a live banner.
@@ -704,14 +747,66 @@ class TerminalAgent(QObject):
         preferences stay independent: a cut-off found at startup is resumed
         only if startup recovery is on, one observed live only if
         resume-on-reset is on.
+
+        `cut_off_at` is when the limit ACTUALLY stopped the agent (the
+        transcript record's own timestamp), which is what the ledger files and
+        what the user is shown — not `time.time()`, which here is only "when
+        this process got round to looking".
         """
         if self._limit_blocked:
             return
         self._limit_blocked = True
         self._limit_at = time.time()
+        self._limit_cut_off_at = cut_off_at or self._limit_at
         self._limit_resets_at = resets_at
         self._limit_from_startup = bool(from_startup)
+        self._limit_window = window
+        self._limit_banner = banner
         self.limit_blocked_changed.emit(True)
+
+    def limit_window(self) -> str:
+        """Which limit window stopped this agent ("session" / "weekly" / ...).
+
+        A weekly cut-off must not be resumed on its banner's clock alone: that
+        clock is a bare wall time for a reset that can be days out. See
+        `limit_banner.banner_window`.
+        """
+        return self._limit_window
+
+    def limit_cut_off_at(self) -> float:
+        """When the limit actually stopped this agent (epoch), as opposed to
+        `limit_latched_at()` — when AI Hive noticed."""
+        return self._limit_cut_off_at
+
+    def limit_banner_text(self) -> str:
+        """The banner line that evidenced this cut-off (for the ledger)."""
+        return self._limit_banner
+
+    def limit_summary(self) -> str:
+        """One line describing this agent's cut-off, for the marker's tooltip.
+        "" when it is not cut off.
+
+        Lives on the model rather than in either view because both the card
+        header and the sidebar row show the same thing, and every fact in it
+        (when it stopped, when the window reopens, how many resumes have been
+        tried) is state only the agent holds.
+        """
+        if not self._limit_blocked:
+            return ""
+        parts = ["Stopped by the usage limit"]
+        if self._limit_cut_off_at:
+            parts[0] += time.strftime(
+                " on %Y-%m-%d at %H:%M", time.localtime(self._limit_cut_off_at))
+        if self._limit_resets_at:
+            parts.append(time.strftime("limit resets %H:%M",
+                                       time.localtime(self._limit_resets_at)))
+        else:
+            parts.append("reset time unknown")
+        if self._limit_tries:
+            parts.append(f"auto-continue tried {self._limit_tries}x")
+        else:
+            parts.append("waiting to auto-continue")
+        return " · ".join(parts)
 
     def limit_from_startup(self) -> bool:
         """True when this latch was recovered from disk rather than seen live."""
@@ -741,13 +836,22 @@ class TerminalAgent(QObject):
         return self._prompt_ready
 
     def clear_limit_block(self) -> None:
-        """Forget the latched cut-off (it resumed, or it restarted)."""
+        """Forget the latched cut-off (it resumed, or it restarted).
+
+        `_limit_last_banner` deliberately SURVIVES this: it is the only thing
+        stopping the banner still on screen from instantly re-latching the
+        agent we just resumed. It is reset by `start`/`restart` alone, where
+        the screen genuinely starts over.
+        """
         self._limit_blocked = False
         self._limit_resets_at = None
         self._limit_tries = 0
         self._limit_last_try = 0.0
         self._limit_from_startup = False
         self._limit_at = 0.0
+        self._limit_cut_off_at = 0.0
+        self._limit_window = ""
+        self._limit_banner = ""
 
     def note_limit_attempt(self) -> None:
         """Record that we just tried to resume this agent."""

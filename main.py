@@ -184,10 +184,12 @@ def main() -> int:
     window.show()
     window.autostart_active_workspace()
     # ...then look for agents a spent plan limit stopped BEFORE this run and
-    # arm them to be resumed. Must follow the autostart above: it only
-    # considers agents that are actually running, and it reads the user's real
-    # transcripts, so like the usage poll it is opted into here rather than in
-    # the factory the smoke suite shares.
+    # arm them to be resumed. Follows the autostart so the ordinary restore
+    # happens first and this only has to start the stragglers — an agent the
+    # LIMIT stopped is started here even if the user's card was left stopped,
+    # since it was not the user who stopped it. Reads the user's real
+    # transcripts and types into real agents, so like the usage poll it is
+    # opted into here rather than in the factory the smoke suite shares.
     window.recover_blocked_at_startup()
     return app.exec()
 
