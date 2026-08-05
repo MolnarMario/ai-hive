@@ -445,6 +445,54 @@ this file is the invariants that must survive every change.
   that rule is the defense against transcript truncation (a real incident).
   If you add a new launch path, call `transcripts.backup_for_agents` before
   any Claude agent starts.
+- **The model/effort on the card is a LIVE READING, never the launch flags**
+  (`transcripts.latest_model_effort` → `WorkspaceManager.refresh_model_effort`
+  → `TerminalAgent.set_live_model` → the header's `#CardModel` chip, polled on
+  `MainWindow._model_sync_timer`/`MODEL_SYNC_MS`). `spec.model`/`spec.effort`
+  are what the agent LAUNCHED with: they are persisted, they rebuild the
+  command line through `providers.build_invocation`, and they go stale the
+  moment the user types `/model` or `/effort` in the TUI, which is normal use.
+  So they seed the display (`_seed_model`, falling back to the user's own
+  `~/.claude/settings.json` model when the agent launched on "Default") and are
+  NEVER written back to from a reading. The transcript carries BOTH signals and
+  both are needed: every assistant record has `message.model` + a TOP-LEVEL
+  `effort` (ground truth, but only as of the last turn), and a `/model`
+  or `/effort` pick appends a `<local-command-stdout>Set model to …` user
+  record the instant it happens — which is the only thing that shows an IDLE
+  agent's switch without waiting for another turn. Merge them in FILE ORDER,
+  last one wins; skip `isSidechain` (a sub-agent runs its own model) and the
+  `<synthetic>` pseudo-model. Do NOT scrape the screen for this (`_screen_tail`
+  is a 4000-char rolling buffer — the same trap the limit-banner invariant
+  documents) and do NOT add a hook: a `/model` typed at an idle prompt fires
+  none, and the hook plumbing is exactly what the SessionStart `startup`
+  invariant says not to perturb. CRITICAL, same rule as `activity_changed` and
+  the plan usage reading: this is TRANSIENT. It polls every 1.5s for the life
+  of the process, so `set_live_model` must never mark `dirty`, and it emits
+  `model_changed` only when the DISPLAYED badge string changes. An EMPTY
+  reading is ignored rather than blanking a good label (a fresh conversation
+  has no evidence yet). The reader is tail-only (`_MODEL_TAIL_BYTES`) with a
+  full-scan fallback and an (mtime,size) cache, because unlike
+  `refresh_ai_titles` it runs several times a second.
+- **The card header is summary-first** (`widgets/terminal_card.py`): the
+  one-line summary carries the layout stretch and is an `ornaments.ElidingLabel`
+  — it re-fits in its OWN `resizeEvent` and reports a zero-width hint
+  (`QSizePolicy.Ignored`), so it takes every pixel the fixed chrome leaves and
+  can never be pushed around by its neighbours. Do NOT go back to eliding
+  against a parent-supplied width with a character-count fallback: `_on_task`
+  runs in the CONSTRUCTOR, before any real width exists, which left restored
+  cards stranded on a 48-character truncation in a header with hundreds of free
+  pixels. The same label serves the sidebar's agent rows. Start/Stop/Restart/
+  Assign are NOT header buttons (they cost ~130px of every header for actions
+  the terminal itself replaces); they live in the header's right-click menu
+  (`show_actions_menu`), which is also where `reassignRequested` is emitted
+  from — the signal and its `WorkspacePage`/`MainWindow` wiring are unchanged.
+  The assignment badge is gone from the header too (the terminal says what the
+  agent is doing); `AssignmentState` still drives the model and the board.
+- **No em dash in text the user sees.** Labels, tooltips, dialog copy, terminal
+  notices and the board markdown use other punctuation or a rephrase; a smoke
+  check (`test_no_em_dashes_in_visible_text`) parses every module and fails on
+  an em dash in any NON-docstring string literal. Comments and docstrings are
+  prose for us, not for the reader, and are deliberately out of scope.
 - **Agents launch with a SANITIZED env** (`pty_worker.agent_environment`):
   `CLAUDECODE`/`CLAUDE_CODE_*` markers are stripped — a claude that inherits
   them believes it is nested inside another claude session and SILENTLY

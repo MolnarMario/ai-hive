@@ -553,6 +553,22 @@ class WorkspaceManager(QObject):
                     spec.cwd, spec.session_id)
                 a.set_token_usage(used, window)
 
+    def refresh_model_effort(self) -> None:
+        """Pull each running Claude agent's CURRENT model and effort from its
+        transcript, so the card header follows a `/model` or `/effort` the user
+        typed in the terminal. Transient like the AI title: `set_live_model`
+        never persists and never marks the session dirty. Polled far more often
+        than `refresh_ai_titles`, which is why its reader only touches the tail
+        of the file and re-reads nothing while the transcript is unchanged."""
+        for w in self._workspaces:
+            for a in w.agents:
+                spec = a.spec
+                if spec.provider != "claude" or not a.is_running():
+                    continue
+                model, effort = transcripts.latest_model_effort(
+                    spec.cwd, spec.session_id)
+                a.set_live_model(model, effort)
+
     def sync_live_sessions(self) -> list:
         """Reconcile each running Claude agent's pinned session id with the
         conversation it is ACTUALLY on, so a conversation the user switched to

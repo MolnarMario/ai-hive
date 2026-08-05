@@ -40,6 +40,32 @@ _USAGE_CACHE: dict[str, tuple[float, int, int, int]] = {}
 # cache for limit_cut_off: path -> (mtime, size, verdict dict).
 _LIMIT_CACHE: dict[str, tuple[float, int, dict]] = {}
 
+# cache for latest_model_effort: path -> (mtime, size, model, effort).
+_MODEL_CACHE: dict[str, tuple[float, int, str, str]] = {}
+
+# How much of the tail latest_model_effort reads. It polls far more often than
+# the title/usage readers, so it must not re-scan a multi-MB conversation on
+# every write: both signals it wants (the last assistant record, the last
+# /model or /effort announcement) are at the END of the file. A full scan is
+# the fallback for the rare case the tail holds neither.
+_MODEL_TAIL_BYTES = 65536
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# `/model` and `/effort` echo their result into the transcript as a
+# <local-command-stdout> user record, the instant the user picks. Observed
+# shapes (the model name arrives wrapped in a bold SGR run):
+#   Set model to <b>Opus 5</b> and saved as your default for new sessions
+#   Set model to <b>Opus 4.8 (1M context)</b> and saved ... with <b>high</b> effort
+#   Set effort level to max (this session only): Maximum capability with ...
+_SET_MODEL_BOLD_RE = re.compile(r"Set model to\s+\x1b\[1m(.+?)\x1b\[")
+_SET_MODEL_RE = re.compile(
+    r"Set model to\s+(.+?)(?:\s+and saved\b|\s+for this session\b|[.\n]|$)")
+_SET_MODEL_EFFORT_RE = re.compile(r"with\s+(\w+)\s+effort")
+_SET_EFFORT_RE = re.compile(r"Set effort level to\s+([A-Za-z]+)")
+# a concrete model id as Claude writes it on an assistant record, e.g.
+# claude-opus-5, claude-opus-4-8, claude-haiku-4-5-20251001, claude-sonnet-5[1m]
+_MODEL_ID_RE = re.compile(r"^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?")
+
 
 def context_window_for(model: str) -> int:
     """The context-window size (in tokens) a model runs with in AI Hive, used
@@ -272,6 +298,135 @@ def _read_latest_token_usage(path: str) -> tuple[int, int]:
         window = 1_000_000
     _USAGE_CACHE[path] = (st.st_mtime, st.st_size, used, window)
     return (used, window)
+
+
+def model_display(raw: str) -> str:
+    """A concrete model id or alias as a short human label: claude-opus-5 ->
+    'Opus 5', claude-opus-4-8 -> 'Opus 4.8', claude-haiku-4-5-20251001 ->
+    'Haiku 4.5', claude-sonnet-5[1m] -> 'Sonnet 5 (1M)', 'opus' -> 'Opus'.
+    Names Claude already prints in friendly form (from a /model announcement)
+    pass through, only trimmed. "" stays ""."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    big = "[1m]" in lowered or lowered.endswith("-1m")
+    core = lowered.replace("[1m]", "").rstrip()
+    m = _MODEL_ID_RE.match(core)
+    if m:
+        family, major, minor = m.group(1).title(), m.group(2), m.group(3)
+        # a trailing 8-digit group is a release date (claude-haiku-4-5-20251001),
+        # not a version component
+        version = f"{major}.{minor}" if minor and len(minor) <= 2 else major
+        return f"{family} {version}" + (" (1M)" if big else "")
+    if core in ("opus", "sonnet", "haiku", "fable"):
+        return core.title() + (" (1M)" if big else "")
+    # already friendly ("Opus 4.8 (1M context)"): only shorten the window note
+    return text.replace("(1M context)", "(1M)").strip()
+
+
+def latest_model_effort(cwd: str, session_id: str) -> tuple[str, str]:
+    """The model and effort this conversation is on RIGHT NOW, as
+    (model_display, effort). Both can change mid-session (/model, /effort), so
+    neither the launch flags nor a single record kind is enough; two sources are
+    merged in file order, last one wins:
+
+      * every assistant record carries `message.model` and a top-level `effort`
+        (ground truth, but only as of the last turn);
+      * `/model` and `/effort` append a <local-command-stdout> user record the
+        instant the user picks, which is what makes an idle agent's switch
+        visible without waiting for a turn.
+
+    Sub-agent sidechains are skipped (they run their own model) and so is the
+    `<synthetic>` pseudo-model. ("", "") when there is no file / no evidence.
+    Cached by (mtime,size); never raises."""
+    if not session_id or not cwd:
+        return ("", "")
+    return _read_model_effort(transcript_path(cwd, session_id))
+
+
+def _read_model_effort(path: str) -> tuple[str, str]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ("", "")
+    cached = _MODEL_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return (cached[2], cached[3])
+    try:
+        model, effort = _scan_model_effort(_tail_lines(path, _MODEL_TAIL_BYTES))
+        if not model and st.st_size > _MODEL_TAIL_BYTES:
+            # nothing in the tail (a long stretch of tool output, say): pay for
+            # the full scan once, then the cache holds until the file changes
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                model, effort = _scan_model_effort(fh)
+    except OSError:
+        return (cached[2], cached[3]) if cached else ("", "")
+    _MODEL_CACHE[path] = (st.st_mtime, st.st_size, model, effort)
+    return (model, effort)
+
+
+def _tail_lines(path: str, limit: int) -> list[str]:
+    """The last `limit` bytes of `path` as whole lines (a leading partial line
+    is dropped, since it cannot be parsed anyway)."""
+    with open(path, "rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        start = max(0, size - limit)
+        fh.seek(start)
+        data = fh.read()
+    if start:
+        cut = data.find(b"\n")
+        data = data[cut + 1:] if cut >= 0 else b""
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def _scan_model_effort(lines) -> tuple[str, str]:
+    model = effort = ""
+    for line in lines:
+        is_turn = '"assistant"' in line
+        is_pick = "Set model to" in line or "Set effort level to" in line
+        if not (is_turn or is_pick):
+            continue  # cheap prefilter before the JSON parse
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue  # a partial last line while Claude is writing
+        if rec.get("isSidechain"):
+            continue  # a sub-agent's model, not this conversation's
+        if rec.get("type") == "assistant":
+            raw = ((rec.get("message") or {}).get("model") or "")
+            if raw and not raw.startswith("<"):   # skip the <synthetic> model
+                model = model_display(raw)
+            if rec.get("effort"):
+                effort = str(rec["effort"])
+            continue
+        content = (rec.get("message") or {}).get("content")
+        if not isinstance(content, str):
+            continue
+        picked, with_effort = _parse_set_model(content)
+        if picked:
+            model = picked
+        if with_effort:
+            effort = with_effort
+        m = _SET_EFFORT_RE.search(_ANSI_RE.sub("", content))
+        if m:
+            effort = m.group(1).lower()
+    return (model, effort)
+
+
+def _parse_set_model(content: str) -> tuple[str, str]:
+    """(model, effort) announced by a `/model` pick; ("", "") if this isn't one.
+    The bold run around the name is the precise delimiter; the plain-text form
+    is the fallback for a build that stops emitting the SGR codes."""
+    if "Set model to" not in content:
+        return ("", "")
+    m = _SET_MODEL_BOLD_RE.search(content)
+    plain = _ANSI_RE.sub("", content)
+    if not m:
+        m = _SET_MODEL_RE.search(plain)
+    name = model_display(m.group(1)) if m else ""
+    eff = _SET_MODEL_EFFORT_RE.search(plain)
+    return (name, eff.group(1).lower() if eff else "")
 
 
 def _same_file(a: str, b: str) -> bool:

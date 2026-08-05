@@ -352,7 +352,7 @@ WorkspaceRow {{
 WorkspaceRow:hover {{ background: {p.BG_HOVER}; }}
 /* The SELECTED workspace owns the theme accent: a thick bright bar and an
    accent-colored, bolder name. Nothing else in the sidebar wears the accent
-   as a fill (category groups are neutral — see sidebar.drawRow), so the
+   as a fill (category groups are neutral, see sidebar.drawRow), so the
    current workspace is unmistakable even when other rows are grouped. */
 WorkspaceRow[active="true"] {{
     background: {p.BG_ACTIVE};
@@ -408,7 +408,7 @@ WorkspaceRow[search_hit="true"] {{
     padding: 1px 4px; color: {p.ACCENT_GOLD}; font-size: 13px;
 }}
 #AddCatBtn:hover {{ background: {p.BG_HOVER}; border-color: {p.BORDER}; }}
-/* the primary "add workspace" action — a bold, evident gold "+" in a pill */
+/* the primary "add workspace" action: a bold, evident gold "+" in a pill */
 #AddWsBtn {{
     color: {p.ACCENT_GOLD}; font-size: 18px; font-weight: 800;
     background: {p.BG_ACTIVE}; border: 1px solid {p.BORDER};
@@ -453,7 +453,7 @@ WorkspaceRow[search_hit="true"] {{
 #WsAgentName {{ font-family: {BODY_FONT}; font-size: 13px; font-weight: 600; }}
 #WsAgentTask {{ color: {p.TEXT_DIM}; font-size: 13px; }}
 #WsAgentQ {{ color: {p.YELLOW}; font-size: 14px; font-weight: 800; }}
-/* cut off by the usage limit — amber like the "?", but deliberately NOT the
+/* cut off by the usage limit: amber like the "?", but deliberately NOT the
    error red: the agent is fine, it is only waiting for the window to reopen */
 #WsAgentLimit {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
 
@@ -499,18 +499,14 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     color: {p.CARDHEAD_FG};
 }}
 #CardRole {{ color: {p.CARDHEAD_SUB}; font-size: 11px; }}
+/* live model + effort ("Opus 5 . high"), a shade brighter than the role so it
+   reads as state rather than another label */
+#CardModel {{ color: {p.ACCENT_GOLD_DIM}; font-size: 11px; font-weight: 700; }}
 #CardTaskSummary {{ color: {p.CARDHEAD_SUB}; font-size: 13px; font-style: italic; }}
 #CardTokens {{
     color: {p.CARDHEAD_SUB}; font-size: 10px; font-weight: 700;
     padding: 0px 4px;
 }}
-#CardBadge {{
-    border-radius: 8px; padding: 1px 8px; font-size: 10px; font-weight: 700;
-    background: {p.BG_HOVER}; color: {p.TEXT_DIM};
-}}
-#CardBadge[state="working"] {{ background: rgba(95,174,107,0.20); color: {p.GREEN}; }}
-#CardBadge[state="completed"] {{ background: rgba(201,162,39,0.22); color: {p.ACCENT_GOLD}; }}
-#CardBadge[state="awaiting"] {{ background: rgba(217,178,74,0.18); color: {p.YELLOW}; }}
 #CardLimitMark {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
 #Console {{
     background: {p.BG_CONSOLE};
@@ -548,19 +544,18 @@ QToolButton:pressed {{ background: {p.BG_ACTIVE}; }}
 QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 /* compact single-glyph buttons live in the ultramarine running-head, so they
    take the head's subtitle color, not the body text color */
-#CardStart, #CardStop, #CardRestart, #CardClose, #WsDelete,
-#CardFontDec, #CardFontInc, #CardReassign, #CardMaximize {{
+#CardClose, #WsDelete,
+#CardFontDec, #CardFontInc, #CardMaximize {{
     padding: 3px 6px; font-size: 14px; color: {p.CARDHEAD_SUB};
 }}
-#CardStart:hover, #CardStop:hover, #CardRestart:hover, #CardFontDec:hover,
-#CardFontInc:hover, #CardReassign:hover, #CardMaximize:hover {{ color: {p.CARDHEAD_FG}; }}
+#CardFontDec:hover,
+#CardFontInc:hover, #CardMaximize:hover {{ color: {p.CARDHEAD_FG}; }}
 /* the A-/A+ font steppers read better a hair smaller than the glyph icons;
    the maximize/restore glyph a hair larger (later rules win on equal id
    specificity) */
 #CardFontDec, #CardFontInc {{ font-size: 12px; font-weight: 700; }}
 #CardMaximize {{ font-size: 16px; }}
 #WsDelete {{ color: {p.TEXT}; font-size: 17px; font-weight: 900; }}
-#CardReassign:hover {{ border-color: {p.ACCENT_GOLD}; }}
 #GlobalFontBtn {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 2px 7px; color: {p.TEXT_DIM}; font-weight: 700;

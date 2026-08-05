@@ -14,6 +14,7 @@ from enum import Enum
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from . import providers, transcripts
 from .coordination import sanitize_text
 from .process_worker import AgentSpec, ProcessWorker, WorkerState
 from .pty_worker import PtyWorker
@@ -155,6 +156,7 @@ class TerminalAgent(QObject):
     waiting_changed = Signal(bool)      # waiting for the user (prompt/question)
     summary_changed = Signal(str)       # displayed summary (task or AI title)
     tokens_changed = Signal(str)        # context-usage badge text ("" = hide)
+    model_changed = Signal(str)         # live model/effort badge text ("" = hide)
     limit_blocked_changed = Signal(bool)  # cut off by the plan limit (latched)
 
     def __init__(self, spec: AgentSpec, parent: QObject | None = None):
@@ -167,6 +169,13 @@ class TerminalAgent(QObject):
         self._ai_title = ""                 # Claude's live conversation title
         self._token_used = 0                # last-turn context occupancy (tokens)
         self._token_window = 0              # sized context window for the model
+        # what the agent is ACTUALLY running on, which the user can change
+        # mid-session with /model and /effort. Seeded from the launch flags so
+        # the card is never blank, then kept true by the manager's transcript
+        # poll. Transient: never written back to spec (that is the persisted
+        # command line) and never marks the session dirty.
+        self._live_model = self._seed_model()
+        self._live_effort = (spec.effort or "").strip()
         self.assignment = AssignmentState.IDLE  # task-assignment lifecycle
         self.auto_created = False           # created with a task via spawn_worker
         self.autostart_on_restore = False  # set from persisted run state
@@ -287,8 +296,8 @@ class TerminalAgent(QObject):
         exclude.add(self.spec.session_id)
         candidate = session_sync.best_recovery_id(self.spec.cwd, exclude=exclude)
         if candidate:
-            self.notice("— pinned conversation missing; recovering the most "
-                        "recent one in this folder —")
+            self.notice("[pinned conversation missing; recovering the most "
+                        "recent one in this folder]")
             self.spec.session_id = candidate
 
     def stop(self) -> None:
@@ -394,6 +403,49 @@ class TerminalAgent(QObject):
         else:
             win = f"{self._token_window // 1000}K"
         return f"{pct}% of {win}"
+
+    def _seed_model(self) -> str:
+        """The model label to show before the transcript has said anything.
+        Claude agents launched on "Default" pass no --model, so the CLI falls
+        back to the user's own saved setting: read that rather than show
+        nothing. Other providers bake effort into their model string already
+        (agy's "Gemini 3.1 Pro (High)"), so it is shown verbatim."""
+        chosen = (self.spec.model or "").strip()
+        if self.spec.provider != "claude":
+            return chosen
+        return transcripts.model_display(chosen or providers.user_default_model())
+
+    def set_live_model(self, model: str, effort: str) -> None:
+        """Adopt the model/effort the conversation is actually on, as read from
+        the transcript. Transient like the AI title and the token badge: never
+        persisted, never marks the session dirty, and emits only when the
+        DISPLAYED badge text changes (this polls every couple of seconds).
+        An empty reading is ignored rather than blanking a good label: a fresh
+        conversation has no evidence yet, and the launch seed is still right."""
+        model = (model or "").strip()
+        effort = (effort or "").strip()
+        if not model and not effort:
+            return
+        before = self.model_badge()
+        if model:
+            self._live_model = model
+        if effort:
+            self._live_effort = effort
+        if self.model_badge() != before:
+            self.model_changed.emit(self.model_badge())
+
+    def model_badge(self) -> str:
+        """Compact "what am I running on" string for the card header, e.g.
+        "Opus 5 · high". Model alone when the effort is the CLI's own default,
+        "" when neither is known (a non-Claude agent on a bare command)."""
+        if not self._live_model:
+            return ""
+        if not self._live_effort:
+            return self._live_model
+        return f"{self._live_model} · {self._live_effort}"
+
+    def live_model(self) -> tuple[str, str]:
+        return (self._live_model, self._live_effort)
 
     def set_assignment(self, state) -> None:
         if state is not self.assignment:
@@ -520,7 +572,8 @@ class TerminalAgent(QObject):
         self._emit(STREAM_INPUT, f"> {text}\n")
         self._hint_if_tty_only(text.strip())
         if not self.worker.send_line(text):
-            self._emit(STREAM_SYSTEM, "[not running — press Start (▶)]\n")
+            self._emit(STREAM_SYSTEM,
+                       "[not running; right-click the card header to start]\n")
 
     def _hint_if_tty_only(self, command: str) -> None:
         parts = command.split()
@@ -537,7 +590,7 @@ class TerminalAgent(QObject):
                        'card, use:  claude -p "your prompt"]\n')
         elif program in TUI_PROGRAMS:
             self._emit(STREAM_SYSTEM,
-                       f"[{program} is a full-screen terminal app — it won't "
+                       f"[{program} is a full-screen terminal app, so it won't "
                        "render in this line-mode console. Add it in a \"Full "
                        "terminal (interactive)\" card instead.]\n")
 
@@ -982,7 +1035,7 @@ class TerminalAgent(QObject):
             self._resume_fallback_done = True
             self._resume_attempt = False
             self.spec.resume = False
-            self.notice("— no earlier session to resume; starting fresh —")
+            self.notice("[no earlier session to resume; starting fresh]")
             self.start()
             return
         if crashed:

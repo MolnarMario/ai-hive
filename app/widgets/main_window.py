@@ -53,6 +53,13 @@ SESSION_SYNC_MS = 5000
 # is a cheap incremental read of a small append-only file.
 PROMPT_SYNC_MS = 750
 
+# how often to re-read each running Claude agent's current model/effort from its
+# transcript, so the card header follows a /model or /effort typed in the
+# terminal. Deliberately its own timer rather than the 5s session sync: that
+# tick does full-file title/usage scans, while this one is a stat per agent
+# while nothing changed, and a tail-only read when it did.
+MODEL_SYNC_MS = 1500
+
 # how often to re-read the Claude account's plan usage from the API. One small
 # HTTPS GET; a minute is well inside the resolution of a 5-hour window.
 USAGE_POLL_MS = 60000
@@ -274,8 +281,8 @@ class TopBar(QFrame):
     def _refresh_sound_btn(self) -> None:
         self.sound_btn.setText("🔔" if self._sound_on else "🔕")
         self.sound_btn.setToolTip(
-            "Notification chime: ON — click to mute" if self._sound_on
-            else "Notification chime: OFF — click to enable")
+            "Notification chime: ON, click to mute" if self._sound_on
+            else "Notification chime: OFF, click to enable")
 
     def _on_recover_clicked(self) -> None:
         self.set_startup_recovery(not self._startup_recovery)
@@ -311,22 +318,22 @@ class TopBar(QFrame):
         led = "\U0001F7E2" if self._startup_recovery else "⚫"
         self.recover_btn.setText(f"{led} App start-up⏻")
         self.recover_btn.setToolTip(
-            "Recover at startup: ON — when AI Hive opens, agents whose work "
+            "Recover at startup: ON. When AI Hive opens, agents whose work "
             "stopped because the plan limit ran out are continued "
             "automatically.\nClick to turn off."
             if self._startup_recovery else
-            "Recover at startup: OFF — agents left stuck on a spent plan "
+            "Recover at startup: OFF. Agents left stuck on a spent plan "
             "limit stay stopped when AI Hive opens.\nClick to turn on.")
         self.resume_btn.setCheckable(True)
         self.resume_btn.setChecked(self._auto_continue)
         led = "\U0001F7E2" if self._auto_continue else "⚫"
         self.resume_btn.setText(f"{led} Usage reset\U0001F504")
         self.resume_btn.setToolTip(
-            "Resume on limit reset: ON — while AI Hive is running, agents cut "
+            "Resume on limit reset: ON. While AI Hive is running, agents cut "
             "off mid-work by the plan limit are continued the moment the "
             "limit resets.\nClick to turn off."
             if self._auto_continue else
-            "Resume on limit reset: OFF — agents cut off by the plan limit "
+            "Resume on limit reset: OFF. Agents cut off by the plan limit "
             "wait for you.\nClick to turn on.")
 
     def set_usage(self, usage) -> None:
@@ -431,7 +438,7 @@ class AddTerminalDialog(QDialog):
         # with Shift+Tab (Claude only). Default omits the flag = today's behavior.
         self.mode_combo = QComboBox(self)
         self.mode_combo.setToolTip(
-            "Which permission mode this Claude agent starts in — the same modes "
+            "Which permission mode this Claude agent starts in: the same modes "
             "you flip through with Shift+Tab in the terminal. 'Normal' is the "
             "current default; the agent can still switch modes once running.")
         # resume an existing conversation from this workspace folder (Claude)
@@ -453,7 +460,7 @@ class AddTerminalDialog(QDialog):
         self.args_edit.setPlaceholderText("extra arguments (optional)")
 
         self.pty_check = QCheckBox(
-            "Full terminal (interactive — TUIs, colors, Ctrl+C)", self)
+            "Full terminal (interactive: TUIs, colors, Ctrl+C)", self)
         self.pty_check.setToolTip(
             "Run inside a real pseudo-console (ConPTY). Uncheck for a "
             "lightweight line-only console.")
@@ -561,7 +568,7 @@ class AddTerminalDialog(QDialog):
                 if not self.command_edit.text().strip() and prov.base_cmd:
                     tmpl = prov.base_cmd + (" " + prov.model_flag if prov.model_flag else "")
                     self.command_edit.setPlaceholderText(tmpl + "  (edit to taste)")
-            status = "✓ detected" if detected else "⚠ CLI not detected — install it or edit the command"
+            status = "✓ detected" if detected else "⚠ CLI not detected; install it or edit the command"
             self.provider_note.setText(f"{prov.note}\n{status}")
 
         # AI agents are always interactive (ConPTY); shells/scripts choose
@@ -586,7 +593,7 @@ class AddTerminalDialog(QDialog):
         # out, so users know to enable it manually in the terminal.
         if prov.native_flags:
             self.effort_combo.addItem(
-                "Ultracode (activate manually in terminal — model-dependent)", None)
+                "Ultracode (activate manually in terminal, model-dependent)", None)
             model = self.effort_combo.model()
             item = model.item(self.effort_combo.count() - 1)
             item.setEnabled(False)  # visible but non-selectable
@@ -721,6 +728,12 @@ class MainWindow(QMainWindow):
         self._prompt_sync_timer.setInterval(PROMPT_SYNC_MS)
         self._prompt_sync_timer.timeout.connect(self.manager.sync_prompt_events)
 
+        # keep the header's model/effort label on what the agent is really
+        # running (transient: this never saves)
+        self._model_sync_timer = QTimer(self)
+        self._model_sync_timer.setInterval(MODEL_SYNC_MS)
+        self._model_sync_timer.timeout.connect(self.manager.refresh_model_effort)
+
         # ---- Claude plan usage (top-bar readout + limit-reached edges) ----
         # PURELY TRANSIENT: a reading refreshes the badge and may emit the
         # plan-limit edges, but it must NEVER mark the session dirty — the same
@@ -805,6 +818,7 @@ class MainWindow(QMainWindow):
         self._heartbeat_timer.start()
         self._session_sync_timer.start()
         self._prompt_sync_timer.start()
+        self._model_sync_timer.start()
         self._limit_watch_timer.start()
 
     def _arm_agent_mcp(self, ws, agent) -> None:
@@ -1535,7 +1549,7 @@ class MainWindow(QMainWindow):
             # audit trail: on the card, and on the workspace board. The board
             # write goes through the same serialized append the log_activity
             # tool uses, so it can't interleave with an agent's own note.
-            agent.notice("— plan limit reset; auto-continued —")
+            agent.notice("[plan limit reset; auto-continued]")
             ws = self.manager.workspace_of(agent.id)
             if ws is not None and ws.board is not None:
                 ws.board.append_activity(
@@ -2089,6 +2103,7 @@ class MainWindow(QMainWindow):
         self._heartbeat_timer.stop()
         self._session_sync_timer.stop()
         self._prompt_sync_timer.stop()
+        self._model_sync_timer.stop()
         self._limit_watch_timer.stop()
         self._usage_timer.stop()
         self._usage_tick_timer.stop()

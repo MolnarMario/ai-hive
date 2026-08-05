@@ -111,7 +111,7 @@ class ActivityPanel(QFrame):
         self.files_header = QLabel("Changed files (git)", inner)
         self.files_header.setObjectName("ActivitySection")
         self.inner_lay.addWidget(self.files_header)
-        self.files_label = QLabel("—", inner)
+        self.files_label = QLabel("-", inner)
         self.files_label.setObjectName("ActivityFiles")
         self.files_label.setWordWrap(True)
         self.inner_lay.addWidget(self.files_label)
@@ -177,9 +177,9 @@ class ActivityPanel(QFrame):
             else:
                 item.refresh(agent)
         if not workspace.agents:
-            self.roster_header.setText("Agents — none yet")
+            self.roster_header.setText("Agents: none yet")
         else:
-            self.roster_header.setText(f"Agents — {len(workspace.agents)}")
+            self.roster_header.setText(f"Agents: {len(workspace.agents)}")
 
         board = getattr(workspace, "board", None)
         tail = board.read_log_tail(30) if board else []
@@ -188,4 +188,4 @@ class ActivityPanel(QFrame):
         if with_git:  # blocking git call — only on the slow path
             self._git_cache = coordination.git_changed_files(workspace.project_path)
         self.files_label.setText("\n".join(self._git_cache) if self._git_cache
-                                 else "— (not a git repo, or no changes)")
+                                 else "(not a git repo, or no changes)")

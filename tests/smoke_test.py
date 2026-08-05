@@ -1594,6 +1594,231 @@ def test_token_usage_badge():
     a.deleteLater()
 
 
+def test_live_model_effort():
+    """The card header says which model and effort the agent is ACTUALLY on.
+    Both change mid-session (/model, /effort in the terminal), so the reading
+    comes from the transcript: assistant records carry message.model + a
+    top-level effort, and a /model or /effort pick writes a local-command-stdout
+    record the instant the user chooses. Last in file order wins. Transient like
+    the AI title: it never touches spec and never saves."""
+    import json as _json
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import transcripts
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    # --- model id normalization ---
+    cases = [("claude-opus-5", "Opus 5"),
+             ("claude-opus-4-8", "Opus 4.8"),
+             ("claude-haiku-4-5-20251001", "Haiku 4.5"),
+             ("claude-sonnet-5[1m]", "Sonnet 5 (1M)"),
+             ("opus", "Opus"),
+             ("Opus 4.8 (1M context)", "Opus 4.8 (1M)"),
+             ("", "")]
+    for raw, want in cases:
+        check(f"model: {raw or 'empty'} displays as {want or 'empty'}",
+              transcripts.model_display(raw) == want,
+              transcripts.model_display(raw))
+
+    # --- transcript parsing ---
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-model-"))
+    tpath = tmp / "conv.jsonl"
+
+    def _turn(model="claude-opus-5", effort="high", side=False):
+        return {"type": "assistant", "isSidechain": side, "effort": effort,
+                "message": {"model": model, "role": "assistant"}}
+
+    def _pick(text):
+        return {"type": "user",
+                "message": {"role": "user",
+                            "content": f"<local-command-stdout>{text}"
+                                       f"</local-command-stdout>"}}
+
+    def write(recs):
+        tpath.write_text("\n".join(_json.dumps(r) for r in recs) + "\n",
+                         encoding="utf-8")
+
+    write([{"type": "user", "text": "hi"}, _turn()])
+    check("model: a turn reports its model and effort",
+          transcripts._read_model_effort(str(tpath)) == ("Opus 5", "high"),
+          transcripts._read_model_effort(str(tpath)))
+
+    # a /model pick AFTER the last turn is the newer truth (the whole point:
+    # an idle agent's switch must show without waiting for another turn)
+    write([_turn(),
+           _pick("Set model to \x1b[1mSonnet 5\x1b[22m and saved as your "
+                 "default for new sessions")])
+    check("model: a /model pick after the last turn wins",
+          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5", "high"),
+          transcripts._read_model_effort(str(tpath)))
+
+    write([_turn(),
+           _pick("Set model to \x1b[1mSonnet 5\x1b[22m and saved as your "
+                 "default for new sessions"),
+           _pick("Set effort level to max (this session only): Maximum "
+                 "capability with deepest reasoning.")])
+    check("model: a /effort pick changes only the effort",
+          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5", "max"),
+          transcripts._read_model_effort(str(tpath)))
+
+    write([_turn(),
+           _pick("Set model to \x1b[1mOpus 4.8 (1M context)\x1b[22m and saved "
+                 "as your default for new sessions with \x1b[1mhigh\x1b[22m "
+                 "effort")])
+    check("model: a pick that names an effort applies both",
+          transcripts._read_model_effort(str(tpath)) == ("Opus 4.8 (1M)", "high"),
+          transcripts._read_model_effort(str(tpath)))
+
+    # a turn AFTER a pick wins again (ordering is file order, not kind)
+    write([_pick("Set model to \x1b[1mSonnet 5\x1b[22m and saved as your "
+                 "default for new sessions"),
+           _turn(model="claude-fable-5", effort="max")])
+    check("model: a turn after a pick wins again",
+          transcripts._read_model_effort(str(tpath)) == ("Fable 5", "max"),
+          transcripts._read_model_effort(str(tpath)))
+
+    # a sub-agent's model is a different context; <synthetic> is not a model
+    write([_turn(), _turn(model="claude-haiku-4-5", effort="low", side=True),
+           {"type": "assistant", "message": {"model": "<synthetic>"}}])
+    check("model: sidechain and synthetic records never win",
+          transcripts._read_model_effort(str(tpath)) == ("Opus 5", "high"),
+          transcripts._read_model_effort(str(tpath)))
+
+    check("model: missing file reads as unknown",
+          transcripts.latest_model_effort(str(tmp), "nope") == ("", ""))
+
+    # the reader only touches the tail, so it must still find evidence that sits
+    # behind a long stretch of unrelated records (full-scan fallback)
+    filler = [{"type": "user", "text": "x" * 400} for _ in range(400)]
+    write([_turn(model="claude-opus-4-8", effort="xhigh")] + filler)
+    check("model: falls back to a full scan when the tail has no evidence",
+          transcripts._read_model_effort(str(tpath)) == ("Opus 4.8", "xhigh"),
+          transcripts._read_model_effort(str(tpath)))
+
+    # --- agent-side badge: transient, emits only on a real change ---
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd=".",
+                                 model="opus", effort="high"))
+    seen = []
+    a.model_changed.connect(seen.append)
+    check("model: badge seeded from the launch flags",
+          a.model_badge() == "Opus · high", a.model_badge())
+    a.set_live_model("Sonnet 5", "max")
+    check("model: badge follows the live reading",
+          a.model_badge() == "Sonnet 5 · max" and seen[-1] == "Sonnet 5 · max",
+          (a.model_badge(), seen))
+    n = len(seen)
+    a.set_live_model("Sonnet 5", "max")
+    check("model: no signal when the reading is unchanged", len(seen) == n)
+    a.set_live_model("", "")
+    check("model: an empty reading never blanks a good label",
+          a.model_badge() == "Sonnet 5 · max" and len(seen) == n)
+    b = TerminalAgent(build_spec(AgentKind.CLAUDE, "Bare", cwd="", model="",
+                                 effort=""))
+    b._live_model = ""      # no launch flag and no saved user default
+    check("model: badge hidden when nothing is known", b.model_badge() == "")
+    b.set_live_model("Opus 5", "")
+    check("model: model alone renders without an effort",
+          b.model_badge() == "Opus 5", b.model_badge())
+
+    # --- header: the chip shows/hides with the badge ---
+    card = TerminalCard(a)
+    card.resize(900, 300); card.show(); pump(80)
+    check("model: card chip shows the live model and effort",
+          card.model_label.isVisible()
+          and card.model_label.text() == "Sonnet 5 · max",
+          card.model_label.text())
+    card2 = TerminalCard(b)
+    b._live_model = ""
+    card2._on_model(b.model_badge())
+    card2.resize(900, 300); card2.show(); pump(60)
+    check("model: card chip hidden when the model is unknown",
+          not card2.model_label.isVisible())
+
+    # --- the manager's poll adopts it, and never saves for it ---
+    from app.workspace_manager import WorkspaceManager
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Models", str(tmp))
+    live = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Live",
+                                              cwd=str(tmp)), autostart=False)
+    live.spec.session_id = "11111111-2222-3333-4444-555555555555"
+    live.is_running = lambda: True    # stand in for a launched process
+    conv = Path(transcripts.transcript_path(str(tmp), live.spec.session_id))
+    conv.parent.mkdir(parents=True, exist_ok=True)
+    conv.write_text(_json.dumps(_turn(model="claude-sonnet-5", effort="low"))
+                    + "\n", encoding="utf-8")
+    dirtied = []
+    mgr.dirty.connect(lambda: dirtied.append(True))
+    mgr.refresh_model_effort()
+    check("model: the manager poll adopts the transcript's model/effort",
+          live.model_badge() == "Sonnet 5 · low", live.model_badge())
+    check("model: a reading never marks the session dirty", not dirtied, dirtied)
+    shutil.rmtree(conv.parent, ignore_errors=True)
+
+    # --- the summary uses the width it was actually given ---
+    long_task = ("Rework the pty worker so grandchildren die with the job "
+                 "object and the graceful stop stays an stdin EOF, then check "
+                 "the restart path keeps its pinned conversation")
+    a.set_task(long_task)
+    pump(80)
+    shown = card.task_summary.text()
+    check("summary: fits the real header width, not a fixed character count",
+          len(shown) > 60, (len(shown), shown))
+    check("summary: keeps the untruncated text on hover",
+          card.task_summary.toolTip() == long_task)
+    card.resize(420, 300); pump(80)
+    narrow = card.task_summary.text()
+    check("summary: re-fits when the card narrows",
+          len(narrow) < len(shown), (len(narrow), len(shown)))
+    a.set_task("")
+    pump(40)
+    check("summary: empty task clears the label",
+          card.task_summary.text() == "")
+
+    card.detach(); card2.detach()
+    card.close(); card2.close()
+    a.deleteLater(); b.deleteLater()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_no_em_dashes_in_visible_text():
+    """No em dash reaches the reader. The app's visible strings (labels,
+    tooltips, dialog copy, terminal notices, the board markdown) are checked by
+    parsing every module and looking at string literals that are NOT
+    docstrings; comments and docstrings are prose for us, not for the user, and
+    are deliberately out of scope."""
+    import ast
+
+    root = Path(__file__).resolve().parent.parent
+    targets = [root / "main.py"] + sorted((root / "app").rglob("*.py"))
+    offenders = []
+    for path in targets:
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+        docs = set()
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)) and body \
+                    and isinstance(body[0], ast.Expr) \
+                    and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                docs.add(id(body[0].value))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                    and id(node) not in docs and "—" in node.value:
+                offenders.append(f"{path.name}:{node.lineno}")
+    check("text: no em dash in any user-visible string",
+          not offenders, ", ".join(offenders[:8]))
+
+
 def test_reveal_agent():
     """_reveal_agent (shared by the map + the dropdown) switches to the agent's
     workspace and finds its terminal card."""
@@ -6461,6 +6686,8 @@ def main():
     test_agent_inline_expansion()
     test_ai_title_summary()
     test_token_usage_badge()
+    test_live_model_effort()
+    test_no_em_dashes_in_visible_text()
     test_reveal_agent()
     test_agent_busy_activity()
     test_ansi()

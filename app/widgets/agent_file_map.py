@@ -269,7 +269,7 @@ class AgentFileMapCanvas(QWidget):
             f = QFont(); f.setPixelSize(12); p.setFont(f)
             p.drawText(QRectF(_TREE_LEFT, _TREE_TOP, _TREE_W - _TREE_LEFT, 40),
                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                       "No files attributed yet — agents appear on the right\n"
+                       "No files attributed yet. Agents appear on the right\n"
                        "once they read or edit files.")
         # connectors first (under the hubs, which are opaque)
         for row in self._tree_rows:
@@ -704,7 +704,7 @@ class AgentFileMapWindow(QWidget):
         self._workspace = workspace
         self._ws_id = ws_id
         name = getattr(workspace, "name", "") if workspace else ""
-        self.setWindowTitle(f"Agent / File Map — {name}" if name
+        self.setWindowTitle(f"Agent / File Map: {name}" if name
                             else "Agent / File Map")
         self.title.setText(name or "Agent / File Map")
         self.refresh()
