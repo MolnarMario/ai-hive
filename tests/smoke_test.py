@@ -5785,6 +5785,39 @@ def test_screen_snapshots():
               and card.overlay.y() > card.terminal.height() // 2)
         card.detach(); seeded.dispose(); pump(150)
 
+        # An AUTOSTARTED agent is already running long before the first
+        # settled size arrives: the launch starts agents synchronously right
+        # after show(), while TerminalView debounces its resize by 120ms. So
+        # gating the re-render on "not running" skipped exactly the cards that
+        # needed it, and every restored-and-resumed card came back showing a
+        # mangled narrow fragment in the top-left of a full-width terminal.
+        from app.process_worker import WorkerState
+        line = "R" * 60
+        waking = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Waking", cwd=str(tmp), pty=True))
+        waking.seed_pty_replay(line + "\r\n")
+        card3 = TerminalCard(waking)
+        waking.worker.state = WorkerState.RUNNING  # the launch autostart...
+        card3.terminal.screen.reset()              # ...before any settled size
+        card3._rerender_restored()
+        check("screens: an autostarted card still re-renders its restored "
+              "screen at the settled size",
+              line in card3.terminal.screen_text())
+        card3.detach(); waking.dispose(); pump(50)
+
+        # ...but once the child has actually drawn, the screen is its own and
+        # a stale re-feed would fight it
+        live = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Live", cwd=str(tmp), pty=True))
+        live.seed_pty_replay(line + "\r\n")
+        card4 = TerminalCard(live)
+        live._pty_buffer.append("output from the child\r\n")
+        card4.terminal.screen.reset()
+        card4._rerender_restored()
+        check("screens: ...but never over a child that has since written",
+              line not in card4.terminal.screen_text())
+        card4.detach(); live.dispose(); pump(50)
+
         # an agent with NOTHING to show keeps the original centred banner:
         # that card really is a dead black screen and must say so
         blank = TerminalAgent(build_spec(

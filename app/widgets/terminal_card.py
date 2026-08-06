@@ -131,16 +131,24 @@ class TerminalCard(QFrame):
             replay = self.agent.pty_replay()
             if replay:
                 self.terminal.feed(replay)
-                if not self.agent.is_running():
-                    # A RESTORED screen (app/screen_snapshot.py) has no child
-                    # behind it to repaint once the grid hands the card its
-                    # real size, and pyte drops lines off the TOP when it
-                    # shrinks — so the newest part of the conversation, the
-                    # part worth showing, is exactly what would vanish.
-                    # Re-render once at the final size instead. A running
-                    # agent needs none of this: its child redraws on SIGWINCH.
-                    self._pending_replay = replay
-                    self.terminal.sizeChanged.connect(self._rerender_restored)
+                # A RESTORED screen (app/screen_snapshot.py) is fed here, in
+                # the constructor, which is BEFORE the tiling grid hands the
+                # card its real size — and pyte neither reflows on resize nor
+                # keeps the lines it drops off the TOP when it shrinks, so the
+                # newest part of the conversation is exactly what would
+                # vanish. Re-render once at the settled size instead.
+                # This is deliberately NOT gated on the agent being stopped.
+                # The launch autostart starts agents SYNCHRONOUSLY right after
+                # show(), while TerminalView debounces its resize by 120ms, so
+                # "is running" is already true by the time the first real size
+                # arrives — the gate that used to be here therefore skipped
+                # precisely the cards that needed it, and every autostarted
+                # agent came back showing a mangled 24-column fragment in the
+                # top-left of a full-width terminal until its child finished
+                # launching. `_rerender_restored` guards the live case the
+                # only way that is actually true: the agent's own buffer.
+                self._pending_replay = replay
+                self.terminal.sizeChanged.connect(self._rerender_restored)
         else:
             self._replay_log()
         self._on_status(agent.status)
@@ -569,8 +577,18 @@ class TerminalCard(QFrame):
             self.terminal.sizeChanged.disconnect(self._rerender_restored)
         except (RuntimeError, TypeError):
             pass
-        if not replay or self.agent.is_running():
-            return  # a woken agent owns its screen; never fight the child
+        if not replay:
+            return
+        if self.agent.pty_replay() != replay:
+            # The child has written (or a restart cleared the buffer) since
+            # this card was built, so what is on screen is no longer the
+            # restored snapshot. Whoever owns it now redraws on the SIGWINCH
+            # that `agent.resize` just sent — never fight that with a stale
+            # re-feed. Note the test is the agent's BUFFER, not `is_running`:
+            # an agent can be running for a good fraction of a second before
+            # its child emits its first byte, and that gap is the whole window
+            # this re-render exists to cover.
+            return
         self.terminal.screen.reset()
         self.terminal.feed(replay)
         self._refresh_overlay()

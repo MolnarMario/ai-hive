@@ -523,8 +523,16 @@ this file is the invariants that must survive every change.
   it is built, so the newest part of a restored conversation is exactly what
   vanished — `TerminalCard._rerender_restored` re-renders ONCE on the first
   `sizeChanged` (consuming `_pending_replay` first so a retile storm cannot
-  repeat it, and bailing if the agent has since started, because a live child
-  owns its own screen). (2) `seed_pty_replay` refuses to overwrite a buffer
+  repeat it). It bails when a live child owns the screen, and the test for
+  that is the agent's own BUFFER (`pty_replay()` still byte-identical to what
+  was fed), NEVER `is_running()`: the launch autostart starts agents
+  SYNCHRONOUSLY right after `show()` while `TerminalView` debounces its
+  resize by 120 ms, so an `is_running()` gate skipped precisely the cards it
+  was meant to serve, and every restored-and-resumed card came back showing a
+  mangled ~24-column fragment in the top-left corner of a full-width terminal
+  until its child finished launching (pyte does not reflow on resize, so
+  nothing else ever repaired it). The buffer test covers `restart()` too,
+  which empties the buffer. (2) `seed_pty_replay` refuses to overwrite a buffer
   that already has output, and `restart()` clears the buffer while `start()`
   does not: waking a stopped card resumes its conversation, so the replayed
   screen scrolling up is right, whereas a deliberate restart is a fresh
