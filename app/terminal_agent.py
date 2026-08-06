@@ -182,6 +182,7 @@ class TerminalAgent(QObject):
         self.log: deque = deque(maxlen=LOG_CAP)  # line-mode segments
         self._pty_buffer: list[str] = []         # pty raw tail (for replay)
         self._pty_bytes = 0
+        self._pty_seed = ""    # restored screen, until a child draws over it
         self._prompt_ready = False    # the TUI's input prompt is interactive
         self._ready_tail = ""         # rolling stripped tail (pre-ready only)
         self._pending_task = None     # task queued until the TUI is ready
@@ -322,6 +323,7 @@ class TerminalAgent(QObject):
         if self.is_pty:
             self._pty_buffer = []
             self._pty_bytes = 0
+            self._pty_seed = ""
         else:
             self._emit(STREAM_SYSTEM, "--- restarted ---\n")
         self.worker.restart()
@@ -362,6 +364,30 @@ class TerminalAgent(QObject):
             return False
         self._pty_buffer = [text]
         self._pty_bytes = len(text)
+        self._pty_seed = text
+        return True
+
+    def drop_seeded_screen(self) -> bool:
+        """Forget a restored screen that no live child has drawn over.
+
+        A snapshot exists to keep a card the user left STOPPED from reading
+        as a dead black rectangle. The moment a child is launching behind
+        that card the snapshot has no job left: the TUI paints its own frame
+        within seconds, and until it does the seeded copy is WORSE than an
+        empty terminal, because it was fed before the tiling grid gave the
+        card a real size and pyte cannot reflow it (see
+        `TerminalCard._on_status`, which is what calls this).
+
+        Only ever drops the seed itself: once the child has written a single
+        byte the buffer is the real screen and must survive."""
+        if not self._pty_seed:
+            return False
+        dropped = self._pty_buffer == [self._pty_seed]
+        self._pty_seed = ""
+        if not dropped:
+            return False
+        self._pty_buffer = []
+        self._pty_bytes = 0
         return True
 
     def dispose(self) -> None:

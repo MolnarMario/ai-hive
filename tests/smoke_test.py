@@ -5818,6 +5818,47 @@ def test_screen_snapshots():
               line not in card4.terminal.screen_text())
         card4.detach(); live.dispose(); pump(50)
 
+        # A card whose agent STARTS before it ever got a real size drops the
+        # restored screen entirely. Both launch paths that start an agent
+        # (autostart_active_workspace, recover_blocked_at_startup) run
+        # synchronously right after show(), ahead of TerminalView's 120ms
+        # resize debounce — so this is EVERY agent that comes back running,
+        # and leaving the seed there parked each of their cards on a mangled
+        # narrow fragment until the TUI finished booting. An empty terminal
+        # that fills in a few seconds is the pre-snapshot behavior; the whole
+        # point of the feature is the card that stays STOPPED.
+        from app.terminal_agent import AgentStatus
+        launching = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Launching", cwd=str(tmp), pty=True))
+        launching.seed_pty_replay("OLD-CONVERSATION\r\n")
+        card5 = TerminalCard(launching)
+        check("screens: a restored card starts out showing its conversation",
+              "OLD-CONVERSATION" in card5.terminal.screen_text())
+        card5._on_status(AgentStatus.STARTING)  # the launch autostart
+        check("screens: an agent starting before the first settled size gets "
+              "a clean terminal, not a mangled fragment",
+              "OLD-CONVERSATION" not in card5.terminal.screen_text())
+        check("screens: ...and the seed is dropped on the AGENT too, so a "
+              "retile cannot replay it under the child",
+              launching.pty_replay() == "")
+        card5.detach(); launching.dispose(); pump(50)
+
+        # ...but a card WOKEN by a keystroke has long since re-rendered at its
+        # real size, and its conversation must still be there to scroll up out
+        # of the way, exactly as a real terminal's would
+        woken = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Woken", cwd=str(tmp), pty=True))
+        woken.seed_pty_replay("KEPT-CONVERSATION\r\n")
+        card6 = TerminalCard(woken)
+        card6.resize(640, 400); card6.show(); pump(150)  # settles, re-renders
+        check("screens: a settled restored card has consumed its replay",
+              card6._pending_replay == "")
+        card6._on_status(AgentStatus.STARTING)  # the waking keystroke
+        check("screens: waking a stopped card KEEPS the conversation on screen",
+              "KEPT-CONVERSATION" in card6.terminal.screen_text()
+              and "KEPT-CONVERSATION" in woken.pty_replay())
+        card6.detach(); woken.dispose(); pump(50)
+
         # an agent with NOTHING to show keeps the original centred banner:
         # that card really is a dead black screen and must say so
         blank = TerminalAgent(build_spec(
@@ -5879,6 +5920,37 @@ def test_screen_snapshots():
         check("screens: ...under a slim footer, not a wall of dead terminals",
               card3.overlay.isVisible() and card3._overlay_compact)
         win2.close(); pump(300)
+
+        # ...and the OTHER half of the round-trip, which is the launch the
+        # user actually looks at: an agent that was RUNNING comes back to a
+        # CLEAN terminal that its child fills in a few seconds, never a
+        # fragment of last night's screen. autostart_active_workspace() runs
+        # synchronously right after show(), ahead of TerminalView's 120ms
+        # resize debounce, so the restored screen never gets a settled size
+        # and pyte cannot reflow what was drawn at the pre-layout width.
+        store.save({"version": 3, "active": "w1", "workspaces": [
+            {"id": "w1", "name": "Solo", "project_path": str(home),
+             "layout": "auto", "terminals": [
+                 {**term, "kind": "powershell", "name": "Runner",
+                  "running": True}]}]})
+        win3 = create_main_window(store)
+        runner = win3.manager.workspaces[0].agents[0]
+        check("screens: a restored RUNNING agent is seeded like any other",
+              "MARKER-FROM-LAST-SESSION" in runner.pty_replay())
+        run_card = win3._pages[win3.manager.workspaces[0].id].cards[0]
+        check("screens: ...and its card starts out showing that screen",
+              "MARKER-FROM-LAST-SESSION" in run_card.terminal.screen_text())
+        # main.py's exact order: show(), then autostart, with no turn of the
+        # event loop in between. Pumping here instead would let the resize
+        # settle first and test the WAKE path by accident.
+        win3.show(); win3.autostart_active_workspace(); pump(600)
+        check("screens: ...but the launch autostart hands it a clean terminal",
+              "MARKER-FROM-LAST-SESSION"
+              not in run_card.terminal.screen_text(),
+              run_card.terminal.screen_text()[:160])
+        check("screens: ...and drops the stale seed off the agent as well",
+              "MARKER-FROM-LAST-SESSION" not in runner.pty_replay())
+        win3.close(); pump(300)
         shutil.rmtree(home, ignore_errors=True)
 
     shutil.rmtree(tmp, ignore_errors=True)

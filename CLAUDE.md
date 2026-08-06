@@ -518,7 +518,24 @@ this file is the invariants that must survive every change.
   conversation makes staleness self-correcting: a pin that moved on simply
   misses, so a card never shows another chat's screen. `prune` drops unclaimed
   keys, because every `/clear` mints a new conversation and the directory
-  would otherwise only grow. TWO subtleties, both live-found: (1) pyte drops
+  would otherwise only grow. THE SNAPSHOT SERVES THE STOPPED CARD ONLY: an
+  agent that comes back RUNNING gets a CLEAN terminal that its child fills in
+  a few seconds, which is what a restored hive looked like before snapshots
+  existed. `TerminalCard._on_status` drops the restored screen (its own, and
+  the agent's via `TerminalAgent.drop_seeded_screen`, or a card rebuilt by a
+  retile would replay the same stale seed under the child) the moment the
+  agent starts while `_pending_replay` is STILL SET — i.e. this card has
+  never re-rendered it at a settled size. Both launch paths that start an
+  agent (`autostart_active_workspace`, `recover_blocked_at_startup`) run
+  SYNCHRONOUSLY right after `show()`, ahead of `TerminalView`'s 120 ms resize
+  debounce, so that is every agent restored running: leaving the seed there
+  parked each of their cards on a mangled ~24-column fragment of last
+  session's screen until the TUI finished booting (reported twice, and the
+  reason it is not enough to fix the RE-RENDER: a launching child writes
+  within milliseconds, so any guard that defers to a live child leaves the
+  bad frame up). `_pending_replay` is the right test because a card WOKEN by
+  a keystroke has long since consumed it, so the wake path below is
+  untouched. TWO subtleties, both live-found: (1) pyte drops
   lines off the TOP when it shrinks, and the tiling grid resizes a card AFTER
   it is built, so the newest part of a restored conversation is exactly what
   vanished — `TerminalCard._rerender_restored` re-renders ONCE on the first
@@ -536,7 +553,8 @@ this file is the invariants that must survive every change.
   that already has output, and `restart()` clears the buffer while `start()`
   does not: waking a stopped card resumes its conversation, so the replayed
   screen scrolling up is right, whereas a deliberate restart is a fresh
-  session and must drop it. The wake banner still exists but takes TWO shapes
+  session and must drop it. (That `start()` rule is about the WAKE; the
+  launch-time drop above is keyed on the card, not on `start()`.) The wake banner still exists but takes TWO shapes
   (`TerminalCard._refresh_overlay`): a slim bottom strip when there IS a
   screen to read, the original centred box only when the terminal is genuinely
   empty. The invariant it serves is unchanged (a stopped terminal must never

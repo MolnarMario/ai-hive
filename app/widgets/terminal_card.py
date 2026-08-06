@@ -567,6 +567,35 @@ class TerminalCard(QFrame):
             self._place_overlay()
         return super().eventFilter(obj, event)
 
+    def _drop_restored_screen(self) -> None:
+        """Give the launching child a clean terminal.
+
+        `_pending_replay` still being set means this card has NEVER re-rendered
+        its restored screen at a settled size, so what is on the terminal was
+        drawn at the pre-layout width and pyte cannot reflow it. Both launch
+        paths that start an agent (`autostart_active_workspace` and
+        `recover_blocked_at_startup`) run SYNCHRONOUSLY right after `show()`,
+        while `TerminalView` debounces its resize by 120ms, so this is every
+        agent that comes back running: their cards would sit on a mangled
+        narrow fragment of the old conversation until the TUI finished
+        booting. An empty terminal that fills in a few seconds is what a
+        restored hive looked like before snapshots existed, and snapshots were
+        never meant to change it.
+
+        A card WOKEN by a keystroke is untouched: it has long since
+        re-rendered (`_pending_replay` is empty by then), so its conversation
+        still scrolls up out of the way as a real terminal's would."""
+        self._pending_replay = ""
+        try:
+            self.terminal.sizeChanged.disconnect(self._rerender_restored)
+        except (RuntimeError, TypeError):
+            pass
+        # drop it on the AGENT too, or a card rebuilt later (a retile, a
+        # workspace switch) replays the same stale seed under the child
+        if self.agent.drop_seeded_screen():
+            self.terminal.screen.reset()
+            self.terminal.update()
+
     def _rerender_restored(self, *_) -> None:
         """One-shot: repaint a restored screen at the card's settled size.
 
@@ -688,6 +717,9 @@ class TerminalCard(QFrame):
         if exit_info and not running:
             tip += f" (code {exit_info[0]})"
         self.glyph.setToolTip(tip)
+
+        if self.is_pty and running and self._pending_replay:
+            self._drop_restored_screen()
 
         if self.is_pty:  # stopped terminal shows the wake banner, never black
             self.overlay.setVisible(not running
