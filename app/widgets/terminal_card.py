@@ -115,6 +115,8 @@ class TerminalCard(QFrame):
         self._cr_pending = False
         self._renaming = False  # inline title-edit in progress
         self._task_full = ""    # untruncated current-task (the label elides it)
+        self._pending_replay = ""  # restored screen, re-rendered once at size
+        self._overlay_compact = False
         self._follow = True  # sticky auto-scroll (survives resizes/retiles)
         self._history: list[str] = []
         self._hist_idx = 0
@@ -129,6 +131,16 @@ class TerminalCard(QFrame):
             replay = self.agent.pty_replay()
             if replay:
                 self.terminal.feed(replay)
+                if not self.agent.is_running():
+                    # A RESTORED screen (app/screen_snapshot.py) has no child
+                    # behind it to repaint once the grid hands the card its
+                    # real size, and pyte drops lines off the TOP when it
+                    # shrinks — so the newest part of the conversation, the
+                    # part worth showing, is exactly what would vanish.
+                    # Re-render once at the final size instead. A running
+                    # agent needs none of this: its child redraws on SIGWINCH.
+                    self._pending_replay = replay
+                    self.terminal.sizeChanged.connect(self._rerender_restored)
         else:
             self._replay_log()
         self._on_status(agent.status)
@@ -232,16 +244,16 @@ class TerminalCard(QFrame):
                                          font_px=self.agent.spec.font_px)
             root.addWidget(self.terminal, 1)
             # a stopped terminal must NEVER read as a dead black screen: a
-            # visible banner says so, and any keystroke starts the session
-            self.overlay = QLabel("terminal not running\n"
-                                  "press any key to start",
-                                  self.terminal)
+            # visible banner says so, and any keystroke starts the session.
+            # It takes TWO shapes, because the banner is only the whole story
+            # when there is nothing else to look at. A card restored with its
+            # previous conversation on screen (see app/screen_snapshot.py) gets
+            # a slim footer instead: covering that conversation with a centred
+            # box is what made a reopened hive read as a wall of dead
+            # terminals, which is the thing this was supposed to prevent.
+            self.overlay = QLabel(self.terminal)
             self.overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.overlay.setStyleSheet(
-                "QLabel { background: rgba(10, 10, 12, 200);"
-                f" color: {Palette.ACCENT_ORANGE}; font-size: 13px;"
-                " font-style: italic; border: 1px dashed #6b5b28;"
-                " border-radius: 6px; padding: 10px; }")
+            self._overlay_compact = False
             self.overlay.hide()
         else:
             self.console = QPlainTextEdit(self)
@@ -547,8 +559,56 @@ class TerminalCard(QFrame):
             self._place_overlay()
         return super().eventFilter(obj, event)
 
+    def _rerender_restored(self, *_) -> None:
+        """One-shot: repaint a restored screen at the card's settled size.
+
+        Consumes `_pending_replay` first, so a resize storm (a retile, a
+        sidebar toggle, a window drag) can only ever re-render once."""
+        replay, self._pending_replay = self._pending_replay, ""
+        try:
+            self.terminal.sizeChanged.disconnect(self._rerender_restored)
+        except (RuntimeError, TypeError):
+            pass
+        if not replay or self.agent.is_running():
+            return  # a woken agent owns its screen; never fight the child
+        self.terminal.screen.reset()
+        self.terminal.feed(replay)
+        self._refresh_overlay()
+
+    def _refresh_overlay(self) -> None:
+        """Pick the banner's shape from what is already on the screen.
+
+        Deciding here (on a status change) rather than in `_place_overlay`
+        keeps `screen_text()` off the resize path, which fires per pixel
+        while a card is dragged or a workspace retiles."""
+        if not self.is_pty:
+            return
+        compact = bool(self.terminal.screen_text().strip())
+        self._overlay_compact = compact
+        if compact:
+            self.overlay.setText("not running · press any key to resume")
+            self.overlay.setStyleSheet(
+                "QLabel { background: rgba(10, 10, 12, 225);"
+                f" color: {Palette.ACCENT_ORANGE}; font-size: 12px;"
+                " font-style: italic; border-top: 1px dashed #6b5b28;"
+                " padding: 4px; }")
+        else:
+            self.overlay.setText("terminal not running\n"
+                                 "press any key to start")
+            self.overlay.setStyleSheet(
+                "QLabel { background: rgba(10, 10, 12, 200);"
+                f" color: {Palette.ACCENT_ORANGE}; font-size: 13px;"
+                " font-style: italic; border: 1px dashed #6b5b28;"
+                " border-radius: 6px; padding: 10px; }")
+        self._place_overlay()
+
     def _place_overlay(self) -> None:
         if not self.is_pty:
+            return
+        if self._overlay_compact:  # a full-width strip along the bottom edge,
+            h = 24                 # so the conversation above stays readable
+            self.overlay.setGeometry(0, max(0, self.terminal.height() - h),
+                                     self.terminal.width(), h)
             return
         w = min(320, max(220, self.terminal.width() - 40))
         h = 64
@@ -615,7 +675,7 @@ class TerminalCard(QFrame):
             self.overlay.setVisible(not running
                                     and status is not AgentStatus.STOPPING)
             if not running:
-                self._place_overlay()
+                self._refresh_overlay()
                 self.overlay.raise_()
 
         if status is AgentStatus.STARTING:

@@ -342,6 +342,28 @@ class TerminalAgent(QObject):
     def pty_replay(self) -> str:
         return "".join(self._pty_buffer)
 
+    def seed_pty_replay(self, text: str) -> bool:
+        """Preload the screen a previous run left behind, so a RESTORED but
+        not-yet-started card paints its conversation instead of a black
+        rectangle (see app/screen_snapshot.py).
+
+        Only ever seeds a pty agent that has produced nothing this run —
+        never a live one, whose buffer is the real thing. It goes into
+        `_pty_buffer` rather than straight to the view because that is the
+        one source every card already replays from (`TerminalCard.__init__`),
+        so a card built later (a retile, a workspace switch) shows the same
+        screen instead of only the card that happened to exist at launch.
+
+        `restart()` clears the buffer, so a deliberate fresh session drops the
+        old screen. `start()` deliberately does NOT: waking a stopped card
+        resumes its conversation, and the replayed screen scrolling up out of
+        the way is exactly what a real terminal would do."""
+        if not self.is_pty or self._pty_buffer or not text:
+            return False
+        self._pty_buffer = [text]
+        self._pty_bytes = len(text)
+        return True
+
     def dispose(self) -> None:
         """Final teardown on card close / workspace delete / app quit."""
         self._disposing = True

@@ -120,6 +120,18 @@ def create_main_window(store: SessionStore | None = None) -> MainWindow:
     transcripts.backup_for_agents(
         manager.all_agents(), str(store.path.parent / "transcripts"))
 
+    # ...and give every restored pty agent back the screen it had at close,
+    # BEFORE the window builds its cards: TerminalCard replays pty_replay()
+    # in its constructor, so seeding after this point would leave the launch
+    # cards blank and only paint on a later retile. An agent about to
+    # autostart is seeded too — its conversation is on screen from the first
+    # frame instead of after the TUI finishes drawing.
+    from app import screen_snapshot
+    for agent in manager.all_agents():
+        if getattr(agent, "is_pty", False):
+            agent.seed_pty_replay(screen_snapshot.load(
+                str(store.path.parent), agent.spec.cwd, agent.spec.session_id))
+
     first_run = not manager.workspaces
     if first_run:
         ws = manager.create_workspace("Workspace 1")

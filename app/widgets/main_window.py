@@ -1386,6 +1386,25 @@ class MainWindow(QMainWindow):
                                     outcome, tries=agent.limit_attempts(),
                                     detail=detail)
 
+    def _snapshot_screens(self, agents=None) -> int:
+        """Persist every pty agent's screen and drop the ones nothing claims.
+
+        Never raises: this runs inside `closeEvent`, after the authoritative
+        save, and a cosmetic feature must not be able to interfere with a
+        clean shutdown."""
+        from .. import screen_snapshot
+        try:
+            agents = list(self.manager.all_agents() if agents is None
+                          else agents)
+            root = str(self.store.path.parent)
+            written = screen_snapshot.save_for_agents(agents, root)
+            # keys go stale on their own: every /clear or fork mints a new
+            # conversation, so without this the directory only ever grows
+            screen_snapshot.prune(root, screen_snapshot.keys_for_agents(agents))
+            return written
+        except Exception:
+            return 0
+
     def _limit_audit(self, message: str) -> None:
         """Forensic line in session.log for the auto-continue path.
 
@@ -2235,10 +2254,16 @@ class MainWindow(QMainWindow):
         for agent_id, old, new in self.manager.sync_live_sessions():
             self.store.audit(f"SESSION-SYNC agent={agent_id} {old} -> {new}")
         self._save_session()  # persist FIRST: teardown can never lose state
-        from .. import transcripts  # snapshot the day's conversations
-        transcripts.backup_for_agents(
-            self.manager.all_agents(),
-            str(self.store.path.parent / "transcripts"))
+        from .. import transcripts
+        agents = self.manager.all_agents()
+        transcripts.backup_for_agents(  # snapshot the day's conversations
+            agents, str(self.store.path.parent / "transcripts"))
+        # ...and the SCREENS, so a card left stopped reopens showing its
+        # conversation rather than a black rectangle. Must run while the
+        # agents are still alive (dispose() below drops their pty buffers),
+        # and after sync_live_sessions above so a last-moment conversation
+        # switch is keyed on the pin that will actually be restored.
+        self._snapshot_screens(agents)
         self.bridge.stop()    # stop the RPC server + remove the endpoint file
         for page in self._pages.values():
             for card in list(page.cards):

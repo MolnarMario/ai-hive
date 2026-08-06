@@ -5651,6 +5651,206 @@ def test_wake_and_resume_all():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_screen_snapshots():
+    """A card left STOPPED reopens showing the conversation it had at close,
+    not a black rectangle with a banner over it. (The regression: a reopened
+    hive read as a wall of dead terminals, because "restore as it was" only
+    ever restored the process state, never the screen.)
+
+    The snapshot is keyed on (cwd, pinned conversation) because agent ids are
+    minted fresh on every load, and it lives in its own file, never in
+    session.json."""
+    import pathlib
+    import shutil
+    import tempfile
+    import time
+
+    from app import screen_snapshot
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.terminal_agent import TerminalAgent
+
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="aihive-screens-"))
+
+    # -- keying -----------------------------------------------------------
+    k = screen_snapshot.key_of(str(tmp), "sess-1")
+    check("screens: key is stable for the same (cwd, conversation)",
+          k == screen_snapshot.key_of(str(tmp), "sess-1"))
+    check("screens: a different conversation is a different key",
+          k != screen_snapshot.key_of(str(tmp), "sess-2"))
+    check("screens: a different folder is a different key",
+          k != screen_snapshot.key_of(str(tmp / "other"), "sess-1"))
+    check("screens: the key is filesystem-safe",
+          k.isalnum() and len(k) <= 24, k)
+
+    # -- round-trip -------------------------------------------------------
+    vt = "hello \x1b[32mworld\x1b[0m\r\n> the conversation\r\n"
+    check("screens: save reports success", screen_snapshot.save(
+        str(tmp), str(tmp), "sess-1", vt))
+    check("screens: raw VT round-trips byte for byte",
+          screen_snapshot.load(str(tmp), str(tmp), "sess-1") == vt)
+    check("screens: a conversation with no snapshot loads empty",
+          screen_snapshot.load(str(tmp), str(tmp), "nope") == "")
+    check("screens: an empty screen is not written",
+          not screen_snapshot.save(str(tmp), str(tmp), "sess-x", ""))
+    check("screens: a pin-less agent is never keyed",
+          not screen_snapshot.save(str(tmp), str(tmp), "", vt))
+    check("screens: the snapshot is NOT in session.json",
+          not (tmp / "session.json").exists())
+
+    # oversized screens are capped, and the TAIL is what survives
+    big = ("x" * 10) + ("y" * (screen_snapshot.MAX_BYTES + 500))
+    screen_snapshot.save(str(tmp), str(tmp), "sess-big", big)
+    got = screen_snapshot.load(str(tmp), str(tmp), "sess-big")
+    check("screens: an oversized screen is capped",
+          len(got) == screen_snapshot.MAX_BYTES, len(got))
+    check("screens: the capped screen keeps the TAIL (the recent output)",
+          got.endswith("y" * 100) and not got.startswith("x"))
+
+    # a corrupt/unreadable snapshot degrades to an empty card, never a raise
+    bad = pathlib.Path(screen_snapshot._path(
+        str(tmp), screen_snapshot.key_of(str(tmp), "sess-bad")))
+    bad.write_bytes(b"\xff\xfe\x00raw")
+    check("screens: an unreadable snapshot degrades to empty, never raises",
+          isinstance(screen_snapshot.load(str(tmp), str(tmp), "sess-bad"), str))
+
+    # -- pruning ----------------------------------------------------------
+    removed = screen_snapshot.prune(str(tmp), {k})
+    check("screens: unclaimed snapshots are pruned",
+          removed >= 2 and screen_snapshot.load(
+              str(tmp), str(tmp), "sess-big") == "")
+    check("screens: a claimed snapshot survives pruning",
+          screen_snapshot.load(str(tmp), str(tmp), "sess-1") == vt)
+
+    # -- seeding a restored agent -----------------------------------------
+    spec = build_spec(AgentKind.CLAUDE, "Restored", cwd=str(tmp), pty=True)
+    spec.session_id = "sess-1"
+    agent = TerminalAgent(spec)
+    check("screens: keys_for_agents reports the agent's pin",
+          screen_snapshot.keys_for_agents([agent]) == {k})
+    check("screens: a restored agent is seeded with its last screen",
+          agent.seed_pty_replay(vt) and agent.pty_replay() == vt)
+    check("screens: seeding never overwrites a screen already there",
+          not agent.seed_pty_replay("clobber")
+          and agent.pty_replay() == vt)
+    check("screens: an empty snapshot seeds nothing",
+          not TerminalAgent(build_spec(
+              AgentKind.CLAUDE, "Blank", cwd=str(tmp),
+              pty=True)).seed_pty_replay(""))
+    # restart() is a DELIBERATE fresh session: the old screen must not linger
+    agent.worker = type("_W", (), {"restart": lambda s: None,
+                                   "is_running": lambda s: False,
+                                   "dispose": lambda s: None})()
+    agent.restart()
+    check("screens: a deliberate restart drops the restored screen",
+          agent.pty_replay() == "")
+    agent.dispose()
+
+    # -- the card paints it, and the banner gets out of the way ------------
+    if HAS_CONPTY:
+        from PySide6.QtCore import QEventLoop, QTimer
+        from PySide6.QtWidgets import QApplication
+
+        from app.widgets.terminal_card import TerminalCard
+        QApplication.instance() or QApplication([])
+
+        def pump(ms):
+            loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+        def wait_until(pred, timeout_ms=4000, step=50):
+            deadline = time.monotonic() + timeout_ms / 1000
+            while time.monotonic() < deadline:
+                if pred():
+                    return True
+                pump(step)
+            return pred()
+
+        seeded = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Seeded", cwd=str(tmp), pty=True))
+        seeded.seed_pty_replay("the previous conversation\r\n")
+        card = TerminalCard(seeded)
+        card.resize(640, 400); card.show(); pump(150)
+        # the tiling grid resizes the card AFTER it is built, and pyte drops
+        # lines off the TOP when it shrinks: without the one-shot re-render,
+        # a short restored screen is gone before the user ever sees it
+        check("screens: the restored card paints its conversation",
+              "the previous conversation" in card.terminal.screen_text())
+        check("screens: the re-render is one-shot (a retile cannot repeat it)",
+              card._pending_replay == "")
+        check("screens: the banner still says the terminal is not live",
+              card.overlay.isVisible())
+        check("screens: ...as a slim footer, not a box over the conversation",
+              card._overlay_compact
+              and card.overlay.height() < 40
+              and card.overlay.y() > card.terminal.height() // 2)
+        card.detach(); seeded.dispose(); pump(150)
+
+        # an agent with NOTHING to show keeps the original centred banner:
+        # that card really is a dead black screen and must say so
+        blank = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Blank", cwd=str(tmp), pty=True))
+        card2 = TerminalCard(blank)
+        card2.resize(640, 400); card2.show(); pump(150)
+        check("screens: an empty stopped card keeps the centred wake banner",
+              card2.overlay.isVisible() and not card2._overlay_compact
+              and "press any key to start" in card2.overlay.text())
+        card2.detach(); blank.dispose(); pump(150)
+
+    # -- the whole round-trip, through the real window -------------------
+    # This is the user-visible regression: close the app with a card left
+    # stopped, reopen, and the conversation is on the card. The pieces above
+    # all passed while the feature was still broken end to end.
+    if HAS_CONPTY:
+        from app.session_store import SessionStore
+        from main import create_main_window
+
+        home = pathlib.Path(tempfile.mkdtemp(prefix="aihive-screen-e2e-"))
+        store = SessionStore(path=home / "session.json")
+        term = {"role": "", "cwd": str(home), "user_program": "",
+                "user_args": [], "pty": True, "provider": "", "model": "",
+                "effort": "", "custom_command": "", "font_px": 0,
+                "is_orchestrator": False, "task": "", "assignment": "idle",
+                "auto_created": False, "session_id": "screen-e2e-1"}
+        store.save({"version": 3, "active": "w1", "workspaces": [
+            {"id": "w1", "name": "Solo", "project_path": str(home),
+             "layout": "auto", "terminals": [
+                 {**term, "kind": "powershell", "name": "Keeper",
+                  "running": False}]}]})
+
+        win = create_main_window(store)
+        win.show(); pump(200)
+        agent = win.manager.workspaces[0].agents[0]
+        # stand in for a conversation the agent had before the app closed
+        agent.seed_pty_replay("\r\n" * 4 + "MARKER-FROM-LAST-SESSION\r\n")
+        win.close(); pump(300)
+
+        snap = screen_snapshot.load(str(home), str(home), "screen-e2e-1")
+        check("screens: closing the app writes the card's screen to disk",
+              "MARKER-FROM-LAST-SESSION" in snap)
+        check("screens: the screen is a file of its own, not session.json",
+              "MARKER-FROM-LAST-SESSION" not in
+              (home / "session.json").read_text(encoding="utf-8"))
+
+        win2 = create_main_window(store)
+        win2.show(); pump(300)
+        agent2 = win2.manager.workspaces[0].agents[0]
+        check("screens: reopening seeds the restored agent from disk",
+              "MARKER-FROM-LAST-SESSION" in agent2.pty_replay())
+        check("screens: ...and it is still NOT running (restored as left)",
+              not agent2.is_running())
+        card3 = win2._pages[win2.manager.workspaces[0].id].cards[0]
+        check("screens: ...and the reopened CARD shows the conversation",
+              wait_until(lambda: "MARKER-FROM-LAST-SESSION"
+                         in card3.terminal.screen_text(), 4000),
+              card3.terminal.screen_text()[-200:])
+        check("screens: ...under a slim footer, not a wall of dead terminals",
+              card3.overlay.isVisible() and card3._overlay_compact)
+        win2.close(); pump(300)
+        shutil.rmtree(home, ignore_errors=True)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_resume_fallback():
     """A resume (--continue) launch that dies before the interactive prompt ever
     comes up (Claude prints 'No conversation found to continue' and exits) must
@@ -7117,6 +7317,7 @@ def main():
     test_review_hardening_fixes()
     test_resume_picker()
     test_transcript_backups()
+    test_screen_snapshots()
     test_agent_file_map()
     test_fsopen_helpers()
     test_filetypes_icons()

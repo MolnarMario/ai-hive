@@ -498,6 +498,44 @@ this file is the invariants that must survive every change.
   (Cinzel/EB Garamond/Spectral) are bundled OFL TTFs in `app/assets/fonts`,
   registered by `main._load_bundled_fonts`; themes name them with a serif
   fallback chain so a missing file degrades gracefully.
+- **A stopped card shows its CONVERSATION, not a black rectangle**
+  (`app/screen_snapshot.py`, Qt-free/stdlib-only like `chime.py`). "Restore as
+  it was" used to restore only the PROCESS state, so a reopened hive was a
+  wall of dead terminals with a centred "terminal not running" box over each
+  one. `closeEvent` now writes each pty agent's raw VT tail
+  (`TerminalAgent.pty_replay()`) to `<session-dir>/screens/<key>.vt` and
+  `create_main_window` seeds it back via `seed_pty_replay` BEFORE building the
+  window: `TerminalCard.__init__` replays `pty_replay()` in its constructor,
+  so seeding after that leaves the launch cards blank. The RAW STREAM is kept,
+  not the transcript (`transcripts.py` already backs those up) — replaying the
+  bytes through the same pyte screen that drew them reproduces what was there;
+  re-rendering a jsonl transcript would not look like the TUI. It is NOT
+  session state: half a megabyte of escape codes per agent has no business in
+  `session.json`, so these are plain files beside the transcript backups, and
+  the "a latch is never persisted" style rules are unaffected. Identity is
+  (cwd, pinned session id) via `key_of` — `TerminalAgent.id` is minted fresh
+  every load (same reason `limit_ledger.key_of` avoids it), and keying on the
+  conversation makes staleness self-correcting: a pin that moved on simply
+  misses, so a card never shows another chat's screen. `prune` drops unclaimed
+  keys, because every `/clear` mints a new conversation and the directory
+  would otherwise only grow. TWO subtleties, both live-found: (1) pyte drops
+  lines off the TOP when it shrinks, and the tiling grid resizes a card AFTER
+  it is built, so the newest part of a restored conversation is exactly what
+  vanished — `TerminalCard._rerender_restored` re-renders ONCE on the first
+  `sizeChanged` (consuming `_pending_replay` first so a retile storm cannot
+  repeat it, and bailing if the agent has since started, because a live child
+  owns its own screen). (2) `seed_pty_replay` refuses to overwrite a buffer
+  that already has output, and `restart()` clears the buffer while `start()`
+  does not: waking a stopped card resumes its conversation, so the replayed
+  screen scrolling up is right, whereas a deliberate restart is a fresh
+  session and must drop it. The wake banner still exists but takes TWO shapes
+  (`TerminalCard._refresh_overlay`): a slim bottom strip when there IS a
+  screen to read, the original centred box only when the terminal is genuinely
+  empty. The invariant it serves is unchanged (a stopped terminal must never
+  read as a dead black screen); covering the restored conversation with a box
+  was defeating the very thing it exists for. `_refresh_overlay` decides the
+  shape on a STATUS change, never in `_place_overlay`, which runs per pixel
+  during a drag or retile.
 - **Transcripts are backed up by AI Hive** (`app/transcripts.py`): snapshots
   land in `<session-dir>/transcripts/` at app start (in `create_main_window`,
   BEFORE agents launch) and at graceful close (`closeEvent`). The

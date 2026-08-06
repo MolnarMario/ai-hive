@@ -289,9 +289,13 @@ error dialog instead of silently closing. Packaging to a distributable
   agents share one folder (which the filesystem alone can't disambiguate). A
   pinned id whose transcript has gone missing still recovers the folder's most
   recent one instead of erroring. No more manually hunting for a lost chat.
-  Agents that were *stopped* stay stopped, but never as a black screen: the
-  card shows a **wake banner** and the first keystroke starts it —
-  a woken Claude agent also reclaims its conversation.
+  Agents that were *stopped* stay stopped, but the card is **not** blank:
+  it comes back showing **the conversation that was on it when you closed**,
+  exactly as it looked, with a slim `not running · press any key to resume`
+  strip along the bottom. So reopening the app shows you your work rather
+  than a wall of dead terminals, and nothing relaunches behind your back;
+  the first keystroke starts it, and a woken Claude agent also reclaims its
+  conversation.
 - **Scrolling** — in a full terminal the wheel does what a real terminal does:
   fullscreen apps that request mouse events (Claude Code) receive the wheel
   and scroll their own transcript; other fullscreen apps (vim, less) get
@@ -500,7 +504,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-966 checks drive the real app headlessly (offscreen Qt platform) with real
+997 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -556,6 +560,7 @@ app/
   mcp_server.py            stdlib MCP stdio server (log_activity) the Claude CLI spawns
   session_store.py         atomic JSON persistence (AppData) + save-audit log
   transcripts.py           Claude-transcript snapshots (start/close, high-water)
+  screen_snapshot.py       a stopped card's last screen, so reopen shows the conversation (Qt-free)
   session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
   session_hook.py          SessionStart hook: the child reports its live conversation id
   chime.py                 notification bell (WAV synth + async play, Qt-free) for the "?" alert
@@ -574,7 +579,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (966 checks)
+tests/smoke_test.py        headless end-to-end suite (997 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
