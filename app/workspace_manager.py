@@ -690,9 +690,12 @@ class WorkspaceManager(QObject):
     # -------------------------------------------------------- persistence ---
 
     def _agent_dict(self, a) -> dict:
-        # auto-created agents (orchestrator/workers) keep their "resume on next
-        # open" intent even if the process momentarily died — otherwise a
-        # crashed/failed auto-agent silently goes dormant and never comes back.
+        # auto-created agents (task-spawned workers) keep recording "was meant
+        # to be running" even if the process momentarily died, so a crash
+        # mid-task is distinguishable on disk from a deliberate stop. Nothing
+        # currently auto-starts an agent on launch just because this is True
+        # (see main.py: only a plan-limit cut-off recovers unattended) — this
+        # is bookkeeping for a future consumer, not a live resume path.
         # User-created agents persist their live running state as before.
         return {**a.spec.to_dict(),
                 "running": (a.is_running()

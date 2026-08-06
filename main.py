@@ -128,31 +128,32 @@ def create_main_window(store: SessionStore | None = None) -> MainWindow:
     window = MainWindow(manager, store, session=session)
 
     if first_run:
-        agent = manager.add_terminal(
+        # idle like any other restored agent: the card's wake banner + first
+        # keystroke (never a dead black screen) starts it, same as a plain
+        # reopen — no special-cased autostart for the very first window.
+        manager.add_terminal(
             ws.id, build_spec(AgentKind.POWERSHELL, "Agent 1",
                               cwd=ws.project_path, pty=HAS_CONPTY),
             autostart=False)
-        agent.autostart_on_restore = True
     else:
         from app.providers import RESUME_PROVIDERS
         for ws in manager.workspaces:
             for agent in ws.agents:
-                # everything that was running comes back in EVERY workspace,
-                # and every restored Claude/Gemini agent reclaims its prior
-                # conversation (--continue) on its NEXT start — whether that
-                # is the launch autostart or a later press-any-key wake.
-                # resume is one-shot: consumed at first start, so a manual
-                # restart after that is a deliberate fresh session.
+                # nothing auto-starts here anymore — a restored agent waits
+                # for a manual wake (any keystroke) or, if its transcript
+                # proves the plan limit cut it off, recover_blocked_at_startup
+                # further down. But every restored Claude/Gemini agent still
+                # reclaims its prior conversation (--continue) on its NEXT
+                # start, whichever path triggers that start. resume is
+                # one-shot: consumed at first start, so a manual restart after
+                # that is a deliberate fresh session.
                 if agent.spec.provider in RESUME_PROVIDERS:
                     agent.spec.resume = True
                     # this resume is a RESTORE: verify the pinned conversation
                     # still exists and recover it if a stale/never-used id
                     # would otherwise make --resume error on a dead terminal
                     agent._verify_resume_target = True
-                if agent.autostart_on_restore:
-                    agent.notice("[resuming previous session…]")
-                else:
-                    agent.notice("[session restored; press any key to start]")
+                agent.notice("[session restored; press any key to start]")
     return window
 
 
@@ -268,14 +269,13 @@ def main() -> int:
     window.start_usage_polling()
     window.show()
     _register_relaunch_properties(int(window.winId()))
-    window.autostart_active_workspace()
-    # ...then look for agents a spent plan limit stopped BEFORE this run and
-    # arm them to be resumed. Follows the autostart so the ordinary restore
-    # happens first and this only has to start the stragglers — an agent the
-    # LIMIT stopped is started here even if the user's card was left stopped,
-    # since it was not the user who stopped it. Reads the user's real
-    # transcripts and types into real agents, so like the usage poll it is
-    # opted into here rather than in the factory the smoke suite shares.
+    # No blanket "resume everything that was running" anymore — a restored
+    # agent just sits stopped until you wake it (keystroke) or its transcript
+    # proves the plan limit cut it off mid-turn, which is the one case worth
+    # coming back unattended: it was not the user who stopped it. Reads the
+    # user's real transcripts and types into real agents, so like the usage
+    # poll it is opted into here rather than in the factory the smoke suite
+    # shares.
     window.recover_blocked_at_startup()
     return app.exec()
 
