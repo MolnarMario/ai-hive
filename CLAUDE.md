@@ -451,6 +451,26 @@ this file is the invariants that must survive every change.
   drifted pin, an unflushed conversation — is no evidence either way and must
   never strand a genuine cut-off. `ended_on_limit` collapses both to False,
   which is right only for a caller wanting positive evidence.
+  A cut-off is also refuted when the turn behind the banner was Claude Code's
+  OWN plumbing rather than anything anyone asked for — a background task's
+  completion notification can start a brand-new turn with no input from the
+  user or AI Hive, and if the account runs out right then it eats the same
+  menu a real interruption would, with nothing of substance lost (that
+  auto-nudged an agent hours after its work was done). `transcripts.
+  _SYNTHETIC_USER_TAGS` is an ALLOWLIST of those injected tags and must stay
+  one: keying off a leading `<` alone also swept in `<command-name>`, i.e. a
+  slash command the USER typed, whose work is exactly as real as any prompt's.
+  There are TWO checks and they are gated differently ON PURPOSE.
+  `_auto_continue_agent`'s runs at reset time and may dismiss on a plain
+  `not cut_off`. `MainWindow._dismiss_if_phantom` (`LIMIT_PHANTOM_CHECK_MS`
+  after the LIVE latch, so a phantom never even shows the hourglass) may NOT:
+  a running agent's transcript always exists, so a banner Claude has drawn but
+  not yet WRITTEN reads as `cut_off False`, not None — and clearing the latch
+  on that races away a genuine cut-off with no way back, since a silently
+  parked agent emits nothing to re-latch on. It therefore gates on the
+  POSITIVE `synthetic` field (a banner that WAS found, refuted by the turn
+  behind it), never on the absence of a cut-off. Any new early consumer must
+  do the same.
   A reset read off the SCREEN also gets `LIMIT_RESET_GRACE_S` of slack (the
   banner names a minute, not an instant, and a nudge into a still-shut window
   spends one of very few retries); a reset from the ACCOUNT reading needs none,

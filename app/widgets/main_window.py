@@ -105,6 +105,14 @@ LIMIT_WATCH_MS = 60000
 # enough for the TUI to redraw without the banner, short enough that a failed
 # attempt is retried while it still matters.
 AUTO_CONTINUE_VERIFY_MS = 20000
+# How long after a LIVE latch to cross-check it against the transcript, to
+# catch a cut-off that was Claude Code's own background-task-notification
+# auto-continuing rather than real work (see `_dismiss_if_phantom`). The
+# screen shows the identical menu either way, so this is the earliest point
+# the two can be told apart. Short: the transcript record behind the banner
+# is normally flushed within a second or two of it being drawn, and a miss
+# here is never fatal -- the identical check runs again at nudge time.
+LIMIT_PHANTOM_CHECK_MS = 3000
 # A resume can land while the window is still shut, so one attempt is not
 # enough — but it must not become a Continue every minute forever either.
 LIMIT_RETRY_S = 300
@@ -1417,6 +1425,50 @@ class MainWindow(QMainWindow):
             self._ledger_cut_off(agent, agent.limit_cut_off_at(), at or 0.0,
                                  agent.limit_window(),
                                  agent.limit_banner_text(), source="live")
+        QTimer.singleShot(LIMIT_PHANTOM_CHECK_MS,
+                          lambda: self._dismiss_if_phantom(ws_id, agent_id,
+                                                            key))
+
+    def _dismiss_if_phantom(self, ws_id: str, agent_id: str, key: tuple) -> None:
+        """Shortly after a live latch: was the interrupted turn something the
+        user or AI Hive actually asked for, or Claude Code's own background-
+        task-notification auto-continuing on its own? Both render the
+        identical "Stop and wait for limit to reset" menu, so the screen
+        genuinely cannot tell them apart — the transcript can, because it
+        carries the raw record behind the banner (see
+        `transcripts._is_synthetic_user_turn`).
+
+        Gated on POSITIVE evidence (`info["synthetic"]`), NOT on the absence
+        of a cut-off, and that difference is the whole safety of running this
+        early. `_auto_continue_agent` may dismiss on a plain `not cut_off`
+        because it runs at reset time, hours later, when the transcript is
+        certainly written; three seconds after the banner was DRAWN it may
+        not be, and a running agent's transcript always exists, so an
+        unflushed banner reads as `cut_off False` rather than None (see
+        `transcripts.limit_cut_off`). Dismissing on that would clear a
+        genuine latch during the race — the exact inversion the tri-state
+        exists to prevent, and unrecoverable unless the parked TUI happens to
+        redraw and re-latch. So only a transcript that positively SHOWS the
+        interrupted turn was Claude Code's own plumbing clears anything here;
+        every other reading leaves the latch alone and the nudge-time check
+        remains the backstop.
+        """
+        if self._closing:
+            return
+        agent = self.manager.agent(ws_id, agent_id)
+        if agent is None or not agent.is_limit_blocked():
+            return
+        if tuple(self._ledger_key(agent)) != key:
+            return   # a newer cut-off has since taken this one's place
+        info = transcripts.limit_cut_off(agent.spec.cwd, agent.spec.session_id)
+        if info is None or not info.get("synthetic"):
+            return
+        self._limit_audit(
+            f"PHANTOM agent={agent.spec.name} (the interrupted turn was a "
+            f"background/system notification, not real work)")
+        self._ledger_outcome(agent, limit_ledger.DISMISSED,
+                             detail="trivial background-task cut-off")
+        agent.clear_limit_block()
 
     def _check_limit_resets(self) -> None:
         """Network-free trigger: resume any cut-off agent whose OWN banner said
@@ -1530,15 +1582,21 @@ class MainWindow(QMainWindow):
         # on, so the screen alone can be describing history — and a stray
         # "Continue" into an agent that is working fine is both an
         # interruption and real quota spent. TRI-STATE on purpose: only a
-        # transcript that demonstrably CARRIED ON refutes the latch; one that
-        # cannot be read (a drifted pin, a conversation Claude hasn't flushed)
-        # is no evidence either way and must not strand a genuine cut-off.
+        # transcript that demonstrably CARRIED ON, OR shows the interrupted
+        # turn was Claude's own background-task-notification rather than real
+        # work (see `transcripts._is_synthetic_user_turn` — normally caught
+        # already, promptly, by `_dismiss_if_phantom`; this is the backstop
+        # for a transcript that hadn't flushed yet at latch time), refutes the
+        # latch; one that cannot be read (a drifted pin, a conversation Claude
+        # hasn't flushed) is no evidence either way and must not strand a
+        # genuine cut-off.
         info = transcripts.limit_cut_off(agent.spec.cwd, agent.spec.session_id)
         if info is not None and not info["cut_off"]:
             self._limit_audit(f"PHANTOM agent={agent.spec.name} (the "
-                              f"conversation carried on past the banner)")
+                              f"conversation carried on, or the interrupted "
+                              f"turn wasn't real work)")
             self._ledger_outcome(agent, limit_ledger.DISMISSED,
-                                 detail="transcript carried on")
+                                 detail="transcript shows no real work lost")
             agent.clear_limit_block()
             self._resume_pending.discard(agent.id)
             return
@@ -2051,16 +2109,6 @@ class MainWindow(QMainWindow):
         self._focused_card = card
         card.set_focused(True)
 
-    def autostart_active_workspace(self) -> None:
-        """Restore what was running: every agent that was RUNNING at save
-        time — in EVERY workspace — starts (and resumes) automatically, so
-        opening the app brings the whole hive back without manual steps.
-        Agents that were stopped, and one-shot scripts, never re-execute as
-        a side effect of launch. (Name kept for the smoke-test API.)"""
-        for ws in self.manager.workspaces:
-            for agent in ws.agents:
-                if agent.autostart_on_restore and not agent.is_running():
-                    agent.start()
 
     # -------------------------------------------------------- persistence ---
 

@@ -2433,7 +2433,7 @@ def test_app():
           (tmp / "session.json").exists()
           and "Bravo" in (tmp / "session.json").read_text(encoding="utf-8"))
 
-    # -- 11. restore round-trip: lazy start honors saved run state ----------
+    # -- 11. restore round-trip: nothing auto-starts, saved run state kept --
     win2 = create_main_window(store)
     win2.resize(1600, 900)
     win2.show()
@@ -2443,14 +2443,9 @@ def test_app():
     running_flags = [a.autostart_on_restore for a in alpha2.agents]
     check("restore: run state loaded per agent",
           any(running_flags) and not all(running_flags), running_flags)
-    win2.autostart_active_workspace()
-    to_start = [a for a in alpha2.agents if a.autostart_on_restore]
-    to_stay = [a for a in alpha2.agents if not a.autostart_on_restore]
-    check("restore: previously-running agents autostart",
-          wait_until(lambda: all(a.is_running() for a in to_start), 15000))
     pump(500)
-    check("restore: stopped agents stay idle (no side-effect re-runs)",
-          all(not a.is_running() for a in to_stay))
+    check("restore: no agent auto-starts on launch (manual wake only)",
+          all(not a.is_running() for a in alpha2.agents))
     win2.close()
     procs2 = [a.worker.process() for a in mgr2.all_agents()
               if a.worker.process()]
@@ -4765,7 +4760,7 @@ def test_lifecycle_e2e():
     check("e2e: reopened agent resumes, not --continue",
           agent2.spec.resume
           and "--resume" in agent2.spec.effective_args())
-    win2.autostart_active_workspace()
+    agent2.start()  # nothing auto-starts restored agents anymore; wake it
     check("e2e: THE SAME conversation came back on the card",
           wait_until(lambda: marker.lower() in screen_text(agent2), 90000),
           screen_text(agent2)[-300:])
@@ -5566,12 +5561,12 @@ def test_resume_picker():
 
 
 def test_wake_and_resume_all():
-    """The hive comes back WHOLE on reopen: previously-running agents
-    autostart in EVERY workspace (not just the active one), every restored
-    Claude agent carries one-shot resume for whenever it next starts, and a
-    stopped pty card is never a dead black screen — it shows a wake banner
-    and starts on the first keystroke. (The regression: a user switching to a
-    non-active workspace found an unlabeled black terminal that ate input.)"""
+    """Reopening the app auto-starts NOTHING, in any workspace — a restored
+    agent (however it was left) waits for a manual wake, except the separate
+    plan-limit recovery path tested elsewhere. Every restored Claude agent
+    still carries one-shot resume for whenever it next starts, and a stopped
+    pty card is never a dead black screen — it shows a wake banner and starts
+    on the first keystroke."""
     import json as _json  # noqa: F401
     import time
     from PySide6.QtCore import QEventLoop, QTimer
@@ -5625,12 +5620,10 @@ def test_wake_and_resume_all():
 
     check("wake: restored Claude carries one-shot resume (--continue)",
           coder.spec.resume and "--continue" in coder.spec.effective_args())
-    win.autostart_active_workspace()
-    check("wake: running agent in a NON-active workspace autostarts",
-          wait_until(lambda: bg.is_running()))
     pump(300)
-    check("wake: stopped agents stay stopped (no side-effect runs)",
-          not stopped.is_running() and not coder.is_running())
+    check("wake: nothing auto-starts on launch, in ANY workspace",
+          not bg.is_running() and not stopped.is_running()
+          and not coder.is_running())
     win.close(); pump(250)
 
     # stopped pty card: visible banner + press-any-key wake
@@ -6608,6 +6601,123 @@ def test_auto_continue_on_limit_reset():
     check("auto-continue: an unreadable transcript does not veto the latch",
           AUTO_CONTINUE_TEXT in sent(unknown))
 
+    # --- a trivial background-task cut-off is dismissed EARLY, before the ---
+    # --- watchdog ever gets a chance to nudge it -----------------------------
+    # The screen renders the identical "Stop and wait for limit to reset"
+    # menu whether the interrupted turn was real work or Claude Code's own
+    # background-command-completion notification auto-continuing on its own
+    # -- so the live latch (correctly) cannot tell them apart, and the
+    # hourglass shows either way. `_dismiss_if_phantom` re-checks the
+    # transcript a few seconds after the latch and clears it once the
+    # evidence says nothing of the agent's actual work was lost, instead of
+    # waiting for reset time to find out via a wasted nudge.
+    from app.widgets.main_window import LIMIT_PHANTOM_CHECK_MS
+
+    def write_raw(cwd_, sid, records):
+        path = _tr.transcript_path(cwd_, sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(_json.dumps(rec) + "\n")
+
+    def ts(at):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(at))
+
+    writes.clear()
+    bg_cwd = str(tmp / "bgnotify")
+    bg = mk("BgNotify")
+    bg.spec.cwd, bg.spec.session_id = bg_cwd, "sid-bg-notify"
+    write_raw(bg_cwd, "sid-bg-notify", [
+        {"type": "assistant", "timestamp": ts(now - 3600),
+         "message": {"content": [{"type": "text", "text": "Done, merged."}]}},
+        {"type": "user", "timestamp": ts(now - 30),
+         "message": {"content": "<task-notification>\n<task-id>t1</task-id>\n"
+                                "<status>completed</status>\n"
+                                "</task-notification>"}},
+        {"type": "assistant", "timestamp": ts(now - 30),
+         "message": {"content": [{"type": "text", "text": BANNER.strip()}]}},
+    ])
+    settle(bg, BANNER)
+    ws.agents.append(bg)
+    check("auto-continue: a trivial background-task cut-off still latches "
+          "live (the screen alone can't tell it apart from a real one)",
+          bg.is_limit_blocked())
+    win._on_agent_limit_blocked(ws.id, bg.id)
+    pump(LIMIT_PHANTOM_CHECK_MS + 500)
+    check("auto-continue: ...but the early phantom check clears it once the "
+          "transcript shows the interrupted turn wasn't real work",
+          not bg.is_limit_blocked())
+    check("auto-continue: it is never nudged", sent(bg) == "")
+    check("auto-continue: the early dismissal is recorded as an outcome too",
+          any(r.get("event") == limit_ledger.DISMISSED
+              and "background-task" in r.get("detail", "")
+              for r in limit_ledger.read_all(str(tmp))))
+
+    # ...and a GENUINE cut-off latched the same way must survive that same
+    # early check untouched.
+    writes.clear()
+    real_cwd = str(tmp / "realask")
+    real_ask = mk("RealAsk")
+    real_ask.spec.cwd, real_ask.spec.session_id = real_cwd, "sid-real-ask"
+    write_raw(real_cwd, "sid-real-ask", [
+        {"type": "assistant", "timestamp": ts(now - 3600),
+         "message": {"content": [{"type": "text", "text": "Done, merged."}]}},
+        {"type": "user", "timestamp": ts(now - 30),
+         "message": {"content": "can you add Chess960 castling support?"}},
+        {"type": "assistant", "timestamp": ts(now - 30),
+         "message": {"content": [{"type": "text", "text": BANNER.strip()}]}},
+    ])
+    settle(real_ask, BANNER)
+    ws.agents.append(real_ask)
+    win._on_agent_limit_blocked(ws.id, real_ask.id)
+    pump(LIMIT_PHANTOM_CHECK_MS + 500)
+    check("auto-continue: a genuine cut-off survives the early phantom check",
+          real_ask.is_limit_blocked())
+
+    # THE RACE the early check has to lose safely: it runs seconds after the
+    # banner was DRAWN, and Claude may not have written that record yet. A
+    # running agent's transcript always exists, so an unflushed banner does
+    # NOT read as "no transcript" -- it reads as a conversation that carried
+    # on. Dismissing on that would clear a genuine latch outright (nothing
+    # re-latches a silently parked agent), so the early check gates on
+    # positive `synthetic` evidence instead.
+    writes.clear()
+    slow_cwd = str(tmp / "unflushed")
+    slow = mk("Unflushed")
+    slow.spec.cwd, slow.spec.session_id = slow_cwd, "sid-unflushed"
+    write_raw(slow_cwd, "sid-unflushed", [
+        {"type": "user", "timestamp": ts(now - 60),
+         "message": {"content": "please refactor the parser"}},
+        {"type": "assistant", "timestamp": ts(now - 50),
+         "message": {"content": [{"type": "text", "text": "Working on it."}]}},
+    ])
+    settle(slow, BANNER)
+    ws.agents.append(slow)
+    win._on_agent_limit_blocked(ws.id, slow.id)
+    pump(LIMIT_PHANTOM_CHECK_MS + 500)
+    check("auto-continue: a latch whose banner has not been written to the "
+          "transcript yet is NOT dismissed early", slow.is_limit_blocked())
+
+    # ...and a slash command is the user's own work, however much its record
+    # looks like plumbing.
+    writes.clear()
+    slash_cwd = str(tmp / "slashcmd")
+    slash = mk("SlashCmd")
+    slash.spec.cwd, slash.spec.session_id = slash_cwd, "sid-slash-cmd"
+    write_raw(slash_cwd, "sid-slash-cmd", [
+        {"type": "user", "timestamp": ts(now - 30),
+         "message": {"content": "<command-name>/security-review</command-name>"
+                                "\n<command-message>go</command-message>"}},
+        {"type": "assistant", "timestamp": ts(now - 30),
+         "message": {"content": [{"type": "text", "text": BANNER.strip()}]}},
+    ])
+    settle(slash, BANNER)
+    ws.agents.append(slash)
+    win._on_agent_limit_blocked(ws.id, slash.id)
+    pump(LIMIT_PHANTOM_CHECK_MS + 500)
+    check("auto-continue: a cut-off during a USER-typed slash command is not "
+          "dismissed as plumbing", slash.is_limit_blocked())
+
     # --- the cut-off is visible on the card ---------------------------------
     marked = mk("Marked")
     settle(marked, BANNER)
@@ -6742,6 +6852,79 @@ def test_startup_limit_recovery():
           "not a cut-off", not hit2)
     check("startup-recovery: no transcript at all is not a cut-off",
           transcripts.ended_on_limit(cwd, "sid-missing")[0] is False)
+
+    # A cut-off is only real when the turn it stopped was something the user
+    # (or a delivered task) actually asked for. Claude Code can turn a
+    # background command's own completion into a brand-new turn with NO input
+    # from anyone -- if the account is exhausted right then, that turn hits
+    # the identical banner a real interruption would, but nothing of the
+    # agent's actual work was lost. Observed live: an agent long done with its
+    # assigned task got auto-nudged over a stray background Playwright lookup
+    # finishing hours later.
+    def user_msg(content, at):
+        return {"type": "user", "timestamp": iso(at),
+                "message": {"content": content}}
+
+    write_transcript(cwd, "sid-bg-notify", [
+        assistant("Done, merged and clean.", cut_at - 3600),
+        user_msg("<task-notification>\n<task-id>abc</task-id>\n"
+                 "<status>completed</status>\n</task-notification>", cut_at),
+        assistant(BANNER, cut_at)])
+    hit3, _, _ = transcripts.ended_on_limit(cwd, "sid-bg-notify")
+    check("startup-recovery: a banner behind a <task-notification> (no real "
+          "input from the user or AI Hive) is not a cut-off worth resuming",
+          not hit3)
+
+    write_transcript(cwd, "sid-real-ask", [
+        assistant("Done, merged and clean.", cut_at - 3600),
+        user_msg("can you also add Chess960 castling support?", cut_at),
+        assistant(BANNER, cut_at)])
+    hit4, _, _ = transcripts.ended_on_limit(cwd, "sid-real-ask")
+    check("startup-recovery: a banner behind a REAL user prompt is still a "
+          "genuine cut-off", hit4)
+
+    write_transcript(cwd, "sid-tool-result", [
+        assistant("Done, merged and clean.", cut_at - 3600),
+        {"type": "user", "timestamp": iso(cut_at),
+         "message": {"content": [{"type": "tool_result",
+                                  "content": [{"type": "text",
+                                               "text": "exit 0"}]}]}},
+        assistant(BANNER, cut_at)])
+    hit5, _, _ = transcripts.ended_on_limit(cwd, "sid-tool-result")
+    check("startup-recovery: a banner behind an ordinary tool-result reply "
+          "(mid-turn, not synthetic) is still a genuine cut-off", hit5)
+
+    # A slash command READS like plumbing -- a bare `<command-name>` string,
+    # same shape as a <task-notification> -- but the user typed it, so the
+    # work behind it is theirs and a cut-off there is as real as any other.
+    # Keying "synthetic" off the leading "<" alone swept these in and would
+    # have silently dropped the cut-off (real transcripts do carry a
+    # `<command-name>` record followed straight by the assistant turn).
+    write_transcript(cwd, "sid-slash-cmd", [
+        assistant("Done, merged and clean.", cut_at - 3600),
+        user_msg("<command-name>/security-review</command-name>\n"
+                 "<command-message>security-review</command-message>", cut_at),
+        assistant(BANNER, cut_at)])
+    hit6, _, _ = transcripts.ended_on_limit(cwd, "sid-slash-cmd")
+    check("startup-recovery: a banner behind a USER-typed slash command is a "
+          "genuine cut-off, not plumbing", hit6)
+
+    # `synthetic` is positive evidence and must never stand in for "no banner
+    # found": an early caller gates on it precisely because a banner Claude
+    # has drawn but not yet WRITTEN reads as cut_off False on an existing
+    # transcript, which is not evidence of anything.
+    write_transcript(cwd, "sid-unflushed", [
+        user_msg("please refactor the parser", cut_at - 60),
+        assistant("Working on it now.", cut_at - 50)])
+    unflushed = transcripts.limit_cut_off(cwd, "sid-unflushed")
+    check("startup-recovery: an unwritten banner is NOT flagged synthetic "
+          "(absence of evidence is not evidence)",
+          unflushed is not None and not unflushed["cut_off"]
+          and not unflushed["synthetic"], unflushed)
+    check("startup-recovery: a real plumbing cut-off IS flagged synthetic",
+          transcripts.limit_cut_off(cwd, "sid-bg-notify")["synthetic"])
+    check("startup-recovery: a genuine cut-off is not flagged synthetic",
+          not transcripts.limit_cut_off(cwd, "sid-real-ask")["synthetic"])
 
     # --- arming from it ------------------------------------------------------
     store = SessionStore(path=tmp / "s.json")

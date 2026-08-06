@@ -159,7 +159,7 @@ def limit_cut_off(cwd: str, session_id: str) -> dict | None:
     """The same verdict as `ended_on_limit`, but TRI-STATE and detailed.
 
     Returns None when there is no readable transcript at all, and otherwise
-    `{"cut_off", "at", "resets_at", "banner", "window"}`.
+    `{"cut_off", "at", "resets_at", "banner", "window", "synthetic"}`.
 
     The distinction between "the conversation carried on" and "there is no
     conversation to read" is what makes this safe to act on. A caller using it
@@ -169,6 +169,18 @@ def limit_cut_off(cwd: str, session_id: str) -> dict | None:
     parked agent. `ended_on_limit` collapses both to False, which is right for
     a caller that only wants positive evidence.
 
+    CAREFUL, and this is the trap: "not flushed yet" only reads as None while
+    the transcript file does not EXIST. A running agent always has one, so a
+    banner Claude has drawn but not yet written reads as `cut_off False` —
+    indistinguishable, on that field alone, from a conversation that carried
+    on. That is fine for a caller running hours later at reset time, and
+    wrong for one running seconds after the banner appeared. Hence
+    `synthetic`: True only when a banner WAS found and the turn behind it was
+    Claude Code's own plumbing (`_is_synthetic_user_turn`) rather than
+    anything the user or AI Hive asked for, so nothing of substance was
+    interrupted. It is POSITIVE evidence, never the absence of evidence, and
+    it is what an early caller must gate on.
+
     The banner text and its window come back too, because a cut-off's identity
     (which window stopped it, and when that window reopens) cannot be
     reconstructed from a bool. Cached by (mtime,size); never raises.
@@ -176,6 +188,40 @@ def limit_cut_off(cwd: str, session_id: str) -> dict | None:
     if not session_id or not cwd:
         return None
     return _read_limit_cut_off(transcript_path(cwd, session_id))
+
+
+# Claude Code's own plumbing, as it appears in a bare-string 'user' record.
+# An ALLOWLIST, deliberately, not "any <tag>": the tags below are things the
+# CLI injects with nobody asking, while `<command-name>`/`<command-message>`
+# -- which read identically -- are a slash command the USER typed, i.e. work
+# they asked for and would want resumed. Keying off the leading "<" alone
+# swept those in and would silently drop a genuine cut-off during `/compact`,
+# a custom command, or anything else invoked by name (observed in real
+# transcripts: a `<command-name>` record followed directly by the assistant
+# turn). Every entry here was seen standing alone in a real transcript;
+# `<system-reminder>` is the one defensive addition -- it is injected context,
+# never a request.
+_SYNTHETIC_USER_TAGS = ("<task-notification>", "<local-command-stdout>",
+                        "<local-command-caveat>", "<system-reminder>")
+
+
+def _is_synthetic_user_turn(rec: dict) -> bool:
+    """True when a 'user' record is Claude Code's OWN plumbing -- a background
+    command's completion notification, a slash-command's stdout, ... -- rather
+    than something a human or AI Hive actually asked for.
+
+    These are a bare `<tag>...` string from `_SYNTHETIC_USER_TAGS` (the same
+    family `latest_model_effort` already skips as `<synthetic>`), never how a
+    real prompt or a delivered task reads. The distinction matters here
+    because Claude Code can turn a background tool's own completion into a
+    brand-new turn with NO input from the user or AI Hive at all -- and if the
+    account happens to be exhausted right then, that turn eats the SAME
+    "You've hit your session limit" menu a real interruption would, with
+    nothing of substance actually lost."""
+    content = (rec.get("message") or {}).get("content")
+    if not isinstance(content, str):
+        return False        # a list of blocks is a real prompt or a tool reply
+    return content.lstrip().startswith(_SYNTHETIC_USER_TAGS)
 
 
 def _read_limit_cut_off(path: str) -> dict | None:
@@ -187,17 +233,22 @@ def _read_limit_cut_off(path: str) -> dict | None:
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
         return cached[2]
     found = {"cut_off": False, "at": 0.0, "resets_at": 0.0,
-             "banner": "", "window": ""}
+             "banner": "", "window": "", "synthetic": False}
+    last_user_synthetic = False   # no evidence yet -> assume a real turn
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
-                if '"assistant"' not in line:   # cheap prefilter
-                    continue
+                if '"assistant"' not in line and '"user"' not in line:
+                    continue      # cheap prefilter
                 try:
                     rec = json.loads(line)
                 except ValueError:
                     continue  # a partial last line while Claude is writing
-                if rec.get("type") != "assistant" or rec.get("isSidechain"):
+                rtype = rec.get("type")
+                if rtype == "user" and not rec.get("isSidechain"):
+                    last_user_synthetic = _is_synthetic_user_turn(rec)
+                    continue
+                if rtype != "assistant" or rec.get("isSidechain"):
                     continue
                 text = _message_text(rec)
                 # every assistant turn overwrites the verdict, so only the LAST
@@ -207,16 +258,29 @@ def _read_limit_cut_off(path: str) -> dict | None:
                 # it never needed (observed live on an agent working on this
                 # feature). A real cut-off is a short injected line.
                 banner = limit_banner.banner_line(text)
-                if banner:
+                # A banner is only a genuine interruption when the turn it cut
+                # off was one the user (or a delivered task) actually asked
+                # for -- see `_is_synthetic_user_turn`. Otherwise this is the
+                # SAME class of false alarm as the "quoting the banner in
+                # prose" case above: real API exhaustion, but nothing of the
+                # agent's assigned work was actually lost.
+                if banner and not last_user_synthetic:
                     when = _record_epoch(rec)
                     found = {
                         "cut_off": True, "at": when, "banner": banner,
                         "window": limit_banner.banner_window(banner),
                         "resets_at": (limit_banner.banner_reset_at(text, when)
-                                      or 0.0)}
+                                      or 0.0),
+                        "synthetic": False}
                 else:
+                    # `synthetic` is POSITIVE evidence and only that: a banner
+                    # we DID see, refuted by the turn behind it. A last turn
+                    # with no banner at all leaves it False, which is what
+                    # keeps "the record isn't written yet" distinguishable
+                    # from "this was never real work" -- see `limit_cut_off`.
                     found = {"cut_off": False, "at": 0.0, "resets_at": 0.0,
-                             "banner": "", "window": ""}
+                             "banner": "", "window": "",
+                             "synthetic": bool(banner)}
     except OSError:
         return cached[2] if cached else None
     _LIMIT_CACHE[path] = (st.st_mtime, st.st_size, found)
