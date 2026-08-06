@@ -2433,7 +2433,7 @@ def test_app():
           (tmp / "session.json").exists()
           and "Bravo" in (tmp / "session.json").read_text(encoding="utf-8"))
 
-    # -- 11. restore round-trip: nothing auto-starts, saved run state kept --
+    # -- 11. restore round-trip: lazy start honors saved run state ----------
     win2 = create_main_window(store)
     win2.resize(1600, 900)
     win2.show()
@@ -2443,9 +2443,14 @@ def test_app():
     running_flags = [a.autostart_on_restore for a in alpha2.agents]
     check("restore: run state loaded per agent",
           any(running_flags) and not all(running_flags), running_flags)
+    win2.autostart_active_workspace()
+    to_start = [a for a in alpha2.agents if a.autostart_on_restore]
+    to_stay = [a for a in alpha2.agents if not a.autostart_on_restore]
+    check("restore: previously-running agents autostart",
+          wait_until(lambda: all(a.is_running() for a in to_start), 15000))
     pump(500)
-    check("restore: no agent auto-starts on launch (manual wake only)",
-          all(not a.is_running() for a in alpha2.agents))
+    check("restore: stopped agents stay idle (no side-effect re-runs)",
+          all(not a.is_running() for a in to_stay))
     win2.close()
     procs2 = [a.worker.process() for a in mgr2.all_agents()
               if a.worker.process()]
@@ -4760,7 +4765,7 @@ def test_lifecycle_e2e():
     check("e2e: reopened agent resumes, not --continue",
           agent2.spec.resume
           and "--resume" in agent2.spec.effective_args())
-    agent2.start()  # nothing auto-starts restored agents anymore; wake it
+    win2.autostart_active_workspace()
     check("e2e: THE SAME conversation came back on the card",
           wait_until(lambda: marker.lower() in screen_text(agent2), 90000),
           screen_text(agent2)[-300:])
@@ -5561,12 +5566,12 @@ def test_resume_picker():
 
 
 def test_wake_and_resume_all():
-    """Reopening the app auto-starts NOTHING, in any workspace — a restored
-    agent (however it was left) waits for a manual wake, except the separate
-    plan-limit recovery path tested elsewhere. Every restored Claude agent
-    still carries one-shot resume for whenever it next starts, and a stopped
-    pty card is never a dead black screen — it shows a wake banner and starts
-    on the first keystroke."""
+    """The hive comes back WHOLE on reopen: previously-running agents
+    autostart in EVERY workspace (not just the active one), every restored
+    Claude agent carries one-shot resume for whenever it next starts, and a
+    stopped pty card is never a dead black screen — it shows a wake banner
+    and starts on the first keystroke. (The regression: a user switching to a
+    non-active workspace found an unlabeled black terminal that ate input.)"""
     import json as _json  # noqa: F401
     import time
     from PySide6.QtCore import QEventLoop, QTimer
@@ -5620,10 +5625,12 @@ def test_wake_and_resume_all():
 
     check("wake: restored Claude carries one-shot resume (--continue)",
           coder.spec.resume and "--continue" in coder.spec.effective_args())
+    win.autostart_active_workspace()
+    check("wake: running agent in a NON-active workspace autostarts",
+          wait_until(lambda: bg.is_running()))
     pump(300)
-    check("wake: nothing auto-starts on launch, in ANY workspace",
-          not bg.is_running() and not stopped.is_running()
-          and not coder.is_running())
+    check("wake: stopped agents stay stopped (no side-effect runs)",
+          not stopped.is_running() and not coder.is_running())
     win.close(); pump(250)
 
     # stopped pty card: visible banner + press-any-key wake

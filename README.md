@@ -276,24 +276,22 @@ error dialog instead of silently closing. Packaging to a distributable
   instead of leaving you with a cryptic error.
 - **Sessions** — workspaces and terminals are saved automatically and
   restored on launch (including provider/model/effort, per-agent font, grid
-  layout, current task, and assignment badges). Nothing auto-starts on
-  reopen, in any workspace — a restored agent, however it was left, waits
-  for you to wake it (any keystroke starts it, never a dead black screen),
-  except one deliberate exception: an agent whose transcript proves the plan
-  usage limit cut it off mid-turn comes back on its own, since that wasn't
-  you choosing to stop it. Whenever an agent does start (woken by you, or
-  recovered from a limit cut-off), each Claude agent resumes **its own
-  pinned conversation** (`--resume <session-id>` — so two agents sharing a
-  project folder can never race for or swap each other's conversations) —
-  falling back to a fresh launch instead of a dead card if there's nothing to
-  resume. The pin **tracks the live conversation**: if you switch
-  conversations inside a terminal (`/resume` or `/clear` in the TUI, a fork),
-  the agent *reports its own new conversation id back to AI Hive* through a
-  `SessionStart` hook, so reopen brings back *exactly* the conversation that
-  was on each card — reliably, even when two agents share one folder (which
-  the filesystem alone can't disambiguate). A pinned id whose transcript has
-  gone missing still recovers the folder's most recent one instead of
-  erroring. No more manually hunting for a lost chat.
+  layout, current task, and assignment badges). Everything that was running
+  comes back **in every workspace**: previously-running agents autostart, and
+  each Claude agent resumes **its own pinned conversation** (`--resume
+  <session-id>` — so two agents sharing a project folder can never race for
+  or swap each other's conversations) — falling back to a fresh launch
+  instead of a dead card if there's nothing to resume. The pin **tracks the
+  live conversation**: if you switch conversations inside a terminal (`/resume`
+  or `/clear` in the TUI, a fork), the agent *reports its own new conversation
+  id back to AI Hive* through a `SessionStart` hook, so reopen brings back
+  *exactly* the conversation that was on each card — reliably, even when two
+  agents share one folder (which the filesystem alone can't disambiguate). A
+  pinned id whose transcript has gone missing still recovers the folder's most
+  recent one instead of erroring. No more manually hunting for a lost chat.
+  Agents that were *stopped* stay stopped, but never as a black screen: the
+  card shows a **wake banner** and the first keystroke starts it —
+  a woken Claude agent also reclaims its conversation.
 - **Scrolling** — in a full terminal the wheel does what a real terminal does:
   fullscreen apps that request mouse events (Claude Code) receive the wheel
   and scroll their own transcript; other fullscreen apps (vim, less) get
@@ -502,7 +500,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-964 checks drive the real app headlessly (offscreen Qt platform) with real
+966 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -576,7 +574,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (964 checks)
+tests/smoke_test.py        headless end-to-end suite (966 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

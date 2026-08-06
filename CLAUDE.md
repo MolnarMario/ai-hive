@@ -417,23 +417,10 @@ this file is the invariants that must survive every change.
   ordinary UI preferences that save via `_schedule_save` (like `usage_visible`);
   the latch itself is NEVER persisted — the transcript is the durable record,
   and a persisted flag would go stale. `recover_blocked_at_startup` is OPT-IN
-  from `main.py`, called right after `window.show()`, exactly like
+  from `main.py` (after `autostart_active_workspace`, so the ordinary restore
+  runs first and this only starts the stragglers) exactly like
   `start_usage_polling`: it reads the user's real transcripts and types into
-  real agents, which the smoke suite must never do. It is now the ONLY thing
-  that auto-starts an agent on launch — there is deliberately no more blanket
-  "resume everything that was running" (that used to be `autostart_active_
-  workspace`, since removed: a restored agent that was merely left running,
-  with no limit cut-off, sits stopped behind the ordinary "press any key to
-  start" wake until the user acts, even though `create_main_window` still
-  primes its one-shot `spec.resume`/`_verify_resume_target` so THAT eventual
-  start, whenever it happens, resumes rather than forking a fresh
-  conversation). This was a deliberate reversal: bringing a whole workspace
-  back unattended looked convenient, but a resumed Claude session can itself
-  act on stale context the instant it wakes — e.g. checking on and restarting
-  a background dev server the prior session had left running — which read as
-  the agent "doing things on its own" with no cut-off to justify it. A
-  genuine plan-limit cut-off is the one case worth reviving unattended, since
-  the user didn't choose to stop that agent; an ordinary close did.
+  real agents, which the smoke suite must never do.
   The whole path is audited to `session.log` via `_limit_audit`
   (`STARTUP-SCAN`/`STARTUP-SKIP`/`STARTUP-START`/`BLOCKED`/`NUDGE`/`WAIT`/
   `PHANTOM`/`RESUMED`/`STILL-BLOCKED`/`GAVE-UP`) — this feature failed silently

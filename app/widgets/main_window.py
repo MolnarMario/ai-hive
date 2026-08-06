@@ -2109,6 +2109,16 @@ class MainWindow(QMainWindow):
         self._focused_card = card
         card.set_focused(True)
 
+    def autostart_active_workspace(self) -> None:
+        """Restore what was running: every agent that was RUNNING at save
+        time — in EVERY workspace — starts (and resumes) automatically, so
+        opening the app brings the whole hive back without manual steps.
+        Agents that were stopped, and one-shot scripts, never re-execute as
+        a side effect of launch. (Name kept for the smoke-test API.)"""
+        for ws in self.manager.workspaces:
+            for agent in ws.agents:
+                if agent.autostart_on_restore and not agent.is_running():
+                    agent.start()
 
     # -------------------------------------------------------- persistence ---
 
