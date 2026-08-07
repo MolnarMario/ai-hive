@@ -349,7 +349,7 @@ class TopBar(QFrame):
         self.recover_btn.setCheckable(True)
         self.recover_btn.setChecked(self._startup_recovery)
         led = "\U0001F7E2" if self._startup_recovery else "⚫"
-        self.recover_btn.setText(f"{led} App start-up⏻")
+        self.recover_btn.setText(f"{led} App start-up ⏻")
         self.recover_btn.setToolTip(
             "Recover at startup: ON. When AI Hive opens, agents whose work "
             "stopped because the plan limit ran out are continued "
@@ -360,7 +360,7 @@ class TopBar(QFrame):
         self.resume_btn.setCheckable(True)
         self.resume_btn.setChecked(self._auto_continue)
         led = "\U0001F7E2" if self._auto_continue else "⚫"
-        self.resume_btn.setText(f"{led} Usage reset\U0001F504")
+        self.resume_btn.setText(f"{led} Usage reset \U0001F504")
         self.resume_btn.setToolTip(
             "Resume on limit reset: ON. While AI Hive is running, agents cut "
             "off mid-work by the plan limit are continued the moment the "
