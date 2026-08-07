@@ -337,9 +337,13 @@ TASKBAR_ASKING = "#3b82f6"    # at least one agent is waiting on the user
 # no agent is busy or asking, but one or more are idle with a background
 # command still running (see TerminalAgent.poll_bg_shell) -- the case that
 # used to leave the taskbar silent even though real work was still in
-# flight. A third fixed hue distinct from both above; orange keeps it in the
-# warm "working-adjacent" family without being mistaken for TASKBAR_WORKING.
-TASKBAR_BG_SHELL = "#c97a3d"
+# flight. Violet, not a warm amber/orange shade: WORKING is already warm and
+# ASKING is cool blue, and an orange tried here first read as too close to
+# WORKING at 16px. Violet sits apart from both on the wheel (roughly equal
+# hue distance from amber and blue) and isn't otherwise a "meaning" color in
+# this app (no green-for-fine or red-for-error overtone), so it reads as its
+# own distinct third signal rather than a shade of either existing one.
+TASKBAR_BG_SHELL = "#a855f7"
 
 
 def taskbar_badge_bgra(text: str, fill: str, size: int):

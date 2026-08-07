@@ -98,7 +98,7 @@ workspaces keep executing — switching never pauses anything.
   card header once that's been true for a few seconds, so you don't close AI
   Hive thinking nothing is happening. It shares the taskbar's one overlay
   square too: when nothing is busy or asking but a shell is still running,
-  the disc turns **orange** with the count, instead of showing nothing at
+  the disc turns **violet** with the count, instead of showing nothing at
   all.
 - **Plan usage readout** — a top-bar badge, left of the theme picker, showing
   how much of your Claude plan you've burned and when it comes back:

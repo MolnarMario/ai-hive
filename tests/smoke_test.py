@@ -803,7 +803,7 @@ def test_bg_shell_taskbar_state():
 
     agents[0]._bg_shell = True
     key, text, fill, note = spec()
-    check("taskbar bg: one agent idle-on-a-shell shows an orange 1",
+    check("taskbar bg: one agent idle-on-a-shell shows a violet 1",
           (text, fill) == ("1", ornaments.TASKBAR_BG_SHELL), (text, fill))
     check("taskbar bg: the description names the count",
           "background command" in note, note)
