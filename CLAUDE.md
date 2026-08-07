@@ -23,9 +23,18 @@ this file is the invariants that must survive every change.
   suppressed while `_closing`) and `SAVE-FAIL payload` (exception while
   BUILDING the payload, which is upstream of `store.save`'s own guard) via
   `SessionStore.audit`; and `to_session_dict` serializes each agent through
-  `_agent_dict_safe` so one un-serializable agent degrades to a minimal
-  (identity + session_id + running) entry instead of aborting the entire
-  session's save. Don't remove these guards or let a new save path bypass the
+  `_agent_dict_safe` so one un-serializable agent degrades to a minimal entry
+  instead of aborting the entire session's save. That degrade is itself
+  audited (`SAVE-DEGRADE` + the exception, via the manager's `audit` hook,
+  which `MainWindow` sets alongside `arm_agent`) and it carries every field it
+  can read without risking a second throw (`pty`, `model`, `effort`,
+  `permission_mode`, `role`, `font_px`, `task`). Both halves are from a live
+  find: two agents were degrading on EVERY save, silently resetting their
+  model/effort/task on the next restore, and the cause was NOT recoverable
+  from disk — a `kind` that is a plain str and a `user_args` of None throw at
+  different lines of `AgentSpec.to_dict` but produce byte-identical output,
+  and `AgentKind` is a str-mixin enum so even the serialized `kind` can't tell
+  them apart. Don't remove these guards or let a new save path bypass the
   audit trail. Conversely, TRANSIENT signals must NEVER mark `dirty`:
   `activity_changed` (busy/standby, derived from output activity — see the
   status-badge invariant) fires every couple of seconds while an agent works,
@@ -425,7 +434,17 @@ this file is the invariants that must survive every change.
   (`STARTUP-SCAN`/`STARTUP-SKIP`/`STARTUP-START`/`BLOCKED`/`NUDGE`/`WAIT`/
   `PHANTOM`/`RESUMED`/`STILL-BLOCKED`/`GAVE-UP`) — this feature failed silently
   TWICE and both causes had to be reconstructed from transcript timestamps
-  hours later; do not remove it.
+  hours later; do not remove it. `NO-LATCH` (`TerminalAgent._note_limit_skip`,
+  routed through `WorkspaceManager._wire_agent` → the manager's `audit` hook)
+  completes it from the other end: every line above describes something that
+  happened AFTER a latch, so the decision NOT to latch — the one that actually
+  strands work — used to leave no trace at all, and a third live miss could
+  only be narrowed by elimination, never explained. It is bounded twice over
+  because `_scrape_limit` runs on EVERY output burst: it says nothing unless a
+  banner is genuinely on screen, and it repeats only when the (reason, banner)
+  pair CHANGES, so one frame repainted hundreds of times is recorded once
+  (`_limit_last_skip`, reset by `start`/`restart` alongside
+  `_limit_last_banner`). Keep both bounds if you add a rejection reason.
 - **The cut-off itself is a HISTORICAL FACT and is kept** (`app/limit_ledger.py`,
   Qt-free/stdlib-only, `<session-dir>/limit_events.jsonl`). Every other piece
   of this feature is transient on purpose, which left nothing able to answer

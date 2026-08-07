@@ -239,6 +239,12 @@ class TerminalAgent(QObject):
         # cut-off, kept ACROSS clear_limit_block so the same line still on
         # screen can't re-latch the agent we just resumed (see _scrape_limit)
         self._limit_last_banner = ""
+        # optional hook (set by WorkspaceManager._wire_agent): a line into
+        # session.log. Only used by _note_limit_skip; None is a no-op.
+        self.audit = None
+        # last (reason, banner) reported by _note_limit_skip, so a rejection
+        # that persists across hundreds of repaints is recorded ONCE
+        self._limit_last_skip = None
         # "waiting for the user" is the OR of three independent sources (see
         # _emit_waiting): _scrape_waiting (the settled screen shows a numbered
         # menu + selection caret — a permission prompt), _tool_waiting (an
@@ -277,6 +283,7 @@ class TerminalAgent(QObject):
         self._reset_waiting()
         self.clear_limit_block()
         self._limit_last_banner = ""   # a new screen: nothing is an echo yet
+        self._limit_last_skip = None   # ...so a skip is reported again too
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         # a NON-resume start is a new conversation, so it gets a new pinned
@@ -331,6 +338,7 @@ class TerminalAgent(QObject):
         self._reset_waiting()
         self.clear_limit_block()
         self._limit_last_banner = ""   # a new screen: nothing is an echo yet
+        self._limit_last_skip = None   # ...so a skip is reported again too
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         if self.spec.provider == "claude":  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
@@ -945,6 +953,7 @@ class TerminalAgent(QObject):
         # checked before _on_pty_output sets the flag, so the burst that ends
         # the replay is itself excluded.)
         if not self._prompt_ready:
+            self._note_limit_skip("prompt not ready (launch or resume replay)")
             return
         # Deliberately a WIDER region than _screen_waiting's last 18 lines.
         # That bound is right for a selection menu, which is anchored just
@@ -974,6 +983,9 @@ class TerminalAgent(QObject):
             # 5-hour windows never end at the same wall time — so an identical
             # line with no menu can only be the echo of one we already handled.
             if not banner or banner == self._limit_last_banner:
+                if banner:
+                    self._note_limit_skip("no menu, and the same banner line "
+                                          "already produced a latch", banner)
                 return
         self._limit_blocked = True
         self._limit_at = time.time()
@@ -988,6 +1000,41 @@ class TerminalAgent(QObject):
         self._limit_resets_at = parse_reset_clock(region)
         self._limit_from_startup = False
         self.limit_blocked_changed.emit(True)
+
+    def _note_limit_skip(self, reason: str, banner: str = "") -> None:
+        """Record that a plan-limit banner was ON SCREEN and nothing latched.
+
+        Everything AFTER a latch is audited (BLOCKED / NUDGE / WAIT / PHANTOM
+        / RESUMED), but the decision NOT to latch was invisible, and that is
+        the one that strands work: a cut-off nobody saw looks exactly like a
+        cut-off that never happened. It cost a real diagnosis — an agent was
+        found sitting on a spent limit hours later with no trace anywhere of
+        why the live scrape had passed over it, and the cause could only be
+        narrowed by elimination, never identified.
+
+        Bounded twice over, because `_scrape_limit` runs on EVERY output burst
+        and this must not become a log flood: it says nothing at all unless a
+        banner is actually visible (the overwhelmingly common case is that
+        there is none), and it repeats only when the (reason, banner) pair
+        CHANGES, so a state that persists across hundreds of repaints of the
+        same frame is written once. `_limit_last_skip` is reset by
+        start/restart, so a fresh screen reports again.
+        """
+        try:
+            if not banner:
+                banner = banner_line(
+                    "\n".join(self._screen_tail.splitlines()[-40:]))
+            if not banner:
+                return
+            state = (reason, banner)
+            if state == self._limit_last_skip:
+                return
+            self._limit_last_skip = state
+            if self.audit is not None:
+                self.audit(f"LIMIT NO-LATCH agent={self.spec.name} ({reason}) "
+                           f"banner={banner[:80]!r}")
+        except Exception:
+            pass    # forensics must never break the feature they observe
 
     def mark_limit_blocked(self, resets_at: float | None,
                            from_startup: bool = True,

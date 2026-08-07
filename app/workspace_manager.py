@@ -77,6 +77,13 @@ class WorkspaceManager(QObject):
         # optional hook (set by MainWindow): arm an agent's MCP config before
         # it starts, so workers launch able to log_activity. callable(ws, agent)
         self.arm_agent = None
+        # optional hook (set by MainWindow): append a line to session.log.
+        # callable(str). The manager has no SessionStore of its own, and
+        # _agent_dict_safe's degrade path is exactly the kind of failure that
+        # must not happen in silence. Same set-by-MainWindow shape as
+        # `arm_agent`, and unset is a no-op so a bare manager (the tests build
+        # many) never depends on it.
+        self.audit = None
         # path to the shared SessionStart-hook mapping file (set by MainWindow);
         # sync_live_sessions reads it for the authoritative live conversation id
         self.session_map_path = ""
@@ -468,6 +475,10 @@ class WorkspaceManager(QObject):
         # recovery (verify-before-resume) must never land on a peer's
         # conversation, so give the agent a live view of its folder-mates' pins
         agent._sibling_sessions = lambda a=agent: self.sibling_session_ids(a)
+        # so the agent can record WHY a limit banner on its screen did not
+        # latch (see TerminalAgent._note_limit_skip). Routed through the
+        # manager's own hook, so it is a no-op until MainWindow sets one.
+        agent.audit = self._audit
         # busy/standby is TRANSIENT (not persisted): refresh the badge only,
         # never mark dirty — otherwise every output burst would thrash saves
         agent.activity_changed.connect(lambda *_: self._recompute(wid))
@@ -740,10 +751,31 @@ class WorkspaceManager(QObject):
         workspace's agents down with it (that is how a folder's agents once
         vanished from disk with nothing in the log). Fall back to a minimal
         entry that still preserves identity + resume so the agent survives; if
-        even that fails, drop just this one and keep going."""
+        even that fails, drop just this one and keep going.
+
+        The degrade is AUDITED, with the exception on the line, because it was
+        found happening in production and could not be diagnosed: two live
+        agents were being written as fallback records on EVERY save, silently,
+        and the cause is not recoverable from the file. Two different failures
+        in `AgentSpec.to_dict` (a `kind` that is a plain str, so `.value`
+        raises; a `user_args` of None, so `list()` raises) produce byte-
+        identical output, and `AgentKind` is a str-mixin enum so even the
+        serialized `kind` cannot tell them apart. One line here turns that
+        into a name and an exception type.
+
+        The fallback also carries every field it can read WITHOUT calling
+        anything that might throw again (plain attribute reads with defaults).
+        The loss is otherwise real: model, effort, permission mode, role and
+        the current task all silently reset to defaults on the next restore.
+        (`pty` is included for the same reason but is belt-and-braces for AI
+        agents: they are in `PTY_ONLY_KINDS`, so `build_spec` re-forces it
+        even when the record has no such field.)
+        """
         try:
             return self._agent_dict(a)
-        except Exception:
+        except Exception as exc:
+            self._audit(f"SAVE-DEGRADE agent={getattr(a.spec, 'name', '?')!r} "
+                        f"{type(exc).__name__}: {exc}")
             try:
                 spec = a.spec
                 return {"kind": getattr(spec, "kind", ""),
@@ -752,9 +784,21 @@ class WorkspaceManager(QObject):
                         "cwd": getattr(spec, "cwd", ""),
                         "provider": getattr(spec, "provider", ""),
                         "session_id": getattr(spec, "session_id", ""),
+                        # everything below is why the degrade is survivable:
+                        # pty in particular decides whether the agent comes
+                        # back as a terminal at all
+                        "pty": bool(getattr(spec, "pty", False)),
+                        "model": getattr(spec, "model", ""),
+                        "effort": getattr(spec, "effort", ""),
+                        "permission_mode": getattr(spec, "permission_mode", ""),
+                        "role": getattr(spec, "role", ""),
+                        "font_px": getattr(spec, "font_px", 0),
+                        "task": getattr(a, "current_task", ""),
                         "scheduled": self._scheduled_safe(a),
                         "running": True}
-            except Exception:
+            except Exception as exc2:
+                self._audit(f"SAVE-DROP agent (even the minimal record failed) "
+                            f"{type(exc2).__name__}: {exc2}")
                 return None
 
     @staticmethod
@@ -766,6 +810,15 @@ class WorkspaceManager(QObject):
             return a.scheduled_dicts()
         except Exception:
             return []
+
+    def _audit(self, message: str) -> None:
+        """Best-effort line into session.log; forensics must never break the
+        save they observe (the same rule `MainWindow._limit_audit` follows)."""
+        try:
+            if self.audit is not None:
+                self.audit(message)
+        except Exception:
+            pass
 
     def to_session_dict(self) -> dict:
         return {

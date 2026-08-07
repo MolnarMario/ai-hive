@@ -3984,6 +3984,61 @@ def test_persistence_resume():
     check("persist: bad agent cannot abort the whole save (good survives)",
           "Good" in names5 and len(terms) >= 1, names5)
 
+    # THE DEGRADE MUST NOT BE SILENT. Found in production: two claude agents
+    # were being written as fallback records on EVERY save, losing model,
+    # effort, permission mode, role and task to defaults on the next restore --
+    # and the cause could not be recovered from the file, because two different
+    # failures in AgentSpec.to_dict produce byte-identical output and nothing
+    # had recorded which one fired.
+    # END TO END: an agent created through the manager inherits the audit hook,
+    # so a NO-LATCH line from deep in the scrape actually reaches session.log.
+    # The helper is unit-tested elsewhere; the PLUMBING is the part that breaks.
+    sp6 = tmp / "wired.json"
+    store6 = SessionStore(path=sp6)
+    win6 = create_main_window(store6)
+    win6.show(); pump(120)
+    ws6 = win6.manager.workspaces[0]
+    wired = win6.manager.add_terminal(
+        ws6.id, build_spec(AgentKind.CLAUDE, "Wired", cwd=str(tmp), pty=True),
+        autostart=False)
+    wired._prompt_ready = False          # as during a resume replay
+    wired._screen_tail = ("You've hit your session limit \xb7 resets 3am "
+                          "(Europe/Bucharest)\n")
+    wired._on_idle_timeout()
+    win6.close(); pump(120)
+    logged = sp6.with_suffix(".log").read_text(encoding="utf-8", errors="replace")
+    check("persist: a manager-wired agent's NO-LATCH reaches session.log",
+          "NO-LATCH" in logged and "Wired" in logged,
+          [l for l in logged.splitlines() if "LIMIT" in l][-3:])
+
+    lines = []
+    mgr5.audit = lines.append
+    pty_spec = build_spec(AgentKind.CLAUDE, "Degraded", cwd=str(tmp), pty=True,
+                          model="opus", effort="high")
+    degraded = mgr5.add_terminal(ws5.id, pty_spec, autostart=False)
+    degraded.current_task = "keep me"
+    degraded.assignment = object()             # .value raises -> degrade path
+    rec = mgr5._agent_dict_safe(degraded)
+    degraded.assignment = saved_assignment     # restore before teardown/GC
+    check("persist: a degraded save is audited with the exception",
+          any(m.startswith("SAVE-DEGRADE") and "Degraded" in m
+              and "AttributeError" in m for m in lines), lines)
+    check("persist: the fallback record keeps pty", rec.get("pty") is True, rec)
+    check("persist: the fallback record keeps model/effort/task",
+          rec.get("model") == "opus" and rec.get("effort") == "high"
+          and rec.get("task") == "keep me", rec)
+    # and it must still round-trip into a real spec
+    from app.process_worker import AgentSpec as _Spec
+    check("persist: the fallback record still restores as a pty claude agent",
+          _Spec.from_dict(rec).pty is True
+          and _Spec.from_dict(rec).provider == "claude")
+    # an unset audit hook stays a no-op (a bare manager must never depend on it)
+    mgr5.audit = None
+    degraded.assignment = object()
+    check("persist: degrading without an audit hook does not raise",
+          mgr5._agent_dict_safe(degraded).get("name") == "Degraded")
+    degraded.assignment = saved_assignment
+
     shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -6613,6 +6668,53 @@ def test_auto_continue_on_limit_reset():
     check("auto-continue: the parked-on menu alone IS a cut-off",
           menu_only.is_limit_blocked())
 
+    # --- WHY a banner did not latch has to be on the record -----------------
+    # Everything after a latch is audited; the decision NOT to latch was not,
+    # and that is the one that strands work. An agent was found parked on a
+    # spent limit with no trace anywhere of why the scrape had passed over it,
+    # and the cause could only be narrowed by elimination. These lines close
+    # that gap -- while staying bounded, since _scrape_limit runs on EVERY
+    # output burst.
+    skips: list = []
+    quiet = mk("Quiet")
+    quiet.audit = skips.append
+    quiet._prompt_ready = False
+    settle(quiet, BANNER)          # a banner during a resume replay
+    check("no-latch: a banner ignored as replay says so in the log",
+          any("NO-LATCH" in m and "Quiet" in m and "prompt not ready" in m
+              for m in skips), skips)
+    check("no-latch: ...and it did not latch", not quiet.is_limit_blocked())
+    before = len(skips)
+    for _ in range(20):            # the same frame repainted many times over
+        settle(quiet, BANNER)
+    check("no-latch: an unchanged rejection is recorded ONCE, not per burst",
+          len(skips) == before, skips[before:])
+
+    # the echo guard is the other silent path: a banner still on screen after
+    # a resume, with the menu torn down
+    echo = mk("Echo")
+    echo.audit = skips.append
+    settle(echo, BANNER)                       # first sighting latches
+    echo.clear_limit_block()                   # ...resumed off it
+    n = len(skips)
+    settle(echo, BANNER)                       # same line, no menu -> echo
+    check("no-latch: a suppressed banner echo names the reason",
+          any("NO-LATCH" in m and "Echo" in m and "already produced a latch"
+              in m for m in skips[n:]), skips[n:])
+    check("no-latch: ...and the echo still does not re-latch",
+          not echo.is_limit_blocked())
+
+    # and it must stay silent when there is nothing to say
+    mute: list = []
+    ordinary = mk("Ordinary")
+    ordinary.audit = mute.append
+    settle(ordinary, "building the index...\ndone in 4.1s\n")
+    latched = mk("Latched")
+    latched.audit = mute.append
+    settle(latched, BANNER)
+    check("no-latch: ordinary output and a successful latch log nothing",
+          mute == [] and latched.is_limit_blocked(), mute)
+
     # An agent WRITING ABOUT the limit is not stopped by it. Observed live: an
     # agent working on this feature quoted the banner in its own output and was
     # armed for a resume it never needed. A real banner is a short line of its
@@ -7437,6 +7539,19 @@ def test_startup_limit_recovery():
     win.recover_blocked_at_startup()
     check("startup-recovery: a cut-off already resolved is not revived",
           not again.is_limit_blocked())
+
+    # The `is_pty` gate above is unreachable for a claude agent, and that is
+    # load-bearing rather than incidental: CLAUDE is in PTY_ONLY_KINDS, so
+    # `build_spec` forces pty=True -- including inside `AgentSpec.from_dict`,
+    # which is what makes a session record that has LOST its pty field (see
+    # the degraded-save fallback in test_v3_features) still restore as a real
+    # terminal instead of a line-mode card that this feature would skip.
+    from app.process_worker import AgentSpec as _Spec
+    check("startup-recovery: a claude agent is pty even when asked not to be",
+          build_spec(AgentKind.CLAUDE, "X", cwd=cwd, pty=False).pty is True)
+    check("startup-recovery: ...and a record with no pty field restores as one",
+          _Spec.from_dict({"kind": "claude", "name": "X", "cwd": cwd,
+                           "provider": "claude", "session_id": "s"}).pty is True)
 
     # --- the toggle owns its own latches ------------------------------------
     win._startup_recovery = False

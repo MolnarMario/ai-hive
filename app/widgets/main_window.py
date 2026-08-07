@@ -1046,6 +1046,7 @@ class MainWindow(QMainWindow):
         self.manager.prompt_events_path = self._prompt_events_path
         manager.save_now = self._save_now  # immediate persistence for spawn_worker
         manager.arm_agent = self._arm_agent_mcp  # arm new agents before they start
+        manager.audit = self._store_audit   # so a degraded save leaves a trace
         self._rearm_agent_configs()  # restored claude agents re-acquire MCP tools
 
         self._build_ui()
@@ -1634,6 +1635,15 @@ class MainWindow(QMainWindow):
             return written
         except Exception:
             return 0
+
+    def _store_audit(self, message: str) -> None:
+        """Plain forensic line in session.log, for callers that have no store
+        of their own (the manager's degraded-save path). Same never-raise rule
+        as `_limit_audit`."""
+        try:
+            self.store.audit(message)
+        except Exception:
+            pass
 
     def _limit_audit(self, message: str) -> None:
         """Forensic line in session.log for the auto-continue path.
