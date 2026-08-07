@@ -15,6 +15,7 @@ from PySide6.QtCore import QObject, Signal
 
 from . import coordination
 from . import orchestration
+from . import providers
 from . import session_hook
 from . import session_sync
 from . import transcripts
@@ -571,20 +572,37 @@ class WorkspaceManager(QObject):
                 a.set_token_usage(used, window)
 
     def refresh_model_effort(self) -> None:
-        """Pull each running Claude agent's CURRENT model and effort from its
-        transcript, so the card header follows a `/model` or `/effort` the user
-        typed in the terminal. Transient like the AI title: `set_live_model`
-        never persists and never marks the session dirty. Polled far more often
-        than `refresh_ai_titles`, which is why its reader only touches the tail
-        of the file and re-reads nothing while the transcript is unchanged."""
+        """Pull each running Claude agent's CURRENT model, effort and permission
+        mode from its transcript, so the card header follows a `/model`,
+        `/effort` or Shift+Tab the user did inside the terminal. Polled far more
+        often than `refresh_ai_titles`, which is why its reader only touches the
+        tail of the file and re-reads nothing while the transcript is unchanged.
+
+        The model and effort are TRANSIENT display state (`set_live_model` never
+        persists them; `spec.model`/`spec.effort` stay the launch record). The
+        PERMISSION MODE is the deliberate exception and IS written back, because
+        the CLI does not carry a mode across a `--resume`: an agent whose user
+        put it in plan or auto mode came back ask-each-time on every reopen,
+        which is exactly what the launch flag exists to set. Like a pin change
+        in `sync_live_sessions` this marks the session dirty ONLY when the mode
+        genuinely changed, so the poll never thrashes saves."""
+        changed = False
         for w in self._workspaces:
             for a in w.agents:
                 spec = a.spec
                 if spec.provider != "claude" or not a.is_running():
                     continue
-                model, effort = transcripts.latest_model_effort(
+                model, effort, mode = transcripts.latest_model_effort(
                     spec.cwd, spec.session_id)
-                a.set_live_model(model, effort)
+                a.set_live_model(model, effort, mode)
+                # the transcript names modes the command line cannot ("default"
+                # is spelled by omitting the flag), so translate before storing:
+                # spec.permission_mode is a LAUNCH flag, not a reading
+                if mode and spec.set_permission_mode(
+                        providers.normalize_permission_mode(mode)):
+                    changed = True
+        if changed:
+            self.dirty.emit()
 
     def sync_live_sessions(self) -> list:
         """Reconcile each running Claude agent's pinned session id with the

@@ -453,16 +453,22 @@ class TerminalCard(QFrame):
         self.token_label.setVisible(bool(badge))
 
     def _on_model(self, badge: str = "") -> None:
-        # "Opus 5 · high", tracking /model and /effort inside the terminal.
-        # Hidden when empty so a plain shell shows nothing (never a guess).
+        # "Opus 5 · high · plan", tracking /model, /effort and the Shift+Tab
+        # permission mode inside the terminal. Hidden when empty so a plain
+        # shell shows nothing (never a guess).
         if badge:
             model, effort = self.agent.live_model()
             tip = f"Model: {model}"
             if effort:
                 tip += f"\nEffort: {effort}"
+            mode = self.agent.permission_mode_label()
+            if mode:
+                tip += (f"\nPermission mode: {mode}"
+                        "\nKept for the next launch, so this agent reopens"
+                        " in the same mode")
             self.model_label.setText(badge)
             self.model_label.setToolTip(
-                tip + "\nFollows /model and /effort in this terminal")
+                tip + "\nFollows /model, /effort and Shift+Tab in this terminal")
         else:
             self.model_label.clear()
         self.model_label.setVisible(bool(badge))

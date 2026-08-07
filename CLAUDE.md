@@ -597,6 +597,39 @@ this file is the invariants that must survive every change.
   has no evidence yet). The reader is tail-only (`_MODEL_TAIL_BYTES`) with a
   full-scan fallback and an (mtime,size) cache, because unlike
   `refresh_ai_titles` it runs several times a second.
+- **The PERMISSION MODE rides the same reading and is the ONE part of it that
+  IS written back.** The chip reads `Opus 5 · high · plan`; the third token is
+  the Shift+Tab mode, from the same transcript scan (`latest_model_effort`
+  returns `(model, effort, permission_mode)`), shown via
+  `TerminalAgent.permission_mode_label`. Two record shapes carry it, and both
+  are needed for the same reason `/model` needs two: every user prompt has a
+  top-level `permissionMode` (ground truth as of the last turn), and Claude
+  appends a bare `{"type":"permission-mode","permissionMode":…}` record the
+  instant Shift+Tab changes it, which is what shows an IDLE agent's switch.
+  The write-back is the deliberate exception to the invariant above: the CLI
+  does NOT carry a permission mode across a `--resume`, so an agent the user
+  put in plan/auto came back ask-each-time on EVERY reopen. So
+  `refresh_model_effort` calls `AgentSpec.set_permission_mode` and emits
+  `dirty` — but ONLY when the mode genuinely changed, exactly like a pin change
+  in `sync_live_sessions`, or a 1.5s poll would rewrite `session.json` forever.
+  `set_permission_mode` REBUILDS `spec.args`: they are baked once by
+  `build_spec`, so mutating the field alone persists the new mode while every
+  launch for the rest of the process keeps the old flag. `closeEvent` runs one
+  last `refresh_model_effort` before the final save (same reason it runs
+  `sync_live_sessions` there): a Shift+Tab in the last second must still
+  reopen in that mode. CRITICAL, the vocabularies differ and are NOT
+  interchangeable: the transcript writes the CLI's INTERNAL names, and the
+  ask-each-time mode is `"default"`, which `--permission-mode` does not accept
+  at all (its choices are acceptEdits|auto|bypassPermissions|manual|dontAsk|
+  plan, verified 2.1.220). `providers.normalize_permission_mode` translates
+  before anything is stored ("default"/"manual" → `""`, i.e. omit the flag;
+  an unknown token → `""` rather than a flag that would stop the agent
+  launching), and `providers.permission_mode_display` turns it into the card's
+  word. Validation in `build_invocation` is against the provider's
+  `cli_permission_modes`, NOT the New Agent dropdown: the dropdown is a curated
+  subset, and a mode adopted from a live conversation is routinely outside it
+  ("auto" is what a current CLI records where an older build said
+  "acceptEdits").
 - **The card header is summary-first** (`widgets/terminal_card.py`): the
   one-line summary carries the layout stretch and is an `ornaments.ElidingLabel`
   — it re-fits in its OWN `resizeEvent` and reports a zero-width hint

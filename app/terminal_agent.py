@@ -176,6 +176,11 @@ class TerminalAgent(QObject):
         # command line) and never marks the session dirty.
         self._live_model = self._seed_model()
         self._live_effort = (spec.effort or "").strip()
+        # ...and which permission mode (Shift+Tab) it is in. Same live reading,
+        # with ONE difference: this one IS written back to the spec by the
+        # manager, because the CLI does not carry a permission mode across a
+        # --resume and a reopened agent must come back in the mode it was in.
+        self._live_mode = (getattr(spec, "permission_mode", "") or "").strip()
         self.assignment = AssignmentState.IDLE  # task-assignment lifecycle
         self.auto_created = False           # created with a task via spawn_worker
         self.autostart_on_restore = False  # set from persisted run state
@@ -463,34 +468,59 @@ class TerminalAgent(QObject):
             return chosen
         return transcripts.model_display(chosen or providers.user_default_model())
 
-    def set_live_model(self, model: str, effort: str) -> None:
-        """Adopt the model/effort the conversation is actually on, as read from
-        the transcript. Transient like the AI title and the token badge: never
-        persisted, never marks the session dirty, and emits only when the
-        DISPLAYED badge text changes (this polls every couple of seconds).
-        An empty reading is ignored rather than blanking a good label: a fresh
-        conversation has no evidence yet, and the launch seed is still right."""
+    def set_live_model(self, model: str, effort: str, mode: str = "") -> None:
+        """Adopt the model/effort/permission mode the conversation is actually
+        on, as read from the transcript. The BADGE is transient like the AI
+        title and the token badge: never marks the session dirty here, and emits
+        only when the DISPLAYED text changes (this polls every couple of
+        seconds). An empty reading is ignored rather than blanking a good label:
+        a fresh conversation has no evidence yet, and the launch seed is still
+        right. Persisting the mode is the manager's job, deliberately kept out
+        of here so this stays a pure display update."""
         model = (model or "").strip()
         effort = (effort or "").strip()
-        if not model and not effort:
+        mode = (mode or "").strip()
+        if not model and not effort and not mode:
             return
         before = self.model_badge()
         if model:
             self._live_model = model
         if effort:
             self._live_effort = effort
+        if mode:
+            self._live_mode = mode
         if self.model_badge() != before:
             self.model_changed.emit(self.model_badge())
 
+    def permission_mode(self) -> str:
+        """The raw permission-mode token this agent is in, as the CLI names it
+        ("", "default", "auto", "plan", ...). "" for a fresh Claude agent means
+        the CLI's own ask-each-time default; for anything else it means the
+        concept does not apply."""
+        return self._live_mode
+
+    def permission_mode_label(self) -> str:
+        """That mode as it reads on the card, e.g. "auto" / "plan" / "manual".
+        "" for a non-Claude agent, which has no such mode at all."""
+        if self.spec.provider != "claude":
+            return ""
+        return providers.permission_mode_display(self._live_mode)
+
     def model_badge(self) -> str:
         """Compact "what am I running on" string for the card header, e.g.
-        "Opus 5 · high". Model alone when the effort is the CLI's own default,
-        "" when neither is known (a non-Claude agent on a bare command)."""
+        "Opus 5 · high · plan" (model, effort, permission mode). Effort is
+        dropped when it is the CLI's own default and the mode when the agent
+        has none; "" when even the model is unknown (a non-Claude agent on a
+        bare command), which hides the chip entirely."""
         if not self._live_model:
             return ""
-        if not self._live_effort:
-            return self._live_model
-        return f"{self._live_model} · {self._live_effort}"
+        parts = [self._live_model]
+        if self._live_effort:
+            parts.append(self._live_effort)
+        mode = self.permission_mode_label()
+        if mode:
+            parts.append(mode)
+        return " · ".join(parts)
 
     def live_model(self) -> tuple[str, str]:
         return (self._live_model, self._live_effort)

@@ -35,6 +35,11 @@ class Provider:
     # exactly today's behavior. These mirror the modes the interactive TUI
     # cycles through with Shift+Tab, so a spawned agent can start pre-set.
     permission_modes: tuple = ()
+    # every token the CLI's own --permission-mode actually accepts. A SUPERSET
+    # of the dropdown above, because a mode read back off a live conversation
+    # can be one the dialog never offers (the TUI's Shift+Tab cycle sets modes
+    # of its own). Empty = only the dropdown values are launchable.
+    cli_permission_modes: tuple = ()
     native_flags: bool = False  # True → --model/--effort (Claude); else template
     base_cmd: str = ""         # template providers, e.g. "codex"
     model_flag: str = ""       # template, e.g. "--model {model}" / "-m {model}"
@@ -67,12 +72,59 @@ CLAUDE_PERMISSION_MODES = (
     ("Plan mode (read-only until you approve)", "plan"),
     ("Bypass permissions (skip all prompts)", "bypassPermissions"),
 )
+# Every token `claude --permission-mode` accepts (verified 2.1.220). The
+# dropdown above is the curated subset a NEW agent can be launched in; this is
+# the full vocabulary, needed because the mode is also read back off a live
+# conversation, where the user's own Shift+Tab may have picked something the
+# dialog never offers ("auto" is what a current CLI records where an older
+# build said "acceptEdits"). Note there is NO "default" token even though the
+# transcript writes that name for the ask-each-time mode: it is spelled
+# "manual" on the command line, or reproduced exactly by omitting the flag.
+CLAUDE_CLI_PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions",
+                               "manual", "dontAsk", "plan")
+
+# transcript token -> the launch flag that reproduces it. Only the modes whose
+# names differ between the two need an entry; anything else passes through if
+# the CLI accepts it. "default"/"manual" both mean ask-each-time, which is what
+# omitting the flag already does, so they map to "".
+_MODE_LAUNCH = {"": "", "default": "", "manual": ""}
+
+# ...and how each reads on the card. Short lowercase words, since this sits in
+# a header chip beside the model and effort.
+_MODE_DISPLAY = {
+    "": "manual", "default": "manual", "manual": "manual",
+    "auto": "auto", "acceptEdits": "auto edits", "plan": "plan",
+    "bypassPermissions": "bypass", "dontAsk": "no prompts",
+}
+
+
+def normalize_permission_mode(raw: str) -> str:
+    """The `--permission-mode` value that reproduces `raw` on the next launch.
+
+    `raw` is a mode as the CLI names it internally (what a transcript record
+    carries), which is not always a launchable token: the ask-each-time mode is
+    written "default" and has no flag spelling at all. Anything unrecognized
+    becomes "" (omit the flag) rather than a bogus flag that would stop the
+    agent launching."""
+    token = (raw or "").strip()
+    if token in _MODE_LAUNCH:
+        return _MODE_LAUNCH[token]
+    return token if token in CLAUDE_CLI_PERMISSION_MODES else ""
+
+
+def permission_mode_display(raw: str) -> str:
+    """A permission mode as a short label for the card header, e.g.
+    "default" -> "manual". Unknown tokens show verbatim (a newer CLI's mode is
+    better shown as-is than hidden); "" is the CLI default, i.e. "manual"."""
+    token = (raw or "").strip()
+    return _MODE_DISPLAY.get(token, token)
 
 PROVIDERS: dict[str, Provider] = {
     "claude": Provider(
         key="claude", display="Claude Code", exe_names=("claude",),
         models=CLAUDE_MODELS, efforts=CLAUDE_EFFORTS,
-        permission_modes=CLAUDE_PERMISSION_MODES, native_flags=True,
+        permission_modes=CLAUDE_PERMISSION_MODES,
+        cli_permission_modes=CLAUDE_CLI_PERMISSION_MODES, native_flags=True,
         note="Anthropic Claude Code: full interactive agent."),
     "openai": Provider(
         key="openai", display="OpenAI (Codex CLI)", exe_names=("codex",),
@@ -218,8 +270,11 @@ def build_invocation(key: str, model: str = "", effort: str = "",
             args += ["--effort", effort]
         # only ever pass a mode the provider actually declares (the "" default
         # is not a launch token — it means "omit the flag"), so a stale or
-        # bogus value can never reach the CLI as an invalid --permission-mode
-        valid_modes = {v for _, v in p.permission_modes if v}
+        # bogus value can never reach the CLI as an invalid --permission-mode.
+        # The CLI's own vocabulary wins where it is known, since a mode adopted
+        # from a live conversation is often outside the dialog's shortlist.
+        valid_modes = (set(p.cli_permission_modes)
+                       or {v for _, v in p.permission_modes if v})
         if permission_mode and permission_mode in valid_modes:
             args += ["--permission-mode", permission_mode]
         return program, args + extra_args

@@ -2253,6 +2253,9 @@ class MainWindow(QMainWindow):
         # transcripts on disk are current.
         for agent_id, old, new in self.manager.sync_live_sessions():
             self.store.audit(f"SESSION-SYNC agent={agent_id} {old} -> {new}")
+        # same reason, for the OTHER thing a user changes inside the terminal:
+        # a Shift+Tab in the last second before closing must reopen in that mode
+        self.manager.refresh_model_effort()
         self._save_session()  # persist FIRST: teardown can never lose state
         from .. import transcripts
         agents = self.manager.all_agents()

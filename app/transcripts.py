@@ -40,8 +40,8 @@ _USAGE_CACHE: dict[str, tuple[float, int, int, int]] = {}
 # cache for limit_cut_off: path -> (mtime, size, verdict dict).
 _LIMIT_CACHE: dict[str, tuple[float, int, dict]] = {}
 
-# cache for latest_model_effort: path -> (mtime, size, model, effort).
-_MODEL_CACHE: dict[str, tuple[float, int, str, str]] = {}
+# cache for latest_model_effort: path -> (mtime, size, model, effort, mode).
+_MODEL_CACHE: dict[str, tuple[float, int, str, str, str]] = {}
 
 # How much of the tail latest_model_effort reads. It polls far more often than
 # the title/usage readers, so it must not re-scan a multi-MB conversation on
@@ -389,45 +389,52 @@ def model_display(raw: str) -> str:
     return text.replace("(1M context)", "(1M)").strip()
 
 
-def latest_model_effort(cwd: str, session_id: str) -> tuple[str, str]:
-    """The model and effort this conversation is on RIGHT NOW, as
-    (model_display, effort). Both can change mid-session (/model, /effort), so
-    neither the launch flags nor a single record kind is enough; two sources are
-    merged in file order, last one wins:
+def latest_model_effort(cwd: str, session_id: str) -> tuple[str, str, str]:
+    """What this conversation is running with RIGHT NOW, as
+    (model_display, effort, permission_mode). All three can change mid-session
+    (/model, /effort, Shift+Tab), so neither the launch flags nor a single
+    record kind is enough; the sources are merged in file order, last one wins:
 
       * every assistant record carries `message.model` and a top-level `effort`
         (ground truth, but only as of the last turn);
       * `/model` and `/effort` append a <local-command-stdout> user record the
         instant the user picks, which is what makes an idle agent's switch
-        visible without waiting for a turn.
+        visible without waiting for a turn;
+      * the permission mode rides on every user prompt record as a top-level
+        `permissionMode`, AND on a dedicated `{"type":"permission-mode"}`
+        record Claude appends as soon as Shift+Tab changes it (again, the part
+        that shows an idle agent's switch). Its token is the CLI's INTERNAL
+        name, which is not always a launch flag ("default"); translating that
+        is providers.normalize_permission_mode's job, not this reader's.
 
     Sub-agent sidechains are skipped (they run their own model) and so is the
-    `<synthetic>` pseudo-model. ("", "") when there is no file / no evidence.
-    Cached by (mtime,size); never raises."""
+    `<synthetic>` pseudo-model. ("", "", "") when there is no file / no
+    evidence. Cached by (mtime,size); never raises."""
     if not session_id or not cwd:
-        return ("", "")
+        return ("", "", "")
     return _read_model_effort(transcript_path(cwd, session_id))
 
 
-def _read_model_effort(path: str) -> tuple[str, str]:
+def _read_model_effort(path: str) -> tuple[str, str, str]:
     try:
         st = os.stat(path)
     except OSError:
-        return ("", "")
+        return ("", "", "")
     cached = _MODEL_CACHE.get(path)
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
-        return (cached[2], cached[3])
+        return (cached[2], cached[3], cached[4])
     try:
-        model, effort = _scan_model_effort(_tail_lines(path, _MODEL_TAIL_BYTES))
+        model, effort, mode = _scan_model_effort(
+            _tail_lines(path, _MODEL_TAIL_BYTES))
         if not model and st.st_size > _MODEL_TAIL_BYTES:
             # nothing in the tail (a long stretch of tool output, say): pay for
             # the full scan once, then the cache holds until the file changes
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                model, effort = _scan_model_effort(fh)
+                model, effort, mode = _scan_model_effort(fh)
     except OSError:
-        return (cached[2], cached[3]) if cached else ("", "")
-    _MODEL_CACHE[path] = (st.st_mtime, st.st_size, model, effort)
-    return (model, effort)
+        return (cached[2], cached[3], cached[4]) if cached else ("", "", "")
+    _MODEL_CACHE[path] = (st.st_mtime, st.st_size, model, effort, mode)
+    return (model, effort, mode)
 
 
 def _tail_lines(path: str, limit: int) -> list[str]:
@@ -444,12 +451,13 @@ def _tail_lines(path: str, limit: int) -> list[str]:
     return data.decode("utf-8", "replace").splitlines()
 
 
-def _scan_model_effort(lines) -> tuple[str, str]:
-    model = effort = ""
+def _scan_model_effort(lines) -> tuple[str, str, str]:
+    model = effort = mode = ""
     for line in lines:
         is_turn = '"assistant"' in line
         is_pick = "Set model to" in line or "Set effort level to" in line
-        if not (is_turn or is_pick):
+        is_mode = '"permissionMode"' in line
+        if not (is_turn or is_pick or is_mode):
             continue  # cheap prefilter before the JSON parse
         try:
             rec = json.loads(line)
@@ -457,6 +465,13 @@ def _scan_model_effort(lines) -> tuple[str, str]:
             continue  # a partial last line while Claude is writing
         if rec.get("isSidechain"):
             continue  # a sub-agent's model, not this conversation's
+        # the permission mode rides on ordinary records rather than having a
+        # record kind of its own, so it is read before the type dispatch: a
+        # user prompt carries the mode it was submitted under, and a bare
+        # {"type":"permission-mode"} record marks a Shift+Tab as it happens
+        current = rec.get("permissionMode")
+        if isinstance(current, str) and current:
+            mode = current
         if rec.get("type") == "assistant":
             raw = ((rec.get("message") or {}).get("model") or "")
             if raw and not raw.startswith("<"):   # skip the <synthetic> model
@@ -475,7 +490,7 @@ def _scan_model_effort(lines) -> tuple[str, str]:
         m = _SET_EFFORT_RE.search(_ANSI_RE.sub("", content))
         if m:
             effort = m.group(1).lower()
-    return (model, effort)
+    return (model, effort, mode)
 
 
 def _parse_set_model(content: str) -> tuple[str, str]:

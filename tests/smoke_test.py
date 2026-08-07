@@ -1664,18 +1664,21 @@ def test_token_usage_badge():
 
 
 def test_live_model_effort():
-    """The card header says which model and effort the agent is ACTUALLY on.
-    Both change mid-session (/model, /effort in the terminal), so the reading
-    comes from the transcript: assistant records carry message.model + a
-    top-level effort, and a /model or /effort pick writes a local-command-stdout
-    record the instant the user chooses. Last in file order wins. Transient like
-    the AI title: it never touches spec and never saves."""
+    """The card header says which model, effort and permission mode the agent
+    is ACTUALLY on. All three change mid-session (/model, /effort, Shift+Tab in
+    the terminal), so the reading comes from the transcript: assistant records
+    carry message.model + a top-level effort, a /model or /effort pick writes a
+    local-command-stdout record the instant the user chooses, and the mode rides
+    on every prompt plus a dedicated permission-mode record. Last in file order
+    wins. Model and effort are transient (they never touch spec and never save);
+    the MODE is written back, because it is the flag that reopens the agent in
+    the same mode."""
     import json as _json
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
-    from app import transcripts
+    from app import providers, transcripts
     from app.terminal_agent import TerminalAgent
-    from app.process_worker import AgentKind, build_spec
+    from app.process_worker import AgentKind, AgentSpec, build_spec
     from app.widgets.terminal_card import TerminalCard
 
     QApplication.instance() or QApplication([])
@@ -1716,7 +1719,7 @@ def test_live_model_effort():
 
     write([{"type": "user", "text": "hi"}, _turn()])
     check("model: a turn reports its model and effort",
-          transcripts._read_model_effort(str(tpath)) == ("Opus 5", "high"),
+          transcripts._read_model_effort(str(tpath)) == ("Opus 5", "high", ""),
           transcripts._read_model_effort(str(tpath)))
 
     # a /model pick AFTER the last turn is the newer truth (the whole point:
@@ -1725,7 +1728,7 @@ def test_live_model_effort():
            _pick("Set model to \x1b[1mSonnet 5\x1b[22m and saved as your "
                  "default for new sessions")])
     check("model: a /model pick after the last turn wins",
-          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5", "high"),
+          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5", "high", ""),
           transcripts._read_model_effort(str(tpath)))
 
     write([_turn(),
@@ -1734,7 +1737,7 @@ def test_live_model_effort():
            _pick("Set effort level to max (this session only): Maximum "
                  "capability with deepest reasoning.")])
     check("model: a /effort pick changes only the effort",
-          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5", "max"),
+          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5", "max", ""),
           transcripts._read_model_effort(str(tpath)))
 
     write([_turn(),
@@ -1742,7 +1745,7 @@ def test_live_model_effort():
                  "as your default for new sessions with \x1b[1mhigh\x1b[22m "
                  "effort")])
     check("model: a pick that names an effort applies both",
-          transcripts._read_model_effort(str(tpath)) == ("Opus 4.8 (1M)", "high"),
+          transcripts._read_model_effort(str(tpath)) == ("Opus 4.8 (1M)", "high", ""),
           transcripts._read_model_effort(str(tpath)))
 
     # a turn AFTER a pick wins again (ordering is file order, not kind)
@@ -1750,26 +1753,90 @@ def test_live_model_effort():
                  "default for new sessions"),
            _turn(model="claude-fable-5", effort="max")])
     check("model: a turn after a pick wins again",
-          transcripts._read_model_effort(str(tpath)) == ("Fable 5", "max"),
+          transcripts._read_model_effort(str(tpath)) == ("Fable 5", "max", ""),
           transcripts._read_model_effort(str(tpath)))
 
     # a sub-agent's model is a different context; <synthetic> is not a model
     write([_turn(), _turn(model="claude-haiku-4-5", effort="low", side=True),
            {"type": "assistant", "message": {"model": "<synthetic>"}}])
     check("model: sidechain and synthetic records never win",
-          transcripts._read_model_effort(str(tpath)) == ("Opus 5", "high"),
+          transcripts._read_model_effort(str(tpath)) == ("Opus 5", "high", ""),
           transcripts._read_model_effort(str(tpath)))
 
     check("model: missing file reads as unknown",
-          transcripts.latest_model_effort(str(tmp), "nope") == ("", ""))
+          transcripts.latest_model_effort(str(tmp), "nope") == ("", "", ""))
 
     # the reader only touches the tail, so it must still find evidence that sits
     # behind a long stretch of unrelated records (full-scan fallback)
     filler = [{"type": "user", "text": "x" * 400} for _ in range(400)]
     write([_turn(model="claude-opus-4-8", effort="xhigh")] + filler)
     check("model: falls back to a full scan when the tail has no evidence",
-          transcripts._read_model_effort(str(tpath)) == ("Opus 4.8", "xhigh"),
+          transcripts._read_model_effort(str(tpath)) == ("Opus 4.8", "xhigh", ""),
           transcripts._read_model_effort(str(tpath)))
+
+    # --- the permission mode (Shift+Tab), read off the same transcript ---
+    def _mode(mode):    # the record Claude appends the instant the mode changes
+        return {"type": "permission-mode", "permissionMode": mode}
+
+    write([_turn(), _mode("plan")])
+    check("mode: a permission-mode record is the live mode",
+          transcripts._read_model_effort(str(tpath))[2] == "plan",
+          transcripts._read_model_effort(str(tpath)))
+    write([_mode("plan"), _mode("auto")])
+    check("mode: the LAST mode record wins",
+          transcripts._read_model_effort(str(tpath))[2] == "auto",
+          transcripts._read_model_effort(str(tpath)))
+    # an ordinary prompt carries the mode it was submitted under, which is what
+    # covers a CLI build that writes no dedicated record
+    write([_mode("plan"),
+           {"type": "user", "permissionMode": "auto",
+            "message": {"role": "user", "content": "go"}}])
+    check("mode: a user prompt's own permissionMode counts too",
+          transcripts._read_model_effort(str(tpath))[2] == "auto",
+          transcripts._read_model_effort(str(tpath)))
+    write([_mode("auto"),
+           {"type": "user", "isSidechain": True, "permissionMode": "plan",
+            "message": {"role": "user", "content": "sub"}}])
+    check("mode: a sidechain's mode is a sub-agent's, never this one's",
+          transcripts._read_model_effort(str(tpath))[2] == "auto",
+          transcripts._read_model_effort(str(tpath)))
+
+    # translation: the transcript's names are not all launch flags
+    check("mode: 'default' is spelled by omitting the flag",
+          providers.normalize_permission_mode("default") == ""
+          and providers.normalize_permission_mode("manual") == "")
+    check("mode: a real CLI token passes through",
+          providers.normalize_permission_mode("auto") == "auto"
+          and providers.normalize_permission_mode("plan") == "plan")
+    check("mode: an unknown token never reaches the command line",
+          providers.normalize_permission_mode("wat") == "")
+    check("mode: 'default' reads as manual on the card",
+          providers.permission_mode_display("default") == "manual"
+          and providers.permission_mode_display("") == "manual")
+    # ...and a mode adopted from a conversation must be launchable, even though
+    # the New Agent dropdown never offers it
+    _, auto_args = providers.build_invocation("claude", permission_mode="auto")
+    check("mode: 'auto' survives into the launch flags",
+          auto_args == ["--permission-mode", "auto"], auto_args)
+    _, bogus_args = providers.build_invocation("claude", permission_mode="wat")
+    check("mode: a bogus mode is dropped rather than launched", bogus_args == [])
+
+    # the spec REBUILDS its args, or the new mode would persist while every
+    # launch in this process kept using the old flag
+    mspec = build_spec(AgentKind.CLAUDE, "Mode", cwd=str(tmp))
+    check("mode: a fresh spec carries no --permission-mode",
+          "--permission-mode" not in mspec.args, mspec.args)
+    check("mode: adopting a mode reports the change",
+          mspec.set_permission_mode("plan")
+          and not mspec.set_permission_mode("plan"))
+    check("mode: adopting a mode rebuilds the launch args",
+          mspec.args[-2:] == ["--permission-mode", "plan"], mspec.args)
+    check("mode: the adopted mode round-trips through the session file",
+          AgentSpec.from_dict(mspec.to_dict()).permission_mode == "plan"
+          and "--permission-mode" in AgentSpec.from_dict(mspec.to_dict()).args)
+    mspec.set_permission_mode("")
+    check("mode: going back to the default drops the flag again",
+          "--permission-mode" not in mspec.args, mspec.args)
 
     # --- agent-side badge: transient, emits only on a real change ---
     a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd=".",
@@ -1777,31 +1844,43 @@ def test_live_model_effort():
     seen = []
     a.model_changed.connect(seen.append)
     check("model: badge seeded from the launch flags",
-          a.model_badge() == "Opus · high", a.model_badge())
+          a.model_badge() == "Opus · high · manual", a.model_badge())
     a.set_live_model("Sonnet 5", "max")
     check("model: badge follows the live reading",
-          a.model_badge() == "Sonnet 5 · max" and seen[-1] == "Sonnet 5 · max",
+          a.model_badge() == "Sonnet 5 · max · manual"
+          and seen[-1] == "Sonnet 5 · max · manual",
           (a.model_badge(), seen))
     n = len(seen)
     a.set_live_model("Sonnet 5", "max")
     check("model: no signal when the reading is unchanged", len(seen) == n)
     a.set_live_model("", "")
     check("model: an empty reading never blanks a good label",
-          a.model_badge() == "Sonnet 5 · max" and len(seen) == n)
+          a.model_badge() == "Sonnet 5 · max · manual" and len(seen) == n)
+    a.set_live_model("", "", "plan")
+    check("model: badge follows the live permission mode",
+          a.model_badge() == "Sonnet 5 · max · plan"
+          and seen[-1] == "Sonnet 5 · max · plan", (a.model_badge(), seen))
+    a.set_live_model("Sonnet 5", "max", "auto")
+    check("model: the mode label is the CLI's own name",
+          a.model_badge() == "Sonnet 5 · max · auto", a.model_badge())
     b = TerminalAgent(build_spec(AgentKind.CLAUDE, "Bare", cwd="", model="",
                                  effort=""))
     b._live_model = ""      # no launch flag and no saved user default
     check("model: badge hidden when nothing is known", b.model_badge() == "")
     b.set_live_model("Opus 5", "")
     check("model: model alone renders without an effort",
-          b.model_badge() == "Opus 5", b.model_badge())
+          b.model_badge() == "Opus 5 · manual", b.model_badge())
+    sh = TerminalAgent(build_spec(AgentKind.POWERSHELL, "Shell", cwd=""))
+    check("model: a shell has no permission mode to show",
+          sh.permission_mode_label() == "" and sh.model_badge() == "",
+          (sh.permission_mode_label(), sh.model_badge()))
 
     # --- header: the chip shows/hides with the badge ---
     card = TerminalCard(a)
     card.resize(900, 300); card.show(); pump(80)
-    check("model: card chip shows the live model and effort",
+    check("model: card chip shows the live model, effort and mode",
           card.model_label.isVisible()
-          and card.model_label.text() == "Sonnet 5 · max",
+          and card.model_label.text() == "Sonnet 5 · max · auto",
           card.model_label.text())
     card2 = TerminalCard(b)
     b._live_model = ""
@@ -1826,8 +1905,41 @@ def test_live_model_effort():
     mgr.dirty.connect(lambda: dirtied.append(True))
     mgr.refresh_model_effort()
     check("model: the manager poll adopts the transcript's model/effort",
-          live.model_badge() == "Sonnet 5 · low", live.model_badge())
+          live.model_badge() == "Sonnet 5 · low · manual", live.model_badge())
     check("model: a reading never marks the session dirty", not dirtied, dirtied)
+
+    # ...except the permission mode, which IS the launch flag for next time:
+    # the CLI does not carry a mode across --resume, so an agent the user put
+    # in plan mode came back ask-each-time on every reopen
+    conv.write_text(_json.dumps(_turn(model="claude-sonnet-5", effort="low"))
+                    + "\n" + _json.dumps(_mode("plan")) + "\n",
+                    encoding="utf-8")
+    mgr.refresh_model_effort()
+    check("mode: the manager poll shows the live mode",
+          live.model_badge() == "Sonnet 5 · low · plan", live.model_badge())
+    check("mode: the live mode is written back as the next launch flag",
+          live.spec.permission_mode == "plan"
+          and live.spec.args[-2:] == ["--permission-mode", "plan"],
+          (live.spec.permission_mode, live.spec.args))
+    check("mode: adopting a mode marks the session dirty", dirtied)
+    check("mode: the adopted mode reaches the persisted session record",
+          mgr.to_session_dict()["workspaces"][0]["terminals"][0].get(
+              "permission_mode") == "plan")
+    dirtied.clear()
+    mgr.refresh_model_effort()
+    check("mode: an unchanged mode never re-saves", not dirtied, dirtied)
+    # the ask-each-time mode is written "default" in the transcript and has no
+    # flag spelling, so it must clear the flag rather than launch a bogus one
+    conv.write_text(_json.dumps(_turn(model="claude-sonnet-5", effort="low"))
+                    + "\n" + _json.dumps(_mode("default")) + "\n",
+                    encoding="utf-8")
+    mgr.refresh_model_effort()
+    check("mode: going back to ask-each-time clears the flag",
+          live.spec.permission_mode == ""
+          and "--permission-mode" not in live.spec.args, live.spec.args)
+    check("mode: clearing it reaches the persisted session record too",
+          mgr.to_session_dict()["workspaces"][0]["terminals"][0].get(
+              "permission_mode", "-") == "")
     shutil.rmtree(conv.parent, ignore_errors=True)
 
     # --- the summary uses the width it was actually given ---

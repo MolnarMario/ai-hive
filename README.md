@@ -60,11 +60,14 @@ workspaces keep executing — switching never pauses anything.
   `/resume`) — so you can tell at a glance what each agent is working on without
   reading its terminal. The same summary shows in the terminal card header,
   where it fits itself to whatever width the row leaves (full text on hover).
-- **Live model + effort on every card** — the header says what the agent is
-  *actually* running, e.g. `Opus 5 · high`, right of its role. Both are yours to
-  change from inside the terminal with `/model` and `/effort`, so the readout
-  follows the live conversation rather than the flags the agent launched with,
-  and updates a second or two after you pick.
+- **Live model, effort and mode on every card** — the header says what the
+  agent is *actually* running, e.g. `Opus 5 · high · plan`, right of its role.
+  All three are yours to change from inside the terminal (`/model`, `/effort`,
+  and `Shift+Tab` for the permission mode), so the readout follows the live
+  conversation rather than the flags the agent launched with, and updates a
+  second or two after you pick. The **permission mode is remembered**: an agent
+  you put in plan or auto mode comes back in that mode the next time you open
+  AI Hive, instead of reverting to ask-each-time.
   Click any agent to jump straight
   to its terminal card (switching workspace first if needed). When an agent is
   actually **waiting for you** — a permission prompt or an interactive
@@ -275,8 +278,9 @@ error dialog instead of silently closing. Packaging to a distributable
   Typing a TTY-only program (`claude`, `vim`, `htop`, …) prints a hint
   instead of leaving you with a cryptic error.
 - **Sessions** — workspaces and terminals are saved automatically and
-  restored on launch (including provider/model/effort, per-agent font, grid
-  layout, current task, and assignment badges). Everything that was running
+  restored on launch (including provider/model/effort, the Claude permission
+  mode each agent was last in, per-agent font, grid layout, current task, and
+  assignment badges). Everything that was running
   comes back **in every workspace**: previously-running agents autostart, and
   each Claude agent resumes **its own pinned conversation** (`--resume
   <session-id>` — so two agents sharing a project folder can never race for
@@ -504,7 +508,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1008 checks drive the real app headlessly (offscreen Qt platform) with real
+1033 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -518,9 +522,13 @@ a per-agent task summary beside the name, the per-card maximize/restore toggle
 (solo one agent full-area without touching any sibling's process, then restore
 the exact prior tiling) and the context-window usage badge beside the summary
 ("N% of 1M/200K", read from the transcript's last usage record — transient,
-never persisted), the live model/effort readout beside the agent's role
+never persisted), the live model/effort/permission-mode readout beside the
+agent's role
 (normalising `claude-opus-5` to "Opus 5", merging the last turn's model with a
-mid-session `/model` or `/effort` pick, transient and never persisted) and the
+mid-session `/model` or `/effort` pick, reading the Shift+Tab mode off the
+transcript's permission-mode records and writing it back so a reopened agent
+returns in the same mode, translating the CLI's internal "default" into an
+omitted flag) and the
 self-fitting header summary that uses every free pixel, the sidebar status badge
 (output-activity busy detection, pulse/colour state machine, hover-only
 controls), sidebar drag-reorder + collapsible categories (create/rename/delete,
@@ -579,7 +587,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1008 checks)
+tests/smoke_test.py        headless end-to-end suite (1033 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
