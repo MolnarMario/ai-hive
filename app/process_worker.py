@@ -243,6 +243,19 @@ def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
     AI-agent kinds (Claude/OpenAI/Gemini/Grok) route through app.providers so
     the model/effort selections become real CLI flags.
     """
+    # Coerce to the real enum, because a plain str gets this far in practice
+    # and does not fail until much later, somewhere else. Qt is the source:
+    # QComboBox.currentData() round-trips a value through QVariant, and a
+    # str-mixin enum comes back out as a plain str (verified) — so every agent
+    # built from the New Agent dialog carried kind="claude" rather than
+    # AgentKind.CLAUDE. Nothing here notices: AgentKind is a str-mixin, so the
+    # `in PTY_ONLY_KINDS` / `in AI_KINDS` lookups below all still hit. What
+    # breaks is `AgentSpec.to_dict`'s `self.kind.value`, on every save, for the
+    # life of the process — the agent degrades to a minimal record and silently
+    # loses its model, effort, permission mode, role and task on the next
+    # restore. Restarting "fixed" it only because `from_dict` rebuilds the enum.
+    # Doing it here makes the invariant true by construction for every caller.
+    kind = AgentKind(kind)
     args = list(args or [])
     if kind in PTY_ONLY_KINDS:
         pty = True

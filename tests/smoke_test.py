@@ -8180,6 +8180,182 @@ def test_startup_limit_recovery():
     win2.close()
 
 
+def test_limit_recovery_reliability():
+    """The four ways a real cut-off (2026-08-07, CVsummer2026) went unrecovered.
+
+    Every one of them is silent by construction — the agent simply sits there —
+    so each gets a check that reproduces the exact screen or timing shape that
+    defeated it. See app/terminal_agent.py `_tail_lines` and `mark_limit_blocked`
+    for the reasoning behind the fixes."""
+    import time as _time
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import (REPAINT_RESTORE_MS, AgentStatus,
+                                    TerminalAgent)
+    from app.widgets.main_window import LIMIT_REPAINT_AFTER_WAITS
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-limit-rel-"))
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    BANNER = ("You've hit your session limit \xb7 resets 9:30pm "
+              "(Europe/Bucharest)")
+    # a LATER window's cut-off: successive 5-hour windows never end at the same
+    # wall time, which is what makes the banner line a cut-off's identity
+    NEXT = ("You've hit your session limit \xb7 resets 2:30am "
+            "(Europe/Bucharest)")
+    MENU = ("What do you want to do?\n"
+            "> 1. Stop and wait for limit to reset\n"
+            "  2. Upgrade your plan\n")
+    # Claude's TUI pads its frame with blank rows, so the banner ends up far
+    # above the bottom in LINES while being close to it in CONTENT. Measured on
+    # real screen snapshots: a raw [-40:] slice spanned 432 chars / 5 non-blank
+    # lines. This is the frame that lost a genuine cut-off.
+    PADDED = BANNER + "\n" + "\n" * 60 + "> try \"fix the tests\"\n  ? for shortcuts\n"
+
+    def mk(name="Coder"):
+        a = TerminalAgent(build_spec(AgentKind.CLAUDE, name, cwd=os.getcwd()))
+        a._prompt_ready = True
+        return a
+
+    # --- 1. the scrape window counts CONTENT, not padding -------------------
+    a = mk()
+    a._screen_tail = PADDED
+    a._scrape_limit()
+    check("limit-scrape: a banner above the TUI's blank padding still latches",
+          a.is_limit_blocked())
+    check("limit-scrape: ...and it carries the reset clock the banner stated",
+          a.limit_resets_at() is not None)
+
+    # the two callers that deliberately keep RAW-line windows must not have
+    # been widened along with it: recheck_limit reaching further back would
+    # find a torn-down menu forever and never report a resume
+    b = mk()
+    b.mark_limit_blocked(_time.time() + 60, from_startup=False, banner=BANNER)
+    b._screen_tail = MENU + "\n" * 60 + "  ? for shortcuts\n"
+    check("limit-scrape: recheck_limit still uses raw lines (a menu pushed "
+          "past 40 raw lines reads as resumed)",
+          b.recheck_limit() is False)
+
+    # --- 2. a disk-recovered latch arms the banner-echo guard ---------------
+    # The live re-latch this prevents was observed one SECOND after a verified
+    # resume, and dated its phantom cut-off a full day out.
+    c = mk()
+    c.mark_limit_blocked(1786127400.0, from_startup=True,
+                         cut_off_at=1786127061.0, window="session",
+                         banner=BANNER)
+    c.clear_limit_block()          # what a successful resume does
+    c._screen_tail = PADDED        # the same banner, still on screen
+    c._scrape_limit()
+    check("limit-echo: a startup-armed latch is not re-raised by its own "
+          "banner after the resume",
+          not c.is_limit_blocked())
+    c._screen_tail = NEXT + "\n" + "\n" * 60 + "  ? for shortcuts\n"
+    c._scrape_limit()
+    check("limit-echo: ...but a genuinely NEW cut-off still latches",
+          c.is_limit_blocked())
+
+    # --- 3. readiness is re-checked once the screen settles -----------------
+    # _on_pty_output decides readiness against a 600-char tail, once per burst.
+    # A footer followed by more than that in the same burst is never seen, and
+    # a child that then falls quiet is never looked at again.
+    d = mk()
+    d._prompt_ready = False
+    d.status = AgentStatus.RUNNING
+    d._on_pty_output("pty", "welcome\n  ? for shortcuts\n"
+                     + ("x" * 400 + "\n") * 3)
+    check("prompt-ready: a footer buried in its own burst is missed per-burst",
+          not d.prompt_ready())
+    d._on_idle_timeout()
+    check("prompt-ready: ...and recovered when the screen settles",
+          d.prompt_ready())
+
+    e = mk()
+    e._prompt_ready = False
+    e.status = AgentStatus.RUNNING
+    e._on_pty_output("pty", "booting" + "y" * 2000)
+    e._on_idle_timeout()
+    check("prompt-ready: a settle with no footer at all stays not-ready",
+          not e.prompt_ready())
+
+    # --- 4. request_repaint, for a card that never gets a resizeEvent -------
+    f = mk()
+    check("repaint: refused when the child isn't running", not f.request_repaint())
+    resizes: list = []
+    f.worker.rows, f.worker.cols = 30, 100
+    f.worker.is_running = lambda: True
+    f.worker.resize = lambda r, c: resizes.append((r, c))
+    check("repaint: accepted for a live pty agent", f.request_repaint())
+    check("repaint: narrows first", resizes == [(30, 99)])
+    pump(REPAINT_RESTORE_MS + 120)
+    check("repaint: and gives the width straight back",
+          resizes == [(30, 99), (30, 100)])
+
+    # --- 5. the watchdog stops waiting forever ------------------------------
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    ws = win.manager.create_workspace("W", str(tmp))
+    agent = win.manager.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "A",
+                                                       cwd=str(tmp)))
+    agent._prompt_ready = False    # a card the user has never opened
+    asked: list = []
+    agent.request_repaint = lambda: (asked.append(1), True)[1]
+    agent.worker.is_running = lambda: True
+    agent.mark_limit_blocked(_time.time() - 60, from_startup=True,
+                             banner=BANNER)
+    for _ in range(LIMIT_REPAINT_AFTER_WAITS - 1):
+        win._auto_continue_agent(agent)
+    check("limit-wait: a booting TUI is left alone at first", not asked)
+    win._auto_continue_agent(agent)
+    check("limit-wait: after a few quiet ticks the TUI is asked to redraw",
+          len(asked) == 1)
+    win._auto_continue_agent(agent)
+    check("limit-wait: and it is asked exactly once, not every tick",
+          len(asked) == 1)
+    check("limit-wait: a refused resume still consumes no attempt",
+          agent.limit_attempts() == 0)
+    agent._prompt_ready = True
+    win._auto_continue_agent(agent)
+    check("limit-wait: the counter resets once the prompt is live",
+          win._limit_wait_ticks.get(agent.id) is None)
+    win.close()
+
+
+def test_agent_kind_is_always_an_enum():
+    """`build_spec` coerces `kind`, so an agent can always be serialized.
+
+    QComboBox.currentData() round-trips a value through QVariant and hands a
+    str-mixin enum back as a PLAIN STR, so every agent built from the New Agent
+    dialog carried kind="claude". Nothing notices until `AgentSpec.to_dict`
+    reaches `self.kind.value` — on every save, for the life of the process —
+    and the agent degrades to a minimal record that loses its model, effort,
+    permission mode, role and task on the next restore. Observed live: 832
+    SAVE-DEGRADE lines in one session."""
+    from PySide6.QtWidgets import QApplication, QComboBox
+    from app.process_worker import AgentKind, build_spec
+
+    app = QApplication.instance() or QApplication([])
+
+    combo = QComboBox()
+    combo.addItem("Claude Code", AgentKind.CLAUDE)
+    from_qt = combo.currentData()
+    check("agent-kind: Qt really does hand back a plain str (the trap)",
+          type(from_qt) is str and not isinstance(from_qt, AgentKind))
+
+    spec = build_spec(from_qt, "Agent 1", cwd=os.getcwd())
+    check("agent-kind: build_spec coerces it back to the enum",
+          spec.kind is AgentKind.CLAUDE)
+    check("agent-kind: so the agent serializes instead of degrading",
+          spec.to_dict()["kind"] == "claude")
+    check("agent-kind: an enum in still comes out unchanged",
+          build_spec(AgentKind.CMD, "S", cwd=os.getcwd()).kind is AgentKind.CMD)
+
+
 def test_scheduled_send():
     """A message the user writes now and has typed in LATER.
 
@@ -8725,6 +8901,8 @@ def main():
     test_taskbar_badge()
     test_bg_shell_taskbar_state()
     test_limit_ledger()
+    test_agent_kind_is_always_an_enum()
+    test_limit_recovery_reliability()
     test_auto_continue_on_limit_reset()
     test_startup_limit_recovery()
     test_scheduled_send()

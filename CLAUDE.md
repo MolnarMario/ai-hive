@@ -35,7 +35,17 @@ this file is the invariants that must survive every change.
   different lines of `AgentSpec.to_dict` but produce byte-identical output,
   and `AgentKind` is a str-mixin enum so even the serialized `kind` can't tell
   them apart. Don't remove these guards or let a new save path bypass the
-  audit trail. Conversely, TRANSIENT signals must NEVER mark `dirty`:
+  audit trail. The plain-str `kind` half was then found and CLOSED AT SOURCE:
+  `QComboBox.currentData()` round-trips a value through QVariant and hands a
+  str-mixin enum back as a PLAIN STR, so every agent built from the New Agent
+  dialog carried `kind="claude"`. Nothing downstream notices (the str-mixin
+  makes every `in AI_KINDS` / `in PTY_ONLY_KINDS` lookup still hit) until
+  `to_dict` reaches `.value`, on EVERY save, for the life of the process —
+  832 `SAVE-DEGRADE` lines in one observed session, and the agent silently
+  losing its model/effort/permission-mode/role/task on the next restore.
+  Restarting appeared to "fix" it only because `from_dict` rebuilds the enum.
+  `build_spec` now coerces (`kind = AgentKind(kind)`) so the invariant holds by
+  construction for every caller; do NOT rely on call sites passing the enum. Conversely, TRANSIENT signals must NEVER mark `dirty`:
   `activity_changed` (busy/standby, derived from output activity — see the
   status-badge invariant) fires every couple of seconds while an agent works,
   so it connects to `_recompute` (refresh derived UI only), never `_touch`;
@@ -367,7 +377,31 @@ this file is the invariants that must survive every change.
   successive 5-hour windows never end at the same wall time, and a genuine
   cut-off renders its menu directly below the banner (hence in view whenever the
   banner is), so this suppresses only the echo. `_limit_last_banner` therefore
-  SURVIVES `clear_limit_block` and is reset by `start`/`restart` alone.
+  SURVIVES `clear_limit_block` and is reset by `start`/`restart` alone — and
+  `mark_limit_blocked` MUST set it too. That was missed at first, so a latch
+  recovered from DISK armed no guard at all: the moment `recheck_limit` cleared
+  it on a successful resume, the very next burst re-latched on the same banner
+  still on screen and dated it 24 h out (live, 2026-08-07: `RESUMED` 22:29:42,
+  `BLOCKED … resets 2026-08-08 21:30` at 22:29:43). Comparing the LINE is
+  enough because both sources normalize through the same
+  `limit_banner.banner_line`; the transcript record and the live re-latch
+  carried byte-identical text.
+  THE SCAN WINDOW IS COUNTED IN CONTENT, NOT LINES (`TerminalAgent._tail_lines`,
+  the one helper all four screen-scan call sites now share). Claude's TUI pads
+  its frame with blank rows, so a raw `[-40:]` slice spans as little as 432
+  characters and 5 non-blank lines — measured on real screen snapshots, against
+  a median ~900 characters per frame repaint, i.e. less than half a frame. A
+  genuine cut-off was therefore invisible to BOTH the per-burst scrape and the
+  settle scrape 2 s later, and left no trace at all because `_note_limit_skip`
+  reads the same window (2026-08-07, CVsummer2026: zero `LIMIT` lines for an
+  agent whose transcript ends on the banner). `_scrape_limit` and
+  `_note_limit_skip` therefore pass `skip_blank=True` and MUST stay in
+  agreement. The other two callers keep RAW lines deliberately:
+  `_screen_waiting`'s 18-line bound plus its caret requirement is the tuning
+  that keeps the "?" chime off an agent's own numbered prose, and
+  `recheck_limit` wants the menu that is TORN DOWN on a resume — the raw tail
+  still holds that menu's earlier renders, so reaching further back would find
+  it forever and report "still blocked" on an agent already going again.
   TWO triggers land in `_resume_blocked_agents`, and the second is the one that
   must be reliable: (1) `planLimitCleared` resumes every latched agent (the
   ACCOUNT is provably clear); (2) `_check_limit_resets` on `LIMIT_WATCH_MS`
@@ -401,6 +435,25 @@ this file is the invariants that must survive every change.
   the window is still shut, and clearing the latch on the nudge itself — as
   this first did — burns the only attempt and parks the agent for good. A
   `nudge` refused because the TUI isn't ready must NOT consume an attempt.
+  BUT WAITING FOR READINESS MUST BE BOUNDED, because readiness can never
+  arrive on its own. Qt gives a `QStackedWidget` page NO `resizeEvent` until it
+  is made current (verified), so a card in a workspace the user has not opened
+  never fires `TerminalView.sizeChanged`, never calls `agent.resize`, and never
+  asks its child to redraw. Combined with readiness being decided ONCE PER
+  BURST against a 600-char `_ready_tail` — a footer followed by more than that
+  in the same burst is simply missed — an agent could sit un-nudgeable
+  indefinitely: `WAIT (TUI not ready)` every minute, ending only when the user
+  happened to click that workspace (live, 2026-08-07: nine ticks over ten
+  minutes). Two independent repairs, and both are needed because they cover
+  different halves: `_on_idle_timeout` RE-CHECKS readiness against the
+  4000-char `_screen_tail` (this fires 2 s after output settles, so it can only
+  ever flip readiness LATE — it cannot perturb launch or first-task-submit
+  timing, which is the whole point of the SessionStart invariant), and after
+  `LIMIT_REPAINT_AFTER_WAITS` quiet ticks `MainWindow._auto_continue_agent`
+  calls `TerminalAgent.request_repaint()` ONCE, which sends the child one
+  column narrower and back (`REPAINT_RESTORE_MS`) to force a full frame. The
+  repaint is reachable only by an agent already latched on a cut-off whose
+  reset has passed, so it can never poke a normally launching TUI.
   Related: an agent parked on the limit raises the "?" (its menu is exactly
   what `_screen_waiting` looks for) but must NOT ring the chime — it is not a
   question the user can answer, and it would wake them at 4am for something

@@ -90,6 +90,11 @@ INPUT_ECHO_S = 0.8
 # flickers the indicator.
 BG_SHELL_DEBOUNCE_S = 3.0
 
+# How long `request_repaint` holds the child one column narrower before giving
+# the width back. Long enough that ConPTY delivers two distinct size changes
+# rather than coalescing them into nothing, short enough that no one sees it.
+REPAINT_RESTORE_MS = 120
+
 # strips escape sequences so on-screen TEXT can be matched: the raw stream
 # positions words individually ("trust\x1b[20Gthis\x1b[25Gfolder"), so a
 # phrase can never be matched against raw bytes
@@ -388,6 +393,36 @@ class TerminalAgent(QObject):
     def resize(self, rows: int, cols: int) -> None:
         if self.is_pty:
             self.worker.resize(rows, cols)
+
+    def request_repaint(self) -> bool:
+        """Ask the child TUI to redraw its whole frame. False if it can't.
+
+        A size change is the only portable way to make a full-screen TUI repaint
+        on demand, and it is what an ordinary terminal emitter does whenever its
+        window is dragged. Sending one column narrower and back is a no-op for
+        the user (the card re-sends its true size on the next `sizeChanged`
+        anyway) but forces a fresh frame.
+
+        This exists because a card in a workspace the user has not opened never
+        gets one. Qt gives a QStackedWidget page NO resizeEvent until it is made
+        current, so `TerminalView.sizeChanged` never fires, `resize` is never
+        called, and nothing asks the child to redraw. If that child's prompt
+        footer was missed on the way past (see `_on_idle_timeout`), the agent
+        looks un-nudgeable until the user clicks the workspace — which is not a
+        recovery mechanism.
+
+        Deliberately a request and not a policy: the caller decides when an
+        agent has waited long enough to be worth poking.
+        """
+        if not self.is_pty or not self.worker.is_running():
+            return False
+        rows, cols = self.worker.rows, self.worker.cols
+        if cols <= 10:      # already at PtyWorker's floor; nothing to give back
+            return False
+        self.worker.resize(rows, cols - 1)
+        QTimer.singleShot(REPAINT_RESTORE_MS,
+                          lambda: self.worker.resize(rows, cols))
+        return True
 
     def pty_replay(self) -> str:
         return "".join(self._pty_buffer)
@@ -986,6 +1021,55 @@ class TerminalAgent(QObject):
         # ...and is this the plan-limit banner? Latch it NOW, while the frame is
         # current; by reset time the rolling tail no longer holds it.
         self._scrape_limit()
+        # ...and did we MISS the prompt going live? _on_pty_output decides
+        # readiness once per burst against a 600-char tail, so a footer followed
+        # by more than that in the same burst is never seen — and if the child
+        # then falls quiet (a resumed conversation parked at its prompt) nothing
+        # ever looks again. The agent stays "not ready" forever: `nudge` refuses
+        # it, so a plan-limit resume is declined every minute, and a delivered
+        # task waits in _pending_task indefinitely. Observed live 2026-08-07:
+        # nine consecutive "WAIT (TUI not ready)" ticks on an agent whose child
+        # had been up for ten minutes, ending only when the user happened to
+        # click that workspace.
+        #
+        # Re-checking here can only ever flip readiness LATE (this fires 2 s
+        # after output settles, never before the burst path has had its go), so
+        # it cannot perturb launch or first-task-submit timing — the one thing
+        # the SessionStart invariant is about. It reads the 4000-char screen
+        # tail rather than the 600-char one for the same reason as above.
+        if not self._prompt_ready and self.spec.provider == "claude":
+            if self._has_ready_hint(self._screen_tail):
+                self._became_prompt_ready()
+
+    def _tail_lines(self, n: int, skip_blank: bool = False) -> str:
+        """The last `n` lines of the escape-stripped screen tail, joined.
+
+        `skip_blank` COUNTS ONLY LINES WITH CONTENT, and the difference is not
+        cosmetic. Claude's TUI pads its frame with blank rows, so a raw
+        `[-40:]` slice can span as little as 432 characters and 5 non-blank
+        lines — measured on real screen snapshots, against a median ~900
+        characters per frame repaint. That is less than half a frame, which is
+        how a plan-limit banner went unseen by BOTH the per-burst scrape and
+        the settle scrape 2 s later, and stranded an agent overnight
+        (2026-08-07, CVsummer2026).
+
+        Callers that hunt for something NOT anchored to the bottom of the frame
+        (the limit banner, which renders above the menu, the input box and the
+        footer) pass skip_blank=True. The two callers that do NOT are
+        deliberate, and must stay that way:
+
+          * `_screen_waiting` wants the drawn menu just above the input box,
+            and its 18-line bound plus the caret requirement is the tuning that
+            keeps the "?" chime off an agent's own numbered prose.
+          * `recheck_limit` wants the menu that is TORN DOWN on a resume. The
+            raw tail still holds that menu's earlier renders, so reaching
+            further back would find it forever and report "still blocked" on an
+            agent that is already going again.
+        """
+        lines = self._screen_tail.splitlines()
+        if skip_blank:
+            lines = [ln for ln in lines if ln.strip()]
+        return "\n".join(lines[-n:])
 
     def _screen_waiting(self) -> bool:
         # ground-truth on the drawn box; suppress for a mode that shows no
@@ -995,7 +1079,8 @@ class TerminalAgent(QObject):
             return False
         if getattr(self.spec, "permission_mode", "") == "bypassPermissions":
             return False
-        region = "\n".join(self._screen_tail.splitlines()[-18:])
+        # raw lines on purpose — see _tail_lines
+        region = self._tail_lines(18)
         if not region:
             return False
         # a live menu = 2+ numbered options AND a selection caret on one of
@@ -1055,7 +1140,12 @@ class TerminalAgent(QObject):
         # menu, the input box and the footer all render below it, so 18 lines
         # can push it out of view on a full frame. Both patterns are specific
         # enough to search a wider window safely.
-        region = "\n".join(self._screen_tail.splitlines()[-40:])
+        #
+        # skip_blank is what makes "40 lines" mean 40 lines of CONTENT. Counting
+        # the TUI's blank padding rows instead shrank this window to a handful
+        # of characters on a real frame and lost a genuine cut-off — see
+        # _tail_lines.
+        region = self._tail_lines(40, skip_blank=True)
         menu = bool(LIMIT_MENU_RE.search(region))
         banner = banner_line(region)
         if not menu:
@@ -1116,8 +1206,9 @@ class TerminalAgent(QObject):
         """
         try:
             if not banner:
-                banner = banner_line(
-                    "\n".join(self._screen_tail.splitlines()[-40:]))
+                # the SAME window the detector used, or this reports "nothing
+                # to see" for exactly the frames it is meant to explain
+                banner = banner_line(self._tail_lines(40, skip_blank=True))
             if not banner:
                 return
             state = (reason, banner)
@@ -1157,6 +1248,23 @@ class TerminalAgent(QObject):
         self._limit_from_startup = bool(from_startup)
         self._limit_window = window
         self._limit_banner = banner
+        # ARM THE ECHO GUARD, exactly as a live latch does. Without this a
+        # disk-recovered latch left `_limit_last_banner` empty, so the moment
+        # `recheck_limit` cleared the latch on a successful resume, the very
+        # next output burst re-latched on the SAME banner still sitting on
+        # screen — and `parse_reset_clock` dated it a full day out, because
+        # that clock had just passed. Observed live on 2026-08-07: RESUMED at
+        # 22:29:42, BLOCKED again at 22:29:43 with a reset 24 h ahead, which
+        # mutes the agent's chime for a day and later types a stray Continue
+        # into an agent that is working fine.
+        #
+        # Comparing the LINE works because both sources normalize through the
+        # same `limit_banner.banner_line`: the transcript record and the live
+        # re-latch above carried byte-identical text. (A banner the TUI wrapped
+        # across two rows would not match — that is equally true of a live
+        # latch today, and is not made worse here.)
+        if banner:
+            self._limit_last_banner = banner
         self.limit_blocked_changed.emit(True)
 
     def limit_window(self) -> str:
@@ -1299,7 +1407,8 @@ class TerminalAgent(QObject):
         """
         if not self._limit_blocked:
             return False
-        region = "\n".join(self._screen_tail.splitlines()[-40:])
+        # raw lines on purpose — see _tail_lines
+        region = self._tail_lines(40)
         if region and LIMIT_MENU_RE.search(region):
             return True
         self.clear_limit_block()
@@ -1351,16 +1460,27 @@ class TerminalAgent(QObject):
             if self.spec.provider == "claude":
                 self._ready_tail = (self._ready_tail
                                     + _CSI_RE.sub("", text))[-600:]
-                tail = self._ready_tail.lower()
-                ready = any(h in tail for h in _CLAUDE_READY_HINTS)
+                ready = self._has_ready_hint(self._ready_tail)
             else:
                 ready = "\x1b[?2004h" in text
             if ready:
-                self._set_prompt_ready(True)
-                if self._pending_task is not None and self.worker.is_running():
-                    task, self._pending_task = self._pending_task, None
-                    self._write_task_to_pty(task)
+                self._became_prompt_ready()
         self.pty_output.emit(text)
+
+    @staticmethod
+    def _has_ready_hint(text: str) -> bool:
+        """Whether `text` shows Claude's input-box footer, in any of its
+        rotating forms."""
+        low = text.lower()
+        return any(h in low for h in _CLAUDE_READY_HINTS)
+
+    def _became_prompt_ready(self) -> None:
+        """The TUI's prompt just went live: announce it and release any task
+        that was waiting for exactly this."""
+        self._set_prompt_ready(True)
+        if self._pending_task is not None and self.worker.is_running():
+            task, self._pending_task = self._pending_task, None
+            self._write_task_to_pty(task)
 
     def _set_status(self, status: AgentStatus) -> None:
         if status is not self.status:

@@ -126,6 +126,13 @@ LIMIT_PHANTOM_CHECK_MS = 3000
 LIMIT_RETRY_S = 300
 LIMIT_MAX_TRIES = 4
 
+# How many consecutive "TUI not ready" watchdog ticks (LIMIT_WATCH_MS apart) a
+# latched agent may spend before we stop waiting for a frame and ask for one —
+# see TerminalAgent.request_repaint. Three minutes is well past any real TUI
+# launch, so a genuinely booting agent is never poked, while an agent whose
+# card has never been on screen no longer waits for the user to click it.
+LIMIT_REPAINT_AFTER_WAITS = 3
+
 # --- taskbar working-count overlay ---
 # `workspaceStatsChanged` fires every couple of seconds PER BUSY AGENT, and each
 # push costs a COM round trip plus a fresh HICON, so the recompute is coalesced
@@ -1084,6 +1091,10 @@ class MainWindow(QMainWindow):
         # four agents (burning half their retry budget and dropping a stray
         # message into freshly started work).
         self._resume_pending: set[str] = set()
+        # consecutive "TUI not ready" watchdog ticks per agent id, so a latched
+        # agent that never gets a frame is eventually asked for one rather than
+        # waited on forever (see LIMIT_REPAINT_AFTER_WAITS)
+        self._limit_wait_ticks: dict[str, int] = {}
         # ledger keys already filed this run, so one cut-off is written once
         # however many times its latch is (re)raised
         self._ledger_seen: set[tuple] = set()
@@ -1791,6 +1802,8 @@ class MainWindow(QMainWindow):
         when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(at)) if at
                 else "unknown")
         self._limit_audit(f"BLOCKED agent={agent.spec.name} resets={when}")
+        # a fresh cut-off gets the full patience budget again
+        self._limit_wait_ticks.pop(agent_id, None)
         # File it durably. Skipped when this cut-off is already on record: the
         # startup scan files before it arms, and a failed verify re-latches the
         # same cut-off, so this signal fires more than once per episode.
@@ -1948,8 +1961,25 @@ class MainWindow(QMainWindow):
         # the watchdog picks it up as soon as the prompt is live.
         if not agent.prompt_ready():
             self._resume_pending.discard(agent.id)
+            waits = self._limit_wait_ticks.get(agent.id, 0) + 1
+            self._limit_wait_ticks[agent.id] = waits
             self._limit_audit(f"WAIT agent={agent.spec.name} (TUI not ready)")
+            # Waiting is right for a booting TUI; waiting FOREVER is how this
+            # silently does nothing. A card in a workspace the user has not
+            # opened never receives a resizeEvent, so its child is never asked
+            # to redraw, so a prompt footer missed on the way past is never
+            # seen again and this branch is taken every minute for as long as
+            # the app runs (observed live 2026-08-07: nine ticks, ending only
+            # when the user clicked that workspace). After a few minutes'
+            # patience, ask for the frame instead of hoping for it. Once only,
+            # and never during a normal launch — this path is reached only by
+            # an agent already latched on a cut-off whose reset has passed.
+            if waits == LIMIT_REPAINT_AFTER_WAITS and agent.request_repaint():
+                self._limit_audit(f"REPAINT agent={agent.spec.name} "
+                                  f"(asked the TUI to redraw after {waits} "
+                                  f"quiet ticks)")
             return
+        self._limit_wait_ticks.pop(agent.id, None)
         # TWO AGREEING SOURCES before anything is typed. The screen said this
         # agent was cut off; the conversation on disk has to still end there.
         # A banner stays in view (and is redrawn) long after the agent moved
