@@ -688,6 +688,24 @@ class TerminalAgent(QObject):
         self.scheduled_changed.emit()
         return True
 
+    def reschedule(self, mid: str, text: str, due_ts: float) -> bool:
+        """Edit an already-queued message's text and/or fire time in place,
+        keeping its identity -- the alternative (cancel + re-create) loses its
+        spot silently. A MISSED entry given a future time is revived to
+        PENDING: MISSED only means "was due and nobody acted on it", not a
+        dead end."""
+        msg = self.find_scheduled(mid)
+        text = sanitize_text(text or "").strip()
+        if msg is None or not text:
+            return False
+        msg.text = text
+        msg.due_ts = float(due_ts)
+        if msg.due_ts > time.time():
+            msg.state = PENDING
+            msg.attempts = 0
+        self.scheduled_changed.emit()
+        return True
+
     def mark_scheduled_sent(self, mid: str) -> bool:
         """It went in. The entry is DROPPED, not kept: the conversation itself
         is the record of what was said, and this is a queue, not a ledger."""

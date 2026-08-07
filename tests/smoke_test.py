@@ -7835,6 +7835,25 @@ def test_scheduled_send():
           len(a.pending_scheduled()) == ss.MAX_PER_AGENT)
     a._scheduled = [m for m in a._scheduled if not m.text.startswith("filler")]
 
+    # --- editing an already-queued message in place, instead of cancel+ ----
+    # recreate (which would silently lose its spot in the queue)
+    edges.clear()
+    ok = a.reschedule(msg.id, "run the smoke suite twice", now + 1200)
+    check("schedule: reschedule edits text and due_ts in place, same id",
+          ok and msg.text == "run the smoke suite twice"
+          and msg.due_ts == now + 1200 and edges == [1])
+    check("schedule: an unknown id is refused",
+          not a.reschedule("no-such-id", "x", now + 60))
+    check("schedule: empty text is refused, existing message unchanged",
+          not a.reschedule(msg.id, "   ", now + 1)
+          and msg.text == "run the smoke suite twice")
+    stale = a.schedule_message("stale", now - 10)
+    a.mark_scheduled_missed(stale.id)
+    check("schedule: a missed message given a future time revives to PENDING",
+          a.reschedule(stale.id, "stale", now + 300)
+          and stale.state == ss.PENDING)
+    a._scheduled = [m for m in a._scheduled if m.id != stale.id]
+
     # --- delivery is a NUDGE, never an assignment --------------------------
     # deliver_task overwrites the persisted current_task, flips the assignment
     # to WORKING and re-infers the role. The user pressed a deferred Enter; they
@@ -8015,6 +8034,34 @@ def test_scheduled_send():
           keys == ["\n"] and len(seen) == 1, (keys, seen))
     view.deleteLater()
 
+    # a genuine wrapped/multi-line message (no prompt glyph on continuation
+    # rows) must still capture in full
+    view2 = TerminalView(rows=24, cols=80)
+    seen2 = []
+    view2.scheduleRequested.connect(seen2.append)
+    view2.feed("> line one\r\nline two")
+    view2.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return,
+                                  Qt.KeyboardModifier.ControlModifier
+                                  | Qt.KeyboardModifier.ShiftModifier, "\r"))
+    check("schedule: a real wrapped continuation line is captured in full",
+          seen2 == ["line one\nline two"], seen2)
+    view2.deleteLater()
+
+    # Claude Code paints its footer hint directly under the box with NO
+    # blank line in between, then repositions the caret back onto the input
+    # row (a full-screen TUI redraw, not a plain linefeed) -- that hint row
+    # (and anything under it) must never be swept into the captured message
+    view3 = TerminalView(rows=24, cols=80)
+    seen3 = []
+    view3.scheduleRequested.connect(seen3.append)
+    view3.feed("> send this only" "\x1b[2;1H? for shortcuts" "\x1b[1;17H")
+    view3.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return,
+                                  Qt.KeyboardModifier.ControlModifier
+                                  | Qt.KeyboardModifier.ShiftModifier, "\r"))
+    check("schedule: the footer hint under the box is not swept into the "
+          "captured message", seen3 == ["send this only"], seen3)
+    view3.deleteLater()
+
     # --- the composer -------------------------------------------------------
     from PySide6.QtWidgets import QDialog, QDialogButtonBox
     from app.widgets.main_window import ScheduleMessageDialog
@@ -8062,7 +8109,41 @@ def test_scheduled_send():
     dlg.refresh_pending()
     check("schedule: the composer lists what is already queued",
           dlg.pending_box.count() > 0)
+
+    # --- editing an existing entry in place, via its row's ✏ button --------
+    target = comp.next_scheduled()
+    dlg._start_edit(target)
+    check("schedule: edit loads the message's text into the form",
+          dlg.text_edit.toPlainText() == "already queued"
+          and dlg.editing_id == target.id)
+    check("schedule: the OK button reads Save while editing",
+          ok_btn.text() == "Save")
+    dlg._cancel(target)
+    check("schedule: cancelling the row you're editing exits edit mode",
+          dlg.editing_id is None and ok_btn.text() == "Schedule")
     dlg.deleteLater()
+
+    # editing end-to-end through the popup updates the SAME entry in place --
+    # not a second one alongside it
+    editable = mk("Editable")
+    ws.agents.append(editable)
+    original = editable.schedule_message("first draft", now + 500)
+    real_exec2 = ScheduleMessageDialog.exec
+    try:
+        def fake_edit_exec(self):
+            self._start_edit(self.agent.next_scheduled())
+            self.text_edit.setPlainText("revised draft")
+            self.delay_edit.setText("15m")
+            self._revalidate()
+            return QDialog.DialogCode.Accepted
+        ScheduleMessageDialog.exec = fake_edit_exec
+        win._on_schedule_message(editable.id)
+    finally:
+        ScheduleMessageDialog.exec = real_exec2
+    check("schedule: editing through the popup rewrites the entry in place",
+          [m.text for m in editable.scheduled_messages()] == ["revised draft"]
+          and editable.next_scheduled().id == original.id,
+          [m.text for m in editable.scheduled_messages()])
 
     # confirming from the TERMINAL gesture also clears the child's input box:
     # the text now lives in AI Hive, so a copy left in the prompt would be
@@ -8103,6 +8184,29 @@ def test_scheduled_send():
     chip_agent.cancel_scheduled(chip_agent.scheduled_messages()[0].id)
     check("schedule: cancelling the last message hides the chip again",
           not card.sched_mark.isVisible())
+
+    # --- the sidebar's own clock, next to the agent in its inline row -------
+    from app.widgets.sidebar import AgentRow
+
+    sb_agent = mgr.add_terminal(
+        ws.id, build_spec(AgentKind.CLAUDE, "SidebarSched", cwd=os.getcwd()),
+        autostart=False)
+    row = AgentRow(ws.id, sb_agent)
+    check("schedule: the sidebar row's clock is hidden with nothing queued",
+          row.sched_mark.isHidden())
+    sb_agent.schedule_message("ping later", now + 300)
+    row.refresh(sb_agent)
+    check("schedule: it shows once something is queued",
+          not row.sched_mark.isHidden())
+    sched_hits, act_hits = [], []
+    row.schedRequested.connect(lambda w, a: sched_hits.append((w, a)))
+    row.activated.connect(lambda w, a: act_hits.append((w, a)))
+    row.sched_mark.click()
+    check("schedule: clicking it emits schedRequested(ws_id, agent_id)",
+          sched_hits == [(ws.id, sb_agent.id)], sched_hits)
+    check("schedule: ...and the click is CONSUMED, not also a row-wide "
+          "'reveal the card' activation", act_hits == [], act_hits)
+    row.deleteLater()
 
     win.close()
 
