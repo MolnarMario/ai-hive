@@ -143,6 +143,13 @@ _NAMED = {
 # transcript). Claude Code draws '>'; '❯' covers common shell/other prompts.
 _INPUT_PROMPTS = (">", "❯")
 
+# The Unicode Box Drawing block. Claude Code paints a horizontal rule (plain
+# dashes, or a rounded-corner box border) directly between the input box and
+# its footer hint, with no blank line either side -- a row built ENTIRELY
+# from these glyphs is that rule, never typed content, since none of them
+# show up in ordinary prose.
+_RULE_CHARS = frozenset(chr(c) for c in range(0x2500, 0x2580))
+
 _KEY_SEQUENCES = {
     Qt.Key.Key_Return: "\r", Qt.Key.Key_Enter: "\r",
     Qt.Key.Key_Backspace: "\x7f", Qt.Key.Key_Tab: "\t",
@@ -1045,7 +1052,11 @@ class TerminalView(QWidget):
         caret, stopping BEFORE the box's own footer hint (Claude Code paints
         that directly under the box with no blank line, so a naive non-blank
         scan swept it -- and anything under it -- into the captured input; see
-        _row_is_input_footer). Bounds multi-line click-to-position so a click
+        _row_is_input_footer) or a divider/border row (_row_is_rule) -- Claude
+        Code also paints a plain rule or box border between the input and its
+        footer with no blank line, and a naive scan swept that in too (it
+        showed up literally as a line of box-drawing dashes in a scheduled
+        message's prefill). Bounds multi-line click-to-position so a click
         on the transcript or on blank space below the box never drives the
         child's caret."""
         buf = self.screen.buffer
@@ -1061,14 +1072,16 @@ class TerminalView(QWidget):
             if buf[r][first].data in _INPUT_PROMPTS:
                 top = r  # the box's first line -- stop, never climb higher
                 break
+            if self._row_is_rule(r):
+                break  # a divider row: never part of typed content
             r -= 1
         bottom = cy
         r = cy + 1
         while r < self.screen.lines:
             if self._row_content(r) == (-1, -1):
                 break
-            if self._row_is_input_footer(r):
-                break  # the box's footer hint, not more typed text -- stop before it
+            if self._row_is_input_footer(r) or self._row_is_rule(r):
+                break  # footer hint or divider, not more typed text -- stop before it
             bottom = r
             r += 1
         return top, bottom
@@ -1388,6 +1401,15 @@ class TerminalView(QWidget):
         row = self.screen.buffer[r]
         text = "".join(row[c].data for c in range(first, last + 1)).strip().lower()
         return any(hint in text for hint in _CLAUDE_READY_HINTS)
+
+    def _row_is_rule(self, r: int) -> bool:
+        """True when row r is a horizontal divider (box border or plain rule)
+        rather than typed content -- see `_RULE_CHARS`."""
+        first, last = self._row_content(r)
+        if first < 0:
+            return False
+        row = self.screen.buffer[r]
+        return all(row[c].data in _RULE_CHARS for c in range(first, last + 1))
 
     def _select_input_line(self) -> None:
         """Best-effort highlight of the text you're typing. Claude Code's input
