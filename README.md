@@ -134,6 +134,23 @@ workspaces keep executing — switching never pauses anything.
   carries an **⏳N** badge counting how many of its agents are currently
   stuck — all three clear the instant that agent resumes, whether that was
   auto-continue or you restarting it yourself.
+- **Send a message on a countdown** — type into an agent's terminal as usual,
+  then press **`Ctrl+Shift+Enter`** instead of Enter. A small composer opens
+  with what you typed, you pick when it should go in (**5m / 15m / 30m / 1h /
+  2h**, a custom delay like `45m`, `1h30` or `2:15`, or a wall-clock time like
+  `03:30`), and AI Hive holds the message and types it in when the countdown
+  ends. This is what makes **chaining agents while you're away** possible: send
+  the first one off now, queue the second for twenty minutes' time and the third
+  for forty five, then leave. An **⏱ countdown** sits in the card header for as
+  long as something is queued (click it to change or cancel, or to send a
+  queued message right away), with an **⏱N** badge on the workspace row and a
+  marker beside the agent in the sidebar's expanded list. Same dialog from the
+  header's right-click menu if you'd rather not learn the chord.
+  A scheduled message is a *message*, not an assignment: it never overwrites
+  what the card says the agent is working on. Queued messages survive a
+  restart, but one whose moment passed while the app was closed comes back
+  marked **missed** rather than firing hours late into a conversation that has
+  moved on: you decide whether it still applies.
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
@@ -508,7 +525,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1033 checks drive the real app headlessly (offscreen Qt platform) with real
+1087 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -522,8 +539,12 @@ a per-agent task summary beside the name, the per-card maximize/restore toggle
 (solo one agent full-area without touching any sibling's process, then restore
 the exact prior tiling) and the context-window usage badge beside the summary
 ("N% of 1M/200K", read from the transcript's last usage record — transient,
-never persisted), the live model/effort/permission-mode readout beside the
-agent's role
+never persisted), deferred "send later" messages (delay/clock parsing, the
+Ctrl+Shift+Enter gesture sending nothing to the child, delivery by nudge so an
+assignment is never overwritten, a refusal retried then given up on as missed,
+the countdown tick never marking the session dirty, and a message that came due
+while the app was closed coming back missed rather than firing late), the live
+model/effort/permission-mode readout beside the agent's role
 (normalising `claude-opus-5` to "Opus 5", merging the last turn's model with a
 mid-session `/model` or `/effort` pick, reading the Shift+Tab mode off the
 transcript's permission-mode records and writing it back so a reopened agent
@@ -575,6 +596,7 @@ app/
   claude_usage.py          live plan-usage reading (/api/oauth/usage) + limit edges (Qt-free)
   limit_banner.py          recognising a usage cut-off + when it resets (Qt-free, shared)
   limit_ledger.py          durable record of cut-offs: who, when, and how it ended (Qt-free)
+  scheduled_send.py        deferred messages: parse a delay/clock, hold it, format the countdown (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
@@ -587,7 +609,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1033 checks)
+tests/smoke_test.py        headless end-to-end suite (1087 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

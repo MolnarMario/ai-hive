@@ -138,8 +138,13 @@ class WorkspaceManager(QObject):
         # (auto-continue or manual); drives the row's hourglass count, mirroring
         # the "?" indicator above
         limit_blocked = sum(1 for a in agents if a.is_limit_blocked())
+        # "scheduled" = holding at least one deferred message (pending, or one
+        # that was missed and is still waiting to be dealt with); drives the
+        # row's countdown badge, mirroring the two indicators above
+        scheduled = sum(1 for a in agents if a.scheduled_messages())
         return {"total": len(agents), "active": active, "error": error,
                 "busy": busy, "waiting": waiting, "limit_blocked": limit_blocked,
+                "scheduled": scheduled,
                 "idle": len(agents) - active - error}
 
     def next_agent_name(self, ws_id: str) -> str:
@@ -478,6 +483,12 @@ class WorkspaceManager(QObject):
         agent.limit_blocked_changed.connect(
             lambda blocked, wid=wid, aid=agent.id:
             self._on_agent_limit_blocked_changed(wid, aid, blocked))
+        # deferred messages are the one derived-looking signal that IS
+        # persisted, so unlike busy/waiting/limit above this one refreshes the
+        # badge AND marks dirty. It fires on add/cancel/send/miss only — the
+        # per-second countdown never reaches the model, which is what keeps
+        # this from behaving like `activity_changed` and thrashing saves.
+        agent.scheduled_changed.connect(lambda wid=wid: self._touch(wid))
 
     def _on_agent_limit_blocked_changed(self, ws_id: str, agent_id: str,
                                         blocked: bool) -> None:
@@ -717,6 +728,10 @@ class WorkspaceManager(QObject):
                             or (a.auto_created and a.autostart_on_restore)),
                 "task": a.current_task,
                 "assignment": a.assignment.value,
+                # messages the user deferred (app/scheduled_send). Only the
+                # PENDING ones; a restore turns any that came due while we were
+                # closed into MISSED rather than firing them late.
+                "scheduled": a.scheduled_dicts(),
                 "auto_created": a.auto_created}
 
     def _agent_dict_safe(self, a) -> dict | None:
@@ -737,9 +752,20 @@ class WorkspaceManager(QObject):
                         "cwd": getattr(spec, "cwd", ""),
                         "provider": getattr(spec, "provider", ""),
                         "session_id": getattr(spec, "session_id", ""),
+                        "scheduled": self._scheduled_safe(a),
                         "running": True}
             except Exception:
                 return None
+
+    @staticmethod
+    def _scheduled_safe(a) -> list:
+        """The deferred-message queue for the DEGRADED record. Everything in
+        the fallback is a read that must not throw a second time (the whole
+        point of that path), and this one calls a method, so it is guarded."""
+        try:
+            return a.scheduled_dicts()
+        except Exception:
+            return []
 
     def to_session_dict(self) -> dict:
         return {
@@ -791,6 +817,7 @@ class WorkspaceManager(QObject):
                 spec.cwd = spec.cwd if os.path.isdir(spec.cwd) else ws.project_path
                 agent = TerminalAgent(spec, parent=self)
                 agent.current_task = td.get("task", "")
+                agent.restore_scheduled(td.get("scheduled") or [])
                 agent.auto_created = bool(td.get("auto_created", False))
                 try:
                     agent.assignment = AssignmentState(td.get("assignment", "idle"))

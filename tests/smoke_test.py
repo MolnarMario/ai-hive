@@ -7482,6 +7482,378 @@ def test_startup_limit_recovery():
     win2.close()
 
 
+def test_scheduled_send():
+    """A message the user writes now and has typed in LATER.
+
+    Ctrl+Shift+Enter in a terminal is "Enter, but on a countdown" - the gesture
+    that makes chaining agents possible while away from the machine. The rules
+    that matter are the ones about NOT sending: a scheduled message is a nudge
+    and never an assignment, and one that came due while the app was closed is
+    surfaced as missed rather than fired hours late into a conversation that has
+    moved on."""
+    import time as _time
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+    from app import scheduled_send as ss
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import AssignmentState, TerminalAgent
+    from app.widgets.main_window import SCHEDULE_GIVE_UP_S
+    from app.workspace_manager import WorkspaceManager
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    now = _time.time()
+
+    # --- parsing: what a person types into a "send in" box ------------------
+    delays = {"45": 2700, "45m": 2700, "30 min": 1800, "1h": 3600,
+              "1h30": 5400, "1h30m": 5400, "1.5h": 5400, "90s": 90,
+              "2:15": 8100, "1h 30m 10s": 5410}
+    bad = ["", "   ", "abc", "0", "45x", "-5", "200h"]  # 200h > the week cap
+    check("schedule: delays parse (bare number = minutes, 1h30, 90s, 2:15)",
+          all(ss.parse_delay(k) == v for k, v in delays.items()),
+          {k: ss.parse_delay(k) for k, v in delays.items()
+           if ss.parse_delay(k) != v})
+    check("schedule: junk and non-positive delays are rejected",
+          all(ss.parse_delay(b) is None for b in bad),
+          [b for b in bad if ss.parse_delay(b) is not None])
+    # a bare clock has no date, so a time already past today means tomorrow --
+    # the rollover that matters when scheduling late at night for the morning
+    anchor = _time.mktime((2026, 8, 7, 14, 0, 0, 0, 0, -1))
+    later = ss.parse_clock("15:30", anchor)
+    tomorrow = ss.parse_clock("03:30", anchor)
+    check("schedule: a clock still ahead today resolves to today",
+          later is not None and 0 < later - anchor < 86400
+          and _time.localtime(later).tm_mday == 7)
+    check("schedule: a clock already past resolves to TOMORROW",
+          tomorrow is not None and _time.localtime(tomorrow).tm_mday == 8)
+    check("schedule: pm/am clocks parse",
+          ss.parse_clock("3pm", anchor) == ss.parse_clock("15:00", anchor))
+    check("schedule: an impossible clock is rejected",
+          ss.parse_clock("25:00", anchor) is None)
+    check("schedule: countdowns format h:mm:ss / m:ss and clamp at zero",
+          (ss.format_countdown(3862), ss.format_countdown(724),
+           ss.format_countdown(9), ss.format_countdown(-5))
+          == ("1:04:22", "12:04", "0:09", "0:00"))
+
+    # a malformed persisted row must never cost an agent its other messages
+    check("schedule: an unusable persisted row decodes to None, not a crash",
+          ss.ScheduledMessage.from_dict({"text": "", "due_ts": 1}) is None
+          and ss.ScheduledMessage.from_dict({"text": "x"}) is None
+          and ss.ScheduledMessage.from_dict({"text": "x", "due_ts": "no"})
+          is None)
+
+    # --- the queue on the agent --------------------------------------------
+    writes: dict = {}
+
+    def mk(name="Coder", pty=True):
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=os.getcwd(), pty=pty)
+        a = TerminalAgent(spec)
+        a.worker = type("W", (), {
+            "is_running": lambda s: True,
+            "write": lambda s, d: (writes.setdefault(id(s), []).append(d),
+                                   True)[1],
+            "start": lambda s: None, "dispose": lambda s: None})()
+        a._prompt_ready = True
+        return a
+
+    def sent(agent):
+        return "".join(writes.get(id(agent.worker), []))
+
+    a = mk()
+    edges = []
+    a.scheduled_changed.connect(lambda: edges.append(1))
+    msg = a.schedule_message("run the smoke suite", now + 600)
+    check("schedule: a queued message is held and announced once",
+          msg is not None and len(a.pending_scheduled()) == 1 and edges == [1])
+    check("schedule: an empty message is refused",
+          a.schedule_message("   ", now + 60) is None)
+    check("schedule: the soonest message is the one shown",
+          a.schedule_message("later", now + 9000) is not None
+          and a.next_scheduled().text == "run the smoke suite")
+    check("schedule: nothing is due before its time", a.due_scheduled(now) == [])
+    check("schedule: it is due at its time",
+          [m.text for m in a.due_scheduled(now + 601)]
+          == ["run the smoke suite"])
+    for i in range(ss.MAX_PER_AGENT):
+        a.schedule_message(f"filler {i}", now + 4000 + i)
+    check("schedule: an agent caps how many it will hold",
+          len(a.pending_scheduled()) == ss.MAX_PER_AGENT)
+    a._scheduled = [m for m in a._scheduled if not m.text.startswith("filler")]
+
+    # --- delivery is a NUDGE, never an assignment --------------------------
+    # deliver_task overwrites the persisted current_task, flips the assignment
+    # to WORKING and re-infers the role. The user pressed a deferred Enter; they
+    # did not assign anything, so none of that may move.
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-sched-"))
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.show()
+    mgr = win.manager
+    ws = mgr.workspaces[0]
+
+    d = mk("Deliver")
+    d.set_task("the original task")
+    d.set_assignment(AssignmentState.COMPLETED)
+    d.spec.role = "Reviewer"
+    before = (d.current_task, d.assignment, d.spec.role)
+    due = d.schedule_message("please continue", now - 1)
+    ws.agents.append(d)
+    win._tick_schedules()
+    check("schedule: a due message is typed into the agent",
+          "please continue" in sent(d))
+    check("schedule: delivery leaves task/assignment/role untouched "
+          "(nudge, not deliver_task)",
+          (d.current_task, d.assignment, d.spec.role) == before,
+          (d.current_task, d.assignment, d.spec.role))
+    check("schedule: a sent message is dropped from the queue",
+          d.scheduled_messages() == [])
+    check("schedule: delivery does not stamp the user-input clock "
+          "(the work it starts still pulses the sidebar)",
+          d._last_input_ts == 0.0)
+
+    # --- a refusal is retried, then given up on as MISSED -------------------
+    r = mk("NotReady")
+    r._prompt_ready = False
+    late = r.schedule_message("go", now - 5)
+    ws.agents.append(r)
+    win._tick_schedules()
+    check("schedule: an agent whose prompt is not ready is not typed into",
+          sent(r) == "")
+    check("schedule: ...and the message stays queued for the next tick",
+          late.is_pending() and late.attempts == 1)
+    late.due_ts = now - SCHEDULE_GIVE_UP_S - 1
+    win._tick_schedules()
+    check("schedule: past the give-up window it becomes MISSED, not sent",
+          late.state == ss.MISSED and sent(r) == "")
+    check("schedule: a missed message is KEPT so the user can see it",
+          [m.state for m in r.scheduled_messages()] == [ss.MISSED])
+
+    # an agent parked on the plan limit must not be typed into: the text would
+    # land in the limit's options menu, not the prompt underneath it
+    b = mk("Blocked")
+    b.mark_limit_blocked(now + 3600)
+    b.schedule_message("go", now - 1)
+    ws.agents.append(b)
+    win._tick_schedules()
+    check("schedule: an agent parked on the plan limit is not typed into",
+          sent(b) == "" and b.pending_scheduled())
+
+    # --- the countdown tick must never touch the session file ---------------
+    saves = []
+    mgr.dirty.connect(lambda: saves.append(1))
+    t = mk("Ticker")
+    ws.agents.append(t)
+    mgr._wire_agent(ws, t)
+    t.schedule_message("soon", now + 3600)
+    queued_saves = len(saves)
+    check("schedule: queueing a message DOES mark the session dirty "
+          "(the queue is persisted)", queued_saves >= 1)
+    for _ in range(5):
+        win._tick_schedules()
+    check("schedule: the per-second tick marks the session dirty ZERO times",
+          len(saves) == queued_saves, len(saves) - queued_saves)
+    t.cancel_scheduled(t.next_scheduled().id)
+    check("schedule: cancelling drops it and marks dirty",
+          not t.scheduled_messages() and len(saves) > queued_saves)
+
+    # the tick only RUNS while something is queued, so a hive with nothing
+    # scheduled pays nothing for the feature
+    for agent in (d, r, b, t):
+        agent._scheduled.clear()
+    win._sync_schedule_timer()
+    check("schedule: the tick timer stops when nothing is queued",
+          not win._schedule_timer.isActive())
+    t.schedule_message("wake up", now + 60)
+    win._sync_schedule_timer()
+    check("schedule: the tick timer runs while something is queued",
+          win._schedule_timer.isActive())
+    # QTimer.start() RESTARTS a running timer, and this is called from
+    # workspaceStatsChanged (which fires every couple of seconds per busy
+    # agent) -- an unconditional start would reset the countdown forever
+    win._schedule_timer.setInterval(50000)
+    win._sync_schedule_timer()
+    check("schedule: re-syncing an already-running tick does not restart it",
+          win._schedule_timer.remainingTime() <= 50000)
+    win._schedule_timer.setInterval(1000)
+
+    check("schedule: workspace stats count agents holding a message",
+          mgr.workspace_stats(ws.id)["scheduled"] == 1)
+
+    # ...and the whole thing runs on its OWN timer. Every check above drives
+    # _tick_schedules by hand, which proves the logic but not the feature: this
+    # one queues a message, touches nothing, and waits for it to arrive.
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    live = mk("Live")
+    ws.agents.append(live)
+    live.schedule_message("wake up and work", _time.time() + 0.2)
+    win._sync_schedule_timer()
+    pump(1600)
+    check("schedule: the countdown fires on its own timer and delivers",
+          "wake up and work" in sent(live) and not live.scheduled_messages(),
+          sent(live))
+
+    # --- persistence, and the rule about coming back late -------------------
+    m2 = WorkspaceManager()
+    ahead, behind = now + 7200, now - 7200
+    keeper = mk("Keeper")
+    keeper.schedule_message("still ahead", ahead)
+    keeper.schedule_message("long overdue", behind)
+    ws.agents.append(keeper)
+    data = mgr.to_session_dict()
+    rows = [t_ for w in data["workspaces"] for t_ in w["terminals"]
+            if t_.get("name") == "Keeper"]
+    check("schedule: pending messages are persisted with the agent",
+          len(rows) == 1 and len(rows[0].get("scheduled", [])) == 2,
+          rows)
+    m2.load_session_dict(data)
+    back = next((x for x in m2.all_agents() if x.spec.name == "Keeper"), None)
+    states = {m.text: m.state for m in (back.scheduled_messages() if back else [])}
+    check("schedule: a message still ahead comes back PENDING",
+          states.get("still ahead") == ss.PENDING, states)
+    # THE RULE: a 3am message the app was closed for must NOT fire at 10am into
+    # a conversation that has moved on. It comes back visible, not delivered.
+    check("schedule: a message that came due while the app was closed comes "
+          "back MISSED, never sent", states.get("long overdue") == ss.MISSED,
+          states)
+    check("schedule: a session with no queue restores cleanly",
+          m2.load_session_dict({"workspaces": [{"id": "w", "name": "W",
+                                                "project_path": os.getcwd(),
+                                                "terminals": []}]}) is None)
+    # the degraded save path keeps the queue too: it exists so a malformed
+    # agent loses as little as possible, and a dropped hand-off is a real loss
+    broken = mk("Broken")
+    broken.schedule_message("survive the degrade", ahead)
+    broken.spec.kind = "not-an-enum"       # AgentSpec.to_dict raises on .value
+    degraded = mgr._agent_dict_safe(broken)
+    check("schedule: the degraded save record still carries the queue",
+          len(degraded.get("scheduled", [])) == 1, degraded)
+
+    # --- the gesture --------------------------------------------------------
+    from app.widgets.terminal_view import TerminalView
+    view = TerminalView(rows=24, cols=80)
+    seen, keys = [], []
+    view.scheduleRequested.connect(seen.append)
+    view.keyInput.connect(keys.append)
+
+    def press(key, ctrl=False, shift=False):
+        mods = Qt.KeyboardModifier.NoModifier
+        if ctrl:
+            mods |= Qt.KeyboardModifier.ControlModifier
+        if shift:
+            mods |= Qt.KeyboardModifier.ShiftModifier
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, mods, "\r"))
+
+    view.feed("> run the tests")
+    press(Qt.Key.Key_Return, ctrl=True, shift=True)
+    check("schedule: Ctrl+Shift+Enter asks for a countdown, carrying what is "
+          "typed", seen == ["run the tests"], seen)
+    check("schedule: ...and sends NOTHING to the child (no submit, no clear)",
+          keys == [], keys)
+    # Ctrl+Enter is NOT available for this: it inserts a newline, which is how
+    # multi-line input works in Claude Code
+    press(Qt.Key.Key_Return, ctrl=True)
+    check("schedule: plain Ctrl+Enter still inserts a newline",
+          keys == ["\n"] and len(seen) == 1, (keys, seen))
+    view.deleteLater()
+
+    # --- the composer -------------------------------------------------------
+    from PySide6.QtWidgets import QDialog, QDialogButtonBox
+    from app.widgets.main_window import ScheduleMessageDialog
+
+    comp = mk("Composer")
+    dlg = ScheduleMessageDialog(comp, parent=win, prefill="deploy the thing")
+    ok_btn = dlg.buttons.button(QDialogButtonBox.StandardButton.Ok)
+    check("schedule: the composer opens prefilled with what was typed",
+          dlg.text_edit.toPlainText() == "deploy the thing")
+    check("schedule: it opens on a usable default delay",
+          ok_btn.isEnabled() and dlg.result_message() is not None)
+    # a preset must be written in the DELAY vocabulary, never the countdown
+    # one: "5:00" reads back as five HOURS, not five minutes
+    preset_bad = []
+    for label, seconds in ScheduleMessageDialog.PRESETS:
+        dlg._set_preset(seconds)
+        got = ss.parse_delay(dlg.delay_edit.text())
+        if got != seconds:
+            preset_bad.append(f"{label}: {dlg.delay_edit.text()!r}={got}")
+    check("schedule: every preset button means what its label says",
+          not preset_bad, preset_bad)
+    dlg.delay_edit.setText("90m")
+    dlg._revalidate()
+    text, when = dlg.result_message()
+    check("schedule: a custom delay resolves to a fire time",
+          text == "deploy the thing" and 5300 < when - _time.time() < 5500)
+    check("schedule: the composer says exactly when it will fire",
+          "in 1:29" in dlg.when_label.text(), dlg.when_label.text())
+    # the two time fields are alternatives: there must never be a hidden second
+    # answer deciding the fire time
+    dlg.clock_edit.setText("03:30")
+    dlg._on_time_edited(False)
+    check("schedule: typing a clock clears the delay field (one answer only)",
+          dlg.delay_edit.text() == ""
+          and dlg.result_message()[1] == ss.parse_clock("03:30"))
+    dlg.text_edit.setPlainText("   ")
+    check("schedule: an empty message cannot be scheduled",
+          not ok_btn.isEnabled() and dlg.result_message() is None)
+    dlg.text_edit.setPlainText("ok")
+    dlg.clock_edit.setText("nonsense")
+    dlg._on_time_edited(False)
+    check("schedule: an unparseable time cannot be scheduled",
+          not ok_btn.isEnabled() and dlg.result_message() is None)
+    comp.schedule_message("already queued", now + 60)
+    dlg.refresh_pending()
+    check("schedule: the composer lists what is already queued",
+          dlg.pending_box.count() > 0)
+    dlg.deleteLater()
+
+    # confirming from the TERMINAL gesture also clears the child's input box:
+    # the text now lives in AI Hive, so a copy left in the prompt would be
+    # submitted a second time the moment the user pressed Enter
+    gest = mk("Gesture")
+    ws.agents.append(gest)
+    real_exec = ScheduleMessageDialog.exec
+    try:
+        ScheduleMessageDialog.exec = lambda self: (
+            self.text_edit.setPlainText("scheduled from the terminal"),
+            self.delay_edit.setText("10m"), self._revalidate(),
+            QDialog.DialogCode.Accepted)[-1]
+        win._on_schedule_message(gest.id, "scheduled from the terminal")
+    finally:
+        ScheduleMessageDialog.exec = real_exec
+    check("schedule: confirming queues the message",
+          [m.text for m in gest.pending_scheduled()]
+          == ["scheduled from the terminal"])
+    check("schedule: ...and clears the child's input box (double-Escape), so "
+          "the text is never submitted twice", sent(gest) == "\x1b\x1b")
+
+    # --- the card chip ------------------------------------------------------
+    page = win._pages[ws.id]
+    chip_agent = mgr.add_terminal(
+        ws.id, build_spec(AgentKind.CLAUDE, "Chip", cwd=os.getcwd()),
+        autostart=False)
+    card = page.card_for(chip_agent.id)
+    check("schedule: a card with nothing queued shows no countdown chip",
+          card is not None and not card.sched_mark.isVisible())
+    chip_agent.schedule_message("later", now + 724)
+    check("schedule: the chip appears with the countdown to the soonest one",
+          card.sched_mark.isVisible() and "12:0" in card.sched_mark.text(),
+          card.sched_mark.text())
+    chip_agent.mark_scheduled_missed(chip_agent.next_scheduled().id)
+    check("schedule: a missed message flips the chip to its warning state",
+          card.sched_mark.property("missed") is True
+          and "missed" in card.sched_mark.text())
+    chip_agent.cancel_scheduled(chip_agent.scheduled_messages()[0].id)
+    check("schedule: cancelling the last message hides the chip again",
+          not card.sched_mark.isVisible())
+
+    win.close()
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
@@ -7547,6 +7919,7 @@ def main():
     test_limit_ledger()
     test_auto_continue_on_limit_reset()
     test_startup_limit_recovery()
+    test_scheduled_send()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0

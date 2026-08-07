@@ -15,7 +15,7 @@ from PySide6.QtGui import (QAction, QColor, QDrag, QPainter, QPixmap,
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QPlainTextEdit, QToolButton, QVBoxLayout)
 
-from .. import ui_theme
+from .. import scheduled_send, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
 from ..terminal_agent import (STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
                               TerminalAgent)
@@ -44,6 +44,12 @@ SYSTEM_STYLE = CharStyle(fg=Palette.SYSTEM_MSG, italic=True)
 # drag payload for reordering agent cards within a workspace (started by
 # _CardHeader, resolved by WorkspacePage's drop handling)
 CARD_REORDER_MIME = "application/x-aihive-card-reorder"
+
+
+def _snippet(text: str, limit: int = 140) -> str:
+    """One-line preview of a queued message for a tooltip or a list row."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[:limit - 1] + "…"
 
 
 class _CardHeader(QFrame):
@@ -99,6 +105,7 @@ class TerminalCard(QFrame):
     reassignRequested = Signal(str)  # agent id (retask a completed/idle agent)
     maximizeRequested = Signal(object)  # self (toggle solo view of this card)
     fileActivated = Signal(str)      # abs path Ctrl+clicked in the conversation
+    scheduleRequested = Signal(str, str)  # agent id, text to prefill (may be "")
 
     def __init__(self, agent: TerminalAgent, parent=None):
         super().__init__(parent)
@@ -200,6 +207,15 @@ class TerminalCard(QFrame):
         self.limit_mark = QLabel("⏳", header)   # hourglass
         self.limit_mark.setObjectName("CardLimitMark")
         self.limit_mark.hide()
+        # "a message is queued to be typed in at N" — the countdown for a
+        # deferred submit (Ctrl+Shift+Enter). Visible for as long as something
+        # is held, so a scheduled send is never a surprise: the user can see it
+        # coming and click to change or cancel it. Ticked by MainWindow, which
+        # updates the LABEL only and never the model.
+        self.sched_mark = QToolButton(header)
+        self.sched_mark.setObjectName("CardSchedule")
+        self.sched_mark.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sched_mark.hide()
         # one-line summary of what this agent is working on (its current task),
         # so several agents in a workspace are tellable apart at a glance
         # without reading each terminal. It takes every pixel the fixed chrome
@@ -220,6 +236,7 @@ class TerminalCard(QFrame):
         hl.addWidget(self.model_label)
         hl.addSpacing(6)
         hl.addWidget(self.limit_mark)
+        hl.addWidget(self.sched_mark)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
         hl.addWidget(self.token_label)
 
@@ -291,6 +308,10 @@ class TerminalCard(QFrame):
         self.agent.model_changed.connect(self._on_model)
         self.agent.limit_blocked_changed.connect(self._on_limit_blocked)
         self._on_limit_blocked(self.agent.is_limit_blocked())
+        self.agent.scheduled_changed.connect(self.refresh_schedule)
+        self.sched_mark.clicked.connect(
+            lambda: self.scheduleRequested.emit(self.agent.id, ""))
+        self.refresh_schedule()
         self.title.installEventFilter(self)        # double-click to rename
         self.title_edit.installEventFilter(self)   # Esc cancels, focus-out commits
         self.title_edit.returnPressed.connect(self._commit_rename)
@@ -307,6 +328,11 @@ class TerminalCard(QFrame):
             # Ctrl+clicking a file bubbles up so the app can reveal it
             self.terminal.set_base_dir(getattr(self.agent.spec, "cwd", "") or "")
             self.terminal.fileActivated.connect(self.fileActivated)
+            # Ctrl+Shift+Enter in the terminal: "send this, but later". The view
+            # hands up what is currently typed; the window turns it into the
+            # countdown dialog and, only on confirm, clears the input box.
+            self.terminal.scheduleRequested.connect(
+                lambda text: self.scheduleRequested.emit(self.agent.id, text))
             self.terminal.installEventFilter(self)
             return
 
@@ -341,6 +367,14 @@ class TerminalCard(QFrame):
             lambda: self.reassignRequested.emit(self.agent.id))
         for act in (act_start, act_stop, act_restart, act_assign):
             menu.addAction(act)
+        menu.addSeparator()
+        # the discoverable half of Ctrl+Shift+Enter (which needs the terminal
+        # focused and something typed); this opens the same dialog empty
+        act_sched = QAction("Send a message on a countdown…", menu)
+        act_sched.triggered.connect(
+            lambda: self.scheduleRequested.emit(self.agent.id, ""))
+        act_sched.setEnabled(self.is_pty)
+        menu.addAction(act_sched)
         menu.addSeparator()
         act_max = QAction("Maximize (focus this agent)", menu)
         act_max.triggered.connect(lambda: self.maximizeRequested.emit(self))
@@ -381,7 +415,8 @@ class TerminalCard(QFrame):
                  (self.agent.summary_changed, self._on_task),
                  (self.agent.tokens_changed, self._on_tokens),
                  (self.agent.model_changed, self._on_model),
-                 (self.agent.limit_blocked_changed, self._on_limit_blocked)]
+                 (self.agent.limit_blocked_changed, self._on_limit_blocked),
+                 (self.agent.scheduled_changed, self.refresh_schedule)]
         if self.is_pty:
             pairs.append((self.agent.pty_output, self._on_pty_output))
         else:
@@ -440,6 +475,44 @@ class TerminalCard(QFrame):
         self.limit_mark.setVisible(bool(blocked))
         if blocked:
             self.limit_mark.setToolTip(self.agent.limit_summary())
+
+    def refresh_schedule(self) -> None:
+        """Repaint the deferred-message chip: the countdown to the soonest one,
+        or a warning that one was missed.
+
+        Called both on `scheduled_changed` (the queue changed) and once a second
+        from MainWindow's tick while anything is pending. It touches nothing but
+        this label, which is what keeps a per-second countdown off the session
+        file - see the `scheduled_changed` wiring in WorkspaceManager.
+        """
+        msg = self.agent.next_scheduled()
+        missed = self.agent.missed_scheduled()
+        if msg is not None:
+            count = len(self.agent.pending_scheduled())
+            self.sched_mark.setText(
+                f"⏱ {scheduled_send.format_countdown(msg.seconds_left())}")
+            more = f" (+{count - 1} more)" if count > 1 else ""
+            self.sched_mark.setToolTip(
+                f"Sending {scheduled_send.format_clock(msg.due_ts)}{more}:\n"
+                f"{_snippet(msg.text)}\n\nClick to change or cancel")
+            self._set_sched_missed(False)
+        elif missed:
+            self.sched_mark.setText(f"⏱ missed ({len(missed)})")
+            self.sched_mark.setToolTip(
+                f"{len(missed)} scheduled message(s) came due while this agent "
+                f"was unreachable and were NOT sent.\n"
+                f"Click to send one now or dismiss it.")
+            self._set_sched_missed(True)
+        self.sched_mark.setVisible(msg is not None or bool(missed))
+
+    def _set_sched_missed(self, missed: bool) -> None:
+        """Flip the chip's warning state, restyling ONLY on a real change.
+        `refresh_schedule` runs once a second while a countdown is live, and an
+        unconditional repolish would re-run the stylesheet on every tick."""
+        if self.sched_mark.property("missed") is missed:
+            return
+        self.sched_mark.setProperty("missed", missed)
+        repolish(self.sched_mark)
 
     def _on_tokens(self, badge: str = "") -> None:
         # context-window usage badge beside the summary; hidden when empty so a

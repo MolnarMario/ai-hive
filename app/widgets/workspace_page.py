@@ -112,6 +112,7 @@ class WorkspacePage(QWidget):
     closeRequested = Signal(str)        # agent id
     focusGained = Signal(object)        # TerminalCard
     reassignRequested = Signal(str)     # agent id
+    scheduleRequested = Signal(str, str)  # agent id, text to prefill
     addRequested = Signal(str)          # ws_id (empty slot clicked)
     layoutChosen = Signal(str, str)     # ws_id, layout
     openFolderRequested = Signal(str)   # ws_id
@@ -268,6 +269,7 @@ class WorkspacePage(QWidget):
         card.closeRequested.connect(self.closeRequested)
         card.focusGained.connect(self.focusGained)
         card.reassignRequested.connect(self.reassignRequested)
+        card.scheduleRequested.connect(self.scheduleRequested)
         card.maximizeRequested.connect(self.toggle_solo)
         card.fileActivated.connect(
             lambda p: self.fileActivated.emit(self.workspace.id, p))

@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
                                QToolButton, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget)
 
+from .. import scheduled_send
 from ..filetypes import EMOJI_FONT, FOLDER_ICON, FOLDER_OPEN_ICON, file_icon
 from ..terminal_agent import AgentStatus
 from ..ui_theme import Palette, repolish
@@ -175,6 +176,18 @@ class WorkspaceRow(QFrame):
         self.limit_badge.clicked.connect(
             lambda: self.agentsRequested.emit(self.ws_id))
 
+        # stopwatch + count: agent(s) here are holding a message the user
+        # deferred (Ctrl+Shift+Enter). Same click target as the two badges
+        # above. No countdown here on purpose: the row would then have to
+        # repaint every second for every workspace, and the card already shows
+        # the time. This just says "something is queued over here".
+        self.sched_badge = QToolButton(self)
+        self.sched_badge.setObjectName("WsSched")
+        self.sched_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sched_badge.hide()
+        self.sched_badge.clicked.connect(
+            lambda: self.agentsRequested.emit(self.ws_id))
+
         # a sweeping-arc throbber with the WORKING count; pinned far-right, so
         # the hover folder/delete buttons appear to its LEFT (see layout order)
         self.work_spinner = WorkspaceSpinner(self)
@@ -185,6 +198,7 @@ class WorkspaceRow(QFrame):
         lay.addLayout(text_col, 1)
         lay.addWidget(self.folder_btn)
         lay.addWidget(self.delete_btn)
+        lay.addWidget(self.sched_badge)
         lay.addWidget(self.limit_badge)
         lay.addWidget(self.q_badge)
         lay.addWidget(self.work_spinner)
@@ -245,8 +259,17 @@ class WorkspaceRow(QFrame):
             self.limit_badge.setToolTip(
                 f"{blocked} agent(s) stopped by the usage limit, "
                 "click to see who")
+        # the stopwatch + count shows agent(s) holding a deferred message
+        scheduled = stats.get("scheduled", 0)
+        self.sched_badge.setVisible(scheduled > 0)
+        if scheduled > 0:
+            self.sched_badge.setText(f"⏱{scheduled}")
+            self.sched_badge.setToolTip(
+                f"{scheduled} agent(s) with a scheduled message, "
+                "click to see who")
         tip = (f"{total} agent(s): {busy} working, {running} running, "
-               f"{e} error, {waiting} waiting, {blocked} limit-stopped")
+               f"{e} error, {waiting} waiting, {blocked} limit-stopped, "
+               f"{scheduled} scheduled")
         self.setToolTip(f"{tip}\n{self._folder}" if self._folder else tip)
 
     # ------------------------------------------------------------ rename ---
@@ -640,9 +663,15 @@ class AgentRow(QFrame):
         self.limit_mark = QLabel("⏳", self)
         self.limit_mark.setObjectName("WsAgentLimit")
         self.limit_mark.hide()
+        # a message is queued to be typed into this agent later, so a scheduled
+        # send is findable from a collapsed workspace too
+        self.sched_mark = QLabel("⏱", self)
+        self.sched_mark.setObjectName("WsAgentSched")
+        self.sched_mark.hide()
         lay.addWidget(self.dot)
         lay.addWidget(self.name)
         lay.addWidget(self.summary, 1)
+        lay.addWidget(self.sched_mark)
         lay.addWidget(self.limit_mark)
         lay.addWidget(self.q)
         self.refresh(agent)
@@ -667,6 +696,15 @@ class AgentRow(QFrame):
         if blocked:
             self.limit_mark.setToolTip(
                 getattr(agent, "limit_summary", lambda: "")())
+        # deferred messages, polled on the same tick as everything else here.
+        # The countdown itself stays on the card: this row only says one exists.
+        held = list(getattr(agent, "scheduled_messages", lambda: [])())
+        self.sched_mark.setVisible(bool(held))
+        if held:
+            missed = sum(1 for m in held if m.state == scheduled_send.MISSED)
+            self.sched_mark.setToolTip(
+                f"{len(held)} scheduled message(s)"
+                + (f", {missed} missed" if missed else ""))
         # summary = assigned task, else Claude's live AI conversation title
         get = getattr(agent, "summary", None)
         self._full = (get() if callable(get) else agent.current_task or "").strip()

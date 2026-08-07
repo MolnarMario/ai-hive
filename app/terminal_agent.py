@@ -14,8 +14,9 @@ from enum import Enum
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from . import providers, transcripts
+from . import providers, scheduled_send, transcripts
 from .coordination import sanitize_text
+from .scheduled_send import MISSED, PENDING, SENT, ScheduledMessage
 from .process_worker import AgentSpec, ProcessWorker, WorkerState
 from .pty_worker import PtyWorker
 
@@ -158,6 +159,10 @@ class TerminalAgent(QObject):
     tokens_changed = Signal(str)        # context-usage badge text ("" = hide)
     model_changed = Signal(str)         # live model/effort badge text ("" = hide)
     limit_blocked_changed = Signal(bool)  # cut off by the plan limit (latched)
+    # the deferred-message queue changed (added/cancelled/sent/missed). NOT a
+    # countdown tick: this list IS persisted, so the manager wires this to a
+    # save, and a per-second tick on that would rewrite session.json all day.
+    scheduled_changed = Signal()
 
     def __init__(self, spec: AgentSpec, parent: QObject | None = None):
         super().__init__(parent)
@@ -208,6 +213,11 @@ class TerminalAgent(QObject):
         # bumped on every (re)start so a queued task-submit Enter from a prior
         # session is never delivered into a fresh, not-yet-ready TUI
         self._submit_gen = 0
+        # messages the user wrote now to be typed in later (app/scheduled_send).
+        # Persisted (only the PENDING ones) because the whole point is
+        # unattended operation, and an app restart must not silently drop a
+        # queued hand-off.
+        self._scheduled: list[ScheduledMessage] = []
         self._busy = False            # actively streaming output right now
         self._last_output_ts = 0.0    # walltime of the last output burst
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
@@ -615,6 +625,119 @@ class TerminalAgent(QObject):
             return False
         self._write_task_to_pty(text)
         return True
+
+    # ------------------------------------------------- deferred messages ---
+    # A scheduled message is a submit the user deferred: they typed it now and
+    # chose when it should go in. Everything here is bookkeeping — the actual
+    # send is `nudge` above, driven by MainWindow's tick, for the same reason
+    # the plan-limit auto-continue lives there rather than in the model.
+
+    def schedule_message(self, text: str, due_ts: float) -> ScheduledMessage | None:
+        """Queue `text` to be typed in at `due_ts`. Returns the entry, or None
+        when the text is empty or this agent is already at its cap."""
+        text = sanitize_text(text or "").strip()
+        if not text or len(self.pending_scheduled()) >= scheduled_send.MAX_PER_AGENT:
+            return None
+        msg = ScheduledMessage(text=text, due_ts=float(due_ts))
+        self._scheduled.append(msg)
+        self.scheduled_changed.emit()
+        return msg
+
+    def scheduled_messages(self) -> list[ScheduledMessage]:
+        """Everything still held, soonest first. Sent entries are dropped as
+        they go out, so in practice this is the pending ones plus any missed
+        entry still waiting for the user to notice it."""
+        return sorted(self._scheduled, key=lambda m: m.due_ts)
+
+    def pending_scheduled(self) -> list[ScheduledMessage]:
+        return [m for m in self.scheduled_messages() if m.is_pending()]
+
+    def next_scheduled(self) -> ScheduledMessage | None:
+        """The soonest pending message — what the card's countdown shows."""
+        pending = self.pending_scheduled()
+        return pending[0] if pending else None
+
+    def due_scheduled(self, now: float | None = None) -> list[ScheduledMessage]:
+        return [m for m in self.scheduled_messages() if m.is_due(now)]
+
+    def missed_scheduled(self) -> list[ScheduledMessage]:
+        return [m for m in self.scheduled_messages() if m.state == MISSED]
+
+    def find_scheduled(self, mid: str) -> ScheduledMessage | None:
+        return next((m for m in self._scheduled if m.id == mid), None)
+
+    def cancel_scheduled(self, mid: str) -> bool:
+        """Drop a message entirely (the user cancelled it, or dismissed a
+        missed one). Removes rather than marks so it stops being persisted."""
+        msg = self.find_scheduled(mid)
+        if msg is None:
+            return False
+        self._scheduled.remove(msg)
+        self.scheduled_changed.emit()
+        return True
+
+    def mark_scheduled_sent(self, mid: str) -> bool:
+        """It went in. The entry is DROPPED, not kept: the conversation itself
+        is the record of what was said, and this is a queue, not a ledger."""
+        msg = self.find_scheduled(mid)
+        if msg is None:
+            return False
+        msg.state = SENT
+        self._scheduled.remove(msg)
+        self.scheduled_changed.emit()
+        return True
+
+    def mark_scheduled_missed(self, mid: str) -> bool:
+        """Give up on delivering it, but KEEP it visible. The user chose a time
+        and it did not happen; silently discarding that is how an unattended
+        hand-off disappears without trace."""
+        msg = self.find_scheduled(mid)
+        if msg is None or msg.state == MISSED:
+            return False
+        msg.state = MISSED
+        self.scheduled_changed.emit()
+        return True
+
+    def note_scheduled_attempt(self, mid: str) -> None:
+        """Record a delivery attempt that the agent refused (its TUI is not
+        ready yet). Deliberately does NOT emit: this happens on the tick, and
+        the queue's shape has not changed."""
+        msg = self.find_scheduled(mid)
+        if msg is not None:
+            msg.attempts += 1
+
+    def scheduled_dicts(self) -> list[dict]:
+        """The PENDING queue, for the session file. Missed entries are left out
+        on purpose: on the next launch they would be re-derived as missed
+        anyway, and a stale one would linger on the card forever."""
+        return [m.to_dict() for m in self.pending_scheduled()]
+
+    def restore_scheduled(self, rows) -> None:
+        """Rebuild the queue from a session record.
+
+        CRITICAL: anything whose time has already passed comes back MISSED, and
+        is never sent. A message set for 3am that the app was closed for must
+        not fire at 10am into a conversation that has moved on — the agent may
+        have been restarted, the work it was chaining onto may be long done, and
+        an unexpected prompt hours late is both a surprise and real quota spent.
+        The user sees it on the card and decides.
+        """
+        if not rows:
+            return
+        now = time.time()
+        for row in rows or []:
+            if len(self._scheduled) >= scheduled_send.MAX_PER_AGENT:
+                break
+            if not isinstance(row, dict):
+                continue
+            msg = ScheduledMessage.from_dict(row)
+            if msg is None:
+                continue
+            if msg.state == PENDING and msg.due_ts <= now:
+                msg.state = MISSED
+            self._scheduled.append(msg)
+        if self._scheduled:
+            self.scheduled_changed.emit()
 
     def _write_task_to_pty(self, text: str) -> None:
         body = text.replace("\r\n", "\r").replace("\n", "\r")

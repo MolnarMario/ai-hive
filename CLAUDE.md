@@ -479,6 +479,48 @@ this file is the invariants that must survive every change.
   banner prints a bare wall clock for a reset that can be days out, which
   `parse_reset_clock` can only ever resolve to the next occurrence, so a weekly
   cut-off ignores its clock and waits for the account reading.
+- **A scheduled message is a DEFERRED ENTER, not an assignment**
+  (`app/scheduled_send.py`, Qt-free/stdlib-only like `limit_banner.py`).
+  `Ctrl+Shift+Enter` in a pty terminal hands `TerminalView._input_text()` up
+  through `TerminalCard`/`WorkspacePage` to `MainWindow._on_schedule_message`,
+  which opens `ScheduleMessageDialog`; the message is held on the AGENT
+  (`TerminalAgent._scheduled`) and typed in later by `MainWindow._tick_schedules`
+  (`SCHEDULE_TICK_MS`). This exists so agents can be chained while the user is
+  AFK. Several rules are load-bearing:
+  * **Delivery is `nudge`, NEVER `deliver_task`** — same distinction the
+    auto-continue makes, for the same reason: `deliver_task` overwrites the
+    persisted `current_task`, flips the assignment to WORKING and re-infers the
+    role. The user deferred an Enter; they did not assign anything.
+  * **The chord cannot be `Ctrl+Enter`** — that inserts a newline
+    (`terminal_view._sequence_for`), which is how multi-line input works in
+    Claude Code. Hence the third modifier, as with `Ctrl+Shift+A`. The keypress
+    sends NOTHING to the child; the input box is cleared (double-Escape, via
+    `write` so the echo isn't mistaken for work) only once something is
+    actually queued, so a cancelled dialog leaves the typing alone.
+  * **The prefill is INFERRED from the painted input box**, which can come up
+    short on a long horizontally-scrolled line — so it is shown back in an
+    editable box rather than scheduled blind. That is why this is a dialog and
+    not a silent hotkey. Do NOT "streamline" it into an immediate schedule.
+  * **An overdue message is MISSED, never sent late.** `restore_scheduled`
+    marks anything already past due on load, and `_deliver_scheduled` gives up
+    after `SCHEDULE_GIVE_UP_S`. A 3am message firing at 10am into a conversation
+    that has moved on is a surprise and real quota spent; the entry is KEPT and
+    surfaced (the `missed` chip state) so the loss is visible rather than
+    silent. A refusal itself is not a failure — a stopped agent, a booting TUI,
+    or one parked on a limit menu (where the text would land IN the menu) is
+    retried on the next tick.
+  * **The queue IS persisted** (`_agent_dict`'s `"scheduled"`, only the PENDING
+    ones; `_agent_dict_safe` carries it too), so `scheduled_changed` is wired to
+    `_touch` (dirty) — the one indicator-shaped signal here that is not
+    transient. No `SESSION_VERSION` bump: it is an additive optional key like
+    `task`. CRITICAL, the other half: the per-second COUNTDOWN must never reach
+    the model — `_tick_schedules` repaints `TerminalCard.refresh_schedule` and
+    nothing else, or `session.json` would be rewritten 3600 times an hour (the
+    `activity_changed` rule). And `_sync_schedule_timer` only touches the timer
+    when the desired state DIFFERS from `isActive()`: it is driven by
+    `workspaceStatsChanged`, which fires every couple of seconds per busy agent,
+    and `QTimer.start()` RESTARTS a running timer — the exact trap
+    `_retune_usage_poll` documents.
 - **Theming is a skin registry** (`app/ui_theme.py`): each skin is a `Theme`
   in `THEMES`; `apply_theme(id)` rewrites the module-level `Palette` attrs,
   the `ANSI_16` list (IN PLACE — same object), and the font globals, so every
