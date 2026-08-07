@@ -217,6 +217,11 @@ class TerminalCard(QFrame):
         self.limit_mark = QLabel("⏳", header)   # hourglass
         self.limit_mark.setObjectName("CardLimitMark")
         self.limit_mark.hide()
+        # "idle, but a background command it started is still running" — same
+        # transient-marker treatment as limit_mark above.
+        self.bg_mark = QLabel("⚙", header)
+        self.bg_mark.setObjectName("CardBgShell")
+        self.bg_mark.hide()
         # "a message is queued to be typed in at N" — the countdown for a
         # deferred submit (Ctrl+Shift+Enter). Visible for as long as something
         # is held, so a scheduled send is never a surprise: the user can see it
@@ -246,6 +251,7 @@ class TerminalCard(QFrame):
         hl.addWidget(self.model_label)
         hl.addSpacing(6)
         hl.addWidget(self.limit_mark)
+        hl.addWidget(self.bg_mark)
         hl.addWidget(self.sched_mark)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
         hl.addWidget(self.token_label)
@@ -322,6 +328,8 @@ class TerminalCard(QFrame):
         self.agent.model_changed.connect(self._on_model)
         self.agent.limit_blocked_changed.connect(self._on_limit_blocked)
         self._on_limit_blocked(self.agent.is_limit_blocked())
+        self.agent.bg_shell_changed.connect(self._on_bg_shell)
+        self._on_bg_shell(self.agent.is_bg_shell_busy())
         self.agent.scheduled_changed.connect(self.refresh_schedule)
         self.sched_mark.clicked.connect(
             lambda: self.scheduleRequested.emit(self.agent.id, ""))
@@ -431,6 +439,7 @@ class TerminalCard(QFrame):
                  (self.agent.tokens_changed, self._on_tokens),
                  (self.agent.model_changed, self._on_model),
                  (self.agent.limit_blocked_changed, self._on_limit_blocked),
+                 (self.agent.bg_shell_changed, self._on_bg_shell),
                  (self.agent.scheduled_changed, self.refresh_schedule)]
         if self.is_pty:
             pairs.append((self.agent.pty_output, self._on_pty_output))
@@ -497,6 +506,14 @@ class TerminalCard(QFrame):
         self.limit_mark.setVisible(bool(blocked))
         if blocked:
             self.limit_mark.setToolTip(self.agent.limit_summary())
+
+    def _on_bg_shell(self, active: bool) -> None:
+        """Show/hide the 'idle, but a background command it started is still
+        running' marker."""
+        self.bg_mark.setVisible(bool(active))
+        if active:
+            self.bg_mark.setToolTip(
+                "Idle, but a background command it started is still running")
 
     def refresh_schedule(self) -> None:
         """Repaint the deferred-message chip: the countdown to the soonest one,

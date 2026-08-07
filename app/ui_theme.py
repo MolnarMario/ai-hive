@@ -408,6 +408,18 @@ WorkspaceRow[search_hit="true"] {{
     min-height: 20px;
 }}
 #WsSched:hover {{ background: rgba(217,178,74,0.20); border-radius: 4px; }}
+/* gear + count: agent(s) idle but waiting on a background command they
+   started to finish. Orange (ACCENT_ORANGE) rather than gold/yellow -- the
+   same warm family as the "working" pulse, but a distinct hue so it doesn't
+   read as another instance of it. Deliberately UNBOXED, same pattern as
+   #WsLimit/#WsSched, and NOT animated (unlike the pulsing AgentCountBadge)
+   so it stays visually calmer than "actively working". */
+#WsBgShell {{
+    background: transparent; border: none; color: {p.ACCENT_ORANGE};
+    font-weight: 800; font-size: 17px; padding: 0 2px; min-width: 18px;
+    min-height: 20px;
+}}
+#WsBgShell:hover {{ background: rgba(232,152,58,0.20); border-radius: 4px; }}
 
 /* sidebar search: the magnifier toggle + the overlay input it reveals */
 #SearchBtn {{
@@ -478,6 +490,10 @@ WorkspaceRow[search_hit="true"] {{
    Sized up to match #WsAgentSched beside it -- still an inert label (no
    click of its own; the row itself is the click target), so no hover chrome. */
 #WsAgentLimit {{ color: {p.ACCENT_GOLD}; font-size: 16px; }}
+/* idle but a background command it started is still running: orange like
+   #WsBgShell, distinct from the gold "fine, just waiting" family. Same
+   inert-label treatment as #WsAgentLimit. */
+#WsAgentBgShell {{ color: {p.ACCENT_ORANGE}; font-size: 16px; }}
 /* a message is queued to be typed into this agent later -- a QToolButton
    (unlike WsAgentQ/WsAgentLimit, which are inert labels), so it needs its own
    flat/borderless base or it grows platform button chrome. Sized up from the
@@ -543,6 +559,7 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     padding: 0px 4px;
 }}
 #CardLimitMark {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
+#CardBgShell {{ color: {p.ACCENT_ORANGE}; font-size: 13px; }}
 /* the deferred-message countdown ("(clock) 12:04"), clickable to change or
    cancel it. Gold like the hourglass beside it: nothing is wrong, something is
    simply scheduled. The MISSED state is the exception and is meant to be

@@ -91,6 +91,15 @@ workspaces keep executing — switching never pauses anything.
   Windows 11, the icon's top-right corner), which is why the count and the
   question have to share one small square rather than getting a corner each.
   Toggle it with the **🪟 button** beside the bell (persists across restarts).
+- **Background-shell indicator** — an agent can look completely idle while a
+  command it started (a Claude `Bash` call run in the background, a plain
+  shell's `cmd &`) is still going. A **⚙ gear badge** shows on the sidebar
+  row, next to the affected agent in the expanded list, and in the terminal's
+  card header once that's been true for a few seconds, so you don't close AI
+  Hive thinking nothing is happening. It shares the taskbar's one overlay
+  square too: when nothing is busy or asking but a shell is still running,
+  the disc turns **orange** with the count, instead of showing nothing at
+  all.
 - **Plan usage readout** — a top-bar badge, left of the theme picker, showing
   how much of your Claude plan you've burned and when it comes back:
   `21% used, resets in 1h20m at 14:49` — countdown first, then the wall-clock
@@ -542,7 +551,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1160 checks drive the real app headlessly (offscreen Qt platform) with real
+1195 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -627,7 +636,7 @@ app/
                            + working-count spinner + taskbar-badge painter)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1160 checks)
+tests/smoke_test.py        headless end-to-end suite (1195 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

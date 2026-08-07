@@ -226,6 +226,9 @@ class PtyWorker(QObject):
     def process(self):
         return self._proc
 
+    def job_process_count(self) -> int:
+        return self._job.process_count() if self._job else 0
+
     # -------------------------------------------------------------- slots ---
 
     def _set_state(self, state: WorkerState) -> None:

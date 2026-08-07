@@ -396,11 +396,33 @@ if sys.platform == "win32":
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
+    # fixed-capacity stand-in for JOBOBJECT_BASIC_PROCESS_ID_LIST's flexible
+    # trailing array (ctypes has no flexible array member); we only ever
+    # read the NumberOfAssignedProcesses header field, so a generous cap is
+    # enough -- no realistic agent process tree needs more.
+    _BG_JOB_PID_CAP = 64
+
+    class _JOBOBJECT_BASIC_PROCESS_ID_LIST(ctypes.Structure):
+        _fields_ = [
+            ("NumberOfAssignedProcesses", wintypes.DWORD),
+            ("NumberOfProcessIdsInList", wintypes.DWORD),
+            ("ProcessIdList", ctypes.c_size_t * _BG_JOB_PID_CAP),
+        ]
+
     _JobObjectExtendedLimitInformation = 9
+    _JobObjectBasicProcessIdList = 3
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
     _PROCESS_SET_QUOTA = 0x0100
     _PROCESS_TERMINATE = 0x0001
     _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # QueryInformationJobObject's info buffer is a real (variable-shaped)
+    # struct, unlike the fixed-size ones the other WinJob calls exchange --
+    # give it explicit prototypes rather than relying on ctypes' default
+    # int-sized inference, which can truncate the HANDLE on 64-bit.
+    _k32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    _k32.QueryInformationJobObject.restype = wintypes.BOOL
 
 
 class WinJob:
@@ -445,6 +467,24 @@ class WinJob:
         if not self._handle or not self._assigned:
             return False
         return bool(_k32.TerminateJobObject(self._handle, exit_code))
+
+    def process_count(self) -> int:
+        """Best-effort count of processes currently alive in this job (the
+        agent itself plus any descendant it spawned) -- used to notice a
+        still-running background command even once the agent has gone
+        quiet. Returns 0 on any failure (no handle, unsupported, query
+        error), same as every other WinJob method never raising; callers
+        must treat 0 as "unknown," not "empty.\""""
+        if not self._handle:
+            return 0
+        info = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
+        needed = wintypes.DWORD(0)
+        ok = _k32.QueryInformationJobObject(
+            self._handle, _JobObjectBasicProcessIdList, ctypes.byref(info),
+            ctypes.sizeof(info), ctypes.byref(needed))
+        if not ok:
+            return 0
+        return int(info.NumberOfAssignedProcesses)
 
     def close(self) -> None:
         if self._handle:
@@ -627,6 +667,9 @@ class ProcessWorker(QObject):
 
     def process(self) -> QProcess | None:
         return self._proc
+
+    def job_process_count(self) -> int:
+        return self._job.process_count() if self._job else 0
 
     # -------------------------------------------------------------- slots ---
 

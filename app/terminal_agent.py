@@ -83,6 +83,13 @@ BUSY_IDLE_MS = 2000
 # pulses a beat later. Seconds, compared against time.time().
 INPUT_ECHO_S = 0.8
 
+# How long a job's process count must stay above this agent's learned resting
+# level, while the agent itself is NOT busy, before it's flagged as "idle but
+# a background command it started is still running." Debounced like
+# BUSY_IDLE_MS so a process that comes and goes quickly (git, rg) never
+# flickers the indicator.
+BG_SHELL_DEBOUNCE_S = 3.0
+
 # strips escape sequences so on-screen TEXT can be matched: the raw stream
 # positions words individually ("trust\x1b[20Gthis\x1b[25Gfolder"), so a
 # phrase can never be matched against raw bytes
@@ -159,6 +166,9 @@ class TerminalAgent(QObject):
     tokens_changed = Signal(str)        # context-usage badge text ("" = hide)
     model_changed = Signal(str)         # live model/effort badge text ("" = hide)
     limit_blocked_changed = Signal(bool)  # cut off by the plan limit (latched)
+    # idle (not streaming output) but a background command it started is
+    # still running -- see poll_bg_shell(). Transient, like activity/waiting.
+    bg_shell_changed = Signal(bool)
     # the child TUI's input prompt went interactive (or was re-armed by a
     # (re)start). Purely a VIEW signal — the card uses it to lift its boot
     # veil — and, like activity/waiting, it must never mark the session dirty.
@@ -262,6 +272,15 @@ class TerminalAgent(QObject):
         self._turn_waiting = False
         self._waiting = False
         self._screen_tail = ""        # rolling escape-stripped output tail
+        # "idle, but a background command it started is still running" (see
+        # poll_bg_shell): _bg_baseline is the quietest job-process-count ever
+        # observed for this launch (learned downward, so a wrapper process
+        # like ConPTY's conhost is never mistaken for "extra"); _bg_extra_since
+        # is when a count above baseline was first seen while not busy;
+        # _bg_shell is the debounced, emitted effective value.
+        self._bg_baseline: int | None = None
+        self._bg_extra_since: float | None = None
+        self._bg_shell = False
         # single-shot: (re)armed on each output burst; firing = output went
         # quiet, so the agent has dropped back to standby
         self._idle_timer = QTimer(self)
@@ -285,6 +304,7 @@ class TerminalAgent(QObject):
         self._ready_tail = ""
         self._screen_tail = ""
         self._reset_waiting()
+        self._reset_bg_shell()
         self.clear_limit_block()
         self._limit_last_banner = ""   # a new screen: nothing is an echo yet
         self._limit_last_skip = None   # ...so a skip is reported again too
@@ -340,6 +360,7 @@ class TerminalAgent(QObject):
         self._ready_tail = ""
         self._screen_tail = ""
         self._reset_waiting()
+        self._reset_bg_shell()
         self.clear_limit_block()
         self._limit_last_banner = ""   # a new screen: nothing is an echo yet
         self._limit_last_skip = None   # ...so a skip is reported again too
@@ -834,6 +855,12 @@ class TerminalAgent(QObject):
         interactive process idling at its prompt."""
         return self._busy
 
+    def is_bg_shell_busy(self) -> bool:
+        """True when the agent itself is quiet (not is_busy()) but a
+        background command it started is still running -- see
+        poll_bg_shell()."""
+        return self._bg_shell
+
     def is_waiting(self) -> bool:
         """True when the agent needs the user: it has settled on a numbered
         prompt, an interactive AskUserQuestion/ExitPlanMode prompt is open, or
@@ -877,6 +904,51 @@ class TerminalAgent(QObject):
         self._tool_waiting = False
         self._turn_waiting = False
         self._emit_waiting()
+
+    def _reset_bg_shell(self) -> None:
+        """Clear the background-shell latch and its learned baseline
+        (start/restart/exit) and emit if it was set. A fresh launch's job
+        starts from a clean slate, and a dead agent isn't waiting on
+        anything."""
+        self._bg_baseline = None
+        self._bg_extra_since = None
+        if self._bg_shell:
+            self._bg_shell = False
+            self.bg_shell_changed.emit(False)
+
+    def poll_bg_shell(self) -> None:
+        """Externally ticked (see WorkspaceManager.poll_bg_shell_activity):
+        notice a job whose live process count sits above this agent's
+        learned resting level while the agent ITSELF is quiet -- the
+        signature of a background command (a Bash tool call with
+        run_in_background, a shell's own `cmd &`) still running after the
+        agent returned to its prompt. Debounced like _mark_busy/idle so a
+        process that comes and goes quickly never flickers the indicator."""
+        if self.status not in (AgentStatus.RUNNING, AgentStatus.STARTING):
+            return
+        count = self.worker.job_process_count()
+        if count <= 0:
+            return  # query unsupported/failed -- don't flap on missing data
+        # learn the resting size down over time: only a count ABOVE the
+        # quietest one ever seen for this launch counts as "extra" -- this is
+        # what keeps a ConPTY wrapper process (conhost/OpenConsole) or any
+        # other fixed overhead from being mistaken for background work
+        if self._bg_baseline is None or count < self._bg_baseline:
+            self._bg_baseline = count
+        extra = count > self._bg_baseline
+        now = time.time()
+        if self.is_busy() or not extra:
+            self._bg_extra_since = None
+            if self._bg_shell:
+                self._bg_shell = False
+                self.bg_shell_changed.emit(False)
+            return
+        if self._bg_extra_since is None:
+            self._bg_extra_since = now
+        elif (now - self._bg_extra_since >= BG_SHELL_DEBOUNCE_S
+              and not self._bg_shell):
+            self._bg_shell = True
+            self.bg_shell_changed.emit(True)
 
     def _mark_busy(self) -> None:
         # only a live agent can be working; guard on status (not worker state)
@@ -1301,6 +1373,7 @@ class TerminalAgent(QObject):
                     self._busy = False
                     self.activity_changed.emit(False)
                 self._reset_waiting()  # a dead/stopped agent isn't waiting
+                self._reset_bg_shell()  # ...nor waiting on a shell to finish
             self.status_changed.emit(status)
 
     def _on_worker_state(self, state: WorkerState) -> None:

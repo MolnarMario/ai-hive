@@ -420,6 +420,155 @@ def test_limit_blocked_workspace_stats():
           blocked_events == [(ws.id, agent.id)], blocked_events)
 
 
+def test_winjob_process_count():
+    """WinJob.process_count() reports the live process count for a job -- the
+    detection primitive behind poll_bg_shell(). Windows-only; skipped
+    everywhere else since job objects don't exist there."""
+    if sys.platform != "win32":
+        check("winjob: skipped on non-Windows (job objects are Windows-only)",
+              True)
+        return
+    from app.process_worker import WinJob
+
+    job = WinJob()
+    check("winjob: a fresh job object gets a real handle on Windows",
+          job._handle is not None)
+    check("winjob: process_count on an empty (unassigned) job is 0",
+          job.process_count() == 0)
+
+    procs = [subprocess.Popen([sys.executable, "-c",
+                               "import time; time.sleep(5)"])
+             for _ in range(2)]
+    try:
+        for p in procs:
+            check(f"winjob: assign succeeds for a live child (pid {p.pid})",
+                  job.assign(p.pid))
+        check("winjob: process_count reflects both assigned processes",
+              job.process_count() == 2, job.process_count())
+    finally:
+        job.terminate_tree()
+        for p in procs:
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+        job.close()
+    check("winjob: process_count after close is 0 (no handle)",
+          job.process_count() == 0)
+
+
+def test_bg_shell_workspace_stats():
+    """poll_bg_shell()/workspace_stats()'s bg_shell count must: debounce a
+    transient process blip (git/rg-style, never flags), never flag a BUSY
+    agent (the amber "working" indicator already covers that case), flag
+    once a job's process count sits above its learned baseline for
+    BG_SHELL_DEBOUNCE_S while quiet, clear the instant the extra process is
+    gone, and reset on exit -- transient like busy/waiting, never dirty."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import AgentStatus, BG_SHELL_DEBOUNCE_S
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+    import app.terminal_agent as terminal_agent_mod
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("BgShell", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Shelled",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+    check("bg shell stats: nobody flagged yet",
+          mgr.workspace_stats(ws.id)["bg_shell"] == 0)
+
+    stats_events = []
+    dirtied = []
+    mgr.workspaceStatsChanged.connect(
+        lambda wid, s: stats_events.append(dict(s)) if wid == ws.id else None)
+    mgr.dirty.connect(lambda: dirtied.append(True))
+
+    fake_now = [1000.0]
+    orig_time = terminal_agent_mod.time.time
+    orig_count = agent.worker.job_process_count
+    count = [1]
+    terminal_agent_mod.time.time = lambda: fake_now[0]
+    agent.worker.job_process_count = lambda: count[0]
+    try:
+        agent.poll_bg_shell()   # learns the baseline (1)
+        check("bg shell: the baseline alone never flags",
+              not agent.is_bg_shell_busy())
+
+        count[0] = 0   # a failed/unsupported query must never flap state
+        agent.poll_bg_shell()
+        check("bg shell: a count<=0 (query failed) leaves the state alone",
+              not agent.is_bg_shell_busy())
+        count[0] = 1
+
+        count[0] = 2   # an extra process appears
+        agent.poll_bg_shell()
+        check("bg shell: an extra process alone (before the debounce "
+              "elapses) does not flag yet", not agent.is_bg_shell_busy())
+
+        fake_now[0] += 1.0   # a blip: gone before the debounce elapses
+        count[0] = 1
+        agent.poll_bg_shell()
+        check("bg shell: a process that goes away before the debounce "
+              "elapses never flags (no flicker on git/rg-style blips)",
+              not agent.is_bg_shell_busy() and agent._bg_extra_since is None)
+
+        count[0] = 2
+        agent.poll_bg_shell()             # extra_since starts again
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell: an extra process sustained past the debounce flags "
+              "it", agent.is_bg_shell_busy())
+        check("bg shell stats: count is 1 once flagged",
+              mgr.workspace_stats(ws.id)["bg_shell"] == 1)
+        check("bg shell stats: workspaceStatsChanged fired live",
+              stats_events and stats_events[-1]["bg_shell"] == 1, stats_events)
+        check("bg shell: never marks the session dirty (transient)",
+              not dirtied, dirtied)
+
+        # a genuinely busy agent must never be flagged, even with an extra
+        # process present -- the amber "working" indicator already covers it
+        agent._busy = True
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 1
+        agent.poll_bg_shell()
+        check("bg shell: a busy agent is never flagged",
+              not agent.is_bg_shell_busy())
+        check("bg shell stats: count drops back to 0 while busy",
+              mgr.workspace_stats(ws.id)["bg_shell"] == 0)
+        agent._busy = False
+
+        # re-flag once busy clears and it's sustained again (the extra-since
+        # clock restarted while busy, so this needs its own poll to start,
+        # then a later one past the debounce), then clear the instant the
+        # extra process itself is gone
+        agent.poll_bg_shell()             # extra_since starts now
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 1
+        agent.poll_bg_shell()
+        check("bg shell: re-flags once busy clears and it's sustained again",
+              agent.is_bg_shell_busy())
+        count[0] = 1
+        agent.poll_bg_shell()
+        check("bg shell: clears the instant the extra process is gone",
+              not agent.is_bg_shell_busy())
+        check("bg shell stats: workspaceStatsChanged fired on the falling "
+              "edge too", stats_events[-1]["bg_shell"] == 0, stats_events)
+
+        # exit resets the latch AND the learned baseline
+        count[0] = 2
+        agent.poll_bg_shell()             # extra_since starts now
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 1
+        agent.poll_bg_shell()
+        check("bg shell: sanity flag before exit", agent.is_bg_shell_busy())
+        agent._set_status(AgentStatus.EXITED_OK)
+        check("bg shell: exit clears the flag and its learned baseline",
+              not agent.is_bg_shell_busy() and agent._bg_baseline is None)
+    finally:
+        terminal_agent_mod.time.time = orig_time
+        agent.worker.job_process_count = orig_count
+
+
 def test_chime_persistence():
     """The top-bar chime toggle flips its glyph + emits soundToggled, and the
     on/off preference round-trips through the session ui state."""
@@ -512,12 +661,12 @@ def test_taskbar_badge():
 
     key, text, fill, note = spec()
     check("taskbar: an idle hive gets NO overlay at all",
-          text is None and key == "0|0", (key, text))
+          text is None and key == "0|0|0", (key, text))
 
     agents[0]._busy = True        # what _mark_busy sets on an output burst
     key, text, fill, note = spec()
     check("taskbar: one agent working shows an amber 1",
-          (key, text, fill) == ("1|0", "1", ornaments.TASKBAR_WORKING),
+          (key, text, fill) == ("1|0|0", "1", ornaments.TASKBAR_WORKING),
           (key, text, fill))
     check("taskbar: the description names the count", note == "1 working", note)
 
@@ -531,7 +680,7 @@ def test_taskbar_badge():
     agents[2]._waiting = True
     key, text, fill, note = spec()
     check("taskbar: an agent with a question turns the disc blue, count intact",
-          (key, text, fill) == ("3|1", "3", ornaments.TASKBAR_ASKING),
+          (key, text, fill) == ("3|1|0", "3", ornaments.TASKBAR_ASKING),
           (key, text, fill))
     check("taskbar: the description says someone is waiting",
           "waiting for you" in note, note)
@@ -540,7 +689,7 @@ def test_taskbar_badge():
         a._busy = False
     key, text, fill, note = spec()
     check("taskbar: nothing working but a question pending shows a blue '?'",
-          (key, text, fill) == ("0|1", "?", ornaments.TASKBAR_ASKING),
+          (key, text, fill) == ("0|1|0", "?", ornaments.TASKBAR_ASKING),
           (key, text, fill))
 
     agents[2]._waiting = False
@@ -561,7 +710,7 @@ def test_taskbar_badge():
     key, text, _f, _n = spec()
     check("taskbar: past 9 the disc says 9+ (a bigger number is unreadable "
           "at this size) and every such state collapses to one key",
-          (key, text) == ("10|0", "9+"), (key, text))
+          (key, text) == ("10|0|0", "9+"), (key, text))
 
     # --- transient: the count must NEVER reach the session ----------------
     win._save_timer.stop()
@@ -618,6 +767,78 @@ def test_taskbar_badge():
           again._taskbar_key is None, again._taskbar_key)
     again._save_timer.stop()
     again.close()
+    app.processEvents()
+
+
+def test_bg_shell_taskbar_state():
+    """The taskbar's third state: no agent is busy or asking, but one or more
+    are idle with a background command still running -- previously invisible
+    everywhere, including the taskbar. It must surface ONLY when neither busy
+    nor asking is true (both outrank it), and the edge-guard key must still
+    coalesce an unchanged state."""
+    from PySide6.QtWidgets import QApplication
+    from app.session_store import SessionStore
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets import ornaments
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-taskbar-bg-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    app.processEvents()
+    mgr = win.manager
+    ws = mgr.create_workspace("TaskbarBg", str(tmp))
+    agents = [mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, f"A{i}",
+                                                 cwd=str(tmp)), autostart=False)
+              for i in range(2)]
+
+    def spec():
+        return win._taskbar_badge_spec()
+
+    key, text, fill, note = spec()
+    check("taskbar bg: idle hive with nothing flagged shows no overlay",
+          text is None, (key, text))
+
+    agents[0]._bg_shell = True
+    key, text, fill, note = spec()
+    check("taskbar bg: one agent idle-on-a-shell shows an orange 1",
+          (text, fill) == ("1", ornaments.TASKBAR_BG_SHELL), (text, fill))
+    check("taskbar bg: the description names the count",
+          "background command" in note, note)
+
+    agents[1]._bg_shell = True
+    check("taskbar bg: the count is every bg-shell agent",
+          spec()[1] == "2", spec())
+
+    # busy anywhere outranks bg-shell, even elsewhere in the hive
+    agents[1]._busy = True
+    key, text, fill, note = spec()
+    check("taskbar bg: a busy agent elsewhere wins over bg-shell (amber, "
+          "busy count only)",
+          (text, fill) == ("1", ornaments.TASKBAR_WORKING), (text, fill))
+    agents[1]._busy = False
+
+    # asking outranks both
+    agents[1]._waiting = True
+    key, text, fill, note = spec()
+    check("taskbar bg: asking wins over bg-shell too",
+          fill == ornaments.TASKBAR_ASKING, (text, fill))
+    agents[1]._waiting = False
+
+    # unchanged bg-shell state -> unchanged key (the push's edge guard)
+    first_key = spec()[0]
+    check("taskbar bg: an unchanged bg-shell state renders an unchanged key",
+          spec()[0] == first_key, (first_key, spec()[0]))
+
+    agents[0]._bg_shell = False
+    agents[1]._bg_shell = False
+    check("taskbar bg: clearing every flag clears the overlay",
+          spec()[1] is None, spec())
+
+    win._save_timer.stop()
+    win.close()
     app.processEvents()
 
 
@@ -2185,6 +2406,55 @@ def test_limit_blocked_live_ui():
     row.refresh(a)
     check("limit UI: sidebar agent row also clears on its next poll",
           row.limit_mark.isHidden())
+
+    card.detach(); card.close()
+    row.deleteLater()
+    a.deleteLater()
+
+
+def test_bg_shell_live_ui():
+    """The card header's gear mark and the sidebar's inline agent-row gear
+    mark both say "idle, but a background command it started is still
+    running" -- and both must clear the instant it isn't true anymore. The
+    card is signal-driven (bg_shell_changed), the sidebar AgentRow is polled
+    (refresh() reads is_bg_shell_busy() directly) -- this exercises both
+    paths end to end."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard
+    from app.widgets.sidebar import AgentRow
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Shelled", cwd="."))
+    card = TerminalCard(a)
+    card.resize(900, 300); card.show(); pump(60)
+    check("bg shell UI: gear hidden before anything is flagged",
+          not card.bg_mark.isVisible())
+
+    a._bg_shell = True
+    a.bg_shell_changed.emit(True)
+    pump(30)
+    check("bg shell UI: card gear shows once the agent is flagged",
+          card.bg_mark.isVisible())
+
+    row = AgentRow("w1", a)
+    check("bg shell UI: a freshly built sidebar agent row also shows it",
+          not row.bg_mark.isHidden())
+
+    a._bg_shell = False
+    a.bg_shell_changed.emit(False)
+    pump(30)
+    check("bg shell UI: card gear disappears LIVE once cleared",
+          not card.bg_mark.isVisible())
+    row.refresh(a)
+    check("bg shell UI: sidebar agent row also clears on its next poll",
+          row.bg_mark.isHidden())
 
     card.detach(); card.close()
     row.deleteLater()
@@ -8393,6 +8663,8 @@ def main():
     test_agent_waiting()
     test_notification_chime()
     test_limit_blocked_workspace_stats()
+    test_winjob_process_count()
+    test_bg_shell_workspace_stats()
     test_chime_persistence()
     test_hook_prompt_events()
     test_agent_hook_waiting()
@@ -8409,6 +8681,7 @@ def main():
     test_token_usage_badge()
     test_live_model_effort()
     test_limit_blocked_live_ui()
+    test_bg_shell_live_ui()
     test_no_em_dashes_in_visible_text()
     test_reveal_agent()
     test_agent_busy_activity()
@@ -8450,6 +8723,7 @@ def main():
     test_sidebar_search()
     test_plan_usage()
     test_taskbar_badge()
+    test_bg_shell_taskbar_state()
     test_limit_ledger()
     test_auto_continue_on_limit_reset()
     test_startup_limit_recovery()

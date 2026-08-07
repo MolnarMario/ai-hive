@@ -334,6 +334,12 @@ class AgentCountBadge(QWidget):
 # only channel that reliably carries a second meaning.
 TASKBAR_WORKING = "#d9b24a"   # agents working, none of them asking
 TASKBAR_ASKING = "#3b82f6"    # at least one agent is waiting on the user
+# no agent is busy or asking, but one or more are idle with a background
+# command still running (see TerminalAgent.poll_bg_shell) -- the case that
+# used to leave the taskbar silent even though real work was still in
+# flight. A third fixed hue distinct from both above; orange keeps it in the
+# warm "working-adjacent" family without being mistaken for TASKBAR_WORKING.
+TASKBAR_BG_SHELL = "#c97a3d"
 
 
 def taskbar_badge_bgra(text: str, fill: str, size: int):

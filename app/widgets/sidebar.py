@@ -188,6 +188,16 @@ class WorkspaceRow(QFrame):
         self.sched_badge.clicked.connect(
             lambda: self.agentsRequested.emit(self.ws_id))
 
+        # gear + count: agent(s) here are idle (not busy) but a background
+        # command they started (a Bash run_in_background call, a shell's
+        # `cmd &`) is still running. Same click target as the badges above.
+        self.bg_badge = QToolButton(self)
+        self.bg_badge.setObjectName("WsBgShell")
+        self.bg_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.bg_badge.hide()
+        self.bg_badge.clicked.connect(
+            lambda: self.agentsRequested.emit(self.ws_id))
+
         # a sweeping-arc throbber with the WORKING count; pinned far-right, so
         # the hover folder/delete buttons appear to its LEFT (see layout order)
         self.work_spinner = WorkspaceSpinner(self)
@@ -200,6 +210,7 @@ class WorkspaceRow(QFrame):
         lay.addWidget(self.delete_btn)
         lay.addWidget(self.sched_badge)
         lay.addWidget(self.limit_badge)
+        lay.addWidget(self.bg_badge)
         lay.addWidget(self.q_badge)
         lay.addWidget(self.work_spinner)
 
@@ -267,9 +278,18 @@ class WorkspaceRow(QFrame):
             self.sched_badge.setToolTip(
                 f"{scheduled} agent(s) with a scheduled message, "
                 "click to see who")
+        # the gear + count shows agent(s) idle but waiting on a background
+        # command they started to finish (see TerminalAgent.poll_bg_shell)
+        bg = stats.get("bg_shell", 0)
+        self.bg_badge.setVisible(bg > 0)
+        if bg > 0:
+            self.bg_badge.setText(f"⚙{bg}")
+            self.bg_badge.setToolTip(
+                f"{bg} agent(s) idle but still waiting on a background "
+                "command to finish, click to see who")
         tip = (f"{total} agent(s): {busy} working, {running} running, "
                f"{e} error, {waiting} waiting, {blocked} limit-stopped, "
-               f"{scheduled} scheduled")
+               f"{scheduled} scheduled, {bg} background-shell")
         self.setToolTip(f"{tip}\n{self._folder}" if self._folder else tip)
 
     # ------------------------------------------------------------ rename ---
@@ -664,6 +684,13 @@ class AgentRow(QFrame):
         self.limit_mark = QLabel("⏳", self)
         self.limit_mark.setObjectName("WsAgentLimit")
         self.limit_mark.hide()
+        # idle but a background command it started is still running -- same
+        # marker as the card header
+        self.bg_mark = QLabel("⚙", self)
+        self.bg_mark.setObjectName("WsAgentBgShell")
+        self.bg_mark.setToolTip(
+            "Idle, but a background command it started is still running")
+        self.bg_mark.hide()
         # a message is queued to be typed into this agent later, so a scheduled
         # send is findable from a collapsed workspace too. A QToolButton (not a
         # QLabel like q/limit_mark above) so its own click is CONSUMED instead
@@ -682,6 +709,7 @@ class AgentRow(QFrame):
         lay.addWidget(self.summary, 1)
         lay.addWidget(self.sched_mark)
         lay.addWidget(self.limit_mark)
+        lay.addWidget(self.bg_mark)
         lay.addWidget(self.q)
         self.refresh(agent)
 
@@ -705,6 +733,10 @@ class AgentRow(QFrame):
         if blocked:
             self.limit_mark.setToolTip(
                 getattr(agent, "limit_summary", lambda: "")())
+        # idle but a background command it started is still running, polled
+        # on the same tick as everything else here
+        self.bg_mark.setVisible(
+            bool(getattr(agent, "is_bg_shell_busy", lambda: False)()))
         # deferred messages, polled on the same tick as everything else here.
         # The countdown itself stays on the card: this row only says one exists.
         held = list(getattr(agent, "scheduled_messages", lambda: [])())

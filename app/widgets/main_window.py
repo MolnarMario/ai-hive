@@ -62,6 +62,12 @@ PROMPT_SYNC_MS = 750
 # while nothing changed, and a tail-only read when it did.
 MODEL_SYNC_MS = 1500
 
+# how often to poll each running agent's Job Object process count, to notice
+# a background command still running after the agent itself has gone quiet
+# (drives the gear badge). A single cheap syscall per agent, so a short
+# interval is fine.
+BG_SHELL_POLL_MS = 2000
+
 # how often to re-read the Claude account's plan usage from the API. One small
 # HTTPS GET; a minute is well inside the resolution of a 5-hour window.
 USAGE_POLL_MS = 60000
@@ -1049,6 +1055,12 @@ class MainWindow(QMainWindow):
         self._model_sync_timer.setInterval(MODEL_SYNC_MS)
         self._model_sync_timer.timeout.connect(self.manager.refresh_model_effort)
 
+        # notice a background command still running after the agent itself
+        # has gone quiet (transient: this never saves)
+        self._bg_shell_timer = QTimer(self)
+        self._bg_shell_timer.setInterval(BG_SHELL_POLL_MS)
+        self._bg_shell_timer.timeout.connect(self.manager.poll_bg_shell_activity)
+
         # ---- Claude plan usage (top-bar readout + limit-reached edges) ----
         # PURELY TRANSIENT: a reading refreshes the badge and may emit the
         # plan-limit edges, but it must NEVER mark the session dirty — the same
@@ -1144,6 +1156,7 @@ class MainWindow(QMainWindow):
         self._session_sync_timer.start()
         self._prompt_sync_timer.start()
         self._model_sync_timer.start()
+        self._bg_shell_timer.start()
         self._limit_watch_timer.start()
         # a restored session can bring back queued messages, so the tick may
         # need to be running before anything else happens
@@ -2201,16 +2214,19 @@ class MainWindow(QMainWindow):
     # a question. An idle hive gets no overlay at all, which is what makes "is
     # anything still running?" answerable from across the room.
 
-    def _taskbar_state(self) -> tuple[int, bool]:
-        """(agents working, does any agent need the user).
+    def _taskbar_state(self) -> tuple[int, bool, int]:
+        """(agents working, does any agent need the user, agents idle but
+        waiting on a background shell to finish).
 
         Deliberately the SAME predicates the sidebar reads (`is_busy` /
-        `is_waiting`) rather than a parallel notion of activity, so the taskbar
-        and the sidebar can never disagree about what the hive is doing.
+        `is_waiting` / `is_bg_shell_busy`) rather than a parallel notion of
+        activity, so the taskbar and the sidebar can never disagree about
+        what the hive is doing.
         """
         agents = self.manager.all_agents()
         return (sum(1 for a in agents if a.is_busy()),
-                any(a.is_waiting() for a in agents))
+                any(a.is_waiting() for a in agents),
+                sum(1 for a in agents if a.is_bg_shell_busy()))
 
     def _schedule_taskbar_badge(self) -> None:
         """Coalesce a burst of stat recomputes into one push.
@@ -2236,24 +2252,32 @@ class MainWindow(QMainWindow):
 
         Kept separate from the push so the whole state table is decidable
         without a shell, a window handle or a COM apartment.
+
+        Priority when several states hold at once: asking wins outright (it
+        needs the user NOW); a genuinely busy count is next; a background
+        shell only surfaces when NEITHER of those is true -- it is exactly
+        the case that used to leave the taskbar silent even though a
+        background command was still running.
         """
-        count, asking = self._taskbar_state()
+        count, asking, bg = self._taskbar_state()
         if not self._taskbar_badge:
-            count, asking = 0, False   # switched off reads as "nothing to show"
-        key = f"{min(count, 10)}|{int(asking)}"
-        if count <= 0 and not asking:
+            count, asking, bg = 0, False, 0   # switched off reads as "nothing"
+        key = f"{min(count, 10)}|{int(asking)}|{min(bg, 10)}"
+        if count <= 0 and not asking and bg <= 0:
             return (key, None, None, "")
         # >9 stops being a number anyone reads at a glance, and stops fitting
         # the disc; with nothing working the glyph carries the meaning instead.
-        text = "?" if count <= 0 else ("9+" if count > 9 else str(count))
-        fill = ornaments.TASKBAR_ASKING if asking else ornaments.TASKBAR_WORKING
-        if asking and count > 0:
-            note = f"{count} working, one is waiting for you"
-        elif asking:
-            note = "an agent is waiting for you"
-        else:
-            note = f"{count} working"
-        return (key, text, fill, note)
+        if asking:
+            text = "?" if count <= 0 else ("9+" if count > 9 else str(count))
+            note = (f"{count} working, one is waiting for you" if count > 0
+                     else "an agent is waiting for you")
+            return (key, text, ornaments.TASKBAR_ASKING, note)
+        if count > 0:
+            text = "9+" if count > 9 else str(count)
+            return (key, text, ornaments.TASKBAR_WORKING, f"{count} working")
+        text = "9+" if bg > 9 else str(bg)
+        note = f"{bg} agent(s) idle, waiting on a background command to finish"
+        return (key, text, ornaments.TASKBAR_BG_SHELL, note)
 
     def _push_taskbar_badge(self) -> None:
         """Render the overlay and hand it to the shell, if it actually changed.
@@ -2855,6 +2879,7 @@ class MainWindow(QMainWindow):
         self._session_sync_timer.stop()
         self._prompt_sync_timer.stop()
         self._model_sync_timer.stop()
+        self._bg_shell_timer.stop()
         self._limit_watch_timer.stop()
         self._usage_timer.stop()
         self._usage_tick_timer.stop()
