@@ -40,8 +40,8 @@ _USAGE_CACHE: dict[str, tuple[float, int, int, int]] = {}
 # cache for limit_cut_off: path -> (mtime, size, verdict dict).
 _LIMIT_CACHE: dict[str, tuple[float, int, dict]] = {}
 
-# cache for latest_model_effort: path -> (mtime, size, model, effort).
-_MODEL_CACHE: dict[str, tuple[float, int, str, str]] = {}
+# cache for latest_model_effort: path -> (mtime, size, model, effort, mode).
+_MODEL_CACHE: dict[str, tuple[float, int, str, str, str]] = {}
 
 # How much of the tail latest_model_effort reads. It polls far more often than
 # the title/usage readers, so it must not re-scan a multi-MB conversation on
@@ -159,7 +159,7 @@ def limit_cut_off(cwd: str, session_id: str) -> dict | None:
     """The same verdict as `ended_on_limit`, but TRI-STATE and detailed.
 
     Returns None when there is no readable transcript at all, and otherwise
-    `{"cut_off", "at", "resets_at", "banner", "window"}`.
+    `{"cut_off", "at", "resets_at", "banner", "window", "synthetic"}`.
 
     The distinction between "the conversation carried on" and "there is no
     conversation to read" is what makes this safe to act on. A caller using it
@@ -169,6 +169,18 @@ def limit_cut_off(cwd: str, session_id: str) -> dict | None:
     parked agent. `ended_on_limit` collapses both to False, which is right for
     a caller that only wants positive evidence.
 
+    CAREFUL, and this is the trap: "not flushed yet" only reads as None while
+    the transcript file does not EXIST. A running agent always has one, so a
+    banner Claude has drawn but not yet written reads as `cut_off False` —
+    indistinguishable, on that field alone, from a conversation that carried
+    on. That is fine for a caller running hours later at reset time, and
+    wrong for one running seconds after the banner appeared. Hence
+    `synthetic`: True only when a banner WAS found and the turn behind it was
+    Claude Code's own plumbing (`_is_synthetic_user_turn`) rather than
+    anything the user or AI Hive asked for, so nothing of substance was
+    interrupted. It is POSITIVE evidence, never the absence of evidence, and
+    it is what an early caller must gate on.
+
     The banner text and its window come back too, because a cut-off's identity
     (which window stopped it, and when that window reopens) cannot be
     reconstructed from a bool. Cached by (mtime,size); never raises.
@@ -176,6 +188,40 @@ def limit_cut_off(cwd: str, session_id: str) -> dict | None:
     if not session_id or not cwd:
         return None
     return _read_limit_cut_off(transcript_path(cwd, session_id))
+
+
+# Claude Code's own plumbing, as it appears in a bare-string 'user' record.
+# An ALLOWLIST, deliberately, not "any <tag>": the tags below are things the
+# CLI injects with nobody asking, while `<command-name>`/`<command-message>`
+# -- which read identically -- are a slash command the USER typed, i.e. work
+# they asked for and would want resumed. Keying off the leading "<" alone
+# swept those in and would silently drop a genuine cut-off during `/compact`,
+# a custom command, or anything else invoked by name (observed in real
+# transcripts: a `<command-name>` record followed directly by the assistant
+# turn). Every entry here was seen standing alone in a real transcript;
+# `<system-reminder>` is the one defensive addition -- it is injected context,
+# never a request.
+_SYNTHETIC_USER_TAGS = ("<task-notification>", "<local-command-stdout>",
+                        "<local-command-caveat>", "<system-reminder>")
+
+
+def _is_synthetic_user_turn(rec: dict) -> bool:
+    """True when a 'user' record is Claude Code's OWN plumbing -- a background
+    command's completion notification, a slash-command's stdout, ... -- rather
+    than something a human or AI Hive actually asked for.
+
+    These are a bare `<tag>...` string from `_SYNTHETIC_USER_TAGS` (the same
+    family `latest_model_effort` already skips as `<synthetic>`), never how a
+    real prompt or a delivered task reads. The distinction matters here
+    because Claude Code can turn a background tool's own completion into a
+    brand-new turn with NO input from the user or AI Hive at all -- and if the
+    account happens to be exhausted right then, that turn eats the SAME
+    "You've hit your session limit" menu a real interruption would, with
+    nothing of substance actually lost."""
+    content = (rec.get("message") or {}).get("content")
+    if not isinstance(content, str):
+        return False        # a list of blocks is a real prompt or a tool reply
+    return content.lstrip().startswith(_SYNTHETIC_USER_TAGS)
 
 
 def _read_limit_cut_off(path: str) -> dict | None:
@@ -187,17 +233,22 @@ def _read_limit_cut_off(path: str) -> dict | None:
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
         return cached[2]
     found = {"cut_off": False, "at": 0.0, "resets_at": 0.0,
-             "banner": "", "window": ""}
+             "banner": "", "window": "", "synthetic": False}
+    last_user_synthetic = False   # no evidence yet -> assume a real turn
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
-                if '"assistant"' not in line:   # cheap prefilter
-                    continue
+                if '"assistant"' not in line and '"user"' not in line:
+                    continue      # cheap prefilter
                 try:
                     rec = json.loads(line)
                 except ValueError:
                     continue  # a partial last line while Claude is writing
-                if rec.get("type") != "assistant" or rec.get("isSidechain"):
+                rtype = rec.get("type")
+                if rtype == "user" and not rec.get("isSidechain"):
+                    last_user_synthetic = _is_synthetic_user_turn(rec)
+                    continue
+                if rtype != "assistant" or rec.get("isSidechain"):
                     continue
                 text = _message_text(rec)
                 # every assistant turn overwrites the verdict, so only the LAST
@@ -207,16 +258,29 @@ def _read_limit_cut_off(path: str) -> dict | None:
                 # it never needed (observed live on an agent working on this
                 # feature). A real cut-off is a short injected line.
                 banner = limit_banner.banner_line(text)
-                if banner:
+                # A banner is only a genuine interruption when the turn it cut
+                # off was one the user (or a delivered task) actually asked
+                # for -- see `_is_synthetic_user_turn`. Otherwise this is the
+                # SAME class of false alarm as the "quoting the banner in
+                # prose" case above: real API exhaustion, but nothing of the
+                # agent's assigned work was actually lost.
+                if banner and not last_user_synthetic:
                     when = _record_epoch(rec)
                     found = {
                         "cut_off": True, "at": when, "banner": banner,
                         "window": limit_banner.banner_window(banner),
                         "resets_at": (limit_banner.banner_reset_at(text, when)
-                                      or 0.0)}
+                                      or 0.0),
+                        "synthetic": False}
                 else:
+                    # `synthetic` is POSITIVE evidence and only that: a banner
+                    # we DID see, refuted by the turn behind it. A last turn
+                    # with no banner at all leaves it False, which is what
+                    # keeps "the record isn't written yet" distinguishable
+                    # from "this was never real work" -- see `limit_cut_off`.
                     found = {"cut_off": False, "at": 0.0, "resets_at": 0.0,
-                             "banner": "", "window": ""}
+                             "banner": "", "window": "",
+                             "synthetic": bool(banner)}
     except OSError:
         return cached[2] if cached else None
     _LIMIT_CACHE[path] = (st.st_mtime, st.st_size, found)
@@ -325,45 +389,52 @@ def model_display(raw: str) -> str:
     return text.replace("(1M context)", "(1M)").strip()
 
 
-def latest_model_effort(cwd: str, session_id: str) -> tuple[str, str]:
-    """The model and effort this conversation is on RIGHT NOW, as
-    (model_display, effort). Both can change mid-session (/model, /effort), so
-    neither the launch flags nor a single record kind is enough; two sources are
-    merged in file order, last one wins:
+def latest_model_effort(cwd: str, session_id: str) -> tuple[str, str, str]:
+    """What this conversation is running with RIGHT NOW, as
+    (model_display, effort, permission_mode). All three can change mid-session
+    (/model, /effort, Shift+Tab), so neither the launch flags nor a single
+    record kind is enough; the sources are merged in file order, last one wins:
 
       * every assistant record carries `message.model` and a top-level `effort`
         (ground truth, but only as of the last turn);
       * `/model` and `/effort` append a <local-command-stdout> user record the
         instant the user picks, which is what makes an idle agent's switch
-        visible without waiting for a turn.
+        visible without waiting for a turn;
+      * the permission mode rides on every user prompt record as a top-level
+        `permissionMode`, AND on a dedicated `{"type":"permission-mode"}`
+        record Claude appends as soon as Shift+Tab changes it (again, the part
+        that shows an idle agent's switch). Its token is the CLI's INTERNAL
+        name, which is not always a launch flag ("default"); translating that
+        is providers.normalize_permission_mode's job, not this reader's.
 
     Sub-agent sidechains are skipped (they run their own model) and so is the
-    `<synthetic>` pseudo-model. ("", "") when there is no file / no evidence.
-    Cached by (mtime,size); never raises."""
+    `<synthetic>` pseudo-model. ("", "", "") when there is no file / no
+    evidence. Cached by (mtime,size); never raises."""
     if not session_id or not cwd:
-        return ("", "")
+        return ("", "", "")
     return _read_model_effort(transcript_path(cwd, session_id))
 
 
-def _read_model_effort(path: str) -> tuple[str, str]:
+def _read_model_effort(path: str) -> tuple[str, str, str]:
     try:
         st = os.stat(path)
     except OSError:
-        return ("", "")
+        return ("", "", "")
     cached = _MODEL_CACHE.get(path)
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
-        return (cached[2], cached[3])
+        return (cached[2], cached[3], cached[4])
     try:
-        model, effort = _scan_model_effort(_tail_lines(path, _MODEL_TAIL_BYTES))
+        model, effort, mode = _scan_model_effort(
+            _tail_lines(path, _MODEL_TAIL_BYTES))
         if not model and st.st_size > _MODEL_TAIL_BYTES:
             # nothing in the tail (a long stretch of tool output, say): pay for
             # the full scan once, then the cache holds until the file changes
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                model, effort = _scan_model_effort(fh)
+                model, effort, mode = _scan_model_effort(fh)
     except OSError:
-        return (cached[2], cached[3]) if cached else ("", "")
-    _MODEL_CACHE[path] = (st.st_mtime, st.st_size, model, effort)
-    return (model, effort)
+        return (cached[2], cached[3], cached[4]) if cached else ("", "", "")
+    _MODEL_CACHE[path] = (st.st_mtime, st.st_size, model, effort, mode)
+    return (model, effort, mode)
 
 
 def _tail_lines(path: str, limit: int) -> list[str]:
@@ -380,12 +451,13 @@ def _tail_lines(path: str, limit: int) -> list[str]:
     return data.decode("utf-8", "replace").splitlines()
 
 
-def _scan_model_effort(lines) -> tuple[str, str]:
-    model = effort = ""
+def _scan_model_effort(lines) -> tuple[str, str, str]:
+    model = effort = mode = ""
     for line in lines:
         is_turn = '"assistant"' in line
         is_pick = "Set model to" in line or "Set effort level to" in line
-        if not (is_turn or is_pick):
+        is_mode = '"permissionMode"' in line
+        if not (is_turn or is_pick or is_mode):
             continue  # cheap prefilter before the JSON parse
         try:
             rec = json.loads(line)
@@ -393,6 +465,13 @@ def _scan_model_effort(lines) -> tuple[str, str]:
             continue  # a partial last line while Claude is writing
         if rec.get("isSidechain"):
             continue  # a sub-agent's model, not this conversation's
+        # the permission mode rides on ordinary records rather than having a
+        # record kind of its own, so it is read before the type dispatch: a
+        # user prompt carries the mode it was submitted under, and a bare
+        # {"type":"permission-mode"} record marks a Shift+Tab as it happens
+        current = rec.get("permissionMode")
+        if isinstance(current, str) and current:
+            mode = current
         if rec.get("type") == "assistant":
             raw = ((rec.get("message") or {}).get("model") or "")
             if raw and not raw.startswith("<"):   # skip the <synthetic> model
@@ -411,7 +490,7 @@ def _scan_model_effort(lines) -> tuple[str, str]:
         m = _SET_EFFORT_RE.search(_ANSI_RE.sub("", content))
         if m:
             effort = m.group(1).lower()
-    return (model, effort)
+    return (model, effort, mode)
 
 
 def _parse_set_model(content: str) -> tuple[str, str]:

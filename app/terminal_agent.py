@@ -14,8 +14,9 @@ from enum import Enum
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from . import providers, transcripts
+from . import providers, scheduled_send, transcripts
 from .coordination import sanitize_text
+from .scheduled_send import MISSED, PENDING, SENT, ScheduledMessage
 from .process_worker import AgentSpec, ProcessWorker, WorkerState
 from .pty_worker import PtyWorker
 
@@ -158,6 +159,10 @@ class TerminalAgent(QObject):
     tokens_changed = Signal(str)        # context-usage badge text ("" = hide)
     model_changed = Signal(str)         # live model/effort badge text ("" = hide)
     limit_blocked_changed = Signal(bool)  # cut off by the plan limit (latched)
+    # the deferred-message queue changed (added/cancelled/sent/missed). NOT a
+    # countdown tick: this list IS persisted, so the manager wires this to a
+    # save, and a per-second tick on that would rewrite session.json all day.
+    scheduled_changed = Signal()
 
     def __init__(self, spec: AgentSpec, parent: QObject | None = None):
         super().__init__(parent)
@@ -176,12 +181,18 @@ class TerminalAgent(QObject):
         # command line) and never marks the session dirty.
         self._live_model = self._seed_model()
         self._live_effort = (spec.effort or "").strip()
+        # ...and which permission mode (Shift+Tab) it is in. Same live reading,
+        # with ONE difference: this one IS written back to the spec by the
+        # manager, because the CLI does not carry a permission mode across a
+        # --resume and a reopened agent must come back in the mode it was in.
+        self._live_mode = (getattr(spec, "permission_mode", "") or "").strip()
         self.assignment = AssignmentState.IDLE  # task-assignment lifecycle
         self.auto_created = False           # created with a task via spawn_worker
         self.autostart_on_restore = False  # set from persisted run state
         self.log: deque = deque(maxlen=LOG_CAP)  # line-mode segments
         self._pty_buffer: list[str] = []         # pty raw tail (for replay)
         self._pty_bytes = 0
+        self._pty_seed = ""    # restored screen, until a child draws over it
         self._prompt_ready = False    # the TUI's input prompt is interactive
         self._ready_tail = ""         # rolling stripped tail (pre-ready only)
         self._pending_task = None     # task queued until the TUI is ready
@@ -202,6 +213,11 @@ class TerminalAgent(QObject):
         # bumped on every (re)start so a queued task-submit Enter from a prior
         # session is never delivered into a fresh, not-yet-ready TUI
         self._submit_gen = 0
+        # messages the user wrote now to be typed in later (app/scheduled_send).
+        # Persisted (only the PENDING ones) because the whole point is
+        # unattended operation, and an app restart must not silently drop a
+        # queued hand-off.
+        self._scheduled: list[ScheduledMessage] = []
         self._busy = False            # actively streaming output right now
         self._last_output_ts = 0.0    # walltime of the last output burst
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
@@ -223,6 +239,12 @@ class TerminalAgent(QObject):
         # cut-off, kept ACROSS clear_limit_block so the same line still on
         # screen can't re-latch the agent we just resumed (see _scrape_limit)
         self._limit_last_banner = ""
+        # optional hook (set by WorkspaceManager._wire_agent): a line into
+        # session.log. Only used by _note_limit_skip; None is a no-op.
+        self.audit = None
+        # last (reason, banner) reported by _note_limit_skip, so a rejection
+        # that persists across hundreds of repaints is recorded ONCE
+        self._limit_last_skip = None
         # "waiting for the user" is the OR of three independent sources (see
         # _emit_waiting): _scrape_waiting (the settled screen shows a numbered
         # menu + selection caret — a permission prompt), _tool_waiting (an
@@ -261,6 +283,7 @@ class TerminalAgent(QObject):
         self._reset_waiting()
         self.clear_limit_block()
         self._limit_last_banner = ""   # a new screen: nothing is an echo yet
+        self._limit_last_skip = None   # ...so a skip is reported again too
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         # a NON-resume start is a new conversation, so it gets a new pinned
@@ -315,6 +338,7 @@ class TerminalAgent(QObject):
         self._reset_waiting()
         self.clear_limit_block()
         self._limit_last_banner = ""   # a new screen: nothing is an echo yet
+        self._limit_last_skip = None   # ...so a skip is reported again too
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         if self.spec.provider == "claude":  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
@@ -322,6 +346,7 @@ class TerminalAgent(QObject):
         if self.is_pty:
             self._pty_buffer = []
             self._pty_bytes = 0
+            self._pty_seed = ""
         else:
             self._emit(STREAM_SYSTEM, "--- restarted ---\n")
         self.worker.restart()
@@ -341,6 +366,52 @@ class TerminalAgent(QObject):
 
     def pty_replay(self) -> str:
         return "".join(self._pty_buffer)
+
+    def seed_pty_replay(self, text: str) -> bool:
+        """Preload the screen a previous run left behind, so a RESTORED but
+        not-yet-started card paints its conversation instead of a black
+        rectangle (see app/screen_snapshot.py).
+
+        Only ever seeds a pty agent that has produced nothing this run —
+        never a live one, whose buffer is the real thing. It goes into
+        `_pty_buffer` rather than straight to the view because that is the
+        one source every card already replays from (`TerminalCard.__init__`),
+        so a card built later (a retile, a workspace switch) shows the same
+        screen instead of only the card that happened to exist at launch.
+
+        `restart()` clears the buffer, so a deliberate fresh session drops the
+        old screen. `start()` deliberately does NOT: waking a stopped card
+        resumes its conversation, and the replayed screen scrolling up out of
+        the way is exactly what a real terminal would do."""
+        if not self.is_pty or self._pty_buffer or not text:
+            return False
+        self._pty_buffer = [text]
+        self._pty_bytes = len(text)
+        self._pty_seed = text
+        return True
+
+    def drop_seeded_screen(self) -> bool:
+        """Forget a restored screen that no live child has drawn over.
+
+        A snapshot exists to keep a card the user left STOPPED from reading
+        as a dead black rectangle. The moment a child is launching behind
+        that card the snapshot has no job left: the TUI paints its own frame
+        within seconds, and until it does the seeded copy is WORSE than an
+        empty terminal, because it was fed before the tiling grid gave the
+        card a real size and pyte cannot reflow it (see
+        `TerminalCard._on_status`, which is what calls this).
+
+        Only ever drops the seed itself: once the child has written a single
+        byte the buffer is the real screen and must survive."""
+        if not self._pty_seed:
+            return False
+        dropped = self._pty_buffer == [self._pty_seed]
+        self._pty_seed = ""
+        if not dropped:
+            return False
+        self._pty_buffer = []
+        self._pty_bytes = 0
+        return True
 
     def dispose(self) -> None:
         """Final teardown on card close / workspace delete / app quit."""
@@ -415,34 +486,59 @@ class TerminalAgent(QObject):
             return chosen
         return transcripts.model_display(chosen or providers.user_default_model())
 
-    def set_live_model(self, model: str, effort: str) -> None:
-        """Adopt the model/effort the conversation is actually on, as read from
-        the transcript. Transient like the AI title and the token badge: never
-        persisted, never marks the session dirty, and emits only when the
-        DISPLAYED badge text changes (this polls every couple of seconds).
-        An empty reading is ignored rather than blanking a good label: a fresh
-        conversation has no evidence yet, and the launch seed is still right."""
+    def set_live_model(self, model: str, effort: str, mode: str = "") -> None:
+        """Adopt the model/effort/permission mode the conversation is actually
+        on, as read from the transcript. The BADGE is transient like the AI
+        title and the token badge: never marks the session dirty here, and emits
+        only when the DISPLAYED text changes (this polls every couple of
+        seconds). An empty reading is ignored rather than blanking a good label:
+        a fresh conversation has no evidence yet, and the launch seed is still
+        right. Persisting the mode is the manager's job, deliberately kept out
+        of here so this stays a pure display update."""
         model = (model or "").strip()
         effort = (effort or "").strip()
-        if not model and not effort:
+        mode = (mode or "").strip()
+        if not model and not effort and not mode:
             return
         before = self.model_badge()
         if model:
             self._live_model = model
         if effort:
             self._live_effort = effort
+        if mode:
+            self._live_mode = mode
         if self.model_badge() != before:
             self.model_changed.emit(self.model_badge())
 
+    def permission_mode(self) -> str:
+        """The raw permission-mode token this agent is in, as the CLI names it
+        ("", "default", "auto", "plan", ...). "" for a fresh Claude agent means
+        the CLI's own ask-each-time default; for anything else it means the
+        concept does not apply."""
+        return self._live_mode
+
+    def permission_mode_label(self) -> str:
+        """That mode as it reads on the card, e.g. "auto" / "plan" / "manual".
+        "" for a non-Claude agent, which has no such mode at all."""
+        if self.spec.provider != "claude":
+            return ""
+        return providers.permission_mode_display(self._live_mode)
+
     def model_badge(self) -> str:
         """Compact "what am I running on" string for the card header, e.g.
-        "Opus 5 · high". Model alone when the effort is the CLI's own default,
-        "" when neither is known (a non-Claude agent on a bare command)."""
+        "Opus 5 · high · plan" (model, effort, permission mode). Effort is
+        dropped when it is the CLI's own default and the mode when the agent
+        has none; "" when even the model is unknown (a non-Claude agent on a
+        bare command), which hides the chip entirely."""
         if not self._live_model:
             return ""
-        if not self._live_effort:
-            return self._live_model
-        return f"{self._live_model} · {self._live_effort}"
+        parts = [self._live_model]
+        if self._live_effort:
+            parts.append(self._live_effort)
+        mode = self.permission_mode_label()
+        if mode:
+            parts.append(mode)
+        return " · ".join(parts)
 
     def live_model(self) -> tuple[str, str]:
         return (self._live_model, self._live_effort)
@@ -537,6 +633,119 @@ class TerminalAgent(QObject):
             return False
         self._write_task_to_pty(text)
         return True
+
+    # ------------------------------------------------- deferred messages ---
+    # A scheduled message is a submit the user deferred: they typed it now and
+    # chose when it should go in. Everything here is bookkeeping — the actual
+    # send is `nudge` above, driven by MainWindow's tick, for the same reason
+    # the plan-limit auto-continue lives there rather than in the model.
+
+    def schedule_message(self, text: str, due_ts: float) -> ScheduledMessage | None:
+        """Queue `text` to be typed in at `due_ts`. Returns the entry, or None
+        when the text is empty or this agent is already at its cap."""
+        text = sanitize_text(text or "").strip()
+        if not text or len(self.pending_scheduled()) >= scheduled_send.MAX_PER_AGENT:
+            return None
+        msg = ScheduledMessage(text=text, due_ts=float(due_ts))
+        self._scheduled.append(msg)
+        self.scheduled_changed.emit()
+        return msg
+
+    def scheduled_messages(self) -> list[ScheduledMessage]:
+        """Everything still held, soonest first. Sent entries are dropped as
+        they go out, so in practice this is the pending ones plus any missed
+        entry still waiting for the user to notice it."""
+        return sorted(self._scheduled, key=lambda m: m.due_ts)
+
+    def pending_scheduled(self) -> list[ScheduledMessage]:
+        return [m for m in self.scheduled_messages() if m.is_pending()]
+
+    def next_scheduled(self) -> ScheduledMessage | None:
+        """The soonest pending message — what the card's countdown shows."""
+        pending = self.pending_scheduled()
+        return pending[0] if pending else None
+
+    def due_scheduled(self, now: float | None = None) -> list[ScheduledMessage]:
+        return [m for m in self.scheduled_messages() if m.is_due(now)]
+
+    def missed_scheduled(self) -> list[ScheduledMessage]:
+        return [m for m in self.scheduled_messages() if m.state == MISSED]
+
+    def find_scheduled(self, mid: str) -> ScheduledMessage | None:
+        return next((m for m in self._scheduled if m.id == mid), None)
+
+    def cancel_scheduled(self, mid: str) -> bool:
+        """Drop a message entirely (the user cancelled it, or dismissed a
+        missed one). Removes rather than marks so it stops being persisted."""
+        msg = self.find_scheduled(mid)
+        if msg is None:
+            return False
+        self._scheduled.remove(msg)
+        self.scheduled_changed.emit()
+        return True
+
+    def mark_scheduled_sent(self, mid: str) -> bool:
+        """It went in. The entry is DROPPED, not kept: the conversation itself
+        is the record of what was said, and this is a queue, not a ledger."""
+        msg = self.find_scheduled(mid)
+        if msg is None:
+            return False
+        msg.state = SENT
+        self._scheduled.remove(msg)
+        self.scheduled_changed.emit()
+        return True
+
+    def mark_scheduled_missed(self, mid: str) -> bool:
+        """Give up on delivering it, but KEEP it visible. The user chose a time
+        and it did not happen; silently discarding that is how an unattended
+        hand-off disappears without trace."""
+        msg = self.find_scheduled(mid)
+        if msg is None or msg.state == MISSED:
+            return False
+        msg.state = MISSED
+        self.scheduled_changed.emit()
+        return True
+
+    def note_scheduled_attempt(self, mid: str) -> None:
+        """Record a delivery attempt that the agent refused (its TUI is not
+        ready yet). Deliberately does NOT emit: this happens on the tick, and
+        the queue's shape has not changed."""
+        msg = self.find_scheduled(mid)
+        if msg is not None:
+            msg.attempts += 1
+
+    def scheduled_dicts(self) -> list[dict]:
+        """The PENDING queue, for the session file. Missed entries are left out
+        on purpose: on the next launch they would be re-derived as missed
+        anyway, and a stale one would linger on the card forever."""
+        return [m.to_dict() for m in self.pending_scheduled()]
+
+    def restore_scheduled(self, rows) -> None:
+        """Rebuild the queue from a session record.
+
+        CRITICAL: anything whose time has already passed comes back MISSED, and
+        is never sent. A message set for 3am that the app was closed for must
+        not fire at 10am into a conversation that has moved on — the agent may
+        have been restarted, the work it was chaining onto may be long done, and
+        an unexpected prompt hours late is both a surprise and real quota spent.
+        The user sees it on the card and decides.
+        """
+        if not rows:
+            return
+        now = time.time()
+        for row in rows or []:
+            if len(self._scheduled) >= scheduled_send.MAX_PER_AGENT:
+                break
+            if not isinstance(row, dict):
+                continue
+            msg = ScheduledMessage.from_dict(row)
+            if msg is None:
+                continue
+            if msg.state == PENDING and msg.due_ts <= now:
+                msg.state = MISSED
+            self._scheduled.append(msg)
+        if self._scheduled:
+            self.scheduled_changed.emit()
 
     def _write_task_to_pty(self, text: str) -> None:
         body = text.replace("\r\n", "\r").replace("\n", "\r")
@@ -744,6 +953,7 @@ class TerminalAgent(QObject):
         # checked before _on_pty_output sets the flag, so the burst that ends
         # the replay is itself excluded.)
         if not self._prompt_ready:
+            self._note_limit_skip("prompt not ready (launch or resume replay)")
             return
         # Deliberately a WIDER region than _screen_waiting's last 18 lines.
         # That bound is right for a selection menu, which is anchored just
@@ -773,6 +983,9 @@ class TerminalAgent(QObject):
             # 5-hour windows never end at the same wall time — so an identical
             # line with no menu can only be the echo of one we already handled.
             if not banner or banner == self._limit_last_banner:
+                if banner:
+                    self._note_limit_skip("no menu, and the same banner line "
+                                          "already produced a latch", banner)
                 return
         self._limit_blocked = True
         self._limit_at = time.time()
@@ -787,6 +1000,41 @@ class TerminalAgent(QObject):
         self._limit_resets_at = parse_reset_clock(region)
         self._limit_from_startup = False
         self.limit_blocked_changed.emit(True)
+
+    def _note_limit_skip(self, reason: str, banner: str = "") -> None:
+        """Record that a plan-limit banner was ON SCREEN and nothing latched.
+
+        Everything AFTER a latch is audited (BLOCKED / NUDGE / WAIT / PHANTOM
+        / RESUMED), but the decision NOT to latch was invisible, and that is
+        the one that strands work: a cut-off nobody saw looks exactly like a
+        cut-off that never happened. It cost a real diagnosis — an agent was
+        found sitting on a spent limit hours later with no trace anywhere of
+        why the live scrape had passed over it, and the cause could only be
+        narrowed by elimination, never identified.
+
+        Bounded twice over, because `_scrape_limit` runs on EVERY output burst
+        and this must not become a log flood: it says nothing at all unless a
+        banner is actually visible (the overwhelmingly common case is that
+        there is none), and it repeats only when the (reason, banner) pair
+        CHANGES, so a state that persists across hundreds of repaints of the
+        same frame is written once. `_limit_last_skip` is reset by
+        start/restart, so a fresh screen reports again.
+        """
+        try:
+            if not banner:
+                banner = banner_line(
+                    "\n".join(self._screen_tail.splitlines()[-40:]))
+            if not banner:
+                return
+            state = (reason, banner)
+            if state == self._limit_last_skip:
+                return
+            self._limit_last_skip = state
+            if self.audit is not None:
+                self.audit(f"LIMIT NO-LATCH agent={self.spec.name} ({reason}) "
+                           f"banner={banner[:80]!r}")
+        except Exception:
+            pass    # forensics must never break the feature they observe
 
     def mark_limit_blocked(self, resets_at: float | None,
                            from_startup: bool = True,

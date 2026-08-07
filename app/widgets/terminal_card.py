@@ -15,7 +15,7 @@ from PySide6.QtGui import (QAction, QColor, QDrag, QPainter, QPixmap,
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QPlainTextEdit, QToolButton, QVBoxLayout)
 
-from .. import ui_theme
+from .. import scheduled_send, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
 from ..terminal_agent import (STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
                               TerminalAgent)
@@ -44,6 +44,12 @@ SYSTEM_STYLE = CharStyle(fg=Palette.SYSTEM_MSG, italic=True)
 # drag payload for reordering agent cards within a workspace (started by
 # _CardHeader, resolved by WorkspacePage's drop handling)
 CARD_REORDER_MIME = "application/x-aihive-card-reorder"
+
+
+def _snippet(text: str, limit: int = 140) -> str:
+    """One-line preview of a queued message for a tooltip or a list row."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[:limit - 1] + "…"
 
 
 class _CardHeader(QFrame):
@@ -99,6 +105,7 @@ class TerminalCard(QFrame):
     reassignRequested = Signal(str)  # agent id (retask a completed/idle agent)
     maximizeRequested = Signal(object)  # self (toggle solo view of this card)
     fileActivated = Signal(str)      # abs path Ctrl+clicked in the conversation
+    scheduleRequested = Signal(str, str)  # agent id, text to prefill (may be "")
 
     def __init__(self, agent: TerminalAgent, parent=None):
         super().__init__(parent)
@@ -115,6 +122,8 @@ class TerminalCard(QFrame):
         self._cr_pending = False
         self._renaming = False  # inline title-edit in progress
         self._task_full = ""    # untruncated current-task (the label elides it)
+        self._pending_replay = ""  # restored screen, re-rendered once at size
+        self._overlay_compact = False
         self._follow = True  # sticky auto-scroll (survives resizes/retiles)
         self._history: list[str] = []
         self._hist_idx = 0
@@ -129,6 +138,24 @@ class TerminalCard(QFrame):
             replay = self.agent.pty_replay()
             if replay:
                 self.terminal.feed(replay)
+                # A RESTORED screen (app/screen_snapshot.py) is fed here, in
+                # the constructor, which is BEFORE the tiling grid hands the
+                # card its real size — and pyte neither reflows on resize nor
+                # keeps the lines it drops off the TOP when it shrinks, so the
+                # newest part of the conversation is exactly what would
+                # vanish. Re-render once at the settled size instead.
+                # This is deliberately NOT gated on the agent being stopped.
+                # The launch autostart starts agents SYNCHRONOUSLY right after
+                # show(), while TerminalView debounces its resize by 120ms, so
+                # "is running" is already true by the time the first real size
+                # arrives — the gate that used to be here therefore skipped
+                # precisely the cards that needed it, and every autostarted
+                # agent came back showing a mangled 24-column fragment in the
+                # top-left of a full-width terminal until its child finished
+                # launching. `_rerender_restored` guards the live case the
+                # only way that is actually true: the agent's own buffer.
+                self._pending_replay = replay
+                self.terminal.sizeChanged.connect(self._rerender_restored)
         else:
             self._replay_log()
         self._on_status(agent.status)
@@ -180,6 +207,15 @@ class TerminalCard(QFrame):
         self.limit_mark = QLabel("⏳", header)   # hourglass
         self.limit_mark.setObjectName("CardLimitMark")
         self.limit_mark.hide()
+        # "a message is queued to be typed in at N" — the countdown for a
+        # deferred submit (Ctrl+Shift+Enter). Visible for as long as something
+        # is held, so a scheduled send is never a surprise: the user can see it
+        # coming and click to change or cancel it. Ticked by MainWindow, which
+        # updates the LABEL only and never the model.
+        self.sched_mark = QToolButton(header)
+        self.sched_mark.setObjectName("CardSchedule")
+        self.sched_mark.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sched_mark.hide()
         # one-line summary of what this agent is working on (its current task),
         # so several agents in a workspace are tellable apart at a glance
         # without reading each terminal. It takes every pixel the fixed chrome
@@ -200,6 +236,7 @@ class TerminalCard(QFrame):
         hl.addWidget(self.model_label)
         hl.addSpacing(6)
         hl.addWidget(self.limit_mark)
+        hl.addWidget(self.sched_mark)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
         hl.addWidget(self.token_label)
 
@@ -232,16 +269,16 @@ class TerminalCard(QFrame):
                                          font_px=self.agent.spec.font_px)
             root.addWidget(self.terminal, 1)
             # a stopped terminal must NEVER read as a dead black screen: a
-            # visible banner says so, and any keystroke starts the session
-            self.overlay = QLabel("terminal not running\n"
-                                  "press any key to start",
-                                  self.terminal)
+            # visible banner says so, and any keystroke starts the session.
+            # It takes TWO shapes, because the banner is only the whole story
+            # when there is nothing else to look at. A card restored with its
+            # previous conversation on screen (see app/screen_snapshot.py) gets
+            # a slim footer instead: covering that conversation with a centred
+            # box is what made a reopened hive read as a wall of dead
+            # terminals, which is the thing this was supposed to prevent.
+            self.overlay = QLabel(self.terminal)
             self.overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.overlay.setStyleSheet(
-                "QLabel { background: rgba(10, 10, 12, 200);"
-                f" color: {Palette.ACCENT_ORANGE}; font-size: 13px;"
-                " font-style: italic; border: 1px dashed #6b5b28;"
-                " border-radius: 6px; padding: 10px; }")
+            self._overlay_compact = False
             self.overlay.hide()
         else:
             self.console = QPlainTextEdit(self)
@@ -271,6 +308,10 @@ class TerminalCard(QFrame):
         self.agent.model_changed.connect(self._on_model)
         self.agent.limit_blocked_changed.connect(self._on_limit_blocked)
         self._on_limit_blocked(self.agent.is_limit_blocked())
+        self.agent.scheduled_changed.connect(self.refresh_schedule)
+        self.sched_mark.clicked.connect(
+            lambda: self.scheduleRequested.emit(self.agent.id, ""))
+        self.refresh_schedule()
         self.title.installEventFilter(self)        # double-click to rename
         self.title_edit.installEventFilter(self)   # Esc cancels, focus-out commits
         self.title_edit.returnPressed.connect(self._commit_rename)
@@ -287,6 +328,11 @@ class TerminalCard(QFrame):
             # Ctrl+clicking a file bubbles up so the app can reveal it
             self.terminal.set_base_dir(getattr(self.agent.spec, "cwd", "") or "")
             self.terminal.fileActivated.connect(self.fileActivated)
+            # Ctrl+Shift+Enter in the terminal: "send this, but later". The view
+            # hands up what is currently typed; the window turns it into the
+            # countdown dialog and, only on confirm, clears the input box.
+            self.terminal.scheduleRequested.connect(
+                lambda text: self.scheduleRequested.emit(self.agent.id, text))
             self.terminal.installEventFilter(self)
             return
 
@@ -321,6 +367,14 @@ class TerminalCard(QFrame):
             lambda: self.reassignRequested.emit(self.agent.id))
         for act in (act_start, act_stop, act_restart, act_assign):
             menu.addAction(act)
+        menu.addSeparator()
+        # the discoverable half of Ctrl+Shift+Enter (which needs the terminal
+        # focused and something typed); this opens the same dialog empty
+        act_sched = QAction("Send a message on a countdown…", menu)
+        act_sched.triggered.connect(
+            lambda: self.scheduleRequested.emit(self.agent.id, ""))
+        act_sched.setEnabled(self.is_pty)
+        menu.addAction(act_sched)
         menu.addSeparator()
         act_max = QAction("Maximize (focus this agent)", menu)
         act_max.triggered.connect(lambda: self.maximizeRequested.emit(self))
@@ -361,7 +415,8 @@ class TerminalCard(QFrame):
                  (self.agent.summary_changed, self._on_task),
                  (self.agent.tokens_changed, self._on_tokens),
                  (self.agent.model_changed, self._on_model),
-                 (self.agent.limit_blocked_changed, self._on_limit_blocked)]
+                 (self.agent.limit_blocked_changed, self._on_limit_blocked),
+                 (self.agent.scheduled_changed, self.refresh_schedule)]
         if self.is_pty:
             pairs.append((self.agent.pty_output, self._on_pty_output))
         else:
@@ -421,6 +476,44 @@ class TerminalCard(QFrame):
         if blocked:
             self.limit_mark.setToolTip(self.agent.limit_summary())
 
+    def refresh_schedule(self) -> None:
+        """Repaint the deferred-message chip: the countdown to the soonest one,
+        or a warning that one was missed.
+
+        Called both on `scheduled_changed` (the queue changed) and once a second
+        from MainWindow's tick while anything is pending. It touches nothing but
+        this label, which is what keeps a per-second countdown off the session
+        file - see the `scheduled_changed` wiring in WorkspaceManager.
+        """
+        msg = self.agent.next_scheduled()
+        missed = self.agent.missed_scheduled()
+        if msg is not None:
+            count = len(self.agent.pending_scheduled())
+            self.sched_mark.setText(
+                f"⏱ {scheduled_send.format_countdown(msg.seconds_left())}")
+            more = f" (+{count - 1} more)" if count > 1 else ""
+            self.sched_mark.setToolTip(
+                f"Sending {scheduled_send.format_clock(msg.due_ts)}{more}:\n"
+                f"{_snippet(msg.text)}\n\nClick to change or cancel")
+            self._set_sched_missed(False)
+        elif missed:
+            self.sched_mark.setText(f"⏱ missed ({len(missed)})")
+            self.sched_mark.setToolTip(
+                f"{len(missed)} scheduled message(s) came due while this agent "
+                f"was unreachable and were NOT sent.\n"
+                f"Click to send one now or dismiss it.")
+            self._set_sched_missed(True)
+        self.sched_mark.setVisible(msg is not None or bool(missed))
+
+    def _set_sched_missed(self, missed: bool) -> None:
+        """Flip the chip's warning state, restyling ONLY on a real change.
+        `refresh_schedule` runs once a second while a countdown is live, and an
+        unconditional repolish would re-run the stylesheet on every tick."""
+        if self.sched_mark.property("missed") is missed:
+            return
+        self.sched_mark.setProperty("missed", missed)
+        repolish(self.sched_mark)
+
     def _on_tokens(self, badge: str = "") -> None:
         # context-window usage badge beside the summary; hidden when empty so a
         # fresh or non-Claude agent shows nothing (never a misleading "0%")
@@ -433,16 +526,22 @@ class TerminalCard(QFrame):
         self.token_label.setVisible(bool(badge))
 
     def _on_model(self, badge: str = "") -> None:
-        # "Opus 5 · high", tracking /model and /effort inside the terminal.
-        # Hidden when empty so a plain shell shows nothing (never a guess).
+        # "Opus 5 · high · plan", tracking /model, /effort and the Shift+Tab
+        # permission mode inside the terminal. Hidden when empty so a plain
+        # shell shows nothing (never a guess).
         if badge:
             model, effort = self.agent.live_model()
             tip = f"Model: {model}"
             if effort:
                 tip += f"\nEffort: {effort}"
+            mode = self.agent.permission_mode_label()
+            if mode:
+                tip += (f"\nPermission mode: {mode}"
+                        "\nKept for the next launch, so this agent reopens"
+                        " in the same mode")
             self.model_label.setText(badge)
             self.model_label.setToolTip(
-                tip + "\nFollows /model and /effort in this terminal")
+                tip + "\nFollows /model, /effort and Shift+Tab in this terminal")
         else:
             self.model_label.clear()
         self.model_label.setVisible(bool(badge))
@@ -547,8 +646,95 @@ class TerminalCard(QFrame):
             self._place_overlay()
         return super().eventFilter(obj, event)
 
+    def _drop_restored_screen(self) -> None:
+        """Give the launching child a clean terminal.
+
+        `_pending_replay` still being set means this card has NEVER re-rendered
+        its restored screen at a settled size, so what is on the terminal was
+        drawn at the pre-layout width and pyte cannot reflow it. Both launch
+        paths that start an agent (`autostart_active_workspace` and
+        `recover_blocked_at_startup`) run SYNCHRONOUSLY right after `show()`,
+        while `TerminalView` debounces its resize by 120ms, so this is every
+        agent that comes back running: their cards would sit on a mangled
+        narrow fragment of the old conversation until the TUI finished
+        booting. An empty terminal that fills in a few seconds is what a
+        restored hive looked like before snapshots existed, and snapshots were
+        never meant to change it.
+
+        A card WOKEN by a keystroke is untouched: it has long since
+        re-rendered (`_pending_replay` is empty by then), so its conversation
+        still scrolls up out of the way as a real terminal's would."""
+        self._pending_replay = ""
+        try:
+            self.terminal.sizeChanged.disconnect(self._rerender_restored)
+        except (RuntimeError, TypeError):
+            pass
+        # drop it on the AGENT too, or a card rebuilt later (a retile, a
+        # workspace switch) replays the same stale seed under the child
+        if self.agent.drop_seeded_screen():
+            self.terminal.screen.reset()
+            self.terminal.update()
+
+    def _rerender_restored(self, *_) -> None:
+        """One-shot: repaint a restored screen at the card's settled size.
+
+        Consumes `_pending_replay` first, so a resize storm (a retile, a
+        sidebar toggle, a window drag) can only ever re-render once."""
+        replay, self._pending_replay = self._pending_replay, ""
+        try:
+            self.terminal.sizeChanged.disconnect(self._rerender_restored)
+        except (RuntimeError, TypeError):
+            pass
+        if not replay:
+            return
+        if self.agent.pty_replay() != replay:
+            # The child has written (or a restart cleared the buffer) since
+            # this card was built, so what is on screen is no longer the
+            # restored snapshot. Whoever owns it now redraws on the SIGWINCH
+            # that `agent.resize` just sent — never fight that with a stale
+            # re-feed. Note the test is the agent's BUFFER, not `is_running`:
+            # an agent can be running for a good fraction of a second before
+            # its child emits its first byte, and that gap is the whole window
+            # this re-render exists to cover.
+            return
+        self.terminal.screen.reset()
+        self.terminal.feed(replay)
+        self._refresh_overlay()
+
+    def _refresh_overlay(self) -> None:
+        """Pick the banner's shape from what is already on the screen.
+
+        Deciding here (on a status change) rather than in `_place_overlay`
+        keeps `screen_text()` off the resize path, which fires per pixel
+        while a card is dragged or a workspace retiles."""
+        if not self.is_pty:
+            return
+        compact = bool(self.terminal.screen_text().strip())
+        self._overlay_compact = compact
+        if compact:
+            self.overlay.setText("not running · press any key to resume")
+            self.overlay.setStyleSheet(
+                "QLabel { background: rgba(10, 10, 12, 225);"
+                f" color: {Palette.ACCENT_ORANGE}; font-size: 12px;"
+                " font-style: italic; border-top: 1px dashed #6b5b28;"
+                " padding: 4px; }")
+        else:
+            self.overlay.setText("terminal not running\n"
+                                 "press any key to start")
+            self.overlay.setStyleSheet(
+                "QLabel { background: rgba(10, 10, 12, 200);"
+                f" color: {Palette.ACCENT_ORANGE}; font-size: 13px;"
+                " font-style: italic; border: 1px dashed #6b5b28;"
+                " border-radius: 6px; padding: 10px; }")
+        self._place_overlay()
+
     def _place_overlay(self) -> None:
         if not self.is_pty:
+            return
+        if self._overlay_compact:  # a full-width strip along the bottom edge,
+            h = 24                 # so the conversation above stays readable
+            self.overlay.setGeometry(0, max(0, self.terminal.height() - h),
+                                     self.terminal.width(), h)
             return
         w = min(320, max(220, self.terminal.width() - 40))
         h = 64
@@ -611,11 +797,14 @@ class TerminalCard(QFrame):
             tip += f" (code {exit_info[0]})"
         self.glyph.setToolTip(tip)
 
+        if self.is_pty and running and self._pending_replay:
+            self._drop_restored_screen()
+
         if self.is_pty:  # stopped terminal shows the wake banner, never black
             self.overlay.setVisible(not running
                                     and status is not AgentStatus.STOPPING)
             if not running:
-                self._place_overlay()
+                self._refresh_overlay()
                 self.overlay.raise_()
 
         if status is AgentStatus.STARTING:

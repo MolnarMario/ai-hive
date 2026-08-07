@@ -1664,18 +1664,21 @@ def test_token_usage_badge():
 
 
 def test_live_model_effort():
-    """The card header says which model and effort the agent is ACTUALLY on.
-    Both change mid-session (/model, /effort in the terminal), so the reading
-    comes from the transcript: assistant records carry message.model + a
-    top-level effort, and a /model or /effort pick writes a local-command-stdout
-    record the instant the user chooses. Last in file order wins. Transient like
-    the AI title: it never touches spec and never saves."""
+    """The card header says which model, effort and permission mode the agent
+    is ACTUALLY on. All three change mid-session (/model, /effort, Shift+Tab in
+    the terminal), so the reading comes from the transcript: assistant records
+    carry message.model + a top-level effort, a /model or /effort pick writes a
+    local-command-stdout record the instant the user chooses, and the mode rides
+    on every prompt plus a dedicated permission-mode record. Last in file order
+    wins. Model and effort are transient (they never touch spec and never save);
+    the MODE is written back, because it is the flag that reopens the agent in
+    the same mode."""
     import json as _json
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
-    from app import transcripts
+    from app import providers, transcripts
     from app.terminal_agent import TerminalAgent
-    from app.process_worker import AgentKind, build_spec
+    from app.process_worker import AgentKind, AgentSpec, build_spec
     from app.widgets.terminal_card import TerminalCard
 
     QApplication.instance() or QApplication([])
@@ -1716,7 +1719,7 @@ def test_live_model_effort():
 
     write([{"type": "user", "text": "hi"}, _turn()])
     check("model: a turn reports its model and effort",
-          transcripts._read_model_effort(str(tpath)) == ("Opus 5", "high"),
+          transcripts._read_model_effort(str(tpath)) == ("Opus 5", "high", ""),
           transcripts._read_model_effort(str(tpath)))
 
     # a /model pick AFTER the last turn is the newer truth (the whole point:
@@ -1725,7 +1728,7 @@ def test_live_model_effort():
            _pick("Set model to \x1b[1mSonnet 5\x1b[22m and saved as your "
                  "default for new sessions")])
     check("model: a /model pick after the last turn wins",
-          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5", "high"),
+          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5", "high", ""),
           transcripts._read_model_effort(str(tpath)))
 
     write([_turn(),
@@ -1734,7 +1737,7 @@ def test_live_model_effort():
            _pick("Set effort level to max (this session only): Maximum "
                  "capability with deepest reasoning.")])
     check("model: a /effort pick changes only the effort",
-          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5", "max"),
+          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5", "max", ""),
           transcripts._read_model_effort(str(tpath)))
 
     write([_turn(),
@@ -1742,7 +1745,7 @@ def test_live_model_effort():
                  "as your default for new sessions with \x1b[1mhigh\x1b[22m "
                  "effort")])
     check("model: a pick that names an effort applies both",
-          transcripts._read_model_effort(str(tpath)) == ("Opus 4.8 (1M)", "high"),
+          transcripts._read_model_effort(str(tpath)) == ("Opus 4.8 (1M)", "high", ""),
           transcripts._read_model_effort(str(tpath)))
 
     # a turn AFTER a pick wins again (ordering is file order, not kind)
@@ -1750,26 +1753,90 @@ def test_live_model_effort():
                  "default for new sessions"),
            _turn(model="claude-fable-5", effort="max")])
     check("model: a turn after a pick wins again",
-          transcripts._read_model_effort(str(tpath)) == ("Fable 5", "max"),
+          transcripts._read_model_effort(str(tpath)) == ("Fable 5", "max", ""),
           transcripts._read_model_effort(str(tpath)))
 
     # a sub-agent's model is a different context; <synthetic> is not a model
     write([_turn(), _turn(model="claude-haiku-4-5", effort="low", side=True),
            {"type": "assistant", "message": {"model": "<synthetic>"}}])
     check("model: sidechain and synthetic records never win",
-          transcripts._read_model_effort(str(tpath)) == ("Opus 5", "high"),
+          transcripts._read_model_effort(str(tpath)) == ("Opus 5", "high", ""),
           transcripts._read_model_effort(str(tpath)))
 
     check("model: missing file reads as unknown",
-          transcripts.latest_model_effort(str(tmp), "nope") == ("", ""))
+          transcripts.latest_model_effort(str(tmp), "nope") == ("", "", ""))
 
     # the reader only touches the tail, so it must still find evidence that sits
     # behind a long stretch of unrelated records (full-scan fallback)
     filler = [{"type": "user", "text": "x" * 400} for _ in range(400)]
     write([_turn(model="claude-opus-4-8", effort="xhigh")] + filler)
     check("model: falls back to a full scan when the tail has no evidence",
-          transcripts._read_model_effort(str(tpath)) == ("Opus 4.8", "xhigh"),
+          transcripts._read_model_effort(str(tpath)) == ("Opus 4.8", "xhigh", ""),
           transcripts._read_model_effort(str(tpath)))
+
+    # --- the permission mode (Shift+Tab), read off the same transcript ---
+    def _mode(mode):    # the record Claude appends the instant the mode changes
+        return {"type": "permission-mode", "permissionMode": mode}
+
+    write([_turn(), _mode("plan")])
+    check("mode: a permission-mode record is the live mode",
+          transcripts._read_model_effort(str(tpath))[2] == "plan",
+          transcripts._read_model_effort(str(tpath)))
+    write([_mode("plan"), _mode("auto")])
+    check("mode: the LAST mode record wins",
+          transcripts._read_model_effort(str(tpath))[2] == "auto",
+          transcripts._read_model_effort(str(tpath)))
+    # an ordinary prompt carries the mode it was submitted under, which is what
+    # covers a CLI build that writes no dedicated record
+    write([_mode("plan"),
+           {"type": "user", "permissionMode": "auto",
+            "message": {"role": "user", "content": "go"}}])
+    check("mode: a user prompt's own permissionMode counts too",
+          transcripts._read_model_effort(str(tpath))[2] == "auto",
+          transcripts._read_model_effort(str(tpath)))
+    write([_mode("auto"),
+           {"type": "user", "isSidechain": True, "permissionMode": "plan",
+            "message": {"role": "user", "content": "sub"}}])
+    check("mode: a sidechain's mode is a sub-agent's, never this one's",
+          transcripts._read_model_effort(str(tpath))[2] == "auto",
+          transcripts._read_model_effort(str(tpath)))
+
+    # translation: the transcript's names are not all launch flags
+    check("mode: 'default' is spelled by omitting the flag",
+          providers.normalize_permission_mode("default") == ""
+          and providers.normalize_permission_mode("manual") == "")
+    check("mode: a real CLI token passes through",
+          providers.normalize_permission_mode("auto") == "auto"
+          and providers.normalize_permission_mode("plan") == "plan")
+    check("mode: an unknown token never reaches the command line",
+          providers.normalize_permission_mode("wat") == "")
+    check("mode: 'default' reads as manual on the card",
+          providers.permission_mode_display("default") == "manual"
+          and providers.permission_mode_display("") == "manual")
+    # ...and a mode adopted from a conversation must be launchable, even though
+    # the New Agent dropdown never offers it
+    _, auto_args = providers.build_invocation("claude", permission_mode="auto")
+    check("mode: 'auto' survives into the launch flags",
+          auto_args == ["--permission-mode", "auto"], auto_args)
+    _, bogus_args = providers.build_invocation("claude", permission_mode="wat")
+    check("mode: a bogus mode is dropped rather than launched", bogus_args == [])
+
+    # the spec REBUILDS its args, or the new mode would persist while every
+    # launch in this process kept using the old flag
+    mspec = build_spec(AgentKind.CLAUDE, "Mode", cwd=str(tmp))
+    check("mode: a fresh spec carries no --permission-mode",
+          "--permission-mode" not in mspec.args, mspec.args)
+    check("mode: adopting a mode reports the change",
+          mspec.set_permission_mode("plan")
+          and not mspec.set_permission_mode("plan"))
+    check("mode: adopting a mode rebuilds the launch args",
+          mspec.args[-2:] == ["--permission-mode", "plan"], mspec.args)
+    check("mode: the adopted mode round-trips through the session file",
+          AgentSpec.from_dict(mspec.to_dict()).permission_mode == "plan"
+          and "--permission-mode" in AgentSpec.from_dict(mspec.to_dict()).args)
+    mspec.set_permission_mode("")
+    check("mode: going back to the default drops the flag again",
+          "--permission-mode" not in mspec.args, mspec.args)
 
     # --- agent-side badge: transient, emits only on a real change ---
     a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd=".",
@@ -1777,31 +1844,43 @@ def test_live_model_effort():
     seen = []
     a.model_changed.connect(seen.append)
     check("model: badge seeded from the launch flags",
-          a.model_badge() == "Opus · high", a.model_badge())
+          a.model_badge() == "Opus · high · manual", a.model_badge())
     a.set_live_model("Sonnet 5", "max")
     check("model: badge follows the live reading",
-          a.model_badge() == "Sonnet 5 · max" and seen[-1] == "Sonnet 5 · max",
+          a.model_badge() == "Sonnet 5 · max · manual"
+          and seen[-1] == "Sonnet 5 · max · manual",
           (a.model_badge(), seen))
     n = len(seen)
     a.set_live_model("Sonnet 5", "max")
     check("model: no signal when the reading is unchanged", len(seen) == n)
     a.set_live_model("", "")
     check("model: an empty reading never blanks a good label",
-          a.model_badge() == "Sonnet 5 · max" and len(seen) == n)
+          a.model_badge() == "Sonnet 5 · max · manual" and len(seen) == n)
+    a.set_live_model("", "", "plan")
+    check("model: badge follows the live permission mode",
+          a.model_badge() == "Sonnet 5 · max · plan"
+          and seen[-1] == "Sonnet 5 · max · plan", (a.model_badge(), seen))
+    a.set_live_model("Sonnet 5", "max", "auto")
+    check("model: the mode label is the CLI's own name",
+          a.model_badge() == "Sonnet 5 · max · auto", a.model_badge())
     b = TerminalAgent(build_spec(AgentKind.CLAUDE, "Bare", cwd="", model="",
                                  effort=""))
     b._live_model = ""      # no launch flag and no saved user default
     check("model: badge hidden when nothing is known", b.model_badge() == "")
     b.set_live_model("Opus 5", "")
     check("model: model alone renders without an effort",
-          b.model_badge() == "Opus 5", b.model_badge())
+          b.model_badge() == "Opus 5 · manual", b.model_badge())
+    sh = TerminalAgent(build_spec(AgentKind.POWERSHELL, "Shell", cwd=""))
+    check("model: a shell has no permission mode to show",
+          sh.permission_mode_label() == "" and sh.model_badge() == "",
+          (sh.permission_mode_label(), sh.model_badge()))
 
     # --- header: the chip shows/hides with the badge ---
     card = TerminalCard(a)
     card.resize(900, 300); card.show(); pump(80)
-    check("model: card chip shows the live model and effort",
+    check("model: card chip shows the live model, effort and mode",
           card.model_label.isVisible()
-          and card.model_label.text() == "Sonnet 5 · max",
+          and card.model_label.text() == "Sonnet 5 · max · auto",
           card.model_label.text())
     card2 = TerminalCard(b)
     b._live_model = ""
@@ -1826,8 +1905,41 @@ def test_live_model_effort():
     mgr.dirty.connect(lambda: dirtied.append(True))
     mgr.refresh_model_effort()
     check("model: the manager poll adopts the transcript's model/effort",
-          live.model_badge() == "Sonnet 5 · low", live.model_badge())
+          live.model_badge() == "Sonnet 5 · low · manual", live.model_badge())
     check("model: a reading never marks the session dirty", not dirtied, dirtied)
+
+    # ...except the permission mode, which IS the launch flag for next time:
+    # the CLI does not carry a mode across --resume, so an agent the user put
+    # in plan mode came back ask-each-time on every reopen
+    conv.write_text(_json.dumps(_turn(model="claude-sonnet-5", effort="low"))
+                    + "\n" + _json.dumps(_mode("plan")) + "\n",
+                    encoding="utf-8")
+    mgr.refresh_model_effort()
+    check("mode: the manager poll shows the live mode",
+          live.model_badge() == "Sonnet 5 · low · plan", live.model_badge())
+    check("mode: the live mode is written back as the next launch flag",
+          live.spec.permission_mode == "plan"
+          and live.spec.args[-2:] == ["--permission-mode", "plan"],
+          (live.spec.permission_mode, live.spec.args))
+    check("mode: adopting a mode marks the session dirty", dirtied)
+    check("mode: the adopted mode reaches the persisted session record",
+          mgr.to_session_dict()["workspaces"][0]["terminals"][0].get(
+              "permission_mode") == "plan")
+    dirtied.clear()
+    mgr.refresh_model_effort()
+    check("mode: an unchanged mode never re-saves", not dirtied, dirtied)
+    # the ask-each-time mode is written "default" in the transcript and has no
+    # flag spelling, so it must clear the flag rather than launch a bogus one
+    conv.write_text(_json.dumps(_turn(model="claude-sonnet-5", effort="low"))
+                    + "\n" + _json.dumps(_mode("default")) + "\n",
+                    encoding="utf-8")
+    mgr.refresh_model_effort()
+    check("mode: going back to ask-each-time clears the flag",
+          live.spec.permission_mode == ""
+          and "--permission-mode" not in live.spec.args, live.spec.args)
+    check("mode: clearing it reaches the persisted session record too",
+          mgr.to_session_dict()["workspaces"][0]["terminals"][0].get(
+              "permission_mode", "-") == "")
     shutil.rmtree(conv.parent, ignore_errors=True)
 
     # --- the summary uses the width it was actually given ---
@@ -3872,6 +3984,61 @@ def test_persistence_resume():
     check("persist: bad agent cannot abort the whole save (good survives)",
           "Good" in names5 and len(terms) >= 1, names5)
 
+    # THE DEGRADE MUST NOT BE SILENT. Found in production: two claude agents
+    # were being written as fallback records on EVERY save, losing model,
+    # effort, permission mode, role and task to defaults on the next restore --
+    # and the cause could not be recovered from the file, because two different
+    # failures in AgentSpec.to_dict produce byte-identical output and nothing
+    # had recorded which one fired.
+    # END TO END: an agent created through the manager inherits the audit hook,
+    # so a NO-LATCH line from deep in the scrape actually reaches session.log.
+    # The helper is unit-tested elsewhere; the PLUMBING is the part that breaks.
+    sp6 = tmp / "wired.json"
+    store6 = SessionStore(path=sp6)
+    win6 = create_main_window(store6)
+    win6.show(); pump(120)
+    ws6 = win6.manager.workspaces[0]
+    wired = win6.manager.add_terminal(
+        ws6.id, build_spec(AgentKind.CLAUDE, "Wired", cwd=str(tmp), pty=True),
+        autostart=False)
+    wired._prompt_ready = False          # as during a resume replay
+    wired._screen_tail = ("You've hit your session limit \xb7 resets 3am "
+                          "(Europe/Bucharest)\n")
+    wired._on_idle_timeout()
+    win6.close(); pump(120)
+    logged = sp6.with_suffix(".log").read_text(encoding="utf-8", errors="replace")
+    check("persist: a manager-wired agent's NO-LATCH reaches session.log",
+          "NO-LATCH" in logged and "Wired" in logged,
+          [l for l in logged.splitlines() if "LIMIT" in l][-3:])
+
+    lines = []
+    mgr5.audit = lines.append
+    pty_spec = build_spec(AgentKind.CLAUDE, "Degraded", cwd=str(tmp), pty=True,
+                          model="opus", effort="high")
+    degraded = mgr5.add_terminal(ws5.id, pty_spec, autostart=False)
+    degraded.current_task = "keep me"
+    degraded.assignment = object()             # .value raises -> degrade path
+    rec = mgr5._agent_dict_safe(degraded)
+    degraded.assignment = saved_assignment     # restore before teardown/GC
+    check("persist: a degraded save is audited with the exception",
+          any(m.startswith("SAVE-DEGRADE") and "Degraded" in m
+              and "AttributeError" in m for m in lines), lines)
+    check("persist: the fallback record keeps pty", rec.get("pty") is True, rec)
+    check("persist: the fallback record keeps model/effort/task",
+          rec.get("model") == "opus" and rec.get("effort") == "high"
+          and rec.get("task") == "keep me", rec)
+    # and it must still round-trip into a real spec
+    from app.process_worker import AgentSpec as _Spec
+    check("persist: the fallback record still restores as a pty claude agent",
+          _Spec.from_dict(rec).pty is True
+          and _Spec.from_dict(rec).provider == "claude")
+    # an unset audit hook stays a no-op (a bare manager must never depend on it)
+    mgr5.audit = None
+    degraded.assignment = object()
+    check("persist: degrading without an audit hook does not raise",
+          mgr5._agent_dict_safe(degraded).get("name") == "Degraded")
+    degraded.assignment = saved_assignment
+
     shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -4088,6 +4255,41 @@ def test_themes():
             w.grab()  # runs paintEvent; raises if the paint path is broken
             w.deleteLater()
     check("themes: ornament widgets paint under every skin", True)
+
+    # SHAPED-ICON GUARANTEE. The artwork is exported flat on a near-black
+    # ground; shipping that unkeyed put a hard black square in the title bar,
+    # the taskbar, Alt+Tab and the Start tile (all of which can be light), and
+    # the same bitmap backs LogoRoundel, where it read as a cold black tile on
+    # the warm panel. generate_app_icon.py keys the ground out and trims to the
+    # mark, so both assets must arrive with see-through corners; a future flat
+    # re-export that skipped that step would fail here rather than quietly
+    # reinstating the square.
+    from PySide6.QtGui import QImage
+    icons = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "app", "assets", "icons")
+    shaped, opaque_corner = [], []
+    for asset in ("app_logo.png", "app_icon.ico"):
+        img = QImage(os.path.join(icons, asset))
+        if img.isNull():
+            opaque_corner.append(f"{asset}: missing")
+            continue
+        w, h = img.width(), img.height()
+        alphas = [img.pixelColor(x, y).alpha() for x, y in
+                  ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1))]
+        (shaped if not any(alphas) else opaque_corner).append(
+            f"{asset}: {alphas}")
+        # and the mark itself has to still be there — a key that ate the
+        # artwork would also leave the corners clear. A RATIO, because the
+        # .ico hands QImage whichever single frame it likes (a 16px one here),
+        # so an absolute sample count would only measure that choice.
+        step_x, step_y = max(1, w // 40), max(1, h // 40)
+        pts = [(x, y) for y in range(0, h, step_y) for x in range(0, w, step_x)]
+        ink = sum(1 for x, y in pts if img.pixelColor(x, y).alpha() > 200)
+        if ink < len(pts) * 0.25:
+            opaque_corner.append(
+                f"{asset}: only {ink}/{len(pts)} samples are opaque")
+    check("themes: shipped icon assets are shaped, not opaque squares",
+          len(shaped) == 2 and not opaque_corner, opaque_corner)
 
     # CONTRAST GUARANTEE (chrome): every skin's text tokens must clearly read
     # on their own backgrounds — the fix behind the white-on-vellum report.
@@ -5616,6 +5818,311 @@ def test_wake_and_resume_all():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_screen_snapshots():
+    """A card left STOPPED reopens showing the conversation it had at close,
+    not a black rectangle with a banner over it. (The regression: a reopened
+    hive read as a wall of dead terminals, because "restore as it was" only
+    ever restored the process state, never the screen.)
+
+    The snapshot is keyed on (cwd, pinned conversation) because agent ids are
+    minted fresh on every load, and it lives in its own file, never in
+    session.json."""
+    import pathlib
+    import shutil
+    import tempfile
+    import time
+
+    from app import screen_snapshot
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.terminal_agent import TerminalAgent
+
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="aihive-screens-"))
+
+    # -- keying -----------------------------------------------------------
+    k = screen_snapshot.key_of(str(tmp), "sess-1")
+    check("screens: key is stable for the same (cwd, conversation)",
+          k == screen_snapshot.key_of(str(tmp), "sess-1"))
+    check("screens: a different conversation is a different key",
+          k != screen_snapshot.key_of(str(tmp), "sess-2"))
+    check("screens: a different folder is a different key",
+          k != screen_snapshot.key_of(str(tmp / "other"), "sess-1"))
+    check("screens: the key is filesystem-safe",
+          k.isalnum() and len(k) <= 24, k)
+
+    # -- round-trip -------------------------------------------------------
+    vt = "hello \x1b[32mworld\x1b[0m\r\n> the conversation\r\n"
+    check("screens: save reports success", screen_snapshot.save(
+        str(tmp), str(tmp), "sess-1", vt))
+    check("screens: raw VT round-trips byte for byte",
+          screen_snapshot.load(str(tmp), str(tmp), "sess-1") == vt)
+    check("screens: a conversation with no snapshot loads empty",
+          screen_snapshot.load(str(tmp), str(tmp), "nope") == "")
+    check("screens: an empty screen is not written",
+          not screen_snapshot.save(str(tmp), str(tmp), "sess-x", ""))
+    check("screens: a pin-less agent is never keyed",
+          not screen_snapshot.save(str(tmp), str(tmp), "", vt))
+    check("screens: the snapshot is NOT in session.json",
+          not (tmp / "session.json").exists())
+
+    # oversized screens are capped, and the TAIL is what survives
+    big = ("x" * 10) + ("y" * (screen_snapshot.MAX_BYTES + 500))
+    screen_snapshot.save(str(tmp), str(tmp), "sess-big", big)
+    got = screen_snapshot.load(str(tmp), str(tmp), "sess-big")
+    check("screens: an oversized screen is capped",
+          len(got) == screen_snapshot.MAX_BYTES, len(got))
+    check("screens: the capped screen keeps the TAIL (the recent output)",
+          got.endswith("y" * 100) and not got.startswith("x"))
+
+    # a corrupt/unreadable snapshot degrades to an empty card, never a raise
+    bad = pathlib.Path(screen_snapshot._path(
+        str(tmp), screen_snapshot.key_of(str(tmp), "sess-bad")))
+    bad.write_bytes(b"\xff\xfe\x00raw")
+    check("screens: an unreadable snapshot degrades to empty, never raises",
+          isinstance(screen_snapshot.load(str(tmp), str(tmp), "sess-bad"), str))
+
+    # -- pruning ----------------------------------------------------------
+    removed = screen_snapshot.prune(str(tmp), {k})
+    check("screens: unclaimed snapshots are pruned",
+          removed >= 2 and screen_snapshot.load(
+              str(tmp), str(tmp), "sess-big") == "")
+    check("screens: a claimed snapshot survives pruning",
+          screen_snapshot.load(str(tmp), str(tmp), "sess-1") == vt)
+
+    # -- seeding a restored agent -----------------------------------------
+    spec = build_spec(AgentKind.CLAUDE, "Restored", cwd=str(tmp), pty=True)
+    spec.session_id = "sess-1"
+    agent = TerminalAgent(spec)
+    check("screens: keys_for_agents reports the agent's pin",
+          screen_snapshot.keys_for_agents([agent]) == {k})
+    check("screens: a restored agent is seeded with its last screen",
+          agent.seed_pty_replay(vt) and agent.pty_replay() == vt)
+    check("screens: seeding never overwrites a screen already there",
+          not agent.seed_pty_replay("clobber")
+          and agent.pty_replay() == vt)
+    check("screens: an empty snapshot seeds nothing",
+          not TerminalAgent(build_spec(
+              AgentKind.CLAUDE, "Blank", cwd=str(tmp),
+              pty=True)).seed_pty_replay(""))
+    # restart() is a DELIBERATE fresh session: the old screen must not linger
+    agent.worker = type("_W", (), {"restart": lambda s: None,
+                                   "is_running": lambda s: False,
+                                   "dispose": lambda s: None})()
+    agent.restart()
+    check("screens: a deliberate restart drops the restored screen",
+          agent.pty_replay() == "")
+    agent.dispose()
+
+    # -- the card paints it, and the banner gets out of the way ------------
+    if HAS_CONPTY:
+        from PySide6.QtCore import QEventLoop, QTimer
+        from PySide6.QtWidgets import QApplication
+
+        from app.widgets.terminal_card import TerminalCard
+        QApplication.instance() or QApplication([])
+
+        def pump(ms):
+            loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+        def wait_until(pred, timeout_ms=4000, step=50):
+            deadline = time.monotonic() + timeout_ms / 1000
+            while time.monotonic() < deadline:
+                if pred():
+                    return True
+                pump(step)
+            return pred()
+
+        seeded = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Seeded", cwd=str(tmp), pty=True))
+        seeded.seed_pty_replay("the previous conversation\r\n")
+        card = TerminalCard(seeded)
+        card.resize(640, 400); card.show(); pump(150)
+        # the tiling grid resizes the card AFTER it is built, and pyte drops
+        # lines off the TOP when it shrinks: without the one-shot re-render,
+        # a short restored screen is gone before the user ever sees it
+        check("screens: the restored card paints its conversation",
+              "the previous conversation" in card.terminal.screen_text())
+        check("screens: the re-render is one-shot (a retile cannot repeat it)",
+              card._pending_replay == "")
+        check("screens: the banner still says the terminal is not live",
+              card.overlay.isVisible())
+        check("screens: ...as a slim footer, not a box over the conversation",
+              card._overlay_compact
+              and card.overlay.height() < 40
+              and card.overlay.y() > card.terminal.height() // 2)
+        card.detach(); seeded.dispose(); pump(150)
+
+        # An AUTOSTARTED agent is already running long before the first
+        # settled size arrives: the launch starts agents synchronously right
+        # after show(), while TerminalView debounces its resize by 120ms. So
+        # gating the re-render on "not running" skipped exactly the cards that
+        # needed it, and every restored-and-resumed card came back showing a
+        # mangled narrow fragment in the top-left of a full-width terminal.
+        from app.process_worker import WorkerState
+        line = "R" * 60
+        waking = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Waking", cwd=str(tmp), pty=True))
+        waking.seed_pty_replay(line + "\r\n")
+        card3 = TerminalCard(waking)
+        waking.worker.state = WorkerState.RUNNING  # the launch autostart...
+        card3.terminal.screen.reset()              # ...before any settled size
+        card3._rerender_restored()
+        check("screens: an autostarted card still re-renders its restored "
+              "screen at the settled size",
+              line in card3.terminal.screen_text())
+        card3.detach(); waking.dispose(); pump(50)
+
+        # ...but once the child has actually drawn, the screen is its own and
+        # a stale re-feed would fight it
+        live = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Live", cwd=str(tmp), pty=True))
+        live.seed_pty_replay(line + "\r\n")
+        card4 = TerminalCard(live)
+        live._pty_buffer.append("output from the child\r\n")
+        card4.terminal.screen.reset()
+        card4._rerender_restored()
+        check("screens: ...but never over a child that has since written",
+              line not in card4.terminal.screen_text())
+        card4.detach(); live.dispose(); pump(50)
+
+        # A card whose agent STARTS before it ever got a real size drops the
+        # restored screen entirely. Both launch paths that start an agent
+        # (autostart_active_workspace, recover_blocked_at_startup) run
+        # synchronously right after show(), ahead of TerminalView's 120ms
+        # resize debounce — so this is EVERY agent that comes back running,
+        # and leaving the seed there parked each of their cards on a mangled
+        # narrow fragment until the TUI finished booting. An empty terminal
+        # that fills in a few seconds is the pre-snapshot behavior; the whole
+        # point of the feature is the card that stays STOPPED.
+        from app.terminal_agent import AgentStatus
+        launching = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Launching", cwd=str(tmp), pty=True))
+        launching.seed_pty_replay("OLD-CONVERSATION\r\n")
+        card5 = TerminalCard(launching)
+        check("screens: a restored card starts out showing its conversation",
+              "OLD-CONVERSATION" in card5.terminal.screen_text())
+        card5._on_status(AgentStatus.STARTING)  # the launch autostart
+        check("screens: an agent starting before the first settled size gets "
+              "a clean terminal, not a mangled fragment",
+              "OLD-CONVERSATION" not in card5.terminal.screen_text())
+        check("screens: ...and the seed is dropped on the AGENT too, so a "
+              "retile cannot replay it under the child",
+              launching.pty_replay() == "")
+        card5.detach(); launching.dispose(); pump(50)
+
+        # ...but a card WOKEN by a keystroke has long since re-rendered at its
+        # real size, and its conversation must still be there to scroll up out
+        # of the way, exactly as a real terminal's would
+        woken = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Woken", cwd=str(tmp), pty=True))
+        woken.seed_pty_replay("KEPT-CONVERSATION\r\n")
+        card6 = TerminalCard(woken)
+        card6.resize(640, 400); card6.show(); pump(150)  # settles, re-renders
+        check("screens: a settled restored card has consumed its replay",
+              card6._pending_replay == "")
+        card6._on_status(AgentStatus.STARTING)  # the waking keystroke
+        check("screens: waking a stopped card KEEPS the conversation on screen",
+              "KEPT-CONVERSATION" in card6.terminal.screen_text()
+              and "KEPT-CONVERSATION" in woken.pty_replay())
+        card6.detach(); woken.dispose(); pump(50)
+
+        # an agent with NOTHING to show keeps the original centred banner:
+        # that card really is a dead black screen and must say so
+        blank = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Blank", cwd=str(tmp), pty=True))
+        card2 = TerminalCard(blank)
+        card2.resize(640, 400); card2.show(); pump(150)
+        check("screens: an empty stopped card keeps the centred wake banner",
+              card2.overlay.isVisible() and not card2._overlay_compact
+              and "press any key to start" in card2.overlay.text())
+        card2.detach(); blank.dispose(); pump(150)
+
+    # -- the whole round-trip, through the real window -------------------
+    # This is the user-visible regression: close the app with a card left
+    # stopped, reopen, and the conversation is on the card. The pieces above
+    # all passed while the feature was still broken end to end.
+    if HAS_CONPTY:
+        from app.session_store import SessionStore
+        from main import create_main_window
+
+        home = pathlib.Path(tempfile.mkdtemp(prefix="aihive-screen-e2e-"))
+        store = SessionStore(path=home / "session.json")
+        term = {"role": "", "cwd": str(home), "user_program": "",
+                "user_args": [], "pty": True, "provider": "", "model": "",
+                "effort": "", "custom_command": "", "font_px": 0,
+                "is_orchestrator": False, "task": "", "assignment": "idle",
+                "auto_created": False, "session_id": "screen-e2e-1"}
+        store.save({"version": 3, "active": "w1", "workspaces": [
+            {"id": "w1", "name": "Solo", "project_path": str(home),
+             "layout": "auto", "terminals": [
+                 {**term, "kind": "powershell", "name": "Keeper",
+                  "running": False}]}]})
+
+        win = create_main_window(store)
+        win.show(); pump(200)
+        agent = win.manager.workspaces[0].agents[0]
+        # stand in for a conversation the agent had before the app closed
+        agent.seed_pty_replay("\r\n" * 4 + "MARKER-FROM-LAST-SESSION\r\n")
+        win.close(); pump(300)
+
+        snap = screen_snapshot.load(str(home), str(home), "screen-e2e-1")
+        check("screens: closing the app writes the card's screen to disk",
+              "MARKER-FROM-LAST-SESSION" in snap)
+        check("screens: the screen is a file of its own, not session.json",
+              "MARKER-FROM-LAST-SESSION" not in
+              (home / "session.json").read_text(encoding="utf-8"))
+
+        win2 = create_main_window(store)
+        win2.show(); pump(300)
+        agent2 = win2.manager.workspaces[0].agents[0]
+        check("screens: reopening seeds the restored agent from disk",
+              "MARKER-FROM-LAST-SESSION" in agent2.pty_replay())
+        check("screens: ...and it is still NOT running (restored as left)",
+              not agent2.is_running())
+        card3 = win2._pages[win2.manager.workspaces[0].id].cards[0]
+        check("screens: ...and the reopened CARD shows the conversation",
+              wait_until(lambda: "MARKER-FROM-LAST-SESSION"
+                         in card3.terminal.screen_text(), 4000),
+              card3.terminal.screen_text()[-200:])
+        check("screens: ...under a slim footer, not a wall of dead terminals",
+              card3.overlay.isVisible() and card3._overlay_compact)
+        win2.close(); pump(300)
+
+        # ...and the OTHER half of the round-trip, which is the launch the
+        # user actually looks at: an agent that was RUNNING comes back to a
+        # CLEAN terminal that its child fills in a few seconds, never a
+        # fragment of last night's screen. autostart_active_workspace() runs
+        # synchronously right after show(), ahead of TerminalView's 120ms
+        # resize debounce, so the restored screen never gets a settled size
+        # and pyte cannot reflow what was drawn at the pre-layout width.
+        store.save({"version": 3, "active": "w1", "workspaces": [
+            {"id": "w1", "name": "Solo", "project_path": str(home),
+             "layout": "auto", "terminals": [
+                 {**term, "kind": "powershell", "name": "Runner",
+                  "running": True}]}]})
+        win3 = create_main_window(store)
+        runner = win3.manager.workspaces[0].agents[0]
+        check("screens: a restored RUNNING agent is seeded like any other",
+              "MARKER-FROM-LAST-SESSION" in runner.pty_replay())
+        run_card = win3._pages[win3.manager.workspaces[0].id].cards[0]
+        check("screens: ...and its card starts out showing that screen",
+              "MARKER-FROM-LAST-SESSION" in run_card.terminal.screen_text())
+        # main.py's exact order: show(), then autostart, with no turn of the
+        # event loop in between. Pumping here instead would let the resize
+        # settle first and test the WAKE path by accident.
+        win3.show(); win3.autostart_active_workspace(); pump(600)
+        check("screens: ...but the launch autostart hands it a clean terminal",
+              "MARKER-FROM-LAST-SESSION"
+              not in run_card.terminal.screen_text(),
+              run_card.terminal.screen_text()[:160])
+        check("screens: ...and drops the stale seed off the agent as well",
+              "MARKER-FROM-LAST-SESSION" not in runner.pty_replay())
+        win3.close(); pump(300)
+        shutil.rmtree(home, ignore_errors=True)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_resume_fallback():
     """A resume (--continue) launch that dies before the interactive prompt ever
     comes up (Claude prints 'No conversation found to continue' and exits) must
@@ -6161,6 +6668,53 @@ def test_auto_continue_on_limit_reset():
     check("auto-continue: the parked-on menu alone IS a cut-off",
           menu_only.is_limit_blocked())
 
+    # --- WHY a banner did not latch has to be on the record -----------------
+    # Everything after a latch is audited; the decision NOT to latch was not,
+    # and that is the one that strands work. An agent was found parked on a
+    # spent limit with no trace anywhere of why the scrape had passed over it,
+    # and the cause could only be narrowed by elimination. These lines close
+    # that gap -- while staying bounded, since _scrape_limit runs on EVERY
+    # output burst.
+    skips: list = []
+    quiet = mk("Quiet")
+    quiet.audit = skips.append
+    quiet._prompt_ready = False
+    settle(quiet, BANNER)          # a banner during a resume replay
+    check("no-latch: a banner ignored as replay says so in the log",
+          any("NO-LATCH" in m and "Quiet" in m and "prompt not ready" in m
+              for m in skips), skips)
+    check("no-latch: ...and it did not latch", not quiet.is_limit_blocked())
+    before = len(skips)
+    for _ in range(20):            # the same frame repainted many times over
+        settle(quiet, BANNER)
+    check("no-latch: an unchanged rejection is recorded ONCE, not per burst",
+          len(skips) == before, skips[before:])
+
+    # the echo guard is the other silent path: a banner still on screen after
+    # a resume, with the menu torn down
+    echo = mk("Echo")
+    echo.audit = skips.append
+    settle(echo, BANNER)                       # first sighting latches
+    echo.clear_limit_block()                   # ...resumed off it
+    n = len(skips)
+    settle(echo, BANNER)                       # same line, no menu -> echo
+    check("no-latch: a suppressed banner echo names the reason",
+          any("NO-LATCH" in m and "Echo" in m and "already produced a latch"
+              in m for m in skips[n:]), skips[n:])
+    check("no-latch: ...and the echo still does not re-latch",
+          not echo.is_limit_blocked())
+
+    # and it must stay silent when there is nothing to say
+    mute: list = []
+    ordinary = mk("Ordinary")
+    ordinary.audit = mute.append
+    settle(ordinary, "building the index...\ndone in 4.1s\n")
+    latched = mk("Latched")
+    latched.audit = mute.append
+    settle(latched, BANNER)
+    check("no-latch: ordinary output and a successful latch log nothing",
+          mute == [] and latched.is_limit_blocked(), mute)
+
     # An agent WRITING ABOUT the limit is not stopped by it. Observed live: an
     # agent working on this feature quoted the banner in its own output and was
     # armed for a resume it never needed. A real banner is a short line of its
@@ -6573,6 +7127,123 @@ def test_auto_continue_on_limit_reset():
     check("auto-continue: an unreadable transcript does not veto the latch",
           AUTO_CONTINUE_TEXT in sent(unknown))
 
+    # --- a trivial background-task cut-off is dismissed EARLY, before the ---
+    # --- watchdog ever gets a chance to nudge it -----------------------------
+    # The screen renders the identical "Stop and wait for limit to reset"
+    # menu whether the interrupted turn was real work or Claude Code's own
+    # background-command-completion notification auto-continuing on its own
+    # -- so the live latch (correctly) cannot tell them apart, and the
+    # hourglass shows either way. `_dismiss_if_phantom` re-checks the
+    # transcript a few seconds after the latch and clears it once the
+    # evidence says nothing of the agent's actual work was lost, instead of
+    # waiting for reset time to find out via a wasted nudge.
+    from app.widgets.main_window import LIMIT_PHANTOM_CHECK_MS
+
+    def write_raw(cwd_, sid, records):
+        path = _tr.transcript_path(cwd_, sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(_json.dumps(rec) + "\n")
+
+    def ts(at):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(at))
+
+    writes.clear()
+    bg_cwd = str(tmp / "bgnotify")
+    bg = mk("BgNotify")
+    bg.spec.cwd, bg.spec.session_id = bg_cwd, "sid-bg-notify"
+    write_raw(bg_cwd, "sid-bg-notify", [
+        {"type": "assistant", "timestamp": ts(now - 3600),
+         "message": {"content": [{"type": "text", "text": "Done, merged."}]}},
+        {"type": "user", "timestamp": ts(now - 30),
+         "message": {"content": "<task-notification>\n<task-id>t1</task-id>\n"
+                                "<status>completed</status>\n"
+                                "</task-notification>"}},
+        {"type": "assistant", "timestamp": ts(now - 30),
+         "message": {"content": [{"type": "text", "text": BANNER.strip()}]}},
+    ])
+    settle(bg, BANNER)
+    ws.agents.append(bg)
+    check("auto-continue: a trivial background-task cut-off still latches "
+          "live (the screen alone can't tell it apart from a real one)",
+          bg.is_limit_blocked())
+    win._on_agent_limit_blocked(ws.id, bg.id)
+    pump(LIMIT_PHANTOM_CHECK_MS + 500)
+    check("auto-continue: ...but the early phantom check clears it once the "
+          "transcript shows the interrupted turn wasn't real work",
+          not bg.is_limit_blocked())
+    check("auto-continue: it is never nudged", sent(bg) == "")
+    check("auto-continue: the early dismissal is recorded as an outcome too",
+          any(r.get("event") == limit_ledger.DISMISSED
+              and "background-task" in r.get("detail", "")
+              for r in limit_ledger.read_all(str(tmp))))
+
+    # ...and a GENUINE cut-off latched the same way must survive that same
+    # early check untouched.
+    writes.clear()
+    real_cwd = str(tmp / "realask")
+    real_ask = mk("RealAsk")
+    real_ask.spec.cwd, real_ask.spec.session_id = real_cwd, "sid-real-ask"
+    write_raw(real_cwd, "sid-real-ask", [
+        {"type": "assistant", "timestamp": ts(now - 3600),
+         "message": {"content": [{"type": "text", "text": "Done, merged."}]}},
+        {"type": "user", "timestamp": ts(now - 30),
+         "message": {"content": "can you add Chess960 castling support?"}},
+        {"type": "assistant", "timestamp": ts(now - 30),
+         "message": {"content": [{"type": "text", "text": BANNER.strip()}]}},
+    ])
+    settle(real_ask, BANNER)
+    ws.agents.append(real_ask)
+    win._on_agent_limit_blocked(ws.id, real_ask.id)
+    pump(LIMIT_PHANTOM_CHECK_MS + 500)
+    check("auto-continue: a genuine cut-off survives the early phantom check",
+          real_ask.is_limit_blocked())
+
+    # THE RACE the early check has to lose safely: it runs seconds after the
+    # banner was DRAWN, and Claude may not have written that record yet. A
+    # running agent's transcript always exists, so an unflushed banner does
+    # NOT read as "no transcript" -- it reads as a conversation that carried
+    # on. Dismissing on that would clear a genuine latch outright (nothing
+    # re-latches a silently parked agent), so the early check gates on
+    # positive `synthetic` evidence instead.
+    writes.clear()
+    slow_cwd = str(tmp / "unflushed")
+    slow = mk("Unflushed")
+    slow.spec.cwd, slow.spec.session_id = slow_cwd, "sid-unflushed"
+    write_raw(slow_cwd, "sid-unflushed", [
+        {"type": "user", "timestamp": ts(now - 60),
+         "message": {"content": "please refactor the parser"}},
+        {"type": "assistant", "timestamp": ts(now - 50),
+         "message": {"content": [{"type": "text", "text": "Working on it."}]}},
+    ])
+    settle(slow, BANNER)
+    ws.agents.append(slow)
+    win._on_agent_limit_blocked(ws.id, slow.id)
+    pump(LIMIT_PHANTOM_CHECK_MS + 500)
+    check("auto-continue: a latch whose banner has not been written to the "
+          "transcript yet is NOT dismissed early", slow.is_limit_blocked())
+
+    # ...and a slash command is the user's own work, however much its record
+    # looks like plumbing.
+    writes.clear()
+    slash_cwd = str(tmp / "slashcmd")
+    slash = mk("SlashCmd")
+    slash.spec.cwd, slash.spec.session_id = slash_cwd, "sid-slash-cmd"
+    write_raw(slash_cwd, "sid-slash-cmd", [
+        {"type": "user", "timestamp": ts(now - 30),
+         "message": {"content": "<command-name>/security-review</command-name>"
+                                "\n<command-message>go</command-message>"}},
+        {"type": "assistant", "timestamp": ts(now - 30),
+         "message": {"content": [{"type": "text", "text": BANNER.strip()}]}},
+    ])
+    settle(slash, BANNER)
+    ws.agents.append(slash)
+    win._on_agent_limit_blocked(ws.id, slash.id)
+    pump(LIMIT_PHANTOM_CHECK_MS + 500)
+    check("auto-continue: a cut-off during a USER-typed slash command is not "
+          "dismissed as plumbing", slash.is_limit_blocked())
+
     # --- the cut-off is visible on the card ---------------------------------
     marked = mk("Marked")
     settle(marked, BANNER)
@@ -6708,6 +7379,79 @@ def test_startup_limit_recovery():
     check("startup-recovery: no transcript at all is not a cut-off",
           transcripts.ended_on_limit(cwd, "sid-missing")[0] is False)
 
+    # A cut-off is only real when the turn it stopped was something the user
+    # (or a delivered task) actually asked for. Claude Code can turn a
+    # background command's own completion into a brand-new turn with NO input
+    # from anyone -- if the account is exhausted right then, that turn hits
+    # the identical banner a real interruption would, but nothing of the
+    # agent's actual work was lost. Observed live: an agent long done with its
+    # assigned task got auto-nudged over a stray background Playwright lookup
+    # finishing hours later.
+    def user_msg(content, at):
+        return {"type": "user", "timestamp": iso(at),
+                "message": {"content": content}}
+
+    write_transcript(cwd, "sid-bg-notify", [
+        assistant("Done, merged and clean.", cut_at - 3600),
+        user_msg("<task-notification>\n<task-id>abc</task-id>\n"
+                 "<status>completed</status>\n</task-notification>", cut_at),
+        assistant(BANNER, cut_at)])
+    hit3, _, _ = transcripts.ended_on_limit(cwd, "sid-bg-notify")
+    check("startup-recovery: a banner behind a <task-notification> (no real "
+          "input from the user or AI Hive) is not a cut-off worth resuming",
+          not hit3)
+
+    write_transcript(cwd, "sid-real-ask", [
+        assistant("Done, merged and clean.", cut_at - 3600),
+        user_msg("can you also add Chess960 castling support?", cut_at),
+        assistant(BANNER, cut_at)])
+    hit4, _, _ = transcripts.ended_on_limit(cwd, "sid-real-ask")
+    check("startup-recovery: a banner behind a REAL user prompt is still a "
+          "genuine cut-off", hit4)
+
+    write_transcript(cwd, "sid-tool-result", [
+        assistant("Done, merged and clean.", cut_at - 3600),
+        {"type": "user", "timestamp": iso(cut_at),
+         "message": {"content": [{"type": "tool_result",
+                                  "content": [{"type": "text",
+                                               "text": "exit 0"}]}]}},
+        assistant(BANNER, cut_at)])
+    hit5, _, _ = transcripts.ended_on_limit(cwd, "sid-tool-result")
+    check("startup-recovery: a banner behind an ordinary tool-result reply "
+          "(mid-turn, not synthetic) is still a genuine cut-off", hit5)
+
+    # A slash command READS like plumbing -- a bare `<command-name>` string,
+    # same shape as a <task-notification> -- but the user typed it, so the
+    # work behind it is theirs and a cut-off there is as real as any other.
+    # Keying "synthetic" off the leading "<" alone swept these in and would
+    # have silently dropped the cut-off (real transcripts do carry a
+    # `<command-name>` record followed straight by the assistant turn).
+    write_transcript(cwd, "sid-slash-cmd", [
+        assistant("Done, merged and clean.", cut_at - 3600),
+        user_msg("<command-name>/security-review</command-name>\n"
+                 "<command-message>security-review</command-message>", cut_at),
+        assistant(BANNER, cut_at)])
+    hit6, _, _ = transcripts.ended_on_limit(cwd, "sid-slash-cmd")
+    check("startup-recovery: a banner behind a USER-typed slash command is a "
+          "genuine cut-off, not plumbing", hit6)
+
+    # `synthetic` is positive evidence and must never stand in for "no banner
+    # found": an early caller gates on it precisely because a banner Claude
+    # has drawn but not yet WRITTEN reads as cut_off False on an existing
+    # transcript, which is not evidence of anything.
+    write_transcript(cwd, "sid-unflushed", [
+        user_msg("please refactor the parser", cut_at - 60),
+        assistant("Working on it now.", cut_at - 50)])
+    unflushed = transcripts.limit_cut_off(cwd, "sid-unflushed")
+    check("startup-recovery: an unwritten banner is NOT flagged synthetic "
+          "(absence of evidence is not evidence)",
+          unflushed is not None and not unflushed["cut_off"]
+          and not unflushed["synthetic"], unflushed)
+    check("startup-recovery: a real plumbing cut-off IS flagged synthetic",
+          transcripts.limit_cut_off(cwd, "sid-bg-notify")["synthetic"])
+    check("startup-recovery: a genuine cut-off is not flagged synthetic",
+          not transcripts.limit_cut_off(cwd, "sid-real-ask")["synthetic"])
+
     # --- arming from it ------------------------------------------------------
     store = SessionStore(path=tmp / "s.json")
     win = create_main_window(store)
@@ -6796,6 +7540,19 @@ def test_startup_limit_recovery():
     check("startup-recovery: a cut-off already resolved is not revived",
           not again.is_limit_blocked())
 
+    # The `is_pty` gate above is unreachable for a claude agent, and that is
+    # load-bearing rather than incidental: CLAUDE is in PTY_ONLY_KINDS, so
+    # `build_spec` forces pty=True -- including inside `AgentSpec.from_dict`,
+    # which is what makes a session record that has LOST its pty field (see
+    # the degraded-save fallback in test_v3_features) still restore as a real
+    # terminal instead of a line-mode card that this feature would skip.
+    from app.process_worker import AgentSpec as _Spec
+    check("startup-recovery: a claude agent is pty even when asked not to be",
+          build_spec(AgentKind.CLAUDE, "X", cwd=cwd, pty=False).pty is True)
+    check("startup-recovery: ...and a record with no pty field restores as one",
+          _Spec.from_dict({"kind": "claude", "name": "X", "cwd": cwd,
+                           "provider": "claude", "session_id": "s"}).pty is True)
+
     # --- the toggle owns its own latches ------------------------------------
     win._startup_recovery = False
     fresh = agent_for("Fresh", "sid-cut")
@@ -6838,6 +7595,378 @@ def test_startup_limit_recovery():
           create_main_window(
               SessionStore(path=tmp / "fresh.json")).top_bar.startup_recovery())
     win2.close()
+
+
+def test_scheduled_send():
+    """A message the user writes now and has typed in LATER.
+
+    Ctrl+Shift+Enter in a terminal is "Enter, but on a countdown" - the gesture
+    that makes chaining agents possible while away from the machine. The rules
+    that matter are the ones about NOT sending: a scheduled message is a nudge
+    and never an assignment, and one that came due while the app was closed is
+    surfaced as missed rather than fired hours late into a conversation that has
+    moved on."""
+    import time as _time
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+    from app import scheduled_send as ss
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import AssignmentState, TerminalAgent
+    from app.widgets.main_window import SCHEDULE_GIVE_UP_S
+    from app.workspace_manager import WorkspaceManager
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    now = _time.time()
+
+    # --- parsing: what a person types into a "send in" box ------------------
+    delays = {"45": 2700, "45m": 2700, "30 min": 1800, "1h": 3600,
+              "1h30": 5400, "1h30m": 5400, "1.5h": 5400, "90s": 90,
+              "2:15": 8100, "1h 30m 10s": 5410}
+    bad = ["", "   ", "abc", "0", "45x", "-5", "200h"]  # 200h > the week cap
+    check("schedule: delays parse (bare number = minutes, 1h30, 90s, 2:15)",
+          all(ss.parse_delay(k) == v for k, v in delays.items()),
+          {k: ss.parse_delay(k) for k, v in delays.items()
+           if ss.parse_delay(k) != v})
+    check("schedule: junk and non-positive delays are rejected",
+          all(ss.parse_delay(b) is None for b in bad),
+          [b for b in bad if ss.parse_delay(b) is not None])
+    # a bare clock has no date, so a time already past today means tomorrow --
+    # the rollover that matters when scheduling late at night for the morning
+    anchor = _time.mktime((2026, 8, 7, 14, 0, 0, 0, 0, -1))
+    later = ss.parse_clock("15:30", anchor)
+    tomorrow = ss.parse_clock("03:30", anchor)
+    check("schedule: a clock still ahead today resolves to today",
+          later is not None and 0 < later - anchor < 86400
+          and _time.localtime(later).tm_mday == 7)
+    check("schedule: a clock already past resolves to TOMORROW",
+          tomorrow is not None and _time.localtime(tomorrow).tm_mday == 8)
+    check("schedule: pm/am clocks parse",
+          ss.parse_clock("3pm", anchor) == ss.parse_clock("15:00", anchor))
+    check("schedule: an impossible clock is rejected",
+          ss.parse_clock("25:00", anchor) is None)
+    check("schedule: countdowns format h:mm:ss / m:ss and clamp at zero",
+          (ss.format_countdown(3862), ss.format_countdown(724),
+           ss.format_countdown(9), ss.format_countdown(-5))
+          == ("1:04:22", "12:04", "0:09", "0:00"))
+
+    # a malformed persisted row must never cost an agent its other messages
+    check("schedule: an unusable persisted row decodes to None, not a crash",
+          ss.ScheduledMessage.from_dict({"text": "", "due_ts": 1}) is None
+          and ss.ScheduledMessage.from_dict({"text": "x"}) is None
+          and ss.ScheduledMessage.from_dict({"text": "x", "due_ts": "no"})
+          is None)
+
+    # --- the queue on the agent --------------------------------------------
+    writes: dict = {}
+
+    def mk(name="Coder", pty=True):
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=os.getcwd(), pty=pty)
+        a = TerminalAgent(spec)
+        a.worker = type("W", (), {
+            "is_running": lambda s: True,
+            "write": lambda s, d: (writes.setdefault(id(s), []).append(d),
+                                   True)[1],
+            "start": lambda s: None, "dispose": lambda s: None})()
+        a._prompt_ready = True
+        return a
+
+    def sent(agent):
+        return "".join(writes.get(id(agent.worker), []))
+
+    a = mk()
+    edges = []
+    a.scheduled_changed.connect(lambda: edges.append(1))
+    msg = a.schedule_message("run the smoke suite", now + 600)
+    check("schedule: a queued message is held and announced once",
+          msg is not None and len(a.pending_scheduled()) == 1 and edges == [1])
+    check("schedule: an empty message is refused",
+          a.schedule_message("   ", now + 60) is None)
+    check("schedule: the soonest message is the one shown",
+          a.schedule_message("later", now + 9000) is not None
+          and a.next_scheduled().text == "run the smoke suite")
+    check("schedule: nothing is due before its time", a.due_scheduled(now) == [])
+    check("schedule: it is due at its time",
+          [m.text for m in a.due_scheduled(now + 601)]
+          == ["run the smoke suite"])
+    for i in range(ss.MAX_PER_AGENT):
+        a.schedule_message(f"filler {i}", now + 4000 + i)
+    check("schedule: an agent caps how many it will hold",
+          len(a.pending_scheduled()) == ss.MAX_PER_AGENT)
+    a._scheduled = [m for m in a._scheduled if not m.text.startswith("filler")]
+
+    # --- delivery is a NUDGE, never an assignment --------------------------
+    # deliver_task overwrites the persisted current_task, flips the assignment
+    # to WORKING and re-infers the role. The user pressed a deferred Enter; they
+    # did not assign anything, so none of that may move.
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-sched-"))
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.show()
+    mgr = win.manager
+    ws = mgr.workspaces[0]
+
+    d = mk("Deliver")
+    d.set_task("the original task")
+    d.set_assignment(AssignmentState.COMPLETED)
+    d.spec.role = "Reviewer"
+    before = (d.current_task, d.assignment, d.spec.role)
+    due = d.schedule_message("please continue", now - 1)
+    ws.agents.append(d)
+    win._tick_schedules()
+    check("schedule: a due message is typed into the agent",
+          "please continue" in sent(d))
+    check("schedule: delivery leaves task/assignment/role untouched "
+          "(nudge, not deliver_task)",
+          (d.current_task, d.assignment, d.spec.role) == before,
+          (d.current_task, d.assignment, d.spec.role))
+    check("schedule: a sent message is dropped from the queue",
+          d.scheduled_messages() == [])
+    check("schedule: delivery does not stamp the user-input clock "
+          "(the work it starts still pulses the sidebar)",
+          d._last_input_ts == 0.0)
+
+    # --- a refusal is retried, then given up on as MISSED -------------------
+    r = mk("NotReady")
+    r._prompt_ready = False
+    late = r.schedule_message("go", now - 5)
+    ws.agents.append(r)
+    win._tick_schedules()
+    check("schedule: an agent whose prompt is not ready is not typed into",
+          sent(r) == "")
+    check("schedule: ...and the message stays queued for the next tick",
+          late.is_pending() and late.attempts == 1)
+    late.due_ts = now - SCHEDULE_GIVE_UP_S - 1
+    win._tick_schedules()
+    check("schedule: past the give-up window it becomes MISSED, not sent",
+          late.state == ss.MISSED and sent(r) == "")
+    check("schedule: a missed message is KEPT so the user can see it",
+          [m.state for m in r.scheduled_messages()] == [ss.MISSED])
+
+    # an agent parked on the plan limit must not be typed into: the text would
+    # land in the limit's options menu, not the prompt underneath it
+    b = mk("Blocked")
+    b.mark_limit_blocked(now + 3600)
+    b.schedule_message("go", now - 1)
+    ws.agents.append(b)
+    win._tick_schedules()
+    check("schedule: an agent parked on the plan limit is not typed into",
+          sent(b) == "" and b.pending_scheduled())
+
+    # --- the countdown tick must never touch the session file ---------------
+    saves = []
+    mgr.dirty.connect(lambda: saves.append(1))
+    t = mk("Ticker")
+    ws.agents.append(t)
+    mgr._wire_agent(ws, t)
+    t.schedule_message("soon", now + 3600)
+    queued_saves = len(saves)
+    check("schedule: queueing a message DOES mark the session dirty "
+          "(the queue is persisted)", queued_saves >= 1)
+    for _ in range(5):
+        win._tick_schedules()
+    check("schedule: the per-second tick marks the session dirty ZERO times",
+          len(saves) == queued_saves, len(saves) - queued_saves)
+    t.cancel_scheduled(t.next_scheduled().id)
+    check("schedule: cancelling drops it and marks dirty",
+          not t.scheduled_messages() and len(saves) > queued_saves)
+
+    # the tick only RUNS while something is queued, so a hive with nothing
+    # scheduled pays nothing for the feature
+    for agent in (d, r, b, t):
+        agent._scheduled.clear()
+    win._sync_schedule_timer()
+    check("schedule: the tick timer stops when nothing is queued",
+          not win._schedule_timer.isActive())
+    t.schedule_message("wake up", now + 60)
+    win._sync_schedule_timer()
+    check("schedule: the tick timer runs while something is queued",
+          win._schedule_timer.isActive())
+    # QTimer.start() RESTARTS a running timer, and this is called from
+    # workspaceStatsChanged (which fires every couple of seconds per busy
+    # agent) -- an unconditional start would reset the countdown forever
+    win._schedule_timer.setInterval(50000)
+    win._sync_schedule_timer()
+    check("schedule: re-syncing an already-running tick does not restart it",
+          win._schedule_timer.remainingTime() <= 50000)
+    win._schedule_timer.setInterval(1000)
+
+    check("schedule: workspace stats count agents holding a message",
+          mgr.workspace_stats(ws.id)["scheduled"] == 1)
+
+    # ...and the whole thing runs on its OWN timer. Every check above drives
+    # _tick_schedules by hand, which proves the logic but not the feature: this
+    # one queues a message, touches nothing, and waits for it to arrive.
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    live = mk("Live")
+    ws.agents.append(live)
+    live.schedule_message("wake up and work", _time.time() + 0.2)
+    win._sync_schedule_timer()
+    pump(1600)
+    check("schedule: the countdown fires on its own timer and delivers",
+          "wake up and work" in sent(live) and not live.scheduled_messages(),
+          sent(live))
+
+    # --- persistence, and the rule about coming back late -------------------
+    m2 = WorkspaceManager()
+    ahead, behind = now + 7200, now - 7200
+    keeper = mk("Keeper")
+    keeper.schedule_message("still ahead", ahead)
+    keeper.schedule_message("long overdue", behind)
+    ws.agents.append(keeper)
+    data = mgr.to_session_dict()
+    rows = [t_ for w in data["workspaces"] for t_ in w["terminals"]
+            if t_.get("name") == "Keeper"]
+    check("schedule: pending messages are persisted with the agent",
+          len(rows) == 1 and len(rows[0].get("scheduled", [])) == 2,
+          rows)
+    m2.load_session_dict(data)
+    back = next((x for x in m2.all_agents() if x.spec.name == "Keeper"), None)
+    states = {m.text: m.state for m in (back.scheduled_messages() if back else [])}
+    check("schedule: a message still ahead comes back PENDING",
+          states.get("still ahead") == ss.PENDING, states)
+    # THE RULE: a 3am message the app was closed for must NOT fire at 10am into
+    # a conversation that has moved on. It comes back visible, not delivered.
+    check("schedule: a message that came due while the app was closed comes "
+          "back MISSED, never sent", states.get("long overdue") == ss.MISSED,
+          states)
+    check("schedule: a session with no queue restores cleanly",
+          m2.load_session_dict({"workspaces": [{"id": "w", "name": "W",
+                                                "project_path": os.getcwd(),
+                                                "terminals": []}]}) is None)
+    # the degraded save path keeps the queue too: it exists so a malformed
+    # agent loses as little as possible, and a dropped hand-off is a real loss
+    broken = mk("Broken")
+    broken.schedule_message("survive the degrade", ahead)
+    broken.spec.kind = "not-an-enum"       # AgentSpec.to_dict raises on .value
+    degraded = mgr._agent_dict_safe(broken)
+    check("schedule: the degraded save record still carries the queue",
+          len(degraded.get("scheduled", [])) == 1, degraded)
+
+    # --- the gesture --------------------------------------------------------
+    from app.widgets.terminal_view import TerminalView
+    view = TerminalView(rows=24, cols=80)
+    seen, keys = [], []
+    view.scheduleRequested.connect(seen.append)
+    view.keyInput.connect(keys.append)
+
+    def press(key, ctrl=False, shift=False):
+        mods = Qt.KeyboardModifier.NoModifier
+        if ctrl:
+            mods |= Qt.KeyboardModifier.ControlModifier
+        if shift:
+            mods |= Qt.KeyboardModifier.ShiftModifier
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, mods, "\r"))
+
+    view.feed("> run the tests")
+    press(Qt.Key.Key_Return, ctrl=True, shift=True)
+    check("schedule: Ctrl+Shift+Enter asks for a countdown, carrying what is "
+          "typed", seen == ["run the tests"], seen)
+    check("schedule: ...and sends NOTHING to the child (no submit, no clear)",
+          keys == [], keys)
+    # Ctrl+Enter is NOT available for this: it inserts a newline, which is how
+    # multi-line input works in Claude Code
+    press(Qt.Key.Key_Return, ctrl=True)
+    check("schedule: plain Ctrl+Enter still inserts a newline",
+          keys == ["\n"] and len(seen) == 1, (keys, seen))
+    view.deleteLater()
+
+    # --- the composer -------------------------------------------------------
+    from PySide6.QtWidgets import QDialog, QDialogButtonBox
+    from app.widgets.main_window import ScheduleMessageDialog
+
+    comp = mk("Composer")
+    dlg = ScheduleMessageDialog(comp, parent=win, prefill="deploy the thing")
+    ok_btn = dlg.buttons.button(QDialogButtonBox.StandardButton.Ok)
+    check("schedule: the composer opens prefilled with what was typed",
+          dlg.text_edit.toPlainText() == "deploy the thing")
+    check("schedule: it opens on a usable default delay",
+          ok_btn.isEnabled() and dlg.result_message() is not None)
+    # a preset must be written in the DELAY vocabulary, never the countdown
+    # one: "5:00" reads back as five HOURS, not five minutes
+    preset_bad = []
+    for label, seconds in ScheduleMessageDialog.PRESETS:
+        dlg._set_preset(seconds)
+        got = ss.parse_delay(dlg.delay_edit.text())
+        if got != seconds:
+            preset_bad.append(f"{label}: {dlg.delay_edit.text()!r}={got}")
+    check("schedule: every preset button means what its label says",
+          not preset_bad, preset_bad)
+    dlg.delay_edit.setText("90m")
+    dlg._revalidate()
+    text, when = dlg.result_message()
+    check("schedule: a custom delay resolves to a fire time",
+          text == "deploy the thing" and 5300 < when - _time.time() < 5500)
+    check("schedule: the composer says exactly when it will fire",
+          "in 1:29" in dlg.when_label.text(), dlg.when_label.text())
+    # the two time fields are alternatives: there must never be a hidden second
+    # answer deciding the fire time
+    dlg.clock_edit.setText("03:30")
+    dlg._on_time_edited(False)
+    check("schedule: typing a clock clears the delay field (one answer only)",
+          dlg.delay_edit.text() == ""
+          and dlg.result_message()[1] == ss.parse_clock("03:30"))
+    dlg.text_edit.setPlainText("   ")
+    check("schedule: an empty message cannot be scheduled",
+          not ok_btn.isEnabled() and dlg.result_message() is None)
+    dlg.text_edit.setPlainText("ok")
+    dlg.clock_edit.setText("nonsense")
+    dlg._on_time_edited(False)
+    check("schedule: an unparseable time cannot be scheduled",
+          not ok_btn.isEnabled() and dlg.result_message() is None)
+    comp.schedule_message("already queued", now + 60)
+    dlg.refresh_pending()
+    check("schedule: the composer lists what is already queued",
+          dlg.pending_box.count() > 0)
+    dlg.deleteLater()
+
+    # confirming from the TERMINAL gesture also clears the child's input box:
+    # the text now lives in AI Hive, so a copy left in the prompt would be
+    # submitted a second time the moment the user pressed Enter
+    gest = mk("Gesture")
+    ws.agents.append(gest)
+    real_exec = ScheduleMessageDialog.exec
+    try:
+        ScheduleMessageDialog.exec = lambda self: (
+            self.text_edit.setPlainText("scheduled from the terminal"),
+            self.delay_edit.setText("10m"), self._revalidate(),
+            QDialog.DialogCode.Accepted)[-1]
+        win._on_schedule_message(gest.id, "scheduled from the terminal")
+    finally:
+        ScheduleMessageDialog.exec = real_exec
+    check("schedule: confirming queues the message",
+          [m.text for m in gest.pending_scheduled()]
+          == ["scheduled from the terminal"])
+    check("schedule: ...and clears the child's input box (double-Escape), so "
+          "the text is never submitted twice", sent(gest) == "\x1b\x1b")
+
+    # --- the card chip ------------------------------------------------------
+    page = win._pages[ws.id]
+    chip_agent = mgr.add_terminal(
+        ws.id, build_spec(AgentKind.CLAUDE, "Chip", cwd=os.getcwd()),
+        autostart=False)
+    card = page.card_for(chip_agent.id)
+    check("schedule: a card with nothing queued shows no countdown chip",
+          card is not None and not card.sched_mark.isVisible())
+    chip_agent.schedule_message("later", now + 724)
+    check("schedule: the chip appears with the countdown to the soonest one",
+          card.sched_mark.isVisible() and "12:0" in card.sched_mark.text(),
+          card.sched_mark.text())
+    chip_agent.mark_scheduled_missed(chip_agent.next_scheduled().id)
+    check("schedule: a missed message flips the chip to its warning state",
+          card.sched_mark.property("missed") is True
+          and "missed" in card.sched_mark.text())
+    chip_agent.cancel_scheduled(chip_agent.scheduled_messages()[0].id)
+    check("schedule: cancelling the last message hides the chip again",
+          not card.sched_mark.isVisible())
+
+    win.close()
 
 
 def main():
@@ -6892,6 +8021,7 @@ def main():
     test_review_hardening_fixes()
     test_resume_picker()
     test_transcript_backups()
+    test_screen_snapshots()
     test_agent_file_map()
     test_fsopen_helpers()
     test_filetypes_icons()
@@ -6904,6 +8034,7 @@ def main():
     test_limit_ledger()
     test_auto_continue_on_limit_reset()
     test_startup_limit_recovery()
+    test_scheduled_send()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0

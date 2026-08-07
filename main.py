@@ -45,17 +45,22 @@ from app.workspace_manager import WorkspaceManager
 
 
 def _app_icon():
-    """Window/taskbar icon: the bundled multi-resolution .ico (see
-    generate_app_icon.py) so the SAME glyph appears in the title bar, the
-    taskbar while running, and — once the shortcut's IconLocation points at
-    it too — the pinned taskbar slot. Falls back to a single runtime-painted
-    pixmap if the asset hasn't been generated yet."""
+    """Window/taskbar icon: the bundled multi-resolution .ico (baked from
+    app/assets/icons/app_logo.png by generate_app_icon.py) so the SAME
+    artwork appears in the title bar, the taskbar while running, and — once
+    the shortcut's IconLocation points at it too — the pinned taskbar slot.
+    Falls back to the raw source PNG, then a runtime-painted placeholder, if
+    the .ico asset hasn't been (re)generated yet."""
     from PySide6.QtGui import QIcon
 
-    ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "app", "assets", "icons", "app_icon.ico")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    ico_path = os.path.join(base_dir, "app", "assets", "icons", "app_icon.ico")
     if os.path.isfile(ico_path):
         return QIcon(ico_path)
+
+    logo_path = os.path.join(base_dir, "app", "assets", "icons", "app_logo.png")
+    if os.path.isfile(logo_path):
+        return QIcon(logo_path)
 
     from PySide6.QtCore import QRectF
     from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
@@ -114,6 +119,18 @@ def create_main_window(store: SessionStore | None = None) -> MainWindow:
     from app import transcripts
     transcripts.backup_for_agents(
         manager.all_agents(), str(store.path.parent / "transcripts"))
+
+    # ...and give every restored pty agent back the screen it had at close,
+    # BEFORE the window builds its cards: TerminalCard replays pty_replay()
+    # in its constructor, so seeding after this point would leave the launch
+    # cards blank and only paint on a later retile. An agent about to
+    # autostart is seeded too — its conversation is on screen from the first
+    # frame instead of after the TUI finishes drawing.
+    from app import screen_snapshot
+    for agent in manager.all_agents():
+        if getattr(agent, "is_pty", False):
+            agent.seed_pty_replay(screen_snapshot.load(
+                str(store.path.parent), agent.spec.cwd, agent.spec.session_id))
 
     first_run = not manager.workspaces
     if first_run:

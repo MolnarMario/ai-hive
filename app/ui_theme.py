@@ -399,6 +399,16 @@ WorkspaceRow[search_hit="true"] {{
     min-height: 18px; max-height: 18px;
 }}
 #WsLimit:hover {{ background: rgba(217,178,74,0.34); }}
+/* stopwatch + count: agent(s) here hold a message queued to be typed in
+   later. Same pill shape as #WsLimit so the row's indicators read as one
+   family; the glyph is what tells them apart. */
+#WsSched {{
+    background: rgba(217,178,74,0.14); color: {p.ACCENT_GOLD};
+    border: 1px solid {p.ACCENT_GOLD_DIM}; border-radius: 9px;
+    font-weight: 800; font-size: 11px; padding: 0 5px; min-width: 18px;
+    min-height: 18px; max-height: 18px;
+}}
+#WsSched:hover {{ background: rgba(217,178,74,0.30); }}
 
 /* sidebar search: the magnifier toggle + the overlay input it reveals */
 #SearchBtn {{
@@ -467,6 +477,8 @@ WorkspaceRow[search_hit="true"] {{
 /* cut off by the usage limit: amber like the "?", but deliberately NOT the
    error red: the agent is fine, it is only waiting for the window to reopen */
 #WsAgentLimit {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
+/* a message is queued to be typed into this agent later */
+#WsAgentSched {{ color: {p.ACCENT_GOLD_DIM}; font-size: 12px; }}
 
 /* inline file explorer rows (a workspace expanded to its VS Code-style file
    tree): a type/folder icon + the name; the revealed row (a file jumped to from
@@ -519,6 +531,36 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     padding: 0px 4px;
 }}
 #CardLimitMark {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
+/* the deferred-message countdown ("(clock) 12:04"), clickable to change or
+   cancel it. Gold like the hourglass beside it: nothing is wrong, something is
+   simply scheduled. The MISSED state is the exception and is meant to be
+   noticed, so it inverts to a red-tinted pill in primary text (which every
+   skin guarantees readable) rather than red ink, which is unreadable on the
+   light manuscript header. */
+#CardSchedule {{
+    background: transparent; color: {p.ACCENT_GOLD};
+    border: 1px solid transparent; border-radius: 8px;
+    font-size: 11px; font-weight: 700; padding: 0 5px;
+}}
+#CardSchedule:hover {{
+    background: rgba(217,178,74,0.20); border-color: {p.ACCENT_GOLD_DIM};
+}}
+#CardSchedule[missed="true"] {{
+    background: rgba(190,60,60,0.30); color: {p.TEXT};
+    border-color: {p.RED};
+}}
+/* the "send later" composer: preset delay buttons + the resolved fire time */
+#SchedulePreset {{
+    background: {p.BG_INPUT}; color: {p.TEXT};
+    border: 1px solid {p.BORDER}; border-radius: 3px;
+    padding: 3px 9px; font-family: {BODY_FONT}; font-size: 12px;
+}}
+#SchedulePreset:hover {{
+    border-color: {p.ACCENT_GOLD}; color: {p.ACCENT_GOLD};
+}}
+#ScheduleWhen {{
+    color: {p.TEXT_DIM}; font-family: {BODY_FONT}; font-size: 12px;
+}}
 #Console {{
     background: {p.BG_CONSOLE};
     border: none;

@@ -6,6 +6,9 @@ so the other skins stay clean and light. SVG geometry/colours are lifted from
 the design handoff's inline data-URIs.
 """
 
+import os
+from functools import lru_cache
+
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
                             QRectF, Qt, QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient,
@@ -127,6 +130,21 @@ def _pixmap(svg: str, w: int, h: int) -> QPixmap:
     r.render(p, QRectF(0, 0, w, h))
     p.end()
     return pm
+
+
+_LOGO_PATH = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "assets", "icons", "app_logo.png")
+
+
+@lru_cache(maxsize=None)
+def _logo_pixmap(size: int) -> QPixmap:
+    """The bundled hexagon/hive artwork (same source as the window icon,
+    see generate_app_icon.py), rasterised once per requested size."""
+    src = QPixmap(_LOGO_PATH)
+    if src.isNull():
+        return src
+    return src.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                      Qt.TransformationMode.SmoothTransformation)
 
 
 def _gilt(rect: QRectF) -> QRadialGradient:
@@ -605,7 +623,8 @@ class PlanUsageBadge(QWidget):
 
 class LogoRoundel(QWidget):
     """The gilt logo roundel: gold-leaf boss, ultramarine inner disc, white
-    vine tendrils, gold 'A'. Falls back to a plain gold hexagon glyph off the
+    vine tendrils, gold 'A'. Falls back to the bundled hive-hexagon artwork
+    (app/assets/icons/app_logo.png, same source as the window icon) off the
     illuminated theme."""
 
     def __init__(self, parent=None):
@@ -651,12 +670,19 @@ class LogoRoundel(QWidget):
             p.setBrush(cg)
             p.drawEllipse(core, r, r)
         else:
-            f = QFont("Segoe UI Symbol")
-            f.setPixelSize(17)
-            f.setBold(True)
-            p.setFont(f)
-            p.setPen(QColor(Palette.ACCENT_GOLD))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "⬡")
+            side = round(rect.width())
+            logo = _logo_pixmap(side)
+            if logo.isNull():
+                f = QFont("Segoe UI Symbol")
+                f.setPixelSize(17)
+                f.setBold(True)
+                p.setFont(f)
+                p.setPen(QColor(Palette.ACCENT_GOLD))
+                p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "⬡")
+            else:
+                x = rect.left() + (rect.width() - logo.width()) / 2
+                y = rect.top() + (rect.height() - logo.height()) / 2
+                p.drawPixmap(round(x), round(y), logo)
         p.end()
 
 

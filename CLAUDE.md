@@ -23,9 +23,18 @@ this file is the invariants that must survive every change.
   suppressed while `_closing`) and `SAVE-FAIL payload` (exception while
   BUILDING the payload, which is upstream of `store.save`'s own guard) via
   `SessionStore.audit`; and `to_session_dict` serializes each agent through
-  `_agent_dict_safe` so one un-serializable agent degrades to a minimal
-  (identity + session_id + running) entry instead of aborting the entire
-  session's save. Don't remove these guards or let a new save path bypass the
+  `_agent_dict_safe` so one un-serializable agent degrades to a minimal entry
+  instead of aborting the entire session's save. That degrade is itself
+  audited (`SAVE-DEGRADE` + the exception, via the manager's `audit` hook,
+  which `MainWindow` sets alongside `arm_agent`) and it carries every field it
+  can read without risking a second throw (`pty`, `model`, `effort`,
+  `permission_mode`, `role`, `font_px`, `task`). Both halves are from a live
+  find: two agents were degrading on EVERY save, silently resetting their
+  model/effort/task on the next restore, and the cause was NOT recoverable
+  from disk — a `kind` that is a plain str and a `user_args` of None throw at
+  different lines of `AgentSpec.to_dict` but produce byte-identical output,
+  and `AgentKind` is a str-mixin enum so even the serialized `kind` can't tell
+  them apart. Don't remove these guards or let a new save path bypass the
   audit trail. Conversely, TRANSIENT signals must NEVER mark `dirty`:
   `activity_changed` (busy/standby, derived from output activity — see the
   status-badge invariant) fires every couple of seconds while an agent works,
@@ -425,7 +434,17 @@ this file is the invariants that must survive every change.
   (`STARTUP-SCAN`/`STARTUP-SKIP`/`STARTUP-START`/`BLOCKED`/`NUDGE`/`WAIT`/
   `PHANTOM`/`RESUMED`/`STILL-BLOCKED`/`GAVE-UP`) — this feature failed silently
   TWICE and both causes had to be reconstructed from transcript timestamps
-  hours later; do not remove it.
+  hours later; do not remove it. `NO-LATCH` (`TerminalAgent._note_limit_skip`,
+  routed through `WorkspaceManager._wire_agent` → the manager's `audit` hook)
+  completes it from the other end: every line above describes something that
+  happened AFTER a latch, so the decision NOT to latch — the one that actually
+  strands work — used to leave no trace at all, and a third live miss could
+  only be narrowed by elimination, never explained. It is bounded twice over
+  because `_scrape_limit` runs on EVERY output burst: it says nothing unless a
+  banner is genuinely on screen, and it repeats only when the (reason, banner)
+  pair CHANGES, so one frame repainted hundreds of times is recorded once
+  (`_limit_last_skip`, reset by `start`/`restart` alongside
+  `_limit_last_banner`). Keep both bounds if you add a rejection reason.
 - **The cut-off itself is a HISTORICAL FACT and is kept** (`app/limit_ledger.py`,
   Qt-free/stdlib-only, `<session-dir>/limit_events.jsonl`). Every other piece
   of this feature is transient on purpose, which left nothing able to answer
@@ -451,6 +470,26 @@ this file is the invariants that must survive every change.
   drifted pin, an unflushed conversation — is no evidence either way and must
   never strand a genuine cut-off. `ended_on_limit` collapses both to False,
   which is right only for a caller wanting positive evidence.
+  A cut-off is also refuted when the turn behind the banner was Claude Code's
+  OWN plumbing rather than anything anyone asked for — a background task's
+  completion notification can start a brand-new turn with no input from the
+  user or AI Hive, and if the account runs out right then it eats the same
+  menu a real interruption would, with nothing of substance lost (that
+  auto-nudged an agent hours after its work was done). `transcripts.
+  _SYNTHETIC_USER_TAGS` is an ALLOWLIST of those injected tags and must stay
+  one: keying off a leading `<` alone also swept in `<command-name>`, i.e. a
+  slash command the USER typed, whose work is exactly as real as any prompt's.
+  There are TWO checks and they are gated differently ON PURPOSE.
+  `_auto_continue_agent`'s runs at reset time and may dismiss on a plain
+  `not cut_off`. `MainWindow._dismiss_if_phantom` (`LIMIT_PHANTOM_CHECK_MS`
+  after the LIVE latch, so a phantom never even shows the hourglass) may NOT:
+  a running agent's transcript always exists, so a banner Claude has drawn but
+  not yet WRITTEN reads as `cut_off False`, not None — and clearing the latch
+  on that races away a genuine cut-off with no way back, since a silently
+  parked agent emits nothing to re-latch on. It therefore gates on the
+  POSITIVE `synthetic` field (a banner that WAS found, refuted by the turn
+  behind it), never on the absence of a cut-off. Any new early consumer must
+  do the same.
   A reset read off the SCREEN also gets `LIMIT_RESET_GRACE_S` of slack (the
   banner names a minute, not an instant, and a nudge into a still-shut window
   spends one of very few retries); a reset from the ACCOUNT reading needs none,
@@ -459,6 +498,48 @@ this file is the invariants that must survive every change.
   banner prints a bare wall clock for a reset that can be days out, which
   `parse_reset_clock` can only ever resolve to the next occurrence, so a weekly
   cut-off ignores its clock and waits for the account reading.
+- **A scheduled message is a DEFERRED ENTER, not an assignment**
+  (`app/scheduled_send.py`, Qt-free/stdlib-only like `limit_banner.py`).
+  `Ctrl+Shift+Enter` in a pty terminal hands `TerminalView._input_text()` up
+  through `TerminalCard`/`WorkspacePage` to `MainWindow._on_schedule_message`,
+  which opens `ScheduleMessageDialog`; the message is held on the AGENT
+  (`TerminalAgent._scheduled`) and typed in later by `MainWindow._tick_schedules`
+  (`SCHEDULE_TICK_MS`). This exists so agents can be chained while the user is
+  AFK. Several rules are load-bearing:
+  * **Delivery is `nudge`, NEVER `deliver_task`** — same distinction the
+    auto-continue makes, for the same reason: `deliver_task` overwrites the
+    persisted `current_task`, flips the assignment to WORKING and re-infers the
+    role. The user deferred an Enter; they did not assign anything.
+  * **The chord cannot be `Ctrl+Enter`** — that inserts a newline
+    (`terminal_view._sequence_for`), which is how multi-line input works in
+    Claude Code. Hence the third modifier, as with `Ctrl+Shift+A`. The keypress
+    sends NOTHING to the child; the input box is cleared (double-Escape, via
+    `write` so the echo isn't mistaken for work) only once something is
+    actually queued, so a cancelled dialog leaves the typing alone.
+  * **The prefill is INFERRED from the painted input box**, which can come up
+    short on a long horizontally-scrolled line — so it is shown back in an
+    editable box rather than scheduled blind. That is why this is a dialog and
+    not a silent hotkey. Do NOT "streamline" it into an immediate schedule.
+  * **An overdue message is MISSED, never sent late.** `restore_scheduled`
+    marks anything already past due on load, and `_deliver_scheduled` gives up
+    after `SCHEDULE_GIVE_UP_S`. A 3am message firing at 10am into a conversation
+    that has moved on is a surprise and real quota spent; the entry is KEPT and
+    surfaced (the `missed` chip state) so the loss is visible rather than
+    silent. A refusal itself is not a failure — a stopped agent, a booting TUI,
+    or one parked on a limit menu (where the text would land IN the menu) is
+    retried on the next tick.
+  * **The queue IS persisted** (`_agent_dict`'s `"scheduled"`, only the PENDING
+    ones; `_agent_dict_safe` carries it too), so `scheduled_changed` is wired to
+    `_touch` (dirty) — the one indicator-shaped signal here that is not
+    transient. No `SESSION_VERSION` bump: it is an additive optional key like
+    `task`. CRITICAL, the other half: the per-second COUNTDOWN must never reach
+    the model — `_tick_schedules` repaints `TerminalCard.refresh_schedule` and
+    nothing else, or `session.json` would be rewritten 3600 times an hour (the
+    `activity_changed` rule). And `_sync_schedule_timer` only touches the timer
+    when the desired state DIFFERS from `isActive()`: it is driven by
+    `workspaceStatsChanged`, which fires every couple of seconds per busy agent,
+    and `QTimer.start()` RESTARTS a running timer — the exact trap
+    `_retune_usage_poll` documents.
 - **Theming is a skin registry** (`app/ui_theme.py`): each skin is a `Theme`
   in `THEMES`; `apply_theme(id)` rewrites the module-level `Palette` attrs,
   the `ANSI_16` list (IN PLACE — same object), and the font globals, so every
@@ -478,6 +559,70 @@ this file is the invariants that must survive every change.
   (Cinzel/EB Garamond/Spectral) are bundled OFL TTFs in `app/assets/fonts`,
   registered by `main._load_bundled_fonts`; themes name them with a serif
   fallback chain so a missing file degrades gracefully.
+- **A stopped card shows its CONVERSATION, not a black rectangle**
+  (`app/screen_snapshot.py`, Qt-free/stdlib-only like `chime.py`). "Restore as
+  it was" used to restore only the PROCESS state, so a reopened hive was a
+  wall of dead terminals with a centred "terminal not running" box over each
+  one. `closeEvent` now writes each pty agent's raw VT tail
+  (`TerminalAgent.pty_replay()`) to `<session-dir>/screens/<key>.vt` and
+  `create_main_window` seeds it back via `seed_pty_replay` BEFORE building the
+  window: `TerminalCard.__init__` replays `pty_replay()` in its constructor,
+  so seeding after that leaves the launch cards blank. The RAW STREAM is kept,
+  not the transcript (`transcripts.py` already backs those up) — replaying the
+  bytes through the same pyte screen that drew them reproduces what was there;
+  re-rendering a jsonl transcript would not look like the TUI. It is NOT
+  session state: half a megabyte of escape codes per agent has no business in
+  `session.json`, so these are plain files beside the transcript backups, and
+  the "a latch is never persisted" style rules are unaffected. Identity is
+  (cwd, pinned session id) via `key_of` — `TerminalAgent.id` is minted fresh
+  every load (same reason `limit_ledger.key_of` avoids it), and keying on the
+  conversation makes staleness self-correcting: a pin that moved on simply
+  misses, so a card never shows another chat's screen. `prune` drops unclaimed
+  keys, because every `/clear` mints a new conversation and the directory
+  would otherwise only grow. THE SNAPSHOT SERVES THE STOPPED CARD ONLY: an
+  agent that comes back RUNNING gets a CLEAN terminal that its child fills in
+  a few seconds, which is what a restored hive looked like before snapshots
+  existed. `TerminalCard._on_status` drops the restored screen (its own, and
+  the agent's via `TerminalAgent.drop_seeded_screen`, or a card rebuilt by a
+  retile would replay the same stale seed under the child) the moment the
+  agent starts while `_pending_replay` is STILL SET — i.e. this card has
+  never re-rendered it at a settled size. Both launch paths that start an
+  agent (`autostart_active_workspace`, `recover_blocked_at_startup`) run
+  SYNCHRONOUSLY right after `show()`, ahead of `TerminalView`'s 120 ms resize
+  debounce, so that is every agent restored running: leaving the seed there
+  parked each of their cards on a mangled ~24-column fragment of last
+  session's screen until the TUI finished booting (reported twice, and the
+  reason it is not enough to fix the RE-RENDER: a launching child writes
+  within milliseconds, so any guard that defers to a live child leaves the
+  bad frame up). `_pending_replay` is the right test because a card WOKEN by
+  a keystroke has long since consumed it, so the wake path below is
+  untouched. TWO subtleties, both live-found: (1) pyte drops
+  lines off the TOP when it shrinks, and the tiling grid resizes a card AFTER
+  it is built, so the newest part of a restored conversation is exactly what
+  vanished — `TerminalCard._rerender_restored` re-renders ONCE on the first
+  `sizeChanged` (consuming `_pending_replay` first so a retile storm cannot
+  repeat it). It bails when a live child owns the screen, and the test for
+  that is the agent's own BUFFER (`pty_replay()` still byte-identical to what
+  was fed), NEVER `is_running()`: the launch autostart starts agents
+  SYNCHRONOUSLY right after `show()` while `TerminalView` debounces its
+  resize by 120 ms, so an `is_running()` gate skipped precisely the cards it
+  was meant to serve, and every restored-and-resumed card came back showing a
+  mangled ~24-column fragment in the top-left corner of a full-width terminal
+  until its child finished launching (pyte does not reflow on resize, so
+  nothing else ever repaired it). The buffer test covers `restart()` too,
+  which empties the buffer. (2) `seed_pty_replay` refuses to overwrite a buffer
+  that already has output, and `restart()` clears the buffer while `start()`
+  does not: waking a stopped card resumes its conversation, so the replayed
+  screen scrolling up is right, whereas a deliberate restart is a fresh
+  session and must drop it. (That `start()` rule is about the WAKE; the
+  launch-time drop above is keyed on the card, not on `start()`.) The wake banner still exists but takes TWO shapes
+  (`TerminalCard._refresh_overlay`): a slim bottom strip when there IS a
+  screen to read, the original centred box only when the terminal is genuinely
+  empty. The invariant it serves is unchanged (a stopped terminal must never
+  read as a dead black screen); covering the restored conversation with a box
+  was defeating the very thing it exists for. `_refresh_overlay` decides the
+  shape on a STATUS change, never in `_place_overlay`, which runs per pixel
+  during a drag or retile.
 - **Transcripts are backed up by AI Hive** (`app/transcripts.py`): snapshots
   land in `<session-dir>/transcripts/` at app start (in `create_main_window`,
   BEFORE agents launch) and at graceful close (`closeEvent`). The
@@ -513,6 +658,39 @@ this file is the invariants that must survive every change.
   has no evidence yet). The reader is tail-only (`_MODEL_TAIL_BYTES`) with a
   full-scan fallback and an (mtime,size) cache, because unlike
   `refresh_ai_titles` it runs several times a second.
+- **The PERMISSION MODE rides the same reading and is the ONE part of it that
+  IS written back.** The chip reads `Opus 5 · high · plan`; the third token is
+  the Shift+Tab mode, from the same transcript scan (`latest_model_effort`
+  returns `(model, effort, permission_mode)`), shown via
+  `TerminalAgent.permission_mode_label`. Two record shapes carry it, and both
+  are needed for the same reason `/model` needs two: every user prompt has a
+  top-level `permissionMode` (ground truth as of the last turn), and Claude
+  appends a bare `{"type":"permission-mode","permissionMode":…}` record the
+  instant Shift+Tab changes it, which is what shows an IDLE agent's switch.
+  The write-back is the deliberate exception to the invariant above: the CLI
+  does NOT carry a permission mode across a `--resume`, so an agent the user
+  put in plan/auto came back ask-each-time on EVERY reopen. So
+  `refresh_model_effort` calls `AgentSpec.set_permission_mode` and emits
+  `dirty` — but ONLY when the mode genuinely changed, exactly like a pin change
+  in `sync_live_sessions`, or a 1.5s poll would rewrite `session.json` forever.
+  `set_permission_mode` REBUILDS `spec.args`: they are baked once by
+  `build_spec`, so mutating the field alone persists the new mode while every
+  launch for the rest of the process keeps the old flag. `closeEvent` runs one
+  last `refresh_model_effort` before the final save (same reason it runs
+  `sync_live_sessions` there): a Shift+Tab in the last second must still
+  reopen in that mode. CRITICAL, the vocabularies differ and are NOT
+  interchangeable: the transcript writes the CLI's INTERNAL names, and the
+  ask-each-time mode is `"default"`, which `--permission-mode` does not accept
+  at all (its choices are acceptEdits|auto|bypassPermissions|manual|dontAsk|
+  plan, verified 2.1.220). `providers.normalize_permission_mode` translates
+  before anything is stored ("default"/"manual" → `""`, i.e. omit the flag;
+  an unknown token → `""` rather than a flag that would stop the agent
+  launching), and `providers.permission_mode_display` turns it into the card's
+  word. Validation in `build_invocation` is against the provider's
+  `cli_permission_modes`, NOT the New Agent dropdown: the dropdown is a curated
+  subset, and a mode adopted from a live conversation is routinely outside it
+  ("auto" is what a current CLI records where an older build said
+  "acceptEdits").
 - **The card header is summary-first** (`widgets/terminal_card.py`): the
   one-line summary carries the layout stretch and is an `ornaments.ElidingLabel`
   — it re-fits in its OWN `resizeEvent` and reports a zero-width hint

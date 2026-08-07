@@ -13,9 +13,9 @@ from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QLabel, QLineEdit, QMainWindow, QMenu,
-                               QMessageBox, QPushButton, QSplitter,
-                               QStackedWidget, QToolButton, QVBoxLayout,
-                               QWidget)
+                               QMessageBox, QPlainTextEdit, QPushButton,
+                               QSplitter, QStackedWidget, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from .. import __version__
 from .. import chime
@@ -23,6 +23,7 @@ from .. import claude_usage
 from .. import fsopen
 from .. import limit_ledger
 from .. import providers
+from .. import scheduled_send
 from .. import session_hook
 from .. import transcripts
 from .. import ui_theme
@@ -38,7 +39,7 @@ from .ornaments import LogoRoundel, PageBorder, PlanUsageBadge
 from .sidebar import SIDEBAR_WIDTH, Sidebar
 
 SIDEBAR_MIN, SIDEBAR_MAX = 170, 700  # drag bounds (ultrawide-friendly)
-from .terminal_card import TerminalCard
+from .terminal_card import TerminalCard, _snippet
 from .workspace_page import WorkspacePage
 
 SAVE_DEBOUNCE_MS = 800
@@ -105,10 +106,32 @@ LIMIT_WATCH_MS = 60000
 # enough for the TUI to redraw without the banner, short enough that a failed
 # attempt is retried while it still matters.
 AUTO_CONTINUE_VERIFY_MS = 20000
+# How long after a LIVE latch to cross-check it against the transcript, to
+# catch a cut-off that was Claude Code's own background-task-notification
+# auto-continuing rather than real work (see `_dismiss_if_phantom`). The
+# screen shows the identical menu either way, so this is the earliest point
+# the two can be told apart. Short: the transcript record behind the banner
+# is normally flushed within a second or two of it being drawn, and a miss
+# here is never fatal -- the identical check runs again at nudge time.
+LIMIT_PHANTOM_CHECK_MS = 3000
 # A resume can land while the window is still shut, so one attempt is not
 # enough — but it must not become a Continue every minute forever either.
 LIMIT_RETRY_S = 300
 LIMIT_MAX_TRIES = 4
+
+# --- deferred ("send later") messages ---
+# The countdown is shown to the second, so the tick is a second. It runs ONLY
+# while something is actually queued (see `_sync_schedule_timer`), the same way
+# a workspace row's spinner stops at zero, so a hive with nothing scheduled
+# pays nothing for this feature.
+SCHEDULE_TICK_MS = 1000
+# How long past its time a message keeps trying before it is given up on as
+# MISSED. It is retried rather than dropped because the usual reason for a
+# refusal is temporary (the agent is stopped, or its TUI is still booting), and
+# it is bounded because a message that lands far from its intended moment is a
+# surprise, not a hand-off. The user still sees the missed entry and can send it
+# by hand.
+SCHEDULE_GIVE_UP_S = 900
 # Slack past a reset time READ OFF THE SCREEN before acting on it. The account
 # does not free up on the exact second its banner named — the clock is printed
 # to the minute, the server rounds, and a nudge into a still-shut window costs
@@ -685,6 +708,207 @@ class AddTerminalDialog(QDialog):
         return build_spec(kind, name, cwd=cwd, program=program, args=args, pty=pty)
 
 
+class ScheduleMessageDialog(QDialog):
+    """Compose a message now, choose when it is typed in.
+
+    Opened by Ctrl+Shift+Enter in an agent's terminal (prefilled with whatever
+    was typed) or from the card's right-click menu (empty). It doubles as the
+    manage view: everything already queued for this agent is listed with a
+    cancel button, and a MISSED entry can be sent immediately or dismissed.
+
+    The prefill is INFERRED from the painted input box, which can come up short
+    on a very long horizontally-scrolled line, so it is shown in an editable box
+    rather than scheduled behind the user's back. That is the whole reason this
+    is a dialog and not a silent hotkey.
+
+    Model-free like AddTerminalDialog: it produces a (text, due_ts) pair and the
+    window does the scheduling, so headless tests never need it.
+    """
+
+    PRESETS = [("5m", 300), ("15m", 900), ("30m", 1800),
+               ("1h", 3600), ("2h", 7200)]
+
+    def __init__(self, agent, parent=None, prefill: str = ""):
+        super().__init__(parent)
+        self.agent = agent
+        self._due_ts = None
+        self.setWindowTitle(f"Send later to {agent.spec.name}")
+        self.setMinimumWidth(460)
+
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel("Message", self))
+        self.text_edit = QPlainTextEdit(prefill or "", self)
+        self.text_edit.setPlaceholderText(
+            "what to type into this agent when the countdown ends")
+        self.text_edit.setMinimumHeight(90)
+        root.addWidget(self.text_edit)
+
+        presets = QHBoxLayout()
+        presets.addWidget(QLabel("Send in:", self))
+        for label, seconds in self.PRESETS:
+            btn = QPushButton(label, self)
+            btn.setObjectName("SchedulePreset")
+            btn.clicked.connect(
+                lambda _checked=False, s=seconds: self._set_preset(s))
+            presets.addWidget(btn)
+        presets.addStretch(1)
+        root.addLayout(presets)
+
+        custom = QHBoxLayout()
+        self.delay_edit = QLineEdit(self)
+        self.delay_edit.setPlaceholderText("45m, 1h30, 2:15")
+        self.delay_edit.setToolTip(
+            "A delay from now. A bare number means minutes.")
+        self.clock_edit = QLineEdit(self)
+        self.clock_edit.setPlaceholderText("03:30")
+        self.clock_edit.setToolTip(
+            "A wall-clock time. A time already past today means tomorrow.")
+        custom.addWidget(QLabel("or in", self))
+        custom.addWidget(self.delay_edit, 1)
+        custom.addWidget(QLabel("or at", self))
+        custom.addWidget(self.clock_edit, 1)
+        root.addLayout(custom)
+
+        # says exactly when this will fire, so "at 3" is never ambiguous
+        self.when_label = QLabel("", self)
+        self.when_label.setObjectName("ScheduleWhen")
+        self.when_label.setWordWrap(True)
+        root.addWidget(self.when_label)
+
+        self.pending_box = QVBoxLayout()
+        root.addLayout(self.pending_box)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel, self)
+        self.buttons.button(
+            QDialogButtonBox.StandardButton.Ok).setText("Schedule")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        root.addWidget(self.buttons)
+
+        self.text_edit.textChanged.connect(self._revalidate)
+        # the two time fields are alternatives: typing in one clears the other,
+        # so there is never a hidden second answer deciding the fire time
+        self.delay_edit.textEdited.connect(lambda *_: self._on_time_edited(True))
+        self.clock_edit.textEdited.connect(lambda *_: self._on_time_edited(False))
+        self._set_preset(self.PRESETS[0][1])
+        self.refresh_pending()
+
+    # ------------------------------------------------------------ helpers ---
+
+    def _set_preset(self, seconds: int) -> None:
+        # Write the preset in the DELAY vocabulary ("5m", "1h"), never the
+        # countdown one: `format_countdown(300)` is "5:00", and "H:MM" means
+        # five HOURS to `parse_delay`. The two formats look alike and mean
+        # different things, so a preset must never round-trip through the
+        # display format.
+        self.delay_edit.setText(f"{seconds // 3600}h" if seconds % 3600 == 0
+                                else f"{seconds // 60}m")
+        self.clock_edit.clear()
+        self._revalidate()
+
+    def _on_time_edited(self, from_delay: bool) -> None:
+        if from_delay:
+            self.clock_edit.clear()
+        else:
+            self.delay_edit.clear()
+        self._revalidate()
+
+    def _resolve_due(self) -> float | None:
+        """The chosen fire time, or None when neither field parses. The clock
+        wins only when the delay field is empty, which the mutual clearing
+        above guarantees."""
+        delay = scheduled_send.parse_delay(self.delay_edit.text())
+        if delay is not None:
+            return time.time() + delay
+        return scheduled_send.parse_clock(self.clock_edit.text())
+
+    def _revalidate(self) -> None:
+        self._due_ts = self._resolve_due()
+        has_text = bool(self.text_edit.toPlainText().strip())
+        ok = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok.setEnabled(has_text and self._due_ts is not None)
+        if self._due_ts is None:
+            self.when_label.setText("Enter a delay (45m, 1h30, 2:15) or a "
+                                    "time (03:30).")
+            return
+        left = scheduled_send.format_countdown(self._due_ts - time.time())
+        self.when_label.setText(
+            f"Sends {scheduled_send.format_clock(self._due_ts)}, in {left}.")
+
+    def refresh_pending(self) -> None:
+        """(Re)build the list of what this agent is already holding."""
+        while self.pending_box.count():
+            item = self.pending_box.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+            elif item.layout() is not None:
+                self._clear_layout(item.layout())
+        held = self.agent.scheduled_messages()
+        if not held:
+            return
+        self.pending_box.addWidget(QLabel(f"Already queued ({len(held)})", self))
+        for msg in held:
+            self.pending_box.addLayout(self._pending_row(msg))
+
+    def _clear_layout(self, layout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+            elif item.layout() is not None:
+                self._clear_layout(item.layout())
+        layout.deleteLater()
+
+    def _pending_row(self, msg):
+        row = QHBoxLayout()
+        missed = msg.state == scheduled_send.MISSED
+        when = ("missed" if missed
+                else scheduled_send.format_countdown(msg.seconds_left()))
+        label = QLabel(f"{when}  {_snippet(msg.text, 60)}", self)
+        label.setToolTip(f"{scheduled_send.format_clock(msg.due_ts)}\n{msg.text}")
+        row.addWidget(label, 1)
+        if missed:
+            send_now = QToolButton(self)
+            send_now.setText("send now")
+            send_now.setToolTip("Type this into the agent right away")
+            send_now.clicked.connect(
+                lambda _checked=False, m=msg: self._send_now(m))
+            row.addWidget(send_now)
+        drop = QToolButton(self)
+        drop.setText("✕")
+        drop.setToolTip("Cancel this message")
+        drop.clicked.connect(lambda _checked=False, m=msg: self._cancel(m))
+        row.addWidget(drop)
+        return row
+
+    def _cancel(self, msg) -> None:
+        self.agent.cancel_scheduled(msg.id)
+        self.refresh_pending()
+
+    def _send_now(self, msg) -> None:
+        """Deliver a missed message immediately, on the user's say-so.
+
+        Goes through `nudge` exactly as the timed path does, so this can never
+        become an assignment. A refusal (the agent is stopped) leaves the entry
+        alone so it is still there to try again."""
+        if self.agent.nudge(msg.text):
+            self.agent.mark_scheduled_sent(msg.id)
+        self.refresh_pending()
+
+    # -------------------------------------------------------------- result ---
+
+    def result_message(self) -> tuple[str, float] | None:
+        """(text, due_ts), or None when the dialog produced nothing usable."""
+        text = self.text_edit.toPlainText().strip()
+        if not text or self._due_ts is None:
+            return None
+        return text, self._due_ts
+
+
 class MainWindow(QMainWindow):
     # Plan-usage edges, for features that need to ACT on the account being cut
     # off rather than just display it (e.g. relaunching agents that died on a
@@ -786,6 +1010,11 @@ class MainWindow(QMainWindow):
         self._limit_watch_timer = QTimer(self)
         self._limit_watch_timer.setInterval(LIMIT_WATCH_MS)
         self._limit_watch_timer.timeout.connect(self._check_limit_resets)
+        # deferred-message countdown + delivery. Started and stopped by
+        # _sync_schedule_timer so it only runs while something is queued.
+        self._schedule_timer = QTimer(self)
+        self._schedule_timer.setInterval(SCHEDULE_TICK_MS)
+        self._schedule_timer.timeout.connect(self._tick_schedules)
 
         # shared-board control channel (named-pipe RPC → this GUI): relays each
         # agent's log_activity note onto its workspace board. Additive and
@@ -817,6 +1046,7 @@ class MainWindow(QMainWindow):
         self.manager.prompt_events_path = self._prompt_events_path
         manager.save_now = self._save_now  # immediate persistence for spawn_worker
         manager.arm_agent = self._arm_agent_mcp  # arm new agents before they start
+        manager.audit = self._store_audit   # so a degraded save leaves a trace
         self._rearm_agent_configs()  # restored claude agents re-acquire MCP tools
 
         self._build_ui()
@@ -830,6 +1060,9 @@ class MainWindow(QMainWindow):
         self._prompt_sync_timer.start()
         self._model_sync_timer.start()
         self._limit_watch_timer.start()
+        # a restored session can bring back queued messages, so the tick may
+        # need to be running before anything else happens
+        self._sync_schedule_timer()
 
     def _arm_agent_mcp(self, ws, agent) -> None:
         """Arm a Claude agent's per-run launch config before it starts (and
@@ -1012,6 +1245,12 @@ class MainWindow(QMainWindow):
         mgr.terminalRemoved.connect(self._on_terminal_removed)
         mgr.workspaceStatsChanged.connect(self.sidebar.set_stats)
         mgr.workspaceStatsChanged.connect(self._on_stats_for_activity)
+        # start/stop the countdown tick as messages are queued and drained.
+        # Stats are recomputed on every `scheduled_changed`, so this is the
+        # one edge that always covers it; _sync_schedule_timer is written to
+        # be safe under this signal's high firing rate.
+        mgr.workspaceStatsChanged.connect(
+            lambda *_: self._sync_schedule_timer())
         mgr.workspacePathChanged.connect(self._on_workspace_path_changed)
         mgr.layoutChanged.connect(self._on_layout_changed)
         # an agent just settled on a question ("?" appeared) -> sound the chime
@@ -1378,6 +1617,34 @@ class MainWindow(QMainWindow):
                                     outcome, tries=agent.limit_attempts(),
                                     detail=detail)
 
+    def _snapshot_screens(self, agents=None) -> int:
+        """Persist every pty agent's screen and drop the ones nothing claims.
+
+        Never raises: this runs inside `closeEvent`, after the authoritative
+        save, and a cosmetic feature must not be able to interfere with a
+        clean shutdown."""
+        from .. import screen_snapshot
+        try:
+            agents = list(self.manager.all_agents() if agents is None
+                          else agents)
+            root = str(self.store.path.parent)
+            written = screen_snapshot.save_for_agents(agents, root)
+            # keys go stale on their own: every /clear or fork mints a new
+            # conversation, so without this the directory only ever grows
+            screen_snapshot.prune(root, screen_snapshot.keys_for_agents(agents))
+            return written
+        except Exception:
+            return 0
+
+    def _store_audit(self, message: str) -> None:
+        """Plain forensic line in session.log, for callers that have no store
+        of their own (the manager's degraded-save path). Same never-raise rule
+        as `_limit_audit`."""
+        try:
+            self.store.audit(message)
+        except Exception:
+            pass
+
     def _limit_audit(self, message: str) -> None:
         """Forensic line in session.log for the auto-continue path.
 
@@ -1417,6 +1684,50 @@ class MainWindow(QMainWindow):
             self._ledger_cut_off(agent, agent.limit_cut_off_at(), at or 0.0,
                                  agent.limit_window(),
                                  agent.limit_banner_text(), source="live")
+        QTimer.singleShot(LIMIT_PHANTOM_CHECK_MS,
+                          lambda: self._dismiss_if_phantom(ws_id, agent_id,
+                                                            key))
+
+    def _dismiss_if_phantom(self, ws_id: str, agent_id: str, key: tuple) -> None:
+        """Shortly after a live latch: was the interrupted turn something the
+        user or AI Hive actually asked for, or Claude Code's own background-
+        task-notification auto-continuing on its own? Both render the
+        identical "Stop and wait for limit to reset" menu, so the screen
+        genuinely cannot tell them apart — the transcript can, because it
+        carries the raw record behind the banner (see
+        `transcripts._is_synthetic_user_turn`).
+
+        Gated on POSITIVE evidence (`info["synthetic"]`), NOT on the absence
+        of a cut-off, and that difference is the whole safety of running this
+        early. `_auto_continue_agent` may dismiss on a plain `not cut_off`
+        because it runs at reset time, hours later, when the transcript is
+        certainly written; three seconds after the banner was DRAWN it may
+        not be, and a running agent's transcript always exists, so an
+        unflushed banner reads as `cut_off False` rather than None (see
+        `transcripts.limit_cut_off`). Dismissing on that would clear a
+        genuine latch during the race — the exact inversion the tri-state
+        exists to prevent, and unrecoverable unless the parked TUI happens to
+        redraw and re-latch. So only a transcript that positively SHOWS the
+        interrupted turn was Claude Code's own plumbing clears anything here;
+        every other reading leaves the latch alone and the nudge-time check
+        remains the backstop.
+        """
+        if self._closing:
+            return
+        agent = self.manager.agent(ws_id, agent_id)
+        if agent is None or not agent.is_limit_blocked():
+            return
+        if tuple(self._ledger_key(agent)) != key:
+            return   # a newer cut-off has since taken this one's place
+        info = transcripts.limit_cut_off(agent.spec.cwd, agent.spec.session_id)
+        if info is None or not info.get("synthetic"):
+            return
+        self._limit_audit(
+            f"PHANTOM agent={agent.spec.name} (the interrupted turn was a "
+            f"background/system notification, not real work)")
+        self._ledger_outcome(agent, limit_ledger.DISMISSED,
+                             detail="trivial background-task cut-off")
+        agent.clear_limit_block()
 
     def _check_limit_resets(self) -> None:
         """Network-free trigger: resume any cut-off agent whose OWN banner said
@@ -1530,15 +1841,21 @@ class MainWindow(QMainWindow):
         # on, so the screen alone can be describing history — and a stray
         # "Continue" into an agent that is working fine is both an
         # interruption and real quota spent. TRI-STATE on purpose: only a
-        # transcript that demonstrably CARRIED ON refutes the latch; one that
-        # cannot be read (a drifted pin, a conversation Claude hasn't flushed)
-        # is no evidence either way and must not strand a genuine cut-off.
+        # transcript that demonstrably CARRIED ON, OR shows the interrupted
+        # turn was Claude's own background-task-notification rather than real
+        # work (see `transcripts._is_synthetic_user_turn` — normally caught
+        # already, promptly, by `_dismiss_if_phantom`; this is the backstop
+        # for a transcript that hadn't flushed yet at latch time), refutes the
+        # latch; one that cannot be read (a drifted pin, a conversation Claude
+        # hasn't flushed) is no evidence either way and must not strand a
+        # genuine cut-off.
         info = transcripts.limit_cut_off(agent.spec.cwd, agent.spec.session_id)
         if info is not None and not info["cut_off"]:
             self._limit_audit(f"PHANTOM agent={agent.spec.name} (the "
-                              f"conversation carried on past the banner)")
+                              f"conversation carried on, or the interrupted "
+                              f"turn wasn't real work)")
             self._ledger_outcome(agent, limit_ledger.DISMISSED,
-                                 detail="transcript carried on")
+                                 detail="transcript shows no real work lost")
             agent.clear_limit_block()
             self._resume_pending.discard(agent.id)
             return
@@ -1620,6 +1937,139 @@ class MainWindow(QMainWindow):
                     f"reset")
 
         QTimer.singleShot(AUTO_CONTINUE_ESC_MS, send)
+
+    # ---------------------------------------------- deferred ("send later") ---
+
+    def _schedule_audit(self, message: str) -> None:
+        """Forensic line in session.log for the deferred-message path. Same
+        reasoning as `_limit_audit`: this fires while nobody is watching, so a
+        message that did not go out has to leave a trace saying why."""
+        try:
+            self.store.audit(f"SCHEDULE {message}")
+        except Exception:
+            pass    # forensics must never break the feature they observe
+
+    def _card_for_agent(self, agent_id: str):
+        for page in self._pages.values():
+            card = page.card_for(agent_id)
+            if card is not None:
+                return card
+        return None
+
+    def _on_schedule_message(self, agent_id: str, prefill: str = "") -> None:
+        """Open the countdown composer for an agent.
+
+        `prefill` is what the terminal had typed when Ctrl+Shift+Enter was
+        pressed. It is only INFERRED from the painted input box, so the dialog
+        shows it for confirmation rather than scheduling it blind - and the
+        child's input box is cleared only once something is actually queued, so
+        a cancelled dialog leaves the user's typing exactly where it was.
+        """
+        agent = self.manager.resolve_agent(agent_id)
+        if agent is None:
+            return
+        dialog = ScheduleMessageDialog(agent, parent=self, prefill=prefill)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        result = dialog.result_message() if accepted else None
+        if result is None:
+            self._sync_schedule_timer()   # cancels made in the manage list
+            return
+        text, due_ts = result
+        msg = agent.schedule_message(text, due_ts)
+        if msg is None:
+            QMessageBox.information(
+                self, "Not scheduled",
+                f"“{agent.spec.name}” is already holding the maximum number of "
+                f"scheduled messages. Cancel one first.")
+            return
+        if prefill.strip():
+            # The text now lives in AI Hive, so leaving a copy in the child's
+            # input box would submit it twice the moment the user hits Enter.
+            # Double-Escape is Claude Code's clear-prompt gesture (the same one
+            # TerminalView uses for Backspace over a Ctrl+A highlight), and
+            # `write` is right for it: it stamps _last_input_ts, so the pty's
+            # echo of the Escapes is not mistaken for the agent working.
+            agent.write("\x1b\x1b")
+        self._schedule_audit(
+            f"QUEUED agent={agent.spec.name} "
+            f"at={scheduled_send.format_clock(due_ts)} "
+            f"in={scheduled_send.format_countdown(due_ts - time.time())}")
+        self._sync_schedule_timer()
+
+    def _schedule_pending(self) -> bool:
+        return any(a.pending_scheduled() for a in self.manager.all_agents())
+
+    def _sync_schedule_timer(self) -> None:
+        """Run the countdown tick only while something is actually queued.
+
+        CRITICAL: only touch the timer when the desired state DIFFERS from the
+        current one. `QTimer.start()` RESTARTS a running timer, and this is
+        called from `workspaceStatsChanged`, which fires every couple of seconds
+        per busy agent - so an unconditional start would reset the countdown
+        forever and the tick would never fire at all. Exactly the trap
+        `_retune_usage_poll` documents.
+        """
+        want = self._schedule_pending() and not self._closing
+        if want and not self._schedule_timer.isActive():
+            self._schedule_timer.start()
+        elif not want and self._schedule_timer.isActive():
+            self._schedule_timer.stop()
+
+    def _tick_schedules(self) -> None:
+        """Repaint every countdown, and deliver anything that has come due.
+
+        The repaint half touches ONLY the card's label - no model state, no
+        `dirty`. A per-second tick wired to the session file would rewrite it
+        3600 times an hour, the same rule `activity_changed` and the plan-usage
+        reading follow.
+        """
+        if self._closing or not self._ready:
+            return
+        now = time.time()
+        for agent in self.manager.all_agents():
+            if not agent.scheduled_messages():
+                continue
+            card = self._card_for_agent(agent.id)
+            if card is not None:
+                card.refresh_schedule()
+            for msg in agent.due_scheduled(now):
+                self._deliver_scheduled(agent, msg, now)
+        self._sync_schedule_timer()
+
+    def _deliver_scheduled(self, agent, msg, now: float) -> None:
+        """Type one due message into its agent, or decide it can't be.
+
+        Delivery is `nudge`, NEVER `deliver_task`: the user pressed a deferred
+        Enter, they did not assign a task, so `current_task`, the assignment
+        state and the role must all be left exactly as they are. `nudge` also
+        does not stamp `_last_input_ts`, so the work it kicks off still pulses
+        the sidebar rather than reading as the user's own typing.
+
+        A refusal is not a failure. The usual reasons are temporary (the agent
+        is stopped, its TUI is still booting, or it is parked on a plan-limit
+        menu where the text would land in the menu instead of the prompt), so
+        the message stays queued and is retried on the next tick. Only after
+        `SCHEDULE_GIVE_UP_S` is it given up on - and even then it is kept,
+        MISSED, rather than dropped: the user chose a moment and it did not
+        happen, which they need to be able to see.
+        """
+        blocked = agent.is_limit_blocked()
+        if not blocked and agent.nudge(msg.text):
+            agent.mark_scheduled_sent(msg.id)
+            agent.notice("[scheduled message sent]")
+            self._schedule_audit(f"SENT agent={agent.spec.name} "
+                                 f"late={int(now - msg.due_ts)}s")
+            return
+        agent.note_scheduled_attempt(msg.id)
+        if now - msg.due_ts < SCHEDULE_GIVE_UP_S:
+            return
+        if agent.mark_scheduled_missed(msg.id):
+            why = ("the agent is stopped" if not agent.is_running()
+                   else "the plan limit has it parked" if blocked
+                   else "its prompt never became ready")
+            agent.notice(f"[scheduled message NOT sent: {why}]")
+            self._schedule_audit(f"MISSED agent={agent.spec.name} "
+                                 f"tries={msg.attempts} ({why})")
 
     def _on_sound_toggled(self, enabled: bool) -> None:
         """User flipped the top-bar chime toggle. Persist the preference (via
@@ -1703,6 +2153,7 @@ class MainWindow(QMainWindow):
         page.activityToggled.connect(self._toggle_activity)
         page.mapRequested.connect(self._open_agent_map)
         page.reassignRequested.connect(self._on_reassign_agent)
+        page.scheduleRequested.connect(self._on_schedule_message)
         page.fileActivated.connect(self._reveal_file_in_tree)
         page.reorderCommitted.connect(self.manager.reorder_agents)
         self._pages[ws.id] = page
@@ -2176,11 +2627,20 @@ class MainWindow(QMainWindow):
         # transcripts on disk are current.
         for agent_id, old, new in self.manager.sync_live_sessions():
             self.store.audit(f"SESSION-SYNC agent={agent_id} {old} -> {new}")
+        # same reason, for the OTHER thing a user changes inside the terminal:
+        # a Shift+Tab in the last second before closing must reopen in that mode
+        self.manager.refresh_model_effort()
         self._save_session()  # persist FIRST: teardown can never lose state
-        from .. import transcripts  # snapshot the day's conversations
-        transcripts.backup_for_agents(
-            self.manager.all_agents(),
-            str(self.store.path.parent / "transcripts"))
+        from .. import transcripts
+        agents = self.manager.all_agents()
+        transcripts.backup_for_agents(  # snapshot the day's conversations
+            agents, str(self.store.path.parent / "transcripts"))
+        # ...and the SCREENS, so a card left stopped reopens showing its
+        # conversation rather than a black rectangle. Must run while the
+        # agents are still alive (dispose() below drops their pty buffers),
+        # and after sync_live_sessions above so a last-moment conversation
+        # switch is keyed on the pin that will actually be restored.
+        self._snapshot_screens(agents)
         self.bridge.stop()    # stop the RPC server + remove the endpoint file
         for page in self._pages.values():
             for card in list(page.cards):

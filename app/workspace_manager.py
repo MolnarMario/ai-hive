@@ -15,6 +15,7 @@ from PySide6.QtCore import QObject, Signal
 
 from . import coordination
 from . import orchestration
+from . import providers
 from . import session_hook
 from . import session_sync
 from . import transcripts
@@ -76,6 +77,13 @@ class WorkspaceManager(QObject):
         # optional hook (set by MainWindow): arm an agent's MCP config before
         # it starts, so workers launch able to log_activity. callable(ws, agent)
         self.arm_agent = None
+        # optional hook (set by MainWindow): append a line to session.log.
+        # callable(str). The manager has no SessionStore of its own, and
+        # _agent_dict_safe's degrade path is exactly the kind of failure that
+        # must not happen in silence. Same set-by-MainWindow shape as
+        # `arm_agent`, and unset is a no-op so a bare manager (the tests build
+        # many) never depends on it.
+        self.audit = None
         # path to the shared SessionStart-hook mapping file (set by MainWindow);
         # sync_live_sessions reads it for the authoritative live conversation id
         self.session_map_path = ""
@@ -137,8 +145,13 @@ class WorkspaceManager(QObject):
         # (auto-continue or manual); drives the row's hourglass count, mirroring
         # the "?" indicator above
         limit_blocked = sum(1 for a in agents if a.is_limit_blocked())
+        # "scheduled" = holding at least one deferred message (pending, or one
+        # that was missed and is still waiting to be dealt with); drives the
+        # row's countdown badge, mirroring the two indicators above
+        scheduled = sum(1 for a in agents if a.scheduled_messages())
         return {"total": len(agents), "active": active, "error": error,
                 "busy": busy, "waiting": waiting, "limit_blocked": limit_blocked,
+                "scheduled": scheduled,
                 "idle": len(agents) - active - error}
 
     def next_agent_name(self, ws_id: str) -> str:
@@ -462,6 +475,10 @@ class WorkspaceManager(QObject):
         # recovery (verify-before-resume) must never land on a peer's
         # conversation, so give the agent a live view of its folder-mates' pins
         agent._sibling_sessions = lambda a=agent: self.sibling_session_ids(a)
+        # so the agent can record WHY a limit banner on its screen did not
+        # latch (see TerminalAgent._note_limit_skip). Routed through the
+        # manager's own hook, so it is a no-op until MainWindow sets one.
+        agent.audit = self._audit
         # busy/standby is TRANSIENT (not persisted): refresh the badge only,
         # never mark dirty — otherwise every output burst would thrash saves
         agent.activity_changed.connect(lambda *_: self._recompute(wid))
@@ -477,6 +494,12 @@ class WorkspaceManager(QObject):
         agent.limit_blocked_changed.connect(
             lambda blocked, wid=wid, aid=agent.id:
             self._on_agent_limit_blocked_changed(wid, aid, blocked))
+        # deferred messages are the one derived-looking signal that IS
+        # persisted, so unlike busy/waiting/limit above this one refreshes the
+        # badge AND marks dirty. It fires on add/cancel/send/miss only — the
+        # per-second countdown never reaches the model, which is what keeps
+        # this from behaving like `activity_changed` and thrashing saves.
+        agent.scheduled_changed.connect(lambda wid=wid: self._touch(wid))
 
     def _on_agent_limit_blocked_changed(self, ws_id: str, agent_id: str,
                                         blocked: bool) -> None:
@@ -571,20 +594,37 @@ class WorkspaceManager(QObject):
                 a.set_token_usage(used, window)
 
     def refresh_model_effort(self) -> None:
-        """Pull each running Claude agent's CURRENT model and effort from its
-        transcript, so the card header follows a `/model` or `/effort` the user
-        typed in the terminal. Transient like the AI title: `set_live_model`
-        never persists and never marks the session dirty. Polled far more often
-        than `refresh_ai_titles`, which is why its reader only touches the tail
-        of the file and re-reads nothing while the transcript is unchanged."""
+        """Pull each running Claude agent's CURRENT model, effort and permission
+        mode from its transcript, so the card header follows a `/model`,
+        `/effort` or Shift+Tab the user did inside the terminal. Polled far more
+        often than `refresh_ai_titles`, which is why its reader only touches the
+        tail of the file and re-reads nothing while the transcript is unchanged.
+
+        The model and effort are TRANSIENT display state (`set_live_model` never
+        persists them; `spec.model`/`spec.effort` stay the launch record). The
+        PERMISSION MODE is the deliberate exception and IS written back, because
+        the CLI does not carry a mode across a `--resume`: an agent whose user
+        put it in plan or auto mode came back ask-each-time on every reopen,
+        which is exactly what the launch flag exists to set. Like a pin change
+        in `sync_live_sessions` this marks the session dirty ONLY when the mode
+        genuinely changed, so the poll never thrashes saves."""
+        changed = False
         for w in self._workspaces:
             for a in w.agents:
                 spec = a.spec
                 if spec.provider != "claude" or not a.is_running():
                     continue
-                model, effort = transcripts.latest_model_effort(
+                model, effort, mode = transcripts.latest_model_effort(
                     spec.cwd, spec.session_id)
-                a.set_live_model(model, effort)
+                a.set_live_model(model, effort, mode)
+                # the transcript names modes the command line cannot ("default"
+                # is spelled by omitting the flag), so translate before storing:
+                # spec.permission_mode is a LAUNCH flag, not a reading
+                if mode and spec.set_permission_mode(
+                        providers.normalize_permission_mode(mode)):
+                    changed = True
+        if changed:
+            self.dirty.emit()
 
     def sync_live_sessions(self) -> list:
         """Reconcile each running Claude agent's pinned session id with the
@@ -690,7 +730,7 @@ class WorkspaceManager(QObject):
     # -------------------------------------------------------- persistence ---
 
     def _agent_dict(self, a) -> dict:
-        # auto-created agents (orchestrator/workers) keep their "resume on next
+        # auto-created agents (task-spawned workers) keep their "resume on next
         # open" intent even if the process momentarily died — otherwise a
         # crashed/failed auto-agent silently goes dormant and never comes back.
         # User-created agents persist their live running state as before.
@@ -699,6 +739,10 @@ class WorkspaceManager(QObject):
                             or (a.auto_created and a.autostart_on_restore)),
                 "task": a.current_task,
                 "assignment": a.assignment.value,
+                # messages the user deferred (app/scheduled_send). Only the
+                # PENDING ones; a restore turns any that came due while we were
+                # closed into MISSED rather than firing them late.
+                "scheduled": a.scheduled_dicts(),
                 "auto_created": a.auto_created}
 
     def _agent_dict_safe(self, a) -> dict | None:
@@ -707,10 +751,31 @@ class WorkspaceManager(QObject):
         workspace's agents down with it (that is how a folder's agents once
         vanished from disk with nothing in the log). Fall back to a minimal
         entry that still preserves identity + resume so the agent survives; if
-        even that fails, drop just this one and keep going."""
+        even that fails, drop just this one and keep going.
+
+        The degrade is AUDITED, with the exception on the line, because it was
+        found happening in production and could not be diagnosed: two live
+        agents were being written as fallback records on EVERY save, silently,
+        and the cause is not recoverable from the file. Two different failures
+        in `AgentSpec.to_dict` (a `kind` that is a plain str, so `.value`
+        raises; a `user_args` of None, so `list()` raises) produce byte-
+        identical output, and `AgentKind` is a str-mixin enum so even the
+        serialized `kind` cannot tell them apart. One line here turns that
+        into a name and an exception type.
+
+        The fallback also carries every field it can read WITHOUT calling
+        anything that might throw again (plain attribute reads with defaults).
+        The loss is otherwise real: model, effort, permission mode, role and
+        the current task all silently reset to defaults on the next restore.
+        (`pty` is included for the same reason but is belt-and-braces for AI
+        agents: they are in `PTY_ONLY_KINDS`, so `build_spec` re-forces it
+        even when the record has no such field.)
+        """
         try:
             return self._agent_dict(a)
-        except Exception:
+        except Exception as exc:
+            self._audit(f"SAVE-DEGRADE agent={getattr(a.spec, 'name', '?')!r} "
+                        f"{type(exc).__name__}: {exc}")
             try:
                 spec = a.spec
                 return {"kind": getattr(spec, "kind", ""),
@@ -719,9 +784,41 @@ class WorkspaceManager(QObject):
                         "cwd": getattr(spec, "cwd", ""),
                         "provider": getattr(spec, "provider", ""),
                         "session_id": getattr(spec, "session_id", ""),
+                        # everything below is why the degrade is survivable:
+                        # pty in particular decides whether the agent comes
+                        # back as a terminal at all
+                        "pty": bool(getattr(spec, "pty", False)),
+                        "model": getattr(spec, "model", ""),
+                        "effort": getattr(spec, "effort", ""),
+                        "permission_mode": getattr(spec, "permission_mode", ""),
+                        "role": getattr(spec, "role", ""),
+                        "font_px": getattr(spec, "font_px", 0),
+                        "task": getattr(a, "current_task", ""),
+                        "scheduled": self._scheduled_safe(a),
                         "running": True}
-            except Exception:
+            except Exception as exc2:
+                self._audit(f"SAVE-DROP agent (even the minimal record failed) "
+                            f"{type(exc2).__name__}: {exc2}")
                 return None
+
+    @staticmethod
+    def _scheduled_safe(a) -> list:
+        """The deferred-message queue for the DEGRADED record. Everything in
+        the fallback is a read that must not throw a second time (the whole
+        point of that path), and this one calls a method, so it is guarded."""
+        try:
+            return a.scheduled_dicts()
+        except Exception:
+            return []
+
+    def _audit(self, message: str) -> None:
+        """Best-effort line into session.log; forensics must never break the
+        save they observe (the same rule `MainWindow._limit_audit` follows)."""
+        try:
+            if self.audit is not None:
+                self.audit(message)
+        except Exception:
+            pass
 
     def to_session_dict(self) -> dict:
         return {
@@ -773,6 +870,7 @@ class WorkspaceManager(QObject):
                 spec.cwd = spec.cwd if os.path.isdir(spec.cwd) else ws.project_path
                 agent = TerminalAgent(spec, parent=self)
                 agent.current_task = td.get("task", "")
+                agent.restore_scheduled(td.get("scheduled") or [])
                 agent.auto_created = bool(td.get("auto_created", False))
                 try:
                     agent.assignment = AssignmentState(td.get("assignment", "idle"))

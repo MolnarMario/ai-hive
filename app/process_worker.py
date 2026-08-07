@@ -121,6 +121,27 @@ class AgentSpec:
     user_program: str = ""   # PYTHON_SCRIPT: script path; CUSTOM: exe
     user_args: list = field(default_factory=list)
 
+    def set_permission_mode(self, mode: str) -> bool:
+        """Adopt `mode` as the startup permission mode and REBUILD the provider
+        args that carry it. Returns True when something actually changed.
+
+        Mutating the field alone is not enough: `args` is baked once by
+        build_spec, so the new mode would persist correctly but every launch
+        for the rest of this process would still use the old flag. Claude only
+        (no other provider has the concept), and `mode` must already be a
+        launchable token, i.e. run through providers.normalize_permission_mode.
+        """
+        mode = (mode or "").strip()
+        if mode == self.permission_mode:
+            return False
+        self.permission_mode = mode
+        if self.provider == "claude":
+            self.program, self.args = providers.build_invocation(
+                self.provider, model=self.model, effort=self.effort,
+                custom_command=self.custom_command,
+                extra_args=list(self.user_args), permission_mode=mode)
+        return True
+
     def effective_args(self) -> list:
         """Args actually passed to the process, including coordination flags
         (Claude native flags only)."""

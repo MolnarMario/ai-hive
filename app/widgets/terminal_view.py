@@ -338,6 +338,10 @@ class TerminalView(QWidget):
     keyInput = Signal(str)        # VT byte sequence for the PTY
     sizeChanged = Signal(int, int)  # rows, cols
     fileActivated = Signal(str)   # absolute path Ctrl+clicked in the conversation
+    # Ctrl+Shift+Enter: "submit this, but later". Carries the INFERRED input
+    # text so the card can prefill the countdown dialog; nothing is sent to the
+    # child, and nothing is cleared, until the user confirms.
+    scheduleRequested = Signal(str)
 
     def __init__(self, rows: int = 30, cols: int = 100, parent=None,
                  font_px: int = 0):
@@ -621,6 +625,23 @@ class TerminalView(QWidget):
             return
         if shift and key == Qt.Key.Key_PageDown:
             self.scroll_by(-max(1, self.screen.lines - 1))
+            event.accept()
+            return
+
+        # Ctrl+Shift+Enter is "Enter, but on a countdown": hand the card what is
+        # currently typed so it can offer to send it later. NOTHING goes to the
+        # child here — not the text, not a submit, not a clear. The card only
+        # clears the input if the user actually schedules something, so an
+        # accidental chord or a cancelled dialog leaves the prompt untouched.
+        #
+        # Ctrl+Enter (and Shift/Alt+Enter) are NOT available for this: they
+        # insert a newline, which is how multi-line input works in Claude Code.
+        # Hence the third modifier, the same move that put select-all on
+        # Ctrl+Shift+A when Ctrl+A was needed for the input line.
+        if ctrl and shift and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._input_selected:
+                self._clear_input_selection(send=False)  # visual mark only
+            self.scheduleRequested.emit(self._input_text())
             event.accept()
             return
 
