@@ -79,6 +79,18 @@ workspaces keep executing — switching never pauses anything.
   even while you're heads-down in another workspace — handy when agents you sent
   into plan mode come back with questions. Toggle it with the **🔔 button** in
   the top bar (persists across restarts).
+- **Taskbar working count** — the same signal, but from *outside* the app. The
+  Windows taskbar icon carries a small badge with the number of agents currently
+  working, so you can tell at a glance from any other window whether the hive is
+  still churning, whether it dropped from five workers to one (time to start
+  reviewing), or whether it has gone completely quiet. **No badge at all** means
+  nothing is running, so an idle hive costs you no visual noise. The disc turns
+  **blue** when one of the working agents is waiting on a question, and shows a
+  blue **?** when nothing is working but something needs you. Past nine it reads
+  `9+`. Windows allows an app exactly one overlay icon and places it itself (on
+  Windows 11, the icon's top-right corner), which is why the count and the
+  question have to share one small square rather than getting a corner each.
+  Toggle it with the **🪟 button** beside the bell (persists across restarts).
 - **Plan usage readout** — a top-bar badge, left of the theme picker, showing
   how much of your Claude plan you've burned and when it comes back:
   `21% used, resets in 1h20m at 14:49` — countdown first, then the wall-clock
@@ -530,7 +542,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1119 checks drive the real app headlessly (offscreen Qt platform) with real
+1160 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -598,6 +610,7 @@ app/
   session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
   session_hook.py          SessionStart hook: the child reports its live conversation id
   chime.py                 notification bell (WAV synth + async play, Qt-free) for the "?" alert
+  taskbar_overlay.py       the Windows taskbar corner badge (ITaskbarList3 via ctypes, Qt-free)
   claude_usage.py          live plan-usage reading (/api/oauth/usage) + limit edges (Qt-free)
   limit_banner.py          recognising a usage cut-off + when it resets (Qt-free, shared)
   limit_ledger.py          durable record of cut-offs: who, when, and how it ended (Qt-free)
@@ -611,10 +624,10 @@ app/
                            Ctrl+click paths open + reveal), grid_selector
                            (on-screen popup), activity_panel, agent_file_map (tree
                            diagram), ornaments (drop-caps / dividers / count-badge
-                           + working-count spinner)
+                           + working-count spinner + taskbar-badge painter)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1119 checks)
+tests/smoke_test.py        headless end-to-end suite (1160 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

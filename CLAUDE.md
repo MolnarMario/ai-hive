@@ -124,6 +124,41 @@ this file is the invariants that must survive every change.
   `Sidebar.agentActivated` → `MainWindow._reveal_agent` (switch ws + scroll+focus
   its card — the same primitive the Agent/File Map uses). The badge click is
   CONSUMED so it never bubbles to row-select/switch.
+- **The taskbar overlay is the ONE signal that leaves the window**
+  (`app/taskbar_overlay.py`, Qt-free/stdlib-only like `chime.py`;
+  `ornaments.taskbar_badge_bgra` paints it; `MainWindow._taskbar_badge_spec`/
+  `_push_taskbar_badge` drive it). Every other "an agent is working" indicator
+  lives INSIDE the app (the pulsing `AgentCountBadge`, the `WorkspaceSpinner`),
+  which is useless while the user is in another application waiting for the hive
+  to finish — the taskbar button is visible from everywhere, so the working count
+  goes there. THE CONSTRAINT THAT SHAPES IT: Windows gives an app exactly ONE
+  overlay icon and fixes it to the corner of the button
+  (`ITaskbarList3::SetOverlayIcon`; Qt 6 dropped `QWinTaskbarButton`, hence the
+  ctypes/COM shim beside `main.py`'s existing Win32 work). There is no second
+  slot and no choice of corner, so the count and "an agent has a question" SHARE
+  one ~16px square: the DIGIT is `sum(is_busy())` over `manager.all_agents()`,
+  the FILL COLOUR is `any(is_waiting())`. Deliberately the same two predicates
+  the sidebar reads, so the two surfaces can never disagree. Zero and zero means
+  NO overlay — that absence is the readout ("nothing is running, go and look"),
+  and it is what makes the feature self-silencing enough to leave on. Rules:
+  colours are FIXED constants (`ornaments.TASKBAR_WORKING`/`TASKBAR_ASKING`),
+  NOT `Palette` reads like every other badge — this is painted onto the OS
+  taskbar over the user's own accent colour, not onto our chrome, so following
+  the skin buys no coherence while risking a disc that vanishes; the count is
+  TRANSIENT exactly like `activity_changed` and the plan-usage reading, so
+  `_push_taskbar_badge` must NEVER `_touch`/`_schedule_save` (only the
+  `ui.taskbar_badge` preference saves, additively, no `SESSION_VERSION` bump);
+  the push is EDGE-GUARDED on a rendered key and coalesced behind
+  `TASKBAR_BADGE_MS`, because `workspaceStatsChanged` fires every couple of
+  seconds per busy agent and each push builds an HICON and crosses a COM
+  boundary; `_taskbar_key` advances only on a SUCCESSFUL push, so a refusal is
+  retried rather than remembered as current. `_push_taskbar_badge` returns early
+  unless `QGuiApplication.platformName() == "windows"`, which is what keeps the
+  offscreen smoke suite out of COM entirely — the whole state table is therefore
+  decided in `_taskbar_badge_spec`, with no window handle or apartment, and
+  that is what the tests drive. `taskbar_overlay` never raises (every entry
+  point returns a bool), and `closeEvent` clears the overlay before the window
+  goes so a stale "3 working" can't outlive the hive.
 - **The sidebar is a model-driven tree** (`widgets/sidebar.py`): `_nodes` is the
   ordered top-level list (workspaces + single-level `category` nodes with
   workspace children); drag-and-drop never moves Qt items (that strands the rich

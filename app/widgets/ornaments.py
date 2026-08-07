@@ -11,8 +11,9 @@ from functools import lru_cache
 
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
                             QRectF, Qt, QTimer, QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient,
-                           QPainter, QPen, QPixmap, QRadialGradient)
+from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage,
+                           QLinearGradient, QPainter, QPen, QPixmap,
+                           QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QLabel, QSizePolicy, QWidget
 
@@ -320,6 +321,82 @@ class AgentCountBadge(QWidget):
         p.setPen(color)
         p.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(self._count))
         p.end()
+
+
+# The two states the Windows taskbar overlay can be in. These are FIXED
+# constants rather than `Palette` reads, unlike every other badge in this file,
+# and deliberately so: the overlay is painted onto the OS taskbar, over whatever
+# accent colour the user has chosen there, not onto our own chrome. Following
+# the active skin would buy no visual coherence (nothing of ours is next to it)
+# while risking a disc that vanishes into the taskbar on a light theme.
+# Amber is the app's "working" hue so the two surfaces still read as related;
+# blue is a hue nothing else in AI Hive uses, because at 16 pixels colour is the
+# only channel that reliably carries a second meaning.
+TASKBAR_WORKING = "#d9b24a"   # agents working, none of them asking
+TASKBAR_ASKING = "#3b82f6"    # at least one agent is waiting on the user
+
+
+def taskbar_badge_bgra(text: str, fill: str, size: int):
+    """Paint the taskbar overlay disc and return `(w, h, premultiplied BGRA)`.
+
+    Returns exactly what `taskbar_overlay.set_overlay` wants, so the Qt half of
+    this feature stops here and the ctypes half never imports Qt.
+
+    Everything about the drawing is in service of legibility at 16 pixels: a
+    filled disc rather than an outline (an outline's interior shows the taskbar
+    through it), a dark rim so the disc still has an edge when the user's
+    taskbar happens to be the same hue, contrast-picked text, and a glyph
+    scaled by how many characters it has, since "9+" needs materially more room
+    than "3".
+    """
+    from .terminal_view import contrast_ratio
+
+    size = max(8, int(size))
+    img = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+    body = QColor(fill)
+    rim = QColor(body.darker(190))
+    rim.setAlpha(215)
+    inset = max(0.5, size * 0.045)
+    disc = QRectF(inset, inset, size - 2 * inset, size - 2 * inset)
+    pen = QPen(rim)
+    pen.setWidthF(max(1.0, size * 0.07))
+    p.setPen(pen)
+    p.setBrush(body)
+    p.drawEllipse(disc)
+
+    text = str(text or "")
+    if text:
+        ink = QColor("#101010")
+        if contrast_ratio(ink, body) < contrast_ratio(QColor("#ffffff"), body):
+            ink = QColor("#ffffff")
+        # Segoe UI, not the skin's body font, for the same reason the colours
+        # are fixed: this glyph is drawn into Windows' furniture, not ours.
+        f = QFont("Segoe UI")
+        f.setPixelSize(max(6, int(size * (0.70 if len(text) == 1 else 0.52))))
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(ink)
+        # Centre on the glyph's own INK, not the font's line box: at this size
+        # the box's ascent/descent padding visibly drops a digit off-centre.
+        # tightBoundingRect is relative to the baseline origin, so the ink runs
+        # from baseline+top to baseline+top+height.
+        box = QFontMetrics(f).tightBoundingRect(text)
+        p.drawText(round(disc.center().x() - box.left() - box.width() / 2.0),
+                   round(disc.center().y() - box.top() - box.height() / 2.0),
+                   text)
+    p.end()
+
+    stride = img.bytesPerLine()
+    raw = bytes(img.constBits())
+    want = size * 4
+    if stride != want:   # 32bpp is already 4-byte aligned, but never assume it
+        raw = b"".join(raw[y * stride:y * stride + want] for y in range(size))
+    return (size, size, raw)
 
 
 class BootVeil(QWidget):

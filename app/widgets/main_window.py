@@ -9,7 +9,7 @@ import threading
 import time
 
 from PySide6.QtCore import QProcess, Qt, QTimer, Signal
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QLabel, QLineEdit, QMainWindow, QMenu,
@@ -35,6 +35,7 @@ from .. import coordination
 from ..orchestrator_bridge import OrchestratorBridge
 from .activity_panel import ActivityPanel
 from .agent_file_map import AgentFileMapWindow
+from . import ornaments
 from .ornaments import LogoRoundel, PageBorder, PlanUsageBadge
 from .sidebar import SIDEBAR_WIDTH, Sidebar
 
@@ -119,6 +120,14 @@ LIMIT_PHANTOM_CHECK_MS = 3000
 LIMIT_RETRY_S = 300
 LIMIT_MAX_TRIES = 4
 
+# --- taskbar working-count overlay ---
+# `workspaceStatsChanged` fires every couple of seconds PER BUSY AGENT, and each
+# push costs a COM round trip plus a fresh HICON, so the recompute is coalesced
+# behind a single-shot timer and then edge-guarded on the rendered key. Short
+# enough that "everything went quiet" still reaches the taskbar promptly, which
+# is half the point of the feature.
+TASKBAR_BADGE_MS = 400
+
 # --- deferred ("send later") messages ---
 # The countdown is shown to the second, so the tick is a second. It runs ONLY
 # while something is actually queued (see `_sync_schedule_timer`), the same way
@@ -180,6 +189,7 @@ class TopBar(QFrame):
     themeChanged = Signal(str)   # theme id
     soundToggled = Signal(bool)  # notification chime enabled/muted
     usageVisibilityToggled = Signal(bool)  # show/hide the plan-usage readout
+    taskbarBadgeToggled = Signal(bool)     # show/hide the taskbar count overlay
     autoContinueToggled = Signal(bool)     # resume cut-off agents at the reset
     startupRecoveryToggled = Signal(bool)  # recover cut-off agents on startup
     usageRefreshRequested = Signal()       # user clicked the readout
@@ -235,6 +245,19 @@ class TopBar(QFrame):
         self.sound_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sound_btn.clicked.connect(self._on_sound_clicked)
         self._refresh_sound_btn()
+
+        # taskbar working-count overlay toggle. Sits next to the chime because
+        # both are the same kind of thing: a signal that reaches the user when
+        # the window is NOT the one they are looking at.
+        self._taskbar_badge = True
+        self.taskbar_btn = QToolButton(self)
+        # RecoveryToggle rather than SoundToggle: there is no slashed-window
+        # glyph to carry off-state the way 🔕 does for the chime, so this
+        # borrows the recovery switches' lit/dim + LED treatment instead.
+        self.taskbar_btn.setObjectName("RecoveryToggle")
+        self.taskbar_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.taskbar_btn.clicked.connect(self._on_taskbar_clicked)
+        self._refresh_taskbar_btn()
 
         # Claude plan usage: "21% used, resets in 1h20m at 14:49". Hidden until
         # a reading arrives (and permanently when there's no Claude login), and
@@ -299,12 +322,37 @@ class TopBar(QFrame):
         lay.addWidget(self.font_inc_btn)
         lay.addSpacing(8)
         lay.addWidget(self.sound_btn)
+        lay.addWidget(self.taskbar_btn)
         lay.addSpacing(8)
         lay.addWidget(self.add_terminal_btn)
 
     def _on_sound_clicked(self) -> None:
         self.set_sound_enabled(not self._sound_on)
         self.soundToggled.emit(self._sound_on)
+
+    def _on_taskbar_clicked(self) -> None:
+        self.set_taskbar_badge(not self._taskbar_badge)
+        self.taskbarBadgeToggled.emit(self._taskbar_badge)
+
+    def set_taskbar_badge(self, on: bool) -> None:
+        """Reflect the taskbar-overlay preference (no signal emitted)."""
+        self._taskbar_badge = bool(on)
+        self._refresh_taskbar_btn()
+
+    def _refresh_taskbar_btn(self) -> None:
+        self.taskbar_btn.setCheckable(True)
+        self.taskbar_btn.setChecked(self._taskbar_badge)
+        led = "\U0001F7E2" if self._taskbar_badge else "⚫"
+        self.taskbar_btn.setText(f"{led} \U0001FA9F")
+        self.taskbar_btn.setToolTip(
+            "Taskbar count: ON. The taskbar icon carries a badge with the "
+            "number of agents working, blue when one of them is waiting on a "
+            "question, and nothing at all when the hive is idle.\n"
+            "Click to turn off."
+            if self._taskbar_badge else
+            "Taskbar count: OFF. The taskbar icon stays plain, so you cannot "
+            "tell from other apps whether agents are still working.\n"
+            "Click to turn on.")
 
     def set_sound_enabled(self, on: bool) -> None:
         """Reflect the chime on/off state in the button (no signal emitted)."""
@@ -1008,6 +1056,10 @@ class MainWindow(QMainWindow):
         # forever; wiring it to a save would rewrite session.json 60x an hour.
         self._usage = None            # latest claude_usage.Usage
         self._usage_visible = True    # user preference (persisted)
+        # taskbar working-count overlay. The default MUST be set here, above
+        # _restore_ui_state, or the restored preference is clobbered back to on.
+        self._taskbar_badge = True    # user preference (persisted)
+        self._taskbar_key = None      # last key actually pushed to the shell
         self._usage_inflight = False  # one request at a time, never stack
         self._plan_blocked = False    # edge state for planLimitReached/Cleared
         # agent ids with a resume SCHEDULED but not yet delivered. The attempt
@@ -1190,12 +1242,20 @@ class MainWindow(QMainWindow):
         self._activity_timer.setInterval(3000)
         self._activity_timer.timeout.connect(self._refresh_activity)
 
+        # taskbar working-count overlay: coalesce a burst of per-workspace stat
+        # recomputes into one push (see TASKBAR_BADGE_MS)
+        self._taskbar_timer = QTimer(self)
+        self._taskbar_timer.setSingleShot(True)
+        self._taskbar_timer.setInterval(TASKBAR_BADGE_MS)
+        self._taskbar_timer.timeout.connect(self._push_taskbar_badge)
+
         self.top_bar.addTerminalClicked.connect(self._on_add_terminal_clicked)
         self.top_bar.sidebarToggleClicked.connect(self._toggle_sidebar)
         self.top_bar.globalFontDelta.connect(self._change_global_font)
         self.top_bar.themeChanged.connect(self._change_theme)
         self.top_bar.soundToggled.connect(self._on_sound_toggled)
         self.top_bar.usageVisibilityToggled.connect(self._on_usage_visibility)
+        self.top_bar.taskbarBadgeToggled.connect(self._on_taskbar_badge_toggled)
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
         self.top_bar.startupRecoveryToggled.connect(self._on_startup_recovery)
         # resume whoever the limit cut off, the moment the window reopens
@@ -1288,6 +1348,11 @@ class MainWindow(QMainWindow):
         # be safe under this signal's high firing rate.
         mgr.workspaceStatsChanged.connect(
             lambda *_: self._sync_schedule_timer())
+        # ...and the same edge drives the taskbar badge: busy and waiting both
+        # recompute stats, which is exactly the pair the overlay encodes. It is
+        # coalesced rather than pushed here, since this fires per workspace.
+        mgr.workspaceStatsChanged.connect(
+            lambda *_: self._schedule_taskbar_badge())
         mgr.workspacePathChanged.connect(self._on_workspace_path_changed)
         mgr.layoutChanged.connect(self._on_layout_changed)
         # an agent just settled on a question ("?" appeared) -> sound the chime
@@ -2124,6 +2189,118 @@ class MainWindow(QMainWindow):
         self._sound_enabled = bool(enabled)
         self._schedule_save()
 
+    # ------------------------------------------- taskbar working-count badge ---
+    # The one signal AI Hive has that reaches the user in ANOTHER application.
+    # Everything else that says "an agent is working" lives inside the window
+    # (the sidebar's pulsing badge, the WorkspaceSpinner), which is no use at
+    # all while the user is waiting in some other app for the hive to finish.
+    #
+    # Windows allows exactly ONE overlay icon and fixes it to the corner of the
+    # taskbar button, so both facts have to share one ~16px square: the DIGIT is
+    # how many agents are working, the COLOUR is whether any of them is stuck on
+    # a question. An idle hive gets no overlay at all, which is what makes "is
+    # anything still running?" answerable from across the room.
+
+    def _taskbar_state(self) -> tuple[int, bool]:
+        """(agents working, does any agent need the user).
+
+        Deliberately the SAME predicates the sidebar reads (`is_busy` /
+        `is_waiting`) rather than a parallel notion of activity, so the taskbar
+        and the sidebar can never disagree about what the hive is doing.
+        """
+        agents = self.manager.all_agents()
+        return (sum(1 for a in agents if a.is_busy()),
+                any(a.is_waiting() for a in agents))
+
+    def _schedule_taskbar_badge(self) -> None:
+        """Coalesce a burst of stat recomputes into one push.
+
+        (An Explorer restart destroys the taskbar button and with it the
+        overlay. No re-arm is wired for that on purpose: a working hive changes
+        busy state within seconds, so the very next push repaints it, and an
+        idle hive is meant to have no overlay anyway. The message hook that
+        would cover the remaining case runs on EVERY window message, which is
+        not a Python callback this app wants in its terminals' path.)
+        """
+        if self._closing:
+            return
+        self._taskbar_timer.start()   # single-shot: restarting is the debounce
+
+    def _taskbar_badge_spec(self) -> tuple[str, str | None, str | None, str]:
+        """What the overlay should be right now: `(key, text, fill, note)`.
+
+        `text is None` means NO overlay - an idle hive shows a plain icon, and
+        that absence is itself the readout ("nothing is running, go and look").
+        The `key` is what the push is edge-guarded on, so it must collapse every
+        state that renders identically: past 9 the disc only ever says "9+".
+
+        Kept separate from the push so the whole state table is decidable
+        without a shell, a window handle or a COM apartment.
+        """
+        count, asking = self._taskbar_state()
+        if not self._taskbar_badge:
+            count, asking = 0, False   # switched off reads as "nothing to show"
+        key = f"{min(count, 10)}|{int(asking)}"
+        if count <= 0 and not asking:
+            return (key, None, None, "")
+        # >9 stops being a number anyone reads at a glance, and stops fitting
+        # the disc; with nothing working the glyph carries the meaning instead.
+        text = "?" if count <= 0 else ("9+" if count > 9 else str(count))
+        fill = ornaments.TASKBAR_ASKING if asking else ornaments.TASKBAR_WORKING
+        if asking and count > 0:
+            note = f"{count} working, one is waiting for you"
+        elif asking:
+            note = "an agent is waiting for you"
+        else:
+            note = f"{count} working"
+        return (key, text, fill, note)
+
+    def _push_taskbar_badge(self) -> None:
+        """Render the overlay and hand it to the shell, if it actually changed.
+
+        CRITICAL, the same rule as `activity_changed` and the plan-usage
+        reading: this is TRANSIENT. It runs for the life of the process every
+        time an agent's output starts or stops, so it must never touch `_touch`
+        or `_schedule_save` - only the on/off preference saves. And the edge
+        guard is not an optimisation: `workspaceStatsChanged` fires every couple
+        of seconds per busy agent, and each push builds an HICON and crosses a
+        COM boundary, so pushing unconditionally would have the shell repainting
+        an identical badge forever.
+
+        `_taskbar_key` advances only on a SUCCESSFUL push, so a shell that
+        refused one attempt is retried on the next state change rather than
+        being remembered as up to date.
+        """
+        if self._closing:
+            return
+        if QGuiApplication.platformName() != "windows":
+            return   # offscreen (the smoke suite) has no taskbar to decorate
+        from .. import taskbar_overlay
+        if not taskbar_overlay.available():
+            return   # the shell refused the interface; it will not start later
+        key, text, fill, note = self._taskbar_badge_spec()
+        if key == self._taskbar_key:
+            return
+        hwnd = int(self.winId())
+        if text is None:
+            ok = taskbar_overlay.clear(hwnd)
+        else:
+            ok = taskbar_overlay.set_overlay(
+                hwnd,
+                ornaments.taskbar_badge_bgra(
+                    text, fill, taskbar_overlay.overlay_size()),
+                note)
+        if ok:
+            self._taskbar_key = key
+
+    def _on_taskbar_badge_toggled(self, enabled: bool) -> None:
+        """User flipped the top-bar taskbar-count toggle. An ordinary UI
+        preference, so it persists on the debounced save like `sound_enabled`;
+        the COUNT it controls never does."""
+        self._taskbar_badge = bool(enabled)
+        self._schedule_save()
+        self._push_taskbar_badge()   # apply now, don't wait for an agent event
+
     def _restore_ui_state(self, session: dict) -> None:
         ui = session.get("ui", {})
         # restore the saved skin FIRST so the stylesheet below is built once
@@ -2147,6 +2324,10 @@ class MainWindow(QMainWindow):
         # no SESSION_VERSION bump — same as sound_enabled before it.
         self._usage_visible = bool(ui.get("usage_visible", True))
         self.top_bar.set_usage_visible(self._usage_visible)
+        # taskbar working-count overlay (default ON: it is self-silencing, an
+        # idle hive shows no badge at all, so it never nags)
+        self._taskbar_badge = bool(ui.get("taskbar_badge", True))
+        self.top_bar.set_taskbar_badge(self._taskbar_badge)
         self._auto_continue = bool(ui.get("auto_continue", True))
         self.top_bar.set_auto_continue(self._auto_continue)
         self._startup_recovery = bool(ui.get("startup_recovery", True))
@@ -2596,6 +2777,7 @@ class MainWindow(QMainWindow):
             "theme": self._theme_id,
             "sound_enabled": self._sound_enabled,
             "usage_visible": self._usage_visible,
+            "taskbar_badge": self._taskbar_badge,
             "auto_continue": self._auto_continue,
             "startup_recovery": self._startup_recovery,
             "window": {"w": w, "h": h, "maximized": self.isMaximized()},
@@ -2659,6 +2841,15 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._closing = True
+        # take the badge off the button before the window goes: a stale "3
+        # working" left on a taskbar icon during the seconds Windows keeps the
+        # button alive says the opposite of the truth
+        try:
+            from .. import taskbar_overlay
+            taskbar_overlay.shutdown(int(self.winId()))
+        except Exception:
+            pass
+        self._taskbar_timer.stop()
         self._save_timer.stop()
         self._heartbeat_timer.stop()
         self._session_sync_timer.stop()

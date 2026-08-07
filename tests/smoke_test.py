@@ -446,6 +446,181 @@ def test_chime_persistence():
     bar.deleteLater()
 
 
+def test_taskbar_badge():
+    """The Windows taskbar overlay is the ONLY 'agents are working' signal that
+    reaches the user in another application, so its state table is the feature.
+
+    Windows allows exactly one overlay icon, fixed to the corner of the taskbar
+    button, so the working COUNT and the "someone is asking" flag have to share
+    one ~16px square: the digit is the count, the fill colour is the question.
+    An idle hive must show NO overlay - that absence is the readout.
+
+    Also checks the two rules a transient indicator in this app always has to
+    obey: the count NEVER marks the session dirty (this recomputes every time an
+    agent's output starts or stops, so a save here would rewrite session.json
+    all day), and the push is edge-guarded on a rendered key (each push builds
+    an HICON and crosses a COM boundary, and workspaceStatsChanged fires every
+    couple of seconds per busy agent).
+    """
+    from PySide6.QtWidgets import QApplication
+    from app.session_store import SessionStore
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets import ornaments
+    from app.widgets.main_window import TopBar
+    from app import taskbar_overlay
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    # --- the painter: real pixels, whatever the shell asks for -------------
+    size = taskbar_overlay.overlay_size()
+    check("taskbar: overlay_size is a sane icon size",
+          8 <= size <= 256, size)
+    w, h, raw = ornaments.taskbar_badge_bgra("3", ornaments.TASKBAR_WORKING, 16)
+    check("taskbar: badge is a 16x16 BGRA buffer of the right length",
+          (w, h) == (16, 16) and len(raw) == 16 * 16 * 4, (w, h, len(raw)))
+    # a disc, not a square: the corners stay transparent so it reads as a badge
+    # on whatever colour the user's taskbar happens to be
+    corner = raw[0:4]
+    centre = raw[((8 * 16) + 8) * 4:((8 * 16) + 8) * 4 + 4]
+    check("taskbar: the badge is a disc (corner transparent, centre opaque)",
+          corner[3] < 40 and centre[3] > 200, (corner[3], centre[3]))
+    amber = ornaments.taskbar_badge_bgra("3", ornaments.TASKBAR_WORKING, 16)[2]
+    blue = ornaments.taskbar_badge_bgra("3", ornaments.TASKBAR_ASKING, 16)[2]
+    check("taskbar: the working and asking fills are visibly different",
+          amber != blue)
+    check("taskbar: a two-character count still renders",
+          len(ornaments.taskbar_badge_bgra(
+              "9+", ornaments.TASKBAR_WORKING, 16)[2]) == 16 * 16 * 4)
+
+    # --- the state table --------------------------------------------------
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-taskbar-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    app.processEvents()
+    mgr = win.manager
+    ws = mgr.create_workspace("Taskbar", str(tmp))
+    agents = [mgr.add_terminal(ws.id,
+                               build_spec(AgentKind.CLAUDE, f"A{i}",
+                                          cwd=str(tmp)), autostart=False)
+              for i in range(3)]
+
+    def spec():
+        return win._taskbar_badge_spec()
+
+    key, text, fill, note = spec()
+    check("taskbar: an idle hive gets NO overlay at all",
+          text is None and key == "0|0", (key, text))
+
+    agents[0]._busy = True        # what _mark_busy sets on an output burst
+    key, text, fill, note = spec()
+    check("taskbar: one agent working shows an amber 1",
+          (key, text, fill) == ("1|0", "1", ornaments.TASKBAR_WORKING),
+          (key, text, fill))
+    check("taskbar: the description names the count", note == "1 working", note)
+
+    agents[1]._busy = True
+    agents[2]._busy = True
+    check("taskbar: the count is every working agent across ALL workspaces",
+          spec()[1] == "3", spec())
+
+    # the "?" rides the SAME square as a colour swap, since there is no second
+    # overlay slot to put it in
+    agents[2]._waiting = True
+    key, text, fill, note = spec()
+    check("taskbar: an agent with a question turns the disc blue, count intact",
+          (key, text, fill) == ("3|1", "3", ornaments.TASKBAR_ASKING),
+          (key, text, fill))
+    check("taskbar: the description says someone is waiting",
+          "waiting for you" in note, note)
+
+    for a in agents:
+        a._busy = False
+    key, text, fill, note = spec()
+    check("taskbar: nothing working but a question pending shows a blue '?'",
+          (key, text, fill) == ("0|1", "?", ornaments.TASKBAR_ASKING),
+          (key, text, fill))
+
+    agents[2]._waiting = False
+    check("taskbar: everything quiet again clears the overlay",
+          spec()[1] is None, spec())
+
+    # --- the edge guard: identical states collapse to ONE key -------------
+    for a in agents:
+        a._busy = True
+    first = spec()[0]
+    check("taskbar: an unchanged state renders an unchanged key",
+          spec()[0] == first, (first, spec()[0]))
+    many = [mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, f"B{i}",
+                                               cwd=str(tmp)), autostart=False)
+            for i in range(9)]
+    for a in many:
+        a._busy = True
+    key, text, _f, _n = spec()
+    check("taskbar: past 9 the disc says 9+ (a bigger number is unreadable "
+          "at this size) and every such state collapses to one key",
+          (key, text) == ("10|0", "9+"), (key, text))
+
+    # --- transient: the count must NEVER reach the session ----------------
+    win._save_timer.stop()
+    win._taskbar_key = None
+    win._push_taskbar_badge()
+    check("taskbar: pushing the badge never marks the session dirty",
+          not win._save_timer.isActive())
+    check("taskbar: the push is a no-op off a real taskbar (offscreen suite)",
+          win._taskbar_key is None, win._taskbar_key)
+
+    # --- the toggle: a preference, so it DOES save, and it round-trips -----
+    bar = TopBar()
+    check("taskbar toggle: defaults to ON",
+          bar._taskbar_badge and bar.taskbar_btn.isChecked())
+    emitted = []
+    bar.taskbarBadgeToggled.connect(emitted.append)
+    bar.taskbar_btn.click()
+    check("taskbar toggle: a click turns it off and emits False",
+          emitted == [False] and not bar._taskbar_badge, emitted)
+    bar.set_taskbar_badge(True)   # restore path: reflect without re-emitting
+    check("taskbar toggle: set_taskbar_badge does not re-emit",
+          bar._taskbar_badge and emitted == [False])
+    bar.deleteLater()
+
+    win._save_timer.stop()
+    win._on_taskbar_badge_toggled(False)
+    check("taskbar: flipping the PREFERENCE does mark the session dirty",
+          win._save_timer.isActive())
+    check("taskbar: switched off, a fully working hive still shows nothing",
+          spec()[1] is None, spec())
+    payload = win._session_payload()
+    check("taskbar: the preference is persisted under ui",
+          payload["ui"]["taskbar_badge"] is False, payload["ui"])
+    win._restore_ui_state({"ui": {"taskbar_badge": True}})
+    check("taskbar: the preference is restored onto the window and the button",
+          win._taskbar_badge and win.top_bar._taskbar_badge)
+    win._restore_ui_state({"ui": {}})
+    check("taskbar: a session that predates the feature defaults it ON",
+          win._taskbar_badge)
+
+    # ...and the same thing through a REAL close/reopen, which is the only way
+    # to catch the default being assigned after _restore_ui_state has run (it
+    # was, and it silently switched the badge back on at every launch).
+    win._taskbar_badge = False
+    win.top_bar.set_taskbar_badge(False)
+    win._save_session()
+    win.close()
+    app.processEvents()
+    again = create_main_window(SessionStore(path=tmp / "session.json"))
+    check("taskbar: OFF survives a close and reopen",
+          not again._taskbar_badge and not again.top_bar._taskbar_badge,
+          again._taskbar_badge)
+    check("taskbar: reopening starts with no badge pushed yet",
+          again._taskbar_key is None, again._taskbar_key)
+    again._save_timer.stop()
+    again.close()
+    app.processEvents()
+
+
 def test_hook_prompt_events():
     """The Claude-hook script is the AUTHORITATIVE 'needs the user' signal for
     the prompts the screen scrape cannot see. Verify: the shared settings file
@@ -8274,6 +8449,7 @@ def main():
     test_sidebar_file_tree()
     test_sidebar_search()
     test_plan_usage()
+    test_taskbar_badge()
     test_limit_ledger()
     test_auto_continue_on_limit_reset()
     test_startup_limit_recovery()
