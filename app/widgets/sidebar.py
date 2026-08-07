@@ -632,7 +632,8 @@ class AgentRow(QFrame):
     dot, the agent's NAME on the left, its current-task SUMMARY beside the name,
     and a "?" when it's waiting for the user. Clicking it reveals the card."""
 
-    activated = Signal(str, str)   # ws_id, agent_id
+    activated = Signal(str, str)        # ws_id, agent_id
+    schedRequested = Signal(str, str)   # ws_id, agent_id (⏱ clicked)
 
     def __init__(self, ws_id: str, agent, parent=None):
         super().__init__(parent)
@@ -664,10 +665,18 @@ class AgentRow(QFrame):
         self.limit_mark.setObjectName("WsAgentLimit")
         self.limit_mark.hide()
         # a message is queued to be typed into this agent later, so a scheduled
-        # send is findable from a collapsed workspace too
-        self.sched_mark = QLabel("⏱", self)
+        # send is findable from a collapsed workspace too. A QToolButton (not a
+        # QLabel like q/limit_mark above) so its own click is CONSUMED instead
+        # of bubbling to the row's whole-row "reveal the card" handler -- same
+        # trick WorkspaceRow's badges already use to stay independently
+        # clickable inside a row that is itself one big click target.
+        self.sched_mark = QToolButton(self)
         self.sched_mark.setObjectName("WsAgentSched")
+        self.sched_mark.setText("⏱")
+        self.sched_mark.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sched_mark.hide()
+        self.sched_mark.clicked.connect(
+            lambda: self.schedRequested.emit(self.ws_id, self.agent_id))
         lay.addWidget(self.dot)
         lay.addWidget(self.name)
         lay.addWidget(self.summary, 1)
@@ -704,7 +713,8 @@ class AgentRow(QFrame):
             missed = sum(1 for m in held if m.state == scheduled_send.MISSED)
             self.sched_mark.setToolTip(
                 f"{len(held)} scheduled message(s)"
-                + (f", {missed} missed" if missed else ""))
+                + (f", {missed} missed" if missed else "")
+                + " -- click to view or edit")
         # summary = assigned task, else Claude's live AI conversation title
         get = getattr(agent, "summary", None)
         self._full = (get() if callable(get) else agent.current_task or "").strip()
@@ -802,6 +812,7 @@ class Sidebar(QFrame):
     openFolderRequested = Signal(str)
     agentsRequested = Signal(str)            # ws_id (count badge clicked; M3)
     agentActivated = Signal(str, str)        # ws_id, agent_id (reveal its card)
+    agentScheduleRequested = Signal(str, str)  # ws_id, agent_id (⏱ clicked)
     reordered = Signal(list)                 # flattened ws-id order (M1)
     layoutChanged = Signal(list)             # full node model: order+categories
     filesRequested = Signal(str)             # ws_id (file-tree toggle clicked)
@@ -1179,6 +1190,7 @@ class Sidebar(QFrame):
             child.setSizeHint(0, QSize(SIDEBAR_WIDTH, AGENT_HEIGHT))
             arow = AgentRow(ws_id, agent)
             arow.activated.connect(self.agentActivated)
+            arow.schedRequested.connect(self.agentScheduleRequested)
             arow.set_search_hit(agent.id in self._search_agent_hits)
             self.tree.setItemWidget(child, 0, arow)
             self._agent_rows[agent.id] = arow

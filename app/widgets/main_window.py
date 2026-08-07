@@ -732,6 +732,7 @@ class ScheduleMessageDialog(QDialog):
         super().__init__(parent)
         self.agent = agent
         self._due_ts = None
+        self.editing_id: str | None = None
         self.setWindowTitle(f"Send later to {agent.spec.name}")
         self.setMinimumWidth(460)
 
@@ -871,6 +872,11 @@ class ScheduleMessageDialog(QDialog):
         label = QLabel(f"{when}  {_snippet(msg.text, 60)}", self)
         label.setToolTip(f"{scheduled_send.format_clock(msg.due_ts)}\n{msg.text}")
         row.addWidget(label, 1)
+        edit = QToolButton(self)
+        edit.setText("✏")
+        edit.setToolTip("Edit this message or its time")
+        edit.clicked.connect(lambda _checked=False, m=msg: self._start_edit(m))
+        row.addWidget(edit)
         if missed:
             send_now = QToolButton(self)
             send_now.setText("send now")
@@ -885,8 +891,35 @@ class ScheduleMessageDialog(QDialog):
         row.addWidget(drop)
         return row
 
+    def _start_edit(self, msg) -> None:
+        """Load an already-queued message back into the compose form so its
+        text and/or fire time can be changed in place, instead of
+        cancel-and-recreate (which would silently lose its spot in the
+        queue)."""
+        self.editing_id = msg.id
+        self.text_edit.setPlainText(msg.text)
+        self.text_edit.setFocus()
+        self.text_edit.selectAll()
+        remaining = msg.due_ts - time.time()
+        if remaining > 0:
+            self.delay_edit.setText(f"{max(1, round(remaining / 60))}m")
+            self.clock_edit.clear()
+            self._revalidate()
+        else:
+            self._set_preset(self.PRESETS[0][1])  # missed: the old time is gone
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Save")
+        self.setWindowTitle(f"Edit message for {self.agent.spec.name}")
+
+    def _cancel_edit(self) -> None:
+        self.editing_id = None
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Schedule")
+        self.setWindowTitle(f"Send later to {self.agent.spec.name}")
+
     def _cancel(self, msg) -> None:
         self.agent.cancel_scheduled(msg.id)
+        if msg.id == self.editing_id:
+            self._cancel_edit()
         self.refresh_pending()
 
     def _send_now(self, msg) -> None:
@@ -1182,6 +1215,10 @@ class MainWindow(QMainWindow):
         # reveals a clicked agent's card (no overlapping popup)
         self.sidebar.agents_provider = self._agents_for_ws
         self.sidebar.agentActivated.connect(self._reveal_agent)
+        # the sidebar's own "⏱" clock opens the same view/edit/cancel popup
+        # as the card's clock chip, always empty-prefill (manage, not compose)
+        self.sidebar.agentScheduleRequested.connect(
+            lambda ws_id, agent_id: self._on_schedule_message(agent_id))
         # inline file explorer: the sidebar resolves a ws to its root folder,
         # opens files with the OS default app, and its open/closed set persists
         self.sidebar.files_root_provider = self._project_path_for_ws
@@ -1975,6 +2012,16 @@ class MainWindow(QMainWindow):
             self._sync_schedule_timer()   # cancels made in the manage list
             return
         text, due_ts = result
+        if dialog.editing_id:
+            # the tick could have delivered or dropped it while the dialog was
+            # open, so this can legitimately no-op rather than error
+            if agent.reschedule(dialog.editing_id, text, due_ts):
+                self._schedule_audit(
+                    f"RESCHEDULED agent={agent.spec.name} "
+                    f"at={scheduled_send.format_clock(due_ts)} "
+                    f"in={scheduled_send.format_countdown(due_ts - time.time())}")
+            self._sync_schedule_timer()
+            return
         msg = agent.schedule_message(text, due_ts)
         if msg is None:
             QMessageBox.information(

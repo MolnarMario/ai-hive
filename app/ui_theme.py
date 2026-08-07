@@ -477,8 +477,15 @@ WorkspaceRow[search_hit="true"] {{
 /* cut off by the usage limit: amber like the "?", but deliberately NOT the
    error red: the agent is fine, it is only waiting for the window to reopen */
 #WsAgentLimit {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
-/* a message is queued to be typed into this agent later */
-#WsAgentSched {{ color: {p.ACCENT_GOLD_DIM}; font-size: 12px; }}
+/* a message is queued to be typed into this agent later -- a QToolButton
+   (unlike WsAgentQ/WsAgentLimit, which are inert labels), so it needs its own
+   flat/borderless base or it grows platform button chrome, plus a hover tint
+   for the click affordance */
+#WsAgentSched {{
+    background: transparent; border: none; padding: 0;
+    color: {p.ACCENT_GOLD_DIM}; font-size: 12px;
+}}
+#WsAgentSched:hover {{ color: {p.ACCENT_GOLD}; }}
 
 /* inline file explorer rows (a workspace expanded to its VS Code-style file
    tree): a type/folder icon + the name; the revealed row (a file jumped to from

@@ -124,6 +124,7 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import ui_theme
+from ..terminal_agent import _CLAUDE_READY_HINTS
 from ..ui_theme import ANSI_16, Palette
 
 _NAMED = {
@@ -1041,8 +1042,12 @@ class TerminalView(QWidget):
         _select_input_line finds it -- when there is no prompt glyph it stays on
         the caret's own row, so a promptless transcript above is never absorbed);
         `bottom` is the last non-blank row of the contiguous block at/below the
-        caret. Bounds multi-line click-to-position so a click on the transcript
-        or on blank space below the box never drives the child's caret."""
+        caret, stopping BEFORE the box's own footer hint (Claude Code paints
+        that directly under the box with no blank line, so a naive non-blank
+        scan swept it -- and anything under it -- into the captured input; see
+        _row_is_input_footer). Bounds multi-line click-to-position so a click
+        on the transcript or on blank space below the box never drives the
+        child's caret."""
         buf = self.screen.buffer
         cy = self.screen.cursor.y
         if self._row_content(cy) == (-1, -1):
@@ -1062,6 +1067,8 @@ class TerminalView(QWidget):
         while r < self.screen.lines:
             if self._row_content(r) == (-1, -1):
                 break
+            if self._row_is_input_footer(r):
+                break  # the box's footer hint, not more typed text -- stop before it
             bottom = r
             r += 1
         return top, bottom
@@ -1369,6 +1376,18 @@ class TerminalView(QWidget):
                 first = c if first < 0 else first
                 last = c
         return first, last
+
+    def _row_is_input_footer(self, r: int) -> bool:
+        """True when row r is Claude Code's input-box footer hint (e.g. '? for
+        shortcuts') -- painted with NO blank line between it and the box, so
+        the bottom-scan in `_input_block_span` must stop before it instead of
+        folding it into the captured/selected input."""
+        first, last = self._row_content(r)
+        if first < 0:
+            return False
+        row = self.screen.buffer[r]
+        text = "".join(row[c].data for c in range(first, last + 1)).strip().lower()
+        return any(hint in text for hint in _CLAUDE_READY_HINTS)
 
     def _select_input_line(self) -> None:
         """Best-effort highlight of the text you're typing. Claude Code's input
