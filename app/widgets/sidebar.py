@@ -114,6 +114,13 @@ class WorkspaceRow(QFrame):
         text_col.setSpacing(0)
         self.name_label = QLabel(name, self)
         self.name_label.setObjectName("WsName")
+        # allowed to shrink all the way to 0: the icons/badges to its right
+        # must NEVER be squeezed out or collapsed behind a "..." overflow to
+        # make room for the name — the name concedes the space instead, even
+        # if that means it's fully covered. A workspace's name and position
+        # are static, so a temporarily short name while badges are up front
+        # is a non-issue; a hidden icon (a waiting "?", a working spinner) is not.
+        self.name_label.setMinimumWidth(0)
         self.rename_edit = QLineEdit(self)
         self.rename_edit.setObjectName("WsRenameEdit")
         self.rename_edit.hide()
@@ -206,16 +213,60 @@ class WorkspaceRow(QFrame):
         lay.addWidget(self.count_badge)
         lay.addWidget(self.tree_btn)      # always-visible file-explorer caret
         lay.addLayout(text_col, 1)
-        lay.addWidget(self.folder_btn)
-        lay.addWidget(self.delete_btn)
-        lay.addWidget(self.sched_badge)
-        lay.addWidget(self.limit_badge)
-        lay.addWidget(self.bg_badge)
-        lay.addWidget(self.q_badge)
-        lay.addWidget(self.work_spinner)
+
+        # folder/delete + every status badge live OUTSIDE `lay`, in their own
+        # tiny widget with its own layout, positioned by hand (_position_icon_
+        # stack) pinned to the row's right edge and RAISED above the name. A
+        # shared QHBoxLayout with the name would fight it for width and, once
+        # enough badges lit up at once (measured: folder+delete+one badge
+        # alone already exceeds the 230px sidebar), the layout engine crushes
+        # the losers down to a sliver — small enough that Qt's own button
+        # painter starts eliding their glyph+count text down to a bare "…",
+        # which is the exact "icons collapse under a ...' the user reported
+        # (and had pre-emptively asked to avoid). Living outside `lay` means
+        # this stack is sized ONLY from its own visible children's natural
+        # width, so it is NEVER a party to that squeeze; the name concedes
+        # the space instead by shrinking (down to 0, see name_label above),
+        # up to and including being covered outright.
+        self._icon_stack = QWidget(self)
+        icon_lay = QHBoxLayout(self._icon_stack)
+        icon_lay.setContentsMargins(0, 0, 0, 0)
+        icon_lay.setSpacing(8)
+        icon_lay.addWidget(self.folder_btn)
+        icon_lay.addWidget(self.delete_btn)
+        icon_lay.addWidget(self.sched_badge)
+        icon_lay.addWidget(self.limit_badge)
+        icon_lay.addWidget(self.bg_badge)
+        icon_lay.addWidget(self.q_badge)
+        icon_lay.addWidget(self.work_spinner)
+        self._icon_stack.raise_()
 
         self.rename_edit.returnPressed.connect(self._commit_rename)
         self.rename_edit.installEventFilter(self)
+        self._position_icon_stack()
+
+    # -------------------------------------------------------- icon stack ---
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_icon_stack()
+
+    def _position_icon_stack(self) -> None:
+        """Pin the icon stack to the row's right edge, sized to exactly what
+        its currently-visible children need — never squeezed, never elided."""
+        self._icon_stack.adjustSize()
+        w, h = self._icon_stack.width(), self._icon_stack.height()
+        margin = self.layout().contentsMargins().right()
+        x = self.width() - w - margin
+        # in the rare case where every badge is lit at once and there simply
+        # isn't 230px of room, prefer covering the count badge/name over
+        # letting the stack hang off the row's LEFT edge (which would clip
+        # its leftmost icon instead of just overlapping other chrome) — clamp
+        # so the stack always stays fully inside the row when it can fit at
+        # all, and is right-anchored (never left-clipped) when it can't.
+        x = max(0, x)
+        y = (self.height() - h) // 2
+        self._icon_stack.move(x, y)
 
     # ------------------------------------------------------------- state ---
 
@@ -291,6 +342,9 @@ class WorkspaceRow(QFrame):
                f"{e} error, {waiting} waiting, {blocked} limit-stopped, "
                f"{scheduled} scheduled, {bg} background-shell")
         self.setToolTip(f"{tip}\n{self._folder}" if self._folder else tip)
+        # any of the above may have changed the icon stack's visible children
+        # (and so its natural width) — re-pin it to the right edge
+        self._position_icon_stack()
 
     # ------------------------------------------------------------ rename ---
 
@@ -377,9 +431,13 @@ class WorkspaceRow(QFrame):
         # folder/delete appear ONLY while hovering the row (not on the active
         # row) so the workspace name keeps the full width the rest of the time;
         # the count badge carries the workspace's status at all times, and the
-        # file-explorer caret (tree_btn) is always visible up front by the name
+        # file-explorer caret (tree_btn) is always visible up front by the name.
+        # These are the ONLY things gated on hover — every status badge and the
+        # working spinner stay governed purely by their own state (see
+        # set_stats), never by hover, so they can never be hidden by it.
         self.delete_btn.setVisible(hovered)
         self.folder_btn.setVisible(hovered)
+        self._position_icon_stack()
 
 
 class CategoryRow(QFrame):

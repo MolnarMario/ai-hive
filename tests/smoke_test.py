@@ -152,7 +152,7 @@ def test_sidebar_count_badge():
     from PySide6.QtWidgets import QApplication
     from app.widgets.ornaments import AgentCountBadge
     from app.ui_theme import Palette
-    from app.widgets.sidebar import WorkspaceRow
+    from app.widgets.sidebar import WorkspaceRow, SIDEBAR_WIDTH, ROW_HEIGHT
 
     QApplication.instance() or QApplication([])
     row = WorkspaceRow("w1", "Alpha", "C:/proj")
@@ -215,6 +215,56 @@ def test_sidebar_count_badge():
     row._update_hover_buttons(hovered=True)
     check("row: hover reveals folder/delete",
           not row.folder_btn.isHidden() and not row.delete_btn.isHidden())
+
+    # even with hover buttons up AND every status badge lit at once, none of
+    # them may be hidden to make room — only the name label may shrink (down
+    # to 0 width; it has no minimum), so icons are never squeezed out or
+    # collapsed behind a "..." overflow.
+    row.set_stats({"total": 3, "active": 3, "busy": 2, "error": 0,
+                   "waiting": 1, "idle": 0, "limit_blocked": 1,
+                   "scheduled": 1, "bg_shell": 1})
+    check("row: name label has no minimum width (can shrink to 0 for icons)",
+          row.name_label.minimumWidth() == 0, row.name_label.minimumWidth())
+    check("row: every badge stays visible with hover buttons also up",
+          not row.folder_btn.isHidden() and not row.delete_btn.isHidden()
+          and not row.q_badge.isHidden() and not row.limit_badge.isHidden()
+          and not row.sched_badge.isHidden() and not row.bg_badge.isHidden()
+          and not row.work_spinner.isHidden(),
+          (row.folder_btn.isHidden(), row.delete_btn.isHidden(),
+           row.q_badge.isHidden(), row.limit_badge.isHidden(),
+           row.sched_badge.isHidden(), row.bg_badge.isHidden(),
+           row.work_spinner.isHidden()))
+
+    # the actual regression: forced into the real (narrow) sidebar column via
+    # setGeometry -- exactly what QTreeWidget.setItemWidget does -- a shared
+    # QHBoxLayout crushes every fixed-size icon down toward its floor, and a
+    # QToolButton whose ALLOCATED width lands below its text's natural width
+    # gets its own label auto-elided by Qt's style into a bare "...". Living
+    # in their own untouched layout (_icon_stack), each badge's width must be
+    # INDEPENDENT of the row's width -- squeezing the row into the real
+    # sidebar column must not change it at all. Compare against the same
+    # badges laid out with the row given plenty of room, rather than against
+    # sizeHint() directly, since sizeHint() and the post-layout width are not
+    # bit-identical on every platform/DPI -- what must hold is that the row
+    # being narrow changes nothing.
+    badges = (row.folder_btn, row.delete_btn, row.sched_badge,
+              row.limit_badge, row.bg_badge)
+    row.setGeometry(0, 0, 2000, ROW_HEIGHT)
+    row.layout().activate()
+    row._position_icon_stack()
+    row._icon_stack.layout().activate()
+    roomy_widths = {b.objectName(): b.width() for b in badges}
+
+    row.setGeometry(0, 0, SIDEBAR_WIDTH, ROW_HEIGHT)
+    row.layout().activate()
+    row._position_icon_stack()
+    row._icon_stack.layout().activate()
+    for btn in badges:
+        roomy_w = roomy_widths[btn.objectName()]
+        check(f"row: {btn.objectName()} keeps its full width when the row "
+              "is squeezed to the real sidebar width (never elided to '...')",
+              btn.width() == roomy_w, (btn.objectName(), btn.width(), roomy_w))
+    row._update_hover_buttons(hovered=False)
 
     # "?" waiting indicator: hidden when nobody waits, shown otherwise; clicking
     # it opens the agent dropdown (agentsRequested)
@@ -8682,6 +8732,22 @@ def test_scheduled_send():
     check("schedule: the footer hint under the box is not swept into the "
           "captured message", seen3 == ["send this only"], seen3)
     view3.deleteLater()
+
+    # Claude Code also paints a plain divider/box-border row between the
+    # input and its footer hint, again with no blank line -- that must not
+    # be swept in either (it showed up literally as a line of dashes in a
+    # scheduled message's prefill)
+    view4 = TerminalView(rows=24, cols=80)
+    seen4 = []
+    view4.scheduleRequested.connect(seen4.append)
+    view4.feed("> send this only" + "\x1b[2;1H" + ("─" * 40)
+               + "\x1b[3;1H? for shortcuts" + "\x1b[1;17H")
+    view4.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return,
+                                  Qt.KeyboardModifier.ControlModifier
+                                  | Qt.KeyboardModifier.ShiftModifier, "\r"))
+    check("schedule: a divider row under the box is not swept into the "
+          "captured message", seen4 == ["send this only"], seen4)
+    view4.deleteLater()
 
     # --- the composer -------------------------------------------------------
     from PySide6.QtWidgets import QDialog, QDialogButtonBox
