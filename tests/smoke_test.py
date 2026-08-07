@@ -6123,6 +6123,144 @@ def test_screen_snapshots():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_boot_veil():
+    """A launching terminal shows a loader, not the child's half-drawn frame.
+
+    The regression: every reopen parked each restored card on a mangled narrow
+    fragment in its top-left corner (the child's first frames, drawn at the
+    pre-layout width, which pyte cannot reflow) until the conversation finished
+    replaying. The veil covers exactly the launch-to-prompt window, and must
+    ALWAYS lift again: on readiness, on a keystroke, on the agent stopping, or
+    on its own backstop timer."""
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+
+    # -- the agent-side signal --------------------------------------------
+    spec = build_spec(AgentKind.CLAUDE, "Booting", cwd=os.getcwd(), pty=True)
+    agent = TerminalAgent(spec)
+    seen = []
+    agent.prompt_ready_changed.connect(seen.append)
+    agent._on_pty_output("stdout", "Claude Code is booting")
+    check("boot-veil: a booting child is not reported ready",
+          seen == [] and not agent.prompt_ready())
+    agent._on_pty_output("stdout", "? for shortcuts")
+    check("boot-veil: the ready footer announces an interactive prompt",
+          seen == [True] and agent.prompt_ready())
+    agent._on_pty_output("stdout", "? for shortcuts")
+    check("boot-veil: readiness is edge-only, never once per output burst",
+          seen == [True])
+
+    class _StubWorker:
+        state = None
+        def start(self): pass
+        def restart(self): pass
+        def is_running(self): return False
+        def dispose(self): pass
+    agent.worker = _StubWorker()
+    agent.start()
+    check("boot-veil: a (re)start re-arms readiness and says so",
+          seen == [True, False] and not agent.prompt_ready())
+    agent.dispose()
+
+    # -- the widget --------------------------------------------------------
+    from PySide6.QtCore import QAbstractAnimation, QEventLoop, Qt, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.ornaments import BootVeil
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    from PySide6.QtWidgets import QWidget
+    host = QWidget()          # a real parent, so raise_() is a stacking op
+    host.resize(400, 240)     # rather than an offscreen window request
+    veil = BootVeil(host)
+    veil.resize(400, 240)
+    check("boot-veil: a fresh veil is down and idle", not veil.is_active())
+    veil.begin("restoring conversation…")
+    check("boot-veil: begin() covers the terminal and starts the sweep",
+          veil.is_active() and veil._spin.state() ==
+          QAbstractAnimation.State.Running)
+    veil.finish()
+    pump(500)  # the fade is 260ms
+    check("boot-veil: finish() dissolves it and stops animating",
+          not veil.is_active()
+          and veil._spin.state() != QAbstractAnimation.State.Running)
+    veil.begin("starting…")
+    veil.dismiss()
+    check("boot-veil: dismiss() drops it at once",
+          not veil.is_active()
+          and veil._spin.state() != QAbstractAnimation.State.Running)
+    veil.deleteLater(); host.deleteLater()
+
+    # -- the card ----------------------------------------------------------
+    from app.pty_worker import HAS_CONPTY
+    if not HAS_CONPTY:
+        return
+    from app.widgets.terminal_card import BOOT_VEIL_MAX_MS, TerminalCard
+
+    booting = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Boot", cwd=os.getcwd(), pty=True))
+    card = TerminalCard(booting)
+    card.resize(640, 400); card.show(); pump(150)
+    check("boot-veil: a stopped card shows the wake banner, not the loader",
+          not card.boot.is_active())
+    card._on_status(AgentStatus.STARTING)   # the launch autostart
+    check("boot-veil: a launching card is covered while its child boots",
+          card.boot.is_active())
+    check("boot-veil: ...over the whole terminal, so no fragment shows through",
+          card.boot.geometry() == card.terminal.rect())
+    check("boot-veil: ...and it never takes the keyboard from the child",
+          card.boot.focusPolicy() == Qt.FocusPolicy.NoFocus)
+    # the point of the feature, in PIXELS: whatever the booting child paints
+    # underneath must not reach the user. Checking a flag would have passed
+    # just as happily with the veil sitting at the wrong geometry or behind
+    # the terminal.
+    from PySide6.QtGui import QColor
+
+    from app.ui_theme import Palette
+    card.terminal.feed("BOOT-FRAGMENT-" + "#" * 40 + "\r\n")
+    pump(60)
+    img = card.terminal.grab().toImage()
+    ground = QColor(Palette.BG_CONSOLE).rgb()
+    top_rows = [img.pixel(x, y) for y in (3, 6, 9)
+                for x in range(0, min(240, img.width()), 3)]
+    check("boot-veil: the child's first frames are covered in pixels, not "
+          "merely hidden behind a flag",
+          top_rows and all(p == ground for p in top_rows))
+    booting._set_prompt_ready(True)
+    pump(500)
+    check("boot-veil: the prompt going live lifts it",
+          not card.boot.is_active())
+
+    # typing means the user wants the terminal, whatever the child has said
+    from app.process_worker import WorkerState
+    booting._set_prompt_ready(False)
+    card._on_status(AgentStatus.STARTING)
+    booting.worker.state = WorkerState.RUNNING   # the child is live, if quiet
+    card._on_key_input("x")
+    check("boot-veil: typing drops it immediately",
+          not card.boot.is_active() and not card._boot_timer.isActive())
+
+    # a stopped agent hands the screen back to the wake banner
+    card._on_status(AgentStatus.STARTING)
+    card._on_status(AgentStatus.EXITED_OK)
+    check("boot-veil: a stopped agent drops it (the wake banner owns that)",
+          not card.boot.is_active() and card.overlay.isVisible())
+
+    # ...and a child that never reports readiness at all still gets its
+    # terminal back: the veil is bounded, never a permanent cover
+    card._on_status(AgentStatus.STARTING)
+    check("boot-veil: the backstop timer is armed while covered",
+          card._boot_timer.isActive() and 0 < card._boot_timer.interval()
+          <= BOOT_VEIL_MAX_MS)
+    card._dismiss_boot_veil()
+    check("boot-veil: ...and firing it uncovers the terminal",
+          not card.boot.is_active())
+    card.detach(); booting.dispose(); pump(100)
+
+
 def test_resume_fallback():
     """A resume (--continue) launch that dies before the interactive prompt ever
     comes up (Claude prints 'No conversation found to continue' and exits) must
@@ -8009,6 +8147,7 @@ def main():
     test_v2_review_fixes()
     test_v3_features()
     test_persistence_resume()
+    test_boot_veil()
     test_resume_fallback()
     test_scrollback()
     test_themes()

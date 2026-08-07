@@ -9,7 +9,7 @@ agent signals can't fire into a dead widget.
 
 import re
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, Signal
+from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (QAction, QColor, QDrag, QPainter, QPixmap,
                            QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
@@ -20,9 +20,15 @@ from ..ansi_parser import AnsiSgrParser, CharStyle
 from ..terminal_agent import (STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
                               TerminalAgent)
 from ..ui_theme import Palette, repolish
-from .ornaments import ElidingLabel
+from .ornaments import BootVeil, ElidingLabel
 
 _LINE_BREAKS = re.compile(r"[\r\n]")
+
+# How long the boot veil may cover a launching terminal before it lifts on its
+# own. Readiness normally arrives in a second or two; this only exists so a
+# child that never emits the ready signal at all (an exotic pty shell) can
+# never leave the user looking at a cover instead of their terminal.
+BOOT_VEIL_MAX_MS = 25_000
 
 _GLYPH_STATE = {
     AgentStatus.IDLE: "idle",
@@ -124,6 +130,10 @@ class TerminalCard(QFrame):
         self._task_full = ""    # untruncated current-task (the label elides it)
         self._pending_replay = ""  # restored screen, re-rendered once at size
         self._overlay_compact = False
+        # single-shot backstop for the boot veil (see _begin_boot_veil)
+        self._boot_timer = QTimer(self)
+        self._boot_timer.setSingleShot(True)
+        self._boot_timer.timeout.connect(self._dismiss_boot_veil)
         self._follow = True  # sticky auto-scroll (survives resizes/retiles)
         self._history: list[str] = []
         self._hist_idx = 0
@@ -280,6 +290,10 @@ class TerminalCard(QFrame):
             self.overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._overlay_compact = False
             self.overlay.hide()
+            # ...and a LAUNCHING terminal shows a quiet loader rather than the
+            # child's half-drawn boot frame, which at app launch is drawn at
+            # the pre-layout width and cannot reflow (see BootVeil).
+            self.boot = BootVeil(self.terminal)
         else:
             self.console = QPlainTextEdit(self)
             self.console.setObjectName("Console")
@@ -322,6 +336,7 @@ class TerminalCard(QFrame):
 
         if self.is_pty:
             self.agent.pty_output.connect(self._on_pty_output)
+            self.agent.prompt_ready_changed.connect(self._on_prompt_ready)
             self.terminal.keyInput.connect(self._on_key_input)
             self.terminal.sizeChanged.connect(self.agent.resize)
             # relative paths in the output resolve against the agent's cwd, and
@@ -419,6 +434,10 @@ class TerminalCard(QFrame):
                  (self.agent.scheduled_changed, self.refresh_schedule)]
         if self.is_pty:
             pairs.append((self.agent.pty_output, self._on_pty_output))
+            pairs.append((self.agent.prompt_ready_changed,
+                          self._on_prompt_ready))
+            # a card on its way out must not leave a throbber animating
+            self._dismiss_boot_veil()
         else:
             pairs.append((self.agent.output_segment, self._on_segment))
             pairs.append((self.agent.cleared, self._on_cleared))
@@ -435,6 +454,9 @@ class TerminalCard(QFrame):
         """Keystrokes reach the process — and a stopped terminal is never a
         dead end: the first keypress starts (or resumes) the session."""
         if self.agent.is_running():
+            # typing into a still-booting child means the user wants the
+            # terminal, not the loader: the veil gets out of the way at once
+            self._dismiss_boot_veil()
             self.agent.write(seq)
         else:
             self.agent.start()  # the waking keystroke is deliberately eaten
@@ -728,9 +750,44 @@ class TerminalCard(QFrame):
                 " border-radius: 6px; padding: 10px; }")
         self._place_overlay()
 
+    def _begin_boot_veil(self) -> None:
+        """Cover a launching terminal until its conversation is on screen.
+
+        The veil lifts on the FIRST of: the child reporting an interactive
+        prompt (`prompt_ready_changed`, which for Claude is the input-box
+        footer, i.e. after any trust dialog AND after a `--resume` replay has
+        finished drawing), the user typing, the agent stopping, or
+        `BOOT_VEIL_MAX_MS`. A terminal is never covered for good."""
+        if not self.is_pty or self.agent.prompt_ready():
+            return
+        # `spec.resume` is cleared by `start()` right after the worker is
+        # launched, so at STARTING it still says whether this launch is
+        # reopening a conversation or beginning one.
+        self.boot.begin("restoring conversation…" if self.agent.spec.resume
+                        else "starting…")
+        self._place_overlay()
+        self._boot_timer.start(BOOT_VEIL_MAX_MS)
+
+    def _end_boot_veil(self) -> None:
+        """Ready: dissolve, so the conversation appears rather than snaps in."""
+        self._boot_timer.stop()
+        if self.is_pty:
+            self.boot.finish()
+
+    def _dismiss_boot_veil(self) -> None:
+        """Drop it immediately (stopped, typed into, or timed out)."""
+        self._boot_timer.stop()
+        if self.is_pty:
+            self.boot.dismiss()
+
+    def _on_prompt_ready(self, ready: bool) -> None:
+        if ready:
+            self._end_boot_veil()
+
     def _place_overlay(self) -> None:
         if not self.is_pty:
             return
+        self.boot.setGeometry(self.terminal.rect())
         if self._overlay_compact:  # a full-width strip along the bottom edge,
             h = 24                 # so the conversation above stays readable
             self.overlay.setGeometry(0, max(0, self.terminal.height() - h),
@@ -806,6 +863,12 @@ class TerminalCard(QFrame):
             if not running:
                 self._refresh_overlay()
                 self.overlay.raise_()
+            # a booting child and a stopped one are mutually exclusive states,
+            # and the wake banner owns the stopped one
+            if running and not self.agent.prompt_ready():
+                self._begin_boot_veil()
+            elif not running:
+                self._dismiss_boot_veil()
 
         if status is AgentStatus.STARTING:
             self._parsers = {}  # fresh session: never inherit stale carry

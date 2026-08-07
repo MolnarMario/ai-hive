@@ -159,6 +159,10 @@ class TerminalAgent(QObject):
     tokens_changed = Signal(str)        # context-usage badge text ("" = hide)
     model_changed = Signal(str)         # live model/effort badge text ("" = hide)
     limit_blocked_changed = Signal(bool)  # cut off by the plan limit (latched)
+    # the child TUI's input prompt went interactive (or was re-armed by a
+    # (re)start). Purely a VIEW signal — the card uses it to lift its boot
+    # veil — and, like activity/waiting, it must never mark the session dirty.
+    prompt_ready_changed = Signal(bool)
     # the deferred-message queue changed (added/cancelled/sent/missed). NOT a
     # countdown tick: this list IS persisted, so the manager wires this to a
     # save, and a per-second tick on that would rewrite session.json all day.
@@ -277,7 +281,7 @@ class TerminalAgent(QObject):
     # ------------------------------------------------------------ control ---
 
     def start(self) -> None:
-        self._prompt_ready = False  # re-armed for the fresh TUI
+        self._set_prompt_ready(False)  # re-armed for the fresh TUI
         self._ready_tail = ""
         self._screen_tail = ""
         self._reset_waiting()
@@ -332,7 +336,7 @@ class TerminalAgent(QObject):
         self.worker.kill()
 
     def restart(self) -> None:
-        self._prompt_ready = False
+        self._set_prompt_ready(False)
         self._ready_tail = ""
         self._screen_tail = ""
         self._reset_waiting()
@@ -1136,6 +1140,18 @@ class TerminalAgent(QObject):
         """True once the TUI's input prompt is live and will accept typing."""
         return self._prompt_ready
 
+    def _set_prompt_ready(self, ready: bool) -> None:
+        """Flip readiness and announce a real change (never a repeat).
+
+        The only consumer is the card's boot veil, so this stays edge-only for
+        the same reason `activity_changed` does: readiness is re-armed on every
+        (re)start and settled once per launch, and a signal per output burst
+        would be pure churn."""
+        if bool(ready) is self._prompt_ready:
+            return
+        self._prompt_ready = bool(ready)
+        self.prompt_ready_changed.emit(self._prompt_ready)
+
     def clear_limit_block(self) -> None:
         """Forget the latched cut-off (it resumed, or it restarted).
 
@@ -1250,7 +1266,7 @@ class TerminalAgent(QObject):
             else:
                 ready = "\x1b[?2004h" in text
             if ready:
-                self._prompt_ready = True
+                self._set_prompt_ready(True)
                 if self._pending_task is not None and self.worker.is_running():
                     task, self._pending_task = self._pending_task, None
                     self._write_task_to_pty(task)

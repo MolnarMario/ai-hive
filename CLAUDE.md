@@ -623,6 +623,30 @@ this file is the invariants that must survive every change.
   was defeating the very thing it exists for. `_refresh_overlay` decides the
   shape on a STATUS change, never in `_place_overlay`, which runs per pixel
   during a drag or retile.
+- **A LAUNCHING terminal shows a loader, never the child's first frames**
+  (`ornaments.BootVeil`, `TerminalCard._begin_boot_veil`). The clean terminal
+  above is the right thing to hand a launching child, but it is not what the
+  user SEES: the child paints within milliseconds, at the PRE-LAYOUT width
+  (the tiling grid sizes the card after the agent is started, and
+  `TerminalView` debounces its resize by 120 ms), so every reopen still showed
+  a mangled narrow fragment in each terminal's top-left corner until the
+  conversation finished replaying. The veil covers exactly the launch-to-
+  prompt window: `_on_status` raises it whenever the agent is running and
+  `prompt_ready()` is False, and it comes down on the FIRST of four things,
+  all of which must keep working — the new `TerminalAgent.prompt_ready_changed`
+  edge (a fade, `finish()`), a keystroke, the agent stopping (the wake banner
+  owns that state), or `BOOT_VEIL_MAX_MS`. The last two are not optional: a
+  cover with only a positive release is a way to lose a terminal for good, and
+  readiness is a SCRAPE of the child's output (Claude's footer-hint family,
+  `?2004h` elsewhere) that an exotic shell may never produce. `prompt_ready_
+  changed` is TRANSIENT like `activity_changed` — a view signal only, edge-only
+  (`_set_prompt_ready`), never wired to a save. `is_active()` reads the veil's
+  OWN `_up` flag, not `isVisible()`: a card in a hidden workspace is not on
+  screen yet its child is still booting. Colours are read from the live
+  `Palette` at paint time (so it follows every skin, no QSS token), the widget
+  is `WA_TransparentForMouseEvents` + `NoFocus` so the terminal underneath
+  keeps every event, and both animations stop on `dismiss()` so a resting card
+  is free.
 - **Transcripts are backed up by AI Hive** (`app/transcripts.py`): snapshots
   land in `<session-dir>/transcripts/` at app start (in `create_main_window`,
   BEFORE agents launch) and at graceful close (`closeEvent`). The

@@ -316,7 +316,12 @@ error dialog instead of silently closing. Packaging to a distributable
   strip along the bottom. So reopening the app shows you your work rather
   than a wall of dead terminals, and nothing relaunches behind your back;
   the first keystroke starts it, and a woken Claude agent also reclaims its
-  conversation.
+  conversation. While an agent that *is* coming back up launches, its card
+  shows a **quiet loader** (a sweeping arc over `restoring conversation…`)
+  instead of the CLI's half-drawn boot frames, which used to appear as a
+  mangled narrow fragment in the terminal's top-left corner until the
+  conversation finished replaying. It lifts with a short fade the moment the
+  prompt is live, and gets out of the way at once if you start typing.
 - **Scrolling** — in a full terminal the wheel does what a real terminal does:
   fullscreen apps that request mouse events (Claude Code) receive the wheel
   and scroll their own transcript; other fullscreen apps (vim, less) get
@@ -525,7 +530,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1101 checks drive the real app headlessly (offscreen Qt platform) with real
+1119 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -609,7 +614,7 @@ app/
                            + working-count spinner)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1101 checks)
+tests/smoke_test.py        headless end-to-end suite (1119 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
