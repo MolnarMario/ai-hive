@@ -88,7 +88,18 @@ INPUT_ECHO_S = 0.8
 # a background command it started is still running." Debounced like
 # BUSY_IDLE_MS so a process that comes and goes quickly (git, rg) never
 # flickers the indicator.
-BG_SHELL_DEBOUNCE_S = 3.0
+BG_SHELL_DEBOUNCE_S = 5.0
+
+# baseline learning is deliberately deferred for this long after (re)start:
+# ConPTY's own helper processes (conhost/OpenConsole) can still be spinning up
+# right when the job is first assigned, so a sample taken too early can read
+# LOWER than true steady state -- and since the baseline only ever ratchets
+# DOWN (see poll_bg_shell), one too-early low sample becomes a permanent
+# floor a perfectly idle agent can never satisfy again (this was a live-
+# reported bug: an agent with nothing running kept showing the gear badge).
+# Giving the process tree a moment to settle before the first sample avoids
+# seeding a baseline that is wrong for the agent's entire remaining lifetime.
+BG_SHELL_WARMUP_S = 6.0
 
 # How long `request_repaint` holds the child one column narrower before giving
 # the width back. Long enough that ConPTY delivers two distinct size changes
@@ -961,13 +972,21 @@ class TerminalAgent(QObject):
         process that comes and goes quickly never flickers the indicator."""
         if self.status not in (AgentStatus.RUNNING, AgentStatus.STARTING):
             return
+        # let the process tree settle before trusting any sample as the
+        # resting baseline (see BG_SHELL_WARMUP_S)
+        if time.time() - self._session_started < BG_SHELL_WARMUP_S:
+            return
         count = self.worker.job_process_count()
         if count <= 0:
             return  # query unsupported/failed -- don't flap on missing data
         # learn the resting size down over time: only a count ABOVE the
         # quietest one ever seen for this launch counts as "extra" -- this is
         # what keeps a ConPTY wrapper process (conhost/OpenConsole) or any
-        # other fixed overhead from being mistaken for background work
+        # other fixed overhead from being mistaken for background work. This
+        # can ONLY move the floor down, never up, so it can never absorb a
+        # genuine background job (which raises the count) as "the new
+        # normal" -- the risk is entirely in the other direction (see
+        # BG_SHELL_WARMUP_S), which is why that warmup exists.
         if self._bg_baseline is None or count < self._bg_baseline:
             self._bg_baseline = count
         extra = count > self._bg_baseline
@@ -984,6 +1003,15 @@ class TerminalAgent(QObject):
               and not self._bg_shell):
             self._bg_shell = True
             self.bg_shell_changed.emit(True)
+            # forensic trail: if the baseline is ever wrong (a live report
+            # already happened once), this is what lets it be diagnosed from
+            # session.log instead of reconstructed by elimination
+            if self.audit is not None:
+                try:
+                    self.audit(f"BG-SHELL agent={self.spec.name} "
+                               f"count={count} baseline={self._bg_baseline}")
+                except Exception:
+                    pass
 
     def _mark_busy(self) -> None:
         # only a live agent can be working; guard on status (not worker state)
