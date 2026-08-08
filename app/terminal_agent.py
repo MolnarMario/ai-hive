@@ -101,6 +101,24 @@ BG_SHELL_DEBOUNCE_S = 5.0
 # seeding a baseline that is wrong for the agent's entire remaining lifetime.
 BG_SHELL_WARMUP_S = 6.0
 
+# ...but the warmup alone was not enough (live-reported again: an agent's job
+# settled at count=3 while its baseline had locked onto 1). The board bridge
+# every Claude agent gets (`log_activity`, spawned as a python child of the
+# claude.exe process) itself double-forks a second interpreter, and on a slow
+# machine -- e.g. right after a full reboot, cold disk caches, AV scanning --
+# that second fork can still be missing when the FIRST post-warmup sample is
+# taken. Since that single sample became a permanent floor, the badge could
+# never clear again for the rest of that agent's life. So baseline learning
+# gets a further settle window on top of the warmup: for this long AFTER
+# warmup ends, a sample still sets the baseline outright (tracking the latest
+# count, not just ratcheting it down) instead of being compared for "extra",
+# so a late-arriving steady-state process is absorbed as normal rather than
+# flagged forever. Only once BOTH windows have elapsed does the baseline
+# switch to ratchet-down-only, which is what protects a genuine long-running
+# background job started later from ever being silently absorbed as "the new
+# normal".
+BG_SHELL_SETTLE_S = 10.0
+
 # How long `request_repaint` holds the child one column narrower before giving
 # the width back. Long enough that ConPTY delivers two distinct size changes
 # rather than coalescing them into nothing, short enough that no one sees it.
@@ -972,13 +990,25 @@ class TerminalAgent(QObject):
         process that comes and goes quickly never flickers the indicator."""
         if self.status not in (AgentStatus.RUNNING, AgentStatus.STARTING):
             return
+        elapsed = time.time() - self._session_started
         # let the process tree settle before trusting any sample as the
         # resting baseline (see BG_SHELL_WARMUP_S)
-        if time.time() - self._session_started < BG_SHELL_WARMUP_S:
+        if elapsed < BG_SHELL_WARMUP_S:
             return
         count = self.worker.job_process_count()
         if count <= 0:
             return  # query unsupported/failed -- don't flap on missing data
+        if elapsed < BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S:
+            # still settling: track the latest count outright (up or down)
+            # rather than only ratcheting down, so a steady-state process
+            # that spawns a little late (see BG_SHELL_SETTLE_S) is learned as
+            # baseline instead of being locked in as "extra" forever.
+            self._bg_baseline = count
+            self._bg_extra_since = None
+            if self._bg_shell:
+                self._bg_shell = False
+                self.bg_shell_changed.emit(False)
+            return
         # learn the resting size down over time: only a count ABOVE the
         # quietest one ever seen for this launch counts as "extra" -- this is
         # what keeps a ConPTY wrapper process (conhost/OpenConsole) or any
@@ -986,7 +1016,7 @@ class TerminalAgent(QObject):
         # can ONLY move the floor down, never up, so it can never absorb a
         # genuine background job (which raises the count) as "the new
         # normal" -- the risk is entirely in the other direction (see
-        # BG_SHELL_WARMUP_S), which is why that warmup exists.
+        # BG_SHELL_WARMUP_S/BG_SHELL_SETTLE_S), which is why those exist.
         if self._bg_baseline is None or count < self._bg_baseline:
             self._bg_baseline = count
         extra = count > self._bg_baseline

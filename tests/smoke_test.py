@@ -619,6 +619,94 @@ def test_bg_shell_workspace_stats():
         agent.worker.job_process_count = orig_count
 
 
+def test_bg_shell_settle_relearn():
+    """Live-reported: right after a cold boot, the log_activity MCP bridge's
+    own double-fork can still be missing when the FIRST post-warmup sample is
+    taken, so a job whose real steady state is 3 processes got a baseline of
+    1 -- and since baseline only ratchets down, the gear badge stayed on for
+    that agent's entire remaining life (session.log showed count=3
+    baseline=1 repeatedly, never clearing). BG_SHELL_SETTLE_S fixes this: for
+    a further window after warmup, baseline tracks the latest sample outright
+    (up or down) instead of only ratcheting down, so a late-arriving steady
+    process is absorbed as normal. Once that settle window elapses too, the
+    original ratchet-down-only behavior must still catch a genuine background
+    job started later -- the settle window must not weaken that guarantee."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import (AgentStatus, BG_SHELL_DEBOUNCE_S,
+                                     BG_SHELL_SETTLE_S, BG_SHELL_WARMUP_S)
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+    import app.terminal_agent as terminal_agent_mod
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-settle-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("BgShellSettle", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Shelled",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+
+    fake_now = [1000.0]
+    agent._session_started = fake_now[0]   # simulate a just-launched agent
+    orig_time = terminal_agent_mod.time.time
+    orig_count = agent.worker.job_process_count
+    count = [1]
+    terminal_agent_mod.time.time = lambda: fake_now[0]
+    agent.worker.job_process_count = lambda: count[0]
+    try:
+        agent.poll_bg_shell()   # still within warmup: ignored entirely
+        check("bg shell settle: a sample during warmup is ignored",
+              agent._bg_baseline is None)
+
+        fake_now[0] += BG_SHELL_WARMUP_S + 0.1   # warmup just elapsed
+        count[0] = 1   # the too-early low sample (bridge not forked yet)
+        agent.poll_bg_shell()
+        check("bg shell settle: first post-warmup sample seeds baseline",
+              agent._bg_baseline == 1, agent._bg_baseline)
+        check("bg shell settle: never flags while still settling",
+              not agent.is_bg_shell_busy())
+
+        fake_now[0] += 2.0   # still within the settle window
+        count[0] = 3   # the bridge's child finally forked -- real steady state
+        agent.poll_bg_shell()
+        check("bg shell settle: baseline RISES to the real steady state "
+              "instead of staying locked on the too-early low sample",
+              agent._bg_baseline == 3, agent._bg_baseline)
+        check("bg shell settle: still doesn't flag mid-settle even though "
+              "count rose above the old baseline",
+              not agent.is_bg_shell_busy())
+
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 1   # sustained, but still settling
+        agent.poll_bg_shell()
+        check("bg shell settle: a sustained-but-unchanged count never flags "
+              "while the settle window is still open",
+              not agent.is_bg_shell_busy())
+
+        # settle window fully elapsed: ratchet-down-only resumes, and the
+        # now-correct baseline must not spuriously flag a steady count
+        fake_now[0] = 1000.0 + BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell settle: once settled, an unchanged steady count "
+              "never flags (this is the bug: it used to flag forever)",
+              not agent.is_bg_shell_busy())
+        check("bg shell settle: baseline holds at the learned steady state",
+              agent._bg_baseline == 3, agent._bg_baseline)
+
+        # a GENUINE background job starting after settle must still be
+        # caught -- the settle window must not weaken the real detection
+        count[0] = 5
+        agent.poll_bg_shell()             # extra_since starts
+        check("bg shell settle: a fresh extra process doesn't flag before "
+              "the debounce elapses", not agent.is_bg_shell_busy())
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell settle: a genuine background job started after "
+              "settle still flags once sustained", agent.is_bg_shell_busy())
+    finally:
+        terminal_agent_mod.time.time = orig_time
+        agent.worker.job_process_count = orig_count
+
+
 def test_chime_persistence():
     """The top-bar chime toggle flips its glyph + emits soundToggled, and the
     on/off preference round-trips through the session ui state."""
@@ -2579,6 +2667,67 @@ def test_reveal_agent():
     check("reveal: switched to the agent's workspace", mgr.active_id == ws2.id)
     check("reveal: the agent's card was located",
           win._pages[ws2.id].card_for(a2.id) is not None)
+    win.close()
+
+
+def test_new_agent_autofocus():
+    """Opening a new agent (header '+', empty-slot '+', or Ctrl+Shift+T — all
+    three funnel into _on_add_terminal_clicked) reveals its card right away:
+    the workspace becomes active, the card scrolls into view, and keyboard
+    focus lands in its terminal, so the user can start typing without an
+    extra click. Uses pty=True (the same TerminalView path Claude agents use)
+    since that's the case the feature targets."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app.session_store import SessionStore
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-autofocus-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    pump(150)
+    mgr = win.manager
+    ws1 = mgr.workspaces[0]
+    ws2 = mgr.create_workspace("Two", str(tmp))
+    pump(60)
+    mgr.set_active(ws1.id)
+    pump(60)
+    check("autofocus: precondition active is ws1", mgr.active_id == ws1.id)
+
+    # stand in for the modal "New Agent" dialog: accept immediately with a
+    # lightweight interactive shell (no network/auth, unlike a Claude agent)
+    orig_exec = AddTerminalDialog.exec
+    orig_result_spec = AddTerminalDialog.result_spec
+    AddTerminalDialog.exec = lambda self: QDialog.DialogCode.Accepted
+    AddTerminalDialog.result_spec = lambda self, cwd="": build_spec(
+        AgentKind.CMD, "AutoFocus", cwd=cwd, pty=True)
+    try:
+        win._on_add_terminal_clicked(ws2.id)
+    finally:
+        AddTerminalDialog.exec = orig_exec
+        AddTerminalDialog.result_spec = orig_result_spec
+    pump(200)
+
+    agent = ws2.agents[-1]
+    card = win._pages[ws2.id].card_for(agent.id)
+    check("autofocus: switched to the new agent's workspace",
+          mgr.active_id == ws2.id)
+    check("autofocus: the new agent's card was located", card is not None)
+    check("autofocus: the card is the focused card", win._focused_card is card)
+    check("autofocus: keyboard focus landed in the terminal",
+          card is not None and card.terminal is not None
+          and card.terminal.hasFocus())
     win.close()
 
 
@@ -8907,6 +9056,7 @@ def main():
     test_limit_blocked_workspace_stats()
     test_winjob_process_count()
     test_bg_shell_workspace_stats()
+    test_bg_shell_settle_relearn()
     test_chime_persistence()
     test_hook_prompt_events()
     test_agent_hook_waiting()
@@ -8926,6 +9076,7 @@ def main():
     test_bg_shell_live_ui()
     test_no_em_dashes_in_visible_text()
     test_reveal_agent()
+    test_new_agent_autofocus()
     test_agent_busy_activity()
     test_ansi()
     test_terminal_keys()

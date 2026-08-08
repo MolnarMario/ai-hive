@@ -20,7 +20,9 @@ workspaces keep executing — switching never pauses anything.
   **Grok via the xAI CLI** (`grok`) with `-m` model selection + `--continue`
   resume, verified against grok 0.2.93; OpenAI as an editable command template
   until its CLI is installed). Shells
-  and Python scripts are also first-class agent types.
+  and Python scripts are also first-class agent types. A newly created agent's
+  card is scrolled into view and given keyboard focus immediately, so you can
+  start typing without an extra click.
 - **One-click grid layouts** — a visual selector (Auto, 1×1 … 4×3, including
   the 3×1 strip and 1×3 stack) applies instantly and preserves agent state;
   empty cells show clickable "＋ New agent" slots. Layout names read
@@ -551,7 +553,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1216 checks drive the real app headlessly (offscreen Qt platform) with real
+1239 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -636,7 +638,7 @@ app/
                            + working-count spinner + taskbar-badge painter)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1195 checks)
+tests/smoke_test.py        headless end-to-end suite (1239 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
