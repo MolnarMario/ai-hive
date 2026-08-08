@@ -507,6 +507,56 @@ def test_winjob_process_count():
           job.process_count() == 0)
 
 
+def test_winjob_process_ids_and_kill():
+    """process_ids() is the identity-carrying sibling of process_count() --
+    what kill_bg_shell_extras() needs to know WHICH processes are extra, not
+    just how many there are. kill_extra_processes() (identical on
+    ProcessWorker and PtyWorker) must kill everything in the job except the
+    ids it's told to keep, and leave the kept one alone. Windows-only."""
+    if sys.platform != "win32":
+        check("winjob kill: skipped on non-Windows (job objects are "
+              "Windows-only)", True)
+        return
+    import types
+    from app.process_worker import WinJob, ProcessWorker
+
+    job = WinJob()
+    procs = [subprocess.Popen([sys.executable, "-c",
+                               "import time; time.sleep(20)"])
+             for _ in range(3)]
+    try:
+        for p in procs:
+            check(f"winjob kill: assign succeeds for pid {p.pid}",
+                  job.assign(p.pid))
+        ids = job.process_ids()
+        check("winjob kill: process_ids reports every assigned pid",
+              set(ids) == {p.pid for p in procs}, (ids, [p.pid for p in procs]))
+
+        worker = types.SimpleNamespace(_job=job, job_process_ids=job.process_ids)
+        keep_pid = procs[0].pid
+        killed = ProcessWorker.kill_extra_processes(worker, {keep_pid})
+        check("winjob kill: kills every pid except the one told to keep",
+              set(killed) == {procs[1].pid, procs[2].pid}, killed)
+
+        for p in procs[1:]:
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+        check("winjob kill: the kept process is still alive",
+              procs[0].poll() is None)
+        check("winjob kill: the killed processes are gone",
+              procs[1].poll() is not None and procs[2].poll() is not None)
+    finally:
+        job.terminate_tree()
+        for p in procs:
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+        job.close()
+
+
 def test_bg_shell_workspace_stats():
     """poll_bg_shell()/workspace_stats()'s bg_shell count must: debounce a
     transient process blip (git/rg-style, never flags), never flag a BUSY
@@ -705,6 +755,86 @@ def test_bg_shell_settle_relearn():
     finally:
         terminal_agent_mod.time.time = orig_time
         agent.worker.job_process_count = orig_count
+
+
+def test_bg_shell_kill_extras():
+    """kill_bg_shell_extras() is a no-op unless the gear is actually lit (a
+    stray click on a just-cleared marker must not kill anything), and once
+    lit it must ask the worker to kill everything EXCEPT the agent's own
+    root process and whatever was seen while the baseline was learned (the
+    mcp bridge, ConPTY's own conhost/OpenConsole helper) -- never the whole
+    job, which would also take down the interactive session. A successful
+    kill clears the latch immediately rather than waiting for the next poll,
+    and is recorded to the audit trail."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import (AgentStatus, BG_SHELL_DEBOUNCE_S,
+                                     BG_SHELL_SETTLE_S, BG_SHELL_WARMUP_S)
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+    import app.terminal_agent as terminal_agent_mod
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-kill-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("BgShellKill", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Shelled",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+    audit_lines = []
+    agent.audit = audit_lines.append
+
+    fake_now = [1000.0]
+    agent._session_started = fake_now[0]
+    orig_time = terminal_agent_mod.time.time
+    orig_count = agent.worker.job_process_count
+    orig_ids = agent.worker.job_process_ids
+    orig_pid = agent.worker.pid
+    orig_kill = agent.worker.kill_extra_processes
+    pids = [100, 101]           # root(100) + the mcp bridge(101), the baseline
+    kill_calls = []
+    terminal_agent_mod.time.time = lambda: fake_now[0]
+    agent.worker.job_process_count = lambda: len(pids)
+    agent.worker.job_process_ids = lambda: list(pids)
+    agent.worker.pid = lambda: 100
+    agent.worker.kill_extra_processes = (
+        lambda keep: kill_calls.append(keep) or [p for p in pids
+                                                  if p not in keep])
+    try:
+        killed = agent.kill_bg_shell_extras()
+        check("bg shell kill: a no-op when nothing is flagged",
+              killed == [] and not kill_calls, killed)
+
+        fake_now[0] += BG_SHELL_WARMUP_S + 0.1   # seed the baseline: {100,101}
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_SETTLE_S + 0.1    # settle elapses, still {100,101}
+        agent.poll_bg_shell()
+        check("bg shell kill: baseline pids learned during settle",
+              agent._bg_baseline_pids == {100, 101}, agent._bg_baseline_pids)
+
+        pids.append(103)   # a genuine extra shows up (e.g. a Gradle daemon)
+        agent.poll_bg_shell()             # extra_since starts
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell kill: flags once the extra is sustained",
+              agent.is_bg_shell_busy())
+
+        killed = agent.kill_bg_shell_extras()
+        check("bg shell kill: asks the worker to keep the baseline pids "
+              "(root + mcp bridge), never the whole job",
+              kill_calls and kill_calls[-1] == {100, 101}, kill_calls)
+        check("bg shell kill: returns exactly the pid(s) the worker killed",
+              killed == [103], killed)
+        check("bg shell kill: clears the latch immediately, not on the "
+              "next poll", not agent.is_bg_shell_busy())
+        check("bg shell kill: the kill is recorded to the audit trail",
+              any("BG-SHELL-KILL" in line and "103" in line
+                  for line in audit_lines), audit_lines)
+    finally:
+        terminal_agent_mod.time.time = orig_time
+        agent.worker.job_process_count = orig_count
+        agent.worker.job_process_ids = orig_ids
+        agent.worker.pid = orig_pid
+        agent.worker.kill_extra_processes = orig_kill
 
 
 def test_chime_persistence():
@@ -2593,6 +2723,30 @@ def test_bg_shell_live_ui():
     row.refresh(a)
     check("bg shell UI: sidebar agent row also clears on its next poll",
           row.bg_mark.isHidden())
+
+    # clicking either kills the extras: the card calls kill_bg_shell_extras()
+    # directly (it owns the agent for its whole life), the sidebar row only
+    # EMITS a request (it doesn't own the agent) for MainWindow to route via
+    # resolve_agent -- same split as the schedule chip's card/sidebar pair.
+    a._bg_shell = True
+    a.bg_shell_changed.emit(True)
+    pump(30)
+    card.bg_mark.click()
+    pump(30)
+    check("bg shell UI: clicking the card gear reaches "
+          "kill_bg_shell_extras() and clears it live",
+          not card.bg_mark.isVisible() and not a.is_bg_shell_busy())
+
+    row.refresh(a)
+    kill_hits, act_hits = [], []
+    row.bgKillRequested.connect(lambda w, aid: kill_hits.append((w, aid)))
+    row.activated.connect(lambda w, aid: act_hits.append((w, aid)))
+    row.bg_mark.click()
+    check("bg shell UI: clicking the sidebar gear emits "
+          "bgKillRequested(ws_id, agent_id)",
+          kill_hits == [("w1", a.id)], kill_hits)
+    check("bg shell UI: ...and the click is CONSUMED, not also a row-wide "
+          "'reveal the card' activation", act_hits == [], act_hits)
 
     card.detach(); card.close()
     row.deleteLater()
@@ -9055,8 +9209,10 @@ def main():
     test_notification_chime()
     test_limit_blocked_workspace_stats()
     test_winjob_process_count()
+    test_winjob_process_ids_and_kill()
     test_bg_shell_workspace_stats()
     test_bg_shell_settle_relearn()
+    test_bg_shell_kill_extras()
     test_chime_persistence()
     test_hook_prompt_events()
     test_agent_hook_waiting()

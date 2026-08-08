@@ -499,6 +499,26 @@ class WinJob:
             return 0
         return int(info.NumberOfAssignedProcesses)
 
+    def process_ids(self) -> list[int]:
+        """Best-effort list of process ids currently alive in this job --
+        the identity-carrying sibling of process_count(), used to tell WHICH
+        extra processes to kill (see TerminalAgent.kill_bg_shell_extras)
+        rather than just how many there are. Same contract as
+        process_count(): an empty list on any failure means "unknown," not
+        "empty." Capped at _BG_JOB_PID_CAP like the query buffer itself; no
+        realistic agent process tree needs more."""
+        if not self._handle:
+            return []
+        info = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
+        needed = wintypes.DWORD(0)
+        ok = _k32.QueryInformationJobObject(
+            self._handle, _JobObjectBasicProcessIdList, ctypes.byref(info),
+            ctypes.sizeof(info), ctypes.byref(needed))
+        if not ok:
+            return []
+        n = min(int(info.NumberOfProcessIdsInList), _BG_JOB_PID_CAP)
+        return [int(info.ProcessIdList[i]) for i in range(n)]
+
     def close(self) -> None:
         if self._handle:
             _k32.CloseHandle(self._handle)
@@ -683,6 +703,19 @@ class ProcessWorker(QObject):
 
     def job_process_count(self) -> int:
         return self._job.process_count() if self._job else 0
+
+    def job_process_ids(self) -> list[int]:
+        return self._job.process_ids() if self._job else []
+
+    def kill_extra_processes(self, keep: set[int]) -> list[int]:
+        """Hard-kill every process in this job EXCEPT the given ids -- see
+        TerminalAgent.kill_bg_shell_extras, which decides who's in `keep`.
+        Each victim is tree-killed individually (never the job as a whole,
+        which would also take down the interactive process itself)."""
+        victims = [p for p in self.job_process_ids() if p not in keep]
+        for p in victims:
+            _taskkill_tree(p)
+        return victims
 
     # -------------------------------------------------------------- slots ---
 

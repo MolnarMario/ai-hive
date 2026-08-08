@@ -313,6 +313,13 @@ class TerminalAgent(QObject):
         # is when a count above baseline was first seen while not busy;
         # _bg_shell is the debounced, emitted effective value.
         self._bg_baseline: int | None = None
+        # the actual PIDs seen while learning the baseline above -- identity,
+        # not just a count, so a later kill (see kill_bg_shell_extras) can
+        # tell "known resting overhead" (keep) apart from "showed up on top
+        # of that" (safe to kill) instead of only knowing there ARE extras.
+        # Mirrors _bg_baseline's own rules: replaced outright during the
+        # settle window, only ever intersected (never grown) after.
+        self._bg_baseline_pids: set[int] | None = None
         self._bg_extra_since: float | None = None
         self._bg_shell = False
         # single-shot: (re)armed on each output burst; firing = output went
@@ -975,6 +982,7 @@ class TerminalAgent(QObject):
         starts from a clean slate, and a dead agent isn't waiting on
         anything."""
         self._bg_baseline = None
+        self._bg_baseline_pids = None
         self._bg_extra_since = None
         if self._bg_shell:
             self._bg_shell = False
@@ -1002,8 +1010,10 @@ class TerminalAgent(QObject):
             # still settling: track the latest count outright (up or down)
             # rather than only ratcheting down, so a steady-state process
             # that spawns a little late (see BG_SHELL_SETTLE_S) is learned as
-            # baseline instead of being locked in as "extra" forever.
+            # baseline instead of being locked in as "extra" forever. Same
+            # replace-outright treatment for the PID identities behind it.
             self._bg_baseline = count
+            self._bg_baseline_pids = set(self.worker.job_process_ids())
             self._bg_extra_since = None
             if self._bg_shell:
                 self._bg_shell = False
@@ -1019,6 +1029,12 @@ class TerminalAgent(QObject):
         # BG_SHELL_WARMUP_S/BG_SHELL_SETTLE_S), which is why those exist.
         if self._bg_baseline is None or count < self._bg_baseline:
             self._bg_baseline = count
+        # the PID identities mirror that same one-way rule: intersect only
+        # (drop a baseline pid that has since exited), never grow past
+        # settling -- so a process that shows up AFTER settling is always
+        # "extra" for kill_bg_shell_extras, never silently adopted as normal.
+        if self._bg_baseline_pids is not None:
+            self._bg_baseline_pids &= set(self.worker.job_process_ids())
         extra = count > self._bg_baseline
         now = time.time()
         if self.is_busy() or not extra:
@@ -1042,6 +1058,36 @@ class TerminalAgent(QObject):
                                f"count={count} baseline={self._bg_baseline}")
                 except Exception:
                     pass
+
+    def kill_bg_shell_extras(self) -> list[int]:
+        """Hard-kill whatever is making this agent's job look busier than
+        its learned baseline (see poll_bg_shell) -- e.g. a Gradle/Kotlin
+        daemon or an adb server a shell command spawned and left detached,
+        still running long after the command that started it returned.
+        Never touches the agent's own root process or anything seen while
+        the baseline was being learned (the log_activity mcp bridge,
+        ConPTY's own conhost/OpenConsole helper) -- only processes that
+        showed up on top of that and are still present now. A no-op
+        (returns []) unless the badge is actually lit, so a stray click on a
+        just-cleared marker can't kill something legitimate."""
+        if not self._bg_shell:
+            return []
+        keep = set(self._bg_baseline_pids or ())
+        root = self.worker.pid()
+        if root:
+            keep.add(root)
+        killed = self.worker.kill_extra_processes(keep)
+        if killed and self.audit is not None:
+            try:
+                self.audit(f"BG-SHELL-KILL agent={self.spec.name} "
+                           f"pids={killed}")
+            except Exception:
+                pass
+        self._bg_extra_since = None
+        if self._bg_shell:
+            self._bg_shell = False
+            self.bg_shell_changed.emit(False)
+        return killed
 
     def _mark_busy(self) -> None:
         # only a live agent can be working; guard on status (not worker state)

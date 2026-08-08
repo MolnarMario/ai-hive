@@ -712,6 +712,7 @@ class AgentRow(QFrame):
 
     activated = Signal(str, str)        # ws_id, agent_id
     schedRequested = Signal(str, str)   # ws_id, agent_id (⏱ clicked)
+    bgKillRequested = Signal(str, str)  # ws_id, agent_id (⚙ clicked)
 
     def __init__(self, ws_id: str, agent, parent=None):
         super().__init__(parent)
@@ -743,12 +744,19 @@ class AgentRow(QFrame):
         self.limit_mark.setObjectName("WsAgentLimit")
         self.limit_mark.hide()
         # idle but a background command it started is still running -- same
-        # marker as the card header
-        self.bg_mark = QLabel("⚙", self)
+        # marker as the card header, and same QToolButton-not-QLabel trick as
+        # sched_mark below: a click kills it (bgKillRequested) and must be
+        # CONSUMED rather than bubbling to the row's whole-row activation.
+        self.bg_mark = QToolButton(self)
         self.bg_mark.setObjectName("WsAgentBgShell")
+        self.bg_mark.setText("⚙")
+        self.bg_mark.setCursor(Qt.CursorShape.PointingHandCursor)
         self.bg_mark.setToolTip(
-            "Idle, but a background command it started is still running")
+            "Idle, but a background command it started is still running. "
+            "Click to stop it")
         self.bg_mark.hide()
+        self.bg_mark.clicked.connect(
+            lambda: self.bgKillRequested.emit(self.ws_id, self.agent_id))
         # a message is queued to be typed into this agent later, so a scheduled
         # send is findable from a collapsed workspace too. A QToolButton (not a
         # QLabel like q/limit_mark above) so its own click is CONSUMED instead
@@ -903,6 +911,7 @@ class Sidebar(QFrame):
     agentsRequested = Signal(str)            # ws_id (count badge clicked; M3)
     agentActivated = Signal(str, str)        # ws_id, agent_id (reveal its card)
     agentScheduleRequested = Signal(str, str)  # ws_id, agent_id (⏱ clicked)
+    agentBgKillRequested = Signal(str, str)  # ws_id, agent_id (⚙ clicked)
     reordered = Signal(list)                 # flattened ws-id order (M1)
     layoutChanged = Signal(list)             # full node model: order+categories
     filesRequested = Signal(str)             # ws_id (file-tree toggle clicked)
@@ -1281,6 +1290,7 @@ class Sidebar(QFrame):
             arow = AgentRow(ws_id, agent)
             arow.activated.connect(self.agentActivated)
             arow.schedRequested.connect(self.agentScheduleRequested)
+            arow.bgKillRequested.connect(self.agentBgKillRequested)
             arow.set_search_hit(agent.id in self._search_agent_hits)
             self.tree.setItemWidget(child, 0, arow)
             self._agent_rows[agent.id] = arow

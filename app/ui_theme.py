@@ -491,9 +491,16 @@ WorkspaceRow[search_hit="true"] {{
    click of its own; the row itself is the click target), so no hover chrome. */
 #WsAgentLimit {{ color: {p.ACCENT_GOLD}; font-size: 16px; }}
 /* idle but a background command it started is still running: orange like
-   #WsBgShell, distinct from the gold "fine, just waiting" family. Same
-   inert-label treatment as #WsAgentLimit. */
-#WsAgentBgShell {{ color: {p.ACCENT_ORANGE}; font-size: 16px; }}
+   #WsBgShell, distinct from the gold "fine, just waiting" family. A
+   QToolButton like #WsAgentSched below (a click kills it), same flat base +
+   hover pill so it reads as clickable rather than another status glyph. */
+#WsAgentBgShell {{
+    background: transparent; border: 1px solid transparent; border-radius: 4px;
+    padding: 1px 3px; color: {p.ACCENT_ORANGE}; font-size: 16px;
+}}
+#WsAgentBgShell:hover {{
+    background: rgba(232,152,58,0.20); border-color: {p.ACCENT_ORANGE};
+}}
 /* a message is queued to be typed into this agent later -- a QToolButton
    (unlike WsAgentQ/WsAgentLimit, which are inert labels), so it needs its own
    flat/borderless base or it grows platform button chrome. Sized up from the
@@ -559,7 +566,15 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     padding: 0px 4px;
 }}
 #CardLimitMark {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
-#CardBgShell {{ color: {p.ACCENT_ORANGE}; font-size: 13px; }}
+/* clickable (kills the lingering process) -- transparent by default, like
+   #CardSchedule, so it doesn't inherit the platform's default button chrome */
+#CardBgShell {{
+    background: transparent; color: {p.ACCENT_ORANGE};
+    border: 1px solid transparent; border-radius: 8px; font-size: 13px;
+}}
+#CardBgShell:hover {{
+    background: rgba(232,152,58,0.20); border-color: {p.ACCENT_ORANGE};
+}}
 /* the deferred-message countdown ("(clock) 12:04"), clickable to change or
    cancel it. Gold like the hourglass beside it: nothing is wrong, something is
    simply scheduled. The MISSED state is the exception and is meant to be

@@ -1303,6 +1303,11 @@ class MainWindow(QMainWindow):
         # as the card's clock chip, always empty-prefill (manage, not compose)
         self.sidebar.agentScheduleRequested.connect(
             lambda ws_id, agent_id: self._on_schedule_message(agent_id))
+        # the sidebar's gear mark kills whatever background command is still
+        # running behind it (see TerminalAgent.kill_bg_shell_extras) -- same
+        # click target as the card header's gear
+        self.sidebar.agentBgKillRequested.connect(
+            lambda ws_id, agent_id: self._on_bg_shell_kill(agent_id))
         # inline file explorer: the sidebar resolves a ws to its root folder,
         # opens files with the OS default app, and its open/closed set persists
         self.sidebar.files_root_provider = self._project_path_for_ws
@@ -2100,6 +2105,13 @@ class MainWindow(QMainWindow):
             if card is not None:
                 return card
         return None
+
+    def _on_bg_shell_kill(self, agent_id: str) -> None:
+        """Kill whatever background command an idle agent left running (the
+        sidebar/card gear mark) -- see TerminalAgent.kill_bg_shell_extras."""
+        agent = self.manager.resolve_agent(agent_id)
+        if agent is not None:
+            agent.kill_bg_shell_extras()
 
     def _on_schedule_message(self, agent_id: str, prefill: str = "") -> None:
         """Open the countdown composer for an agent.

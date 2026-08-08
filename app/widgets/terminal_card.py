@@ -218,9 +218,14 @@ class TerminalCard(QFrame):
         self.limit_mark.setObjectName("CardLimitMark")
         self.limit_mark.hide()
         # "idle, but a background command it started is still running" — same
-        # transient-marker treatment as limit_mark above.
-        self.bg_mark = QLabel("⚙", header)
+        # transient-marker treatment as limit_mark above, but clickable: a
+        # QToolButton (not a QLabel) so a click hard-kills whatever is still
+        # running (see TerminalAgent.kill_bg_shell_extras) without also
+        # triggering anything the marker sits inside.
+        self.bg_mark = QToolButton(header)
         self.bg_mark.setObjectName("CardBgShell")
+        self.bg_mark.setText("⚙")
+        self.bg_mark.setCursor(Qt.CursorShape.PointingHandCursor)
         self.bg_mark.hide()
         # "a message is queued to be typed in at N" — the countdown for a
         # deferred submit (Ctrl+Shift+Enter). Visible for as long as something
@@ -330,6 +335,7 @@ class TerminalCard(QFrame):
         self._on_limit_blocked(self.agent.is_limit_blocked())
         self.agent.bg_shell_changed.connect(self._on_bg_shell)
         self._on_bg_shell(self.agent.is_bg_shell_busy())
+        self.bg_mark.clicked.connect(self.agent.kill_bg_shell_extras)
         self.agent.scheduled_changed.connect(self.refresh_schedule)
         self.sched_mark.clicked.connect(
             lambda: self.scheduleRequested.emit(self.agent.id, ""))
@@ -513,7 +519,8 @@ class TerminalCard(QFrame):
         self.bg_mark.setVisible(bool(active))
         if active:
             self.bg_mark.setToolTip(
-                "Idle, but a background command it started is still running")
+                "Idle, but a background command it started is still "
+                "running. Click to stop it")
 
     def refresh_schedule(self) -> None:
         """Repaint the deferred-message chip: the countdown to the soonest one,
