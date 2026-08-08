@@ -518,11 +518,18 @@ def test_winjob_process_ids_and_kill():
               "Windows-only)", True)
         return
     import types
-    from app.process_worker import WinJob, ProcessWorker
+    from app.process_worker import (CREATE_NO_WINDOW, WinJob, ProcessWorker,
+                                    describe_pid)
 
     job = WinJob()
+    # CREATE_NO_WINDOW avoids spawning a console host (conhost.exe) of our
+    # own; membership checks below are still subset (<=), not equality --
+    # a dev shell already nested inside its own job (this suite can run
+    # inside a live AI Hive agent's own terminal) can add incidental extra
+    # members that have nothing to do with the primitives under test.
     procs = [subprocess.Popen([sys.executable, "-c",
-                               "import time; time.sleep(20)"])
+                               "import time; time.sleep(20)"],
+                              creationflags=CREATE_NO_WINDOW)
              for _ in range(3)]
     try:
         for p in procs:
@@ -530,13 +537,29 @@ def test_winjob_process_ids_and_kill():
                   job.assign(p.pid))
         ids = job.process_ids()
         check("winjob kill: process_ids reports every assigned pid",
-              set(ids) == {p.pid for p in procs}, (ids, [p.pid for p in procs]))
+              {p.pid for p in procs} <= set(ids), (ids, [p.pid for p in procs]))
+
+        label = describe_pid(procs[0].pid)
+        check("winjob kill: describe_pid names a real live process "
+              "(python's own executable), not the bare-pid fallback",
+              label.lower() != f"pid {procs[0].pid}"
+              and label.lower().startswith("python"), label)
+        check("winjob kill: describe_pid falls back to a bare label for an "
+              "unreachable/invalid pid",
+              describe_pid(0) == "pid 0")
 
         worker = types.SimpleNamespace(_job=job, job_process_ids=job.process_ids)
         keep_pid = procs[0].pid
         killed = ProcessWorker.kill_extra_processes(worker, {keep_pid})
+        # a subset check, not exact equality: this test's own nested-job dev
+        # environment (a live shell spawning python which spawns python, all
+        # already inside another job) can add incidental extra members
+        # (conhost.exe, stray interpreter helpers) that have nothing to do
+        # with the primitive under test -- what matters is that the two
+        # deliberately spawned targets ARE killed and the kept one NEVER is
         check("winjob kill: kills every pid except the one told to keep",
-              set(killed) == {procs[1].pid, procs[2].pid}, killed)
+              keep_pid not in killed
+              and {procs[1].pid, procs[2].pid} <= set(killed), killed)
 
         for p in procs[1:]:
             try:
@@ -2724,33 +2747,110 @@ def test_bg_shell_live_ui():
     check("bg shell UI: sidebar agent row also clears on its next poll",
           row.bg_mark.isHidden())
 
-    # clicking either kills the extras: the card calls kill_bg_shell_extras()
-    # directly (it owns the agent for its whole life), the sidebar row only
-    # EMITS a request (it doesn't own the agent) for MainWindow to route via
-    # resolve_agent -- same split as the schedule chip's card/sidebar pair.
+    # clicking either opens a menu of individual processes to kill, rather
+    # than an all-or-nothing kill on the click itself -- an accidental click
+    # near the badge must not risk killing something an agent is actually
+    # waiting on. bg_shell_extra_pids() is empty here (no baseline was ever
+    # learned in this test), so both handlers must take the early-return
+    # "nothing to show" path rather than opening a real (blocking) QMenu --
+    # this is what proves a click can never fall back to killing everything.
     a._bg_shell = True
     a.bg_shell_changed.emit(True)
     pump(30)
-    card.bg_mark.click()
-    pump(30)
-    check("bg shell UI: clicking the card gear reaches "
-          "kill_bg_shell_extras() and clears it live",
-          not card.bg_mark.isVisible() and not a.is_bg_shell_busy())
+    check("bg shell UI: nothing to kill yet (no baseline learned)",
+          a.bg_shell_extra_pids() == [])
+    card.bg_mark.click()          # must NOT hang on a QMenu.exec() or crash
+    check("bg shell UI: clicking the card gear with nothing resolvable is a "
+          "safe no-op, not a kill-everything fallback", a.is_bg_shell_busy())
 
     row.refresh(a)
-    kill_hits, act_hits = [], []
-    row.bgKillRequested.connect(lambda w, aid: kill_hits.append((w, aid)))
-    row.activated.connect(lambda w, aid: act_hits.append((w, aid)))
-    row.bg_mark.click()
-    check("bg shell UI: clicking the sidebar gear emits "
-          "bgKillRequested(ws_id, agent_id)",
-          kill_hits == [("w1", a.id)], kill_hits)
-    check("bg shell UI: ...and the click is CONSUMED, not also a row-wide "
-          "'reveal the card' activation", act_hits == [], act_hits)
+    row.bg_mark.click()           # same early-return path, same guarantee
+    check("bg shell UI: clicking the sidebar gear is the same safe no-op",
+          a.is_bg_shell_busy())
 
     card.detach(); card.close()
     row.deleteLater()
     a.deleteLater()
+
+
+def test_bg_shell_extra_pids_and_kill_pid():
+    """bg_shell_extra_pids() is what the kill menu lists, and
+    kill_bg_shell_pid() is its per-item action -- letting the user kill one
+    process at a time instead of the all-or-nothing kill_bg_shell_extras().
+    kill_bg_shell_pid() must refuse anything that isn't CURRENTLY a genuine
+    extra (re-checked, not trusted from a menu built a moment ago), and must
+    only clear the latch once EVERY extra is gone, not on the first kill."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import (AgentStatus, BG_SHELL_DEBOUNCE_S,
+                                     BG_SHELL_SETTLE_S, BG_SHELL_WARMUP_S)
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+    import app.terminal_agent as terminal_agent_mod
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-pids-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("BgShellPids", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Shelled",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+    kill_calls = []
+
+    fake_now = [1000.0]
+    agent._session_started = fake_now[0]
+    orig_time = terminal_agent_mod.time.time
+    orig_count = agent.worker.job_process_count
+    orig_ids = agent.worker.job_process_ids
+    orig_pid = agent.worker.pid
+    orig_kill_pid = agent.worker.kill_pid
+    pids = [100, 101]   # root(100) + mcp bridge(101): the baseline
+    terminal_agent_mod.time.time = lambda: fake_now[0]
+    agent.worker.job_process_count = lambda: len(pids)
+    agent.worker.job_process_ids = lambda: list(pids)
+    agent.worker.pid = lambda: 100
+    agent.worker.kill_pid = lambda p: (kill_calls.append(p),
+                                       pids.remove(p) if p in pids else None)
+    try:
+        check("bg shell pids: nothing before a baseline is learned",
+              agent.bg_shell_extra_pids() == [])
+
+        fake_now[0] += BG_SHELL_WARMUP_S + 0.1
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_SETTLE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell pids: still nothing once settled with no extras",
+              agent.bg_shell_extra_pids() == [])
+
+        pids.extend([102, 103])   # e.g. Gradle daemon + Kotlin daemon
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell pids: lists exactly the extras, not root/baseline",
+              agent.bg_shell_extra_pids() == [102, 103],
+              agent.bg_shell_extra_pids())
+
+        check("bg shell pids: refuses to kill a baseline pid (not extra)",
+              agent.kill_bg_shell_pid(101) is False and not kill_calls)
+        check("bg shell pids: refuses to kill the agent's own root process",
+              agent.kill_bg_shell_pid(100) is False and not kill_calls)
+
+        ok = agent.kill_bg_shell_pid(102)
+        check("bg shell pids: kills a genuine extra", ok is True)
+        check("bg shell pids: the worker was asked to kill exactly that pid",
+              kill_calls == [102], kill_calls)
+        check("bg shell pids: one extra remains, so the badge stays lit",
+              agent.is_bg_shell_busy() and agent.bg_shell_extra_pids() == [103])
+
+        ok = agent.kill_bg_shell_pid(103)
+        check("bg shell pids: kills the last remaining extra", ok is True)
+        check("bg shell pids: the badge clears once EVERY extra is gone",
+              not agent.is_bg_shell_busy())
+    finally:
+        terminal_agent_mod.time.time = orig_time
+        agent.worker.job_process_count = orig_count
+        agent.worker.job_process_ids = orig_ids
+        agent.worker.pid = orig_pid
+        agent.worker.kill_pid = orig_kill_pid
 
 
 def test_no_em_dashes_in_visible_text():
@@ -9230,6 +9330,7 @@ def main():
     test_live_model_effort()
     test_limit_blocked_live_ui()
     test_bg_shell_live_ui()
+    test_bg_shell_extra_pids_and_kill_pid()
     test_no_em_dashes_in_visible_text()
     test_reveal_agent()
     test_new_agent_autofocus()

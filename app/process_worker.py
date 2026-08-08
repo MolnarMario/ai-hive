@@ -436,6 +436,15 @@ if sys.platform == "win32":
         wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
         ctypes.POINTER(wintypes.DWORD)]
     _k32.QueryInformationJobObject.restype = wintypes.BOOL
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    # same explicit-prototype discipline as QueryInformationJobObject above:
+    # this one hands back a HANDLE-adjacent BOOL too, and it's only ever used
+    # to label a pid for a human (describe_pid), so a truncation here should
+    # fail closed to the bare "pid N" fallback, not silently misread memory.
+    _k32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD)]
+    _k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 
 
 class WinJob:
@@ -533,6 +542,29 @@ def _taskkill_tree(pid: int) -> None:
                        timeout=5)
     except Exception:
         pass
+
+
+def describe_pid(pid: int) -> str:
+    """Best-effort short label for a pid -- its executable's base name (e.g.
+    "java.exe", "adb.exe") -- so a human picking one process out of the kill
+    menu can tell them apart. Purely cosmetic: nothing here feeds a kill
+    decision. Falls back to a bare "pid N" if the process can't be queried
+    (already exited, access denied, non-Windows)."""
+    if sys.platform != "win32" or not pid:
+        return f"pid {pid}"
+    handle = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False,
+                              int(pid))
+    if not handle:
+        return f"pid {pid}"
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(260)
+        ok = _k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+        if not ok or not buf.value:
+            return f"pid {pid}"
+        return buf.value.rsplit("\\", 1)[-1]
+    finally:
+        _k32.CloseHandle(handle)
 
 
 # ----------------------------------------------------------------- worker ---
@@ -716,6 +748,11 @@ class ProcessWorker(QObject):
         for p in victims:
             _taskkill_tree(p)
         return victims
+
+    def kill_pid(self, pid: int) -> None:
+        """Hard-kill exactly one process -- the single-item equivalent of
+        kill_extra_processes, for TerminalAgent.kill_bg_shell_pid."""
+        _taskkill_tree(pid)
 
     # -------------------------------------------------------------- slots ---
 

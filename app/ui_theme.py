@@ -492,8 +492,9 @@ WorkspaceRow[search_hit="true"] {{
 #WsAgentLimit {{ color: {p.ACCENT_GOLD}; font-size: 16px; }}
 /* idle but a background command it started is still running: orange like
    #WsBgShell, distinct from the gold "fine, just waiting" family. A
-   QToolButton like #WsAgentSched below (a click kills it), same flat base +
-   hover pill so it reads as clickable rather than another status glyph. */
+   QToolButton like #WsAgentSched below (a click opens a menu of what to
+   kill), same flat base + hover pill so it reads as clickable rather than
+   another status glyph. */
 #WsAgentBgShell {{
     background: transparent; border: 1px solid transparent; border-radius: 4px;
     padding: 1px 3px; color: {p.ACCENT_ORANGE}; font-size: 16px;
@@ -566,7 +567,7 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     padding: 0px 4px;
 }}
 #CardLimitMark {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
-/* clickable (kills the lingering process) -- transparent by default, like
+/* clickable (opens a menu of what to kill) -- transparent by default, like
    #CardSchedule, so it doesn't inherit the platform's default button chrome */
 #CardBgShell {{
     background: transparent; color: {p.ACCENT_ORANGE};

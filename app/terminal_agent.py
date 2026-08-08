@@ -1059,24 +1059,60 @@ class TerminalAgent(QObject):
                 except Exception:
                     pass
 
-    def kill_bg_shell_extras(self) -> list[int]:
-        """Hard-kill whatever is making this agent's job look busier than
-        its learned baseline (see poll_bg_shell) -- e.g. a Gradle/Kotlin
-        daemon or an adb server a shell command spawned and left detached,
-        still running long after the command that started it returned.
-        Never touches the agent's own root process or anything seen while
-        the baseline was being learned (the log_activity mcp bridge,
-        ConPTY's own conhost/OpenConsole helper) -- only processes that
-        showed up on top of that and are still present now. A no-op
-        (returns []) unless the badge is actually lit, so a stray click on a
-        just-cleared marker can't kill something legitimate."""
-        if not self._bg_shell:
-            return []
+    def _bg_shell_keep_pids(self) -> set[int]:
+        """Pids that must never be treated as 'extra': the agent's own root
+        process, plus everything seen while the baseline was learned (the
+        log_activity mcp bridge, ConPTY's own conhost/OpenConsole helper).
+        Shared by every read/kill path below so they can never disagree
+        about what's safe to touch."""
         keep = set(self._bg_baseline_pids or ())
         root = self.worker.pid()
         if root:
             keep.add(root)
-        killed = self.worker.kill_extra_processes(keep)
+        return keep
+
+    def bg_shell_extra_pids(self) -> list[int]:
+        """The actual extra processes behind the gear badge right now -- a
+        fresh query, not the last poll's snapshot -- so a kill menu can list
+        exactly what's there and let the user choose, instead of an
+        all-or-nothing kill. Empty before a baseline exists to compare
+        against (i.e. before poll_bg_shell has ever settled)."""
+        if self._bg_baseline_pids is None:
+            return []
+        keep = self._bg_shell_keep_pids()
+        return [p for p in self.worker.job_process_ids() if p not in keep]
+
+    def kill_bg_shell_pid(self, pid: int) -> bool:
+        """Kill exactly one process bg_shell_extra_pids() listed -- the
+        per-item action in the kill menu, for when killing everything at
+        once risks taking down a command the agent is actually waiting on.
+        Refuses anything not CURRENTLY a genuine extra (re-checked here, not
+        trusted from a menu built a moment ago), so it can never be used to
+        kill the agent's own process or something from its baseline."""
+        if pid not in self.bg_shell_extra_pids():
+            return False
+        self.worker.kill_pid(pid)
+        if self.audit is not None:
+            try:
+                self.audit(f"BG-SHELL-KILL agent={self.spec.name} "
+                           f"pids=[{pid}]")
+            except Exception:
+                pass
+        if not self.bg_shell_extra_pids():
+            self._bg_extra_since = None
+            if self._bg_shell:
+                self._bg_shell = False
+                self.bg_shell_changed.emit(False)
+        return True
+
+    def kill_bg_shell_extras(self) -> list[int]:
+        """Hard-kill every extra at once (the menu's "kill all" action) --
+        see kill_bg_shell_pid for the per-item equivalent and what "extra"
+        excludes. A no-op (returns []) unless the badge is actually lit, so
+        a stray click on a just-cleared marker can't kill anything."""
+        if not self._bg_shell:
+            return []
+        killed = self.worker.kill_extra_processes(self._bg_shell_keep_pids())
         if killed and self.audit is not None:
             try:
                 self.audit(f"BG-SHELL-KILL agent={self.spec.name} "

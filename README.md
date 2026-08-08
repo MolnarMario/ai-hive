@@ -553,7 +553,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1256 checks drive the real app headlessly (offscreen Qt platform) with real
+1268 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -638,7 +638,7 @@ app/
                            + working-count spinner + taskbar-badge painter)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1256 checks)
+tests/smoke_test.py        headless end-to-end suite (1268 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

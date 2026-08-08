@@ -38,15 +38,16 @@ import uuid
 from PySide6.QtCore import (QEasingCurve, QEvent, QFileSystemWatcher, QMimeData,
                             QPoint, QPropertyAnimation, QRect, QSize, Qt, QTimer,
                             Signal)
-from PySide6.QtGui import (QColor, QDrag, QFont, QFontMetrics, QPainter, QPen,
-                           QPixmap)
+from PySide6.QtGui import (QAction, QColor, QDrag, QFont, QFontMetrics,
+                           QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
-                               QHBoxLayout, QLabel, QLineEdit, QSizePolicy,
-                               QToolButton, QTreeWidget, QTreeWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QHBoxLayout, QLabel, QLineEdit, QMenu,
+                               QSizePolicy, QToolButton, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import scheduled_send
 from ..filetypes import EMOJI_FONT, FOLDER_ICON, FOLDER_OPEN_ICON, file_icon
+from ..process_worker import describe_pid
 from ..terminal_agent import AgentStatus
 from ..ui_theme import Palette, repolish
 from .activity_panel import _ICON
@@ -712,7 +713,6 @@ class AgentRow(QFrame):
 
     activated = Signal(str, str)        # ws_id, agent_id
     schedRequested = Signal(str, str)   # ws_id, agent_id (⏱ clicked)
-    bgKillRequested = Signal(str, str)  # ws_id, agent_id (⚙ clicked)
 
     def __init__(self, ws_id: str, agent, parent=None):
         super().__init__(parent)
@@ -720,6 +720,11 @@ class AgentRow(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.ws_id = ws_id
         self.agent_id = agent.id
+        # kept live by refresh() on every poll -- the gear's kill menu is
+        # built directly from this (unlike sched_mark, which only needs to
+        # ask MainWindow to open a dialog), since a menu of what to kill
+        # depends on this exact agent's current process list, not just its id
+        self.agent = agent
         self._full = ""     # untruncated summary, re-elided to the live width
         self.setFixedHeight(AGENT_HEIGHT)
 
@@ -745,7 +750,7 @@ class AgentRow(QFrame):
         self.limit_mark.hide()
         # idle but a background command it started is still running -- same
         # marker as the card header, and same QToolButton-not-QLabel trick as
-        # sched_mark below: a click kills it (bgKillRequested) and must be
+        # sched_mark below: a click opens a menu of what to kill and must be
         # CONSUMED rather than bubbling to the row's whole-row activation.
         self.bg_mark = QToolButton(self)
         self.bg_mark.setObjectName("WsAgentBgShell")
@@ -753,10 +758,9 @@ class AgentRow(QFrame):
         self.bg_mark.setCursor(Qt.CursorShape.PointingHandCursor)
         self.bg_mark.setToolTip(
             "Idle, but a background command it started is still running. "
-            "Click to stop it")
+            "Click to choose what to stop")
         self.bg_mark.hide()
-        self.bg_mark.clicked.connect(
-            lambda: self.bgKillRequested.emit(self.ws_id, self.agent_id))
+        self.bg_mark.clicked.connect(self._show_bg_shell_menu)
         # a message is queued to be typed into this agent later, so a scheduled
         # send is findable from a collapsed workspace too. A QToolButton (not a
         # QLabel like q/limit_mark above) so its own click is CONSUMED instead
@@ -780,6 +784,7 @@ class AgentRow(QFrame):
         self.refresh(agent)
 
     def refresh(self, agent) -> None:
+        self.agent = agent   # kept live -- see the comment in __init__
         # WORK, not liveness (mirrors the sidebar workspace badge): a RUNNING
         # agent that is actively producing output (is_busy) shows amber; a
         # RUNNING-but-quiet agent stays green. Other statuses map as usual.
@@ -817,6 +822,27 @@ class AgentRow(QFrame):
         get = getattr(agent, "summary", None)
         self._full = (get() if callable(get) else agent.current_task or "").strip()
         self.summary.set_full_text(self._full)
+
+    def _show_bg_shell_menu(self) -> None:
+        """List each process behind the gear badge so the user can kill one
+        at a time instead of an all-or-nothing click -- an accidental click
+        near the badge must not risk killing something an agent is actually
+        waiting on. Same menu the card header's gear builds."""
+        pids = list(getattr(self.agent, "bg_shell_extra_pids", lambda: [])())
+        if not pids:
+            return
+        menu = QMenu(self)
+        for pid in pids:
+            act = QAction(f"Kill {describe_pid(pid)} (pid {pid})", menu)
+            act.triggered.connect(
+                lambda checked=False, p=pid: self.agent.kill_bg_shell_pid(p))
+            menu.addAction(act)
+        if len(pids) > 1:
+            menu.addSeparator()
+            act_all = QAction(f"Kill all {len(pids)}", menu)
+            act_all.triggered.connect(self.agent.kill_bg_shell_extras)
+            menu.addAction(act_all)
+        menu.exec(self.bg_mark.mapToGlobal(self.bg_mark.rect().bottomLeft()))
 
     def set_search_hit(self, hit: bool) -> None:
         """Tint the agent row when it matches the active sidebar search."""
@@ -911,7 +937,6 @@ class Sidebar(QFrame):
     agentsRequested = Signal(str)            # ws_id (count badge clicked; M3)
     agentActivated = Signal(str, str)        # ws_id, agent_id (reveal its card)
     agentScheduleRequested = Signal(str, str)  # ws_id, agent_id (⏱ clicked)
-    agentBgKillRequested = Signal(str, str)  # ws_id, agent_id (⚙ clicked)
     reordered = Signal(list)                 # flattened ws-id order (M1)
     layoutChanged = Signal(list)             # full node model: order+categories
     filesRequested = Signal(str)             # ws_id (file-tree toggle clicked)
@@ -1290,7 +1315,6 @@ class Sidebar(QFrame):
             arow = AgentRow(ws_id, agent)
             arow.activated.connect(self.agentActivated)
             arow.schedRequested.connect(self.agentScheduleRequested)
-            arow.bgKillRequested.connect(self.agentBgKillRequested)
             arow.set_search_hit(agent.id in self._search_agent_hits)
             self.tree.setItemWidget(child, 0, arow)
             self._agent_rows[agent.id] = arow

@@ -242,6 +242,11 @@ class PtyWorker(QObject):
             _taskkill_tree(p)
         return victims
 
+    def kill_pid(self, pid: int) -> None:
+        """Hard-kill exactly one process -- the single-item equivalent of
+        kill_extra_processes, for TerminalAgent.kill_bg_shell_pid."""
+        _taskkill_tree(pid)
+
     # -------------------------------------------------------------- slots ---
 
     def _set_state(self, state: WorkerState) -> None:

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
 
 from .. import scheduled_send, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
+from ..process_worker import describe_pid
 from ..terminal_agent import (STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
                               TerminalAgent)
 from ..ui_theme import Palette, repolish
@@ -335,7 +336,7 @@ class TerminalCard(QFrame):
         self._on_limit_blocked(self.agent.is_limit_blocked())
         self.agent.bg_shell_changed.connect(self._on_bg_shell)
         self._on_bg_shell(self.agent.is_bg_shell_busy())
-        self.bg_mark.clicked.connect(self.agent.kill_bg_shell_extras)
+        self.bg_mark.clicked.connect(self._show_bg_shell_menu)
         self.agent.scheduled_changed.connect(self.refresh_schedule)
         self.sched_mark.clicked.connect(
             lambda: self.scheduleRequested.emit(self.agent.id, ""))
@@ -520,7 +521,28 @@ class TerminalCard(QFrame):
         if active:
             self.bg_mark.setToolTip(
                 "Idle, but a background command it started is still "
-                "running. Click to stop it")
+                "running. Click to choose what to stop")
+
+    def _show_bg_shell_menu(self) -> None:
+        """List each process behind the gear badge so the user can kill one
+        at a time instead of an all-or-nothing click -- an accidental click
+        near the badge must not risk killing something an agent is actually
+        waiting on."""
+        pids = self.agent.bg_shell_extra_pids()
+        if not pids:
+            return
+        menu = QMenu(self)
+        for pid in pids:
+            act = QAction(f"Kill {describe_pid(pid)} (pid {pid})", menu)
+            act.triggered.connect(
+                lambda checked=False, p=pid: self.agent.kill_bg_shell_pid(p))
+            menu.addAction(act)
+        if len(pids) > 1:
+            menu.addSeparator()
+            act_all = QAction(f"Kill all {len(pids)}", menu)
+            act_all.triggered.connect(self.agent.kill_bg_shell_extras)
+            menu.addAction(act_all)
+        menu.exec(self.bg_mark.mapToGlobal(self.bg_mark.rect().bottomLeft()))
 
     def refresh_schedule(self) -> None:
         """Repaint the deferred-message chip: the countdown to the soonest one,
