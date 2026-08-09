@@ -1,6 +1,6 @@
 """Top-bar visual readout for Gemini (Antigravity CLI `agy`) rate-limit utilization.
 
-Painted widget for Gemini rate-limit monitoring.
+Painted widget with fixed width (no jittering) and live loading state.
 """
 
 from __future__ import annotations
@@ -24,38 +24,48 @@ class GeminiUsageBadge(QWidget):
     _PAD = 8
     _GAP = 7
     _AMBER, _RED = 60.0, 85.0
+    _FIXED_WIDTH = 250  # Fixed width to prevent content jittering
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(24)
+        self.setFixedWidth(self._FIXED_WIDTH)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._usage: gemini_usage.GeminiUsage | None = None
         self._limit: gemini_usage.GeminiLimit | None = None
-        self._text = ""
+        self._fetching = True
+        self._text = "fetching most recent usage data..."
         self._stale = False
         self._label = False
         self._unreadable = ""
-        self.set_usage(gemini_usage.fetch())
+        self.setVisible(True)
+        self._refresh_text()
 
     def set_usage(self, usage: gemini_usage.GeminiUsage | None) -> None:
+        self._fetching = False
         self._usage = usage
         self._limit = gemini_usage.headline(usage)
         self._unreadable = ""
         if self._limit is None:
-            self.setVisible(False)
-            return
-        self._label = len(usage.limits) > 1 if usage else False
-        self._stale = bool(usage.error) if usage else False
+            self._text = "no usage data"
+        else:
+            self._label = len(usage.limits) > 1 if usage else False
+            self._stale = bool(usage.error) if usage else False
         self.setVisible(True)
         self._refresh_text()
+
+    def mark_fetching(self) -> None:
+        self._fetching = True
+        self.update()
 
     def has_reading(self) -> bool:
         return self._limit is not None
 
     def has_content(self) -> bool:
-        return self._limit is not None or bool(self._unreadable)
+        return True
 
     def mark_unreadable(self, error: str = "") -> None:
+        self._fetching = False
         self._unreadable = str(error) or "unavailable"
         self._stale = True
         self.setVisible(True)
@@ -65,20 +75,15 @@ class GeminiUsageBadge(QWidget):
         self._refresh_text()
 
     def _refresh_text(self) -> None:
-        if self._limit is not None:
-            text = gemini_usage.format_limit(self._limit, with_label=self._label)
+        if self._fetching:
+            self._text = "fetching most recent usage data..."
+        elif self._limit is not None:
+            self._text = gemini_usage.format_limit(self._limit, with_label=self._label)
         elif self._unreadable:
-            text = "Gemini limit unreadable, click to refresh"
+            self._text = "Gemini limit unreadable, click to refresh"
         else:
-            text = ""
-        tip = self._build_tooltip()
-        if text == self._text:
-            self.setToolTip(tip)
-            return
-        self._text = text
-        self.setToolTip(tip)
-        fm = QFontMetrics(self._text_font())
-        self.setFixedWidth(self._PAD * 2 + self._RING + self._GAP + fm.horizontalAdvance(text))
+            self._text = "no usage data"
+        self.setToolTip(self._build_tooltip())
         self.update()
 
     @staticmethod
@@ -88,6 +93,8 @@ class GeminiUsageBadge(QWidget):
         return f
 
     def _build_tooltip(self) -> str:
+        if self._fetching:
+            return "Fetching most recent Gemini rate-limit usage data..."
         if self._limit is None and self._unreadable:
             return ("Gemini rate-limit usage could not be read.\n"
                     f"Last attempt failed: {self._unreadable}\n"
@@ -106,7 +113,7 @@ class GeminiUsageBadge(QWidget):
         return "\n".join(lines)
 
     def _color(self) -> QColor:
-        if self._stale or self._limit is None:
+        if self._fetching or self._stale or self._limit is None:
             return QColor(Palette.TEXT_DIM)
         pct = self._limit.percent
         if pct >= self._RED:
@@ -117,25 +124,25 @@ class GeminiUsageBadge(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self._fetching = True
+            self._refresh_text()
             self.refreshRequested.emit()
             event.accept()
         else:
             super().mousePressEvent(event)
 
     def paintEvent(self, _event):
-        if not self._text:
-            return
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         col = self._color()
 
-        # Background pill
+        # Background pill with fixed width
         bg_col = QColor(col)
-        bg_col.setAlpha(25 if not self._stale else 12)
+        bg_col.setAlpha(20 if not self._fetching and not self._stale else 10)
         p.setBrush(bg_col)
         border_col = QColor(col)
-        border_col.setAlpha(60 if not self._stale else 30)
+        border_col.setAlpha(50 if not self._fetching and not self._stale else 25)
         p.setPen(QPen(border_col, 1))
         rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
         p.drawRoundedRect(rect, 12, 12)
@@ -152,7 +159,7 @@ class GeminiUsageBadge(QWidget):
         p.drawEllipse(ring_rect)
 
         # Arc for percent utilization
-        if self._limit is not None and self._limit.percent > 0:
+        if not self._fetching and self._limit is not None and self._limit.percent > 0:
             pct = min(100.0, max(0.0, self._limit.percent))
             span = int(-pct / 100.0 * 360 * 16)
             p.setPen(QPen(col, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
@@ -160,9 +167,13 @@ class GeminiUsageBadge(QWidget):
 
         # Text
         p.setFont(self._text_font())
-        txt_col = QColor(Palette.TEXT) if not self._stale else QColor(Palette.TEXT_DIM)
+        txt_col = QColor(Palette.TEXT) if not self._fetching and not self._stale else QColor(Palette.TEXT_DIM)
         p.setPen(txt_col)
         txt_x = ring_x + self._RING + self._GAP
         txt_y = (self.height() + p.fontMetrics().ascent() - p.fontMetrics().descent()) / 2.0 - 1
-        p.drawText(txt_x, int(txt_y), self._text)
+        
+        # Elide text if it ever exceeds pill bounds
+        avail_w = int(self.width() - txt_x - self._PAD)
+        elided = p.fontMetrics().elidedText(self._text, Qt.TextElideMode.ElideRight, avail_w)
+        p.drawText(txt_x, int(txt_y), elided)
         p.end()
