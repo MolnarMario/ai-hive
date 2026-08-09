@@ -499,8 +499,22 @@ class TerminalView(QWidget):
         self.update()
 
     def screen_text(self) -> str:
-        """Plain text of the live screen (used by tests)."""
-        return "\n".join(self.screen.display)
+        """Plain text of the live screen (used by tests).
+
+        pyte's own `display` property can raise on a malformed buffer cell
+        (observed live: a wide CJK character combined with an absolute
+        cursor-column jump left a cell with empty `.data`, which crashed
+        `wcwidth(char[0])` with an IndexError). That cell is reachable from a
+        REPLAYED snapshot (`screen_snapshot.py`) fed straight into a fresh
+        screen in `TerminalCard.__init__`, before the window is even shown --
+        so an unguarded call here doesn't just blank one card, it takes down
+        the whole app on startup with pythonw giving no console to see why.
+        Degrade to empty text instead: the caller only uses this to decide
+        compact-vs-full overlay styling, so losing it is cosmetic."""
+        try:
+            return "\n".join(self.screen.display)
+        except Exception:
+            return ""
 
     def _view_state(self):
         """(history_list, clamped_offset) for composite rendering, or

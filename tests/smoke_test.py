@@ -7018,6 +7018,26 @@ def test_screen_snapshots():
         win3.close(); pump(300)
         shutil.rmtree(home, ignore_errors=True)
 
+    # -- a corrupted restored screen degrades, it never crashes the app --
+    # The regression: a wide CJK character's leading cell later overwritten
+    # (e.g. by an absolute-column cursor jump, common in TUI mockups) orphans
+    # pyte's own zero-width stub cell (data=""). pyte's `display` property
+    # then does wcwidth(char[0]) on that empty string and raises IndexError.
+    # screen_text() is called from TerminalCard.__init__ -> _on_status ->
+    # _refresh_overlay for EVERY restored card, so one corrupted .vt snapshot
+    # (app/screen_snapshot.py) crashed the whole app on startup, before the
+    # window was ever shown -- and silently, since the launch shortcut runs
+    # pythonw.exe with no console to print the traceback.
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import TerminalView
+    QApplication.instance() or QApplication([])
+    corrupt = TerminalView(rows=3, cols=20)
+    corrupt.feed("\x1b[1;1HあX\x1b[1;1HY")
+    check("screens: a corrupted pyte buffer degrades screen_text() to "
+          "empty instead of crashing the app",
+          corrupt.screen_text() == "")
+
     shutil.rmtree(tmp, ignore_errors=True)
 
 
