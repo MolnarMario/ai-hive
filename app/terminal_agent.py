@@ -83,6 +83,47 @@ BUSY_IDLE_MS = 2000
 # pulses a beat later. Seconds, compared against time.time().
 INPUT_ECHO_S = 0.8
 
+# How long a job's process count must stay above this agent's learned resting
+# level, while the agent itself is NOT busy, before it's flagged as "idle but
+# a background command it started is still running." Debounced like
+# BUSY_IDLE_MS so a process that comes and goes quickly (git, rg) never
+# flickers the indicator.
+BG_SHELL_DEBOUNCE_S = 5.0
+
+# baseline learning is deliberately deferred for this long after (re)start:
+# ConPTY's own helper processes (conhost/OpenConsole) can still be spinning up
+# right when the job is first assigned, so a sample taken too early can read
+# LOWER than true steady state -- and since the baseline only ever ratchets
+# DOWN (see poll_bg_shell), one too-early low sample becomes a permanent
+# floor a perfectly idle agent can never satisfy again (this was a live-
+# reported bug: an agent with nothing running kept showing the gear badge).
+# Giving the process tree a moment to settle before the first sample avoids
+# seeding a baseline that is wrong for the agent's entire remaining lifetime.
+BG_SHELL_WARMUP_S = 6.0
+
+# ...but the warmup alone was not enough (live-reported again: an agent's job
+# settled at count=3 while its baseline had locked onto 1). The board bridge
+# every Claude agent gets (`log_activity`, spawned as a python child of the
+# claude.exe process) itself double-forks a second interpreter, and on a slow
+# machine -- e.g. right after a full reboot, cold disk caches, AV scanning --
+# that second fork can still be missing when the FIRST post-warmup sample is
+# taken. Since that single sample became a permanent floor, the badge could
+# never clear again for the rest of that agent's life. So baseline learning
+# gets a further settle window on top of the warmup: for this long AFTER
+# warmup ends, a sample still sets the baseline outright (tracking the latest
+# count, not just ratcheting it down) instead of being compared for "extra",
+# so a late-arriving steady-state process is absorbed as normal rather than
+# flagged forever. Only once BOTH windows have elapsed does the baseline
+# switch to ratchet-down-only, which is what protects a genuine long-running
+# background job started later from ever being silently absorbed as "the new
+# normal".
+BG_SHELL_SETTLE_S = 10.0
+
+# How long `request_repaint` holds the child one column narrower before giving
+# the width back. Long enough that ConPTY delivers two distinct size changes
+# rather than coalescing them into nothing, short enough that no one sees it.
+REPAINT_RESTORE_MS = 120
+
 # strips escape sequences so on-screen TEXT can be matched: the raw stream
 # positions words individually ("trust\x1b[20Gthis\x1b[25Gfolder"), so a
 # phrase can never be matched against raw bytes
@@ -159,6 +200,13 @@ class TerminalAgent(QObject):
     tokens_changed = Signal(str)        # context-usage badge text ("" = hide)
     model_changed = Signal(str)         # live model/effort badge text ("" = hide)
     limit_blocked_changed = Signal(bool)  # cut off by the plan limit (latched)
+    # idle (not streaming output) but a background command it started is
+    # still running -- see poll_bg_shell(). Transient, like activity/waiting.
+    bg_shell_changed = Signal(bool)
+    # the child TUI's input prompt went interactive (or was re-armed by a
+    # (re)start). Purely a VIEW signal — the card uses it to lift its boot
+    # veil — and, like activity/waiting, it must never mark the session dirty.
+    prompt_ready_changed = Signal(bool)
     # the deferred-message queue changed (added/cancelled/sent/missed). NOT a
     # countdown tick: this list IS persisted, so the manager wires this to a
     # save, and a per-second tick on that would rewrite session.json all day.
@@ -258,6 +306,22 @@ class TerminalAgent(QObject):
         self._turn_waiting = False
         self._waiting = False
         self._screen_tail = ""        # rolling escape-stripped output tail
+        # "idle, but a background command it started is still running" (see
+        # poll_bg_shell): _bg_baseline is the quietest job-process-count ever
+        # observed for this launch (learned downward, so a wrapper process
+        # like ConPTY's conhost is never mistaken for "extra"); _bg_extra_since
+        # is when a count above baseline was first seen while not busy;
+        # _bg_shell is the debounced, emitted effective value.
+        self._bg_baseline: int | None = None
+        # the actual PIDs seen while learning the baseline above -- identity,
+        # not just a count, so a later kill (see kill_bg_shell_extras) can
+        # tell "known resting overhead" (keep) apart from "showed up on top
+        # of that" (safe to kill) instead of only knowing there ARE extras.
+        # Mirrors _bg_baseline's own rules: replaced outright during the
+        # settle window, only ever intersected (never grown) after.
+        self._bg_baseline_pids: set[int] | None = None
+        self._bg_extra_since: float | None = None
+        self._bg_shell = False
         # single-shot: (re)armed on each output burst; firing = output went
         # quiet, so the agent has dropped back to standby
         self._idle_timer = QTimer(self)
@@ -277,10 +341,11 @@ class TerminalAgent(QObject):
     # ------------------------------------------------------------ control ---
 
     def start(self) -> None:
-        self._prompt_ready = False  # re-armed for the fresh TUI
+        self._set_prompt_ready(False)  # re-armed for the fresh TUI
         self._ready_tail = ""
         self._screen_tail = ""
         self._reset_waiting()
+        self._reset_bg_shell()
         self.clear_limit_block()
         self._limit_last_banner = ""   # a new screen: nothing is an echo yet
         self._limit_last_skip = None   # ...so a skip is reported again too
@@ -332,10 +397,11 @@ class TerminalAgent(QObject):
         self.worker.kill()
 
     def restart(self) -> None:
-        self._prompt_ready = False
+        self._set_prompt_ready(False)
         self._ready_tail = ""
         self._screen_tail = ""
         self._reset_waiting()
+        self._reset_bg_shell()
         self.clear_limit_block()
         self._limit_last_banner = ""   # a new screen: nothing is an echo yet
         self._limit_last_skip = None   # ...so a skip is reported again too
@@ -363,6 +429,36 @@ class TerminalAgent(QObject):
     def resize(self, rows: int, cols: int) -> None:
         if self.is_pty:
             self.worker.resize(rows, cols)
+
+    def request_repaint(self) -> bool:
+        """Ask the child TUI to redraw its whole frame. False if it can't.
+
+        A size change is the only portable way to make a full-screen TUI repaint
+        on demand, and it is what an ordinary terminal emitter does whenever its
+        window is dragged. Sending one column narrower and back is a no-op for
+        the user (the card re-sends its true size on the next `sizeChanged`
+        anyway) but forces a fresh frame.
+
+        This exists because a card in a workspace the user has not opened never
+        gets one. Qt gives a QStackedWidget page NO resizeEvent until it is made
+        current, so `TerminalView.sizeChanged` never fires, `resize` is never
+        called, and nothing asks the child to redraw. If that child's prompt
+        footer was missed on the way past (see `_on_idle_timeout`), the agent
+        looks un-nudgeable until the user clicks the workspace — which is not a
+        recovery mechanism.
+
+        Deliberately a request and not a policy: the caller decides when an
+        agent has waited long enough to be worth poking.
+        """
+        if not self.is_pty or not self.worker.is_running():
+            return False
+        rows, cols = self.worker.rows, self.worker.cols
+        if cols <= 10:      # already at PtyWorker's floor; nothing to give back
+            return False
+        self.worker.resize(rows, cols - 1)
+        QTimer.singleShot(REPAINT_RESTORE_MS,
+                          lambda: self.worker.resize(rows, cols))
+        return True
 
     def pty_replay(self) -> str:
         return "".join(self._pty_buffer)
@@ -684,6 +780,24 @@ class TerminalAgent(QObject):
         self.scheduled_changed.emit()
         return True
 
+    def reschedule(self, mid: str, text: str, due_ts: float) -> bool:
+        """Edit an already-queued message's text and/or fire time in place,
+        keeping its identity -- the alternative (cancel + re-create) loses its
+        spot silently. A MISSED entry given a future time is revived to
+        PENDING: MISSED only means "was due and nobody acted on it", not a
+        dead end."""
+        msg = self.find_scheduled(mid)
+        text = sanitize_text(text or "").strip()
+        if msg is None or not text:
+            return False
+        msg.text = text
+        msg.due_ts = float(due_ts)
+        if msg.due_ts > time.time():
+            msg.state = PENDING
+            msg.attempts = 0
+        self.scheduled_changed.emit()
+        return True
+
     def mark_scheduled_sent(self, mid: str) -> bool:
         """It went in. The entry is DROPPED, not kept: the conversation itself
         is the record of what was said, and this is a queue, not a ledger."""
@@ -812,6 +926,12 @@ class TerminalAgent(QObject):
         interactive process idling at its prompt."""
         return self._busy
 
+    def is_bg_shell_busy(self) -> bool:
+        """True when the agent itself is quiet (not is_busy()) but a
+        background command it started is still running -- see
+        poll_bg_shell()."""
+        return self._bg_shell
+
     def is_waiting(self) -> bool:
         """True when the agent needs the user: it has settled on a numbered
         prompt, an interactive AskUserQuestion/ExitPlanMode prompt is open, or
@@ -856,6 +976,155 @@ class TerminalAgent(QObject):
         self._turn_waiting = False
         self._emit_waiting()
 
+    def _reset_bg_shell(self) -> None:
+        """Clear the background-shell latch and its learned baseline
+        (start/restart/exit) and emit if it was set. A fresh launch's job
+        starts from a clean slate, and a dead agent isn't waiting on
+        anything."""
+        self._bg_baseline = None
+        self._bg_baseline_pids = None
+        self._bg_extra_since = None
+        if self._bg_shell:
+            self._bg_shell = False
+            self.bg_shell_changed.emit(False)
+
+    def poll_bg_shell(self) -> None:
+        """Externally ticked (see WorkspaceManager.poll_bg_shell_activity):
+        notice a job whose live process count sits above this agent's
+        learned resting level while the agent ITSELF is quiet -- the
+        signature of a background command (a Bash tool call with
+        run_in_background, a shell's own `cmd &`) still running after the
+        agent returned to its prompt. Debounced like _mark_busy/idle so a
+        process that comes and goes quickly never flickers the indicator."""
+        if self.status not in (AgentStatus.RUNNING, AgentStatus.STARTING):
+            return
+        elapsed = time.time() - self._session_started
+        # let the process tree settle before trusting any sample as the
+        # resting baseline (see BG_SHELL_WARMUP_S)
+        if elapsed < BG_SHELL_WARMUP_S:
+            return
+        count = self.worker.job_process_count()
+        if count <= 0:
+            return  # query unsupported/failed -- don't flap on missing data
+        if elapsed < BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S:
+            # still settling: track the latest count outright (up or down)
+            # rather than only ratcheting down, so a steady-state process
+            # that spawns a little late (see BG_SHELL_SETTLE_S) is learned as
+            # baseline instead of being locked in as "extra" forever. Same
+            # replace-outright treatment for the PID identities behind it.
+            self._bg_baseline = count
+            self._bg_baseline_pids = set(self.worker.job_process_ids())
+            self._bg_extra_since = None
+            if self._bg_shell:
+                self._bg_shell = False
+                self.bg_shell_changed.emit(False)
+            return
+        # learn the resting size down over time: only a count ABOVE the
+        # quietest one ever seen for this launch counts as "extra" -- this is
+        # what keeps a ConPTY wrapper process (conhost/OpenConsole) or any
+        # other fixed overhead from being mistaken for background work. This
+        # can ONLY move the floor down, never up, so it can never absorb a
+        # genuine background job (which raises the count) as "the new
+        # normal" -- the risk is entirely in the other direction (see
+        # BG_SHELL_WARMUP_S/BG_SHELL_SETTLE_S), which is why those exist.
+        if self._bg_baseline is None or count < self._bg_baseline:
+            self._bg_baseline = count
+        # the PID identities mirror that same one-way rule: intersect only
+        # (drop a baseline pid that has since exited), never grow past
+        # settling -- so a process that shows up AFTER settling is always
+        # "extra" for kill_bg_shell_extras, never silently adopted as normal.
+        if self._bg_baseline_pids is not None:
+            self._bg_baseline_pids &= set(self.worker.job_process_ids())
+        extra = count > self._bg_baseline
+        now = time.time()
+        if self.is_busy() or not extra:
+            self._bg_extra_since = None
+            if self._bg_shell:
+                self._bg_shell = False
+                self.bg_shell_changed.emit(False)
+            return
+        if self._bg_extra_since is None:
+            self._bg_extra_since = now
+        elif (now - self._bg_extra_since >= BG_SHELL_DEBOUNCE_S
+              and not self._bg_shell):
+            self._bg_shell = True
+            self.bg_shell_changed.emit(True)
+            # forensic trail: if the baseline is ever wrong (a live report
+            # already happened once), this is what lets it be diagnosed from
+            # session.log instead of reconstructed by elimination
+            if self.audit is not None:
+                try:
+                    self.audit(f"BG-SHELL agent={self.spec.name} "
+                               f"count={count} baseline={self._bg_baseline}")
+                except Exception:
+                    pass
+
+    def _bg_shell_keep_pids(self) -> set[int]:
+        """Pids that must never be treated as 'extra': the agent's own root
+        process, plus everything seen while the baseline was learned (the
+        log_activity mcp bridge, ConPTY's own conhost/OpenConsole helper).
+        Shared by every read/kill path below so they can never disagree
+        about what's safe to touch."""
+        keep = set(self._bg_baseline_pids or ())
+        root = self.worker.pid()
+        if root:
+            keep.add(root)
+        return keep
+
+    def bg_shell_extra_pids(self) -> list[int]:
+        """The actual extra processes behind the gear badge right now -- a
+        fresh query, not the last poll's snapshot -- so a kill menu can list
+        exactly what's there and let the user choose, instead of an
+        all-or-nothing kill. Empty before a baseline exists to compare
+        against (i.e. before poll_bg_shell has ever settled)."""
+        if self._bg_baseline_pids is None:
+            return []
+        keep = self._bg_shell_keep_pids()
+        return [p for p in self.worker.job_process_ids() if p not in keep]
+
+    def kill_bg_shell_pid(self, pid: int) -> bool:
+        """Kill exactly one process bg_shell_extra_pids() listed -- the
+        per-item action in the kill menu, for when killing everything at
+        once risks taking down a command the agent is actually waiting on.
+        Refuses anything not CURRENTLY a genuine extra (re-checked here, not
+        trusted from a menu built a moment ago), so it can never be used to
+        kill the agent's own process or something from its baseline."""
+        if pid not in self.bg_shell_extra_pids():
+            return False
+        self.worker.kill_pid(pid)
+        if self.audit is not None:
+            try:
+                self.audit(f"BG-SHELL-KILL agent={self.spec.name} "
+                           f"pids=[{pid}]")
+            except Exception:
+                pass
+        if not self.bg_shell_extra_pids():
+            self._bg_extra_since = None
+            if self._bg_shell:
+                self._bg_shell = False
+                self.bg_shell_changed.emit(False)
+        return True
+
+    def kill_bg_shell_extras(self) -> list[int]:
+        """Hard-kill every extra at once (the menu's "kill all" action) --
+        see kill_bg_shell_pid for the per-item equivalent and what "extra"
+        excludes. A no-op (returns []) unless the badge is actually lit, so
+        a stray click on a just-cleared marker can't kill anything."""
+        if not self._bg_shell:
+            return []
+        killed = self.worker.kill_extra_processes(self._bg_shell_keep_pids())
+        if killed and self.audit is not None:
+            try:
+                self.audit(f"BG-SHELL-KILL agent={self.spec.name} "
+                           f"pids={killed}")
+            except Exception:
+                pass
+        self._bg_extra_since = None
+        if self._bg_shell:
+            self._bg_shell = False
+            self.bg_shell_changed.emit(False)
+        return killed
+
     def _mark_busy(self) -> None:
         # only a live agent can be working; guard on status (not worker state)
         # so this is unit-testable without a real child process
@@ -892,6 +1161,55 @@ class TerminalAgent(QObject):
         # ...and is this the plan-limit banner? Latch it NOW, while the frame is
         # current; by reset time the rolling tail no longer holds it.
         self._scrape_limit()
+        # ...and did we MISS the prompt going live? _on_pty_output decides
+        # readiness once per burst against a 600-char tail, so a footer followed
+        # by more than that in the same burst is never seen — and if the child
+        # then falls quiet (a resumed conversation parked at its prompt) nothing
+        # ever looks again. The agent stays "not ready" forever: `nudge` refuses
+        # it, so a plan-limit resume is declined every minute, and a delivered
+        # task waits in _pending_task indefinitely. Observed live 2026-08-07:
+        # nine consecutive "WAIT (TUI not ready)" ticks on an agent whose child
+        # had been up for ten minutes, ending only when the user happened to
+        # click that workspace.
+        #
+        # Re-checking here can only ever flip readiness LATE (this fires 2 s
+        # after output settles, never before the burst path has had its go), so
+        # it cannot perturb launch or first-task-submit timing — the one thing
+        # the SessionStart invariant is about. It reads the 4000-char screen
+        # tail rather than the 600-char one for the same reason as above.
+        if not self._prompt_ready and self.spec.provider == "claude":
+            if self._has_ready_hint(self._screen_tail):
+                self._became_prompt_ready()
+
+    def _tail_lines(self, n: int, skip_blank: bool = False) -> str:
+        """The last `n` lines of the escape-stripped screen tail, joined.
+
+        `skip_blank` COUNTS ONLY LINES WITH CONTENT, and the difference is not
+        cosmetic. Claude's TUI pads its frame with blank rows, so a raw
+        `[-40:]` slice can span as little as 432 characters and 5 non-blank
+        lines — measured on real screen snapshots, against a median ~900
+        characters per frame repaint. That is less than half a frame, which is
+        how a plan-limit banner went unseen by BOTH the per-burst scrape and
+        the settle scrape 2 s later, and stranded an agent overnight
+        (2026-08-07, CVsummer2026).
+
+        Callers that hunt for something NOT anchored to the bottom of the frame
+        (the limit banner, which renders above the menu, the input box and the
+        footer) pass skip_blank=True. The two callers that do NOT are
+        deliberate, and must stay that way:
+
+          * `_screen_waiting` wants the drawn menu just above the input box,
+            and its 18-line bound plus the caret requirement is the tuning that
+            keeps the "?" chime off an agent's own numbered prose.
+          * `recheck_limit` wants the menu that is TORN DOWN on a resume. The
+            raw tail still holds that menu's earlier renders, so reaching
+            further back would find it forever and report "still blocked" on an
+            agent that is already going again.
+        """
+        lines = self._screen_tail.splitlines()
+        if skip_blank:
+            lines = [ln for ln in lines if ln.strip()]
+        return "\n".join(lines[-n:])
 
     def _screen_waiting(self) -> bool:
         # ground-truth on the drawn box; suppress for a mode that shows no
@@ -901,7 +1219,8 @@ class TerminalAgent(QObject):
             return False
         if getattr(self.spec, "permission_mode", "") == "bypassPermissions":
             return False
-        region = "\n".join(self._screen_tail.splitlines()[-18:])
+        # raw lines on purpose — see _tail_lines
+        region = self._tail_lines(18)
         if not region:
             return False
         # a live menu = 2+ numbered options AND a selection caret on one of
@@ -961,7 +1280,12 @@ class TerminalAgent(QObject):
         # menu, the input box and the footer all render below it, so 18 lines
         # can push it out of view on a full frame. Both patterns are specific
         # enough to search a wider window safely.
-        region = "\n".join(self._screen_tail.splitlines()[-40:])
+        #
+        # skip_blank is what makes "40 lines" mean 40 lines of CONTENT. Counting
+        # the TUI's blank padding rows instead shrank this window to a handful
+        # of characters on a real frame and lost a genuine cut-off — see
+        # _tail_lines.
+        region = self._tail_lines(40, skip_blank=True)
         menu = bool(LIMIT_MENU_RE.search(region))
         banner = banner_line(region)
         if not menu:
@@ -1022,8 +1346,9 @@ class TerminalAgent(QObject):
         """
         try:
             if not banner:
-                banner = banner_line(
-                    "\n".join(self._screen_tail.splitlines()[-40:]))
+                # the SAME window the detector used, or this reports "nothing
+                # to see" for exactly the frames it is meant to explain
+                banner = banner_line(self._tail_lines(40, skip_blank=True))
             if not banner:
                 return
             state = (reason, banner)
@@ -1063,6 +1388,23 @@ class TerminalAgent(QObject):
         self._limit_from_startup = bool(from_startup)
         self._limit_window = window
         self._limit_banner = banner
+        # ARM THE ECHO GUARD, exactly as a live latch does. Without this a
+        # disk-recovered latch left `_limit_last_banner` empty, so the moment
+        # `recheck_limit` cleared the latch on a successful resume, the very
+        # next output burst re-latched on the SAME banner still sitting on
+        # screen — and `parse_reset_clock` dated it a full day out, because
+        # that clock had just passed. Observed live on 2026-08-07: RESUMED at
+        # 22:29:42, BLOCKED again at 22:29:43 with a reset 24 h ahead, which
+        # mutes the agent's chime for a day and later types a stray Continue
+        # into an agent that is working fine.
+        #
+        # Comparing the LINE works because both sources normalize through the
+        # same `limit_banner.banner_line`: the transcript record and the live
+        # re-latch above carried byte-identical text. (A banner the TUI wrapped
+        # across two rows would not match — that is equally true of a live
+        # latch today, and is not made worse here.)
+        if banner:
+            self._limit_last_banner = banner
         self.limit_blocked_changed.emit(True)
 
     def limit_window(self) -> str:
@@ -1136,6 +1478,18 @@ class TerminalAgent(QObject):
         """True once the TUI's input prompt is live and will accept typing."""
         return self._prompt_ready
 
+    def _set_prompt_ready(self, ready: bool) -> None:
+        """Flip readiness and announce a real change (never a repeat).
+
+        The only consumer is the card's boot veil, so this stays edge-only for
+        the same reason `activity_changed` does: readiness is re-armed on every
+        (re)start and settled once per launch, and a signal per output burst
+        would be pure churn."""
+        if bool(ready) is self._prompt_ready:
+            return
+        self._prompt_ready = bool(ready)
+        self.prompt_ready_changed.emit(self._prompt_ready)
+
     def clear_limit_block(self) -> None:
         """Forget the latched cut-off (it resumed, or it restarted).
 
@@ -1193,7 +1547,8 @@ class TerminalAgent(QObject):
         """
         if not self._limit_blocked:
             return False
-        region = "\n".join(self._screen_tail.splitlines()[-40:])
+        # raw lines on purpose — see _tail_lines
+        region = self._tail_lines(40)
         if region and LIMIT_MENU_RE.search(region):
             return True
         self.clear_limit_block()
@@ -1245,16 +1600,27 @@ class TerminalAgent(QObject):
             if self.spec.provider == "claude":
                 self._ready_tail = (self._ready_tail
                                     + _CSI_RE.sub("", text))[-600:]
-                tail = self._ready_tail.lower()
-                ready = any(h in tail for h in _CLAUDE_READY_HINTS)
+                ready = self._has_ready_hint(self._ready_tail)
             else:
                 ready = "\x1b[?2004h" in text
             if ready:
-                self._prompt_ready = True
-                if self._pending_task is not None and self.worker.is_running():
-                    task, self._pending_task = self._pending_task, None
-                    self._write_task_to_pty(task)
+                self._became_prompt_ready()
         self.pty_output.emit(text)
+
+    @staticmethod
+    def _has_ready_hint(text: str) -> bool:
+        """Whether `text` shows Claude's input-box footer, in any of its
+        rotating forms."""
+        low = text.lower()
+        return any(h in low for h in _CLAUDE_READY_HINTS)
+
+    def _became_prompt_ready(self) -> None:
+        """The TUI's prompt just went live: announce it and release any task
+        that was waiting for exactly this."""
+        self._set_prompt_ready(True)
+        if self._pending_task is not None and self.worker.is_running():
+            task, self._pending_task = self._pending_task, None
+            self._write_task_to_pty(task)
 
     def _set_status(self, status: AgentStatus) -> None:
         if status is not self.status:
@@ -1267,6 +1633,7 @@ class TerminalAgent(QObject):
                     self._busy = False
                     self.activity_changed.emit(False)
                 self._reset_waiting()  # a dead/stopped agent isn't waiting
+                self._reset_bg_shell()  # ...nor waiting on a shell to finish
             self.status_changed.emit(status)
 
     def _on_worker_state(self, state: WorkerState) -> None:

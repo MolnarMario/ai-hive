@@ -226,6 +226,27 @@ class PtyWorker(QObject):
     def process(self):
         return self._proc
 
+    def job_process_count(self) -> int:
+        return self._job.process_count() if self._job else 0
+
+    def job_process_ids(self) -> list[int]:
+        return self._job.process_ids() if self._job else []
+
+    def kill_extra_processes(self, keep: set[int]) -> list[int]:
+        """Hard-kill every process in this job EXCEPT the given ids -- see
+        TerminalAgent.kill_bg_shell_extras, which decides who's in `keep`.
+        Each victim is tree-killed individually (never the job as a whole,
+        which would also take down the interactive process itself)."""
+        victims = [p for p in self.job_process_ids() if p not in keep]
+        for p in victims:
+            _taskkill_tree(p)
+        return victims
+
+    def kill_pid(self, pid: int) -> None:
+        """Hard-kill exactly one process -- the single-item equivalent of
+        kill_extra_processes, for TerminalAgent.kill_bg_shell_pid."""
+        _taskkill_tree(pid)
+
     # -------------------------------------------------------------- slots ---
 
     def _set_state(self, state: WorkerState) -> None:

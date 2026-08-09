@@ -390,25 +390,36 @@ WorkspaceRow[search_hit="true"] {{
 #WsQ:hover {{ background: rgba(217,178,74,0.34); }}
 /* hourglass + count: agent(s) stopped by the plan usage limit, not yet
    resumed. Gold like #WsAgentLimit/#CardLimitMark (the agent is fine, only
-   waiting for the window), never the error red. Wider than #WsQ's fixed pill
-   since the label carries a count, not a single glyph. */
+   waiting for the window), never the error red. Deliberately UNBOXED (like
+   #WsSched below, unlike #WsQ's fixed pill) and sized up so the glyph itself
+   reads at a glance instead of needing a frame around it. */
 #WsLimit {{
-    background: rgba(217,178,74,0.18); color: {p.ACCENT_GOLD};
-    border: 1px solid {p.ACCENT_GOLD}; border-radius: 9px;
-    font-weight: 800; font-size: 11px; padding: 0 5px; min-width: 18px;
-    min-height: 18px; max-height: 18px;
+    background: transparent; border: none; color: {p.ACCENT_GOLD};
+    font-weight: 800; font-size: 17px; padding: 0 2px; min-width: 18px;
+    min-height: 20px;
 }}
-#WsLimit:hover {{ background: rgba(217,178,74,0.34); }}
+#WsLimit:hover {{ background: rgba(217,178,74,0.20); border-radius: 4px; }}
 /* stopwatch + count: agent(s) here hold a message queued to be typed in
-   later. Same pill shape as #WsLimit so the row's indicators read as one
-   family; the glyph is what tells them apart. */
+   later. Deliberately UNBOXED (unlike #WsQ's pill) and sized up so the
+   glyph itself reads at a glance instead of needing a frame around it. */
 #WsSched {{
-    background: rgba(217,178,74,0.14); color: {p.ACCENT_GOLD};
-    border: 1px solid {p.ACCENT_GOLD_DIM}; border-radius: 9px;
-    font-weight: 800; font-size: 11px; padding: 0 5px; min-width: 18px;
-    min-height: 18px; max-height: 18px;
+    background: transparent; border: none; color: {p.ACCENT_GOLD};
+    font-weight: 800; font-size: 17px; padding: 0 2px; min-width: 18px;
+    min-height: 20px;
 }}
-#WsSched:hover {{ background: rgba(217,178,74,0.30); }}
+#WsSched:hover {{ background: rgba(217,178,74,0.20); border-radius: 4px; }}
+/* gear + count: agent(s) idle but waiting on a background command they
+   started to finish. Orange (ACCENT_ORANGE) rather than gold/yellow -- the
+   same warm family as the "working" pulse, but a distinct hue so it doesn't
+   read as another instance of it. Deliberately UNBOXED, same pattern as
+   #WsLimit/#WsSched, and NOT animated (unlike the pulsing AgentCountBadge)
+   so it stays visually calmer than "actively working". */
+#WsBgShell {{
+    background: transparent; border: none; color: {p.ACCENT_ORANGE};
+    font-weight: 800; font-size: 17px; padding: 0 2px; min-width: 18px;
+    min-height: 20px;
+}}
+#WsBgShell:hover {{ background: rgba(232,152,58,0.20); border-radius: 4px; }}
 
 /* sidebar search: the magnifier toggle + the overlay input it reveals */
 #SearchBtn {{
@@ -475,10 +486,35 @@ WorkspaceRow[search_hit="true"] {{
 #WsAgentTask {{ color: {p.TEXT_DIM}; font-size: 13px; }}
 #WsAgentQ {{ color: {p.YELLOW}; font-size: 14px; font-weight: 800; }}
 /* cut off by the usage limit: amber like the "?", but deliberately NOT the
-   error red: the agent is fine, it is only waiting for the window to reopen */
-#WsAgentLimit {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
-/* a message is queued to be typed into this agent later */
-#WsAgentSched {{ color: {p.ACCENT_GOLD_DIM}; font-size: 12px; }}
+   error red: the agent is fine, it is only waiting for the window to reopen.
+   Sized up to match #WsAgentSched beside it -- still an inert label (no
+   click of its own; the row itself is the click target), so no hover chrome. */
+#WsAgentLimit {{ color: {p.ACCENT_GOLD}; font-size: 16px; }}
+/* idle but a background command it started is still running: orange like
+   #WsBgShell, distinct from the gold "fine, just waiting" family. A
+   QToolButton like #WsAgentSched below (a click opens a menu of what to
+   kill), same flat base + hover pill so it reads as clickable rather than
+   another status glyph. */
+#WsAgentBgShell {{
+    background: transparent; border: 1px solid transparent; border-radius: 4px;
+    padding: 1px 3px; color: {p.ACCENT_ORANGE}; font-size: 16px;
+}}
+#WsAgentBgShell:hover {{
+    background: rgba(232,152,58,0.20); border-color: {p.ACCENT_ORANGE};
+}}
+/* a message is queued to be typed into this agent later -- a QToolButton
+   (unlike WsAgentQ/WsAgentLimit, which are inert labels), so it needs its own
+   flat/borderless base or it grows platform button chrome. Sized up from the
+   inert marks beside it and given a hover pill (border appears only on
+   hover) so it reads as clickable, not as another status glyph. */
+#WsAgentSched {{
+    background: transparent; border: 1px solid transparent; border-radius: 4px;
+    padding: 1px 3px; color: {p.ACCENT_GOLD_DIM}; font-size: 16px;
+}}
+#WsAgentSched:hover {{
+    color: {p.ACCENT_GOLD}; background: rgba(217,178,74,0.20);
+    border-color: {p.ACCENT_GOLD_DIM};
+}}
 
 /* inline file explorer rows (a workspace expanded to its VS Code-style file
    tree): a type/folder icon + the name; the revealed row (a file jumped to from
@@ -531,6 +567,15 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     padding: 0px 4px;
 }}
 #CardLimitMark {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
+/* clickable (opens a menu of what to kill) -- transparent by default, like
+   #CardSchedule, so it doesn't inherit the platform's default button chrome */
+#CardBgShell {{
+    background: transparent; color: {p.ACCENT_ORANGE};
+    border: 1px solid transparent; border-radius: 8px; font-size: 13px;
+}}
+#CardBgShell:hover {{
+    background: rgba(232,152,58,0.20); border-color: {p.ACCENT_ORANGE};
+}}
 /* the deferred-message countdown ("(clock) 12:04"), clickable to change or
    cancel it. Gold like the hourglass beside it: nothing is wrong, something is
    simply scheduled. The MISSED state is the exception and is meant to be
@@ -652,6 +697,21 @@ QLineEdit {{
 }}
 QLineEdit:focus {{ border-color: {p.ACCENT_BLUE}; }}
 QLineEdit:disabled {{ color: {p.TEXT_FAINT}; }}
+/* Any plain QPlainTextEdit/QTextEdit dropped into a dialog (e.g. the
+   schedule-message composer) with no objectName of its own used to fall back
+   to the platform's native white base + default text color instead of the
+   skin, which read as a near-illegible pale-on-white box on every dark
+   theme. #Console/#RosterTask keep their own rules below/above (those ARE
+   objectName-scoped and win on specificity), this is just the catch-all so a
+   future bare text area is never unstyled again. */
+QPlainTextEdit, QTextEdit {{
+    background: {p.BG_INPUT}; color: {p.TEXT};
+    border: 1px solid {p.BORDER}; border-radius: 3px;
+    selection-background-color: {p.SELECTION};
+    selection-color: {p.SELECTION_FG};
+    placeholder-text-color: {p.TEXT_FAINT};
+}}
+QPlainTextEdit:focus, QTextEdit:focus {{ border-color: {p.ACCENT_BLUE}; }}
 QComboBox {{
     background: {p.BG_INPUT}; border: 1px solid {p.BORDER};
     border-radius: 3px; padding: 4px 8px;

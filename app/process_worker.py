@@ -243,6 +243,19 @@ def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
     AI-agent kinds (Claude/OpenAI/Gemini/Grok) route through app.providers so
     the model/effort selections become real CLI flags.
     """
+    # Coerce to the real enum, because a plain str gets this far in practice
+    # and does not fail until much later, somewhere else. Qt is the source:
+    # QComboBox.currentData() round-trips a value through QVariant, and a
+    # str-mixin enum comes back out as a plain str (verified) — so every agent
+    # built from the New Agent dialog carried kind="claude" rather than
+    # AgentKind.CLAUDE. Nothing here notices: AgentKind is a str-mixin, so the
+    # `in PTY_ONLY_KINDS` / `in AI_KINDS` lookups below all still hit. What
+    # breaks is `AgentSpec.to_dict`'s `self.kind.value`, on every save, for the
+    # life of the process — the agent degrades to a minimal record and silently
+    # loses its model, effort, permission mode, role and task on the next
+    # restore. Restarting "fixed" it only because `from_dict` rebuilds the enum.
+    # Doing it here makes the invariant true by construction for every caller.
+    kind = AgentKind(kind)
     args = list(args or [])
     if kind in PTY_ONLY_KINDS:
         pty = True
@@ -396,11 +409,42 @@ if sys.platform == "win32":
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
+    # fixed-capacity stand-in for JOBOBJECT_BASIC_PROCESS_ID_LIST's flexible
+    # trailing array (ctypes has no flexible array member); we only ever
+    # read the NumberOfAssignedProcesses header field, so a generous cap is
+    # enough -- no realistic agent process tree needs more.
+    _BG_JOB_PID_CAP = 64
+
+    class _JOBOBJECT_BASIC_PROCESS_ID_LIST(ctypes.Structure):
+        _fields_ = [
+            ("NumberOfAssignedProcesses", wintypes.DWORD),
+            ("NumberOfProcessIdsInList", wintypes.DWORD),
+            ("ProcessIdList", ctypes.c_size_t * _BG_JOB_PID_CAP),
+        ]
+
     _JobObjectExtendedLimitInformation = 9
+    _JobObjectBasicProcessIdList = 3
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
     _PROCESS_SET_QUOTA = 0x0100
     _PROCESS_TERMINATE = 0x0001
     _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # QueryInformationJobObject's info buffer is a real (variable-shaped)
+    # struct, unlike the fixed-size ones the other WinJob calls exchange --
+    # give it explicit prototypes rather than relying on ctypes' default
+    # int-sized inference, which can truncate the HANDLE on 64-bit.
+    _k32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    _k32.QueryInformationJobObject.restype = wintypes.BOOL
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    # same explicit-prototype discipline as QueryInformationJobObject above:
+    # this one hands back a HANDLE-adjacent BOOL too, and it's only ever used
+    # to label a pid for a human (describe_pid), so a truncation here should
+    # fail closed to the bare "pid N" fallback, not silently misread memory.
+    _k32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD)]
+    _k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 
 
 class WinJob:
@@ -446,6 +490,44 @@ class WinJob:
             return False
         return bool(_k32.TerminateJobObject(self._handle, exit_code))
 
+    def process_count(self) -> int:
+        """Best-effort count of processes currently alive in this job (the
+        agent itself plus any descendant it spawned) -- used to notice a
+        still-running background command even once the agent has gone
+        quiet. Returns 0 on any failure (no handle, unsupported, query
+        error), same as every other WinJob method never raising; callers
+        must treat 0 as "unknown," not "empty.\""""
+        if not self._handle:
+            return 0
+        info = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
+        needed = wintypes.DWORD(0)
+        ok = _k32.QueryInformationJobObject(
+            self._handle, _JobObjectBasicProcessIdList, ctypes.byref(info),
+            ctypes.sizeof(info), ctypes.byref(needed))
+        if not ok:
+            return 0
+        return int(info.NumberOfAssignedProcesses)
+
+    def process_ids(self) -> list[int]:
+        """Best-effort list of process ids currently alive in this job --
+        the identity-carrying sibling of process_count(), used to tell WHICH
+        extra processes to kill (see TerminalAgent.kill_bg_shell_extras)
+        rather than just how many there are. Same contract as
+        process_count(): an empty list on any failure means "unknown," not
+        "empty." Capped at _BG_JOB_PID_CAP like the query buffer itself; no
+        realistic agent process tree needs more."""
+        if not self._handle:
+            return []
+        info = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
+        needed = wintypes.DWORD(0)
+        ok = _k32.QueryInformationJobObject(
+            self._handle, _JobObjectBasicProcessIdList, ctypes.byref(info),
+            ctypes.sizeof(info), ctypes.byref(needed))
+        if not ok:
+            return []
+        n = min(int(info.NumberOfProcessIdsInList), _BG_JOB_PID_CAP)
+        return [int(info.ProcessIdList[i]) for i in range(n)]
+
     def close(self) -> None:
         if self._handle:
             _k32.CloseHandle(self._handle)
@@ -460,6 +542,29 @@ def _taskkill_tree(pid: int) -> None:
                        timeout=5)
     except Exception:
         pass
+
+
+def describe_pid(pid: int) -> str:
+    """Best-effort short label for a pid -- its executable's base name (e.g.
+    "java.exe", "adb.exe") -- so a human picking one process out of the kill
+    menu can tell them apart. Purely cosmetic: nothing here feeds a kill
+    decision. Falls back to a bare "pid N" if the process can't be queried
+    (already exited, access denied, non-Windows)."""
+    if sys.platform != "win32" or not pid:
+        return f"pid {pid}"
+    handle = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False,
+                              int(pid))
+    if not handle:
+        return f"pid {pid}"
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        size = wintypes.DWORD(260)
+        ok = _k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+        if not ok or not buf.value:
+            return f"pid {pid}"
+        return buf.value.rsplit("\\", 1)[-1]
+    finally:
+        _k32.CloseHandle(handle)
 
 
 # ----------------------------------------------------------------- worker ---
@@ -627,6 +732,27 @@ class ProcessWorker(QObject):
 
     def process(self) -> QProcess | None:
         return self._proc
+
+    def job_process_count(self) -> int:
+        return self._job.process_count() if self._job else 0
+
+    def job_process_ids(self) -> list[int]:
+        return self._job.process_ids() if self._job else []
+
+    def kill_extra_processes(self, keep: set[int]) -> list[int]:
+        """Hard-kill every process in this job EXCEPT the given ids -- see
+        TerminalAgent.kill_bg_shell_extras, which decides who's in `keep`.
+        Each victim is tree-killed individually (never the job as a whole,
+        which would also take down the interactive process itself)."""
+        victims = [p for p in self.job_process_ids() if p not in keep]
+        for p in victims:
+            _taskkill_tree(p)
+        return victims
+
+    def kill_pid(self, pid: int) -> None:
+        """Hard-kill exactly one process -- the single-item equivalent of
+        kill_extra_processes, for TerminalAgent.kill_bg_shell_pid."""
+        _taskkill_tree(pid)
 
     # -------------------------------------------------------------- slots ---
 

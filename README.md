@@ -20,7 +20,9 @@ workspaces keep executing — switching never pauses anything.
   **Grok via the xAI CLI** (`grok`) with `-m` model selection + `--continue`
   resume, verified against grok 0.2.93; OpenAI as an editable command template
   until its CLI is installed). Shells
-  and Python scripts are also first-class agent types.
+  and Python scripts are also first-class agent types. A newly created agent's
+  card is scrolled into view and given keyboard focus immediately, so you can
+  start typing without an extra click.
 - **One-click grid layouts** — a visual selector (Auto, 1×1 … 4×3, including
   the 3×1 strip and 1×3 stack) applies instantly and preserves agent state;
   empty cells show clickable "＋ New agent" slots. Layout names read
@@ -79,6 +81,27 @@ workspaces keep executing — switching never pauses anything.
   even while you're heads-down in another workspace — handy when agents you sent
   into plan mode come back with questions. Toggle it with the **🔔 button** in
   the top bar (persists across restarts).
+- **Taskbar working count** — the same signal, but from *outside* the app. The
+  Windows taskbar icon carries a small badge with the number of agents currently
+  working, so you can tell at a glance from any other window whether the hive is
+  still churning, whether it dropped from five workers to one (time to start
+  reviewing), or whether it has gone completely quiet. **No badge at all** means
+  nothing is running, so an idle hive costs you no visual noise. The disc turns
+  **blue** when one of the working agents is waiting on a question, and shows a
+  blue **?** when nothing is working but something needs you. Past nine it reads
+  `9+`. Windows allows an app exactly one overlay icon and places it itself (on
+  Windows 11, the icon's top-right corner), which is why the count and the
+  question have to share one small square rather than getting a corner each.
+  Toggle it with the **🪟 button** beside the bell (persists across restarts).
+- **Background-shell indicator** — an agent can look completely idle while a
+  command it started (a Claude `Bash` call run in the background, a plain
+  shell's `cmd &`) is still going. A **⚙ gear badge** shows on the sidebar
+  row, next to the affected agent in the expanded list, and in the terminal's
+  card header once that's been true for a few seconds, so you don't close AI
+  Hive thinking nothing is happening. It shares the taskbar's one overlay
+  square too: when nothing is busy or asking but a shell is still running,
+  the disc turns **violet** with the count, instead of showing nothing at
+  all.
 - **Plan usage readout** — a top-bar badge, left of the theme picker, showing
   how much of your Claude plan you've burned and when it comes back:
   `21% used, resets in 1h20m at 14:49` — countdown first, then the wall-clock
@@ -316,7 +339,12 @@ error dialog instead of silently closing. Packaging to a distributable
   strip along the bottom. So reopening the app shows you your work rather
   than a wall of dead terminals, and nothing relaunches behind your back;
   the first keystroke starts it, and a woken Claude agent also reclaims its
-  conversation.
+  conversation. While an agent that *is* coming back up launches, its card
+  shows a **quiet loader** (a sweeping arc over `restoring conversation…`)
+  instead of the CLI's half-drawn boot frames, which used to appear as a
+  mangled narrow fragment in the terminal's top-left corner until the
+  conversation finished replaying. It lifts with a short fade the moment the
+  prompt is live, and gets out of the way at once if you start typing.
 - **Scrolling** — in a full terminal the wheel does what a real terminal does:
   fullscreen apps that request mouse events (Claude Code) receive the wheel
   and scroll their own transcript; other fullscreen apps (vim, less) get
@@ -525,7 +553,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1101 checks drive the real app headlessly (offscreen Qt platform) with real
+1269 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -593,6 +621,7 @@ app/
   session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
   session_hook.py          SessionStart hook: the child reports its live conversation id
   chime.py                 notification bell (WAV synth + async play, Qt-free) for the "?" alert
+  taskbar_overlay.py       the Windows taskbar corner badge (ITaskbarList3 via ctypes, Qt-free)
   claude_usage.py          live plan-usage reading (/api/oauth/usage) + limit edges (Qt-free)
   limit_banner.py          recognising a usage cut-off + when it resets (Qt-free, shared)
   limit_ledger.py          durable record of cut-offs: who, when, and how it ended (Qt-free)
@@ -606,10 +635,10 @@ app/
                            Ctrl+click paths open + reveal), grid_selector
                            (on-screen popup), activity_panel, agent_file_map (tree
                            diagram), ornaments (drop-caps / dividers / count-badge
-                           + working-count spinner)
+                           + working-count spinner + taskbar-badge painter)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1101 checks)
+tests/smoke_test.py        headless end-to-end suite (1269 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

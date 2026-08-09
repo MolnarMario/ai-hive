@@ -38,15 +38,16 @@ import uuid
 from PySide6.QtCore import (QEasingCurve, QEvent, QFileSystemWatcher, QMimeData,
                             QPoint, QPropertyAnimation, QRect, QSize, Qt, QTimer,
                             Signal)
-from PySide6.QtGui import (QColor, QDrag, QFont, QFontMetrics, QPainter, QPen,
-                           QPixmap)
+from PySide6.QtGui import (QAction, QColor, QDrag, QFont, QFontMetrics,
+                           QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
-                               QHBoxLayout, QLabel, QLineEdit, QSizePolicy,
-                               QToolButton, QTreeWidget, QTreeWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QHBoxLayout, QLabel, QLineEdit, QMenu,
+                               QSizePolicy, QToolButton, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import scheduled_send
 from ..filetypes import EMOJI_FONT, FOLDER_ICON, FOLDER_OPEN_ICON, file_icon
+from ..process_worker import describe_pid
 from ..terminal_agent import AgentStatus
 from ..ui_theme import Palette, repolish
 from .activity_panel import _ICON
@@ -114,6 +115,13 @@ class WorkspaceRow(QFrame):
         text_col.setSpacing(0)
         self.name_label = QLabel(name, self)
         self.name_label.setObjectName("WsName")
+        # allowed to shrink all the way to 0: the icons/badges to its right
+        # must NEVER be squeezed out or collapsed behind a "..." overflow to
+        # make room for the name — the name concedes the space instead, even
+        # if that means it's fully covered. A workspace's name and position
+        # are static, so a temporarily short name while badges are up front
+        # is a non-issue; a hidden icon (a waiting "?", a working spinner) is not.
+        self.name_label.setMinimumWidth(0)
         self.rename_edit = QLineEdit(self)
         self.rename_edit.setObjectName("WsRenameEdit")
         self.rename_edit.hide()
@@ -188,6 +196,16 @@ class WorkspaceRow(QFrame):
         self.sched_badge.clicked.connect(
             lambda: self.agentsRequested.emit(self.ws_id))
 
+        # gear + count: agent(s) here are idle (not busy) but a background
+        # command they started (a Bash run_in_background call, a shell's
+        # `cmd &`) is still running. Same click target as the badges above.
+        self.bg_badge = QToolButton(self)
+        self.bg_badge.setObjectName("WsBgShell")
+        self.bg_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.bg_badge.hide()
+        self.bg_badge.clicked.connect(
+            lambda: self.agentsRequested.emit(self.ws_id))
+
         # a sweeping-arc throbber with the WORKING count; pinned far-right, so
         # the hover folder/delete buttons appear to its LEFT (see layout order)
         self.work_spinner = WorkspaceSpinner(self)
@@ -196,15 +214,60 @@ class WorkspaceRow(QFrame):
         lay.addWidget(self.count_badge)
         lay.addWidget(self.tree_btn)      # always-visible file-explorer caret
         lay.addLayout(text_col, 1)
-        lay.addWidget(self.folder_btn)
-        lay.addWidget(self.delete_btn)
-        lay.addWidget(self.sched_badge)
-        lay.addWidget(self.limit_badge)
-        lay.addWidget(self.q_badge)
-        lay.addWidget(self.work_spinner)
+
+        # folder/delete + every status badge live OUTSIDE `lay`, in their own
+        # tiny widget with its own layout, positioned by hand (_position_icon_
+        # stack) pinned to the row's right edge and RAISED above the name. A
+        # shared QHBoxLayout with the name would fight it for width and, once
+        # enough badges lit up at once (measured: folder+delete+one badge
+        # alone already exceeds the 230px sidebar), the layout engine crushes
+        # the losers down to a sliver — small enough that Qt's own button
+        # painter starts eliding their glyph+count text down to a bare "…",
+        # which is the exact "icons collapse under a ...' the user reported
+        # (and had pre-emptively asked to avoid). Living outside `lay` means
+        # this stack is sized ONLY from its own visible children's natural
+        # width, so it is NEVER a party to that squeeze; the name concedes
+        # the space instead by shrinking (down to 0, see name_label above),
+        # up to and including being covered outright.
+        self._icon_stack = QWidget(self)
+        icon_lay = QHBoxLayout(self._icon_stack)
+        icon_lay.setContentsMargins(0, 0, 0, 0)
+        icon_lay.setSpacing(8)
+        icon_lay.addWidget(self.folder_btn)
+        icon_lay.addWidget(self.delete_btn)
+        icon_lay.addWidget(self.sched_badge)
+        icon_lay.addWidget(self.limit_badge)
+        icon_lay.addWidget(self.bg_badge)
+        icon_lay.addWidget(self.q_badge)
+        icon_lay.addWidget(self.work_spinner)
+        self._icon_stack.raise_()
 
         self.rename_edit.returnPressed.connect(self._commit_rename)
         self.rename_edit.installEventFilter(self)
+        self._position_icon_stack()
+
+    # -------------------------------------------------------- icon stack ---
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_icon_stack()
+
+    def _position_icon_stack(self) -> None:
+        """Pin the icon stack to the row's right edge, sized to exactly what
+        its currently-visible children need — never squeezed, never elided."""
+        self._icon_stack.adjustSize()
+        w, h = self._icon_stack.width(), self._icon_stack.height()
+        margin = self.layout().contentsMargins().right()
+        x = self.width() - w - margin
+        # in the rare case where every badge is lit at once and there simply
+        # isn't 230px of room, prefer covering the count badge/name over
+        # letting the stack hang off the row's LEFT edge (which would clip
+        # its leftmost icon instead of just overlapping other chrome) — clamp
+        # so the stack always stays fully inside the row when it can fit at
+        # all, and is right-anchored (never left-clipped) when it can't.
+        x = max(0, x)
+        y = (self.height() - h) // 2
+        self._icon_stack.move(x, y)
 
     # ------------------------------------------------------------- state ---
 
@@ -267,10 +330,22 @@ class WorkspaceRow(QFrame):
             self.sched_badge.setToolTip(
                 f"{scheduled} agent(s) with a scheduled message, "
                 "click to see who")
+        # the gear + count shows agent(s) idle but waiting on a background
+        # command they started to finish (see TerminalAgent.poll_bg_shell)
+        bg = stats.get("bg_shell", 0)
+        self.bg_badge.setVisible(bg > 0)
+        if bg > 0:
+            self.bg_badge.setText(f"⚙{bg}")
+            self.bg_badge.setToolTip(
+                f"{bg} agent(s) idle but still waiting on a background "
+                "command to finish, click to see who")
         tip = (f"{total} agent(s): {busy} working, {running} running, "
                f"{e} error, {waiting} waiting, {blocked} limit-stopped, "
-               f"{scheduled} scheduled")
+               f"{scheduled} scheduled, {bg} background-shell")
         self.setToolTip(f"{tip}\n{self._folder}" if self._folder else tip)
+        # any of the above may have changed the icon stack's visible children
+        # (and so its natural width) — re-pin it to the right edge
+        self._position_icon_stack()
 
     # ------------------------------------------------------------ rename ---
 
@@ -357,9 +432,13 @@ class WorkspaceRow(QFrame):
         # folder/delete appear ONLY while hovering the row (not on the active
         # row) so the workspace name keeps the full width the rest of the time;
         # the count badge carries the workspace's status at all times, and the
-        # file-explorer caret (tree_btn) is always visible up front by the name
+        # file-explorer caret (tree_btn) is always visible up front by the name.
+        # These are the ONLY things gated on hover — every status badge and the
+        # working spinner stay governed purely by their own state (see
+        # set_stats), never by hover, so they can never be hidden by it.
         self.delete_btn.setVisible(hovered)
         self.folder_btn.setVisible(hovered)
+        self._position_icon_stack()
 
 
 class CategoryRow(QFrame):
@@ -632,7 +711,8 @@ class AgentRow(QFrame):
     dot, the agent's NAME on the left, its current-task SUMMARY beside the name,
     and a "?" when it's waiting for the user. Clicking it reveals the card."""
 
-    activated = Signal(str, str)   # ws_id, agent_id
+    activated = Signal(str, str)        # ws_id, agent_id
+    schedRequested = Signal(str, str)   # ws_id, agent_id (⏱ clicked)
 
     def __init__(self, ws_id: str, agent, parent=None):
         super().__init__(parent)
@@ -640,6 +720,11 @@ class AgentRow(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.ws_id = ws_id
         self.agent_id = agent.id
+        # kept live by refresh() on every poll -- the gear's kill menu is
+        # built directly from this (unlike sched_mark, which only needs to
+        # ask MainWindow to open a dialog), since a menu of what to kill
+        # depends on this exact agent's current process list, not just its id
+        self.agent = agent
         self._full = ""     # untruncated summary, re-elided to the live width
         self.setFixedHeight(AGENT_HEIGHT)
 
@@ -663,20 +748,43 @@ class AgentRow(QFrame):
         self.limit_mark = QLabel("⏳", self)
         self.limit_mark.setObjectName("WsAgentLimit")
         self.limit_mark.hide()
+        # idle but a background command it started is still running -- same
+        # marker as the card header, and same QToolButton-not-QLabel trick as
+        # sched_mark below: a click opens a menu of what to kill and must be
+        # CONSUMED rather than bubbling to the row's whole-row activation.
+        self.bg_mark = QToolButton(self)
+        self.bg_mark.setObjectName("WsAgentBgShell")
+        self.bg_mark.setText("⚙")
+        self.bg_mark.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.bg_mark.setToolTip(
+            "Idle, but a background command it started is still running. "
+            "Click to choose what to stop")
+        self.bg_mark.hide()
+        self.bg_mark.clicked.connect(self._show_bg_shell_menu)
         # a message is queued to be typed into this agent later, so a scheduled
-        # send is findable from a collapsed workspace too
-        self.sched_mark = QLabel("⏱", self)
+        # send is findable from a collapsed workspace too. A QToolButton (not a
+        # QLabel like q/limit_mark above) so its own click is CONSUMED instead
+        # of bubbling to the row's whole-row "reveal the card" handler -- same
+        # trick WorkspaceRow's badges already use to stay independently
+        # clickable inside a row that is itself one big click target.
+        self.sched_mark = QToolButton(self)
         self.sched_mark.setObjectName("WsAgentSched")
+        self.sched_mark.setText("⏱")
+        self.sched_mark.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sched_mark.hide()
+        self.sched_mark.clicked.connect(
+            lambda: self.schedRequested.emit(self.ws_id, self.agent_id))
         lay.addWidget(self.dot)
         lay.addWidget(self.name)
         lay.addWidget(self.summary, 1)
         lay.addWidget(self.sched_mark)
         lay.addWidget(self.limit_mark)
+        lay.addWidget(self.bg_mark)
         lay.addWidget(self.q)
         self.refresh(agent)
 
     def refresh(self, agent) -> None:
+        self.agent = agent   # kept live -- see the comment in __init__
         # WORK, not liveness (mirrors the sidebar workspace badge): a RUNNING
         # agent that is actively producing output (is_busy) shows amber; a
         # RUNNING-but-quiet agent stays green. Other statuses map as usual.
@@ -696,6 +804,10 @@ class AgentRow(QFrame):
         if blocked:
             self.limit_mark.setToolTip(
                 getattr(agent, "limit_summary", lambda: "")())
+        # idle but a background command it started is still running, polled
+        # on the same tick as everything else here
+        self.bg_mark.setVisible(
+            bool(getattr(agent, "is_bg_shell_busy", lambda: False)()))
         # deferred messages, polled on the same tick as everything else here.
         # The countdown itself stays on the card: this row only says one exists.
         held = list(getattr(agent, "scheduled_messages", lambda: [])())
@@ -704,11 +816,33 @@ class AgentRow(QFrame):
             missed = sum(1 for m in held if m.state == scheduled_send.MISSED)
             self.sched_mark.setToolTip(
                 f"{len(held)} scheduled message(s)"
-                + (f", {missed} missed" if missed else ""))
+                + (f", {missed} missed" if missed else "")
+                + " -- click to view or edit")
         # summary = assigned task, else Claude's live AI conversation title
         get = getattr(agent, "summary", None)
         self._full = (get() if callable(get) else agent.current_task or "").strip()
         self.summary.set_full_text(self._full)
+
+    def _show_bg_shell_menu(self) -> None:
+        """List each process behind the gear badge so the user can kill one
+        at a time instead of an all-or-nothing click -- an accidental click
+        near the badge must not risk killing something an agent is actually
+        waiting on. Same menu the card header's gear builds."""
+        pids = list(getattr(self.agent, "bg_shell_extra_pids", lambda: [])())
+        if not pids:
+            return
+        menu = QMenu(self)
+        for pid in pids:
+            act = QAction(f"Kill {describe_pid(pid)} (pid {pid})", menu)
+            act.triggered.connect(
+                lambda checked=False, p=pid: self.agent.kill_bg_shell_pid(p))
+            menu.addAction(act)
+        if len(pids) > 1:
+            menu.addSeparator()
+            act_all = QAction(f"Kill all {len(pids)}", menu)
+            act_all.triggered.connect(self.agent.kill_bg_shell_extras)
+            menu.addAction(act_all)
+        menu.exec(self.bg_mark.mapToGlobal(self.bg_mark.rect().bottomLeft()))
 
     def set_search_hit(self, hit: bool) -> None:
         """Tint the agent row when it matches the active sidebar search."""
@@ -802,6 +936,7 @@ class Sidebar(QFrame):
     openFolderRequested = Signal(str)
     agentsRequested = Signal(str)            # ws_id (count badge clicked; M3)
     agentActivated = Signal(str, str)        # ws_id, agent_id (reveal its card)
+    agentScheduleRequested = Signal(str, str)  # ws_id, agent_id (⏱ clicked)
     reordered = Signal(list)                 # flattened ws-id order (M1)
     layoutChanged = Signal(list)             # full node model: order+categories
     filesRequested = Signal(str)             # ws_id (file-tree toggle clicked)
@@ -1179,6 +1314,7 @@ class Sidebar(QFrame):
             child.setSizeHint(0, QSize(SIDEBAR_WIDTH, AGENT_HEIGHT))
             arow = AgentRow(ws_id, agent)
             arow.activated.connect(self.agentActivated)
+            arow.schedRequested.connect(self.agentScheduleRequested)
             arow.set_search_hit(agent.id in self._search_agent_hits)
             self.tree.setItemWidget(child, 0, arow)
             self._agent_rows[agent.id] = arow

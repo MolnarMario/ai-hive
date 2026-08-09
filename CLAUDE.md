@@ -35,7 +35,17 @@ this file is the invariants that must survive every change.
   different lines of `AgentSpec.to_dict` but produce byte-identical output,
   and `AgentKind` is a str-mixin enum so even the serialized `kind` can't tell
   them apart. Don't remove these guards or let a new save path bypass the
-  audit trail. Conversely, TRANSIENT signals must NEVER mark `dirty`:
+  audit trail. The plain-str `kind` half was then found and CLOSED AT SOURCE:
+  `QComboBox.currentData()` round-trips a value through QVariant and hands a
+  str-mixin enum back as a PLAIN STR, so every agent built from the New Agent
+  dialog carried `kind="claude"`. Nothing downstream notices (the str-mixin
+  makes every `in AI_KINDS` / `in PTY_ONLY_KINDS` lookup still hit) until
+  `to_dict` reaches `.value`, on EVERY save, for the life of the process —
+  832 `SAVE-DEGRADE` lines in one observed session, and the agent silently
+  losing its model/effort/permission-mode/role/task on the next restore.
+  Restarting appeared to "fix" it only because `from_dict` rebuilds the enum.
+  `build_spec` now coerces (`kind = AgentKind(kind)`) so the invariant holds by
+  construction for every caller; do NOT rely on call sites passing the enum. Conversely, TRANSIENT signals must NEVER mark `dirty`:
   `activity_changed` (busy/standby, derived from output activity — see the
   status-badge invariant) fires every couple of seconds while an agent works,
   so it connects to `_recompute` (refresh derived UI only), never `_touch`;
@@ -124,6 +134,41 @@ this file is the invariants that must survive every change.
   `Sidebar.agentActivated` → `MainWindow._reveal_agent` (switch ws + scroll+focus
   its card — the same primitive the Agent/File Map uses). The badge click is
   CONSUMED so it never bubbles to row-select/switch.
+- **The taskbar overlay is the ONE signal that leaves the window**
+  (`app/taskbar_overlay.py`, Qt-free/stdlib-only like `chime.py`;
+  `ornaments.taskbar_badge_bgra` paints it; `MainWindow._taskbar_badge_spec`/
+  `_push_taskbar_badge` drive it). Every other "an agent is working" indicator
+  lives INSIDE the app (the pulsing `AgentCountBadge`, the `WorkspaceSpinner`),
+  which is useless while the user is in another application waiting for the hive
+  to finish — the taskbar button is visible from everywhere, so the working count
+  goes there. THE CONSTRAINT THAT SHAPES IT: Windows gives an app exactly ONE
+  overlay icon and fixes it to the corner of the button
+  (`ITaskbarList3::SetOverlayIcon`; Qt 6 dropped `QWinTaskbarButton`, hence the
+  ctypes/COM shim beside `main.py`'s existing Win32 work). There is no second
+  slot and no choice of corner, so the count and "an agent has a question" SHARE
+  one ~16px square: the DIGIT is `sum(is_busy())` over `manager.all_agents()`,
+  the FILL COLOUR is `any(is_waiting())`. Deliberately the same two predicates
+  the sidebar reads, so the two surfaces can never disagree. Zero and zero means
+  NO overlay — that absence is the readout ("nothing is running, go and look"),
+  and it is what makes the feature self-silencing enough to leave on. Rules:
+  colours are FIXED constants (`ornaments.TASKBAR_WORKING`/`TASKBAR_ASKING`),
+  NOT `Palette` reads like every other badge — this is painted onto the OS
+  taskbar over the user's own accent colour, not onto our chrome, so following
+  the skin buys no coherence while risking a disc that vanishes; the count is
+  TRANSIENT exactly like `activity_changed` and the plan-usage reading, so
+  `_push_taskbar_badge` must NEVER `_touch`/`_schedule_save` (only the
+  `ui.taskbar_badge` preference saves, additively, no `SESSION_VERSION` bump);
+  the push is EDGE-GUARDED on a rendered key and coalesced behind
+  `TASKBAR_BADGE_MS`, because `workspaceStatsChanged` fires every couple of
+  seconds per busy agent and each push builds an HICON and crosses a COM
+  boundary; `_taskbar_key` advances only on a SUCCESSFUL push, so a refusal is
+  retried rather than remembered as current. `_push_taskbar_badge` returns early
+  unless `QGuiApplication.platformName() == "windows"`, which is what keeps the
+  offscreen smoke suite out of COM entirely — the whole state table is therefore
+  decided in `_taskbar_badge_spec`, with no window handle or apartment, and
+  that is what the tests drive. `taskbar_overlay` never raises (every entry
+  point returns a bool), and `closeEvent` clears the overlay before the window
+  goes so a stale "3 working" can't outlive the hive.
 - **The sidebar is a model-driven tree** (`widgets/sidebar.py`): `_nodes` is the
   ordered top-level list (workspaces + single-level `category` nodes with
   workspace children); drag-and-drop never moves Qt items (that strands the rich
@@ -332,7 +377,31 @@ this file is the invariants that must survive every change.
   successive 5-hour windows never end at the same wall time, and a genuine
   cut-off renders its menu directly below the banner (hence in view whenever the
   banner is), so this suppresses only the echo. `_limit_last_banner` therefore
-  SURVIVES `clear_limit_block` and is reset by `start`/`restart` alone.
+  SURVIVES `clear_limit_block` and is reset by `start`/`restart` alone — and
+  `mark_limit_blocked` MUST set it too. That was missed at first, so a latch
+  recovered from DISK armed no guard at all: the moment `recheck_limit` cleared
+  it on a successful resume, the very next burst re-latched on the same banner
+  still on screen and dated it 24 h out (live, 2026-08-07: `RESUMED` 22:29:42,
+  `BLOCKED … resets 2026-08-08 21:30` at 22:29:43). Comparing the LINE is
+  enough because both sources normalize through the same
+  `limit_banner.banner_line`; the transcript record and the live re-latch
+  carried byte-identical text.
+  THE SCAN WINDOW IS COUNTED IN CONTENT, NOT LINES (`TerminalAgent._tail_lines`,
+  the one helper all four screen-scan call sites now share). Claude's TUI pads
+  its frame with blank rows, so a raw `[-40:]` slice spans as little as 432
+  characters and 5 non-blank lines — measured on real screen snapshots, against
+  a median ~900 characters per frame repaint, i.e. less than half a frame. A
+  genuine cut-off was therefore invisible to BOTH the per-burst scrape and the
+  settle scrape 2 s later, and left no trace at all because `_note_limit_skip`
+  reads the same window (2026-08-07, CVsummer2026: zero `LIMIT` lines for an
+  agent whose transcript ends on the banner). `_scrape_limit` and
+  `_note_limit_skip` therefore pass `skip_blank=True` and MUST stay in
+  agreement. The other two callers keep RAW lines deliberately:
+  `_screen_waiting`'s 18-line bound plus its caret requirement is the tuning
+  that keeps the "?" chime off an agent's own numbered prose, and
+  `recheck_limit` wants the menu that is TORN DOWN on a resume — the raw tail
+  still holds that menu's earlier renders, so reaching further back would find
+  it forever and report "still blocked" on an agent already going again.
   TWO triggers land in `_resume_blocked_agents`, and the second is the one that
   must be reliable: (1) `planLimitCleared` resumes every latched agent (the
   ACCOUNT is provably clear); (2) `_check_limit_resets` on `LIMIT_WATCH_MS`
@@ -366,6 +435,25 @@ this file is the invariants that must survive every change.
   the window is still shut, and clearing the latch on the nudge itself — as
   this first did — burns the only attempt and parks the agent for good. A
   `nudge` refused because the TUI isn't ready must NOT consume an attempt.
+  BUT WAITING FOR READINESS MUST BE BOUNDED, because readiness can never
+  arrive on its own. Qt gives a `QStackedWidget` page NO `resizeEvent` until it
+  is made current (verified), so a card in a workspace the user has not opened
+  never fires `TerminalView.sizeChanged`, never calls `agent.resize`, and never
+  asks its child to redraw. Combined with readiness being decided ONCE PER
+  BURST against a 600-char `_ready_tail` — a footer followed by more than that
+  in the same burst is simply missed — an agent could sit un-nudgeable
+  indefinitely: `WAIT (TUI not ready)` every minute, ending only when the user
+  happened to click that workspace (live, 2026-08-07: nine ticks over ten
+  minutes). Two independent repairs, and both are needed because they cover
+  different halves: `_on_idle_timeout` RE-CHECKS readiness against the
+  4000-char `_screen_tail` (this fires 2 s after output settles, so it can only
+  ever flip readiness LATE — it cannot perturb launch or first-task-submit
+  timing, which is the whole point of the SessionStart invariant), and after
+  `LIMIT_REPAINT_AFTER_WAITS` quiet ticks `MainWindow._auto_continue_agent`
+  calls `TerminalAgent.request_repaint()` ONCE, which sends the child one
+  column narrower and back (`REPAINT_RESTORE_MS`) to force a full frame. The
+  repaint is reachable only by an agent already latched on a cut-off whose
+  reset has passed, so it can never poke a normally launching TUI.
   Related: an agent parked on the limit raises the "?" (its menu is exactly
   what `_screen_waiting` looks for) but must NOT ring the chime — it is not a
   question the user can answer, and it would wake them at 4am for something
@@ -623,6 +711,30 @@ this file is the invariants that must survive every change.
   was defeating the very thing it exists for. `_refresh_overlay` decides the
   shape on a STATUS change, never in `_place_overlay`, which runs per pixel
   during a drag or retile.
+- **A LAUNCHING terminal shows a loader, never the child's first frames**
+  (`ornaments.BootVeil`, `TerminalCard._begin_boot_veil`). The clean terminal
+  above is the right thing to hand a launching child, but it is not what the
+  user SEES: the child paints within milliseconds, at the PRE-LAYOUT width
+  (the tiling grid sizes the card after the agent is started, and
+  `TerminalView` debounces its resize by 120 ms), so every reopen still showed
+  a mangled narrow fragment in each terminal's top-left corner until the
+  conversation finished replaying. The veil covers exactly the launch-to-
+  prompt window: `_on_status` raises it whenever the agent is running and
+  `prompt_ready()` is False, and it comes down on the FIRST of four things,
+  all of which must keep working — the new `TerminalAgent.prompt_ready_changed`
+  edge (a fade, `finish()`), a keystroke, the agent stopping (the wake banner
+  owns that state), or `BOOT_VEIL_MAX_MS`. The last two are not optional: a
+  cover with only a positive release is a way to lose a terminal for good, and
+  readiness is a SCRAPE of the child's output (Claude's footer-hint family,
+  `?2004h` elsewhere) that an exotic shell may never produce. `prompt_ready_
+  changed` is TRANSIENT like `activity_changed` — a view signal only, edge-only
+  (`_set_prompt_ready`), never wired to a save. `is_active()` reads the veil's
+  OWN `_up` flag, not `isVisible()`: a card in a hidden workspace is not on
+  screen yet its child is still booting. Colours are read from the live
+  `Palette` at paint time (so it follows every skin, no QSS token), the widget
+  is `WA_TransparentForMouseEvents` + `NoFocus` so the terminal underneath
+  keeps every event, and both animations stop on `dismiss()` so a resting card
+  is free.
 - **Transcripts are backed up by AI Hive** (`app/transcripts.py`): snapshots
   land in `<session-dir>/transcripts/` at app start (in `create_main_window`,
   BEFORE agents launch) and at graceful close (`closeEvent`). The

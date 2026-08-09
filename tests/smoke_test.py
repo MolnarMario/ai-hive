@@ -152,7 +152,7 @@ def test_sidebar_count_badge():
     from PySide6.QtWidgets import QApplication
     from app.widgets.ornaments import AgentCountBadge
     from app.ui_theme import Palette
-    from app.widgets.sidebar import WorkspaceRow
+    from app.widgets.sidebar import WorkspaceRow, SIDEBAR_WIDTH, ROW_HEIGHT
 
     QApplication.instance() or QApplication([])
     row = WorkspaceRow("w1", "Alpha", "C:/proj")
@@ -215,6 +215,56 @@ def test_sidebar_count_badge():
     row._update_hover_buttons(hovered=True)
     check("row: hover reveals folder/delete",
           not row.folder_btn.isHidden() and not row.delete_btn.isHidden())
+
+    # even with hover buttons up AND every status badge lit at once, none of
+    # them may be hidden to make room — only the name label may shrink (down
+    # to 0 width; it has no minimum), so icons are never squeezed out or
+    # collapsed behind a "..." overflow.
+    row.set_stats({"total": 3, "active": 3, "busy": 2, "error": 0,
+                   "waiting": 1, "idle": 0, "limit_blocked": 1,
+                   "scheduled": 1, "bg_shell": 1})
+    check("row: name label has no minimum width (can shrink to 0 for icons)",
+          row.name_label.minimumWidth() == 0, row.name_label.minimumWidth())
+    check("row: every badge stays visible with hover buttons also up",
+          not row.folder_btn.isHidden() and not row.delete_btn.isHidden()
+          and not row.q_badge.isHidden() and not row.limit_badge.isHidden()
+          and not row.sched_badge.isHidden() and not row.bg_badge.isHidden()
+          and not row.work_spinner.isHidden(),
+          (row.folder_btn.isHidden(), row.delete_btn.isHidden(),
+           row.q_badge.isHidden(), row.limit_badge.isHidden(),
+           row.sched_badge.isHidden(), row.bg_badge.isHidden(),
+           row.work_spinner.isHidden()))
+
+    # the actual regression: forced into the real (narrow) sidebar column via
+    # setGeometry -- exactly what QTreeWidget.setItemWidget does -- a shared
+    # QHBoxLayout crushes every fixed-size icon down toward its floor, and a
+    # QToolButton whose ALLOCATED width lands below its text's natural width
+    # gets its own label auto-elided by Qt's style into a bare "...". Living
+    # in their own untouched layout (_icon_stack), each badge's width must be
+    # INDEPENDENT of the row's width -- squeezing the row into the real
+    # sidebar column must not change it at all. Compare against the same
+    # badges laid out with the row given plenty of room, rather than against
+    # sizeHint() directly, since sizeHint() and the post-layout width are not
+    # bit-identical on every platform/DPI -- what must hold is that the row
+    # being narrow changes nothing.
+    badges = (row.folder_btn, row.delete_btn, row.sched_badge,
+              row.limit_badge, row.bg_badge)
+    row.setGeometry(0, 0, 2000, ROW_HEIGHT)
+    row.layout().activate()
+    row._position_icon_stack()
+    row._icon_stack.layout().activate()
+    roomy_widths = {b.objectName(): b.width() for b in badges}
+
+    row.setGeometry(0, 0, SIDEBAR_WIDTH, ROW_HEIGHT)
+    row.layout().activate()
+    row._position_icon_stack()
+    row._icon_stack.layout().activate()
+    for btn in badges:
+        roomy_w = roomy_widths[btn.objectName()]
+        check(f"row: {btn.objectName()} keeps its full width when the row "
+              "is squeezed to the real sidebar width (never elided to '...')",
+              btn.width() == roomy_w, (btn.objectName(), btn.width(), roomy_w))
+    row._update_hover_buttons(hovered=False)
 
     # "?" waiting indicator: hidden when nobody waits, shown otherwise; clicking
     # it opens the agent dropdown (agentsRequested)
@@ -420,6 +470,396 @@ def test_limit_blocked_workspace_stats():
           blocked_events == [(ws.id, agent.id)], blocked_events)
 
 
+def test_winjob_process_count():
+    """WinJob.process_count() reports the live process count for a job -- the
+    detection primitive behind poll_bg_shell(). Windows-only; skipped
+    everywhere else since job objects don't exist there."""
+    if sys.platform != "win32":
+        check("winjob: skipped on non-Windows (job objects are Windows-only)",
+              True)
+        return
+    from app.process_worker import WinJob
+
+    job = WinJob()
+    check("winjob: a fresh job object gets a real handle on Windows",
+          job._handle is not None)
+    check("winjob: process_count on an empty (unassigned) job is 0",
+          job.process_count() == 0)
+
+    procs = [subprocess.Popen([sys.executable, "-c",
+                               "import time; time.sleep(5)"])
+             for _ in range(2)]
+    try:
+        for p in procs:
+            check(f"winjob: assign succeeds for a live child (pid {p.pid})",
+                  job.assign(p.pid))
+        check("winjob: process_count reflects both assigned processes",
+              job.process_count() == 2, job.process_count())
+    finally:
+        job.terminate_tree()
+        for p in procs:
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+        job.close()
+    check("winjob: process_count after close is 0 (no handle)",
+          job.process_count() == 0)
+
+
+def test_winjob_process_ids_and_kill():
+    """process_ids() is the identity-carrying sibling of process_count() --
+    what kill_bg_shell_extras() needs to know WHICH processes are extra, not
+    just how many there are. kill_extra_processes() (identical on
+    ProcessWorker and PtyWorker) must kill everything in the job except the
+    ids it's told to keep, and leave the kept one alone. Windows-only."""
+    if sys.platform != "win32":
+        check("winjob kill: skipped on non-Windows (job objects are "
+              "Windows-only)", True)
+        return
+    import types
+    from app.process_worker import (CREATE_NO_WINDOW, WinJob, ProcessWorker,
+                                    describe_pid)
+
+    job = WinJob()
+    # CREATE_NO_WINDOW avoids spawning a console host (conhost.exe) of our
+    # own; membership checks below are still subset (<=), not equality --
+    # a dev shell already nested inside its own job (this suite can run
+    # inside a live AI Hive agent's own terminal) can add incidental extra
+    # members that have nothing to do with the primitives under test.
+    procs = [subprocess.Popen([sys.executable, "-c",
+                               "import time; time.sleep(20)"],
+                              creationflags=CREATE_NO_WINDOW)
+             for _ in range(3)]
+    try:
+        for p in procs:
+            check(f"winjob kill: assign succeeds for pid {p.pid}",
+                  job.assign(p.pid))
+        ids = job.process_ids()
+        check("winjob kill: process_ids reports every assigned pid",
+              {p.pid for p in procs} <= set(ids), (ids, [p.pid for p in procs]))
+
+        label = describe_pid(procs[0].pid)
+        check("winjob kill: describe_pid names a real live process "
+              "(python's own executable), not the bare-pid fallback",
+              label.lower() != f"pid {procs[0].pid}"
+              and label.lower().startswith("python"), label)
+        check("winjob kill: describe_pid falls back to a bare label for an "
+              "unreachable/invalid pid",
+              describe_pid(0) == "pid 0")
+
+        worker = types.SimpleNamespace(_job=job, job_process_ids=job.process_ids)
+        keep_pid = procs[0].pid
+        killed = ProcessWorker.kill_extra_processes(worker, {keep_pid})
+        # a subset check, not exact equality: this test's own nested-job dev
+        # environment (a live shell spawning python which spawns python, all
+        # already inside another job) can add incidental extra members
+        # (conhost.exe, stray interpreter helpers) that have nothing to do
+        # with the primitive under test -- what matters is that the two
+        # deliberately spawned targets ARE killed and the kept one NEVER is
+        check("winjob kill: kills every pid except the one told to keep",
+              keep_pid not in killed
+              and {procs[1].pid, procs[2].pid} <= set(killed), killed)
+
+        for p in procs[1:]:
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+        check("winjob kill: the kept process is still alive",
+              procs[0].poll() is None)
+        check("winjob kill: the killed processes are gone",
+              procs[1].poll() is not None and procs[2].poll() is not None)
+    finally:
+        job.terminate_tree()
+        for p in procs:
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+        job.close()
+
+
+def test_bg_shell_workspace_stats():
+    """poll_bg_shell()/workspace_stats()'s bg_shell count must: debounce a
+    transient process blip (git/rg-style, never flags), never flag a BUSY
+    agent (the amber "working" indicator already covers that case), flag
+    once a job's process count sits above its learned baseline for
+    BG_SHELL_DEBOUNCE_S while quiet, clear the instant the extra process is
+    gone, and reset on exit -- transient like busy/waiting, never dirty."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import AgentStatus, BG_SHELL_DEBOUNCE_S
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+    import app.terminal_agent as terminal_agent_mod
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("BgShell", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Shelled",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+    check("bg shell stats: nobody flagged yet",
+          mgr.workspace_stats(ws.id)["bg_shell"] == 0)
+
+    stats_events = []
+    dirtied = []
+    mgr.workspaceStatsChanged.connect(
+        lambda wid, s: stats_events.append(dict(s)) if wid == ws.id else None)
+    mgr.dirty.connect(lambda: dirtied.append(True))
+
+    fake_now = [1000.0]
+    orig_time = terminal_agent_mod.time.time
+    orig_count = agent.worker.job_process_count
+    count = [1]
+    terminal_agent_mod.time.time = lambda: fake_now[0]
+    agent.worker.job_process_count = lambda: count[0]
+    try:
+        agent.poll_bg_shell()   # learns the baseline (1)
+        check("bg shell: the baseline alone never flags",
+              not agent.is_bg_shell_busy())
+
+        count[0] = 0   # a failed/unsupported query must never flap state
+        agent.poll_bg_shell()
+        check("bg shell: a count<=0 (query failed) leaves the state alone",
+              not agent.is_bg_shell_busy())
+        count[0] = 1
+
+        count[0] = 2   # an extra process appears
+        agent.poll_bg_shell()
+        check("bg shell: an extra process alone (before the debounce "
+              "elapses) does not flag yet", not agent.is_bg_shell_busy())
+
+        fake_now[0] += 1.0   # a blip: gone before the debounce elapses
+        count[0] = 1
+        agent.poll_bg_shell()
+        check("bg shell: a process that goes away before the debounce "
+              "elapses never flags (no flicker on git/rg-style blips)",
+              not agent.is_bg_shell_busy() and agent._bg_extra_since is None)
+
+        count[0] = 2
+        agent.poll_bg_shell()             # extra_since starts again
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell: an extra process sustained past the debounce flags "
+              "it", agent.is_bg_shell_busy())
+        check("bg shell stats: count is 1 once flagged",
+              mgr.workspace_stats(ws.id)["bg_shell"] == 1)
+        check("bg shell stats: workspaceStatsChanged fired live",
+              stats_events and stats_events[-1]["bg_shell"] == 1, stats_events)
+        check("bg shell: never marks the session dirty (transient)",
+              not dirtied, dirtied)
+
+        # a genuinely busy agent must never be flagged, even with an extra
+        # process present -- the amber "working" indicator already covers it
+        agent._busy = True
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 1
+        agent.poll_bg_shell()
+        check("bg shell: a busy agent is never flagged",
+              not agent.is_bg_shell_busy())
+        check("bg shell stats: count drops back to 0 while busy",
+              mgr.workspace_stats(ws.id)["bg_shell"] == 0)
+        agent._busy = False
+
+        # re-flag once busy clears and it's sustained again (the extra-since
+        # clock restarted while busy, so this needs its own poll to start,
+        # then a later one past the debounce), then clear the instant the
+        # extra process itself is gone
+        agent.poll_bg_shell()             # extra_since starts now
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 1
+        agent.poll_bg_shell()
+        check("bg shell: re-flags once busy clears and it's sustained again",
+              agent.is_bg_shell_busy())
+        count[0] = 1
+        agent.poll_bg_shell()
+        check("bg shell: clears the instant the extra process is gone",
+              not agent.is_bg_shell_busy())
+        check("bg shell stats: workspaceStatsChanged fired on the falling "
+              "edge too", stats_events[-1]["bg_shell"] == 0, stats_events)
+
+        # exit resets the latch AND the learned baseline
+        count[0] = 2
+        agent.poll_bg_shell()             # extra_since starts now
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 1
+        agent.poll_bg_shell()
+        check("bg shell: sanity flag before exit", agent.is_bg_shell_busy())
+        agent._set_status(AgentStatus.EXITED_OK)
+        check("bg shell: exit clears the flag and its learned baseline",
+              not agent.is_bg_shell_busy() and agent._bg_baseline is None)
+    finally:
+        terminal_agent_mod.time.time = orig_time
+        agent.worker.job_process_count = orig_count
+
+
+def test_bg_shell_settle_relearn():
+    """Live-reported: right after a cold boot, the log_activity MCP bridge's
+    own double-fork can still be missing when the FIRST post-warmup sample is
+    taken, so a job whose real steady state is 3 processes got a baseline of
+    1 -- and since baseline only ratchets down, the gear badge stayed on for
+    that agent's entire remaining life (session.log showed count=3
+    baseline=1 repeatedly, never clearing). BG_SHELL_SETTLE_S fixes this: for
+    a further window after warmup, baseline tracks the latest sample outright
+    (up or down) instead of only ratcheting down, so a late-arriving steady
+    process is absorbed as normal. Once that settle window elapses too, the
+    original ratchet-down-only behavior must still catch a genuine background
+    job started later -- the settle window must not weaken that guarantee."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import (AgentStatus, BG_SHELL_DEBOUNCE_S,
+                                     BG_SHELL_SETTLE_S, BG_SHELL_WARMUP_S)
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+    import app.terminal_agent as terminal_agent_mod
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-settle-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("BgShellSettle", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Shelled",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+
+    fake_now = [1000.0]
+    agent._session_started = fake_now[0]   # simulate a just-launched agent
+    orig_time = terminal_agent_mod.time.time
+    orig_count = agent.worker.job_process_count
+    count = [1]
+    terminal_agent_mod.time.time = lambda: fake_now[0]
+    agent.worker.job_process_count = lambda: count[0]
+    try:
+        agent.poll_bg_shell()   # still within warmup: ignored entirely
+        check("bg shell settle: a sample during warmup is ignored",
+              agent._bg_baseline is None)
+
+        fake_now[0] += BG_SHELL_WARMUP_S + 0.1   # warmup just elapsed
+        count[0] = 1   # the too-early low sample (bridge not forked yet)
+        agent.poll_bg_shell()
+        check("bg shell settle: first post-warmup sample seeds baseline",
+              agent._bg_baseline == 1, agent._bg_baseline)
+        check("bg shell settle: never flags while still settling",
+              not agent.is_bg_shell_busy())
+
+        fake_now[0] += 2.0   # still within the settle window
+        count[0] = 3   # the bridge's child finally forked -- real steady state
+        agent.poll_bg_shell()
+        check("bg shell settle: baseline RISES to the real steady state "
+              "instead of staying locked on the too-early low sample",
+              agent._bg_baseline == 3, agent._bg_baseline)
+        check("bg shell settle: still doesn't flag mid-settle even though "
+              "count rose above the old baseline",
+              not agent.is_bg_shell_busy())
+
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 1   # sustained, but still settling
+        agent.poll_bg_shell()
+        check("bg shell settle: a sustained-but-unchanged count never flags "
+              "while the settle window is still open",
+              not agent.is_bg_shell_busy())
+
+        # settle window fully elapsed: ratchet-down-only resumes, and the
+        # now-correct baseline must not spuriously flag a steady count
+        fake_now[0] = 1000.0 + BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell settle: once settled, an unchanged steady count "
+              "never flags (this is the bug: it used to flag forever)",
+              not agent.is_bg_shell_busy())
+        check("bg shell settle: baseline holds at the learned steady state",
+              agent._bg_baseline == 3, agent._bg_baseline)
+
+        # a GENUINE background job starting after settle must still be
+        # caught -- the settle window must not weaken the real detection
+        count[0] = 5
+        agent.poll_bg_shell()             # extra_since starts
+        check("bg shell settle: a fresh extra process doesn't flag before "
+              "the debounce elapses", not agent.is_bg_shell_busy())
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell settle: a genuine background job started after "
+              "settle still flags once sustained", agent.is_bg_shell_busy())
+    finally:
+        terminal_agent_mod.time.time = orig_time
+        agent.worker.job_process_count = orig_count
+
+
+def test_bg_shell_kill_extras():
+    """kill_bg_shell_extras() is a no-op unless the gear is actually lit (a
+    stray click on a just-cleared marker must not kill anything), and once
+    lit it must ask the worker to kill everything EXCEPT the agent's own
+    root process and whatever was seen while the baseline was learned (the
+    mcp bridge, ConPTY's own conhost/OpenConsole helper) -- never the whole
+    job, which would also take down the interactive session. A successful
+    kill clears the latch immediately rather than waiting for the next poll,
+    and is recorded to the audit trail."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import (AgentStatus, BG_SHELL_DEBOUNCE_S,
+                                     BG_SHELL_SETTLE_S, BG_SHELL_WARMUP_S)
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+    import app.terminal_agent as terminal_agent_mod
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-kill-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("BgShellKill", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Shelled",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+    audit_lines = []
+    agent.audit = audit_lines.append
+
+    fake_now = [1000.0]
+    agent._session_started = fake_now[0]
+    orig_time = terminal_agent_mod.time.time
+    orig_count = agent.worker.job_process_count
+    orig_ids = agent.worker.job_process_ids
+    orig_pid = agent.worker.pid
+    orig_kill = agent.worker.kill_extra_processes
+    pids = [100, 101]           # root(100) + the mcp bridge(101), the baseline
+    kill_calls = []
+    terminal_agent_mod.time.time = lambda: fake_now[0]
+    agent.worker.job_process_count = lambda: len(pids)
+    agent.worker.job_process_ids = lambda: list(pids)
+    agent.worker.pid = lambda: 100
+    agent.worker.kill_extra_processes = (
+        lambda keep: kill_calls.append(keep) or [p for p in pids
+                                                  if p not in keep])
+    try:
+        killed = agent.kill_bg_shell_extras()
+        check("bg shell kill: a no-op when nothing is flagged",
+              killed == [] and not kill_calls, killed)
+
+        fake_now[0] += BG_SHELL_WARMUP_S + 0.1   # seed the baseline: {100,101}
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_SETTLE_S + 0.1    # settle elapses, still {100,101}
+        agent.poll_bg_shell()
+        check("bg shell kill: baseline pids learned during settle",
+              agent._bg_baseline_pids == {100, 101}, agent._bg_baseline_pids)
+
+        pids.append(103)   # a genuine extra shows up (e.g. a Gradle daemon)
+        agent.poll_bg_shell()             # extra_since starts
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell kill: flags once the extra is sustained",
+              agent.is_bg_shell_busy())
+
+        killed = agent.kill_bg_shell_extras()
+        check("bg shell kill: asks the worker to keep the baseline pids "
+              "(root + mcp bridge), never the whole job",
+              kill_calls and kill_calls[-1] == {100, 101}, kill_calls)
+        check("bg shell kill: returns exactly the pid(s) the worker killed",
+              killed == [103], killed)
+        check("bg shell kill: clears the latch immediately, not on the "
+              "next poll", not agent.is_bg_shell_busy())
+        check("bg shell kill: the kill is recorded to the audit trail",
+              any("BG-SHELL-KILL" in line and "103" in line
+                  for line in audit_lines), audit_lines)
+    finally:
+        terminal_agent_mod.time.time = orig_time
+        agent.worker.job_process_count = orig_count
+        agent.worker.job_process_ids = orig_ids
+        agent.worker.pid = orig_pid
+        agent.worker.kill_extra_processes = orig_kill
+
+
 def test_chime_persistence():
     """The top-bar chime toggle flips its glyph + emits soundToggled, and the
     on/off preference round-trips through the session ui state."""
@@ -444,6 +884,253 @@ def test_chime_persistence():
     check("chime toggle: set_sound_enabled updates glyph, no emit",
           not bar._sound_on and emitted == [False, True])
     bar.deleteLater()
+
+
+def test_taskbar_badge():
+    """The Windows taskbar overlay is the ONLY 'agents are working' signal that
+    reaches the user in another application, so its state table is the feature.
+
+    Windows allows exactly one overlay icon, fixed to the corner of the taskbar
+    button, so the working COUNT and the "someone is asking" flag have to share
+    one ~16px square: the digit is the count, the fill colour is the question.
+    An idle hive must show NO overlay - that absence is the readout.
+
+    Also checks the two rules a transient indicator in this app always has to
+    obey: the count NEVER marks the session dirty (this recomputes every time an
+    agent's output starts or stops, so a save here would rewrite session.json
+    all day), and the push is edge-guarded on a rendered key (each push builds
+    an HICON and crosses a COM boundary, and workspaceStatsChanged fires every
+    couple of seconds per busy agent).
+    """
+    from PySide6.QtWidgets import QApplication
+    from app.session_store import SessionStore
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets import ornaments
+    from app.widgets.main_window import TopBar
+    from app import taskbar_overlay
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    # --- the painter: real pixels, whatever the shell asks for -------------
+    size = taskbar_overlay.overlay_size()
+    check("taskbar: overlay_size is a sane icon size",
+          8 <= size <= 256, size)
+    w, h, raw = ornaments.taskbar_badge_bgra("3", ornaments.TASKBAR_WORKING, 16)
+    check("taskbar: badge is a 16x16 BGRA buffer of the right length",
+          (w, h) == (16, 16) and len(raw) == 16 * 16 * 4, (w, h, len(raw)))
+    # a disc, not a square: the corners stay transparent so it reads as a badge
+    # on whatever colour the user's taskbar happens to be
+    corner = raw[0:4]
+    centre = raw[((8 * 16) + 8) * 4:((8 * 16) + 8) * 4 + 4]
+    check("taskbar: the badge is a disc (corner transparent, centre opaque)",
+          corner[3] < 40 and centre[3] > 200, (corner[3], centre[3]))
+    amber = ornaments.taskbar_badge_bgra("3", ornaments.TASKBAR_WORKING, 16)[2]
+    blue = ornaments.taskbar_badge_bgra("3", ornaments.TASKBAR_ASKING, 16)[2]
+    check("taskbar: the working and asking fills are visibly different",
+          amber != blue)
+    check("taskbar: a two-character count still renders",
+          len(ornaments.taskbar_badge_bgra(
+              "9+", ornaments.TASKBAR_WORKING, 16)[2]) == 16 * 16 * 4)
+
+    # --- the state table --------------------------------------------------
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-taskbar-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    app.processEvents()
+    mgr = win.manager
+    ws = mgr.create_workspace("Taskbar", str(tmp))
+    agents = [mgr.add_terminal(ws.id,
+                               build_spec(AgentKind.CLAUDE, f"A{i}",
+                                          cwd=str(tmp)), autostart=False)
+              for i in range(3)]
+
+    def spec():
+        return win._taskbar_badge_spec()
+
+    key, text, fill, note = spec()
+    check("taskbar: an idle hive gets NO overlay at all",
+          text is None and key == "0|0|0", (key, text))
+
+    agents[0]._busy = True        # what _mark_busy sets on an output burst
+    key, text, fill, note = spec()
+    check("taskbar: one agent working shows an amber 1",
+          (key, text, fill) == ("1|0|0", "1", ornaments.TASKBAR_WORKING),
+          (key, text, fill))
+    check("taskbar: the description names the count", note == "1 working", note)
+
+    agents[1]._busy = True
+    agents[2]._busy = True
+    check("taskbar: the count is every working agent across ALL workspaces",
+          spec()[1] == "3", spec())
+
+    # the "?" rides the SAME square as a colour swap, since there is no second
+    # overlay slot to put it in
+    agents[2]._waiting = True
+    key, text, fill, note = spec()
+    check("taskbar: an agent with a question turns the disc blue, count intact",
+          (key, text, fill) == ("3|1|0", "3", ornaments.TASKBAR_ASKING),
+          (key, text, fill))
+    check("taskbar: the description says someone is waiting",
+          "waiting for you" in note, note)
+
+    for a in agents:
+        a._busy = False
+    key, text, fill, note = spec()
+    check("taskbar: nothing working but a question pending shows a blue '?'",
+          (key, text, fill) == ("0|1|0", "?", ornaments.TASKBAR_ASKING),
+          (key, text, fill))
+
+    agents[2]._waiting = False
+    check("taskbar: everything quiet again clears the overlay",
+          spec()[1] is None, spec())
+
+    # --- the edge guard: identical states collapse to ONE key -------------
+    for a in agents:
+        a._busy = True
+    first = spec()[0]
+    check("taskbar: an unchanged state renders an unchanged key",
+          spec()[0] == first, (first, spec()[0]))
+    many = [mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, f"B{i}",
+                                               cwd=str(tmp)), autostart=False)
+            for i in range(9)]
+    for a in many:
+        a._busy = True
+    key, text, _f, _n = spec()
+    check("taskbar: past 9 the disc says 9+ (a bigger number is unreadable "
+          "at this size) and every such state collapses to one key",
+          (key, text) == ("10|0|0", "9+"), (key, text))
+
+    # --- transient: the count must NEVER reach the session ----------------
+    win._save_timer.stop()
+    win._taskbar_key = None
+    win._push_taskbar_badge()
+    check("taskbar: pushing the badge never marks the session dirty",
+          not win._save_timer.isActive())
+    check("taskbar: the push is a no-op off a real taskbar (offscreen suite)",
+          win._taskbar_key is None, win._taskbar_key)
+
+    # --- the toggle: a preference, so it DOES save, and it round-trips -----
+    bar = TopBar()
+    check("taskbar toggle: defaults to ON",
+          bar._taskbar_badge and bar.taskbar_btn.isChecked())
+    emitted = []
+    bar.taskbarBadgeToggled.connect(emitted.append)
+    bar.taskbar_btn.click()
+    check("taskbar toggle: a click turns it off and emits False",
+          emitted == [False] and not bar._taskbar_badge, emitted)
+    bar.set_taskbar_badge(True)   # restore path: reflect without re-emitting
+    check("taskbar toggle: set_taskbar_badge does not re-emit",
+          bar._taskbar_badge and emitted == [False])
+    bar.deleteLater()
+
+    win._save_timer.stop()
+    win._on_taskbar_badge_toggled(False)
+    check("taskbar: flipping the PREFERENCE does mark the session dirty",
+          win._save_timer.isActive())
+    check("taskbar: switched off, a fully working hive still shows nothing",
+          spec()[1] is None, spec())
+    payload = win._session_payload()
+    check("taskbar: the preference is persisted under ui",
+          payload["ui"]["taskbar_badge"] is False, payload["ui"])
+    win._restore_ui_state({"ui": {"taskbar_badge": True}})
+    check("taskbar: the preference is restored onto the window and the button",
+          win._taskbar_badge and win.top_bar._taskbar_badge)
+    win._restore_ui_state({"ui": {}})
+    check("taskbar: a session that predates the feature defaults it ON",
+          win._taskbar_badge)
+
+    # ...and the same thing through a REAL close/reopen, which is the only way
+    # to catch the default being assigned after _restore_ui_state has run (it
+    # was, and it silently switched the badge back on at every launch).
+    win._taskbar_badge = False
+    win.top_bar.set_taskbar_badge(False)
+    win._save_session()
+    win.close()
+    app.processEvents()
+    again = create_main_window(SessionStore(path=tmp / "session.json"))
+    check("taskbar: OFF survives a close and reopen",
+          not again._taskbar_badge and not again.top_bar._taskbar_badge,
+          again._taskbar_badge)
+    check("taskbar: reopening starts with no badge pushed yet",
+          again._taskbar_key is None, again._taskbar_key)
+    again._save_timer.stop()
+    again.close()
+    app.processEvents()
+
+
+def test_bg_shell_taskbar_state():
+    """The taskbar's third state: no agent is busy or asking, but one or more
+    are idle with a background command still running -- previously invisible
+    everywhere, including the taskbar. It must surface ONLY when neither busy
+    nor asking is true (both outrank it), and the edge-guard key must still
+    coalesce an unchanged state."""
+    from PySide6.QtWidgets import QApplication
+    from app.session_store import SessionStore
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets import ornaments
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-taskbar-bg-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    app.processEvents()
+    mgr = win.manager
+    ws = mgr.create_workspace("TaskbarBg", str(tmp))
+    agents = [mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, f"A{i}",
+                                                 cwd=str(tmp)), autostart=False)
+              for i in range(2)]
+
+    def spec():
+        return win._taskbar_badge_spec()
+
+    key, text, fill, note = spec()
+    check("taskbar bg: idle hive with nothing flagged shows no overlay",
+          text is None, (key, text))
+
+    agents[0]._bg_shell = True
+    key, text, fill, note = spec()
+    check("taskbar bg: one agent idle-on-a-shell shows a violet 1",
+          (text, fill) == ("1", ornaments.TASKBAR_BG_SHELL), (text, fill))
+    check("taskbar bg: the description names the count",
+          "background command" in note, note)
+
+    agents[1]._bg_shell = True
+    check("taskbar bg: the count is every bg-shell agent",
+          spec()[1] == "2", spec())
+
+    # busy anywhere outranks bg-shell, even elsewhere in the hive
+    agents[1]._busy = True
+    key, text, fill, note = spec()
+    check("taskbar bg: a busy agent elsewhere wins over bg-shell (amber, "
+          "busy count only)",
+          (text, fill) == ("1", ornaments.TASKBAR_WORKING), (text, fill))
+    agents[1]._busy = False
+
+    # asking outranks both
+    agents[1]._waiting = True
+    key, text, fill, note = spec()
+    check("taskbar bg: asking wins over bg-shell too",
+          fill == ornaments.TASKBAR_ASKING, (text, fill))
+    agents[1]._waiting = False
+
+    # unchanged bg-shell state -> unchanged key (the push's edge guard)
+    first_key = spec()[0]
+    check("taskbar bg: an unchanged bg-shell state renders an unchanged key",
+          spec()[0] == first_key, (first_key, spec()[0]))
+
+    agents[0]._bg_shell = False
+    agents[1]._bg_shell = False
+    check("taskbar bg: clearing every flag clears the overlay",
+          spec()[1] is None, spec())
+
+    win._save_timer.stop()
+    win.close()
+    app.processEvents()
 
 
 def test_hook_prompt_events():
@@ -2016,6 +2703,156 @@ def test_limit_blocked_live_ui():
     a.deleteLater()
 
 
+def test_bg_shell_live_ui():
+    """The card header's gear mark and the sidebar's inline agent-row gear
+    mark both say "idle, but a background command it started is still
+    running" -- and both must clear the instant it isn't true anymore. The
+    card is signal-driven (bg_shell_changed), the sidebar AgentRow is polled
+    (refresh() reads is_bg_shell_busy() directly) -- this exercises both
+    paths end to end."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard
+    from app.widgets.sidebar import AgentRow
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Shelled", cwd="."))
+    card = TerminalCard(a)
+    card.resize(900, 300); card.show(); pump(60)
+    check("bg shell UI: gear hidden before anything is flagged",
+          not card.bg_mark.isVisible())
+
+    a._bg_shell = True
+    a.bg_shell_changed.emit(True)
+    pump(30)
+    check("bg shell UI: card gear shows once the agent is flagged",
+          card.bg_mark.isVisible())
+
+    row = AgentRow("w1", a)
+    check("bg shell UI: a freshly built sidebar agent row also shows it",
+          not row.bg_mark.isHidden())
+
+    a._bg_shell = False
+    a.bg_shell_changed.emit(False)
+    pump(30)
+    check("bg shell UI: card gear disappears LIVE once cleared",
+          not card.bg_mark.isVisible())
+    row.refresh(a)
+    check("bg shell UI: sidebar agent row also clears on its next poll",
+          row.bg_mark.isHidden())
+
+    # clicking either opens a menu of individual processes to kill, rather
+    # than an all-or-nothing kill on the click itself -- an accidental click
+    # near the badge must not risk killing something an agent is actually
+    # waiting on. bg_shell_extra_pids() is empty here (no baseline was ever
+    # learned in this test), so both handlers must take the early-return
+    # "nothing to show" path rather than opening a real (blocking) QMenu --
+    # this is what proves a click can never fall back to killing everything.
+    a._bg_shell = True
+    a.bg_shell_changed.emit(True)
+    pump(30)
+    check("bg shell UI: nothing to kill yet (no baseline learned)",
+          a.bg_shell_extra_pids() == [])
+    card.bg_mark.click()          # must NOT hang on a QMenu.exec() or crash
+    check("bg shell UI: clicking the card gear with nothing resolvable is a "
+          "safe no-op, not a kill-everything fallback", a.is_bg_shell_busy())
+
+    row.refresh(a)
+    row.bg_mark.click()           # same early-return path, same guarantee
+    check("bg shell UI: clicking the sidebar gear is the same safe no-op",
+          a.is_bg_shell_busy())
+
+    card.detach(); card.close()
+    row.deleteLater()
+    a.deleteLater()
+
+
+def test_bg_shell_extra_pids_and_kill_pid():
+    """bg_shell_extra_pids() is what the kill menu lists, and
+    kill_bg_shell_pid() is its per-item action -- letting the user kill one
+    process at a time instead of the all-or-nothing kill_bg_shell_extras().
+    kill_bg_shell_pid() must refuse anything that isn't CURRENTLY a genuine
+    extra (re-checked, not trusted from a menu built a moment ago), and must
+    only clear the latch once EVERY extra is gone, not on the first kill."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import (AgentStatus, BG_SHELL_DEBOUNCE_S,
+                                     BG_SHELL_SETTLE_S, BG_SHELL_WARMUP_S)
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+    import app.terminal_agent as terminal_agent_mod
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-pids-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("BgShellPids", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Shelled",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+    kill_calls = []
+
+    fake_now = [1000.0]
+    agent._session_started = fake_now[0]
+    orig_time = terminal_agent_mod.time.time
+    orig_count = agent.worker.job_process_count
+    orig_ids = agent.worker.job_process_ids
+    orig_pid = agent.worker.pid
+    orig_kill_pid = agent.worker.kill_pid
+    pids = [100, 101]   # root(100) + mcp bridge(101): the baseline
+    terminal_agent_mod.time.time = lambda: fake_now[0]
+    agent.worker.job_process_count = lambda: len(pids)
+    agent.worker.job_process_ids = lambda: list(pids)
+    agent.worker.pid = lambda: 100
+    agent.worker.kill_pid = lambda p: (kill_calls.append(p),
+                                       pids.remove(p) if p in pids else None)
+    try:
+        check("bg shell pids: nothing before a baseline is learned",
+              agent.bg_shell_extra_pids() == [])
+
+        fake_now[0] += BG_SHELL_WARMUP_S + 0.1
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_SETTLE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell pids: still nothing once settled with no extras",
+              agent.bg_shell_extra_pids() == [])
+
+        pids.extend([102, 103])   # e.g. Gradle daemon + Kotlin daemon
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell pids: lists exactly the extras, not root/baseline",
+              agent.bg_shell_extra_pids() == [102, 103],
+              agent.bg_shell_extra_pids())
+
+        check("bg shell pids: refuses to kill a baseline pid (not extra)",
+              agent.kill_bg_shell_pid(101) is False and not kill_calls)
+        check("bg shell pids: refuses to kill the agent's own root process",
+              agent.kill_bg_shell_pid(100) is False and not kill_calls)
+
+        ok = agent.kill_bg_shell_pid(102)
+        check("bg shell pids: kills a genuine extra", ok is True)
+        check("bg shell pids: the worker was asked to kill exactly that pid",
+              kill_calls == [102], kill_calls)
+        check("bg shell pids: one extra remains, so the badge stays lit",
+              agent.is_bg_shell_busy() and agent.bg_shell_extra_pids() == [103])
+
+        ok = agent.kill_bg_shell_pid(103)
+        check("bg shell pids: kills the last remaining extra", ok is True)
+        check("bg shell pids: the badge clears once EVERY extra is gone",
+              not agent.is_bg_shell_busy())
+    finally:
+        terminal_agent_mod.time.time = orig_time
+        agent.worker.job_process_count = orig_count
+        agent.worker.job_process_ids = orig_ids
+        agent.worker.pid = orig_pid
+        agent.worker.kill_pid = orig_kill_pid
+
+
 def test_no_em_dashes_in_visible_text():
     """No em dash reaches the reader. The app's visible strings (labels,
     tooltips, dialog copy, terminal notices, the board markdown) are checked by
@@ -2084,6 +2921,67 @@ def test_reveal_agent():
     check("reveal: switched to the agent's workspace", mgr.active_id == ws2.id)
     check("reveal: the agent's card was located",
           win._pages[ws2.id].card_for(a2.id) is not None)
+    win.close()
+
+
+def test_new_agent_autofocus():
+    """Opening a new agent (header '+', empty-slot '+', or Ctrl+Shift+T — all
+    three funnel into _on_add_terminal_clicked) reveals its card right away:
+    the workspace becomes active, the card scrolls into view, and keyboard
+    focus lands in its terminal, so the user can start typing without an
+    extra click. Uses pty=True (the same TerminalView path Claude agents use)
+    since that's the case the feature targets."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app.session_store import SessionStore
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-autofocus-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    pump(150)
+    mgr = win.manager
+    ws1 = mgr.workspaces[0]
+    ws2 = mgr.create_workspace("Two", str(tmp))
+    pump(60)
+    mgr.set_active(ws1.id)
+    pump(60)
+    check("autofocus: precondition active is ws1", mgr.active_id == ws1.id)
+
+    # stand in for the modal "New Agent" dialog: accept immediately with a
+    # lightweight interactive shell (no network/auth, unlike a Claude agent)
+    orig_exec = AddTerminalDialog.exec
+    orig_result_spec = AddTerminalDialog.result_spec
+    AddTerminalDialog.exec = lambda self: QDialog.DialogCode.Accepted
+    AddTerminalDialog.result_spec = lambda self, cwd="": build_spec(
+        AgentKind.CMD, "AutoFocus", cwd=cwd, pty=True)
+    try:
+        win._on_add_terminal_clicked(ws2.id)
+    finally:
+        AddTerminalDialog.exec = orig_exec
+        AddTerminalDialog.result_spec = orig_result_spec
+    pump(200)
+
+    agent = ws2.agents[-1]
+    card = win._pages[ws2.id].card_for(agent.id)
+    check("autofocus: switched to the new agent's workspace",
+          mgr.active_id == ws2.id)
+    check("autofocus: the new agent's card was located", card is not None)
+    check("autofocus: the card is the focused card", win._focused_card is card)
+    check("autofocus: keyboard focus landed in the terminal",
+          card is not None and card.terminal is not None
+          and card.terminal.hasFocus())
     win.close()
 
 
@@ -6120,7 +7018,165 @@ def test_screen_snapshots():
         win3.close(); pump(300)
         shutil.rmtree(home, ignore_errors=True)
 
+    # -- a corrupted restored screen degrades, it never crashes the app --
+    # The regression: a wide CJK character's leading cell later overwritten
+    # (e.g. by an absolute-column cursor jump, common in TUI mockups) orphans
+    # pyte's own zero-width stub cell (data=""). pyte's `display` property
+    # then does wcwidth(char[0]) on that empty string and raises IndexError.
+    # screen_text() is called from TerminalCard.__init__ -> _on_status ->
+    # _refresh_overlay for EVERY restored card, so one corrupted .vt snapshot
+    # (app/screen_snapshot.py) crashed the whole app on startup, before the
+    # window was ever shown -- and silently, since the launch shortcut runs
+    # pythonw.exe with no console to print the traceback.
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import TerminalView
+    QApplication.instance() or QApplication([])
+    corrupt = TerminalView(rows=3, cols=20)
+    corrupt.feed("\x1b[1;1HあX\x1b[1;1HY")
+    check("screens: a corrupted pyte buffer degrades screen_text() to "
+          "empty instead of crashing the app",
+          corrupt.screen_text() == "")
+
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_boot_veil():
+    """A launching terminal shows a loader, not the child's half-drawn frame.
+
+    The regression: every reopen parked each restored card on a mangled narrow
+    fragment in its top-left corner (the child's first frames, drawn at the
+    pre-layout width, which pyte cannot reflow) until the conversation finished
+    replaying. The veil covers exactly the launch-to-prompt window, and must
+    ALWAYS lift again: on readiness, on a keystroke, on the agent stopping, or
+    on its own backstop timer."""
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+
+    # -- the agent-side signal --------------------------------------------
+    spec = build_spec(AgentKind.CLAUDE, "Booting", cwd=os.getcwd(), pty=True)
+    agent = TerminalAgent(spec)
+    seen = []
+    agent.prompt_ready_changed.connect(seen.append)
+    agent._on_pty_output("stdout", "Claude Code is booting")
+    check("boot-veil: a booting child is not reported ready",
+          seen == [] and not agent.prompt_ready())
+    agent._on_pty_output("stdout", "? for shortcuts")
+    check("boot-veil: the ready footer announces an interactive prompt",
+          seen == [True] and agent.prompt_ready())
+    agent._on_pty_output("stdout", "? for shortcuts")
+    check("boot-veil: readiness is edge-only, never once per output burst",
+          seen == [True])
+
+    class _StubWorker:
+        state = None
+        def start(self): pass
+        def restart(self): pass
+        def is_running(self): return False
+        def dispose(self): pass
+    agent.worker = _StubWorker()
+    agent.start()
+    check("boot-veil: a (re)start re-arms readiness and says so",
+          seen == [True, False] and not agent.prompt_ready())
+    agent.dispose()
+
+    # -- the widget --------------------------------------------------------
+    from PySide6.QtCore import QAbstractAnimation, QEventLoop, Qt, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.ornaments import BootVeil
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    from PySide6.QtWidgets import QWidget
+    host = QWidget()          # a real parent, so raise_() is a stacking op
+    host.resize(400, 240)     # rather than an offscreen window request
+    veil = BootVeil(host)
+    veil.resize(400, 240)
+    check("boot-veil: a fresh veil is down and idle", not veil.is_active())
+    veil.begin("restoring conversation…")
+    check("boot-veil: begin() covers the terminal and starts the sweep",
+          veil.is_active() and veil._spin.state() ==
+          QAbstractAnimation.State.Running)
+    veil.finish()
+    pump(500)  # the fade is 260ms
+    check("boot-veil: finish() dissolves it and stops animating",
+          not veil.is_active()
+          and veil._spin.state() != QAbstractAnimation.State.Running)
+    veil.begin("starting…")
+    veil.dismiss()
+    check("boot-veil: dismiss() drops it at once",
+          not veil.is_active()
+          and veil._spin.state() != QAbstractAnimation.State.Running)
+    veil.deleteLater(); host.deleteLater()
+
+    # -- the card ----------------------------------------------------------
+    from app.pty_worker import HAS_CONPTY
+    if not HAS_CONPTY:
+        return
+    from app.widgets.terminal_card import BOOT_VEIL_MAX_MS, TerminalCard
+
+    booting = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Boot", cwd=os.getcwd(), pty=True))
+    card = TerminalCard(booting)
+    card.resize(640, 400); card.show(); pump(150)
+    check("boot-veil: a stopped card shows the wake banner, not the loader",
+          not card.boot.is_active())
+    card._on_status(AgentStatus.STARTING)   # the launch autostart
+    check("boot-veil: a launching card is covered while its child boots",
+          card.boot.is_active())
+    check("boot-veil: ...over the whole terminal, so no fragment shows through",
+          card.boot.geometry() == card.terminal.rect())
+    check("boot-veil: ...and it never takes the keyboard from the child",
+          card.boot.focusPolicy() == Qt.FocusPolicy.NoFocus)
+    # the point of the feature, in PIXELS: whatever the booting child paints
+    # underneath must not reach the user. Checking a flag would have passed
+    # just as happily with the veil sitting at the wrong geometry or behind
+    # the terminal.
+    from PySide6.QtGui import QColor
+
+    from app.ui_theme import Palette
+    card.terminal.feed("BOOT-FRAGMENT-" + "#" * 40 + "\r\n")
+    pump(60)
+    img = card.terminal.grab().toImage()
+    ground = QColor(Palette.BG_CONSOLE).rgb()
+    top_rows = [img.pixel(x, y) for y in (3, 6, 9)
+                for x in range(0, min(240, img.width()), 3)]
+    check("boot-veil: the child's first frames are covered in pixels, not "
+          "merely hidden behind a flag",
+          top_rows and all(p == ground for p in top_rows))
+    booting._set_prompt_ready(True)
+    pump(500)
+    check("boot-veil: the prompt going live lifts it",
+          not card.boot.is_active())
+
+    # typing means the user wants the terminal, whatever the child has said
+    from app.process_worker import WorkerState
+    booting._set_prompt_ready(False)
+    card._on_status(AgentStatus.STARTING)
+    booting.worker.state = WorkerState.RUNNING   # the child is live, if quiet
+    card._on_key_input("x")
+    check("boot-veil: typing drops it immediately",
+          not card.boot.is_active() and not card._boot_timer.isActive())
+
+    # a stopped agent hands the screen back to the wake banner
+    card._on_status(AgentStatus.STARTING)
+    card._on_status(AgentStatus.EXITED_OK)
+    check("boot-veil: a stopped agent drops it (the wake banner owns that)",
+          not card.boot.is_active() and card.overlay.isVisible())
+
+    # ...and a child that never reports readiness at all still gets its
+    # terminal back: the veil is bounded, never a permanent cover
+    card._on_status(AgentStatus.STARTING)
+    check("boot-veil: the backstop timer is armed while covered",
+          card._boot_timer.isActive() and 0 < card._boot_timer.interval()
+          <= BOOT_VEIL_MAX_MS)
+    card._dismiss_boot_veil()
+    check("boot-veil: ...and firing it uncovers the terminal",
+          not card.boot.is_active())
+    card.detach(); booting.dispose(); pump(100)
 
 
 def test_resume_fallback():
@@ -7597,6 +8653,182 @@ def test_startup_limit_recovery():
     win2.close()
 
 
+def test_limit_recovery_reliability():
+    """The four ways a real cut-off (2026-08-07, CVsummer2026) went unrecovered.
+
+    Every one of them is silent by construction — the agent simply sits there —
+    so each gets a check that reproduces the exact screen or timing shape that
+    defeated it. See app/terminal_agent.py `_tail_lines` and `mark_limit_blocked`
+    for the reasoning behind the fixes."""
+    import time as _time
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import (REPAINT_RESTORE_MS, AgentStatus,
+                                    TerminalAgent)
+    from app.widgets.main_window import LIMIT_REPAINT_AFTER_WAITS
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-limit-rel-"))
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    BANNER = ("You've hit your session limit \xb7 resets 9:30pm "
+              "(Europe/Bucharest)")
+    # a LATER window's cut-off: successive 5-hour windows never end at the same
+    # wall time, which is what makes the banner line a cut-off's identity
+    NEXT = ("You've hit your session limit \xb7 resets 2:30am "
+            "(Europe/Bucharest)")
+    MENU = ("What do you want to do?\n"
+            "> 1. Stop and wait for limit to reset\n"
+            "  2. Upgrade your plan\n")
+    # Claude's TUI pads its frame with blank rows, so the banner ends up far
+    # above the bottom in LINES while being close to it in CONTENT. Measured on
+    # real screen snapshots: a raw [-40:] slice spanned 432 chars / 5 non-blank
+    # lines. This is the frame that lost a genuine cut-off.
+    PADDED = BANNER + "\n" + "\n" * 60 + "> try \"fix the tests\"\n  ? for shortcuts\n"
+
+    def mk(name="Coder"):
+        a = TerminalAgent(build_spec(AgentKind.CLAUDE, name, cwd=os.getcwd()))
+        a._prompt_ready = True
+        return a
+
+    # --- 1. the scrape window counts CONTENT, not padding -------------------
+    a = mk()
+    a._screen_tail = PADDED
+    a._scrape_limit()
+    check("limit-scrape: a banner above the TUI's blank padding still latches",
+          a.is_limit_blocked())
+    check("limit-scrape: ...and it carries the reset clock the banner stated",
+          a.limit_resets_at() is not None)
+
+    # the two callers that deliberately keep RAW-line windows must not have
+    # been widened along with it: recheck_limit reaching further back would
+    # find a torn-down menu forever and never report a resume
+    b = mk()
+    b.mark_limit_blocked(_time.time() + 60, from_startup=False, banner=BANNER)
+    b._screen_tail = MENU + "\n" * 60 + "  ? for shortcuts\n"
+    check("limit-scrape: recheck_limit still uses raw lines (a menu pushed "
+          "past 40 raw lines reads as resumed)",
+          b.recheck_limit() is False)
+
+    # --- 2. a disk-recovered latch arms the banner-echo guard ---------------
+    # The live re-latch this prevents was observed one SECOND after a verified
+    # resume, and dated its phantom cut-off a full day out.
+    c = mk()
+    c.mark_limit_blocked(1786127400.0, from_startup=True,
+                         cut_off_at=1786127061.0, window="session",
+                         banner=BANNER)
+    c.clear_limit_block()          # what a successful resume does
+    c._screen_tail = PADDED        # the same banner, still on screen
+    c._scrape_limit()
+    check("limit-echo: a startup-armed latch is not re-raised by its own "
+          "banner after the resume",
+          not c.is_limit_blocked())
+    c._screen_tail = NEXT + "\n" + "\n" * 60 + "  ? for shortcuts\n"
+    c._scrape_limit()
+    check("limit-echo: ...but a genuinely NEW cut-off still latches",
+          c.is_limit_blocked())
+
+    # --- 3. readiness is re-checked once the screen settles -----------------
+    # _on_pty_output decides readiness against a 600-char tail, once per burst.
+    # A footer followed by more than that in the same burst is never seen, and
+    # a child that then falls quiet is never looked at again.
+    d = mk()
+    d._prompt_ready = False
+    d.status = AgentStatus.RUNNING
+    d._on_pty_output("pty", "welcome\n  ? for shortcuts\n"
+                     + ("x" * 400 + "\n") * 3)
+    check("prompt-ready: a footer buried in its own burst is missed per-burst",
+          not d.prompt_ready())
+    d._on_idle_timeout()
+    check("prompt-ready: ...and recovered when the screen settles",
+          d.prompt_ready())
+
+    e = mk()
+    e._prompt_ready = False
+    e.status = AgentStatus.RUNNING
+    e._on_pty_output("pty", "booting" + "y" * 2000)
+    e._on_idle_timeout()
+    check("prompt-ready: a settle with no footer at all stays not-ready",
+          not e.prompt_ready())
+
+    # --- 4. request_repaint, for a card that never gets a resizeEvent -------
+    f = mk()
+    check("repaint: refused when the child isn't running", not f.request_repaint())
+    resizes: list = []
+    f.worker.rows, f.worker.cols = 30, 100
+    f.worker.is_running = lambda: True
+    f.worker.resize = lambda r, c: resizes.append((r, c))
+    check("repaint: accepted for a live pty agent", f.request_repaint())
+    check("repaint: narrows first", resizes == [(30, 99)])
+    pump(REPAINT_RESTORE_MS + 120)
+    check("repaint: and gives the width straight back",
+          resizes == [(30, 99), (30, 100)])
+
+    # --- 5. the watchdog stops waiting forever ------------------------------
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    ws = win.manager.create_workspace("W", str(tmp))
+    agent = win.manager.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "A",
+                                                       cwd=str(tmp)))
+    agent._prompt_ready = False    # a card the user has never opened
+    asked: list = []
+    agent.request_repaint = lambda: (asked.append(1), True)[1]
+    agent.worker.is_running = lambda: True
+    agent.mark_limit_blocked(_time.time() - 60, from_startup=True,
+                             banner=BANNER)
+    for _ in range(LIMIT_REPAINT_AFTER_WAITS - 1):
+        win._auto_continue_agent(agent)
+    check("limit-wait: a booting TUI is left alone at first", not asked)
+    win._auto_continue_agent(agent)
+    check("limit-wait: after a few quiet ticks the TUI is asked to redraw",
+          len(asked) == 1)
+    win._auto_continue_agent(agent)
+    check("limit-wait: and it is asked exactly once, not every tick",
+          len(asked) == 1)
+    check("limit-wait: a refused resume still consumes no attempt",
+          agent.limit_attempts() == 0)
+    agent._prompt_ready = True
+    win._auto_continue_agent(agent)
+    check("limit-wait: the counter resets once the prompt is live",
+          win._limit_wait_ticks.get(agent.id) is None)
+    win.close()
+
+
+def test_agent_kind_is_always_an_enum():
+    """`build_spec` coerces `kind`, so an agent can always be serialized.
+
+    QComboBox.currentData() round-trips a value through QVariant and hands a
+    str-mixin enum back as a PLAIN STR, so every agent built from the New Agent
+    dialog carried kind="claude". Nothing notices until `AgentSpec.to_dict`
+    reaches `self.kind.value` — on every save, for the life of the process —
+    and the agent degrades to a minimal record that loses its model, effort,
+    permission mode, role and task on the next restore. Observed live: 832
+    SAVE-DEGRADE lines in one session."""
+    from PySide6.QtWidgets import QApplication, QComboBox
+    from app.process_worker import AgentKind, build_spec
+
+    app = QApplication.instance() or QApplication([])
+
+    combo = QComboBox()
+    combo.addItem("Claude Code", AgentKind.CLAUDE)
+    from_qt = combo.currentData()
+    check("agent-kind: Qt really does hand back a plain str (the trap)",
+          type(from_qt) is str and not isinstance(from_qt, AgentKind))
+
+    spec = build_spec(from_qt, "Agent 1", cwd=os.getcwd())
+    check("agent-kind: build_spec coerces it back to the enum",
+          spec.kind is AgentKind.CLAUDE)
+    check("agent-kind: so the agent serializes instead of degrading",
+          spec.to_dict()["kind"] == "claude")
+    check("agent-kind: an enum in still comes out unchanged",
+          build_spec(AgentKind.CMD, "S", cwd=os.getcwd()).kind is AgentKind.CMD)
+
+
 def test_scheduled_send():
     """A message the user writes now and has typed in LATER.
 
@@ -7696,6 +8928,25 @@ def test_scheduled_send():
     check("schedule: an agent caps how many it will hold",
           len(a.pending_scheduled()) == ss.MAX_PER_AGENT)
     a._scheduled = [m for m in a._scheduled if not m.text.startswith("filler")]
+
+    # --- editing an already-queued message in place, instead of cancel+ ----
+    # recreate (which would silently lose its spot in the queue)
+    edges.clear()
+    ok = a.reschedule(msg.id, "run the smoke suite twice", now + 1200)
+    check("schedule: reschedule edits text and due_ts in place, same id",
+          ok and msg.text == "run the smoke suite twice"
+          and msg.due_ts == now + 1200 and edges == [1])
+    check("schedule: an unknown id is refused",
+          not a.reschedule("no-such-id", "x", now + 60))
+    check("schedule: empty text is refused, existing message unchanged",
+          not a.reschedule(msg.id, "   ", now + 1)
+          and msg.text == "run the smoke suite twice")
+    stale = a.schedule_message("stale", now - 10)
+    a.mark_scheduled_missed(stale.id)
+    check("schedule: a missed message given a future time revives to PENDING",
+          a.reschedule(stale.id, "stale", now + 300)
+          and stale.state == ss.PENDING)
+    a._scheduled = [m for m in a._scheduled if m.id != stale.id]
 
     # --- delivery is a NUDGE, never an assignment --------------------------
     # deliver_task overwrites the persisted current_task, flips the assignment
@@ -7877,6 +9128,50 @@ def test_scheduled_send():
           keys == ["\n"] and len(seen) == 1, (keys, seen))
     view.deleteLater()
 
+    # a genuine wrapped/multi-line message (no prompt glyph on continuation
+    # rows) must still capture in full
+    view2 = TerminalView(rows=24, cols=80)
+    seen2 = []
+    view2.scheduleRequested.connect(seen2.append)
+    view2.feed("> line one\r\nline two")
+    view2.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return,
+                                  Qt.KeyboardModifier.ControlModifier
+                                  | Qt.KeyboardModifier.ShiftModifier, "\r"))
+    check("schedule: a real wrapped continuation line is captured in full",
+          seen2 == ["line one\nline two"], seen2)
+    view2.deleteLater()
+
+    # Claude Code paints its footer hint directly under the box with NO
+    # blank line in between, then repositions the caret back onto the input
+    # row (a full-screen TUI redraw, not a plain linefeed) -- that hint row
+    # (and anything under it) must never be swept into the captured message
+    view3 = TerminalView(rows=24, cols=80)
+    seen3 = []
+    view3.scheduleRequested.connect(seen3.append)
+    view3.feed("> send this only" "\x1b[2;1H? for shortcuts" "\x1b[1;17H")
+    view3.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return,
+                                  Qt.KeyboardModifier.ControlModifier
+                                  | Qt.KeyboardModifier.ShiftModifier, "\r"))
+    check("schedule: the footer hint under the box is not swept into the "
+          "captured message", seen3 == ["send this only"], seen3)
+    view3.deleteLater()
+
+    # Claude Code also paints a plain divider/box-border row between the
+    # input and its footer hint, again with no blank line -- that must not
+    # be swept in either (it showed up literally as a line of dashes in a
+    # scheduled message's prefill)
+    view4 = TerminalView(rows=24, cols=80)
+    seen4 = []
+    view4.scheduleRequested.connect(seen4.append)
+    view4.feed("> send this only" + "\x1b[2;1H" + ("─" * 40)
+               + "\x1b[3;1H? for shortcuts" + "\x1b[1;17H")
+    view4.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return,
+                                  Qt.KeyboardModifier.ControlModifier
+                                  | Qt.KeyboardModifier.ShiftModifier, "\r"))
+    check("schedule: a divider row under the box is not swept into the "
+          "captured message", seen4 == ["send this only"], seen4)
+    view4.deleteLater()
+
     # --- the composer -------------------------------------------------------
     from PySide6.QtWidgets import QDialog, QDialogButtonBox
     from app.widgets.main_window import ScheduleMessageDialog
@@ -7924,7 +9219,41 @@ def test_scheduled_send():
     dlg.refresh_pending()
     check("schedule: the composer lists what is already queued",
           dlg.pending_box.count() > 0)
+
+    # --- editing an existing entry in place, via its row's ✏ button --------
+    target = comp.next_scheduled()
+    dlg._start_edit(target)
+    check("schedule: edit loads the message's text into the form",
+          dlg.text_edit.toPlainText() == "already queued"
+          and dlg.editing_id == target.id)
+    check("schedule: the OK button reads Save while editing",
+          ok_btn.text() == "Save")
+    dlg._cancel(target)
+    check("schedule: cancelling the row you're editing exits edit mode",
+          dlg.editing_id is None and ok_btn.text() == "Schedule")
     dlg.deleteLater()
+
+    # editing end-to-end through the popup updates the SAME entry in place --
+    # not a second one alongside it
+    editable = mk("Editable")
+    ws.agents.append(editable)
+    original = editable.schedule_message("first draft", now + 500)
+    real_exec2 = ScheduleMessageDialog.exec
+    try:
+        def fake_edit_exec(self):
+            self._start_edit(self.agent.next_scheduled())
+            self.text_edit.setPlainText("revised draft")
+            self.delay_edit.setText("15m")
+            self._revalidate()
+            return QDialog.DialogCode.Accepted
+        ScheduleMessageDialog.exec = fake_edit_exec
+        win._on_schedule_message(editable.id)
+    finally:
+        ScheduleMessageDialog.exec = real_exec2
+    check("schedule: editing through the popup rewrites the entry in place",
+          [m.text for m in editable.scheduled_messages()] == ["revised draft"]
+          and editable.next_scheduled().id == original.id,
+          [m.text for m in editable.scheduled_messages()])
 
     # confirming from the TERMINAL gesture also clears the child's input box:
     # the text now lives in AI Hive, so a copy left in the prompt would be
@@ -7966,6 +9295,29 @@ def test_scheduled_send():
     check("schedule: cancelling the last message hides the chip again",
           not card.sched_mark.isVisible())
 
+    # --- the sidebar's own clock, next to the agent in its inline row -------
+    from app.widgets.sidebar import AgentRow
+
+    sb_agent = mgr.add_terminal(
+        ws.id, build_spec(AgentKind.CLAUDE, "SidebarSched", cwd=os.getcwd()),
+        autostart=False)
+    row = AgentRow(ws.id, sb_agent)
+    check("schedule: the sidebar row's clock is hidden with nothing queued",
+          row.sched_mark.isHidden())
+    sb_agent.schedule_message("ping later", now + 300)
+    row.refresh(sb_agent)
+    check("schedule: it shows once something is queued",
+          not row.sched_mark.isHidden())
+    sched_hits, act_hits = [], []
+    row.schedRequested.connect(lambda w, a: sched_hits.append((w, a)))
+    row.activated.connect(lambda w, a: act_hits.append((w, a)))
+    row.sched_mark.click()
+    check("schedule: clicking it emits schedRequested(ws_id, agent_id)",
+          sched_hits == [(ws.id, sb_agent.id)], sched_hits)
+    check("schedule: ...and the click is CONSUMED, not also a row-wide "
+          "'reveal the card' activation", act_hits == [], act_hits)
+    row.deleteLater()
+
     win.close()
 
 
@@ -7976,6 +9328,11 @@ def main():
     test_agent_waiting()
     test_notification_chime()
     test_limit_blocked_workspace_stats()
+    test_winjob_process_count()
+    test_winjob_process_ids_and_kill()
+    test_bg_shell_workspace_stats()
+    test_bg_shell_settle_relearn()
+    test_bg_shell_kill_extras()
     test_chime_persistence()
     test_hook_prompt_events()
     test_agent_hook_waiting()
@@ -7992,8 +9349,11 @@ def main():
     test_token_usage_badge()
     test_live_model_effort()
     test_limit_blocked_live_ui()
+    test_bg_shell_live_ui()
+    test_bg_shell_extra_pids_and_kill_pid()
     test_no_em_dashes_in_visible_text()
     test_reveal_agent()
+    test_new_agent_autofocus()
     test_agent_busy_activity()
     test_ansi()
     test_terminal_keys()
@@ -8009,6 +9369,7 @@ def main():
     test_v2_review_fixes()
     test_v3_features()
     test_persistence_resume()
+    test_boot_veil()
     test_resume_fallback()
     test_scrollback()
     test_themes()
@@ -8031,7 +9392,11 @@ def main():
     test_sidebar_file_tree()
     test_sidebar_search()
     test_plan_usage()
+    test_taskbar_badge()
+    test_bg_shell_taskbar_state()
     test_limit_ledger()
+    test_agent_kind_is_always_an_enum()
+    test_limit_recovery_reliability()
     test_auto_continue_on_limit_reset()
     test_startup_limit_recovery()
     test_scheduled_send()

@@ -11,8 +11,9 @@ from functools import lru_cache
 
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
                             QRectF, Qt, QTimer, QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QFont, QFontMetrics, QLinearGradient,
-                           QPainter, QPen, QPixmap, QRadialGradient)
+from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage,
+                           QLinearGradient, QPainter, QPen, QPixmap,
+                           QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QLabel, QSizePolicy, QWidget
 
@@ -319,6 +320,232 @@ class AgentCountBadge(QWidget):
         p.setFont(f)
         p.setPen(color)
         p.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(self._count))
+        p.end()
+
+
+# The two states the Windows taskbar overlay can be in. These are FIXED
+# constants rather than `Palette` reads, unlike every other badge in this file,
+# and deliberately so: the overlay is painted onto the OS taskbar, over whatever
+# accent colour the user has chosen there, not onto our own chrome. Following
+# the active skin would buy no visual coherence (nothing of ours is next to it)
+# while risking a disc that vanishes into the taskbar on a light theme.
+# Amber is the app's "working" hue so the two surfaces still read as related;
+# blue is a hue nothing else in AI Hive uses, because at 16 pixels colour is the
+# only channel that reliably carries a second meaning.
+TASKBAR_WORKING = "#d9b24a"   # agents working, none of them asking
+TASKBAR_ASKING = "#3b82f6"    # at least one agent is waiting on the user
+# no agent is busy or asking, but one or more are idle with a background
+# command still running (see TerminalAgent.poll_bg_shell) -- the case that
+# used to leave the taskbar silent even though real work was still in
+# flight. Violet, not a warm amber/orange shade: WORKING is already warm and
+# ASKING is cool blue, and an orange tried here first read as too close to
+# WORKING at 16px. Violet sits apart from both on the wheel (roughly equal
+# hue distance from amber and blue) and isn't otherwise a "meaning" color in
+# this app (no green-for-fine or red-for-error overtone), so it reads as its
+# own distinct third signal rather than a shade of either existing one.
+TASKBAR_BG_SHELL = "#a855f7"
+
+
+def taskbar_badge_bgra(text: str, fill: str, size: int):
+    """Paint the taskbar overlay disc and return `(w, h, premultiplied BGRA)`.
+
+    Returns exactly what `taskbar_overlay.set_overlay` wants, so the Qt half of
+    this feature stops here and the ctypes half never imports Qt.
+
+    Everything about the drawing is in service of legibility at 16 pixels: a
+    filled disc rather than an outline (an outline's interior shows the taskbar
+    through it), a dark rim so the disc still has an edge when the user's
+    taskbar happens to be the same hue, contrast-picked text, and a glyph
+    scaled by how many characters it has, since "9+" needs materially more room
+    than "3".
+    """
+    from .terminal_view import contrast_ratio
+
+    size = max(8, int(size))
+    img = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(Qt.GlobalColor.transparent)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+
+    body = QColor(fill)
+    rim = QColor(body.darker(190))
+    rim.setAlpha(215)
+    inset = max(0.5, size * 0.045)
+    disc = QRectF(inset, inset, size - 2 * inset, size - 2 * inset)
+    pen = QPen(rim)
+    pen.setWidthF(max(1.0, size * 0.07))
+    p.setPen(pen)
+    p.setBrush(body)
+    p.drawEllipse(disc)
+
+    text = str(text or "")
+    if text:
+        ink = QColor("#101010")
+        if contrast_ratio(ink, body) < contrast_ratio(QColor("#ffffff"), body):
+            ink = QColor("#ffffff")
+        # Segoe UI, not the skin's body font, for the same reason the colours
+        # are fixed: this glyph is drawn into Windows' furniture, not ours.
+        f = QFont("Segoe UI")
+        f.setPixelSize(max(6, int(size * (0.70 if len(text) == 1 else 0.52))))
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(ink)
+        # Centre on the glyph's own INK, not the font's line box: at this size
+        # the box's ascent/descent padding visibly drops a digit off-centre.
+        # tightBoundingRect is relative to the baseline origin, so the ink runs
+        # from baseline+top to baseline+top+height.
+        box = QFontMetrics(f).tightBoundingRect(text)
+        p.drawText(round(disc.center().x() - box.left() - box.width() / 2.0),
+                   round(disc.center().y() - box.top() - box.height() / 2.0),
+                   text)
+    p.end()
+
+    stride = img.bytesPerLine()
+    raw = bytes(img.constBits())
+    want = size * 4
+    if stride != want:   # 32bpp is already 4-byte aligned, but never assume it
+        raw = b"".join(raw[y * stride:y * stride + want] for y in range(size))
+    return (size, size, raw)
+
+
+class BootVeil(QWidget):
+    """A quiet cover over a terminal while its child TUI is booting.
+
+    A launching agent is not a blank terminal for the second or two before its
+    prompt is live: it paints a half-drawn frame, and at app launch it paints
+    that frame at the pre-layout width (the tiling grid sizes the card AFTER
+    the child is started, and pyte cannot reflow), so what the user actually
+    saw on every reopen was a mangled narrow fragment in the top-left corner
+    until the conversation finished replaying. The veil covers exactly that
+    window, from the (re)start to `prompt_ready`, and then dissolves.
+
+    It is deliberately the app's existing throbber motif (the sidebar's
+    sweeping arc) rather than a new one, colours read from the live `Palette`
+    at paint time so it follows every skin. It never takes focus and is
+    transparent to the mouse, so the terminal underneath keeps every
+    keystroke, and the animation runs ONLY while the veil is up.
+    """
+
+    _SPAN = 270 * 16   # arc sweep, in 1/16-degree units (QPainter.drawArc)
+    _RING = 30         # ring diameter, px
+    _FADE_MS = 260
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setVisible(False)
+        self._caption = ""
+        self._angle = 0.0
+        self._fade = 1.0
+        # whether the veil is UP, which is not the same question as
+        # `isVisible()`: a card in a hidden workspace is not on screen, yet its
+        # launching agent is still booting and must be covered when the user
+        # switches to it
+        self._up = False
+        self._spin = QVariantAnimation(self)
+        self._spin.setStartValue(0.0)
+        self._spin.setEndValue(360.0)
+        self._spin.setDuration(1100)
+        self._spin.setLoopCount(-1)
+        self._spin.setEasingCurve(QEasingCurve.Type.Linear)
+        self._spin.valueChanged.connect(self._on_spin)
+        # revealing the conversation is a fade, never a cut: the terminal is
+        # already correct underneath by the time this runs
+        self._fader = QVariantAnimation(self)
+        self._fader.setStartValue(1.0)
+        self._fader.setEndValue(0.0)
+        self._fader.setDuration(self._FADE_MS)
+        self._fader.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._fader.valueChanged.connect(self._on_fade)
+        self._fader.finished.connect(self.dismiss)
+
+    # ------------------------------------------------------------- control ---
+
+    def begin(self, caption: str = "") -> None:
+        """Cover the terminal now. Instant, never a fade in: the whole point is
+        that the child's first frame is never seen."""
+        self._caption = caption
+        self._fader.stop()
+        self._fade = 1.0
+        self._up = True
+        # cover the parent NOW rather than trusting a resize to have arrived:
+        # a veil that comes up an inch too small leaves the child's fragment
+        # showing round its edges, which is the whole thing it exists to hide
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(parent.rect())
+        self.setVisible(True)
+        self.raise_()
+        if self._spin.state() != QAbstractAnimation.State.Running:
+            self._spin.start()
+        self.update()
+
+    def finish(self) -> None:
+        """The conversation is ready: dissolve."""
+        if not self._up or self._fader.state() == \
+                QAbstractAnimation.State.Running:
+            return
+        self._fader.start()
+
+    def dismiss(self) -> None:
+        """Drop the veil at once (the agent stopped, the user typed, or the
+        fade finished). Stopping the spin here is what keeps a card that is
+        merely sitting there from animating forever."""
+        self._fader.stop()
+        self._spin.stop()
+        self._fade = 1.0
+        self._up = False
+        self.setVisible(False)
+
+    def is_active(self) -> bool:
+        """Is the veil up? (See `_up`: not the same as being on screen.)"""
+        return self._up
+
+    # ------------------------------------------------------------- painting ---
+
+    def _on_spin(self, value):
+        self._angle = float(value or 0.0)
+        self.update()
+
+    def _on_fade(self, value):
+        self._fade = float(value if value is not None else 1.0)
+        self.update()
+
+    def paintEvent(self, event):
+        from .terminal_view import legible_color  # avoids an import cycle
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setOpacity(max(0.0, min(1.0, self._fade)))
+        bg = QColor(Palette.BG_CONSOLE)
+        p.fillRect(self.rect(), bg)
+        color = QColor(Palette.ACCENT_GOLD)
+        cx = self.width() / 2.0
+        cy = self.height() / 2.0 - (9 if self._caption else 0)
+        rect = QRectF(cx - self._RING / 2.0, cy - self._RING / 2.0,
+                      self._RING, self._RING)
+        track = QColor(color)
+        track.setAlpha(46)          # faint full ring, so the sweep reads as motion
+        pen = QPen(track)
+        pen.setWidthF(2.0)
+        p.setPen(pen)
+        p.drawArc(rect, 0, 360 * 16)
+        arc = QPen(color)
+        arc.setWidthF(2.4)
+        arc.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(arc)
+        p.drawArc(rect, int(-self._angle * 16), -self._SPAN)
+        if self._caption:
+            f = QFont()
+            f.setPixelSize(12)
+            f.setItalic(True)
+            p.setFont(f)
+            p.setPen(legible_color(QColor(Palette.TEXT_DIM), bg))
+            p.drawText(QRectF(0, cy + self._RING / 2.0 + 10,
+                              self.width(), 20),
+                       Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                       self._caption)
         p.end()
 
 

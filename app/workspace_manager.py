@@ -149,9 +149,13 @@ class WorkspaceManager(QObject):
         # that was missed and is still waiting to be dealt with); drives the
         # row's countdown badge, mirroring the two indicators above
         scheduled = sum(1 for a in agents if a.scheduled_messages())
+        # "bg_shell" = quiet (not busy) but a background command it started
+        # (a Bash run_in_background call, a shell's `cmd &`) is still running;
+        # drives the row's gear badge, mirroring the three indicators above
+        bg_shell = sum(1 for a in agents if a.is_bg_shell_busy())
         return {"total": len(agents), "active": active, "error": error,
                 "busy": busy, "waiting": waiting, "limit_blocked": limit_blocked,
-                "scheduled": scheduled,
+                "scheduled": scheduled, "bg_shell": bg_shell,
                 "idle": len(agents) - active - error}
 
     def next_agent_name(self, ws_id: str) -> str:
@@ -500,6 +504,9 @@ class WorkspaceManager(QObject):
         # per-second countdown never reaches the model, which is what keeps
         # this from behaving like `activity_changed` and thrashing saves.
         agent.scheduled_changed.connect(lambda wid=wid: self._touch(wid))
+        # idle-but-a-shell-is-still-running is transient like busy/waiting:
+        # refresh the badge only, never mark dirty
+        agent.bg_shell_changed.connect(lambda *_, wid=wid: self._recompute(wid))
 
     def _on_agent_limit_blocked_changed(self, ws_id: str, agent_id: str,
                                         blocked: bool) -> None:
@@ -521,6 +528,13 @@ class WorkspaceManager(QObject):
         self._recompute(ws_id)
         if waiting:
             self.agentWaiting.emit(ws_id, agent_id)
+
+    def poll_bg_shell_activity(self) -> None:
+        """Tick every agent's background-shell check (see
+        TerminalAgent.poll_bg_shell) -- cheap, a single Job Object syscall
+        per running agent, so a plain loop on a timer is enough."""
+        for agent in self.all_agents():
+            agent.poll_bg_shell()
 
     def sync_prompt_events(self) -> None:
         """Apply new "needs the user" edges the Claude hooks appended since the

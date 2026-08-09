@@ -124,6 +124,7 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import ui_theme
+from ..terminal_agent import _CLAUDE_READY_HINTS
 from ..ui_theme import ANSI_16, Palette
 
 _NAMED = {
@@ -141,6 +142,13 @@ _NAMED = {
 # you're typing into begins (so the highlight stops there, not up in the
 # transcript). Claude Code draws '>'; '❯' covers common shell/other prompts.
 _INPUT_PROMPTS = (">", "❯")
+
+# The Unicode Box Drawing block. Claude Code paints a horizontal rule (plain
+# dashes, or a rounded-corner box border) directly between the input box and
+# its footer hint, with no blank line either side -- a row built ENTIRELY
+# from these glyphs is that rule, never typed content, since none of them
+# show up in ordinary prose.
+_RULE_CHARS = frozenset(chr(c) for c in range(0x2500, 0x2580))
 
 _KEY_SEQUENCES = {
     Qt.Key.Key_Return: "\r", Qt.Key.Key_Enter: "\r",
@@ -491,8 +499,22 @@ class TerminalView(QWidget):
         self.update()
 
     def screen_text(self) -> str:
-        """Plain text of the live screen (used by tests)."""
-        return "\n".join(self.screen.display)
+        """Plain text of the live screen (used by tests).
+
+        pyte's own `display` property can raise on a malformed buffer cell
+        (observed live: a wide CJK character combined with an absolute
+        cursor-column jump left a cell with empty `.data`, which crashed
+        `wcwidth(char[0])` with an IndexError). That cell is reachable from a
+        REPLAYED snapshot (`screen_snapshot.py`) fed straight into a fresh
+        screen in `TerminalCard.__init__`, before the window is even shown --
+        so an unguarded call here doesn't just blank one card, it takes down
+        the whole app on startup with pythonw giving no console to see why.
+        Degrade to empty text instead: the caller only uses this to decide
+        compact-vs-full overlay styling, so losing it is cosmetic."""
+        try:
+            return "\n".join(self.screen.display)
+        except Exception:
+            return ""
 
     def _view_state(self):
         """(history_list, clamped_offset) for composite rendering, or
@@ -1041,8 +1063,16 @@ class TerminalView(QWidget):
         _select_input_line finds it -- when there is no prompt glyph it stays on
         the caret's own row, so a promptless transcript above is never absorbed);
         `bottom` is the last non-blank row of the contiguous block at/below the
-        caret. Bounds multi-line click-to-position so a click on the transcript
-        or on blank space below the box never drives the child's caret."""
+        caret, stopping BEFORE the box's own footer hint (Claude Code paints
+        that directly under the box with no blank line, so a naive non-blank
+        scan swept it -- and anything under it -- into the captured input; see
+        _row_is_input_footer) or a divider/border row (_row_is_rule) -- Claude
+        Code also paints a plain rule or box border between the input and its
+        footer with no blank line, and a naive scan swept that in too (it
+        showed up literally as a line of box-drawing dashes in a scheduled
+        message's prefill). Bounds multi-line click-to-position so a click
+        on the transcript or on blank space below the box never drives the
+        child's caret."""
         buf = self.screen.buffer
         cy = self.screen.cursor.y
         if self._row_content(cy) == (-1, -1):
@@ -1056,12 +1086,16 @@ class TerminalView(QWidget):
             if buf[r][first].data in _INPUT_PROMPTS:
                 top = r  # the box's first line -- stop, never climb higher
                 break
+            if self._row_is_rule(r):
+                break  # a divider row: never part of typed content
             r -= 1
         bottom = cy
         r = cy + 1
         while r < self.screen.lines:
             if self._row_content(r) == (-1, -1):
                 break
+            if self._row_is_input_footer(r) or self._row_is_rule(r):
+                break  # footer hint or divider, not more typed text -- stop before it
             bottom = r
             r += 1
         return top, bottom
@@ -1369,6 +1403,27 @@ class TerminalView(QWidget):
                 first = c if first < 0 else first
                 last = c
         return first, last
+
+    def _row_is_input_footer(self, r: int) -> bool:
+        """True when row r is Claude Code's input-box footer hint (e.g. '? for
+        shortcuts') -- painted with NO blank line between it and the box, so
+        the bottom-scan in `_input_block_span` must stop before it instead of
+        folding it into the captured/selected input."""
+        first, last = self._row_content(r)
+        if first < 0:
+            return False
+        row = self.screen.buffer[r]
+        text = "".join(row[c].data for c in range(first, last + 1)).strip().lower()
+        return any(hint in text for hint in _CLAUDE_READY_HINTS)
+
+    def _row_is_rule(self, r: int) -> bool:
+        """True when row r is a horizontal divider (box border or plain rule)
+        rather than typed content -- see `_RULE_CHARS`."""
+        first, last = self._row_content(r)
+        if first < 0:
+            return False
+        row = self.screen.buffer[r]
+        return all(row[c].data in _RULE_CHARS for c in range(first, last + 1))
 
     def _select_input_line(self) -> None:
         """Best-effort highlight of the text you're typing. Claude Code's input
