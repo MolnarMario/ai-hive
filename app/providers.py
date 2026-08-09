@@ -58,6 +58,22 @@ CLAUDE_MODELS = (
     ("Haiku", "haiku"), ("Fable", "fable"),
 )
 CLAUDE_EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
+
+GEMINI_MODELS = (
+    ("Default", ""),
+    ("Gemini 3.6 Flash (High)", "Gemini 3.6 Flash (High)"),
+    ("Gemini 3.6 Flash (Medium)", "Gemini 3.6 Flash (Medium)"),
+    ("Gemini 3.6 Flash (Low)", "Gemini 3.6 Flash (Low)"),
+    ("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (High)"),
+    ("Gemini 3.1 Pro (Low)", "Gemini 3.1 Pro (Low)"),
+    ("Gemini 3.5 Flash (High)", "Gemini 3.5 Flash (High)"),
+    ("Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Medium)"),
+    ("Gemini 3.5 Flash (Low)", "Gemini 3.5 Flash (Low)"),
+    ("Claude Sonnet 4.6 (Thinking)", "Claude Sonnet 4.6 (Thinking)"),
+    ("Claude Opus 4.6 (Thinking)", "Claude Opus 4.6 (Thinking)"),
+    ("GPT-OSS 120B (Medium)", "GPT-OSS 120B (Medium)"),
+)
+GEMINI_EFFORTS = ("", "low", "medium", "high")
 # The startup permission modes the interactive TUI cycles through with
 # Shift+Tab. "" launches with NO --permission-mode flag (the CLI's own default,
 # i.e. today's behavior) and is the dialog default. acceptEdits/plan are the
@@ -140,17 +156,7 @@ PROVIDERS: dict[str, Provider] = {
     "gemini": Provider(
         key="gemini", display="Gemini (Antigravity CLI)",
         exe_names=("agy", "gemini"),
-        # values are the CLI's own display strings — verified against
-        # `agy models` + a live `-p --model` round-trip (agy 1.0.16)
-        models=(("Default", ""),
-                ("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (High)"),
-                ("Gemini 3.1 Pro (Low)", "Gemini 3.1 Pro (Low)"),
-                ("Gemini 3.5 Flash (High)", "Gemini 3.5 Flash (High)"),
-                ("Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Medium)"),
-                ("Gemini 3.5 Flash (Low)", "Gemini 3.5 Flash (Low)"),
-                ("Claude Sonnet 4.6 (Thinking)", "Claude Sonnet 4.6 (Thinking)"),
-                ("Claude Opus 4.6 (Thinking)", "Claude Opus 4.6 (Thinking)"),
-                ("GPT-OSS 120B (Medium)", "GPT-OSS 120B (Medium)")),
+        models=GEMINI_MODELS, efforts=GEMINI_EFFORTS, native_flags=True,
         base_cmd="agy", model_flag="--model {model}",
         fallback_paths=(r"%LOCALAPPDATA%\agy\bin\agy.exe",),
         note="Google Antigravity CLI (`agy`): Gemini 3.x agent."),

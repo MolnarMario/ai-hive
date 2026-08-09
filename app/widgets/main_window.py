@@ -685,7 +685,7 @@ class AddTerminalDialog(QDialog):
         # Ultracode isn't a launch flag (claude --effort only takes
         # low/medium/high/xhigh/max); it's an in-session mode. Show it, greyed
         # out, so users know to enable it manually in the terminal.
-        if prov.native_flags:
+        if prov.native_flags and prov.key == "claude":
             self.effort_combo.addItem(
                 "Ultracode (activate manually in terminal, model-dependent)", None)
             model = self.effort_combo.model()

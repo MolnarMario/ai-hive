@@ -4364,13 +4364,17 @@ def test_v2_features():
     # Gemini rides the Antigravity CLI (agy): its model values are multiword
     # display strings and MUST stay one argv entry, and its spec shares
     # Claude's --continue resume + --add-dir board access (agy 1.0.16)
-    _, gargs = providers.build_invocation("gemini", model="Gemini 3.1 Pro (High)")
-    check("v2 providers: multiword gemini model stays ONE argument",
-          gargs == ["--model", "Gemini 3.1 Pro (High)"], gargs)
+    _, gargs = providers.build_invocation("gemini", model="Gemini 3.6 Flash (High)", effort="high")
+    check("v2 providers: gemini model and effort flags build correctly",
+          gargs == ["--model", "Gemini 3.6 Flash (High)", "--effort", "high"], gargs)
+    check("v2 providers: gemini provider has native_flags enabled",
+          providers.get("gemini").native_flags is True)
+    check("v2 providers: gemini offers effort levels",
+          providers.get("gemini").efforts == ("", "low", "medium", "high"))
     check("v2 providers: gemini detection returns bool (env-independent)",
           isinstance(providers.detected("gemini"), bool))
     gspec = build_spec(AgentKind.GEMINI, "G", cwd=str(proj_a),
-                       model="Gemini 3.5 Flash (Low)")
+                       model="Gemini 3.6 Flash (High)", effort="high")
     gspec.resume = True
     gspec.extra_dirs = [str(proj_a)]
     check("v2 providers: gemini resumes with --continue + board --add-dir",
