@@ -280,6 +280,12 @@ class TopBar(QFrame):
         self.usage_badge.refreshRequested.connect(self.usageRefreshRequested)
         self._usage_wanted = True   # the user's show/hide preference
 
+        # Gemini rate-limit usage readout
+        from .gemini_usage_badge import GeminiUsageBadge
+        self.gemini_badge = GeminiUsageBadge(self)
+        self.gemini_badge.setVisible(True)
+        self.gemini_badge.refreshRequested.connect(self.usageRefreshRequested)
+
         # The two auto-recovery switches, beside the readout they belong to.
         # Both act on agents the plan limit cut off; they differ only in WHEN
         # the cut-off is discovered — on opening the app, or while it runs.
@@ -323,6 +329,7 @@ class TopBar(QFrame):
         lay.addWidget(self.breadcrumb)
         lay.addStretch(1)
         lay.addWidget(self.usage_badge)
+        lay.addWidget(self.gemini_badge)
         lay.addSpacing(10)
         lay.addWidget(self.recovery_label)
         lay.addSpacing(6)
@@ -1107,6 +1114,13 @@ class MainWindow(QMainWindow):
         self._usage_tick_timer = QTimer(self)
         self._usage_tick_timer.setInterval(USAGE_TICK_MS)
         self._usage_tick_timer.timeout.connect(self._tick_usage)
+
+        # Gemini usage timer
+        self._gemini_usage_timer = QTimer(self)
+        self._gemini_usage_timer.setInterval(USAGE_POLL_MS)
+        self._gemini_usage_timer.timeout.connect(self._poll_gemini_usage)
+        self._poll_gemini_usage()
+        self._gemini_usage_timer.start()
         # fires just after a spent limit's stated reset, so the "cleared" edge
         # doesn't wait out a full poll interval
         self._usage_reset_timer = QTimer(self)
@@ -1591,7 +1605,19 @@ class MainWindow(QMainWindow):
         number can move.
         """
         self.top_bar.usage_badge.tick()
+        if hasattr(self.top_bar, "gemini_badge"):
+            self.top_bar.gemini_badge.tick()
         self._retune_usage_poll()
+
+    def _poll_gemini_usage(self) -> None:
+        """Poll Gemini rate-limit utilization and update the top bar readout."""
+        try:
+            from app import gemini_usage
+            reading = gemini_usage.fetch()
+            if hasattr(self.top_bar, "gemini_badge"):
+                self.top_bar.gemini_badge.set_usage(reading)
+        except Exception:
+            pass
 
     def _on_usage_visibility(self, on: bool) -> None:
         """User toggled the readout from the top bar's context menu."""
