@@ -1608,6 +1608,36 @@ class MainWindow(QMainWindow):
         if hasattr(self.top_bar, "gemini_badge"):
             self.top_bar.gemini_badge.tick()
         self._retune_usage_poll()
+        self._retune_gemini_usage_poll()
+
+    def _gemini_agents_working(self) -> bool:
+        """True if at least one Gemini agent is currently running."""
+        for ws in self.manager.workspaces:
+            for agent in ws.agents:
+                if agent.spec.provider == "gemini" and agent.is_running():
+                    return True
+        return False
+
+    def _retune_gemini_usage_poll(self) -> None:
+        """Retune Gemini usage poll interval:
+        If Gemini agents are working AND 5-hour usage is >= 90%, poll every 10 seconds (10000 ms).
+        Otherwise poll every 60 seconds (60000 ms).
+        """
+        if not hasattr(self, "_gemini_usage_timer"):
+            return
+        interval = USAGE_POLL_MS  # default 60000 ms
+        try:
+            from app import gemini_usage
+            reading = gemini_usage.fetch()
+            five_hour = next((l for l in reading.limits if l.key == "five_hour"), None)
+            pct = five_hour.percent if five_hour else (reading.blocked.percent if reading.blocked else 0.0)
+            if self._gemini_agents_working() and pct >= 90.0:
+                interval = 10000  # urgent 10-second polling
+        except Exception:
+            pass
+
+        if interval != self._gemini_usage_timer.interval():
+            self._gemini_usage_timer.setInterval(interval)
 
     def _poll_gemini_usage(self) -> None:
         """Poll Gemini rate-limit utilization and update the top bar readout."""
@@ -1616,6 +1646,7 @@ class MainWindow(QMainWindow):
             reading = gemini_usage.fetch()
             if hasattr(self.top_bar, "gemini_badge"):
                 self.top_bar.gemini_badge.set_usage(reading)
+            self._retune_gemini_usage_poll()
         except Exception:
             pass
 
