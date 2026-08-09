@@ -2535,7 +2535,7 @@ class MainWindow(QMainWindow):
         if card is None:
             return
         page.scroll.ensureWidgetVisible(card)
-        target = card.terminal or card
+        target = card.terminal or card.input or card
         target.setFocus(Qt.FocusReason.OtherFocusReason)
         self.raise_()
         self.activateWindow()
@@ -2692,9 +2692,13 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         spec = dialog.result_spec(cwd=ws.project_path)
-        if self.manager.add_terminal(ws.id, spec) is None:
+        agent = self.manager.add_terminal(ws.id, spec)
+        if agent is None:
             QMessageBox.warning(self, "AI Hive",
                                 "This workspace is at its agent limit.")
+            return
+        # opening a terminal is for typing into it right away
+        self._reveal_agent(ws.id, agent.id)
 
     def _confirm_delete_workspace(self, ws_id: str) -> None:
         ws = self.manager.workspace(ws_id)
