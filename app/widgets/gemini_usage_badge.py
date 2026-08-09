@@ -35,7 +35,7 @@ class GeminiUsageBadge(QWidget):
         self._stale = False
         self._label = False
         self._unreadable = ""
-        self._refresh_text()
+        self.set_usage(gemini_usage.fetch())
 
     def set_usage(self, usage: gemini_usage.GeminiUsage | None) -> None:
         self._usage = usage

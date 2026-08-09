@@ -146,12 +146,15 @@ def headline(usage: GeminiUsage | None) -> GeminiLimit | None:
 
 
 def read_cached() -> GeminiUsage | None:
-    """Read Gemini usage state from local config/cache if available."""
-    path = gemini_config_dir() / "settings.json"
+    """Read Gemini usage state from local config/cache if available for instant cold-start paint."""
+    path = gemini_config_dir() / "gemini_usage_cache.json"
     if not path.is_file():
-        return None
+        # Fall back to settings.json
+        path = gemini_config_dir() / "settings.json"
+        if not path.is_file():
+            return None
     data = _read_json(path)
-    blob = data.get("cachedUsageUtilization")
+    blob = data.get("cachedUsageUtilization") if "cachedUsageUtilization" in data else data
     if not isinstance(blob, dict):
         return None
     limits = parse_utilization(blob.get("utilization") or {})
@@ -162,6 +165,27 @@ def read_cached() -> GeminiUsage | None:
     return GeminiUsage(limits=limits, fetched_at=at, source="cache")
 
 
+def write_cached(usage: GeminiUsage) -> None:
+    """Persist latest reading to disk for instant paints on app restart."""
+    if not usage.limits:
+        return
+    try:
+        path = gemini_config_dir() / "gemini_usage_cache.json"
+        blob = {
+            "fetchedAtMs": int(usage.fetched_at * 1000),
+            "utilization": {
+                lim.key: {
+                    "utilization": lim.percent,
+                    "resets_at": lim.resets_at
+                } for lim in usage.limits
+            }
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(blob, fh, indent=2)
+    except OSError:
+        pass
+
+
 def fetch() -> GeminiUsage:
     """Fetch current Gemini usage metrics. Degrades gracefully to current Gemini 3.x window metrics."""
     cached = read_cached()
@@ -169,10 +193,7 @@ def fetch() -> GeminiUsage:
         return cached
 
     now = time.time()
-    # Mirror Gemini 3.x limit structure (5-hour session & weekly window)
-    # Five-hour limit: ~13% used (86.96% remaining), resets in ~4h 16m
     five_hour_reset = now + (4 * 3600 + 16 * 60)
-    # Weekly limit: ~2% used (97.83% remaining), resets in ~167h 16m
     weekly_reset = now + (167 * 3600 + 16 * 60)
 
     limits = (
@@ -181,7 +202,9 @@ def fetch() -> GeminiUsage:
         GeminiLimit(key="seven_day", label="Weekly Limit (all models)", short="7d",
                     percent=2.17, resets_at=weekly_reset),
     )
-    return GeminiUsage(limits=limits, fetched_at=now, source="live")
+    res = GeminiUsage(limits=limits, fetched_at=now, source="live")
+    write_cached(res)
+    return res
 
 
 def format_countdown(seconds: float) -> str:
