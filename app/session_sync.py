@@ -146,6 +146,116 @@ def list_transcripts(cwd: str) -> dict:
     return out
 
 
+def gemini_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli")
+
+
+def list_gemini_transcripts(cwd: str) -> dict:
+    """{session_id: mtime} for every conversation Gemini (Antigravity CLI) has
+    recorded for `cwd`. Never raises."""
+    base = gemini_dir()
+    meta_path = os.path.join(base, "cache", "conversation_metadata.json")
+    conv_dir = os.path.join(base, "conversations")
+    pres_dir = os.path.join(base, "presence")
+    norm_cwd = os.path.normpath(cwd).lower() if cwd else ""
+
+    out: dict = {}
+    if os.path.isdir(conv_dir):
+        try:
+            for name in os.listdir(conv_dir):
+                if name.endswith(".db"):
+                    sid = name[:-3]
+                    if _ID_RE.match(sid):
+                        try:
+                            out[sid] = os.path.getmtime(os.path.join(conv_dir, name))
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+
+    meta_map = {}
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            meta_map = data.get("conversations", {})
+        except Exception:
+            pass
+
+    filtered = {}
+    for sid, mtime in out.items():
+        info = meta_map.get(sid, {})
+        summary = info.get("summary") or {}
+        uris = summary.get("WorkspaceURIs") or []
+        match = False
+        if uris:
+            for u in uris:
+                if u.startswith("file:///"):
+                    path = u[8:]
+                    if os.path.normpath(path).lower() == norm_cwd:
+                        match = True
+                        break
+        else:
+            match = True
+
+        if match:
+            filtered[sid] = mtime
+
+    return filtered
+
+
+def gemini_transcript_exists(cwd: str, session_id: str) -> bool:
+    if not session_id:
+        return False
+    db_path = os.path.join(gemini_dir(), "conversations", f"{session_id}.db")
+    return os.path.isfile(db_path)
+
+
+def best_gemini_recovery_id(cwd: str, exclude=()) -> str | None:
+    ex = set(exclude)
+    cands = [(mt, sid) for sid, mt in list_gemini_transcripts(cwd).items()
+             if sid not in ex]
+    if not cands:
+        return None
+    cands.sort()
+    return cands[-1][1]
+
+
+def get_gemini_live_session(cwd: str, exclude=()) -> str | None:
+    """Read the active Gemini session id for `cwd` from last_conversations.json
+    or the newest transcript for `cwd`, skipping any session_id in `exclude`."""
+    norm_cwd = os.path.normpath(cwd).lower() if cwd else ""
+    if not norm_cwd:
+        return None
+    ex = set(exclude or ())
+    trans = {sid: mt for sid, mt in list_gemini_transcripts(cwd).items()
+             if sid not in ex}
+    last_path = os.path.join(gemini_dir(), "cache", "last_conversations.json")
+    last_sid = None
+    if os.path.isfile(last_path):
+        try:
+            with open(last_path, "r", encoding="utf-8") as fh:
+                last_map = json.load(fh)
+                for k, v in last_map.items():
+                    if (os.path.normpath(k).lower() == norm_cwd
+                            and is_session_id(v) and v not in ex):
+                        last_sid = v
+                        break
+        except Exception:
+            pass
+
+    if last_sid and last_sid in trans:
+        last_mt = trans[last_sid]
+        newer = [sid for sid, mt in trans.items() if mt > last_mt + 1.0]
+        if not newer:
+            return last_sid
+
+    if trans:
+        cands = sorted(trans.items(), key=lambda x: x[1])
+        return cands[-1][0]
+    return last_sid if (last_sid and last_sid not in ex) else None
+
+
 def transcript_exists(cwd: str, session_id: str) -> bool:
     return bool(session_id) and os.path.isfile(
         transcripts.transcript_path(cwd, session_id))

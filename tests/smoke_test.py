@@ -4364,13 +4364,17 @@ def test_v2_features():
     # Gemini rides the Antigravity CLI (agy): its model values are multiword
     # display strings and MUST stay one argv entry, and its spec shares
     # Claude's --continue resume + --add-dir board access (agy 1.0.16)
-    _, gargs = providers.build_invocation("gemini", model="Gemini 3.1 Pro (High)")
-    check("v2 providers: multiword gemini model stays ONE argument",
-          gargs == ["--model", "Gemini 3.1 Pro (High)"], gargs)
+    _, gargs = providers.build_invocation("gemini", model="Gemini 3.6 Flash (High)", effort="high")
+    check("v2 providers: gemini model flag builds correctly",
+          gargs == ["--model", "Gemini 3.6 Flash (High)"], gargs)
+    check("v2 providers: gemini provider has native_flags enabled",
+          providers.get("gemini").native_flags is True)
+    check("v2 providers: gemini efforts omitted (included in model choice)",
+          providers.get("gemini").efforts == ())
     check("v2 providers: gemini detection returns bool (env-independent)",
           isinstance(providers.detected("gemini"), bool))
     gspec = build_spec(AgentKind.GEMINI, "G", cwd=str(proj_a),
-                       model="Gemini 3.5 Flash (Low)")
+                       model="Gemini 3.6 Flash (High)", effort="high")
     gspec.resume = True
     gspec.extra_dirs = [str(proj_a)]
     check("v2 providers: gemini resumes with --continue + board --add-dir",
@@ -4441,8 +4445,8 @@ def test_v2_features():
     check("v2 grid: every palette swatch matches its applied layout (WYSIWYG)",
           not mismatched, mismatched)
     offered = {s for _lbl, s, _r, _c in LAYOUTS}
-    check("v2 grid: 3x1 and 1x3 both offered",
-          {"3x1", "1x3"} <= offered, offered)
+    check("v2 grid: 3x1, 1x3, 4x1, 1x4 offered",
+          {"3x1", "1x3", "4x1", "1x4"} <= offered, offered)
 
     # ---- font (#5) ------------------------------------------------------
     tv = TerminalView(rows=20, cols=60)
@@ -8350,6 +8354,243 @@ def test_auto_continue_on_limit_reset():
         _chime.play = real_play
 
 
+def test_gemini_limit_detection():
+    """A Gemini agent cut off by its quota is seen, shown and resumed too.
+
+    The whole recovery path was gated on `provider == "claude"`, so an agy agent
+    that ran out of quota sat there silently: no hourglass, no ledger entry, no
+    auto-continue (reported live, 2026-08-09, on Agent 10 of the AI Hive
+    workspace). Detecting it is not a matter of one more pattern -- agy's
+    cut-off is a different SHAPE, and each difference is checked here:
+
+      * no interactive menu, so the identity guard carries the whole weight;
+      * a RELATIVE countdown ("Resets in 1h40m21s") rather than a wall clock;
+      * the message WRAPS, so its identity is not on the matched line;
+      * no conversation on disk, so there is no second source to agree with.
+    """
+    import time as _time
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import limit_banner as lb
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.main_window import AUTO_CONTINUE_TEXT
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    now = _time.time()
+    AUTO_CONTINUE_SETTLE_MS = 1200
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    # exactly as agy renders it, wrapped across three rows, warning glyph and
+    # all. The Error ID's trailing counter differs per message.
+    def quota(countdown="1h40m21s", tag="266"):
+        return ("⚠Individual quota reached. Please upgrade your "
+                "subscription to increase your\n"
+                f"limits. Resets in {countdown}.\n"
+                f"Error ID: 6a22d054-3666-4717-b0ac-7b359153c647-{tag}\n")
+
+    FOOTER = "\n> \n? for shortcuts                    Gemini 3.6 Flash \xb7 high\n"
+
+    # --- the patterns, in isolation -----------------------------------------
+    line = lb.gemini_banner_line(quota())
+    check("gemini-limit: the wrapped message is read as one banner",
+          line.startswith("Individual quota reached") and "1h40m21s" in line
+          and line.endswith("-266"), line)
+    check("gemini-limit: the LAST message wins (a retry describes the state "
+          "now)", "-273" in lb.gemini_banner_line(quota() + quota("1h39m56s",
+                                                                  "273")))
+    check("gemini-limit: two cut-offs are told apart by their own text",
+          lb.gemini_banner_line(quota()) != lb.gemini_banner_line(
+              quota("1h39m56s", "273")))
+    check("gemini-limit: an agent DISCUSSING a quota is not cut off by one",
+          lb.gemini_banner_line("note that the quota reached its cap "
+                                "yesterday, resets in 3h") == "")
+    check("gemini-limit: Claude's banner is not read as a Gemini one, or the "
+          "reverse",
+          lb.gemini_banner_line("You've hit your session limit - resets 3am")
+          == "" and lb.banner_line(quota()) == "")
+    check("gemini-limit: the relative countdown resolves against NOW",
+          lb.gemini_reset_at(quota(), 1000.0) == 1000.0 + 3600 + 40 * 60 + 21)
+    for text, secs in (("resets in 45m", 2700), ("Resets in 30s", 30),
+                       ("resets in 2h", 7200)):
+        check(f"gemini-limit: {text!r} -> {secs}s",
+              lb.gemini_reset_at(text, 0.0) == secs)
+    check("gemini-limit: a message with no countdown yields no reset time",
+          lb.gemini_reset_at("Individual quota reached.") is None)
+    # the printed text is frozen; only the moment it is READ can date it, which
+    # is why the epoch is resolved once at latch time and then kept
+    check("gemini-limit: the same text read later resolves later (read once)",
+          lb.gemini_reset_at(quota(), 2000.0)
+          - lb.gemini_reset_at(quota(), 1000.0) == 1000.0)
+
+    # --- the live latch ------------------------------------------------------
+    writes: dict = {}
+
+    def mk(name="Gem", kind=AgentKind.GEMINI):
+        spec = build_spec(kind, name, cwd=os.getcwd(), pty=True)
+        a = TerminalAgent(spec)
+        a.worker = type("W", (), {
+            "is_running": lambda s: True,
+            "write": lambda s, d: (writes.setdefault(id(s), []).append(d), True)[1],
+            "start": lambda s: None, "dispose": lambda s: None})()
+        a._prompt_ready = True
+        return a
+
+    sent = lambda ag: "".join(writes.get(id(ag.worker), []))
+
+    g = mk()
+    g._on_pty_output("pty", "running the suite...\n" + FOOTER)
+    check("gemini-limit: ordinary output is not a cut-off",
+          not g.is_limit_blocked())
+    g._on_pty_output("pty", quota() + FOOTER)
+    check("gemini-limit: the quota message IS a cut-off", g.is_limit_blocked())
+    check("gemini-limit: its countdown is latched as a real reset time",
+          g.limit_resets_at() is not None
+          and 6000 < g.limit_resets_at() - _time.time() < 6100)
+    # "quota" and not "weekly": agy states a DURATION, which is equally correct
+    # for a window days out, so it never has the bare-wall-clock ambiguity that
+    # makes a Claude weekly banner unusable
+    check("gemini-limit: the window is ordinary and due on its own clock",
+          g.limit_window() == "quota")
+
+    # No menu exists, so the message alone must not re-latch an agent that has
+    # already been resumed off it -- the guard Claude gets from the torn-down
+    # menu, Gemini gets entirely from the message's identity.
+    g.clear_limit_block()
+    g._on_pty_output("pty", quota() + "\ncarrying on\n" + FOOTER)
+    check("gemini-limit: the same message lingering after a resume does NOT "
+          "re-latch", not g.is_limit_blocked())
+    g._on_pty_output("pty", quota("58m12s", "301") + FOOTER)
+    check("gemini-limit: a genuinely NEW refusal (its own Error ID) does latch",
+          g.is_limit_blocked())
+
+    notready = mk("NotReady")
+    notready._prompt_ready = False
+    notready._on_pty_output("pty", quota())
+    check("gemini-limit: a message drawn before the prompt is ready is history",
+          not notready.is_limit_blocked())
+
+    # --- recovery after a restart, off the REPLAY ---------------------------
+    # This IS Gemini's startup recovery: the live latch is never persisted and
+    # there is no conversation on disk, but `agy --continue` redraws the
+    # conversation it ended on, so the message is right there. Verified live
+    # (2026-08-09, Agent 10): it latched 5 s after launch off the replay.
+    #
+    # THE COUNTDOWN IN IT IS STALE, and that is the defect this pins down. The
+    # text says "1h39m56s" forever, so resolving it against the clock at launch
+    # dated the reset 1h49m too late -- a quota that came back at 19:05 would
+    # not have been touched until 21:54. It is discarded and the agent probed
+    # at once; a quota that is still spent says so with an exact countdown.
+    replay = mk("Replay")
+    replay._session_started = _time.time()          # ...just launched
+    replay._on_pty_output("pty", quota() + FOOTER)
+    check("gemini-limit: a cut-off replayed at launch is recovered",
+          replay.is_limit_blocked())
+    check("gemini-limit: ...probed NOW, not on the replay's frozen countdown",
+          replay.limit_resets_at() is not None
+          and abs(replay.limit_resets_at() - _time.time()) < 5)
+    check("gemini-limit: ...and it answers to the startup-recovery toggle",
+          replay.limit_from_startup() is True)
+
+    # a message with real work after it belongs to a cut-off the conversation
+    # already recovered from -- continuing that would interrupt finished work
+    carried = mk("CarriedOn")
+    carried._session_started = _time.time()
+    carried._on_pty_output("pty", quota()
+                           + "".join(f"  Edit(file_{i}.py)\n" for i in range(14))
+                           + "All 1324 tests passed cleanly!\n" + FOOTER)
+    check("gemini-limit: a replayed message with work after it is NOT a "
+          "live cut-off", not carried.is_limit_blocked())
+    # ...and that judgement has to OUTLAST the launch window: the message sits
+    # in the rolling tail long after, so without arming the echo guard the next
+    # repaint would read it as live and latch its stale countdown
+    carried._session_started = _time.time() - 3600
+    carried._on_pty_output("pty", "  ? for shortcuts\n")
+    check("gemini-limit: ...and a later repaint does not latch it either",
+          not carried.is_limit_blocked())
+
+    # once the launch window has passed, the printed countdown is current again
+    live = mk("Live")
+    live._session_started = _time.time() - 3600      # long since settled
+    live._on_pty_output("pty", quota() + FOOTER)
+    check("gemini-limit: a refusal outside the launch window keeps its own "
+          "countdown", live.is_limit_blocked()
+          and live.limit_resets_at() - _time.time() > 3000)
+    check("gemini-limit: ...and is owned by the live auto-continue toggle",
+          live.limit_from_startup() is False)
+
+    # a provider with no patterns of its own is untouched by either CLI's
+    shell = mk("Shell", kind=AgentKind.CMD)
+    shell._on_pty_output("pty", quota() + FOOTER)
+    check("gemini-limit: a plain shell agent is never limit-blocked",
+          not shell.is_limit_blocked())
+
+    # --- verification: agy answers a still-spent quota with a NEW message ----
+    v = mk("Verify")
+    v._on_pty_output("pty", quota() + FOOTER)
+    first_reset = v.limit_resets_at()
+    v._screen_tail = quota() + "\nContinue\n" + quota("59m1s", "500") + FOOTER
+    check("gemini-limit: a fresh refusal after the nudge means STILL blocked",
+          v.recheck_limit() is True and v.is_limit_blocked())
+    check("gemini-limit: ...and the retry waits out the NEW countdown, not the "
+          "spent one", v.limit_resets_at() != first_reset
+          and v.limit_resets_at() - _time.time() > 3000)
+    # ...and now nothing newer appears: the messages are still in the
+    # scrollback (they never go away, there being no menu to tear down), but the
+    # newest is the one already accounted for, so the agent is going again
+    v._screen_tail = (quota() + "\nContinue\n" + quota("59m1s", "500")
+                      + "\nworking on it...\n" + FOOTER)
+    check("gemini-limit: the message merely lingering means it RESUMED",
+          v.recheck_limit() is False and not v.is_limit_blocked())
+
+    # --- the wiring ----------------------------------------------------------
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-gemlimit-"))
+    win = create_main_window(SessionStore(path=tmp / "s.json"))
+    win.show(); pump(50)
+    ws = win.manager.workspaces[0]
+
+    gem = mk("GemCut")
+    gem._on_pty_output("pty", quota() + FOOTER)
+    ws.agents.append(gem)
+    check("gemini-limit: the workspace's blocked count sees it (hourglass)",
+          win.manager.workspace_stats(ws.id)["limit_blocked"] == 1)
+
+    # The account reading behind the no-`due` trigger is CLAUDE's plan, which
+    # says nothing at all about a Gemini quota -- so that shortcut must not
+    # reach a Gemini agent.
+    win._resume_blocked_agents()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("gemini-limit: the Claude account's cleared edge does NOT resume a "
+          "Gemini agent", sent(gem) == "" and gem.is_limit_blocked())
+
+    # its own countdown does, through the network-free watchdog
+    gem._limit_resets_at = now + 3600
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("gemini-limit: an agent whose countdown has not run out waits",
+          sent(gem) == "")
+    gem._limit_resets_at = now - 600
+    # ...and with NO usage reading of any kind in the app. The Gemini pill and
+    # this path share nothing: the resume is driven entirely by the countdown
+    # the agent's own message stated, so a usage readout that is missing, stale
+    # or wrong can never be the reason a Continue fails to go out.
+    check("gemini-limit: the resume path holds no usage reading at all",
+          win.plan_usage() is None)
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("gemini-limit: the watchdog resumes it once the countdown has passed",
+          AUTO_CONTINUE_TEXT in sent(gem))
+    # Esc closes CLAUDE's options menu. agy has none, and an Esc there would
+    # clear whatever the user had half-typed instead.
+    check("gemini-limit: no stray Esc is sent (there is no menu to dismiss)",
+          "\x1b" not in sent(gem))
+    win.close()
+
+
 def test_startup_limit_recovery():
     """Agents the plan limit stopped BEFORE the app opened are found and armed.
 
@@ -9321,6 +9562,735 @@ def test_scheduled_send():
     win.close()
 
 
+def test_projection_happens_once():
+    """The scrollback is projected ONCE, at the card's settled width.
+
+    pyte does not reflow, so a card built before the tiling grid sizes it has
+    to project again at the real width. The cost of that is paid on the GUI
+    thread per card, and the card used to do the FULL projection twice -- once
+    at a width that never reached the screen -- plus a full transcript read
+    each time. Measured on real captures: ~80ms + 90-165ms per card, per
+    projection, which is what made launch and every retile visibly freeze."""
+    import pathlib
+    import tempfile
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.terminal_agent import TerminalAgent
+    from app.widgets import terminal_card as tc
+
+    if not HAS_CONPTY:
+        return
+    QApplication.instance() or QApplication([])
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="aihive-project-"))
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    check("project: the seed cap is far smaller than the full cap",
+          tc.REPLAY_SEED_CAP < tc.REPLAY_PROJECT_CAP // 4,
+          (tc.REPLAY_SEED_CAP, tc.REPLAY_PROJECT_CAP))
+
+    # a buffer much larger than the seed cap, with a marker line right at the
+    # start so we can tell a seed-sized projection from a full one
+    head = "HEADLINE-" + "h" * 40
+    body = "".join(f"body line {i} " + "b" * 40 + "\r\n" for i in range(4000))
+    big = head + "\r\n" + body
+
+    # -- an ordinary rebuild (retile / workspace switch): the buffer IS the
+    #    live conversation, so the settled projection must project it in full
+    live = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Live", cwd=str(tmp), pty=True))
+    live._pty_buffer.append(big)
+    live._pty_bytes = len(big)
+    live._pty_total = len(big)
+    card = tc.TerminalCard(live)
+    seeded_hist = len(card.terminal.screen.history.top)
+    check("project: the constructor projects only a screenful, not the cap",
+          0 < seeded_hist < 400, seeded_hist)
+    check("project: ...and defers the real one", bool(card._pending_replay))
+
+    card.terminal.resize(900, 500)
+    card._rerender_restored()
+    full_hist = len(card.terminal.screen.history.top)
+    check("project: the settled projection is the FULL one",
+          full_hist > seeded_hist * 3, (seeded_hist, full_hist))
+    check("project: ...and it projects the LIVE buffer, so a busy agent's "
+          "rebuilt card is not left holding only the seed",
+          full_hist > 1000, full_hist)
+    check("project: it records the width it projected at, so the very next "
+          "resize check is not a redundant third projection",
+          card._proj_cols == card.terminal.screen.columns,
+          (card._proj_cols, card.terminal.screen.columns))
+    check("project: the pending marker is consumed, so a resize storm "
+          "cannot project again", card._pending_replay == "")
+    card.detach(); live.dispose(); pump(30)
+
+    # -- a restored snapshot a child has since drawn over is NOT replayed
+    #    under it (an agent that comes back running gets a clean terminal)
+    seed = "PREVIOUS-RUN-SCREEN\r\n"
+    over = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Over", cwd=str(tmp), pty=True))
+    over.seed_pty_replay(seed)
+    card2 = tc.TerminalCard(over)
+    check("project: a seed no child has touched is not 'written over'",
+          not over.seed_written_over())
+    over._pty_buffer.append("the child's own output\r\n")
+    check("project: ...but it is once the child writes",
+          over.seed_written_over())
+    card2.terminal.screen.reset()
+    card2._rerender_restored()
+    check("project: the previous run's screen is never projected under a "
+          "live child", "PREVIOUS-RUN-SCREEN" not in card2.terminal.screen_text())
+    card2.detach(); over.dispose(); pump(30)
+
+    # -- the backstop: TerminalView._apply_resize returns EARLY when rows/cols
+    #    are unchanged, so sizeChanged is not guaranteed to arrive
+    quiet = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Quiet", cwd=str(tmp), pty=True))
+    quiet._pty_buffer.append(big)
+    quiet._pty_bytes = quiet._pty_total = len(big)
+    card3 = tc.TerminalCard(quiet)
+    check("project: a backstop timer is armed for the settled projection",
+          card3._settle_timer.isActive())
+    pump(tc.REPLAY_SETTLE_MS + 250)
+    check("project: ...and it projects even though sizeChanged never fired",
+          card3._pending_replay == ""
+          and len(card3.terminal.screen.history.top) > 1000,
+          len(card3.terminal.screen.history.top))
+    card3.detach(); quiet.dispose(); pump(30)
+
+    # -- dropping the restored screen must cancel the backstop too, or it
+    #    fires a moment later and puts back what was just dropped
+    dropped = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Dropped", cwd=str(tmp), pty=True))
+    dropped.seed_pty_replay(seed)
+    card4 = tc.TerminalCard(dropped)
+    card4._drop_restored_screen()
+    check("project: dropping the restored screen stops the backstop",
+          not card4._settle_timer.isActive())
+    pump(tc.REPLAY_SETTLE_MS + 150)
+    check("project: ...so the dropped screen stays dropped",
+          "PREVIOUS-RUN-SCREEN" not in card4.terminal.screen_text())
+    card4.detach(); dropped.dispose(); pump(30)
+
+
+def test_recovered_prompts_are_cached():
+    """_recover_marks must not re-read the transcript on every projection.
+
+    It runs on every projection (card build, and every width change), the read
+    is O(whole transcript), and transcripts' own (mtime,size) cache misses for
+    exactly the agents that matter -- a LIVE agent rewrites its transcript
+    continuously. Measured at 90-165ms on the user's real 50MB transcripts, on
+    the GUI thread, per card. Re-reading within one conversation cannot find
+    anything the card doesn't already know: it watched those prompts being
+    typed, so they carry live marks that outrank a recovered one."""
+    import pathlib
+    import tempfile
+
+    from PySide6.QtWidgets import QApplication
+
+    from app import transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.terminal_agent import TerminalAgent
+    from app.widgets import terminal_card as tc
+
+    if not HAS_CONPTY:
+        return
+    QApplication.instance() or QApplication([])
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="aihive-recover-"))
+
+    calls = []
+    real = transcripts.typed_prompts
+
+    def counting(cwd, sid):
+        calls.append(sid)
+        return ["count the reads"]
+
+    transcripts.typed_prompts = counting
+    try:
+        agent = TerminalAgent(build_spec(
+            AgentKind.CLAUDE, "Cached", cwd=str(tmp), pty=True))
+        agent.spec.session_id = "conv-1"
+        agent._pty_buffer.append("count the reads\r\n" + "x\r\n" * 200)
+        agent._pty_bytes = agent._pty_total = 1
+        card = tc.TerminalCard(agent)
+        check("recover: the constructor's seed projection does NOT read the "
+              "transcript at all", calls == [], calls)
+
+        card._rerender_restored()
+        first = len(calls)
+        check("recover: the settled projection reads it once", first == 1, calls)
+
+        for _ in range(5):
+            card._recover_marks()
+        check("recover: ...and further projections of the same conversation "
+              "reuse it", len(calls) == first, calls)
+
+        agent.spec.session_id = "conv-2"
+        card._recover_marks()
+        check("recover: a NEW conversation re-reads (a /clear or a pin change "
+              "means different prompts)", len(calls) == first + 1, calls)
+        card.detach(); agent.dispose()
+    finally:
+        transcripts.typed_prompts = real
+
+
+def test_gemini_usage_polling_is_offthread_and_optin():
+    """The Gemini readout must never block the GUI thread, and must never poll
+    unless main.py asks for it.
+
+    `gemini_usage.fetch()` shells out to `agy --print /usage` and MEASURES ~3.0
+    seconds. It was being called inline, in MainWindow.__init__ and again on
+    every timer tick -- and TWICE per tick, because the retune fetched its own
+    copy. That froze the whole app for ~6s a minute (worse at the 10s urgent
+    rate) with the CPU idle, since it is blocked on a subprocess rather than
+    computing. It also made this suite shell out to the user's real CLI and
+    added ~3s to every window it builds, which is what started breaking the
+    elapsed-time-sensitive checks elsewhere. Same rule as the Claude readout:
+    off-thread, and OPT-IN via start_usage_polling."""
+    import pathlib
+    import tempfile
+
+    from PySide6.QtWidgets import QApplication
+
+    from app import gemini_usage
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    QApplication.instance() or QApplication([])
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="ai-hive-gemusage-"))
+
+    calls = []
+    real = gemini_usage.fetch
+    gemini_usage.fetch = lambda *a, **k: (calls.append(1), None)[1]
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        check("gemini-usage: building a window does NOT shell out to the CLI",
+              calls == [], len(calls))
+        check("gemini-usage: ...and does not arm the poll timer either",
+              not win._gemini_usage_timer.isActive())
+
+        # the retune must use the reading it is given, never fetch its own
+        win._retune_gemini_usage_poll(None)
+        check("gemini-usage: retuning never fetches", calls == [], len(calls))
+
+        # in-flight guard: a 6s CLI timeout is longer than the urgent interval,
+        # so a stacking timer must not launch a thread per tick
+        win._gemini_usage_inflight = True
+        win._poll_gemini_usage()
+        check("gemini-usage: a poll already in flight is not stacked",
+              calls == [], len(calls))
+
+        win._gemini_usage_inflight = False
+        win._on_gemini_usage_ready(None)
+        check("gemini-usage: a finished poll clears the in-flight guard",
+              not win._gemini_usage_inflight)
+        win.close()
+    finally:
+        gemini_usage.fetch = real
+
+
+def test_history_screen_wrapper_removed():
+    """_FastHistoryScreen drops pyte's per-event wrapper without changing what
+    is rendered.
+
+    pyte routes every attribute access on a HistoryScreen through a Python
+    __getattribute__ that re-wraps each event in before_event/after_event, both
+    of which only serve prev_page/next_page. AI Hive never pages, so they are
+    no-ops -- but not free ones: taking the scrollback back made pyte's scroll
+    path hot (it shuffles every buffer row per scrolled line), and the tax was
+    43% of feed time. This asserts the wrapper is gone AND that its removal is
+    invisible, which is the only thing that makes the speedup safe."""
+    import pyte
+    from app.widgets import terminal_view as tv
+
+    fast = tv._new_history_screen(40, 12)
+    check("pyte: the view's screen bypasses HistoryScreen.__getattribute__",
+          type(fast).__getattribute__ is object.__getattribute__,
+          type(fast).__getattribute__)
+
+    # a stream that scrolls well past the screen, hides/shows the cursor
+    # (DECTCEM -- what after_event also maintained), wraps, uses SGR, and
+    # finally wipes history with ED 3
+    parts = ["\x1b[?25l"]
+    for i in range(60):
+        parts.append(f"\x1b[3{i % 8}mline {i} " + "x" * (i % 50) + "\r\n")
+        if i % 7 == 0:
+            parts.append("\x1b[?25h" if i % 14 == 0 else "\x1b[?25l")
+    parts.append("\x1b[2;5Hmid-screen\x1b[0m")
+    data = "".join(parts)
+
+    def drive(screen):
+        stream = pyte.Stream(screen)
+        for i in range(0, len(data), 64):     # split mid-sequence deliberately
+            stream.feed(data[i:i + 64])
+        return screen
+
+    stock = drive(pyte.HistoryScreen(40, 12, history=tv.HISTORY_LINES,
+                                     ratio=0.25))
+    drive(fast)
+
+    def htext(sc):
+        return ["".join(l[x].data for x in sorted(l)) for l in sc.history.top]
+
+    check("pyte: unwrapped screen renders an identical live screen",
+          list(fast.display) == list(stock.display),
+          (list(fast.display)[:2], list(stock.display)[:2]))
+    check("pyte: ...and identical scrollback history",
+          htext(fast) == htext(stock),
+          (len(htext(fast)), len(htext(stock))))
+    check("pyte: ...and identical cursor, incl. DECTCEM hidden state",
+          (fast.cursor.x, fast.cursor.y, fast.cursor.hidden)
+          == (stock.cursor.x, stock.cursor.y, stock.cursor.hidden),
+          (fast.cursor.hidden, stock.cursor.hidden))
+    check("pyte: history actually filled (otherwise this proves nothing)",
+          len(htext(fast)) > 40, len(htext(fast)))
+    check("pyte: pushed still counts every scrolled-off line",
+          getattr(fast.history.top, "pushed", 0) == len(htext(stock)),
+          getattr(fast.history.top, "pushed", None))
+
+    # ED 3 must still reach _reset_history through the unwrapped call
+    pyte.Stream(fast).feed("\x1b[3J")
+    check("pyte: ED 3 still wipes history without the wrapper",
+          len(fast.history.top) == 0, len(fast.history.top))
+
+    # paging is the one thing the wrapper made safe, so it must fail loudly
+    for name in ("prev_page", "next_page"):
+        try:
+            getattr(fast, name)()
+            raised = False
+        except NotImplementedError:
+            raised = True
+        check(f"pyte: {name} raises rather than silently paging away",
+              raised, raised)
+
+
+def test_terminal_scrollbar():
+    """The terminal scrollbar and its prompt milestones.
+
+    Covers the coordinate identity everything rests on, the capture point (a
+    bare Enter and nothing else), the overlay's no-stolen-columns contract, and
+    every path that has to wipe a milestone."""
+    from PySide6.QtCore import QEvent, QPoint, Qt
+    from PySide6.QtGui import QKeyEvent, QMouseEvent, QPixmap
+    from PySide6.QtWidgets import QApplication
+
+    import json
+
+    from app import session_hook, ui_theme
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import PROMPT_MARK_CAP, TerminalAgent
+    from app.widgets.terminal_card import TerminalCard
+    from app.widgets.terminal_scrollbar import WIDTH, TerminalScrollBar
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+
+    def enter(view, mods=Qt.KeyboardModifier.NoModifier):
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress,
+                                     Qt.Key.Key_Return, mods))
+
+    # ---- viewChanged: fires on real changes, silent on no-ops -----------
+    v = TerminalView(rows=10, cols=40)
+    hits = []
+    v.viewChanged.connect(lambda: hits.append(1))
+    for i in range(30):
+        v.feed(f"line {i}\r\n")
+    v._view_notify_timer.timeout.emit()      # drive the coalescer directly
+    check("scrollbar: viewChanged fires as history grows", hits, hits)
+    n = len(hits)
+    v.scroll_by(-1)                          # already live: clamped no-op
+    check("scrollbar: a clamped no-op scroll emits nothing", len(hits) == n)
+    v.scroll_by(5)
+    check("scrollbar: scrolling back emits", len(hits) > n)
+    n = len(hits)
+    v.feed("")                               # nothing pushed, nothing changed
+    check("scrollbar: an empty feed emits nothing", len(hits) == n)
+
+    # ---- the absolute-line identity -------------------------------------
+    def row_text(view, r):
+        hist, off = view._view_state()
+        return "".join(view._visible_line(r, hist, off)[c].data or " "
+                       for c in range(view.screen.columns)).strip()
+    check("scrollbar: abs id identifies the line under it, scrolled back",
+          row_text(v, 0) == f"line {v.abs_line_at_row(0)}",
+          (row_text(v, 0), v.abs_line_at_row(0)))
+    target = v.abs_line_at_row(0)
+    v.scroll_to_abs(target, lead=0)
+    check("scrollbar: scroll_to_abs(lead=0) puts the line on row 0",
+          row_text(v, 0) == f"line {target}", row_text(v, 0))
+    oldest, newest = v.history_span()
+    check("scrollbar: history_span brackets every live id",
+          oldest <= v.abs_line_at_row(0) <= newest, (oldest, newest))
+
+    # ---- history wipe: pushed SURVIVES, ids stay consistent -------------
+    cleared = []
+    v.historyCleared.connect(lambda: cleared.append(1))
+    before = v.history_pushed()
+    v.feed("\x1b[3J")
+    check("scrollbar: ED 3 fires historyCleared", cleared == [1], cleared)
+    check("scrollbar: ...and empties history", len(v.screen.history.top) == 0)
+    check("scrollbar: ...and snaps back to live", v.scroll_offset() == 0)
+    check("scrollbar: ...but `pushed` is deliberately NOT reset",
+          v.history_pushed() == before, (v.history_pushed(), before))
+    v.feed("after the wipe\r\n" * 12)
+    check("scrollbar: ids stay self-consistent across a wipe",
+          row_text(v, 0) == "after the wipe"
+          or v.abs_line_at_row(0) >= before, v.abs_line_at_row(0))
+
+    # ---- capture point: a bare Enter, and nothing else -------------------
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Marks", cwd=".",
+                                     pty=True))
+    card = TerminalCard(agent)
+    card.resize(640, 420)
+    t = card.terminal
+    cols_without_bar = t.screen.columns
+
+    t.feed("> refactor the parser")
+    enter(t)
+    check("scrollbar: a bare Enter records a milestone",
+          [m.text for m in agent.prompt_marks()] == ["refactor the parser"],
+          agent.prompt_marks())
+    check("scrollbar: ...and the view is given it in view coordinates",
+          len(t.marks()) == 1 and t.marks()[0][0] == card._mark_lines[
+              agent.prompt_marks()[0].uid], t.marks())
+
+    # the classic renderer parks the caret on a BLANK row below the box, which
+    # is what made the span reading come back empty and record nothing
+    below = TerminalView(rows=20, cols=40)
+    below.feed("output\r\n" * 14 + "─" * 30 + "\r\n> find the leak\x1b[19;3H")
+    check("scrollbar: input is still found when the caret sits below the box",
+          below._submitted_input() == (15, "find the leak"),
+          below._submitted_input())
+    below2 = TerminalView(rows=20, cols=40)
+    below2.feed("output\r\n" * 14 + "─" * 30 + "\r\n\x1b[19;3H")
+    check("scrollbar: ...but an empty box behind that rule records nothing",
+          below2._submitted_input() is None, below2._submitted_input())
+    below3 = TerminalView(rows=20, cols=40)
+    below3.feed("conversation output\r\n\r\n")
+    check("scrollbar: ...and a caret up in the conversation records nothing",
+          below3._submitted_input() is None, below3._submitted_input())
+
+    for mods, label in ((Qt.KeyboardModifier.ShiftModifier, "Shift"),
+                        (Qt.KeyboardModifier.ControlModifier, "Ctrl"),
+                        (Qt.KeyboardModifier.AltModifier, "Alt")):
+        t.feed("\r\n> a newline, not a submit")
+        enter(t, mods)
+        check(f"scrollbar: {label}+Enter is a newline, never a milestone",
+              len(agent.prompt_marks()) == 1, agent.prompt_marks())
+
+    t.feed("\r\n> ")
+    enter(t)
+    check("scrollbar: an empty input records nothing",
+          len(agent.prompt_marks()) == 1)
+
+    t.feed("\r\n> 1. Yes, proceed")
+    enter(t)
+    check("scrollbar: a numbered menu row is an ANSWER, not a milestone",
+          len(agent.prompt_marks()) == 1, agent.prompt_marks())
+
+    # AI Hive's own writes must never look like the user typing
+    agent.write("\r")
+    agent.nudge("Continue")
+    agent.deliver_task("go and do the thing")
+    check("scrollbar: write/nudge/deliver_task record no milestones",
+          len(agent.prompt_marks()) == 1, agent.prompt_marks())
+
+    # ---- uid is never an id() ------------------------------------------
+    evicted = agent.prompt_marks()[0].uid
+    for i in range(PROMPT_MARK_CAP + 5):
+        t.feed(f"\r\n> prompt {i}")
+        enter(t)
+    uids = [m.uid for m in agent.prompt_marks()]
+    check("scrollbar: the milestone list is FIFO-capped",
+          len(uids) == PROMPT_MARK_CAP, len(uids))
+    check("scrollbar: a surviving uid never reuses an evicted one",
+          evicted not in uids and len(set(uids)) == len(uids))
+    card._refresh_marks()
+    check("scrollbar: an evicted milestone is not still painted",
+          all(uid in {m.uid for m in agent.prompt_marks()}
+              for uid in {m.uid for m in agent.prompt_marks()}))
+
+    # ---- re-anchoring across a card rebuild ----------------------------
+    agent2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Replay", cwd=".",
+                                      pty=True))
+    c1 = TerminalCard(agent2)
+    c1.resize(640, 420)
+    for k in range(4):
+        agent2._on_pty_output("pty", f"> prompt {k}\r\n")
+        c1.terminal.feed(f"> prompt {k}")
+        enter(c1.terminal)
+        for i in range(20):
+            agent2._on_pty_output("pty", f"  reply {k} line {i}\r\n")
+    c2 = TerminalCard(agent2)          # what a retile does
+    c2.resize(640, 420)
+    check("scrollbar: a rebuilt card re-derives the SAME milestone lines",
+          c1._mark_lines == c2._mark_lines,
+          (c1._mark_lines, c2._mark_lines))
+    check("scrollbar: every milestone is anchored inside the new history",
+          all(c2.terminal.history_span()[0] <= line
+              <= c2.terminal.history_span()[1]
+              for line in c2._mark_lines.values()))
+    agent2._pty_dropped = 10 ** 9      # everything has aged out of the buffer
+    check("scrollbar: a milestone whose bytes aged out is dropped, not clamped",
+          agent2.replay_marks() == [], agent2.replay_marks())
+
+    # ---- the overlay contract ------------------------------------------
+    check("scrollbar: it is a child of the terminal, not a layout sibling",
+          card.scroll_bar.parent() is t)
+    check("scrollbar: it never takes focus off the terminal",
+          card.scroll_bar.focusPolicy() == Qt.FocusPolicy.NoFocus)
+    check("scrollbar: it steals no terminal columns",
+          t.screen.columns == cols_without_bar,
+          (t.screen.columns, cols_without_bar))
+    bare = TerminalView(rows=10, cols=40)
+    bar = TerminalScrollBar(bare, bare)
+    bar.refresh()
+    check("scrollbar: hidden while there is no scrollback",
+          not bar.isVisibleTo(bare))
+    for i in range(40):
+        bare.feed(f"line {i}\r\n")
+    bar.refresh()
+    check("scrollbar: visible once there is", bar.isVisibleTo(bare))
+    check("scrollbar: its range is the history depth",
+          bar.maximum() == len(bare.screen.history.top), bar.maximum())
+    check("scrollbar: maximum means live (offset 0)",
+          bar.value() == bar.maximum() - bare.scroll_offset())
+    card._place_overlay()
+    geo = card.scroll_bar.geometry()
+    check("scrollbar: pinned to the right edge, full height",
+          geo.right() >= t.width() - 2 and geo.height() == t.height()
+          and geo.width() == WIDTH, geo)
+
+    # ---- markers paint, and a click on one jumps -------------------------
+    bare.resize(WIDTH, 200)
+    bar.resize(WIDTH, 200)
+    oldest, newest = bare.history_span()
+    marks = [(oldest + 2, "first prompt"), (oldest + 20, "second prompt")]
+    bare.set_marks(marks)
+    bar.refresh()
+    pm = QPixmap(bar.size())
+    pm.fill()
+    bar.render(pm)
+    img = pm.toImage()
+    accent = ui_theme.Palette.ACCENT_ORANGE
+    want = (int(accent[1:3], 16), int(accent[3:5], 16), int(accent[5:7], 16))
+
+    def band_has_accent(y):
+        for dy in range(-3, 4):
+            yy = y + dy
+            if not (0 <= yy < img.height()):
+                continue
+            for x in range(img.width()):
+                c = img.pixelColor(x, yy)
+                if (abs(c.red() - want[0]) < 60 and abs(c.green() - want[1]) < 60
+                        and abs(c.blue() - want[2]) < 60):
+                    return True
+        return False
+    check("scrollbar: a milestone is painted at its own position",
+          band_has_accent(int(bar._y_for(marks[0][0]))))
+    check("scrollbar: ...and so is the second one",
+          band_has_accent(int(bar._y_for(marks[1][0]))))
+
+    jumped = []
+    bar.markActivated.connect(jumped.append)
+    bar.markActivated.connect(bare.scroll_to_abs)
+    y = bar._y_for(marks[1][0])
+    bar.mousePressEvent(QMouseEvent(
+        QEvent.Type.MouseButtonPress, QPoint(int(WIDTH / 2), int(y)),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier))
+    check("scrollbar: clicking a milestone activates THAT milestone",
+          jumped == [marks[1][0]], jumped)
+    check("scrollbar: ...and the view lands on it",
+          bare.abs_line_at_row(2) == marks[1][0], bare.abs_line_at_row(2))
+
+    # ---- a fresh milestone is drawable BEFORE it scrolls off ------------
+    live = TerminalView(rows=10, cols=40)
+    livebar = TerminalScrollBar(live, live)
+    livebar.resize(WIDTH, 200)
+    for i in range(30):
+        live.feed(f"line {i}\r\n")
+    livebar.refresh()
+    fresh = live.history_pushed() + 3          # still on the live screen
+    live.set_marks([(fresh, "just typed")])
+    oldest, span = livebar._span()
+    check("scrollbar: a milestone on the LIVE screen is inside the track",
+          oldest <= fresh <= oldest + span, (oldest, span, fresh))
+    pm2 = QPixmap(livebar.size())
+    pm2.fill()
+    livebar.render(pm2)
+    img2 = pm2.toImage()
+    found = False
+    for dy in range(-4, 5):
+        yy = int(livebar._y_for(fresh)) + dy
+        if not (0 <= yy < img2.height()):
+            continue
+        for x in range(img2.width()):
+            c = img2.pixelColor(x, yy)
+            if (abs(c.red() - want[0]) < 60 and abs(c.green() - want[1]) < 60
+                    and abs(c.blue() - want[2]) < 60):
+                found = True
+    check("scrollbar: ...and is actually painted, not waiting to scroll off",
+          found)
+
+    # ---- width change re-projects the scrollback -------------------------
+    wide = TerminalAgent(build_spec(AgentKind.CLAUDE, "Reflow", cwd=".",
+                                    pty=True))
+    wcard = TerminalCard(wide)
+    wt = wcard.terminal
+    wt.screen.resize(20, 30)                   # a pre-layout narrow card
+    wcard._proj_cols = 30
+    wide._on_pty_output("pty", ("A very long line of conversation text that "
+                                "must wrap at thirty columns\r\n") * 20)
+    narrow_lines = len(wt.screen.history.top)
+    wt.screen.resize(20, 100)                  # the tiling grid widens it
+    wcard._reproject_on_size(20, 100)
+    check("scrollbar: widening re-projects the scrollback instead of "
+          "leaving it wrapped for a screen that is gone",
+          len(wt.screen.history.top) < narrow_lines,
+          (narrow_lines, len(wt.screen.history.top)))
+    joined = "".join(
+        "".join(ln[c].data or " " for c in range(100)).rstrip() + "\n"
+        for ln in wt.screen.history.top)
+    check("scrollbar: ...and the re-projected lines use the full width",
+          any(len(l) > 40 for l in joined.splitlines()),
+          max((len(l) for l in joined.splitlines()), default=0))
+    before_cols = len(wt.screen.history.top)
+    wcard._reproject_on_size(30, 100)          # height-only change
+    check("scrollbar: a height-only change re-projects nothing",
+          len(wt.screen.history.top) == before_cols)
+    wcard.deleteLater()
+
+    # ---- milestones recovered for a conversation we did not watch --------
+    from app import transcripts
+    rtmp = Path(tempfile.mkdtemp(prefix="ai-hive-marks-"))
+    conv = rtmp / "conv.jsonl"
+    typed = ["refactor the session pinning logic",
+             "now write the regression tests for it",
+             "explain why the anchor drifts by one line"]
+    recs = []
+    for i, text in enumerate(typed):
+        recs.append(json.dumps({
+            "type": "user", "promptSource": "typed",
+            "origin": {"kind": "human"}, "isSidechain": False,
+            "timestamp": f"2026-08-09T1{i}:00:00.000Z",
+            "message": {"role": "user", "content": text}}))
+    # noise that must NOT become a milestone
+    recs.append(json.dumps({
+        "type": "user", "promptSource": "typed", "isSidechain": True,
+        "message": {"role": "user", "content": "a sub-agent turn"}}))
+    recs.append(json.dumps({
+        "type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "x"}]}}))
+    recs.append(json.dumps({
+        "type": "user", "promptSource": "typed", "message": {
+            "role": "user",
+            "content": "<local-command-stdout>Set model to Opus</local-command-stdout>"}}))
+    conv.write_text("\n".join(recs) + "\n", encoding="utf-8")
+
+    real_tp = transcripts.transcript_path
+    transcripts.transcript_path = lambda cwd, sid: str(conv)
+    try:
+        got = transcripts.typed_prompts(str(rtmp), "sid")
+        check("scrollbar: the transcript yields exactly the typed prompts",
+              got == typed, got)
+
+        rag = TerminalAgent(build_spec(AgentKind.CLAUDE, "Recover",
+                                       cwd=str(rtmp), pty=True))
+        rag.spec.session_id = "sid"
+        rcard = TerminalCard(rag)
+        rcard.terminal.screen.resize(24, 80)
+        # a conversation replayed from disk: the prompts are echoed in the
+        # scrollback, but no keystroke was ever seen by this process
+        stream = ""
+        for text in typed:
+            stream += f"> {text}\r\n"
+            stream += "".join(f"  reply line {i}\r\n" for i in range(9))
+        rag._on_pty_output("pty", stream)
+        rcard._recover_marks()
+        rcard._refresh_marks()
+        found = [t for _line, t in rcard._recovered]
+        check("scrollbar: every earlier prompt is recovered from the "
+              "scrollback", found == typed, found)
+        check("scrollbar: ...and none of them came from a live keystroke",
+              rag.prompt_marks() == [])
+        rv = rcard.terminal
+        hist_r = list(rv.screen.history.top)
+        all_rows = hist_r + [rv.screen.buffer[r] for r in range(rv.screen.lines)]
+        oldest_r = rv.history_pushed() - len(hist_r)
+        ok = True
+        for line, text in rcard._recovered:
+            idx = line - oldest_r
+            if not (0 <= idx < len(all_rows)):
+                ok = False
+                continue
+            row = "".join(all_rows[idx][c].data or " " for c in range(80))
+            if text[:20] not in row:
+                ok = False
+        check("scrollbar: ...and each dot sits on that prompt's own line", ok)
+        check("scrollbar: recovered milestones reach the view",
+              len(rcard.terminal.marks()) == len(typed),
+              rcard.terminal.marks())
+
+        # a prompt the transcript does not contain is never marked
+        rag2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "NoMatch",
+                                        cwd=str(rtmp), pty=True))
+        rag2.spec.session_id = "sid"
+        rcard2 = TerminalCard(rag2)
+        rcard2.terminal.screen.resize(24, 80)
+        rag2._on_pty_output("pty", "> something nobody ever typed\r\n" * 30)
+        rcard2._recover_marks()
+        check("scrollbar: a line that matches no typed prompt gets no dot",
+              rcard2._recovered == [], rcard2._recovered)
+        rcard.deleteLater()
+        rcard2.deleteLater()
+    finally:
+        transcripts.transcript_path = real_tp
+
+    # ---- resets ---------------------------------------------------------
+    replaced = []
+    agent2.conversation_replaced.connect(lambda: replaced.append(1))
+    agent2.note_conversation_replaced()
+    check("scrollbar: a replaced conversation drops every milestone",
+          agent2.prompt_marks() == [] and replaced == [1])
+    c2.terminal.clear_history()
+    check("scrollbar: ...and its scrollback, so the bar goes away",
+          len(c2.terminal.screen.history.top) == 0
+          and c2._mark_lines == {} and c2.terminal.marks() == [])
+    agent.restart()
+    check("scrollbar: a restart clears milestones and stream coordinates",
+          agent.prompt_marks() == [] and agent._pty_total == 0
+          and agent._pty_dropped == 0)
+
+    # ---- the tui renderer setting --------------------------------------
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-tui-"))
+    sp, mp, ep = (str(tmp / "s.json"), str(tmp / "m.jsonl"),
+                  str(tmp / "e.jsonl"))
+    session_hook.write_settings_file(sp, mp, ep, tui="default")
+    data = json.loads(Path(sp).read_text(encoding="utf-8"))
+    check("scrollbar: tui='default' selects the classic renderer",
+          data.get("tui") == "default", data.get("tui"))
+    check("scrollbar: the renderer key never disturbs the hook matcher",
+          data["hooks"]["SessionStart"][0]["matcher"] == "resume|clear|compact",
+          data["hooks"]["SessionStart"][0]["matcher"])
+    session_hook.write_settings_file(sp, mp, ep)
+    data = json.loads(Path(sp).read_text(encoding="utf-8"))
+    check("scrollbar: omitted when AI Hive is not owning the scrollback",
+          "tui" not in data, data)
+    check("scrollbar: ...and the hooks are still intact",
+          data["hooks"]["SessionStart"][0]["matcher"] == "resume|clear|compact")
+
+    card.deleteLater()
+    c1.deleteLater()
+    c2.deleteLater()
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
@@ -9398,11 +10368,123 @@ def main():
     test_agent_kind_is_always_an_enum()
     test_limit_recovery_reliability()
     test_auto_continue_on_limit_reset()
+    test_gemini_limit_detection()
     test_startup_limit_recovery()
+    test_terminal_scrollbar()
+    test_history_screen_wrapper_removed()
+    test_gemini_usage_polling_is_offthread_and_optin()
+    test_projection_happens_once()
+    test_recovered_prompts_are_cached()
+    test_multi_agent_session_isolation()
+    test_gemini_usage_badge_fixed_width()
     test_scheduled_send()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0
+
+
+def test_gemini_usage_badge_fixed_width():
+    """GeminiUsageBadge maintains a stable, non-jittering 315px fixed width that
+    comfortably accommodates max length rate-limit text without truncation."""
+    import json
+    import os
+    import tempfile
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QColor
+    from app.widgets.gemini_usage_badge import GeminiUsageBadge
+    from app import gemini_usage
+
+    QApplication.instance() or QApplication([])
+    badge = GeminiUsageBadge(window="five_hour")
+    weekly_badge = GeminiUsageBadge(window="weekly")
+
+    # Before usage set
+    check("gemini-badge: has_content returns False before usage", badge.has_content() is False)
+
+    lim_five_hour = gemini_usage.GeminiLimit(key="five_hour", label="Five Hour Limit (5h)", short="5h", percent=13.0, resets_at=time.time() + 3600.0)
+    lim_weekly = gemini_usage.GeminiLimit(key="seven_day", label="Weekly Limit (all models)", short="7d", percent=2.5, resets_at=time.time() + 86400.0)
+
+    reading = gemini_usage.GeminiUsage(limits=(lim_five_hour, lim_weekly))
+    badge.set_usage(reading)
+    weekly_badge.set_usage(reading)
+
+    check("gemini-badge: 5h badge shows 5h limit text", "5h Gemini 13%" in badge._text)
+    check("gemini-badge: weekly badge shows 7d limit text", "7d Gemini 2%" in weekly_badge._text)
+    check("gemini-badge: both badges maintain stable 315px fixed width", badge.width() == 315 and weekly_badge.width() == 315)
+    check("gemini-badge: has_content returns True when usage present", badge.has_content() is True)
+
+    # Test _color evaluation (verifying _AMBER and _RED attributes exist)
+    col = badge._color()
+    check("gemini-badge: _color returns QColor without raising AttributeError", isinstance(col, QColor))
+
+    # Test disk cache reading & expired reset auto-zeroing
+    with tempfile.TemporaryDirectory() as tmpdir:
+        old_env = os.environ.get("GEMINI_CONFIG_DIR")
+        try:
+            os.environ["GEMINI_CONFIG_DIR"] = tmpdir
+            cache_file = Path(tmpdir) / "gemini_usage_cache.json"
+            cache_file.write_text(json.dumps({
+                "fetchedAtMs": int(time.time() * 1000),
+                "utilization": {
+                    "five_hour": {"utilization": 45.0, "resets_at": time.time() + 1800},
+                    "seven_day": {"utilization": 80.0, "resets_at": time.time() - 100}  # expired reset
+                }
+            }), encoding="utf-8")
+
+            cached = gemini_usage.read_cached()
+            check("gemini-usage: read_cached reads utilization from disk file", cached is not None and len(cached.limits) == 2)
+            if cached:
+                fh = next(l for l in cached.limits if l.key == "five_hour")
+                sd = next(l for l in cached.limits if l.key == "seven_day")
+                check("gemini-usage: active limit maintains percentage", fh.percent == 45.0)
+                check("gemini-usage: expired limit resets percentage to 0.0", sd.percent == 0.0)
+        finally:
+            if old_env is None:
+                os.environ.pop("GEMINI_CONFIG_DIR", None)
+            else:
+                os.environ["GEMINI_CONFIG_DIR"] = old_env
+
+    badge.deleteLater()
+    weekly_badge.deleteLater()
+
+
+def test_multi_agent_session_isolation():
+    """Ensure two agents in the same workspace never share a session ID, and
+    Gemini session sync isolates multi-agent folders properly."""
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-iso-test-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Test", str(tmp))
+
+    spec1 = build_spec(AgentKind.GEMINI, "Gemini 1", cwd=str(tmp))
+    spec1.session_id = "11111111-1111-1111-1111-111111111111"
+    agent1 = mgr.add_terminal(ws.id, spec1, autostart=False)
+
+    check("iso: agent1 has its pinned session_id",
+          agent1.spec.session_id == "11111111-1111-1111-1111-111111111111")
+    check("iso: sibling_session_ids of agent1 is empty",
+          mgr.sibling_session_ids(agent1) == set())
+
+    # Add a second Gemini agent with a DUPLICATE session_id
+    spec2 = build_spec(AgentKind.GEMINI, "Gemini 2", cwd=str(tmp))
+    spec2.session_id = "11111111-1111-1111-1111-111111111111"  # duplicate!
+    agent2 = mgr.add_terminal(ws.id, spec2, autostart=False)
+
+    check("iso: sibling_session_ids of agent2 sees agent1 pin",
+          mgr.sibling_session_ids(agent2) == {"11111111-1111-1111-1111-111111111111"})
+    check("iso: agent2 duplicate pin was disallocated on wire",
+          agent2.spec.session_id != "11111111-1111-1111-1111-111111111111")
+
+    # Verify sync_live_sessions does NOT cross-pin multi-agent Gemini folder
+    mgr.sync_live_sessions()
+    check("iso: sync_live_sessions keeps agent1 and agent2 distinct",
+          agent1.spec.session_id != agent2.spec.session_id)
+
+
 
 
 if __name__ == "__main__":

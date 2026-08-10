@@ -23,6 +23,7 @@ from .. import claude_usage
 from .. import fsopen
 from .. import limit_ledger
 from .. import providers
+from ..limit_banner import LIMIT_PROVIDERS
 from .. import scheduled_send
 from .. import session_hook
 from .. import transcripts
@@ -202,6 +203,9 @@ class TopBar(QFrame):
     themeChanged = Signal(str)   # theme id
     soundToggled = Signal(bool)  # notification chime enabled/muted
     usageVisibilityToggled = Signal(bool)  # show/hide the plan-usage readout
+    # should Claude agents run the classic renderer, so their scrollback (and
+    # therefore the terminal scrollbar and its prompt milestones) is ours?
+    terminalScrollbackToggled = Signal(bool)
     taskbarBadgeToggled = Signal(bool)     # show/hide the taskbar count overlay
     autoContinueToggled = Signal(bool)     # resume cut-off agents at the reset
     startupRecoveryToggled = Signal(bool)  # recover cut-off agents on startup
@@ -279,6 +283,17 @@ class TopBar(QFrame):
         self.usage_badge.setVisible(False)
         self.usage_badge.refreshRequested.connect(self.usageRefreshRequested)
         self._usage_wanted = True   # the user's show/hide preference
+        self._scrollback_wanted = True  # AI Hive owns the terminal scrollback
+
+        # Gemini rate-limit usage readout (5-hour limit and weekly limit pills)
+        from .gemini_usage_badge import GeminiUsageBadge
+        self.gemini_badge = GeminiUsageBadge(self, window="five_hour")
+        self.gemini_badge.setVisible(True)
+        self.gemini_badge.refreshRequested.connect(self.usageRefreshRequested)
+
+        self.gemini_weekly_badge = GeminiUsageBadge(self, window="weekly")
+        self.gemini_weekly_badge.setVisible(True)
+        self.gemini_weekly_badge.refreshRequested.connect(self.usageRefreshRequested)
 
         # The two auto-recovery switches, beside the readout they belong to.
         # Both act on agents the plan limit cut off; they differ only in WHEN
@@ -323,6 +338,9 @@ class TopBar(QFrame):
         lay.addWidget(self.breadcrumb)
         lay.addStretch(1)
         lay.addWidget(self.usage_badge)
+        lay.addWidget(self.gemini_badge)
+        lay.addSpacing(6)
+        lay.addWidget(self.gemini_weekly_badge)
         lay.addSpacing(10)
         lay.addWidget(self.recovery_label)
         lay.addSpacing(6)
@@ -451,6 +469,12 @@ class TopBar(QFrame):
         self._usage_wanted = bool(on)
         self.usage_badge.setVisible(self._usage_wanted
                                     and self.usage_badge.has_content())
+        if hasattr(self, "gemini_badge"):
+            self.gemini_badge.setVisible(self._usage_wanted
+                                        and self.gemini_badge.has_content())
+        if hasattr(self, "gemini_weekly_badge"):
+            self.gemini_weekly_badge.setVisible(self._usage_wanted
+                                               and self.gemini_weekly_badge.has_content())
 
     def usage_visible(self) -> bool:
         return self._usage_wanted
@@ -464,11 +488,18 @@ class TopBar(QFrame):
         self.recover_btn.setVisible(bool(on))
         self.resume_btn.setVisible(bool(on))
 
-    def contextMenuEvent(self, event):
-        """Right-click anywhere on the bar: toggle the plan-usage readout.
+    def set_terminal_scrollback(self, on: bool) -> None:
+        """Reflect the scrollback-ownership preference (no signal emitted)."""
+        self._scrollback_wanted = bool(on)
 
-        A context-menu item rather than another button — the bar is already
-        busy, and this is a set-once preference. The two RECOVERY switches are
+    def terminal_scrollback(self) -> bool:
+        return self._scrollback_wanted
+
+    def contextMenuEvent(self, event):
+        """Right-click anywhere on the bar: the set-once display preferences.
+
+        Context-menu items rather than more buttons — the bar is already busy,
+        and these are set-once preferences. The two RECOVERY switches are
         deliberately NOT here: they decide whether unattended work resumes, so
         they get visible buttons instead (and each setting has exactly one
         control, never two that can disagree).
@@ -478,6 +509,14 @@ class TopBar(QFrame):
         act.setCheckable(True)
         act.setChecked(self._usage_wanted)
         act.toggled.connect(self.usageVisibilityToggled)
+        act2 = menu.addAction("Scrollback lives in AI Hive")
+        act2.setCheckable(True)
+        act2.setChecked(self._scrollback_wanted)
+        act2.setToolTip(
+            "Claude agents run the classic renderer, so their conversation "
+            "scrolls into AI Hive's own scrollbar. Applies to agents started "
+            "from now on.")
+        act2.toggled.connect(self.terminalScrollbackToggled)
         menu.exec(event.globalPos())
 
     def set_theme(self, theme_id: str) -> None:
@@ -685,7 +724,7 @@ class AddTerminalDialog(QDialog):
         # Ultracode isn't a launch flag (claude --effort only takes
         # low/medium/high/xhigh/max); it's an in-session mode. Show it, greyed
         # out, so users know to enable it manually in the terminal.
-        if prov.native_flags:
+        if prov.native_flags and prov.key == "claude":
             self.effort_combo.addItem(
                 "Ultracode (activate manually in terminal, model-dependent)", None)
             model = self.effort_combo.model()
@@ -1017,6 +1056,7 @@ class MainWindow(QMainWindow):
     # Qt marshals a cross-thread emit through the event loop, so everything the
     # slot touches (widgets, timers) stays on the main thread.
     _usageReady = Signal(object)
+    _geminiUsageReady = Signal(object)
 
     def __init__(self, manager: WorkspaceManager, store: SessionStore,
                  session: dict | None = None):
@@ -1107,6 +1147,20 @@ class MainWindow(QMainWindow):
         self._usage_tick_timer = QTimer(self)
         self._usage_tick_timer.setInterval(USAGE_TICK_MS)
         self._usage_tick_timer.timeout.connect(self._tick_usage)
+
+        # Gemini usage timer. NOT started here and NOT polled here: the reading
+        # comes from shelling out to `agy --print /usage`, which measures ~3.0s,
+        # so doing it in the constructor froze every launch (and every window
+        # the smoke suite builds) for that long, and made the suite shell out to
+        # the user's real CLI. Same rule as the Claude readout: polling is
+        # OPT-IN, armed by `start_usage_polling` from main.py only.
+        self._gemini_usage_timer = QTimer(self)
+        self._gemini_usage_timer.setInterval(USAGE_POLL_MS)
+        self._gemini_usage_timer.timeout.connect(self._poll_gemini_usage)
+        self._gemini_usage_inflight = False
+        # last good Gemini reading, so the countdown tick can retune the poll
+        # without shelling out again (that tick fires every 20s)
+        self._gemini_usage = None
         # fires just after a spent limit's stated reset, so the "cleared" edge
         # doesn't wait out a full poll interval
         self._usage_reset_timer = QTimer(self)
@@ -1141,10 +1195,13 @@ class MainWindow(QMainWindow):
         self._hook_settings_path = str(session_dir / "aihive_session_hook.json")
         self._session_map_path = str(session_dir / "live_sessions.jsonl")
         self._prompt_events_path = str(session_dir / "prompt_events.jsonl")
+        # Seeded here rather than in _restore_ui_state because the settings
+        # file is written NOW, before any agent is armed, and the renderer it
+        # names is what those agents launch with.
+        self._terminal_scrollback = bool(
+            (session or {}).get("ui", {}).get("terminal_scrollback", True))
         try:
-            session_hook.write_settings_file(self._hook_settings_path,
-                                             self._session_map_path,
-                                             self._prompt_events_path)
+            self._write_hook_settings()
             session_hook.reset_map(self._session_map_path)
             session_hook.reset_events(self._prompt_events_path)
         except OSError as e:
@@ -1194,6 +1251,34 @@ class MainWindow(QMainWindow):
         if not self.bridge.enabled:
             return
         agent.spec.mcp_config_path = self.bridge.mcp_config_path_for(ws.id)
+
+    def _write_hook_settings(self) -> None:
+        """(Re)write the shared `--settings` file every Claude agent launches
+        with. Carries the hooks, plus the renderer choice when AI Hive is
+        owning the scrollback. Cheap, and re-run whenever the preference
+        changes so the NEXT launch picks it up."""
+        if not self._hook_settings_path:
+            return
+        session_hook.write_settings_file(
+            self._hook_settings_path, self._session_map_path,
+            self._prompt_events_path,
+            tui="default" if self._terminal_scrollback else "")
+
+    def _on_terminal_scrollback(self, on: bool) -> None:
+        """Toggle: should Claude agents run the classic renderer so their
+        conversation scrolls into AI Hive's own scrollbar?
+
+        Only affects agents started from here on -- a running agent keeps the
+        renderer it launched with, and restarting someone's working agent to
+        change a display preference is exactly the kind of surprise the
+        nudge-vs-deliver_task rules exist to avoid. An ordinary UI preference:
+        _schedule_save, never _touch."""
+        on = bool(on)
+        if on == self._terminal_scrollback:
+            return
+        self._terminal_scrollback = on
+        self._write_hook_settings()
+        self._schedule_save()
 
     def _rearm_agent_configs(self) -> None:
         # Re-arm EVERY restored Claude agent. Must NOT bail when the bridge is
@@ -1279,6 +1364,8 @@ class MainWindow(QMainWindow):
         self.top_bar.themeChanged.connect(self._change_theme)
         self.top_bar.soundToggled.connect(self._on_sound_toggled)
         self.top_bar.usageVisibilityToggled.connect(self._on_usage_visibility)
+        self.top_bar.terminalScrollbackToggled.connect(
+            self._on_terminal_scrollback)
         self.top_bar.taskbarBadgeToggled.connect(self._on_taskbar_badge_toggled)
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
         self.top_bar.startupRecoveryToggled.connect(self._on_startup_recovery)
@@ -1290,6 +1377,8 @@ class MainWindow(QMainWindow):
         # runs on the GUI thread where touching widgets/timers is legal
         self._usageReady.connect(self._on_usage_ready,
                                  Qt.ConnectionType.QueuedConnection)
+        self._geminiUsageReady.connect(self._on_gemini_usage_ready,
+                                       Qt.ConnectionType.QueuedConnection)
         self.sidebar.addRequested.connect(self._on_add_workspace_clicked)
         self.sidebar.workspaceSelected.connect(self.manager.set_active)
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
@@ -1436,6 +1525,9 @@ class MainWindow(QMainWindow):
         self._usage_timer.start()
         self._usage_tick_timer.start()
         self._poll_usage()
+        # the Gemini readout rides the same opt-in, for the same reasons
+        self._gemini_usage_timer.start()
+        self._poll_gemini_usage()
 
     def _poll_usage(self) -> None:
         """Kick a fetch on a daemon thread (the pty_worker/mcp_server pattern).
@@ -1502,6 +1594,7 @@ class MainWindow(QMainWindow):
         if self._usage_timer.isActive():
             self._usage_timer.start()      # restart the interval from now
         self._poll_usage()
+        self._poll_gemini_usage()
 
     def _on_usage_ready(self, reading) -> None:
         self._usage_inflight = False
@@ -1591,7 +1684,90 @@ class MainWindow(QMainWindow):
         number can move.
         """
         self.top_bar.usage_badge.tick()
+        if hasattr(self.top_bar, "gemini_badge"):
+            self.top_bar.gemini_badge.tick()
+        if hasattr(self.top_bar, "gemini_weekly_badge"):
+            self.top_bar.gemini_weekly_badge.tick()
         self._retune_usage_poll()
+        # from the LAST reading, never a fresh fetch: this tick fires every 20s
+        self._retune_gemini_usage_poll(self._gemini_usage)
+
+    def _gemini_agents_working(self) -> bool:
+        """True if at least one Gemini agent is currently running."""
+        for ws in self.manager.workspaces:
+            for agent in ws.agents:
+                if agent.spec.provider == "gemini" and agent.is_running():
+                    return True
+        return False
+
+    def _retune_gemini_usage_poll(self, reading) -> None:
+        """Retune Gemini usage poll interval:
+        If Gemini agents are working AND 5-hour usage is >= 90%, poll every 10 seconds (10000 ms).
+        Otherwise poll every 60 seconds (60000 ms).
+
+        Takes the reading the caller already has. It used to fetch its own,
+        which meant a second ~3.0s CLI subprocess on the GUI thread per tick.
+        """
+        if not hasattr(self, "_gemini_usage_timer") or reading is None:
+            return
+        interval = USAGE_POLL_MS  # default 60000 ms
+        try:
+            five_hour = next((l for l in reading.limits if l.key == "five_hour"), None)
+            pct = five_hour.percent if five_hour else (reading.blocked.percent if reading.blocked else 0.0)
+            if self._gemini_agents_working() and pct >= 90.0:
+                interval = 10000  # urgent 10-second polling
+        except Exception:
+            pass
+
+        if interval != self._gemini_usage_timer.interval():
+            self._gemini_usage_timer.setInterval(interval)
+
+    def _poll_gemini_usage(self) -> None:
+        """Kick a Gemini usage fetch on a daemon thread (the `_poll_usage`
+        pattern, for the same reason).
+
+        `gemini_usage.fetch()` shells out to `agy --print /usage` and MEASURES
+        ~3.0 SECONDS. Calling it inline froze the whole GUI for that long on
+        every tick -- and the tick can be as fast as 10s under the urgent rate,
+        so the app spent a large fraction of its life unresponsive with the CPU
+        idle (it is blocked on a subprocess, not computing). Reported as
+        constant stuttering.
+
+        `_gemini_usage_inflight` is the guard that matters: a 6-second CLI
+        timeout is longer than the urgent interval, so without it the timer
+        would stack threads behind a slow call."""
+        if self._closing or self._gemini_usage_inflight:
+            return
+        self._gemini_usage_inflight = True
+
+        def worker():
+            from app import gemini_usage
+            try:
+                reading = gemini_usage.fetch()
+            except Exception:
+                reading = None
+            self._geminiUsageReady.emit(reading)   # queued -> GUI thread
+
+        threading.Thread(target=worker, daemon=True,
+                         name="aihive-gemini-usage").start()
+
+    def _on_gemini_usage_ready(self, reading) -> None:
+        """Apply a Gemini reading on the GUI thread."""
+        self._gemini_usage_inflight = False
+        if reading is None or self._closing:
+            return
+        self._gemini_usage = reading
+        try:
+            if hasattr(self.top_bar, "gemini_badge"):
+                self.top_bar.gemini_badge.set_usage(reading)
+            if hasattr(self.top_bar, "gemini_weekly_badge"):
+                self.top_bar.gemini_weekly_badge.set_usage(reading)
+            # retune from the reading we already have: re-fetching here doubled
+            # the freeze, because it shelled out to the CLI a SECOND time on
+            # every single tick
+            self._retune_gemini_usage_poll(reading)
+        except Exception:
+            pass
 
     def _on_usage_visibility(self, on: bool) -> None:
         """User toggled the readout from the top bar's context menu."""
@@ -1793,8 +1969,10 @@ class MainWindow(QMainWindow):
         # out of the searched region, so a latch can arrive with no due time —
         # which strands the network-free watchdog and leaves only the flaky
         # usage API. The ACCOUNT reading knows when the window reopens even
-        # when the screen doesn't, so borrow it.
-        if agent.limit_resets_at() is None:
+        # when the screen doesn't, so borrow it. CLAUDE's account, and therefore
+        # only for a Claude agent: filling a Gemini latch with the time the
+        # Claude plan reopens would nudge it at an unrelated moment.
+        if agent.spec.provider == "claude" and agent.limit_resets_at() is None:
             usage = self.plan_usage()
             if usage is not None:
                 agent.set_limit_reset(usage.resets_at)
@@ -1812,9 +1990,13 @@ class MainWindow(QMainWindow):
             self._ledger_cut_off(agent, agent.limit_cut_off_at(), at or 0.0,
                                  agent.limit_window(),
                                  agent.limit_banner_text(), source="live")
-        QTimer.singleShot(LIMIT_PHANTOM_CHECK_MS,
-                          lambda: self._dismiss_if_phantom(ws_id, agent_id,
-                                                            key))
+        # The phantom check reads the interrupted turn out of the conversation
+        # on disk; only Claude writes one, so a Gemini latch has nothing to
+        # re-examine and simply stands.
+        if agent.spec.provider == "claude":
+            QTimer.singleShot(LIMIT_PHANTOM_CHECK_MS,
+                              lambda: self._dismiss_if_phantom(ws_id, agent_id,
+                                                               key))
 
     def _dismiss_if_phantom(self, ws_id: str, agent_id: str, key: tuple) -> None:
         """Shortly after a live latch: was the interrupted turn something the
@@ -1876,7 +2058,11 @@ class MainWindow(QMainWindow):
         usage = self.plan_usage()
         if usage is not None and usage.resets_at:
             for a in self.manager.all_agents():
-                if a.is_limit_blocked() and a.limit_resets_at() is None:
+                # Claude's window, so only Claude's agents — see the
+                # cross-provider rule in `_resume_blocked_agents`. A Gemini
+                # latch always carries its own countdown anyway.
+                if (a.spec.provider == "claude" and a.is_limit_blocked()
+                        and a.limit_resets_at() is None):
                     a.set_limit_reset(usage.resets_at)
 
         account_clear = usage is not None and usage.blocked is None
@@ -1925,11 +2111,20 @@ class MainWindow(QMainWindow):
         at startup answers to `startup_recovery`, one seen live answers to
         `auto_continue`. That keeps the two switches genuinely independent —
         turning one off can never strand a latch the other created.
+
+        CROSS-PROVIDER RULE: the account reading behind the no-`due` trigger is
+        CLAUDE's, and it says nothing whatsoever about a Gemini quota. So the
+        "the account is provably clear, resume everyone" shortcut is Claude-only
+        by construction, and a Gemini latch resumes solely on the countdown its
+        own message stated (the `due` path). Since agy prints a duration rather
+        than a wall clock, that clock is never the ambiguous kind, so nothing is
+        lost by leaving it as the only trigger.
         """
         if self._closing or not self._ready:
             return
         blocked = [a for a in self.manager.all_agents()
-                   if a.spec.provider == "claude" and a.is_pty
+                   if a.spec.provider in LIMIT_PROVIDERS and a.is_pty
+                   and (due is not None or a.spec.provider == "claude")
                    and a.is_running() and not a.is_busy()
                    and a.is_limit_blocked()
                    and (self._startup_recovery if a.limit_from_startup()
@@ -1994,17 +2189,30 @@ class MainWindow(QMainWindow):
         # latch; one that cannot be read (a drifted pin, a conversation Claude
         # hasn't flushed) is no evidence either way and must not strand a
         # genuine cut-off.
-        info = transcripts.limit_cut_off(agent.spec.cwd, agent.spec.session_id)
-        if info is not None and not info["cut_off"]:
-            self._limit_audit(f"PHANTOM agent={agent.spec.name} (the "
-                              f"conversation carried on, or the interrupted "
-                              f"turn wasn't real work)")
-            self._ledger_outcome(agent, limit_ledger.DISMISSED,
-                                 detail="transcript shows no real work lost")
-            agent.clear_limit_block()
-            self._resume_pending.discard(agent.id)
-            return
-        agent.write("\x1b")
+        #
+        # CLAUDE ONLY, and unavoidably so: agy keeps no conversation on disk
+        # (only its binary and an `argv.json`), so there is no second source to
+        # agree with and the screen latch stands alone. Its identity guard is
+        # doing more work here than Claude's as a result — which is why the
+        # Gemini reading keys on a per-message Error ID rather than a clock.
+        if agent.spec.provider == "claude":
+            info = transcripts.limit_cut_off(agent.spec.cwd,
+                                             agent.spec.session_id)
+            if info is not None and not info["cut_off"]:
+                self._limit_audit(f"PHANTOM agent={agent.spec.name} (the "
+                                  f"conversation carried on, or the interrupted "
+                                  f"turn wasn't real work)")
+                self._ledger_outcome(agent, limit_ledger.DISMISSED,
+                                     detail="transcript shows no real work lost")
+                agent.clear_limit_block()
+                self._resume_pending.discard(agent.id)
+                return
+            # The Esc closes the limit's options menu sitting over the prompt.
+            # agy has no such menu, and an Esc there would clear whatever the
+            # user had half-typed into the input box instead, so it is sent only
+            # where there is something to dismiss. The beat before the text goes
+            # out is kept for both: it costs nothing and staggers the send.
+            agent.write("\x1b")
 
         def send():
             if self._closing or not agent.is_running():
@@ -2044,8 +2252,15 @@ class MainWindow(QMainWindow):
                 # produced another line. The conversation on disk is the real
                 # evidence — if it STILL ends on the banner, nothing happened.
                 menu_gone = not agent.recheck_limit()
-                stuck, _, _ = transcripts.ended_on_limit(
-                    agent.spec.cwd, agent.spec.session_id)
+                # Same asymmetry as the pre-nudge check: there is no Gemini
+                # conversation on disk to consult, so `recheck_limit` is the
+                # only evidence there — and it is stronger there than here,
+                # because agy answers a still-spent quota with a NEW message
+                # rather than leaving the old menu standing.
+                stuck = False
+                if agent.spec.provider == "claude":
+                    stuck, _, _ = transcripts.ended_on_limit(
+                        agent.spec.cwd, agent.spec.session_id)
                 if menu_gone and not stuck:
                     self._limit_audit(f"RESUMED agent={agent.spec.name}")
                     limit_ledger.record_outcome(
@@ -2386,6 +2601,12 @@ class MainWindow(QMainWindow):
         self.top_bar.set_auto_continue(self._auto_continue)
         self._startup_recovery = bool(ui.get("startup_recovery", True))
         self.top_bar.set_startup_recovery(self._startup_recovery)
+        # AI Hive owns the terminal scrollback (Claude launches with the
+        # classic renderer). Already seeded in __init__ -- the settings file is
+        # written before any agent is armed -- so this only mirrors it to the
+        # menu; re-reading keeps the two in step if a restore lands later.
+        self._terminal_scrollback = bool(ui.get("terminal_scrollback", True))
+        self.top_bar.set_terminal_scrollback(self._terminal_scrollback)
         win = ui.get("window", {})
         if win.get("w") and win.get("h"):
             self.resize(int(win["w"]), int(win["h"]))
@@ -2838,6 +3059,7 @@ class MainWindow(QMainWindow):
             "taskbar_badge": self._taskbar_badge,
             "auto_continue": self._auto_continue,
             "startup_recovery": self._startup_recovery,
+            "terminal_scrollback": self._terminal_scrollback,
             "window": {"w": w, "h": h, "maximized": self.isMaximized()},
             # which workspaces have their inline file tree open (per-folder
             # expansion + highlight are transient, not persisted)

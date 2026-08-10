@@ -175,11 +175,10 @@ class AgentSpec:
                          "--strict-mcp-config",
                          "--allowedTools", "mcp__aihive__log_activity"]
         elif self.provider == "gemini":
-            # Antigravity CLI (agy 1.0.16) shares Claude's resume/workspace
-            # flags: --continue and a repeatable --add-dir. It has no
-            # system-prompt or MCP-config flags, so no board wiring.
+            # Antigravity CLI (agy) shares --continue, --conversation <id>, and --add-dir
             if self.resume:
-                args += ["--continue"]
+                args += (["--conversation", self.session_id] if self.session_id
+                         else ["--continue"])
             for d in self.extra_dirs:
                 if d:
                     args += ["--add-dir", d]

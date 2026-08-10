@@ -157,6 +157,24 @@ workspaces keep executing — switching never pauses anything.
   carries an **⏳N** badge counting how many of its agents are currently
   stuck — all three clear the instant that agent resumes, whether that was
   auto-continue or you restarting it yourself.
+
+  **Gemini agents are covered too**, with the differences their CLI forces.
+  agy refuses a turn with `⚠ Individual quota reached … Resets in 1h40m21s`
+  and then returns to its prompt, so there is no menu to close (none is sent)
+  and no menu disappearing to prove the resume took — instead a quota that is
+  still spent answers with a *fresh* message, which is what AI Hive watches for.
+  The countdown is relative rather than a wall clock, which is if anything
+  better: it is resolved to a real time the moment the message appears and needs
+  no guessing about which side of midnight the reset falls on. **⏯ Recover at
+  startup** works too, by a different route: agy keeps no conversation on disk,
+  so instead of reading a transcript AI Hive uses the fact that `agy --continue`
+  redraws the conversation it ended on — a quota message still sitting there
+  when the agent comes back up is a cut-off that was never resolved. Its printed
+  countdown is stale by then (the text is frozen at the moment it was written),
+  so rather than trust it the agent is simply tried straight away: if the quota
+  is back it carries on, and if it isn't, agy says so with a fresh countdown that
+  *is* accurate and the retry waits for that instead. Claude's account readout is
+  never used to resume a Gemini agent (it knows nothing about a Google quota).
 - **Send a message on a countdown** — type into an agent's terminal as usual,
   then press **`Ctrl+Shift+Enter`** instead of Enter. A small composer opens
   with what you typed, you pick when it should go in (**5m / 15m / 30m / 1h /
@@ -174,6 +192,30 @@ workspaces keep executing — switching never pauses anything.
   restart, but one whose moment passed while the app was closed comes back
   marked **missed** rather than firing hours late into a conversation that has
   moved on: you decide whether it still applies.
+- **Scrollbar with prompt milestones** — every terminal has a slim scrollbar on
+  its right edge, with a dot at each point where *you* submitted a prompt. Hover
+  a dot for the prompt text, click it to jump straight back to that moment. It
+  is the conversation's table of contents: the dots are the milestones, and the
+  stretch between two of them is one exchange. Nothing AI Hive types itself gets
+  a dot (delivered tasks, scheduled messages, auto-continue nudges), and neither
+  does answering a permission menu or a question, so the marks are only ever
+  your own instructions. The bar hides itself when there is nothing to scroll,
+  so a fresh terminal shows none, and a **`/clear`** takes the scrollback and its
+  dots with it.
+  Dots are **not lost when you reopen AI Hive**: milestones are only minted from
+  a live keystroke, so a restored conversation would otherwise come back with
+  none, and that is exactly the conversation long enough to want to jump around
+  in. The prompts you typed are read back from Claude's own transcript and
+  matched against the restored scrollback, so the dots come back where they
+  belong. Only genuinely typed prompts are used, so nothing can invent a dot you
+  did not create.
+  This works because AI Hive asks Claude for its **classic renderer**, which
+  prints the conversation into the terminal proper instead of keeping it inside
+  the alternate screen where the app can never see it. The trade is that the
+  classic renderer is not the flicker-free one, and Claude's menus stop being
+  clickable (keyboard still works). Right-click the top bar and untick
+  **Scrollback lives in AI Hive** if you would rather have the flicker-free
+  renderer back; agents already running keep whatever they launched with.
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
@@ -553,7 +595,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1269 checks drive the real app headlessly (offscreen Qt platform) with real
+1411 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -638,7 +680,7 @@ app/
                            + working-count spinner + taskbar-badge painter)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1269 checks)
+tests/smoke_test.py        headless end-to-end suite (1411 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

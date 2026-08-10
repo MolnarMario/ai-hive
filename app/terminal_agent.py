@@ -10,6 +10,7 @@ import re
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from enum import Enum
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -66,6 +67,7 @@ TUI_PROGRAMS = {"vim", "vi", "nano", "htop", "top", "less", "ssh"}
 
 
 PTY_BUFFER_CAP = 512 * 1024  # raw VT tail kept for fresh-card replay
+PROMPT_MARK_CAP = 200        # prompt milestones kept per agent (FIFO)
 
 # "Busy" = the agent is actively streaming output (thinking, generating,
 # running a command). An interactive process (Claude at its prompt, an idle
@@ -124,6 +126,20 @@ BG_SHELL_SETTLE_S = 10.0
 # rather than coalescing them into nothing, short enough that no one sees it.
 REPAINT_RESTORE_MS = 120
 
+# How long after a launch a Gemini agent's output can still be its previous
+# conversation being redrawn (`agy --continue`). A quota message inside this
+# window is treated as the cut-off that ENDED that conversation rather than a
+# live one — see `_replay_cut_off`. Generous on purpose: mistaking a live
+# refusal for a replayed one only probes the quota sooner, and a still-spent
+# quota corrects the retry time itself.
+LIMIT_REPLAY_S = 120.0
+
+# How much of the settled screen counts as "the conversation ended here" for
+# that replay. The message wraps over three rows and the prompt plus footer sit
+# below it, so this is a handful of lines of CONTENT, not the 40 the detector
+# searches: anything further up has real work after it and is history.
+LIMIT_REPLAY_TAIL_LINES = 12
+
 # strips escape sequences so on-screen TEXT can be matched: the raw stream
 # positions words individually ("trust\x1b[20Gthis\x1b[25Gfolder"), so a
 # phrase can never be matched against raw bytes
@@ -160,6 +176,17 @@ _CLAUDE_READY_HINTS = (
     "ctrl+t to show tasks",
 )
 
+
+def _despace(text: str) -> str:
+    """Lowered, with every run of whitespace removed. Readiness matching runs
+    through this on both sides -- see TerminalAgent._has_ready_hint for the
+    renderer difference that makes it load-bearing."""
+    return _WS_RE.sub("", text.lower())
+
+
+_WS_RE = re.compile(r"\s+")
+_READY_HINTS_DESPACED = tuple(_despace(h) for h in _CLAUDE_READY_HINTS)
+
 # --- "this agent was cut off by the plan limit" detection ---
 # WHICH agents to resume when the window reopens. The plan-usage reading
 # (app/claude_usage.py) is ACCOUNT-wide — it says the account is out and until
@@ -180,8 +207,31 @@ _CLAUDE_READY_HINTS = (
 #    repaint) long after a resume, so it must never re-latch an agent that has
 #    already been resumed off it — see `_scrape_limit`.
 from .limit_banner import (LIMIT_HIT_RE, LIMIT_MENU_RE,  # noqa: F401
-                           banner_line, banner_reset_at, banner_window,
+                           LIMIT_PROVIDERS, banner_line, banner_reset_at,
+                           banner_window, gemini_banner_line, gemini_reset_at,
                            is_limit_screen, parse_reset_clock)
+
+
+@dataclass
+class PromptMark:
+    """One "the user submitted a prompt here" milestone on the scrollbar.
+
+    `pos` is a CHARACTER offset into this agent's pty stream, not a screen
+    line, because screen lines do not survive a card rebuild: a new
+    TerminalView starts with `pushed == 0` and re-feeds the replay buffer, so
+    the only coordinate both sides can agree on is how far into the stream the
+    submit happened (see TerminalCard._replay_with_marks).
+
+    `uid` is the key any per-card map must use. `id(mark)` cannot be: marks are
+    FIFO-capped, and CPython reuses an address once the object is collected, so
+    a dropped mark can hand its id to a new one, which would then silently
+    inherit the dropped marker's line. `pos` is not unique either (two submits
+    with no output between them share an offset)."""
+
+    uid: int
+    pos: int
+    text: str
+    ts: float
 
 
 class TerminalAgent(QObject):
@@ -211,6 +261,16 @@ class TerminalAgent(QObject):
     # countdown tick: this list IS persisted, so the manager wires this to a
     # save, and a per-second tick on that would rewrite session.json all day.
     scheduled_changed = Signal()
+    # a prompt milestone was added or the set was cleared. TRANSIENT like
+    # activity_changed: milestones are never persisted (the transcript is the
+    # durable record of a conversation, and a stored marker list would go stale
+    # exactly the way a stored limit latch does), so this must NEVER be wired
+    # to a save.
+    prompt_marks_changed = Signal()
+    # the agent's live conversation was REPLACED (/clear, or a /resume onto a
+    # different session), so the scrollback behind the current screen belongs
+    # to a conversation that is no longer on display. Transient view signal.
+    conversation_replaced = Signal()
 
     def __init__(self, spec: AgentSpec, parent: QObject | None = None):
         super().__init__(parent)
@@ -240,6 +300,15 @@ class TerminalAgent(QObject):
         self.log: deque = deque(maxlen=LOG_CAP)  # line-mode segments
         self._pty_buffer: list[str] = []         # pty raw tail (for replay)
         self._pty_bytes = 0
+        # Stream coordinates for prompt milestones. _pty_total counts EVERY
+        # character this agent has ever emitted and is never trimmed;
+        # _pty_dropped counts what has aged out of the front of _pty_buffer.
+        # The difference is what turns a mark's absolute stream position into
+        # an offset within pty_replay() -- see replay_marks.
+        self._pty_total = 0
+        self._pty_dropped = 0
+        self._prompt_marks: list[PromptMark] = []
+        self._mark_seq = 0     # monotonic; source of PromptMark.uid
         self._pty_seed = ""    # restored screen, until a child draws over it
         self._prompt_ready = False    # the TUI's input prompt is interactive
         self._ready_tail = ""         # rolling stripped tail (pre-ready only)
@@ -354,9 +423,9 @@ class TerminalAgent(QObject):
         # a NON-resume start is a new conversation, so it gets a new pinned
         # identity (rotating also avoids --session-id colliding with an
         # existing transcript); a resume keeps its pin
-        if self.spec.provider == "claude" and not self.spec.resume:
+        if self.spec.provider in ("claude", "gemini") and not self.spec.resume:
             self.spec.session_id = str(uuid.uuid4())
-        elif (self.spec.provider == "claude" and self.spec.resume
+        elif (self.spec.provider in ("claude", "gemini") and self.spec.resume
               and self._verify_resume_target):
             self._recover_missing_resume_target()
         self._session_started = time.time()
@@ -376,6 +445,18 @@ class TerminalAgent(QObject):
         agents' conversations so two agents sharing a folder never resume the
         same transcript (that once truncated one)."""
         from . import session_sync
+        if self.spec.provider == "gemini":
+            if session_sync.gemini_transcript_exists(self.spec.cwd, self.spec.session_id):
+                return
+            exclude = set(self._sibling_sessions() if self._sibling_sessions else ())
+            exclude.add(self.spec.session_id)
+            candidate = session_sync.best_gemini_recovery_id(self.spec.cwd, exclude=exclude)
+            if candidate:
+                self.notice("[pinned conversation missing; recovering the most "
+                            "recent one in this folder]")
+                self.spec.session_id = candidate
+            return
+
         if session_sync.transcript_exists(self.spec.cwd, self.spec.session_id):
             return
         if not session_sync.list_transcripts(self.spec.cwd):
@@ -406,12 +487,17 @@ class TerminalAgent(QObject):
         self._limit_last_banner = ""   # a new screen: nothing is an echo yet
         self._limit_last_skip = None   # ...so a skip is reported again too
         self._submit_gen += 1  # invalidate any pending task-submit Enter
-        if self.spec.provider == "claude":  # deliberate fresh session
+        if self.spec.provider in ("claude", "gemini"):  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
         self._session_started = time.time()
         if self.is_pty:
             self._pty_buffer = []
             self._pty_bytes = 0
+            # a restart is a deliberately fresh conversation, so the stream
+            # coordinates and every milestone anchored into them go with it
+            self._pty_total = 0
+            self._pty_dropped = 0
+            self.clear_prompt_marks()
             self._pty_seed = ""
         else:
             self._emit(STREAM_SYSTEM, "--- restarted ---\n")
@@ -463,6 +549,62 @@ class TerminalAgent(QObject):
     def pty_replay(self) -> str:
         return "".join(self._pty_buffer)
 
+    # ------------------------------------------------- prompt milestones ---
+
+    def note_prompt_submitted(self, text: str):
+        """Record that the user submitted `text` at the current stream
+        position. Returns the mark, or None if it was not recorded.
+
+        Called from TerminalCard, off TerminalView.promptSubmitted -- which
+        fires ONLY on a bare Enter in the terminal, so AI Hive's own writes
+        (deliver_task, nudge, scheduled sends) can never land here."""
+        if not self.is_pty:
+            return None
+        self._mark_seq += 1
+        mark = PromptMark(uid=self._mark_seq, pos=self._pty_total,
+                          text=text, ts=time.time())
+        self._prompt_marks.append(mark)
+        while len(self._prompt_marks) > PROMPT_MARK_CAP:
+            self._prompt_marks.pop(0)
+        self.prompt_marks_changed.emit()
+        return mark
+
+    def prompt_marks(self) -> list:
+        return list(self._prompt_marks)
+
+    def clear_prompt_marks(self) -> bool:
+        """Drop every milestone (the conversation was cleared or replaced).
+        Guarded so a no-op stays silent."""
+        if not self._prompt_marks:
+            return False
+        self._prompt_marks = []
+        self.prompt_marks_changed.emit()
+        return True
+
+    def note_conversation_replaced(self) -> None:
+        """The pinned conversation changed under us (a /clear or an in-TUI
+        /resume). Drop the milestones and tell the card to drop the scrollback
+        they were anchored in.
+
+        This is the PRIMARY reset signal, not the ED 3 escape: measured on a
+        live classic-renderer session, /clear emits no ED 3 at all and simply
+        reprints the banner, so the old conversation would otherwise sit in the
+        scrollbar behind a screen that has moved on."""
+        if not self.is_pty:
+            return
+        self.clear_prompt_marks()
+        self.conversation_replaced.emit()
+
+    def replay_marks(self) -> list:
+        """[(offset within pty_replay(), mark)] for the marks whose bytes are
+        still in the replay buffer.
+
+        A mark older than `_pty_dropped` is discarded rather than clamped: its
+        content has aged out of the buffer too, so there is no line left for it
+        to point at and a clamped marker would just lie."""
+        return [(m.pos - self._pty_dropped, m) for m in self._prompt_marks
+                if m.pos >= self._pty_dropped]
+
     def seed_pty_replay(self, text: str) -> bool:
         """Preload the screen a previous run left behind, so a RESTORED but
         not-yet-started card paints its conversation instead of a black
@@ -483,8 +625,25 @@ class TerminalAgent(QObject):
             return False
         self._pty_buffer = [text]
         self._pty_bytes = len(text)
+        self._pty_total = len(text)
+        self._pty_dropped = 0
         self._pty_seed = text
         return True
+
+    def seed_written_over(self) -> bool:
+        """True when this buffer STARTED as a restored snapshot and a live
+        child has since written past it.
+
+        The distinction the card's settled-size projection needs. Re-projecting
+        the buffer at the real width is right for an ordinary rebuild (a
+        retile, a workspace switch), where the buffer IS the live conversation.
+        It is wrong for a snapshot a child has drawn over: that seed is the
+        previous run's screen, and a running agent is supposed to get a clean
+        terminal it fills itself (see `drop_seeded_screen`). Comparing the
+        buffer to the snapshot is the only way to tell those apart -- the agent
+        being RUNNING is not, since the launch autostart starts agents
+        synchronously, well before any card has a settled size."""
+        return bool(self._pty_seed) and self._pty_buffer != [self._pty_seed]
 
     def drop_seeded_screen(self) -> bool:
         """Forget a restored screen that no live child has drawn over.
@@ -1261,7 +1420,7 @@ class TerminalAgent(QObject):
         explicitly instead — on start/restart, and by `clear_limit_block` once
         the agent has genuinely resumed.
         """
-        if self.spec.provider != "claude" or self._limit_blocked:
+        if self.spec.provider not in LIMIT_PROVIDERS or self._limit_blocked:
             return
         # Only a LIVE cut-off counts. On `--resume` Claude redraws the whole
         # prior conversation, so a banner from a previous session scrolls past
@@ -1286,8 +1445,13 @@ class TerminalAgent(QObject):
         # of characters on a real frame and lost a genuine cut-off — see
         # _tail_lines.
         region = self._tail_lines(40, skip_blank=True)
-        menu = bool(LIMIT_MENU_RE.search(region))
-        banner = banner_line(region)
+        menu, banner, window, resets_at = self._read_limit_screen(region)
+        from_replay = False
+        if banner and self.spec.provider == "gemini" and self._in_launch_replay():
+            ok, resets_at = self._replay_cut_off(banner)
+            if not ok:
+                return
+            from_replay = True
         if not menu:
             # A BANNER ON ITS OWN IS NOT PROOF OF A LIVE CUT-OFF. It is ordinary
             # output that stays in view — and is re-emitted by every frame
@@ -1316,14 +1480,110 @@ class TerminalAgent(QObject):
         self._limit_cut_off_at = self._limit_at   # seen as it happened
         self._limit_last_banner = banner
         self._limit_banner = banner
-        self._limit_window = banner_window(banner)
+        self._limit_window = window
         # The reset clock lives in the banner, not the menu, so it may be
         # absent (the banner can have scrolled while the menu is still up).
         # None simply means "no network-free due time" — the watchdog then
         # leaves this one to the plan-usage edge rather than guessing.
-        self._limit_resets_at = parse_reset_clock(region)
-        self._limit_from_startup = False
+        self._limit_resets_at = resets_at
+        # A cut-off read off a launch REPLAY is a startup recovery in every
+        # sense but the source, so it answers to the toggle that owns those.
+        self._limit_from_startup = from_replay
         self.limit_blocked_changed.emit(True)
+
+    def _in_launch_replay(self) -> bool:
+        """Whether output arriving now can still be a previous session being
+        redrawn rather than anything happening live.
+
+        Deliberately generous. A quota message that is genuinely live inside
+        this window is handled correctly anyway — `_replay_cut_off` only makes
+        the reset EARLIER, and an early probe that turns out to be premature
+        draws a fresh refusal whose countdown is exact. Being late is the
+        expensive mistake here; being early costs one message.
+        """
+        return (self._session_started > 0.0
+                and time.time() - self._session_started <= LIMIT_REPLAY_S)
+
+    def _replay_cut_off(self, banner: str) -> tuple:
+        """`(latch_it, resets_at)` for a quota message drawn during the replay.
+
+        This is Gemini's startup recovery, and it exists because the two
+        mechanisms that rescue a Claude agent both refuse to work here: the live
+        latch is gone (it is never persisted) and there is no conversation on
+        disk to reconstruct it from. What agy DOES have is the message itself,
+        still on screen, because `--continue` redraws the conversation it ended
+        on. Verified live (2026-08-09, Agent 10): the cut-off latched 5 s after
+        launch, entirely off the replay.
+
+        TWO corrections make that usable.
+
+        (1) THE COUNTDOWN IS STALE, and by an unknowable amount. "Resets in
+        1h39m56s" is frozen at the moment it was printed, so resolving it
+        against the clock at launch dates the reset late by EXACTLY THE AGE OF
+        THE MESSAGE. Measured end to end on 2026-08-09: agy printed it at ~17:25
+        (reopening ~19:05), the app was restarted at 20:15:02 and dated the
+        reset 21:54, and the nudge went out at 21:57:58 — 2h50m of an idle agent
+        for a quota that had been back for nearly three hours. There is nothing
+        on screen to date it with, so the countdown is DISCARDED and the agent
+        is probed straight away. That is safe precisely because a refusal is
+        self-correcting: a quota that is still spent answers with a WHOLE NEW
+        message, and `recheck_limit` adopts its countdown, which is exact
+        because it was printed just now. So the cost of guessing early is one
+        message; the cost of guessing late is hours of an idle agent.
+
+        (2) IT MUST BE THE LAST THING THAT HAPPENED. A message with real work
+        after it belongs to a cut-off the conversation already recovered from,
+        and continuing that would interrupt finished work — the same rule
+        `transcripts.ended_on_limit` applies to a Claude transcript, read off
+        the screen instead. The agent's own prompt and footer sit below it, so
+        the window is a handful of lines rather than one.
+        """
+        tail = self._tail_lines(LIMIT_REPLAY_TAIL_LINES, skip_blank=True)
+        if not gemini_banner_line(tail):
+            # Judged history — so ARM THE ECHO GUARD with it, or the judgement
+            # only holds until the launch window lapses: the message stays in
+            # the rolling tail long after, and the next repaint would read it as
+            # live and latch it with its stale countdown. This is where the old
+            # `_seed_limit_history` belonged all along — applied to a message we
+            # have positively decided about, rather than to whatever happened to
+            # be on screen at the readiness edge.
+            self._limit_last_banner = banner
+            self._note_limit_skip("a replayed quota message with work after "
+                                  "it (the conversation carried on)", banner)
+            return False, None
+        return True, time.time()
+
+    def _read_limit_screen(self, region: str) -> tuple:
+        """`(menu, banner, window, resets_at)` for whichever CLI this agent is.
+
+        The two providers cut an agent off in different shapes and only the
+        latch itself is common, so the reading is the one place they diverge —
+        see the Gemini section of `limit_banner` for what each difference costs.
+        Two of them show up right here:
+
+          * agy renders NO menu, so `menu` is always False and a Gemini cut-off
+            always goes through the identity guard below. That is the intended
+            outcome, not a degradation: the guard is what the weak scrollback
+            signal needs, and agy's message carries a far sharper identity than
+            Claude's (a per-message Error ID rather than a wall clock).
+          * its countdown is RELATIVE, so it must be resolved to an epoch here,
+            once, at the moment the message is read. It is parsed from the
+            joined banner rather than the whole region for the same reason the
+            identity is: the countdown sits on a continuation row, and reading
+            the region would let an older message's countdown win.
+
+        There is no `weekly` ambiguity on the Gemini side either — a duration is
+        equally correct for a window days out — so its window is simply
+        "quota", which `_check_limit_resets` treats as ordinary and due on its
+        own clock.
+        """
+        if self.spec.provider == "gemini":
+            banner = gemini_banner_line(region)
+            return False, banner, ("quota" if banner else ""), \
+                gemini_reset_at(banner)
+        banner = banner_line(region)
+        return (bool(LIMIT_MENU_RE.search(region)), banner,
+                banner_window(banner), parse_reset_clock(region))
 
     def _note_limit_skip(self, reason: str, banner: str = "") -> None:
         """Record that a plan-limit banner was ON SCREEN and nothing latched.
@@ -1346,9 +1606,11 @@ class TerminalAgent(QObject):
         """
         try:
             if not banner:
-                # the SAME window the detector used, or this reports "nothing
-                # to see" for exactly the frames it is meant to explain
-                banner = banner_line(self._tail_lines(40, skip_blank=True))
+                # the SAME window AND the same reading the detector used, or
+                # this reports "nothing to see" for exactly the frames it is
+                # meant to explain
+                banner = self._read_limit_screen(
+                    self._tail_lines(40, skip_blank=True))[1]
             if not banner:
                 return
             state = (reason, banner)
@@ -1544,8 +1806,29 @@ class TerminalAgent(QObject):
         stuck and gone the moment it is going again. The banner must NOT be
         used here: it is scrollback, so it lingers in the tail well after a
         successful resume and would report a false "still blocked" forever.
+
+        agy has no menu to key on, so the Gemini half asks the same question a
+        different way: a quota that is still spent answers the nudge with a
+        FRESH message (its own countdown and Error ID), so a banner that differs
+        from the one we latched on is the proof, and the unchanged one still
+        sitting in the scrollback is not. Same discriminator as the latch's
+        identity guard, read from the other direction. The newer message also
+        REPLACES the latched reset time: its countdown is the current answer to
+        "when can this be tried again", and keeping the spent one would have the
+        watchdog retry immediately and burn the whole budget in a minute.
         """
         if not self._limit_blocked:
+            return False
+        if self.spec.provider == "gemini":
+            banner = gemini_banner_line(self._tail_lines(40, skip_blank=True))
+            if banner and banner != self._limit_last_banner:
+                self._limit_last_banner = banner
+                self._limit_banner = banner
+                resets_at = gemini_reset_at(banner)
+                if resets_at is not None:
+                    self._limit_resets_at = resets_at
+                return True
+            self.clear_limit_block()
             return False
         # raw lines on purpose — see _tail_lines
         region = self._tail_lines(40)
@@ -1570,8 +1853,11 @@ class TerminalAgent(QObject):
         # screen; the live TerminalView is fed directly via the signal
         self._pty_buffer.append(text)
         self._pty_bytes += len(text)
+        self._pty_total += len(text)
         while self._pty_bytes > PTY_BUFFER_CAP and len(self._pty_buffer) > 1:
-            self._pty_bytes -= len(self._pty_buffer.pop(0))
+            dropped = self._pty_buffer.pop(0)
+            self._pty_bytes -= len(dropped)
+            self._pty_dropped += len(dropped)
         # rolling escape-stripped tail for waiting-for-input detection (the idle
         # timer scans it once output settles — see _screen_waiting)
         self._screen_tail = (self._screen_tail + _CSI_RE.sub("", text))[-4000:]
@@ -1610,9 +1896,23 @@ class TerminalAgent(QObject):
     @staticmethod
     def _has_ready_hint(text: str) -> bool:
         """Whether `text` shows Claude's input-box footer, in any of its
-        rotating forms."""
-        low = text.lower()
-        return any(h in low for h in _CLAUDE_READY_HINTS)
+        rotating forms.
+
+        Matched with ALL WHITESPACE REMOVED from both sides, which is not
+        cosmetic: the classic main-screen renderer (`tui: "default"`, the one
+        AI Hive selects to own the scrollback) lays the footer out by MOVING
+        THE CURSOR between segments instead of emitting literal spaces. Strip
+        the escapes -- which is exactly what `_ready_tail`/`_screen_tail` do --
+        and "? for shortcuts" arrives as "?forshortcuts", so a spaced match
+        never fires. Measured on a live classic-renderer session: the hint was
+        present and correctly spaced on the rendered pyte screen from the first
+        frame, and matched the escape-stripped stream NEVER. Since readiness
+        gates task delivery, that silently parks every first task in
+        `_pending_task` forever and leaves the BootVeil up until its timeout.
+        Despacing both sides is a superset of the old comparison, so the
+        alt-screen renderer keeps matching exactly as before."""
+        low = _despace(text)
+        return any(h in low for h in _READY_HINTS_DESPACED)
 
     def _became_prompt_ready(self) -> None:
         """The TUI's prompt just went live: announce it and release any task

@@ -49,7 +49,8 @@ class AgentRosterItem(QFrame):
         self.refresh(agent)
 
     def refresh(self, agent) -> None:
-        icon = _ICON.get(agent.status, "⚪")
+        busy = bool(getattr(agent, "is_busy", lambda: False)())
+        icon = "🟡" if (busy and agent.status == AgentStatus.RUNNING) else _ICON.get(agent.status, "⚪")
         model = agent.spec.model or agent.spec.provider or agent.spec.kind.value
         self.head.setText(f"{icon}  <b>{agent.spec.name}</b>  "
                           f"<span style='color:#8a8a8a'>{model}</span>")

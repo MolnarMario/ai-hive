@@ -222,6 +222,195 @@ this file is the invariants that must survive every change.
   is never persisted. `OrchestratorBridge`/`orchestrator_bridge.py`/
   `mcp_server.py` keep their historical names but are now just the board
   channel.
+- **AI Hive OWNS the scrollback, and that is a launch flag, not a widget.**
+  The terminal scrollbar (`widgets/terminal_scrollbar.py`) and its prompt
+  milestones only exist because Claude is asked for its CLASSIC renderer:
+  `tui: "default"`, written into the SAME shared `--settings` file as the hooks
+  (`session_hook.write_settings_file`'s `tui` arg, driven by
+  `MainWindow._write_hook_settings` / `ui.terminal_scrollback`). The default
+  `"fullscreen"` renderer keeps a VIRTUALIZED scrollback inside the alternate
+  screen and redraws in place, so nothing ever scrolls off and pyte's
+  `history.top` stays EMPTY — measured on real `.vt` snapshots: 0 lines of
+  history for 4 of 5 sessions, and `?1049h` sent with `?1049l` never sent. A
+  scrollbar over that is permanently blank, which is why the renderer switch is
+  the feature. The `tui` key is a SIBLING of `hooks` and must never be folded
+  into it: those matchers are the timing-critical `startup`-exclusion ones.
+  It is an ordinary UI preference (`_schedule_save`, additive optional key, NO
+  `SESSION_VERSION` bump) and it takes effect on the NEXT launch only — never
+  restart a working agent to apply it. Two consequences of the classic renderer
+  are real and were measured, not guessed: it is not flicker-free, and it does
+  NOT enable mouse tracking (so Claude's menus stop being clickable, and
+  `wheelEvent` needs no change — with `_mouse_tracking` and `_alt_screen` both
+  False it already falls through to `scroll_by`).
+- **Readiness is matched WITHOUT WHITESPACE, and that is load-bearing**
+  (`TerminalAgent._has_ready_hint`, `_despace`). The classic renderer lays its
+  footer out by MOVING THE CURSOR between segments instead of emitting spaces,
+  so once `_CSI_RE` strips the escapes, "? for shortcuts" arrives as
+  "?forshortcuts". Measured: the hint was on the rendered pyte screen from the
+  first frame and matched the escape-stripped stream NEVER. Since
+  `prompt_ready` gates task delivery, a spaced match parks every first task in
+  `_pending_task` forever and leaves the BootVeil up until its timeout — the
+  exact silent failure the `startup`-hook invariant warns about, from a
+  different direction. Despacing both sides is a superset, so the alt-screen
+  renderer keeps matching exactly as before.
+- **pyte's HistoryScreen event wrapper is REMOVED, and that is a performance
+  invariant** (`terminal_view._FastHistoryScreen`). pyte routes EVERY attribute
+  access on a `HistoryScreen` through a Python-level `__getattribute__` that
+  re-wraps each stream event in `before_event`/`after_event`. Both hooks exist
+  only to serve `prev_page`/`next_page`: "before" pages back to the bottom of
+  the history buffer, "after" re-clips line widths. AI Hive NEVER pages
+  (scrollback is a view offset), so `history.position` never leaves
+  `history.size` and both are no-ops on every single call. They are not free
+  no-ops, and taking the scrollback back is what made them hot: pyte's scroll
+  path (`Screen.index` at the bottom margin) shuffles EVERY row of the buffer
+  one dict entry at a time, so it touches ~2*rows attributes per scrolled line
+  — and under Claude's alt-screen renderer that path was never entered at all
+  (the spike measured `pushed == 0` for 4 of 5 sessions: nothing ever
+  scrolled). The classic renderer scrolls thousands of times per session, which
+  multiplied a per-attribute tax nobody had previously paid, and the app
+  visibly stuttered. MEASURED replaying 1.7 MiB of real captured agent output:
+  4.2 MILLION `__getattribute__` calls, 43% of all feed time, 8.0M total
+  function calls; removing the wrapper renders a byte-identical screen, history
+  AND cursor 2.87x faster (924ms → 318ms on the largest capture, 3.1M calls).
+  `after_event` also maintained `cursor.hidden`, but only as
+  `position == size and DECTCEM in mode` — the first term is always true here,
+  leaving exactly what the base `Screen`'s own `set_mode`/`reset_mode` already
+  does (verified against a capture exercising DECTCEM 3982 times). Because the
+  snap-back hook is gone, `prev_page`/`next_page` RAISE rather than silently
+  paging the screen away with nothing to restore it; do not "implement" them
+  without restoring the wrapper. This is the terminal's hot loop and it runs on
+  the GUI thread for every agent at once, so do not reintroduce a plain
+  `pyte.HistoryScreen` — `_new_history_screen` is the one construction site.
+- **ONE identity carries the scrollbar and every milestone**:
+  `abs_line(visual row r) == history.top.pushed - scroll_offset + r`. Both
+  branches of `_visible_line` reduce to it. NOTE the other coordinate space:
+  `_input_block_span`/`cursor.y` are LIVE BUFFER rows, so `anchor_line()` is
+  `pushed + row` with no offset term; the two agree at offset 0 and nowhere
+  else. `_CountingDeque.pushed` is deliberately NOT reset by a history wipe
+  (pyte's `_reset_history` clears the same deque object), which is what keeps
+  ids monotonic across a `/clear` — "fixing" that would silently corrupt every
+  marker. And do NOT try to stretch `HISTORY_LINES` by filtering duplicate
+  lines out of the history push: the identity holds only while EVERY line
+  leaving the screen is counted, so one suppressed append drifts every
+  live-anchored mark by one, permanently.
+- **A milestone is the user's own bare Enter, and nothing else**
+  (`TerminalView._note_prompt_submit`, the branch that already calls
+  `_reset_undo`). Rejected sources, each for a concrete reason: `agent.write`/
+  `_on_key_input` see a `\r` inside a bracketed PASTE; `_last_input_ts` is any
+  keystroke; a `UserPromptSubmit` hook is forbidden by the `startup` invariant.
+  It also excludes `deliver_task`/`nudge`/scheduled sends by construction —
+  they reach `worker.write` and never touch a key event. Two guards keep
+  ANSWERS out: the view rejects `_NUM_OPTION_RE` shapes (`_INPUT_PROMPTS`
+  includes the `❯` caret Claude paints on a highlighted menu row, so
+  `_input_text()` over a menu returns "1. Yes"), and the card rejects while
+  `agent.is_waiting()`. Marks live on the AGENT (`PromptMark`), keyed by a
+  monotonic `uid` and NEVER by `id()` — they are FIFO-capped, and CPython
+  reuses an address after collection, so a dropped mark would hand its id to a
+  new one and silently donate its position. `pos` is a CHARACTER offset into
+  the pty stream, because a card rebuild throws the view away and restarts
+  `pushed` at 0; `TerminalCard._replay_with_marks` splits the replay at those
+  offsets and re-derives each line with the SAME `anchor_line()` used live.
+  Do not extend a segment past the submit echo to "catch" the reprinted
+  prompt: that breaks the symmetry. Marks are TRANSIENT and never persisted
+  (`prompt_marks_changed` must never reach a save) — the transcript is the
+  durable record, and a stored marker list goes stale like a stored limit
+  latch. The PRIMARY reset is `note_conversation_replaced()`, called from
+  `sync_live_sessions` wherever a pin actually changes, because `/clear` under
+  the classic renderer emits NO `ED 3` at all (measured) and simply reprints
+  the banner; the `feed()` history-shrink check is the secondary edge.
+- **A milestone the app never watched being typed is RECOVERED, not invented**
+  (`TerminalCard._recover_marks` + `transcripts.typed_prompts`). Marks are
+  minted from a keystroke, so a conversation restored from disk comes back with
+  NONE — which is precisely the conversation long enough to want milestones in
+  (reported live: reopened the app, saw no dots at all). The prompt TEXTS come
+  from the transcript, where Claude tags a genuinely typed prompt with
+  `promptSource: "typed"` (absent on tool results, on `isSidechain` sub-agent
+  turns, and on the `_SYNTHETIC_USER_TAGS` plumbing), so the worst case is
+  failing to LOCATE a prompt, never inventing one. Matching is strict on the
+  prompt side and loose on the line side, because the classic renderer can drop
+  the leading character of the echo (measured) and wraps long prompts: a
+  normalized head is searched anywhere in a line, first hit wins, and the scan
+  carries on from the next line so prompts match in order and a repeated prompt
+  cannot claim an earlier line twice. It scans history AND the live screen —
+  their absolute ids are contiguous (`oldest + len(hist) == pushed`) and a
+  short conversation has scrolled nothing off yet, so history alone finds
+  nothing. Recovered marks are recomputed on every projection and merged BEHIND
+  the live ones (a live capture is exact; a recovered one was matched), and
+  like every other mark they are never persisted.
+- **A width change RE-PROJECTS the scrollback** (`TerminalCard.
+  _reproject_on_size`). pyte does not reflow: a history line keeps the column
+  count it had when it was pushed. That was invisible while Claude owned its
+  own scrollback (history was always empty), but now every width change would
+  leave the old lines wrapped for a screen that no longer exists — rendering as
+  a short fragment with the wrapped remainder stranded at the old right edge.
+  The launch case is the one that bites and the one that was reported: a card is
+  built at its pre-layout width, the child paints into it, those lines scroll
+  into history, and only THEN does the tiling grid give the card its real size.
+  The raw pty stream is the truth and the screen is only a projection of it at
+  one width, so the repair is to project again. Bounded by
+  `REPLAY_PROJECT_CAP`, which is a COMPROMISE and not a free bound: a full
+  512 KiB buffer takes ~1.25s (which would freeze a retile across a hive),
+  while 128 KiB costs ~80ms since the pyte wrapper came off (~250ms before it)
+  and reaches only 844-1519 of `HISTORY_LINES`' 2000 lines — so the cap is
+  already what truncates reachable scrollback, and LOWERING it to buy speed
+  costs milestones. (An earlier note here and in the code claimed 96 KiB filled
+  all 2000; re-measurement on real captures disproved that. It reaches
+  576-1126.) The cut is moved forward to the next ESC so a projection never
+  starts mid-sequence. Height-only changes do nothing.
+- **That projection happens ONCE, at the SETTLED width** (`TerminalCard.
+  _rerender_restored`). The constructor runs before the tiling grid sizes the
+  card, so its projection is thrown away and redone by construction — doing the
+  FULL cap there as well meant every card at launch and every retile projected
+  128 KiB twice, the first time at a width that never reached the screen, AND
+  read the whole transcript twice for milestone recovery. Measured per card:
+  ~80ms + 90-165ms per projection (the user's real transcripts run to 50 MB),
+  i.e. multiple seconds of frozen window across a six-agent hive, reported as
+  the app freezing right after it "paints the picture". So the constructor
+  seeds only `REPLAY_SEED_CAP` (a screenful, ~5ms, `recover=False`) — its ONLY
+  job is that the terminal is never briefly blank — and `_rerender_restored`
+  does the one real projection. THREE things keep that safe. (1) It projects
+  the agent's CURRENT buffer, not the constructor's snapshot: for an ordinary
+  rebuild the buffer IS the live conversation, and an earlier version that
+  compared the two and bailed on any difference would leave a BUSY agent's
+  rebuilt card holding nothing but the 8 KiB seed. (2) It still refuses a
+  restored snapshot a live child has drawn over (`TerminalAgent.
+  seed_written_over`, which compares the buffer to `_pty_seed`) — that seed is
+  the previous run's screen and a running agent is deliberately given a clean
+  terminal, so replaying it would put back the mangled fragment
+  `_drop_restored_screen` exists to remove. `is_running()` is NOT the test, for
+  the reason that function documents. (3) A `REPLAY_SETTLE_MS` single-shot
+  BACKSTOP, because `TerminalView._apply_resize` returns EARLY when rows/cols
+  are unchanged, so `sizeChanged` is not guaranteed to fire at all and a card
+  built at exactly its final size would keep the seed forever.
+  `_drop_restored_screen` must stop that timer as well as disconnect the
+  signal, or it re-projects the very screen that was just dropped.
+- **The transcript behind milestone recovery is cached per conversation**
+  (`TerminalCard._recover_key`/`_recover_prompts`). `_recover_marks` runs on
+  EVERY projection and `transcripts.typed_prompts` is O(whole transcript);
+  `transcripts` keeps an (mtime,size) cache, but a LIVE agent rewrites its
+  transcript continuously, so that cache misses for precisely the agents being
+  used. Re-reading inside one conversation cannot find anything the card does
+  not already know — it WATCHED those prompts being typed, so they carry live
+  marks, which outrank recovered ones in `_refresh_marks`. A new conversation
+  (a `/clear`, a pin change) changes `spec.session_id`, which changes the key
+  and re-reads.
+- **The scrollbar's TRACK spans history PLUS the live screen**
+  (`TerminalScrollBar._span`), which is wider than the scrollable range. A
+  prompt just submitted is still on the live screen, so bounding the track at
+  `pushed` left its dot undrawable until it happened to scroll off — i.e. you
+  type a prompt and no dot appears, which reads as the feature being broken.
+- **The submitted input is read from the box, NOT from the caret's row**
+  (`TerminalView._submitted_input`). `_input_block_span` is the precise
+  reading and is tried first, but it REQUIRES the caret to be on a row with
+  content, and the classic renderer parks the caret on a BLANK row below the
+  input box after a submit (measured on a real session: text on row 33, caret
+  on row 35), so the span came back None and NO milestone was ever recorded.
+  The fallback scans up from the caret and is bounded twice so it can never
+  mistake output for a prompt: it only runs when the caret is in the box's own
+  region at the bottom of the screen, and it STOPS at the box's rule/footer
+  rather than stepping over it into the conversation, so an empty box records
+  nothing. It also trims a wide run of spaces, because the renderer
+  right-aligns footer bits onto the same row by jumping the cursor.
 - **pyte quirks are handled in `terminal_view.feed()`** — private-marker CSI
   stripping, partial-escape carry, DECSET mode tracking. Scrollback is a view
   offset, never pyte paging (`prev_page` snaps back on any event). The wheel
@@ -309,7 +498,23 @@ this file is the invariants that must survive every change.
   `MainWindow.start_usage_polling()` exactly like it sets `quit_on_close`,
   because the smoke suite shares `create_main_window` and must never touch the
   network or the user's real account; tests drive `_on_usage_ready` with
-  synthetic readings. The BLOCKED state (`Usage.blocked`, utilization >= 100 —
+  synthetic readings. THE GEMINI READOUT OBEYS BOTH HALVES OF THIS, and every
+  one of them was learned the hard way: `gemini_usage.fetch()` shells out to
+  `agy --print /usage`, which MEASURES ~3.0s, and it was called INLINE on the
+  GUI thread — once in `MainWindow.__init__` and TWICE per tick, because
+  `_retune_gemini_usage_poll` fetched its own copy. That froze the entire app
+  for ~6s a minute (the urgent rate is 10s, i.e. shorter than one call), with
+  the CPU IDLE because it is blocked on a subprocess rather than computing —
+  reported as constant stuttering, and the reason "my CPU is not maxed out"
+  was the correct observation. It also made the offscreen suite shell out to
+  the user's real CLI and added ~3s to EVERY window it builds, which is what
+  started breaking elapsed-time-sensitive checks in unrelated sections. So:
+  `_poll_gemini_usage` kicks a daemon thread and emits `_geminiUsageReady`
+  (queued) exactly like `_poll_usage`/`_usageReady`; `_gemini_usage_inflight`
+  guards it because a 6s CLI timeout outlasts the urgent interval and the timer
+  would otherwise stack threads; the retune TAKES the reading; and the timer is
+  armed in `start_usage_polling`, never in `__init__`. Do not "simplify" any of
+  those back to an inline `fetch()`. The BLOCKED state (`Usage.blocked`, utilization >= 100 —
   derived from the number, NOT from the payload's server-side `severity`
   string) is the machine-readable half: `MainWindow.planLimitReached(Limit)` /
   `planLimitCleared()` are edge-triggered and level-correct like the chime, and
@@ -586,6 +791,63 @@ this file is the invariants that must survive every change.
   banner prints a bare wall clock for a reset that can be days out, which
   `parse_reset_clock` can only ever resolve to the next occurrence, so a weekly
   cut-off ignores its clock and waits for the account reading.
+- **GEMINI IS CUT OFF IN A DIFFERENT SHAPE, and every difference removes a
+  guard the Claude path leans on.** The whole recovery path used to be gated on
+  `provider == "claude"`, so an agy agent that ran out of quota simply sat there
+  (live, 2026-08-09). Callers now gate on `limit_banner.LIMIT_PROVIDERS`, and
+  the ONE place the two diverge is `TerminalAgent._read_limit_screen` — keep it
+  that way; everything downstream (`workspace_stats["limit_blocked"]`, the
+  hourglass, the ledger, the watchdog) is provider-agnostic already. What agy
+  prints is `⚠ Individual quota reached … Resets in 1h40m21s.` + an `Error ID:`
+  line, and then it RETURNS TO ITS PROMPT. So: (1) THERE IS NO MENU, which is
+  Claude's primary signal precisely because it persists while the agent is stuck
+  and is torn down on a resume — the Gemini path therefore always goes through
+  the identity guard, and `recheck_limit` asks the question backwards, treating a
+  NEW message (a still-spent quota answers a nudge with one) as "still blocked"
+  and the latched one merely lingering as "resumed"; that newer message also
+  REPLACES the latched reset, or the watchdog retries instantly and burns the
+  whole budget. No Esc is sent either — there is no menu, and an Esc would clear
+  whatever the user had half-typed. (2) THE CLOCK IS A DURATION, which is
+  strictly better (no rollover guess, and it is equally usable for a window days
+  out, so there is no `weekly` ambiguity — the window is just "quota"), but it
+  MUST be resolved to an epoch the moment the message is read, since the printed
+  text says "1h40m21s" forever. (3) THE MESSAGE WRAPS, so the countdown and the
+  Error ID land on continuation rows and the identity of the cut-off is NOT on
+  the matched line: `gemini_banner_line` returns the matched line JOINED with
+  those rows, which makes the identity sharper than Claude's wall clock (the
+  Error ID is unique per message) — do not "simplify" it back to one line.
+  (4) THERE IS NO CONVERSATION ON DISK (`~/.antigravity` holds `argv.json` and
+  `extensions`, nothing else), so the transcript corroboration that refutes a
+  phantom Claude latch has no Gemini equivalent. THE REPLAY IS THEREFORE THE
+  RECOVERY, not something to be filtered out (`_in_launch_replay` /
+  `_replay_cut_off`), and that inverts the Claude rule: `_scrape_limit` rejects a
+  replayed banner by requiring `_prompt_ready`, which works for Claude because
+  readiness IS the prompt footer, but agy sends bracketed-paste-enable BEFORE
+  its trust dialog (verified by driving agy through a pty), so a resumed Gemini
+  agent is "ready" while `--continue` is still redrawing the conversation it
+  ended on — and since the live latch is never persisted and there is no
+  transcript, that redraw is the ONLY surviving evidence of an overnight
+  cut-off. So a quota message inside `LIMIT_REPLAY_S` of launch LATCHES, with
+  `limit_from_startup=True` (it is a startup recovery, and answers to that
+  toggle). TWO corrections make it usable, both from a live miss on 2026-08-09:
+  its FROZEN COUNTDOWN IS DISCARDED and the agent probed at once, because "1h39m
+  56s" is stale by EXACTLY THE AGE OF THE MESSAGE — printed ~17:25 (reopening
+  ~19:05), re-read on a 20:15 restart, dated 21:54, nudged 21:57:58: 2h50m of an
+  idle agent — and there is nothing on screen to date it with. That is safe only
+  because a refusal SELF-CORRECTS: a still-spent quota answers with a whole new
+  message whose countdown is exact, which `recheck_limit` adopts — so guessing
+  early costs one message and guessing late costs hours. And it must be the LAST
+  thing on the screen (`LIMIT_REPLAY_TAIL_LINES` of content, the screen-side
+  equivalent of `transcripts.ended_on_limit`), or a cut-off the conversation
+  already recovered from would be "continued" over finished work. An earlier
+  attempt to solve this from the other end — `_seed_limit_history`, adopting the
+  on-screen message as history at the readiness edge — is REMOVED: it never
+  fired, because readiness arrives before the replay is drawn, and it would have
+  suppressed the very recovery this needs. Finally, the CLAUDE account reading
+  says nothing about a Google quota: `_resume_blocked_agents`'s no-`due`
+  shortcut (the `planLimitCleared` edge) is Claude-only by construction, the
+  late-fill in `_check_limit_resets` and the borrow in `_on_agent_limit_blocked`
+  likewise, and a Gemini latch resumes solely on its own countdown.
 - **A scheduled message is a DEFERRED ENTER, not an assignment**
   (`app/scheduled_send.py`, Qt-free/stdlib-only like `limit_banner.py`).
   `Ctrl+Shift+Enter` in a pty terminal hands `TerminalView._input_text()` up
@@ -950,3 +1212,21 @@ Use a scratch cwd.
   Qt-free (mcp_server must not import PySide6 at all).
 - Keep README.md's check count and feature list current when adding tests
   or features.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as markdown files under `.scratch/<feature-slug>/` in this repo.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles, used verbatim (`needs-triage`, `needs-info`,
+`ready-for-agent`, `ready-for-human`, `wontfix`).
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root.
+See `docs/agents/domain.md`.

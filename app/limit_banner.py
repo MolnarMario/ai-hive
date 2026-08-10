@@ -1,10 +1,14 @@
-"""Recognising a Claude plan-limit cut-off, and when it ends.
+"""Recognising a plan/quota-limit cut-off, and when it ends.
 
 Shared by two callers that must agree exactly, which is why the patterns live
 here rather than in either of them: `terminal_agent` matches them against the
 LIVE screen, and `transcripts` matches them against the conversation on disk
 (the durable record used to recover agents at startup). Qt-free and stdlib-only
 like `chime.py` / `claude_usage.py`, because `transcripts` is.
+
+TWO PROVIDERS are recognised, and their cut-offs are not the same shape at all
+(see the Gemini section at the bottom for what that costs). `LIMIT_PROVIDERS`
+is the set every caller should gate on rather than spelling out either name.
 
 TWO signals, in order of reliability:
 
@@ -34,6 +38,11 @@ seven_day:"weekly limit", ...}.
 
 import re
 import time
+
+# Providers whose cut-off this module can recognise at all. Everything in the
+# recovery path (the live scrape, the resume pass) gates on this rather than on
+# a literal "claude", so adding a third CLI is a change here plus its patterns.
+LIMIT_PROVIDERS = ("claude", "gemini")
 
 # The parked-on menu — primary, because it persists while the agent is stuck.
 LIMIT_MENU_RE = re.compile(r"stop\s+and\s+wait\s+for\s+limit\s+to\s+reset",
@@ -66,6 +75,18 @@ _LIMIT_RESET_RE = re.compile(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
 # always its own short line.
 _BANNER_MAX_CHARS = 200
 
+# Everything a TUI can paint to the LEFT of the message itself: indentation,
+# the box-drawing gutter Claude draws down its output, the selection caret, and
+# the warning glyph agy puts in front of an error (with its variation selector,
+# which arrives as a separate code point). Stripped before matching so both
+# banners can be anchored at the start of their line, which is the discriminator
+# that keeps an agent's own prose about a limit from being read as one.
+_GUTTER = " \t│┃|>❯⚠✗✘×•*️"
+
+
+def _strip_gutter(line: str) -> str:
+    return line.lstrip(_GUTTER).strip()
+
 
 def banner_line(text: str) -> str:
     """The banner line itself, normalized, or "" when `text` holds none.
@@ -88,8 +109,7 @@ def banner_line(text: str) -> str:
     if not text:
         return found
     for line in text.splitlines():
-        # drop leading whitespace and any box-drawing gutter the TUI draws
-        line = line.lstrip(" \t│┃|>❯").strip()
+        line = _strip_gutter(line)
         if len(line) <= _BANNER_MAX_CHARS and LIMIT_HIT_RE.match(line):
             found = line
     return found
@@ -170,3 +190,113 @@ def banner_reset_at(text: str, written_at: float) -> float | None:
     land on 3am TOMORROW and the agent would sit idle for a full day.
     """
     return parse_reset_clock(text, written_at)
+
+
+# --------------------------------------------------------------- Gemini ---
+#
+# The Antigravity CLI (`agy`) cuts an agent off in a completely different shape,
+# and every difference costs something:
+#
+#     ⚠ Individual quota reached. Please upgrade your subscription to increase
+#       your limits. Resets in 1h40m21s.
+#       Error ID: 6a22d054-3666-4717-b0ac-7b359153c647-266
+#
+#  * THERE IS NO MENU. Claude parks the agent on an interactive prompt, which
+#    is the primary signal precisely because it persists while the agent is
+#    stuck and is torn down when it goes again. agy just prints an error and
+#    returns to its prompt, so this whole family has only the weak, scrollback
+#    signal — the equivalent of Claude's banner and nothing else.
+#  * THE CLOCK IS A DURATION, not a wall time. That is strictly BETTER: it
+#    needs no rollover guess, and it is equally usable for a window days out,
+#    so a Gemini cut-off never has the "weekly banner can't be trusted" problem
+#    `banner_window` exists for. It must be resolved the moment it is READ,
+#    though, because the printed text keeps saying "1h40m21s" forever.
+#  * THE MESSAGE WRAPS. The duration and the Error ID land on continuation
+#    rows, so unlike Claude's one-line banner the identity of the cut-off is
+#    NOT on the matched line — which matters enormously, because the identity
+#    is what stops a banner still sitting in the scrollback from re-latching an
+#    agent that has already been resumed off it. `gemini_banner_line` therefore
+#    returns the matched line JOINED with those detail rows. The Error ID is
+#    unique per message and the duration differs between any two cut-offs, so
+#    the joined string is a far sharper identity than Claude's wall clock.
+#  * THE WORDING IS THE SERVER'S. "Individual quota reached" is nowhere in
+#    agy.exe (only a "Quota Reached" UI label is), so it arrives over the wire
+#    and may vary. Hence one leading qualifier word is allowed, and the match
+#    is anchored rather than a bare search.
+
+# One optional qualifier ("Individual"/"Daily"/"Model"/...) then the phrase.
+# ANCHORED at the start of the line, like `LIMIT_HIT_RE`: an agent discussing a
+# quota embeds the words mid-sentence, and allowing just the one word in front
+# is what keeps "note that the quota reached its cap" from matching.
+GEMINI_LIMIT_RE = re.compile(r"(?:\w+\s+)?quota\s+(?:reached|exceeded)\b", re.I)
+
+# The rows the message wraps onto that are worth keeping: the countdown and the
+# per-message Error ID. Anything else on those rows is ordinary wrapped prose
+# and is dropped, so the identity stays short and stable.
+_GEMINI_DETAIL_RE = re.compile(r"resets?\s+in\s+\d|error\s+id\s*:", re.I)
+
+# How far past the matched line to look for them. The observed message wraps
+# over three rows; four is one row of slack, and small enough that a following
+# unrelated line can't be swept in (it would have to match _GEMINI_DETAIL_RE).
+_GEMINI_DETAIL_LINES = 4
+
+# "Resets in 1h40m21s" / "resets in 45m" / "resets in 30s".
+_GEMINI_RESET_RE = re.compile(r"resets?\s+in\s+((?:\d+\s*[hms]\s*)+)", re.I)
+_GEMINI_DUR_RE = re.compile(r"(\d+)\s*([hms])", re.I)
+_GEMINI_UNITS = {"h": 3600, "m": 60, "s": 1}
+
+
+def gemini_banner_line(text: str) -> str:
+    """The agy quota message, normalized to one line, or "" when `text` holds
+    none.
+
+    The matched line plus its countdown/Error-ID continuation rows, joined with
+    single spaces. Returning the whole thing rather than a bool is what makes it
+    usable as the IDENTITY of one cut-off — see the section comment above, and
+    `terminal_agent._scrape_limit` for what that identity is guarding.
+
+    The LAST match wins, for the same reason as `banner_line`: when a retry has
+    printed a second message, the newest one describes the current state.
+    """
+    if not text:
+        return ""
+    lines = [_strip_gutter(ln) for ln in text.splitlines()]
+    found = ""
+    for i, line in enumerate(lines):
+        if len(line) > _BANNER_MAX_CHARS or not GEMINI_LIMIT_RE.match(line):
+            continue
+        parts = [line]
+        for cont in lines[i + 1:i + 1 + _GEMINI_DETAIL_LINES]:
+            if GEMINI_LIMIT_RE.match(cont):
+                break           # the next message begins; this one is done
+            if _GEMINI_DETAIL_RE.search(cont):
+                parts.append(cont)
+        found = " ".join(parts)
+    return found
+
+
+def gemini_banner_in(text: str) -> bool:
+    """True when `text` shows an agy quota cut-off."""
+    return bool(gemini_banner_line(text))
+
+
+def gemini_reset_at(text: str, now: float | None = None) -> float | None:
+    """Epoch seconds the quota frees up, from agy's RELATIVE countdown, or None
+    when `text` states none.
+
+    Resolved against `now` at READ time, which is the whole difference from
+    `parse_reset_clock`: the printed text is a snapshot ("Resets in 1h40m21s")
+    that never updates, so parsing the same message an hour later would push the
+    reset an hour further out. Callers must resolve it ONCE, when the message is
+    first seen, and keep the epoch — which is exactly what latching it on the
+    agent does.
+    """
+    m = _GEMINI_RESET_RE.search(text or "")
+    if not m:
+        return None
+    seconds = 0
+    for value, unit in _GEMINI_DUR_RE.findall(m.group(1)):
+        seconds += int(value) * _GEMINI_UNITS[unit.lower()]
+    if seconds <= 0:
+        return None
+    return (time.time() if now is None else now) + seconds
