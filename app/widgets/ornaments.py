@@ -12,8 +12,8 @@ from functools import lru_cache
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
                             QRectF, Qt, QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage,
-                           QLinearGradient, QPainter, QPen, QPixmap,
-                           QRadialGradient)
+                           QLinearGradient, QPainter, QPainterPath, QPen,
+                           QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QLabel, QSizePolicy, QToolButton, QWidget
 
@@ -638,11 +638,15 @@ class UsagePillBadge(QWidget):
     side, so a second hand-copy of the formula is the same bug waiting to
     happen; subclasses supply only the TEXT.
 
-    The X's width is reserved unconditionally and only its VISIBILITY is
-    hover-gated. Reserving it on hover instead would grow the pill by 20px as
-    the pointer crossed it, and since the pills sit after the layout's stretch
-    that shoves the whole right-hand cluster (recovery caption, LED toggles,
-    theme combo, font steppers, Add Terminal) sideways on every mouse-over.
+    The X costs NO layout width: it FLOATS over the tail of the text, which
+    fades out under it for the moment the pointer is inside the pill. Reserving
+    a permanent slot for it (the first cut of this) left ~20px of every pill
+    blank for the 99% of the time nobody is hovering. What must NOT change is
+    the width: the pills sit after the layout's stretch, so a pill that grew on
+    hover would shove the whole right-hand cluster (recovery caption, LED
+    toggles, theme combo, font steppers, Add Terminal) sideways as the pointer
+    crossed it. Overlaying keeps that property for free - `_measure_width`
+    depends on the text alone, and hovering paints, it never re-measures.
 
     The widget is a pure VIEW - it never fetches, and it never decides its own
     visibility. `MainWindow` polls off-thread and pushes readings in; a click on
@@ -657,8 +661,8 @@ class UsagePillBadge(QWidget):
     _RING = 15          # ring diameter
     _PAD = 8            # horizontal padding inside the pill
     _GAP = 7            # ring -> text gap
-    _CLOSE_W = 14       # the hover X, always RESERVED (see the class docstring)
-    _CLOSE_GAP = 6      # text -> X gap
+    _CLOSE_W = 14       # the hover X, OVERLAID (see the class docstring)
+    _FADE_W = 14        # how far the text fades out ahead of the hovered X
     _RADIUS = 6         # pill corner radius
     _BORDER_W = 1.2
     _FILL_ALPHA, _BORDER_ALPHA = 30, 140          # a live reading
@@ -680,6 +684,7 @@ class UsagePillBadge(QWidget):
         self._label = False         # prefix the window name (multi-limit plans)
         self._unreadable = ""       # last error, when we have NO reading at all
         self._loading = False       # a fetch is in flight and we have nothing yet
+        self._hovering = False      # paint the X's scrim over the text tail
         # A child QToolButton rather than a rect hit-tested in mousePressEvent:
         # it consumes its own press, so closing can never be mistaken for the
         # click-to-refresh affordance, and it gets the hover cursor, hover
@@ -774,11 +779,14 @@ class UsagePillBadge(QWidget):
 
     @classmethod
     def _measure_width(cls, text: str) -> int:
-        """[pad][ring][gap][text][close gap][X][pad]. The one width formula."""
+        """[pad][ring][gap][text][pad]. The one width formula, for every pill.
+
+        The X is deliberately NOT a term here: it floats over the text's tail,
+        so it costs no width and hovering can never resize the pill.
+        """
         fm = QFontMetrics(cls._text_font())
         return (cls._PAD * 2 + cls._RING + cls._GAP
-                + fm.horizontalAdvance(text)
-                + cls._CLOSE_GAP + cls._CLOSE_W)
+                + fm.horizontalAdvance(text))
 
     @staticmethod
     def _text_font() -> QFont:
@@ -806,11 +814,15 @@ class UsagePillBadge(QWidget):
                             int((self.height() - self._CLOSE_W) / 2))
 
     def enterEvent(self, event):
+        self._hovering = True
         self.close_btn.setVisible(True)
+        self.update()          # repaint so the text fades under the X
         super().enterEvent(event)
 
     def leaveEvent(self, event):
+        self._hovering = False
         self.close_btn.setVisible(False)
+        self.update()
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
@@ -885,9 +897,8 @@ class UsagePillBadge(QWidget):
         p.setPen(color)
         text_x = self._PAD + self._RING + self._GAP
         # the pill is sized for this exact string, so the elide is insurance
-        # only - but it is what guarantees the text can never reach the X
-        avail = (self.width() - text_x - self._PAD
-                 - self._CLOSE_W - self._CLOSE_GAP)
+        # only (a subclass could yet hand us something longer than it measured)
+        avail = self.width() - text_x - self._PAD
         elided = p.fontMetrics().elidedText(self._text,
                                             Qt.TextElideMode.ElideRight,
                                             int(max(0, avail)))
@@ -895,7 +906,43 @@ class UsagePillBadge(QWidget):
                    int(Qt.AlignmentFlag.AlignLeft
                        | Qt.AlignmentFlag.AlignVCenter),
                    elided)
+        if self._hovering:
+            self._paint_close_scrim(p, color, dim)
         p.end()
+
+    def _paint_close_scrim(self, p, color, dim) -> None:
+        """Fade the text out under the hovered X.
+
+        The X owns no layout width, so without this it would sit on top of live
+        glyphs and neither would be readable. The scrim is the pill's OWN
+        background rebuilt opaque - the flat bar colour with the same tint the
+        fill uses - so the covered tail reads as empty pill rather than as a
+        patch of some other colour. It is clipped to the rounded outline, or it
+        would square off the right-hand corners it paints over.
+        """
+        ground = QColor(Palette.BG_PANEL)
+        a = (self._FILL_ALPHA_DIM if dim else self._FILL_ALPHA) / 255.0
+        blend = QColor(
+            int(round(ground.red() * (1 - a) + color.red() * a)),
+            int(round(ground.green() * (1 - a) + color.green() * a)),
+            int(round(ground.blue() * (1 - a) + color.blue() * a)))
+        x1 = self.width() - self._PAD - self._CLOSE_W
+        x0 = max(0.0, x1 - self._FADE_W)
+        clear = QColor(blend)
+        clear.setAlpha(0)
+        grad = QLinearGradient(x0, 0.0, float(x1), 0.0)
+        grad.setColorAt(0.0, clear)
+        grad.setColorAt(1.0, blend)     # PadSpread keeps it solid past x1
+        outline = QPainterPath()
+        outline.addRoundedRect(QRectF(0.5, 0.5, self.width() - 1,
+                                      self.height() - 1),
+                               self._RADIUS, self._RADIUS)
+        p.save()
+        p.setClipPath(outline)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(grad)
+        p.drawRect(QRectF(x0, 0.0, self.width() - x0, self.height()))
+        p.restore()
 
 
 class PlanUsageBadge(UsagePillBadge):

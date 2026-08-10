@@ -10654,12 +10654,16 @@ def test_usage_pill_geometry_and_close():
     # the formula, and that BOTH classes use the same one
     def want(cls, text):
         fm = QFontMetrics(cls._text_font())
-        return (cls._PAD * 2 + cls._RING + cls._GAP
-                + fm.horizontalAdvance(text)
-                + cls._CLOSE_GAP + cls._CLOSE_W)
+        return cls._PAD * 2 + cls._RING + cls._GAP + fm.horizontalAdvance(text)
 
-    check("usage-pill: width is ring + pads + text + the reserved X",
+    check("usage-pill: width is ring + pads + text, and nothing else",
           badge.width() == want(GeminiUsageBadge, badge._text))
+    check("usage-pill: the X reserves NO width - it floats over the text",
+          badge.width()
+          == GeminiUsageBadge._PAD * 2 + GeminiUsageBadge._RING
+          + GeminiUsageBadge._GAP
+          + QFontMetrics(GeminiUsageBadge._text_font()).horizontalAdvance(
+              badge._text))
     check("usage-pill: Claude and Gemini measure an identical string alike",
           PlanUsageBadge._measure_width("21% used, resets in 1h20m at 14:49")
           == GeminiUsageBadge._measure_width(
@@ -10667,11 +10671,14 @@ def test_usage_pill_geometry_and_close():
     check("usage-pill: the fixed 315px width is gone",
           not hasattr(GeminiUsageBadge, "_FIXED_WIDTH")
           and badge.width() != weekly_badge.width())
-    check("usage-pill: the text can never reach the X",
-          badge.width() - (badge._PAD + badge._RING + badge._GAP)
-          - badge._PAD - badge._CLOSE_W - badge._CLOSE_GAP
+    check("usage-pill: the full text fits, so nothing is ever truncated",
+          badge.width() - (badge._PAD + badge._RING + badge._GAP) - badge._PAD
           >= QFontMetrics(GeminiUsageBadge._text_font()).horizontalAdvance(
               badge._text))
+    check("usage-pill: the X sits inside the text's own run",
+          badge.close_btn.x() < badge.width() - badge._PAD
+          and badge.close_btn.x() + badge._CLOSE_W
+          <= badge.width() - badge._PAD + 1)
 
     # the hover X (isVisibleTo, not isVisible: these badges are never shown,
     # so a real isVisible() would be False either way and prove nothing)
@@ -10683,6 +10690,8 @@ def test_usage_pill_geometry_and_close():
           badge.close_btn.isVisibleTo(badge))
     check("usage-pill: hovering does NOT change the width",
           badge.width() == w_before)
+    check("usage-pill: the hovered pill paints its fade under the X",
+          badge._hovering and not badge.grab().isNull())
     badge.leaveEvent(None)
     check("usage-pill: leaving hides the X again",
           not badge.close_btn.isVisibleTo(badge))

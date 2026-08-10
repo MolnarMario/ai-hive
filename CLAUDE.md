@@ -641,18 +641,25 @@ this file is the invariants that must survive every change.
   actually changes.
 - **A usage pill is exactly as wide as its text, by ONE formula**
   (`ornaments.UsagePillBadge._measure_width`: `_PAD*2 + _RING + _GAP +
-  advance(text) + _CLOSE_GAP + _CLOSE_W`, measured with `_text_font()` — the
-  font `paintEvent` actually draws with, never the widget's QSS font, or the
-  pill is sized for text of a different size). `PlanUsageBadge` and
+  advance(text)`, measured with `_text_font()` — the font `paintEvent` actually
+  draws with, never the widget's QSS font, or the pill is sized for text of a
+  different size). `PlanUsageBadge` and
   `GeminiUsageBadge` are both subclasses and supply only the TEXT; the Gemini
   pills previously carried a hardcoded `_FIXED_WIDTH = 315` and elided into it,
   which reserved 630px of the bar for two readouts whose real content is ~215px
   each, truncated anything longer, and drifted from the Claude pill sitting
-  beside them. Do not re-copy the formula into a subclass. The ✕'s width is
-  RESERVED UNCONDITIONALLY and only its VISIBILITY is hover-gated: the pills sit
-  after the layout's `addStretch(1)`, so growing one on hover shoves the entire
+  beside them. Do not re-copy the formula into a subclass. The ✕ is NOT a term
+  in that formula: it FLOATS over the tail of the text, which fades out under
+  it (`_paint_close_scrim`, the pill's own background rebuilt opaque and
+  clipped to the rounded outline) for as long as the pointer is inside. An
+  earlier cut RESERVED a permanent slot for it, which left ~20px of every pill
+  blank for the 99% of the time nobody is hovering. THE INVARIANT THE RESERVED
+  SLOT WAS PROTECTING STILL HOLDS AND STILL MATTERS: the pills sit after the
+  layout's `addStretch(1)`, so a pill that grew on hover would shove the entire
   right-hand cluster (recovery caption, LED toggles, theme combo, font steppers,
-  Add Terminal) sideways as the pointer crosses it. The ✕ is a child
+  Add Terminal) sideways as the pointer crossed it. Overlaying keeps it for
+  free — `_measure_width` reads the text alone and hovering only repaints — so
+  do not make the width depend on hover state. The ✕ is a child
   `QToolButton`, NOT a rect hit-tested in `mousePressEvent`, so it consumes its
   own press and closing can never be mistaken for the click-to-refresh
   affordance that same handler owns. Loading strings must stay SHORTER than the
