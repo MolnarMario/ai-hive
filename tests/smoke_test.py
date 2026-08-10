@@ -10378,6 +10378,7 @@ def main():
     test_multi_agent_session_isolation()
     test_gemini_usage_badge_fixed_width()
     test_scheduled_send()
+    test_cli_auto_update()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0
@@ -10446,6 +10447,441 @@ def test_gemini_usage_badge_fixed_width():
 
     badge.deleteLater()
     weekly_badge.deleteLater()
+
+
+class _FakeCli:
+    """A recording `Runner` for the CLI-update gate. Every check below drives
+    the real `run_gate` through one of these; NO test ever shells out, which is
+    the same rule that keeps the suite off the network and off the user's real
+    Claude account."""
+
+    def __init__(self, versions=("2.1.224",), available="2.1.224", alive=0,
+                 upgrade=(0, ""), update_out=(0, "already on the latest"),
+                 timeout_on=()):
+        self.calls = []                 # every argv, in order
+        self.versions = list(versions)  # one per `--version`, last repeats
+        self.available = available
+        self.alive = alive
+        self.upgrade = upgrade
+        self.update_out = update_out
+        self.timeout_on = tuple(timeout_on)
+
+    def argvs(self):
+        return [list(a) for a, _t in self.calls]
+
+    def __call__(self, argv, timeout):
+        argv = list(argv)
+        self.calls.append((argv, timeout))
+        joined = " ".join(argv).lower()
+        if any(token in joined for token in self.timeout_on):
+            from app import cli_update
+            return cli_update.RC_TIMEOUT, ""
+        if argv[0] == "tasklist":
+            name = argv[2].split()[-1]
+            if self.alive < 0:
+                return 1, "ERROR"
+            body = "\n".join(f"{name}   {1000 + i} Console  1  285,000 K"
+                             for i in range(self.alive))
+            return 0, body or ("INFO: No tasks are running which match the "
+                               "specified criteria.")
+        if argv[-1] == "--version":
+            out = self.versions[0]
+            if len(self.versions) > 1:
+                out = self.versions.pop(0)
+            return 0, out
+        if argv[0] == "winget" and argv[1] == "show":
+            return 0, f"Found Claude Code [Anthropic.ClaudeCode]\n" \
+                      f"Version: {self.available}\n"
+        if argv[0] == "winget" and argv[1] == "upgrade":
+            return self.upgrade
+        return self.update_out          # `agy update`
+
+
+def test_cli_auto_update():
+    """The startup CLI auto-update gate.
+
+    Root cause it exists for: `claude.exe` is a single self-contained binary
+    and Windows cannot overwrite a running one, while every AI Hive agent IS a
+    claude.exe child. An upgrade run with agents up cannot replace the file,
+    but winget records the new version in its database anyway, after which the
+    old binary nags forever and winget insists there is nothing to do. So the
+    gate runs BEFORE any window or agent exists, it decides success by reading
+    `--version` off the resolved binary rather than by believing the installer,
+    and it refuses to run an upgrade at all while a target process is alive.
+
+    Everything here is driven through an injected runner: the suite must never
+    upgrade the user's CLI."""
+    from PySide6.QtWidgets import QApplication
+    from app import cli_update
+    from app.cli_update import Status
+    from app.session_store import SessionStore
+    from app.widgets.main_window import TopBar
+    from app.workspace_manager import SESSION_VERSION
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+
+    claude = cli_update.Target(
+        key="claude", label="Claude Code", exe=r"C:\fake\claude.exe",
+        process_names=("claude.exe",), winget_id="Anthropic.ClaudeCode")
+    agy = cli_update.Target(
+        key="gemini", label="Gemini (agy)", exe=r"C:\fake\agy.exe",
+        process_names=("agy.exe",), self_update=("update",))
+
+    def upgrade_calls(runner):
+        """Every argv that could MUTATE anything."""
+        return [a for a in runner.argvs()
+                if "upgrade" in a or "install" in a or "update" in a]
+
+    # --- 1. parse_version reads all three real output shapes ---------------
+    check("cli-update: parses the Claude CLI's own version line",
+          cli_update.parse_version("2.1.224 (Claude Code)") == "2.1.224")
+    check("cli-update: parses agy's bare version",
+          cli_update.parse_version("1.1.11") == "1.1.11")
+    check("cli-update: prefers winget's Version: line over other numbers",
+          cli_update.parse_version(
+              "Found Claude Code [Anthropic.ClaudeCode]\n"
+              "Version: 2.1.231\nRelease Notes Url: https://x/v1.2.3")
+          == "2.1.231")
+    check("cli-update: garbage parses to nothing",
+          cli_update.parse_version("no version here") == "")
+    # ...and an unparseable version can never be the REASON to install: a parse
+    # failure fails open in both directions
+    check("cli-update: an unparseable version never triggers an install",
+          not cli_update.needs_update("garbage", "2.1.231")
+          and not cli_update.needs_update("2.1.224", "garbage")
+          and cli_update.needs_update("2.1.224", "2.1.231"))
+    check("cli-update: version ordering is numeric, not lexical",
+          cli_update.version_tuple("2.1.99") < cli_update.version_tuple("2.1.224"))
+
+    # --- 2. the toggle off means the machine is never touched --------------
+    runner = _FakeCli()
+    outs = cli_update.run_gate([claude, agy], runner, enabled=False)
+    check("cli-update: switched off, not one command is run",
+          runner.calls == [] and [o.status for o in outs]
+          == [Status.DISABLED, Status.DISABLED], runner.argvs())
+    check("cli-update: a disabled target writes no audit line",
+          cli_update.audit_lines(outs[0]) == [])
+
+    # --- 3. already current: the upgrade command is never issued -----------
+    runner = _FakeCli(versions=("2.1.224 (Claude Code)",), available="2.1.224")
+    out = cli_update.run_gate([claude], runner)[0]
+    check("cli-update: installed == available is UP_TO_DATE",
+          out.status is Status.UP_TO_DATE and out.before == "2.1.224", out)
+    check("cli-update: nothing to do means no upgrade command at all",
+          upgrade_calls(runner) == [], runner.argvs())
+    check("cli-update: the manifest is read with `winget show`, never `upgrade`",
+          ["winget", "show", "--id", "Anthropic.ClaudeCode", "--exact",
+           "--accept-source-agreements"] in runner.argvs(), runner.argvs())
+
+    # --- 4. a real update, decided by the FILE both times ------------------
+    runner = _FakeCli(versions=("2.1.224 (Claude Code)", "2.1.231 (Claude Code)"),
+                      available="2.1.231")
+    out = cli_update.run_gate([claude], runner)[0]
+    check("cli-update: a version that actually moved is UPDATED",
+          out.status is Status.UPDATED and (out.before, out.after)
+          == ("2.1.224", "2.1.231"), out)
+    check("cli-update: the transition is audited",
+          "UPDATE claude 2.1.224 -> 2.1.231" in cli_update.audit_lines(out),
+          cli_update.audit_lines(out))
+    check("cli-update: the check itself is audited with both versions",
+          "UPDATE-CHECK claude installed=2.1.224 available=2.1.231"
+          in cli_update.audit_lines(out), cli_update.audit_lines(out))
+    check("cli-update: success is read back off the binary, not off winget",
+          runner.argvs().count([r"C:\fake\claude.exe", "--version"]) == 2,
+          runner.argvs())
+
+    # --- 5. THE REPORTED BUG: winget claims success, the file is unchanged --
+    runner = _FakeCli(versions=("2.1.224 (Claude Code)",), available="2.1.231",
+                      upgrade=(0, "Successfully installed"))
+    out = cli_update.run_gate([claude], runner)[0]
+    check("cli-update: an installer that reports success but changes nothing "
+          "is REPORTED_BUT_UNCHANGED",
+          out.status is Status.REPORTED_BUT_UNCHANGED, out)
+    check("cli-update: that is audited precisely",
+          any(line.startswith("UPDATE-UNCHANGED claude")
+              for line in cli_update.audit_lines(out)),
+          cli_update.audit_lines(out))
+    check("cli-update: and it earns the pill",
+          "Claude Code" in cli_update.pill_text([out]),
+          cli_update.pill_text([out]))
+
+    # --- 6. THE CAUSE: a live claude.exe means no upgrade command runs -----
+    runner = _FakeCli(versions=("2.1.224 (Claude Code)",), available="2.1.231",
+                      alive=3)
+    out = cli_update.run_gate([claude], runner)[0]
+    check("cli-update: a target process alive blocks the update",
+          out.status is Status.BLOCKED_PROCESSES and "3 claude.exe" in out.detail,
+          out)
+    check("cli-update: blocked means NO winget command at all, so its database "
+          "can never be poisoned by us",
+          not any(a[0] == "winget" for a in runner.argvs()), runner.argvs())
+    check("cli-update: the skip names the count",
+          "UPDATE-SKIP claude (3 claude.exe alive)"
+          in cli_update.audit_lines(out), cli_update.audit_lines(out))
+    # ...and if we cannot even ask, we still refuse (better a missed update
+    # than an upgrade run against a file we cannot prove is unlocked)
+    runner = _FakeCli(alive=-1, available="2.1.231")
+    out = cli_update.run_gate([claude], runner)[0]
+    check("cli-update: an unanswerable process check blocks too",
+          out.status is Status.BLOCKED_PROCESSES
+          and not any(a[0] == "winget" for a in runner.argvs()), out)
+
+    # --- 7. the poisoned database, reported but never forced --------------
+    runner = _FakeCli(versions=("2.1.224 (Claude Code)",), available="2.1.231",
+                      upgrade=(0, "No available upgrade found."))
+    out = cli_update.run_gate([claude], runner)[0]
+    check("cli-update: behind the manifest but 'no upgrade found' is DB_STALE",
+          out.status is Status.DB_STALE, out)
+    check("cli-update: DB_STALE reports and does NOT force a reinstall",
+          not any("--force" in a for a in runner.argvs()), runner.argvs())
+    check("cli-update: the stale record is audited with both versions",
+          any("2.1.224 < 2.1.231" in line
+              for line in cli_update.audit_lines(out)),
+          cli_update.audit_lines(out))
+    check("cli-update: the pill carries the one command to run by hand",
+          "winget install --id Anthropic.ClaudeCode --exact --force"
+          in cli_update.pill_tooltip([out]), cli_update.pill_tooltip([out]))
+
+    # --- 8. a hung check fails OPEN to launch ------------------------------
+    runner = _FakeCli(timeout_on=("winget show",), available="2.1.231")
+    out = cli_update.run_gate([claude], runner)[0]
+    check("cli-update: a check that outruns its budget is TIMEOUT",
+          out.status is Status.TIMEOUT, out)
+    check("cli-update: a timeout is audited and shows no pill (launch wins)",
+          cli_update.audit_lines(out) == [
+              "UPDATE-CHECK claude installed=2.1.224",
+              "UPDATE-TIMEOUT claude check exceeded 5s"]
+          and cli_update.pill_text([out]) == "",
+          cli_update.audit_lines(out))
+    check("cli-update: the check phase is bounded, so no upgrade followed",
+          upgrade_calls(runner) == [], runner.argvs())
+
+    # --- 9. serial: two multi-hundred-MB installers never overlap ----------
+    runner = _FakeCli(versions=("2.1.224 (Claude Code)",), available="2.1.224")
+    outs = cli_update.run_gate([claude, agy], runner)
+    seen = [a[0] for a in runner.argvs() if a[0] != "tasklist"]
+    first_agy = next(i for i, a in enumerate(runner.argvs())
+                     if "agy.exe" in a[0])
+    claude_after = [i for i, a in enumerate(runner.argvs())
+                    if a[0] == "winget" or "claude.exe" in a[0]]
+    check("cli-update: agy's commands never interleave with Claude's",
+          all(i < first_agy for i in claude_after), (first_agy, claude_after))
+    check("cli-update: both targets are reported, in order",
+          [o.target for o in outs] == ["claude", "gemini"], outs)
+    # a self-updating CLI has no dry run, so `agy update` IS the check, and an
+    # unchanged version afterwards means it was already current, NOT a failure
+    check("cli-update: agy self-updates unconditionally (there is no dry run)",
+          [r"C:\fake\agy.exe", "update"] in runner.argvs(), runner.argvs())
+    check("cli-update: an unchanged agy after a clean self-update is up to date",
+          outs[1].status is Status.UP_TO_DATE and cli_update.pill_text(outs) == "",
+          outs[1])
+    runner = _FakeCli(versions=("1.1.11", "1.2.0"), update_out=(0, "updated"))
+    out = cli_update.run_gate([agy], runner)[0]
+    check("cli-update: an agy version that moved is UPDATED",
+          out.status is Status.UPDATED and out.after == "1.2.0", out)
+    runner = _FakeCli(versions=("1.1.11",), update_out=(1, "network down"))
+    out = cli_update.run_gate([agy], runner)[0]
+    check("cli-update: a failed self-update is FAILED, with the rc audited",
+          out.status is Status.FAILED
+          and "UPDATE-FAIL gemini rc=1 network down"
+          in cli_update.audit_lines(out), cli_update.audit_lines(out))
+
+    # a target that is not installed is skipped in silence
+    missing = cli_update.Target(key="claude", label="Claude Code", exe="")
+    out = cli_update.run_gate([missing], _FakeCli())[0]
+    check("cli-update: an uninstalled CLI is skipped without any command",
+          out.status is Status.NOT_INSTALLED
+          and cli_update.pill_text([out]) == "", out)
+
+    # --- 11. the pill speaks for exactly four statuses ---------------------
+    def one(status):
+        return cli_update.Outcome("claude", status, before="2.1.224",
+                                  after="2.1.224", available="2.1.231",
+                                  detail="rc=1 boom", label="Claude Code")
+
+    speaks = [s for s in Status if cli_update.pill_text([one(s)])]
+    check("cli-update: only the four reporting statuses show the pill",
+          set(speaks) == {Status.BLOCKED_PROCESSES, Status.DB_STALE,
+                          Status.REPORTED_BUT_UNCHANGED, Status.FAILED},
+          speaks)
+    check("cli-update: a clean gate says nothing at all",
+          cli_update.pill_text([one(Status.UPDATED), one(Status.UP_TO_DATE),
+                                one(Status.TIMEOUT), one(Status.DISABLED),
+                                one(Status.NOT_INSTALLED)]) == "")
+
+    # --- 12. no em dash reaches the reader (the global check covers the
+    # module; these are the strings it actually composes at runtime) --------
+    composed = cli_update.pill_text([one(Status.DB_STALE)], ("gemini",)) + \
+        cli_update.pill_tooltip([one(Status.DB_STALE)], ("gemini",))
+    bar = TopBar()
+    bar.set_auto_update(True)
+    on_tip = bar.auto_update_btn.toolTip()
+    bar.set_auto_update(False)
+    off_tip = bar.auto_update_btn.toolTip()
+    check("cli-update: no em dash in the pill or either tooltip",
+          "\u2014" not in composed + on_tip + off_tip)
+    check("cli-update: both tooltips say what arming this does",
+          "installs it BEFORE any agent launches" in on_tip
+          and "changes installed software" in off_tip)
+
+    # --- the toggle: default OFF, one click, persisted ---------------------
+    check("cli-update toggle: defaults to OFF (it installs software)",
+          not bar.auto_update() and not bar.auto_update_btn.isChecked())
+    emitted = []
+    bar.autoUpdateToggled.connect(emitted.append)
+    bar.auto_update_btn.click()
+    check("cli-update toggle: a click arms it and emits True",
+          emitted == [True] and bar.auto_update())
+    bar.set_auto_update(False)
+    check("cli-update toggle: set_auto_update does not re-emit",
+          emitted == [True] and not bar.auto_update())
+    bar.note_update_pending("")
+    check("cli-update pill: hidden when there is nothing to report",
+          not bar.update_pill.isVisible())
+    bar.note_update_pending("something", "the long form")
+    check("cli-update pill: shown with its tooltip when there is",
+          bar.update_pill.text() == "something"
+          and bar.update_pill.toolTip() == "the long form")
+    bar.deleteLater()
+
+    # --- 10. ui.auto_update round-trips, defaults False, no version bump ---
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-cliupdate-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    check("cli-update: a session that predates the feature defaults it OFF",
+          not win._auto_update and not win.top_bar.auto_update())
+    check("cli-update: the preference is persisted under ui",
+          win._session_payload()["ui"]["auto_update"] is False)
+    win._on_auto_update_toggled(True)
+    check("cli-update: flipping the preference marks the session dirty",
+          win._save_timer.isActive() and win._auto_update)
+    check("cli-update: ...and it is what gets written",
+          win._session_payload()["ui"]["auto_update"] is True)
+    win._restore_ui_state({"ui": {"auto_update": True}})
+    check("cli-update: the preference restores onto the window and the button",
+          win._auto_update and win.top_bar.auto_update())
+    win._restore_ui_state({"ui": {}})
+    check("cli-update: a missing key still means OFF",
+          not win._auto_update and not win.top_bar.auto_update())
+    check("cli-update: the key is additive, so SESSION_VERSION is unchanged",
+          SESSION_VERSION == 4, SESSION_VERSION)
+
+    # a real close/reopen, which is the only way to catch a default assigned
+    # AFTER _restore_ui_state has run (that exact bug hit the taskbar toggle)
+    win._auto_update = True
+    win.top_bar.set_auto_update(True)
+    win._save_session()
+    win.close()
+    app.processEvents()
+    again = create_main_window(SessionStore(path=tmp / "session.json"))
+    check("cli-update: ON survives a close and reopen",
+          again._auto_update and again.top_bar.auto_update())
+
+    # --- the report, and the outcomes never touching session state ---------
+    again._save_timer.stop()
+    blocked = cli_update.Outcome("claude", Status.BLOCKED_PROCESSES,
+                                 detail="3 claude.exe alive", label="Claude Code")
+    again.note_update_outcomes([blocked])
+    check("cli-update: the gate's report reaches the top-bar pill",
+          again.top_bar.update_pill.isVisibleTo(again.top_bar)
+          and "Claude Code" in again.top_bar.update_pill.text(),
+          again.top_bar.update_pill.text())
+    check("cli-update: reporting an outcome NEVER marks the session dirty "
+          "(outcomes are transient, only the preference persists)",
+          not again._save_timer.isActive())
+    again.note_update_outcomes([cli_update.Outcome("claude", Status.UP_TO_DATE)])
+    check("cli-update: a clean gate leaves the pill hidden",
+          not again.top_bar.update_pill.isVisibleTo(again.top_bar))
+
+    # --- 6.1: skipping while an install runs holds those agents back -------
+    # `start` is stubbed rather than really called: the question is which
+    # agents the autostart DECIDES to launch, and no test should spawn a CLI
+    # whose binary this feature is notionally rewriting.
+    from app.process_worker import AgentKind, build_spec
+    ws = again.manager.create_workspace("CliUpdate", str(tmp))
+    gemini_agent = again.manager.add_terminal(
+        ws.id, build_spec(AgentKind.GEMINI, "G1", cwd=str(tmp)),
+        autostart=False)
+    claude_agent = again.manager.add_terminal(
+        ws.id, build_spec(AgentKind.CLAUDE, "C1", cwd=str(tmp)),
+        autostart=False)
+    started = []
+    for a in again.manager.all_agents():
+        a.autostart_on_restore = True
+        a.start = (lambda agent=a: started.append(agent.spec.name))
+
+    again.note_update_outcomes([blocked], installing=("gemini",))
+    check("cli-update: the pill says which agents are being held back",
+          "Gemini (agy)" in again.top_bar.update_pill.text(),
+          again.top_bar.update_pill.text())
+    again.autostart_active_workspace()
+    check("cli-update: an agent whose CLI is mid-install is NOT started "
+          "(it could execute a half written binary)",
+          "G1" not in started, started)
+    check("cli-update: ...while every other agent starts as usual",
+          "C1" in started, started)
+    started.clear()
+    again.note_update_outcomes([blocked])   # install finished / normal launch
+    again.autostart_active_workspace()
+    check("cli-update: and with nothing installing, the deferral is gone",
+          again._update_installing == () and "G1" in started, started)
+    again.close()
+    app.processEvents()
+
+    # --- 13. the factory the suite shares does NO update work --------------
+    import inspect
+    import main as main_module
+    src = inspect.getsource(main_module.create_main_window)
+    check("cli-update: create_main_window contains no update work at all",
+          "update_gate" not in src and "cli_update" not in src)
+    real_runner, real_gate = cli_update.subprocess_runner, cli_update.run_gate
+    touched = []
+    cli_update.subprocess_runner = lambda *a, **k: touched.append(a) or (0, "")
+    cli_update.run_gate = lambda *a, **k: touched.append(a) or []
+    try:
+        armed = SessionStore(path=tmp / "armed.json")
+        armed.save({"ui": {"auto_update": True}})
+        spare = create_main_window(armed)
+        spare._save_timer.stop()
+        check("cli-update: building a window with the toggle ON still runs "
+              "nothing (the gate is opted into from main.py alone)",
+              touched == [] and spare._auto_update, touched)
+        spare.close()
+        app.processEvents()
+    finally:
+        cli_update.subprocess_runner = real_runner
+        cli_update.run_gate = real_gate
+
+    # --- the splash + worker thread, end to end, with a fake runner --------
+    from app.widgets.update_splash import UpdateSplash, run_update_gate
+    audits = []
+
+    class _Audits:
+        def audit(self, line):
+            audits.append(line)
+
+    runner = _FakeCli(versions=("2.1.224 (Claude Code)", "2.1.231 (Claude Code)"),
+                      available="2.1.231")
+    result = run_update_gate(_Audits(), targets=[claude], runner=runner,
+                             auto_close_ms=0)
+    check("cli-update splash: the gate runs off the GUI thread and returns "
+          "its outcomes",
+          [o.status for o in result.outcomes] == [Status.UPDATED], result)
+    check("cli-update splash: nothing was still installing, so no deferral",
+          result.installing == ())
+    check("cli-update splash: the audit trail reached session.log",
+          any(line.startswith("UPDATE claude") for line in audits), audits)
+    splash = UpdateSplash([claude, agy])
+    splash.set_state("claude", "checking", True)
+    check("cli-update splash: a row shows what it is doing",
+          splash.row_state("claude") == "checking")
+    splash.set_state("claude", "up to date (2.1.224)", False)
+    check("cli-update splash: the spinner stops once nothing is busy",
+          splash._spin.state() != splash._spin.State.Running)
+    splash.close()
+    splash.deleteLater()
 
 
 def test_multi_agent_session_isolation():

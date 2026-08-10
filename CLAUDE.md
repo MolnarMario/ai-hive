@@ -461,6 +461,64 @@ this file is the invariants that must survive every change.
   close AI Hive (or reboot), confirm `Get-Process claude` returns nothing, THEN
   upgrade. This is a direct consequence of the Job-Object process model (agents
   are kept alive by design); it is expected, not a bug.
+- **The startup update gate is the ANSWER to the invariant above, and its two
+  rules both come from that one fact** (`app/cli_update.py`, Qt-free/stdlib-only
+  like `chime.py`; `app/widgets/update_splash.py` shows it; `main.py` is the
+  only caller). Because a running `claude.exe` cannot be replaced, the moment
+  ABOVE `create_main_window()` — before a single agent exists — is not merely
+  convenient, it is the ONLY unlocked moment, which is why the gate sits between
+  `setup_application` and the factory and far above
+  `autostart_active_workspace()`. RULE 1: **winget's report is never evidence.**
+  The installed version is read off the FILE (`<exe> --version`, 0.09s) before
+  AND after, and winget is asked only what the MANIFEST offers (`winget show`, a
+  pure read) — never `winget upgrade` for the check. This is the repair for the
+  live bug: an upgrade run with agents up cannot replace the file but winget
+  records the new version anyway, after which the stale binary nags forever (and
+  its baked-in alias table still can't resolve a newer model, per the alias
+  invariant above) while `winget upgrade` answers "No available upgrade found".
+  Hence `Status.DB_STALE` for "the file is behind the manifest AND winget says
+  nothing to do", checked BEFORE the return code because winget reports that
+  with a non-zero rc. DB_STALE only REPORTS: the forcing flag is unverified, and
+  shipping a guessed `--force` at startup is not acceptable. RULE 2: **a live
+  target process skips the target without issuing ANY upgrade command**, which
+  is the direct fix for how the database got poisoned; those processes are the
+  user's own or another app's, outside our Job Object, and are NEVER killed (one
+  kill can destroy a transcript). An unanswerable `tasklist`
+  (`UNKNOWN_PROCESSES`) counts as blocked for the same reason. The two CLIs
+  diverge in exactly one structural way and it must not be flattened: Claude is
+  a winget package so check and install are separate acts, while `agy`
+  self-updates and NEITHER `agy update` nor `claude update` takes any flag, so
+  there is NO dry run and for a `self_update` target checking IS installing
+  (`needs_apply` returns True unconditionally, and an unchanged version after a
+  clean self-update reads UP_TO_DATE, not the REPORTED_BUT_UNCHANGED the same
+  reading means for winget). Claude deliberately stays on winget: `claude
+  update` installs a NATIVE build to a different location and
+  `providers.resolve_claude()` has a hardcoded WinGet-Packages fallback, so a
+  migration could leave AI Hive silently launching the stale copy. Budgets are
+  SPLIT and that is deliberate: the check is bounded (`CHECK_TIMEOUT_S`) and
+  fails OPEN to launch (`TIMEOUT`, no pill — a hung network must never cost the
+  user the app), while the install is NEVER killed on a timer, because a
+  half-written 285 MB binary is worse than the banner. Skip is the escape hatch
+  instead, and its one consequence is handled rather than prevented: providers
+  still installing at Skip come back in `GateResult.installing` and
+  `autostart_active_workspace` holds THOSE agents back, so none can execute a
+  half-written file. Threading is mandatory, not stylistic — the gate runs on a
+  `threading.Thread` while the splash drains a `queue.Queue` on a `QTimer` in a
+  local `QEventLoop` — because `gemini_usage.fetch()` shelling out inline on the
+  GUI thread froze the app ~6s a minute (see the Gemini readout invariant). The
+  runner is INJECTED and the real one is only ever passed from `main.py`, the
+  same opt-in rule as `start_usage_polling()`: the suite shares
+  `create_main_window` and must never upgrade the user's CLI, so every check
+  drives `run_gate` with a fake `Runner`. `ui.auto_update` is an ordinary UI
+  preference (default OFF, since this mutates installed software: additive
+  optional key, `_schedule_save`, NO `SESSION_VERSION` bump) and the OUTCOMES
+  are TRANSIENT exactly like the plan-usage reading — `note_update_outcomes`
+  must never `_touch`/`_schedule_save`. Every version transition is audited to
+  `session.log` (`UPDATE-CHECK`/`UPDATE`/`UPDATE-SKIP`/`UPDATE-STALE`/
+  `UPDATE-UNCHANGED`/`UPDATE-FAIL`/`UPDATE-TIMEOUT`) with deliberately NO
+  patch-versus-minor gate: nothing in the numbering predicts whether a flag
+  moved, so a version gate buys false safety while an audit line turns "it broke
+  this morning" into a lookup.
 - **Plan usage is a LIVE READOUT and a HOOK POINT, never history**
   (`app/claude_usage.py`, Qt-free/stdlib-only like `chime.py`). The number comes
   from `GET /api/oauth/usage` with the account's OAuth bearer token — the same

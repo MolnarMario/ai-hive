@@ -207,6 +207,9 @@ class TopBar(QFrame):
     # therefore the terminal scrollbar and its prompt milestones) is ours?
     terminalScrollbackToggled = Signal(bool)
     taskbarBadgeToggled = Signal(bool)     # show/hide the taskbar count overlay
+    # install newer Claude Code / agy CLIs at the NEXT startup, before any
+    # agent launches (the only moment those binaries are not locked)
+    autoUpdateToggled = Signal(bool)
     autoContinueToggled = Signal(bool)     # resume cut-off agents at the reset
     startupRecoveryToggled = Signal(bool)  # recover cut-off agents on startup
     usageRefreshRequested = Signal()       # user clicked the readout
@@ -275,6 +278,26 @@ class TopBar(QFrame):
         self.taskbar_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.taskbar_btn.clicked.connect(self._on_taskbar_clicked)
         self._refresh_taskbar_btn()
+
+        # startup CLI auto-update. Default OFF and one click to arm, like the
+        # two recovery switches: it mutates installed software unattended, so
+        # it is the user's decision, made once and persisted. Same LED
+        # treatment, so the top bar has one visual language for "will AI Hive
+        # do this by itself?".
+        self._auto_update = False
+        self.auto_update_btn = QToolButton(self)
+        self.auto_update_btn.setObjectName("RecoveryToggle")
+        self.auto_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.auto_update_btn.clicked.connect(self._on_auto_update_clicked)
+        self._refresh_auto_update_btn()
+
+        # ...and the quiet report from the LAST gated startup. Hidden unless
+        # something needs saying (an update that could not apply), never a
+        # chime: it answers "why am I still seeing the update banner?" without
+        # interrupting, the same principle as the usage badge's can't-read pill.
+        self.update_pill = QLabel("", self)
+        self.update_pill.setObjectName("UpdatePill")
+        self.update_pill.setVisible(False)
 
         # Claude plan usage: "21% used, resets in 1h20m at 14:49". Hidden until
         # a reading arrives (and permanently when there's no Claude login), and
@@ -354,6 +377,8 @@ class TopBar(QFrame):
         lay.addSpacing(8)
         lay.addWidget(self.sound_btn)
         lay.addWidget(self.taskbar_btn)
+        lay.addWidget(self.update_pill)
+        lay.addWidget(self.auto_update_btn)
         lay.addSpacing(8)
         lay.addWidget(self.add_terminal_btn)
 
@@ -384,6 +409,43 @@ class TopBar(QFrame):
             "Taskbar count: OFF. The taskbar icon stays plain, so you cannot "
             "tell from other apps whether agents are still working.\n"
             "Click to turn on.")
+
+    def _on_auto_update_clicked(self) -> None:
+        self.set_auto_update(not self._auto_update)
+        self.autoUpdateToggled.emit(self._auto_update)
+
+    def set_auto_update(self, on: bool) -> None:
+        """Reflect the CLI auto-update preference (no signal emitted)."""
+        self._auto_update = bool(on)
+        self._refresh_auto_update_btn()
+
+    def auto_update(self) -> bool:
+        return self._auto_update
+
+    def _refresh_auto_update_btn(self) -> None:
+        self.auto_update_btn.setCheckable(True)
+        self.auto_update_btn.setChecked(self._auto_update)
+        led = "\U0001F7E2" if self._auto_update else "⚫"
+        self.auto_update_btn.setText(f"{led} ⬇")
+        # both tooltips state plainly what arming this does, because it changes
+        # software on the user's machine rather than anything inside the app
+        self.auto_update_btn.setToolTip(
+            "Auto-update CLIs: ON. Next time AI Hive starts, it checks for a "
+            "newer Claude Code and Gemini (agy) CLI and installs it BEFORE any "
+            "agent launches, which is the only moment those files are not "
+            "locked.\nClick to turn off."
+            if self._auto_update else
+            "Auto-update CLIs: OFF. Startup is untouched, so you keep whatever "
+            "CLI version is installed and may keep seeing Claude's own 'update "
+            "available' banner. Turning this on lets AI Hive install CLI "
+            "updates at startup, which changes installed software on your "
+            "machine.\nClick to turn on.")
+
+    def note_update_pending(self, text: str, tooltip: str = "") -> None:
+        """Show (or hide, on an empty text) the last gate's report."""
+        self.update_pill.setText(text or "")
+        self.update_pill.setToolTip(tooltip or text or "")
+        self.update_pill.setVisible(bool(text))
 
     def set_sound_enabled(self, on: bool) -> None:
         """Reflect the chime on/off state in the button (no signal emitted)."""
@@ -1119,6 +1181,15 @@ class MainWindow(QMainWindow):
         # _restore_ui_state, or the restored preference is clobbered back to on.
         self._taskbar_badge = True    # user preference (persisted)
         self._taskbar_key = None      # last key actually pushed to the shell
+        # startup CLI auto-update. Default OFF (it changes installed software),
+        # and like every other preference here the default MUST be assigned
+        # above _restore_ui_state or the restored value is clobbered.
+        self._auto_update = False     # user preference (persisted)
+        # providers whose CLI was STILL INSTALLING when the user skipped the
+        # update splash. Their agents are held out of the autostart, because
+        # launching one now could execute a half written binary. Transient by
+        # construction: it describes this launch only.
+        self._update_installing: tuple = ()
         self._usage_inflight = False  # one request at a time, never stack
         self._plan_blocked = False    # edge state for planLimitReached/Cleared
         # agent ids with a resume SCHEDULED but not yet delivered. The attempt
@@ -1367,6 +1438,7 @@ class MainWindow(QMainWindow):
         self.top_bar.terminalScrollbackToggled.connect(
             self._on_terminal_scrollback)
         self.top_bar.taskbarBadgeToggled.connect(self._on_taskbar_badge_toggled)
+        self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
         self.top_bar.startupRecoveryToggled.connect(self._on_startup_recovery)
         # resume whoever the limit cut off, the moment the window reopens
@@ -2570,6 +2642,29 @@ class MainWindow(QMainWindow):
         self._schedule_save()
         self._push_taskbar_badge()   # apply now, don't wait for an agent event
 
+    def _on_auto_update_toggled(self, enabled: bool) -> None:
+        """User flipped the startup CLI auto-update switch. An ordinary UI
+        preference: additive optional key under "ui", saved on the debounced
+        timer, no SESSION_VERSION bump (identical to `taskbar_badge` and the
+        two recovery toggles). It takes effect on the NEXT launch, since the
+        gate runs before the window exists."""
+        self._auto_update = bool(enabled)
+        self._schedule_save()
+
+    def note_update_outcomes(self, outcomes, installing=()) -> None:
+        """Report what the startup update gate did (called from `main.py`,
+        which is the only place that runs it).
+
+        Purely transient, like the plan-usage reading and the taskbar count:
+        this must never mark the session dirty. Only the four reporting
+        statuses say anything at all, so a clean gate leaves the top bar
+        exactly as it was."""
+        from app import cli_update
+        self._update_installing = tuple(installing or ())
+        text = cli_update.pill_text(outcomes, self._update_installing)
+        self.top_bar.note_update_pending(
+            text, cli_update.pill_tooltip(outcomes, self._update_installing))
+
     def _restore_ui_state(self, session: dict) -> None:
         ui = session.get("ui", {})
         # restore the saved skin FIRST so the stylesheet below is built once
@@ -2597,6 +2692,10 @@ class MainWindow(QMainWindow):
         # idle hive shows no badge at all, so it never nags)
         self._taskbar_badge = bool(ui.get("taskbar_badge", True))
         self.top_bar.set_taskbar_badge(self._taskbar_badge)
+        # startup CLI auto-update (default OFF: it installs software, so it is
+        # armed deliberately, once, exactly like the recovery switches were)
+        self._auto_update = bool(ui.get("auto_update", False))
+        self.top_bar.set_auto_update(self._auto_update)
         self._auto_continue = bool(ui.get("auto_continue", True))
         self.top_bar.set_auto_continue(self._auto_continue)
         self._startup_recovery = bool(ui.get("startup_recovery", True))
@@ -3014,10 +3113,19 @@ class MainWindow(QMainWindow):
         time — in EVERY workspace — starts (and resumes) automatically, so
         opening the app brings the whole hive back without manual steps.
         Agents that were stopped, and one-shot scripts, never re-execute as
-        a side effect of launch. (Name kept for the smoke-test API.)"""
+        a side effect of launch. (Name kept for the smoke-test API.)
+
+        The one exception is a provider whose CLI was still installing when the
+        user skipped the update splash: its binary is being rewritten right
+        now, so starting an agent could execute a half written file. Those wait
+        for the user (the top-bar pill says so) rather than being started."""
         for ws in self.manager.workspaces:
             for agent in ws.agents:
                 if agent.autostart_on_restore and not agent.is_running():
+                    if agent.spec.provider in self._update_installing:
+                        agent.notice("[not started: a CLI update is still "
+                                     "installing]")
+                        continue
                     agent.start()
 
     # -------------------------------------------------------- persistence ---
@@ -3057,6 +3165,7 @@ class MainWindow(QMainWindow):
             "sound_enabled": self._sound_enabled,
             "usage_visible": self._usage_visible,
             "taskbar_badge": self._taskbar_badge,
+            "auto_update": self._auto_update,
             "auto_continue": self._auto_continue,
             "startup_recovery": self._startup_recovery,
             "terminal_scrollback": self._terminal_scrollback,

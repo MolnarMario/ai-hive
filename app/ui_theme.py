@@ -682,6 +682,13 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 #RecoveryToggle:hover {{
     background: {p.BG_HOVER}; border-color: {p.ACCENT_BLUE}; color: {p.TEXT};
 }}
+/* the startup update gate's report. Deliberately quiet: it exists so an
+   update that could NOT apply is answerable at a glance, not to nag. */
+#UpdatePill {{
+    background: {p.BG_HOVER}; color: {p.TEXT_DIM};
+    border: 1px solid {p.BORDER}; border-radius: 3px;
+    padding: 1px 6px; font-size: 11px;
+}}
 #CardClose:hover, #WsDelete:hover {{ color: {p.RED}; border-color: {p.RED}; }}
 QPushButton {{
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
