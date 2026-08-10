@@ -32,10 +32,12 @@ Two consequences shape everything below:
    installed-version record.
 
 And the direct repair for how the database got poisoned in the first place: if
-ANY target process is alive we skip that target without running an upgrade
-command at all. Those processes are the user's own sessions or another app's,
-outside our Job Object, so they are never killed -- killing one can destroy a
-transcript.
+ANY process is holding that target's binary we skip it without running an
+upgrade command at all. Those processes are the user's own sessions or another
+app's, outside our Job Object, so they are never killed -- killing one can
+destroy a transcript. "Holding it" is decided by PATH and not by image name:
+`Claude.exe` is both the CLI and the unrelated desktop app, and counting the
+latter made the gate skip every launch forever (see `count_processes`).
 
 THE TWO CLIs DIFFER, AND THE DIFFERENCE IS STRUCTURAL
 -----------------------------------------------------
@@ -127,7 +129,9 @@ class Target:
     agents will launch. Empty means not installed, which is skipped silently.
 
     Exactly one of `winget_id` / `self_update` is set. `process_names` are the
-    images whose presence locks the binary.
+    images to LOOK for, not the identity: which of them actually lock this
+    binary is decided against `exe` by path (see `count_processes`), because an
+    image name is shared by unrelated programs.
     """
 
     key: str
@@ -209,24 +213,97 @@ def needs_update(installed: str, available: str) -> bool:
 
 # ------------------------------------------------------------ processes ---
 
-def count_processes(names, runner, timeout: float = CHECK_TIMEOUT_S) -> int:
-    """How many of `names` are running, via `tasklist` (stdlib only, no
-    psutil). `UNKNOWN_PROCESSES` when tasklist could not answer.
+def tasklist_argv(name: str) -> list:
+    return ["tasklist", "/FI", f"IMAGENAME eq {name}", "/NH"]
+
+
+def process_paths_argv(name: str) -> list:
+    """List the FULL PATH of every running process with this image name.
+
+    An image name is not an identity: `Claude.exe` is BOTH the Claude Code CLI
+    and the unrelated Claude desktop app, which a user keeps open all day. That
+    collision made the gate count eight desktop windows as a locked CLI and skip
+    the update on every single launch, forever (found live: `UPDATE-SKIP claude
+    (8 claude.EXE alive)` three seconds BEFORE AI Hive started an agent of its
+    own, against a desktop app running since morning). Only the path can tell
+    the two apart, and `tasklist` cannot report one.
+
+    A process whose path cannot be read prints `?` rather than an empty line, so
+    "unreadable" stays distinguishable from "no output" -- it must still count
+    as blocking, and a blank line could not carry that."""
+    return ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='%s'\" | "
+            "ForEach-Object { if ($_.ExecutablePath) "
+            "{ $_.ExecutablePath } else { '?' } }" % name]
+
+
+def count_processes(names, runner, timeout: float = CHECK_TIMEOUT_S,
+                    exe: str = "") -> int:
+    """How many processes are holding `exe` open. `UNKNOWN_PROCESSES` when that
+    could not be answered.
+
+    Two passes, cheapest first. `tasklist` (stdlib only, no psutil) answers "is
+    anything by this name running at all", which is the common case and costs
+    almost nothing; only when it says yes does a second, path-listing command
+    run (measured 0.40s) to decide how many of those are actually OUR binary.
+    So the usual launch pays one cheap command, and the expensive one is spent
+    exactly when there is an ambiguity worth resolving.
+
+    Every fallback leans the same way, towards over-counting: an unreadable
+    path, a path query that fails, or a `tasklist` that cannot answer all end as
+    "assume it is ours". Over-counting costs a skipped update, which the pill
+    reports; under-counting runs an installer against a locked file, which is
+    what writes the false database record this whole module exists to avoid.
 
     At gate time AI Hive has started no agents, so every hit is foreign by
     construction: another window of the user's, or another app's."""
     total = 0
     for name in names or ():
-        rc, out = runner([
-            "tasklist", "/FI", f"IMAGENAME eq {name}", "/NH"], timeout)
+        rc, out = runner(tasklist_argv(name), timeout)
         if rc != 0:
             return UNKNOWN_PROCESSES
         lowered = name.lower()
+        hits = 0
         for line in (out or "").splitlines():
             head = line.strip().split(" ")[0].strip()
             if head.lower() == lowered:
-                total += 1
+                hits += 1
+        if hits and exe:
+            refined = _count_by_path(name, exe, runner, timeout)
+            if refined is not None:
+                hits = refined
+        total += hits
     return total
+
+
+def _count_by_path(name: str, exe: str, runner, timeout: float):
+    """How many `name` processes are running THIS file, or None when the
+    question could not be answered (the caller then keeps the name count).
+
+    None is also the answer when the listing comes back empty while `tasklist`
+    saw hits: the two disagreeing means the path pass cannot see what the name
+    pass can, and believing the smaller number is the unsafe direction."""
+    rc, out = runner(process_paths_argv(name), timeout)
+    if rc != 0:
+        return None
+    lines = [line.strip() for line in (out or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    mine = _canonical(exe)
+    return sum(1 for line in lines
+               if line == "?" or _canonical(line) == mine)
+
+
+def _canonical(path: str) -> str:
+    """A path reduced to something two spellings of the same file agree on.
+    `realpath` matters rather than just `normcase`: winget also installs a
+    symlink shim (`WinGet\\Links\\claude.exe`) and a process launched through it
+    reports the LINK, so a plain string compare would read the user's own
+    terminal session as somebody else's program."""
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    except (OSError, ValueError):
+        return os.path.normcase(path or "")
 
 
 def _blocked_detail(names, alive: int) -> str:
@@ -285,7 +362,8 @@ def check(target: Target, runner, budget: float = CHECK_TIMEOUT_S,
 
     # process check FIRST: a blocked target must not issue any other command,
     # so there is no path on which a locked file reaches winget
-    alive = count_processes(target.process_names, runner, left())
+    alive = count_processes(target.process_names, runner, left(),
+                            exe=target.exe)
     if alive != 0:
         return replace(out, status=Status.BLOCKED_PROCESSES,
                        detail=_blocked_detail(target.process_names, alive))

@@ -201,10 +201,14 @@ workspaces keep executing — switching never pauses anything.
   aliases resolve inside the binary) no new model in `/model` however many times
   you upgrade. So the gate runs above everything: no agent exists yet, nothing
   holds a file. Two rules follow from that:
-  - **If any `claude.exe` or `agy.exe` is already running, the update is
-    skipped without running the installer at all.** Those are your own sessions
-    or another app's, and asking an installer to replace a locked file is
-    precisely what writes the false record. They're never killed either.
+  - **If anything is already running the CLI, the update is skipped without
+    running the installer at all.** Those are your own sessions or another
+    app's, and asking an installer to replace a locked file is precisely what
+    writes the false record. They're never killed either. "Running the CLI" is
+    matched on the executable's full path, not its name: the Claude desktop
+    app's binary is also called `Claude.exe`, and while it was counted the gate
+    skipped every launch forever (19 processes by name on this machine, 11 of
+    them actually the CLI).
   - **Success is decided by running `--version` on the binary itself**, before
     and after, never by what the installer said about itself.
 
@@ -638,7 +642,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1523 checks drive the real app headlessly (offscreen Qt platform) with real
+1531 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -736,7 +740,7 @@ app/
                            worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1523 checks)
+tests/smoke_test.py        headless end-to-end suite (1531 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

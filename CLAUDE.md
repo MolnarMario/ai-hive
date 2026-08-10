@@ -484,7 +484,24 @@ this file is the invariants that must survive every change.
   is the direct fix for how the database got poisoned; those processes are the
   user's own or another app's, outside our Job Object, and are NEVER killed (one
   kill can destroy a transcript). An unanswerable `tasklist`
-  (`UNKNOWN_PROCESSES`) counts as blocked for the same reason. The two CLIs
+  (`UNKNOWN_PROCESSES`) counts as blocked for the same reason. CRITICAL, and a
+  live find: **"live" is decided by PATH, never by image name.** `Claude.exe` is
+  BOTH the CLI and the unrelated Claude DESKTOP app, which a user leaves open
+  all day, so a name-only count read eight desktop windows as a locked CLI and
+  skipped the update on EVERY launch, forever — observed as `UPDATE-SKIP claude
+  (8 claude.EXE alive)` logged three seconds BEFORE AI Hive started an agent of
+  its own, i.e. against a binary nothing was holding (measured on the same
+  machine afterwards: 19 by name, 11 by path). `count_processes` therefore runs
+  two passes cheapest-first — `tasklist` answers "anything by this name at all",
+  and only a non-zero answer pays for the path listing (`process_paths_argv`,
+  measured 0.40s) that decides how many are `target.exe`. Comparison goes
+  through `_canonical` (`realpath` + `normcase`, not a string compare) because
+  winget also installs a symlink shim and a session launched through it reports
+  the LINK. EVERY ambiguity leans towards over-counting — an unreadable path, a
+  failed path query, or a listing that sees fewer than `tasklist` did all mean
+  "assume it is ours" — because over-counting costs a skipped update that the
+  pill reports, while under-counting runs an installer against a locked file,
+  which is the false database record this whole module exists to prevent. The two CLIs
   diverge in exactly one structural way and it must not be flattened: Claude is
   a winget package so check and install are separate acts, while `agy`
   self-updates and NEITHER `agy update` nor `claude update` takes any flag, so

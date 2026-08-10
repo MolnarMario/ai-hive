@@ -10759,7 +10759,7 @@ class _FakeCli:
 
     def __init__(self, versions=("2.1.224",), available="2.1.224", alive=0,
                  upgrade=(0, ""), update_out=(0, "already on the latest"),
-                 timeout_on=()):
+                 timeout_on=(), paths=None, paths_rc=0):
         self.calls = []                 # every argv, in order
         self.versions = list(versions)  # one per `--version`, last repeats
         self.available = available
@@ -10767,6 +10767,11 @@ class _FakeCli:
         self.upgrade = upgrade
         self.update_out = update_out
         self.timeout_on = tuple(timeout_on)
+        # what the path pass reports. None = every `alive` process IS the
+        # target (the tests' exes are `C:\fake\<image name>`), which is the
+        # shape every check written before the desktop-app collision assumed.
+        self.paths = paths
+        self.paths_rc = paths_rc
 
     def argvs(self):
         return [list(a) for a, _t in self.calls]
@@ -10786,6 +10791,13 @@ class _FakeCli:
                              for i in range(self.alive))
             return 0, body or ("INFO: No tasks are running which match the "
                                "specified criteria.")
+        if argv[0] == "powershell":
+            if self.paths_rc != 0:
+                return self.paths_rc, "ERROR"
+            name = joined.split("name='")[1].split("'")[0]
+            lines = self.paths if self.paths is not None else \
+                [rf"C:\fake\{name}"] * self.alive
+            return 0, "\n".join(lines)
         if argv[-1] == "--version":
             out = self.versions[0]
             if len(self.versions) > 1:
@@ -10928,6 +10940,75 @@ def test_cli_auto_update():
     check("cli-update: an unanswerable process check blocks too",
           out.status is Status.BLOCKED_PROCESSES
           and not any(a[0] == "winget" for a in runner.argvs()), out)
+
+    # --- 6b. an image NAME is not an identity (live: the gate counted the
+    # Claude DESKTOP app's Claude.exe as a locked CLI and skipped forever) ---
+    desktop = [r"C:\Program Files\WindowsApps\Claude_1.26832.0.0_x64__p\app"
+               r"\Claude.exe"] * 8
+    runner = _FakeCli(versions=("2.1.224 (Claude Code)", "2.1.231 (Claude Code)"),
+                      available="2.1.231", alive=8, paths=desktop)
+    out = cli_update.run_gate([claude], runner)[0]
+    check("cli-update: eight processes sharing the image name but NOT the "
+          "path do not block the update",
+          out.status is Status.UPDATED, out)
+    check("cli-update: the cheap name pass runs first and the path pass only "
+          "when it found something",
+          [a[0] for a in runner.argvs()][:2] == ["tasklist", "powershell"],
+          runner.argvs())
+    # the same eight, plus one that really is ours: still blocked
+    runner = _FakeCli(versions=("2.1.224 (Claude Code)",), available="2.1.231",
+                      alive=9, paths=desktop + [r"C:\fake\claude.exe"])
+    out = cli_update.run_gate([claude], runner)[0]
+    check("cli-update: one genuine CLI among them still blocks",
+          out.status is Status.BLOCKED_PROCESSES and "1 claude.exe" in out.detail,
+          out)
+    # nothing by that name at all: no reason to pay for the path pass
+    runner = _FakeCli(versions=("2.1.224 (Claude Code)",), available="2.1.224")
+    cli_update.run_gate([claude], runner)
+    check("cli-update: nothing running means the path pass is never run",
+          not any(a[0] == "powershell" for a in runner.argvs()),
+          runner.argvs())
+    # every ambiguity leans towards over-counting: a skipped update is
+    # reportable, an upgrade against a locked file poisons the database
+    for label, kwargs in (
+            ("a path query that fails", dict(paths_rc=1)),
+            ("a path that cannot be read", dict(paths=["?"] * 3)),
+            ("a path pass that sees less than the name pass", dict(paths=[]))):
+        runner = _FakeCli(versions=("2.1.224 (Claude Code)",),
+                          available="2.1.231", alive=3, **kwargs)
+        out = cli_update.run_gate([claude], runner)[0]
+        check(f"cli-update: {label} still blocks",
+              out.status is Status.BLOCKED_PROCESSES
+              and not any(a[0] == "winget" for a in runner.argvs()), out)
+    # two spellings of one file must agree: the live paths differed in case
+    # alone (`claude.EXE` from the resolver, `claude.exe` from the listing)
+    check("cli-update: path identity ignores case",
+          cli_update._canonical(r"C:\Fake\CLAUDE.EXE")
+          == cli_update._canonical(r"c:\fake\claude.exe"),
+          cli_update._canonical(r"C:\Fake\CLAUDE.EXE"))
+    # winget also installs a symlink shim, and a session launched through it
+    # reports the LINK -- a plain string compare would call it somebody else's
+    tmp = tempfile.mkdtemp(prefix="aihive-cliupd-")
+    real = os.path.join(tmp, "claude.exe")
+    link = os.path.join(tmp, "link-claude.exe")
+    with open(real, "wb") as fh:
+        fh.write(b"x")
+    linked = True
+    try:
+        os.symlink(real, link)
+    except (OSError, NotImplementedError, AttributeError):
+        linked = False          # Windows without developer mode / admin
+    if linked:
+        shim_target = cli_update.Target(
+            key="claude", label="Claude Code", exe=real,
+            process_names=("claude.exe",), winget_id="Anthropic.ClaudeCode")
+        runner = _FakeCli(versions=("2.1.224 (Claude Code)",),
+                          available="2.1.231", alive=1, paths=[link])
+        out = cli_update.run_gate([shim_target], runner)[0]
+        check("cli-update: a process launched through the winget shim is "
+              "recognised as the same binary",
+              out.status is Status.BLOCKED_PROCESSES, out)
+    shutil.rmtree(tmp, ignore_errors=True)
 
     # --- 7. the poisoned database, reported but never forced --------------
     runner = _FakeCli(versions=("2.1.224 (Claude Code)",), available="2.1.231",
