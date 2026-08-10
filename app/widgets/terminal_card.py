@@ -15,7 +15,7 @@ from PySide6.QtGui import (QAction, QColor, QDrag, QPainter, QPixmap,
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QPlainTextEdit, QToolButton, QVBoxLayout)
 
-from .. import scheduled_send, ui_theme
+from .. import scheduled_send, transcripts, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
 from ..process_worker import describe_pid
 from ..terminal_agent import (STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
@@ -30,6 +30,44 @@ _LINE_BREAKS = re.compile(r"[\r\n]")
 # child that never emits the ready signal at all (an exotic pty shell) can
 # never leave the user looking at a cover instead of their terminal.
 BOOT_VEIL_MAX_MS = 25_000
+# How much of an agent's raw pty tail is replayed when a card is (re)built or
+# the terminal changes width. This is a COMPROMISE, not a free bound: re-measured
+# on real classic-renderer captures at ~100 cols, 128 KiB projects only 844-1519
+# of HISTORY_LINES' 2000 lines, so the cap is already what truncates reachable
+# scrollback, and LOWERING it costs milestones (an earlier note here claimed
+# 96 KiB filled all 2000; that was wrong on this data -- 96 KiB reaches 576-1126).
+# The other side is that this runs on the GUI thread per card: 128 KiB costs
+# ~80ms per card since the pyte wrapper came off (~250ms before it), so a retile
+# across a six-agent hive spends about half a second projecting.
+# See TerminalCard._replay_with_marks and _reproject_on_size.
+REPLAY_PROJECT_CAP = 128 * 1024
+# How much is projected in the CONSTRUCTOR, before the tiling grid has given the
+# card its real width. That first projection is guaranteed to be thrown away and
+# redone (see _rerender_restored), so spending the full cap on it was pure waste:
+# every card at launch projected 128 KiB twice, once at a width that never
+# reaches the screen. A screenful is enough to paint something immediately --
+# which is the only reason to feed anything this early -- and costs ~5ms instead
+# of ~80ms. Do NOT raise it to "get the scrollback sooner": the settled-size
+# projection is what puts scrollback in, and it lands within ~120ms.
+REPLAY_SEED_CAP = 8 * 1024
+# Backstop for that settled-size projection. TerminalView._apply_resize returns
+# EARLY when rows/cols are unchanged, so sizeChanged is NOT guaranteed to fire --
+# a card built at exactly its final size would otherwise keep the seed forever
+# and show a screenful with no scrollback behind it. Comfortably past the view's
+# own 120ms resize debounce, so a real resize wins the race and this stays a
+# backstop rather than a second projection.
+REPLAY_SETTLE_MS = 300
+# how much of a transcript prompt must be found on a scrollback line to call it
+# that prompt's echo (see TerminalCard._recover_marks)
+_MARK_MATCH_CHARS = 28
+_MARK_WS_RE = re.compile(r"\s+")
+
+
+def _norm_line(text: str) -> str:
+    """Lowered, whitespace-collapsed, prompt glyphs dropped -- the form both
+    sides of the milestone-recovery match are compared in."""
+    return _MARK_WS_RE.sub(" ", text.replace(">", " ").replace("❯", " ")
+                           .lower()).strip()
 
 _GLYPH_STATE = {
     AgentStatus.IDLE: "idle",
@@ -130,7 +168,30 @@ class TerminalCard(QFrame):
         self._renaming = False  # inline title-edit in progress
         self._task_full = ""    # untruncated current-task (the label elides it)
         self._pending_replay = ""  # restored screen, re-rendered once at size
+        # prompt milestone uid -> absolute line IN THIS VIEW. Per-card because
+        # a rebuilt view has a different `pushed` origin; keyed on uid because
+        # id() is reused after a FIFO eviction (see PromptMark).
+        self._mark_lines: dict[int, int] = {}
+        # milestones located by matching the transcript against a scrollback we
+        # did not watch being typed (a restored conversation); recomputed on
+        # every projection, never persisted
+        self._recovered: list[tuple[int, str]] = []
+        # typed-prompt texts for _recover_marks, cached per conversation. The
+        # read is O(transcript) and a live transcript's mtime changes
+        # constantly, so transcripts' own mtime cache never hits for exactly
+        # the agents that matter. See _recover_marks for why re-reading within
+        # one conversation cannot find anything the card doesn't already know.
+        self._recover_key: tuple = ()
+        self._recover_prompts: list[str] = []
+        self.scroll_bar = None
+        # the column count the scrollback was last projected at; a change means
+        # every history line is wrapped for a screen that no longer exists
+        self._proj_cols = None
         self._overlay_compact = False
+        # single-shot backstop for the settled-size projection (see __init__)
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.timeout.connect(self._rerender_restored)
         # single-shot backstop for the boot veil (see _begin_boot_veil)
         self._boot_timer = QTimer(self)
         self._boot_timer.setSingleShot(True)
@@ -148,7 +209,13 @@ class TerminalCard(QFrame):
         if self.is_pty:
             replay = self.agent.pty_replay()
             if replay:
-                self.terminal.feed(replay)
+                # Only a SCREENFUL here. This projection happens before the
+                # tiling grid has sized the card, so it is thrown away and
+                # redone at the settled width no matter what -- doing the full
+                # cap twice is what made every launch and retile hitch. The
+                # seed exists purely so the terminal is never briefly blank.
+                self._replay_with_marks(replay, cap=REPLAY_SEED_CAP,
+                                        recover=False)
                 # A RESTORED screen (app/screen_snapshot.py) is fed here, in
                 # the constructor, which is BEFORE the tiling grid hands the
                 # card its real size — and pyte neither reflows on resize nor
@@ -167,6 +234,10 @@ class TerminalCard(QFrame):
                 # only way that is actually true: the agent's own buffer.
                 self._pending_replay = replay
                 self.terminal.sizeChanged.connect(self._rerender_restored)
+                # ...and a backstop, because sizeChanged is not guaranteed:
+                # _apply_resize bails when rows/cols are unchanged, so a card
+                # built at exactly its final size would keep the seed forever.
+                self._settle_timer.start(REPLAY_SETTLE_MS)
         else:
             self._replay_log()
         self._on_status(agent.status)
@@ -201,7 +272,7 @@ class TerminalCard(QFrame):
         self.title_edit = QLineEdit(self.agent.spec.name, header)
         self.title_edit.setObjectName("CardTitleEdit")
         self.title_edit.hide()
-        self.role = QLabel(self.agent.spec.role or "", header)
+        self.role = QLabel((self.agent.spec.role or "").replace(" (Antigravity CLI)", ""), header)
         self.role.setObjectName("CardRole")
         # what the agent is RUNNING ON right now. The user can change both from
         # inside the terminal (/model, /effort), so this follows the live
@@ -290,6 +361,11 @@ class TerminalCard(QFrame):
                                          parent=self,
                                          font_px=self.agent.spec.font_px)
             root.addWidget(self.terminal, 1)
+            # Overlay children of the terminal, created in z-order (each new
+            # one sits above the last): the scrollbar is chrome the veil and
+            # the wake banner are both entitled to cover.
+            from .terminal_scrollbar import TerminalScrollBar
+            self.scroll_bar = TerminalScrollBar(self.terminal, self.terminal)
             # a stopped terminal must NEVER read as a dead black screen: a
             # visible banner says so, and any keystroke starts the session.
             # It takes TWO shapes, because the banner is only the whole story
@@ -325,6 +401,7 @@ class TerminalCard(QFrame):
 
     def _wire(self) -> None:
         self.agent.status_changed.connect(self._on_status)
+        self.agent.activity_changed.connect(self._on_activity)
         self.agent.assignment_changed.connect(self._on_assignment)
         self.agent.role_changed.connect(self._on_role)
         self.agent.name_changed.connect(self._on_name)
@@ -354,6 +431,7 @@ class TerminalCard(QFrame):
             self.agent.prompt_ready_changed.connect(self._on_prompt_ready)
             self.terminal.keyInput.connect(self._on_key_input)
             self.terminal.sizeChanged.connect(self.agent.resize)
+            self.terminal.sizeChanged.connect(self._reproject_on_size)
             # relative paths in the output resolve against the agent's cwd, and
             # Ctrl+clicking a file bubbles up so the app can reveal it
             self.terminal.set_base_dir(getattr(self.agent.spec, "cwd", "") or "")
@@ -363,6 +441,15 @@ class TerminalCard(QFrame):
             # countdown dialog and, only on confirm, clears the input box.
             self.terminal.scheduleRequested.connect(
                 lambda text: self.scheduleRequested.emit(self.agent.id, text))
+            # scrollbar + prompt milestones. All four are transient view wiring:
+            # nothing here may reach a save (see prompt_marks_changed).
+            self.terminal.viewChanged.connect(self.scroll_bar.refresh)
+            self.terminal.promptSubmitted.connect(self._on_prompt_submitted)
+            self.terminal.historyCleared.connect(self._on_history_cleared)
+            self.agent.prompt_marks_changed.connect(self._refresh_marks)
+            self.agent.conversation_replaced.connect(
+                self.terminal.clear_history)
+            self.scroll_bar.markActivated.connect(self.terminal.scroll_to_abs)
             self.terminal.installEventFilter(self)
             return
 
@@ -438,6 +525,7 @@ class TerminalCard(QFrame):
     def detach(self) -> None:
         """Unhook from the agent before the card widget is deleted."""
         pairs = [(self.agent.status_changed, self._on_status),
+                 (self.agent.activity_changed, self._on_activity),
                  (self.agent.assignment_changed, self._on_assignment),
                  (self.agent.role_changed, self._on_role),
                  (self.agent.name_changed, self._on_name),
@@ -489,7 +577,7 @@ class TerminalCard(QFrame):
         # the title tracks spec.name (which set_role leaves alone once the user
         # has manually renamed); only the role sublabel follows the emitted role
         self.title.setText(self.agent.spec.name)
-        self.role.setText(self.agent.spec.role or "")
+        self.role.setText((self.agent.spec.role or "").replace(" (Antigravity CLI)", ""))
 
     def _on_name(self, name: str) -> None:
         self.title.setText(name)
@@ -733,6 +821,10 @@ class TerminalCard(QFrame):
         re-rendered (`_pending_replay` is empty by then), so its conversation
         still scrolls up out of the way as a real terminal's would."""
         self._pending_replay = ""
+        # the settled-size projection must be cancelled too, not just the
+        # signal: its backstop timer would otherwise fire a moment later and
+        # re-project the very screen this just decided to drop
+        self._settle_timer.stop()
         try:
             self.terminal.sizeChanged.disconnect(self._rerender_restored)
         except (RuntimeError, TypeError):
@@ -740,33 +832,57 @@ class TerminalCard(QFrame):
         # drop it on the AGENT too, or a card rebuilt later (a retile, a
         # workspace switch) replays the same stale seed under the child
         if self.agent.drop_seeded_screen():
+            self.terminal.note_history_cleared()   # bypasses feed()'s check
             self.terminal.screen.reset()
             self.terminal.update()
 
     def _rerender_restored(self, *_) -> None:
-        """One-shot: repaint a restored screen at the card's settled size.
+        """One-shot: project the conversation at the card's settled size.
 
-        Consumes `_pending_replay` first, so a resize storm (a retile, a
-        sidebar toggle, a window drag) can only ever re-render once."""
-        replay, self._pending_replay = self._pending_replay, ""
+        The constructor only seeds a screenful (REPLAY_SEED_CAP) because it runs
+        before the tiling grid sizes the card, and pyte neither reflows on resize
+        nor keeps the lines it drops off the TOP when it shrinks -- so the newest
+        part of a restored conversation is exactly what a pre-layout projection
+        would lose. This is the projection that actually counts, and it is the
+        ONLY full one: doing it in the constructor as well meant every card at
+        launch and every retile paid the full cap twice, at a width that never
+        reached the screen.
+
+        Consumes `_pending_replay` first, so a resize storm (a retile, a sidebar
+        toggle, a window drag) and the REPLAY_SETTLE_MS backstop between them can
+        only ever project once.
+
+        It projects the agent's CURRENT buffer, not the snapshot the constructor
+        took. For an ordinary rebuild (a retile, a workspace switch) the buffer
+        IS the live conversation, and projecting it is exactly what
+        _reproject_on_size does on every width change; comparing against the
+        constructor snapshot and bailing on any difference -- as an earlier
+        version did -- would leave a busy agent's card showing nothing but the
+        8 KiB seed, because a live child's buffer is different by the time the
+        settled size arrives.
+
+        Two cases are left alone. An EMPTY buffer: restart() clears it and the
+        child owns the screen from there. And a restored snapshot a child has
+        since drawn over (`seed_written_over`): that seed is the PREVIOUS run's
+        screen, and an agent that comes back running is deliberately given a
+        clean terminal it fills itself, so replaying the seed under it would put
+        back the mangled fragment `_drop_restored_screen` exists to remove."""
+        self._pending_replay = ""
+        self._settle_timer.stop()
         try:
             self.terminal.sizeChanged.disconnect(self._rerender_restored)
         except (RuntimeError, TypeError):
             pass
-        if not replay:
+        replay = self.agent.pty_replay()
+        if not replay or self.agent.seed_written_over():
             return
-        if self.agent.pty_replay() != replay:
-            # The child has written (or a restart cleared the buffer) since
-            # this card was built, so what is on screen is no longer the
-            # restored snapshot. Whoever owns it now redraws on the SIGWINCH
-            # that `agent.resize` just sent — never fight that with a stale
-            # re-feed. Note the test is the agent's BUFFER, not `is_running`:
-            # an agent can be running for a good fraction of a second before
-            # its child emits its first byte, and that gap is the whole window
-            # this re-render exists to cover.
-            return
+        # screen.reset() wipes history WITHOUT going through feed(), so the
+        # shrink check there never sees it -- tell the view explicitly, then
+        # re-derive the milestones from the same replay.
+        self.terminal.note_history_cleared()
         self.terminal.screen.reset()
-        self.terminal.feed(replay)
+        self._replay_with_marks(replay)
+        self._proj_cols = self.terminal.screen.columns
         self._refresh_overlay()
 
     def _refresh_overlay(self) -> None:
@@ -830,10 +946,212 @@ class TerminalCard(QFrame):
         if ready:
             self._end_boot_veil()
 
+    def _reproject_on_size(self, _rows: int, cols: int) -> None:
+        """Re-render the scrollback whenever the terminal's WIDTH changes.
+
+        pyte does not reflow: a history line keeps the column count it had when
+        it was pushed. That never mattered while Claude owned its own
+        scrollback (history was always empty), but now that AI Hive keeps it,
+        every width change leaves the old lines wrapped for a screen that no
+        longer exists -- rendering as a short fragment with the wrapped
+        remainder stranded out at the old right edge. The launch case is the
+        one that bites: a card is built at its pre-layout width, the child
+        paints into that, those lines scroll into history, and only then does
+        the tiling grid give the card its real size.
+
+        The raw pty stream is the truth and the screen is only a projection of
+        it at one width, so the honest repair is to project again. Bounded by
+        _replay_with_marks' cap, and skipped entirely when there is no
+        scrollback to mangle."""
+        if not self.is_pty or self._pending_replay:
+            return          # the restored-screen path owns the first render
+        if cols == self._proj_cols:
+            return          # height-only change: wrapping is unaffected
+        self._proj_cols = cols
+        if not len(self.terminal.screen.history.top):
+            return          # nothing captured at the old width yet
+        replay = self.agent.pty_replay()
+        if not replay:
+            return
+        self.terminal.note_history_cleared()
+        self.terminal.screen.reset()
+        self._replay_with_marks(replay)
+
+    def _replay_with_marks(self, replay: str, cap: int | None = None,
+                           recover: bool = True) -> None:
+        """Feed a rebuilt/restored screen, re-deriving each prompt milestone's
+        line as it goes.
+
+        A card rebuild (retile, workspace switch) throws the TerminalView away,
+        and the new one starts at `pushed == 0`, so no absolute line stored by
+        the old view is portable. What IS portable is how far into the agent's
+        pty stream each submit happened. Splitting the replay at those offsets
+        reproduces the exact screen state of each submit -- the typed text was
+        echoed as it was typed, so the input box is already painted -- and
+        `anchor_line()` then returns what it returned live. One function over
+        identical state on both sides is the whole trick.
+
+        Do NOT "improve" this by extending a segment past the submit echo to
+        catch the reprinted prompt: that breaks the symmetry and re-anchors to
+        a different row than the live path used. The reprint lands a line or
+        two below the input box, and `scroll_to_abs`'s lead absorbs it.
+
+        Splitting mid-escape is safe -- feed() carries a trailing partial
+        escape across calls.
+
+        Only the TAIL is replayed, bounded by `cap`. Feeding a full 512 KiB
+        buffer through pyte measures ~1.25s, unaffordable per resize across a
+        hive of cards; the default REPLAY_PROJECT_CAP is the compromise
+        documented beside the constant (it does NOT saturate HISTORY_LINES --
+        an earlier note here claimed 96 KiB filled all 2000 lines, which
+        re-measurement disproved). The constructor passes the much smaller
+        REPLAY_SEED_CAP because its projection is always redone at the settled
+        width. The cut is moved to the next escape so the projection never
+        starts mid-sequence and prints an orphan parameter string as text.
+
+        `recover=False` skips the transcript-backed milestone recovery, which
+        the seed projection has no use for: it is replaced within ~120ms, and
+        the read is O(whole transcript) on the launch path (90-165ms on a real
+        50MB transcript). The settled projection does it once, for real."""
+        if cap is None:
+            cap = REPLAY_PROJECT_CAP
+        skip = 0
+        if len(replay) > cap:
+            skip = len(replay) - cap
+            esc = replay.find("\x1b", skip)
+            skip = esc if esc >= 0 else skip
+        self._mark_lines = {}
+        pos = skip
+        for off, mark in self.agent.replay_marks():
+            off = max(0, min(len(replay), off))
+            if off < skip:
+                continue        # its bytes are outside the projected window
+            if off > pos:
+                self.terminal.feed(replay[pos:off])
+                pos = off
+            self._mark_lines[mark.uid] = self.terminal.anchor_line()
+        if pos < len(replay):
+            self.terminal.feed(replay[pos:])
+        if recover:
+            self._recover_marks()
+        self._refresh_marks()
+
+    def _recover_marks(self) -> None:
+        """Find the user's earlier prompts in a scrollback we did not watch
+        being typed, and mark those lines too.
+
+        Milestones are minted from a keystroke, so they are only ever created
+        while this process is watching. A conversation restored from disk (or
+        one already going when the feature arrived) therefore has none, which
+        is exactly the conversation long enough to want to jump around in.
+
+        The prompt TEXTS come from the transcript, which is authoritative about
+        what the user actually typed, so nothing here can invent a milestone --
+        the worst case is failing to locate one. Matching is deliberately loose
+        on the line side and strict on the prompt side: the classic renderer
+        can drop the leading character of the echoed prompt (measured) and
+        wraps long ones, so we look for a normalized HEAD of each prompt
+        anywhere in a line, take the first hit, and carry on from the next line
+        so prompts match in order and a repeated prompt cannot claim an earlier
+        line twice.
+
+        The prompt TEXTS are cached per conversation, and that is a correctness
+        no-op as well as the difference between a smooth retile and a visible
+        freeze. This runs on EVERY projection (card build, and every width
+        change via _reproject_on_size), and the read is O(whole transcript):
+        transcripts keeps an (mtime,size) cache, but a LIVE agent rewrites its
+        transcript continuously, so that cache misses precisely for the agents
+        being used -- MEASURED at 90-165ms on the user's real 50MB transcripts,
+        on the GUI thread, per card. Re-reading inside one conversation can only
+        turn up prompts typed since the card was built, and the card WATCHED
+        those being typed, so they already have live marks that outrank a
+        recovered one in _refresh_marks. A new conversation changes session_id
+        (a pin change or /clear), which changes the key and re-reads."""
+        self._recovered = []
+        spec = self.agent.spec
+        if not self.is_pty or spec.provider != "claude":
+            return
+        key = (spec.cwd, spec.session_id)
+        if key != self._recover_key:
+            self._recover_key = key
+            self._recover_prompts = transcripts.typed_prompts(
+                spec.cwd, spec.session_id)
+        prompts = self._recover_prompts
+        if not prompts:
+            return
+        view = self.terminal
+        hist = list(view.screen.history.top)
+        cols = view.screen.columns
+        # history THEN the live screen: their absolute ids are contiguous
+        # (oldest + len(hist) == pushed), and a short conversation may not have
+        # scrolled anything off yet, so history alone would find nothing
+        rows = hist + [view.screen.buffer[r] for r in range(view.screen.lines)]
+        if not rows:
+            return
+        oldest = view.history_pushed() - len(hist)
+        lines = [_norm_line("".join(ln[c].data or " " for c in range(cols)))
+                 for ln in rows]
+        heads = []
+        for text in prompts:
+            head = _norm_line(text)[:_MARK_MATCH_CHARS]
+            if len(head) >= 6:      # too short to identify a line safely
+                heads.append((head, text))
+        at = 0
+        for head, text in heads:
+            for i in range(at, len(lines)):
+                # the renderer can lose the first character of the echo, so a
+                # match on the head MINUS its first char counts too
+                if head in lines[i] or head[1:] in lines[i]:
+                    self._recovered.append((oldest + i, text))
+                    at = i + 1
+                    break
+
+    def _refresh_marks(self) -> None:
+        """Push the agent's milestones to the view in THIS view's coordinates.
+        A mark with no line recorded for this card is skipped rather than
+        guessed at."""
+        if not self.is_pty:
+            return
+        live = [(self._mark_lines[m.uid], m.text)
+                for m in self.agent.prompt_marks() if m.uid in self._mark_lines]
+        # A milestone captured live is exact; a recovered one was located by
+        # matching text, so where both point at the same line the live one
+        # wins and the recovered duplicate is dropped.
+        taken = {line for line, _ in live}
+        merged = live + [(line, text) for line, text in self._recovered
+                         if line not in taken]
+        self.terminal.set_marks(sorted(merged))
+
+    def _on_prompt_submitted(self, text: str, abs_line: int) -> None:
+        """A bare Enter in the terminal. Record it as a milestone unless the
+        agent is parked on a question, where an Enter is an ANSWER (a menu
+        selection, a plan approval) rather than a prompt of the user's own.
+        `agent.is_waiting()` is the authoritative half of that guard -- it is
+        hook-driven and fires before the tool even renders -- and the view adds
+        the numbered-option reject for the classic menus."""
+        if self.agent.is_waiting():
+            return
+        mark = self.agent.note_prompt_submitted(text)
+        if mark is not None:
+            self._mark_lines[mark.uid] = abs_line
+            self._refresh_marks()
+
+    def _on_history_cleared(self) -> None:
+        """The scrollback was wiped under us (ED 3 / a reset), so every
+        milestone anchored into it is meaningless."""
+        self._mark_lines = {}
+        self.agent.clear_prompt_marks()
+
     def _place_overlay(self) -> None:
         if not self.is_pty:
             return
         self.boot.setGeometry(self.terminal.rect())
+        # pinned to the right edge, full height. Because it is a CHILD of the
+        # terminal it costs no columns: _apply_resize still derives the child's
+        # width from terminal.width(), so nothing re-wraps.
+        sb_w = self.scroll_bar.width()      # fixed by the widget itself
+        self.scroll_bar.setGeometry(max(0, self.terminal.width() - sb_w), 0,
+                                    sb_w, self.terminal.height())
         if self._overlay_compact:  # a full-width strip along the bottom edge,
             h = 24                 # so the conversation above stays readable
             self.overlay.setGeometry(0, max(0, self.terminal.height() - h),
@@ -890,12 +1208,17 @@ class TerminalCard(QFrame):
 
     # ------------------------------------------------------------- status ---
 
+    def _on_activity(self, _busy: bool) -> None:
+        self._on_status(self.agent.status)
+
     def _on_status(self, status: AgentStatus) -> None:
-        self.glyph.setProperty("state", _GLYPH_STATE.get(status, "idle"))
+        busy = bool(getattr(self.agent, "is_busy", lambda: False)())
+        state = "busy" if (busy and status is AgentStatus.RUNNING) else _GLYPH_STATE.get(status, "idle")
+        self.glyph.setProperty("state", state)
         repolish(self.glyph)
         running = status in (AgentStatus.STARTING, AgentStatus.RUNNING)
         exit_info = self.agent.worker.exit_info
-        tip = f"{status.value}"
+        tip = "working…" if (busy and status is AgentStatus.RUNNING) else f"{status.value}"
         if exit_info and not running:
             tip += f" (code {exit_info[0]})"
         self.glyph.setToolTip(tip)

@@ -124,7 +124,7 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import ui_theme
-from ..terminal_agent import _CLAUDE_READY_HINTS
+from ..terminal_agent import _CLAUDE_READY_HINTS, _NUM_OPTION_RE
 from ..ui_theme import ANSI_16, Palette
 
 _NAMED = {
@@ -181,9 +181,31 @@ _MODIFIED_ARROWS = {
 _NAV_KEYS = (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up,
              Qt.Key.Key_Down, Qt.Key.Key_Home, Qt.Key.Key_End)
 
+# Scrollback depth, and therefore how far back the scrollbar can reach and how
+# long a prompt milestone stays jumpable. Only reachable at all once AI Hive
+# owns the scrollback (Claude's classic renderer -- see MainWindow's tui
+# preference); under the alt-screen renderer history never fills.
+# MEASURED on a live classic-renderer session: ~12 lines pushed per turn with
+# NO frame churn (every repeated frame seen exactly once), so 2000 lines is
+# roughly 160 turns. That is the trade: raising it buys reach into older
+# conversation at a real memory cost (pyte keeps each line as a sparse dict of
+# Char namedtuples, and a hive routinely runs six agents), and lowering it
+# silently drops the oldest milestones. Do NOT try to stretch it by filtering
+# duplicate lines out of the history push: every coordinate here is
+# `pushed - offset + row`, which holds only while EVERY line leaving the screen
+# is counted, so a suppressed append drifts every live-anchored mark by one.
 HISTORY_LINES = 2000
 CELL_PAD_X = 6   # left/right inner padding (real terminals aren't flush)
 CELL_PAD_Y = 4   # top/bottom inner padding
+VIEW_NOTIFY_MS = 50   # coalescing window for viewChanged
+# how far above the caret to look for the submitted input when the caret
+# itself is parked on a blank row (see TerminalView._submitted_input)
+_INPUT_SCAN_ROWS = 6
+# the caret must be this far down the screen for that fallback to apply at all:
+# Claude's classic renderer keeps its input box at the bottom, so a caret up in
+# the conversation means the user is not typing a prompt
+_INPUT_ZONE_ROWS = 12
+_WIDE_GAP_RE = re.compile(r"\s{8,}")
 
 
 class _CountingDeque(collections.deque):
@@ -204,12 +226,55 @@ class _CountingDeque(collections.deque):
         super().append(x)
 
 
+class _FastHistoryScreen(pyte.HistoryScreen):
+    """HistoryScreen with pyte's per-event wrapper removed.
+
+    pyte routes EVERY attribute access on a HistoryScreen through a Python-level
+    `__getattribute__` that re-wraps each stream event in before_event/
+    after_event. Those two hooks exist solely to serve prev_page/next_page: the
+    "before" hook pages back to the bottom of the history buffer, and the
+    "after" hook re-clips line widths. AI Hive NEVER pages -- scrollback is a
+    view offset (see the module docstring), so `history.position` never leaves
+    `history.size` and both hooks are no-ops on every call.
+
+    They are not free no-ops. MEASURED, replaying 1.7 MiB of real captured
+    agent output: 4.2 MILLION __getattribute__ calls, 43% of all feed time, and
+    removing the wrapper renders byte-identical screen, history AND cursor state
+    2.87x faster. The cost only became visible when AI Hive took the scrollback
+    back: pyte's scroll path (Screen.index at the bottom margin) shuffles every
+    row of the buffer one dict entry at a time, so it touches ~2*rows attributes
+    per scrolled line -- and under Claude's old alt-screen renderer that path was
+    never entered at all (the spike measured `pushed == 0` for 4 of 5 sessions,
+    i.e. nothing ever scrolled). The classic renderer scrolls thousands of times
+    per session, which multiplied a per-attribute tax nobody had ever paid.
+
+    after_event ALSO maintained `cursor.hidden`, but only as
+    `position == size and DECTCEM in mode` -- and the first term is always true
+    here, leaving exactly what the base Screen's own set_mode/reset_mode already
+    does. Verified against a capture exercising DECTCEM 3982 times.
+
+    paging is therefore made LOUD rather than silently wrong: without the hook a
+    prev_page would leave the screen paged away with nothing to snap it back."""
+
+    __getattribute__ = object.__getattribute__
+
+    def prev_page(self) -> None:
+        raise NotImplementedError(
+            "AI Hive scrolls by view offset, not pyte paging; "
+            "_FastHistoryScreen removes the hook that would snap the page back")
+
+    def next_page(self) -> None:
+        raise NotImplementedError(
+            "AI Hive scrolls by view offset, not pyte paging; "
+            "_FastHistoryScreen removes the hook that would snap the page back")
+
+
 def _new_history_screen(cols: int, rows: int):
     """A pyte HistoryScreen whose history.top counts total pushes, so feed()
     can anchor a scrolled-back view even after history saturates. Best-effort:
     on any pyte-shape mismatch, return a plain HistoryScreen and let feed() fall
     back to the length delta."""
-    screen = pyte.HistoryScreen(cols, rows, history=HISTORY_LINES, ratio=0.25)
+    screen = _FastHistoryScreen(cols, rows, history=HISTORY_LINES, ratio=0.25)
     try:
         top = screen.history.top
         screen.history = screen.history._replace(
@@ -350,6 +415,19 @@ class TerminalView(QWidget):
     # text so the card can prefill the countdown dialog; nothing is sent to the
     # child, and nothing is cleared, until the user confirms.
     scheduleRequested = Signal(str)
+    # --- scrollbar / prompt-milestone surface (all TRANSIENT, view-only) ---
+    # The scroll offset, history length or page size changed, so an attached
+    # TerminalScrollBar should re-read them. Coalesced (see _notify_view) and
+    # guarded on a signature, because feed() runs several times a second per
+    # busy agent. NEVER wire this to a save -- same rule as activity_changed.
+    viewChanged = Signal()
+    # history.top was wiped (ED 3 / RIS / screen.reset()), so every marker
+    # anchored into it is meaningless and the bar has nothing left to show.
+    historyCleared = Signal()
+    # the user submitted a TYPED prompt: (inferred text, absolute line).
+    # Emitted from the bare-Enter branch of keyPressEvent and nowhere else --
+    # see _note_prompt_submit for why every other candidate source is wrong.
+    promptSubmitted = Signal(str, int)
 
     def __init__(self, rows: int = 30, cols: int = 100, parent=None,
                  font_px: int = 0):
@@ -426,6 +504,22 @@ class TerminalView(QWidget):
         self._snap_timer.setInterval(600)
         self._snap_timer.timeout.connect(self._snapshot_input)
 
+        # prompt milestones painted on the scrollbar: (absolute line, tooltip).
+        # Pure VIEW data -- the durable copy lives on the agent, because a card
+        # rebuild throws this widget away (see TerminalCard._replay_with_marks).
+        self._marks: list[tuple[int, str]] = []
+        # cached list(history.top) for _view_state, keyed on (pushed, len) --
+        # without it, a user parked in scrollback copies up to HISTORY_LINES
+        # items on EVERY repaint, which is precisely the state this feature
+        # invites people into.
+        self._vs_cache: list | None = None
+        self._vs_sig = None
+        self._view_sig = None    # last (pushed, hist, offset, rows) announced
+        self._view_notify_timer = QTimer(self)
+        self._view_notify_timer.setSingleShot(True)
+        self._view_notify_timer.setInterval(VIEW_NOTIFY_MS)
+        self._view_notify_timer.timeout.connect(self._emit_view_changed)
+
     # -------------------------------------------------------------- data ---
 
     def feed(self, data: str) -> None:
@@ -455,6 +549,7 @@ class TerminalView(QWidget):
                     self._alt_screen = on
                     if on:  # the app owns the screen now — leave scrollback
                         self._scroll_offset = 0
+                        self._notify_view()
                 elif tok in ("1000", "1002", "1003"):
                     self._mouse_tracking = on
                 elif tok == "1006":
@@ -482,6 +577,13 @@ class TerminalView(QWidget):
             if grown > 0:
                 self._scroll_offset = min(self._scroll_offset + grown,
                                           len(top_after))
+        # A SHRINK can only be _reset_history (pyte's ED 3 or screen.reset()):
+        # history otherwise just grows toward maxlen, evicting from the front
+        # without changing len() once saturated. That is the cheapest reliable
+        # "the conversation was wiped" edge available from the stream itself.
+        if len(self.screen.history.top) < hist_before:
+            self._on_history_wiped()
+        self._notify_view()
         self.update()
 
     def reset(self) -> None:
@@ -496,7 +598,134 @@ class TerminalView(QWidget):
         self._app_cursor_keys = False
         self._focus_reporting = False
         self._reset_undo()
+        self._on_history_wiped()
+        self._notify_view(immediate=True)
         self.update()
+
+    # ------------------------------------------------ scrollback coordinates ---
+    #
+    # ONE identity underpins the scrollbar and every prompt marker:
+    #
+    #     abs_line(visual row r) == history.top.pushed - scroll_offset + r
+    #
+    # Both branches of _visible_line reduce to it. A live row r is buffer[r],
+    # whose absolute id is pushed + r. A history row at
+    # idx = len(hist) - off + r has absolute id pushed - len(hist) + idx, which
+    # is the same expression. No special cases, and it stays true after history
+    # saturates because `pushed` keeps counting past eviction.
+    #
+    # It also stays true across a WIPE, which is why _CountingDeque.pushed is
+    # deliberately NOT reset by pyte's _reset_history (it clears the same deque
+    # object). After a clear, pushed == P and len(top) == 0, so the next line
+    # pushed is P and history index i is P + i: still monotonic, still correct.
+    # "Fixing" that by zeroing `pushed` would silently corrupt every id.
+
+    def history_pushed(self) -> int:
+        """Total lines ever scrolled off, counting past history saturation."""
+        return getattr(self.screen.history.top, "pushed", 0)
+
+    def abs_line_at_row(self, row: int) -> int:
+        """Absolute scrollback id of the line currently painted at `row`."""
+        _hist, off = self._view_state()
+        return self.history_pushed() - off + row
+
+    def history_span(self) -> tuple[int, int]:
+        """(oldest, newest) absolute ids still reachable. Anything outside is
+        gone from history and must not be drawn as a marker."""
+        pushed = self.history_pushed()
+        return pushed - len(self.screen.history.top), pushed + self.screen.lines
+
+    def anchor_line(self) -> int:
+        """Absolute line of the input box the user is typing in: the '>' row
+        when there is one, else the caret's own row. Used at BOTH prompt-submit
+        capture and replay re-anchoring -- one function over identical screen
+        state is what makes the two agree.
+
+        NOTE the coordinate space: _input_block_span and cursor.y are LIVE
+        BUFFER rows, so the id is `pushed + row` and the scroll offset does not
+        enter into it. Only a VISUAL row (what the scrollbar hit-tests) needs
+        abs_line_at_row's `- offset` term. The two agree at offset 0 and
+        nowhere else, so mixing them up is silent by construction."""
+        span = self._input_block_span()
+        row = span[0] if span is not None else self.screen.cursor.y
+        return self.history_pushed() + row
+
+    def scroll_to_abs(self, abs_line: int, lead: int = 2) -> None:
+        """Put `abs_line` `lead` rows below the top of the view.
+
+        `lead` is slack, not decoration: a submitted prompt is re-printed as
+        committed output a line or two from where the input box stood when it
+        was captured (measured at -1 on a live classic-renderer session), so
+        landing the target slightly inside the view shows it either way."""
+        pushed = self.history_pushed()
+        target = max(0, min(len(self.screen.history.top),
+                            pushed - abs_line + lead))
+        self.scroll_by(target - self._scroll_offset)
+
+    def set_marks(self, marks) -> None:
+        self._marks = list(marks)
+        self._notify_view(immediate=True)
+
+    def marks(self) -> list[tuple[int, str]]:
+        return list(self._marks)
+
+    def clear_history(self) -> None:
+        """Drop the scrollback but leave the LIVE screen alone.
+
+        For "this is a different conversation now" (a /clear or a /resume
+        elsewhere): the child has already repainted its own screen, and what
+        is stale is everything behind it. pyte has no API for this, but
+        clearing the deque is exactly what its own _reset_history does -- and
+        `pushed` deliberately survives, so absolute ids stay monotonic across
+        the boundary (see the coordinate block above)."""
+        try:
+            self.screen.history.top.clear()
+        except Exception:
+            pass
+        self._on_history_wiped()
+        self._notify_view(immediate=True)
+        self.update()
+
+    def note_history_cleared(self) -> None:
+        """Public entry for the card paths that call screen.reset() DIRECTLY
+        and so never pass through feed()'s shrink check."""
+        self._on_history_wiped()
+        self._notify_view(immediate=True)
+
+    def _on_history_wiped(self) -> None:
+        self._scroll_offset = 0
+        self._marks = []
+        self._vs_cache = None
+        self._vs_sig = None
+        self.historyCleared.emit()
+
+    def _notify_view(self, immediate: bool = False) -> None:
+        """Announce a scroll/extent change, coalesced to one emit per 50ms.
+
+        The signature guard skips a genuine no-op, but it cannot do the
+        coalescing on its own: once AI Hive owns the scrollback, `pushed` moves
+        on nearly EVERY feed, so the guard almost always passes while an agent
+        streams. That is exactly when the timer must not be restarted -- a
+        single-shot QTimer.start() re-arms from zero, so a burst arriving inside
+        the window pushes the emit back again, and a continuously streaming
+        agent (bursts every ~10-50ms) can starve it indefinitely: the scrollbar
+        would freeze for the whole reply and only catch up once output paused.
+        Arming only when the timer is idle turns the window into a real 50ms
+        ceiling. This is the QTimer.start trap that bites the usage poll and the
+        schedule tick, reached from the opposite direction."""
+        sig = (self.history_pushed(), len(self.screen.history.top),
+               self._scroll_offset, self.screen.lines)
+        if sig == self._view_sig:
+            return
+        self._view_sig = sig
+        if immediate:
+            self._view_notify_timer.stop()
+            self.viewChanged.emit()
+        elif not self._view_notify_timer.isActive():
+            self._view_notify_timer.start()
+
+    def _emit_view_changed(self) -> None:
+        self.viewChanged.emit()
 
     def screen_text(self) -> str:
         """Plain text of the live screen (used by tests).
@@ -522,7 +751,16 @@ class TerminalView(QWidget):
         (e.g. a full reset) while scrolled back."""
         if not self._scroll_offset:
             return None, 0
-        hist = list(self.screen.history.top)
+        top = self.screen.history.top
+        # The copy is cached on (pushed, len): paintEvent, visible_text,
+        # selected_text and every _visible_line call land here, so a user simply
+        # parked in scrollback with a quiet child was copying up to
+        # HISTORY_LINES entries per repaint. New output still costs one copy per
+        # burst, which is what the uncached version cost per PAINT.
+        sig = (getattr(top, "pushed", 0), len(top))
+        if sig != self._vs_sig or self._vs_cache is None:
+            self._vs_sig, self._vs_cache = sig, list(top)
+        hist = self._vs_cache
         return hist, min(self._scroll_offset, len(hist))
 
     def _visible_line(self, r: int, hist, off: int):
@@ -550,6 +788,7 @@ class TerminalView(QWidget):
                          self._scroll_offset + lines))
         if new != self._scroll_offset:
             self._scroll_offset = new
+            self._notify_view(immediate=True)
             self.update()
 
     def scroll_offset(self) -> int:
@@ -588,6 +827,7 @@ class TerminalView(QWidget):
             return
         self.screen.resize(rows, cols)  # pyte order: (lines, columns)
         self.sizeChanged.emit(rows, cols)
+        self._notify_view(immediate=True)   # page size changed
         self.update()
 
     # ------------------------------------------------------------- input ---
@@ -806,6 +1046,7 @@ class TerminalView(QWidget):
             # input's history; other edit keys (re)arm the coalescing snapshot.
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) \
                     and not (shift or ctrl or alt):
+                self._note_prompt_submit()
                 self._reset_undo()
             else:
                 self._kick_snapshot(key, event.text())
@@ -892,6 +1133,7 @@ class TerminalView(QWidget):
     def _snap_to_bottom(self) -> None:
         if self._scroll_offset:
             self._scroll_offset = 0
+            self._notify_view(immediate=True)
             self.update()
 
     # -------------------------------------------------- mouse / clipboard ---
@@ -1506,6 +1748,79 @@ class TerminalView(QWidget):
             out.append("".join(buf[r][c].data for c in range(start, last + 1)))
         return "\n".join(out).strip("\n")
 
+    def _note_prompt_submit(self) -> None:
+        """Record that the user just submitted a TYPED prompt, for the
+        scrollbar's milestone dots.
+
+        This is the only correct place in the app to notice that. The
+        alternatives all lie:
+          * agent.write() / TerminalCard._on_key_input see a bare string, and a
+            bracketed PASTE carries '\\r' characters that are not submits.
+          * _last_input_ts is stamped by any keystroke, not by a submit.
+          * a UserPromptSubmit hook is forbidden -- it perturbs the launch and
+            first-task-submit timing the SessionStart `startup` exclusion
+            exists to protect.
+        It also excludes what the user asked to exclude, by construction:
+        deliver_task, nudge (auto-continue's "Continue") and scheduled sends
+        all reach worker.write and never pass through a key event.
+
+        The numbered-option reject is the other half of the menu guard (the
+        card adds agent.is_waiting()): _INPUT_PROMPTS includes the selection
+        caret Claude paints on a highlighted permission row, so _input_text()
+        over a live menu returns something like "1. Yes" -- an answer, not a
+        prompt, and not a milestone."""
+        found = self._submitted_input()
+        if found is None:
+            return
+        row, text = found
+        if _NUM_OPTION_RE.search(text):
+            return
+        self.promptSubmitted.emit(text, self.history_pushed() + row)
+
+    def _submitted_input(self):
+        """(live-buffer row, text) of the input just submitted, or None.
+
+        `_input_block_span` is the precise reading and is tried first, but it
+        REQUIRES the cursor to be sitting on a row with content, and the
+        classic renderer frequently parks the cursor on a blank row below the
+        input box after a submit (measured on a real session: text on row 33,
+        cursor on row 35, so the span came back None and no milestone was ever
+        recorded). Falling back to the nearest non-blank row above the cursor
+        recovers it.
+
+        The fallback is bounded two ways so it can never mistake ordinary
+        OUTPUT for a prompt: it only runs when the caret is down in the input
+        box's own region at the bottom of the screen, and it STOPS at the box's
+        rule/footer rather than stepping over it into the conversation. An
+        empty input box therefore hits the rule and records nothing, which is
+        what a bare Enter at an empty prompt should do."""
+        span = self._input_block_span()
+        if span is not None:
+            text = self._input_text()
+            if text.strip():
+                return span[0], text
+        buf = self.screen.buffer
+        lines = self.screen.lines
+        cy = max(0, min(lines - 1, self.screen.cursor.y))
+        # bottom third, floored, so this behaves on a short test screen as well
+        # as a full-height one
+        if cy < lines - max(3, min(_INPUT_ZONE_ROWS, lines // 3)):
+            return None         # the caret is up in the conversation, not typing
+        for r in range(cy, max(-1, cy - _INPUT_SCAN_ROWS), -1):
+            if self._row_is_input_footer(r) or self._row_is_rule(r):
+                return None     # reached the edge of the box: nothing was typed
+            first, last = self._row_content(r)
+            if first < 0:
+                continue
+            text = "".join(buf[r][c].data or "" for c in range(first, last + 1))
+            if buf[r][first].data in _INPUT_PROMPTS:
+                text = text[1:]
+            # the renderer right-aligns footer bits ("high / effort") on the
+            # same row by jumping the cursor, which leaves a wide gap behind
+            text = _WIDE_GAP_RE.split(text.strip(), 1)[0].strip()
+            return (r, text) if len(text) >= 2 else None
+        return None
+
     def _kick_snapshot(self, key, text: str) -> None:
         """(Re)arm the coalescing snapshot after an edit keystroke, so a typing
         burst collapses into ONE undo step."""
@@ -1840,15 +2155,8 @@ class TerminalView(QWidget):
                 painter.setPen(QColor(Palette.ACCENT_ORANGE))
                 painter.drawRect(int(cx), int(cy), max(1, int(cw) - 1), int(ch) - 1)
 
-        if off:  # scrolled-back badge, top-right
-            painter.setFont(self._font)
-            label = f"▲ {off}"
-            metrics = QFontMetricsF(self._font)
-            tw = metrics.horizontalAdvance(label)
-            bx = self.width() - tw - 20
-            bh = metrics.height() + 6
-            painter.fillRect(int(bx), 5, int(tw + 14), int(bh),
-                             QColor(0, 0, 0, 170))
-            painter.setPen(QColor(Palette.ACCENT_ORANGE))
-            painter.drawText(int(bx + 7), int(5 + 3 + metrics.ascent()), label)
+        # (the old "up-arrow N" scrolled-back badge lived here, at
+        # width() - tw - 20 -- exactly where TerminalScrollBar now sits. The
+        # thumb says the same thing continuously and in the right place, so the
+        # badge would only be a second, worse readout fighting it for pixels.)
         painter.end()

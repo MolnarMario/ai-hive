@@ -70,6 +70,44 @@ class GeminiUsage:
         return limit.resets_at if limit else None
 
 
+def cache_path() -> Path:
+    """Path to Gemini rate-limit utilization disk cache file."""
+    env = os.environ.get("GEMINI_CONFIG_DIR", "").strip()
+    if env:
+        return Path(env) / "gemini_usage_cache.json"
+    return Path.home() / ".gemini" / "gemini_usage_cache.json"
+
+
+def read_cached() -> GeminiUsage | None:
+    """Read cached Gemini rate-limit utilization from disk cache file.
+
+    Returns None when no valid cache file exists.
+    """
+    try:
+        path = cache_path()
+        if not path.exists():
+            return None
+        with open(path, "r", encoding="utf-8-sig") as f:
+            blob = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(blob, dict):
+        return None
+    data = blob.get("utilization") or blob
+    limits = parse_utilization(data if isinstance(data, dict) else {})
+    if not limits:
+        return None
+    fetched = blob.get("fetchedAtMs") or blob.get("fetched_at")
+    if isinstance(fetched, (int, float)):
+        at = float(fetched) / 1000.0 if fetched > 1e11 else float(fetched)
+    else:
+        try:
+            at = path.stat().st_mtime
+        except OSError:
+            at = time.time()
+    return GeminiUsage(limits=limits, fetched_at=at, source="cache")
+
+
 def parse_utilization(data: dict) -> tuple[GeminiLimit, ...]:
     """Extract known Gemini limit windows out of a utilization dict.
 
@@ -109,6 +147,9 @@ def parse_utilization(data: dict) -> tuple[GeminiLimit, ...]:
         elif "resets_in_seconds" in entry and isinstance(entry["resets_in_seconds"], (int, float)):
             reset_val = now + float(entry["resets_in_seconds"])
 
+        if reset_val is not None and reset_val <= now:
+            pct = 0.0
+
         out.append(GeminiLimit(key=key, label=label, short=_SHORT.get(key, key),
                               percent=float(pct), resets_at=reset_val))
     return tuple(out)
@@ -124,24 +165,127 @@ def headline(usage: GeminiUsage | None) -> GeminiLimit | None:
     return max(usage.limits, key=lambda l: l.percent)
 
 
-def fetch() -> GeminiUsage:
-    """Fetch current Gemini usage metrics on demand (no disk caching)."""
-    now = time.time()
-    five_hour_reset = now + (4 * 3600 + 16 * 60)
-    weekly_reset = now + (167 * 3600 + 16 * 60)
+def weekly(usage: GeminiUsage | None) -> GeminiLimit | None:
+    """Return the weekly limit window (e.g. seven_day, seven_day_pro, seven_day_flash)."""
+    if usage is None or not usage.limits:
+        return None
+    return next((l for l in usage.limits if l.key.startswith("seven_day")), None)
 
-    limits = (
-        GeminiLimit(key="five_hour", label="Five Hour Limit (5h)", short="5h",
-                    percent=13.04, resets_at=five_hour_reset),
-        GeminiLimit(key="seven_day", label="Weekly Limit (all models)", short="7d",
-                    percent=2.17, resets_at=weekly_reset),
-    )
+
+def write_cached(usage: GeminiUsage) -> None:
+    """Save live Gemini usage reading to disk cache file for startup fast-paint."""
+    if not usage.ok or not usage.limits:
+        return
+    try:
+        path = cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        util_dict = {}
+        for lim in usage.limits:
+            util_dict[lim.key] = {
+                "utilization": lim.percent,
+                "remaining_pct": max(0.0, 100.0 - lim.percent),
+                "resets_at": lim.resets_at,
+            }
+        blob = {
+            "fetchedAtMs": int(usage.fetched_at * 1000),
+            "utilization": util_dict,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(blob, f, indent=2)
+    except OSError:
+        pass
+
+
+def fetch_cli(timeout: float = 6.0) -> GeminiUsage | None:
+    """Shell out to `agy --print /usage` to fetch live Gemini rate-limit utilization."""
+    import re
+    import shutil
+    import subprocess
+
+    exe = shutil.which("agy") or shutil.which("agy.exe")
+    if not exe:
+        alt = Path.home() / "AppData" / "Local" / "agy" / "bin" / "agy.exe"
+        if alt.exists():
+            exe = str(alt)
+    if not exe:
+        return None
+
+    try:
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        res = subprocess.run([exe, "--print", "/usage"], capture_output=True, text=True, timeout=timeout, **kwargs)
+        if res.returncode != 0 or not res.stdout:
+            return None
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+    now = time.time()
+    limits_map: dict[str, GeminiLimit] = {}
+    for line in res.stdout.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 4:
+            group, limit_name, rem_str, reset_str = parts[0], parts[1], parts[2], parts[3]
+            if "gemini" not in group.lower():
+                continue
+            rem_match = re.search(r"(\d+(?:\.\d+)?)%", rem_str)
+            if not rem_match:
+                continue
+            rem_pct = float(rem_match.group(1))
+            used_pct = max(0.0, 100.0 - rem_pct)
+
+            reset_val = None
+            if reset_str:
+                try:
+                    reset_val = datetime.fromisoformat(reset_str.replace("Z", "+00:00")).timestamp()
+                except (ValueError, TypeError):
+                    reset_val = None
+
+            key = None
+            if "five hour" in limit_name.lower():
+                key = "five_hour"
+            elif "weekly" in limit_name.lower():
+                key = "seven_day"
+
+            if key and key in _LABELS:
+                limits_map[key] = GeminiLimit(
+                    key=key,
+                    label=_LABELS[key],
+                    short=_SHORT.get(key, key),
+                    percent=used_pct,
+                    resets_at=reset_val,
+                )
+
+    if not limits_map:
+        return None
+
+    limits = tuple(limits_map.values())
     return GeminiUsage(limits=limits, fetched_at=now, source="live")
 
 
+def fetch() -> GeminiUsage:
+    """Fetch current Gemini usage metrics on demand.
+
+    Queries `agy --print /usage` CLI first for live accuracy; falls back to disk
+    cache when CLI call is unavailable or fails.
+    """
+    live = fetch_cli()
+    if live is not None and live.ok:
+        write_cached(live)
+        return live
+    cached = read_cached()
+    if cached is not None and cached.ok:
+        return cached
+    return GeminiUsage(fetched_at=time.time(), source="live", error="no-data")
+
+
 def format_countdown(seconds: float) -> str:
-    """Format compact '1h20m' / '45m' / '30s' countdown."""
+    """Format compact '6d23h' / '1h20m' / '45m' / '30s' countdown."""
     total = int(max(0, seconds))
+    if total >= 86400:
+        d = total // 86400
+        h = (total % 86400) // 3600
+        return f"{d}d{h}h" if h > 0 else f"{d}d"
     if total >= 3600:
         h, m = divmod(total // 60, 60)
         return f"{h}h{m:02d}m"
@@ -165,3 +309,4 @@ def format_limit(limit: GeminiLimit, now: float | None = None,
     if left <= 0:
         return f"{head}, resets now"
     return f"{head}, resets in {format_countdown(left)} at {when}"
+

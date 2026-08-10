@@ -80,12 +80,25 @@ def _hook_command(mapping_path: str, events_path: str | None = None,
 
 def write_settings_file(settings_path: str, mapping_path: str,
                         events_path: str | None = None,
-                        python_exe: str | None = None) -> None:
-    """Write the shared `--settings` file carrying ONLY our hooks.
+                        python_exe: str | None = None,
+                        tui: str = "") -> None:
+    """Write the shared `--settings` file carrying our hooks, and optionally
+    the terminal-renderer choice.
 
-    Only the `hooks` key is present, so passing it to `--settings` adds our
-    hooks without disturbing any other setting; and because Claude merges hooks
-    across sources, the user's own hooks still fire too (verified). Best-effort.
+    Everything else is left alone, so passing it to `--settings` adds what we
+    need without disturbing any other setting; and because Claude merges hooks
+    across sources, the user's own hooks still fire too (verified).
+    Best-effort.
+
+    `tui` ("default" | "fullscreen" | "" to omit) selects the CLI's renderer.
+    It is NOT a hook and has nothing to do with the matchers below -- it is
+    here only because this is already the file every Claude agent is launched
+    with. AI Hive passes "default" (the classic main-screen renderer) when it
+    wants to own the scrollback: the "fullscreen" renderer keeps its own
+    virtualized scrollback inside the alternate screen, which leaves the
+    terminal's history buffer permanently empty and the scrollbar with nothing
+    to show. Verified on real sessions: 0 lines of history under fullscreen,
+    a clean linear conversation under default.
 
     Two families of hooks, all pointing at this one script:
       * SessionStart -> live-conversation tracking (the original purpose).
@@ -128,9 +141,15 @@ def write_settings_file(settings_path: str, mapping_path: str,
                 {"hooks": [{"type": "command", "command": cmd, "timeout": 30}]}
             ],
         })
+    payload: dict = {"hooks": hooks}
+    if tui:
+        # deliberately a sibling of `hooks`, never folded into it: the matchers
+        # above are timing-critical (see the `startup` exclusion) and a
+        # renderer preference must never be edited as if it were part of them
+        payload["tui"] = tui
     tmp = settings_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"hooks": hooks}, fh)
+        json.dump(payload, fh)
     os.replace(tmp, settings_path)
 
 

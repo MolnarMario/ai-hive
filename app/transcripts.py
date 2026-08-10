@@ -37,8 +37,17 @@ _TITLE_CACHE: dict[str, tuple[float, int, str]] = {}
 # cache for latest_token_usage: transcript path -> (mtime, size, used, window).
 _USAGE_CACHE: dict[str, tuple[float, int, int, int]] = {}
 
+# cache for Gemini token usage: db path -> (mtime, size, used, window).
+_GEMINI_USAGE_CACHE: dict[str, tuple[float, int, int, int]] = {}
+
+# cache for latest_gemini_ai_title: metadata path -> (mtime, size, {session_id: title}).
+_GEMINI_TITLE_CACHE: dict[str, tuple[float, int, dict[str, str]]] = {}
+
 # cache for limit_cut_off: path -> (mtime, size, verdict dict).
 _LIMIT_CACHE: dict[str, tuple[float, int, dict]] = {}
+
+# cache for typed_prompts: path -> (mtime, size, [prompt text, ...]).
+_PROMPT_CACHE: dict[str, tuple[float, int, list]] = {}
 
 # cache for latest_model_effort: path -> (mtime, size, model, effort, mode).
 _MODEL_CACHE: dict[str, tuple[float, int, str, str, str]] = {}
@@ -129,6 +138,95 @@ def _read_latest_ai_title(path: str) -> str:
         return cached[2] if cached else ""
     _TITLE_CACHE[path] = (st.st_mtime, st.st_size, title)
     return title
+
+
+def latest_gemini_ai_title(cwd: str, session_id: str) -> str:
+    """The most recent AI-generated conversation title or preview Gemini
+    (Antigravity CLI) wrote into conversation_metadata.json for this session.
+    "" if none / no file.
+    Cached by (mtime, size) so repeated polling only re-reads on a real change.
+    Never raises."""
+    if not session_id:
+        return ""
+    from . import session_sync
+    meta_path = os.path.join(session_sync.gemini_dir(), "cache", "conversation_metadata.json")
+    return _read_gemini_ai_title(meta_path, session_id)
+
+
+def _read_gemini_ai_title(path: str, session_id: str) -> str:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    cached = _GEMINI_TITLE_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2].get(session_id, "")
+    titles: dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        convs = data.get("conversations", {})
+        for sid, info in convs.items():
+            s = info.get("summary") or {}
+            t = s.get("Title") or s.get("Preview") or ""
+            if t:
+                titles[sid] = t
+    except Exception:
+        return cached[2].get(session_id, "") if cached else ""
+    _GEMINI_TITLE_CACHE[path] = (st.st_mtime, st.st_size, titles)
+    return titles.get(session_id, "")
+
+
+def typed_prompts(cwd: str, session_id: str) -> list[str]:
+    """Every prompt the USER typed in this conversation, oldest first.
+
+    Prompt milestones are transient (they live on the agent and are minted
+    from a keystroke), so a conversation restored from disk starts with none --
+    which is exactly when the user most wants to jump around it. This is the
+    authoritative way to get them back: Claude tags a genuinely typed prompt
+    with `promptSource: "typed"` and `origin: {"kind": "human"}`, both absent
+    on tool results and on the plumbing turns `_is_synthetic_user_turn`
+    excludes. Marking only lines that match one of these can therefore never
+    invent a milestone the user did not create.
+
+    Cached by (mtime,size) like every other reader here. Never raises."""
+    if not session_id or not cwd:
+        return []
+    return _read_typed_prompts(transcript_path(cwd, session_id))
+
+
+def _read_typed_prompts(path: str) -> list[str]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    cached = _PROMPT_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return list(cached[2])
+    out: list[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                # cheap prefilter: most records are not typed user prompts
+                if '"typed"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue    # a partial last line while Claude is writing
+                if rec.get("type") != "user" or rec.get("isSidechain"):
+                    continue
+                if rec.get("promptSource") != "typed":
+                    continue
+                if _is_synthetic_user_turn(rec):
+                    continue
+                text = _message_text(rec).strip()
+                if text:
+                    out.append(text)
+    except OSError:
+        return list(cached[2]) if cached else []
+    _PROMPT_CACHE[path] = (st.st_mtime, st.st_size, list(out))
+    return out
 
 
 def ended_on_limit(cwd: str, session_id: str) -> tuple[bool, float, float]:
@@ -361,6 +459,62 @@ def _read_latest_token_usage(path: str) -> tuple[int, int]:
     if used > window:
         window = 1_000_000
     _USAGE_CACHE[path] = (st.st_mtime, st.st_size, used, window)
+    return (used, window)
+
+
+def _parse_varint(data: bytes, pos: int) -> tuple[int, int]:
+    res = 0
+    shift = 0
+    while pos < len(data):
+        b = data[pos]
+        pos += 1
+        res |= (b & 0x7f) << shift
+        shift += 7
+        if not (b & 0x80):
+            break
+    return res, pos
+
+
+def latest_gemini_token_usage(cwd: str, session_id: str) -> tuple[int, int]:
+    """Context-window occupancy of Gemini session, as (used_tokens, window_tokens).
+    Reads the latest token count from Gemini's sqlite conversation database.
+    Returns (0, 0) when no usage data is found."""
+    if not session_id:
+        return (0, 0)
+    from . import session_sync
+    db_path = os.path.join(session_sync.gemini_dir(), "conversations", f"{session_id}.db")
+    return _read_gemini_db_token_usage(db_path)
+
+
+def _read_gemini_db_token_usage(path: str) -> tuple[int, int]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return (0, 0)
+    cached = _GEMINI_USAGE_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return (cached[2], cached[3])
+    used, window = 0, 1_000_000
+    try:
+        import sqlite3
+        conn = sqlite3.connect(path)
+        cur = conn.cursor()
+        cur.execute('SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1;')
+        row = cur.fetchone()
+        conn.close()
+        if row and row[0]:
+            data = bytes(row[0])
+            matches = re.finditer(rb'[\x22][\x00-\xff]{5,150}\x28', data)
+            last_val = 0
+            for m in matches:
+                val, _ = _parse_varint(data, m.end())
+                if 0 < val < 10_000_000:
+                    last_val = val
+            if last_val > 0:
+                used = last_val
+    except Exception:
+        return (cached[2], cached[3]) if cached else (0, 0)
+    _GEMINI_USAGE_CACHE[path] = (st.st_mtime, st.st_size, used, window)
     return (used, window)
 
 

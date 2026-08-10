@@ -23,11 +23,12 @@ class GeminiUsageBadge(QWidget):
     _RING = 15
     _PAD = 8
     _GAP = 7
+    _FIXED_WIDTH = 315  # Fixed width to fit max possible string without jitter or truncation
     _AMBER, _RED = 60.0, 85.0
-    _FIXED_WIDTH = 250  # Fixed width to prevent content jittering
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, window: str = "five_hour"):
         super().__init__(parent)
+        self.window = window
         self.setFixedHeight(24)
         self.setFixedWidth(self._FIXED_WIDTH)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -36,7 +37,7 @@ class GeminiUsageBadge(QWidget):
         self._fetching = True
         self._text = "fetching most recent usage data..."
         self._stale = False
-        self._label = False
+        self._label = True
         self._unreadable = ""
         self.setVisible(True)
         self._refresh_text()
@@ -44,12 +45,17 @@ class GeminiUsageBadge(QWidget):
     def set_usage(self, usage: gemini_usage.GeminiUsage | None) -> None:
         self._fetching = False
         self._usage = usage
-        self._limit = gemini_usage.headline(usage)
+        if self.window == "weekly":
+            self._limit = gemini_usage.weekly(usage)
+        else:
+            self._limit = gemini_usage.headline(usage)
         self._unreadable = ""
         if self._limit is None:
             self._text = "no usage data"
+            self.setVisible(False)
+            return
         else:
-            self._label = len(usage.limits) > 1 if usage else False
+            self._label = True
             self._stale = bool(usage.error) if usage else False
         self.setVisible(True)
         self._refresh_text()
@@ -62,7 +68,7 @@ class GeminiUsageBadge(QWidget):
         return self._limit is not None
 
     def has_content(self) -> bool:
-        return True
+        return self._limit is not None or bool(self._unreadable)
 
     def mark_unreadable(self, error: str = "") -> None:
         self._fetching = False
@@ -101,7 +107,7 @@ class GeminiUsageBadge(QWidget):
                     "Click to refresh.")
         if self._usage is None or self._limit is None:
             return "Gemini rate-limit usage"
-        lines = [f"Gemini Antigravity CLI ({self._usage.plan})"]
+        lines = [f"Gemini ({self._usage.plan})"]
         for lim in self._usage.limits:
             lines.append(f"{lim.label}: " + gemini_usage.format_limit(lim))
         if self._usage.fetched_at:

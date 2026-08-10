@@ -547,6 +547,7 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 }}
 #StatusGlyph {{ color: {p.CARDHEAD_SUB}; font-size: 11px; }}
 #StatusGlyph[state="starting"] {{ color: {p.ACCENT_ORANGE}; }}
+#StatusGlyph[state="busy"] {{ color: {p.YELLOW}; }}
 #StatusGlyph[state="running"] {{ color: {p.GREEN}; }}
 #StatusGlyph[state="dead"] {{ color: {p.RED}; }}
 #CardTitle {{ font-family: {DISPLAY_FONT}; font-size: 13px; font-weight: 700;

@@ -9,6 +9,7 @@ can drive the real app.
 import os
 import re
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import QObject, Signal
@@ -507,6 +508,16 @@ class WorkspaceManager(QObject):
         # idle-but-a-shell-is-still-running is transient like busy/waiting:
         # refresh the badge only, never mark dirty
         agent.bg_shell_changed.connect(lambda *_, wid=wid: self._recompute(wid))
+        # Dis-allocate any duplicate session_id already held by a sibling agent
+        # in the same project directory (e.g. from an old un-isolated sync).
+        if agent.spec.session_id and agent.spec.session_id in self.sibling_session_ids(agent):
+            agent.spec.session_id = ""
+
+        if agent.spec.provider == "gemini" and not agent.spec.session_id:
+            exclude = self.sibling_session_ids(agent)
+            live_sid = session_sync.get_gemini_live_session(agent.spec.cwd, exclude=exclude)
+            if live_sid:
+                agent.spec.session_id = live_sid
 
     def _on_agent_limit_blocked_changed(self, ws_id: str, agent_id: str,
                                         blocked: bool) -> None:
@@ -576,20 +587,20 @@ class WorkspaceManager(QObject):
     # ------------------------------------------------- live-session sync ---
 
     def sibling_session_ids(self, agent: TerminalAgent) -> set:
-        """Pinned conversation ids of OTHER Claude agents sharing this agent's
+        """Pinned conversation ids of OTHER agents sharing this agent's
         folder. Recovery must never resume onto one of these — two agents on
         one transcript race and can truncate it (a real past incident)."""
         enc = transcripts.encode_project_dir(agent.spec.cwd)
         out = set()
         for a in self.all_agents():
-            if (a is not agent and a.spec.provider == "claude"
+            if (a is not agent and a.spec.provider == agent.spec.provider
                     and a.spec.session_id
                     and transcripts.encode_project_dir(a.spec.cwd) == enc):
                 out.add(a.spec.session_id)
         return out
 
     def refresh_ai_titles(self) -> None:
-        """Pull each running Claude agent's latest AI conversation title AND its
+        """Pull each running Claude/Gemini agent's latest AI conversation title AND its
         context-window occupancy from the live transcript and adopt both as
         transient card state (`set_ai_title` / `set_token_usage` never persist).
         Cheap: both readers re-read only when the transcript changed. Reads
@@ -598,14 +609,24 @@ class WorkspaceManager(QObject):
         for w in self._workspaces:
             for a in w.agents:
                 spec = a.spec
-                if spec.provider != "claude" or not a.is_running():
+                if not spec.session_id:
                     continue
-                title = transcripts.latest_ai_title(spec.cwd, spec.session_id)
-                if title:
-                    a.set_ai_title(title)
-                used, window = transcripts.latest_token_usage(
-                    spec.cwd, spec.session_id)
-                a.set_token_usage(used, window)
+                if spec.provider == "claude":
+                    title = transcripts.latest_ai_title(spec.cwd, spec.session_id)
+                    if title:
+                        a.set_ai_title(title)
+                    if a.is_running():
+                        used, window = transcripts.latest_token_usage(
+                            spec.cwd, spec.session_id)
+                        a.set_token_usage(used, window)
+                elif spec.provider == "gemini":
+                    title = transcripts.latest_gemini_ai_title(spec.cwd, spec.session_id)
+                    if title:
+                        a.set_ai_title(title)
+                    if a.is_running():
+                        used, window = transcripts.latest_gemini_token_usage(
+                            spec.cwd, spec.session_id)
+                        a.set_token_usage(used, window)
 
     def refresh_model_effort(self) -> None:
         """Pull each running Claude agent's CURRENT model, effort and permission
@@ -641,28 +662,40 @@ class WorkspaceManager(QObject):
             self.dirty.emit()
 
     def sync_live_sessions(self) -> list:
-        """Reconcile each running Claude agent's pinned session id with the
+        """Reconcile each running Claude/Gemini agent's pinned session id with the
         conversation it is ACTUALLY on, so a conversation the user switched to
         (via /resume or /clear inside the TUI, a fork, usage-limit recovery) is
         what comes back on reopen — not the id AI Hive happened to launch with.
         Marks the session dirty when a pin changes. Returns
-        [(agent_id, old_id, new_id)] for the caller to audit.
+        [(agent_id, old_id, new_id)] for the caller to audit."""
+        changed = []
 
-        Two signals, in priority order:
-          1. AUTHORITATIVE — the SessionStart hook (app/session_hook.py) has the
-             child report its own live id, keyed by AIHIVE_AGENT_ID, so it is
-             correct for ANY number of agents per folder (the filesystem cannot
-             disambiguate two agents sharing a folder — see resolve_live_ids).
-          2. FALLBACK — filesystem mtime correlation, but ONLY for single-agent
-             folders and ONLY for agents the hook has not (yet) reported (a
-             legacy agent, or before the first hook fires). Never reshuffles a
-             multi-agent folder; that guessing swapped live conversations."""
+        # Gemini session sync (only for single-agent folders; multi-agent folders
+        # leave pinned IDs alone because filesystem correlation is ambiguous)
+        gemini_agents = [a for a in self.all_agents() if a.spec.provider == "gemini"]
+        g_groups = defaultdict(list)
+        for a in gemini_agents:
+            g_groups[transcripts.encode_project_dir(a.spec.cwd)].append(a)
+
+        for g_group in g_groups.values():
+            if len(g_group) != 1:
+                continue  # multi-agent folder: correlation is unsafe
+            a = g_group[0]
+            exclude = self.sibling_session_ids(a)
+            live_sid = session_sync.get_gemini_live_session(a.spec.cwd, exclude=exclude)
+            if live_sid and live_sid != a.spec.session_id:
+                changed.append((a.id, a.spec.session_id, live_sid))
+                a.spec.session_id = live_sid
+                a.note_conversation_replaced()
+
         running = [a for a in self.all_agents()
                    if a.spec.provider == "claude" and a.is_running()
                    and a.spec.session_id]
         if not running:
-            return []
-        changed = []
+            if changed:
+                self.dirty.emit()
+            return changed
+
         covered = set()
 
         # 1. authoritative hook-reported ids
@@ -678,6 +711,10 @@ class WorkspaceManager(QObject):
                     and session_sync.is_session_id(new)):
                 changed.append((a.id, a.spec.session_id, new))
                 a.spec.session_id = new
+                # a DIFFERENT conversation is on screen now (/clear, /resume):
+                # the scrollback behind it, and every milestone in it, belong
+                # to the old one
+                a.note_conversation_replaced()
 
         # 2. filesystem fallback for agents the hook hasn't reported. Pass ALL
         # running agents (not just the uncovered ones) so resolve_live_ids sees
@@ -701,6 +738,7 @@ class WorkspaceManager(QObject):
             if a and new and new != a.spec.session_id:
                 changed.append((aid, a.spec.session_id, new))
                 a.spec.session_id = new
+                a.note_conversation_replaced()
 
         if changed:
             self.dirty.emit()

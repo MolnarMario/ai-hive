@@ -154,12 +154,12 @@ PROVIDERS: dict[str, Provider] = {
         base_cmd="codex", model_flag="--model {model}",
         note="Requires the OpenAI Codex CLI (`codex`) on PATH."),
     "gemini": Provider(
-        key="gemini", display="Gemini (Antigravity CLI)",
+        key="gemini", display="Gemini CLI",
         exe_names=("agy", "gemini"),
-        models=GEMINI_MODELS, efforts=GEMINI_EFFORTS, native_flags=True,
+        models=GEMINI_MODELS, efforts=(), native_flags=True,
         base_cmd="agy", model_flag="--model {model}",
         fallback_paths=(r"%LOCALAPPDATA%\agy\bin\agy.exe",),
-        note="Google Antigravity CLI (`agy`): Gemini 3.x agent."),
+        note="Google Gemini CLI (`agy`): Gemini 3.x agent."),
     "grok": Provider(
         key="grok", display="Grok (xAI CLI)", exe_names=("grok",),
         # `grok models` reports one entry for this account (grok-build, the
