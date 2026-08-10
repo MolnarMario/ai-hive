@@ -311,6 +311,28 @@ QToolTip {{
     border: 1px solid {p.BORDER}; padding: 3px 6px;
 }}
 
+/* Right-click / dropdown menus everywhere (terminal copy-paste, card and
+   sidebar action menus, top-bar preferences) -- unstyled QMenu falls back to
+   the OS native popup (white background), which then collided with the
+   theme's own (often light) text color from the `*` rule above and read as
+   near-invisible. Themed to match the rest of the chrome instead. */
+QMenu {{
+    background: {p.BG_PANEL}; color: {p.TEXT};
+    border: 1px solid {p.BORDER}; padding: 4px 0;
+}}
+QMenu::item {{ background: transparent; padding: 5px 28px 5px 14px; }}
+QMenu::item:selected {{ background: {p.BG_ACTIVE}; color: {p.TEXT}; }}
+QMenu::item:disabled {{ color: {p.TEXT_FAINT}; }}
+QMenu::separator {{ height: 1px; background: {p.BORDER}; margin: 4px 6px; }}
+QMenu::indicator {{
+    width: 14px; height: 14px; margin-left: 4px;
+    border-radius: 3px; border: 1px solid {p.BORDER}; background: {p.BG_INPUT};
+}}
+QMenu::indicator:checked {{
+    background: {p.ACCENT_GOLD}; border: 1px solid {p.ACCENT_GOLD};
+    {check_img}
+}}
+
 /* ---------------------------------------------------------- top bar --- */
 #TopBar {{ background: {p.BG_PANEL}; border-bottom: 1px solid {p.ACCENT_GOLD_DIM}; }}
 #Logo {{ color: {p.ACCENT_GOLD}; font-size: 17px; font-weight: 700; }}
