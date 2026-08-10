@@ -119,12 +119,25 @@ workspaces keep executing — switching never pauses anything.
   resets in …`**, and the window raises `planLimitReached` / `planLimitCleared`
   signals (with the reset time) so other features can act on being cut off —
   e.g. relaunching blocked agents unattended the moment the limit resets.
-  Right-click the top bar to hide the readout; it hides itself when there's no
-  Claude login. If the number can't be fetched at all — the endpoint
-  rate-limits, and there's no longer an on-disk figure to fall back on — the
-  badge says **`! usage limit unreadable — click to refresh`** rather than
-  quietly disappearing, and clicking it retries immediately instead of waiting
-  out the backoff.
+  It hides itself when there's no Claude login. If the number can't be fetched
+  at all — the endpoint rate-limits, and there's no longer an on-disk figure to
+  fall back on — the badge says **`! usage limit unreadable — click to
+  refresh`** rather than quietly disappearing, and clicking it retries
+  immediately instead of waiting out the backoff.
+- **Pick which usage readouts you want** — three pills can sit on the bar
+  (Claude plan, Gemini 5-hour, Gemini weekly), each sized to its own text.
+  **Hover one and an ✕ appears at its right edge** to close it; the **+ button**
+  left of the auto-restart caption opens a checklist to bring any of them back.
+  The choice is remembered per pill. Closing both Gemini pills also stops the
+  `agy` usage subprocess entirely, so a Claude-only user isn't paying a few
+  seconds a minute for a readout they don't want. Closing the Claude pill only
+  hides the readout: its poll keeps running, because auto-recovery is driven
+  from that reading.
+  **Nothing is remembered between runs except the choice itself.** Every pill
+  opens saying `reading...` and fills in from a fresh fetch at startup, because
+  a stored number goes stale exactly where it matters most — a 5-hour window is
+  routinely spent and reopened between one launch and the next, and a restored
+  figure looks identical to a live one.
 - **Auto-recovery from a spent plan limit** — two switches sit next to the usage
   readout, both on by default, both persisted, each with a tooltip spelling out
   what it does:
@@ -625,7 +638,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1478 checks drive the real app headlessly (offscreen Qt platform) with real
+1520 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -723,7 +736,7 @@ app/
                            worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1478 checks)
+tests/smoke_test.py        headless end-to-end suite (1520 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

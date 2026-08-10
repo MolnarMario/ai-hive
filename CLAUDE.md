@@ -529,10 +529,18 @@ this file is the invariants that must survive every change.
   run a subprocess inside every agent's TUI render loop, exactly the launch-
   timing perturbation the SessionStart `startup` invariant above is about.
   `~/.claude.json` → `cachedUsageUtilization` carries the IDENTICAL shape (one
-  `parse_utilization` serves both) but is only a cold-start seed / offline
-  fallback — the CLI rewrites it opportunistically and it goes stale for days
-  (observed 1.5 days and 10 points out of date), so it must never be the primary
-  source. TOKEN HANDLING IS READ-ONLY: re-read `.credentials.json` per call
+  `parse_utilization` serves both), and `claude_usage.read_cached` still parses
+  it, but NOTHING IN THE APP CALLS IT ANY MORE and nothing may: a STORED NUMBER
+  IS NEVER SHOWN. The cold-start seed was removed, and Gemini's own disk cache
+  (`gemini_usage.cache_path`/`read_cached`/`write_cached`) was DELETED outright,
+  because a 5-hour window is routinely spent and reopened between one launch and
+  the next — so a restored figure is not merely old (observed 1.5 days and 10
+  points out of date), it is wrong in the direction that misleads, and nothing
+  on the bar distinguishes it from a live one. Every enabled pill instead opens
+  in a LOADING state (`UsagePillBadge.mark_loading`, put up by
+  `start_usage_polling`) and only ever shows a figure fetched this run;
+  `gemini_usage.fetch` returns `error="no-data"` rather than reaching for disk.
+  TOKEN HANDLING IS READ-ONLY: re-read `.credentials.json` per call
   (running agents keep it rotated for us), short-circuit on a past `expiresAt`
   instead of putting a dead credential on the wire, and NEVER refresh (that
   races the CLI's own refresh), write, log, or persist it. `fetch()` never
@@ -543,16 +551,48 @@ this file is the invariants that must survive every change.
   (`PlanUsageBadge.mark_unreadable`, "usage limit unreadable — click to
   refresh") — the badge must never just disappear, which is indistinguishable
   from the feature having been deleted (reported as exactly that after a
-  restart met an `http 429`; CLI 2.1.220 no longer writes the
-  `cachedUsageUtilization` seed that used to paint a number instantly, so the
-  gap is now reachable on any cold start). Visibility is therefore gated on
-  `has_content()`, NOT `has_reading()`, and a click resets `_usage_backoff`
+  restart met an `http 429`; there is deliberately no on-disk seed to paint a
+  number instantly, so the gap is reachable on any cold start). The GEMINI pill
+  obeys this too, and did not before: `set_usage` used to hide the badge itself
+  whenever a reading carried no matching window, with a blanket `try/except`
+  hiding that it had, so an absent/erroring `agy` made the readout cease to
+  exist with no way to ask it to retry. Failures now route through
+  `TopBar.note_gemini_usage_error`, which greys an existing number
+  (`mark_stale`) and only says "unreadable" when there is nothing to grey.
+  VISIBILITY IS A PRODUCT OF TWO INDEPENDENT FACTORS, decided in exactly one
+  place (`TopBar._sync_usage_pills`): `has_content()` (a reading, the can't-read
+  pill, OR the loading state) AND the user's per-pill preference. NO badge class
+  may call `setVisible` on itself. That split is what lets a pill the user
+  CLOSED vanish — the point of the hover ✕ — without regressing the rule that a
+  FAILED read must never look like a deleted feature; collapsing them back into
+  one flag makes the two indistinguishable. A click resets `_usage_backoff`
   (`_on_usage_refresh`) so the user asking now isn't parked behind a 16-minute
   retry gap. CRITICAL, same rule as `activity_changed`/`waiting_changed`: a reading
   is TRANSIENT and must NEVER mark `dirty` — `_apply_usage` runs every minute
   for the life of the process, so wiring it to a save would rewrite
-  `session.json` 60x an hour (only the `ui.usage_visible` preference saves, via
-  `_schedule_save`). Polling is OPT-IN — `main.py` calls
+  `session.json` 60x an hour (only the `ui.usage_trackers` preference saves, via
+  `_schedule_save`). THAT PREFERENCE IS PER PILL and has exactly ONE control:
+  the hover ✕ on a pill and the `+` picker beside the auto-restart caption both
+  emit the same `TopBar.usageTrackerToggled(key, on)` into the same
+  `_on_usage_tracker_toggled`, so two controls of one setting can never
+  disagree. The older single `ui.usage_visible` boolean (a right-click item that
+  hid all three) is GONE; it is still WRITTEN as a derived mirror
+  (`any(trackers)`) for one release so a downgrade cannot resurrect closed
+  pills, and `_restore_ui_state` prefers `usage_trackers` and reads
+  `usage_visible: False` as "all trackers off" only when the newer key is
+  absent. Additive optional keys inside `"ui"`, so NO `SESSION_VERSION` bump.
+  The `+` button must NEVER be hidden — not by `set_recovery_available(False)`
+  (a Gemini-only user has no Claude login by definition), not by every tracker
+  being off — or there is no way back. Closing both Gemini pills SKIPS the
+  Gemini poll entirely (`_gemini_wanted`, checked in `start_usage_polling` and
+  again at the top of `_poll_gemini_usage`), which is sound only because
+  `_gemini_usage` has no consumer besides those two pills and
+  `_retune_gemini_usage_poll`; the CLAUDE poll is NEVER gated this way, because
+  `planLimitReached`/`planLimitCleared`/`plan_usage()`/`_arm_reset_poll` all
+  hang off that reading and auto-continue depends on them. Re-enabling a tracker
+  re-arms and fetches at once, but only when `self._polling` is set — which
+  `start_usage_polling` alone does, so the offscreen suite can toggle trackers
+  without ever shelling out to the user's real `agy`. Polling is OPT-IN — `main.py` calls
   `MainWindow.start_usage_polling()` exactly like it sets `quit_on_close`,
   because the smoke suite shares `create_main_window` and must never touch the
   network or the user's real account; tests drive `_on_usage_ready` with
@@ -599,6 +639,24 @@ this file is the invariants that must survive every change.
   flicker would reset the countdown forever and the poll would never fire at
   all; `_retune_usage_poll` therefore only touches the timer when the interval
   actually changes.
+- **A usage pill is exactly as wide as its text, by ONE formula**
+  (`ornaments.UsagePillBadge._measure_width`: `_PAD*2 + _RING + _GAP +
+  advance(text) + _CLOSE_GAP + _CLOSE_W`, measured with `_text_font()` — the
+  font `paintEvent` actually draws with, never the widget's QSS font, or the
+  pill is sized for text of a different size). `PlanUsageBadge` and
+  `GeminiUsageBadge` are both subclasses and supply only the TEXT; the Gemini
+  pills previously carried a hardcoded `_FIXED_WIDTH = 315` and elided into it,
+  which reserved 630px of the bar for two readouts whose real content is ~215px
+  each, truncated anything longer, and drifted from the Claude pill sitting
+  beside them. Do not re-copy the formula into a subclass. The ✕'s width is
+  RESERVED UNCONDITIONALLY and only its VISIBILITY is hover-gated: the pills sit
+  after the layout's `addStretch(1)`, so growing one on hover shoves the entire
+  right-hand cluster (recovery caption, LED toggles, theme combo, font steppers,
+  Add Terminal) sideways as the pointer crosses it. The ✕ is a child
+  `QToolButton`, NOT a rect hit-tested in `mousePressEvent`, so it consumes its
+  own press and closing can never be mistaken for the click-to-refresh
+  affordance that same handler owns. Loading strings must stay SHORTER than the
+  finished line, so a pill only ever grows when its reading lands.
 - **Auto-continue consumes that edge; the SCREEN says who to resume**
   (`MainWindow._resume_blocked_agents`, wired to `planLimitCleared`). The usage
   reading is ACCOUNT-wide — it knows the plan is out and until when, but never

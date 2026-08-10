@@ -4,11 +4,13 @@ Qt-free and stdlib-only: nothing here may import PySide6, and nothing here may r
 
 Tracks Gemini 3.x rate-limit windows (e.g. 5-hour session window and 7-day weekly
 quota window) for Gemini agents.
+
+There is deliberately NO disk cache: see `fetch`. A stale usage number is worse
+than none, because nothing on screen tells the two apart.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from dataclasses import dataclass
@@ -68,44 +70,6 @@ class GeminiUsage:
         """When the currently binding limit frees up (epoch seconds)."""
         limit = self.blocked or headline(self)
         return limit.resets_at if limit else None
-
-
-def cache_path() -> Path:
-    """Path to Gemini rate-limit utilization disk cache file."""
-    env = os.environ.get("GEMINI_CONFIG_DIR", "").strip()
-    if env:
-        return Path(env) / "gemini_usage_cache.json"
-    return Path.home() / ".gemini" / "gemini_usage_cache.json"
-
-
-def read_cached() -> GeminiUsage | None:
-    """Read cached Gemini rate-limit utilization from disk cache file.
-
-    Returns None when no valid cache file exists.
-    """
-    try:
-        path = cache_path()
-        if not path.exists():
-            return None
-        with open(path, "r", encoding="utf-8-sig") as f:
-            blob = json.load(f)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(blob, dict):
-        return None
-    data = blob.get("utilization") or blob
-    limits = parse_utilization(data if isinstance(data, dict) else {})
-    if not limits:
-        return None
-    fetched = blob.get("fetchedAtMs") or blob.get("fetched_at")
-    if isinstance(fetched, (int, float)):
-        at = float(fetched) / 1000.0 if fetched > 1e11 else float(fetched)
-    else:
-        try:
-            at = path.stat().st_mtime
-        except OSError:
-            at = time.time()
-    return GeminiUsage(limits=limits, fetched_at=at, source="cache")
 
 
 def parse_utilization(data: dict) -> tuple[GeminiLimit, ...]:
@@ -170,30 +134,6 @@ def weekly(usage: GeminiUsage | None) -> GeminiLimit | None:
     if usage is None or not usage.limits:
         return None
     return next((l for l in usage.limits if l.key.startswith("seven_day")), None)
-
-
-def write_cached(usage: GeminiUsage) -> None:
-    """Save live Gemini usage reading to disk cache file for startup fast-paint."""
-    if not usage.ok or not usage.limits:
-        return
-    try:
-        path = cache_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        util_dict = {}
-        for lim in usage.limits:
-            util_dict[lim.key] = {
-                "utilization": lim.percent,
-                "remaining_pct": max(0.0, 100.0 - lim.percent),
-                "resets_at": lim.resets_at,
-            }
-        blob = {
-            "fetchedAtMs": int(usage.fetched_at * 1000),
-            "utilization": util_dict,
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(blob, f, indent=2)
-    except OSError:
-        pass
 
 
 def fetch_cli(timeout: float = 6.0) -> GeminiUsage | None:
@@ -264,18 +204,20 @@ def fetch_cli(timeout: float = 6.0) -> GeminiUsage | None:
 
 
 def fetch() -> GeminiUsage:
-    """Fetch current Gemini usage metrics on demand.
+    """Fetch current Gemini usage metrics on demand. Never raises.
 
-    Queries `agy --print /usage` CLI first for live accuracy; falls back to disk
-    cache when CLI call is unavailable or fails.
+    There is deliberately NO disk cache here, and the one this module used to
+    keep has been removed. A usage number is a LIVE READOUT, not history: a
+    five-hour window is routinely spent and reopened by the next launch, so a
+    stored figure is not merely old, it is WRONG in the direction that matters
+    (it says there is headroom when there may be none) — and nothing on screen
+    distinguishes a restored number from a fetched one. A failed read reports
+    itself instead, and the caller paints the can't-read pill, which keeps the
+    click-to-refresh affordance.
     """
     live = fetch_cli()
     if live is not None and live.ok:
-        write_cached(live)
         return live
-    cached = read_cached()
-    if cached is not None and cached.ok:
-        return cached
     return GeminiUsage(fetched_at=time.time(), source="live", error="no-data")
 
 

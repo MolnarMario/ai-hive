@@ -668,6 +668,24 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 /* caption naming the two auto-recovery switches below, so the LED pair
    doesn't read as unlabeled decoration */
 #RecoveryLabel {{ color: {p.TEXT_DIM}; font-size: 12px; }}
+/* The X revealed inside a usage pill on hover, and the + that brings a closed
+   pill back. These two are ordinary chrome, so QSS; the pill BODY around them
+   is still painted, reading Palette at paint time, because its colour tracks
+   utilization as well as the skin. `background: transparent` is load-bearing
+   on the X: it sits on the pill's translucent painted fill and must not punch
+   a hole in it. */
+#UsagePillClose {{
+    background: transparent; border: none; padding: 0px;
+    color: {p.TEXT_DIM}; font-size: 11px;
+}}
+#UsagePillClose:hover {{ color: {p.RED}; }}
+#UsageTrackerAdd {{
+    background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
+    padding: 1px 7px; color: {p.TEXT_DIM}; font-size: 14px; font-weight: 700;
+}}
+#UsageTrackerAdd:hover {{
+    background: {p.BG_HOVER}; border-color: {p.ACCENT_GOLD}; color: {p.TEXT};
+}}
 /* the two auto-recovery switches beside the plan-usage readout. Armed reads
    as lit (accent border + full-strength glyph + green LED), off reads as
    faint with a dark LED, so "will my work resume by itself?" is answerable

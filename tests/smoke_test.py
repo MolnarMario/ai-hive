@@ -7484,26 +7484,30 @@ def test_plan_usage():
           badge._text.startswith("21% used") and badge._stale)
 
     # visibility preference persists; toggling it IS a save (a UI preference)
-    win._on_usage_visibility(False)
+    win._on_usage_tracker_toggled("claude", False)
     app.processEvents()
-    check("plan-usage: hiding removes the badge but keeps polling",
+    check("plan-usage: closing the pill removes it from the bar",
           not badge.isVisible())
-    check("plan-usage: a later reading cannot resurrect a hidden badge",
+    check("plan-usage: a later reading cannot resurrect a closed pill",
           (win._on_usage_ready(good), app.processEvents(),
            not badge.isVisible())[-1])
     payload_ui = win._session_payload()["ui"]
-    check("plan-usage: preference persisted under ui.usage_visible",
-          payload_ui["usage_visible"] is False)
+    check("plan-usage: preference persisted under ui.usage_trackers",
+          payload_ui["usage_trackers"]["claude"] is False
+          and payload_ui["usage_trackers"]["gemini_weekly"] is True)
+    check("plan-usage: the legacy usage_visible mirror is derived, not stale",
+          payload_ui["usage_visible"] is True)
     win.close()
 
     win2 = create_main_window(store)
     win2.show()
     app.processEvents()
     check("plan-usage: preference restored on reopen",
-          win2.top_bar.usage_visible() is False)
+          win2.top_bar.usage_trackers()["claude"] is False)
     check("plan-usage: default is ON when never saved",
           create_main_window(
-              SessionStore(path=tmp / "fresh.json")).top_bar.usage_visible())
+              SessionStore(path=tmp / "fresh.json")
+          ).top_bar.usage_trackers()["claude"])
     win2.close()
 
     # no Claude login at all: hide for good rather than show an empty pill
@@ -7554,12 +7558,170 @@ def test_plan_usage():
           and b4._text.startswith("21% used") and not b4._unreadable)
     # an error is not a reason to force the readout back onto a bar the user
     # deliberately cleared
-    win4._on_usage_visibility(False)
+    win4._on_usage_tracker_toggled("claude", False)
     win4.top_bar.note_usage_error("http 429")
     app.processEvents()
-    check("plan-usage: a hidden readout stays hidden when a poll fails",
+    check("plan-usage: a closed readout stays closed when a poll fails",
           not b4.isVisible())
     win4.close()
+
+
+def test_usage_trackers_preference():
+    """The per-pill usage picker: the X that closes one readout, the + that
+    brings it back, and the preference that remembers.
+
+    The bar used to carry one boolean for all three readouts, on a right-click
+    item. A user who runs only Claude had to look at two Gemini pills that can
+    never say anything (and pay a ~3s subprocess a minute for them), or lose
+    the Claude one too. The preference is now per pill, and the + button is the
+    single control - a master toggle sitting on top of three checkboxes is two
+    controls for one setting, and a pill checked in one but hidden by the other
+    is not explainable.
+    """
+    import json as _json
+    import pathlib
+    import tempfile
+    import time as _time
+    from PySide6.QtWidgets import QApplication
+    from app import claude_usage as cu
+    from app.session_store import SessionStore
+    from app.widgets.main_window import (USAGE_TRACKER_KEYS,
+                                         USAGE_TRACKER_LABELS)
+    from main import create_main_window
+
+    QApplication.instance() or QApplication([])
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="ai-hive-trackers-"))
+    now = _time.time()
+    good = cu.Usage(limits=(cu.Limit(key="five_hour",
+                                     label=cu._LABELS["five_hour"],
+                                     short=cu._SHORT["five_hour"],
+                                     percent=21.0, resets_at=now + 4800),),
+                    fetched_at=now, plan="pro")
+
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.show()
+    app = QApplication.instance()
+    app.processEvents()
+    bar = win.top_bar
+
+    check("usage-trackers: every readout is on by default",
+          all(bar.usage_trackers()[k] for k in USAGE_TRACKER_KEYS))
+    check("usage-trackers: ...but no pill is on the bar without content",
+          not bar.usage_badge.isVisible()
+          and not bar.gemini_badge.isVisible()
+          and not bar.gemini_weekly_badge.isVisible())
+    check("usage-trackers: the + picker is on the bar",
+          bar.usage_add_btn.isVisible())
+
+    # the menu mirrors the preference and is rebuilt per click, so it can never
+    # show a stale checkmark
+    menu = bar.build_tracker_menu()
+    acts = menu.actions()
+    check("usage-trackers: one checkable entry per readout",
+          len(acts) == 3 and all(a.isCheckable() for a in acts)
+          and [a.text() for a in acts]
+          == [USAGE_TRACKER_LABELS[k] for k in USAGE_TRACKER_KEYS])
+    check("usage-trackers: the entries start checked",
+          all(a.isChecked() for a in acts))
+
+    # put content in all three so visibility is decided by the preference alone
+    win._on_usage_ready(good)
+    bar.mark_usage_loading()
+    app.processEvents()
+    check("usage-trackers: loading counts as content, so the bar fills at once",
+          bar.gemini_badge.isVisible() and bar.gemini_weekly_badge.isVisible()
+          and bar.usage_badge.isVisible())
+
+    # the X closes exactly one pill
+    seen = []
+    bar.usageTrackerToggled.connect(lambda k, on: seen.append((k, on)))
+    bar.gemini_weekly_badge.close_btn.click()
+    app.processEvents()
+    check("usage-trackers: the X emits (its own key, False)",
+          seen == [("gemini_weekly", False)], seen)
+    check("usage-trackers: it closes that pill and no other",
+          not bar.gemini_weekly_badge.isVisible()
+          and bar.gemini_badge.isVisible() and bar.usage_badge.isVisible())
+    check("usage-trackers: a later reading cannot resurrect a closed pill",
+          (bar.mark_usage_loading(), app.processEvents(),
+           not bar.gemini_weekly_badge.isVisible())[-1])
+
+    # ...and closing IS a save, while a reading still is NOT
+    win._save_timer.stop()
+    win._on_usage_tracker_toggled("gemini_five_hour", False)
+    check("usage-trackers: closing a pill schedules a save (a UI preference)",
+          win._save_timer.isActive())
+    win._save_timer.stop()
+    win._on_usage_ready(good)
+    check("usage-trackers: a reading still never marks the session dirty",
+          not win._save_timer.isActive())
+
+    check("usage-trackers: the + survives every pill being closed",
+          (win._on_usage_tracker_toggled("claude", False),
+           app.processEvents(),
+           bar.usage_add_btn.isVisible()
+           and not bar.usage_badge.isVisible())[-1])
+    check("usage-trackers: the menu now shows all three unchecked",
+          not any(a.isChecked() for a in bar.build_tracker_menu().actions()))
+
+    # no Claude login hides the recovery switches, but NEVER the picker: a
+    # Gemini-only user would otherwise have no control at all
+    bar.set_recovery_available(False)
+    check("usage-trackers: no-Claude hides the recovery row, not the picker",
+          not bar.recovery_label.isVisible()
+          and not bar.recover_btn.isVisible()
+          and bar.usage_add_btn.isVisible())
+    bar.set_recovery_available(True)
+
+    # re-checking brings it back, in its loading state rather than as a gap
+    win._on_usage_tracker_toggled("claude", True)
+    app.processEvents()
+    check("usage-trackers: re-checking restores the pill, showing loading",
+          bar.usage_badge.isVisible() and bar.usage_badge.has_content()
+          and "reading" in bar.usage_badge._text)
+
+    check("usage-trackers: the old master toggle is gone",
+          not hasattr(bar, "usageVisibilityToggled")
+          and not hasattr(bar, "set_usage_visible"))
+    win._save_session()
+    win.close()
+
+    saved = _json.loads((tmp / "s.json").read_text(encoding="utf-8-sig"))
+    check("usage-trackers: persisted per key under ui.usage_trackers",
+          saved["ui"]["usage_trackers"]["gemini_weekly"] is False
+          and saved["ui"]["usage_trackers"]["claude"] is True)
+
+    win2 = create_main_window(SessionStore(path=tmp / "s.json"))
+    check("usage-trackers: restored per key on reopen",
+          win2.top_bar.usage_trackers() == saved["ui"]["usage_trackers"])
+    win2.close()
+
+    # MIGRATION off the older single boolean. A user who hid the whole readout
+    # must not have it put back; and the newer key wins when both are present.
+    saved["ui"].pop("usage_trackers")
+    saved["ui"]["usage_visible"] = False
+    (tmp / "legacy.json").write_text(_json.dumps(saved), encoding="utf-8")
+    win3 = create_main_window(SessionStore(path=tmp / "legacy.json"))
+    check("usage-trackers: legacy usage_visible=False closes every pill",
+          not any(win3.top_bar.usage_trackers().values()))
+    win3.close()
+
+    saved["ui"]["usage_visible"] = True
+    (tmp / "legacy_on.json").write_text(_json.dumps(saved), encoding="utf-8")
+    win4 = create_main_window(SessionStore(path=tmp / "legacy_on.json"))
+    check("usage-trackers: legacy usage_visible=True opens every pill",
+          all(win4.top_bar.usage_trackers().values()))
+    win4.close()
+
+    saved["ui"]["usage_trackers"] = {"claude": False, "gemini_five_hour": True,
+                                     "gemini_weekly": True}
+    saved["ui"]["usage_visible"] = True          # deliberately contradictory
+    (tmp / "both.json").write_text(_json.dumps(saved), encoding="utf-8")
+    win5 = create_main_window(SessionStore(path=tmp / "both.json"))
+    check("usage-trackers: the per-key preference wins over the legacy mirror",
+          win5.top_bar.usage_trackers()["claude"] is False)
+    win5.close()
 
 
 def test_limit_ledger():
@@ -9790,7 +9952,57 @@ def test_gemini_usage_polling_is_offthread_and_optin():
         win._on_gemini_usage_ready(None)
         check("gemini-usage: a finished poll clears the in-flight guard",
               not win._gemini_usage_inflight)
+        check("gemini-usage: building a window puts no pill on the bar",
+              not win.top_bar.gemini_badge.isVisible()
+              and not win.top_bar.usage_badge.isVisible())
+        # a failed read must SAY so rather than vanish: the badge used to hide
+        # itself, and a blanket try/except hid that it had, so with agy absent
+        # the readout simply ceased to exist with no way to ask it to retry
+        check("gemini-usage: a failed read shows the can't-read pill",
+              (win._on_gemini_usage_ready(
+                  gemini_usage.GeminiUsage(error="no-data")),
+               win.top_bar.gemini_badge.has_content()
+               and not win.top_bar.gemini_badge.has_reading())[-1])
         win.close()
+
+        # With both Gemini pills closed nothing consumes the reading, so the
+        # ~3s subprocess is skipped entirely - that is the point of letting a
+        # Claude-only user close them. The CLAUDE poll is NOT gated this way:
+        # planLimitReached/planLimitCleared/plan_usage() hang off it.
+        import app.claude_usage as _cu
+        real_claude = _cu.fetch
+        _cu.fetch = lambda *a, **k: _cu.Usage(error="no-data")
+        try:
+            win2 = create_main_window(SessionStore(path=tmp / "off.json"))
+            win2._on_usage_tracker_toggled("gemini_five_hour", False)
+            win2._on_usage_tracker_toggled("gemini_weekly", False)
+            calls.clear()
+            win2.start_usage_polling()
+            check("gemini-usage: both trackers off means the poll never arms",
+                  not win2._gemini_usage_timer.isActive() and calls == [],
+                  len(calls))
+            check("gemini-usage: ...but the Claude poll keeps running",
+                  win2._usage_timer.isActive())
+            win2._on_usage_tracker_toggled("gemini_weekly", True)
+            check("gemini-usage: re-enabling arms the timer and fetches at once",
+                  win2._gemini_usage_timer.isActive() and len(calls) == 1,
+                  len(calls))
+            check("gemini-usage: a re-enabled pill shows loading, not a gap",
+                  win2.top_bar.gemini_weekly_badge.has_content())
+            win2.close()
+
+            # ...and a window that never opted in must not shell out even when
+            # a tracker is switched on at runtime
+            win3 = create_main_window(SessionStore(path=tmp / "noopt.json"))
+            win3._on_usage_tracker_toggled("gemini_five_hour", False)
+            calls.clear()
+            win3._on_usage_tracker_toggled("gemini_five_hour", True)
+            check("gemini-usage: a window that never opted in never fetches",
+                  calls == [] and not win3._gemini_usage_timer.isActive(),
+                  len(calls))
+            win3.close()
+        finally:
+            _cu.fetch = real_claude
     finally:
         gemini_usage.fetch = real
 
@@ -10362,6 +10574,7 @@ def main():
     test_sidebar_file_tree()
     test_sidebar_search()
     test_plan_usage()
+    test_usage_trackers_preference()
     test_taskbar_badge()
     test_bg_shell_taskbar_state()
     test_limit_ledger()
@@ -10376,7 +10589,7 @@ def main():
     test_projection_happens_once()
     test_recovered_prompts_are_cached()
     test_multi_agent_session_isolation()
-    test_gemini_usage_badge_fixed_width()
+    test_usage_pill_geometry_and_close()
     test_scheduled_send()
     test_cli_auto_update()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
@@ -10384,62 +10597,142 @@ def main():
     return 1 if FAIL else 0
 
 
-def test_gemini_usage_badge_fixed_width():
-    """GeminiUsageBadge maintains a stable, non-jittering 315px fixed width that
-    comfortably accommodates max length rate-limit text without truncation."""
-    import json
+def test_usage_pill_geometry_and_close():
+    """Every usage pill is sized by ONE formula, and carries a hover X.
+
+    The Gemini pills used to be pinned to a hardcoded 315px and elide into it,
+    which reserved 630px of the bar for two readouts whose real content is
+    ~215px, truncated anything longer, and disagreed with the Claude pill
+    sitting immediately beside them. Width is now the text's width, measured
+    identically for every pill, which is what these checks pin down.
+
+    The X is a child button rather than a rect hit-tested in mousePressEvent,
+    so closing can never be mistaken for the click-to-refresh affordance - and
+    its width is reserved even while it is hidden, because growing the pill on
+    hover would shove the whole right-hand cluster of the bar sideways.
+    """
     import os
     import tempfile
     from PySide6.QtWidgets import QApplication
-    from PySide6.QtGui import QColor
+    from PySide6.QtGui import QColor, QFontMetrics
     from app.widgets.gemini_usage_badge import GeminiUsageBadge
+    from app.widgets.ornaments import PlanUsageBadge, UsagePillBadge
     from app import gemini_usage
 
     QApplication.instance() or QApplication([])
     badge = GeminiUsageBadge(window="five_hour")
     weekly_badge = GeminiUsageBadge(window="weekly")
 
-    # Before usage set
-    check("gemini-badge: has_content returns False before usage", badge.has_content() is False)
+    check("usage-pill: no content before a reading arrives",
+          badge.has_content() is False)
+    check("usage-pill: the loading state IS content, so the bar is never blank",
+          (badge.mark_loading(), badge.has_content() is True)[-1])
+    check("usage-pill: the loading line names its own tracker",
+          "5h" in badge._text and "reading" in badge._text
+          and "7d" in (weekly_badge.mark_loading(), weekly_badge._text)[-1])
+    check("usage-pill: the loading pill paints with no number to draw",
+          not badge.grab().isNull())
 
-    lim_five_hour = gemini_usage.GeminiLimit(key="five_hour", label="Five Hour Limit (5h)", short="5h", percent=13.0, resets_at=time.time() + 3600.0)
-    lim_weekly = gemini_usage.GeminiLimit(key="seven_day", label="Weekly Limit (all models)", short="7d", percent=2.5, resets_at=time.time() + 86400.0)
+    lim_five_hour = gemini_usage.GeminiLimit(
+        key="five_hour", label="Five Hour Limit (5h)", short="5h",
+        percent=13.0, resets_at=time.time() + 3600.0)
+    lim_weekly = gemini_usage.GeminiLimit(
+        key="seven_day", label="Weekly Limit (all models)", short="7d",
+        percent=2.5, resets_at=time.time() + 86400.0)
 
     reading = gemini_usage.GeminiUsage(limits=(lim_five_hour, lim_weekly))
     badge.set_usage(reading)
     weekly_badge.set_usage(reading)
 
-    check("gemini-badge: 5h badge shows 5h limit text", "5h Gemini 13%" in badge._text)
-    check("gemini-badge: weekly badge shows 7d limit text", "7d Gemini 2%" in weekly_badge._text)
-    check("gemini-badge: both badges maintain stable 315px fixed width", badge.width() == 315 and weekly_badge.width() == 315)
-    check("gemini-badge: has_content returns True when usage present", badge.has_content() is True)
+    check("usage-pill: 5h badge shows the 5h limit text",
+          "5h Gemini 13%" in badge._text)
+    check("usage-pill: weekly badge shows the 7d limit text",
+          "7d Gemini 2%" in weekly_badge._text)
+    check("usage-pill: has_content is True once a reading is in",
+          badge.has_content() is True)
 
-    # Test _color evaluation (verifying _AMBER and _RED attributes exist)
+    # the formula, and that BOTH classes use the same one
+    def want(cls, text):
+        fm = QFontMetrics(cls._text_font())
+        return (cls._PAD * 2 + cls._RING + cls._GAP
+                + fm.horizontalAdvance(text)
+                + cls._CLOSE_GAP + cls._CLOSE_W)
+
+    check("usage-pill: width is ring + pads + text + the reserved X",
+          badge.width() == want(GeminiUsageBadge, badge._text))
+    check("usage-pill: Claude and Gemini measure an identical string alike",
+          PlanUsageBadge._measure_width("21% used, resets in 1h20m at 14:49")
+          == GeminiUsageBadge._measure_width(
+              "21% used, resets in 1h20m at 14:49"))
+    check("usage-pill: the fixed 315px width is gone",
+          not hasattr(GeminiUsageBadge, "_FIXED_WIDTH")
+          and badge.width() != weekly_badge.width())
+    check("usage-pill: the text can never reach the X",
+          badge.width() - (badge._PAD + badge._RING + badge._GAP)
+          - badge._PAD - badge._CLOSE_W - badge._CLOSE_GAP
+          >= QFontMetrics(GeminiUsageBadge._text_font()).horizontalAdvance(
+              badge._text))
+
+    # the hover X (isVisibleTo, not isVisible: these badges are never shown,
+    # so a real isVisible() would be False either way and prove nothing)
+    check("usage-pill: the X is hidden until the pill is hovered",
+          not badge.close_btn.isVisibleTo(badge))
+    w_before = badge.width()
+    badge.enterEvent(None)
+    check("usage-pill: hovering reveals the X",
+          badge.close_btn.isVisibleTo(badge))
+    check("usage-pill: hovering does NOT change the width",
+          badge.width() == w_before)
+    badge.leaveEvent(None)
+    check("usage-pill: leaving hides the X again",
+          not badge.close_btn.isVisibleTo(badge))
+
+    closed, refreshed = [], []
+    badge.closeRequested.connect(lambda: closed.append(1))
+    badge.refreshRequested.connect(lambda: refreshed.append(1))
+    badge.close_btn.click()
+    check("usage-pill: the X closes, and does NOT trigger a refresh",
+          closed == [1] and refreshed == [])
+
     col = badge._color()
-    check("gemini-badge: _color returns QColor without raising AttributeError", isinstance(col, QColor))
+    check("usage-pill: _color returns a QColor for a live reading",
+          isinstance(col, QColor))
 
-    # Test disk cache reading & expired reset auto-zeroing
+    # a can't-read pill is content too, on the Gemini side as well as Claude's
+    blank = GeminiUsageBadge(window="five_hour")
+    blank.mark_unreadable("no-data")
+    check("usage-pill: an unreadable Gemini pill says so and offers a refresh",
+          blank.has_content() and not blank.has_reading()
+          and "click to refresh" in blank._text
+          and not blank.grab().isNull())
+    blank.deleteLater()
+
+    check("usage-pill: the shared base owns the geometry",
+          issubclass(GeminiUsageBadge, UsagePillBadge)
+          and issubclass(PlanUsageBadge, UsagePillBadge))
+
+    # THE DISK CACHE IS GONE. A stored number goes stale exactly where it
+    # matters most (a 5-hour window is routinely spent and reopened between
+    # launches), and nothing on the bar tells a restored figure from a live one.
+    check("gemini-usage: the disk cache is removed entirely",
+          not hasattr(gemini_usage, "read_cached")
+          and not hasattr(gemini_usage, "write_cached")
+          and not hasattr(gemini_usage, "cache_path"))
+
+    real_cli = gemini_usage.fetch_cli
     with tempfile.TemporaryDirectory() as tmpdir:
         old_env = os.environ.get("GEMINI_CONFIG_DIR")
         try:
             os.environ["GEMINI_CONFIG_DIR"] = tmpdir
-            cache_file = Path(tmpdir) / "gemini_usage_cache.json"
-            cache_file.write_text(json.dumps({
-                "fetchedAtMs": int(time.time() * 1000),
-                "utilization": {
-                    "five_hour": {"utilization": 45.0, "resets_at": time.time() + 1800},
-                    "seven_day": {"utilization": 80.0, "resets_at": time.time() - 100}  # expired reset
-                }
-            }), encoding="utf-8")
-
-            cached = gemini_usage.read_cached()
-            check("gemini-usage: read_cached reads utilization from disk file", cached is not None and len(cached.limits) == 2)
-            if cached:
-                fh = next(l for l in cached.limits if l.key == "five_hour")
-                sd = next(l for l in cached.limits if l.key == "seven_day")
-                check("gemini-usage: active limit maintains percentage", fh.percent == 45.0)
-                check("gemini-usage: expired limit resets percentage to 0.0", sd.percent == 0.0)
+            gemini_usage.fetch_cli = lambda *a, **k: None
+            failed = gemini_usage.fetch()
+            check("gemini-usage: a failed CLI read reports no-data, never raises",
+                  failed.error == "no-data" and failed.limits == ()
+                  and not failed.ok)
+            check("gemini-usage: a fetch writes nothing to disk",
+                  list(Path(tmpdir).iterdir()) == [])
         finally:
+            gemini_usage.fetch_cli = real_cli
             if old_env is None:
                 os.environ.pop("GEMINI_CONFIG_DIR", None)
             else:
