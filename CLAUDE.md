@@ -501,17 +501,26 @@ this file is the invariants that must survive every change.
   failed path query, or a listing that sees fewer than `tasklist` did all mean
   "assume it is ours" — because over-counting costs a skipped update that the
   pill reports, while under-counting runs an installer against a locked file,
-  which is the false database record this whole module exists to prevent. The two CLIs
-  diverge in exactly one structural way and it must not be flattened: Claude is
-  a winget package so check and install are separate acts, while `agy`
-  self-updates and NEITHER `agy update` nor `claude update` takes any flag, so
+  which is the false database record this whole module exists to prevent. The two SHAPES
+  of target diverge in exactly one structural way and it must not be flattened:
+  a winget package is checked and installed as separate acts, while a
+  self-updating CLI takes NO flags on `agy update`/`claude update`, so
   there is NO dry run and for a `self_update` target checking IS installing
   (`needs_apply` returns True unconditionally, and an unchanged version after a
   clean self-update reads UP_TO_DATE, not the REPORTED_BUT_UNCHANGED the same
-  reading means for winget). Claude deliberately stays on winget: `claude
-  update` installs a NATIVE build to a different location and
-  `providers.resolve_claude()` has a hardcoded WinGet-Packages fallback, so a
-  migration could leave AI Hive silently launching the stale copy. Budgets are
+  reading means for winget). WHICH SHAPE CLAUDE TAKES IS NOW READ OFF THE
+  INSTALL, not hardcoded (`_claude_target`, decided by
+  `cli_install.classify_install` on the PATH, because the binary, the version
+  string and the process name are identical across install methods): a WinGet
+  package keeps the winget shape, a NATIVE install is `self_update`. The old
+  note here said Claude deliberately stays on winget because `claude update`
+  installs a native build elsewhere and `resolve_claude()` would then launch the
+  stale copy. That risk is now HANDLED rather than avoided (`resolve_claude()`
+  checks `%USERPROFILE%\.local\bin\claude.exe` FIRST, see the native-migration
+  invariant below), so the same build serves either machine and rolling the
+  migration back needs no code revert. One real consequence: `Status.DB_STALE`
+  is structurally UNREACHABLE for Claude on a native install, since there is no
+  package database to go stale. Budgets are
   SPLIT and that is deliberate: the check is bounded (`CHECK_TIMEOUT_S`) and
   fails OPEN to launch (`TIMEOUT`, no pill — a hung network must never cost the
   user the app), while the install is NEVER killed on a timer, because a
@@ -536,6 +545,115 @@ this file is the invariants that must survive every change.
   patch-versus-minor gate: nothing in the numbering predicts whether a flag
   moved, so a version gate buys false safety while an audit line turns "it broke
   this morning" into a lookup.
+- **Letting Claude Code update ITSELF is a MIGRATION, not a preference**
+  (`app/cli_install.py`, Qt-free/stdlib-only like `cli_update.py`;
+  `app/widgets/update_panel.py` shows it; `MainWindow.open_updates_panel` /
+  `arm_cli_install` wire it). A package-manager install does not auto-update and
+  NO SETTING FIXES THAT — Claude Code knows a package manager owns its file and
+  refuses to replace it (the documented tell: `claude update` on such an install
+  replies "Claude is up to date!" regardless of the actual version). The install
+  method IS the behaviour, so the only way to change the behaviour is to change
+  the install. Hence a consented, reversible switch onto the documented native
+  installer (`irm https://claude.ai/install.ps1 | iex`), which writes to
+  `%USERPROFILE%\.local\`, needs no Administrator rights, and therefore NEVER
+  touches the running winget file — **the migration is lock-free and may run
+  with every agent alive**, which is the structural advantage over the startup
+  gate above. Only CLEANUP keeps the old constraint (`winget uninstall` cannot
+  remove a package whose `.exe` is running), so cleanup is SEPARATE, OPTIONAL
+  and DEFERRABLE and never blocks the win. Rules, each from a concrete failure:
+  * **THE CONTROL IS NEVER A BOOLEAN.** Label, modal and action are all a
+    function of the detected `Situation` (`MANAGED` / `SELF_ACTIVE` /
+    `SELF_PAUSED` / `NOT_APPLICABLE` / `LOCKED_BY_POLICY` / `MISSING`), so a
+    user is never offered an action that does not apply. `SELF_ACTIVE` ⇄
+    `SELF_PAUSED` is the PRIMARY undo (one `env` key, instant, no download,
+    freezes them on exactly this version); the full revert to winget is
+    deliberately SECONDARY, because conflating the two undos in one click is how
+    a user who wanted to pause ends up reinstalling.
+  * **`resolve_claude()` CHECKS THE NATIVE LAUNCHER FIRST**, and this is the
+    most likely way to ship the whole feature broken. MEASURED: the winget
+    package directory is on PATH DIRECTLY (not via a Links shim) and
+    `%USERPROFILE%\.local\bin` is NOT on PATH, so `shutil.which` would keep
+    answering with the STALE copy after a migration and AI Hive would go on
+    launching the old binary. Deliberate consequence worth keeping: AI Hive
+    never needs the installer's PATH edit, so no new terminal is required.
+  * **...AND THAT IS NOT ENOUGH ON ITS OWN.** `build_spec` bakes `spec.program`
+    once, so a card that existed BEFORE the migration would relaunch the winget
+    binary for the rest of the process. `MainWindow.rebind_claude_specs` re-runs
+    `providers.build_invocation` for every live Claude spec (the precedent is
+    `AgentSpec.set_permission_mode`, which rebuilds `args` for exactly this
+    reason). It must NOT restart/stop a RUNNING agent (the new path applies at
+    its next launch, which is what lock-free bought us), must NOT emit `dirty`
+    (`program`/`args` are derived; `to_dict` stores `user_program`), and is
+    idempotent.
+  * **A CHANNEL IS NEVER WRITTEN WITHOUT ITS FLOOR.** `stable` is a channel, not
+    a ceiling, so setting it on a machine AHEAD of stable lets the next update
+    move the user BACKWARDS — i.e. straight back into the stale-alias failure
+    this feature exists to end. `set_channel` mirrors `/config`: to `stable` it
+    writes `autoUpdatesChannel` AND `minimumVersion` = the version read off the
+    FILE right then, and REFUSES (`ok=False`, writes nothing) when that version
+    is unparseable; back to `latest` it REMOVES `minimumVersion` so the pin
+    cannot outlive its reason. `requiredMinimumVersion` is a different key that
+    stops Claude Code STARTING at all and is never written.
+  * **`~/.claude/settings.json` HAS OTHER WRITERS AND THEY ARE OURS.** Every
+    running agent's `/model` and `/config` writes it. `write_settings` therefore
+    takes a MUTATION, not a finished document, and RE-READS immediately before
+    the replace — atomicity stops a torn file, it does nothing about a LOST
+    UPDATE, and the panel can sit open for a minute between the two. Same rule
+    `session.json` follows, and for the same reason. A file that does not parse
+    is REFUSED and never "repaired", including on the re-read.
+  * **CLEANUP COUNTS AGAINST THE RECORDED WINGET PATH, NEVER
+    `resolve_claude()`.** By cleanup time that function answers with the NATIVE
+    launcher, so counting against it asks a question nobody asked: the user's
+    own winget-launched sessions do not match, the count comes back zero, and
+    `winget uninstall` runs against a file those sessions hold. That is
+    under-counting, the direction `count_processes` documents as unsafe, and
+    here it is unsafe twice (it either poisons the package database again or
+    removes the rollback out from under a live session). A live CLI blocks and
+    is NEVER killed.
+  * `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=1` IS NOT SUPPORTED ANYWHERE. It
+    makes a RUNNING Claude Code invoke `winget upgrade` on itself, the exact act
+    that writes the false database record `cli_update.py` exists to prevent.
+  * Everything here is DERIVED and TRANSIENT: the state is re-read from the
+    filesystem and `~/.claude/settings.json` on every look, never stored (a
+    remembered install method is wrong the moment the user installs anything by
+    hand). NOTHING new goes in `session.json`; the only persisted key is still
+    `ui.auto_update`, no `SESSION_VERSION` bump. The runner is INJECTED and
+    armed from `main.py` alone (`arm_cli_install`), the same opt-in rule as
+    `start_usage_polling()`. Outcomes are audited to `session.log`
+    (`CLI-MIGRATE-STATE`/`-START`/`-OK`/`-FAIL`/`-REBIND`/`-PAUSE`/`-RESUME`/
+    `-CHANNEL`/`-REVERT`/`-CLEANUP`); `REBIND` and the `exe=` on `CLEANUP` name
+    the thing the line is ABOUT rather than what the app happened to resolve,
+    because a cleanup reporting the native path is a cleanup that counted the
+    wrong file.
+  * The startup gate above is DEMOTED, not deleted. After a migration it no
+    longer keeps the user current; it guarantees a downloaded update has LANDED
+    before agents launch rather than "the next time you start Claude Code". It
+    stays fully load-bearing for `agy`, which has no auto-updater and no native
+    option, and remains the single enforcement point for: the binary changes
+    only when nothing is holding it.
+  * VERIFIED, by READING `https://claude.ai/install.ps1` rather than running it
+    (111 lines, inspected 2026-08-11): it contains NO interactive construct at
+    all (no `Read-Host`, `PromptForChoice`, `$Host.UI`, `-Confirm`,
+    `Get-Credential` or console read), so it cannot park the install thread on a
+    prompt with stdin closed. It resolves `latest`, refuses a version string
+    that is not `N.N.N` (an HTML error page), downloads the platform binary,
+    verifies its SHA256 against the SIGNED `manifest.json`, then shells to
+    `<downloaded>.exe install`; every failure path is `Write-Error` + a non-zero
+    exit, which `migrate` reads off the FILE anyway. `subprocess_runner` still
+    passes `stdin=DEVNULL`, and the panel's Close remains the escape hatch.
+  * STILL UNVERIFIED, and only answerable on a machine that has migrated: is the
+    Windows native launcher a stub or the whole binary? The docs describe the
+    launcher-into-`versions/` symlink indirection for macOS and Linux
+    EXPLICITLY and say nothing equivalent for Windows, and the installer above
+    delegates that step to `claude install` so the script does not settle it
+    either. Run
+    `(Get-Item "$env:USERPROFILE\.local\bin\claude.exe").Length` and
+    `Get-ChildItem "$env:USERPROFILE\.local\share\claude\versions\"` right after
+    the first migration and record the answer here. Hundreds of MB (the winget
+    binary is MEASURED at 284,981,920 bytes) means the launcher IS the binary, a
+    background update cannot replace it while agents run, and the startup gate
+    stays load-bearing; a few KB with the bulk under `versions\` means updates
+    apply side by side.
 - **Plan usage is a LIVE READOUT and a HOOK POINT, never history**
   (`app/claude_usage.py`, Qt-free/stdlib-only like `chime.py`). The number comes
   from `GET /api/oauth/usage` with the account's OAuth bearer token — the same

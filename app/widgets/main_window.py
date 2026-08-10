@@ -226,6 +226,9 @@ class TopBar(QFrame):
     # install newer Claude Code / agy CLIs at the NEXT startup, before any
     # agent launches (the only moment those binaries are not locked)
     autoUpdateToggled = Signal(bool)
+    # the down-arrow button: open the Updates panel (the install-method control
+    # and the startup-check checkbox live there, so the bar gains no button)
+    updatesPanelRequested = Signal()
     autoContinueToggled = Signal(bool)     # resume cut-off agents at the reset
     startupRecoveryToggled = Signal(bool)  # recover cut-off agents on startup
     usageRefreshRequested = Signal()       # user clicked the readout
@@ -301,6 +304,7 @@ class TopBar(QFrame):
         # treatment, so the top bar has one visual language for "will AI Hive
         # do this by itself?".
         self._auto_update = False
+        self._install_state = ""
         self.auto_update_btn = QToolButton(self)
         self.auto_update_btn.setObjectName("RecoveryToggle")
         self.auto_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -449,8 +453,18 @@ class TopBar(QFrame):
             "Click to turn on.")
 
     def _on_auto_update_clicked(self) -> None:
-        self.set_auto_update(not self._auto_update)
-        self.autoUpdateToggled.emit(self._auto_update)
+        """The down-arrow now OPENS the Updates panel instead of toggling.
+
+        Deliberately the same button rather than a new one: the top bar's
+        minimum width is already 2101px, letting Claude Code update itself is a
+        one-time setup action that does not earn a permanent slot, and two
+        adjacent update controls meaning different things is worse than either.
+        The startup-gate preference this button used to carry is a checkbox
+        inside the panel, still routed through `autoUpdateToggled`, so nothing
+        downstream changed. `_refresh_auto_update_btn` puts the checked state
+        back, since a checkable button flips itself on click."""
+        self._refresh_auto_update_btn()
+        self.updatesPanelRequested.emit()
 
     def set_auto_update(self, on: bool) -> None:
         """Reflect the CLI auto-update preference (no signal emitted)."""
@@ -460,24 +474,35 @@ class TopBar(QFrame):
     def auto_update(self) -> bool:
         return self._auto_update
 
+    def note_install_state(self, text: str) -> None:
+        """Name the detected Claude Code install state on the button, so the
+        answer is available without opening the panel."""
+        self._install_state = text or ""
+        self._refresh_auto_update_btn()
+
     def _refresh_auto_update_btn(self) -> None:
         self.auto_update_btn.setCheckable(True)
         self.auto_update_btn.setChecked(self._auto_update)
         led = "\U0001F7E2" if self._auto_update else "⚫"
         self.auto_update_btn.setText(f"{led} ⬇")
-        # both tooltips state plainly what arming this does, because it changes
-        # software on the user's machine rather than anything inside the app
+        # the tooltip states plainly what the armed switch does, because it
+        # changes software on the user's machine rather than anything inside
+        # the app, and names the detected install state so the panel is not the
+        # only way to learn it
+        state = getattr(self, "_install_state", "")
         self.auto_update_btn.setToolTip(
-            "Auto-update CLIs: ON. Next time AI Hive starts, it checks for a "
-            "newer Claude Code and Gemini (agy) CLI and installs it BEFORE any "
-            "agent launches, which is the only moment those files are not "
-            "locked.\nClick to turn off."
-            if self._auto_update else
-            "Auto-update CLIs: OFF. Startup is untouched, so you keep whatever "
-            "CLI version is installed and may keep seeing Claude's own 'update "
-            "available' banner. Turning this on lets AI Hive install CLI "
-            "updates at startup, which changes installed software on your "
-            "machine.\nClick to turn on.")
+            "Updates. " + (state + "\n" if state else "")
+            + ("Startup check: ON. Next time AI Hive starts, it checks for a "
+               "newer Claude Code and Gemini (agy) CLI and installs it BEFORE "
+               "any agent launches, which is the only moment those files are "
+               "not locked."
+               if self._auto_update else
+               "Startup check: OFF. Startup is untouched, so you keep whatever "
+               "CLI version is installed and may keep seeing Claude's own "
+               "'update available' banner. Turning it on lets AI Hive install "
+               "CLI updates at startup, which changes installed software on "
+               "your machine.")
+            + "\nClick to open the Updates panel.")
 
     def note_update_pending(self, text: str, tooltip: str = "") -> None:
         """Show (or hide, on an empty text) the last gate's report."""
@@ -1563,6 +1588,7 @@ class MainWindow(QMainWindow):
             self._on_terminal_scrollback)
         self.top_bar.taskbarBadgeToggled.connect(self._on_taskbar_badge_toggled)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
+        self.top_bar.updatesPanelRequested.connect(self.open_updates_panel)
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
         self.top_bar.startupRecoveryToggled.connect(self._on_startup_recovery)
         # resume whoever the limit cut off, the moment the window reopens
@@ -2829,6 +2855,114 @@ class MainWindow(QMainWindow):
         gate runs before the window exists."""
         self._auto_update = bool(enabled)
         self._schedule_save()
+
+    # ------------------------------------------------- the Updates panel ---
+    # The install-method control (`app/cli_install.py`). Everything here is
+    # DERIVED and TRANSIENT: nothing is added to `session.json`, no
+    # SESSION_VERSION bump, and none of it may `_touch`/`_schedule_save`. The
+    # only persisted key is still `ui.auto_update`, written by the checkbox
+    # inside the panel through the unchanged `_on_auto_update_toggled`.
+
+    def _cli_install_runner(self):
+        """The runner the panel acts through, or None.
+
+        OPT-IN exactly like `start_usage_polling()` and the startup gate: the
+        real subprocess runner is armed only from `main.py`, because the
+        offscreen suite shares `create_main_window` and must never install
+        software or rewrite the user's `~/.claude/settings.json`."""
+        return getattr(self, "_install_runner", None)
+
+    def arm_cli_install(self, runner=None) -> None:
+        """Let the Updates panel actually act. Called from `main.py` alone."""
+        from app import cli_update
+        self._install_runner = runner or cli_update.subprocess_runner
+
+    def claude_install_situation(self):
+        """Read the machine now. Never cached: a remembered install method is
+        wrong the moment the user installs something by hand."""
+        from app import cli_install, providers
+        return cli_install.detect(providers.resolve_claude(),
+                                  runner=self._cli_install_runner())
+
+    def refresh_install_state(self) -> None:
+        """Put the detected state on the down-arrow's tooltip, and audit it."""
+        from app import cli_install
+        try:
+            situation = self.claude_install_situation()
+        except Exception:  # noqa: BLE001 - a tooltip must never break a launch
+            return
+        self.top_bar.note_install_state(situation.detail)
+        self._audit_install(cli_install.state_line(situation))
+
+    def open_updates_panel(self) -> None:
+        from app import cli_install
+        from .update_panel import UpdatePanel
+
+        situation = self.claude_install_situation()
+        self.top_bar.note_install_state(situation.detail)
+        self._audit_install(cli_install.state_line(situation))
+        panel = UpdatePanel(situation, auto_update=self._auto_update,
+                            runner=self._cli_install_runner(),
+                            winget_exe=cli_install.winget_exe_path(),
+                            parent=self)
+        panel.autoUpdateToggled.connect(self.top_bar.set_auto_update)
+        panel.autoUpdateToggled.connect(self._on_auto_update_toggled)
+        panel.auditRequested.connect(self._audit_install)
+        panel.migrationApplied.connect(self.rebind_claude_specs)
+        panel.exec()
+        self.top_bar.note_install_state(panel.situation().detail)
+
+    def _audit_install(self, line: str) -> None:
+        store = getattr(self, "store", None)
+        if store is None:
+            return
+        try:
+            store.audit(line)
+        except Exception:  # noqa: BLE001 - forensics, never fatal
+            pass
+
+    def rebind_claude_specs(self) -> int:
+        """Repoint every LIVE Claude spec at whatever `resolve_claude()` now
+        answers, and audit how many moved.
+
+        `providers.resolve_claude()` learning to prefer the native launcher
+        fixes what that function ANSWERS; it does not touch a `spec.program`
+        already baked by `build_spec`. So without this pass, every card that
+        existed before a migration would go on relaunching the WinGet binary
+        for the rest of the process, and the migration would genuinely appear
+        to have done nothing. `AgentSpec.set_permission_mode` is the precedent
+        for the rebuild.
+
+        Three rules. It must NOT restart, stop or otherwise disturb a RUNNING
+        agent (the new path applies at that agent's next launch, which is what
+        the migration being lock-free bought us). It must NOT emit `dirty`:
+        `program`/`args` are derived and are not persisted at all (`to_dict`
+        stores `user_program`). And it is idempotent, so a second migration
+        attempt is harmless."""
+        from app import providers
+
+        moved, exe = 0, ""
+        for agent in self.manager.all_agents():
+            spec = getattr(agent, "spec", None)
+            if spec is None or spec.provider != "claude":
+                continue
+            program, args = providers.build_invocation(
+                spec.provider, model=spec.model, effort=spec.effort,
+                custom_command=spec.custom_command,
+                extra_args=list(spec.user_args),
+                permission_mode=spec.permission_mode)
+            if not program:
+                continue
+            if program == spec.program and list(args) == list(spec.args):
+                continue
+            spec.program, spec.args = program, list(args)
+            exe, moved = program, moved + 1
+        if moved:
+            from app import cli_install
+            self._audit_install(cli_install.audit_lines(
+                cli_install.Result(True, "rebind", before=str(moved),
+                                   after=exe))[0])
+        return moved
 
     def note_update_outcomes(self, outcomes, installing=()) -> None:
         """Report what the startup update gate did (called from `main.py`,

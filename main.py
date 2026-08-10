@@ -291,6 +291,11 @@ def main() -> int:
     # opt in to the plan-usage readout here, not in the factory: the smoke
     # suite shares create_main_window and must never hit the network
     window.start_usage_polling()
+    # ...and to the Updates panel being able to ACT. Same opt-in rule again:
+    # this one installs software and rewrites the user's own
+    # ~/.claude/settings.json, so the runner is armed here and nowhere else.
+    window.arm_cli_install()
+    window.refresh_install_state()
     if gate is not None:
         window.note_update_outcomes(gate.outcomes, gate.installing)
     window.show()

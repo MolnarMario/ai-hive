@@ -10592,6 +10592,7 @@ def main():
     test_usage_pill_geometry_and_close()
     test_scheduled_send()
     test_cli_auto_update()
+    test_cli_native_migration()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0
@@ -11108,13 +11109,24 @@ def test_cli_auto_update():
           "installs it BEFORE any agent launches" in on_tip
           and "changes installed software" in off_tip)
 
-    # --- the toggle: default OFF, one click, persisted ---------------------
+    # --- the toggle: default OFF, persisted, and now behind the panel ------
+    # The down-arrow OPENS the Updates panel rather than toggling: the top
+    # bar's minimum width is already 2101px and a one-time setup action does
+    # not earn a second button, so the preference is a checkbox inside. The
+    # signal that carries it is unchanged.
     check("cli-update toggle: defaults to OFF (it installs software)",
           not bar.auto_update() and not bar.auto_update_btn.isChecked())
-    emitted = []
+    emitted, opened = [], []
     bar.autoUpdateToggled.connect(emitted.append)
+    bar.updatesPanelRequested.connect(lambda: opened.append(True))
     bar.auto_update_btn.click()
-    check("cli-update toggle: a click arms it and emits True",
+    check("cli-update toggle: the button opens the Updates panel and changes "
+          "nothing by itself",
+          opened == [True] and emitted == [] and not bar.auto_update()
+          and not bar.auto_update_btn.isChecked())
+    bar.autoUpdateToggled.emit(True)      # what the panel's checkbox emits
+    bar.set_auto_update(True)
+    check("cli-update toggle: the preference still travels on autoUpdateToggled",
           emitted == [True] and bar.auto_update())
     bar.set_auto_update(False)
     check("cli-update toggle: set_auto_update does not re-emit",
@@ -11265,6 +11277,592 @@ def test_cli_auto_update():
           splash._spin.state() != splash._spin.State.Running)
     splash.close()
     splash.deleteLater()
+
+
+class _FakeInstall:
+    """A recording `Runner` for the install-method control.
+
+    Same rule as `_FakeCli`: no check below shells out, installs anything, or
+    touches the user's real `~/.claude/settings.json`. `versions` maps a
+    canonical exe path to what `--version` prints; `lands` is merged in when the
+    installer runs, which is how "the installer reported success but the file
+    did not change" is expressed."""
+
+    def __init__(self, versions=None, lands=None, install=(0, "installed"),
+                 alive=0, paths=None, winget=(0, "")):
+        from app.cli_update import _canonical
+        self.calls = []
+        self._canon = _canonical
+        self.versions = {_canonical(k): v for k, v in (versions or {}).items()}
+        self.lands = {_canonical(k): v for k, v in (lands or {}).items()}
+        self.install = install
+        self.alive = alive
+        self.paths = paths
+        self.winget = winget
+
+    def argvs(self):
+        return [list(a) for a in self.calls]
+
+    def mutating(self):
+        """Every argv that could change installed software."""
+        return [a for a in self.argvs()
+                if any(t in " ".join(a).lower()
+                       for t in ("install", "uninstall", "upgrade", "irm "))]
+
+    def __call__(self, argv, timeout=0):
+        argv = list(argv)
+        self.calls.append(argv)
+        joined = " ".join(argv)
+        if argv[0] == "tasklist":
+            name = argv[2].split()[-1]
+            body = "\n".join(f"{name}   {1000 + i} Console  1  285,000 K"
+                             for i in range(max(0, self.alive)))
+            return 0, body or "INFO: No tasks are running"
+        if argv[0] == "powershell" and "Get-CimInstance" in joined:
+            lines = self.paths if self.paths is not None else []
+            return 0, "\n".join(lines)
+        if argv[0] == "powershell":            # the documented installer
+            self.versions.update(self.lands)
+            return self.install
+        if argv[-1] == "--version":
+            found = self.versions.get(self._canon(argv[0]), "")
+            return (0, found) if found else (1, "not found")
+        if argv[0] == "winget":
+            return self.winget
+        return 0, ""
+
+
+def test_cli_native_migration():
+    """The consented switch onto the self-updating native install.
+
+    Root cause it exists for: a package-manager Claude Code does not update
+    itself and no setting fixes that, while model aliases resolve CLIENT-SIDE
+    from a table baked into the installed binary, so a stale file silently
+    cannot launch newer models. The install method IS the behaviour, hence a
+    migration rather than a preference.
+
+    Everything is driven through injected runners and temporary directories:
+    no check installs anything, shells out, or touches the real settings file.
+    """
+    import json as _json
+    import threading
+    from PySide6.QtWidgets import QApplication
+    from app import cli_install, cli_update, providers
+    from app.cli_install import InstallKind, UpdateState
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.widgets.update_panel import ConsentDialog, UpdatePanel
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-migrate-"))
+    winget_exe = str(tmp / "Microsoft" / "WinGet" / "Packages"
+                     / "Anthropic.ClaudeCode_x" / "claude.exe")
+    native_exe = str(tmp / "home" / ".local" / "bin" / "claude.exe")
+
+    # --- 1. classify_install: the PATH is the only thing that tells the two
+    # installs apart (identical binary, version string and process name) ------
+    check("cli-install: a WinGet-Packages path classifies as WINGET",
+          cli_install.classify_install(
+              r"C:\Users\x\AppData\Local\Microsoft\WinGet\Packages"
+              r"\Anthropic.ClaudeCode_y\claude.exe") is InstallKind.WINGET)
+    check("cli-install: a .local\\bin path classifies as NATIVE",
+          cli_install.classify_install(r"C:\Users\x\.local\bin\claude.exe")
+          is InstallKind.NATIVE)
+    check("cli-install: an npm global path classifies as NPM",
+          cli_install.classify_install(r"C:\Users\x\AppData\Roaming\npm\claude.cmd")
+          is InstallKind.NPM
+          and cli_install.classify_install(
+              r"C:\x\node_modules\.bin\claude.exe") is InstallKind.NPM)
+    check("cli-install: no binary at all is MISSING",
+          cli_install.classify_install("") is InstallKind.MISSING
+          and cli_install.classify_install("claude.exe") is InstallKind.MISSING)
+    # case and symlink: winget also installs a Links shim, so a plain string
+    # compare would read the user's own session as somebody else's program
+    real = tmp / "packages" / "Microsoft" / "WinGet" / "Packages" / "A_x"
+    real.mkdir(parents=True, exist_ok=True)
+    (real / "claude.exe").write_text("x", encoding="utf-8")
+    check("cli-install: classification ignores case",
+          cli_install.classify_install(
+              str(real / "claude.exe").upper()) is InstallKind.WINGET)
+    link = tmp / "Links" / "claude.exe"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    linked = True
+    try:
+        os.symlink(real / "claude.exe", link)
+    except (OSError, NotImplementedError, AttributeError):
+        linked = False       # unprivileged Windows cannot create a symlink
+    check("cli-install: a symlink shim resolves to its target's install kind",
+          (not linked) or cli_install.classify_install(str(link))
+          is InstallKind.WINGET)
+
+    # --- 2. detect: one state per machine, and never a boolean --------------
+    settings = tmp / "settings.json"
+    settings.write_text(_json.dumps({"model": "opus", "permissions": {"a": 1}}),
+                        encoding="utf-8")
+
+    def situation(exe, policies=()):
+        return cli_install.detect(exe, str(settings), policies=list(policies))
+
+    got = situation(winget_exe)
+    check("cli-install: a winget install with no policy offers the migration",
+          got.state is UpdateState.MANAGED and got.actionable(), got)
+    got = situation(native_exe)
+    check("cli-install: a native install with no disabling key is SELF_ACTIVE",
+          got.state is UpdateState.SELF_ACTIVE and got.paused_key == "", got)
+    settings.write_text(_json.dumps(
+        {"model": "opus", "env": {"DISABLE_AUTOUPDATER": "1"}}),
+        encoding="utf-8")
+    got = situation(native_exe)
+    check("cli-install: DISABLE_AUTOUPDATER reads as SELF_PAUSED, and the key "
+          "is named",
+          got.state is UpdateState.SELF_PAUSED
+          and got.paused_key == "DISABLE_AUTOUPDATER", got)
+    settings.write_text(_json.dumps({"env": {"DISABLE_UPDATES": "1"}}),
+                        encoding="utf-8")
+    check("cli-install: DISABLE_UPDATES also reads as SELF_PAUSED",
+          situation(native_exe).state is UpdateState.SELF_PAUSED
+          and situation(native_exe).paused_key == "DISABLE_UPDATES")
+    settings.write_text(_json.dumps({}), encoding="utf-8")
+    got = situation(r"C:\Users\x\AppData\Roaming\npm\claude.cmd")
+    check("cli-install: an npm install already auto-updates, so nothing is "
+          "offered",
+          got.state is UpdateState.NOT_APPLICABLE and not got.actionable(), got)
+    got = situation(native_exe, policies=[{"autoUpdatesChannel": "stable"}])
+    check("cli-install: managed settings enforcing updates lock the control, "
+          "with the reason shown",
+          got.state is UpdateState.LOCKED_BY_POLICY and not got.actionable()
+          and "managed settings" in got.detail, got)
+    check("cli-install: a policy pinning the env key locks it too",
+          situation(native_exe,
+                    policies=[{"env": {"DISABLE_UPDATES": "1"}}]).state
+          is UpdateState.LOCKED_BY_POLICY)
+    check("cli-install: the managed path read is the documented one, not a "
+          "guess",
+          cli_install.managed_settings_path().endswith(
+              os.path.join("ClaudeCode", "managed-settings.json")),
+          cli_install.managed_settings_path())
+
+    # --- 3. the installer line is the documented one, and only that ---------
+    argv = cli_install.install_argv()
+    check("cli-install: the installer is Anthropic's documented one",
+          argv[0] == "powershell" and "irm https://claude.ai/install.ps1 | iex"
+          in " ".join(argv), argv)
+    check("cli-install: ...and it never runs winget",
+          "winget" not in " ".join(argv).lower(), argv)
+    # CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE is deliberately unsupported: it
+    # makes a RUNNING Claude Code invoke `winget upgrade` on itself, which is
+    # the exact act that writes the false winget database record cli_update.py
+    # exists to prevent. It is named in the module docstring as a decision and
+    # must never become code, so this asserts the module sets no env at all.
+    module_src = Path("app/cli_install.py").read_text(encoding="utf-8")
+    panel_src = Path("app/widgets/update_panel.py").read_text(encoding="utf-8")
+    check("cli-install: no code path ever sets an environment variable, so "
+          "CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE can never be turned on",
+          "os.environ[" not in module_src and "putenv" not in module_src
+          and "CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE" not in panel_src)
+
+    # --- 4. migrate decides success by RE-READING THE FILE ------------------
+    runner = _FakeInstall(lands={native_exe: "2.1.231 (Claude Code)"})
+    out = cli_install.migrate(runner, launcher=native_exe, before="2.1.224")
+    check("cli-install: a migration whose file really moved is ok",
+          out.ok and out.after == "2.1.231", out)
+    check("cli-install: the transition is audited",
+          cli_install.audit_lines(out) == ["CLI-MIGRATE-OK 2.1.224 -> 2.1.231"],
+          cli_install.audit_lines(out))
+    runner = _FakeInstall()          # installer says rc 0, nothing landed
+    out = cli_install.migrate(runner, launcher=native_exe, before="2.1.224")
+    check("cli-install: an installer that reports success while the file did "
+          "not change is a FAILURE",
+          not out.ok and not out.after, out)
+    check("cli-install: ...and the failure is audited, not the success",
+          cli_install.audit_lines(out)[0].startswith("CLI-MIGRATE-FAIL"))
+    runner = _FakeInstall(lands={native_exe: "2.1.200"})
+    out = cli_install.migrate(runner, launcher=native_exe, before="2.1.224")
+    check("cli-install: a native build OLDER than the one you had is refused",
+          not out.ok and "older" in out.detail, out)
+    slow = _FakeInstall(install=(cli_update.RC_TIMEOUT, ""))
+    out = cli_install.migrate(slow, launcher=native_exe, before="2.1.224")
+    check("cli-install: an installer that never finished claims no version",
+          not out.ok and out.after == "" and out.before == "2.1.224", out)
+
+    # --- 5. resolve_claude prefers the NATIVE launcher (the §4.1 trap) ------
+    # MEASURED: the winget package directory is on PATH directly, and
+    # %USERPROFILE%\.local\bin is not, so `shutil.which` would keep answering
+    # with the stale copy and the migration would appear to do nothing.
+    home = tmp / "home"
+    (home / ".local" / "bin").mkdir(parents=True, exist_ok=True)
+    Path(native_exe).write_text("native", encoding="utf-8")
+    real_which, real_home = providers.shutil.which, os.environ.get("USERPROFILE")
+    try:
+        providers.shutil.which = lambda name: winget_exe
+        os.environ["USERPROFILE"] = str(home)
+        check("cli-install: resolve_claude prefers the native launcher even "
+              "when PATH would answer with the winget copy",
+              cli_update._canonical(providers.resolve_claude())
+              == cli_update._canonical(native_exe),
+              providers.resolve_claude())
+        os.environ["USERPROFILE"] = str(tmp / "nowhere")
+        check("cli-install: ...and falls back to PATH when there is no native "
+              "install",
+              providers.resolve_claude() == winget_exe)
+    finally:
+        providers.shutil.which = real_which
+        if real_home is None:
+            os.environ.pop("USERPROFILE", None)
+        else:
+            os.environ["USERPROFILE"] = real_home
+
+    # --- 6. the settings file: other writers, and they are OURS -------------
+    doc = {"model": "opus", "effortLevel": "high",
+           "hooks": {"Stop": [{"x": 1}]}, "somethingWeNeverHeardOf": [1, 2]}
+    settings.write_text(_json.dumps(doc, indent=2), encoding="utf-8")
+    out = cli_install.set_paused(str(settings), True)
+    after = _json.loads(settings.read_text(encoding="utf-8"))
+    check("cli-install: pausing writes exactly one key and preserves every "
+          "other, including unknown ones",
+          out.ok and after["env"] == {"DISABLE_AUTOUPDATER": "1"}
+          and {k: after[k] for k in doc} == doc, after)
+    check("cli-install: a settings write keeps one .bak generation",
+          (tmp / "settings.json.bak").is_file())
+    out = cli_install.set_paused(str(settings), False)
+    check("cli-install: resuming restores the original document shape",
+          out.ok and _json.loads(settings.read_text(encoding="utf-8")) == doc,
+          settings.read_text(encoding="utf-8"))
+    settings.write_text(_json.dumps({"env": {"DISABLE_UPDATES": "1",
+                                             "FOO": "bar"}}), encoding="utf-8")
+    cli_install.set_paused(str(settings), False)
+    check("cli-install: resuming clears the STRICT key too, and leaves the "
+          "user's own env alone",
+          _json.loads(settings.read_text(encoding="utf-8"))
+          == {"env": {"FOO": "bar"}})
+
+    broken = tmp / "broken.json"
+    broken.write_text("{ this is not json", encoding="utf-8")
+    before_bytes = broken.read_bytes()
+    out = cli_install.set_paused(str(broken), True)
+    check("cli-install: an unparseable settings.json is REFUSED, never "
+          "rewritten or repaired",
+          not out.ok and broken.read_bytes() == before_bytes
+          and not (tmp / "broken.json.bak").exists(), out)
+
+    # THE LOST-UPDATE CHECK. `~/.claude/settings.json` has other writers and
+    # they are ours: every agent's `/model` and `/config` writes it, and the
+    # panel can sit open for a minute between the read and the write.
+    settings.write_text(_json.dumps({"model": "opus"}), encoding="utf-8")
+    stale, _reason = cli_install.read_settings(str(settings))
+    settings.write_text(_json.dumps({"model": "opus", "savedByAnAgent": True}),
+                        encoding="utf-8")
+    cli_install.set_paused(str(settings), True)
+    landed = _json.loads(settings.read_text(encoding="utf-8"))
+    check("cli-install: write_settings RE-READS, so a key an agent saved while "
+          "the panel was open survives",
+          landed.get("savedByAnAgent") is True
+          and landed["env"]["DISABLE_AUTOUPDATER"] == "1"
+          and "savedByAnAgent" not in stale, landed)
+
+    guard = tmp / "guard.json"
+    guard.write_text(_json.dumps({"model": "opus"}), encoding="utf-8")
+    real_read = cli_install.read_settings
+    reads = {"n": 0}
+
+    def racing_read(path):
+        reads["n"] += 1
+        if reads["n"] == 2:            # the re-read inside write_settings
+            guard.write_text("{ broken now", encoding="utf-8")
+        return real_read(path)
+
+    cli_install.read_settings = racing_read
+    try:
+        cli_install.read_settings(str(guard))         # the caller's read
+        out = cli_install.set_paused(str(guard), True)
+    finally:
+        cli_install.read_settings = real_read
+    check("cli-install: a re-read that no longer parses ABORTS the write",
+          not out.ok and guard.read_text(encoding="utf-8") == "{ broken now",
+          out)
+
+    # --- 7. the channel is NEVER written without its floor ------------------
+    settings.write_text(_json.dumps({"model": "opus"}), encoding="utf-8")
+    out = cli_install.set_channel(str(settings), "stable", "2.1.226")
+    doc = _json.loads(settings.read_text(encoding="utf-8"))
+    check("cli-install: stable writes the channel AND a minimumVersion floor",
+          out.ok and doc == {"model": "opus", "autoUpdatesChannel": "stable",
+                             "minimumVersion": "2.1.226"}, doc)
+    check("cli-install: the channel change is audited with its floor",
+          cli_install.audit_lines(out)
+          == ["CLI-MIGRATE-CHANNEL stable floor=2.1.226"])
+    settings.write_text(_json.dumps({"model": "opus"}), encoding="utf-8")
+    out = cli_install.set_channel(str(settings), "stable", "")
+    check("cli-install: a channel with no readable floor is REFUSED and "
+          "writes nothing (stable on its own can move you BACKWARDS)",
+          not out.ok
+          and _json.loads(settings.read_text(encoding="utf-8"))
+          == {"model": "opus"}, out)
+    settings.write_text(_json.dumps(
+        {"autoUpdatesChannel": "stable", "minimumVersion": "2.1.226",
+         "model": "opus"}), encoding="utf-8")
+    out = cli_install.set_channel(str(settings), "latest", "2.1.231")
+    doc = _json.loads(settings.read_text(encoding="utf-8"))
+    check("cli-install: going back to latest REMOVES the floor, so the pin "
+          "cannot outlive the reason for it",
+          out.ok and "minimumVersion" not in doc
+          and doc["autoUpdatesChannel"] == "latest", doc)
+    body = Path("app/cli_install.py").read_text(encoding="utf-8")
+    check("cli-install: requiredMinimumVersion is never WRITTEN (it stops "
+          "Claude Code starting at all, and is not ours to set)",
+          'doc["requiredMinimumVersion"]' not in body
+          and "requiredMinimumVersion\"] =" not in body
+          and all("requiredM" not in str(v)
+                  for v in _json.loads(
+                      settings.read_text(encoding="utf-8")).keys()))
+
+    # --- 8. the update TARGET follows the install method --------------------
+    native_target = cli_update._claude_target(native_exe)
+    winget_target = cli_update._claude_target(winget_exe)
+    check("cli-install: a native Claude Code is a self-updating target",
+          native_target.self_update == ("update",)
+          and native_target.winget_id is None, native_target)
+    check("cli-install: ...and nothing about it mentions winget",
+          "winget" not in " ".join(
+              cli_update.upgrade_argv(native_target)
+              + cli_update.check_argv(native_target)).lower())
+    check("cli-install: a winget Claude Code still goes through winget",
+          winget_target.winget_id == "Anthropic.ClaudeCode"
+          and winget_target.self_update is None, winget_target)
+    stale_runner = _FakeCli(versions=("2.1.224 (Claude Code)",),
+                            update_out=(0, "No available upgrade found"))
+    out = cli_update.run_gate([native_target], stale_runner)[0]
+    check("cli-install: DB_STALE is structurally unreachable on a native "
+          "install (there is no package database to go stale)",
+          out.status is cli_update.Status.UP_TO_DATE, out)
+
+    # --- 9. cleanup counts against the RECORDED WinGet path -----------------
+    desktop = r"C:\Users\x\AppData\Local\AnthropicClaude\app-1.0\claude.exe"
+    runner = _FakeInstall(alive=1, paths=[winget_exe])
+    out = cli_install.cleanup(runner, winget_exe)
+    check("cli-install: a live session on the WINGET binary blocks cleanup",
+          not out.ok and "still using" in out.detail, out)
+    check("cli-install: ...and no kill command is ever issued",
+          not any("taskkill" in " ".join(a).lower() or "stop-process"
+                  in " ".join(a).lower() for a in runner.argvs())
+          and runner.mutating() == [], runner.argvs())
+    runner = _FakeInstall(alive=1, paths=[desktop])
+    out = cli_install.cleanup(runner, winget_exe)
+    check("cli-install: the Claude DESKTOP app shares the image name but not "
+          "the path, so it does not block cleanup",
+          out.ok, out)
+    check("cli-install: ...which is the one command that removes the package",
+          runner.mutating() == [["winget", "uninstall", "--id",
+                                 "Anthropic.ClaudeCode", "--exact"]],
+          runner.mutating())
+    runner = _FakeInstall(alive=1, paths=[native_exe])
+    out = cli_install.cleanup(runner, native_exe)
+    check("cli-install: cleanup counts the path it was GIVEN, so passing the "
+          "resolved (native) binary is what would under-count",
+          not out.ok and out.after == native_exe, out)
+    check("cli-install: the cleanup line names the file it was about",
+          cli_install.audit_lines(out)[0].endswith("exe=" + native_exe),
+          cli_install.audit_lines(out))
+
+    # --- 9b. the FULL revert, whose ORDER is not interchangeable ------------
+    # The WinGet copy goes back and is verified FIRST, so a failed reinstall
+    # leaves the user with the working native install rather than with nothing.
+    rev = tmp / "revert"
+    pkg = (rev / "local" / "Microsoft" / "WinGet" / "Packages"
+           / "Anthropic.ClaudeCode_z")
+    pkg.mkdir(parents=True, exist_ok=True)
+    native_bin = rev / "home" / ".local" / "bin"
+    native_bin.mkdir(parents=True, exist_ok=True)
+    (native_bin / "claude.exe").write_text("native", encoding="utf-8")
+    share = rev / "home" / ".local" / "share" / "claude" / "versions"
+    share.mkdir(parents=True, exist_ok=True)
+    (share / "2.1.231").write_text("payload", encoding="utf-8")
+    real_home, real_local = (os.environ.get("USERPROFILE"),
+                             os.environ.get("LOCALAPPDATA"))
+    try:
+        os.environ["USERPROFILE"] = str(rev / "home")
+        os.environ["LOCALAPPDATA"] = str(rev / "local")
+        runner = _FakeInstall(alive=1, paths=[str(native_bin / "claude.exe")])
+        out = cli_install.revert(runner)
+        check("cli-install: a revert is refused while a native session is "
+              "alive, and never kills one",
+              not out.ok and runner.mutating() == []
+              and (native_bin / "claude.exe").is_file(), out)
+        runner = _FakeInstall(alive=0)
+        out = cli_install.revert(runner)
+        check("cli-install: a WinGet copy that did not come back leaves the "
+              "native install in place",
+              not out.ok and (native_bin / "claude.exe").is_file(), out)
+        (pkg / "claude.exe").write_text("winget", encoding="utf-8")
+        runner = _FakeInstall(alive=0,
+                              versions={str(pkg / "claude.exe"): "2.1.224"})
+        out = cli_install.revert(runner)
+        check("cli-install: a verified revert puts WinGet back and removes the "
+              "native install",
+              out.ok and out.after == "2.1.224"
+              and not (native_bin / "claude.exe").exists()
+              and not share.parent.exists()
+              and (pkg / "claude.exe").is_file(), out)
+        check("cli-install: the revert is audited",
+              cli_install.audit_lines(out) == ["CLI-MIGRATE-REVERT ok 2.1.224"])
+    finally:
+        for name, value in (("USERPROFILE", real_home),
+                            ("LOCALAPPDATA", real_local)):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    # --- 10. the live-spec rebuild (§5 step 5) ------------------------------
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Migrate", str(tmp))
+    real_resolve = providers.resolve_claude
+    try:
+        providers.resolve_claude = lambda: winget_exe
+        spec = build_spec(AgentKind.CLAUDE, "C1", cwd=str(tmp), model="opus",
+                          effort="high", permission_mode="plan")
+        agent = win.manager.add_terminal(ws.id, spec, autostart=False)
+        check("cli-install: a spec built before the migration carries the "
+              "WinGet path",
+              agent.spec.program == winget_exe, agent.spec.program)
+        disturbed = []
+        agent.start = lambda *a, **k: disturbed.append("start")
+        agent.stop = lambda *a, **k: disturbed.append("stop")
+        agent.restart = lambda *a, **k: disturbed.append("restart")
+        providers.resolve_claude = lambda: native_exe
+        win._save_timer.stop()
+        moved = win.rebind_claude_specs()
+        check("cli-install: the rebuild repoints every live Claude spec at the "
+              "new binary",
+              moved == 1 and agent.spec.program == native_exe,
+              agent.spec.program)
+        check("cli-install: ...preserving everything the user chose",
+              agent.spec.model == "opus" and agent.spec.effort == "high"
+              and agent.spec.permission_mode == "plan"
+              and "--permission-mode" in agent.spec.args
+              and agent.spec.user_program == "" and agent.spec.user_args == [])
+        check("cli-install: ...without stopping or restarting a running agent",
+              disturbed == [], disturbed)
+        check("cli-install: ...and without marking the session dirty "
+              "(program/args are derived, never persisted)",
+              not win._save_timer.isActive()
+              and "program" not in agent.spec.to_dict())
+        check("cli-install: the rebuild is idempotent, so a second migration "
+              "attempt is harmless",
+              win.rebind_claude_specs() == 0)
+    finally:
+        providers.resolve_claude = real_resolve
+
+    # --- 11. the panel: state in, one action out ----------------------------
+    panel = UpdatePanel(situation(winget_exe), auto_update=False, runner=None,
+                        winget_exe=winget_exe, settings_file=str(settings),
+                        parent=win)
+    check("cli-install panel: a winget machine is offered the migration, and "
+          "the cleanup/revert controls that belong to a native install are "
+          "not shown",
+          panel.action_btn.text() == "Enable automatic updates"
+          and not panel.revert_btn.isVisibleTo(panel)
+          and not panel.cleanup_btn.isVisibleTo(panel))
+    check("cli-install panel: with no runner armed it can show but not act",
+          not panel.action_btn.isEnabled())
+    strings = _dialog_strings(panel)
+    panel.close()
+    panel.deleteLater()
+
+    blocker = threading.Event()
+    released = []
+
+    def never_returns(argv, timeout=0):
+        released.append(list(argv))
+        blocker.wait(10)
+        return 0, ""
+
+    native_panel = UpdatePanel(situation(native_exe), runner=never_returns,
+                               winget_exe=winget_exe,
+                               settings_file=str(settings), parent=win)
+    check("cli-install panel: a native machine is offered pause, not another "
+          "install, plus the two acts about the OLD copy",
+          native_panel.action_btn.text() == "Pause automatic updates"
+          and native_panel.revert_btn.isVisibleTo(native_panel)
+          and native_panel.cleanup_btn.isVisibleTo(native_panel))
+    # the install NEVER runs on the GUI thread: CLAUDE.md records what an
+    # inline ~3.0s subprocess did to this app, and an install can run minutes
+    started = time.time()
+    native_panel._on_cleanup()
+    check("cli-install panel: a command that never returns does not block the "
+          "GUI thread, and the panel says so by disabling its actions",
+          time.time() - started < 1.0 and not native_panel.action_btn.isEnabled()
+          and not native_panel.cleanup_btn.isEnabled())
+    native_panel.close()      # Cancel/Close is the escape hatch, never a kill
+    check("cli-install panel: closing mid-command stops the poll and claims "
+          "no outcome",
+          not native_panel._poll.isActive()
+          and not native_panel.log.toPlainText().strip().endswith("removed."))
+    blocker.set()
+    native_panel.deleteLater()
+
+    locked = UpdatePanel(situation(native_exe,
+                                   policies=[{"requiredMinimumVersion": "1"}]),
+                         runner=None, settings_file=str(settings), parent=win)
+    check("cli-install panel: a policy-locked machine is offered nothing, "
+          "with the reason shown",
+          not locked.action_btn.isVisibleTo(locked)
+          and "managed settings" in locked.state_label.text())
+    locked.close()
+    locked.deleteLater()
+
+    consent = ConsentDialog(winget_exe, win)
+    check("cli-install consent: the action is unavailable until the checkbox "
+          "is ticked",
+          not consent.action_btn.isEnabled())
+    consent.agree.setChecked(True)
+    check("cli-install consent: ticking it enables the action",
+          consent.action_btn.isEnabled())
+    check("cli-install consent: the exact command is shown, and both levels "
+          "of undo are stated BEFORE agreeing",
+          any("irm https://claude.ai/install.ps1 | iex" in s
+              for s in _dialog_strings(consent))
+          and any("Full revert" in s for s in _dialog_strings(consent))
+          and any("rollback" in s for s in _dialog_strings(consent)))
+    strings += _dialog_strings(consent)
+    check("cli-install: no em dash in any panel or modal string",
+          not any("\u2014" in s for s in strings),
+          [s for s in strings if "\u2014" in s])
+    consent.close()
+    consent.deleteLater()
+    check("cli-install: the panel writes nothing to session.json",
+          "auto_update" in win._session_payload()["ui"]
+          and not any(k.startswith("install") or k.startswith("cli_")
+                      for k in win._session_payload()["ui"]),
+          list(win._session_payload()["ui"]))
+    win.close()
+    app.processEvents()
+
+    # --- 12. the factory the suite shares does none of this -----------------
+    import inspect
+    import main as main_module
+    src = inspect.getsource(main_module.create_main_window)
+    check("cli-install: create_main_window contains no install work at all",
+          "cli_install" not in src and "arm_cli_install" not in src)
+    check("cli-install: ...and the real runner is armed from main.py alone",
+          "arm_cli_install" in inspect.getsource(main_module.main))
+
+
+def _dialog_strings(widget) -> list:
+    """Every user-visible string a dialog composes at runtime."""
+    out = []
+    for child in widget.findChildren(object):
+        for attr in ("text", "toolTip"):
+            fn = getattr(child, attr, None)
+            if callable(fn):
+                try:
+                    out.append(str(fn()))
+                except TypeError:
+                    pass
+    return out
 
 
 def test_multi_agent_session_isolation():

@@ -188,9 +188,43 @@ workspaces keep executing — switching never pauses anything.
   is back it carries on, and if it isn't, agy says so with a fresh countdown that
   *is* accurate and the retry waits for that instead. Claude's account readout is
   never used to resume a Gemini agent (it knows nothing about a Google quota).
-- **Auto-update the CLIs at startup** — the **⬇ switch** beside the taskbar
-  toggle, **off by default** because turning it on lets AI Hive install software
-  on your machine. Armed, it checks for a newer Claude Code and Gemini (`agy`)
+- **Let Claude Code update itself** — the **⬇ button** beside the taskbar toggle
+  opens a small **Updates** panel, and what it offers depends on how Claude Code
+  is actually installed on your machine (it re-reads that every time, so it is
+  never out of date):
+
+  A package-manager install *does not update itself*, and there is no setting
+  that fixes it: Claude Code knows a package manager owns its file and refuses
+  to replace it. Meanwhile its own "Update available!" banner compares against
+  Anthropic rather than against `winget`, so a fully upgraded winget install
+  still nags in every terminal — and because model aliases resolve *inside* the
+  binary, a stale one silently can't launch newer models however many times you
+  upgrade. The install method *is* the behaviour, so the panel offers to change
+  the install: it runs Anthropic's documented installer
+  (`irm https://claude.ai/install.ps1 | iex`) behind a consent dialog that shows
+  you the exact command, what changes, what doesn't, and both ways back, with an
+  action button that stays disabled until you tick "I understand and agree".
+
+  It installs *alongside* what you have (under your user folder, no
+  Administrator rights, a different directory from the winget copy), which means
+  **it never touches the running file, so it works with every agent alive** —
+  unlike the startup gate below, which only ever gets one moment. AI Hive picks
+  the new binary up straight away: it looks for the native launcher before it
+  looks at `PATH`, and it repoints the agents already on screen too, so nothing
+  needs a restart or a fresh terminal.
+
+  Afterwards the same panel is the way back. **Pause** is one setting, instant,
+  no download, and freezes you on exactly the version you're running ("I don't
+  trust anything newer than this"). **Follow the stable channel** takes builds
+  about a week old that skip releases with major regressions, and always pins a
+  floor at your current version so switching can never walk you *backwards*.
+  **Revert** reinstalls the winget package and removes the native one. And
+  **remove the old copy** is an optional tidy-up, refused (never forced, never
+  killing anything) while a session is still using it. Every one of these is
+  written to `session.log` as a `CLI-MIGRATE-*` line.
+- **Check for CLI updates at startup** — a checkbox inside that same panel,
+  **off by default** because turning it on lets AI Hive install software on your
+  machine. Armed, it checks for a newer Claude Code and Gemini (`agy`)
   before the window is even built, and installs what it finds.
 
   Startup isn't just convenient here, it's the only moment that works. Every
@@ -642,7 +676,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1531 checks drive the real app headlessly (offscreen Qt platform) with real
+1602 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -690,8 +724,21 @@ database ahead of the file being reported and never forced, a check that
 outruns its budget failing open to launch, agy self-updating serially after
 Claude with no interleaving, the preference defaulting off and surviving a
 close/reopen with no `SESSION_VERSION` bump, outcomes never marking the session
-dirty, and the factory the suite shares doing no update work at all), and the
-reliability
+dirty, and the factory the suite shares doing no update work at all), the
+install-method control (each install path classifying by its full path through
+a symlink shim and regardless of case, one detected state per machine including
+a policy-locked one, `resolve_claude` preferring the native launcher over what
+`PATH` would answer, a migration whose file didn't change counting as a failure,
+a settings write preserving every unknown key and re-reading first so a key an
+agent saved meanwhile survives, an unparseable settings file being refused and
+left byte-identical, the stable channel refusing to be written without its
+version floor, `DB_STALE` being unreachable on a native install, cleanup
+counting the recorded winget path rather than the resolved binary and issuing no
+kill, a revert that leaves the native install in place when the winget copy
+doesn't come back, the live specs being repointed without disturbing a running
+agent or marking the session dirty, a command that never returns not blocking
+the GUI thread, and the consent action staying disabled until the box is
+ticked), and the reliability
 set — immediate structural saves, the safety-net heartbeat, saves that are
 never silent (suppressed/payload-error logging, one bad agent can't abort the
 save), resume + fresh-fallback, BOM tolerance, the single-instance mutex (fail
@@ -726,6 +773,7 @@ app/
   limit_ledger.py          durable record of cut-offs: who, when, and how it ended (Qt-free)
   scheduled_send.py        deferred messages: parse a delay/clock, hold it, format the countdown (Qt-free)
   cli_update.py            startup CLI update gate: decide from the FILE's own version (Qt-free)
+  cli_install.py           how Claude Code is installed + the switch onto the self-updating build (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
@@ -737,10 +785,11 @@ app/
                            diagram), ornaments (drop-caps / dividers / count-badge
                            + working-count spinner + taskbar-badge painter),
                            update_splash (the startup CLI-update panel + its
-                           worker thread)
+                           worker thread), update_panel (the Updates panel +
+                           its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1531 checks)
+tests/smoke_test.py        headless end-to-end suite (1602 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

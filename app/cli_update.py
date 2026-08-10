@@ -41,9 +41,11 @@ latter made the gate skip every launch forever (see `count_processes`).
 
 THE TWO CLIs DIFFER, AND THE DIFFERENCE IS STRUCTURAL
 -----------------------------------------------------
-Claude Code is a winget package, so checking (`winget show`, a pure read) and
+A WINGET Claude Code is a package, so checking (`winget show`, a pure read) and
 installing (`winget upgrade`) are separate acts and the check can decide
-whether to install at all. `agy` is not a winget package, it self-updates, and
+whether to install at all. A NATIVE Claude Code is not (see `_claude_target`):
+it self-updates, so it takes the second shape below, and `Status.DB_STALE`
+cannot arise for it at all. `agy` is not a winget package, it self-updates, and
 neither `agy update` nor `claude update` accepts any flags: there is NO dry
 run, so for a self-updating target checking and installing are the SAME act
 (measured 0.37s and no mutation when already current). That is why
@@ -629,13 +631,42 @@ def _joined(items) -> str:
 
 # -------------------------------------------------------------- targets ---
 
+def _claude_target(exe: str) -> Target:
+    """Which updater owns this binary.
+
+    A native install self-updates (`claude update`); a winget package does not,
+    and asking `claude update` to replace a winget-managed file is how you end
+    up with two installs. Decided on the PATH because nothing else
+    distinguishes them: the binary, the version string and the process name are
+    identical.
+
+    Nothing downstream changes for the native case: `needs_apply` already
+    returns True unconditionally for a `self_update` target, `upgrade_argv`
+    already yields `[exe, "update"]`, and `apply` already reads an unchanged
+    version after a clean self-update as UP_TO_DATE rather than the
+    REPORTED_BUT_UNCHANGED that the same reading means for winget. One real
+    consequence: `Status.DB_STALE` becomes structurally UNREACHABLE for Claude
+    on a native install, because there is no package database to go stale,
+    which retires the one status whose only remedy was a manual command.
+
+    No flag day either: the same build serves a winget machine and a native
+    one, so rolling the migration back needs no code revert.
+    """
+    from . import cli_install   # local: cli_install imports this module
+
+    common = dict(key="claude", label=LABELS["claude"], exe=exe,
+                  process_names=(_image_name(exe, "claude.exe"),))
+    if cli_install.classify_install(exe) is cli_install.InstallKind.WINGET:
+        return Target(**common, winget_id=CLAUDE_WINGET_ID)
+    return Target(**common, self_update=("update",))
+
+
 def default_targets() -> list:
     """The two updatable CLIs, resolved to the SAME binaries the agents launch.
 
-    Claude Code stays on winget deliberately: `claude update` installs a native
-    build to a DIFFERENT location, and `providers.resolve_claude()` has a
-    hardcoded WinGet-Packages fallback, so a migration could leave AI Hive
-    silently launching the stale copy. `agy` is not a winget package at all
+    How Claude Code is updated now depends on how it is INSTALLED (see
+    `_claude_target`): a winget package is upgraded through winget, a native
+    install updates itself. `agy` is not a winget package at all
     (Google.AntigravityIDE is the separate IDE), so it self-updates.
     """
     from . import providers
@@ -643,10 +674,7 @@ def default_targets() -> list:
     targets = []
     claude = providers.resolve_claude() if providers.detected("claude") else ""
     if claude:
-        targets.append(Target(
-            key="claude", label=LABELS["claude"], exe=claude,
-            process_names=(_image_name(claude, "claude.exe"),),
-            winget_id=CLAUDE_WINGET_ID))
+        targets.append(_claude_target(claude))
     gemini = providers.resolve_program("gemini") if \
         providers.detected("gemini") else ""
     # only `agy` self-updates. The provider also answers to a plain `gemini`
