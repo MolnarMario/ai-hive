@@ -399,14 +399,15 @@ class TopBar(QFrame):
         lay.addSpacing(12)
         lay.addWidget(self.breadcrumb)
         lay.addStretch(1)
+        # The pills and their picker are ONE group and sit on the layout's own
+        # spacing with nothing added, which is the same gap the two recovery
+        # switches below have between them. An extra addSpacing() here read as
+        # three unrelated widgets rather than one readout with a control.
         lay.addWidget(self.usage_badge)
-        lay.addSpacing(6)
         lay.addWidget(self.gemini_badge)
-        lay.addSpacing(6)
         lay.addWidget(self.gemini_weekly_badge)
-        lay.addSpacing(10)
         lay.addWidget(self.usage_add_btn)
-        lay.addSpacing(10)
+        lay.addSpacing(10)      # ...and THIS separates that group from the next
         lay.addWidget(self.recovery_label)
         lay.addSpacing(6)
         lay.addWidget(self.recover_btn)
