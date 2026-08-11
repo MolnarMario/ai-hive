@@ -8,7 +8,7 @@ import os
 import threading
 import time
 
-from PySide6.QtCore import QProcess, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QProcess, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
@@ -89,6 +89,19 @@ USAGE_TICK_MS = 20000
 # "limit cleared" edge fires promptly (an unattended relaunch shouldn't wait
 # out a whole poll interval at 4am), plus a small cushion for clock skew.
 USAGE_RESET_GRACE_MS = 8000
+
+# The usage readouts the top bar can show, and the order they sit in. PER PILL
+# rather than per provider: the two Gemini windows are separate pills on the
+# bar, so anything coarser would leave the X on one of them closing the other.
+# Persisted per key under ui.usage_trackers, so a user who runs only Claude (or
+# only Gemini) is not made to look at a readout that can never say anything.
+USAGE_TRACKER_KEYS = ("claude", "gemini_five_hour", "gemini_weekly")
+USAGE_TRACKER_LABELS = {
+    "claude": "Claude plan usage",
+    "gemini_five_hour": "Gemini 5 hour usage",
+    "gemini_weekly": "Gemini weekly usage",
+}
+DEFAULT_USAGE_TRACKERS = {k: True for k in USAGE_TRACKER_KEYS}
 
 # --- auto-continue after a plan-limit reset ---
 # Beat between closing the limit's options menu and typing into the prompt
@@ -202,11 +215,20 @@ class TopBar(QFrame):
     globalFontDelta = Signal(int)
     themeChanged = Signal(str)   # theme id
     soundToggled = Signal(bool)  # notification chime enabled/muted
-    usageVisibilityToggled = Signal(bool)  # show/hide the plan-usage readout
+    # show/hide ONE usage readout: (tracker key, wanted). One signal for both
+    # affordances - the X on a pill and the + menu - so the two controls of the
+    # same preference can never disagree.
+    usageTrackerToggled = Signal(str, bool)
     # should Claude agents run the classic renderer, so their scrollback (and
     # therefore the terminal scrollbar and its prompt milestones) is ours?
     terminalScrollbackToggled = Signal(bool)
     taskbarBadgeToggled = Signal(bool)     # show/hide the taskbar count overlay
+    # install newer Claude Code / agy CLIs at the NEXT startup, before any
+    # agent launches (the only moment those binaries are not locked)
+    autoUpdateToggled = Signal(bool)
+    # the down-arrow button: open the Updates panel (the install-method control
+    # and the startup-check checkbox live there, so the bar gains no button)
+    updatesPanelRequested = Signal()
     autoContinueToggled = Signal(bool)     # resume cut-off agents at the reset
     startupRecoveryToggled = Signal(bool)  # recover cut-off agents on startup
     usageRefreshRequested = Signal()       # user clicked the readout
@@ -276,24 +298,51 @@ class TopBar(QFrame):
         self.taskbar_btn.clicked.connect(self._on_taskbar_clicked)
         self._refresh_taskbar_btn()
 
-        # Claude plan usage: "21% used, resets in 1h20m at 14:49". Hidden until
-        # a reading arrives (and permanently when there's no Claude login), and
-        # hideable from the top bar's context menu.
+        # startup CLI auto-update. Default OFF and one click to arm, like the
+        # two recovery switches: it mutates installed software unattended, so
+        # it is the user's decision, made once and persisted. Same LED
+        # treatment, so the top bar has one visual language for "will AI Hive
+        # do this by itself?".
+        self._auto_update = False
+        self._install_state = ""
+        self.auto_update_btn = QToolButton(self)
+        self.auto_update_btn.setObjectName("RecoveryToggle")
+        self.auto_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.auto_update_btn.clicked.connect(self._on_auto_update_clicked)
+        self._refresh_auto_update_btn()
+
+        # ...and the quiet report from the LAST gated startup. Hidden unless
+        # something needs saying (an update that could not apply), never a
+        # chime: it answers "why am I still seeing the update banner?" without
+        # interrupting, the same principle as the usage badge's can't-read pill.
+        self.update_pill = QLabel("", self)
+        self.update_pill.setObjectName("UpdatePill")
+        self.update_pill.setVisible(False)
+
+        # The three usage readouts: "21% used, resets in 1h20m at 14:49". All
+        # start hidden and EMPTY - no cached figure is ever painted (see
+        # `MainWindow.start_usage_polling`), so a pill appears when polling puts
+        # it into its loading state and stays only while it has something to
+        # say and the user wants it.
         self.usage_badge = PlanUsageBadge(self)
-        self.usage_badge.setVisible(False)
-        self.usage_badge.refreshRequested.connect(self.usageRefreshRequested)
-        self._usage_wanted = True   # the user's show/hide preference
         self._scrollback_wanted = True  # AI Hive owns the terminal scrollback
 
         # Gemini rate-limit usage readout (5-hour limit and weekly limit pills)
         from .gemini_usage_badge import GeminiUsageBadge
         self.gemini_badge = GeminiUsageBadge(self, window="five_hour")
-        self.gemini_badge.setVisible(True)
-        self.gemini_badge.refreshRequested.connect(self.usageRefreshRequested)
-
         self.gemini_weekly_badge = GeminiUsageBadge(self, window="weekly")
-        self.gemini_weekly_badge.setVisible(True)
-        self.gemini_weekly_badge.refreshRequested.connect(self.usageRefreshRequested)
+
+        self._usage_pills = {
+            "claude": self.usage_badge,
+            "gemini_five_hour": self.gemini_badge,
+            "gemini_weekly": self.gemini_weekly_badge,
+        }
+        self._trackers = dict(DEFAULT_USAGE_TRACKERS)
+        for key, pill in self._usage_pills.items():
+            pill.setVisible(False)
+            pill.refreshRequested.connect(self.usageRefreshRequested)
+            pill.closeRequested.connect(
+                lambda k=key: self.usageTrackerToggled.emit(k, False))
 
         # The two auto-recovery switches, beside the readout they belong to.
         # Both act on agents the plan limit cut off; they differ only in WHEN
@@ -305,6 +354,19 @@ class TopBar(QFrame):
         # (🟢 armed / ⚫ off) alongside the accent-lit checked state, so
         # "will my work resume by itself?" survives even a glance too quick
         # to register border color.
+        # The pill picker, immediately LEFT of the recovery caption because it
+        # governs the readouts to its own left. It is the ONLY way back once a
+        # pill has been closed, so it is never hidden: not by a missing
+        # reading, not by every tracker being off, and (unlike the caption and
+        # the two switches beside it) not by `set_recovery_available` either -
+        # a machine with no Claude login still has Gemini pills to manage.
+        self.usage_add_btn = QToolButton(self)
+        self.usage_add_btn.setObjectName("UsageTrackerAdd")
+        self.usage_add_btn.setText("+")
+        self.usage_add_btn.setToolTip("Choose which usage readouts to show")
+        self.usage_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.usage_add_btn.clicked.connect(self._open_tracker_menu)
+
         self._startup_recovery = True
         self._auto_continue = True
         self.recovery_label = QLabel(
@@ -337,11 +399,15 @@ class TopBar(QFrame):
         lay.addSpacing(12)
         lay.addWidget(self.breadcrumb)
         lay.addStretch(1)
+        # The pills and their picker are ONE group and sit on the layout's own
+        # spacing with nothing added, which is the same gap the two recovery
+        # switches below have between them. An extra addSpacing() here read as
+        # three unrelated widgets rather than one readout with a control.
         lay.addWidget(self.usage_badge)
         lay.addWidget(self.gemini_badge)
-        lay.addSpacing(6)
         lay.addWidget(self.gemini_weekly_badge)
-        lay.addSpacing(10)
+        lay.addWidget(self.usage_add_btn)
+        lay.addSpacing(10)      # ...and THIS separates that group from the next
         lay.addWidget(self.recovery_label)
         lay.addSpacing(6)
         lay.addWidget(self.recover_btn)
@@ -354,6 +420,8 @@ class TopBar(QFrame):
         lay.addSpacing(8)
         lay.addWidget(self.sound_btn)
         lay.addWidget(self.taskbar_btn)
+        lay.addWidget(self.update_pill)
+        lay.addWidget(self.auto_update_btn)
         lay.addSpacing(8)
         lay.addWidget(self.add_terminal_btn)
 
@@ -384,6 +452,64 @@ class TopBar(QFrame):
             "Taskbar count: OFF. The taskbar icon stays plain, so you cannot "
             "tell from other apps whether agents are still working.\n"
             "Click to turn on.")
+
+    def _on_auto_update_clicked(self) -> None:
+        """The down-arrow now OPENS the Updates panel instead of toggling.
+
+        Deliberately the same button rather than a new one: the top bar's
+        minimum width is already 2101px, letting Claude Code update itself is a
+        one-time setup action that does not earn a permanent slot, and two
+        adjacent update controls meaning different things is worse than either.
+        The startup-gate preference this button used to carry is a checkbox
+        inside the panel, still routed through `autoUpdateToggled`, so nothing
+        downstream changed. `_refresh_auto_update_btn` puts the checked state
+        back, since a checkable button flips itself on click."""
+        self._refresh_auto_update_btn()
+        self.updatesPanelRequested.emit()
+
+    def set_auto_update(self, on: bool) -> None:
+        """Reflect the CLI auto-update preference (no signal emitted)."""
+        self._auto_update = bool(on)
+        self._refresh_auto_update_btn()
+
+    def auto_update(self) -> bool:
+        return self._auto_update
+
+    def note_install_state(self, text: str) -> None:
+        """Name the detected Claude Code install state on the button, so the
+        answer is available without opening the panel."""
+        self._install_state = text or ""
+        self._refresh_auto_update_btn()
+
+    def _refresh_auto_update_btn(self) -> None:
+        self.auto_update_btn.setCheckable(True)
+        self.auto_update_btn.setChecked(self._auto_update)
+        led = "\U0001F7E2" if self._auto_update else "⚫"
+        self.auto_update_btn.setText(f"{led} ⬇")
+        # the tooltip states plainly what the armed switch does, because it
+        # changes software on the user's machine rather than anything inside
+        # the app, and names the detected install state so the panel is not the
+        # only way to learn it
+        state = getattr(self, "_install_state", "")
+        self.auto_update_btn.setToolTip(
+            "Updates. " + (state + "\n" if state else "")
+            + ("Startup check: ON. Next time AI Hive starts, it checks for a "
+               "newer Claude Code and Gemini (agy) CLI and installs it BEFORE "
+               "any agent launches, which is the only moment those files are "
+               "not locked."
+               if self._auto_update else
+               "Startup check: OFF. Startup is untouched, so you keep whatever "
+               "CLI version is installed and may keep seeing Claude's own "
+               "'update available' banner. Turning it on lets AI Hive install "
+               "CLI updates at startup, which changes installed software on "
+               "your machine.")
+            + "\nClick to open the Updates panel.")
+
+    def note_update_pending(self, text: str, tooltip: str = "") -> None:
+        """Show (or hide, on an empty text) the last gate's report."""
+        self.update_pill.setText(text or "")
+        self.update_pill.setToolTip(tooltip or text or "")
+        self.update_pill.setVisible(bool(text))
 
     def set_sound_enabled(self, on: bool) -> None:
         """Reflect the chime on/off state in the button (no signal emitted)."""
@@ -448,42 +574,118 @@ class TopBar(QFrame):
             "Resume on limit reset: OFF. Agents cut off by the plan limit "
             "wait for you.\nClick to turn on.")
 
+    def build_tracker_menu(self) -> QMenu:
+        """The pill picker's menu: one checkable entry per usage readout.
+
+        Built fresh on every click (rather than kept as an `InstantPopup` menu)
+        so its checkmarks can never be stale. Public because the smoke suite
+        asserts the entries without opening a modal popup.
+        """
+        menu = QMenu(self)
+        for key in USAGE_TRACKER_KEYS:
+            act = menu.addAction(USAGE_TRACKER_LABELS[key])
+            act.setCheckable(True)
+            act.setChecked(bool(self._trackers.get(key, True)))
+            act.toggled.connect(
+                lambda on, k=key: self.usageTrackerToggled.emit(k, on))
+        return menu
+
+    def _open_tracker_menu(self) -> None:
+        menu = self.build_tracker_menu()
+        menu.exec(self.usage_add_btn.mapToGlobal(
+            QPoint(0, self.usage_add_btn.height())))
+
     def set_usage(self, usage) -> None:
-        """Push a plan-usage reading into the badge (no-op while hidden by the
-        user, so a poll can't resurrect a readout they switched off)."""
+        """Push a plan-usage reading into the badge."""
         self.usage_badge.set_usage(usage)
-        if not self._usage_wanted:
-            self.usage_badge.setVisible(False)
+        self._sync_usage_pills()
 
     def note_usage_error(self, error: str) -> None:
         """A poll failed with no earlier reading to fall back on: show the
-        can't-read pill rather than nothing at all. Still honours the user's
-        show/hide preference — an error is not a reason to force the readout
-        back onto a bar they cleared."""
+        can't-read pill rather than nothing at all."""
         self.usage_badge.mark_unreadable(error)
-        if not self._usage_wanted:
-            self.usage_badge.setVisible(False)
+        self._sync_usage_pills()
 
-    def set_usage_visible(self, on: bool) -> None:
-        """Reflect the show/hide preference (no signal emitted)."""
-        self._usage_wanted = bool(on)
-        self.usage_badge.setVisible(self._usage_wanted
-                                    and self.usage_badge.has_content())
-        if hasattr(self, "gemini_badge"):
-            self.gemini_badge.setVisible(self._usage_wanted
-                                        and self.gemini_badge.has_content())
-        if hasattr(self, "gemini_weekly_badge"):
-            self.gemini_weekly_badge.setVisible(self._usage_wanted
-                                               and self.gemini_weekly_badge.has_content())
+    def set_gemini_usage(self, reading) -> None:
+        """Push a Gemini reading into both Gemini pills."""
+        self.gemini_badge.set_usage(reading)
+        self.gemini_weekly_badge.set_usage(reading)
+        self._sync_usage_pills()
 
-    def usage_visible(self) -> bool:
-        return self._usage_wanted
+    def note_gemini_usage_error(self, error: str) -> None:
+        """A Gemini poll failed. Both halves of the Claude pill's rule apply
+        here, and which one depends on whether there is a number already:
+
+        * a pill SHOWING a reading keeps it, greyed, rather than blanking a
+          figure the user is watching;
+        * a pill with nothing at all says so (`mark_unreadable`) rather than
+          vanishing. A readout that silently disappears is indistinguishable
+          from a deleted feature — and this one DID disappear, because the
+          badge used to hide itself whenever a reading carried no usable
+          window, with a blanket try/except hiding that it had.
+        """
+        for pill in (self.gemini_badge, self.gemini_weekly_badge):
+            if pill.has_reading():
+                pill.mark_stale(True)
+            else:
+                pill.mark_unreadable(error)
+        self._sync_usage_pills()
+
+    def tick_usage(self) -> None:
+        """Re-render every pill's countdown from the clock alone (no network)."""
+        for pill in self._usage_pills.values():
+            pill.tick()
+
+    def set_usage_trackers(self, trackers: dict) -> None:
+        """Reflect the per-pill show/hide preference (no signal emitted)."""
+        self._trackers = {k: bool(trackers.get(k, True))
+                          for k in USAGE_TRACKER_KEYS}
+        self._sync_usage_pills()
+
+    def usage_trackers(self) -> dict:
+        return dict(self._trackers)
+
+    def _sync_usage_pills(self) -> None:
+        """The ONE place a usage pill's visibility is decided, and it is the
+        product of TWO independent facts: does the user want this pill (the
+        tracker preference), and does it have anything to say (`has_content` —
+        a reading, the can't-read pill, or the loading state).
+
+        Keeping them separate is what lets a CLOSED pill vanish, which is the
+        point of the X, without regressing the rule that a FAILED read must
+        never make the readout look deleted. Neither state can be mistaken for
+        the other, and no badge class calls `setVisible` on itself.
+        """
+        for key, pill in self._usage_pills.items():
+            pill.setVisible(bool(self._trackers.get(key, True))
+                            and pill.has_content())
+
+    def mark_usage_loading(self, key: str | None = None) -> None:
+        """Put the enabled pills (or just one) into their loading state and show
+        them. This is what fills the bar at startup and the moment a tracker is
+        switched back on, so a fetch in flight is never a blank gap."""
+        for k, pill in self._usage_pills.items():
+            if (key is None or k == key) and self._trackers.get(k, True):
+                pill.mark_loading()
+        self._sync_usage_pills()
+
+    def mark_usage_absent(self, key: str) -> None:
+        """This readout has nothing to show and never will this run (no login).
+        Clears its content, so no later re-sync can resurrect it."""
+        pill = self._usage_pills.get(key)
+        if pill is not None:
+            pill.mark_absent()
+        self._sync_usage_pills()
 
     def set_recovery_available(self, on: bool) -> None:
         """Show/hide both recovery toggles (and their caption). They act only
         on Claude agents cut off by a plan limit, so with no Claude login
         there is nothing for them to do — hide them with the readout rather
-        than offer dead switches."""
+        than offer dead switches.
+
+        `usage_add_btn` is deliberately NOT hidden with them: it is the only way
+        to bring a closed pill back, and a Gemini-only user (who by definition
+        has no Claude login) would otherwise be left with no control at all."""
         self.recovery_label.setVisible(bool(on))
         self.recover_btn.setVisible(bool(on))
         self.resume_btn.setVisible(bool(on))
@@ -503,12 +705,15 @@ class TopBar(QFrame):
         deliberately NOT here: they decide whether unattended work resumes, so
         they get visible buttons instead (and each setting has exactly one
         control, never two that can disagree).
+
+        The usage readouts used to live here too, as a single "Show plan usage"
+        that hid all three at once. They moved to the + button, per pill: the
+        same one-setting-one-control rule, applied the other way round — a
+        master toggle sitting on top of three per-pill checkboxes is two
+        controls for the same preference, and a pill checked in one but hidden
+        by the other is not explainable.
         """
         menu = QMenu(self)
-        act = menu.addAction("Show plan usage")
-        act.setCheckable(True)
-        act.setChecked(self._usage_wanted)
-        act.toggled.connect(self.usageVisibilityToggled)
         act2 = menu.addAction("Scrollback lives in AI Hive")
         act2.setCheckable(True)
         act2.setChecked(self._scrollback_wanted)
@@ -1114,11 +1319,27 @@ class MainWindow(QMainWindow):
         # rule as activity_changed/waiting_changed. This polls every minute
         # forever; wiring it to a save would rewrite session.json 60x an hour.
         self._usage = None            # latest claude_usage.Usage
-        self._usage_visible = True    # user preference (persisted)
+        # which usage readouts the user wants, per pill (persisted under
+        # ui.usage_trackers). The default MUST be assigned here, above
+        # _restore_ui_state, or the restored preference is clobbered back to on.
+        self._usage_trackers = dict(DEFAULT_USAGE_TRACKERS)
+        # did main.py opt this window into polling? Guards the runtime re-arm in
+        # _on_usage_tracker_toggled: a tracker switched on inside the offscreen
+        # suite must never start shelling out to the user's real agy CLI.
+        self._polling = False
         # taskbar working-count overlay. The default MUST be set here, above
         # _restore_ui_state, or the restored preference is clobbered back to on.
         self._taskbar_badge = True    # user preference (persisted)
         self._taskbar_key = None      # last key actually pushed to the shell
+        # startup CLI auto-update. Default OFF (it changes installed software),
+        # and like every other preference here the default MUST be assigned
+        # above _restore_ui_state or the restored value is clobbered.
+        self._auto_update = False     # user preference (persisted)
+        # providers whose CLI was STILL INSTALLING when the user skipped the
+        # update splash. Their agents are held out of the autostart, because
+        # launching one now could execute a half written binary. Transient by
+        # construction: it describes this launch only.
+        self._update_installing: tuple = ()
         self._usage_inflight = False  # one request at a time, never stack
         self._plan_blocked = False    # edge state for planLimitReached/Cleared
         # agent ids with a resume SCHEDULED but not yet delivered. The attempt
@@ -1363,10 +1584,12 @@ class MainWindow(QMainWindow):
         self.top_bar.globalFontDelta.connect(self._change_global_font)
         self.top_bar.themeChanged.connect(self._change_theme)
         self.top_bar.soundToggled.connect(self._on_sound_toggled)
-        self.top_bar.usageVisibilityToggled.connect(self._on_usage_visibility)
+        self.top_bar.usageTrackerToggled.connect(self._on_usage_tracker_toggled)
         self.top_bar.terminalScrollbackToggled.connect(
             self._on_terminal_scrollback)
         self.top_bar.taskbarBadgeToggled.connect(self._on_taskbar_badge_toggled)
+        self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
+        self.top_bar.updatesPanelRequested.connect(self.open_updates_panel)
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
         self.top_bar.startupRecoveryToggled.connect(self._on_startup_recovery)
         # resume whoever the limit cut off, the moment the window reopens
@@ -1515,19 +1738,30 @@ class MainWindow(QMainWindow):
         network (or the user's real account). Tests drive `_on_usage_ready`
         with synthetic readings instead.
 
-        Seeds from Claude's own on-disk cache for an instant first paint, then
-        goes and gets a live reading. The cache is often stale (observed 1.5
-        days out of date), so it is only ever a placeholder until the fetch
-        lands."""
-        cached = claude_usage.read_cached()
-        if cached is not None:
-            self._apply_usage(cached)
+        THERE IS NO CACHED SEED, on purpose, and the one that used to paint the
+        Claude pill instantly from `~/.claude.json` has been removed (Gemini's
+        own disk cache went with it). A stored reading goes stale exactly where
+        it matters most: a 5-hour window is routinely spent and reopened
+        between one launch and the next, so a restored figure is not merely old,
+        it is wrong in the direction that misleads — and nothing on the bar
+        distinguishes it from a live one. Every enabled pill therefore opens in
+        its LOADING state and only ever shows a number fetched THIS run; the
+        immediate polls below are what fill them in."""
+        self._polling = True
+        self.top_bar.mark_usage_loading()   # every enabled pill, from t=0
         self._usage_timer.start()
         self._usage_tick_timer.start()
         self._poll_usage()
-        # the Gemini readout rides the same opt-in, for the same reasons
-        self._gemini_usage_timer.start()
-        self._poll_gemini_usage()
+        # The Gemini readout rides the same opt-in, for the same reasons, but
+        # NOT the same gating: its poll is skipped entirely when both Gemini
+        # pills are off, because `_gemini_usage` has no other consumer. The
+        # Claude poll is never gated on its pill - planLimitReached,
+        # planLimitCleared, plan_usage() and _arm_reset_poll all hang off that
+        # reading, and auto-continue depends on them. Closing a pill hides a
+        # readout; it does not switch a feature off.
+        if self._gemini_wanted():
+            self._gemini_usage_timer.start()
+            self._poll_gemini_usage()
 
     def _poll_usage(self) -> None:
         """Kick a fetch on a daemon thread (the pty_worker/mcp_server pattern).
@@ -1610,7 +1844,7 @@ class MainWindow(QMainWindow):
         # than blanking a figure the user is watching. Only a machine with no
         # Claude login at all (no-auth) has nothing to show, ever.
         if reading is not None and reading.error == "no-auth" and self._usage is None:
-            self.top_bar.usage_badge.setVisible(False)
+            self.top_bar.mark_usage_absent("claude")
             # no Claude account => no plan limit to recover from; don't leave
             # two switches on the bar that can never do anything
             self.top_bar.set_recovery_available(False)
@@ -1683,14 +1917,11 @@ class MainWindow(QMainWindow):
         would retune (and so restart the poll timer) far more often than the
         number can move.
         """
-        self.top_bar.usage_badge.tick()
-        if hasattr(self.top_bar, "gemini_badge"):
-            self.top_bar.gemini_badge.tick()
-        if hasattr(self.top_bar, "gemini_weekly_badge"):
-            self.top_bar.gemini_weekly_badge.tick()
+        self.top_bar.tick_usage()
         self._retune_usage_poll()
         # from the LAST reading, never a fresh fetch: this tick fires every 20s
-        self._retune_gemini_usage_poll(self._gemini_usage)
+        if self._gemini_wanted():
+            self._retune_gemini_usage_poll(self._gemini_usage)
 
     def _gemini_agents_working(self) -> bool:
         """True if at least one Gemini agent is currently running."""
@@ -1735,8 +1966,15 @@ class MainWindow(QMainWindow):
 
         `_gemini_usage_inflight` is the guard that matters: a 6-second CLI
         timeout is longer than the urgent interval, so without it the timer
-        would stack threads behind a slow call."""
-        if self._closing or self._gemini_usage_inflight:
+        would stack threads behind a slow call.
+
+        `_gemini_wanted` is the other one: with both Gemini pills closed there
+        is nothing left that consumes the reading, so the subprocess is skipped
+        rather than run for a readout nobody asked for. It is checked HERE as
+        well as at the two call sites, because `_on_usage_refresh` deliberately
+        refreshes everything the user can see without knowing what that is."""
+        if (self._closing or self._gemini_usage_inflight
+                or not self._gemini_wanted()):
             return
         self._gemini_usage_inflight = True
 
@@ -1754,26 +1992,66 @@ class MainWindow(QMainWindow):
     def _on_gemini_usage_ready(self, reading) -> None:
         """Apply a Gemini reading on the GUI thread."""
         self._gemini_usage_inflight = False
-        if reading is None or self._closing:
+        if self._closing:
+            return
+        # keyed on having LIMITS, not on `ok`: a reading that carries numbers
+        # AND an error is still the freshest thing we have, and `set_usage`
+        # already greys it. Only a reading with nothing in it is a failure.
+        if reading is None or not reading.limits:
+            # A failed read must never blank the pill. Same rule as the Claude
+            # readout, for the same reason: a figure that silently disappears is
+            # indistinguishable from a deleted feature. It DID disappear before
+            # this - the badge hid itself and a blanket try/except hid that it
+            # had - so with `agy` absent or erroring the Gemini readout simply
+            # ceased to exist, with no way to ask it to try again.
+            self.top_bar.note_gemini_usage_error(
+                reading.error if reading is not None else "unknown")
             return
         self._gemini_usage = reading
-        try:
-            if hasattr(self.top_bar, "gemini_badge"):
-                self.top_bar.gemini_badge.set_usage(reading)
-            if hasattr(self.top_bar, "gemini_weekly_badge"):
-                self.top_bar.gemini_weekly_badge.set_usage(reading)
-            # retune from the reading we already have: re-fetching here doubled
-            # the freeze, because it shelled out to the CLI a SECOND time on
-            # every single tick
-            self._retune_gemini_usage_poll(reading)
-        except Exception:
-            pass
+        self.top_bar.set_gemini_usage(reading)
+        # retune from the reading we already have: re-fetching here doubled
+        # the freeze, because it shelled out to the CLI a SECOND time on
+        # every single tick
+        self._retune_gemini_usage_poll(reading)
 
-    def _on_usage_visibility(self, on: bool) -> None:
-        """User toggled the readout from the top bar's context menu."""
-        self._usage_visible = bool(on)
-        self.top_bar.set_usage_visible(self._usage_visible)
-        self._schedule_save()   # a UI preference, like sound_enabled
+    def _gemini_wanted(self) -> bool:
+        """True while at least one Gemini pill is switched on.
+
+        `_gemini_usage` is consumed ONLY by those two pills and by
+        `_retune_gemini_usage_poll`, so with both off the ~3.0s
+        `agy --print /usage` subprocess has no consumer at all and is skipped
+        rather than run and thrown away. That is the whole point of letting a
+        Claude-only user close them."""
+        return bool(self._usage_trackers.get("gemini_five_hour")
+                    or self._usage_trackers.get("gemini_weekly"))
+
+    def _on_usage_tracker_toggled(self, key: str, on: bool) -> None:
+        """The X on a pill, or an entry in the + menu. One handler for both, so
+        the two controls of the same preference can never disagree."""
+        if key not in USAGE_TRACKER_KEYS:
+            return
+        was_gemini = self._gemini_wanted()
+        self._usage_trackers[key] = bool(on)
+        self.top_bar.set_usage_trackers(self._usage_trackers)
+        # a UI PREFERENCE, like sound_enabled. The READING it governs stays
+        # transient and still never reaches a save.
+        self._schedule_save()
+        if not on:
+            if was_gemini and not self._gemini_wanted():
+                self._gemini_usage_timer.stop()   # nothing consumes it now
+            return
+        # Switched back on: load it NOW rather than leave a gap for up to a
+        # minute. The loading state goes up first, so the pill is on the bar
+        # before a fetch that can take ~3s comes back.
+        self.top_bar.mark_usage_loading(key)
+        if not self._polling:
+            return              # this window never opted in; never shell out
+        if key == "claude":
+            self._poll_usage()
+            return
+        if not was_gemini:
+            self._gemini_usage_timer.start()
+        self._poll_gemini_usage()
 
     def _on_auto_continue(self, on: bool) -> None:
         """User toggled resume-on-limit-reset from the top bar."""
@@ -2570,6 +2848,137 @@ class MainWindow(QMainWindow):
         self._schedule_save()
         self._push_taskbar_badge()   # apply now, don't wait for an agent event
 
+    def _on_auto_update_toggled(self, enabled: bool) -> None:
+        """User flipped the startup CLI auto-update switch. An ordinary UI
+        preference: additive optional key under "ui", saved on the debounced
+        timer, no SESSION_VERSION bump (identical to `taskbar_badge` and the
+        two recovery toggles). It takes effect on the NEXT launch, since the
+        gate runs before the window exists."""
+        self._auto_update = bool(enabled)
+        self._schedule_save()
+
+    # ------------------------------------------------- the Updates panel ---
+    # The install-method control (`app/cli_install.py`). Everything here is
+    # DERIVED and TRANSIENT: nothing is added to `session.json`, no
+    # SESSION_VERSION bump, and none of it may `_touch`/`_schedule_save`. The
+    # only persisted key is still `ui.auto_update`, written by the checkbox
+    # inside the panel through the unchanged `_on_auto_update_toggled`.
+
+    def _cli_install_runner(self):
+        """The runner the panel acts through, or None.
+
+        OPT-IN exactly like `start_usage_polling()` and the startup gate: the
+        real subprocess runner is armed only from `main.py`, because the
+        offscreen suite shares `create_main_window` and must never install
+        software or rewrite the user's `~/.claude/settings.json`."""
+        return getattr(self, "_install_runner", None)
+
+    def arm_cli_install(self, runner=None) -> None:
+        """Let the Updates panel actually act. Called from `main.py` alone."""
+        from app import cli_update
+        self._install_runner = runner or cli_update.subprocess_runner
+
+    def claude_install_situation(self):
+        """Read the machine now. Never cached: a remembered install method is
+        wrong the moment the user installs something by hand."""
+        from app import cli_install, providers
+        return cli_install.detect(providers.resolve_claude(),
+                                  runner=self._cli_install_runner())
+
+    def refresh_install_state(self) -> None:
+        """Put the detected state on the down-arrow's tooltip, and audit it."""
+        from app import cli_install
+        try:
+            situation = self.claude_install_situation()
+        except Exception:  # noqa: BLE001 - a tooltip must never break a launch
+            return
+        self.top_bar.note_install_state(situation.detail)
+        self._audit_install(cli_install.state_line(situation))
+
+    def open_updates_panel(self) -> None:
+        from app import cli_install
+        from .update_panel import UpdatePanel
+
+        situation = self.claude_install_situation()
+        self.top_bar.note_install_state(situation.detail)
+        self._audit_install(cli_install.state_line(situation))
+        panel = UpdatePanel(situation, auto_update=self._auto_update,
+                            runner=self._cli_install_runner(),
+                            winget_exe=cli_install.winget_exe_path(),
+                            parent=self)
+        panel.autoUpdateToggled.connect(self.top_bar.set_auto_update)
+        panel.autoUpdateToggled.connect(self._on_auto_update_toggled)
+        panel.auditRequested.connect(self._audit_install)
+        panel.migrationApplied.connect(self.rebind_claude_specs)
+        panel.exec()
+        self.top_bar.note_install_state(panel.situation().detail)
+
+    def _audit_install(self, line: str) -> None:
+        store = getattr(self, "store", None)
+        if store is None:
+            return
+        try:
+            store.audit(line)
+        except Exception:  # noqa: BLE001 - forensics, never fatal
+            pass
+
+    def rebind_claude_specs(self) -> int:
+        """Repoint every LIVE Claude spec at whatever `resolve_claude()` now
+        answers, and audit how many moved.
+
+        `providers.resolve_claude()` learning to prefer the native launcher
+        fixes what that function ANSWERS; it does not touch a `spec.program`
+        already baked by `build_spec`. So without this pass, every card that
+        existed before a migration would go on relaunching the WinGet binary
+        for the rest of the process, and the migration would genuinely appear
+        to have done nothing. `AgentSpec.set_permission_mode` is the precedent
+        for the rebuild.
+
+        Three rules. It must NOT restart, stop or otherwise disturb a RUNNING
+        agent (the new path applies at that agent's next launch, which is what
+        the migration being lock-free bought us). It must NOT emit `dirty`:
+        `program`/`args` are derived and are not persisted at all (`to_dict`
+        stores `user_program`). And it is idempotent, so a second migration
+        attempt is harmless."""
+        from app import providers
+
+        moved, exe = 0, ""
+        for agent in self.manager.all_agents():
+            spec = getattr(agent, "spec", None)
+            if spec is None or spec.provider != "claude":
+                continue
+            program, args = providers.build_invocation(
+                spec.provider, model=spec.model, effort=spec.effort,
+                custom_command=spec.custom_command,
+                extra_args=list(spec.user_args),
+                permission_mode=spec.permission_mode)
+            if not program:
+                continue
+            if program == spec.program and list(args) == list(spec.args):
+                continue
+            spec.program, spec.args = program, list(args)
+            exe, moved = program, moved + 1
+        if moved:
+            from app import cli_install
+            self._audit_install(cli_install.audit_lines(
+                cli_install.Result(True, "rebind", before=str(moved),
+                                   after=exe))[0])
+        return moved
+
+    def note_update_outcomes(self, outcomes, installing=()) -> None:
+        """Report what the startup update gate did (called from `main.py`,
+        which is the only place that runs it).
+
+        Purely transient, like the plan-usage reading and the taskbar count:
+        this must never mark the session dirty. Only the four reporting
+        statuses say anything at all, so a clean gate leaves the top bar
+        exactly as it was."""
+        from app import cli_update
+        self._update_installing = tuple(installing or ())
+        text = cli_update.pill_text(outcomes, self._update_installing)
+        self.top_bar.note_update_pending(
+            text, cli_update.pill_tooltip(outcomes, self._update_installing))
+
     def _restore_ui_state(self, session: dict) -> None:
         ui = session.get("ui", {})
         # restore the saved skin FIRST so the stylesheet below is built once
@@ -2588,15 +2997,31 @@ class MainWindow(QMainWindow):
         # notification chime preference (default ON if never saved)
         self._sound_enabled = bool(ui.get("sound_enabled", True))
         self.top_bar.set_sound_enabled(self._sound_enabled)
-        # plan-usage readout preference (default ON if never saved). A new key
-        # inside "ui" read with a default is backward compatible, so this needs
-        # no SESSION_VERSION bump — same as sound_enabled before it.
-        self._usage_visible = bool(ui.get("usage_visible", True))
-        self.top_bar.set_usage_visible(self._usage_visible)
+        # Which usage readouts to show (default: all of them). A dict rather
+        # than a list of enabled keys, so a missing entry defaults ON per key
+        # and a fourth tracker added later needs no migration. A new key inside
+        # "ui" read with a default is backward compatible, so this needs no
+        # SESSION_VERSION bump — same as sound_enabled before it.
+        saved_trackers = ui.get("usage_trackers")
+        if isinstance(saved_trackers, dict):
+            self._usage_trackers = {k: bool(saved_trackers.get(k, True))
+                                    for k in USAGE_TRACKER_KEYS}
+        elif ui.get("usage_visible", True) is False:
+            # MIGRATION off the older single boolean: this user hid the whole
+            # readout, so honour that as "every tracker off". Reopening must
+            # never put a bar back that they deliberately cleared.
+            self._usage_trackers = {k: False for k in USAGE_TRACKER_KEYS}
+        else:
+            self._usage_trackers = dict(DEFAULT_USAGE_TRACKERS)
+        self.top_bar.set_usage_trackers(self._usage_trackers)
         # taskbar working-count overlay (default ON: it is self-silencing, an
         # idle hive shows no badge at all, so it never nags)
         self._taskbar_badge = bool(ui.get("taskbar_badge", True))
         self.top_bar.set_taskbar_badge(self._taskbar_badge)
+        # startup CLI auto-update (default OFF: it installs software, so it is
+        # armed deliberately, once, exactly like the recovery switches were)
+        self._auto_update = bool(ui.get("auto_update", False))
+        self.top_bar.set_auto_update(self._auto_update)
         self._auto_continue = bool(ui.get("auto_continue", True))
         self.top_bar.set_auto_continue(self._auto_continue)
         self._startup_recovery = bool(ui.get("startup_recovery", True))
@@ -3014,10 +3439,19 @@ class MainWindow(QMainWindow):
         time — in EVERY workspace — starts (and resumes) automatically, so
         opening the app brings the whole hive back without manual steps.
         Agents that were stopped, and one-shot scripts, never re-execute as
-        a side effect of launch. (Name kept for the smoke-test API.)"""
+        a side effect of launch. (Name kept for the smoke-test API.)
+
+        The one exception is a provider whose CLI was still installing when the
+        user skipped the update splash: its binary is being rewritten right
+        now, so starting an agent could execute a half written file. Those wait
+        for the user (the top-bar pill says so) rather than being started."""
         for ws in self.manager.workspaces:
             for agent in ws.agents:
                 if agent.autostart_on_restore and not agent.is_running():
+                    if agent.spec.provider in self._update_installing:
+                        agent.notice("[not started: a CLI update is still "
+                                     "installing]")
+                        continue
                     agent.start()
 
     # -------------------------------------------------------- persistence ---
@@ -3055,8 +3489,14 @@ class MainWindow(QMainWindow):
             "console_font_px": ui_theme.CONSOLE_FONT_PX,
             "theme": self._theme_id,
             "sound_enabled": self._sound_enabled,
-            "usage_visible": self._usage_visible,
+            "usage_trackers": dict(self._usage_trackers),
+            # Legacy mirror, DERIVED, kept for one release so a downgrade to a
+            # build that only understands this key does not resurrect three
+            # pills the user closed. Restore prefers usage_trackers, so the two
+            # can never fight on the way back in.
+            "usage_visible": any(self._usage_trackers.values()),
             "taskbar_badge": self._taskbar_badge,
+            "auto_update": self._auto_update,
             "auto_continue": self._auto_continue,
             "startup_recovery": self._startup_recovery,
             "terminal_scrollback": self._terminal_scrollback,

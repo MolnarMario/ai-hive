@@ -181,6 +181,31 @@ def get(key: str) -> Provider | None:
 
 
 def resolve_claude() -> str:
+    """The Claude Code binary AI Hive launches, native install FIRST.
+
+    THE ORDER IS LOAD-BEARING AND IS THE MOST LIKELY WAY TO SHIP THE NATIVE
+    MIGRATION BROKEN. Measured on the reporting machine: the winget package
+    directory is on PATH DIRECTLY (not through a Links shim), and
+    `%USERPROFILE%\\.local\\bin` is not on PATH at all. The native installer
+    APPENDS its own directory, so after a migration PATH holds both and order
+    decides which one `shutil.which` finds. It would keep answering with the
+    STALE winget copy, AI Hive would go on launching the old binary, and the
+    migration would appear to have done nothing. That is exactly the risk
+    CLAUDE.md used to record as a reason not to migrate at all; checking the
+    native launcher first is what handles it.
+
+    Deliberate consequence, worth keeping: AI Hive does not depend on the
+    installer's PATH edit, so a migration never needs a new terminal, and every
+    agent rebuilt from `session.json` re-resolves through here (`to_dict`
+    stores `user_program`, and `from_dict` re-runs `build_spec`). An agent that
+    already exists in the LIVE process does not, which is why the migration
+    also rebuilds those specs (`MainWindow.rebind_claude_specs`).
+    """
+    native = os.path.join(os.environ.get("USERPROFILE")
+                          or os.path.expanduser("~"),
+                          ".local", "bin", "claude.exe")
+    if os.path.isfile(native):
+        return native
     found = shutil.which("claude")
     if found:
         return found

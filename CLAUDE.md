@@ -461,6 +461,199 @@ this file is the invariants that must survive every change.
   close AI Hive (or reboot), confirm `Get-Process claude` returns nothing, THEN
   upgrade. This is a direct consequence of the Job-Object process model (agents
   are kept alive by design); it is expected, not a bug.
+- **The startup update gate is the ANSWER to the invariant above, and its two
+  rules both come from that one fact** (`app/cli_update.py`, Qt-free/stdlib-only
+  like `chime.py`; `app/widgets/update_splash.py` shows it; `main.py` is the
+  only caller). Because a running `claude.exe` cannot be replaced, the moment
+  ABOVE `create_main_window()` — before a single agent exists — is not merely
+  convenient, it is the ONLY unlocked moment, which is why the gate sits between
+  `setup_application` and the factory and far above
+  `autostart_active_workspace()`. RULE 1: **winget's report is never evidence.**
+  The installed version is read off the FILE (`<exe> --version`, 0.09s) before
+  AND after, and winget is asked only what the MANIFEST offers (`winget show`, a
+  pure read) — never `winget upgrade` for the check. This is the repair for the
+  live bug: an upgrade run with agents up cannot replace the file but winget
+  records the new version anyway, after which the stale binary nags forever (and
+  its baked-in alias table still can't resolve a newer model, per the alias
+  invariant above) while `winget upgrade` answers "No available upgrade found".
+  Hence `Status.DB_STALE` for "the file is behind the manifest AND winget says
+  nothing to do", checked BEFORE the return code because winget reports that
+  with a non-zero rc. DB_STALE only REPORTS: the forcing flag is unverified, and
+  shipping a guessed `--force` at startup is not acceptable. RULE 2: **a live
+  target process skips the target without issuing ANY upgrade command**, which
+  is the direct fix for how the database got poisoned; those processes are the
+  user's own or another app's, outside our Job Object, and are NEVER killed (one
+  kill can destroy a transcript). An unanswerable `tasklist`
+  (`UNKNOWN_PROCESSES`) counts as blocked for the same reason. CRITICAL, and a
+  live find: **"live" is decided by PATH, never by image name.** `Claude.exe` is
+  BOTH the CLI and the unrelated Claude DESKTOP app, which a user leaves open
+  all day, so a name-only count read eight desktop windows as a locked CLI and
+  skipped the update on EVERY launch, forever — observed as `UPDATE-SKIP claude
+  (8 claude.EXE alive)` logged three seconds BEFORE AI Hive started an agent of
+  its own, i.e. against a binary nothing was holding (measured on the same
+  machine afterwards: 19 by name, 11 by path). `count_processes` therefore runs
+  two passes cheapest-first — `tasklist` answers "anything by this name at all",
+  and only a non-zero answer pays for the path listing (`process_paths_argv`,
+  measured 0.40s) that decides how many are `target.exe`. Comparison goes
+  through `_canonical` (`realpath` + `normcase`, not a string compare) because
+  winget also installs a symlink shim and a session launched through it reports
+  the LINK. EVERY ambiguity leans towards over-counting — an unreadable path, a
+  failed path query, or a listing that sees fewer than `tasklist` did all mean
+  "assume it is ours" — because over-counting costs a skipped update that the
+  pill reports, while under-counting runs an installer against a locked file,
+  which is the false database record this whole module exists to prevent. The two SHAPES
+  of target diverge in exactly one structural way and it must not be flattened:
+  a winget package is checked and installed as separate acts, while a
+  self-updating CLI takes NO flags on `agy update`/`claude update`, so
+  there is NO dry run and for a `self_update` target checking IS installing
+  (`needs_apply` returns True unconditionally, and an unchanged version after a
+  clean self-update reads UP_TO_DATE, not the REPORTED_BUT_UNCHANGED the same
+  reading means for winget). WHICH SHAPE CLAUDE TAKES IS NOW READ OFF THE
+  INSTALL, not hardcoded (`_claude_target`, decided by
+  `cli_install.classify_install` on the PATH, because the binary, the version
+  string and the process name are identical across install methods): a WinGet
+  package keeps the winget shape, a NATIVE install is `self_update`. The old
+  note here said Claude deliberately stays on winget because `claude update`
+  installs a native build elsewhere and `resolve_claude()` would then launch the
+  stale copy. That risk is now HANDLED rather than avoided (`resolve_claude()`
+  checks `%USERPROFILE%\.local\bin\claude.exe` FIRST, see the native-migration
+  invariant below), so the same build serves either machine and rolling the
+  migration back needs no code revert. One real consequence: `Status.DB_STALE`
+  is structurally UNREACHABLE for Claude on a native install, since there is no
+  package database to go stale. Budgets are
+  SPLIT and that is deliberate: the check is bounded (`CHECK_TIMEOUT_S`) and
+  fails OPEN to launch (`TIMEOUT`, no pill — a hung network must never cost the
+  user the app), while the install is NEVER killed on a timer, because a
+  half-written 285 MB binary is worse than the banner. Skip is the escape hatch
+  instead, and its one consequence is handled rather than prevented: providers
+  still installing at Skip come back in `GateResult.installing` and
+  `autostart_active_workspace` holds THOSE agents back, so none can execute a
+  half-written file. Threading is mandatory, not stylistic — the gate runs on a
+  `threading.Thread` while the splash drains a `queue.Queue` on a `QTimer` in a
+  local `QEventLoop` — because `gemini_usage.fetch()` shelling out inline on the
+  GUI thread froze the app ~6s a minute (see the Gemini readout invariant). The
+  runner is INJECTED and the real one is only ever passed from `main.py`, the
+  same opt-in rule as `start_usage_polling()`: the suite shares
+  `create_main_window` and must never upgrade the user's CLI, so every check
+  drives `run_gate` with a fake `Runner`. `ui.auto_update` is an ordinary UI
+  preference (default OFF, since this mutates installed software: additive
+  optional key, `_schedule_save`, NO `SESSION_VERSION` bump) and the OUTCOMES
+  are TRANSIENT exactly like the plan-usage reading — `note_update_outcomes`
+  must never `_touch`/`_schedule_save`. Every version transition is audited to
+  `session.log` (`UPDATE-CHECK`/`UPDATE`/`UPDATE-SKIP`/`UPDATE-STALE`/
+  `UPDATE-UNCHANGED`/`UPDATE-FAIL`/`UPDATE-TIMEOUT`) with deliberately NO
+  patch-versus-minor gate: nothing in the numbering predicts whether a flag
+  moved, so a version gate buys false safety while an audit line turns "it broke
+  this morning" into a lookup.
+- **Letting Claude Code update ITSELF is a MIGRATION, not a preference**
+  (`app/cli_install.py`, Qt-free/stdlib-only like `cli_update.py`;
+  `app/widgets/update_panel.py` shows it; `MainWindow.open_updates_panel` /
+  `arm_cli_install` wire it). A package-manager install does not auto-update and
+  NO SETTING FIXES THAT — Claude Code knows a package manager owns its file and
+  refuses to replace it (the documented tell: `claude update` on such an install
+  replies "Claude is up to date!" regardless of the actual version). The install
+  method IS the behaviour, so the only way to change the behaviour is to change
+  the install. Hence a consented, reversible switch onto the documented native
+  installer (`irm https://claude.ai/install.ps1 | iex`), which writes to
+  `%USERPROFILE%\.local\`, needs no Administrator rights, and therefore NEVER
+  touches the running winget file — **the migration is lock-free and may run
+  with every agent alive**, which is the structural advantage over the startup
+  gate above. Only CLEANUP keeps the old constraint (`winget uninstall` cannot
+  remove a package whose `.exe` is running), so cleanup is SEPARATE, OPTIONAL
+  and DEFERRABLE and never blocks the win. Rules, each from a concrete failure:
+  * **THE CONTROL IS NEVER A BOOLEAN.** Label, modal and action are all a
+    function of the detected `Situation` (`MANAGED` / `SELF_ACTIVE` /
+    `SELF_PAUSED` / `NOT_APPLICABLE` / `LOCKED_BY_POLICY` / `MISSING`), so a
+    user is never offered an action that does not apply. `SELF_ACTIVE` ⇄
+    `SELF_PAUSED` is the PRIMARY undo (one `env` key, instant, no download,
+    freezes them on exactly this version); the full revert to winget is
+    deliberately SECONDARY, because conflating the two undos in one click is how
+    a user who wanted to pause ends up reinstalling.
+  * **`resolve_claude()` CHECKS THE NATIVE LAUNCHER FIRST**, and this is the
+    most likely way to ship the whole feature broken. MEASURED: the winget
+    package directory is on PATH DIRECTLY (not via a Links shim) and
+    `%USERPROFILE%\.local\bin` is NOT on PATH, so `shutil.which` would keep
+    answering with the STALE copy after a migration and AI Hive would go on
+    launching the old binary. Deliberate consequence worth keeping: AI Hive
+    never needs the installer's PATH edit, so no new terminal is required.
+  * **...AND THAT IS NOT ENOUGH ON ITS OWN.** `build_spec` bakes `spec.program`
+    once, so a card that existed BEFORE the migration would relaunch the winget
+    binary for the rest of the process. `MainWindow.rebind_claude_specs` re-runs
+    `providers.build_invocation` for every live Claude spec (the precedent is
+    `AgentSpec.set_permission_mode`, which rebuilds `args` for exactly this
+    reason). It must NOT restart/stop a RUNNING agent (the new path applies at
+    its next launch, which is what lock-free bought us), must NOT emit `dirty`
+    (`program`/`args` are derived; `to_dict` stores `user_program`), and is
+    idempotent.
+  * **A CHANNEL IS NEVER WRITTEN WITHOUT ITS FLOOR.** `stable` is a channel, not
+    a ceiling, so setting it on a machine AHEAD of stable lets the next update
+    move the user BACKWARDS — i.e. straight back into the stale-alias failure
+    this feature exists to end. `set_channel` mirrors `/config`: to `stable` it
+    writes `autoUpdatesChannel` AND `minimumVersion` = the version read off the
+    FILE right then, and REFUSES (`ok=False`, writes nothing) when that version
+    is unparseable; back to `latest` it REMOVES `minimumVersion` so the pin
+    cannot outlive its reason. `requiredMinimumVersion` is a different key that
+    stops Claude Code STARTING at all and is never written.
+  * **`~/.claude/settings.json` HAS OTHER WRITERS AND THEY ARE OURS.** Every
+    running agent's `/model` and `/config` writes it. `write_settings` therefore
+    takes a MUTATION, not a finished document, and RE-READS immediately before
+    the replace — atomicity stops a torn file, it does nothing about a LOST
+    UPDATE, and the panel can sit open for a minute between the two. Same rule
+    `session.json` follows, and for the same reason. A file that does not parse
+    is REFUSED and never "repaired", including on the re-read.
+  * **CLEANUP COUNTS AGAINST THE RECORDED WINGET PATH, NEVER
+    `resolve_claude()`.** By cleanup time that function answers with the NATIVE
+    launcher, so counting against it asks a question nobody asked: the user's
+    own winget-launched sessions do not match, the count comes back zero, and
+    `winget uninstall` runs against a file those sessions hold. That is
+    under-counting, the direction `count_processes` documents as unsafe, and
+    here it is unsafe twice (it either poisons the package database again or
+    removes the rollback out from under a live session). A live CLI blocks and
+    is NEVER killed.
+  * `CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE=1` IS NOT SUPPORTED ANYWHERE. It
+    makes a RUNNING Claude Code invoke `winget upgrade` on itself, the exact act
+    that writes the false database record `cli_update.py` exists to prevent.
+  * Everything here is DERIVED and TRANSIENT: the state is re-read from the
+    filesystem and `~/.claude/settings.json` on every look, never stored (a
+    remembered install method is wrong the moment the user installs anything by
+    hand). NOTHING new goes in `session.json`; the only persisted key is still
+    `ui.auto_update`, no `SESSION_VERSION` bump. The runner is INJECTED and
+    armed from `main.py` alone (`arm_cli_install`), the same opt-in rule as
+    `start_usage_polling()`. Outcomes are audited to `session.log`
+    (`CLI-MIGRATE-STATE`/`-START`/`-OK`/`-FAIL`/`-REBIND`/`-PAUSE`/`-RESUME`/
+    `-CHANNEL`/`-REVERT`/`-CLEANUP`); `REBIND` and the `exe=` on `CLEANUP` name
+    the thing the line is ABOUT rather than what the app happened to resolve,
+    because a cleanup reporting the native path is a cleanup that counted the
+    wrong file.
+  * The startup gate above is DEMOTED, not deleted. After a migration it no
+    longer keeps the user current; it guarantees a downloaded update has LANDED
+    before agents launch rather than "the next time you start Claude Code". It
+    stays fully load-bearing for `agy`, which has no auto-updater and no native
+    option, and remains the single enforcement point for: the binary changes
+    only when nothing is holding it.
+  * VERIFIED, by READING `https://claude.ai/install.ps1` rather than running it
+    (111 lines, inspected 2026-08-11): it contains NO interactive construct at
+    all (no `Read-Host`, `PromptForChoice`, `$Host.UI`, `-Confirm`,
+    `Get-Credential` or console read), so it cannot park the install thread on a
+    prompt with stdin closed. It resolves `latest`, refuses a version string
+    that is not `N.N.N` (an HTML error page), downloads the platform binary,
+    verifies its SHA256 against the SIGNED `manifest.json`, then shells to
+    `<downloaded>.exe install`; every failure path is `Write-Error` + a non-zero
+    exit, which `migrate` reads off the FILE anyway. `subprocess_runner` still
+    passes `stdin=DEVNULL`, and the panel's Close remains the escape hatch.
+  * STILL UNVERIFIED, and only answerable on a machine that has migrated: is the
+    Windows native launcher a stub or the whole binary? The docs describe the
+    launcher-into-`versions/` symlink indirection for macOS and Linux
+    EXPLICITLY and say nothing equivalent for Windows, and the installer above
+    delegates that step to `claude install` so the script does not settle it
+    either. Run
+    `(Get-Item "$env:USERPROFILE\.local\bin\claude.exe").Length` and
+    `Get-ChildItem "$env:USERPROFILE\.local\share\claude\versions\"` right after
+    the first migration and record the answer here. Hundreds of MB (the winget
+    binary is MEASURED at 284,981,920 bytes) means the launcher IS the binary, a
+    background update cannot replace it while agents run, and the startup gate
+    stays load-bearing; a few KB with the bulk under `versions\` means updates
+    apply side by side.
 - **Plan usage is a LIVE READOUT and a HOOK POINT, never history**
   (`app/claude_usage.py`, Qt-free/stdlib-only like `chime.py`). The number comes
   from `GET /api/oauth/usage` with the account's OAuth bearer token — the same
@@ -471,10 +664,18 @@ this file is the invariants that must survive every change.
   run a subprocess inside every agent's TUI render loop, exactly the launch-
   timing perturbation the SessionStart `startup` invariant above is about.
   `~/.claude.json` → `cachedUsageUtilization` carries the IDENTICAL shape (one
-  `parse_utilization` serves both) but is only a cold-start seed / offline
-  fallback — the CLI rewrites it opportunistically and it goes stale for days
-  (observed 1.5 days and 10 points out of date), so it must never be the primary
-  source. TOKEN HANDLING IS READ-ONLY: re-read `.credentials.json` per call
+  `parse_utilization` serves both), and `claude_usage.read_cached` still parses
+  it, but NOTHING IN THE APP CALLS IT ANY MORE and nothing may: a STORED NUMBER
+  IS NEVER SHOWN. The cold-start seed was removed, and Gemini's own disk cache
+  (`gemini_usage.cache_path`/`read_cached`/`write_cached`) was DELETED outright,
+  because a 5-hour window is routinely spent and reopened between one launch and
+  the next — so a restored figure is not merely old (observed 1.5 days and 10
+  points out of date), it is wrong in the direction that misleads, and nothing
+  on the bar distinguishes it from a live one. Every enabled pill instead opens
+  in a LOADING state (`UsagePillBadge.mark_loading`, put up by
+  `start_usage_polling`) and only ever shows a figure fetched this run;
+  `gemini_usage.fetch` returns `error="no-data"` rather than reaching for disk.
+  TOKEN HANDLING IS READ-ONLY: re-read `.credentials.json` per call
   (running agents keep it rotated for us), short-circuit on a past `expiresAt`
   instead of putting a dead credential on the wire, and NEVER refresh (that
   races the CLI's own refresh), write, log, or persist it. `fetch()` never
@@ -485,16 +686,48 @@ this file is the invariants that must survive every change.
   (`PlanUsageBadge.mark_unreadable`, "usage limit unreadable — click to
   refresh") — the badge must never just disappear, which is indistinguishable
   from the feature having been deleted (reported as exactly that after a
-  restart met an `http 429`; CLI 2.1.220 no longer writes the
-  `cachedUsageUtilization` seed that used to paint a number instantly, so the
-  gap is now reachable on any cold start). Visibility is therefore gated on
-  `has_content()`, NOT `has_reading()`, and a click resets `_usage_backoff`
+  restart met an `http 429`; there is deliberately no on-disk seed to paint a
+  number instantly, so the gap is reachable on any cold start). The GEMINI pill
+  obeys this too, and did not before: `set_usage` used to hide the badge itself
+  whenever a reading carried no matching window, with a blanket `try/except`
+  hiding that it had, so an absent/erroring `agy` made the readout cease to
+  exist with no way to ask it to retry. Failures now route through
+  `TopBar.note_gemini_usage_error`, which greys an existing number
+  (`mark_stale`) and only says "unreadable" when there is nothing to grey.
+  VISIBILITY IS A PRODUCT OF TWO INDEPENDENT FACTORS, decided in exactly one
+  place (`TopBar._sync_usage_pills`): `has_content()` (a reading, the can't-read
+  pill, OR the loading state) AND the user's per-pill preference. NO badge class
+  may call `setVisible` on itself. That split is what lets a pill the user
+  CLOSED vanish — the point of the hover ✕ — without regressing the rule that a
+  FAILED read must never look like a deleted feature; collapsing them back into
+  one flag makes the two indistinguishable. A click resets `_usage_backoff`
   (`_on_usage_refresh`) so the user asking now isn't parked behind a 16-minute
   retry gap. CRITICAL, same rule as `activity_changed`/`waiting_changed`: a reading
   is TRANSIENT and must NEVER mark `dirty` — `_apply_usage` runs every minute
   for the life of the process, so wiring it to a save would rewrite
-  `session.json` 60x an hour (only the `ui.usage_visible` preference saves, via
-  `_schedule_save`). Polling is OPT-IN — `main.py` calls
+  `session.json` 60x an hour (only the `ui.usage_trackers` preference saves, via
+  `_schedule_save`). THAT PREFERENCE IS PER PILL and has exactly ONE control:
+  the hover ✕ on a pill and the `+` picker beside the auto-restart caption both
+  emit the same `TopBar.usageTrackerToggled(key, on)` into the same
+  `_on_usage_tracker_toggled`, so two controls of one setting can never
+  disagree. The older single `ui.usage_visible` boolean (a right-click item that
+  hid all three) is GONE; it is still WRITTEN as a derived mirror
+  (`any(trackers)`) for one release so a downgrade cannot resurrect closed
+  pills, and `_restore_ui_state` prefers `usage_trackers` and reads
+  `usage_visible: False` as "all trackers off" only when the newer key is
+  absent. Additive optional keys inside `"ui"`, so NO `SESSION_VERSION` bump.
+  The `+` button must NEVER be hidden — not by `set_recovery_available(False)`
+  (a Gemini-only user has no Claude login by definition), not by every tracker
+  being off — or there is no way back. Closing both Gemini pills SKIPS the
+  Gemini poll entirely (`_gemini_wanted`, checked in `start_usage_polling` and
+  again at the top of `_poll_gemini_usage`), which is sound only because
+  `_gemini_usage` has no consumer besides those two pills and
+  `_retune_gemini_usage_poll`; the CLAUDE poll is NEVER gated this way, because
+  `planLimitReached`/`planLimitCleared`/`plan_usage()`/`_arm_reset_poll` all
+  hang off that reading and auto-continue depends on them. Re-enabling a tracker
+  re-arms and fetches at once, but only when `self._polling` is set — which
+  `start_usage_polling` alone does, so the offscreen suite can toggle trackers
+  without ever shelling out to the user's real `agy`. Polling is OPT-IN — `main.py` calls
   `MainWindow.start_usage_polling()` exactly like it sets `quit_on_close`,
   because the smoke suite shares `create_main_window` and must never touch the
   network or the user's real account; tests drive `_on_usage_ready` with
@@ -541,6 +774,31 @@ this file is the invariants that must survive every change.
   flicker would reset the countdown forever and the poll would never fire at
   all; `_retune_usage_poll` therefore only touches the timer when the interval
   actually changes.
+- **A usage pill is exactly as wide as its text, by ONE formula**
+  (`ornaments.UsagePillBadge._measure_width`: `_PAD*2 + _RING + _GAP +
+  advance(text)`, measured with `_text_font()` — the font `paintEvent` actually
+  draws with, never the widget's QSS font, or the pill is sized for text of a
+  different size). `PlanUsageBadge` and
+  `GeminiUsageBadge` are both subclasses and supply only the TEXT; the Gemini
+  pills previously carried a hardcoded `_FIXED_WIDTH = 315` and elided into it,
+  which reserved 630px of the bar for two readouts whose real content is ~215px
+  each, truncated anything longer, and drifted from the Claude pill sitting
+  beside them. Do not re-copy the formula into a subclass. The ✕ is NOT a term
+  in that formula: it FLOATS over the tail of the text, which fades out under
+  it (`_paint_close_scrim`, the pill's own background rebuilt opaque and
+  clipped to the rounded outline) for as long as the pointer is inside. An
+  earlier cut RESERVED a permanent slot for it, which left ~20px of every pill
+  blank for the 99% of the time nobody is hovering. THE INVARIANT THE RESERVED
+  SLOT WAS PROTECTING STILL HOLDS AND STILL MATTERS: the pills sit after the
+  layout's `addStretch(1)`, so a pill that grew on hover would shove the entire
+  right-hand cluster (recovery caption, LED toggles, theme combo, font steppers,
+  Add Terminal) sideways as the pointer crossed it. Overlaying keeps it for
+  free — `_measure_width` reads the text alone and hovering only repaints — so
+  do not make the width depend on hover state. The ✕ is a child
+  `QToolButton`, NOT a rect hit-tested in `mousePressEvent`, so it consumes its
+  own press and closing can never be mistaken for the click-to-refresh
+  affordance that same handler owns. Loading strings must stay SHORTER than the
+  finished line, so a pill only ever grows when its reading lands.
 - **Auto-continue consumes that edge; the SCREEN says who to resume**
   (`MainWindow._resume_blocked_agents`, wired to `planLimitCleared`). The usage
   reading is ACCOUNT-wide — it knows the plan is out and until when, but never

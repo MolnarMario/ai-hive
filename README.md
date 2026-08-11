@@ -119,12 +119,25 @@ workspaces keep executing — switching never pauses anything.
   resets in …`**, and the window raises `planLimitReached` / `planLimitCleared`
   signals (with the reset time) so other features can act on being cut off —
   e.g. relaunching blocked agents unattended the moment the limit resets.
-  Right-click the top bar to hide the readout; it hides itself when there's no
-  Claude login. If the number can't be fetched at all — the endpoint
-  rate-limits, and there's no longer an on-disk figure to fall back on — the
-  badge says **`! usage limit unreadable — click to refresh`** rather than
-  quietly disappearing, and clicking it retries immediately instead of waiting
-  out the backoff.
+  It hides itself when there's no Claude login. If the number can't be fetched
+  at all — the endpoint rate-limits, and there's no longer an on-disk figure to
+  fall back on — the badge says **`! usage limit unreadable — click to
+  refresh`** rather than quietly disappearing, and clicking it retries
+  immediately instead of waiting out the backoff.
+- **Pick which usage readouts you want** — three pills can sit on the bar
+  (Claude plan, Gemini 5-hour, Gemini weekly), each sized to its own text.
+  **Hover one and an ✕ appears at its right edge** to close it; the **+ button**
+  left of the auto-restart caption opens a checklist to bring any of them back.
+  The choice is remembered per pill. Closing both Gemini pills also stops the
+  `agy` usage subprocess entirely, so a Claude-only user isn't paying a few
+  seconds a minute for a readout they don't want. Closing the Claude pill only
+  hides the readout: its poll keeps running, because auto-recovery is driven
+  from that reading.
+  **Nothing is remembered between runs except the choice itself.** Every pill
+  opens saying `reading...` and fills in from a fresh fetch at startup, because
+  a stored number goes stale exactly where it matters most — a 5-hour window is
+  routinely spent and reopened between one launch and the next, and a restored
+  figure looks identical to a live one.
 - **Auto-recovery from a spent plan limit** — two switches sit next to the usage
   readout, both on by default, both persisted, each with a tooltip spelling out
   what it does:
@@ -175,6 +188,74 @@ workspaces keep executing — switching never pauses anything.
   is back it carries on, and if it isn't, agy says so with a fresh countdown that
   *is* accurate and the retry waits for that instead. Claude's account readout is
   never used to resume a Gemini agent (it knows nothing about a Google quota).
+- **Let Claude Code update itself** — the **⬇ button** beside the taskbar toggle
+  opens a small **Updates** panel, and what it offers depends on how Claude Code
+  is actually installed on your machine (it re-reads that every time, so it is
+  never out of date):
+
+  A package-manager install *does not update itself*, and there is no setting
+  that fixes it: Claude Code knows a package manager owns its file and refuses
+  to replace it. Meanwhile its own "Update available!" banner compares against
+  Anthropic rather than against `winget`, so a fully upgraded winget install
+  still nags in every terminal — and because model aliases resolve *inside* the
+  binary, a stale one silently can't launch newer models however many times you
+  upgrade. The install method *is* the behaviour, so the panel offers to change
+  the install: it runs Anthropic's documented installer
+  (`irm https://claude.ai/install.ps1 | iex`) behind a consent dialog that shows
+  you the exact command, what changes, what doesn't, and both ways back, with an
+  action button that stays disabled until you tick "I understand and agree".
+
+  It installs *alongside* what you have (under your user folder, no
+  Administrator rights, a different directory from the winget copy), which means
+  **it never touches the running file, so it works with every agent alive** —
+  unlike the startup gate below, which only ever gets one moment. AI Hive picks
+  the new binary up straight away: it looks for the native launcher before it
+  looks at `PATH`, and it repoints the agents already on screen too, so nothing
+  needs a restart or a fresh terminal.
+
+  Afterwards the same panel is the way back. **Pause** is one setting, instant,
+  no download, and freezes you on exactly the version you're running ("I don't
+  trust anything newer than this"). **Follow the stable channel** takes builds
+  about a week old that skip releases with major regressions, and always pins a
+  floor at your current version so switching can never walk you *backwards*.
+  **Revert** reinstalls the winget package and removes the native one. And
+  **remove the old copy** is an optional tidy-up, refused (never forced, never
+  killing anything) while a session is still using it. Every one of these is
+  written to `session.log` as a `CLI-MIGRATE-*` line.
+- **Check for CLI updates at startup** — a checkbox inside that same panel,
+  **off by default** because turning it on lets AI Hive install software on your
+  machine. Armed, it checks for a newer Claude Code and Gemini (`agy`)
+  before the window is even built, and installs what it finds.
+
+  Startup isn't just convenient here, it's the only moment that works. Every
+  agent is a `claude.exe` child, Windows can't overwrite a running `.exe`, and
+  `winget` records the new version in its database anyway — which is exactly how
+  you end up with the CLI's own "Update available!" banner printing forever
+  while `winget upgrade` insists there's nothing to do, and (because model
+  aliases resolve inside the binary) no new model in `/model` however many times
+  you upgrade. So the gate runs above everything: no agent exists yet, nothing
+  holds a file. Two rules follow from that:
+  - **If anything is already running the CLI, the update is skipped without
+    running the installer at all.** Those are your own sessions or another
+    app's, and asking an installer to replace a locked file is precisely what
+    writes the false record. They're never killed either. "Running the CLI" is
+    matched on the executable's full path, not its name: the Claude desktop
+    app's binary is also called `Claude.exe`, and while it was counted the gate
+    skipped every launch forever (19 processes by name on this machine, 11 of
+    them actually the CLI).
+  - **Success is decided by running `--version` on the binary itself**, before
+    and after, never by what the installer said about itself.
+
+  A small splash names each CLI and what's happening, with a **Skip** button
+  that launches AI Hive immediately (an install already running is left alone,
+  never killed halfway through a 285 MB file — if you skip mid-install, agents
+  for that CLI simply wait rather than risk running a half-written program).
+  When everything is current the whole thing is about a second and a half. If an
+  update *couldn't* apply, a quiet pill appears in the top bar saying so, with
+  the reason on hover, so "why am I still seeing the nag?" has an answer instead
+  of being a mystery. Every version transition, skip and failure is written to
+  `session.log` (`UPDATE-CHECK` / `UPDATE` / `UPDATE-SKIP` / `UPDATE-FAIL`), so
+  "it broke this morning" is a lookup rather than an investigation.
 - **Send a message on a countdown** — type into an agent's terminal as usual,
   then press **`Ctrl+Shift+Enter`** instead of Enter. A small composer opens
   with what you typed, you pick when it should go in (**5m / 15m / 30m / 1h /
@@ -595,7 +676,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1411 checks drive the real app headlessly (offscreen Qt platform) with real
+1602 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -634,7 +715,30 @@ visualizer (transcript parsing for edited-vs-read
 attribution, sub-agent detection, shared-file grouping, headless paint, header-
 button wiring, and the drag/zoom/hit-test/click-to-focus interactions) and the
 Layout popup
-staying on-screen when the window is at a monitor edge, and the reliability
+staying on-screen when the window is at a monitor edge, the startup CLI-update
+gate (version parsing on all three real output shapes, a parse failure never
+being the reason to install, the switch off meaning not one command runs, a
+live `claude.exe` blocking the update with no installer command issued at all,
+an installer that reports success while the binary is unchanged, a package
+database ahead of the file being reported and never forced, a check that
+outruns its budget failing open to launch, agy self-updating serially after
+Claude with no interleaving, the preference defaulting off and surviving a
+close/reopen with no `SESSION_VERSION` bump, outcomes never marking the session
+dirty, and the factory the suite shares doing no update work at all), the
+install-method control (each install path classifying by its full path through
+a symlink shim and regardless of case, one detected state per machine including
+a policy-locked one, `resolve_claude` preferring the native launcher over what
+`PATH` would answer, a migration whose file didn't change counting as a failure,
+a settings write preserving every unknown key and re-reading first so a key an
+agent saved meanwhile survives, an unparseable settings file being refused and
+left byte-identical, the stable channel refusing to be written without its
+version floor, `DB_STALE` being unreachable on a native install, cleanup
+counting the recorded winget path rather than the resolved binary and issuing no
+kill, a revert that leaves the native install in place when the winget copy
+doesn't come back, the live specs being repointed without disturbing a running
+agent or marking the session dirty, a command that never returns not blocking
+the GUI thread, and the consent action staying disabled until the box is
+ticked), and the reliability
 set — immediate structural saves, the safety-net heartbeat, saves that are
 never silent (suppressed/payload-error logging, one bad agent can't abort the
 save), resume + fresh-fallback, BOM tolerance, the single-instance mutex (fail
@@ -668,6 +772,8 @@ app/
   limit_banner.py          recognising a usage cut-off + when it resets (Qt-free, shared)
   limit_ledger.py          durable record of cut-offs: who, when, and how it ended (Qt-free)
   scheduled_send.py        deferred messages: parse a delay/clock, hold it, format the countdown (Qt-free)
+  cli_update.py            startup CLI update gate: decide from the FILE's own version (Qt-free)
+  cli_install.py           how Claude Code is installed + the switch onto the self-updating build (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
@@ -677,10 +783,13 @@ app/
                            Ctrl+click paths open + reveal), grid_selector
                            (on-screen popup), activity_panel, agent_file_map (tree
                            diagram), ornaments (drop-caps / dividers / count-badge
-                           + working-count spinner + taskbar-badge painter)
+                           + working-count spinner + taskbar-badge painter),
+                           update_splash (the startup CLI-update panel + its
+                           worker thread), update_panel (the Updates panel +
+                           its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1411 checks)
+tests/smoke_test.py        headless end-to-end suite (1602 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

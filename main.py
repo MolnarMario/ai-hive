@@ -273,11 +273,31 @@ def main() -> int:
                "time (a second would overwrite the first's saved session). "
                "Use the window that's already open.")
     setup_application(app)
-    window = create_main_window()
+    # ---- CLI auto-update gate (opt-in, before anything else exists) --------
+    # Windows cannot overwrite a running .exe, and every agent IS a claude.exe
+    # child held alive by the Job Object, so THIS is the only moment those
+    # binaries are unlocked: above create_main_window, and far above
+    # autostart_active_workspace. Opting in here rather than in the factory is
+    # the same rule as start_usage_polling / recover_blocked_at_startup: the
+    # offscreen suite shares the factory and must never shell out.
+    store = SessionStore()
+    session = store.load()
+    gate = None
+    if session.get("ui", {}).get("auto_update", False):
+        from app.widgets.update_splash import run_update_gate
+        gate = run_update_gate(store)
+    window = create_main_window(store)
     window.quit_on_close = True  # closed window == dead process, always
     # opt in to the plan-usage readout here, not in the factory: the smoke
     # suite shares create_main_window and must never hit the network
     window.start_usage_polling()
+    # ...and to the Updates panel being able to ACT. Same opt-in rule again:
+    # this one installs software and rewrites the user's own
+    # ~/.claude/settings.json, so the runner is armed here and nowhere else.
+    window.arm_cli_install()
+    window.refresh_install_state()
+    if gate is not None:
+        window.note_update_outcomes(gate.outcomes, gate.installing)
     window.show()
     _register_relaunch_properties(int(window.winId()))
     window.autostart_active_workspace()

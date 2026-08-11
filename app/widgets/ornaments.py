@@ -12,10 +12,10 @@ from functools import lru_cache
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
                             QRectF, Qt, QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage,
-                           QLinearGradient, QPainter, QPen, QPixmap,
-                           QRadialGradient)
+                           QLinearGradient, QPainter, QPainterPath, QPen,
+                           QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QLabel, QSizePolicy, QWidget
+from PySide6.QtWidgets import QLabel, QSizePolicy, QToolButton, QWidget
 
 from .. import ui_theme
 from ..ui_theme import Palette
@@ -619,7 +619,333 @@ class WorkspaceSpinner(QWidget):
         p.end()
 
 
-class PlanUsageBadge(QWidget):
+class UsagePillBadge(QWidget):
+    """The shared body of every top-bar usage readout (Claude plan, Gemini
+    5-hour, Gemini weekly): a percent ring, one line of text, and an X that
+    appears on hover to close the pill.
+
+    Painted rather than styled, for the same reason as `AgentCountBadge`: the
+    colour has to switch on utilization (green -> amber -> red) AND track the
+    active skin, and per-state QSS would fight the theme registry. Reading
+    `Palette` at paint time gives both for free.
+
+    THE WIDTH IS THE TEXT'S WIDTH, measured with the font `paintEvent` actually
+    draws with (never the widget's QSS font, or the pill is sized for text of a
+    different size). One formula, in `_measure_width`, for every pill: the
+    Gemini readout used to carry a hardcoded `_FIXED_WIDTH = 315` and elide into
+    it, which reserved 630px of the bar for two pills whose real content is
+    ~215px each, and which truncated anything longer. The two pills sit side by
+    side, so a second hand-copy of the formula is the same bug waiting to
+    happen; subclasses supply only the TEXT.
+
+    The X costs NO layout width: it FLOATS over the tail of the text, which
+    fades out under it for the moment the pointer is inside the pill. Reserving
+    a permanent slot for it (the first cut of this) left ~20px of every pill
+    blank for the 99% of the time nobody is hovering. What must NOT change is
+    the width: the pills sit after the layout's stretch, so a pill that grew on
+    hover would shove the whole right-hand cluster (recovery caption, LED
+    toggles, theme combo, font steppers, Add Terminal) sideways as the pointer
+    crossed it. Overlaying keeps that property for free - `_measure_width`
+    depends on the text alone, and hovering paints, it never re-measures.
+
+    The widget is a pure VIEW - it never fetches, and it never decides its own
+    visibility. `MainWindow` polls off-thread and pushes readings in; a click on
+    the body emits `refreshRequested`, a click on the X emits `closeRequested`,
+    and `TopBar._sync_usage_pills` is the ONE place `setVisible` is called (see
+    the two-axis rule there).
+    """
+
+    refreshRequested = Signal()
+    closeRequested = Signal()
+
+    _RING = 15          # ring diameter
+    _PAD = 8            # horizontal padding inside the pill
+    _GAP = 7            # ring -> text gap
+    _CLOSE_W = 14       # the hover X, OVERLAID (see the class docstring)
+    _FADE_W = 14        # how far the text fades out ahead of the hovered X
+    _RADIUS = 6         # pill corner radius
+    _BORDER_W = 1.2
+    _FILL_ALPHA, _BORDER_ALPHA = 30, 140          # a live reading
+    _FILL_ALPHA_DIM, _BORDER_ALPHA_DIM = 18, 90   # loading or stale
+
+    # utilization thresholds. Deliberately generous: amber is a nudge, red is
+    # "wrap up", because being cut off mid-task is the thing we're avoiding.
+    _AMBER, _RED = 60.0, 85.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(24)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._usage = None          # the provider's Usage reading | None
+        self._limit = None          # the headline Limit
+        self._text = ""
+        self._sized_for = None      # the text the current width was measured for
+        self._stale = False         # showing an older reading than we'd like
+        self._label = False         # prefix the window name (multi-limit plans)
+        self._unreadable = ""       # last error, when we have NO reading at all
+        self._loading = False       # a fetch is in flight and we have nothing yet
+        self._hovering = False      # paint the X's scrim over the text tail
+        # A child QToolButton rather than a rect hit-tested in mousePressEvent:
+        # it consumes its own press, so closing can never be mistaken for the
+        # click-to-refresh affordance, and it gets the hover cursor, hover
+        # colour and QSS treatment of the other close buttons for free.
+        self.close_btn = QToolButton(self)
+        self.close_btn.setObjectName("UsagePillClose")
+        self.close_btn.setText("✕")
+        self.close_btn.setFixedSize(self._CLOSE_W, self._CLOSE_W)
+        self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.close_btn.setToolTip(
+            "Hide this usage readout. The + button beside the auto-restart "
+            "label brings it back.")
+        self.close_btn.hide()
+        self.close_btn.clicked.connect(self.closeRequested)
+        self._refresh_text()
+
+    # -- state -----------------------------------------------------------
+    def has_reading(self) -> bool:
+        """True once a usable reading has arrived."""
+        return self._limit is not None
+
+    def has_content(self) -> bool:
+        """True when there is anything worth showing - a reading, the can't-read
+        pill, OR the loading state. This is one of the TWO factors that decide
+        visibility (the other is the user's per-pill preference); the error
+        state is content too, and hiding it is what made the readout look
+        deleted."""
+        return self._limit is not None or bool(self._unreadable) or self._loading
+
+    def mark_loading(self) -> None:
+        """A fetch is in flight: say so in place of a number. This is what fills
+        the bar at startup, where there is deliberately no cached figure to
+        paint (a stored reading goes stale exactly where it matters most)."""
+        self._loading = True
+        self._unreadable = ""
+        self._stale = False
+        self._refresh_text()
+
+    def mark_unreadable(self, error: str = "") -> None:
+        """No reading at all and the last poll failed: say so, in place, rather
+        than leave a gap in the bar."""
+        self._loading = False
+        self._unreadable = str(error) or "unavailable"
+        self._stale = True
+        self._refresh_text()
+
+    def mark_stale(self, stale: bool = True) -> None:
+        """A poll failed but we still have a previous reading: keep showing it,
+        greyed, rather than blanking a number the user is watching."""
+        if stale != self._stale:
+            self._stale = bool(stale)
+            self.update()
+
+    def mark_absent(self) -> None:
+        """This readout has nothing to show and never will this run (no login).
+        Clears every kind of content, so no later re-sync can resurrect it."""
+        self._loading = False
+        self._unreadable = ""
+        self._limit = None
+        self._usage = None
+        self._refresh_text()
+
+    def tick(self) -> None:
+        """Re-render the countdown from the clock alone (no network). Repaints
+        only when the visible string actually changes, so the tick costs nothing
+        while the minute digit is unchanged."""
+        self._refresh_text()
+
+    # -- rendering -------------------------------------------------------
+    def _refresh_text(self) -> None:
+        if self._loading:
+            text = self._loading_text()
+        elif self._limit is not None:
+            text = self._format_limit()
+        elif self._unreadable:
+            text = self._unreadable_text()
+        else:
+            text = ""
+        self._set_text(text)
+
+    def _set_text(self, text: str) -> None:
+        tip = self._build_tooltip()
+        if text == self._text and self._sized_for == text:
+            self.setToolTip(tip)   # age keeps moving even when the line doesn't
+            return
+        self._text = text
+        self._sized_for = text
+        self.setToolTip(tip)
+        self.setFixedWidth(self._measure_width(text))
+        self.update()
+
+    @classmethod
+    def _measure_width(cls, text: str) -> int:
+        """[pad][ring][gap][text][pad]. The one width formula, for every pill.
+
+        The X is deliberately NOT a term here: it floats over the text's tail,
+        so it costs no width and hovering can never resize the pill.
+        """
+        fm = QFontMetrics(cls._text_font())
+        return (cls._PAD * 2 + cls._RING + cls._GAP
+                + fm.horizontalAdvance(text))
+
+    @staticmethod
+    def _text_font() -> QFont:
+        f = QFont()
+        f.setPixelSize(11)
+        return f
+
+    # -- subclass hooks --------------------------------------------------
+    def _loading_text(self) -> str:
+        return "usage, reading..."
+
+    def _format_limit(self) -> str:
+        raise NotImplementedError
+
+    def _unreadable_text(self) -> str:
+        return "usage limit unreadable, click to refresh"
+
+    def _build_tooltip(self) -> str:
+        return ""
+
+    # -- interaction -----------------------------------------------------
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.close_btn.move(int(self.width() - self._PAD - self._CLOSE_W),
+                            int((self.height() - self._CLOSE_W) / 2))
+
+    def enterEvent(self, event):
+        self._hovering = True
+        self.close_btn.setVisible(True)
+        self.update()          # repaint so the text fades under the X
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovering = False
+        self.close_btn.setVisible(False)
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            # show the fetch immediately: a click with no visible response reads
+            # as a dead pill, and the Gemini fetch takes ~3s
+            self.mark_loading()
+            self.refreshRequested.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def _color(self) -> QColor:
+        if self._loading or self._stale or self._limit is None:
+            return QColor(Palette.TEXT_DIM)
+        pct = self._limit.percent
+        if pct >= self._RED:
+            return QColor(Palette.RED)
+        if pct >= self._AMBER:
+            return QColor(Palette.YELLOW)
+        return QColor(Palette.GREEN)
+
+    def paintEvent(self, event):
+        if self._limit is None and not self._unreadable and not self._loading:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = self._color()
+        dim = self._loading or self._stale
+        rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
+        fill = QColor(color)
+        fill.setAlpha(self._FILL_ALPHA_DIM if dim else self._FILL_ALPHA)
+        p.setBrush(fill)
+        border = QColor(color)
+        border.setAlpha(self._BORDER_ALPHA_DIM if dim else self._BORDER_ALPHA)
+        pen = QPen(border)
+        pen.setWidthF(self._BORDER_W)
+        p.setPen(pen)
+        p.drawRoundedRect(rect, self._RADIUS, self._RADIUS)
+        # percent ring: faint full track + a filled sweep from 12 o'clock
+        top = (self.height() - self._RING) / 2.0
+        ring = QRectF(self._PAD, top, self._RING, self._RING)
+        track = QColor(color)
+        track.setAlpha(55)
+        tp = QPen(track)
+        tp.setWidthF(2.2)
+        p.setPen(tp)
+        p.drawArc(ring, 0, 360 * 16)
+        span = 0
+        if self._loading:
+            # a bare track already reads as "waiting"; drawing a sweep here
+            # would be a number, and there is deliberately no number yet
+            pass
+        elif self._limit is None:
+            # can't-read state: an empty track with a "!" where the sweep goes,
+            # so the pill reads as a warning at a glance and not as 0% used.
+            bang = self._text_font()
+            bang.setBold(True)
+            p.setFont(bang)
+            p.setPen(color)
+            p.drawText(ring, int(Qt.AlignmentFlag.AlignCenter), "!")
+        else:
+            span = int(max(0.0, min(100.0, self._limit.percent))
+                       / 100.0 * 360 * 16)
+        if span:
+            ap = QPen(color)
+            ap.setWidthF(2.2)
+            ap.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(ap)
+            p.drawArc(ring, 90 * 16, -span)   # clockwise from 12 o'clock
+        p.setFont(self._text_font())
+        p.setPen(color)
+        text_x = self._PAD + self._RING + self._GAP
+        # the pill is sized for this exact string, so the elide is insurance
+        # only (a subclass could yet hand us something longer than it measured)
+        avail = self.width() - text_x - self._PAD
+        elided = p.fontMetrics().elidedText(self._text,
+                                            Qt.TextElideMode.ElideRight,
+                                            int(max(0, avail)))
+        p.drawText(QRectF(text_x, 0, max(0, avail), self.height()),
+                   int(Qt.AlignmentFlag.AlignLeft
+                       | Qt.AlignmentFlag.AlignVCenter),
+                   elided)
+        if self._hovering:
+            self._paint_close_scrim(p, color, dim)
+        p.end()
+
+    def _paint_close_scrim(self, p, color, dim) -> None:
+        """Fade the text out under the hovered X.
+
+        The X owns no layout width, so without this it would sit on top of live
+        glyphs and neither would be readable. The scrim is the pill's OWN
+        background rebuilt opaque - the flat bar colour with the same tint the
+        fill uses - so the covered tail reads as empty pill rather than as a
+        patch of some other colour. It is clipped to the rounded outline, or it
+        would square off the right-hand corners it paints over.
+        """
+        ground = QColor(Palette.BG_PANEL)
+        a = (self._FILL_ALPHA_DIM if dim else self._FILL_ALPHA) / 255.0
+        blend = QColor(
+            int(round(ground.red() * (1 - a) + color.red() * a)),
+            int(round(ground.green() * (1 - a) + color.green() * a)),
+            int(round(ground.blue() * (1 - a) + color.blue() * a)))
+        x1 = self.width() - self._PAD - self._CLOSE_W
+        x0 = max(0.0, x1 - self._FADE_W)
+        clear = QColor(blend)
+        clear.setAlpha(0)
+        grad = QLinearGradient(x0, 0.0, float(x1), 0.0)
+        grad.setColorAt(0.0, clear)
+        grad.setColorAt(1.0, blend)     # PadSpread keeps it solid past x1
+        outline = QPainterPath()
+        outline.addRoundedRect(QRectF(0.5, 0.5, self.width() - 1,
+                                      self.height() - 1),
+                               self._RADIUS, self._RADIUS)
+        p.save()
+        p.setClipPath(outline)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(grad)
+        p.drawRect(QRectF(x0, 0.0, self.width() - x0, self.height()))
+        p.restore()
+
+
+class PlanUsageBadge(UsagePillBadge):
     """The top-bar readout of the Claude account's plan usage:
 
         (o) 21% used, resets in 1h20m at 14:49
@@ -639,122 +965,55 @@ class PlanUsageBadge(QWidget):
     When a poll fails and there is NO earlier number to grey out, the pill says
     so (`mark_unreadable`) instead of vanishing. Disappearing silently reads as
     "the feature was removed" — it was reported as exactly that after a restart
-    that hit an `http 429` with no seed on disk to fall back on (Claude's own
-    `cachedUsageUtilization` is gone from `~/.claude.json` as of CLI 2.1.220, so
-    the instant first paint that used to cover this no longer happens). The
+    that hit an `http 429` with no seed on disk to fall back on. There is now
+    NO on-disk seed at all, by design (see `start_usage_polling`): a stored
+    number goes stale exactly where it matters most, so the pill opens in the
+    LOADING state instead and only ever shows a figure fetched this run. The
     error pill keeps the click-to-refresh affordance, which is the one useful
     thing a user can do about it.
     """
 
-    refreshRequested = Signal()
-
-    _RING = 15          # ring diameter
-    _PAD = 8            # horizontal padding inside the pill
-    _GAP = 7            # ring -> text gap
-
-    # utilization thresholds. Deliberately generous: amber is a nudge, red is
-    # "wrap up", because being cut off mid-task is the thing we're avoiding.
-    _AMBER, _RED = 60.0, 85.0
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(24)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._usage = None          # claude_usage.Usage | None
-        self._limit = None          # the headline Limit
-        self._text = ""
-        self._stale = False         # showing an older reading than we'd like
-        self._label = False         # prefix the window name (multi-limit plans)
-        self._unreadable = ""       # last error, when we have NO reading at all
-        self._refresh_text()
-
     # -- data in ---------------------------------------------------------
     def set_usage(self, usage) -> None:
-        """Adopt a reading. `None`, or a reading with no limits, hides the
-        badge — an API-key user or a logged-out machine has nothing to show and
-        should not be given an empty pill to wonder about."""
+        """Adopt a reading. `None`, or a reading with no limits, leaves the pill
+        with no content — an API-key user or a logged-out machine has nothing to
+        show, and `TopBar._sync_usage_pills` hides it for that reason. Note the
+        badge never calls `setVisible` itself: which pills are on the bar is the
+        product of a reading AND the user's per-pill preference, and only the
+        top bar knows both."""
         from .. import claude_usage
 
         self._usage = usage
         self._limit = claude_usage.headline(usage)
         self._unreadable = ""       # a real number supersedes the error pill
+        self._loading = False
         if self._limit is None:
-            self.setVisible(False)
+            self._refresh_text()
             return
         # only name the window when the plan actually has more than one, so a
         # Pro account (five_hour alone) stays uncluttered
         self._label = len(usage.limits) > 1
         self._stale = bool(usage.error) or usage.source == "cache"
-        self.setVisible(True)
         self._refresh_text()
 
-    def has_reading(self) -> bool:
-        """True once a usable reading has arrived — the top bar consults this
-        so un-hiding never shows an empty pill."""
-        return self._limit is not None
+    def _loading_text(self) -> str:
+        # deliberately SHORTER than the finished line, so the pill only ever
+        # grows when the reading lands (a long loading string makes it snap
+        # narrower, which reads as a glitch), and it names its own tracker so
+        # three grey pills side by side are still tellable apart
+        return "Claude usage, reading..."
 
-    def has_content(self) -> bool:
-        """True when there is anything worth showing — a reading OR the
-        can't-read pill. This, not `has_reading`, gates visibility: the error
-        state is content too, and hiding it is what made the readout look
-        deleted."""
-        return self._limit is not None or bool(self._unreadable)
-
-    def mark_unreadable(self, error: str = "") -> None:
-        """No reading at all and the last poll failed: say so, in place, rather
-        than leave a gap in the bar. Never overrides a real number — the caller
-        only reaches here while `has_reading()` is False."""
-        self._unreadable = str(error) or "unavailable"
-        self._stale = True
-        self.setVisible(True)
-        self._refresh_text()
-
-    def mark_stale(self, stale: bool = True) -> None:
-        """A poll failed but we still have a previous reading: keep showing it,
-        greyed, rather than blanking a number the user is watching."""
-        if stale != self._stale:
-            self._stale = bool(stale)
-            self.update()
-
-    def tick(self) -> None:
-        """Re-render the countdown from the clock alone (no network). Repaints
-        only when the visible string actually changes, so the 30 s tick costs
-        nothing while the minute digit is unchanged."""
-        self._refresh_text()
-
-    # -- rendering -------------------------------------------------------
-    def _refresh_text(self) -> None:
+    def _format_limit(self) -> str:
         from .. import claude_usage
 
-        if self._limit is not None:
-            text = claude_usage.format_limit(self._limit, with_label=self._label)
-        elif self._unreadable:
-            text = "usage limit unreadable, click to refresh"
-        else:
-            text = ""
-        tip = self._build_tooltip()
-        if text == self._text:
-            self.setToolTip(tip)   # age keeps moving even when the line doesn't
-            return
-        self._text = text
-        self.setToolTip(tip)
-        # measure with the SAME font paintEvent draws with, not the widget's
-        # QSS font — otherwise the pill is sized for text of a different size
-        fm = QFontMetrics(self._text_font())
-        self.setFixedWidth(self._PAD * 2 + self._RING + self._GAP
-                           + fm.horizontalAdvance(text))
-        self.update()
-
-    @staticmethod
-    def _text_font() -> QFont:
-        f = QFont()
-        f.setPixelSize(11)
-        return f
+        return claude_usage.format_limit(self._limit, with_label=self._label)
 
     def _build_tooltip(self) -> str:
         from .. import claude_usage
         import time as _time
 
+        if self._loading:
+            return "Reading the Claude plan usage..."
         if self._limit is None and self._unreadable:
             return ("Claude plan usage could not be read.\n"
                     f"Last attempt failed: {self._unreadable}\n"
@@ -776,76 +1035,6 @@ class PlanUsageBadge(QWidget):
             lines.append(f"Last refresh failed: {self._usage.error}")
         lines.append("Click to refresh")
         return "\n".join(lines)
-
-    def _color(self) -> QColor:
-        if self._stale or self._limit is None:
-            return QColor(Palette.TEXT_DIM)
-        pct = self._limit.percent
-        if pct >= self._RED:
-            return QColor(Palette.RED)
-        if pct >= self._AMBER:
-            return QColor(Palette.YELLOW)
-        return QColor(Palette.GREEN)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.refreshRequested.emit()
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def paintEvent(self, event):
-        if self._limit is None and not self._unreadable:
-            return
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        color = self._color()
-        rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
-        fill = QColor(color)
-        fill.setAlpha(30)
-        p.setBrush(fill)
-        border = QColor(color)
-        border.setAlpha(140)
-        pen = QPen(border)
-        pen.setWidthF(1.2)
-        p.setPen(pen)
-        p.drawRoundedRect(rect, 6, 6)
-        # percent ring: faint full track + a filled sweep from 12 o'clock
-        top = (self.height() - self._RING) / 2.0
-        ring = QRectF(self._PAD, top, self._RING, self._RING)
-        track = QColor(color)
-        track.setAlpha(55)
-        tp = QPen(track)
-        tp.setWidthF(2.2)
-        p.setPen(tp)
-        p.drawArc(ring, 0, 360 * 16)
-        if self._limit is None:
-            # can't-read state: an empty track with a "!" where the sweep goes,
-            # so the pill reads as a warning at a glance and not as 0% used.
-            bang = self._text_font()
-            bang.setBold(True)
-            p.setFont(bang)
-            p.setPen(color)
-            p.drawText(ring, int(Qt.AlignmentFlag.AlignCenter), "!")
-            span = 0
-        else:
-            span = int(max(0.0, min(100.0, self._limit.percent))
-                       / 100.0 * 360 * 16)
-        if span:
-            ap = QPen(color)
-            ap.setWidthF(2.2)
-            ap.setCapStyle(Qt.PenCapStyle.RoundCap)
-            p.setPen(ap)
-            p.drawArc(ring, 90 * 16, -span)   # clockwise from 12 o'clock
-        p.setFont(self._text_font())
-        p.setPen(color)
-        text_x = self._PAD + self._RING + self._GAP
-        p.drawText(QRectF(text_x, 0, self.width() - text_x - self._PAD,
-                          self.height()),
-                   int(Qt.AlignmentFlag.AlignLeft
-                       | Qt.AlignmentFlag.AlignVCenter),
-                   self._text)
-        p.end()
 
 
 class LogoRoundel(QWidget):
