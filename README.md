@@ -133,6 +133,13 @@ workspaces keep executing — switching never pauses anything.
   seconds a minute for a readout they don't want. Closing the Claude pill only
   hides the readout: its poll keeps running, because auto-recovery is driven
   from that reading.
+  The two Gemini pills refresh **every five minutes**, not every minute like the
+  Claude one. Reading them means running `agy`, and `agy` occasionally starts a
+  helper that asks Windows for its own console, which Windows 11 grants as a
+  real terminal window that flashes over whatever you are doing and closes a
+  moment later. No launch flag prevents it (the flags we control don't reach
+  that helper), so the fix is to ask less often. Nothing is lost by it: only the
+  pills read this number, and a 5-hour window barely moves in five minutes.
   **Nothing is remembered between runs except the choice itself.** Every pill
   opens saying `reading...` and fills in from a fresh fetch at startup, because
   a stored number goes stale exactly where it matters most — a 5-hour window is
@@ -676,7 +683,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1602 checks drive the real app headlessly (offscreen Qt platform) with real
+1611 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -789,7 +796,7 @@ app/
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1602 checks)
+tests/smoke_test.py        headless end-to-end suite (1611 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

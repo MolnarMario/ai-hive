@@ -10007,6 +10007,94 @@ def test_gemini_usage_polling_is_offthread_and_optin():
         gemini_usage.fetch = real
 
 
+def test_gemini_usage_poll_is_slower_than_claudes():
+    """Gemini rides its OWN, much slower poll clock, because each tick spawns a
+    process rather than making a request.
+
+    `gemini_usage.fetch()` shells out to `agy`, and on some runs agy starts a
+    nested helper that asks Windows for its own console. CREATE_NO_WINDOW is
+    passed and is not enough -- spawn flags do not reach a grandchild, measured
+    8/8 visible windows under CREATE_NO_WINDOW, CREATE_NEW_CONSOLE+SW_HIDE and
+    CREATE_NO_WINDOW+SW_HIDE alike -- so with Windows 11 delegating to Windows
+    Terminal a real window flashes over the user's screen on ~6% of polls. No
+    flag suppresses it; asking less often is the only lever, and it is nearly
+    free because only the two pills consume this reading (a Gemini cut-off
+    recovers on its own printed countdown, never on the account reading).
+
+    This check exists so nobody "tidies" the Gemini timer back onto
+    USAGE_POLL_MS, which is answerable to planLimitReached and the reset poll
+    it arms -- neither of which exists for Gemini."""
+    import pathlib
+    import tempfile
+
+    from PySide6.QtWidgets import QApplication
+
+    from app import gemini_usage
+    from app.session_store import SessionStore
+    from app.widgets.main_window import (GEMINI_USAGE_POLL_MS,
+                                         GEMINI_USAGE_URGENT_POLL_MS,
+                                         USAGE_POLL_MS, USAGE_URGENT_PCT)
+    from main import create_main_window
+
+    QApplication.instance() or QApplication([])
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="ai-hive-gempoll-"))
+
+    check("gemini-poll: the calm rate is well slower than Claude's",
+          GEMINI_USAGE_POLL_MS >= 5 * USAGE_POLL_MS,
+          (GEMINI_USAGE_POLL_MS, USAGE_POLL_MS))
+    check("gemini-poll: even the urgent rate never goes below Claude's calm one",
+          GEMINI_USAGE_URGENT_POLL_MS >= USAGE_POLL_MS,
+          GEMINI_USAGE_URGENT_POLL_MS)
+
+    calls = []
+    real = gemini_usage.fetch
+    gemini_usage.fetch = lambda *a, **k: (calls.append(1), None)[1]
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        check("gemini-poll: the timer is built on the Gemini interval",
+              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
+              win._gemini_usage_timer.interval())
+        check("gemini-poll: ...and Claude's timer is left alone",
+              win._usage_timer.interval() == USAGE_POLL_MS,
+              win._usage_timer.interval())
+
+        def reading(pct):
+            return gemini_usage.GeminiUsage(limits=(
+                gemini_usage.GeminiLimit(key="five_hour", label="5h", short="5h",
+                                         percent=pct, resets_at=None),))
+
+        # a calm window stays on the slow clock even with agents working
+        win._gemini_agents_working = lambda: True
+        win._retune_gemini_usage_poll(reading(10.0))
+        check("gemini-poll: a calm window keeps the slow rate",
+              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
+              win._gemini_usage_timer.interval())
+
+        # the danger zone speeds up, but only to the Gemini urgent rate
+        win._retune_gemini_usage_poll(reading(USAGE_URGENT_PCT + 1))
+        check("gemini-poll: a nearly spent window uses the Gemini urgent rate",
+              win._gemini_usage_timer.interval() == GEMINI_USAGE_URGENT_POLL_MS,
+              win._gemini_usage_timer.interval())
+
+        # ...and drops back, rather than latching fast for the rest of the run
+        win._retune_gemini_usage_poll(reading(5.0))
+        check("gemini-poll: it drops back to the slow rate afterwards",
+              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
+              win._gemini_usage_timer.interval())
+
+        # no agents working means nothing is moving the number, so no rush
+        win._gemini_agents_working = lambda: False
+        win._retune_gemini_usage_poll(reading(99.0))
+        check("gemini-poll: no working agents means no urgent rate",
+              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
+              win._gemini_usage_timer.interval())
+
+        check("gemini-poll: retuning still never fetches", calls == [], len(calls))
+        win.close()
+    finally:
+        gemini_usage.fetch = real
+
+
 def test_history_screen_wrapper_removed():
     """_FastHistoryScreen drops pyte's per-event wrapper without changing what
     is rendered.
@@ -10586,6 +10674,7 @@ def main():
     test_terminal_scrollbar()
     test_history_screen_wrapper_removed()
     test_gemini_usage_polling_is_offthread_and_optin()
+    test_gemini_usage_poll_is_slower_than_claudes()
     test_projection_happens_once()
     test_recovered_prompts_are_cached()
     test_multi_agent_session_isolation()

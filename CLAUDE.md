@@ -747,7 +747,24 @@ this file is the invariants that must survive every change.
   guards it because a 6s CLI timeout outlasts the urgent interval and the timer
   would otherwise stack threads; the retune TAKES the reading; and the timer is
   armed in `start_usage_polling`, never in `__init__`. Do not "simplify" any of
-  those back to an inline `fetch()`. The BLOCKED state (`Usage.blocked`, utilization >= 100 —
+  those back to an inline `fetch()`. AND IT RIDES ITS OWN, MUCH SLOWER CLOCK
+  (`GEMINI_USAGE_POLL_MS` 5 min / `GEMINI_USAGE_URGENT_POLL_MS` 60s), because
+  every Gemini tick SPAWNS A PROCESS where a Claude tick makes a request. On
+  some runs `agy` starts a nested helper that asks Windows for its OWN console;
+  `CREATE_NO_WINDOW` is passed and is NOT ENOUGH, because spawn flags do not
+  reach a GRANDCHILD — MEASURED on a deterministic reproducer, a descendant that
+  demands a console gets a VISIBLE one 8/8 times under `CREATE_NO_WINDOW`,
+  `CREATE_NEW_CONSOLE`+`STARTUPINFO(SW_HIDE)` and `CREATE_NO_WINDOW`+
+  `STARTUPINFO(SW_HIDE)` alike. With Windows 11 delegating to Windows Terminal
+  that console appears as a real window flashing over the user's screen (live:
+  ~6% of polls, 2 of 32, i.e. every quarter hour at 60s — reported as "a
+  terminal keeps popping up and I can't read it"). Since NO flag suppresses it,
+  asking less often is the only lever, and it costs nothing: only the two pills
+  consume this reading, and a Gemini cut-off recovers on its own printed
+  countdown, never on the account reading. Do NOT fold these back onto
+  `USAGE_POLL_MS` — that constant answers to `planLimitReached`/
+  `planLimitCleared` and the reset poll they arm, none of which exist for
+  Gemini. The BLOCKED state (`Usage.blocked`, utilization >= 100 —
   derived from the number, NOT from the payload's server-side `severity`
   string) is the machine-readable half: `MainWindow.planLimitReached(Limit)` /
   `planLimitCleared()` are edge-triggered and level-correct like the chime, and
