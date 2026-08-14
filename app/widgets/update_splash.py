@@ -20,6 +20,17 @@ handled rather than prevented: if the user skips while an install is still
 running, the providers being installed are held out of the autostart (see
 `GateResult.installing`) so no agent can execute a half written file.
 
+THE WORDS ARE NOT DECORATION AND FOLLOW THE MACHINE. Both the row phrases
+(`cli_update.state_text`) and the subtitle (`subtitle_for`) depend on whether a
+target updates itself, because the same outcome means opposite things in the
+two shapes and this window is where a user meets it first. The splash is also
+the most fleeting surface in the app: it auto closes in well under a second and
+leaves nothing behind, so a line that might send someone looking for a problem
+gets `LINGER_CLOSE_MS` instead, and the durable copy lives in the Updates panel
+(`cli_update.last_check_summary`). Reported live: "took too long, skipped"
+flashed past on a launch where nothing was wrong, with nowhere to check
+afterwards.
+
 Everything is themed from the live `Palette` at paint time, like
 `ornaments.BootVeil`, so the splash follows every skin and introduces no QSS
 tokens of its own.
@@ -41,29 +52,35 @@ from ..ui_theme import Palette
 # how long the finished splash stays up so "nothing to do" reads as a glance
 # rather than a flash. Short enough that a fully current machine is not a wait.
 AUTO_CLOSE_MS = 700
+# ...and how long it stays up when a row says something the user may want to
+# read. At AUTO_CLOSE_MS a message is on screen for less than a second and is
+# then unrecoverable, which is how a harmless line came to be reported as
+# alarming: too brief to read, too final to check. Only `worth_reading`
+# outcomes pay this, so a clean launch is exactly as quick as before.
+LINGER_CLOSE_MS = 2600
 POLL_MS = 60
 
-_STATE_TEXT = {
-    cli_update.Status.UP_TO_DATE: "up to date",
-    cli_update.Status.UPDATED: "updated",
-    cli_update.Status.BLOCKED_PROCESSES: "skipped, the CLI was in use",
-    cli_update.Status.DB_STALE: "needs a manual reinstall",
-    cli_update.Status.REPORTED_BUT_UNCHANGED: "unchanged, see the top bar",
-    cli_update.Status.FAILED: "check failed",
-    cli_update.Status.TIMEOUT: "took too long, skipped",
-    cli_update.Status.NOT_INSTALLED: "not installed",
-    cli_update.Status.DISABLED: "off",
-}
+# the phrases live in the Qt-free module so the Updates panel can reuse them
+# verbatim; re-exported here because this is where they used to live
+state_text = cli_update.state_text
+
+# The line under the title, and it is a CLAIM about the machine rather than
+# decoration, so it has to follow the machine. "Now is the only moment these
+# files are not in use" is the winget constraint: a package managed binary can
+# only be replaced before an agent holds it. After the native migration that
+# is no longer true of Claude Code, which installs to the user's own folder
+# and never touches the running file, and the sentence was still being painted
+# directly above its row. It stays for as long as ANY target is package
+# managed, because for that one it is both true and the reason to wait.
+_SUBTITLE_LOCKED = "Now is the only moment these files are not in use."
+_SUBTITLE_SELF = "Making sure a new version has landed before agents start."
 
 
-def state_text(outcome) -> str:
-    """One short phrase per finished target. Never an em dash: this is read."""
-    base = _STATE_TEXT.get(outcome.status, str(outcome.status))
-    if outcome.status is cli_update.Status.UPDATED:
-        return f"updated {outcome.before or '?'} to {outcome.after}"
-    if outcome.status is cli_update.Status.UP_TO_DATE and outcome.before:
-        return f"up to date ({outcome.before})"
-    return base
+def subtitle_for(targets) -> str:
+    for target in targets or ():
+        if not target.self_update:
+            return _SUBTITLE_LOCKED
+    return _SUBTITLE_SELF
 
 
 class UpdateSplash(QWidget):
@@ -89,6 +106,7 @@ class UpdateSplash(QWidget):
                             | Qt.WindowType.WindowStaysOnTopHint)
         self.setWindowTitle("AI Hive")
         self._rows = [[t.key, t.label, "waiting", False] for t in targets]
+        self._subtitle = subtitle_for(targets)
         self._angle = 0.0
         self.setFixedSize(420, self._PAD * 2 + 34 + self._ROW_H * len(self._rows)
                           + 40)
@@ -182,7 +200,7 @@ class UpdateSplash(QWidget):
         p.drawText(QRectF(self._PAD, self._PAD + 17,
                           self.width() - self._PAD * 2, 16),
                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-                   "Now is the only moment these files are not in use.")
+                   self._subtitle)
 
         row_font = QFont()
         row_font.setPixelSize(12)
@@ -224,6 +242,7 @@ def run_update_gate(store=None, targets=None, runner=None,
                     budget: float = cli_update.CHECK_TIMEOUT_S,
                     install_timeout: float = cli_update.INSTALL_TIMEOUT_S,
                     auto_close_ms: int = AUTO_CLOSE_MS,
+                    linger_ms: int = LINGER_CLOSE_MS,
                     show: bool = True) -> cli_update.GateResult:
     """Run the gate with the splash up, and return what happened.
 
@@ -286,7 +305,14 @@ def run_update_gate(store=None, targets=None, runner=None,
                 finished["done"] = True
         if finished["done"]:
             poll.stop()
-            QTimer.singleShot(max(0, auto_close_ms), loop.quit)
+            # a row nobody could have read is the same as a row that was never
+            # shown, so anything worth reading buys the window a moment. Never
+            # when there is no splash: with nothing on screen the wait would
+            # only delay the app.
+            delay = auto_close_ms
+            if splash is not None and cli_update.worth_reading(outcomes):
+                delay = max(auto_close_ms, linger_ms)
+            QTimer.singleShot(max(0, delay), loop.quit)
 
     poll.timeout.connect(drain)
     if splash is not None:

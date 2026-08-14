@@ -1371,6 +1371,11 @@ class MainWindow(QMainWindow):
         # launching one now could execute a half written binary. Transient by
         # construction: it describes this launch only.
         self._update_installing: tuple = ()
+        # every outcome from this launch's gate, kept so the Updates panel can
+        # show what happened after the splash has closed. Transient exactly
+        # like `_update_installing`: it describes this launch only and is never
+        # persisted (a stored version goes stale the moment anything installs).
+        self._update_outcomes: tuple = ()
         self._usage_inflight = False  # one request at a time, never stack
         self._plan_blocked = False    # edge state for planLimitReached/Cleared
         # agent ids with a resume SCHEDULED but not yet delivered. The attempt
@@ -2931,7 +2936,7 @@ class MainWindow(QMainWindow):
         self._audit_install(cli_install.state_line(situation))
 
     def open_updates_panel(self) -> None:
-        from app import cli_install
+        from app import cli_install, cli_update
         from .update_panel import UpdatePanel
 
         situation = self.claude_install_situation()
@@ -2940,6 +2945,8 @@ class MainWindow(QMainWindow):
         panel = UpdatePanel(situation, auto_update=self._auto_update,
                             runner=self._cli_install_runner(),
                             winget_exe=cli_install.winget_exe_path(),
+                            last_check=cli_update.last_check_summary(
+                                self._update_outcomes, self._update_installing),
                             parent=self)
         panel.autoUpdateToggled.connect(self.top_bar.set_auto_update)
         panel.autoUpdateToggled.connect(self._on_auto_update_toggled)
@@ -3010,6 +3017,7 @@ class MainWindow(QMainWindow):
         exactly as it was."""
         from app import cli_update
         self._update_installing = tuple(installing or ())
+        self._update_outcomes = tuple(outcomes or ())
         text = cli_update.pill_text(outcomes, self._update_installing)
         self.top_bar.note_update_pending(
             text, cli_update.pill_tooltip(outcomes, self._update_installing))

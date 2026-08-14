@@ -545,6 +545,40 @@ this file is the invariants that must survive every change.
   patch-versus-minor gate: nothing in the numbering predicts whether a flag
   moved, so a version gate buys false safety while an audit line turns "it broke
   this morning" into a lookup.
+  **WHAT A SKIPPED CHECK MEANS DEPENDS ON THE SHAPE, SO THE WORDS DO TOO.**
+  `Outcome.self_updating` is stamped by `check()` off `Target.self_update` and
+  is what every reporting surface reads. On a WINGET target a TIMEOUT or a
+  locked file is a genuinely missed update (nothing else will fetch one, and
+  the stale binary keeps its alias table and its banner); on a SELF-UPDATING
+  one the CLI fetches its own version in the background regardless, so the same
+  statuses are NON EVENTS. Hence three things move together and must stay
+  together: `_SELF_UPDATING_TEXT` rewords them ("left to its own updater"),
+  `needs_pill` withholds the top-bar nag — every line of `_PILL_LONG` tells the
+  user to close programs or run an installer by hand, and none of that applies
+  — and `worth_reading` does not hold the splash open. ONE predicate
+  (`needs_pill`) decides the pill for both `pill_text` and `pill_tooltip`, so
+  the splash and the bar can never call the same outcome different things.
+  This is a live report, and the shape of the complaint is the point: after the
+  native migration the splash flashed "took too long, skipped" for under a
+  second on a launch where nothing was wrong (the CLI updated itself a minute
+  later), and because TIMEOUT is deliberately NOT in `PILL_STATUSES` there was
+  no surface afterwards that could say so — a message too brief to read and too
+  final to check. So the fleeting surface is no longer the only one:
+  `last_check_summary` lets EVERY outcome speak (unlike `pill_text`, which
+  reports only what needs acting on) and `MainWindow._update_outcomes` carries
+  them to the Updates panel, TRANSIENT exactly like `_update_installing`. A
+  status with nowhere to be re-read is indistinguishable from one the app never
+  produced. `LINGER_CLOSE_MS` buys a `worth_reading` outcome time to be read,
+  and is deliberately NARROWER than "not a clean run" — lingering on a non
+  event would manufacture the very concern the rewording removes. The splash
+  SUBTITLE follows the machine for the same reason (`subtitle_for`): "Now is
+  the only moment these files are not in use" is the winget constraint, false
+  of a native install that never touches the running file, and it was being
+  painted directly above that install's row. It stays while ANY target is
+  package managed. The audit lines record the shape (`UPDATE-TIMEOUT` /
+  `UPDATE-SKIP` gain "(self-updating, left to the CLI)") because which of the
+  two a line describes is read off the install and can change between runs on
+  one machine.
 - **Letting Claude Code update ITSELF is a MIGRATION, not a preference**
   (`app/cli_install.py`, Qt-free/stdlib-only like `cli_update.py`;
   `app/widgets/update_panel.py` shows it; `MainWindow.open_updates_panel` /

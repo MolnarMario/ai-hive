@@ -149,7 +149,12 @@ class UpdatePanel(QDialog):
     panel still shows the detected state; it simply cannot act.
 
     `settings_file` is likewise a parameter so a test can point the whole panel
-    at a temporary directory."""
+    at a temporary directory.
+
+    `last_check` is the startup gate's report (`cli_update.last_check_summary`),
+    passed in rather than re-derived: the gate ran before this window existed
+    and cannot be re-run without touching installed software. It is the only
+    place a user can read an outcome again after the splash has gone."""
 
     autoUpdateToggled = Signal(bool)
     auditRequested = Signal(str)
@@ -158,7 +163,8 @@ class UpdatePanel(QDialog):
     migrationApplied = Signal()
 
     def __init__(self, situation, auto_update: bool = False, runner=None,
-                 winget_exe: str = "", settings_file: str = "", parent=None):
+                 winget_exe: str = "", settings_file: str = "",
+                 last_check: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Updates")
         self.setMinimumWidth(520)
@@ -224,6 +230,19 @@ class UpdatePanel(QDialog):
             "agents start, and the Gemini CLI has no auto-updater at all.")
         self.gate_check.toggled.connect(self.autoUpdateToggled)
         root.addWidget(self.gate_check)
+
+        # What that check actually did this launch. The splash says it once and
+        # closes, and the top-bar pill deliberately speaks only for outcomes the
+        # user can act on, so without this line a status the user glimpsed has
+        # nowhere to be re-read and is indistinguishable from one the app never
+        # produced. Empty (no gate this run, e.g. the toggle is off) hides it
+        # rather than claiming a check happened.
+        self.last_check_label = QLabel(
+            ("Last check: " + last_check) if last_check else "", self)
+        self.last_check_label.setObjectName("RecoveryLabel")
+        self.last_check_label.setWordWrap(True)
+        self.last_check_label.setVisible(bool(last_check))
+        root.addWidget(self.last_check_label)
 
         self.log = QPlainTextEdit(self)
         self.log.setReadOnly(True)

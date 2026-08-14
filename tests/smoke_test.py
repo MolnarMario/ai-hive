@@ -11275,6 +11275,14 @@ def test_cli_auto_update():
     check("cli-update: reporting an outcome NEVER marks the session dirty "
           "(outcomes are transient, only the preference persists)",
           not again._save_timer.isActive())
+    check("cli-update: the window keeps the outcomes so the Updates panel can "
+          "show them after the splash has closed",
+          again._update_outcomes == (blocked,)
+          and "Claude Code" in cli_update.last_check_summary(
+              again._update_outcomes))
+    check("cli-update: ...and keeping them is transient too",
+          not again._save_timer.isActive()
+          and "update_outcomes" not in str(again._session_payload()))
     again.note_update_outcomes([cli_update.Outcome("claude", Status.UP_TO_DATE)])
     check("cli-update: a clean gate leaves the pill hidden",
           not again.top_bar.update_pill.isVisibleTo(again.top_bar))
@@ -11366,6 +11374,113 @@ def test_cli_auto_update():
           splash._spin.state() != splash._spin.State.Running)
     splash.close()
     splash.deleteLater()
+
+    # --- 14. what a skipped check MEANS depends on who updates the binary ---
+    # Live report: after the native migration the splash flashed "took too
+    # long, skipped" for under a second on a launch where nothing was wrong,
+    # the CLI updated itself a minute later, and no surface afterwards could
+    # say so. A self-updating target that we failed to check is a non event;
+    # the same status on a package managed one is a genuinely missed update.
+    from app.widgets.update_splash import LINGER_CLOSE_MS, subtitle_for
+
+    native_claude = cli_update.Target(
+        key="claude", label="Claude Code", exe=r"C:\fake\claude.exe",
+        process_names=("claude.exe",), self_update=("update",))
+
+    def outcome(status, self_updating, **kw):
+        return cli_update.Outcome("claude", status, label="Claude Code",
+                                  self_updating=self_updating, **kw)
+
+    self_late = outcome(Status.TIMEOUT, True, before="2.1.228",
+                        detail="check exceeded 5s")
+    winget_late = outcome(Status.TIMEOUT, False, before="2.1.224",
+                          detail="check exceeded 5s")
+    gemini_ok = cli_update.Outcome("gemini", Status.UP_TO_DATE, before="1.1.12",
+                                   label="Gemini (agy)", self_updating=True)
+
+    check("cli-update words: a self-updating CLI we could not check is left to "
+          "its own updater, not reported as skipped",
+          cli_update.state_text(self_late) == "left to its own updater")
+    check("cli-update words: the same status on a package managed CLI still "
+          "says the update was missed (nothing else will fetch one)",
+          cli_update.state_text(winget_late) == "took too long, skipped")
+    check("cli-update words: the shape is stamped on the outcome by check(), "
+          "so no caller has to remember to set it",
+          cli_update.check(native_claude,
+                           _FakeCli(timeout_on=("--version",))).self_updating
+          and not cli_update.check(claude,
+                                   _FakeCli(timeout_on=("--version",))
+                                   ).self_updating)
+
+    check("cli-update pill: a self-updating CLI raises no nag, because every "
+          "instruction the nag carries would be unnecessary",
+          cli_update.pill_text([self_late, gemini_ok]) == ""
+          and cli_update.pill_tooltip([self_late]) == "")
+    self_busy = outcome(Status.BLOCKED_PROCESSES, True,
+                        detail="3 claude.exe alive")
+    winget_busy = outcome(Status.BLOCKED_PROCESSES, False,
+                          detail="3 claude.exe alive")
+    check("cli-update pill: ...and that holds for a locked file too, since a "
+          "self-updating CLI does not need the user to close anything",
+          cli_update.pill_text([self_busy]) == ""
+          and "Claude Code" in cli_update.pill_text([winget_busy]))
+    check("cli-update pill: the splash and the pill can never disagree, so an "
+          "outcome the splash calls a non event never raises a nag",
+          all(not cli_update.needs_pill(o)
+              for o in (self_late, winget_late, self_busy, winget_busy)
+              if cli_update.state_text(o)
+              in cli_update._SELF_UPDATING_TEXT.values())
+          and cli_update.needs_pill(winget_busy))
+
+    check("cli-update linger: a missed update earns a moment to be read",
+          cli_update.worth_reading([winget_late])
+          and cli_update.worth_reading([winget_busy]))
+    check("cli-update linger: ...and a non event does not, or the pause would "
+          "manufacture the concern the wording removes",
+          not cli_update.worth_reading([self_late, gemini_ok])
+          and not cli_update.worth_reading([]))
+
+    # the durable copy. The pill speaks only for what the user can act on, so
+    # without this a status glimpsed on the splash has nowhere to be re-read.
+    summary = cli_update.last_check_summary([self_late, gemini_ok])
+    check("cli-update panel: the last check reports EVERY outcome, including "
+          "the ones the pill deliberately withholds",
+          "Claude Code: left to its own updater" in summary
+          and "Gemini (agy): up to date (1.1.12)" in summary, summary)
+    check("cli-update panel: ...and names anything still installing",
+          "still installing" in
+          cli_update.last_check_summary([self_late], installing=("gemini",)))
+
+    check("cli-update audit: the timeout line records which shape it describes",
+          cli_update.audit_lines(self_late)[-1].endswith(
+              "(self-updating, left to the CLI)")
+          and cli_update.audit_lines(winget_late)[-1].endswith("exceeded 5s"),
+          cli_update.audit_lines(self_late))
+
+    check("cli-update splash: the subtitle drops the locked-file claim when "
+          "every target updates itself (the native install never touches the "
+          "running file)",
+          "not in use" not in subtitle_for([native_claude, agy])
+          and "before agents start" in subtitle_for([native_claude, agy]))
+    check("cli-update splash: ...and keeps it while any target is package "
+          "managed, where it is both true and the reason to wait",
+          subtitle_for([claude, agy]) ==
+          "Now is the only moment these files are not in use.")
+
+    # the linger, end to end through the real event loop
+    for target, expect_wait in ((claude, True), (native_claude, False)):
+        started = time.time()
+        run_update_gate(None, targets=[target],
+                        runner=_FakeCli(timeout_on=("--version",)),
+                        auto_close_ms=0, linger_ms=400, show=True)
+        waited = time.time() - started
+        check("cli-update splash: a missed update holds the window open"
+              if expect_wait else
+              "cli-update splash: ...and a non event closes as fast as a "
+              "clean launch",
+              (waited >= 0.35) is expect_wait, (target.key, waited))
+    check("cli-update splash: the linger is long enough to actually read",
+          LINGER_CLOSE_MS >= 2000)
 
 
 class _FakeInstall:
@@ -11857,9 +11972,26 @@ def test_cli_native_migration():
           and not panel.cleanup_btn.isVisibleTo(panel))
     check("cli-install panel: with no runner armed it can show but not act",
           not panel.action_btn.isEnabled())
+    check("cli-install panel: with no gate report it claims no check happened",
+          not panel.last_check_label.isVisibleTo(panel)
+          and panel.last_check_label.text() == "")
     strings = _dialog_strings(panel)
     panel.close()
     panel.deleteLater()
+
+    # the splash is the most fleeting surface in the app: it closes itself and
+    # leaves nothing behind, so this is the one place an outcome can be read
+    # again afterwards
+    reported = UpdatePanel(situation(winget_exe), runner=None,
+                           winget_exe=winget_exe, settings_file=str(settings),
+                           last_check="Claude Code: left to its own updater",
+                           parent=win)
+    check("cli-install panel: the startup gate's report is readable here long "
+          "after the splash has gone",
+          reported.last_check_label.isVisibleTo(reported)
+          and "left to its own updater" in reported.last_check_label.text())
+    reported.close()
+    reported.deleteLater()
 
     blocker = threading.Event()
     released = []

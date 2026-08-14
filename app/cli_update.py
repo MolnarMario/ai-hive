@@ -52,6 +52,25 @@ run, so for a self-updating target checking and installing are the SAME act
 `needs_apply` says yes unconditionally for a `self_update` target and why an
 unchanged version after a self-update reads as UP_TO_DATE rather than as the
 REPORTED_BUT_UNCHANGED that the same reading means for winget.
+
+THAT DIFFERENCE REACHES THE WORDS, NOT JUST THE COMMANDS
+--------------------------------------------------------
+A skipped check means opposite things in the two shapes, so `Outcome` carries
+`self_updating` and the reporting surfaces read it. On a WINGET target, a check
+that timed out or found the file locked is a genuinely missed update: nothing
+else will fetch one, and the user keeps the old binary and its banner. On a
+SELF-UPDATING target the CLI fetches its own new version in the background
+regardless, so the same statuses are non events -- `_SELF_UPDATING_TEXT`
+rewords them ("left to its own updater"), `needs_pill` withholds the top-bar
+nag whose advice would not apply, and `worth_reading` does not hold the splash
+open for them. This was a live report: after the native migration the splash
+flashed "took too long, skipped" for under a second on a launch where nothing
+was wrong and the CLI updated itself a minute later, with no surface left
+afterwards that could say so. Hence `last_check_summary`, which unlike
+`pill_text` lets EVERY outcome speak, for the Updates panel the user can open
+on purpose. The audit lines record the shape for the same reason: which of the
+two a line describes is read off the install, so it can change between runs on
+one machine.
 """
 
 from __future__ import annotations
@@ -157,6 +176,13 @@ class Outcome:
     available: str = ""   # what the manifest offers (winget targets only)
     detail: str = ""
     label: str = ""
+    # Whether this target updates ITSELF (`Target.self_update`). Carried on the
+    # outcome rather than looked up from the Target, because what a status MEANS
+    # to the user depends on it and the reporting surfaces (splash, panel, pill)
+    # only ever see outcomes. A skipped check is a missed update on a package
+    # managed install and a non event on a self-updating one, and telling the
+    # user the same sentence for both is how a harmless launch reads as a fault.
+    self_updating: bool = False
 
 
 @dataclass(frozen=True)
@@ -353,7 +379,8 @@ def check(target: Target, runner, budget: float = CHECK_TIMEOUT_S,
     check simply could not decide yet (a self-updating CLI has no dry run) --
     `needs_apply` is the one place that turns a finished check into an install,
     so those two cases never have to be told apart by a status."""
-    out = Outcome(target.key, Status.UP_TO_DATE, label=target.label)
+    out = Outcome(target.key, Status.UP_TO_DATE, label=target.label,
+                  self_updating=bool(target.self_update))
     if not target.exe:
         return replace(out, status=Status.NOT_INSTALLED, detail="not installed")
 
@@ -497,7 +524,9 @@ def audit_lines(outcome: Outcome) -> list:
     if outcome.status is Status.UPDATED:
         lines.append(f"UPDATE {key} {outcome.before or '?'} -> {outcome.after}")
     elif outcome.status is Status.BLOCKED_PROCESSES:
-        lines.append(f"UPDATE-SKIP {key} ({outcome.detail})")
+        lines.append(f"UPDATE-SKIP {key} ({outcome.detail})"
+                     + (" (self-updating, left to the CLI)"
+                        if outcome.self_updating else ""))
     elif outcome.status is Status.NOT_INSTALLED:
         lines.append(f"UPDATE-SKIP {key} (not installed)")
     elif outcome.status is Status.DB_STALE:
@@ -508,7 +537,12 @@ def audit_lines(outcome: Outcome) -> list:
     elif outcome.status is Status.FAILED:
         lines.append(f"UPDATE-FAIL {key} {outcome.detail}")
     elif outcome.status is Status.TIMEOUT:
-        lines.append(f"UPDATE-TIMEOUT {key} {outcome.detail}")
+        # the shape is recorded because it is what decides whether this line
+        # describes a missed update or a non event, and the shape is read off
+        # the install, so it can differ between two runs on the same machine
+        lines.append(f"UPDATE-TIMEOUT {key} {outcome.detail}"
+                     + (" (self-updating, left to the CLI)"
+                        if outcome.self_updating else ""))
     return lines
 
 
@@ -567,12 +601,104 @@ _PILL_LONG = {
 _MANUAL_COMMAND = ("winget install --id {winget_id} --exact --force")
 
 
-def pill_text(outcomes, installing=()) -> str:
-    """One short line for the top-bar pill, or "" when there is nothing to
-    say. Only the four reporting statuses speak."""
+# --------------------------------------------------------- outcome words ---
+# One short phrase per finished target, shown on the splash row and reused
+# verbatim by the Updates panel. It lives HERE rather than in the widget for the
+# same reason every other decision does: the panel and the splash must not be
+# able to describe the same outcome differently.
+
+_STATE_TEXT = {
+    Status.UP_TO_DATE: "up to date",
+    Status.UPDATED: "updated",
+    Status.BLOCKED_PROCESSES: "skipped, the CLI was in use",
+    Status.DB_STALE: "needs a manual reinstall",
+    Status.REPORTED_BUT_UNCHANGED: "unchanged, see the top bar",
+    Status.FAILED: "check failed",
+    Status.TIMEOUT: "took too long, skipped",
+    Status.NOT_INSTALLED: "not installed",
+    Status.DISABLED: "off",
+}
+
+# A self-updating CLI that we did not manage to check is NOT a missed update:
+# it fetches its own new versions in the background, so the gate standing down
+# changes nothing about what the user ends up running. Saying "skipped" there
+# reports a failure that did not happen, and leaves the user looking for
+# something to fix.
+_SELF_UPDATING_TEXT = {
+    Status.TIMEOUT: "left to its own updater",
+    Status.BLOCKED_PROCESSES: "in use, left to its own updater",
+}
+
+
+def state_text(outcome) -> str:
+    """One short phrase per finished target. Never an em dash: this is read."""
+    if outcome.self_updating and outcome.status in _SELF_UPDATING_TEXT:
+        return _SELF_UPDATING_TEXT[outcome.status]
+    base = _STATE_TEXT.get(outcome.status, str(outcome.status))
+    if outcome.status is Status.UPDATED:
+        return f"updated {outcome.before or '?'} to {outcome.after}"
+    if outcome.status is Status.UP_TO_DATE and outcome.before:
+        return f"up to date ({outcome.before})"
+    return base
+
+
+def worth_reading(outcomes) -> bool:
+    """Is there an outcome here the user may want a moment to actually READ?
+
+    The splash auto closes in well under a second, which is right for "nothing
+    to do" and wrong for anything that might send someone looking for a
+    problem. This is deliberately NARROWER than "not a clean run": a timed out
+    check on a self-updating CLI is a genuine non event (see
+    `_SELF_UPDATING_TEXT`), so holding the window open for it would manufacture
+    the very concern the reworded phrase removes."""
+    for outcome in outcomes or ():
+        if needs_pill(outcome):
+            return True
+        if outcome.status is Status.TIMEOUT and not outcome.self_updating:
+            return True
+    return False
+
+
+def last_check_summary(outcomes, installing=()) -> str:
+    """What the startup gate did, for the Updates panel.
+
+    Unlike `pill_text`, EVERY outcome speaks here. The pill is an interruption
+    and so only reports what needs acting on; this is a place the user chose to
+    open, and the whole point of it is that a message which flashed past on the
+    splash can be read again afterwards. A status with nowhere to be re-read is
+    indistinguishable from one the app never produced."""
     parts = []
     for outcome in outcomes or ():
-        if outcome.status in PILL_STATUSES:
+        if outcome.status is Status.DISABLED:
+            continue
+        parts.append(f"{_label(outcome)}: {state_text(outcome)}")
+    if installing:
+        parts.append(_joined(_label_for_key(key, outcomes)
+                             for key in installing) + ": still installing")
+    return "; ".join(parts)
+
+
+def needs_pill(outcome) -> bool:
+    """Does this outcome earn the top-bar nag?
+
+    `PILL_STATUSES` says which statuses can, and `self_updating` is the veto:
+    every line of `_PILL_LONG` tells the user to go and DO something (close
+    programs, run an installer by hand), and on a self-updating install none of
+    that applies -- the CLI fetches its own new version whatever the gate did.
+    A nag whose instructions are unnecessary is worse than silence, and it
+    would also contradict the splash, which now calls the same outcome a non
+    event. One predicate so the two surfaces cannot disagree."""
+    if outcome.status not in PILL_STATUSES:
+        return False
+    return not (outcome.self_updating and outcome.status in _SELF_UPDATING_TEXT)
+
+
+def pill_text(outcomes, installing=()) -> str:
+    """One short line for the top-bar pill, or "" when there is nothing to
+    say. Only the reporting statuses speak, and only where the user can act."""
+    parts = []
+    for outcome in outcomes or ():
+        if needs_pill(outcome):
             parts.append(_PILL_SHORT[outcome.status].format(
                 label=_label(outcome)))
     if installing:
@@ -588,7 +714,7 @@ def pill_tooltip(outcomes, installing=()) -> str:
     package record. Kept out of the widget so it can be tested without Qt."""
     blocks = []
     for outcome in outcomes or ():
-        if outcome.status not in PILL_STATUSES:
+        if not needs_pill(outcome):
             continue
         blocks.append(_PILL_LONG[outcome.status].format(
             label=_label(outcome), detail=outcome.detail or "no detail",
