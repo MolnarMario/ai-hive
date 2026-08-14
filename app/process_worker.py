@@ -444,6 +444,16 @@ if sys.platform == "win32":
         wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
         ctypes.POINTER(wintypes.DWORD)]
     _k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    # SetConsoleCtrlHandler's first parameter is a POINTER, and it is passed
+    # NULL for the ignore-flag half of enable_ctrl_c_for_children() -- without
+    # an explicit prototype ctypes infers an int-sized argument and the
+    # callback pointer is truncated on 64-bit (a truncated handler address is
+    # a crash on the next Ctrl+C, not a failed call).
+    _k32.SetConsoleCtrlHandler.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+    _k32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+    _PHANDLER_ROUTINE = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    _CTRL_C_EVENT = 0
+    _CTRL_BREAK_EVENT = 1
 
 
 class WinJob:
@@ -564,6 +574,86 @@ def describe_pid(pid: int) -> str:
         return buf.value.rsplit("\\", 1)[-1]
     finally:
         _k32.CloseHandle(handle)
+
+
+_ctrl_c_handler_installed = False
+# The console-ctrl callback is invoked by Windows on a thread it injects into
+# this process, forever -- so the WINFUNCTYPE object must outlive the call that
+# registered it. A garbage-collected handler is a crash on the next Ctrl+C, not
+# a lost registration, hence this module-level reference.
+_ctrl_c_handler = None
+
+
+def _self_protect_ctrl(event: int) -> bool:
+    """Swallow Ctrl+C/Ctrl+Break aimed at AI HIVE ITSELF (see
+    enable_ctrl_c_for_children); pass every other console event through."""
+    return event in (_CTRL_C_EVENT, _CTRL_BREAK_EVENT)
+
+
+def enable_ctrl_c_for_children() -> bool:
+    """Clear the INHERITED ignore-Ctrl+C flag, so a pty child can be interrupted.
+
+    Without this, Ctrl+C in a full-terminal card does NOTHING to a running
+    command, and PtyWorker.stop()'s "graceful Ctrl+C" is a no-op that always
+    escalates to the Job-Object kill. The chain, measured rather than inferred:
+    conhost consumes a 0x03 written into the pty as a CONTROL KEY (the child's
+    input mode carries ENABLE_PROCESSED_INPUT) and raises CTRL_C_EVENT instead
+    of delivering the byte -- so if that event is ignored, the keystroke reaches
+    NOBODY, as neither a signal nor data. And it is ignored, because
+    PEB.ProcessParameters.ConsoleFlags bit 0 ("ignore Ctrl+C") is INHERITED at
+    CreateProcess time by every descendant: AI Hive picks it up from whatever
+    launched AI HIVE (any harness that spawns with CREATE_NEW_PROCESS_GROUP --
+    including a Claude Code agent terminal, i.e. how this repo is developed and
+    how the smoke suite is usually run), and hands it to every agent, and every
+    agent hands it to every build/test/ping it starts. Not a pywinpty
+    behaviour: it spawns with EXTENDED_STARTUPINFO_PRESENT |
+    CREATE_UNICODE_ENVIRONMENT and nothing else. Verified A/B in one process:
+    flag set -> `ping -t` under a pty PowerShell ignores 0x03 forever; flag
+    cleared -> ping dies, the shell prints "Control-C" and returns to its
+    prompt. Also verified with NO console attached (the pythonw production
+    shape), where the API still succeeds.
+
+    Two halves, and the split is deliberate:
+
+    * The ignore flag is cleared on EVERY call. It is a PEB field costing a
+      syscall, only inheritance matters, and nothing guarantees some other
+      component has not set it again since the last spawn.
+    * The self-protect handler is installed ONCE. SetConsoleCtrlHandler APPENDS
+      to a handler table, so re-registering the same callback per spawn would
+      run it once per agent ever started.
+
+    That handler is NOT optional. Clearing the flag without it makes AI Hive
+    itself killable by a Ctrl+C in a console it shares with its launcher, and a
+    hard kill skips closeEvent -- no final save, no transcript backup, no screen
+    snapshots, i.e. exactly the silent-loss class the persistence invariants
+    exist to prevent. It returns True (handled, do nothing) for
+    CTRL_C_EVENT/CTRL_BREAK_EVENT and False for CLOSE/LOGOFF/SHUTDOWN, so
+    shutdown behaves as it always has. Handlers are per-process and are NOT
+    inherited -- only the flag is -- so protecting ourselves costs the children
+    nothing.
+
+    Never raises; returns False off Windows or on any API failure, the same
+    contract every WinJob method keeps."""
+    global _ctrl_c_handler_installed, _ctrl_c_handler
+    if sys.platform != "win32":
+        return False
+    try:
+        # Self-protection goes in FIRST, and the order is not stylistic: between
+        # clearing the flag and installing the handler this process runs with
+        # Windows' default handler, which TERMINATES on Ctrl+C. If the handler
+        # cannot be installed, refuse the whole thing -- a dead Ctrl+C in the
+        # cards is a mild failure, an AI Hive killable without closeEvent is a
+        # session-losing one.
+        if not _ctrl_c_handler_installed:
+            handler = _PHANDLER_ROUTINE(_self_protect_ctrl)
+            if not _k32.SetConsoleCtrlHandler(
+                    ctypes.cast(handler, ctypes.c_void_p), True):
+                return False
+            _ctrl_c_handler = handler
+            _ctrl_c_handler_installed = True
+        return bool(_k32.SetConsoleCtrlHandler(None, False))
+    except Exception:
+        return False
 
 
 # ----------------------------------------------------------------- worker ---

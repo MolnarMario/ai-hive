@@ -4,6 +4,13 @@ Where ProcessWorker gives a line-oriented piped console, PtyWorker gives a
 genuine terminal: child processes see a TTY, so interactive TUIs (Claude
 Code, PSReadLine prompts, spinners) work, and Ctrl+C is a real interrupt.
 
+That last one is not free, and it is not something the pty grants: a 0x03
+written into the pseudoconsole is swallowed by conhost and re-raised as
+CTRL_C_EVENT, which every process in an agent's tree IGNORES unless the
+inherited ignore-Ctrl+C ConsoleFlag is cleared BEFORE the spawn. `start()`
+therefore calls `enable_ctrl_c_for_children()` next to `agent_environment()`;
+see that function for the measurements behind it.
+
 Threading model: pywinpty reads are blocking, so one daemon reader thread
 per PTY pumps chunks to the GUI thread via a queued signal; the worker
 batches them on a 33 ms timer exactly like ProcessWorker. All control
@@ -16,7 +23,8 @@ import threading
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from .process_worker import WinJob, WorkerState, _taskkill_tree, AgentSpec
+from .process_worker import (WinJob, WorkerState, _taskkill_tree, AgentSpec,
+                             enable_ctrl_c_for_children)
 
 
 def agent_environment() -> dict:
@@ -127,6 +135,11 @@ class PtyWorker(QObject):
         env = agent_environment()
         if self.spec.env:
             env.update(self.spec.env)
+        # ...and the same sanitizing act for the OTHER piece of inherited state
+        # that silently disables a feature in the child: the ignore-Ctrl+C
+        # ConsoleFlag, which is captured AT SPAWN, so this must run here (every
+        # start and restart) rather than once in main.py.
+        enable_ctrl_c_for_children()
         try:
             self._proc = PtyProcess.spawn(
                 cmd, dimensions=(self.rows, self.cols),

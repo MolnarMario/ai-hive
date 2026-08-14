@@ -4185,6 +4185,56 @@ def test_terminal_input_editor():
           (view._undo_stack, view._undo_last))
 
 
+def test_input_gap_self_heal():
+    """Claude's classic renderer can scroll the screen for a transient
+    dropdown and never scroll back on dismissal, stranding the input box
+    above a dead run of blank rows (see TerminalView._check_input_gap).
+    _on_input_settled is what _snap_timer's 600ms debounce fires; called
+    directly here rather than pumping a real timer, matching the existing
+    _snapshot_input direct-call pattern above."""
+    from app.widgets.terminal_view import TerminalView
+
+    # a tall terminal with the box parked near the TOP and nothing below --
+    # exactly the shape left once a dropdown's rows are erased but the
+    # viewport is never scrolled back down
+    view = TerminalView(rows=20, cols=40)
+    view.feed("> \r\n? for shortcuts")
+    fired = []
+    view.staleLayoutDetected.connect(lambda: fired.append(1))
+    view._on_input_settled()
+    check("input-gap: a footer stranded far from the bottom fires once",
+          fired == [1], fired)
+
+    # settling again with nothing changed must NOT refire -- this is what
+    # keeps a legitimately short conversation free of a repeated resize blip
+    view._on_input_settled()
+    check("input-gap: an unchanged gap does not refire",
+          fired == [1], fired)
+
+    # the footer sits right at the bottom (one row of normal padding) --
+    # within tolerance, so nothing is wrong and nothing fires
+    view2 = TerminalView(rows=3, cols=40)
+    view2.feed("> \r\n? for shortcuts")
+    fired2 = []
+    view2.staleLayoutDetected.connect(lambda: fired2.append(1))
+    view2._on_input_settled()
+    check("input-gap: a footer within tolerance of the bottom never fires",
+          fired2 == [] and view2._input_gap_row is None,
+          (fired2, view2._input_gap_row))
+
+    # no footer line at all (mid-typing) still uses the box's own bottom row
+    # as the edge, and repeated settles with nothing changed still fire once
+    view3 = TerminalView(rows=20, cols=40)
+    view3.feed("hello\r\n> ")
+    fired3 = []
+    view3.staleLayoutDetected.connect(lambda: fired3.append(1))
+    view3._on_input_settled()
+    view3._on_input_settled()
+    view3._on_input_settled()
+    check("input-gap: a stable gap with no footer fires once, not per settle",
+          fired3 == [1], fired3)
+
+
 def test_session_migration():
     """A pre-v2 line-mode shell agent upgrades to interactive on load."""
     from app.pty_worker import HAS_CONPTY
@@ -4231,7 +4281,11 @@ def test_pty():
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
 
-    from app.process_worker import AgentKind, build_spec
+    import ctypes
+    from ctypes import wintypes
+
+    from app import pty_worker
+    from app.process_worker import AgentKind, build_spec, describe_pid
     from app.pty_worker import HAS_CONPTY
     from app.terminal_agent import TerminalAgent
     from app.widgets.terminal_card import TerminalCard
@@ -4266,7 +4320,30 @@ def test_pty():
     check("pty: card hosts a TerminalView (no line console)",
           card.terminal is not None and card.console is None)
 
-    agent.start()
+    # Hand the spawn the WORST case rather than whatever this suite happens to
+    # have been launched with: set the ignore-Ctrl+C ConsoleFlag ON, exactly as
+    # a harness that spawns with CREATE_NEW_PROCESS_GROUP does. Children capture
+    # it at spawn, so unless PtyWorker.start() clears it, the interrupt check
+    # below fails -- which is what makes that check a test of OUR fix and not of
+    # the launching terminal.
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.SetConsoleCtrlHandler.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+    k32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+    k32.SetConsoleCtrlHandler(None, True)
+    enable_calls = []
+    real_enable = pty_worker.enable_ctrl_c_for_children
+
+    def counting_enable():
+        enable_calls.append(1)
+        return real_enable()
+
+    pty_worker.enable_ctrl_c_for_children = counting_enable
+    try:
+        agent.start()
+    finally:
+        pty_worker.enable_ctrl_c_for_children = real_enable
+    check("pty: the spawn clears the inherited ignore-Ctrl+C flag",
+          enable_calls == [1], enable_calls)
     check("pty: agent reaches running", wait_until(agent.is_running, 15000))
     check("pty: interactive prompt renders in the grid",
           wait_until(lambda: "PS" in card.terminal.screen_text()
@@ -4278,16 +4355,27 @@ def test_pty():
           wait_until(lambda: "gridok" in
                      card.terminal.screen_text().replace(" ", ""), 12000))
 
-    # Ctrl+C interrupts a running loop (real signal, not available in line mode)
+    # Ctrl+C interrupts a running child (a real console control event, not
+    # available in line mode). Measured on the PROCESS, never on screen text:
+    # the old check compared a screen snapshot taken before the pending output
+    # had even flushed against one 2.5s later, counted the English-only string
+    # "Reply", and fell back to "PS" in the last 80 chars -- which pyte pads to
+    # full width, so that arm could never fire. It reported FAIL on a working
+    # interrupt and PASS on a broken one, and was written off as flaky for
+    # months while Ctrl+C was genuinely dead (see enable_ctrl_c_for_children).
+    def ping_pids():
+        return [p for p in agent.worker.job_process_ids()
+                if describe_pid(p).lower().startswith("ping")]
+
     agent.write("ping -t 127.0.0.1\r")
-    wait_until(lambda: "127.0.0.1" in card.terminal.screen_text(), 15000)
-    pump(500)
+    check("pty: the child command is running",
+          wait_until(lambda: bool(ping_pids()), 15000),
+          agent.worker.job_process_ids())
     agent.write("\x03")
-    a = card.terminal.screen_text()
-    pump(2500)
-    b = card.terminal.screen_text()
-    check("pty: Ctrl+C stopped the loop",
-          a.count("Reply") == b.count("Reply") or "PS" in b[-80:], b[-160:])
+    check("pty: Ctrl+C interrupted the running child",
+          wait_until(lambda: not ping_pids(), 10000), ping_pids())
+    # an INTERRUPT, not a kill: the shell survives its child being stopped
+    check("pty: Ctrl+C left the shell alive", agent.is_running())
 
     # background retention while hidden
     agent.write("1..8 | %{ $_; Start-Sleep -Milliseconds 100 }\r")
@@ -10632,6 +10720,7 @@ def main():
     test_terminal_mouse_tracking_click()
     test_terminal_selection_edit()
     test_terminal_input_editor()
+    test_input_gap_self_heal()
     test_session_migration()
     test_app()
     test_pty()
@@ -11689,6 +11778,63 @@ def test_cli_native_migration():
     out = cli_install.migrate(slow, launcher=native_exe, before="2.1.224")
     check("cli-install: an installer that never finished claims no version",
           not out.ok and out.after == "" and out.before == "2.1.224", out)
+
+    # --- 4.1 a successful migrate fixes the USER'S OWN terminal's PATH too --
+    # `path_updater` is injected exactly like `runner`: the suite must never
+    # touch the real Windows User PATH registry key, so these drive FAKE
+    # updaters and never call the real `ensure_native_on_path`.
+    runner = _FakeInstall(lands={native_exe: "2.1.231 (Claude Code)"})
+    out = cli_install.migrate(runner, launcher=native_exe, before="2.1.224")
+    check("cli-install: with no path_updater given, nothing is added and "
+          "nothing is audited about PATH (the default the suite exercises)",
+          out.path_added is False
+          and cli_install.audit_lines(out) == ["CLI-MIGRATE-OK 2.1.224 -> 2.1.231"],
+          (out, cli_install.audit_lines(out)))
+    runner = _FakeInstall(lands={native_exe: "2.1.231 (Claude Code)"})
+    out = cli_install.migrate(runner, launcher=native_exe, before="2.1.224",
+                              path_updater=lambda: True)
+    check("cli-install: a path_updater that changed PATH is reflected on the "
+          "result and audited",
+          out.ok and out.path_added is True
+          and cli_install.audit_lines(out) == [
+              "CLI-MIGRATE-OK 2.1.224 -> 2.1.231",
+              "CLI-MIGRATE-PATH added .local\\bin to the User PATH"],
+          (out, cli_install.audit_lines(out)))
+    runner = _FakeInstall(lands={native_exe: "2.1.231 (Claude Code)"})
+    out = cli_install.migrate(runner, launcher=native_exe, before="2.1.224",
+                              path_updater=lambda: False)
+    check("cli-install: a path_updater reporting 'already there' adds nothing",
+          out.ok and out.path_added is False
+          and cli_install.audit_lines(out) == ["CLI-MIGRATE-OK 2.1.224 -> 2.1.231"],
+          out)
+
+    def _boom():
+        raise OSError("registry is locked")
+
+    runner = _FakeInstall(lands={native_exe: "2.1.231 (Claude Code)"})
+    out = cli_install.migrate(runner, launcher=native_exe, before="2.1.224",
+                              path_updater=_boom)
+    check("cli-install: a PATH nicety that raises never takes the migration "
+          "itself down with it",
+          out.ok and out.after == "2.1.231" and out.path_added is False, out)
+
+    # `_compute_updated_path` is the pure decision `ensure_native_on_path`
+    # makes before ever touching the registry, and is tested directly for
+    # that reason.
+    check("cli-install: an empty PATH becomes just the target",
+          cli_install._compute_updated_path("", r"C:\u\.local\bin")
+          == r"C:\u\.local\bin")
+    check("cli-install: the target is appended after existing entries",
+          cli_install._compute_updated_path(
+              r"C:\a;C:\b", r"C:\u\.local\bin")
+          == r"C:\a;C:\b;C:\u\.local\bin")
+    check("cli-install: an exact match already on PATH changes nothing",
+          cli_install._compute_updated_path(
+              r"C:\a;C:\u\.local\bin;C:\b", r"C:\u\.local\bin") is None)
+    check("cli-install: matching is case- and trailing-backslash-insensitive, "
+          "like Windows PATH lookups are",
+          cli_install._compute_updated_path(
+              r"C:\a;" + r"C:\U\.LOCAL\BIN" + "\\", r"C:\u\.local\bin") is None)
 
     # --- 5. resolve_claude prefers the NATIVE launcher (the §4.1 trap) ------
     # MEASURED: the winget package directory is on PATH directly, and

@@ -34,8 +34,9 @@ UNVERIFIED must be settled by the steps given, not assumed.
   `test_no_em_dashes_in_visible_text`, which parses non-docstring string
   literals in every module.
 * Verify with `.venv\Scripts\python.exe tests\smoke_test.py`; all checks must
-  pass except the known-flaky `pty: Ctrl+C stopped the loop`. Update the check
-  count in `README.md` (two places) when done.
+  pass. (This line used to exempt `pty: Ctrl+C stopped the loop` as known-flaky.
+  It was never flaky — it was reporting a real dead-Ctrl+C bug, now fixed.)
+  Update the check count in `README.md` (two places) when done.
 
 ---
 

@@ -330,7 +330,8 @@ class UpdatePanel(QDialog):
         self.auditRequested.emit("CLI-MIGRATE-START")
         before = self._situation.version
         self._run(lambda: cli_install.migrate(
-            self._runner, on_event=self._post_event, before=before))
+            self._runner, on_event=self._post_event, before=before,
+            path_updater=cli_install.ensure_native_on_path))
 
     def _on_channel(self) -> None:
         channel = "stable" if self._situation.channel != "stable" else "latest"
@@ -418,9 +419,14 @@ def _result_text(result) -> str:
     if result is None:
         return ""
     if result.action == "migrate":
-        return (f"Claude Code {result.after} is installed and will update "
-                f"itself from now on." if result.ok
-                else "The migration did not complete: " + result.detail)
+        if not result.ok:
+            return "The migration did not complete: " + result.detail
+        base = (f"Claude Code {result.after} is installed and will update "
+                f"itself from now on.")
+        if result.path_added:
+            base += " Your PATH was updated too, so a new terminal's claude " \
+                    "command will use it."
+        return base
     if result.action == "pause":
         return ("Automatic updates are paused. You stay on this version until "
                 "you turn them back on." if result.ok

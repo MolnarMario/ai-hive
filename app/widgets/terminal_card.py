@@ -446,6 +446,11 @@ class TerminalCard(QFrame):
             self.terminal.viewChanged.connect(self.scroll_bar.refresh)
             self.terminal.promptSubmitted.connect(self._on_prompt_submitted)
             self.terminal.historyCleared.connect(self._on_history_cleared)
+            # self-heal: the classic renderer stranded the input box above a
+            # dead gap (see TerminalView._check_input_gap) -- silently ask
+            # Claude to redraw. request_repaint() is already a no-op when the
+            # agent isn't a running pty, so no extra guard is needed here.
+            self.terminal.staleLayoutDetected.connect(self.agent.request_repaint)
             self.agent.prompt_marks_changed.connect(self._refresh_marks)
             self.agent.conversation_replaced.connect(
                 self.terminal.clear_history)
