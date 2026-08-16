@@ -233,6 +233,25 @@ class _AutoSizingScrollContent(QWidget):
         return super().event(e)
 
 
+class _HWheelScrollArea(QScrollArea):
+    """A QScrollArea whose ordinary (vertical) mouse wheel scrolls this row
+    HORIZONTALLY. There is no vertical scrollbar here - the row is one line
+    tall - so the plain wheel gesture would otherwise do nothing at all,
+    leaving a 10px scrollbar handle as the ONLY way to reach whatever scrolled
+    out of view (reported live as controls simply "disappearing"). Just
+    hovering the row and scrolling reaches them instead, no precision
+    drag-and-hunt required."""
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y() or event.angleDelta().x()
+        if delta:
+            bar = self.horizontalScrollBar()
+            bar.setValue(bar.value() - delta)
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+
 class TopBar(QFrame):
     addTerminalClicked = Signal()
     sidebarToggleClicked = Signal()
@@ -444,16 +463,15 @@ class TopBar(QFrame):
         extras_lay = QHBoxLayout(self._extras)
         extras_lay.setContentsMargins(0, 0, 0, 0)
         extras_lay.setSpacing(8)
-        # The pills and their picker are ONE group and sit on the layout's own
-        # spacing with nothing added, which is the same gap the two recovery
-        # switches below have between them. An extra addSpacing() here read as
-        # three unrelated widgets rather than one readout with a control.
-        extras_lay.addWidget(self.usage_badge)
-        extras_lay.addWidget(self.usage_weekly_badge)
-        extras_lay.addWidget(self.gemini_badge)
-        extras_lay.addWidget(self.gemini_weekly_badge)
-        extras_lay.addWidget(self.usage_add_btn)
-        extras_lay.addSpacing(10)  # ...and THIS separates that group from the next
+        # Ordered by priority: whatever is EARLIEST in this row is what stays
+        # visible longest as the window narrows (content is left-anchored, so
+        # the tail is what scrolls out of view first). The compact, always-
+        # useful icon controls (recovery toggles, theme, font, sound, taskbar,
+        # update) go first; the usage pills - full sentences, easily the
+        # widest things here - go last, so THEY are what gives way first
+        # rather than silently swallowing the theme/font/sound/taskbar row
+        # (reported live: at a moderate window width the pills alone pushed
+        # every other control off-screen behind an easy-to-miss scrollbar).
         extras_lay.addWidget(self.recovery_label)
         extras_lay.addSpacing(6)
         extras_lay.addWidget(self.recover_btn)
@@ -468,8 +486,18 @@ class TopBar(QFrame):
         extras_lay.addWidget(self.taskbar_btn)
         extras_lay.addWidget(self.update_pill)
         extras_lay.addWidget(self.auto_update_btn)
+        extras_lay.addSpacing(10)
+        # The pills and their picker are ONE group and sit on the layout's own
+        # spacing with nothing added, which is the same gap the two recovery
+        # switches above have between them. An extra addSpacing() here read as
+        # three unrelated widgets rather than one readout with a control.
+        extras_lay.addWidget(self.usage_badge)
+        extras_lay.addWidget(self.usage_weekly_badge)
+        extras_lay.addWidget(self.gemini_badge)
+        extras_lay.addWidget(self.gemini_weekly_badge)
+        extras_lay.addWidget(self.usage_add_btn)
 
-        self._extras_scroll = QScrollArea(self)
+        self._extras_scroll = _HWheelScrollArea(self)
         self._extras_scroll.setObjectName("TopBarExtrasScroll")
         self._extras_scroll.setWidget(self._extras)
         self._extras_scroll.setWidgetResizable(False)
