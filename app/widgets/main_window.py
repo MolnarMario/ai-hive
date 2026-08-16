@@ -212,6 +212,14 @@ KIND_GROUPS = [
 ]
 
 
+# A CAP on the width the top bar's extras row may demand of the window, not a
+# floor: whatever QAbstractScrollArea asks for is used when it is smaller
+# (measured 54px), and this only stops a future style with a chunkier
+# scrollbar or frame from quietly raising the whole window's minimum width -
+# which is the property the scroll area exists to protect.
+_EXTRAS_MIN_W = 120
+
+
 class _AutoSizingScrollContent(QWidget):
     """A QScrollArea content widget that keeps itself sized to its own
     layout's sizeHint, for a QScrollArea built with `setWidgetResizable(False)`.
@@ -230,6 +238,15 @@ class _AutoSizingScrollContent(QWidget):
     def event(self, e):
         if e.type() == QEvent.Type.LayoutRequest:
             self.adjustSize()
+            # ...and tell the scroll area, because the area's own sizeHint is
+            # a function of THIS widget's (see `_HWheelScrollArea.sizeHint`).
+            # Without this the row would keep whatever width the outer layout
+            # gave it before the pill arrived and scroll instead of growing.
+            host = self.parentWidget()
+            while host is not None and not isinstance(host, QScrollArea):
+                host = host.parentWidget()
+            if host is not None:
+                host.updateGeometry()
         return super().event(e)
 
 
@@ -240,7 +257,43 @@ class _HWheelScrollArea(QScrollArea):
     leaving a 10px scrollbar handle as the ONLY way to reach whatever scrolled
     out of view (reported live as controls simply "disappearing"). Just
     hovering the row and scrolling reaches them instead, no precision
-    drag-and-hunt required."""
+    drag-and-hunt required.
+
+    It also ASKS FOR ITS CONTENT'S FULL WIDTH, which is the whole point of
+    putting the row in a scroll area rather than a plain widget and is the one
+    thing the first cut of this got wrong. `QAbstractScrollArea.sizeHint()` is
+    a SMALL CONSTANT that has nothing to do with what is inside it (measured:
+    468px whatever the row's real 1860px content), so with the breadcrumb
+    holding the layout's stretch, EVERY pixel of a wider window went to the
+    breadcrumb and this row stayed frozen at 468px - identically on a 1280px
+    laptop and a 3440px ultrawide. Reported live on a 1440p monitor as most of
+    the top bar's controls simply being gone, behind a permanent scrollbar
+    that looked like a stray divider.
+
+    So `sizeHint` reports the content's natural width and `minimumSizeHint`
+    stays small. A QHBoxLayout satisfies size HINTS before handing anything to
+    a stretch, so the row now gets its full width whenever the window can
+    afford it and the breadcrumb (`QSizePolicy.Ignored`, minimum 0) absorbs
+    the slack, keeping the cluster right-aligned exactly as it was before the
+    scroll area existed. When the window cannot afford it, the layout shrinks
+    towards minimums - the breadcrumb to nothing first, then this row, which
+    grows its scrollbar. That is what keeps the WINDOW's minimum width a small
+    constant instead of the sum of everything the bar can show."""
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        content = self.widget()
+        if content is not None:
+            hint.setWidth(max(content.sizeHint().width(),
+                              content.minimumSizeHint().width()))
+        return hint
+
+    def minimumSizeHint(self):
+        # deliberately NOT the content's: this is the number that decides how
+        # narrow the whole window may be
+        hint = super().minimumSizeHint()
+        hint.setWidth(min(hint.width(), _EXTRAS_MIN_W))
+        return hint
 
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y() or event.angleDelta().x()
@@ -508,8 +561,16 @@ class TopBar(QFrame):
             Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._extras_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        # transparent so it reads as part of the bar, not a separate panel
-        self._extras_scroll.setStyleSheet("background: transparent; border: none;")
+        # Transparent so it reads as part of the bar, not a separate panel.
+        # Scoped by object name rather than left selector-less so it cannot
+        # reach the row's own scrollbar as this grows; the themed groove and
+        # handle come from `build_qss` and the row must not fight them.
+        # (Measured: the unscoped form rendered the scrollbar identically, so
+        # this is precision, not the fix - the "bar under auto-restart that
+        # does nothing" was the scrollbar being permanently NEEDED, which the
+        # sizeHint above is what actually cures.)
+        self._extras_scroll.setStyleSheet(
+            "#TopBarExtrasScroll { background: transparent; border: none; }")
         self._extras_scroll.viewport().setStyleSheet("background: transparent;")
 
         lay.addWidget(self.toggle_btn)
@@ -517,6 +578,14 @@ class TopBar(QFrame):
         lay.addWidget(self._name)
         lay.addWidget(self._version)
         lay.addSpacing(12)
+        # The breadcrumb keeps the stretch and the extras row does NOT, which
+        # only works because `_HWheelScrollArea.sizeHint()` reports the row's
+        # real content width: a QHBoxLayout satisfies size hints first and
+        # only then hands the leftover to the stretch, so the row gets every
+        # control it can afford and the breadcrumb takes what remains. Giving
+        # the stretch to the row instead would left-anchor the whole cluster
+        # against the breadcrumb and leave the gap on the right, beside
+        # Add Terminal.
         lay.addWidget(self.breadcrumb, 1)
         lay.addWidget(self._extras_scroll)
         lay.addSpacing(8)

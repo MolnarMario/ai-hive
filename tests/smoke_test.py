@@ -10682,6 +10682,7 @@ def main():
     test_multi_agent_session_isolation()
     test_usage_pill_geometry_and_close()
     test_topbar_extras_autosize()
+    test_topbar_extras_grow_with_window()
     test_scheduled_send()
     test_cli_auto_update()
     test_cli_native_migration()
@@ -10892,6 +10893,68 @@ def test_topbar_extras_autosize():
               bar.usage_weekly_badge.geometry()),
           (bar.usage_badge.geometry(), bar.usage_weekly_badge.geometry()))
     bar.deleteLater()
+
+
+def test_topbar_extras_grow_with_window():
+    """The extras row must take every pixel a wider window can give it.
+
+    `QAbstractScrollArea.sizeHint()` is a small constant unrelated to what is
+    inside it, so with the breadcrumb holding the layout's stretch the row
+    stayed frozen at that constant no matter how wide the window got -
+    identically on a 1280px laptop and a 3440px ultrawide, with most of the
+    bar's controls parked off-screen behind a permanent scrollbar (reported
+    live on a 1440p monitor). `_HWheelScrollArea.sizeHint()` reports the
+    content's real width instead, so the QHBoxLayout satisfies it before
+    handing the leftover to the breadcrumb.
+
+    Two properties are checked together because either one alone is
+    satisfiable by the wrong fix: the row GROWS with the window (a fixed-width
+    row fails), and the WINDOW's minimum stays a small constant (a row that
+    simply demands its full width fails - that is the >2000px minimum the
+    scroll area was introduced to remove).
+    """
+    from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
+    app = QApplication.instance() or QApplication([])
+    from app.widgets.main_window import TopBar
+
+    host = QWidget()
+    v = QVBoxLayout(host)
+    v.setContentsMargins(0, 0, 0, 0)
+    bar = TopBar(host)
+    v.addWidget(bar)
+    host.show()
+
+    # Sized RELATIVE to the row's own natural width rather than at fixed pixel
+    # widths: font metrics differ between the offscreen platform and a real
+    # screen, and a fixed 1280px is already roomy enough here that the row
+    # would sit at its full width for every sample and "growth" could not be
+    # observed at all.
+    app.processEvents()
+    natural = bar._extras.sizeHint().width()
+    narrow, mid, wide = natural // 3, (natural * 2) // 3, natural * 2
+
+    widths = {}
+    for w in (narrow, mid, wide):
+        host.resize(w, 120)
+        app.processEvents()
+        widths[w] = bar._extras_scroll.width()
+
+    check("topbar-grow: the extras row widens as the window does",
+          widths[narrow] < widths[mid] < widths[wide], widths)
+    check("topbar-grow: a wide window fits the row's whole natural width",
+          widths[wide] >= natural, (widths[wide], natural))
+    check("topbar-grow: ...and then no scrollbar is needed",
+          not bar._extras_scroll.horizontalScrollBar().isVisible())
+
+    # the scroll area's own minimum is what decides how narrow the WINDOW may
+    # be; it must stay a small constant rather than tracking the content
+    check("topbar-grow: the row's minimum stays a small constant",
+          bar._extras_scroll.minimumSizeHint().width() <= 120,
+          bar._extras_scroll.minimumSizeHint().width())
+    check("topbar-grow: so the whole bar still fits a laptop width",
+          bar.minimumSizeHint().width() < 1000,
+          bar.minimumSizeHint().width())
+    host.deleteLater()
 
 
 class _FakeCli:
