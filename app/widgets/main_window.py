@@ -8,7 +8,7 @@ import os
 import threading
 import time
 
-from PySide6.QtCore import QPoint, QProcess, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QProcess, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
@@ -210,6 +210,27 @@ KIND_GROUPS = [
         ("Custom command", AgentKind.CUSTOM),
     ]),
 ]
+
+
+class _AutoSizingScrollContent(QWidget):
+    """A QScrollArea content widget that keeps itself sized to its own
+    layout's sizeHint, for a QScrollArea built with `setWidgetResizable(False)`.
+
+    Verified live: Qt does NOT do this automatically for such a widget. A
+    usage pill starts hidden and only gains its real (much wider) size once a
+    reading arrives; without this, `_extras` stayed frozen at the narrower
+    size it happened to have when it was last laid out, and its own QHBoxLayout
+    crammed the newly-widened pill into that stale rect, overlapping its
+    neighbour (reported live - two usage pills drawing on top of each other).
+    Catching `QEvent.LayoutRequest` - the event Qt already sends this widget
+    whenever ITS OWN layout invalidates - covers every cause of a size change
+    (a pill's reading, a longer recovery-button label, a theme's font swap)
+    without having to remember each call site."""
+
+    def event(self, e):
+        if e.type() == QEvent.Type.LayoutRequest:
+            self.adjustSize()
+        return super().event(e)
 
 
 class TopBar(QFrame):
@@ -418,7 +439,7 @@ class TopBar(QFrame):
         # suite, since a widget parked in an unopened popup genuinely isn't
         # visible). Every control stays reachable by the same scroll a long
         # breadcrumb or a wide terminal already asks the user for elsewhere.
-        self._extras = QWidget(self)
+        self._extras = _AutoSizingScrollContent(self)
         self._extras.setObjectName("TopBarExtras")
         extras_lay = QHBoxLayout(self._extras)
         extras_lay.setContentsMargins(0, 0, 0, 0)

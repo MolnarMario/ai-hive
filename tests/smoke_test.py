@@ -10681,6 +10681,7 @@ def main():
     test_recovered_prompts_are_cached()
     test_multi_agent_session_isolation()
     test_usage_pill_geometry_and_close()
+    test_topbar_extras_autosize()
     test_scheduled_send()
     test_cli_auto_update()
     test_cli_native_migration()
@@ -10841,6 +10842,56 @@ def test_usage_pill_geometry_and_close():
 
     badge.deleteLater()
     weekly_badge.deleteLater()
+
+
+def test_topbar_extras_autosize():
+    """The top bar's non-essential controls live in a QScrollArea (so the
+    window's minimum width is a small constant, not the sum of everything the
+    bar could show - see the responsive-layout fix). Built with
+    `setWidgetResizable(False)`, which means Qt does NOT automatically resize
+    the content widget when ITS OWN layout's sizeHint changes later.
+
+    Reported live: a usage pill starts hidden and only gains its real (much
+    wider) size once a reading arrives. Without `_AutoSizingScrollContent`,
+    `_extras` stayed frozen at the narrower size it had when it was last laid
+    out, and its own QHBoxLayout crammed the newly-widened pill into that
+    stale rect - two pills drawing on top of each other, garbled and
+    unreadable. `_AutoSizingScrollContent` catches the `QEvent.LayoutRequest`
+    Qt already sends `_extras` whenever its layout invalidates and resizes it
+    to match, so this covers ANY future cause of a size change, not just
+    usage pills.
+    """
+    import time as _time
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.main_window import TopBar
+    from app import claude_usage as cu
+
+    QApplication.instance() or QApplication([])
+    bar = TopBar()
+    bar.show()
+    bar.resize(1920, 42)
+    QApplication.instance().processEvents()
+
+    def limit(key, pct, resets):
+        return cu.Limit(key=key, label=cu._LABELS[key], short=cu._SHORT[key],
+                        percent=pct, resets_at=resets)
+
+    now = _time.time()
+    good = cu.Usage(limits=(limit("five_hour", 21.0, now + 4800),
+                            limit("seven_day", 64.0, now + 400000)),
+                    fetched_at=now, plan="pro")
+    bar.set_usage(good)
+    QApplication.instance().processEvents()
+
+    check("topbar-autosize: both Claude pills became visible",
+          bar.usage_badge.isVisible() and bar.usage_weekly_badge.isVisible())
+    check("topbar-autosize: _extras grew to fit its now-wider content",
+          bar._extras.width() >= bar._extras.layout().sizeHint().width())
+    check("topbar-autosize: the two pills do not overlap",
+          not bar.usage_badge.geometry().intersects(
+              bar.usage_weekly_badge.geometry()),
+          (bar.usage_badge.geometry(), bar.usage_weekly_badge.geometry()))
+    bar.deleteLater()
 
 
 class _FakeCli:
