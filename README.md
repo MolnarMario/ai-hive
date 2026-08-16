@@ -102,36 +102,43 @@ workspaces keep executing — switching never pauses anything.
   square too: when nothing is busy or asking but a shell is still running,
   the disc turns **violet** with the count, instead of showing nothing at
   all.
-- **Plan usage readout** — a top-bar badge, left of the theme picker, showing
-  how much of your Claude plan you've burned and when it comes back:
-  `21% used, resets in 1h20m at 14:49` — countdown first, then the wall-clock
-  time in your own timezone. A percent ring turns amber past 60% and red past
-  85%, so you see a wall coming instead of hitting it mid-task. **Click it to
-  refresh**; hover for every limit window, your plan, and how old the reading
-  is. The number comes from the same place the CLI's `/usage` gets it, read
-  once a minute in the background — nothing is logged or persisted, it's a live
-  readout only. Past 90% *with agents actually working* it refreshes every 20
-  seconds instead: that's the stretch where several busy agents can spend the
-  rest of the window between two ordinary polls, and the recovery features only
-  learn you're cut off from a reading. Idle agents, a window under 90%, or one
-  already spent all go back to the slow rate, so the endpoint is never polled
-  hard for long. When a limit is actually spent it reads **`limit reached,
-  resets in …`**, and the window raises `planLimitReached` / `planLimitCleared`
-  signals (with the reset time) so other features can act on being cut off —
-  e.g. relaunching blocked agents unattended the moment the limit resets.
-  It hides itself when there's no Claude login. If the number can't be fetched
-  at all — the endpoint rate-limits, and there's no longer an on-disk figure to
-  fall back on — the badge says **`! usage limit unreadable — click to
-  refresh`** rather than quietly disappearing, and clicking it retries
-  immediately instead of waiting out the backoff.
-- **Pick which usage readouts you want** — three pills can sit on the bar
-  (Claude plan, Gemini 5-hour, Gemini weekly), each sized to its own text.
-  **Hover one and an ✕ appears at its right edge** to close it; the **+ button**
-  left of the auto-restart caption opens a checklist to bring any of them back.
-  The choice is remembered per pill. Closing both Gemini pills also stops the
-  `agy` usage subprocess entirely, so a Claude-only user isn't paying a few
-  seconds a minute for a readout they don't want. Closing the Claude pill only
-  hides the readout: its poll keeps running, because auto-recovery is driven
+- **Plan usage readout** — two top-bar badges, left of the theme picker, one
+  per Claude rate-limit window, showing how much you've burned and when it
+  comes back: the **5-hour** pill reads `5h 21% used, resets in 1h20m at
+  14:49` — countdown first, then the wall-clock time in your own timezone; the
+  **7-day** pill reads `7d 40% used, resets in 3d14h at 09:00` — same shape,
+  but its countdown is **days+hours only, no minutes**, since a week-long
+  window doesn't need to-the-minute precision (`3d14h` / `3d` / `14h` / `<1h`
+  rather than an unreadable `86h27m`). A percent ring turns amber past 60% and
+  red past 85% on each, so you see a wall coming instead of hitting it
+  mid-task. **Click either to refresh**; hover for every limit window, your
+  plan, and how old the reading is. The numbers come from the same place the
+  CLI's `/usage` gets them, read once a minute in the background — nothing is
+  logged or persisted, it's a live readout only. Past 90% *with agents actually
+  working* it refreshes every 20 seconds instead: that's the stretch where
+  several busy agents can spend the rest of the window between two ordinary
+  polls, and the recovery features only learn you're cut off from a reading.
+  Idle agents, a window under 90%, or one already spent all go back to the slow
+  rate, so the endpoint is never polled hard for long. When a limit is actually
+  spent its pill reads **`limit reached, resets in …`**, and the window raises
+  `planLimitReached` / `planLimitCleared` signals (with the reset time) so
+  other features can act on being cut off — e.g. relaunching blocked agents
+  unattended the moment the limit resets. Both hide themselves when there's no
+  Claude login. If a number can't be fetched at all — the endpoint
+  rate-limits, and there's no longer an on-disk figure to fall back on — the
+  pill says **`! usage limit unreadable — click to refresh`** rather than
+  quietly disappearing, and clicking it retries immediately instead of waiting
+  out the backoff.
+- **Pick which usage readouts you want** — four pills can sit on the bar
+  (Claude 5-hour, Claude 7-day, Gemini 5-hour, Gemini 7-day — the two Gemini
+  pills use the same days+hours-only countdown on their 7-day window), each
+  sized to its own text. **Hover one and an ✕ appears at its right edge** to
+  close it; the **+ button** left of the auto-restart caption opens a checklist
+  to bring any of them back. The choice is remembered per pill. Closing both
+  Gemini pills also stops the `agy` usage subprocess entirely, so a
+  Claude-only user isn't paying a few seconds a minute for a readout they
+  don't want. Closing a Claude pill only hides that readout: the poll keeps
+  running for both Claude windows regardless, because auto-recovery is driven
   from that reading.
   **Nothing is remembered between runs except the choice itself.** Every pill
   opens saying `reading...` and fills in from a fresh fetch at startup, because
@@ -676,7 +683,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1602 checks drive the real app headlessly (offscreen Qt platform) with real
+1616 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -789,7 +796,7 @@ app/
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1602 checks)
+tests/smoke_test.py        headless end-to-end suite (1616 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

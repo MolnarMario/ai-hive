@@ -7296,6 +7296,26 @@ def test_plan_usage():
     check("plan-usage: headline of an empty reading is None",
           cu.headline(cu.Usage()) is None and cu.headline(None) is None)
 
+    # --- five_hour/weekly: the two SEPARATE selectors the two pills use.
+    # Unlike headline, neither ever falls back to the other window - that
+    # would let one pill silently show the other's number.
+    check("plan-usage: five_hour never falls back to the 7d window",
+          cu.five_hour(multi).key == "five_hour")
+    check("plan-usage: weekly never falls back to the 5h window",
+          cu.weekly(multi).key == "seven_day")
+    max_plan = cu.Usage(limits=(limit("five_hour", 10.0),
+                                limit("seven_day_opus", 30.0),
+                                limit("seven_day_sonnet", 55.0)))
+    check("plan-usage: weekly picks the most-constrained 7d window on Max",
+          cu.weekly(max_plan).key == "seven_day_sonnet")
+    check("plan-usage: five_hour/weekly of an empty reading are None",
+          cu.five_hour(cu.Usage()) is None and cu.weekly(cu.Usage()) is None
+          and cu.five_hour(None) is None and cu.weekly(None) is None)
+    check("plan-usage: five_hour is None when the plan has no 5h window",
+          cu.five_hour(cu.Usage(limits=(limit("seven_day", 10.0),))) is None)
+    check("plan-usage: weekly is None when the plan has no 7d window",
+          cu.weekly(cu.Usage(limits=(limit("five_hour", 10.0),))) is None)
+
     # --- the badge line: countdown FIRST, then wall-clock, in local time ---
     line = cu.format_limit(limit("five_hour", 21.0, now + 4800), now=now)
     check("plan-usage: line reads '21% used, resets in 1h20m at HH:MM'",
@@ -7314,6 +7334,21 @@ def test_plan_usage():
     check("plan-usage: countdown formats scale",
           (cu.format_countdown(4800), cu.format_countdown(600),
            cu.format_countdown(30)) == ("1h20m", "10m", "30s"))
+    # --- format_countdown_dh: days+hours only, for the 7-day pill ---
+    check("plan-usage: dh countdown drops minutes at every scale",
+          (cu.format_countdown_dh(6 * 86400 + 23 * 3600 + 45 * 60),
+           cu.format_countdown_dh(6 * 86400),
+           cu.format_countdown_dh(13 * 3600 + 45 * 60),
+           cu.format_countdown_dh(1800))
+          == ("6d23h", "6d", "13h", "<1h"))
+    check("plan-usage: format_limit(days_only=True) uses the dh countdown",
+          cu.format_limit(limit("seven_day", 40.0, now + 6 * 86400 + 3600),
+                          now=now, days_only=True).startswith(
+                              "40% used, resets in 6d1h at "))
+    check("plan-usage: format_limit(days_only=False) keeps minutes",
+          cu.format_limit(limit("seven_day", 40.0, now + 4800), now=now,
+                          days_only=False).startswith(
+                              "40% used, resets in 1h20m at "))
     check("plan-usage: age formats scale",
           (cu.format_since(2), cu.format_since(42), cu.format_since(180),
            cu.format_since(7200)) == ("just now", "42s ago", "3m ago", "2h ago"))
@@ -7372,8 +7407,12 @@ def test_plan_usage():
     store = SessionStore(path=tmp / "session.json")
     win = create_main_window(store)
     win.show()
+    # wide enough that the top bar's overflow collapse never kicks in - this
+    # test is about pill content/visibility logic, not the responsive layout
+    win.resize(2400, 900)
     app.processEvents()
     badge = win.top_bar.usage_badge
+    weekly_badge = win.top_bar.usage_weekly_badge
 
     check("plan-usage: polling is opt-in, so the suite never fetches",
           not win._usage_timer.isActive() and win.plan_usage() is None)
@@ -7384,13 +7423,51 @@ def test_plan_usage():
                     fetched_at=now, plan="pro")
     win._on_usage_ready(good)
     app.processEvents()
-    check("plan-usage: reading shows the badge with the full line",
-          badge.isVisible() and badge._text.startswith("21% used, resets in"))
+    check("plan-usage: reading shows the badge with the full line, labelled "
+          "5h so it's tellable apart from the 7d pill beside it",
+          badge.isVisible()
+          and badge._text.startswith("5h 21% used, resets in"))
     check("plan-usage: tooltip carries plan, every window, and the age",
           "Pro plan" in badge.toolTip() and "Current session" in badge.toolTip()
           and "Updated" in badge.toolTip())
     check("plan-usage: plan_usage() exposes the reading",
           win.plan_usage() is good)
+    check("plan-usage: the 5h reading has no 7d window, so the weekly pill "
+          "stays empty",
+          not weekly_badge.has_reading())
+
+    # --- the separate 7d pill: its own window, its own days+hours format ---
+    weekly_reading = cu.Usage(
+        limits=(limit("five_hour", 21.0, now + 4800),
+               limit("seven_day", 40.0, now + 6 * 86400 + 3600)),
+        fetched_at=now, plan="max")
+    win._on_usage_ready(weekly_reading)
+    app.processEvents()
+
+    # Not an exact-string match: the widget formats against the REAL clock
+    # (unlike the pure format_limit() checks above, which pin `now`), and
+    # this whole test function runs long enough that a minute can genuinely
+    # tick over between the reading landing and the assertion running. So
+    # this checks the SHAPE (5h keeps minutes, 7d drops them), which is the
+    # thing days_only actually controls, rather than the exact digits.
+    def _countdown(text):
+        return text.split("resets in ")[1].split(" at ")[0]
+
+    five_cd = _countdown(badge._text)
+    weekly_cd = _countdown(weekly_badge._text)
+    check("plan-usage: the 5h pill still shows the 5h window, to the minute",
+          badge._text.startswith("5h 21% used, resets in")
+          and five_cd.endswith("m"))
+    check("plan-usage: the 7d pill shows the 7d window, days+hours only "
+          "(no minutes)",
+          weekly_badge._text.startswith("7d 40% used, resets in")
+          and "m" not in weekly_cd
+          and ("d" in weekly_cd or weekly_cd.endswith("h")
+               or weekly_cd == "<1h"))
+    check("plan-usage: the two pills never share a window",
+          badge.window == "five_hour" and weekly_badge.window == "weekly")
+    win._on_usage_ready(good)
+    app.processEvents()
 
     # a reading is TRANSIENT: it must never schedule a save (this polls every
     # minute forever; wiring it to dirty would thrash session.json)
@@ -7414,7 +7491,7 @@ def test_plan_usage():
     check("plan-usage: the edge carries the reset time",
           seen["limit"] is not None and seen["limit"].resets_at == now + 120)
     check("plan-usage: blocked badge reads 'limit reached'",
-          badge._text.startswith("limit reached, resets in"))
+          badge._text.startswith("5h limit reached, resets in"))
     check("plan-usage: an extra poll is armed for just after the reset",
           win._usage_reset_timer.isActive()
           and win._usage_reset_timer.remainingTime() > 120000)
@@ -7481,10 +7558,10 @@ def test_plan_usage():
     # a failed poll keeps the last good number on screen, greyed
     win._on_usage_ready(cu.Usage(error="urlerror"))
     check("plan-usage: a failed poll keeps the last number, marked stale",
-          badge._text.startswith("21% used") and badge._stale)
+          badge._text.startswith("5h 21% used") and badge._stale)
 
     # visibility preference persists; toggling it IS a save (a UI preference)
-    win._on_usage_tracker_toggled("claude", False)
+    win._on_usage_tracker_toggled("claude_five_hour", False)
     app.processEvents()
     check("plan-usage: closing the pill removes it from the bar",
           not badge.isVisible())
@@ -7493,7 +7570,7 @@ def test_plan_usage():
            not badge.isVisible())[-1])
     payload_ui = win._session_payload()["ui"]
     check("plan-usage: preference persisted under ui.usage_trackers",
-          payload_ui["usage_trackers"]["claude"] is False
+          payload_ui["usage_trackers"]["claude_five_hour"] is False
           and payload_ui["usage_trackers"]["gemini_weekly"] is True)
     check("plan-usage: the legacy usage_visible mirror is derived, not stale",
           payload_ui["usage_visible"] is True)
@@ -7503,11 +7580,11 @@ def test_plan_usage():
     win2.show()
     app.processEvents()
     check("plan-usage: preference restored on reopen",
-          win2.top_bar.usage_trackers()["claude"] is False)
+          win2.top_bar.usage_trackers()["claude_five_hour"] is False)
     check("plan-usage: default is ON when never saved",
           create_main_window(
               SessionStore(path=tmp / "fresh.json")
-          ).top_bar.usage_trackers()["claude"])
+          ).top_bar.usage_trackers()["claude_five_hour"])
     win2.close()
 
     # no Claude login at all: hide for good rather than show an empty pill
@@ -7516,8 +7593,9 @@ def test_plan_usage():
     win3._usage_timer.start()
     win3._on_usage_ready(cu.Usage(error="no-auth"))
     app.processEvents()
-    check("plan-usage: no-auth hides the badge and stops polling",
+    check("plan-usage: no-auth hides both Claude pills and stops polling",
           not win3.top_bar.usage_badge.isVisible()
+          and not win3.top_bar.usage_weekly_badge.isVisible()
           and not win3._usage_timer.isActive())
     win3.close()
 
@@ -7555,10 +7633,10 @@ def test_plan_usage():
     app.processEvents()
     check("plan-usage: a later reading replaces the can't-read pill",
           b4.isVisible() and b4.has_reading()
-          and b4._text.startswith("21% used") and not b4._unreadable)
+          and b4._text.startswith("5h 21% used") and not b4._unreadable)
     # an error is not a reason to force the readout back onto a bar the user
     # deliberately cleared
-    win4._on_usage_tracker_toggled("claude", False)
+    win4._on_usage_tracker_toggled("claude_five_hour", False)
     win4.top_bar.note_usage_error("http 429")
     app.processEvents()
     check("plan-usage: a closed readout stays closed when a poll fails",
@@ -7570,11 +7648,12 @@ def test_usage_trackers_preference():
     """The per-pill usage picker: the X that closes one readout, the + that
     brings it back, and the preference that remembers.
 
-    The bar used to carry one boolean for all three readouts, on a right-click
-    item. A user who runs only Claude had to look at two Gemini pills that can
-    never say anything (and pay a ~3s subprocess a minute for them), or lose
-    the Claude one too. The preference is now per pill, and the + button is the
-    single control - a master toggle sitting on top of three checkboxes is two
+    The bar used to carry one boolean for all readouts, on a right-click item.
+    A user who runs only Claude had to look at two Gemini pills that can never
+    say anything (and pay a ~3s subprocess a minute for them), or lose the
+    Claude ones too. The preference is now per pill (Claude 5h, Claude 7d,
+    Gemini 5h, Gemini 7d - four in all), and the + button is the single
+    control - a master toggle sitting on top of four checkboxes is two
     controls for one setting, and a pill checked in one but hidden by the other
     is not explainable.
     """
@@ -7601,6 +7680,9 @@ def test_usage_trackers_preference():
     store = SessionStore(path=tmp / "s.json")
     win = create_main_window(store)
     win.show()
+    # wide enough that the top bar's overflow collapse never kicks in - this
+    # test is about the pill picker's content/visibility logic, not layout
+    win.resize(2400, 900)
     app = QApplication.instance()
     app.processEvents()
     bar = win.top_bar
@@ -7609,6 +7691,7 @@ def test_usage_trackers_preference():
           all(bar.usage_trackers()[k] for k in USAGE_TRACKER_KEYS))
     check("usage-trackers: ...but no pill is on the bar without content",
           not bar.usage_badge.isVisible()
+          and not bar.usage_weekly_badge.isVisible()
           and not bar.gemini_badge.isVisible()
           and not bar.gemini_weekly_badge.isVisible())
     check("usage-trackers: the + picker is on the bar",
@@ -7619,19 +7702,19 @@ def test_usage_trackers_preference():
     menu = bar.build_tracker_menu()
     acts = menu.actions()
     check("usage-trackers: one checkable entry per readout",
-          len(acts) == 3 and all(a.isCheckable() for a in acts)
+          len(acts) == 4 and all(a.isCheckable() for a in acts)
           and [a.text() for a in acts]
           == [USAGE_TRACKER_LABELS[k] for k in USAGE_TRACKER_KEYS])
     check("usage-trackers: the entries start checked",
           all(a.isChecked() for a in acts))
 
-    # put content in all three so visibility is decided by the preference alone
+    # put content in all four so visibility is decided by the preference alone
     win._on_usage_ready(good)
     bar.mark_usage_loading()
     app.processEvents()
     check("usage-trackers: loading counts as content, so the bar fills at once",
           bar.gemini_badge.isVisible() and bar.gemini_weekly_badge.isVisible()
-          and bar.usage_badge.isVisible())
+          and bar.usage_badge.isVisible() and bar.usage_weekly_badge.isVisible())
 
     # the X closes exactly one pill
     seen = []
@@ -7657,12 +7740,14 @@ def test_usage_trackers_preference():
     check("usage-trackers: a reading still never marks the session dirty",
           not win._save_timer.isActive())
 
+    win._on_usage_tracker_toggled("claude_weekly", False)
     check("usage-trackers: the + survives every pill being closed",
-          (win._on_usage_tracker_toggled("claude", False),
+          (win._on_usage_tracker_toggled("claude_five_hour", False),
            app.processEvents(),
            bar.usage_add_btn.isVisible()
-           and not bar.usage_badge.isVisible())[-1])
-    check("usage-trackers: the menu now shows all three unchecked",
+           and not bar.usage_badge.isVisible()
+           and not bar.usage_weekly_badge.isVisible())[-1])
+    check("usage-trackers: the menu now shows all four unchecked",
           not any(a.isChecked() for a in bar.build_tracker_menu().actions()))
 
     # no Claude login hides the recovery switches, but NEVER the picker: a
@@ -7675,11 +7760,14 @@ def test_usage_trackers_preference():
     bar.set_recovery_available(True)
 
     # re-checking brings it back, in its loading state rather than as a gap
-    win._on_usage_tracker_toggled("claude", True)
+    win._on_usage_tracker_toggled("claude_five_hour", True)
     app.processEvents()
     check("usage-trackers: re-checking restores the pill, showing loading",
           bar.usage_badge.isVisible() and bar.usage_badge.has_content()
           and "reading" in bar.usage_badge._text)
+    check("usage-trackers: its sibling stays closed, closing one leaves the "
+          "other alone",
+          not bar.usage_weekly_badge.isVisible())
 
     check("usage-trackers: the old master toggle is gone",
           not hasattr(bar, "usageVisibilityToggled")
@@ -7690,7 +7778,8 @@ def test_usage_trackers_preference():
     saved = _json.loads((tmp / "s.json").read_text(encoding="utf-8-sig"))
     check("usage-trackers: persisted per key under ui.usage_trackers",
           saved["ui"]["usage_trackers"]["gemini_weekly"] is False
-          and saved["ui"]["usage_trackers"]["claude"] is True)
+          and saved["ui"]["usage_trackers"]["claude_five_hour"] is True
+          and saved["ui"]["usage_trackers"]["claude_weekly"] is False)
 
     win2 = create_main_window(SessionStore(path=tmp / "s.json"))
     check("usage-trackers: restored per key on reopen",
@@ -7714,13 +7803,15 @@ def test_usage_trackers_preference():
           all(win4.top_bar.usage_trackers().values()))
     win4.close()
 
-    saved["ui"]["usage_trackers"] = {"claude": False, "gemini_five_hour": True,
+    saved["ui"]["usage_trackers"] = {"claude_five_hour": False,
+                                     "claude_weekly": False,
+                                     "gemini_five_hour": True,
                                      "gemini_weekly": True}
     saved["ui"]["usage_visible"] = True          # deliberately contradictory
     (tmp / "both.json").write_text(_json.dumps(saved), encoding="utf-8")
     win5 = create_main_window(SessionStore(path=tmp / "both.json"))
     check("usage-trackers: the per-key preference wins over the legacy mirror",
-          win5.top_bar.usage_trackers()["claude"] is False)
+          win5.top_bar.usage_trackers()["claude_five_hour"] is False)
     win5.close()
 
 
@@ -11110,10 +11201,9 @@ def test_cli_auto_update():
           and "changes installed software" in off_tip)
 
     # --- the toggle: default OFF, persisted, and now behind the panel ------
-    # The down-arrow OPENS the Updates panel rather than toggling: the top
-    # bar's minimum width is already 2101px and a one-time setup action does
-    # not earn a second button, so the preference is a checkbox inside. The
-    # signal that carries it is unchanged.
+    # The down-arrow OPENS the Updates panel rather than toggling: a one-time
+    # setup action does not earn a second button, so the preference is a
+    # checkbox inside. The signal that carries it is unchanged.
     check("cli-update toggle: defaults to OFF (it installs software)",
           not bar.auto_update() and not bar.auto_update_btn.isChecked())
     emitted, opened = [], []

@@ -236,9 +236,30 @@ def format_countdown(seconds: float) -> str:
     return f"{total}s"
 
 
+def format_countdown_dh(seconds: float) -> str:
+    """Days+hours only, no minutes: "6d23h" / "6d" / "13h" / "<1h".
+
+    For the 7-day window: a week-long countdown doesn't need to-the-minute
+    precision, and dropping minutes keeps it readable at a glance whether the
+    window has days or just hours left. Mirrors `claude_usage.format_countdown_dh`.
+    """
+    total = int(max(0, seconds))
+    if total < 3600:
+        return "<1h"
+    d, rem = divmod(total, 86400)
+    h = rem // 3600
+    if d > 0:
+        return f"{d}d{h}h" if h > 0 else f"{d}d"
+    return f"{h}h"
+
+
 def format_limit(limit: GeminiLimit, now: float | None = None,
-                 with_label: bool = False) -> str:
-    """Format badge text for Gemini usage limit."""
+                 with_label: bool = False, days_only: bool = False) -> str:
+    """Format badge text for Gemini usage limit.
+
+    `days_only` drops the countdown to day+hour granularity (no minutes) —
+    set it for the 7-day window pill.
+    """
     now = time.time() if now is None else now
     head = ("limit reached" if limit.percent >= EXHAUSTED_PCT
             else f"Gemini {limit.percent:.0f}% used")
@@ -250,5 +271,6 @@ def format_limit(limit: GeminiLimit, now: float | None = None,
     when = datetime.fromtimestamp(limit.resets_at).strftime("%H:%M")
     if left <= 0:
         return f"{head}, resets now"
-    return f"{head}, resets in {format_countdown(left)} at {when}"
+    countdown = format_countdown_dh(left) if days_only else format_countdown(left)
+    return f"{head}, resets in {countdown} at {when}"
 

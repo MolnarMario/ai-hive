@@ -14,8 +14,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QLabel, QLineEdit, QMainWindow, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton,
-                               QSplitter, QStackedWidget, QToolButton,
-                               QVBoxLayout, QWidget)
+                               QScrollArea, QSplitter, QStackedWidget,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from .. import __version__
 from .. import chime
@@ -37,7 +37,7 @@ from ..orchestrator_bridge import OrchestratorBridge
 from .activity_panel import ActivityPanel
 from .agent_file_map import AgentFileMapWindow
 from . import ornaments
-from .ornaments import LogoRoundel, PageBorder, PlanUsageBadge
+from .ornaments import ElidingLabel, LogoRoundel, PageBorder, PlanUsageBadge
 from .sidebar import SIDEBAR_WIDTH, Sidebar
 
 SIDEBAR_MIN, SIDEBAR_MAX = 170, 700  # drag bounds (ultrawide-friendly)
@@ -91,13 +91,16 @@ USAGE_TICK_MS = 20000
 USAGE_RESET_GRACE_MS = 8000
 
 # The usage readouts the top bar can show, and the order they sit in. PER PILL
-# rather than per provider: the two Gemini windows are separate pills on the
-# bar, so anything coarser would leave the X on one of them closing the other.
-# Persisted per key under ui.usage_trackers, so a user who runs only Claude (or
-# only Gemini) is not made to look at a readout that can never say anything.
-USAGE_TRACKER_KEYS = ("claude", "gemini_five_hour", "gemini_weekly")
+# rather than per provider: each window (Claude 5h/7d, Gemini 5h/7d) is its own
+# pill on the bar, so anything coarser would leave the X on one of them closing
+# another. Persisted per key under ui.usage_trackers, so a user who runs only
+# Claude (or only Gemini) is not made to look at a readout that can never say
+# anything.
+USAGE_TRACKER_KEYS = ("claude_five_hour", "claude_weekly",
+                      "gemini_five_hour", "gemini_weekly")
 USAGE_TRACKER_LABELS = {
-    "claude": "Claude plan usage",
+    "claude_five_hour": "Claude 5 hour usage",
+    "claude_weekly": "Claude weekly usage",
     "gemini_five_hour": "Gemini 5 hour usage",
     "gemini_weekly": "Gemini weekly usage",
 }
@@ -248,13 +251,17 @@ class TopBar(QFrame):
         self.toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.toggle_btn.clicked.connect(self.sidebarToggleClicked)
 
-        logo = LogoRoundel(self)   # gilt roundel in illuminated themes, ⬡ else
-        logo.setObjectName("Logo")
-        name = QLabel("AI Hive", self)
-        name.setObjectName("AppName")
-        version = QLabel(f"v{__version__}", self)
-        version.setObjectName("VersionBadge")
-        self.breadcrumb = QLabel("", self)
+        self._logo = LogoRoundel(self)  # gilt roundel in illuminated themes, ⬡ else
+        self._logo.setObjectName("Logo")
+        self._name = QLabel("AI Hive", self)
+        self._name.setObjectName("AppName")
+        self._version = QLabel(f"v{__version__}", self)
+        self._version.setObjectName("VersionBadge")
+        # ElidingLabel reports a zero-width minimum and shrinks to whatever
+        # space is left instead of demanding room for the full "AI Hive > ws"
+        # string — a long workspace name must never be part of what forces
+        # the window wider (the full text still lives in the tooltip).
+        self.breadcrumb = ElidingLabel(self)
         self.breadcrumb.setObjectName("Breadcrumb")
 
         self.add_terminal_btn = QToolButton(self)
@@ -319,12 +326,13 @@ class TopBar(QFrame):
         self.update_pill.setObjectName("UpdatePill")
         self.update_pill.setVisible(False)
 
-        # The three usage readouts: "21% used, resets in 1h20m at 14:49". All
+        # The four usage readouts: "21% used, resets in 1h20m at 14:49". All
         # start hidden and EMPTY - no cached figure is ever painted (see
         # `MainWindow.start_usage_polling`), so a pill appears when polling puts
         # it into its loading state and stays only while it has something to
         # say and the user wants it.
-        self.usage_badge = PlanUsageBadge(self)
+        self.usage_badge = PlanUsageBadge(self, window="five_hour")
+        self.usage_weekly_badge = PlanUsageBadge(self, window="weekly")
         self._scrollback_wanted = True  # AI Hive owns the terminal scrollback
 
         # Gemini rate-limit usage readout (5-hour limit and weekly limit pills)
@@ -333,7 +341,8 @@ class TopBar(QFrame):
         self.gemini_weekly_badge = GeminiUsageBadge(self, window="weekly")
 
         self._usage_pills = {
-            "claude": self.usage_badge,
+            "claude_five_hour": self.usage_badge,
+            "claude_weekly": self.usage_weekly_badge,
             "gemini_five_hour": self.gemini_badge,
             "gemini_weekly": self.gemini_weekly_badge,
         }
@@ -392,36 +401,75 @@ class TopBar(QFrame):
         self.theme_select.currentIndexChanged.connect(
             lambda _i: self.themeChanged.emit(self.theme_select.currentData()))
 
-        lay.addWidget(self.toggle_btn)
-        lay.addWidget(logo)
-        lay.addWidget(name)
-        lay.addWidget(version)
-        lay.addSpacing(12)
-        lay.addWidget(self.breadcrumb)
-        lay.addStretch(1)
+        # Everything past the breadcrumb that is informational or a settings
+        # toggle (never the two truly essential actions - the sidebar toggle
+        # and Add Terminal, which stay pinned on the outer layout below) lives
+        # in ONE row inside a QScrollArea. On a wide monitor there's room for
+        # its full natural width and no scrollbar ever appears - pixel
+        # identical to before. `QAbstractScrollArea.minimumSizeHint()` is a
+        # small constant regardless of what's inside it (unlike a plain
+        # QWidget-with-layout, whose minimum is the sum of every child's own
+        # minimum), so the WINDOW is free to shrink to laptop widths; the row
+        # just grows a thin horizontal scrollbar instead of forcing the window
+        # wider. Nothing is ever hidden behind a menu or reparented out of the
+        # visible tree (an earlier version used a `⋯` overflow popup for this
+        # and both crashed - a QWidgetAction deletes its widget once released
+        # from a menu - and broke every `pill.isVisible()` check in the smoke
+        # suite, since a widget parked in an unopened popup genuinely isn't
+        # visible). Every control stays reachable by the same scroll a long
+        # breadcrumb or a wide terminal already asks the user for elsewhere.
+        self._extras = QWidget(self)
+        self._extras.setObjectName("TopBarExtras")
+        extras_lay = QHBoxLayout(self._extras)
+        extras_lay.setContentsMargins(0, 0, 0, 0)
+        extras_lay.setSpacing(8)
         # The pills and their picker are ONE group and sit on the layout's own
         # spacing with nothing added, which is the same gap the two recovery
         # switches below have between them. An extra addSpacing() here read as
         # three unrelated widgets rather than one readout with a control.
-        lay.addWidget(self.usage_badge)
-        lay.addWidget(self.gemini_badge)
-        lay.addWidget(self.gemini_weekly_badge)
-        lay.addWidget(self.usage_add_btn)
-        lay.addSpacing(10)      # ...and THIS separates that group from the next
-        lay.addWidget(self.recovery_label)
-        lay.addSpacing(6)
-        lay.addWidget(self.recover_btn)
-        lay.addWidget(self.resume_btn)
-        lay.addSpacing(8)
-        lay.addWidget(self.theme_select)
-        lay.addSpacing(8)
-        lay.addWidget(self.font_dec_btn)
-        lay.addWidget(self.font_inc_btn)
-        lay.addSpacing(8)
-        lay.addWidget(self.sound_btn)
-        lay.addWidget(self.taskbar_btn)
-        lay.addWidget(self.update_pill)
-        lay.addWidget(self.auto_update_btn)
+        extras_lay.addWidget(self.usage_badge)
+        extras_lay.addWidget(self.usage_weekly_badge)
+        extras_lay.addWidget(self.gemini_badge)
+        extras_lay.addWidget(self.gemini_weekly_badge)
+        extras_lay.addWidget(self.usage_add_btn)
+        extras_lay.addSpacing(10)  # ...and THIS separates that group from the next
+        extras_lay.addWidget(self.recovery_label)
+        extras_lay.addSpacing(6)
+        extras_lay.addWidget(self.recover_btn)
+        extras_lay.addWidget(self.resume_btn)
+        extras_lay.addSpacing(8)
+        extras_lay.addWidget(self.theme_select)
+        extras_lay.addSpacing(8)
+        extras_lay.addWidget(self.font_dec_btn)
+        extras_lay.addWidget(self.font_inc_btn)
+        extras_lay.addSpacing(8)
+        extras_lay.addWidget(self.sound_btn)
+        extras_lay.addWidget(self.taskbar_btn)
+        extras_lay.addWidget(self.update_pill)
+        extras_lay.addWidget(self.auto_update_btn)
+
+        self._extras_scroll = QScrollArea(self)
+        self._extras_scroll.setObjectName("TopBarExtrasScroll")
+        self._extras_scroll.setWidget(self._extras)
+        self._extras_scroll.setWidgetResizable(False)
+        self._extras_scroll.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self._extras_scroll.setFixedHeight(42)
+        self._extras_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._extras_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._extras_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # transparent so it reads as part of the bar, not a separate panel
+        self._extras_scroll.setStyleSheet("background: transparent; border: none;")
+        self._extras_scroll.viewport().setStyleSheet("background: transparent;")
+
+        lay.addWidget(self.toggle_btn)
+        lay.addWidget(self._logo)
+        lay.addWidget(self._name)
+        lay.addWidget(self._version)
+        lay.addSpacing(12)
+        lay.addWidget(self.breadcrumb, 1)
+        lay.addWidget(self._extras_scroll)
         lay.addSpacing(8)
         lay.addWidget(self.add_terminal_btn)
 
@@ -456,10 +504,10 @@ class TopBar(QFrame):
     def _on_auto_update_clicked(self) -> None:
         """The down-arrow now OPENS the Updates panel instead of toggling.
 
-        Deliberately the same button rather than a new one: the top bar's
-        minimum width is already 2101px, letting Claude Code update itself is a
-        one-time setup action that does not earn a permanent slot, and two
-        adjacent update controls meaning different things is worse than either.
+        Deliberately the same button rather than a new one: letting Claude
+        Code update itself is a one-time setup action that does not earn a
+        permanent slot, and two adjacent update controls meaning different
+        things is worse than either.
         The startup-gate preference this button used to carry is a checkbox
         inside the panel, still routed through `autoUpdateToggled`, so nothing
         downstream changed. `_refresh_auto_update_btn` puts the checked state
@@ -596,14 +644,21 @@ class TopBar(QFrame):
             QPoint(0, self.usage_add_btn.height())))
 
     def set_usage(self, usage) -> None:
-        """Push a plan-usage reading into the badge."""
+        """Push a plan-usage reading into both Claude pills (5h and 7d)."""
         self.usage_badge.set_usage(usage)
+        self.usage_weekly_badge.set_usage(usage)
         self._sync_usage_pills()
 
     def note_usage_error(self, error: str) -> None:
-        """A poll failed with no earlier reading to fall back on: show the
-        can't-read pill rather than nothing at all."""
-        self.usage_badge.mark_unreadable(error)
+        """A poll failed. Same split as `note_gemini_usage_error`: a pill
+        SHOWING a reading keeps it, greyed, rather than blanking a figure the
+        user is watching; a pill with nothing at all says so rather than
+        vanishing."""
+        for pill in (self.usage_badge, self.usage_weekly_badge):
+            if pill.has_reading():
+                pill.mark_stale(True)
+            else:
+                pill.mark_unreadable(error)
         self._sync_usage_pills()
 
     def set_gemini_usage(self, reading) -> None:
@@ -733,8 +788,8 @@ class TopBar(QFrame):
             self.theme_select.blockSignals(False)
 
     def set_breadcrumb(self, workspace_name: str) -> None:
-        self.breadcrumb.setText(f"AI Hive  ›  {workspace_name}"
-                                if workspace_name else "")
+        self.breadcrumb.set_full_text(f"AI Hive  ›  {workspace_name}"
+                                      if workspace_name else "")
 
 
 class AddTerminalDialog(QDialog):
@@ -1844,7 +1899,8 @@ class MainWindow(QMainWindow):
         # than blanking a figure the user is watching. Only a machine with no
         # Claude login at all (no-auth) has nothing to show, ever.
         if reading is not None and reading.error == "no-auth" and self._usage is None:
-            self.top_bar.mark_usage_absent("claude")
+            self.top_bar.mark_usage_absent("claude_five_hour")
+            self.top_bar.mark_usage_absent("claude_weekly")
             # no Claude account => no plan limit to recover from; don't leave
             # two switches on the bar that can never do anything
             self.top_bar.set_recovery_available(False)
@@ -1874,6 +1930,7 @@ class MainWindow(QMainWindow):
                 reading.error if reading is not None else "unknown")
             return
         self.top_bar.usage_badge.mark_stale(True)
+        self.top_bar.usage_weekly_badge.mark_stale(True)
 
     def _apply_usage(self, reading) -> None:
         """Adopt a reading: refresh the badge and fire the plan-limit edges.
@@ -2046,7 +2103,7 @@ class MainWindow(QMainWindow):
         self.top_bar.mark_usage_loading(key)
         if not self._polling:
             return              # this window never opted in; never shell out
-        if key == "claude":
+        if key in ("claude_five_hour", "claude_weekly"):
             self._poll_usage()
             return
         if not was_gemini:

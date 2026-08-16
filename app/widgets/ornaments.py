@@ -946,12 +946,18 @@ class UsagePillBadge(QWidget):
 
 
 class PlanUsageBadge(UsagePillBadge):
-    """The top-bar readout of the Claude account's plan usage:
+    """The top-bar readout of one Claude account plan-usage window (5-hour
+    session, or 7-day):
 
-        (o) 21% used, resets in 1h20m at 14:49
+        (o) 5h 21% used, resets in 1h20m at 14:49
+        (o) 7d 40% used, resets in 3d14h at 09:00
 
     A percent ring plus one line, in the order the user asked for — countdown
-    first ("how long have I got"), wall-clock second, both in LOCAL time.
+    first ("how long have I got"), wall-clock second, both in LOCAL time. The
+    7-day pill's countdown is DAYS+HOURS only (no minutes,
+    `claude_usage.format_countdown_dh`) — a week-long window doesn't need
+    to-the-minute precision, and "167h23m" (what the ordinary countdown gives a
+    multi-day duration) is unreadable at a glance.
 
     Painted rather than styled, for the same reason as `AgentCountBadge`: the
     colour has to switch on utilization (green -> amber -> red) AND track the
@@ -973,6 +979,14 @@ class PlanUsageBadge(UsagePillBadge):
     thing a user can do about it.
     """
 
+    def __init__(self, parent=None, window: str = "five_hour"):
+        super().__init__(parent)
+        self.window = window
+        # always name the window: two Claude pills (5h and 7d) sit side by
+        # side on the bar now, and "which one is this" is the whole point of
+        # the label, exactly like the two Gemini pills beside them
+        self._label = True
+
     # -- data in ---------------------------------------------------------
     def set_usage(self, usage) -> None:
         """Adopt a reading. `None`, or a reading with no limits, leaves the pill
@@ -984,29 +998,31 @@ class PlanUsageBadge(UsagePillBadge):
         from .. import claude_usage
 
         self._usage = usage
-        self._limit = claude_usage.headline(usage)
+        self._limit = (claude_usage.weekly(usage) if self.window == "weekly"
+                       else claude_usage.five_hour(usage))
         self._unreadable = ""       # a real number supersedes the error pill
         self._loading = False
-        if self._limit is None:
-            self._refresh_text()
-            return
-        # only name the window when the plan actually has more than one, so a
-        # Pro account (five_hour alone) stays uncluttered
-        self._label = len(usage.limits) > 1
-        self._stale = bool(usage.error) or usage.source == "cache"
+        self._stale = bool(usage.error) or usage.source == "cache" if usage else False
         self._refresh_text()
 
     def _loading_text(self) -> str:
         # deliberately SHORTER than the finished line, so the pill only ever
         # grows when the reading lands (a long loading string makes it snap
         # narrower, which reads as a glitch), and it names its own tracker so
-        # three grey pills side by side are still tellable apart
-        return "Claude usage, reading..."
+        # four grey pills side by side are still tellable apart
+        return ("Claude 7d usage, reading..." if self.window == "weekly"
+                else "Claude 5h usage, reading...")
 
     def _format_limit(self) -> str:
         from .. import claude_usage
 
-        return claude_usage.format_limit(self._limit, with_label=self._label)
+        return claude_usage.format_limit(self._limit, with_label=self._label,
+                                         days_only=self.window == "weekly")
+
+    def _unreadable_text(self) -> str:
+        return ("Claude 7d usage unreadable, click to refresh"
+                if self.window == "weekly" else
+                "Claude 5h usage unreadable, click to refresh")
 
     def _build_tooltip(self) -> str:
         from .. import claude_usage
@@ -1026,7 +1042,8 @@ class PlanUsageBadge(UsagePillBadge):
             lines.append(f"Claude {self._usage.plan.capitalize()} plan")
         for lim in self._usage.limits:
             lines.append(f"{lim.label}: "
-                         + claude_usage.format_limit(lim))
+                         + claude_usage.format_limit(
+                             lim, days_only=lim.key.startswith("seven_day")))
         if self._usage.fetched_at:
             age = claude_usage.format_since(_time.time() - self._usage.fetched_at)
             src = " (cached by Claude)" if self._usage.source == "cache" else ""
