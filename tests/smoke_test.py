@@ -7754,8 +7754,8 @@ def test_usage_trackers_preference():
     # Gemini-only user would otherwise have no control at all
     bar.set_recovery_available(False)
     check("usage-trackers: no-Claude hides the recovery row, not the picker",
-          not bar.recovery_label.isVisible()
-          and not bar.recover_btn.isVisible()
+          not bar.recover_btn.isVisible()
+          and not bar.resume_btn.isVisible()
           and bar.usage_add_btn.isVisible())
     bar.set_recovery_available(True)
 

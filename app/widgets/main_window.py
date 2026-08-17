@@ -471,9 +471,6 @@ class TopBar(QFrame):
 
         self._startup_recovery = True
         self._auto_continue = True
-        self.recovery_label = QLabel(
-            "Auto-restart agents who ran out of usage on:", self)
-        self.recovery_label.setObjectName("RecoveryLabel")
         self.recover_btn = QToolButton(self)
         self.recover_btn.setObjectName("RecoveryToggle")
         self.recover_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -518,15 +515,20 @@ class TopBar(QFrame):
         extras_lay.setSpacing(8)
         # Ordered by priority: whatever is EARLIEST in this row is what stays
         # visible longest as the window narrows (content is left-anchored, so
-        # the tail is what scrolls out of view first). The compact, always-
-        # useful icon controls (recovery toggles, theme, font, sound, taskbar,
-        # update) go first; the usage pills - full sentences, easily the
-        # widest things here - go last, so THEY are what gives way first
-        # rather than silently swallowing the theme/font/sound/taskbar row
-        # (reported live: at a moderate window width the pills alone pushed
-        # every other control off-screen behind an easy-to-miss scrollbar).
-        extras_lay.addWidget(self.recovery_label)
-        extras_lay.addSpacing(6)
+        # the tail is what scrolls out of view first). The usage pills go
+        # FIRST - they're the one thing here that keeps changing and is worth
+        # glancing at, so they must never be the thing a narrow window hides
+        # behind a scrollbar. The pills and their picker are ONE group and sit
+        # on the layout's own spacing with nothing added between them, which
+        # reads as one readout with a control rather than unrelated widgets.
+        extras_lay.addWidget(self.usage_badge)
+        extras_lay.addWidget(self.usage_weekly_badge)
+        extras_lay.addWidget(self.gemini_badge)
+        extras_lay.addWidget(self.gemini_weekly_badge)
+        extras_lay.addWidget(self.usage_add_btn)
+        extras_lay.addSpacing(10)
+        # The rest are compact, always-useful icon controls that give way
+        # first as the window narrows.
         extras_lay.addWidget(self.recover_btn)
         extras_lay.addWidget(self.resume_btn)
         extras_lay.addSpacing(8)
@@ -539,16 +541,6 @@ class TopBar(QFrame):
         extras_lay.addWidget(self.taskbar_btn)
         extras_lay.addWidget(self.update_pill)
         extras_lay.addWidget(self.auto_update_btn)
-        extras_lay.addSpacing(10)
-        # The pills and their picker are ONE group and sit on the layout's own
-        # spacing with nothing added, which is the same gap the two recovery
-        # switches above have between them. An extra addSpacing() here read as
-        # three unrelated widgets rather than one readout with a control.
-        extras_lay.addWidget(self.usage_badge)
-        extras_lay.addWidget(self.usage_weekly_badge)
-        extras_lay.addWidget(self.gemini_badge)
-        extras_lay.addWidget(self.gemini_weekly_badge)
-        extras_lay.addWidget(self.usage_add_btn)
 
         self._extras_scroll = _HWheelScrollArea(self)
         self._extras_scroll.setObjectName("TopBarExtrasScroll")
@@ -851,15 +843,13 @@ class TopBar(QFrame):
         self._sync_usage_pills()
 
     def set_recovery_available(self, on: bool) -> None:
-        """Show/hide both recovery toggles (and their caption). They act only
-        on Claude agents cut off by a plan limit, so with no Claude login
-        there is nothing for them to do — hide them with the readout rather
-        than offer dead switches.
+        """Show/hide both recovery toggles. They act only on Claude agents cut
+        off by a plan limit, so with no Claude login there is nothing for them
+        to do — hide them with the readout rather than offer dead switches.
 
         `usage_add_btn` is deliberately NOT hidden with them: it is the only way
         to bring a closed pill back, and a Gemini-only user (who by definition
         has no Claude login) would otherwise be left with no control at all."""
-        self.recovery_label.setVisible(bool(on))
         self.recover_btn.setVisible(bool(on))
         self.resume_btn.setVisible(bool(on))
 
