@@ -42,9 +42,9 @@ workspaces keep executing — switching never pauses anything.
   **red** on error and dims when empty (the working/running/error breakdown is
   in the row's hover tooltip). A matching **sweeping-arc spinner** with the live
   working count appears at the row's right edge while any agent is working and
-  vanishes when all are idle. The folder/delete controls stay hidden until you
-  hover the row (opening to the left of the spinner), so the workspace name
-  keeps the space.
+  vanishes when all are idle. Opening a workspace's folder or deleting it are
+  buttons in its own header bar now (see **First-class folders** below), not
+  hover controls on the sidebar row.
 - **Organize the sidebar** — drag workspaces up/down to reorder them, and group
   related ones under **categories** ("Work dev", "Game dev", …) with the 🗂
   button. Categories are collapsible headers you can drag above/below other
@@ -79,7 +79,7 @@ workspaces keep executing — switching never pauses anything.
   (which never prompt). A soft **notification chime** rings the moment that "?"
   appears (the standby→waiting rising edge), so you notice an agent needs you
   even while you're heads-down in another workspace — handy when agents you sent
-  into plan mode come back with questions. Toggle it with the **🔔 button** in
+  into plan mode come back with questions. Toggle it under **⚙ Options** in
   the top bar (persists across restarts).
 - **Taskbar working count** — the same signal, but from *outside* the app. The
   Windows taskbar icon carries a small badge with the number of agents currently
@@ -102,7 +102,7 @@ workspaces keep executing — switching never pauses anything.
   square too: when nothing is busy or asking but a shell is still running,
   the disc turns **violet** with the count, instead of showing nothing at
   all.
-- **Plan usage readout** — two top-bar badges, left of the theme picker, one
+- **Plan usage readout** — two top-bar badges, one
   per Claude rate-limit window, showing how much you've burned and when it
   comes back: the **5-hour** pill reads `5h 21% used, resets in 1h20m at
   14:49` — countdown first, then the wall-clock time in your own timezone; the
@@ -258,9 +258,9 @@ workspaces keep executing — switching never pauses anything.
   never killed halfway through a 285 MB file — if you skip mid-install, agents
   for that CLI simply wait rather than risk running a half-written program).
   When everything is current the whole thing is about a second and a half. If an
-  update *couldn't* apply, a quiet pill appears in the top bar saying so, with
-  the reason on hover, so "why am I still seeing the nag?" has an answer instead
-  of being a mystery. Every version transition, skip and failure is written to
+  update *couldn't* apply, a quiet pill appears under **⚙ Options** saying so
+  and the Options button itself lights up, with the reason on hover, so "why am
+  I still seeing the nag?" has an answer instead of being a mystery. Every version transition, skip and failure is written to
   `session.log` (`UPDATE-CHECK` / `UPDATE` / `UPDATE-SKIP` / `UPDATE-FAIL`), so
   "it broke this morning" is a lookup rather than an investigation.
 - **Send a message on a countdown** — type into an agent's terminal as usual,
@@ -323,10 +323,11 @@ workspaces keep executing — switching never pauses anything.
   match** across workspace names, agent names, and agent summaries, and
   auto-expands a workspace to reveal a matching agent. Esc (or clicking 🔍
   again) closes it and restores what was expanded before.
-- **First-class folders** — every workspace header shows its path with
+- **First-class folders** — every workspace header shows its full path
+  (eliding only what its own buttons don't leave room for) with **Delete**,
   **Open folder** and **Change…** buttons; agents launch rooted there.
-- **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ in the
-  top bar; sizes persist.
+- **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ under
+  **⚙ Options**; sizes persist.
 - **Shared agent awareness** — agents in a workspace coordinate through a
   shared board (`.aihive/board.md`): Claude agents launch with `--add-dir` +
   an appended system prompt so they can read peers' status and post their own,
@@ -357,7 +358,17 @@ workspaces keep executing — switching never pauses anything.
   Task sub-agent is labeled with its type.
   (Sub-agent file work and non-Claude agents can't be attributed — those nodes
   show without file edges; see below.)
-- **Themes (Winamp-style skins)** — a dropdown in the top bar swaps the whole
+- **⚙ Options** — one button on the top bar opens a panel with everything that
+  used to compete for room up there: **Recover at start-up**, **Resume on usage
+  reset**, **Notification chime**, **Taskbar count** and **Check for CLI
+  updates at start-up** as labelled switches (each with a green/dark LED, so
+  "will my work resume by itself?" is answerable at a glance), the detected
+  Claude Code install method with a **Manage…** door to the Updates panel, and
+  the theme and global font size below. Click outside or press `Esc` to close.
+  The bar itself keeps only what you actually glance at: the usage pills and
+  their `+`, and `+ Terminal`, so it fits on a laptop instead of hiding
+  controls behind a scrollbar.
+- **Themes (Winamp-style skins)** — a dropdown under **⚙ Options** swaps the whole
   chrome palette live: **Scriptorium (Dark)** (the shipped warm-parchment/gold
   look), **Illuminated Manuscript** (light vellum, ultramarine running-heads,
   a full **painted foliate border with gilt corner medallions**, a gilt logo
@@ -426,11 +437,12 @@ error dialog instead of silently closing. Packaging to a distributable
   layout is instant and never restarts an agent. Auto tiles to the count
   (1 full, 2 side-by-side, 3 = 3×1, 4 = 2×2, 5–6 = 3×2, …). Line and full-terminal
   cards share the same grid.
-- **Folder & activity** — the workspace header shows the project path with
-  **Open folder** / **Change…**; **Activity** opens a panel with the live
-  agent roster, the shared coordination log, and git-changed files.
+- **Folder & activity** — the workspace header shows the full project path
+  with **Delete** / **Open folder** / **Change…**; **Activity** opens a panel
+  with the live agent roster, the shared coordination log, and git-changed
+  files.
 - **Font size** — per-agent `A−`/`A+` in each card header (or `Ctrl+±` while
-  focused), and global `A−`/`A+` in the top bar; both persist.
+  focused), and global `A−`/`A+` under **⚙ Options**; both persist.
 - **App shortcuts use `Ctrl+Shift+…`** (T = new terminal, N = new workspace,
   B = toggle sidebar) so every plain `Ctrl`/`Alt` key, `Tab`, and `Shift+Tab`
   goes straight to the focused terminal — click a full-terminal card and
@@ -683,7 +695,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1624 checks drive the real app headlessly (offscreen Qt platform) with real
+1652 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -796,7 +808,7 @@ app/
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1624 checks)
+tests/smoke_test.py        headless end-to-end suite (1657 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

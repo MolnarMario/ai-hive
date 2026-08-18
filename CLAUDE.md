@@ -115,7 +115,8 @@ this file is the invariants that must survive every change.
   `winsound` playback, degrades to a silent no-op off-Windows) so the user
   hears an agent needs them from another workspace. The chime is level-vs-edge
   correct (re-entering waiting rings again; staying waiting does not) and
-  mutable via the top-bar 🔔 toggle, persisted transiently in
+  mutable via the chime switch in the Options popup, persisted
+  transiently in
   `session["ui"]["sound_enabled"]` (never a `dirty` mutation). Clicking the
   count badge OR the "?" toggles an INLINE agent expansion in the sidebar tree
   (`_toggle_agents` → `_expanded_ws`; agent child rows built from
@@ -774,6 +775,63 @@ this file is the invariants that must survive every change.
   flicker would reset the countdown forever and the poll would never fire at
   all; `_retune_usage_poll` therefore only touches the timer when the interval
   actually changes.
+- **THE TOP BAR CARRIES READOUTS AND ACTIONS; SETTINGS LIVE IN THE OPTIONS
+  POPUP** (`app/widgets/options_panel.py`, `TopBar.options_btn` /
+  `options_panel`). The bar is a 42px strip and it lost the argument with its
+  own contents: FIVE successive commits rearranged the same fourteen widgets
+  inside it (a responsive layout, a `⋯` overflow menu, a horizontally scrolling
+  row, a wheel handler for that row, a priority re-ordering, a dropped caption)
+  and it was still too small. The scrolling row's answer to running out of room
+  is to slide a control out of view with NO affordance saying it did, so a
+  setting could simply be missing. So the test for the bar is now: does this
+  have to be GLANCEABLE (the four usage pills and their `+`) or is it a PRIMARY
+  ACTION (the sidebar toggle, `+ Terminal`, and the Options button itself)?
+  Everything else is a setting and belongs in the popup. Rules:
+  * **`OptionsPanel` IS A DUMB CONTAINER.** It owns the window flags, the row
+    scaffolding and the placement, and NOTHING else. `TopBar` still constructs
+    and drives every control in it, keeping each `_refresh_*` / `set_*` /
+    getter unchanged, which is why `MainWindow` needed ZERO changes: its whole
+    interface to the bar is the signals connected in `_build_ui` plus the
+    non-emitting `set_*` reflectors called from `_restore_ui_state`. Do not
+    move ownership into the panel; the day it starts holding state is the day
+    restore has two places to write to.
+  * **`Qt.Popup`, NEVER a `QMenu`.** A `QWidgetAction` DELETES its reparented
+    widget when the menu releases it, which crashed the earlier `⋯` overflow
+    outright, and a widget parked in an unopened menu genuinely is not
+    `isVisible()`, which silently broke every visibility assertion in the smoke
+    suite. And the panel is built ONCE and never rebuilt per click (unlike
+    `GridSelectorPopup`, which is `WA_DeleteOnClose`): its children carry the
+    checked state `set_*` writes into on restore.
+  * **Visibility inside the panel is `isVisibleTo(options_panel)`, never
+    `isVisible()`.** A closed popup makes every child invisible, so an
+    `isVisible()` assertion about a control in there passes vacuously and stops
+    testing anything. `set_recovery_available(False)` is the live case.
+  * **A control moved into the panel must leave a TELL on the bar if it was
+    something the user needed to see.** `update_pill` (the "an update could not
+    apply" report) moved inside, so `note_update_pending` also sets the
+    `attention` property on `options_btn` and repolishes it. A warning parked
+    behind a closed panel is not a warning. Same rule as the usage pill's
+    can't-read state: a readout that silently disappears is indistinguishable
+    from a deleted feature.
+  * **`#OptionsPanel`'s background in `build_qss` is LOAD-BEARING.** A
+    `Qt.Popup` is a top-level window with no ancestor to inherit from, so an
+    unstyled one paints as an OS-native white rectangle over the skin.
+  * The startup-update switch is a REAL toggle again (`_on_auto_update_clicked`
+    emits `autoUpdateToggled`) with `updates_manage_btn` as the separate door to
+    the Updates panel. That is not two controls for one setting: the Updates
+    panel's own checkbox is wired in `open_updates_panel` to BOTH
+    `top_bar.set_auto_update` and `_on_auto_update_toggled`, so the two are
+    driven off the same signal and cannot disagree.
+  * The extras scroll row and `_AutoSizingScrollContent` / `_HWheelScrollArea`
+    STAY. Four pills at their measured widths still outrun a laptop's spare bar
+    width, and those two classes are the regression fixes for two live-reported
+    bugs (pills drawing on top of each other; the row frozen at QScrollArea's
+    468px constant). They just have far less to carry now.
+  * `ornaments.anchored_popup_pos` is SHARED with `GridButton._popup_position`,
+    not copied. Both buttons sit at the right end of a wide strip, so
+    left-anchoring a panel under them spills off the window on a narrow window
+    and off the display on a wide one; the helper clamps to the INTERSECTION of
+    the window and the screen's available geometry.
 - **A usage pill is exactly as wide as its text, by ONE formula**
   (`ornaments.UsagePillBadge._measure_width`: `_PAD*2 + _RING + _GAP +
   advance(text)`, measured with `_text_font()` — the font `paintEvent` actually
@@ -791,8 +849,8 @@ this file is the invariants that must survive every change.
   blank for the 99% of the time nobody is hovering. THE INVARIANT THE RESERVED
   SLOT WAS PROTECTING STILL HOLDS AND STILL MATTERS: the pills sit after the
   layout's `addStretch(1)`, so a pill that grew on hover would shove the entire
-  right-hand cluster (recovery caption, LED toggles, theme combo, font steppers,
-  Add Terminal) sideways as the pointer crossed it. Overlaying keeps it for
+  right-hand cluster (the `+` picker, Options, Add Terminal) sideways as the
+  pointer crossed it. Overlaying keeps it for
   free — `_measure_width` reads the text alone and hovering only repaints — so
   do not make the width depend on hover state. The ✕ is a child
   `QToolButton`, NOT a rect hit-tested in `mousePressEvent`, so it consumes its
@@ -1470,6 +1528,17 @@ Use a scratch cwd.
   Qt-free (mcp_server must not import PySide6 at all).
 - Keep README.md's check count and feature list current when adding tests
   or features.
+- **Every PR merged to `main` bumps `__version__` in `app/__init__.py`.** It
+  is the single source of truth for the version badge next to the app name
+  (`TopBar._version` in `main_window.py`) — see the invariant comment above
+  `__version__` for the y/x/1.0.0 bump rule. This is a manual step today (no
+  CI enforces it), so treat it as part of "done": before merging, bump the
+  version alongside the change instead of leaving it for a later PR to
+  remember. If a future PR wires this into CI (e.g. a GitHub Actions check
+  that fails a merge to `main` when `app/__init__.py` didn't change, or a
+  workflow that auto-bumps the patch number on merge), update this bullet to
+  say so — don't leave stale "this is manual" text next to a working
+  automation.
 
 ## Agent skills
 

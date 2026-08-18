@@ -115,6 +115,7 @@ class WorkspacePage(QWidget):
     scheduleRequested = Signal(str, str)  # agent id, text to prefill
     addRequested = Signal(str)          # ws_id (empty slot clicked)
     layoutChosen = Signal(str, str)     # ws_id, layout
+    deleteRequested = Signal(str)       # ws_id
     openFolderRequested = Signal(str)   # ws_id
     changePathRequested = Signal(str)   # ws_id
     activityToggled = Signal(str)       # ws_id (wired in Phase 6)
@@ -203,6 +204,10 @@ class WorkspacePage(QWidget):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             return b
 
+        # delete sits LEFT of open/change — the sidebar used to duplicate both
+        # open-folder and delete as hover buttons on the workspace row; both
+        # actions now live here, once, next to the folder they act on.
+        self.delete_btn = tool("✖", "Delete workspace", "WsDelete")
         self.open_btn = tool("Open folder", "Open this workspace's folder")
         self.change_btn = tool("Change…", "Change the workspace folder")
         self.grid_button = GridButton(header)
@@ -215,13 +220,19 @@ class WorkspacePage(QWidget):
 
         hl.addWidget(folder_icon)
         hl.addWidget(self.path_label, 1)
+        hl.addWidget(self.delete_btn)
         hl.addWidget(self.open_btn)
         hl.addWidget(self.change_btn)
         hl.addSpacing(8)
         hl.addWidget(self.grid_button)
         hl.addWidget(self.map_btn)
         hl.addWidget(self.activity_btn)
+        # kept for `_elide_path`: the space the path label may claim is the
+        # header's width minus every OTHER item in this same row
+        self._header_lay = hl
 
+        self.delete_btn.clicked.connect(
+            lambda: self.deleteRequested.emit(self.workspace.id))
         self.open_btn.clicked.connect(
             lambda: self.openFolderRequested.emit(self.workspace.id))
         self.change_btn.clicked.connect(
@@ -240,11 +251,35 @@ class WorkspacePage(QWidget):
         self._elide_path()
 
     def _elide_path(self) -> None:
+        """Show the FULL path whenever it fits; elide only the overflow.
+
+        The available width is computed from the header row itself (this
+        widget's own width minus every OTHER item's natural width), never
+        from the label's OWN current width — eliding against the label's own
+        width is self-referential: once elided down, its sizeHint shrinks to
+        match, so it never grows back even when the window widens (reported
+        live: a wide window still showed "C:/Users…/ai-hive" with a large gap
+        of empty space before the buttons)."""
         path = getattr(self, "_full_path", self.workspace.project_path)
+        hl = getattr(self, "_header_lay", None)
+        if hl is None:
+            available = max(60, self.path_label.width())
+        else:
+            margins = hl.contentsMargins()
+            used = margins.left() + margins.right()
+            used += hl.spacing() * max(0, hl.count() - 1)
+            for i in range(hl.count()):
+                item = hl.itemAt(i)
+                if item.widget() is self.path_label:
+                    continue
+                if item.widget() is not None:
+                    used += item.widget().sizeHint().width()
+                elif item.spacerItem() is not None:
+                    used += item.spacerItem().sizeHint().width()
+            available = max(60, self.width() - used)
         fm = QFontMetrics(self.path_label.font())
         self.path_label.setText(fm.elidedText(
-            path, Qt.TextElideMode.ElideMiddle,
-            max(60, self.path_label.width())))
+            path, Qt.TextElideMode.ElideMiddle, available))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
