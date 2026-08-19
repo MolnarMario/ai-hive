@@ -55,12 +55,10 @@ _MODEL_CACHE: dict[str, tuple[float, int, str, str, str]] = {}
 # cache for reply_times: path -> (mtime, size, [(epoch, final text), ...]).
 _REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
 
-# How much of the tail reply_times reads. Its consumers only ever ask about
-# replies that are still ON SCREEN -- the header badge wants the last one, and
-# the card can only anchor a stamp to a line the scrollback still holds
-# (bounded by REPLAY_PROJECT_CAP, i.e. a few turns) -- so scanning a multi-MB
-# conversation from the top would cost a great deal to produce entries nothing
-# can use. A full scan is the fallback for the rare case the tail holds no
+# How much of the tail reply_times reads. Its one consumer can only anchor a
+# stamp to a line the scrollback still holds (bounded by REPLAY_PROJECT_CAP,
+# i.e. a few turns), so scanning a multi-MB conversation from the top would
+# cost a great deal to produce entries nothing can use. A full scan is the fallback for the rare case the tail holds no
 # finished reply at all (one enormous turn).
 _REPLY_TAIL_BYTES = 256 * 1024
 
@@ -246,12 +244,12 @@ def reply_times(cwd: str, session_id: str) -> list[tuple[float, str]]:
     (epoch, final text).
 
     The durable answer to "when was this answer actually generated". The live
-    signal cannot be: a reply time is stamped from the CLOCK at the busy -> idle
-    settle, so it only exists for turns THIS process watched finish. Reopen the
-    app and every past turn has no time at all -- which is what the user sees,
-    and reporting the current time for them instead (the bug `_settled_once`
-    fixed) was worse. Claude timestamps every record it writes, so the
-    transcript knows what no live observation can.
+    signal cannot be: a reply mark is minted at the busy -> idle settle, so it
+    only exists for turns THIS process watched finish. Reopen the app and every
+    past turn has no stamp at all -- which is what the user sees, and stamping
+    the current time on them instead (the bug `_settled_once` fixed) was worse.
+    Claude timestamps every record it writes, so the transcript knows what no
+    live observation can.
 
     A finished reply is the LAST assistant record carrying text before the next
     real user turn -- not every assistant text record, because a turn narrates
@@ -269,15 +267,6 @@ def reply_times(cwd: str, session_id: str) -> list[tuple[float, str]]:
     if not session_id or not cwd:
         return []
     return _read_reply_times(transcript_path(cwd, session_id))
-
-
-def latest_reply_at(cwd: str, session_id: str) -> float:
-    """Epoch seconds this conversation's most recent reply finished, or 0.0.
-    The header badge's source once a live reading is gone (see
-    TerminalAgent.last_reply_at); shares reply_times' cache, so asking for both
-    costs one read."""
-    times = reply_times(cwd, session_id)
-    return times[-1][0] if times else 0.0
 
 
 def _read_reply_times(path: str) -> list[tuple[float, str]]:

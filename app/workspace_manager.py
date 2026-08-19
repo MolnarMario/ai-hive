@@ -600,18 +600,12 @@ class WorkspaceManager(QObject):
         return out
 
     def refresh_ai_titles(self) -> None:
-        """Pull each Claude/Gemini agent's latest AI conversation title, its
-        context-window occupancy AND (Claude) the time its last reply finished
-        from the live transcript, adopting all three as transient card state
-        (`set_ai_title` / `set_token_usage` / `set_transcript_reply_at` never
-        persist). Cheap: every reader re-reads only when the transcript changed.
+        """Pull each running Claude/Gemini agent's latest AI conversation title
+        AND its context-window occupancy from the live transcript and adopt both
+        as transient card state (`set_ai_title` / `set_token_usage` never
+        persist). Cheap: both readers re-read only when the transcript changed.
         Reads spec.session_id, which sync keeps pointed at the conversation the
-        agent is actually writing.
-
-        The reply time is deliberately read for STOPPED agents too, unlike the
-        token usage: a card that is not running is exactly the one whose reply
-        time this process never watched being stamped, so it is the one with
-        nothing to show without this."""
+        agent is actually writing."""
         for w in self._workspaces:
             for a in w.agents:
                 spec = a.spec
@@ -621,16 +615,6 @@ class WorkspaceManager(QObject):
                     title = transcripts.latest_ai_title(spec.cwd, spec.session_id)
                     if title:
                         a.set_ai_title(title)
-                    if not a.is_busy():
-                        # ...but never MID-turn: nothing in a transcript marks a
-                        # turn as over, so the reader has to treat the last
-                        # assistant text in the file as a finished reply, and
-                        # while the agent is still streaming that is a narration
-                        # between two tool calls. Waiting for quiet costs one
-                        # poll and keeps the badge off times that are not a
-                        # reply's.
-                        a.set_transcript_reply_at(
-                            transcripts.latest_reply_at(spec.cwd, spec.session_id))
                     if a.is_running():
                         used, window = transcripts.latest_token_usage(
                             spec.cwd, spec.session_id)

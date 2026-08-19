@@ -398,8 +398,20 @@ this file is the invariants that must survive every change.
   nothing. Recovered marks are recomputed on every projection and merged BEHIND
   the live ones (a live capture is exact; a recovered one was matched), and
   like every other mark they are never persisted.
-- **A reply-finished stamp is a SEPARATE milestone type, painted INLINE
-  rather than on the scrollbar** (`ReplyMark` in terminal_agent.py,
+- **A reply-finished stamp is the ONLY reply-time surface, and it sits UNDER
+  Claude's own turn footer** (`ReplyMark`, `TerminalView.reply_anchor_line`,
+  `TerminalCard._reply_end_row`). The card header's `#CardReplyTime` badge is
+  GONE, at the user's request: two surfaces for one reading, and the header one
+  showed only the LATEST reply next to live-updating badges, so it read as a
+  clock. `_format_reply_stamp` therefore always carries the DATE as well as the
+  time ("Aug 19, 19:14") -- with no header left to hold it, a bare HH:MM on a
+  conversation reopened days later reads as "just now". The anchor is the blank
+  row BELOW the "<verb> for Ns" footer (`is_reply_footer`, shared by the live
+  and recovered paths so they land in the same place): anchoring it beside or
+  above that footer wedges the stamp between a reply and its own footer, which
+  is exactly what was reported. A blank row is also the only row the stamp
+  always renders on, since `paintEvent` skips a row whose content runs close to
+  the right edge. Painted INLINE rather than on the scrollbar (`ReplyMark` in terminal_agent.py,
   `TerminalView.reply_anchor_line`/`_reply_marks`, `TerminalCard.
   _refresh_reply_marks`/`_on_reply_mark_added`). The header's
   `#CardReplyTime` badge (`TerminalAgent.last_reply_at`,

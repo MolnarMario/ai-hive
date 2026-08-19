@@ -23,6 +23,7 @@ from ..terminal_agent import (STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
                               TerminalAgent)
 from ..ui_theme import Palette, repolish
 from .ornaments import BootVeil, ElidingLabel
+from .terminal_view import is_reply_footer
 
 _LINE_BREAKS = re.compile(r"[\r\n]")
 
@@ -114,6 +115,10 @@ def _reply_end_row(lines: list[str], tail: str, start: int) -> int | None:
     blank-row test rejects it outright when it is not, so the scan simply walks
     on to the real one.
 
+    A footer directly below that blank row moves the anchor down past it, so a
+    recovered stamp and a live one land in the SAME place relative to the
+    "<verb> for Ns" line (see TerminalView.reply_anchor_line).
+
     The blank row is also the right place to draw: the stamp is painted into a
     row's empty right-hand tail and skipped when the row's own content runs too
     close to the edge (see TerminalView.paintEvent), so a full line of prose
@@ -121,19 +126,29 @@ def _reply_end_row(lines: list[str], tail: str, start: int) -> int | None:
     matching means no stamp -- the same contract reply_anchor_line() and the
     paint-time skip already follow."""
     for i in range(start, len(lines) - 1):
-        if tail in lines[i] and not lines[i + 1]:
-            return i + 1
+        if tail not in lines[i] or lines[i + 1]:
+            continue
+        # the blank row under the reply text is only the stamp's home when
+        # Claude's own turn footer is NOT there. When it is (the newest reply,
+        # the one whose footer survived), the stamp belongs UNDER it, beside
+        # nothing rather than wedged between the reply and its own footer --
+        # which is exactly what the user asked to have moved.
+        if (i + 3 < len(lines) and is_reply_footer(lines[i + 2])
+                and not lines[i + 3]):
+            return i + 3
+        return i + 1
     return None
 
 
 def _format_reply_stamp(ts: float) -> str:
-    """HH:MM for a same-day reply, else date-prefixed -- shared by the
-    header's #CardReplyTime badge and the inline reply marks, so the two
-    surfaces can never disagree on what "today" means."""
-    dt = datetime.datetime.fromtimestamp(ts)
-    if dt.date() == datetime.datetime.now().date():
-        return dt.strftime("%H:%M")
-    return dt.strftime("%b %d, %H:%M")
+    """The date AND time a reply finished, e.g. "Aug 19, 19:14".
+
+    Never time-only, not even for a reply from today: this is now the ONLY
+    surface carrying a reply time (the card header's badge was removed at the
+    user's request), and a bare HH:MM on a conversation reopened days later
+    reads as "just now". Computed at REFRESH time rather than capture time,
+    so a stamp minted today still says so once the day turns over."""
+    return datetime.datetime.fromtimestamp(ts).strftime("%b %d, %H:%M")
 
 _GLYPH_STATE = {
     AgentStatus.IDLE: "idle",
@@ -394,18 +409,6 @@ class TerminalCard(QFrame):
         self.token_label = QLabel("", header)
         self.token_label.setObjectName("CardTokens")
         self.token_label.hide()
-        # walltime the agent last finished a reply (busy -> idle), mirroring
-        # the dated entries the board's log_activity tool writes -- but for a
-        # single agent's own card, live, with no MCP call needed. Refreshed
-        # off the existing activity_changed signal (see _refresh_reply_time);
-        # hidden until the agent has actually replied once. Transient like
-        # the model chip: never persisted, TerminalAgent.last_reply_at() is
-        # the live source of truth. Text is HH:MM for a same-day reply, else
-        # date-prefixed (see _refresh_reply_time) -- the full date is always
-        # in the tooltip regardless.
-        self.reply_time_label = QLabel("", header)
-        self.reply_time_label.setObjectName("CardReplyTime")
-        self.reply_time_label.hide()
         hl.addWidget(self.glyph)
         hl.addWidget(self.title)
         hl.addWidget(self.title_edit)
@@ -417,7 +420,6 @@ class TerminalCard(QFrame):
         hl.addWidget(self.sched_mark)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
         hl.addWidget(self.token_label)
-        hl.addWidget(self.reply_time_label)
 
         def tool(text, obj_name, tip):
             b = QToolButton(header)
@@ -488,10 +490,6 @@ class TerminalCard(QFrame):
     def _wire(self) -> None:
         self.agent.status_changed.connect(self._on_status)
         self.agent.activity_changed.connect(self._on_activity)
-        # the reply time also moves when the manager's poll reads a NEWER one off
-        # the transcript, which is the only source a restored conversation has
-        self.agent.reply_time_changed.connect(self._refresh_reply_time)
-        self._refresh_reply_time()
         self.agent.assignment_changed.connect(self._on_assignment)
         self.agent.role_changed.connect(self._on_role)
         self.agent.name_changed.connect(self._on_name)
@@ -1433,27 +1431,6 @@ class TerminalCard(QFrame):
 
     def _on_activity(self, _busy: bool) -> None:
         self._on_status(self.agent.status)
-        self._refresh_reply_time()
-
-    def _refresh_reply_time(self) -> None:
-        """Mirror TerminalAgent.last_reply_at() onto the header. Runs off the
-        same activity_changed edge card status already reacts to -- it is set
-        ONLY on a genuine busy -> idle settle (see _on_idle_timeout), so a
-        forced clear on stop/crash just re-displays the last real reply time
-        rather than a bogus 'just replied' stamp. The label carries a date
-        prefix whenever the reply wasn't today -- an agent left running
-        overnight (or an idle workspace reopened days later) must not read as
-        having replied "just now" because only HH:MM was ever shown; the date
-        was previously buried in the hover tooltip alone."""
-        ts = self.agent.last_reply_at()
-        if ts is None:
-            self.reply_time_label.hide()
-            return
-        self.reply_time_label.setText(_format_reply_stamp(ts))
-        dt = datetime.datetime.fromtimestamp(ts)
-        self.reply_time_label.setToolTip(
-            "Agent's last reply finished " + dt.strftime("%Y-%m-%d %H:%M:%S"))
-        self.reply_time_label.show()
 
     def _on_status(self, status: AgentStatus) -> None:
         busy = bool(getattr(self.agent, "is_busy", lambda: False)())

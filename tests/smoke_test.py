@@ -3063,32 +3063,6 @@ def test_agent_busy_activity():
     a.dispose()
 
 
-def test_agent_last_reply_at():
-    """last_reply_at() stamps the moment a reply genuinely ENDS (the busy ->
-    idle settle in _on_idle_timeout) so the card header can show it -- and
-    must NOT be re-stamped by a forced busy clear on stop/crash (_set_status),
-    which is not a reply ending, just the process going away mid-turn."""
-    from PySide6.QtWidgets import QApplication
-    from app.terminal_agent import TerminalAgent, AgentStatus
-    from app.process_worker import AgentKind, build_spec
-
-    QApplication.instance() or QApplication([])
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyTime", cwd="."))
-    a.status = AgentStatus.RUNNING
-    check("reply-at: no reply yet -> None", a.last_reply_at() is None)
-    a._on_pty_output("", "generating tokens...")
-    check("reply-at: still busy -> unset", a.last_reply_at() is None)
-    before = time.time()
-    a._on_idle_timeout()  # simulate the quiet-window settle: the reply ended
-    stamped = a.last_reply_at()
-    check("reply-at: settle stamps a recent walltime",
-          stamped is not None and before - 1 <= stamped <= time.time() + 1)
-    a._set_status(AgentStatus.EXITED_OK)  # forced clear, not a real reply end
-    check("reply-at: forced exit does not re-stamp",
-          a.last_reply_at() == stamped)
-    a.dispose()
-
-
 def test_reply_settle_skips_resume_replay():
     """A --resume launch replays the WHOLE past conversation as real output
     before it ever goes quiet, so the FIRST busy -> idle settle of a resumed
@@ -3113,9 +3087,7 @@ def test_reply_settle_skips_resume_replay():
     # the resume replay arrives as real output, then falls quiet
     a._on_pty_output("pty", "...replayed conversation...")
     a._on_idle_timeout()
-    check("reply-settle: a resume's replay settle is NOT a reply",
-          a.last_reply_at() is None, a.last_reply_at())
-    check("reply-settle: ...and records no inline milestone either",
+    check("reply-settle: a resume's replay settle mints no inline milestone",
           a.reply_marks() == [], a.reply_marks())
     check("reply-settle: ...but 'settled once' is now true", a._settled_once)
 
@@ -3123,11 +3095,10 @@ def test_reply_settle_skips_resume_replay():
     a._on_pty_output("pty", "a real new reply")
     before = time.time()
     a._on_idle_timeout()
-    stamped = a.last_reply_at()
-    check("reply-settle: the settle AFTER the replay stamps normally",
-          stamped is not None and before - 1 <= stamped <= time.time() + 1)
-    check("reply-settle: ...and records an inline milestone too",
+    check("reply-settle: the settle AFTER the replay records one milestone",
           len(a.reply_marks()) == 1, a.reply_marks())
+    check("reply-settle: ...stamped with a recent walltime",
+          before - 1 <= a.reply_marks()[0].ts <= time.time() + 1)
 
     # a non-resumed launch has nothing to replay, so its first settle is real
     b = TerminalAgent(build_spec(AgentKind.CLAUDE, "FreshSettle", cwd=".",
@@ -3138,7 +3109,7 @@ def test_reply_settle_skips_resume_replay():
     b._on_pty_output("pty", "first reply ever")
     b._on_idle_timeout()
     check("reply-settle: ...so its first settle stamps immediately",
-          b.last_reply_at() is not None)
+          len(b.reply_marks()) == 1, b.reply_marks())
 
     a.dispose()
     b.dispose()
@@ -3206,113 +3177,7 @@ def test_transcript_reply_times():
     # a missing / unreadable transcript is "" rather than an exception
     check("reply-times: no transcript -> empty, never raises",
           transcripts.reply_times("C:/nope", "no-such-id") == [])
-    check("reply-times: latest_reply_at on nothing is 0.0",
-          transcripts.latest_reply_at("C:/nope", "no-such-id") == 0.0)
 
-
-def test_reply_time_survives_restart():
-    """The live reply stamp only exists for turns THIS process watched settle,
-    so a resumed conversation had none at all and the header badge simply
-    vanished -- the live complaint ("if i open the app, i only get to see the
-    current time instead of when the answer was actually generated", then
-    nothing at all once the resume-replay stamp was suppressed). The transcript
-    reading fills exactly that gap, and the later of the two always wins."""
-    from PySide6.QtWidgets import QApplication
-
-    from app.process_worker import AgentKind, build_spec
-    from app.terminal_agent import AgentStatus, TerminalAgent
-
-    QApplication.instance() or QApplication([])
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyDisk", cwd=".",
-                                 pty=True))
-    a.status = AgentStatus.RUNNING
-
-    dirty = []
-    a.task_changed.connect(lambda *_: dirty.append("task"))
-    edges = []
-    a.reply_time_changed.connect(lambda: edges.append(a.last_reply_at()))
-
-    check("reply-disk: nothing known yet -> None", a.last_reply_at() is None)
-
-    # the reopen case: no live settle this run, but the conversation on disk
-    # says when its last answer was really generated
-    historical = time.time() - 7200
-    a.set_transcript_reply_at(historical)
-    check("reply-disk: a restored conversation reports its REAL past time",
-          a.last_reply_at() == historical, a.last_reply_at())
-    check("reply-disk: ...and announces the change once", len(edges) == 1, edges)
-    a.set_transcript_reply_at(historical)
-    check("reply-disk: re-reading the same value is silent (a poll is free)",
-          len(edges) == 1, edges)
-
-    # a live settle now: it is LATER than the record Claude wrote, so it wins
-    a._on_pty_output("pty", "a brand new reply")
-    a._on_idle_timeout()
-    live = a.last_reply_at()
-    check("reply-disk: a fresh live settle outranks the older disk reading",
-          live is not None and live > historical, (live, historical))
-    a.set_transcript_reply_at(historical)
-    check("reply-disk: ...and a stale poll cannot drag it backwards",
-          a.last_reply_at() == live, a.last_reply_at())
-
-    # a /clear (or an in-TUI /resume onto another chat) invalidates both: the
-    # time described a turn of the conversation being replaced
-    a.note_conversation_replaced()
-    check("reply-disk: a replaced conversation drops the reply time entirely",
-          a.last_reply_at() is None, a.last_reply_at())
-
-    check("reply-disk: none of this is a persistable mutation", dirty == [],
-          dirty)
-    a.dispose()
-
-
-def test_reply_time_card_ui():
-    """The card header's #CardReplyTime label mirrors last_reply_at() LIVE,
-    off the same activity_changed edge the status glyph already reacts to
-    (mirrors test_bg_shell_live_ui's shape for a different marker)."""
-    from PySide6.QtCore import QEventLoop, QTimer
-    from PySide6.QtWidgets import QApplication
-    from app.terminal_agent import TerminalAgent, AgentStatus
-    from app.process_worker import AgentKind, build_spec
-    from app.widgets.terminal_card import TerminalCard
-
-    QApplication.instance() or QApplication([])
-
-    def pump(ms):
-        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
-
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyCard", cwd="."))
-    a.status = AgentStatus.RUNNING
-    card = TerminalCard(a)
-    card.resize(900, 300); card.show(); pump(60)
-    check("reply-time UI: hidden before any reply",
-          not card.reply_time_label.isVisible())
-
-    a._on_pty_output("", "generating tokens...")
-    a._on_idle_timeout()  # busy -> idle settle: a reply just finished
-    pump(30)
-    check("reply-time UI: shown live once the agent settles",
-          card.reply_time_label.isVisible())
-    text = card.reply_time_label.text()
-    check("reply-time UI: label text is a plain HH:MM stamp for today",
-          len(text) == 5 and text[2] == ":" and
-          text[:2].isdigit() and text[3:].isdigit())
-
-    import time as _time
-    import datetime as _datetime
-    yesterday = _time.time() - 86400
-    a._last_reply_ts = yesterday
-    card._refresh_reply_time()
-    pump(30)
-    old_text = card.reply_time_label.text()
-    check("reply-time UI: a non-today reply carries a date prefix",
-          old_text != _datetime.datetime.fromtimestamp(yesterday)
-          .strftime("%H:%M") and len(old_text) > 5)
-    card.detach()
-    a.dispose()
-
-
-# ------------------------------------------------------------ ansi parser ---
 
 def test_ansi():
     from app.ansi_parser import AnsiSgrParser
@@ -11233,6 +11098,19 @@ def test_reply_marks_recovered_from_transcript():
           (line, _format_reply_stamp(when)) in card.terminal.reply_marks(),
           card.terminal.reply_marks())
 
+    # ---- the same placement when the footer IS in the scrollback ---------
+    from app.widgets.terminal_view import is_reply_footer
+    check("reply-recover: Claude's turn footer is recognised",
+          is_reply_footer("✻ Worked for 16m 36s")
+          and is_reply_footer("✻ Cooked for 8m 2s · 1 shell still running"))
+    check("reply-recover: ...and the input box's own hints are not",
+          not is_reply_footer("? for shortcuts")
+          and not is_reply_footer("← for agents"))
+    footered = ["the reply ends here.", "", "✻ Worked for 3m 13s", "", "> "]
+    check("reply-recover: a footer moves the anchor down BELOW it",
+          _reply_end_row(footered, "reply ends here.", 0) == 3,
+          _reply_end_row(footered, "reply ends here.", 0))
+
     # a reply that is NOT on screen is skipped, never invented
     card._recovered_replies = []
     card._recover_replies = [(when, "a reply that scrolled away long ago")]
@@ -11270,10 +11148,11 @@ def agent_row_after(card, text):
 
 
 def test_reply_marks_inline():
-    """Reply-finished milestones drawn INLINE in the terminal content -- a
-    dim date/time stamp above the input box, beside Claude's own "for Ns"
-    footer -- as distinct from the header's #CardReplyTime badge (which
-    only ever shows the LATEST reply). Covers the anchor scan
+    """Reply-finished milestones drawn INLINE in the terminal content -- a dim
+    date-and-time stamp on the blank row directly UNDER Claude's own "for Ns"
+    footer. This is the only reply-time surface there is: the card header's
+    #CardReplyTime badge was removed at the user's request, along with the
+    agent-side reply clock that fed it. Covers the anchor scan
     (TerminalView.reply_anchor_line), the shared stamp formatter, a card
     rebuild re-deriving the same anchor, and every reset path that must wipe
     a reply mark alongside a prompt mark."""
@@ -11302,13 +11181,20 @@ def test_reply_marks_inline():
     mark = agent.note_reply_settled()
     check("reply-mark: note_reply_settled records a mark",
           mark is not None and agent.reply_marks() == [mark])
-    footer_line = t.abs_line_at_row(0)
-    check("reply-mark: the card anchors it on the footer row, not the box",
-          card._reply_mark_lines.get(mark.uid) == footer_line,
-          (card._reply_mark_lines, footer_line))
+    # UNDER the footer, on the blank separator below it -- not beside the
+    # footer and not above it, wedged between the reply and its own footer,
+    # which is where the user reported finding it
+    under_footer = t.abs_line_at_row(1)
+    check("reply-mark: the card anchors it UNDER the footer row",
+          card._reply_mark_lines.get(mark.uid) == under_footer,
+          (card._reply_mark_lines, under_footer))
     check("reply-mark: the view carries exactly one inline stamp",
-          t.reply_marks() == [(footer_line, _format_reply_stamp(mark.ts))],
+          t.reply_marks() == [(under_footer, _format_reply_stamp(mark.ts))],
           t.reply_marks())
+    import datetime as _dt
+    check("reply-mark: the stamp carries the DATE as well as the time",
+          _format_reply_stamp(mark.ts) == _dt.datetime.fromtimestamp(
+              mark.ts).strftime("%b %d, %H:%M"), _format_reply_stamp(mark.ts))
 
     # ---- a rule directly above the box (no footer line) anchors nothing --
     ruled = TerminalView(rows=10, cols=40)
@@ -11385,11 +11271,8 @@ def main():
     test_reveal_agent()
     test_new_agent_autofocus()
     test_agent_busy_activity()
-    test_agent_last_reply_at()
     test_reply_settle_skips_resume_replay()
     test_transcript_reply_times()
-    test_reply_time_survives_restart()
-    test_reply_time_card_ui()
     test_ansi()
     test_terminal_keys()
     test_terminal_image_paste()

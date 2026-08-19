@@ -158,6 +158,25 @@ _INPUT_PROMPTS = (">", "❯")
 # runaway scan that lands on unrelated, much older content.
 _REPLY_ANCHOR_SCAN = 6
 
+# Claude Code's settled-turn footer: a spinner glyph, a verb, and how long the
+# turn took -- "✻ Worked for 16m 36s", "✻ Cooked for 8m 2s · 1 shell still
+# running". The reply stamp is drawn on the blank row BELOW this rather than
+# beside the reply text above it (see reply_anchor_line). The leading-glyph
+# slot must be followed by a WORD and then " for <duration>", which is what
+# keeps the input box's own footer hints ("? for shortcuts", "← for agents")
+# out: neither has a second "for" after its first word.
+_REPLY_FOOTER_RE = re.compile(
+    r"^\s*[^\w\s]?\s*[A-Za-z][A-Za-z'\-]*\s+for\s+"
+    r"(?:\d+h\s*)?(?:\d+m\s*)?\d+(?:\.\d+)?s\b", re.I)
+
+
+def is_reply_footer(text: str) -> bool:
+    """True when a row is Claude Code's "<verb> for <duration>" turn footer.
+    Shared with TerminalCard._reply_end_row so the live anchor and the
+    transcript-recovered one put a stamp in the SAME place."""
+    return bool(_REPLY_FOOTER_RE.match(text.strip()))
+
+
 # The Unicode Box Drawing block. Claude Code paints a horizontal rule (plain
 # dashes, or a rounded-corner box border) directly between the input box and
 # its footer hint, with no blank line either side -- a row built ENTIRELY
@@ -691,9 +710,9 @@ class TerminalView(QWidget):
         return self.history_pushed() + row
 
     def reply_anchor_line(self) -> int | None:
-        """Absolute line of the row the just-finished reply's own footer sits
-        on -- Claude Code's "<spinner verb> for Ns" line, which is left in
-        place once a turn settles. Used at BOTH the live busy -> idle capture
+        """Absolute line of the row a just-finished reply's stamp goes on: the
+        blank row directly UNDER Claude's own "<spinner verb> for Ns" footer,
+        which is left in place once a turn settles. Used at BOTH the live busy -> idle capture
         (TerminalCard._on_activity) and replay re-anchoring
         (_replay_with_marks), exactly like anchor_line() -- one function over
         identical screen state on both sides is what keeps them agreeing.
@@ -712,12 +731,19 @@ class TerminalView(QWidget):
             return None
         bound = span[0] - _REPLY_ANCHOR_SCAN
         r = span[0] - 1
+        blanks = 0
         while r >= 0 and r > bound:
             first, _ = self._row_content(r)
             if first >= 0:
                 if self._row_is_rule(r):
                     return None
-                return self.history_pushed() + r
+                # the stamp belongs UNDER the footer, so hand back the blank
+                # separator we just walked over rather than the footer row
+                # itself. Without a blank there (the footer butting straight
+                # against the input box) there is no row below to use, so the
+                # footer row is the only place left.
+                return self.history_pushed() + (r + 1 if blanks else r)
+            blanks += 1
             r -= 1
         return None
 
