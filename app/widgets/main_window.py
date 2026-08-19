@@ -270,6 +270,21 @@ class _AutoSizingScrollContent(QWidget):
 
     def event(self, e):
         if e.type() == QEvent.Type.LayoutRequest:
+            # The MINIMUM is the belt to `adjustSize`'s braces. Resizing to
+            # the sizeHint is a one-shot: anything that sizes this widget
+            # afterwards (a scroll area rebuilding its layout, a future caller
+            # that means well) can still leave it narrower than the row it
+            # holds, and then the pills at its right-hand end are simply cut
+            # off by its edge - the shape of the overlap bug this class was
+            # written for. `resize()` and `setGeometry()` are both clamped to
+            # `minimumWidth`, so pinning it to the row's real width takes that
+            # state off the table instead of relying on nobody reaching for
+            # it. The WINDOW stays free to be narrower than the row, because
+            # the scroll area's own minimum is capped separately (see
+            # `_HWheelScrollArea.minimumSizeHint`) and the row just scrolls.
+            lay = self.layout()
+            if lay is not None:
+                self.setMinimumWidth(lay.sizeHint().width())
             self.adjustSize()
             # ...and tell the scroll area, because the area's own sizeHint is
             # a function of THIS widget's (see `_HWheelScrollArea.sizeHint`).

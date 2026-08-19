@@ -10,7 +10,8 @@ import os
 from functools import lru_cache
 
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
-                            QRectF, Qt, QTimer, QVariantAnimation, Signal)
+                            QEvent, QRectF, Qt, QTimer, QVariantAnimation,
+                            Signal)
 from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage,
                            QLinearGradient, QPainter, QPainterPath, QPen,
                            QPixmap, QRadialGradient)
@@ -631,13 +632,24 @@ class UsagePillBadge(QWidget):
     `Palette` at paint time gives both for free.
 
     THE WIDTH IS THE TEXT'S WIDTH, measured with the font `paintEvent` actually
-    draws with (never the widget's QSS font, or the pill is sized for text of a
-    different size). One formula, in `_measure_width`, for every pill: the
-    Gemini readout used to carry a hardcoded `_FIXED_WIDTH = 315` and elide into
-    it, which reserved 630px of the bar for two pills whose real content is
-    ~215px each, and which truncated anything longer. The two pills sit side by
-    side, so a second hand-copy of the formula is the same bug waiting to
-    happen; subclasses supply only the TEXT.
+    draws with - the widget's own font at the pill's size, never a bare
+    `QFont()`, whose unset family the metrics and the painter resolve to
+    DIFFERENT faces (`_measure_width` carries the whole story). One formula, in
+    `_measure_width`, for every pill: the Gemini readout used to carry a
+    hardcoded `_FIXED_WIDTH = 315` and elide into it, which reserved 630px of
+    the bar for two pills whose real content is ~215px each, and which
+    truncated anything longer. The two pills sit side by side, so a second
+    hand-copy of the formula is the same bug waiting to happen; subclasses
+    supply only the TEXT.
+
+    A measurement has TWO inputs, so re-measuring is not a `_set_text` concern
+    alone: `changeEvent` re-measures whenever the font moves under a line that
+    has not changed, and `_heal_width` widens the pill when painting finds it
+    narrower than its own text for any other reason (a screen at another
+    scale, a face substituted under the one we asked for). The elide in
+    `paintEvent` stays as the last resort it was always meant to be, but it is
+    no longer the END of the story: a truncated readout now repairs itself
+    instead of sitting there.
 
     The X costs NO layout width: it FLOATS over the tail of the text, which
     fades out under it for the moment the pointer is inside the pill. Reserving
@@ -662,6 +674,8 @@ class UsagePillBadge(QWidget):
     _RING = 15          # ring diameter
     _PAD = 8            # horizontal padding inside the pill
     _GAP = 7            # ring -> text gap
+    _TEXT_PX = 11       # the pill's text size (the family follows the chrome)
+    _TEXT_SLACK = 2     # integer-metrics cushion (see `_measure_width`)
     _CLOSE_W = 14       # the hover X, OVERLAID (see the class docstring)
     _FADE_W = 14        # how far the text fades out ahead of the hovered X
     _RADIUS = 6         # pill corner radius
@@ -686,6 +700,11 @@ class UsagePillBadge(QWidget):
         self._unreadable = ""       # last error, when we have NO reading at all
         self._loading = False       # a fetch is in flight and we have nothing yet
         self._hovering = False      # paint the X's scrim over the text tail
+        # (text, width) a repair has already been tried for, so a pill that
+        # cannot be helped asks exactly once, plus the advance the painter
+        # last measured for the text it could not fit (see `_heal_width`)
+        self._heal_key = None
+        self._painted_advance = 0
         # A child QToolButton rather than a rect hit-tested in mousePressEvent:
         # it consumes its own press, so closing can never be mistaken for the
         # click-to-refresh affordance, and it gets the hover cursor, hover
@@ -773,10 +792,21 @@ class UsagePillBadge(QWidget):
             self.setToolTip(tip)   # age keeps moving even when the line doesn't
             return
         self._text = text
-        self._sized_for = text
         self.setToolTip(tip)
-        self.setFixedWidth(self._measure_width(text))
+        self._resize_to_text()
         self.update()
+
+    def _resize_to_text(self) -> None:
+        """Re-assert the width the CURRENT text needs with the CURRENT font.
+
+        Separate from `_set_text` because the text is only one of the two
+        inputs to the measurement: the FONT is the other, and it changes
+        underneath a pill whose line has not moved (a QSS re-apply, a theme
+        swap, the widget landing on a screen at another scale). Everything
+        that can invalidate a measurement calls this, so there is exactly one
+        place the width is set."""
+        self._sized_for = self._text
+        self.setFixedWidth(self._measure_width(self._text))
 
     def _measure_width(self, text: str) -> int:
         """[pad][ring][gap][text][pad]. The one width formula, for every pill.
@@ -784,27 +814,63 @@ class UsagePillBadge(QWidget):
         The X is deliberately NOT a term here: it floats over the text's tail,
         so it costs no width and hovering can never resize the pill.
 
-        `QFontMetrics` MUST be bound to this widget (`self` as the paint
-        device), never a bare `QFontMetrics(font)`: unbound, Qt resolves the
-        font against the PRIMARY screen's DPI, while `paintEvent` draws with
-        `p.fontMetrics()`, bound to whatever screen this widget is actually
-        on. On a single-monitor 100%-scale machine the two agree and nothing
-        looks wrong; on a mixed-DPI multi-monitor setup they diverge, so the
-        width reserved here undershoots what painting needs and `paintEvent`'s
-        `elidedText` safety net - meant only as insurance against a subclass
-        handing us an unmeasured string - fires for real and truncates a pill
-        that was sized "correctly". Same reason `ElidingLabel` measures with
-        `self.font()` rather than a fresh `QFont`.
+        THE FONT MEASURED HERE MUST BE THE FONT `paintEvent` DRAWS WITH, and
+        making that true takes both halves of `_text_font`:
+
+        * the FAMILY comes from `self.font()`. A bare `QFont()` leaves the
+          family unset, and the two consumers resolve an unset family
+          DIFFERENTLY - `QFontMetrics` falls back to the application font,
+          while `QPainter.setFont` resolves it against the widget's own font
+          (what QSS put there). Those agree only while the chrome family IS
+          the application default, which is exactly the machine this was
+          written on; `setup_application` deliberately picks "Inter" over
+          "Segoe UI" whenever Inter is installed, and on that machine every
+          pill measured Segoe UI and painted Inter, so `paintEvent`'s
+          `elidedText` - insurance only - truncated a pill that had been
+          sized "correctly" (reported live, with a pill reading
+          "5h 86% used, resets n..." beside 70px of unused width).
+        * the metrics are bound to this widget (`self` as the paint device),
+          never a bare `QFontMetrics(font)`: unbound, Qt resolves against the
+          PRIMARY screen's DPI while painting uses whatever screen the widget
+          is actually on, which diverges on a mixed-DPI multi-monitor setup.
+
+        `_TEXT_SLACK` is a rounding cushion, not a design margin: the metrics
+        are integers and a fractional device pixel ratio can make the run laid
+        out at paint time a hair wider than the advance measured here, which
+        would elide a pill sized to the exact pixel.
         """
         fm = QFontMetrics(self._text_font(), self)
-        return (self._PAD * 2 + self._RING + self._GAP
-                + fm.horizontalAdvance(text))
+        return self._chrome_width() + fm.horizontalAdvance(text)
 
-    @staticmethod
-    def _text_font() -> QFont:
-        f = QFont()
-        f.setPixelSize(11)
+    def _chrome_width(self) -> int:
+        """Everything in the width that is not the text itself."""
+        return self._PAD * 2 + self._RING + self._GAP + self._TEXT_SLACK
+
+    def _text_font(self) -> QFont:
+        """The pill's text font: the widget's own family (so it follows the
+        chrome the QSS gives everything else) at the pill's own size. NOT a
+        bare `QFont()` - see `_measure_width` for what that costs."""
+        f = QFont(self.font())
+        f.setPixelSize(self._TEXT_PX)
         return f
+
+    def changeEvent(self, event):
+        """A font the pill did not choose can still change under it (QSS
+        re-applied on a theme swap, the application font changing, a style
+        change). The line is unchanged, so `_set_text` would early-return and
+        leave the pill at a width measured for the OLD face - which paints as
+        a truncated readout in a pill with room to spare."""
+        super().changeEvent(event)
+        # `getattr`, not `self._text`: Qt polishes the widget from inside
+        # QWidget.__init__, so a style/font change can land before this
+        # class's own state exists
+        if event.type() in (QEvent.Type.FontChange,
+                            QEvent.Type.ApplicationFontChange,
+                            QEvent.Type.StyleChange) and getattr(
+                                self, "_text", ""):
+            self._heal_key = None
+            self._resize_to_text()
+            self.update()
 
     # -- subclass hooks --------------------------------------------------
     def _loading_text(self) -> str:
@@ -911,6 +977,9 @@ class UsagePillBadge(QWidget):
         # the pill is sized for this exact string, so the elide is insurance
         # only (a subclass could yet hand us something longer than it measured)
         avail = self.width() - text_x - self._PAD
+        advance = p.fontMetrics().horizontalAdvance(self._text)
+        if advance > avail:
+            self._heal_width(advance)
         elided = p.fontMetrics().elidedText(self._text,
                                             Qt.TextElideMode.ElideRight,
                                             int(max(0, avail)))
@@ -921,6 +990,47 @@ class UsagePillBadge(QWidget):
         if self._hovering:
             self._paint_close_scrim(p, color, dim)
         p.end()
+
+    def _heal_width(self, advance: int) -> None:
+        """Painting found the pill narrower than its own text: widen it,
+        instead of quietly truncating a readout.
+
+        The elide inside `paintEvent` is insurance, and insurance firing means
+        the width is wrong - from a font that moved under us, a screen at
+        another scale, or anything else that leaves the measurement and the
+        painting disagreeing. Whatever the cause, the reading is what the user
+        came for, so the pill asks for the room again on the next turn of the
+        event loop rather than at paint time (resizing inside `paintEvent` is
+        how you get a repaint loop).
+
+        CRITICAL: the repair is driven by the ADVANCE THE PAINTER JUST
+        MEASURED, not by `_measure_width` alone. Re-running the measurement is
+        no repair at all when the measurement is the thing that was wrong -
+        it returns the same too-small number and the pill stays truncated
+        forever. `p.fontMetrics()` is the one authority that cannot disagree
+        with what was drawn, because it IS what drew it.
+
+        `_heal_key` bounds this to ONE attempt per (text, width) state, so a
+        pill that cannot be helped asks once rather than spinning. A new
+        reading, a new font or a new width all move the key, so a repairable
+        state is always retried.
+        """
+        key = (self._text, self.width())
+        if self._heal_key == key:
+            return
+        self._heal_key = key
+        self._painted_advance = int(advance)
+        # the context overload, so a pill deleted before the turn comes round
+        # cancels the call rather than firing into a dead C++ object
+        QTimer.singleShot(0, self, self._reassert_width)
+
+    def _reassert_width(self) -> None:
+        want = max(self._measure_width(self._text),
+                   self._chrome_width() + self._painted_advance)
+        if self.width() != want or self.minimumWidth() != want:
+            self._sized_for = self._text
+            self.setFixedWidth(want)
+            self.update()
 
     def _paint_close_scrim(self, p, color, dim) -> None:
         """Fade the text out under the hovered X.
