@@ -3117,9 +3117,20 @@ def test_reply_time_card_ui():
     check("reply-time UI: shown live once the agent settles",
           card.reply_time_label.isVisible())
     text = card.reply_time_label.text()
-    check("reply-time UI: label text is a plain HH:MM stamp",
+    check("reply-time UI: label text is a plain HH:MM stamp for today",
           len(text) == 5 and text[2] == ":" and
           text[:2].isdigit() and text[3:].isdigit())
+
+    import time as _time
+    import datetime as _datetime
+    yesterday = _time.time() - 86400
+    a._last_reply_ts = yesterday
+    card._refresh_reply_time()
+    pump(30)
+    old_text = card.reply_time_label.text()
+    check("reply-time UI: a non-today reply carries a date prefix",
+          old_text != _datetime.datetime.fromtimestamp(yesterday)
+          .strftime("%H:%M") and len(old_text) > 5)
     card.detach()
     a.dispose()
 

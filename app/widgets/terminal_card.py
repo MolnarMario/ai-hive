@@ -328,7 +328,9 @@ class TerminalCard(QFrame):
         # off the existing activity_changed signal (see _refresh_reply_time);
         # hidden until the agent has actually replied once. Transient like
         # the model chip: never persisted, TerminalAgent.last_reply_at() is
-        # the live source of truth.
+        # the live source of truth. Text is HH:MM for a same-day reply, else
+        # date-prefixed (see _refresh_reply_time) -- the full date is always
+        # in the tooltip regardless.
         self.reply_time_label = QLabel("", header)
         self.reply_time_label.setObjectName("CardReplyTime")
         self.reply_time_label.hide()
@@ -1240,13 +1242,20 @@ class TerminalCard(QFrame):
         same activity_changed edge card status already reacts to -- it is set
         ONLY on a genuine busy -> idle settle (see _on_idle_timeout), so a
         forced clear on stop/crash just re-displays the last real reply time
-        rather than a bogus 'just replied' stamp."""
+        rather than a bogus 'just replied' stamp. The label carries a date
+        prefix whenever the reply wasn't today -- an agent left running
+        overnight (or an idle workspace reopened days later) must not read as
+        having replied "just now" because only HH:MM was ever shown; the date
+        was previously buried in the hover tooltip alone."""
         ts = self.agent.last_reply_at()
         if ts is None:
             self.reply_time_label.hide()
             return
         dt = datetime.datetime.fromtimestamp(ts)
-        self.reply_time_label.setText(dt.strftime("%H:%M"))
+        if dt.date() == datetime.datetime.now().date():
+            self.reply_time_label.setText(dt.strftime("%H:%M"))
+        else:
+            self.reply_time_label.setText(dt.strftime("%b %d, %H:%M"))
         self.reply_time_label.setToolTip(
             "Agent's last reply finished " + dt.strftime("%Y-%m-%d %H:%M:%S"))
         self.reply_time_label.show()
