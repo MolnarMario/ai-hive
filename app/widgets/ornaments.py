@@ -778,15 +778,26 @@ class UsagePillBadge(QWidget):
         self.setFixedWidth(self._measure_width(text))
         self.update()
 
-    @classmethod
-    def _measure_width(cls, text: str) -> int:
+    def _measure_width(self, text: str) -> int:
         """[pad][ring][gap][text][pad]. The one width formula, for every pill.
 
         The X is deliberately NOT a term here: it floats over the text's tail,
         so it costs no width and hovering can never resize the pill.
+
+        `QFontMetrics` MUST be bound to this widget (`self` as the paint
+        device), never a bare `QFontMetrics(font)`: unbound, Qt resolves the
+        font against the PRIMARY screen's DPI, while `paintEvent` draws with
+        `p.fontMetrics()`, bound to whatever screen this widget is actually
+        on. On a single-monitor 100%-scale machine the two agree and nothing
+        looks wrong; on a mixed-DPI multi-monitor setup they diverge, so the
+        width reserved here undershoots what painting needs and `paintEvent`'s
+        `elidedText` safety net - meant only as insurance against a subclass
+        handing us an unmeasured string - fires for real and truncates a pill
+        that was sized "correctly". Same reason `ElidingLabel` measures with
+        `self.font()` rather than a fresh `QFont`.
         """
-        fm = QFontMetrics(cls._text_font())
-        return (cls._PAD * 2 + cls._RING + cls._GAP
+        fm = QFontMetrics(self._text_font(), self)
+        return (self._PAD * 2 + self._RING + self._GAP
                 + fm.horizontalAdvance(text))
 
     @staticmethod

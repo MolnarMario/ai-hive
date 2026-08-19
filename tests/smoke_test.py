@@ -10772,6 +10772,7 @@ def test_usage_pill_geometry_and_close():
     QApplication.instance() or QApplication([])
     badge = GeminiUsageBadge(window="five_hour")
     weekly_badge = GeminiUsageBadge(window="weekly")
+    plan_badge = PlanUsageBadge(window="five_hour")
 
     check("usage-pill: no content before a reading arrives",
           badge.has_content() is False)
@@ -10801,29 +10802,33 @@ def test_usage_pill_geometry_and_close():
     check("usage-pill: has_content is True once a reading is in",
           badge.has_content() is True)
 
-    # the formula, and that BOTH classes use the same one
-    def want(cls, text):
-        fm = QFontMetrics(cls._text_font())
-        return cls._PAD * 2 + cls._RING + cls._GAP + fm.horizontalAdvance(text)
+    # the formula, and that BOTH classes use the same one. Bound to the
+    # instance (the paint device `paintEvent` itself uses), same reason
+    # `_measure_width` is: an unbound QFontMetrics(font) resolves against the
+    # primary screen and can disagree with what actually gets painted.
+    def want(instance, text):
+        fm = QFontMetrics(instance._text_font(), instance)
+        return (instance._PAD * 2 + instance._RING + instance._GAP
+                + fm.horizontalAdvance(text))
 
     check("usage-pill: width is ring + pads + text, and nothing else",
-          badge.width() == want(GeminiUsageBadge, badge._text))
+          badge.width() == want(badge, badge._text))
     check("usage-pill: the X reserves NO width - it floats over the text",
           badge.width()
           == GeminiUsageBadge._PAD * 2 + GeminiUsageBadge._RING
           + GeminiUsageBadge._GAP
-          + QFontMetrics(GeminiUsageBadge._text_font()).horizontalAdvance(
+          + QFontMetrics(badge._text_font(), badge).horizontalAdvance(
               badge._text))
     check("usage-pill: Claude and Gemini measure an identical string alike",
-          PlanUsageBadge._measure_width("21% used, resets in 1h20m at 14:49")
-          == GeminiUsageBadge._measure_width(
+          plan_badge._measure_width("21% used, resets in 1h20m at 14:49")
+          == badge._measure_width(
               "21% used, resets in 1h20m at 14:49"))
     check("usage-pill: the fixed 315px width is gone",
           not hasattr(GeminiUsageBadge, "_FIXED_WIDTH")
           and badge.width() != weekly_badge.width())
     check("usage-pill: the full text fits, so nothing is ever truncated",
           badge.width() - (badge._PAD + badge._RING + badge._GAP) - badge._PAD
-          >= QFontMetrics(GeminiUsageBadge._text_font()).horizontalAdvance(
+          >= QFontMetrics(badge._text_font(), badge).horizontalAdvance(
               badge._text))
     check("usage-pill: the X sits inside the text's own run",
           badge.close_btn.x() < badge.width() - badge._PAD
