@@ -4078,6 +4078,92 @@ def test_terminal_mouse_tracking_click():
                    "\x1b[M" + chr(35) + chr(38) + chr(36)], out2)
 
 
+def test_terminal_click_menu_guard():
+    """Regression guard for the "AskUserQuestion vanishes on click" bug,
+    reopened once the classic/"default" TUI renderer became the default
+    (ui.terminal_scrollback=True): that renderer never negotiates mouse
+    tracking, so a click on a menu falls through to local caret-repositioning
+    (_reposition_cursor), which sends raw arrow/backspace bytes and corrupts
+    an interactive menu that has no readline caret for them to land on. The
+    fix is set_waiting_probe(agent.is_waiting) -- while it reports True, a
+    click (or a selection edit) must send NOTHING to the child."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                            TerminalView)
+
+    QApplication.instance() or QApplication([])
+
+    def click(view, row, col):
+        p = QPointF(CELL_PAD_X + (col + 0.5) * view._cell_w,
+                    CELL_PAD_Y + (row + 0.5) * view._cell_h)
+        a = (p, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+             Qt.KeyboardModifier.NoModifier)
+        view.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, *a))
+        view.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, *a))
+
+    # no mouse tracking (the classic-renderer case): a click 3 columns off the
+    # caret normally sends Right arrows -- confirm that still works by default
+    # (waiting_probe defaults to "never waiting"), then confirm it stops dead
+    # the moment the probe reports an interactive menu is open.
+    v = TerminalView(rows=6, cols=80)
+    v.feed("hello")   # caret at row 0, col 5
+    moves = []
+    v.keyInput.connect(moves.append)
+    click(v, 0, 2)
+    check("click-guard: default probe still allows normal caret placement",
+          moves == ["\x1b[D" * 3], moves)
+    moves.clear()
+
+    v.set_waiting_probe(lambda: True)
+    click(v, 0, 2)
+    check("click-guard: a click sends nothing while waiting_probe is True",
+          moves == [], moves)
+    moves.clear()
+    # clicking the exact caret cell (the row Claude parks its cursor on while
+    # showing a highlighted menu option) is the scenario that actually
+    # corrupted the menu -- must be inert too, not just off-caret clicks
+    click(v, 0, 7)
+    check("click-guard: a click on the caret's own row is inert while waiting",
+          moves == [], moves)
+    moves.clear()
+
+    v.set_waiting_probe(lambda: False)
+    click(v, 0, 2)
+    check("click-guard: caret placement resumes once the probe clears",
+          moves == ["\x1b[D" * 3], moves)
+
+    # independent, narrower fix: _input_block_span() now runs before the
+    # same-row fast path, so a click on the cursor's own row is rejected when
+    # that row is itself BLANK (previously it fired arrows regardless).
+    v2 = TerminalView(rows=8, cols=80)
+    v2.feed("hello\r\n")   # caret moves to row 1 col 0 -- a blank row
+    blanks = []
+    v2.keyInput.connect(blanks.append)
+    click(v2, 1, 5)
+    check("click-guard: a click on the caret's own blank row sends nothing",
+          blanks == [], blanks)
+
+    # _delete_selection carries its own copy of the guard (it sends real
+    # Backspace bytes unconditionally after repositioning, so suppressing only
+    # the reposition would still corrupt the menu with stray deletes).
+    v3 = TerminalView(rows=6, cols=80)
+    v3.feed("hello")
+    v3._sel_anchor, v3._sel_end = (0, 0), (0, 4)  # select "hell"
+    v3.set_waiting_probe(lambda: True)
+    check("click-guard: _delete_selection refuses while waiting_probe is True",
+          v3._delete_selection() is False)
+    dels = []
+    v3.keyInput.connect(dels.append)
+    check("click-guard: _delete_selection sent nothing while waiting",
+          dels == [], dels)
+    v3.set_waiting_probe(lambda: False)
+    check("click-guard: _delete_selection works again once the probe clears",
+          v3._delete_selection() is True)
+
+
 def test_terminal_selection_edit():
     """A mouse selection (double-click word / drag) is editable like an editor
     selection: Backspace/Del deletes it, Ctrl+X cuts it, Ctrl+C copies it.
@@ -10751,6 +10837,7 @@ def main():
     test_terminal_image_paste()
     test_terminal_mouse_words_links()
     test_terminal_mouse_tracking_click()
+    test_terminal_click_menu_guard()
     test_terminal_selection_edit()
     test_terminal_input_editor()
     test_session_migration()

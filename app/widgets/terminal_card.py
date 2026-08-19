@@ -449,6 +449,11 @@ class TerminalCard(QFrame):
             # Ctrl+clicking a file bubbles up so the app can reveal it
             self.terminal.set_base_dir(getattr(self.agent.spec, "cwd", "") or "")
             self.terminal.fileActivated.connect(self.fileActivated)
+            # a click must never drive the child's caret while an interactive
+            # menu (AskUserQuestion/ExitPlanMode/permission prompt) is open --
+            # see TerminalView._reposition_cursor for why. is_waiting() is the
+            # same authoritative signal _on_prompt_submitted already trusts.
+            self.terminal.set_waiting_probe(self.agent.is_waiting)
             # Ctrl+Shift+Enter in the terminal: "send this, but later". The view
             # hands up what is currently typed; the window turns it into the
             # countdown dialog and, only on confirm, clears the input box.

@@ -242,7 +242,40 @@ this file is the invariants that must survive every change.
   are real and were measured, not guessed: it is not flicker-free, and it does
   NOT enable mouse tracking (so Claude's menus stop being clickable, and
   `wheelEvent` needs no change — with `_mouse_tracking` and `_alt_screen` both
-  False it already falls through to `scroll_by`).
+  False it already falls through to `scroll_by`). "Stop being clickable" is
+  not merely inert, and this cost a real regression: with `_mouse_tracking`
+  False, a click falls through to `TerminalView._reposition_cursor` (local
+  caret-repositioning via synthesized arrow keys). Its same-row fast path
+  fires whenever the clicked row equals the screen's current cursor row
+  (`cy`) — which is exactly where Claude parks the live cursor while showing
+  a highlighted menu option — and sends a burst of Left/Right arrow keys
+  straight into the menu based on the column clicked, with no notion that
+  the row is a modal widget rather than a readline input line. That corrupts
+  or dismisses the menu: the EXACT "question vanishes with no way to answer
+  it" bug commits `30dc8d8`/`585d9ff` fixed for the mouse-tracking case,
+  reopened for the (now default, `ui.terminal_scrollback=True`)
+  classic-renderer case by a code path those commits never touched. Since
+  that default shipped, `terminal_scrollback=True` has made clicking an
+  `AskUserQuestion`/`ExitPlanMode`/permission menu unsafe. The fix:
+  `_reposition_cursor` refuses to fire at all while
+  `TerminalView._waiting_probe()` — wired by `TerminalCard._wire()` to
+  `agent.is_waiting()`, the SAME authoritative hook-driven signal
+  `_on_prompt_submitted` already trusts over screen scraping for the
+  analogous Enter-key/milestone guard — reports the agent is parked on such a
+  menu; a click during that state is now inert rather than destructive, and
+  the keyboard is the only way to answer a menu under the classic renderer.
+  (A SEPARATE, narrower fix moved the `_input_block_span` check ahead of the
+  same-row fast path too — that span, whenever non-None, always contains
+  `cy`, so this mainly closes the case of clicking `cy`'s row while it is
+  itself blank; it is not what stops the menu-corruption bug, `waiting_probe`
+  is.) `_delete_selection` (Backspace/Del/Ctrl+X over a selection) carries its
+  OWN copy of the same `waiting_probe()` check, checked FIRST, rather than
+  relying on the one inside `_reposition_cursor` it calls: it sends real
+  Backspace bytes to the child unconditionally afterward, so suppressing only
+  the reposition would still corrupt the menu with stray deletes. Any future
+  click- or selection-driven caret behavior in `terminal_view.py` MUST check
+  `waiting_probe()` before sending anything to the child, or it reopens this
+  same hole.
 - **Readiness is matched WITHOUT WHITESPACE, and that is load-bearing**
   (`TerminalAgent._has_ready_hint`, `_despace`). The classic renderer lays its
   footer out by MOVING THE CURSOR between segments instead of emitting spaces,
