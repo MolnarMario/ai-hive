@@ -3063,6 +3063,67 @@ def test_agent_busy_activity():
     a.dispose()
 
 
+def test_agent_last_reply_at():
+    """last_reply_at() stamps the moment a reply genuinely ENDS (the busy ->
+    idle settle in _on_idle_timeout) so the card header can show it -- and
+    must NOT be re-stamped by a forced busy clear on stop/crash (_set_status),
+    which is not a reply ending, just the process going away mid-turn."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.process_worker import AgentKind, build_spec
+
+    QApplication.instance() or QApplication([])
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyTime", cwd="."))
+    a.status = AgentStatus.RUNNING
+    check("reply-at: no reply yet -> None", a.last_reply_at() is None)
+    a._on_pty_output("", "generating tokens...")
+    check("reply-at: still busy -> unset", a.last_reply_at() is None)
+    before = time.time()
+    a._on_idle_timeout()  # simulate the quiet-window settle: the reply ended
+    stamped = a.last_reply_at()
+    check("reply-at: settle stamps a recent walltime",
+          stamped is not None and before - 1 <= stamped <= time.time() + 1)
+    a._set_status(AgentStatus.EXITED_OK)  # forced clear, not a real reply end
+    check("reply-at: forced exit does not re-stamp",
+          a.last_reply_at() == stamped)
+    a.dispose()
+
+
+def test_reply_time_card_ui():
+    """The card header's #CardReplyTime label mirrors last_reply_at() LIVE,
+    off the same activity_changed edge the status glyph already reacts to
+    (mirrors test_bg_shell_live_ui's shape for a different marker)."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyCard", cwd="."))
+    a.status = AgentStatus.RUNNING
+    card = TerminalCard(a)
+    card.resize(900, 300); card.show(); pump(60)
+    check("reply-time UI: hidden before any reply",
+          not card.reply_time_label.isVisible())
+
+    a._on_pty_output("", "generating tokens...")
+    a._on_idle_timeout()  # busy -> idle settle: a reply just finished
+    pump(30)
+    check("reply-time UI: shown live once the agent settles",
+          card.reply_time_label.isVisible())
+    text = card.reply_time_label.text()
+    check("reply-time UI: label text is a plain HH:MM stamp",
+          len(text) == 5 and text[2] == ":" and
+          text[:2].isdigit() and text[3:].isdigit())
+    card.detach()
+    a.dispose()
+
+
 # ------------------------------------------------------------ ansi parser ---
 
 def test_ansi():
@@ -4015,6 +4076,92 @@ def test_terminal_mouse_tracking_click():
     check("mouse-track: X10 stationary click forwards press(0) then release(3)",
           out2 == ["\x1b[M" + chr(32) + chr(38) + chr(36),
                    "\x1b[M" + chr(35) + chr(38) + chr(36)], out2)
+
+
+def test_terminal_click_menu_guard():
+    """Regression guard for the "AskUserQuestion vanishes on click" bug,
+    reopened once the classic/"default" TUI renderer became the default
+    (ui.terminal_scrollback=True): that renderer never negotiates mouse
+    tracking, so a click on a menu falls through to local caret-repositioning
+    (_reposition_cursor), which sends raw arrow/backspace bytes and corrupts
+    an interactive menu that has no readline caret for them to land on. The
+    fix is set_waiting_probe(agent.is_waiting) -- while it reports True, a
+    click (or a selection edit) must send NOTHING to the child."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                            TerminalView)
+
+    QApplication.instance() or QApplication([])
+
+    def click(view, row, col):
+        p = QPointF(CELL_PAD_X + (col + 0.5) * view._cell_w,
+                    CELL_PAD_Y + (row + 0.5) * view._cell_h)
+        a = (p, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+             Qt.KeyboardModifier.NoModifier)
+        view.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, *a))
+        view.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, *a))
+
+    # no mouse tracking (the classic-renderer case): a click 3 columns off the
+    # caret normally sends Right arrows -- confirm that still works by default
+    # (waiting_probe defaults to "never waiting"), then confirm it stops dead
+    # the moment the probe reports an interactive menu is open.
+    v = TerminalView(rows=6, cols=80)
+    v.feed("hello")   # caret at row 0, col 5
+    moves = []
+    v.keyInput.connect(moves.append)
+    click(v, 0, 2)
+    check("click-guard: default probe still allows normal caret placement",
+          moves == ["\x1b[D" * 3], moves)
+    moves.clear()
+
+    v.set_waiting_probe(lambda: True)
+    click(v, 0, 2)
+    check("click-guard: a click sends nothing while waiting_probe is True",
+          moves == [], moves)
+    moves.clear()
+    # clicking the exact caret cell (the row Claude parks its cursor on while
+    # showing a highlighted menu option) is the scenario that actually
+    # corrupted the menu -- must be inert too, not just off-caret clicks
+    click(v, 0, 7)
+    check("click-guard: a click on the caret's own row is inert while waiting",
+          moves == [], moves)
+    moves.clear()
+
+    v.set_waiting_probe(lambda: False)
+    click(v, 0, 2)
+    check("click-guard: caret placement resumes once the probe clears",
+          moves == ["\x1b[D" * 3], moves)
+
+    # independent, narrower fix: _input_block_span() now runs before the
+    # same-row fast path, so a click on the cursor's own row is rejected when
+    # that row is itself BLANK (previously it fired arrows regardless).
+    v2 = TerminalView(rows=8, cols=80)
+    v2.feed("hello\r\n")   # caret moves to row 1 col 0 -- a blank row
+    blanks = []
+    v2.keyInput.connect(blanks.append)
+    click(v2, 1, 5)
+    check("click-guard: a click on the caret's own blank row sends nothing",
+          blanks == [], blanks)
+
+    # _delete_selection carries its own copy of the guard (it sends real
+    # Backspace bytes unconditionally after repositioning, so suppressing only
+    # the reposition would still corrupt the menu with stray deletes).
+    v3 = TerminalView(rows=6, cols=80)
+    v3.feed("hello")
+    v3._sel_anchor, v3._sel_end = (0, 0), (0, 4)  # select "hell"
+    v3.set_waiting_probe(lambda: True)
+    check("click-guard: _delete_selection refuses while waiting_probe is True",
+          v3._delete_selection() is False)
+    dels = []
+    v3.keyInput.connect(dels.append)
+    check("click-guard: _delete_selection sent nothing while waiting",
+          dels == [], dels)
+    v3.set_waiting_probe(lambda: False)
+    check("click-guard: _delete_selection works again once the probe clears",
+          v3._delete_selection() is True)
 
 
 def test_terminal_selection_edit():
@@ -10683,11 +10830,14 @@ def main():
     test_reveal_agent()
     test_new_agent_autofocus()
     test_agent_busy_activity()
+    test_agent_last_reply_at()
+    test_reply_time_card_ui()
     test_ansi()
     test_terminal_keys()
     test_terminal_image_paste()
     test_terminal_mouse_words_links()
     test_terminal_mouse_tracking_click()
+    test_terminal_click_menu_guard()
     test_terminal_selection_edit()
     test_terminal_input_editor()
     test_session_migration()
@@ -10772,6 +10922,7 @@ def test_usage_pill_geometry_and_close():
     QApplication.instance() or QApplication([])
     badge = GeminiUsageBadge(window="five_hour")
     weekly_badge = GeminiUsageBadge(window="weekly")
+    plan_badge = PlanUsageBadge(window="five_hour")
 
     check("usage-pill: no content before a reading arrives",
           badge.has_content() is False)
@@ -10801,29 +10952,33 @@ def test_usage_pill_geometry_and_close():
     check("usage-pill: has_content is True once a reading is in",
           badge.has_content() is True)
 
-    # the formula, and that BOTH classes use the same one
-    def want(cls, text):
-        fm = QFontMetrics(cls._text_font())
-        return cls._PAD * 2 + cls._RING + cls._GAP + fm.horizontalAdvance(text)
+    # the formula, and that BOTH classes use the same one. Bound to the
+    # instance (the paint device `paintEvent` itself uses), same reason
+    # `_measure_width` is: an unbound QFontMetrics(font) resolves against the
+    # primary screen and can disagree with what actually gets painted.
+    def want(instance, text):
+        fm = QFontMetrics(instance._text_font(), instance)
+        return (instance._PAD * 2 + instance._RING + instance._GAP
+                + fm.horizontalAdvance(text))
 
     check("usage-pill: width is ring + pads + text, and nothing else",
-          badge.width() == want(GeminiUsageBadge, badge._text))
+          badge.width() == want(badge, badge._text))
     check("usage-pill: the X reserves NO width - it floats over the text",
           badge.width()
           == GeminiUsageBadge._PAD * 2 + GeminiUsageBadge._RING
           + GeminiUsageBadge._GAP
-          + QFontMetrics(GeminiUsageBadge._text_font()).horizontalAdvance(
+          + QFontMetrics(badge._text_font(), badge).horizontalAdvance(
               badge._text))
     check("usage-pill: Claude and Gemini measure an identical string alike",
-          PlanUsageBadge._measure_width("21% used, resets in 1h20m at 14:49")
-          == GeminiUsageBadge._measure_width(
+          plan_badge._measure_width("21% used, resets in 1h20m at 14:49")
+          == badge._measure_width(
               "21% used, resets in 1h20m at 14:49"))
     check("usage-pill: the fixed 315px width is gone",
           not hasattr(GeminiUsageBadge, "_FIXED_WIDTH")
           and badge.width() != weekly_badge.width())
     check("usage-pill: the full text fits, so nothing is ever truncated",
           badge.width() - (badge._PAD + badge._RING + badge._GAP) - badge._PAD
-          >= QFontMetrics(GeminiUsageBadge._text_font()).horizontalAdvance(
+          >= QFontMetrics(badge._text_font(), badge).horizontalAdvance(
               badge._text))
     check("usage-pill: the X sits inside the text's own run",
           badge.close_btn.x() < badge.width() - badge._PAD

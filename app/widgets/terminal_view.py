@@ -73,12 +73,20 @@ report to the child, so a plain drag never selected anything -- only Shift+drag
 did.) Shift stays the xterm escape hatch -- Shift+click/drag selects text
 locally regardless. A double-click is a selection gesture too (word-select),
 local even under mouse tracking. When mouse tracking is OFF (a normal
-shell prompt), a plain left-click places the input caret where you clicked, by sending
-the child arrow keys (a terminal can't set the child's cursor directly): exact
-on the caret's own line (Left/Right by the column delta), and best-effort on
-another line of a multi-line prompt (Up/Down to the row, then Left/Right to the
-predicted landing column -- see _reposition_cursor). Only rows inside the input
-box are touched, so clicking the transcript never nudges the prompt. A drag
+shell prompt, OR Claude Code's own classic/"default" TUI renderer -- see
+CLAUDE.md's terminal-scrollback invariant -- which never negotiates mouse
+tracking at all, even while showing a clickable-looking AskUserQuestion/plan/
+permission menu), a plain left-click places the input caret where you clicked,
+by sending the child arrow keys (a terminal can't set the child's cursor
+directly): exact on the caret's own line (Left/Right by the column delta), and
+best-effort on another line of a multi-line prompt (Up/Down to the row, then
+Left/Right to the predicted landing column -- see _reposition_cursor). Only
+rows inside the input box are touched, so clicking the transcript never nudges
+the prompt -- and while the agent is parked on an interactive menu
+(waiting_probe, wired to agent.is_waiting()) a click is inert instead, because
+that menu has no readline caret for arrow keys to land on and sending them
+into it is what corrupts/dismisses it (the classic-renderer path onto the
+exact bug the mouse-tracking forward above exists to prevent). A drag
 selects text instead and never moves the caret. Double-click selects the whitespace-delimited word
 under the pointer (then Ctrl+C copies it); Ctrl+click (or middle/scroll-wheel
 click) opens a URL or an existing local file path under the pointer via the OS
@@ -463,6 +471,10 @@ class TerminalView(QWidget):
         self._pending_fwd = None       # (row, col) of a press on a mouse-tracking
         #   app that is NOT YET forwarded: held until release so we can tell a
         #   click (forward it) from a drag (select locally). None = not pending.
+        # Authoritative "an interactive menu the mouse can't drive is open"
+        # probe, set by the card to agent.is_waiting() (see set_waiting_probe).
+        # Defaults to "never waiting" so the view works standalone/in tests.
+        self._waiting_probe = lambda: False
         self._hover_link = None  # (row, c0, c1) of a link under the pointer
         self._hover_cell = None  # last hovered (row, col), to skip re-scans
         # every clickable URL/path on the visible screen, so they read as links
@@ -1355,17 +1367,39 @@ class TerminalView(QWidget):
         we PREDICT the landing column from the painted row and correct with
         Left/Right. Only rows inside the input box (_input_block_span) are
         touched, so clicking the transcript or a scrolled-back view -- or any row
-        outside the box -- never nudges the prompt."""
+        outside the box -- never nudges the prompt.
+
+        THE waiting_probe() guard is what actually keeps this from firing into
+        something that isn't a normal readline prompt: while the agent is
+        parked on an interactive menu it can't drive via arrow keys
+        (AskUserQuestion, ExitPlanMode, a classic permission menu), sending
+        arrows there is what corrupts/dismisses it -- see set_waiting_probe.
+        This is load-bearing: when Claude's classic/"default" TUI renderer is
+        active (the `ui.terminal_scrollback` default), it never negotiates
+        mouse tracking, so EVERY click -- including one landing on such a
+        menu -- reaches this function; nothing upstream filters it out.
+
+        The span check now also runs BEFORE the same-row fast path rather
+        than after. This is a narrower, independent correctness fix, not the
+        thing that stops menu corruption: `_input_block_span()`, whenever it
+        returns non-None, always spans at least the cursor's own row (`top`/
+        `bottom` both start at `cy`), so a clicked row equal to `cy` was
+        already going to pass the check in the common case. The one real
+        behavior change is a click on `cy`'s row when that row is BLANK
+        (`_input_block_span()` returns None then) -- the old ordering still
+        fired arrows at it; now it correctly does nothing."""
         if self._scroll_offset:
             return  # caret only meaningful on the live screen
+        if self._waiting_probe():
+            return  # an interactive menu is open -- never touch its caret
+        span = self._input_block_span()
+        if span is None or not (span[0] <= row <= span[1]):
+            return  # off the input box: leave the child's caret alone
         cy = self.screen.cursor.y
         cx = self.screen.cursor.x
         if row == cy:
             self._emit_arrows("C" if col > cx else "D", abs(col - cx))
             return
-        span = self._input_block_span()
-        if span is None or not (span[0] <= row <= span[1]):
-            return  # off the input box: leave the child's caret alone
         # 1. vertical: Up/Down carry the goal column (cx), clamped to the target
         #    line's end. Consecutive presses keep the same goal, so N moves land
         #    on `row` at min(cx, line-end).
@@ -1390,7 +1424,17 @@ class TerminalView(QWidget):
         selection that escapes the input box (output/scrollback) is left
         untouched and returns False -- inference from painted rows must never
         corrupt what it can't be sure of. The leading prompt run ('> ') on the
-        box's first row is never counted as deletable input."""
+        box's first row is never counted as deletable input.
+
+        Also fails closed while waiting_probe() is true: _input_block_span's
+        heuristics can misjudge a printed interactive menu as part of the
+        input box (see _reposition_cursor), and unlike a plain click this
+        function sends REAL Backspace bytes to the child regardless of
+        whether the caret-repositioning it does first actually moved
+        anything -- so this must not rely solely on _reposition_cursor's own
+        guard."""
+        if self._waiting_probe():
+            return False
         rng = self._selection_range()
         if rng is None or self._scroll_offset:
             return False
@@ -1588,6 +1632,15 @@ class TerminalView(QWidget):
         """Set the directory relative paths in the output resolve against (the
         agent's working directory). Empty disables relative-path opening."""
         self._base_dir = path or ""
+
+    def set_waiting_probe(self, probe) -> None:
+        """Wire the authoritative "agent is waiting on an interactive menu"
+        signal (agent.is_waiting()) into _reposition_cursor's safety gate. See
+        that function for why this is needed: it is the same hook-driven
+        signal TerminalCard already trusts over screen scraping for the
+        analogous Enter-key/milestone guard, because a scrape alone misses
+        AskUserQuestion/ExitPlanMode."""
+        self._waiting_probe = probe
 
     def _open_target(self, target) -> None:
         """Open a classified link with the OS default handler (user-initiated

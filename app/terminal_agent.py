@@ -338,6 +338,11 @@ class TerminalAgent(QObject):
         self._busy = False            # actively streaming output right now
         self._last_output_ts = 0.0    # walltime of the last output burst
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
+        # walltime the agent last settled after streaming output (i.e. the end
+        # of a reply), set ONLY in _on_idle_timeout so a forced busy->idle
+        # clear from _set_status (stop/crash/exit) never overwrites it with a
+        # non-reply moment. Transient like _last_output_ts -- never persisted.
+        self._last_reply_ts: float | None = None
         # latched "the plan limit cut this agent off" + the reset time its own
         # banner stated. Transient like the waiting flags — never persisted.
         self._limit_blocked = False
@@ -1085,6 +1090,12 @@ class TerminalAgent(QObject):
         interactive process idling at its prompt."""
         return self._busy
 
+    def last_reply_at(self) -> float | None:
+        """Walltime (epoch seconds) the agent last finished a reply -- i.e.
+        the busy -> idle settle in _on_idle_timeout -- or None if it hasn't
+        replied yet this run. A live reading like is_busy(); never persisted."""
+        return self._last_reply_ts
+
     def is_bg_shell_busy(self) -> bool:
         """True when the agent itself is quiet (not is_busy()) but a
         background command it started is still running -- see
@@ -1313,6 +1324,7 @@ class TerminalAgent(QObject):
     def _on_idle_timeout(self) -> None:
         if self._busy:
             self._busy = False
+            self._last_reply_ts = time.time()
             self.activity_changed.emit(False)
         # the screen has settled (2 s quiet) — is it a prompt awaiting the user?
         self._scrape_waiting = self._screen_waiting()
