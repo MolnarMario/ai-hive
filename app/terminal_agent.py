@@ -364,6 +364,11 @@ class TerminalAgent(QObject):
         # clear from _set_status (stop/crash/exit) never overwrites it with a
         # non-reply moment. Transient like _last_output_ts -- never persisted.
         self._last_reply_ts: float | None = None
+        # False until the FIRST busy -> idle settle of the current launch has
+        # happened. See _on_idle_timeout: a --resume launch replays the whole
+        # past conversation as real output before it ever settles, and that
+        # one settle must not be mistaken for a fresh reply finishing NOW.
+        self._settled_once = False
         # latched "the plan limit cut this agent off" + the reset time its own
         # banner stated. Transient like the waiting flags — never persisted.
         self._limit_blocked = False
@@ -446,6 +451,7 @@ class TerminalAgent(QObject):
         self._limit_last_skip = None   # ...so a skip is reported again too
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
+        self._settled_once = False  # see _on_idle_timeout
         # a NON-resume start is a new conversation, so it gets a new pinned
         # identity (rotating also avoids --session-id colliding with an
         # existing transcript); a resume keeps its pin
@@ -516,6 +522,9 @@ class TerminalAgent(QObject):
         if self.spec.provider in ("claude", "gemini"):  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
         self._session_started = time.time()
+        # a restart is always a fresh, non-resumed conversation -- there is no
+        # replay to protect the first settle from (see _on_idle_timeout)
+        self._settled_once = True
         if self.is_pty:
             self._pty_buffer = []
             self._pty_bytes = 0
@@ -1388,8 +1397,21 @@ class TerminalAgent(QObject):
     def _on_idle_timeout(self) -> None:
         if self._busy:
             self._busy = False
-            self._last_reply_ts = time.time()
-            self.note_reply_settled()
+            # A --resume launch replays the WHOLE past conversation as real
+            # terminal output before it ever goes quiet, so the FIRST settle
+            # of a resumed launch is that replay finishing, not a fresh reply
+            # -- stamping it "now" is exactly the live-reported bug where
+            # reopening the app showed the CURRENT time next to the last
+            # reply instead of when it actually happened. Only that one
+            # settle is suppressed; every settle after it (including the
+            # very next one, moments later, once the user sends something
+            # new) is a genuine reply and stamps normally. A non-resumed
+            # launch has nothing to replay, so its first settle is real too.
+            replay_settle = self._resume_attempt and not self._settled_once
+            self._settled_once = True
+            if not replay_settle:
+                self._last_reply_ts = time.time()
+                self.note_reply_settled()
             self.activity_changed.emit(False)
         # the screen has settled (2 s quiet) — is it a prompt awaiting the user?
         self._scrape_waiting = self._screen_waiting()

@@ -440,6 +440,32 @@ this file is the invariants that must survive every change.
   `note_conversation_replaced()`, `TerminalCard._on_history_cleared` — same
   transient, never-persisted contract (`reply_marks_changed` must never
   reach a save) for the same reason: the transcript is the durable record.
+- **The first busy->idle settle of a resumed launch is a REPLAY finishing,
+  not a reply** (`TerminalAgent._settled_once`, checked in
+  `_on_idle_timeout` alongside `_resume_attempt`). A `--resume` launch
+  replays the WHOLE past conversation as real terminal output before the
+  screen ever goes quiet, and that replay settling looks EXACTLY like a
+  fresh reply ending to `_on_idle_timeout` — which used to stamp
+  `_last_reply_ts`/mint a `ReplyMark` unconditionally on every busy->idle
+  edge. Live-reported: reopening the app always showed the CURRENT time
+  next to the last reply (both the header badge and every inline mark),
+  never the actual historical one, because the resume-replay settle fired
+  the instant the app finished redrawing — i.e. "now", at launch time.
+  `_settled_once` (reset `False` in `start()` whenever `spec.resume` was
+  true, forced `True` in `restart()` since a restart is always a fresh,
+  non-resumed conversation with nothing to replay) suppresses ONLY that one
+  settle per launch; the very next settle — a genuine new reply — stamps
+  normally, and a non-resumed launch is never suppressed at all since it has
+  no replay to protect against. `activity_changed.emit(False)` still fires
+  unconditionally on the suppressed settle (the busy/idle UI state itself is
+  still correct); only the reply-time SIDE EFFECTS are skipped. This also
+  means a resumed conversation's PAST turns get no inline `ReplyMark` at
+  all (there is no transcript-backed recovery for reply marks, unlike
+  `PromptMark`'s `_recover_marks` — deliberately out of scope, since a
+  resumed reply has no reliable "settle" position to recover a line from
+  anyway) — only turns replied to AFTER the current launch get inline
+  stamps, which is correct: a stamp for a turn nobody watched settle would
+  be a guess, not a reading.
 - **A width change RE-PROJECTS the scrollback** (`TerminalCard.
   _reproject_on_size`). pyte does not reflow: a history line keeps the column
   count it had when it was pushed. That was invisible while Claude owned its

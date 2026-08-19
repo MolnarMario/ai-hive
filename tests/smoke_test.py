@@ -3089,6 +3089,61 @@ def test_agent_last_reply_at():
     a.dispose()
 
 
+def test_reply_settle_skips_resume_replay():
+    """A --resume launch replays the WHOLE past conversation as real output
+    before it ever goes quiet, so the FIRST busy -> idle settle of a resumed
+    launch is that replay finishing, not a fresh reply -- live-reported bug:
+    reopening the app always showed the CURRENT time next to the last reply
+    (both the header badge and an inline mark), never the actual historical
+    one, because that replay settle stamped "now" unconditionally. Only that
+    one settle is skipped; the very next one (a genuine new reply) stamps
+    normally, and a non-resumed launch -- nothing to replay -- is never
+    suppressed at all."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.process_worker import AgentKind, build_spec
+
+    QApplication.instance() or QApplication([])
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ResumeSettle", cwd=".",
+                                 pty=True))
+    a.status = AgentStatus.RUNNING
+    a._resume_attempt = True          # simulate a --resume launch
+    a._settled_once = False
+
+    # the resume replay arrives as real output, then falls quiet
+    a._on_pty_output("pty", "...replayed conversation...")
+    a._on_idle_timeout()
+    check("reply-settle: a resume's replay settle is NOT a reply",
+          a.last_reply_at() is None, a.last_reply_at())
+    check("reply-settle: ...and records no inline milestone either",
+          a.reply_marks() == [], a.reply_marks())
+    check("reply-settle: ...but 'settled once' is now true", a._settled_once)
+
+    # the NEXT settle is a genuine reply and stamps normally
+    a._on_pty_output("pty", "a real new reply")
+    before = time.time()
+    a._on_idle_timeout()
+    stamped = a.last_reply_at()
+    check("reply-settle: the settle AFTER the replay stamps normally",
+          stamped is not None and before - 1 <= stamped <= time.time() + 1)
+    check("reply-settle: ...and records an inline milestone too",
+          len(a.reply_marks()) == 1, a.reply_marks())
+
+    # a non-resumed launch has nothing to replay, so its first settle is real
+    b = TerminalAgent(build_spec(AgentKind.CLAUDE, "FreshSettle", cwd=".",
+                                 pty=True))
+    b.status = AgentStatus.RUNNING
+    check("reply-settle: a fresh (non-resume) launch is never suppressed",
+          not b._resume_attempt)
+    b._on_pty_output("pty", "first reply ever")
+    b._on_idle_timeout()
+    check("reply-settle: ...so its first settle stamps immediately",
+          b.last_reply_at() is not None)
+
+    a.dispose()
+    b.dispose()
+
+
 def test_reply_time_card_ui():
     """The card header's #CardReplyTime label mirrors last_reply_at() LIVE,
     off the same activity_changed edge the status glyph already reacts to
@@ -11100,6 +11155,7 @@ def main():
     test_new_agent_autofocus()
     test_agent_busy_activity()
     test_agent_last_reply_at()
+    test_reply_settle_skips_resume_replay()
     test_reply_time_card_ui()
     test_ansi()
     test_terminal_keys()
