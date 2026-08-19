@@ -146,8 +146,7 @@ def test_sidebar_count_badge():
     """The workspace row leads with an agent-count badge that also signals
     status by colour: green when agents are alive but idle, pulsing amber when
     any agent works (amber wins if something also errors), red on error, dim
-    when empty. A right-edge spinner mirrors the working count (hidden at 0).
-    Folder/delete show ONLY on hover, never merely because the row is active."""
+    when empty. A right-edge spinner mirrors the working count (hidden at 0)."""
     from PySide6.QtCore import QAbstractAnimation
     from PySide6.QtWidgets import QApplication
     from app.widgets.ornaments import AgentCountBadge
@@ -205,33 +204,21 @@ def test_sidebar_count_badge():
           == QAbstractAnimation.State.Running,
           (row.work_spinner.isHidden(), row.work_spinner._count))
 
-    # folder/delete are hover-only: activating the row must NOT reveal them.
-    # Use isHidden() (explicit show/hide intent) not isVisible() — the row has
-    # no shown ancestor here, so isVisible() would be False either way.
+    # even with every status badge lit at once, none of them may be hidden to
+    # make room — only the name label may shrink (down to 0 width; it has no
+    # minimum), so icons are never squeezed out or collapsed behind a "..."
+    # overflow.
     row.set_active(True)
-    check("row: active row does not show folder/delete (hover-only)",
-          row.folder_btn.isHidden() and row.delete_btn.isHidden(),
-          (row.folder_btn.isHidden(), row.delete_btn.isHidden()))
-    row._update_hover_buttons(hovered=True)
-    check("row: hover reveals folder/delete",
-          not row.folder_btn.isHidden() and not row.delete_btn.isHidden())
-
-    # even with hover buttons up AND every status badge lit at once, none of
-    # them may be hidden to make room — only the name label may shrink (down
-    # to 0 width; it has no minimum), so icons are never squeezed out or
-    # collapsed behind a "..." overflow.
     row.set_stats({"total": 3, "active": 3, "busy": 2, "error": 0,
                    "waiting": 1, "idle": 0, "limit_blocked": 1,
                    "scheduled": 1, "bg_shell": 1})
     check("row: name label has no minimum width (can shrink to 0 for icons)",
           row.name_label.minimumWidth() == 0, row.name_label.minimumWidth())
-    check("row: every badge stays visible with hover buttons also up",
-          not row.folder_btn.isHidden() and not row.delete_btn.isHidden()
-          and not row.q_badge.isHidden() and not row.limit_badge.isHidden()
+    check("row: every badge stays visible",
+          not row.q_badge.isHidden() and not row.limit_badge.isHidden()
           and not row.sched_badge.isHidden() and not row.bg_badge.isHidden()
           and not row.work_spinner.isHidden(),
-          (row.folder_btn.isHidden(), row.delete_btn.isHidden(),
-           row.q_badge.isHidden(), row.limit_badge.isHidden(),
+          (row.q_badge.isHidden(), row.limit_badge.isHidden(),
            row.sched_badge.isHidden(), row.bg_badge.isHidden(),
            row.work_spinner.isHidden()))
 
@@ -247,8 +234,7 @@ def test_sidebar_count_badge():
     # sizeHint() directly, since sizeHint() and the post-layout width are not
     # bit-identical on every platform/DPI -- what must hold is that the row
     # being narrow changes nothing.
-    badges = (row.folder_btn, row.delete_btn, row.sched_badge,
-              row.limit_badge, row.bg_badge)
+    badges = (row.sched_badge, row.limit_badge, row.bg_badge)
     row.setGeometry(0, 0, 2000, ROW_HEIGHT)
     row.layout().activate()
     row._position_icon_stack()
@@ -264,7 +250,6 @@ def test_sidebar_count_badge():
         check(f"row: {btn.objectName()} keeps its full width when the row "
               "is squeezed to the real sidebar width (never elided to '...')",
               btn.width() == roomy_w, (btn.objectName(), btn.width(), roomy_w))
-    row._update_hover_buttons(hovered=False)
 
     # "?" waiting indicator: hidden when nobody waits, shown otherwise; clicking
     # it opens the agent dropdown (agentsRequested)
@@ -861,28 +846,39 @@ def test_bg_shell_kill_extras():
 
 
 def test_chime_persistence():
-    """The top-bar chime toggle flips its glyph + emits soundToggled, and the
-    on/off preference round-trips through the session ui state."""
+    """The chime switch flips its glyph + emits soundToggled, and the on/off
+    preference round-trips through the session ui state.
+
+    The switch lives in the Options panel as a real track-and-thumb
+    `ToggleSwitch` (green/slid-right when armed, grey/slid-left when off),
+    label at `sound_label` and switch at `sound_btn`, `isChecked()` mirroring
+    the state the thumb is drawn in. The bell/muted-bell glyph is still in
+    the label, so the state is readable two ways."""
     from PySide6.QtWidgets import QApplication
     from app.widgets.main_window import TopBar
 
     QApplication.instance() or QApplication([])
     bar = TopBar()
-    check("chime toggle: defaults to ON (bell glyph)",
-          bar._sound_on and bar.sound_btn.text() == "\U0001F514")
+    check("chime toggle: defaults to ON (bell glyph, lit)",
+          bar._sound_on and bar.sound_btn.isChecked()
+          and "\U0001F514" in bar.sound_label.text()
+          and "Notification chime" in bar.sound_label.text(),
+          bar.sound_label.text())
     emitted = []
     bar.soundToggled.connect(emitted.append)
     bar.sound_btn.click()
     check("chime toggle: click mutes + emits False + shows muted glyph",
           emitted == [False] and not bar._sound_on
-          and bar.sound_btn.text() == "\U0001F515", (emitted, bar._sound_on))
+          and "\U0001F515" in bar.sound_label.text()
+          and not bar.sound_btn.isChecked(), (emitted, bar._sound_on))
     bar.sound_btn.click()
     check("chime toggle: click again re-enables + emits True",
           emitted == [False, True] and bar._sound_on, emitted)
     # set_sound_enabled reflects state WITHOUT re-emitting (restore path)
     bar.set_sound_enabled(False)
     check("chime toggle: set_sound_enabled updates glyph, no emit",
-          not bar._sound_on and emitted == [False, True])
+          not bar._sound_on and emitted == [False, True]
+          and not bar.sound_btn.isChecked())
     bar.deleteLater()
 
 
@@ -1564,6 +1560,64 @@ def test_agent_card_reorder():
     mgr.reorder_agents(w.id, [ags[2].id, ags[0].id, ags[1].id])  # same order
     check("mgr reorder_agents: an unchanged order does not re-dirty",
           dirty == [])
+
+
+def test_workspace_header():
+    """The workspace header bar owns Open folder / Change… / Delete (not
+    duplicated as sidebar hover buttons any more) — delete sits LEFT of open,
+    matching the sidebar's old left-to-right order — and the path shows the
+    FULL text whenever it fits, eliding only the overflow the header's own
+    buttons would otherwise be squeezed by."""
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.workspace_page import WorkspacePage
+    from app.workspace_manager import Workspace
+
+    app = QApplication.instance() or QApplication([])
+    long_path = "C:/Users/someone/Documents/Really/Deeply/Nested/Project/ai-hive"
+    ws = Workspace(id="w1", name="WS", project_path=long_path)
+    page = WorkspacePage(ws)
+
+    order = [page._header_lay.itemAt(i).widget()
+             for i in range(page._header_lay.count())]
+    order = [w for w in order if w is not None]
+    idx_delete = order.index(page.delete_btn)
+    idx_open = order.index(page.open_btn)
+    idx_change = order.index(page.change_btn)
+    check("workspace header: delete sits left of open folder, open left of "
+          "change",
+          idx_delete < idx_open < idx_change,
+          (idx_delete, idx_open, idx_change))
+
+    deleted = []
+    page.deleteRequested.connect(deleted.append)
+    page.delete_btn.click()
+    check("workspace header: delete button emits deleteRequested(ws_id)",
+          deleted == ["w1"], deleted)
+
+    # a wide window has room for the full path plus every button
+    page.resize(1600, 200)
+    page.show()
+    app.processEvents()
+    check("workspace header: a wide window shows the FULL path, not "
+          "truncated to a stub with empty space beside it",
+          page.path_label.text() == long_path, page.path_label.text())
+
+    # a narrow window does not have room for the buttons AND the full path;
+    # the path must give way rather than overlap/squeeze the buttons
+    page.resize(260, 200)
+    app.processEvents()
+    check("workspace header: a narrow window elides the path instead of "
+          "overlapping the buttons",
+          page.path_label.text() != long_path, page.path_label.text())
+
+    # growing back out restores the full path (not stuck at the smaller
+    # elision like the old self-referential width computation)
+    page.resize(1600, 200)
+    app.processEvents()
+    check("workspace header: the full path comes back once there is room "
+          "again",
+          page.path_label.text() == long_path, page.path_label.text())
+    page.deleteLater()
 
 
 def test_sidebar_categories():
@@ -3117,8 +3171,6 @@ def test_app():
     check("ws: Alpha row is active",
           win.sidebar._rows[alpha.id][1].property("active") is True
           and win.sidebar._rows[bravo.id][1].property("active") is False)
-    check("ws: breadcrumb shows active workspace",
-          "Alpha" in win.top_bar.breadcrumb.text())
 
     # remove the default idle agent so the tiling count starts at 0
     mgr.remove_terminal(alpha.id, alpha.agents[0].id)
@@ -7753,9 +7805,12 @@ def test_usage_trackers_preference():
     # no Claude login hides the recovery switches, but NEVER the picker: a
     # Gemini-only user would otherwise have no control at all
     bar.set_recovery_available(False)
-    check("usage-trackers: no-Claude hides the recovery row, not the picker",
-          not bar.recovery_label.isVisible()
-          and not bar.recover_btn.isVisible()
+    # isVisibleTo(options_panel), NOT isVisible(): the two switches live in
+    # the Options popup, which is closed here, so isVisible() is False for
+    # every one of them and the assertion would pass while testing nothing.
+    check("usage-trackers: no-Claude hides the recovery rows, not the picker",
+          not bar.recover_btn.isVisibleTo(bar.options_panel)
+          and not bar.resume_btn.isVisibleTo(bar.options_panel)
           and bar.usage_add_btn.isVisible())
     bar.set_recovery_available(True)
 
@@ -10681,7 +10736,9 @@ def main():
     test_recovered_prompts_are_cached()
     test_multi_agent_session_isolation()
     test_usage_pill_geometry_and_close()
+    test_options_panel()
     test_topbar_extras_autosize()
+    test_topbar_extras_grow_with_window()
     test_scheduled_send()
     test_cli_auto_update()
     test_cli_native_migration()
@@ -10892,6 +10949,262 @@ def test_topbar_extras_autosize():
               bar.usage_weekly_badge.geometry()),
           (bar.usage_badge.geometry(), bar.usage_weekly_badge.geometry()))
     bar.deleteLater()
+
+
+def test_options_panel():
+    """Every top-bar SETTING lives in one anchored Options popup.
+
+    The bar is a 42px strip and it lost the argument with its own contents.
+    Five successive attempts rearranged the same fourteen widgets inside it and
+    it was still too small; the scrolling row's answer to running out of room
+    is to slide a control out of view with no affordance saying it did. So the
+    settings moved out, and only the glanceable readouts and the two primary
+    actions keep permanent space.
+
+    What is checked here is the whole contract of that move: the bar keeps
+    exactly the right widgets, the panel owns the rest, every switch still
+    emits its own signal and every `set_*` reflector still reflects WITHOUT
+    emitting (the restore path depends on that - eight saves would fire at
+    launch otherwise), and the placement is clamped so the panel cannot open
+    off the edge of the window or the screen.
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QToolButton
+    from app import ui_theme
+    from app.widgets.main_window import TopBar
+    from app.widgets.ornaments import anchored_popup_pos
+
+    app = QApplication.instance() or QApplication([])
+    app.setStyleSheet(ui_theme.build_qss())
+    bar = TopBar()
+    bar.resize(1400, 42)
+    bar.show()
+    app.processEvents()
+    panel = bar.options_panel
+
+    # --- 1. what stayed on the bar, and what left ------------------------
+    row = bar._extras.layout()
+    on_row = [row.itemAt(i).widget() for i in range(row.count())]
+    check("options: the bar's scrolling row is now the four pills and the +",
+          on_row == [bar.usage_badge, bar.usage_weekly_badge, bar.gemini_badge,
+                     bar.gemini_weekly_badge, bar.usage_add_btn],
+          [w.objectName() or type(w).__name__ for w in on_row])
+    moved = [bar.recover_btn, bar.resume_btn, bar.sound_btn, bar.taskbar_btn,
+             bar.auto_update_btn, bar.updates_manage_btn, bar.install_label,
+             bar.update_pill, bar.theme_select, bar.font_dec_btn,
+             bar.font_inc_btn]
+    check("options: every setting is parented to the panel, not the bar",
+          all(w.parent() is panel for w in moved),
+          [type(w).__name__ for w in moved if w.parent() is not panel])
+    check("options: the two essential actions stay pinned on the bar",
+          bar.toggle_btn.parent() is bar
+          and bar.add_terminal_btn.parent() is bar
+          and bar.options_btn.parent() is bar)
+
+    # --- 2. the panel is a real popup, built once ------------------------
+    # NOT a QMenu: a QWidgetAction DELETES its reparented widget on release,
+    # which crashed the earlier overflow design, and a widget parked in an
+    # unopened menu genuinely is not isVisible(), which broke every visibility
+    # assertion in this suite. A plain Qt.Popup has neither problem.
+    check("options: the panel is a Qt.Popup window",
+          bool(panel.windowFlags() & Qt.WindowType.Popup))
+    check("options: it is not delete-on-close (its children carry state)",
+          not panel.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose))
+    bar.options_btn.click()
+    app.processEvents()
+    check("options: clicking the button opens it", panel.isVisible())
+    same = bar.options_panel
+    panel.hide()
+    app.processEvents()
+    bar.options_btn.click()
+    app.processEvents()
+    check("options: reopening reuses the SAME panel, never a rebuild",
+          bar.options_panel is same and panel.isVisible())
+    panel.hide()
+
+    # --- 3. every switch: click emits, set_* reflects and stays silent ----
+    # Each row is a real track-and-thumb ToggleSwitch (green/slid-right when
+    # armed, grey/slid-left when off) plus a separate plain-words QLabel -
+    # this replaced a whole-row button whose own text carried an LED glyph,
+    # which read as a clickable link rather than a switch.
+    cases = [
+        ("startup recovery", bar.recover_btn, bar.recover_label,
+         bar.startupRecoveryToggled, bar.set_startup_recovery,
+         bar.startup_recovery, True),
+        ("auto continue", bar.resume_btn, bar.resume_label,
+         bar.autoContinueToggled, bar.set_auto_continue,
+         bar.auto_continue, True),
+        ("chime", bar.sound_btn, bar.sound_label,
+         bar.soundToggled, bar.set_sound_enabled,
+         lambda: bar._sound_on, True),
+        ("taskbar count", bar.taskbar_btn, bar.taskbar_label,
+         bar.taskbarBadgeToggled, bar.set_taskbar_badge,
+         lambda: bar._taskbar_badge, True),
+        ("cli updates", bar.auto_update_btn, bar.auto_update_label,
+         bar.autoUpdateToggled, bar.set_auto_update,
+         bar.auto_update, False),
+    ]
+    for name, btn, _label, signal, setter, getter, default in cases:
+        seen = []
+        signal.connect(seen.append)
+        check(f"options: {name} starts at its documented default",
+              getter() is default and btn.isChecked() is default,
+              (getter(), btn.isChecked()))
+        btn.click()
+        check(f"options: clicking {name} flips it and emits the new value",
+              seen == [not default] and getter() is (not default)
+              and btn.isChecked() is (not default), (name, seen, getter()))
+        setter(default)
+        check(f"options: set_* for {name} reflects without re-emitting",
+              seen == [not default] and getter() is default
+              and btn.isChecked() is default, (name, seen))
+        signal.disconnect(seen.append)
+
+    # every row says what it does in words, not in a glyph the tooltip
+    # explains - that was the whole reason for leaving the 42px strip
+    labels = ["Recover at start-up", "Resume on usage reset",
+              "Notification chime", "Taskbar count",
+              "Check for CLI updates at start-up"]
+    check("options: every switch is labelled in plain words",
+          all(lab in label.text() for lab, (_n, _b, label, *_r)
+              in zip(labels, cases)),
+          [label.text() for _n, _b, label, *_r in cases])
+
+    # --- 4. the appearance rows still drive the same signals -------------
+    themed = []
+    bar.themeChanged.connect(themed.append)
+    ids = [bar.theme_select.itemData(i)
+           for i in range(bar.theme_select.count())]
+    other = [i for i in ids if i != bar.theme_select.currentData()][0]
+    bar.theme_select.setCurrentIndex(bar.theme_select.findData(other))
+    check("options: the theme row still emits themeChanged", themed == [other],
+          themed)
+    bar.set_theme(ids[0])
+    check("options: set_theme reflects without re-emitting",
+          themed == [other] and bar.theme_select.currentData() == ids[0])
+    deltas = []
+    bar.globalFontDelta.connect(deltas.append)
+    bar.font_dec_btn.click()
+    bar.font_inc_btn.click()
+    check("options: the font steppers still emit -1 / +1", deltas == [-1, 1],
+          deltas)
+
+    # --- 5. no Claude login hides the two recovery rows, nothing else -----
+    bar.set_recovery_available(False)
+    check("options: no-Claude hides the recovery rows inside the panel",
+          not bar.recover_btn.isVisibleTo(panel)
+          and not bar.resume_btn.isVisibleTo(panel)
+          and bar.sound_btn.isVisibleTo(panel)
+          and bar.usage_add_btn.isVisible())
+    bar.set_recovery_available(True)
+
+    # --- 6. the placement is clamped, same helper the layout palette uses -
+    # The Options button sits at the RIGHT end of a possibly-ultrawide bar, so
+    # left-anchoring a panel under it spills off the window on a narrow window
+    # and off the display on a wide one.
+    panel.adjustSize()
+    pos = anchored_popup_pos(bar.options_btn, panel.size())
+    screen = bar.screen() or QApplication.primaryScreen()
+    avail = screen.availableGeometry()
+    win = bar.window().geometry()
+    check("options: the panel opens inside the app window",
+          pos.x() >= min(win.x(), avail.x())
+          and pos.x() + panel.width()
+          <= max(win.x() + win.width(), avail.x() + avail.width()),
+          (pos.x(), panel.width(), win))
+    check("options: ...and on the screen",
+          pos.y() >= avail.y()
+          and pos.y() + panel.height() <= avail.y() + avail.height(),
+          (pos.y(), panel.height(), avail))
+
+    # --- 7. the bar can now shrink far further than it could -------------
+    check("options: the bar's minimum width is a small constant",
+          bar.minimumSizeHint().width() < 1000,
+          bar.minimumSizeHint().width())
+
+    # --- 8. one control per setting: no duplicate lives on the bar -------
+    bar_buttons = [w for w in bar.findChildren(QToolButton)
+                   if w.parent() is bar]
+    check("options: the bar itself carries exactly three buttons",
+          set(bar_buttons) == {bar.toggle_btn, bar.add_terminal_btn,
+                               bar.options_btn},
+          [w.objectName() for w in bar_buttons])
+    bar.deleteLater()
+
+
+def test_topbar_extras_grow_with_window():
+    """The extras row must take every pixel a wider window can give it.
+
+    `QAbstractScrollArea.sizeHint()` is a small constant unrelated to what is
+    inside it, so with the breadcrumb holding the layout's stretch the row
+    stayed frozen at that constant no matter how wide the window got -
+    identically on a 1280px laptop and a 3440px ultrawide, with most of the
+    bar's controls parked off-screen behind a permanent scrollbar (reported
+    live on a 1440p monitor). `_HWheelScrollArea.sizeHint()` reports the
+    content's real width instead, so the QHBoxLayout satisfies it before
+    handing the leftover to the breadcrumb.
+
+    Two properties are checked together because either one alone is
+    satisfiable by the wrong fix: the row GROWS with the window (a fixed-width
+    row fails), and the WINDOW's minimum stays a small constant (a row that
+    simply demands its full width fails - that is the >2000px minimum the
+    scroll area was introduced to remove).
+    """
+    from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
+    app = QApplication.instance() or QApplication([])
+    from app.widgets.main_window import TopBar
+
+    host = QWidget()
+    v = QVBoxLayout(host)
+    v.setContentsMargins(0, 0, 0, 0)
+    bar = TopBar(host)
+    v.addWidget(bar)
+    host.show()
+
+    # The row starts EMPTY - every usage pill is hidden until it has something
+    # to say - and an empty row is narrower than the scroll area's own floor,
+    # so nothing about growth is observable on it. Put all four pills into
+    # their loading state first, which is the state the bar is genuinely in a
+    # second after launch.
+    bar.mark_usage_loading()
+    app.processEvents()
+
+    # Sized RELATIVE to the row's own natural width rather than at fixed pixel
+    # widths: font metrics differ between the offscreen platform and a real
+    # screen, and a fixed 1280px is already roomy enough here that the row
+    # would sit at its full width for every sample and "growth" could not be
+    # observed at all.
+    # ...and OFFSET by the bar's own minimum, because the pinned chrome (the
+    # sidebar toggle, the identity block, Options, Add Terminal) is served
+    # before the row is: sampling below that floor measures three windows that
+    # all leave the row at its minimum, which says nothing about growth.
+    natural = bar._extras.sizeHint().width()
+    base = bar.minimumSizeHint().width()
+    narrow, mid, wide = (base + natural // 3, base + (natural * 2) // 3,
+                         base + natural * 2)
+
+    widths = {}
+    for w in (narrow, mid, wide):
+        host.resize(w, 120)
+        app.processEvents()
+        widths[w] = bar._extras_scroll.width()
+
+    check("topbar-grow: the extras row widens as the window does",
+          widths[narrow] < widths[mid] < widths[wide], widths)
+    check("topbar-grow: a wide window fits the row's whole natural width",
+          widths[wide] >= natural, (widths[wide], natural))
+    check("topbar-grow: ...and then no scrollbar is needed",
+          not bar._extras_scroll.horizontalScrollBar().isVisible())
+
+    # the scroll area's own minimum is what decides how narrow the WINDOW may
+    # be; it must stay a small constant rather than tracking the content
+    check("topbar-grow: the row's minimum stays a small constant",
+          bar._extras_scroll.minimumSizeHint().width() <= 120,
+          bar._extras_scroll.minimumSizeHint().width())
+    check("topbar-grow: so the whole bar still fits a laptop width",
+          bar.minimumSizeHint().width() < 1000,
+          bar.minimumSizeHint().width())
+    host.deleteLater()
 
 
 class _FakeCli:
@@ -11251,34 +11564,47 @@ def test_cli_auto_update():
           "installs it BEFORE any agent launches" in on_tip
           and "changes installed software" in off_tip)
 
-    # --- the toggle: default OFF, persisted, and now behind the panel ------
-    # The down-arrow OPENS the Updates panel rather than toggling: a one-time
-    # setup action does not earn a second button, so the preference is a
-    # checkbox inside. The signal that carries it is unchanged.
+    # --- the switch: default OFF, persisted, and its own Manage door ------
+    # On the bar there was room for ONE update control, so the button had to be
+    # the door to the Updates panel and the preference lived on a checkbox
+    # inside it. The Options panel has room for both, so the switch is a switch
+    # and `updates_manage_btn` is the door. That is not two controls for one
+    # setting: `open_updates_panel` drives BOTH from the panel's own signal.
     check("cli-update toggle: defaults to OFF (it installs software)",
           not bar.auto_update() and not bar.auto_update_btn.isChecked())
     emitted, opened = [], []
     bar.autoUpdateToggled.connect(emitted.append)
     bar.updatesPanelRequested.connect(lambda: opened.append(True))
     bar.auto_update_btn.click()
-    check("cli-update toggle: the button opens the Updates panel and changes "
-          "nothing by itself",
-          opened == [True] and emitted == [] and not bar.auto_update()
-          and not bar.auto_update_btn.isChecked())
-    bar.autoUpdateToggled.emit(True)      # what the panel's checkbox emits
-    bar.set_auto_update(True)
-    check("cli-update toggle: the preference still travels on autoUpdateToggled",
-          emitted == [True] and bar.auto_update())
+    check("cli-update toggle: the switch arms the gate and emits True",
+          emitted == [True] and opened == [] and bar.auto_update()
+          and bar.auto_update_btn.isChecked(), (emitted, opened))
+    bar.updates_manage_btn.click()
+    check("cli-update toggle: Manage opens the panel and changes no preference",
+          opened == [True] and emitted == [True] and bar.auto_update())
     bar.set_auto_update(False)
     check("cli-update toggle: set_auto_update does not re-emit",
-          emitted == [True] and not bar.auto_update())
+          emitted == [True] and not bar.auto_update()
+          and not bar.auto_update_btn.isChecked())
     bar.note_update_pending("")
     check("cli-update pill: hidden when there is nothing to report",
-          not bar.update_pill.isVisible())
+          not bar.update_pill.isVisibleTo(bar.options_panel)
+          and not bar.options_btn.property("attention"))
     bar.note_update_pending("something", "the long form")
     check("cli-update pill: shown with its tooltip when there is",
           bar.update_pill.text() == "something"
-          and bar.update_pill.toolTip() == "the long form")
+          and bar.update_pill.toolTip() == "the long form"
+          and bar.update_pill.isVisibleTo(bar.options_panel))
+    check("cli-update pill: it also lights the Options button, so a warning "
+          "behind a closed panel is not a secret",
+          bar.options_btn.property("attention") is True
+          and "something" in bar.options_btn.toolTip())
+    # the detected install method is stated in full under the switch, not
+    # crammed into a tooltip
+    bar.note_install_state("Claude Code, WinGet package")
+    check("cli-update: the install method is named under the switch",
+          bar.install_label.text() == "Claude Code, WinGet package"
+          and bar.install_label.isVisibleTo(bar.options_panel))
     bar.deleteLater()
 
     # --- 10. ui.auto_update round-trips, defaults False, no version bump ---
@@ -11321,7 +11647,8 @@ def test_cli_auto_update():
                                  detail="3 claude.exe alive", label="Claude Code")
     again.note_update_outcomes([blocked])
     check("cli-update: the gate's report reaches the top-bar pill",
-          again.top_bar.update_pill.isVisibleTo(again.top_bar)
+          again.top_bar.update_pill.isVisibleTo(
+              again.top_bar.options_panel)
           and "Claude Code" in again.top_bar.update_pill.text(),
           again.top_bar.update_pill.text())
     check("cli-update: reporting an outcome NEVER marks the session dirty "
@@ -11329,7 +11656,8 @@ def test_cli_auto_update():
           not again._save_timer.isActive())
     again.note_update_outcomes([cli_update.Outcome("claude", Status.UP_TO_DATE)])
     check("cli-update: a clean gate leaves the pill hidden",
-          not again.top_bar.update_pill.isVisibleTo(again.top_bar))
+          not again.top_bar.update_pill.isVisibleTo(
+              again.top_bar.options_panel))
 
     # --- 6.1: skipping while an install runs holds those agents back -------
     # `start` is stubbed rather than really called: the question is which

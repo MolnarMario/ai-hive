@@ -15,7 +15,8 @@ from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage,
                            QLinearGradient, QPainter, QPainterPath, QPen,
                            QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QLabel, QSizePolicy, QToolButton, QWidget
+from PySide6.QtWidgets import (QApplication, QComboBox, QLabel, QSizePolicy,
+                               QToolButton, QWidget)
 
 from .. import ui_theme
 from ..ui_theme import Palette
@@ -1299,6 +1300,85 @@ class ElidingLabel(QLabel):
                                    avail))
 
 
+class ToggleSwitch(QWidget):
+    """A track-and-thumb switch for the Options panel: green track with the
+    thumb slid right when armed, grey track with the thumb at the left when
+    off — the ordinary mobile-settings convention. Replaces the older
+    "whole-row button with an LED glyph" rows, which read as a clickable link
+    rather than a switch (reported live). `isChecked`/`setChecked`/`click`
+    mirror `QAbstractButton`'s so every existing caller (`.click()` in tests,
+    `setChecked` in `_refresh_*`) needed no change beyond the type; `clicked`
+    (no args) and `toggled(bool)` both fire on every click, matching
+    `QAbstractButton.clicked` and `.toggled` respectively."""
+
+    toggled = Signal(bool)
+    clicked = Signal()
+
+    _W, _H, _PAD = 34, 18, 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self._W, self._H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._checked = False
+        self._pos = 0.0  # 0..1 thumb travel, animated toward `_checked`
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(140)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on_anim)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, on: bool) -> None:
+        on = bool(on)
+        if on == self._checked:
+            return
+        self._checked = on
+        self._anim.stop()
+        self._anim.setStartValue(self._pos)
+        self._anim.setEndValue(1.0 if on else 0.0)
+        self._anim.start()
+
+    def _on_anim(self, value) -> None:
+        self._pos = float(value or 0.0)
+        self.update()
+
+    def click(self) -> None:
+        self.setChecked(not self._checked)
+        self.clicked.emit()
+        self.toggled.emit(self._checked)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.click()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        off = QColor(Palette.BORDER)
+        on = QColor(Palette.GREEN)
+        t = self._pos
+        track = QColor(
+            int(off.red() + (on.red() - off.red()) * t),
+            int(off.green() + (on.green() - off.green()) * t),
+            int(off.blue() + (on.blue() - off.blue()) * t),
+        )
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track)
+        rect = QRectF(0, 0, self.width(), self.height())
+        radius = rect.height() / 2
+        p.drawRoundedRect(rect, radius, radius)
+        d = self.height() - self._PAD * 2
+        x = self._PAD + (self.width() - d - self._PAD * 2) * t
+        p.setBrush(QColor("#ffffff"))
+        p.drawEllipse(QRectF(x, self._PAD, d, d))
+        p.end()
+
+
 class OrnamentDivider(QWidget):
     """A thin gilt rule with a centered fleuron — a manuscript section break."""
 
@@ -1324,3 +1404,77 @@ class OrnamentDivider(QWidget):
         p.setPen(QColor(Palette.ACCENT_GOLD))
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._glyph)
         p.end()
+
+
+def anchored_popup_pos(anchor, size):
+    """Where to put a popup dropped under `anchor`, kept inside the app window
+    AND the screen.
+
+    Extracted from `GridButton._popup_position` so the top bar's Options panel
+    reuses the same rules rather than growing a second, subtly different copy.
+    Both callers share the shape of the problem: the button sits at the RIGHT
+    end of a wide strip, so left-anchoring a panel under it spills past the
+    window's right edge on a narrow window and off the display on a wide one.
+
+    Overflow right -> right-align to the button (the panel grows leftward, back
+    into the window); overflow bottom -> flip above it. The bound is the
+    INTERSECTION of the window and the screen's available geometry, so neither
+    a window pushed off-screen nor a taskbar can strand the panel.
+    """
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication
+
+    w, h = size.width(), size.height()
+    bl = anchor.mapToGlobal(anchor.rect().bottomLeft())
+    br = anchor.mapToGlobal(anchor.rect().bottomRight())
+    tl = anchor.mapToGlobal(anchor.rect().topLeft())
+    screen = anchor.screen() or QApplication.primaryScreen()
+    avail = screen.availableGeometry()
+    win = anchor.window().geometry()  # client area in global coords
+    left = max(avail.x(), win.x())
+    top = max(avail.y(), win.y())
+    right = min(avail.x() + avail.width(), win.x() + win.width())
+    bottom = min(avail.y() + avail.height(), win.y() + win.height())
+    x = bl.x()
+    if x + w > right:
+        x = br.x() - w                        # right-align under the button
+    x = max(left, min(x, right - w))
+    y = bl.y()
+    if y + h > bottom:
+        y = tl.y() - h                        # flip above the button
+    y = max(top, min(y, bottom - h))
+    return QPoint(x, y)
+
+
+class DropDownComboBox(QComboBox):
+    """A `QComboBox` whose popup always opens directly under it.
+
+    Qt's native combo popup aligns the CURRENTLY SELECTED row with the box
+    (so the list can land above, below, or straddling it depending on which
+    item happens to be picked) - normal for a native OS combo, but every combo
+    here is styled to read as an ordinary list-style dropdown, where that
+    reads as the menu jumping around each time the selection changes (live-
+    reported on the theme selector). `showPopup` lets Qt do its own layout and
+    sizing, then repositions just the popup window's top-left corner under the
+    box afterwards, so nothing about the list itself (size, scroll position)
+    changes. Clamped to the SCREEN only, not `anchored_popup_pos`'s window
+    bound: a combo living inside another `Qt.Popup` (the Options panel) has a
+    tiny host window, and bounding the list to it would truncate a dropdown
+    taller than that panel.
+    """
+
+    def showPopup(self) -> None:
+        super().showPopup()
+        popup = self.view().window()
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        bl = self.mapToGlobal(self.rect().bottomLeft())
+        tl = self.mapToGlobal(self.rect().topLeft())
+        w, h = popup.width(), popup.height()
+        x = min(bl.x(), avail.x() + avail.width() - w)
+        x = max(avail.x(), x)
+        y = bl.y()
+        if y + h > avail.y() + avail.height():
+            y = tl.y() - h                    # flip above when short on room
+        y = max(avail.y(), y)
+        popup.move(x, y)

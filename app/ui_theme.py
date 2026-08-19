@@ -343,7 +343,6 @@ QMenu::indicator:checked {{
     border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 1px 6px; font-size: 11px;
 }}
-#Breadcrumb {{ color: {p.TEXT_DIM}; }}
 #ThemeSelect {{
     background: {p.BG_INPUT}; border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 2px 8px; color: {p.TEXT}; font-size: 11px;
@@ -390,12 +389,6 @@ WorkspaceRow[search_hit="true"] {{
     background: {p.BG_INPUT}; border: 1px solid {p.ACCENT_BLUE};
     border-radius: 2px; padding: 1px 4px; font-size: 16px;
 }}
-#WsFolderBtn {{
-    background: transparent; border: 1px solid transparent; border-radius: 3px;
-    padding: 2px 6px; color: {p.TEXT}; font-size: 17px; font-weight: 900;
-}}
-#WsFolderBtn:hover {{ background: {p.BG_HOVER}; color: {p.ACCENT_BLUE};
-                     border-color: {p.BORDER}; }}
 #WsTreeBtn {{
     background: transparent; border: 1px solid transparent; border-radius: 3px;
     padding: 2px 4px; color: {p.TEXT}; font-size: 15px; font-weight: 900;
@@ -682,13 +675,8 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     padding: 2px 7px; color: {p.TEXT_DIM}; font-weight: 700;
 }}
 #GlobalFontBtn:hover {{ border-color: {p.ACCENT_BLUE}; color: {p.TEXT}; }}
-#SoundToggle {{
-    background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
-    padding: 2px 6px; color: {p.TEXT}; font-size: 14px;
-}}
-#SoundToggle:hover {{ border-color: {p.ACCENT_GOLD}; }}
-/* caption naming the two auto-recovery switches below, so the LED pair
-   doesn't read as unlabeled decoration */
+/* dim caption text: the Updates panel's version/hint lines, and the Options
+   panel's detected-install-method line under its updates switch */
 #RecoveryLabel {{ color: {p.TEXT_DIM}; font-size: 12px; }}
 /* The X revealed inside a usage pill on hover, and the + that brings a closed
    pill back. These two are ordinary chrome, so QSS; the pill BODY around them
@@ -708,19 +696,41 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 #UsageTrackerAdd:hover {{
     background: {p.BG_HOVER}; border-color: {p.ACCENT_GOLD}; color: {p.TEXT};
 }}
-/* the two auto-recovery switches beside the plan-usage readout. Armed reads
-   as lit (accent border + full-strength glyph + green LED), off reads as
-   faint with a dark LED, so "will my work resume by itself?" is answerable
-   without hovering. */
-#RecoveryToggle {{
+/* ------------------------------------------------------ options panel --- */
+/* A Qt.Popup is a TOP-LEVEL window: it has no ancestor to inherit a background
+   from, and an unstyled one paints as an OS-native white rectangle over the
+   skin. This rule is load-bearing, not decoration (same trap the QMenu block
+   above documents). */
+#OptionsPanel {{
+    background: {p.BG_PANEL}; border: 1px solid {p.ACCENT_GOLD_DIM};
+    border-radius: 4px;
+}}
+#OptionsSection {{
+    color: {p.TEXT_DIM}; font-size: 11px; font-weight: 700;
+    letter-spacing: 0.8px;
+}}
+#OptionsRowLabel {{ color: {p.TEXT}; font-size: 12px; }}
+#OptionsSep {{ background: {p.BORDER}; border: none; max-height: 1px; }}
+/* secondary actions inside the panel (the Updates door) */
+#OptionsAction {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
-    padding: 2px 6px; color: {p.TEXT_FAINT}; font-size: 14px;
+    padding: 3px 10px; color: {p.TEXT_DIM}; font-size: 12px;
 }}
-#RecoveryToggle:checked {{
-    color: {p.ACCENT_GOLD}; border-color: {p.ACCENT_GOLD};
+#OptionsAction:hover {{
+    background: {p.BG_HOVER}; border-color: {p.ACCENT_GOLD}; color: {p.TEXT};
 }}
-#RecoveryToggle:hover {{
-    background: {p.BG_HOVER}; border-color: {p.ACCENT_BLUE}; color: {p.TEXT};
+/* the bar button that opens it. `attention` is set when the update pill inside
+   has something to report, because a warning parked behind a closed panel is
+   no warning at all. */
+#OptionsBtn {{
+    background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
+    padding: 3px 9px; color: {p.TEXT_DIM}; font-size: 12px;
+}}
+#OptionsBtn:hover {{
+    background: {p.BG_HOVER}; border-color: {p.ACCENT_GOLD}; color: {p.TEXT};
+}}
+#OptionsBtn[attention="true"] {{
+    border-color: {p.ACCENT_GOLD}; color: {p.ACCENT_GOLD};
 }}
 /* the startup update gate's report. Deliberately quiet: it exists so an
    update that could NOT apply is answerable at a glance, not to nag. */
