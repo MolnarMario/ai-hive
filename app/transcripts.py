@@ -52,6 +52,18 @@ _PROMPT_CACHE: dict[str, tuple[float, int, list]] = {}
 # cache for latest_model_effort: path -> (mtime, size, model, effort, mode).
 _MODEL_CACHE: dict[str, tuple[float, int, str, str, str]] = {}
 
+# cache for reply_times: path -> (mtime, size, [(epoch, final text), ...]).
+_REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
+
+# How much of the tail reply_times reads. Its consumers only ever ask about
+# replies that are still ON SCREEN -- the header badge wants the last one, and
+# the card can only anchor a stamp to a line the scrollback still holds
+# (bounded by REPLAY_PROJECT_CAP, i.e. a few turns) -- so scanning a multi-MB
+# conversation from the top would cost a great deal to produce entries nothing
+# can use. A full scan is the fallback for the rare case the tail holds no
+# finished reply at all (one enormous turn).
+_REPLY_TAIL_BYTES = 256 * 1024
+
 # How much of the tail latest_model_effort reads. It polls far more often than
 # the title/usage readers, so it must not re-scan a multi-MB conversation on
 # every write: both signals it wants (the last assistant record, the last
@@ -227,6 +239,106 @@ def _read_typed_prompts(path: str) -> list[str]:
         return list(cached[2]) if cached else []
     _PROMPT_CACHE[path] = (st.st_mtime, st.st_size, list(out))
     return out
+
+
+def reply_times(cwd: str, session_id: str) -> list[tuple[float, str]]:
+    """Every FINISHED reply in this conversation, oldest first, as
+    (epoch, final text).
+
+    The durable answer to "when was this answer actually generated". The live
+    signal cannot be: a reply time is stamped from the CLOCK at the busy -> idle
+    settle, so it only exists for turns THIS process watched finish. Reopen the
+    app and every past turn has no time at all -- which is what the user sees,
+    and reporting the current time for them instead (the bug `_settled_once`
+    fixed) was worse. Claude timestamps every record it writes, so the
+    transcript knows what no live observation can.
+
+    A finished reply is the LAST assistant record carrying text before the next
+    real user turn -- not every assistant text record, because a turn narrates
+    between its tool calls ("Now bump __version__...") and those are mid-reply,
+    not the end of one. Tool RESULTS come back as `user` records and are
+    therefore not a boundary; everything else from the user side is (a typed
+    prompt, a delivered task, a slash command's stdout), and flushing on those
+    is right either way, since the reply had plainly finished before it.
+
+    Sub-agent sidechains are skipped (they are not this conversation's replies)
+    and so is a record with no usable timestamp -- a stamp reading 1970 is worse
+    than no stamp. Tail-bounded (see _REPLY_TAIL_BYTES) with a full-scan
+    fallback, cached by (mtime,size) like every other reader here. Never raises.
+    """
+    if not session_id or not cwd:
+        return []
+    return _read_reply_times(transcript_path(cwd, session_id))
+
+
+def latest_reply_at(cwd: str, session_id: str) -> float:
+    """Epoch seconds this conversation's most recent reply finished, or 0.0.
+    The header badge's source once a live reading is gone (see
+    TerminalAgent.last_reply_at); shares reply_times' cache, so asking for both
+    costs one read."""
+    times = reply_times(cwd, session_id)
+    return times[-1][0] if times else 0.0
+
+
+def _read_reply_times(path: str) -> list[tuple[float, str]]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    cached = _REPLY_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return list(cached[2])
+    try:
+        out = _scan_reply_times(_tail_lines(path, _REPLY_TAIL_BYTES))
+        if not out and st.st_size > _REPLY_TAIL_BYTES:
+            # one turn longer than the whole tail: pay for the full scan once,
+            # then the cache holds until the file changes
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                out = _scan_reply_times(fh)
+    except OSError:
+        return list(cached[2]) if cached else []
+    _REPLY_CACHE[path] = (st.st_mtime, st.st_size, list(out))
+    return out
+
+
+def _scan_reply_times(lines) -> list[tuple[float, str]]:
+    out: list[tuple[float, str]] = []
+    pending: tuple[float, str] | None = None
+    for line in lines:
+        if '"assistant"' not in line and '"user"' not in line:
+            continue    # cheap prefilter before the JSON parse
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue    # a partial last line while Claude is writing
+        if rec.get("isSidechain"):
+            continue    # a sub-agent's turn, not this conversation's
+        kind = rec.get("type")
+        if kind == "user":
+            if _is_tool_result(rec):
+                continue        # mid-turn: the reply has not finished yet
+            if pending is not None:
+                out.append(pending)
+                pending = None
+        elif kind == "assistant":
+            text = _message_text(rec).strip()
+            when = _record_epoch(rec)
+            if text and when:
+                pending = (when, text)   # only the LAST one ends the reply
+    if pending is not None:
+        out.append(pending)     # the conversation ends on a reply
+    return out
+
+
+def _is_tool_result(rec: dict) -> bool:
+    """True when a 'user' record is a tool's REPLY rather than a turn of its
+    own. These sit inside a reply (Claude calls a tool, reads the result, keeps
+    going), so they must not be read as the boundary that ends one."""
+    content = (rec.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return False
+    return any(b.get("type") == "tool_result" for b in content
+               if isinstance(b, dict))
 
 
 def ended_on_limit(cwd: str, session_id: str) -> tuple[bool, float, float]:

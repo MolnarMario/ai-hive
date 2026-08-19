@@ -62,6 +62,14 @@ REPLAY_SETTLE_MS = 300
 # that prompt's echo (see TerminalCard._recover_marks)
 _MARK_MATCH_CHARS = 28
 _MARK_WS_RE = re.compile(r"\s+")
+# markdown syntax and drawing glyphs the renderer paints rather than prints,
+# dropped from both sides of a reply match (see _norm_reply_line)
+_MARK_MD_RE = re.compile("[*`_#>❯•⏺─-╿]")
+# how much of the END of a reply's last line must be found on a scrollback row
+# to call it that reply's last row (see _reply_end_row). Shorter than the
+# prompt window: a wrapped line's final row holds only what spilled onto it,
+# which can be a few words.
+_REPLY_TAIL_CHARS = 16
 
 
 def _norm_line(text: str) -> str:
@@ -69,6 +77,53 @@ def _norm_line(text: str) -> str:
     sides of the milestone-recovery match are compared in."""
     return _MARK_WS_RE.sub(" ", text.replace(">", " ").replace("❯", " ")
                            .lower()).strip()
+
+
+def _norm_reply_line(text: str) -> str:
+    """_norm_line, plus the markdown the renderer eats. A reply is written as
+    markdown and PAINTED as styled text -- `code`, **bold** and heading hashes
+    arrive on screen as SGR runs with the syntax characters gone -- so matching
+    a transcript reply against a rendered line has to drop them from both
+    sides. Bullet and box glyphs go too: the renderer draws its own."""
+    return _MARK_WS_RE.sub(" ", _MARK_MD_RE.sub(" ", text).lower()).strip()
+
+
+def _last_content_line(text: str) -> str:
+    """The last line of a reply that has anything on it once normalized -- the
+    line that ends up at the bottom of that reply on screen."""
+    for line in reversed(text.splitlines()):
+        if _norm_reply_line(line):
+            return line
+    return ""
+
+
+def _reply_end_row(lines: list[str], tail: str, start: int) -> int | None:
+    """The blank row directly under where a reply ENDED, at or after `start`.
+
+    Two conditions, and each is load-bearing. The row must contain the TAIL of
+    the reply's last line -- not its head, because a long final line wraps and
+    only its last rendered row carries the tail, which is precisely the row the
+    reply ends on. And the row BELOW must be blank, which is what proves the
+    reply really ended there.
+
+    Both come from the same measured failure. pyte does not reflow, so a card
+    resized mid-session keeps BOTH renders of a reply in its scrollback, the
+    older one truncated wherever the redraw overwrote it. Matching the head
+    found that stale copy first and stamped 4 rows into it, i.e. the middle of
+    a paragraph. The tail is usually missing from a truncated copy, and the
+    blank-row test rejects it outright when it is not, so the scan simply walks
+    on to the real one.
+
+    The blank row is also the right place to draw: the stamp is painted into a
+    row's empty right-hand tail and skipped when the row's own content runs too
+    close to the edge (see TerminalView.paintEvent), so a full line of prose
+    would silently lose the very stamp this feature exists to show. Nothing
+    matching means no stamp -- the same contract reply_anchor_line() and the
+    paint-time skip already follow."""
+    for i in range(start, len(lines) - 1):
+        if tail in lines[i] and not lines[i + 1]:
+            return i + 1
+    return None
 
 
 def _format_reply_stamp(ts: float) -> str:
@@ -190,13 +245,17 @@ class TerminalCard(QFrame):
         # did not watch being typed (a restored conversation); recomputed on
         # every projection, never persisted
         self._recovered: list[tuple[int, str]] = []
-        # typed-prompt texts for _recover_marks, cached per conversation. The
+        # same, for reply-finished stamps: (absolute line, epoch)
+        self._recovered_replies: list[tuple[int, float]] = []
+        # typed-prompt texts for _recover_marks and finished-reply times for
+        # _recover_reply_marks, cached per conversation under ONE key. The
         # read is O(transcript) and a live transcript's mtime changes
         # constantly, so transcripts' own mtime cache never hits for exactly
         # the agents that matter. See _recover_marks for why re-reading within
         # one conversation cannot find anything the card doesn't already know.
         self._recover_key: tuple = ()
         self._recover_prompts: list[str] = []
+        self._recover_replies: list[tuple[float, str]] = []
         self.scroll_bar = None
         # the column count the scrollback was last projected at; a change means
         # every history line is wrapped for a screen that no longer exists
@@ -429,6 +488,9 @@ class TerminalCard(QFrame):
     def _wire(self) -> None:
         self.agent.status_changed.connect(self._on_status)
         self.agent.activity_changed.connect(self._on_activity)
+        # the reply time also moves when the manager's poll reads a NEWER one off
+        # the transcript, which is the only source a restored conversation has
+        self.agent.reply_time_changed.connect(self._refresh_reply_time)
         self._refresh_reply_time()
         self.agent.assignment_changed.connect(self._on_assignment)
         self.agent.role_changed.connect(self._on_role)
@@ -1086,6 +1148,7 @@ class TerminalCard(QFrame):
             self.terminal.feed(replay[pos:])
         if recover:
             self._recover_marks()
+            self._recover_reply_marks()
         self._refresh_marks()
         self._refresh_reply_marks()
 
@@ -1129,21 +1192,15 @@ class TerminalCard(QFrame):
             self._recover_key = key
             self._recover_prompts = transcripts.typed_prompts(
                 spec.cwd, spec.session_id)
+            self._recover_replies = transcripts.reply_times(
+                spec.cwd, spec.session_id)
         prompts = self._recover_prompts
         if not prompts:
             return
-        view = self.terminal
-        hist = list(view.screen.history.top)
-        cols = view.screen.columns
-        # history THEN the live screen: their absolute ids are contiguous
-        # (oldest + len(hist) == pushed), and a short conversation may not have
-        # scrolled anything off yet, so history alone would find nothing
-        rows = hist + [view.screen.buffer[r] for r in range(view.screen.lines)]
-        if not rows:
+        oldest, raw = self._scrollback_rows()
+        if not raw:
             return
-        oldest = view.history_pushed() - len(hist)
-        lines = [_norm_line("".join(ln[c].data or " " for c in range(cols)))
-                 for ln in rows]
+        lines = [_norm_line(t) for t in raw]
         heads = []
         for text in prompts:
             head = _norm_line(text)[:_MARK_MATCH_CHARS]
@@ -1158,6 +1215,71 @@ class TerminalCard(QFrame):
                     self._recovered.append((oldest + i, text))
                     at = i + 1
                     break
+
+    def _scrollback_rows(self) -> tuple[int, list[str]]:
+        """(absolute id of the first row, raw text of every row) across history
+        THEN the live screen. Their ids are contiguous (oldest + len(hist) ==
+        pushed) and a short conversation may not have scrolled anything off
+        yet, so history alone would find nothing. Shared by both recoveries so
+        they can never disagree about which line is which."""
+        view = self.terminal
+        hist = list(view.screen.history.top)
+        cols = view.screen.columns
+        rows = hist + [view.screen.buffer[r] for r in range(view.screen.lines)]
+        oldest = view.history_pushed() - len(hist)
+        return oldest, ["".join(ln[c].data or " " for c in range(cols))
+                        for ln in rows]
+
+    def _recover_reply_marks(self) -> None:
+        """Find where each finished reply ENDED in a scrollback we did not
+        watch, and stamp those lines with the time the transcript says that
+        reply finished.
+
+        The counterpart of _recover_marks, and it exists for a sharper reason:
+        a reply mark is minted from a busy -> idle settle, so a conversation
+        restored from disk comes back with NONE, and the resume-replay
+        suppression (_settled_once) means a reopened hive shows no reply time
+        anywhere at all. The transcript is the only record of when those turns
+        actually finished.
+
+        MEASURED, and it shapes the anchor: Claude's own "<verb> for Ns" footer
+        -- what the LIVE mark anchors to -- does NOT survive per turn into the
+        scrollback. Across seven real captured screens at five widths, at most
+        ONE footer was still present in 2000 lines of history and usually none:
+        the renderer erases that region when the next turn starts. So a
+        recovered stamp is anchored to the reply's own last line instead, which
+        is committed output and stays put.
+
+        Matching keeps _recover_marks' discipline -- loose on the line side,
+        strict on the transcript side, first hit wins, the scan carries on
+        below so replies match in file order -- and differs in two ways that
+        _reply_end_row explains: it matches the TAIL of a reply's last line
+        rather than its head, and markdown syntax is dropped from both sides,
+        because the renderer restyles `code`/**bold** rather than printing the
+        characters. The worst case is failing to LOCATE a reply, never
+        inventing a time for one."""
+        self._recovered_replies = []
+        spec = self.agent.spec
+        if not self.is_pty or spec.provider != "claude":
+            return
+        if not self._recover_replies:
+            return
+        oldest, raw = self._scrollback_rows()
+        if not raw:
+            return
+        lines = [_norm_reply_line(t) for t in raw]
+        at = 0
+        for when, text in self._recover_replies:
+            tail = _norm_reply_line(_last_content_line(text))[-_REPLY_TAIL_CHARS:]
+            if len(tail) < 8:   # too short to identify a line safely
+                continue
+            row = _reply_end_row(lines, tail, at)
+            if row is None:
+                continue
+            self._recovered_replies.append((oldest + row, when))
+            # carry on BELOW this reply, so replies match in file order and a
+            # repeated closing line cannot claim an earlier reply's row
+            at = row + 1
 
     def _refresh_marks(self) -> None:
         """Push the agent's milestones to the view in THIS view's coordinates.
@@ -1193,8 +1315,10 @@ class TerminalCard(QFrame):
         """The scrollback was wiped under us (ED 3 / a reset), so every
         milestone anchored into it is meaningless."""
         self._mark_lines = {}
+        self._recovered = []
         self.agent.clear_prompt_marks()
         self._reply_mark_lines = {}
+        self._recovered_replies = []
         self.agent.clear_reply_marks()
 
     def _refresh_reply_marks(self) -> None:
@@ -1202,14 +1326,23 @@ class TerminalCard(QFrame):
         view's coordinates -- same shape as _refresh_marks. The stamp text is
         formatted at REFRESH time (not capture time), so a reply from
         yesterday keeps reading as date-prefixed today rather than freezing
-        whatever "same day" looked like the moment it was captured."""
+        whatever "same day" looked like the moment it was captured.
+
+        Live marks and transcript-recovered ones are merged the same way
+        _refresh_marks merges prompts: a live capture anchored the row it was
+        actually looking at, a recovered one was located by matching text, so
+        where both land on a line the live one wins."""
         if not self.is_pty:
             return
         by_uid = {m.uid: m for m in self.agent.reply_marks()}
-        pairs = [(line, _format_reply_stamp(by_uid[uid].ts))
-                 for uid, line in self._reply_mark_lines.items()
-                 if uid in by_uid]
-        self.terminal.set_reply_marks(sorted(pairs))
+        live = [(line, by_uid[uid].ts)
+                for uid, line in self._reply_mark_lines.items()
+                if uid in by_uid]
+        taken = {line for line, _ in live}
+        merged = live + [(line, when) for line, when in self._recovered_replies
+                         if line not in taken]
+        self.terminal.set_reply_marks(
+            sorted((line, _format_reply_stamp(when)) for line, when in merged))
 
     def _on_reply_mark_added(self) -> None:
         """A reply-finished milestone was recorded on the agent (or the set

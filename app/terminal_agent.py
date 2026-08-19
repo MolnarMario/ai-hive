@@ -286,6 +286,11 @@ class TerminalAgent(QObject):
     # transient contract as prompt_marks_changed -- never persisted, never
     # wired to a save.
     reply_marks_changed = Signal()
+    # the walltime shown for the agent's last finished reply changed -- either a
+    # live settle or the manager's transcript poll (see set_transcript_reply_at).
+    # A live reading exactly like activity_changed and the model chip: NEVER
+    # wire it to a save.
+    reply_time_changed = Signal()
     # the agent's live conversation was REPLACED (/clear, or a /resume onto a
     # different session), so the scrollback behind the current screen belongs
     # to a conversation that is no longer on display. Transient view signal.
@@ -364,6 +369,12 @@ class TerminalAgent(QObject):
         # clear from _set_status (stop/crash/exit) never overwrites it with a
         # non-reply moment. Transient like _last_output_ts -- never persisted.
         self._last_reply_ts: float | None = None
+        # the same walltime read off the TRANSCRIPT, which is the only source
+        # that survives a restart -- _last_reply_ts is stamped from the clock at
+        # a settle this process watched, so a resumed conversation has none for
+        # any of its past turns. Refreshed by the manager's poll; transient like
+        # the AI title, never persisted.
+        self._transcript_reply_ts: float | None = None
         # False until the FIRST busy -> idle settle of the current launch has
         # happened. See _on_idle_timeout: a --resume launch replays the whole
         # past conversation as real output before it ever settles, and that
@@ -525,6 +536,12 @@ class TerminalAgent(QObject):
         # a restart is always a fresh, non-resumed conversation -- there is no
         # replay to protect the first settle from (see _on_idle_timeout)
         self._settled_once = True
+        # ...and it has replied nothing yet, in either source. The new session
+        # id above points at a transcript that does not exist, so leaving the
+        # old reading in place would show the PREVIOUS conversation's time on a
+        # card that no longer has that conversation.
+        self._last_reply_ts = None
+        self._transcript_reply_ts = None
         if self.is_pty:
             self._pty_buffer = []
             self._pty_bytes = 0
@@ -630,6 +647,13 @@ class TerminalAgent(QObject):
             return
         self.clear_prompt_marks()
         self.clear_reply_marks()
+        # the reply time goes with them: it describes a turn of the conversation
+        # being replaced. The next poll re-reads it from the new transcript
+        # (which, after a /clear, has no reply in it yet).
+        if self._last_reply_ts is not None or self._transcript_reply_ts is not None:
+            self._last_reply_ts = None
+            self._transcript_reply_ts = None
+            self.reply_time_changed.emit()
         self.conversation_replaced.emit()
 
     def replay_marks(self) -> list:
@@ -1164,10 +1188,41 @@ class TerminalAgent(QObject):
         return self._busy
 
     def last_reply_at(self) -> float | None:
-        """Walltime (epoch seconds) the agent last finished a reply -- i.e.
-        the busy -> idle settle in _on_idle_timeout -- or None if it hasn't
-        replied yet this run. A live reading like is_busy(); never persisted."""
-        return self._last_reply_ts
+        """Walltime (epoch seconds) the agent last finished a reply, or None if
+        there is no evidence of one. A live reading like is_busy(); never
+        persisted.
+
+        TWO sources, and the later one wins. `_last_reply_ts` is the busy ->
+        idle settle in _on_idle_timeout: exact, instant, and only ever exists
+        for a turn THIS process watched finish. `_transcript_reply_ts` is read
+        off the conversation Claude wrote to disk, which is the only thing that
+        survives a restart -- so a resumed conversation, where the live source
+        has nothing at all, now reports when its last answer was REALLY
+        generated instead of hiding the badge.
+
+        max() rather than a preference for either: the settle lands a couple of
+        seconds after the record Claude wrote, so the live source wins the turn
+        in progress (no waiting for the next poll to see a reply that just
+        landed) and the transcript wins everything this run never saw."""
+        live, disk = self._last_reply_ts, self._transcript_reply_ts
+        if live and disk:
+            return max(live, disk)
+        return live or disk or None
+
+    def set_transcript_reply_at(self, ts: float) -> None:
+        """Adopt the finish time of this conversation's last reply as read from
+        the transcript (transcripts.latest_reply_at), refreshed by the manager's
+        poll. Transient -- never persisted, never marks the session dirty (same
+        rule as the AI title and the model chip); emits only when the walltime
+        the card would DISPLAY actually changes, so a poll over an idle agent is
+        free."""
+        ts = float(ts or 0.0)
+        if ts <= 0 or ts == self._transcript_reply_ts:
+            return
+        before = self.last_reply_at()
+        self._transcript_reply_ts = ts
+        if self.last_reply_at() != before:
+            self.reply_time_changed.emit()
 
     def is_bg_shell_busy(self) -> bool:
         """True when the agent itself is quiet (not is_busy()) but a
@@ -1412,6 +1467,7 @@ class TerminalAgent(QObject):
             if not replay_settle:
                 self._last_reply_ts = time.time()
                 self.note_reply_settled()
+                self.reply_time_changed.emit()
             self.activity_changed.emit(False)
         # the screen has settled (2 s quiet) — is it a prompt awaiting the user?
         self._scrape_waiting = self._screen_waiting()

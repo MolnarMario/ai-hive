@@ -3144,6 +3144,128 @@ def test_reply_settle_skips_resume_replay():
     b.dispose()
 
 
+def test_transcript_reply_times():
+    """transcripts.reply_times reads when each reply ACTUALLY finished out of
+    the conversation on disk -- the only source that survives a restart, since
+    the live stamp is minted from the clock at a settle this process watched.
+
+    The shape that matters: a turn narrates BETWEEN its tool calls, so only the
+    LAST assistant text before the next real user turn is a finished reply, and
+    a tool RESULT (a user record) sits inside a turn rather than ending one."""
+    import datetime as _dt
+    import json
+    import tempfile
+
+    from app import transcripts
+
+    def rec(**kw):
+        return json.dumps(kw)
+
+    stamp = "2026-08-19T12:%02d:00.000Z"
+
+    def at(minute):
+        return _dt.datetime.fromisoformat(
+            (stamp % minute).replace("Z", "+00:00")).timestamp()
+
+    lines = [
+        # turn 1: a prompt, a mid-turn narration, a tool call/result, the reply
+        rec(type="user", timestamp=stamp % 0, promptSource="typed",
+            message={"role": "user", "content": "do the thing"}),
+        rec(type="assistant", timestamp=stamp % 1,
+            message={"content": [{"type": "text", "text": "Looking now."}]}),
+        rec(type="user", timestamp=stamp % 2,
+            message={"content": [{"type": "tool_result", "content": "ok"}]}),
+        rec(type="assistant", timestamp=stamp % 3,
+            message={"content": [{"type": "text", "text": "Done, all green."}]}),
+        # a sub-agent's own turn must never count as this conversation's reply
+        rec(type="assistant", timestamp=stamp % 4, isSidechain=True,
+            message={"content": [{"type": "text", "text": "sidechain noise"}]}),
+        # turn 2
+        rec(type="user", timestamp=stamp % 5, promptSource="typed",
+            message={"role": "user", "content": "and again"}),
+        rec(type="assistant", timestamp=stamp % 6,
+            message={"content": [{"type": "text", "text": "Second reply."}]}),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "conv.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        got = transcripts._read_reply_times(path)
+
+    check("reply-times: one entry per FINISHED reply, not per assistant text",
+          len(got) == 2, got)
+    check("reply-times: a mid-turn narration is not a reply ending",
+          [t for _, t in got] == ["Done, all green.", "Second reply."], got)
+    check("reply-times: each carries the record's OWN timestamp",
+          [w for w, _ in got] == [at(3), at(6)], got)
+    check("reply-times: a tool result does not end a turn",
+          got[0][0] == at(3), got[0])
+    check("reply-times: a sidechain turn is skipped",
+          all("sidechain" not in t for _, t in got), got)
+
+    # a missing / unreadable transcript is "" rather than an exception
+    check("reply-times: no transcript -> empty, never raises",
+          transcripts.reply_times("C:/nope", "no-such-id") == [])
+    check("reply-times: latest_reply_at on nothing is 0.0",
+          transcripts.latest_reply_at("C:/nope", "no-such-id") == 0.0)
+
+
+def test_reply_time_survives_restart():
+    """The live reply stamp only exists for turns THIS process watched settle,
+    so a resumed conversation had none at all and the header badge simply
+    vanished -- the live complaint ("if i open the app, i only get to see the
+    current time instead of when the answer was actually generated", then
+    nothing at all once the resume-replay stamp was suppressed). The transcript
+    reading fills exactly that gap, and the later of the two always wins."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+
+    QApplication.instance() or QApplication([])
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyDisk", cwd=".",
+                                 pty=True))
+    a.status = AgentStatus.RUNNING
+
+    dirty = []
+    a.task_changed.connect(lambda *_: dirty.append("task"))
+    edges = []
+    a.reply_time_changed.connect(lambda: edges.append(a.last_reply_at()))
+
+    check("reply-disk: nothing known yet -> None", a.last_reply_at() is None)
+
+    # the reopen case: no live settle this run, but the conversation on disk
+    # says when its last answer was really generated
+    historical = time.time() - 7200
+    a.set_transcript_reply_at(historical)
+    check("reply-disk: a restored conversation reports its REAL past time",
+          a.last_reply_at() == historical, a.last_reply_at())
+    check("reply-disk: ...and announces the change once", len(edges) == 1, edges)
+    a.set_transcript_reply_at(historical)
+    check("reply-disk: re-reading the same value is silent (a poll is free)",
+          len(edges) == 1, edges)
+
+    # a live settle now: it is LATER than the record Claude wrote, so it wins
+    a._on_pty_output("pty", "a brand new reply")
+    a._on_idle_timeout()
+    live = a.last_reply_at()
+    check("reply-disk: a fresh live settle outranks the older disk reading",
+          live is not None and live > historical, (live, historical))
+    a.set_transcript_reply_at(historical)
+    check("reply-disk: ...and a stale poll cannot drag it backwards",
+          a.last_reply_at() == live, a.last_reply_at())
+
+    # a /clear (or an in-TUI /resume onto another chat) invalidates both: the
+    # time described a turn of the conversation being replaced
+    a.note_conversation_replaced()
+    check("reply-disk: a replaced conversation drops the reply time entirely",
+          a.last_reply_at() is None, a.last_reply_at())
+
+    check("reply-disk: none of this is a persistable mutation", dirty == [],
+          dirty)
+    a.dispose()
+
+
 def test_reply_time_card_ui():
     """The card header's #CardReplyTime label mirrors last_reply_at() LIVE,
     off the same activity_changed edge the status glyph already reacts to
@@ -11038,6 +11160,115 @@ def test_terminal_scrollbar():
     c2.deleteLater()
 
 
+def test_reply_marks_recovered_from_transcript():
+    """A reply mark is minted from a busy -> idle settle, so a conversation
+    restored from disk comes back with NONE -- and since a resume's replay
+    settle is deliberately suppressed, a reopened hive showed no reply time
+    anywhere. These are recovered by matching each transcript reply's CLOSING
+    line against the scrollback.
+
+    MEASURED, and it is why the anchor is what it is: Claude's own "for Ns"
+    footer (what a LIVE mark anchors to) does not survive per turn into the
+    scrollback -- across seven real captured screens at five widths, at most
+    ONE was still present in 2000 lines. And matching a reply's HEAD found a
+    stale narrower re-render first (pyte does not reflow, so a card resized
+    mid-session keeps both) and stamped the middle of a paragraph."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.terminal_card import (TerminalCard, _format_reply_stamp,
+                                           _last_content_line, _norm_reply_line,
+                                           _reply_end_row)
+
+    QApplication.instance() or QApplication([])
+
+    # ---- the normalizer drops what the renderer paints rather than prints --
+    check("reply-recover: markdown syntax is dropped from both sides",
+          _norm_reply_line("**Rebuilt `dist/x.zip`** from the *good* files")
+          == "rebuilt dist/x.zip from the good files",
+          _norm_reply_line("**Rebuilt `dist/x.zip`** from the *good* files"))
+    check("reply-recover: the closing line is the last one with content on it",
+          _last_content_line("first\n\nlast line\n\n  \n") == "last line")
+
+    # ---- the anchor: tail on the row, blank row underneath ----------------
+    rows = ["a stale truncated copy of the same rep",   # 0: no tail, no blank
+            "more of the stale copy",                   # 1
+            "the reply, wrapping over",                 # 2: real copy starts
+            "two rows and ending here.",                # 3: the tail lives here
+            "",                                         # 4: <- the anchor
+            "> next prompt"]                            # 5
+    check("reply-recover: anchors the blank row under the reply's last row",
+          _reply_end_row(rows, "ending here.", 0) == 4,
+          _reply_end_row(rows, "ending here.", 0))
+    check("reply-recover: a row with no blank beneath is not a reply ending",
+          _reply_end_row(["tail here", "still going"], "tail here", 0) is None)
+    check("reply-recover: nothing matching -> no stamp rather than a guess",
+          _reply_end_row(rows, "never written", 0) is None)
+
+    # ---- end to end through a real card ----------------------------------
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyRecover", cwd=".",
+                                     pty=True))
+    card = TerminalCard(agent)
+    card.resize(640, 420)
+
+    when = time.time() - 3600
+    # pretend the transcript said this, bypassing the per-conversation cache
+    # read (the reader itself is covered by test_transcript_reply_times)
+    card._recover_key = (agent.spec.cwd, agent.spec.session_id)
+    card._recover_replies = [(when, "All four suites pass now.")]
+    agent._on_pty_output("pty", "All four suites pass now.\r\n\r\n> ")
+    card._recover_reply_marks()
+
+    check("reply-recover: the past reply is located in the scrollback",
+          len(card._recovered_replies) == 1, card._recovered_replies)
+    line, stamped = card._recovered_replies[0]
+    check("reply-recover: ...stamped with the TRANSCRIPT's time, not now",
+          stamped == when, (stamped, when))
+    check("reply-recover: ...on the blank row under the reply",
+          line == agent_row_after(card, "All four suites pass now."), line)
+
+    card._refresh_reply_marks()
+    check("reply-recover: the view carries it as an inline stamp",
+          (line, _format_reply_stamp(when)) in card.terminal.reply_marks(),
+          card.terminal.reply_marks())
+
+    # a reply that is NOT on screen is skipped, never invented
+    card._recovered_replies = []
+    card._recover_replies = [(when, "a reply that scrolled away long ago")]
+    card._recover_reply_marks()
+    check("reply-recover: a reply not in the scrollback yields no stamp",
+          card._recovered_replies == [], card._recovered_replies)
+
+    # a live mark outranks a recovered one on the same line
+    card._recovered_replies = [(line, when)]
+    card._reply_mark_lines = {}
+    mark = agent.note_reply_settled()
+    card._reply_mark_lines[mark.uid] = line
+    card._refresh_reply_marks()
+    check("reply-recover: a live capture wins the line over a recovered one",
+          card.terminal.reply_marks() == [(line, _format_reply_stamp(mark.ts))],
+          card.terminal.reply_marks())
+
+    card.deleteLater()
+    agent.dispose()
+
+
+def agent_row_after(card, text):
+    """Absolute line of the blank row directly under `text` in a card's
+    terminal -- the row test_reply_marks_recovered_from_transcript expects a
+    recovered stamp to land on."""
+    from app.widgets.terminal_card import _norm_reply_line
+
+    oldest, raw = card._scrollback_rows()
+    lines = [_norm_reply_line(t) for t in raw]
+    needle = _norm_reply_line(text)
+    for i, line in enumerate(lines):
+        if needle and needle in line and i + 1 < len(lines) and not lines[i + 1]:
+            return oldest + i + 1
+    return -1
+
+
 def test_reply_marks_inline():
     """Reply-finished milestones drawn INLINE in the terminal content -- a
     dim date/time stamp above the input box, beside Claude's own "for Ns"
@@ -11156,6 +11387,8 @@ def main():
     test_agent_busy_activity()
     test_agent_last_reply_at()
     test_reply_settle_skips_resume_replay()
+    test_transcript_reply_times()
+    test_reply_time_survives_restart()
     test_reply_time_card_ui()
     test_ansi()
     test_terminal_keys()
@@ -11207,6 +11440,7 @@ def main():
     test_startup_limit_recovery()
     test_terminal_scrollbar()
     test_reply_marks_inline()
+    test_reply_marks_recovered_from_transcript()
     test_history_screen_wrapper_removed()
     test_gemini_usage_polling_is_offthread_and_optin()
     test_gemini_usage_poll_is_slower_than_claudes()
@@ -11214,6 +11448,7 @@ def main():
     test_recovered_prompts_are_cached()
     test_multi_agent_session_isolation()
     test_usage_pill_geometry_and_close()
+    test_usage_pill_never_truncates()
     test_options_panel()
     test_topbar_extras_autosize()
     test_topbar_extras_grow_with_window()
@@ -11242,7 +11477,7 @@ def test_usage_pill_geometry_and_close():
     import os
     import tempfile
     from PySide6.QtWidgets import QApplication
-    from PySide6.QtGui import QColor, QFontMetrics
+    from PySide6.QtGui import QColor, QFont, QFontMetrics
     from app.widgets.gemini_usage_badge import GeminiUsageBadge
     from app.widgets.ornaments import PlanUsageBadge, UsagePillBadge
     from app import gemini_usage
@@ -11286,21 +11521,28 @@ def test_usage_pill_geometry_and_close():
     # primary screen and can disagree with what actually gets painted.
     def want(instance, text):
         fm = QFontMetrics(instance._text_font(), instance)
-        return (instance._PAD * 2 + instance._RING + instance._GAP
-                + fm.horizontalAdvance(text))
+        return instance._chrome_width() + fm.horizontalAdvance(text)
 
     check("usage-pill: width is ring + pads + text, and nothing else",
           badge.width() == want(badge, badge._text))
     check("usage-pill: the X reserves NO width - it floats over the text",
           badge.width()
-          == GeminiUsageBadge._PAD * 2 + GeminiUsageBadge._RING
-          + GeminiUsageBadge._GAP
+          == badge._PAD * 2 + badge._RING + badge._GAP + badge._TEXT_SLACK
           + QFontMetrics(badge._text_font(), badge).horizontalAdvance(
               badge._text))
+    # ONE formula, not a per-subclass copy. The two pills are given the same
+    # font first, deliberately: a measurement follows the pill's OWN font now
+    # (the fix for pills that measured one face and painted another), so two
+    # widgets in different polish states measuring differently is correct
+    # behaviour and would make this a test of nothing.
+    same_font = QFont(plan_badge.font())
+    plan_badge.setFont(same_font)
+    badge.setFont(same_font)
     check("usage-pill: Claude and Gemini measure an identical string alike",
           plan_badge._measure_width("21% used, resets in 1h20m at 14:49")
-          == badge._measure_width(
-              "21% used, resets in 1h20m at 14:49"))
+          == badge._measure_width("21% used, resets in 1h20m at 14:49")
+          and GeminiUsageBadge._measure_width is UsagePillBadge._measure_width
+          and PlanUsageBadge._measure_width is UsagePillBadge._measure_width)
     check("usage-pill: the fixed 315px width is gone",
           not hasattr(GeminiUsageBadge, "_FIXED_WIDTH")
           and badge.width() != weekly_badge.width())
@@ -11384,6 +11626,133 @@ def test_usage_pill_geometry_and_close():
     weekly_badge.deleteLater()
 
 
+def test_usage_pill_never_truncates():
+    """A pill is as wide as the text it PAINTS, whatever the font turns out
+    to be, and it repairs itself if it ever is not.
+
+    Reported live, twice, with screenshots: pills reading "5h 86% used,
+    resets n..." and "5h 0% us..." in a bar with hundreds of free pixels. The
+    mechanism was a font the measurement never saw. `_text_font` used to
+    return a bare `QFont()`, whose family is UNSET, and the two consumers of
+    that font resolve an unset family differently: `QFontMetrics` falls back
+    to the application font, while `QPainter.setFont` resolves it against the
+    widget's own (whatever QSS put there). They agree only while the chrome
+    family IS the application default - and `setup_application` deliberately
+    prefers "Inter" whenever it is installed, so on such a machine every pill
+    measured one face and painted a wider one, and `paintEvent`'s elide (a
+    safety net, never meant to fire) truncated the reading.
+
+    Two independent guarantees are checked here: the measurement now follows
+    the widget's font, and a pill that finds itself too narrow at paint time
+    widens itself using THE PAINTER'S OWN metrics - which is what makes the
+    repair work even when the measurement is the thing that is wrong.
+    """
+    from PySide6.QtCore import QTimer, QEventLoop
+    from PySide6.QtGui import QFont, QFontMetrics, QPainter
+    from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+    from app import claude_usage
+    from app.widgets.ornaments import PlanUsageBadge
+
+    app = QApplication.instance() or QApplication([])
+
+    def spin(ms=60):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    def painted_advance(pill):
+        """What the pill's own painting metrics say the line needs."""
+        return QFontMetrics(pill._text_font(), pill).horizontalAdvance(
+            pill._text)
+
+    def text_room(pill):
+        return pill.width() - (pill._PAD + pill._RING + pill._GAP) - pill._PAD
+
+    host = QWidget()
+    lay = QVBoxLayout(host)
+    pill = PlanUsageBadge(host, window="five_hour")
+    lay.addWidget(pill)
+    host.resize(900, 60)
+    host.show()
+    pill.set_usage(claude_usage.Usage(
+        limits=(claude_usage.Limit(key="five_hour", label="5h", short="5h",
+                                   percent=86.0,
+                                   resets_at=time.time() + 4800),),
+        fetched_at=time.time(), plan="max"))
+    spin()
+
+    check("usage-pill: the text font follows the widget's own family",
+          pill._text_font().family() == pill.font().family()
+          and pill._text_font().pixelSize() == pill._TEXT_PX)
+    check("usage-pill: a fresh reading fits with room to spare",
+          text_room(pill) >= painted_advance(pill))
+
+    # a font swapped under a line that has NOT changed: `_set_text` would
+    # early-return, so only `changeEvent` can keep the width honest
+    before = pill.width()
+    wide = QFont("Courier New")
+    wide.setPixelSize(13)
+    pill.setFont(wide)
+    spin()
+    widened = pill.width()
+    check("usage-pill: a font change re-measures the pill",
+          widened > before and text_room(pill) >= painted_advance(pill))
+
+    # ...and the same the other way, so a narrower face gives the bar its
+    # pixels back rather than leaving a padded pill behind. Measured against
+    # the WIDE width, not the original: what a bare QFont() resolves to
+    # depends on the widget's polish state, which the suite's earlier tests
+    # can have moved - the invariant here is that the pill follows its font
+    # in both directions, not what the default face happens to be.
+    narrow = QFont("Segoe UI")
+    narrow.setPixelSize(11)
+    pill.setFont(narrow)
+    spin()
+    check("usage-pill: a narrower font shrinks the pill back",
+          pill.width() < widened
+          and text_room(pill) >= painted_advance(pill))
+
+    # THE MEASUREMENT ITSELF IS WRONG: the exact shape of the reported bug.
+    # Re-running it would repeat the error, so the repair has to come from
+    # the painter's metrics.
+    class Undersizing(PlanUsageBadge):
+        def _measure_width(self, text):
+            return int(super()._measure_width(text) * 0.62)
+
+    broken = Undersizing(host, window="five_hour")
+    lay.addWidget(broken)
+    broken.set_usage(claude_usage.Usage(
+        limits=(claude_usage.Limit(key="five_hour", label="5h", short="5h",
+                                   percent=86.0,
+                                   resets_at=time.time() + 4800),),
+        fetched_at=time.time(), plan="max"))
+    check("usage-pill: a broken measurement starts out too narrow",
+          text_room(broken) < painted_advance(broken))
+    broken.grab()      # one paint is all the repair needs
+    spin()
+    healed = broken.width()
+    check("usage-pill: painting too narrow widens the pill instead of eliding",
+          text_room(broken) >= painted_advance(broken))
+    broken.grab()
+    spin()
+    check("usage-pill: the repair settles - it never oscillates",
+          broken.width() == healed)
+
+    # and the repair is bounded: a pill that cannot be helped asks once
+    calls = []
+    real = broken._reassert_width
+    broken._reassert_width = lambda: calls.append(1) or real()
+    for _ in range(3):
+        broken.grab()
+        spin()
+    check("usage-pill: a settled pill asks for no further repair",
+          calls == [])
+
+    broken.deleteLater()
+    pill.deleteLater()
+    host.deleteLater()
+
+
 def test_topbar_extras_autosize():
     """The top bar's non-essential controls live in a QScrollArea (so the
     window's minimum width is a small constant, not the sum of everything the
@@ -11402,6 +11771,7 @@ def test_topbar_extras_autosize():
     usage pills.
     """
     import time as _time
+    from PySide6.QtGui import QFontMetrics
     from PySide6.QtWidgets import QApplication
     from app.widgets.main_window import TopBar
     from app import claude_usage as cu
@@ -11431,6 +11801,24 @@ def test_topbar_extras_autosize():
           not bar.usage_badge.geometry().intersects(
               bar.usage_weekly_badge.geometry()),
           (bar.usage_badge.geometry(), bar.usage_weekly_badge.geometry()))
+
+    # The MINIMUM is what makes a squeeze impossible rather than unlikely: a
+    # QHBoxLayout with less room than its children's minimums shrinks them
+    # PAST those minimums, and any moment where this widget is narrower than
+    # its row would truncate a pill that has the pixels to spare. `resize()`
+    # is clamped to `minimumWidth`, so nothing can put it in that state.
+    check("topbar-autosize: the row's minimum is its real content width",
+          bar._extras.minimumWidth()
+          == bar._extras.layout().sizeHint().width())
+    bar._extras.resize(120, bar._extras.height())
+    check("topbar-autosize: the row refuses to be squeezed below its content",
+          bar._extras.width() >= bar._extras.layout().sizeHint().width())
+    for pill in (bar.usage_badge, bar.usage_weekly_badge):
+        room = (pill.width() - (pill._PAD + pill._RING + pill._GAP)
+                - pill._PAD)
+        check("topbar-autosize: a squeezed row still fits each pill's text",
+              room >= QFontMetrics(pill._text_font(),
+                                   pill).horizontalAdvance(pill._text))
     bar.deleteLater()
 
 

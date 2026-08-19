@@ -458,14 +458,71 @@ this file is the invariants that must survive every change.
   normally, and a non-resumed launch is never suppressed at all since it has
   no replay to protect against. `activity_changed.emit(False)` still fires
   unconditionally on the suppressed settle (the busy/idle UI state itself is
-  still correct); only the reply-time SIDE EFFECTS are skipped. This also
-  means a resumed conversation's PAST turns get no inline `ReplyMark` at
-  all (there is no transcript-backed recovery for reply marks, unlike
-  `PromptMark`'s `_recover_marks` — deliberately out of scope, since a
-  resumed reply has no reliable "settle" position to recover a line from
-  anyway) — only turns replied to AFTER the current launch get inline
-  stamps, which is correct: a stamp for a turn nobody watched settle would
-  be a guess, not a reading.
+  still correct); only the reply-time SIDE EFFECTS are skipped.
+- **A reply time is READ OFF THE TRANSCRIPT, because the clock only knows
+  turns this process watched** (`transcripts.reply_times`/`latest_reply_at`,
+  `TerminalAgent.set_transcript_reply_at`, `TerminalCard.
+  _recover_reply_marks`). Suppressing the resume-replay settle above is
+  correct and it left a hole: a restored conversation then has NO live stamp
+  for any past turn, so the header badge hid itself and not one inline mark
+  existed — the user asked "where is the date and timestamp?" three times
+  running, and the honest answer was "nowhere". A live observation
+  structurally cannot serve the reopen case, which is the only case anyone
+  complained about; Claude timestamps every record it writes, so the
+  conversation on disk knows what no settle can. Rules:
+  * **A finished reply is the LAST assistant record carrying text before the
+    next real user turn**, not every assistant text record — a turn NARRATES
+    between its tool calls and those are mid-reply. Tool RESULTS come back as
+    `user` records and are therefore NOT a boundary (`_is_tool_result`);
+    everything else from the user side is, and flushing on it is right either
+    way since the reply had plainly finished before it. Sidechains and records
+    with no parseable timestamp are skipped (a stamp reading 1970 is worse
+    than none).
+  * **Tail-bounded** (`_REPLY_TAIL_BYTES`) with a full-scan fallback, like
+    `latest_model_effort` — MEASURED 0.3-2.7ms on the user's real 1-3 MB
+    transcripts, against the 90-165ms `typed_prompts` pays for its full scan.
+    The bound costs nothing real: both consumers only ever ask about replies
+    still ON SCREEN, and the scrollback reaches back a few turns at most.
+  * **Both surfaces, one reading.** `last_reply_at()` returns `max(live,
+    transcript)`: the settle lands a couple of seconds AFTER the record
+    Claude wrote, so live wins the turn in progress (no waiting a poll to see
+    a reply that just landed) and the transcript wins everything this run
+    never saw. TRANSIENT exactly like the model chip and the plan-usage
+    reading — `set_transcript_reply_at` must NEVER `_touch`/`_schedule_save`,
+    and it emits `reply_time_changed` only when the DISPLAYED walltime moves,
+    so a poll over an idle agent is free. It rides `refresh_ai_titles`
+    (`SESSION_SYNC_MS`, 5s) and NOT the 1.5s model poll, and it is read for
+    STOPPED agents too — a card that is not running is precisely the one with
+    nothing to show without it — but never while `is_busy()`, since nothing in
+    a transcript marks a turn as over and the last assistant text mid-stream
+    is a narration, not a reply.
+  * **The inline stamps are recovered by matching the reply's CLOSING line**,
+    mirroring `PromptMark`'s `_recover_marks` (which an earlier version of
+    this bullet wrongly called impossible). Two measurements shape the anchor
+    and neither is guessable: (1) Claude's own "<verb> for Ns" footer — what a
+    LIVE `ReplyMark` anchors to — does NOT survive per turn into the
+    scrollback; across seven real captured `.vt` screens at five widths, at
+    most ONE was still present in 2000 lines of history and usually none, so
+    footer-anchoring history is a dead end. (2) Matching the reply's HEAD
+    found a STALE narrower re-render first (pyte does not reflow, so a card
+    resized mid-session keeps both copies, the older truncated where the
+    redraw overwrote it) and stamped the middle of a paragraph. So
+    `_reply_end_row` matches the TAIL of the last line and requires the row
+    BELOW to be blank: the tail is usually missing from a truncated copy, the
+    blank-row test rejects it when it is not, and the blank row is also the
+    only place the stamp reliably RENDERS (`paintEvent` skips a row whose own
+    content runs too close to the right edge). Markdown syntax is stripped
+    from both sides (`_norm_reply_line`) because the renderer restyles
+    `code`/**bold** rather than printing the characters. MEASURED end to end
+    against real paired (screen, transcript) samples: 11/15 anchored, up from
+    4/13 with head matching. It fails by being ABSENT, never wrong — a reply
+    that scrolled away yields no stamp rather than a guessed line, and a live
+    capture always outranks a recovered one on the same line
+    (`_refresh_reply_marks`, the same merge `_refresh_marks` does).
+  * Recovered replies share `_recover_key` with the recovered PROMPTS, so one
+    conversation costs one read of each; a `/clear` or pin change rotates the
+    key. Everything here stays TRANSIENT and un-persisted — the transcript IS
+    the durable record, which is the whole point.
 - **A width change RE-PROJECTS the scrollback** (`TerminalCard.
   _reproject_on_size`). pyte does not reflow: a history line keeps the column
   count it had when it was pushed. That was invisible while Claude owned its
@@ -1029,16 +1086,59 @@ this file is the invariants that must survive every change.
     width, and those two classes are the regression fixes for two live-reported
     bugs (pills drawing on top of each other; the row frozen at QScrollArea's
     468px constant). They just have far less to carry now.
+    `_AutoSizingScrollContent` also pins its own `minimumWidth` to its
+    layout's `sizeHint` — belt to `adjustSize`'s braces, since resizing to the
+    hint is a one-shot and anything that sizes the widget afterwards could
+    still leave it narrower than the row, cutting the right-hand pills off at
+    its edge (the overlap bug the class was written for). `resize()` and
+    `setGeometry()` are both clamped to `minimumWidth`, so that state is off
+    the table rather than merely unlikely. The WINDOW stays free to be
+    narrower than the row because the scroll area's OWN `minimumSizeHint` is
+    capped at `_EXTRAS_MIN_W` — do not "tidy" that cap away with this minimum.
   * `ornaments.anchored_popup_pos` is SHARED with `GridButton._popup_position`,
     not copied. Both buttons sit at the right end of a wide strip, so
     left-anchoring a panel under them spills off the window on a narrow window
     and off the display on a wide one; the helper clamps to the INTERSECTION of
     the window and the screen's available geometry.
 - **A usage pill is exactly as wide as its text, by ONE formula**
-  (`ornaments.UsagePillBadge._measure_width`: `_PAD*2 + _RING + _GAP +
-  advance(text)`, measured with `_text_font()` — the font `paintEvent` actually
-  draws with, never the widget's QSS font, or the pill is sized for text of a
-  different size). `PlanUsageBadge` and
+  (`ornaments.UsagePillBadge._measure_width`: `_chrome_width()` — `_PAD*2 +
+  _RING + _GAP + _TEXT_SLACK` — `+ advance(text)`, measured with
+  `_text_font()`, THE FONT `paintEvent` ACTUALLY DRAWS WITH). That last clause
+  is the whole invariant and it was violated for months: `_text_font()`
+  returned a bare `QFont()` whose FAMILY IS UNSET, and the two consumers
+  resolve an unset family DIFFERENTLY — `QFontMetrics` falls back to the
+  application font, `QPainter.setFont` resolves it against the WIDGET's font
+  (whatever QSS put there). Those agree only while the chrome family IS the
+  application default, which is exactly the machine it was written on;
+  `setup_application` deliberately picks `Inter` over `Segoe UI` whenever Inter
+  is installed, so on such a machine every pill measured one face and painted a
+  wider one and `paintEvent`'s elide — insurance, never meant to fire —
+  truncated the reading (reported live with screenshots: `5h 86% used, resets
+  n…` in a bar with hundreds of free pixels). `_text_font()` is therefore an
+  INSTANCE method built from `self.font()`, and a bare `QFont()` must never
+  come back. Two consequences ride along. (1) A measurement has TWO inputs, so
+  re-measuring is not `_set_text`'s business alone: the text can stand still
+  while the FONT moves under it (a QSS re-apply, a theme swap, an application
+  font change), and `_set_text` early-returns on an unchanged line — so
+  `changeEvent` re-measures on `FontChange`/`ApplicationFontChange`/
+  `StyleChange`. (2) `_heal_width`/`_reassert_width`: when painting finds the
+  line wider than the pill, the pill widens itself on the next turn of the
+  event loop instead of sitting there truncated. CRITICAL, and the reason it
+  works at all: the repair is driven by THE ADVANCE THE PAINTER JUST MEASURED,
+  never by re-running `_measure_width` — re-running the measurement is no
+  repair when the measurement is the thing that is wrong, and `p.fontMetrics()`
+  is the one authority that cannot disagree with what was drawn, because it is
+  what drew it. `_heal_key` bounds it to one attempt per (text, width) state so
+  a pill that cannot be helped asks once rather than spinning; a resize inside
+  `paintEvent` would be a repaint loop, hence the deferred single-shot (with
+  the `context` overload, so a deleted pill cancels rather than firing into a
+  dead C++ object). `_TEXT_SLACK` is a rounding cushion, NOT a design margin:
+  the metrics are integers and a fractional device pixel ratio can lay the run
+  out a hair wider than the advance, which would elide a pill sized to the
+  exact pixel. NOTE what is NOT the cause here, because it was checked and
+  ruled out: a parent layout CANNOT squeeze a pill — `QWidget::setGeometry`
+  and `resize()` both clamp to the fixed width — so a narrow window is never
+  the explanation for a truncated pill. `PlanUsageBadge` and
   `GeminiUsageBadge` are both subclasses and supply only the TEXT; the Gemini
   pills previously carried a hardcoded `_FIXED_WIDTH = 315` and elided into it,
   which reserved 630px of the bar for two readouts whose real content is ~215px
