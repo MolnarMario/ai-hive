@@ -409,7 +409,18 @@ this file is the invariants that must survive every change.
   row BELOW the "<verb> for Ns" footer (`is_reply_footer`, shared by the live
   and recovered paths so they land in the same place): anchoring it beside or
   above that footer wedges the stamp between a reply and its own footer, which
-  is exactly what was reported. A blank row is also the only row the stamp
+  is exactly what was reported. CRITICAL, and it cost a silent live failure:
+  the scan up from the input box must SKIP the box's own TOP BORDER (a
+  `_row_is_rule` row sitting directly above the prompt row) and its hint line,
+  not bail on them. `reply_anchor_line` used to `return None` at the first
+  rule, which is the very first row it looks at on the real screen, so the
+  LIVE stamp never appeared at all -- every stamp anyone saw came from the
+  transcript-recovery path, which runs only on a card build or resize, so a
+  fresh reply in an open card showed nothing. The suite missed it because the
+  fixture fed "footer, blank, > " with NO border, a shape Claude never draws.
+  Any fixture for this MUST include the box border (`test_reply_marks_inline`
+  asserts it does, via `_row_is_rule`), or it tests a screen that cannot
+  happen. A blank row is also the only row the stamp
   always renders on, since `paintEvent` skips a row whose content runs close to
   the right edge. Painted INLINE rather than on the scrollbar (`ReplyMark` in terminal_agent.py,
   `TerminalView.reply_anchor_line`/`_reply_marks`, `TerminalCard.

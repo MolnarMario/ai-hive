@@ -718,8 +718,9 @@ class TerminalView(QWidget):
         identical screen state on both sides is what keeps them agreeing.
 
         Found by scanning up from the input box Claude redraws at settle
-        (`_input_block_span`'s top row), skipping the blank separator, to the
-        nearest non-blank row above -- bounded by _REPLY_ANCHOR_SCAN so a
+        (`_input_block_span`'s top row), skipping the chrome between the two --
+        blank separators AND the box's own top border, which is what sits
+        directly above the prompt row -- to the nearest real content row -- bounded by _REPLY_ANCHOR_SCAN so a
         missing footer (an unusual screen shape, or the settle firing before
         the redraw) can never walk into unrelated older history and mislabel
         it. None when there is no live input box to scan from at all (e.g. the
@@ -731,19 +732,21 @@ class TerminalView(QWidget):
             return None
         bound = span[0] - _REPLY_ANCHOR_SCAN
         r = span[0] - 1
-        blanks = 0
         while r >= 0 and r > bound:
             first, _ = self._row_content(r)
-            if first >= 0:
-                if self._row_is_rule(r):
-                    return None
-                # the stamp belongs UNDER the footer, so hand back the blank
-                # separator we just walked over rather than the footer row
-                # itself. Without a blank there (the footer butting straight
-                # against the input box) there is no row below to use, so the
-                # footer row is the only place left.
-                return self.history_pushed() + (r + 1 if blanks else r)
-            blanks += 1
+            # Blanks, rules and the box's hint line are all chrome between
+            # the box and the reply. The box's own top BORDER sits directly
+            # above the prompt row, so a scan that stopped at the first rule
+            # stopped before it had looked at anything -- that bail-out is why
+            # the live stamp silently never appeared on the real screen shape,
+            # while a fixture without that border passed.
+            if (first >= 0 and not self._row_is_rule(r)
+                    and not self._row_is_input_footer(r)):
+                below = r + 1
+                if (below < self.screen.lines
+                        and self._row_content(below) == (-1, -1)):
+                    return self.history_pushed() + below  # UNDER the footer
+                return self.history_pushed() + r    # nothing below to use
             r -= 1
         return None
 

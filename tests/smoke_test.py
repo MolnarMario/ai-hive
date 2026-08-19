@@ -11171,20 +11171,30 @@ def test_reply_marks_inline():
     card.resize(640, 420)
     t = card.terminal
 
-    # a settled turn: footer line, one blank separator, empty input box --
-    # exactly the shape Claude Code leaves on screen once a reply finishes.
+    # A settled turn in the shape Claude Code REALLY leaves on screen: the
+    # reply, a blank, the "for Ns" footer, a blank, then the input box --
+    # whose TOP BORDER (a rule) sits directly above the prompt row. That
+    # border is the point of this fixture. An earlier version fed only
+    # "footer, blank, > " with no border, so the anchor scan never met the
+    # rule it stopped dead on in real use, and the test passed while the
+    # live stamp silently never appeared. Do NOT simplify this back.
     # Fed through _on_pty_output (not terminal.feed directly) so it lands in
     # BOTH the live view (via the connected pty_output signal) and the
     # agent's own replay buffer -- real usage does the same, and the
     # rebuilt-card check below needs the replay half.
-    agent._on_pty_output("pty", "✳ Crunched for 58s\r\n\r\n> ")
+    agent._on_pty_output("pty", "● Hi!\r\n\r\n✳ Crunched for 58s"
+                         "\r\n\r\n" + "─" * 40 + "\r\n> ")
     mark = agent.note_reply_settled()
     check("reply-mark: note_reply_settled records a mark",
           mark is not None and agent.reply_marks() == [mark])
+    check("reply-mark: the fixture really has the box border in the way",
+          t._row_is_rule(4) and t._input_block_span() == (5, 5),
+          (t._input_block_span(),))
     # UNDER the footer, on the blank separator below it -- not beside the
-    # footer and not above it, wedged between the reply and its own footer,
-    # which is where the user reported finding it
-    under_footer = t.abs_line_at_row(1)
+    # footer, not above it wedged between the reply and its own footer
+    # (where the user reported finding it), and not skipped because the
+    # box border got in the way of the scan
+    under_footer = t.abs_line_at_row(3)
     check("reply-mark: the card anchors it UNDER the footer row",
           card._reply_mark_lines.get(mark.uid) == under_footer,
           (card._reply_mark_lines, under_footer))
