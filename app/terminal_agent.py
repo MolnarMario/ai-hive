@@ -68,6 +68,7 @@ TUI_PROGRAMS = {"vim", "vi", "nano", "htop", "top", "less", "ssh"}
 
 PTY_BUFFER_CAP = 512 * 1024  # raw VT tail kept for fresh-card replay
 PROMPT_MARK_CAP = 200        # prompt milestones kept per agent (FIFO)
+REPLY_MARK_CAP = 200         # reply-finished milestones kept per agent (FIFO)
 
 # "Busy" = the agent is actively streaming output (thinking, generating,
 # running a command). An interactive process (Claude at its prompt, an idle
@@ -234,6 +235,20 @@ class PromptMark:
     ts: float
 
 
+@dataclass
+class ReplyMark:
+    """One "a reply finished here" milestone, rendered inline in the terminal
+    right above the input box (see TerminalView.reply_anchor_line) rather than
+    on the scrollbar. Mirrors PromptMark's shape and the same `pos`/`uid`
+    reasoning -- a character offset into the pty stream survives a card
+    rebuild where a screen line does not, and `uid` (never `id()`) is the only
+    safe FIFO-capped key."""
+
+    uid: int
+    pos: int
+    ts: float
+
+
 class TerminalAgent(QObject):
     output_segment = Signal(str, str)   # stream, text (line mode)
     pty_output = Signal(str)            # raw VT stream (pty mode)
@@ -267,6 +282,10 @@ class TerminalAgent(QObject):
     # exactly the way a stored limit latch does), so this must NEVER be wired
     # to a save.
     prompt_marks_changed = Signal()
+    # a reply-finished milestone was added or the set was cleared. Same
+    # transient contract as prompt_marks_changed -- never persisted, never
+    # wired to a save.
+    reply_marks_changed = Signal()
     # the agent's live conversation was REPLACED (/clear, or a /resume onto a
     # different session), so the scrollback behind the current screen belongs
     # to a conversation that is no longer on display. Transient view signal.
@@ -309,6 +328,8 @@ class TerminalAgent(QObject):
         self._pty_dropped = 0
         self._prompt_marks: list[PromptMark] = []
         self._mark_seq = 0     # monotonic; source of PromptMark.uid
+        self._reply_marks: list[ReplyMark] = []
+        self._reply_mark_seq = 0   # monotonic; source of ReplyMark.uid
         self._pty_seed = ""    # restored screen, until a child draws over it
         self._prompt_ready = False    # the TUI's input prompt is interactive
         self._ready_tail = ""         # rolling stripped tail (pre-ready only)
@@ -503,6 +524,7 @@ class TerminalAgent(QObject):
             self._pty_total = 0
             self._pty_dropped = 0
             self.clear_prompt_marks()
+            self.clear_reply_marks()
             self._pty_seed = ""
         else:
             self._emit(STREAM_SYSTEM, "--- restarted ---\n")
@@ -598,6 +620,7 @@ class TerminalAgent(QObject):
         if not self.is_pty:
             return
         self.clear_prompt_marks()
+        self.clear_reply_marks()
         self.conversation_replaced.emit()
 
     def replay_marks(self) -> list:
@@ -608,6 +631,47 @@ class TerminalAgent(QObject):
         content has aged out of the buffer too, so there is no line left for it
         to point at and a clamped marker would just lie."""
         return [(m.pos - self._pty_dropped, m) for m in self._prompt_marks
+                if m.pos >= self._pty_dropped]
+
+    # -------------------------------------------------- reply milestones ---
+
+    def note_reply_settled(self):
+        """Record that a reply just finished (busy -> idle) at the current
+        stream position -- the inline reply-time stamp shown right above the
+        input box (see TerminalView.reply_anchor_line). Returns the mark, or
+        None if it was not recorded.
+
+        Called unconditionally from `_on_idle_timeout`, NOT gated on a card
+        existing (unlike a typed prompt, which can only ever originate from
+        one): a hidden workspace keeps executing per the model-owns-processes
+        invariant, and its reply history must still be there — via
+        reply_replay_marks() — whenever a card is next built for it."""
+        if not self.is_pty:
+            return None
+        self._reply_mark_seq += 1
+        mark = ReplyMark(uid=self._reply_mark_seq, pos=self._pty_total,
+                         ts=time.time())
+        self._reply_marks.append(mark)
+        while len(self._reply_marks) > REPLY_MARK_CAP:
+            self._reply_marks.pop(0)
+        self.reply_marks_changed.emit()
+        return mark
+
+    def reply_marks(self) -> list:
+        return list(self._reply_marks)
+
+    def clear_reply_marks(self) -> bool:
+        """Drop every reply milestone. Guarded so a no-op stays silent."""
+        if not self._reply_marks:
+            return False
+        self._reply_marks = []
+        self.reply_marks_changed.emit()
+        return True
+
+    def reply_replay_marks(self) -> list:
+        """Same shape and same discard rule as replay_marks(), for reply
+        milestones."""
+        return [(m.pos - self._pty_dropped, m) for m in self._reply_marks
                 if m.pos >= self._pty_dropped]
 
     def seed_pty_replay(self, text: str) -> bool:
@@ -1325,6 +1389,7 @@ class TerminalAgent(QObject):
         if self._busy:
             self._busy = False
             self._last_reply_ts = time.time()
+            self.note_reply_settled()
             self.activity_changed.emit(False)
         # the screen has settled (2 s quiet) — is it a prompt awaiting the user?
         self._scrape_waiting = self._screen_waiting()

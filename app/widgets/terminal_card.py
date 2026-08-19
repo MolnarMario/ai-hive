@@ -70,6 +70,16 @@ def _norm_line(text: str) -> str:
     return _MARK_WS_RE.sub(" ", text.replace(">", " ").replace("❯", " ")
                            .lower()).strip()
 
+
+def _format_reply_stamp(ts: float) -> str:
+    """HH:MM for a same-day reply, else date-prefixed -- shared by the
+    header's #CardReplyTime badge and the inline reply marks, so the two
+    surfaces can never disagree on what "today" means."""
+    dt = datetime.datetime.fromtimestamp(ts)
+    if dt.date() == datetime.datetime.now().date():
+        return dt.strftime("%H:%M")
+    return dt.strftime("%b %d, %H:%M")
+
 _GLYPH_STATE = {
     AgentStatus.IDLE: "idle",
     AgentStatus.STARTING: "starting",
@@ -173,6 +183,9 @@ class TerminalCard(QFrame):
         # a rebuilt view has a different `pushed` origin; keyed on uid because
         # id() is reused after a FIFO eviction (see PromptMark).
         self._mark_lines: dict[int, int] = {}
+        # same shape/reasoning as _mark_lines, for reply-finished milestones
+        # (see ReplyMark / TerminalView.reply_anchor_line).
+        self._reply_mark_lines: dict[int, int] = {}
         # milestones located by matching the transcript against a scrollback we
         # did not watch being typed (a restored conversation); recomputed on
         # every projection, never persisted
@@ -472,6 +485,7 @@ class TerminalCard(QFrame):
             # agent isn't a running pty, so no extra guard is needed here.
             self.terminal.staleLayoutDetected.connect(self.agent.request_repaint)
             self.agent.prompt_marks_changed.connect(self._refresh_marks)
+            self.agent.reply_marks_changed.connect(self._on_reply_mark_added)
             self.agent.conversation_replaced.connect(
                 self.terminal.clear_history)
             self.scroll_bar.markActivated.connect(self.terminal.scroll_to_abs)
@@ -1046,20 +1060,34 @@ class TerminalCard(QFrame):
             esc = replay.find("\x1b", skip)
             skip = esc if esc >= 0 else skip
         self._mark_lines = {}
+        self._reply_mark_lines = {}
+        # merged into ONE pass over the (capped) replay text -- a second full
+        # feed just for reply marks would double the pyte cost of every card
+        # rebuild, exactly what _rerender_restored's single-projection rule
+        # exists to avoid.
+        tagged = ([(off, "prompt", mark) for off, mark in self.agent.replay_marks()] +
+                  [(off, "reply", mark) for off, mark in self.agent.reply_replay_marks()])
+        tagged.sort(key=lambda t: t[0])
         pos = skip
-        for off, mark in self.agent.replay_marks():
+        for off, kind, mark in tagged:
             off = max(0, min(len(replay), off))
             if off < skip:
                 continue        # its bytes are outside the projected window
             if off > pos:
                 self.terminal.feed(replay[pos:off])
                 pos = off
-            self._mark_lines[mark.uid] = self.terminal.anchor_line()
+            if kind == "prompt":
+                self._mark_lines[mark.uid] = self.terminal.anchor_line()
+            else:
+                line = self.terminal.reply_anchor_line()
+                if line is not None:
+                    self._reply_mark_lines[mark.uid] = line
         if pos < len(replay):
             self.terminal.feed(replay[pos:])
         if recover:
             self._recover_marks()
         self._refresh_marks()
+        self._refresh_reply_marks()
 
     def _recover_marks(self) -> None:
         """Find the user's earlier prompts in a scrollback we did not watch
@@ -1166,6 +1194,43 @@ class TerminalCard(QFrame):
         milestone anchored into it is meaningless."""
         self._mark_lines = {}
         self.agent.clear_prompt_marks()
+        self._reply_mark_lines = {}
+        self.agent.clear_reply_marks()
+
+    def _refresh_reply_marks(self) -> None:
+        """Push the agent's reply-finished milestones to the view, in THIS
+        view's coordinates -- same shape as _refresh_marks. The stamp text is
+        formatted at REFRESH time (not capture time), so a reply from
+        yesterday keeps reading as date-prefixed today rather than freezing
+        whatever "same day" looked like the moment it was captured."""
+        if not self.is_pty:
+            return
+        by_uid = {m.uid: m for m in self.agent.reply_marks()}
+        pairs = [(line, _format_reply_stamp(by_uid[uid].ts))
+                 for uid, line in self._reply_mark_lines.items()
+                 if uid in by_uid]
+        self.terminal.set_reply_marks(sorted(pairs))
+
+    def _on_reply_mark_added(self) -> None:
+        """A reply-finished milestone was recorded on the agent (or the set
+        was cleared, e.g. a restart). Only the newest mark can ever be new
+        here -- note_reply_settled() appends exactly one mark per call, so
+        the CARD only has to catch up on the tail; an already-anchored mark
+        keeps whatever line _replay_with_marks (or an earlier call here) gave
+        it."""
+        if not self.is_pty:
+            return
+        marks = self.agent.reply_marks()
+        if not marks:
+            self._reply_mark_lines = {}
+            self._refresh_reply_marks()
+            return
+        latest = marks[-1]
+        if latest.uid not in self._reply_mark_lines:
+            line = self.terminal.reply_anchor_line()
+            if line is not None:
+                self._reply_mark_lines[latest.uid] = line
+        self._refresh_reply_marks()
 
     def _place_overlay(self) -> None:
         if not self.is_pty:
@@ -1251,11 +1316,8 @@ class TerminalCard(QFrame):
         if ts is None:
             self.reply_time_label.hide()
             return
+        self.reply_time_label.setText(_format_reply_stamp(ts))
         dt = datetime.datetime.fromtimestamp(ts)
-        if dt.date() == datetime.datetime.now().date():
-            self.reply_time_label.setText(dt.strftime("%H:%M"))
-        else:
-            self.reply_time_label.setText(dt.strftime("%b %d, %H:%M"))
         self.reply_time_label.setToolTip(
             "Agent's last reply finished " + dt.strftime("%Y-%m-%d %H:%M:%S"))
         self.reply_time_label.show()

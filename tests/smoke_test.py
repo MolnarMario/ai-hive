@@ -10983,6 +10983,88 @@ def test_terminal_scrollbar():
     c2.deleteLater()
 
 
+def test_reply_marks_inline():
+    """Reply-finished milestones drawn INLINE in the terminal content -- a
+    dim date/time stamp above the input box, beside Claude's own "for Ns"
+    footer -- as distinct from the header's #CardReplyTime badge (which
+    only ever shows the LATEST reply). Covers the anchor scan
+    (TerminalView.reply_anchor_line), the shared stamp formatter, a card
+    rebuild re-deriving the same anchor, and every reset path that must wipe
+    a reply mark alongside a prompt mark."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import REPLY_MARK_CAP, TerminalAgent
+    from app.widgets.terminal_card import TerminalCard, _format_reply_stamp
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyMarks", cwd=".",
+                                     pty=True))
+    card = TerminalCard(agent)
+    card.resize(640, 420)
+    t = card.terminal
+
+    # a settled turn: footer line, one blank separator, empty input box --
+    # exactly the shape Claude Code leaves on screen once a reply finishes.
+    # Fed through _on_pty_output (not terminal.feed directly) so it lands in
+    # BOTH the live view (via the connected pty_output signal) and the
+    # agent's own replay buffer -- real usage does the same, and the
+    # rebuilt-card check below needs the replay half.
+    agent._on_pty_output("pty", "✳ Crunched for 58s\r\n\r\n> ")
+    mark = agent.note_reply_settled()
+    check("reply-mark: note_reply_settled records a mark",
+          mark is not None and agent.reply_marks() == [mark])
+    footer_line = t.abs_line_at_row(0)
+    check("reply-mark: the card anchors it on the footer row, not the box",
+          card._reply_mark_lines.get(mark.uid) == footer_line,
+          (card._reply_mark_lines, footer_line))
+    check("reply-mark: the view carries exactly one inline stamp",
+          t.reply_marks() == [(footer_line, _format_reply_stamp(mark.ts))],
+          t.reply_marks())
+
+    # ---- a rule directly above the box (no footer line) anchors nothing --
+    ruled = TerminalView(rows=10, cols=40)
+    ruled.feed("─" * 20 + "\r\n> ")
+    check("reply-mark: a rule row above the box is never mistaken for a footer",
+          ruled.reply_anchor_line() is None)
+
+    # ---- no live input box at all (e.g. settled on a menu) -> no anchor --
+    menu = TerminalView(rows=10, cols=40)
+    menu.feed("some output\r\n")
+    check("reply-mark: no input box in view -> nothing to anchor to",
+          menu.reply_anchor_line() is None)
+
+    # ---- FIFO cap -----------------------------------------------------
+    for _ in range(REPLY_MARK_CAP + 5):
+        agent.note_reply_settled()
+    check("reply-mark: the mark list is FIFO-capped",
+          len(agent.reply_marks()) == REPLY_MARK_CAP, len(agent.reply_marks()))
+
+    # ---- a rebuilt card re-derives the SAME anchor from the pty replay ---
+    card2 = TerminalCard(agent)
+    card2.resize(640, 420)
+    latest = agent.reply_marks()[-1]
+    check("reply-mark: a rebuilt card recovers the latest mark's anchor",
+          latest.uid in card2._reply_mark_lines, card2._reply_mark_lines)
+    card2.deleteLater()
+
+    # ---- resets: restart and history-clear wipe reply marks too ---------
+    card.terminal.clear_history()
+    check("reply-mark: clearing history wipes the card's reply-mark lines",
+          card._reply_mark_lines == {} and card.terminal.reply_marks() == [])
+    check("reply-mark: ...and the agent's own mark list",
+          agent.reply_marks() == [])
+
+    agent.note_reply_settled()
+    agent.restart()
+    check("reply-mark: a restart clears reply marks too",
+          agent.reply_marks() == [])
+
+    card.deleteLater()
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
@@ -11068,6 +11150,7 @@ def main():
     test_gemini_limit_detection()
     test_startup_limit_recovery()
     test_terminal_scrollbar()
+    test_reply_marks_inline()
     test_history_screen_wrapper_removed()
     test_gemini_usage_polling_is_offthread_and_optin()
     test_gemini_usage_poll_is_slower_than_claudes()

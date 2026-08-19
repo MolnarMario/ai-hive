@@ -398,6 +398,48 @@ this file is the invariants that must survive every change.
   nothing. Recovered marks are recomputed on every projection and merged BEHIND
   the live ones (a live capture is exact; a recovered one was matched), and
   like every other mark they are never persisted.
+- **A reply-finished stamp is a SEPARATE milestone type, painted INLINE
+  rather than on the scrollbar** (`ReplyMark` in terminal_agent.py,
+  `TerminalView.reply_anchor_line`/`_reply_marks`, `TerminalCard.
+  _refresh_reply_marks`/`_on_reply_mark_added`). The header's
+  `#CardReplyTime` badge (`TerminalAgent.last_reply_at`,
+  `TerminalCard._refresh_reply_time`) only ever shows the LATEST reply; a
+  user asked to see the date/time under EVERY finished turn, the same way
+  Claude's own "Crunched for Ns" footer marks each one — so this is a full
+  second mark type mirroring `PromptMark`'s
+  shape (`uid`/`pos`/`ts`, FIFO-capped at `REPLY_MARK_CAP`, `pos` a pty-
+  stream character offset because a card rebuild restarts `pushed` at 0),
+  created unconditionally in `_on_idle_timeout`'s busy->idle edge
+  (`note_reply_settled`) rather than card-triggered like a typed prompt —
+  a hidden workspace keeps replying with no card around to notice, and the
+  mark must still be there (via `reply_replay_marks`) whenever one is next
+  built. `reply_anchor_line()` finds the row by scanning UP from the input
+  box Claude redraws at settle (`_input_block_span`'s top row), skipping the
+  blank separator, bounded by `_REPLY_ANCHOR_SCAN` so a missing footer can
+  never walk into unrelated older history and mislabel it; a rule row
+  (`_row_is_rule`) immediately above the box anchors nothing rather than
+  guessing. It is the SAME function at both the live capture
+  (`TerminalCard._on_reply_mark_added`, wired to `reply_marks_changed`) and
+  replay re-anchoring (`_replay_with_marks`), exactly like `anchor_line()` —
+  identical screen state on both sides is what keeps them agreeing.
+  `_replay_with_marks` merges prompt-offsets and reply-offsets into ONE
+  sorted pass over the (capped) replay text rather than feeding it twice: a
+  second full feed per card rebuild would double the pyte cost
+  `_rerender_restored`'s single-projection rule exists to avoid. Rendering
+  is NEVER a new terminal row — pyte has no room to insert one without
+  reflowing every anchor below it — it is a dim, right-aligned stamp drawn
+  into the row's own blank tail in `TerminalView.paintEvent`, and is skipped
+  outright (not clipped, not overlapped) whenever the row's real content
+  runs too close to the right edge: better to silently miss a stamp than
+  draw over real output. Formatting (`_format_reply_stamp` — HH:MM same-day,
+  else date-prefixed) is centralized and shared with `#CardReplyTime` so the
+  two surfaces can never disagree about what "today" means, and it is
+  computed at REFRESH time, not capture time, so a mark made today still
+  reads as date-prefixed once the day turns over. Every reset path that
+  wipes `PromptMark`s wipes `ReplyMark`s the same tick — `restart()`,
+  `note_conversation_replaced()`, `TerminalCard._on_history_cleared` — same
+  transient, never-persisted contract (`reply_marks_changed` must never
+  reach a save) for the same reason: the transcript is the durable record.
 - **A width change RE-PROJECTS the scrollback** (`TerminalCard.
   _reproject_on_size`). pyte does not reflow: a history line keeps the column
   count it had when it was pushed. That was invisible while Claude owned its
