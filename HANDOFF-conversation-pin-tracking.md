@@ -313,6 +313,9 @@ the hook approach is the proposal.
 ```
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
-All must pass. Note: `pty: Ctrl+C stopped the loop` is a PRE-EXISTING
-timing/locale-flaky check unrelated to this work (it drives a real `ping -t`);
-don't chase it as a regression. Add a new regression check for whatever you fix.
+All must pass. Add a new regression check for whatever you fix.
+
+(Historical note: this section used to wave off `pty: Ctrl+C stopped the loop`
+as a pre-existing timing/locale flake. It was not flaky — it was reporting a
+real bug, that Ctrl+C did nothing to a running command in a pty card. Both the
+bug and the check are fixed; see the ignore-Ctrl+C invariant in `CLAUDE.md`.)

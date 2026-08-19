@@ -92,6 +92,37 @@ USAGE_TICK_MS = 20000
 # out a whole poll interval at 4am), plus a small cushion for clock skew.
 USAGE_RESET_GRACE_MS = 8000
 
+# GEMINI IS POLLED ON A SEPARATE, MUCH SLOWER CLOCK, and the reason is not
+# request cost -- it is that this fetch SPAWNS A PROCESS. `gemini_usage.fetch()`
+# shells out to `agy --print /usage`, and on some runs agy starts a nested
+# helper that asks Windows for its OWN console. AI Hive passes CREATE_NO_WINDOW,
+# which is correct and not enough: spawn flags do not reach a GRANDCHILD.
+# Measured on a deterministic reproducer, a descendant that demands a console
+# gets a visible one 8/8 times under every combination tried -- plain
+# CREATE_NO_WINDOW, CREATE_NEW_CONSOLE + STARTUPINFO(SW_HIDE), and
+# CREATE_NO_WINDOW + STARTUPINFO(SW_HIDE) alike. With Windows 11 delegating to
+# Windows Terminal, that console materializes as a real window which flashes
+# over whatever the user is doing and closes a moment later. Live, it fired on
+# ~6% of polls (2 of 32), i.e. about every quarter hour at a 60s interval,
+# which is exactly often enough to be reported as "a terminal keeps popping up
+# and I can't read it".
+#
+# So there is no flag to fix this with, and the only lever left is asking less
+# often. That is nearly free here, unlike on the Claude side: NOTHING consumes
+# this reading except the two pills. A Gemini cut-off recovers on the countdown
+# its own banner printed, never on the account reading (see the limit
+# invariant), so no edge is delayed by a slower poll -- only the number on a
+# pill, describing a 5-hour window that does not move far in five minutes.
+# Do NOT fold this back onto USAGE_POLL_MS: that constant is answerable to
+# planLimitReached/planLimitCleared and the reset poll they arm, none of which
+# exist for Gemini.
+GEMINI_USAGE_POLL_MS = 300000
+# The danger zone still buys a fresher READOUT, so it still exists -- but with
+# no cut-off edge hanging off it the way Claude's does, it has no reason to go
+# to Claude's 20s and every reason not to, each fast tick being another chance
+# to flash a console over the user's screen.
+GEMINI_USAGE_URGENT_POLL_MS = 60000
+
 # The usage readouts the top bar can show, and the order they sit in. PER PILL
 # rather than per provider: each window (Claude 5h/7d, Gemini 5h/7d) is its own
 # pill on the bar, so anything coarser would leave the X on one of them closing
@@ -1558,6 +1589,11 @@ class MainWindow(QMainWindow):
         # launching one now could execute a half written binary. Transient by
         # construction: it describes this launch only.
         self._update_installing: tuple = ()
+        # every outcome from this launch's gate, kept so the Updates panel can
+        # show what happened after the splash has closed. Transient exactly
+        # like `_update_installing`: it describes this launch only and is never
+        # persisted (a stored version goes stale the moment anything installs).
+        self._update_outcomes: tuple = ()
         self._usage_inflight = False  # one request at a time, never stack
         self._plan_blocked = False    # edge state for planLimitReached/Cleared
         # agent ids with a resume SCHEDULED but not yet delivered. The attempt
@@ -1594,7 +1630,7 @@ class MainWindow(QMainWindow):
         # the user's real CLI. Same rule as the Claude readout: polling is
         # OPT-IN, armed by `start_usage_polling` from main.py only.
         self._gemini_usage_timer = QTimer(self)
-        self._gemini_usage_timer.setInterval(USAGE_POLL_MS)
+        self._gemini_usage_timer.setInterval(GEMINI_USAGE_POLL_MS)
         self._gemini_usage_timer.timeout.connect(self._poll_gemini_usage)
         self._gemini_usage_inflight = False
         # last good Gemini reading, so the countdown tick can retune the poll
@@ -2150,21 +2186,25 @@ class MainWindow(QMainWindow):
         return False
 
     def _retune_gemini_usage_poll(self, reading) -> None:
-        """Retune Gemini usage poll interval:
-        If Gemini agents are working AND 5-hour usage is >= 90%, poll every 10 seconds (10000 ms).
-        Otherwise poll every 60 seconds (60000 ms).
+        """Retune the Gemini usage poll: GEMINI_USAGE_URGENT_POLL_MS while
+        Gemini agents are working AND the 5-hour window is >= 90% spent,
+        GEMINI_USAGE_POLL_MS otherwise.
+
+        Both rates are deliberately far slower than the Claude equivalents, and
+        the constants carry the reason: every tick here spawns `agy`, which
+        intermittently flashes a console window no spawn flag can suppress.
 
         Takes the reading the caller already has. It used to fetch its own,
         which meant a second ~3.0s CLI subprocess on the GUI thread per tick.
         """
         if not hasattr(self, "_gemini_usage_timer") or reading is None:
             return
-        interval = USAGE_POLL_MS  # default 60000 ms
+        interval = GEMINI_USAGE_POLL_MS
         try:
             five_hour = next((l for l in reading.limits if l.key == "five_hour"), None)
             pct = five_hour.percent if five_hour else (reading.blocked.percent if reading.blocked else 0.0)
-            if self._gemini_agents_working() and pct >= 90.0:
-                interval = 10000  # urgent 10-second polling
+            if self._gemini_agents_working() and pct >= USAGE_URGENT_PCT:
+                interval = GEMINI_USAGE_URGENT_POLL_MS
         except Exception:
             pass
 
@@ -3114,7 +3154,7 @@ class MainWindow(QMainWindow):
         self._audit_install(cli_install.state_line(situation))
 
     def open_updates_panel(self) -> None:
-        from app import cli_install
+        from app import cli_install, cli_update
         from .update_panel import UpdatePanel
 
         situation = self.claude_install_situation()
@@ -3123,6 +3163,8 @@ class MainWindow(QMainWindow):
         panel = UpdatePanel(situation, auto_update=self._auto_update,
                             runner=self._cli_install_runner(),
                             winget_exe=cli_install.winget_exe_path(),
+                            last_check=cli_update.last_check_summary(
+                                self._update_outcomes, self._update_installing),
                             parent=self)
         panel.autoUpdateToggled.connect(self.top_bar.set_auto_update)
         panel.autoUpdateToggled.connect(self._on_auto_update_toggled)
@@ -3193,6 +3235,7 @@ class MainWindow(QMainWindow):
         exactly as it was."""
         from app import cli_update
         self._update_installing = tuple(installing or ())
+        self._update_outcomes = tuple(outcomes or ())
         text = cli_update.pill_text(outcomes, self._update_installing)
         self.top_bar.note_update_pending(
             text, cli_update.pill_tooltip(outcomes, self._update_installing))

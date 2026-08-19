@@ -184,6 +184,7 @@ class Result:
     before: str = ""
     after: str = ""
     detail: str = ""
+    path_added: bool = False   # migrate only: see `ensure_native_on_path`
 
 
 # ------------------------------------------------------------------ paths ---
@@ -251,6 +252,92 @@ def winget_exe_path() -> str:
     except OSError:
         pass
     return ""
+
+
+def _compute_updated_path(current: str, target: str) -> str | None:
+    """Pure decision for `ensure_native_on_path`: the PATH string to write, or
+    `None` when `target` is already present and nothing should change.
+
+    Split out so this can be unit tested without touching the real registry
+    (the offscreen smoke suite must never do that, same rule as every other
+    injected side effect in this module). Comparison is case-insensitive with
+    a trailing backslash stripped on both sides, because Windows PATH lookups
+    are case-insensitive and a user or installer may have written the entry
+    either way."""
+    entries = [p for p in current.split(";") if p]
+    norm_target = os.path.normcase(target.rstrip("\\"))
+    if any(os.path.normcase(p.rstrip("\\")) == norm_target for p in entries):
+        return None
+    return (current.rstrip(";") + ";" + target) if current else target
+
+
+def ensure_native_on_path() -> bool:
+    """Append `%USERPROFILE%\\.local\\bin` to the User PATH, so a PLAIN
+    terminal (not just AI Hive) resolves the current `claude` after a
+    migration.
+
+    `resolve_claude()` never needed this — it checks the native launcher path
+    directly, on purpose, so AI Hive's own launches never depended on the
+    installer's PATH edit. But a user's own terminal only has `shutil.which`,
+    which only finds what PATH lists, and MEASURED on the reporting machine:
+    the native installer did not put its own directory on PATH at all. Two
+    concrete symptoms follow from that, for the two shapes of migrated
+    machine: with BOTH installs present, a user kept typing `claude` into the
+    OLD winget copy after migrating (stale version, silently) until the
+    winget copy was removed by `cleanup()`, and with ONLY the native install
+    (no winget fallback to fall back to), a bare `claude` in an ordinary
+    terminal did not resolve AT ALL.
+
+    Idempotent and additive-only, mirroring `write_settings`'s own rule for
+    `~/.claude/settings.json`: the CURRENT registry value is read immediately
+    before writing (another installer could have touched PATH since AI Hive
+    last looked), and the directory is appended only when `_compute_updated_
+    path` says it is not already there. Only the User environment key is
+    touched, never Machine (that needs Administrator, and a native install is
+    a per-user install that does not need it either). Broadcasts
+    WM_SETTINGCHANGE afterwards so already-open Explorer-launched processes
+    pick it up without a reboot; a terminal that was already open when this
+    runs still needs to be reopened regardless, like any other PATH change.
+
+    Never raises (every failure, including off-Windows, is a silent no-op:
+    this is a nicety, not something that may take the migration down with
+    it — see the `path_updater` try/except in `migrate()`). Returns True only
+    when it actually changed the registry."""
+    try:
+        import winreg  # noqa: PLC0415 - Windows only, and optional
+    except ImportError:
+        return False
+    target = os.path.join(_home(), *_NATIVE_BIN)
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                            winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            try:
+                current, kind = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                current, kind = "", winreg.REG_EXPAND_SZ
+            updated = _compute_updated_path(current, target)
+            if updated is None:
+                return False
+            winreg.SetValueEx(key, "Path", 0, kind or winreg.REG_EXPAND_SZ,
+                              updated)
+    except OSError:
+        return False
+    _broadcast_environment_change()
+    return True
+
+
+def _broadcast_environment_change() -> None:
+    """Tell already-running processes PATH changed, the way installers do.
+    Purely a nicety (a new terminal picks up the registry change anyway with
+    or without this), so any failure here is swallowed."""
+    try:
+        import ctypes  # noqa: PLC0415 - Windows only
+        result = ctypes.c_long()
+        ctypes.windll.user32.SendMessageTimeoutW(
+            0xFFFF, 0x001A, 0, ctypes.create_unicode_buffer("Environment"),
+            0x0002, 5000, ctypes.byref(result))
+    except Exception:  # noqa: BLE001 - never let a broadcast fail anything
+        pass
 
 
 def classify_install(exe: str) -> InstallKind:
@@ -630,7 +717,7 @@ def winget_uninstall_argv() -> list:
 # ----------------------------------------------------------------- verbs ---
 
 def migrate(runner, on_event=None, timeout: float = cli_update.INSTALL_TIMEOUT_S,
-            launcher: str = "", before: str = "") -> Result:
+            launcher: str = "", before: str = "", path_updater=None) -> Result:
     """Install the native build, then decide success by READING THE FILE.
 
     Never by the installer's report: that is the rule the whole `cli_update`
@@ -640,7 +727,15 @@ def migrate(runner, on_event=None, timeout: float = cli_update.INSTALL_TIMEOUT_S
     is the escape hatch, matching the startup gate's install phase.
 
     `before` is the version of the OUTGOING install, so a native build older
-    than what the user already had is refused rather than announced."""
+    than what the user already had is refused rather than announced.
+
+    `path_updater`, when given, runs ONCE after a successful install and is
+    `ensure_native_on_path`. It is INJECTED exactly like `runner` — the
+    offscreen smoke suite calls `migrate()` directly and must never touch the
+    real Windows User PATH registry key, so the default (`None`) is a no-op
+    and only `update_panel.py`'s live caller passes the real function. See
+    `ensure_native_on_path` for why this exists at all: `resolve_claude()`
+    never needed PATH, but a user's own terminal does."""
     launcher = launcher or native_launcher_path()
     _emit(on_event, "install", INSTALL_COMMAND)
     rc, text = runner(install_argv(), timeout)
@@ -656,7 +751,14 @@ def migrate(runner, on_event=None, timeout: float = cli_update.INSTALL_TIMEOUT_S
         return Result(False, "migrate", before=before, after=after,
                       detail=f"the native install is {after}, older than the "
                              f"{before} you already had, so it was not adopted")
-    return Result(True, "migrate", before=before, after=after)
+    path_added = False
+    if path_updater is not None:
+        try:
+            path_added = bool(path_updater())
+        except Exception:  # noqa: BLE001 - a PATH nicety must never fail the migration
+            path_added = False
+    return Result(True, "migrate", before=before, after=after,
+                  path_added=path_added)
 
 
 def _install_failure(rc: int, text, launcher: str) -> str:
@@ -805,7 +907,11 @@ def audit_lines(result: Result) -> list:
     action, detail = result.action, result.detail or ""
     if action == "migrate":
         if result.ok:
-            return [f"CLI-MIGRATE-OK {result.before or '?'} -> {result.after}"]
+            lines = [f"CLI-MIGRATE-OK {result.before or '?'} -> {result.after}"]
+            if result.path_added:
+                lines.append("CLI-MIGRATE-PATH added .local\\bin to the User "
+                             "PATH")
+            return lines
         return [f"CLI-MIGRATE-FAIL {detail}"]
     if action == "pause":
         return [f"CLI-MIGRATE-PAUSE {result.after or detail}"]

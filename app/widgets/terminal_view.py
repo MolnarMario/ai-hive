@@ -158,6 +158,11 @@ _INPUT_PROMPTS = (">", "❯")
 # show up in ordinary prose.
 _RULE_CHARS = frozenset(chr(c) for c in range(0x2500, 0x2580))
 
+# Rows of blank padding allowed below the input box's footer before
+# _check_input_gap treats it as a stranded layout rather than ordinary
+# spacing. See _check_input_gap for why this exists at all.
+_INPUT_GAP_TOLERANCE = 1
+
 _KEY_SEQUENCES = {
     Qt.Key.Key_Return: "\r", Qt.Key.Key_Enter: "\r",
     Qt.Key.Key_Backspace: "\x7f", Qt.Key.Key_Tab: "\t",
@@ -436,6 +441,13 @@ class TerminalView(QWidget):
     # Emitted from the bare-Enter branch of keyPressEvent and nowhere else --
     # see _note_prompt_submit for why every other candidate source is wrong.
     promptSubmitted = Signal(str, int)
+    # Claude's classic renderer scrolled the screen to fit a transient
+    # dropdown (autocomplete/@-mention) and, on dismissal, left the input box
+    # stranded above a dead run of blank rows instead of pinned to the
+    # bottom -- see _check_input_gap. The card turns this into a silent
+    # TerminalAgent.request_repaint() so the layout self-heals with no user
+    # action.
+    staleLayoutDetected = Signal()
 
     def __init__(self, rows: int = 30, cols: int = 100, parent=None,
                  font_px: int = 0):
@@ -451,6 +463,10 @@ class TerminalView(QWidget):
         self._base_dir = ""
         self._esc_carry = ""  # trailing partial escape between feed() calls
         self._scroll_offset = 0  # lines scrolled back into history (0 = live)
+        # footer row _check_input_gap last asked for a repaint at, so a
+        # persistent (legitimately short) gap is checked once and left alone
+        # rather than re-triggering a repaint on every settle
+        self._input_gap_row = None
         self._sel_anchor = None  # (row, col) selection start, in screen coords
         self._sel_end = None     # (row, col) selection end
         self._input_selected = False  # Ctrl+A input-line highlight is active
@@ -514,7 +530,7 @@ class TerminalView(QWidget):
         self._snap_timer = QTimer(self)
         self._snap_timer.setSingleShot(True)
         self._snap_timer.setInterval(600)
-        self._snap_timer.timeout.connect(self._snapshot_input)
+        self._snap_timer.timeout.connect(self._on_input_settled)
 
         # prompt milestones painted on the scrollbar: (absolute line, tooltip).
         # Pure VIEW data -- the durable copy lives on the agent, because a card
@@ -1891,6 +1907,57 @@ class TerminalView(QWidget):
                 self._undo_stack.pop(0)
             self._redo_stack.clear()
             self._undo_last = cur
+
+    def _on_input_settled(self) -> None:
+        """Fired once, 600ms after the last edit keystroke (see _snap_timer /
+        _kick_snapshot) -- the "user stopped touching the input" moment. Does
+        the existing undo bookkeeping and then checks whether the box got
+        left in a stale spot (_check_input_gap): a burst of typing is exactly
+        when Claude's classic renderer can scroll for a dropdown and fail to
+        scroll back, and by the time this fires the child's redraw has long
+        since arrived and been painted."""
+        self._snapshot_input()
+        self._check_input_gap()
+
+    def _check_input_gap(self) -> None:
+        """Self-heal a classic-renderer glitch: Claude's autocomplete/mention
+        dropdown scrolls the whole screen to make room, and on dismissal the
+        input box can be left stranded above a dead run of blank rows instead
+        of pinned to the bottom of the terminal (the dropdown's rows are
+        erased, but nothing re-scrolls the viewport back down). A raw VT100
+        terminal fed the same bytes would show the identical gap -- this is
+        upstream Claude Code CLI behaviour, not a scroll_offset bug (typing
+        already calls _snap_to_bottom, so offset is 0 here) -- so the fix is
+        to ask Claude to redraw its whole frame, exactly like a real terminal
+        recovers from this when its window is resized (TerminalAgent.
+        request_repaint, wired to staleLayoutDetected by TerminalCard).
+
+        Fires ONLY on the EDGE: a footer row that moved further from the
+        bottom than the last check. A short conversation that legitimately
+        has blank space below its footer gets checked once, finds nothing to
+        fix next time (same row), and is never repainted again -- this is
+        what keeps normal use free of any repeated resize blip."""
+        if self._scroll_offset:
+            return  # only the live tail can be "stranded"
+        span = self._input_block_span()
+        if span is None:
+            self._input_gap_row = None
+            return
+        _, bottom = span
+        footer = bottom + 1
+        edge = footer if (footer < self.screen.lines
+                          and self._row_is_input_footer(footer)) else bottom
+        gap = (self.screen.lines - 1) - edge
+        if gap <= _INPUT_GAP_TOLERANCE:
+            self._input_gap_row = None
+            return
+        for r in range(edge + 1, self.screen.lines):
+            if self._row_content(r) != (-1, -1):
+                return  # not actually blank all the way down -- leave it
+        if self._input_gap_row == edge:
+            return  # already asked for a repaint at this exact position
+        self._input_gap_row = edge
+        self.staleLayoutDetected.emit()
 
     def _reset_undo(self) -> None:
         """Forget the edit history -- called on submit (bare Enter) and reset,

@@ -276,6 +276,33 @@ this file is the invariants that must survive every change.
   click- or selection-driven caret behavior in `terminal_view.py` MUST check
   `waiting_probe()` before sending anything to the child, or it reopens this
   same hole.
+- **A dropdown that scrolls the classic renderer can strand the input box, and
+  that is self-healed, not merely tolerated** (`TerminalView._check_input_gap`
+  / `staleLayoutDetected`, wired in `TerminalCard._wire` to
+  `TerminalAgent.request_repaint()`). Because the classic renderer does GENUINE
+  terminal scrolling (see the bullet above), Claude's own autocomplete/
+  @-mention dropdown growing below the input line can scroll the whole screen
+  up to fit; when the text is cleared and the dropdown is dismissed, Claude
+  erases those rows but never re-emits anything to scroll the viewport back
+  down, leaving the input box and its footer stranded mid-screen above a dead,
+  genuinely-blank run of rows. A raw VT100 terminal fed the identical bytes
+  would show the same gap — this is upstream Claude Code CLI behaviour, not an
+  AI Hive scroll-offset bug (typing already calls `_snap_to_bottom`, so
+  `_scroll_offset` is 0 throughout; the screen buffer itself is blank). The fix
+  is the same one a real terminal gets for free on a window resize: ask the
+  child to redraw its whole frame. `_check_input_gap` reuses `_input_block_span`
+  / `_row_is_input_footer` to find the footer row and measures the blank run
+  beneath it against `_INPUT_GAP_TOLERANCE`; it deliberately piggybacks on
+  `_snap_timer` (the EXISTING 600ms debounce that coalesces a typing burst for
+  undo, re-armed by every edit keystroke) rather than adding a second timer —
+  by the time a typing burst has been quiet for 600ms, the child's redraw has
+  long since arrived and been painted. It fires ONLY on the EDGE: `_input_gap_row`
+  remembers the footer row a repaint was last requested for, so a short
+  conversation that legitimately has blank space below its footer is checked
+  once, finds the SAME row next time, and is never repainted again — this is
+  what keeps ordinary use free of any repeated resize blip. Do not lower this
+  to a per-keystroke or per-`feed()` check; the whole point is one silent,
+  debounced repair per genuine occurrence, not a jittery poll.
 - **Readiness is matched WITHOUT WHITESPACE, and that is load-bearing**
   (`TerminalAgent._has_ready_hint`, `_despace`). The classic renderer lays its
   footer out by MOVING THE CURSOR between segments instead of emitting spaces,
@@ -579,6 +606,40 @@ this file is the invariants that must survive every change.
   patch-versus-minor gate: nothing in the numbering predicts whether a flag
   moved, so a version gate buys false safety while an audit line turns "it broke
   this morning" into a lookup.
+  **WHAT A SKIPPED CHECK MEANS DEPENDS ON THE SHAPE, SO THE WORDS DO TOO.**
+  `Outcome.self_updating` is stamped by `check()` off `Target.self_update` and
+  is what every reporting surface reads. On a WINGET target a TIMEOUT or a
+  locked file is a genuinely missed update (nothing else will fetch one, and
+  the stale binary keeps its alias table and its banner); on a SELF-UPDATING
+  one the CLI fetches its own version in the background regardless, so the same
+  statuses are NON EVENTS. Hence three things move together and must stay
+  together: `_SELF_UPDATING_TEXT` rewords them ("left to its own updater"),
+  `needs_pill` withholds the top-bar nag — every line of `_PILL_LONG` tells the
+  user to close programs or run an installer by hand, and none of that applies
+  — and `worth_reading` does not hold the splash open. ONE predicate
+  (`needs_pill`) decides the pill for both `pill_text` and `pill_tooltip`, so
+  the splash and the bar can never call the same outcome different things.
+  This is a live report, and the shape of the complaint is the point: after the
+  native migration the splash flashed "took too long, skipped" for under a
+  second on a launch where nothing was wrong (the CLI updated itself a minute
+  later), and because TIMEOUT is deliberately NOT in `PILL_STATUSES` there was
+  no surface afterwards that could say so — a message too brief to read and too
+  final to check. So the fleeting surface is no longer the only one:
+  `last_check_summary` lets EVERY outcome speak (unlike `pill_text`, which
+  reports only what needs acting on) and `MainWindow._update_outcomes` carries
+  them to the Updates panel, TRANSIENT exactly like `_update_installing`. A
+  status with nowhere to be re-read is indistinguishable from one the app never
+  produced. `LINGER_CLOSE_MS` buys a `worth_reading` outcome time to be read,
+  and is deliberately NARROWER than "not a clean run" — lingering on a non
+  event would manufacture the very concern the rewording removes. The splash
+  SUBTITLE follows the machine for the same reason (`subtitle_for`): "Now is
+  the only moment these files are not in use" is the winget constraint, false
+  of a native install that never touches the running file, and it was being
+  painted directly above that install's row. It stays while ANY target is
+  package managed. The audit lines record the shape (`UPDATE-TIMEOUT` /
+  `UPDATE-SKIP` gain "(self-updating, left to the CLI)") because which of the
+  two a line describes is read off the install and can change between runs on
+  one machine.
 - **Letting Claude Code update ITSELF is a MIGRATION, not a preference**
   (`app/cli_install.py`, Qt-free/stdlib-only like `cli_update.py`;
   `app/widgets/update_panel.py` shows it; `MainWindow.open_updates_panel` /
@@ -610,6 +671,29 @@ this file is the invariants that must survive every change.
     answering with the STALE copy after a migration and AI Hive would go on
     launching the old binary. Deliberate consequence worth keeping: AI Hive
     never needs the installer's PATH edit, so no new terminal is required.
+  * **THE USER'S OWN TERMINAL STILL NEEDS PATH, SO A SUCCESSFUL MIGRATION
+    FIXES IT** (`cli_install.ensure_native_on_path`). `resolve_claude()`
+    sidesteps PATH for AI Hive's own launches, but a user typing `claude` into
+    an ordinary terminal only has `shutil.which`, and MEASURED: the native
+    installer does not put `%USERPROFILE%\.local\bin` on PATH at all. Left
+    alone that is two live symptoms, one per machine shape — with BOTH installs
+    present (the ordinary post-migration state until `cleanup()` runs) a plain
+    terminal keeps resolving the OLD winget copy, silently stale; with ONLY the
+    native install (no winget fallback to land on) a bare `claude` does not
+    resolve AT ALL. So `migrate()` calls `path_updater` once, on success only —
+    INJECTED exactly like `runner`, defaulting to `None` (a no-op), because the
+    offscreen smoke suite calls `migrate()` directly and must never touch the
+    real Windows User PATH registry key; only `update_panel.py`'s live caller
+    passes the real `ensure_native_on_path`. That function itself re-reads the
+    registry immediately before writing (same "copy aside and re-read" rule
+    `write_settings` follows for `settings.json`) and is additive-only,
+    appending the directory only when it is not already there
+    (case/trailing-backslash-insensitive, since Windows PATH lookups are); it
+    never touches the Machine PATH, and it never raises (a PATH nicety must
+    never take the migration itself down with it). The CLEANUP button remains
+    separate and manual (see below) — this only ever ADDS the native
+    directory, it never removes the winget one, so a user who has not yet
+    cleaned up still lands on a working `claude` either way.
   * **...AND THAT IS NOT ENOUGH ON ITS OWN.** `build_spec` bakes `spec.program`
     once, so a card that existed BEFORE the migration would relaunch the winget
     binary for the rest of the process. `MainWindow.rebind_claude_specs` re-runs
@@ -781,7 +865,24 @@ this file is the invariants that must survive every change.
   guards it because a 6s CLI timeout outlasts the urgent interval and the timer
   would otherwise stack threads; the retune TAKES the reading; and the timer is
   armed in `start_usage_polling`, never in `__init__`. Do not "simplify" any of
-  those back to an inline `fetch()`. The BLOCKED state (`Usage.blocked`, utilization >= 100 —
+  those back to an inline `fetch()`. AND IT RIDES ITS OWN, MUCH SLOWER CLOCK
+  (`GEMINI_USAGE_POLL_MS` 5 min / `GEMINI_USAGE_URGENT_POLL_MS` 60s), because
+  every Gemini tick SPAWNS A PROCESS where a Claude tick makes a request. On
+  some runs `agy` starts a nested helper that asks Windows for its OWN console;
+  `CREATE_NO_WINDOW` is passed and is NOT ENOUGH, because spawn flags do not
+  reach a GRANDCHILD — MEASURED on a deterministic reproducer, a descendant that
+  demands a console gets a VISIBLE one 8/8 times under `CREATE_NO_WINDOW`,
+  `CREATE_NEW_CONSOLE`+`STARTUPINFO(SW_HIDE)` and `CREATE_NO_WINDOW`+
+  `STARTUPINFO(SW_HIDE)` alike. With Windows 11 delegating to Windows Terminal
+  that console appears as a real window flashing over the user's screen (live:
+  ~6% of polls, 2 of 32, i.e. every quarter hour at 60s — reported as "a
+  terminal keeps popping up and I can't read it"). Since NO flag suppresses it,
+  asking less often is the only lever, and it costs nothing: only the two pills
+  consume this reading, and a Gemini cut-off recovers on its own printed
+  countdown, never on the account reading. Do NOT fold these back onto
+  `USAGE_POLL_MS` — that constant answers to `planLimitReached`/
+  `planLimitCleared` and the reset poll they arm, none of which exist for
+  Gemini. The BLOCKED state (`Usage.blocked`, utilization >= 100 —
   derived from the number, NOT from the payload's server-side `severity`
   string) is the machine-readable half: `MainWindow.planLimitReached(Limit)` /
   `planLimitCleared()` are edge-triggered and level-correct like the chime, and
@@ -1440,6 +1541,40 @@ this file is the invariants that must survive every change.
   disables transcript persistence (verified live; it also breaks
   `--session-id` pinning). This bites whenever AI Hive itself is launched
   from a Claude Code terminal — which is exactly how the test suite runs.
+- **Ctrl+C is only a real interrupt because the spawn CLEARS AN INHERITED
+  FLAG** (`process_worker.enable_ctrl_c_for_children`, called from
+  `PtyWorker.start` beside `agent_environment()` — the same family of bug, and
+  the same repair). The pty does NOT grant the interrupt. Measured chain: a
+  0x03 written into the pseudoconsole is never delivered as DATA, because
+  conhost consumes it as a control key while the child's input carries
+  `ENABLE_PROCESSED_INPUT` and raises `CTRL_C_EVENT` instead — so if that event
+  is ignored, the keystroke reaches NOBODY, as neither signal nor byte (the tell
+  is that 0x04 and 0x1a arrive as keys and 0x03 simply vanishes). And it WAS
+  ignored: `PEB.ProcessParameters.ConsoleFlags` bit 0 ("ignore Ctrl+C") is
+  inherited at `CreateProcess` time by every descendant, AI Hive picks it up
+  from WHATEVER LAUNCHED AI HIVE (any harness spawning with
+  `CREATE_NEW_PROCESS_GROUP`, including a Claude Code agent terminal — again how
+  this repo is developed and how the suite is run), and hands it to every agent,
+  which hands it to every build/test/`ping` it starts. NOT a pywinpty behaviour:
+  it spawns with `EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT` and
+  nothing else, so there is no library version to chase. Verified A/B in one
+  process: flag set → `ping -t` under a pty PowerShell ignores 0x03 forever;
+  flag cleared → ping dies, the shell prints "Control-C" and returns to its
+  prompt, alive. Consequences worth keeping straight: it must run AT SPAWN
+  (inheritance is captured there, so a one-shot in `main.py` would miss restarts
+  and the suite), the flag is cleared on EVERY call while the SELF-PROTECT
+  HANDLER is installed ONCE (`SetConsoleCtrlHandler` APPENDS to a table), and
+  that handler is NOT optional — clearing the flag without it makes AI Hive
+  itself killable by a Ctrl+C in a console it shares with its launcher, and a
+  hard kill skips `closeEvent`, i.e. no final save, no transcript backup, no
+  screen snapshots. It returns True for `CTRL_C_EVENT`/`CTRL_BREAK_EVENT` and
+  False for CLOSE/LOGOFF/SHUTDOWN so shutdown is unchanged; handlers are
+  per-process and NOT inherited, so protecting ourselves costs the children
+  nothing. This also makes `PtyWorker.stop()`'s "Ctrl+C first" graceful path
+  real rather than an always-escalating no-op. The regression check drives it
+  from the WORST case on purpose (`test_pty` sets the ignore flag ON before
+  `start()`), because on a machine launched from a plain terminal the flag is
+  already clear and the check would pass without the fix.
 - **Claude task delivery submits with a delayed Enter** (350 ms,
   `_write_task_to_pty`): a CR in the same input burst as the text reads as
   part of a paste and inserts a newline instead of submitting — the task

@@ -4384,6 +4384,56 @@ def test_terminal_input_editor():
           (view._undo_stack, view._undo_last))
 
 
+def test_input_gap_self_heal():
+    """Claude's classic renderer can scroll the screen for a transient
+    dropdown and never scroll back on dismissal, stranding the input box
+    above a dead run of blank rows (see TerminalView._check_input_gap).
+    _on_input_settled is what _snap_timer's 600ms debounce fires; called
+    directly here rather than pumping a real timer, matching the existing
+    _snapshot_input direct-call pattern above."""
+    from app.widgets.terminal_view import TerminalView
+
+    # a tall terminal with the box parked near the TOP and nothing below --
+    # exactly the shape left once a dropdown's rows are erased but the
+    # viewport is never scrolled back down
+    view = TerminalView(rows=20, cols=40)
+    view.feed("> \r\n? for shortcuts")
+    fired = []
+    view.staleLayoutDetected.connect(lambda: fired.append(1))
+    view._on_input_settled()
+    check("input-gap: a footer stranded far from the bottom fires once",
+          fired == [1], fired)
+
+    # settling again with nothing changed must NOT refire -- this is what
+    # keeps a legitimately short conversation free of a repeated resize blip
+    view._on_input_settled()
+    check("input-gap: an unchanged gap does not refire",
+          fired == [1], fired)
+
+    # the footer sits right at the bottom (one row of normal padding) --
+    # within tolerance, so nothing is wrong and nothing fires
+    view2 = TerminalView(rows=3, cols=40)
+    view2.feed("> \r\n? for shortcuts")
+    fired2 = []
+    view2.staleLayoutDetected.connect(lambda: fired2.append(1))
+    view2._on_input_settled()
+    check("input-gap: a footer within tolerance of the bottom never fires",
+          fired2 == [] and view2._input_gap_row is None,
+          (fired2, view2._input_gap_row))
+
+    # no footer line at all (mid-typing) still uses the box's own bottom row
+    # as the edge, and repeated settles with nothing changed still fire once
+    view3 = TerminalView(rows=20, cols=40)
+    view3.feed("hello\r\n> ")
+    fired3 = []
+    view3.staleLayoutDetected.connect(lambda: fired3.append(1))
+    view3._on_input_settled()
+    view3._on_input_settled()
+    view3._on_input_settled()
+    check("input-gap: a stable gap with no footer fires once, not per settle",
+          fired3 == [1], fired3)
+
+
 def test_session_migration():
     """A pre-v2 line-mode shell agent upgrades to interactive on load."""
     from app.pty_worker import HAS_CONPTY
@@ -4430,7 +4480,11 @@ def test_pty():
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
 
-    from app.process_worker import AgentKind, build_spec
+    import ctypes
+    from ctypes import wintypes
+
+    from app import pty_worker
+    from app.process_worker import AgentKind, build_spec, describe_pid
     from app.pty_worker import HAS_CONPTY
     from app.terminal_agent import TerminalAgent
     from app.widgets.terminal_card import TerminalCard
@@ -4465,7 +4519,30 @@ def test_pty():
     check("pty: card hosts a TerminalView (no line console)",
           card.terminal is not None and card.console is None)
 
-    agent.start()
+    # Hand the spawn the WORST case rather than whatever this suite happens to
+    # have been launched with: set the ignore-Ctrl+C ConsoleFlag ON, exactly as
+    # a harness that spawns with CREATE_NEW_PROCESS_GROUP does. Children capture
+    # it at spawn, so unless PtyWorker.start() clears it, the interrupt check
+    # below fails -- which is what makes that check a test of OUR fix and not of
+    # the launching terminal.
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.SetConsoleCtrlHandler.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+    k32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+    k32.SetConsoleCtrlHandler(None, True)
+    enable_calls = []
+    real_enable = pty_worker.enable_ctrl_c_for_children
+
+    def counting_enable():
+        enable_calls.append(1)
+        return real_enable()
+
+    pty_worker.enable_ctrl_c_for_children = counting_enable
+    try:
+        agent.start()
+    finally:
+        pty_worker.enable_ctrl_c_for_children = real_enable
+    check("pty: the spawn clears the inherited ignore-Ctrl+C flag",
+          enable_calls == [1], enable_calls)
     check("pty: agent reaches running", wait_until(agent.is_running, 15000))
     check("pty: interactive prompt renders in the grid",
           wait_until(lambda: "PS" in card.terminal.screen_text()
@@ -4477,16 +4554,27 @@ def test_pty():
           wait_until(lambda: "gridok" in
                      card.terminal.screen_text().replace(" ", ""), 12000))
 
-    # Ctrl+C interrupts a running loop (real signal, not available in line mode)
+    # Ctrl+C interrupts a running child (a real console control event, not
+    # available in line mode). Measured on the PROCESS, never on screen text:
+    # the old check compared a screen snapshot taken before the pending output
+    # had even flushed against one 2.5s later, counted the English-only string
+    # "Reply", and fell back to "PS" in the last 80 chars -- which pyte pads to
+    # full width, so that arm could never fire. It reported FAIL on a working
+    # interrupt and PASS on a broken one, and was written off as flaky for
+    # months while Ctrl+C was genuinely dead (see enable_ctrl_c_for_children).
+    def ping_pids():
+        return [p for p in agent.worker.job_process_ids()
+                if describe_pid(p).lower().startswith("ping")]
+
     agent.write("ping -t 127.0.0.1\r")
-    wait_until(lambda: "127.0.0.1" in card.terminal.screen_text(), 15000)
-    pump(500)
+    check("pty: the child command is running",
+          wait_until(lambda: bool(ping_pids()), 15000),
+          agent.worker.job_process_ids())
     agent.write("\x03")
-    a = card.terminal.screen_text()
-    pump(2500)
-    b = card.terminal.screen_text()
-    check("pty: Ctrl+C stopped the loop",
-          a.count("Reply") == b.count("Reply") or "PS" in b[-80:], b[-160:])
+    check("pty: Ctrl+C interrupted the running child",
+          wait_until(lambda: not ping_pids(), 10000), ping_pids())
+    # an INTERRUPT, not a kill: the shell survives its child being stopped
+    check("pty: Ctrl+C left the shell alive", agent.is_running())
 
     # background retention while hidden
     agent.write("1..8 | %{ $_; Start-Sleep -Milliseconds 100 }\r")
@@ -10300,6 +10388,94 @@ def test_gemini_usage_polling_is_offthread_and_optin():
         gemini_usage.fetch = real
 
 
+def test_gemini_usage_poll_is_slower_than_claudes():
+    """Gemini rides its OWN, much slower poll clock, because each tick spawns a
+    process rather than making a request.
+
+    `gemini_usage.fetch()` shells out to `agy`, and on some runs agy starts a
+    nested helper that asks Windows for its own console. CREATE_NO_WINDOW is
+    passed and is not enough -- spawn flags do not reach a grandchild, measured
+    8/8 visible windows under CREATE_NO_WINDOW, CREATE_NEW_CONSOLE+SW_HIDE and
+    CREATE_NO_WINDOW+SW_HIDE alike -- so with Windows 11 delegating to Windows
+    Terminal a real window flashes over the user's screen on ~6% of polls. No
+    flag suppresses it; asking less often is the only lever, and it is nearly
+    free because only the two pills consume this reading (a Gemini cut-off
+    recovers on its own printed countdown, never on the account reading).
+
+    This check exists so nobody "tidies" the Gemini timer back onto
+    USAGE_POLL_MS, which is answerable to planLimitReached and the reset poll
+    it arms -- neither of which exists for Gemini."""
+    import pathlib
+    import tempfile
+
+    from PySide6.QtWidgets import QApplication
+
+    from app import gemini_usage
+    from app.session_store import SessionStore
+    from app.widgets.main_window import (GEMINI_USAGE_POLL_MS,
+                                         GEMINI_USAGE_URGENT_POLL_MS,
+                                         USAGE_POLL_MS, USAGE_URGENT_PCT)
+    from main import create_main_window
+
+    QApplication.instance() or QApplication([])
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="ai-hive-gempoll-"))
+
+    check("gemini-poll: the calm rate is well slower than Claude's",
+          GEMINI_USAGE_POLL_MS >= 5 * USAGE_POLL_MS,
+          (GEMINI_USAGE_POLL_MS, USAGE_POLL_MS))
+    check("gemini-poll: even the urgent rate never goes below Claude's calm one",
+          GEMINI_USAGE_URGENT_POLL_MS >= USAGE_POLL_MS,
+          GEMINI_USAGE_URGENT_POLL_MS)
+
+    calls = []
+    real = gemini_usage.fetch
+    gemini_usage.fetch = lambda *a, **k: (calls.append(1), None)[1]
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        check("gemini-poll: the timer is built on the Gemini interval",
+              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
+              win._gemini_usage_timer.interval())
+        check("gemini-poll: ...and Claude's timer is left alone",
+              win._usage_timer.interval() == USAGE_POLL_MS,
+              win._usage_timer.interval())
+
+        def reading(pct):
+            return gemini_usage.GeminiUsage(limits=(
+                gemini_usage.GeminiLimit(key="five_hour", label="5h", short="5h",
+                                         percent=pct, resets_at=None),))
+
+        # a calm window stays on the slow clock even with agents working
+        win._gemini_agents_working = lambda: True
+        win._retune_gemini_usage_poll(reading(10.0))
+        check("gemini-poll: a calm window keeps the slow rate",
+              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
+              win._gemini_usage_timer.interval())
+
+        # the danger zone speeds up, but only to the Gemini urgent rate
+        win._retune_gemini_usage_poll(reading(USAGE_URGENT_PCT + 1))
+        check("gemini-poll: a nearly spent window uses the Gemini urgent rate",
+              win._gemini_usage_timer.interval() == GEMINI_USAGE_URGENT_POLL_MS,
+              win._gemini_usage_timer.interval())
+
+        # ...and drops back, rather than latching fast for the rest of the run
+        win._retune_gemini_usage_poll(reading(5.0))
+        check("gemini-poll: it drops back to the slow rate afterwards",
+              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
+              win._gemini_usage_timer.interval())
+
+        # no agents working means nothing is moving the number, so no rush
+        win._gemini_agents_working = lambda: False
+        win._retune_gemini_usage_poll(reading(99.0))
+        check("gemini-poll: no working agents means no urgent rate",
+              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
+              win._gemini_usage_timer.interval())
+
+        check("gemini-poll: retuning still never fetches", calls == [], len(calls))
+        win.close()
+    finally:
+        gemini_usage.fetch = real
+
+
 def test_history_screen_wrapper_removed():
     """_FastHistoryScreen drops pyte's per-event wrapper without changing what
     is rendered.
@@ -10840,6 +11016,7 @@ def main():
     test_terminal_click_menu_guard()
     test_terminal_selection_edit()
     test_terminal_input_editor()
+    test_input_gap_self_heal()
     test_session_migration()
     test_app()
     test_pty()
@@ -10882,6 +11059,7 @@ def main():
     test_terminal_scrollbar()
     test_history_screen_wrapper_removed()
     test_gemini_usage_polling_is_offthread_and_optin()
+    test_gemini_usage_poll_is_slower_than_claudes()
     test_projection_happens_once()
     test_recovered_prompts_are_cached()
     test_multi_agent_session_isolation()
@@ -11809,6 +11987,14 @@ def test_cli_auto_update():
     check("cli-update: reporting an outcome NEVER marks the session dirty "
           "(outcomes are transient, only the preference persists)",
           not again._save_timer.isActive())
+    check("cli-update: the window keeps the outcomes so the Updates panel can "
+          "show them after the splash has closed",
+          again._update_outcomes == (blocked,)
+          and "Claude Code" in cli_update.last_check_summary(
+              again._update_outcomes))
+    check("cli-update: ...and keeping them is transient too",
+          not again._save_timer.isActive()
+          and "update_outcomes" not in str(again._session_payload()))
     again.note_update_outcomes([cli_update.Outcome("claude", Status.UP_TO_DATE)])
     check("cli-update: a clean gate leaves the pill hidden",
           not again.top_bar.update_pill.isVisibleTo(
@@ -11901,6 +12087,113 @@ def test_cli_auto_update():
           splash._spin.state() != splash._spin.State.Running)
     splash.close()
     splash.deleteLater()
+
+    # --- 14. what a skipped check MEANS depends on who updates the binary ---
+    # Live report: after the native migration the splash flashed "took too
+    # long, skipped" for under a second on a launch where nothing was wrong,
+    # the CLI updated itself a minute later, and no surface afterwards could
+    # say so. A self-updating target that we failed to check is a non event;
+    # the same status on a package managed one is a genuinely missed update.
+    from app.widgets.update_splash import LINGER_CLOSE_MS, subtitle_for
+
+    native_claude = cli_update.Target(
+        key="claude", label="Claude Code", exe=r"C:\fake\claude.exe",
+        process_names=("claude.exe",), self_update=("update",))
+
+    def outcome(status, self_updating, **kw):
+        return cli_update.Outcome("claude", status, label="Claude Code",
+                                  self_updating=self_updating, **kw)
+
+    self_late = outcome(Status.TIMEOUT, True, before="2.1.228",
+                        detail="check exceeded 5s")
+    winget_late = outcome(Status.TIMEOUT, False, before="2.1.224",
+                          detail="check exceeded 5s")
+    gemini_ok = cli_update.Outcome("gemini", Status.UP_TO_DATE, before="1.1.12",
+                                   label="Gemini (agy)", self_updating=True)
+
+    check("cli-update words: a self-updating CLI we could not check is left to "
+          "its own updater, not reported as skipped",
+          cli_update.state_text(self_late) == "left to its own updater")
+    check("cli-update words: the same status on a package managed CLI still "
+          "says the update was missed (nothing else will fetch one)",
+          cli_update.state_text(winget_late) == "took too long, skipped")
+    check("cli-update words: the shape is stamped on the outcome by check(), "
+          "so no caller has to remember to set it",
+          cli_update.check(native_claude,
+                           _FakeCli(timeout_on=("--version",))).self_updating
+          and not cli_update.check(claude,
+                                   _FakeCli(timeout_on=("--version",))
+                                   ).self_updating)
+
+    check("cli-update pill: a self-updating CLI raises no nag, because every "
+          "instruction the nag carries would be unnecessary",
+          cli_update.pill_text([self_late, gemini_ok]) == ""
+          and cli_update.pill_tooltip([self_late]) == "")
+    self_busy = outcome(Status.BLOCKED_PROCESSES, True,
+                        detail="3 claude.exe alive")
+    winget_busy = outcome(Status.BLOCKED_PROCESSES, False,
+                          detail="3 claude.exe alive")
+    check("cli-update pill: ...and that holds for a locked file too, since a "
+          "self-updating CLI does not need the user to close anything",
+          cli_update.pill_text([self_busy]) == ""
+          and "Claude Code" in cli_update.pill_text([winget_busy]))
+    check("cli-update pill: the splash and the pill can never disagree, so an "
+          "outcome the splash calls a non event never raises a nag",
+          all(not cli_update.needs_pill(o)
+              for o in (self_late, winget_late, self_busy, winget_busy)
+              if cli_update.state_text(o)
+              in cli_update._SELF_UPDATING_TEXT.values())
+          and cli_update.needs_pill(winget_busy))
+
+    check("cli-update linger: a missed update earns a moment to be read",
+          cli_update.worth_reading([winget_late])
+          and cli_update.worth_reading([winget_busy]))
+    check("cli-update linger: ...and a non event does not, or the pause would "
+          "manufacture the concern the wording removes",
+          not cli_update.worth_reading([self_late, gemini_ok])
+          and not cli_update.worth_reading([]))
+
+    # the durable copy. The pill speaks only for what the user can act on, so
+    # without this a status glimpsed on the splash has nowhere to be re-read.
+    summary = cli_update.last_check_summary([self_late, gemini_ok])
+    check("cli-update panel: the last check reports EVERY outcome, including "
+          "the ones the pill deliberately withholds",
+          "Claude Code: left to its own updater" in summary
+          and "Gemini (agy): up to date (1.1.12)" in summary, summary)
+    check("cli-update panel: ...and names anything still installing",
+          "still installing" in
+          cli_update.last_check_summary([self_late], installing=("gemini",)))
+
+    check("cli-update audit: the timeout line records which shape it describes",
+          cli_update.audit_lines(self_late)[-1].endswith(
+              "(self-updating, left to the CLI)")
+          and cli_update.audit_lines(winget_late)[-1].endswith("exceeded 5s"),
+          cli_update.audit_lines(self_late))
+
+    check("cli-update splash: the subtitle drops the locked-file claim when "
+          "every target updates itself (the native install never touches the "
+          "running file)",
+          "not in use" not in subtitle_for([native_claude, agy])
+          and "before agents start" in subtitle_for([native_claude, agy]))
+    check("cli-update splash: ...and keeps it while any target is package "
+          "managed, where it is both true and the reason to wait",
+          subtitle_for([claude, agy]) ==
+          "Now is the only moment these files are not in use.")
+
+    # the linger, end to end through the real event loop
+    for target, expect_wait in ((claude, True), (native_claude, False)):
+        started = time.time()
+        run_update_gate(None, targets=[target],
+                        runner=_FakeCli(timeout_on=("--version",)),
+                        auto_close_ms=0, linger_ms=400, show=True)
+        waited = time.time() - started
+        check("cli-update splash: a missed update holds the window open"
+              if expect_wait else
+              "cli-update splash: ...and a non event closes as fast as a "
+              "clean launch",
+              (waited >= 0.35) is expect_wait, (target.key, waited))
+    check("cli-update splash: the linger is long enough to actually read",
+          LINGER_CLOSE_MS >= 2000)
 
 
 class _FakeInstall:
@@ -12109,6 +12402,63 @@ def test_cli_native_migration():
     out = cli_install.migrate(slow, launcher=native_exe, before="2.1.224")
     check("cli-install: an installer that never finished claims no version",
           not out.ok and out.after == "" and out.before == "2.1.224", out)
+
+    # --- 4.1 a successful migrate fixes the USER'S OWN terminal's PATH too --
+    # `path_updater` is injected exactly like `runner`: the suite must never
+    # touch the real Windows User PATH registry key, so these drive FAKE
+    # updaters and never call the real `ensure_native_on_path`.
+    runner = _FakeInstall(lands={native_exe: "2.1.231 (Claude Code)"})
+    out = cli_install.migrate(runner, launcher=native_exe, before="2.1.224")
+    check("cli-install: with no path_updater given, nothing is added and "
+          "nothing is audited about PATH (the default the suite exercises)",
+          out.path_added is False
+          and cli_install.audit_lines(out) == ["CLI-MIGRATE-OK 2.1.224 -> 2.1.231"],
+          (out, cli_install.audit_lines(out)))
+    runner = _FakeInstall(lands={native_exe: "2.1.231 (Claude Code)"})
+    out = cli_install.migrate(runner, launcher=native_exe, before="2.1.224",
+                              path_updater=lambda: True)
+    check("cli-install: a path_updater that changed PATH is reflected on the "
+          "result and audited",
+          out.ok and out.path_added is True
+          and cli_install.audit_lines(out) == [
+              "CLI-MIGRATE-OK 2.1.224 -> 2.1.231",
+              "CLI-MIGRATE-PATH added .local\\bin to the User PATH"],
+          (out, cli_install.audit_lines(out)))
+    runner = _FakeInstall(lands={native_exe: "2.1.231 (Claude Code)"})
+    out = cli_install.migrate(runner, launcher=native_exe, before="2.1.224",
+                              path_updater=lambda: False)
+    check("cli-install: a path_updater reporting 'already there' adds nothing",
+          out.ok and out.path_added is False
+          and cli_install.audit_lines(out) == ["CLI-MIGRATE-OK 2.1.224 -> 2.1.231"],
+          out)
+
+    def _boom():
+        raise OSError("registry is locked")
+
+    runner = _FakeInstall(lands={native_exe: "2.1.231 (Claude Code)"})
+    out = cli_install.migrate(runner, launcher=native_exe, before="2.1.224",
+                              path_updater=_boom)
+    check("cli-install: a PATH nicety that raises never takes the migration "
+          "itself down with it",
+          out.ok and out.after == "2.1.231" and out.path_added is False, out)
+
+    # `_compute_updated_path` is the pure decision `ensure_native_on_path`
+    # makes before ever touching the registry, and is tested directly for
+    # that reason.
+    check("cli-install: an empty PATH becomes just the target",
+          cli_install._compute_updated_path("", r"C:\u\.local\bin")
+          == r"C:\u\.local\bin")
+    check("cli-install: the target is appended after existing entries",
+          cli_install._compute_updated_path(
+              r"C:\a;C:\b", r"C:\u\.local\bin")
+          == r"C:\a;C:\b;C:\u\.local\bin")
+    check("cli-install: an exact match already on PATH changes nothing",
+          cli_install._compute_updated_path(
+              r"C:\a;C:\u\.local\bin;C:\b", r"C:\u\.local\bin") is None)
+    check("cli-install: matching is case- and trailing-backslash-insensitive, "
+          "like Windows PATH lookups are",
+          cli_install._compute_updated_path(
+              r"C:\a;" + r"C:\U\.LOCAL\BIN" + "\\", r"C:\u\.local\bin") is None)
 
     # --- 5. resolve_claude prefers the NATIVE launcher (the §4.1 trap) ------
     # MEASURED: the winget package directory is on PATH directly, and
@@ -12392,9 +12742,26 @@ def test_cli_native_migration():
           and not panel.cleanup_btn.isVisibleTo(panel))
     check("cli-install panel: with no runner armed it can show but not act",
           not panel.action_btn.isEnabled())
+    check("cli-install panel: with no gate report it claims no check happened",
+          not panel.last_check_label.isVisibleTo(panel)
+          and panel.last_check_label.text() == "")
     strings = _dialog_strings(panel)
     panel.close()
     panel.deleteLater()
+
+    # the splash is the most fleeting surface in the app: it closes itself and
+    # leaves nothing behind, so this is the one place an outcome can be read
+    # again afterwards
+    reported = UpdatePanel(situation(winget_exe), runner=None,
+                           winget_exe=winget_exe, settings_file=str(settings),
+                           last_check="Claude Code: left to its own updater",
+                           parent=win)
+    check("cli-install panel: the startup gate's report is readable here long "
+          "after the splash has gone",
+          reported.last_check_label.isVisibleTo(reported)
+          and "left to its own updater" in reported.last_check_label.text())
+    reported.close()
+    reported.deleteLater()
 
     blocker = threading.Event()
     released = []
