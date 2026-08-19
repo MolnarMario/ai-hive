@@ -3063,6 +3063,67 @@ def test_agent_busy_activity():
     a.dispose()
 
 
+def test_agent_last_reply_at():
+    """last_reply_at() stamps the moment a reply genuinely ENDS (the busy ->
+    idle settle in _on_idle_timeout) so the card header can show it -- and
+    must NOT be re-stamped by a forced busy clear on stop/crash (_set_status),
+    which is not a reply ending, just the process going away mid-turn."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.process_worker import AgentKind, build_spec
+
+    QApplication.instance() or QApplication([])
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyTime", cwd="."))
+    a.status = AgentStatus.RUNNING
+    check("reply-at: no reply yet -> None", a.last_reply_at() is None)
+    a._on_pty_output("", "generating tokens...")
+    check("reply-at: still busy -> unset", a.last_reply_at() is None)
+    before = time.time()
+    a._on_idle_timeout()  # simulate the quiet-window settle: the reply ended
+    stamped = a.last_reply_at()
+    check("reply-at: settle stamps a recent walltime",
+          stamped is not None and before - 1 <= stamped <= time.time() + 1)
+    a._set_status(AgentStatus.EXITED_OK)  # forced clear, not a real reply end
+    check("reply-at: forced exit does not re-stamp",
+          a.last_reply_at() == stamped)
+    a.dispose()
+
+
+def test_reply_time_card_ui():
+    """The card header's #CardReplyTime label mirrors last_reply_at() LIVE,
+    off the same activity_changed edge the status glyph already reacts to
+    (mirrors test_bg_shell_live_ui's shape for a different marker)."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyCard", cwd="."))
+    a.status = AgentStatus.RUNNING
+    card = TerminalCard(a)
+    card.resize(900, 300); card.show(); pump(60)
+    check("reply-time UI: hidden before any reply",
+          not card.reply_time_label.isVisible())
+
+    a._on_pty_output("", "generating tokens...")
+    a._on_idle_timeout()  # busy -> idle settle: a reply just finished
+    pump(30)
+    check("reply-time UI: shown live once the agent settles",
+          card.reply_time_label.isVisible())
+    text = card.reply_time_label.text()
+    check("reply-time UI: label text is a plain HH:MM stamp",
+          len(text) == 5 and text[2] == ":" and
+          text[:2].isdigit() and text[3:].isdigit())
+    card.detach()
+    a.dispose()
+
+
 # ------------------------------------------------------------ ansi parser ---
 
 def test_ansi():
@@ -10683,6 +10744,8 @@ def main():
     test_reveal_agent()
     test_new_agent_autofocus()
     test_agent_busy_activity()
+    test_agent_last_reply_at()
+    test_reply_time_card_ui()
     test_ansi()
     test_terminal_keys()
     test_terminal_image_paste()
