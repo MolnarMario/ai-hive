@@ -15,7 +15,8 @@ from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage,
                            QLinearGradient, QPainter, QPainterPath, QPen,
                            QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QLabel, QSizePolicy, QToolButton, QWidget
+from PySide6.QtWidgets import (QApplication, QComboBox, QLabel, QSizePolicy,
+                               QToolButton, QWidget)
 
 from .. import ui_theme
 from ..ui_theme import Palette
@@ -777,15 +778,26 @@ class UsagePillBadge(QWidget):
         self.setFixedWidth(self._measure_width(text))
         self.update()
 
-    @classmethod
-    def _measure_width(cls, text: str) -> int:
+    def _measure_width(self, text: str) -> int:
         """[pad][ring][gap][text][pad]. The one width formula, for every pill.
 
         The X is deliberately NOT a term here: it floats over the text's tail,
         so it costs no width and hovering can never resize the pill.
+
+        `QFontMetrics` MUST be bound to this widget (`self` as the paint
+        device), never a bare `QFontMetrics(font)`: unbound, Qt resolves the
+        font against the PRIMARY screen's DPI, while `paintEvent` draws with
+        `p.fontMetrics()`, bound to whatever screen this widget is actually
+        on. On a single-monitor 100%-scale machine the two agree and nothing
+        looks wrong; on a mixed-DPI multi-monitor setup they diverge, so the
+        width reserved here undershoots what painting needs and `paintEvent`'s
+        `elidedText` safety net - meant only as insurance against a subclass
+        handing us an unmeasured string - fires for real and truncates a pill
+        that was sized "correctly". Same reason `ElidingLabel` measures with
+        `self.font()` rather than a fresh `QFont`.
         """
-        fm = QFontMetrics(cls._text_font())
-        return (cls._PAD * 2 + cls._RING + cls._GAP
+        fm = QFontMetrics(self._text_font(), self)
+        return (self._PAD * 2 + self._RING + self._GAP
                 + fm.horizontalAdvance(text))
 
     @staticmethod
@@ -946,12 +958,18 @@ class UsagePillBadge(QWidget):
 
 
 class PlanUsageBadge(UsagePillBadge):
-    """The top-bar readout of the Claude account's plan usage:
+    """The top-bar readout of one Claude account plan-usage window (5-hour
+    session, or 7-day):
 
-        (o) 21% used, resets in 1h20m at 14:49
+        (o) 5h 21% used, resets in 1h20m at 14:49
+        (o) 7d 40% used, resets in 3d14h at 09:00
 
     A percent ring plus one line, in the order the user asked for — countdown
-    first ("how long have I got"), wall-clock second, both in LOCAL time.
+    first ("how long have I got"), wall-clock second, both in LOCAL time. The
+    7-day pill's countdown is DAYS+HOURS only (no minutes,
+    `claude_usage.format_countdown_dh`) — a week-long window doesn't need
+    to-the-minute precision, and "167h23m" (what the ordinary countdown gives a
+    multi-day duration) is unreadable at a glance.
 
     Painted rather than styled, for the same reason as `AgentCountBadge`: the
     colour has to switch on utilization (green -> amber -> red) AND track the
@@ -973,6 +991,14 @@ class PlanUsageBadge(UsagePillBadge):
     thing a user can do about it.
     """
 
+    def __init__(self, parent=None, window: str = "five_hour"):
+        super().__init__(parent)
+        self.window = window
+        # always name the window: two Claude pills (5h and 7d) sit side by
+        # side on the bar now, and "which one is this" is the whole point of
+        # the label, exactly like the two Gemini pills beside them
+        self._label = True
+
     # -- data in ---------------------------------------------------------
     def set_usage(self, usage) -> None:
         """Adopt a reading. `None`, or a reading with no limits, leaves the pill
@@ -984,29 +1010,31 @@ class PlanUsageBadge(UsagePillBadge):
         from .. import claude_usage
 
         self._usage = usage
-        self._limit = claude_usage.headline(usage)
+        self._limit = (claude_usage.weekly(usage) if self.window == "weekly"
+                       else claude_usage.five_hour(usage))
         self._unreadable = ""       # a real number supersedes the error pill
         self._loading = False
-        if self._limit is None:
-            self._refresh_text()
-            return
-        # only name the window when the plan actually has more than one, so a
-        # Pro account (five_hour alone) stays uncluttered
-        self._label = len(usage.limits) > 1
-        self._stale = bool(usage.error) or usage.source == "cache"
+        self._stale = bool(usage.error) or usage.source == "cache" if usage else False
         self._refresh_text()
 
     def _loading_text(self) -> str:
         # deliberately SHORTER than the finished line, so the pill only ever
         # grows when the reading lands (a long loading string makes it snap
         # narrower, which reads as a glitch), and it names its own tracker so
-        # three grey pills side by side are still tellable apart
-        return "Claude usage, reading..."
+        # four grey pills side by side are still tellable apart
+        return ("Claude 7d usage, reading..." if self.window == "weekly"
+                else "Claude 5h usage, reading...")
 
     def _format_limit(self) -> str:
         from .. import claude_usage
 
-        return claude_usage.format_limit(self._limit, with_label=self._label)
+        return claude_usage.format_limit(self._limit, with_label=self._label,
+                                         days_only=self.window == "weekly")
+
+    def _unreadable_text(self) -> str:
+        return ("Claude 7d usage unreadable, click to refresh"
+                if self.window == "weekly" else
+                "Claude 5h usage unreadable, click to refresh")
 
     def _build_tooltip(self) -> str:
         from .. import claude_usage
@@ -1026,7 +1054,8 @@ class PlanUsageBadge(UsagePillBadge):
             lines.append(f"Claude {self._usage.plan.capitalize()} plan")
         for lim in self._usage.limits:
             lines.append(f"{lim.label}: "
-                         + claude_usage.format_limit(lim))
+                         + claude_usage.format_limit(
+                             lim, days_only=lim.key.startswith("seven_day")))
         if self._usage.fetched_at:
             age = claude_usage.format_since(_time.time() - self._usage.fetched_at)
             src = " (cached by Claude)" if self._usage.source == "cache" else ""
@@ -1282,6 +1311,85 @@ class ElidingLabel(QLabel):
                                    avail))
 
 
+class ToggleSwitch(QWidget):
+    """A track-and-thumb switch for the Options panel: green track with the
+    thumb slid right when armed, grey track with the thumb at the left when
+    off — the ordinary mobile-settings convention. Replaces the older
+    "whole-row button with an LED glyph" rows, which read as a clickable link
+    rather than a switch (reported live). `isChecked`/`setChecked`/`click`
+    mirror `QAbstractButton`'s so every existing caller (`.click()` in tests,
+    `setChecked` in `_refresh_*`) needed no change beyond the type; `clicked`
+    (no args) and `toggled(bool)` both fire on every click, matching
+    `QAbstractButton.clicked` and `.toggled` respectively."""
+
+    toggled = Signal(bool)
+    clicked = Signal()
+
+    _W, _H, _PAD = 34, 18, 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self._W, self._H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._checked = False
+        self._pos = 0.0  # 0..1 thumb travel, animated toward `_checked`
+        self._anim = QVariantAnimation(self)
+        self._anim.setDuration(140)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.valueChanged.connect(self._on_anim)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, on: bool) -> None:
+        on = bool(on)
+        if on == self._checked:
+            return
+        self._checked = on
+        self._anim.stop()
+        self._anim.setStartValue(self._pos)
+        self._anim.setEndValue(1.0 if on else 0.0)
+        self._anim.start()
+
+    def _on_anim(self, value) -> None:
+        self._pos = float(value or 0.0)
+        self.update()
+
+    def click(self) -> None:
+        self.setChecked(not self._checked)
+        self.clicked.emit()
+        self.toggled.emit(self._checked)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.click()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        off = QColor(Palette.BORDER)
+        on = QColor(Palette.GREEN)
+        t = self._pos
+        track = QColor(
+            int(off.red() + (on.red() - off.red()) * t),
+            int(off.green() + (on.green() - off.green()) * t),
+            int(off.blue() + (on.blue() - off.blue()) * t),
+        )
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track)
+        rect = QRectF(0, 0, self.width(), self.height())
+        radius = rect.height() / 2
+        p.drawRoundedRect(rect, radius, radius)
+        d = self.height() - self._PAD * 2
+        x = self._PAD + (self.width() - d - self._PAD * 2) * t
+        p.setBrush(QColor("#ffffff"))
+        p.drawEllipse(QRectF(x, self._PAD, d, d))
+        p.end()
+
+
 class OrnamentDivider(QWidget):
     """A thin gilt rule with a centered fleuron — a manuscript section break."""
 
@@ -1307,3 +1415,77 @@ class OrnamentDivider(QWidget):
         p.setPen(QColor(Palette.ACCENT_GOLD))
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._glyph)
         p.end()
+
+
+def anchored_popup_pos(anchor, size):
+    """Where to put a popup dropped under `anchor`, kept inside the app window
+    AND the screen.
+
+    Extracted from `GridButton._popup_position` so the top bar's Options panel
+    reuses the same rules rather than growing a second, subtly different copy.
+    Both callers share the shape of the problem: the button sits at the RIGHT
+    end of a wide strip, so left-anchoring a panel under it spills past the
+    window's right edge on a narrow window and off the display on a wide one.
+
+    Overflow right -> right-align to the button (the panel grows leftward, back
+    into the window); overflow bottom -> flip above it. The bound is the
+    INTERSECTION of the window and the screen's available geometry, so neither
+    a window pushed off-screen nor a taskbar can strand the panel.
+    """
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication
+
+    w, h = size.width(), size.height()
+    bl = anchor.mapToGlobal(anchor.rect().bottomLeft())
+    br = anchor.mapToGlobal(anchor.rect().bottomRight())
+    tl = anchor.mapToGlobal(anchor.rect().topLeft())
+    screen = anchor.screen() or QApplication.primaryScreen()
+    avail = screen.availableGeometry()
+    win = anchor.window().geometry()  # client area in global coords
+    left = max(avail.x(), win.x())
+    top = max(avail.y(), win.y())
+    right = min(avail.x() + avail.width(), win.x() + win.width())
+    bottom = min(avail.y() + avail.height(), win.y() + win.height())
+    x = bl.x()
+    if x + w > right:
+        x = br.x() - w                        # right-align under the button
+    x = max(left, min(x, right - w))
+    y = bl.y()
+    if y + h > bottom:
+        y = tl.y() - h                        # flip above the button
+    y = max(top, min(y, bottom - h))
+    return QPoint(x, y)
+
+
+class DropDownComboBox(QComboBox):
+    """A `QComboBox` whose popup always opens directly under it.
+
+    Qt's native combo popup aligns the CURRENTLY SELECTED row with the box
+    (so the list can land above, below, or straddling it depending on which
+    item happens to be picked) - normal for a native OS combo, but every combo
+    here is styled to read as an ordinary list-style dropdown, where that
+    reads as the menu jumping around each time the selection changes (live-
+    reported on the theme selector). `showPopup` lets Qt do its own layout and
+    sizing, then repositions just the popup window's top-left corner under the
+    box afterwards, so nothing about the list itself (size, scroll position)
+    changes. Clamped to the SCREEN only, not `anchored_popup_pos`'s window
+    bound: a combo living inside another `Qt.Popup` (the Options panel) has a
+    tiny host window, and bounding the list to it would truncate a dropdown
+    taller than that panel.
+    """
+
+    def showPopup(self) -> None:
+        super().showPopup()
+        popup = self.view().window()
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        bl = self.mapToGlobal(self.rect().bottomLeft())
+        tl = self.mapToGlobal(self.rect().topLeft())
+        w, h = popup.width(), popup.height()
+        x = min(bl.x(), avail.x() + avail.width() - w)
+        x = max(avail.x(), x)
+        y = bl.y()
+        if y + h > avail.y() + avail.height():
+            y = tl.y() - h                    # flip above when short on room
+        y = max(avail.y(), y)
+        popup.move(x, y)

@@ -8,14 +8,14 @@ import os
 import threading
 import time
 
-from PySide6.QtCore import QPoint, QProcess, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QProcess, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QLabel, QLineEdit, QMainWindow, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton,
-                               QSplitter, QStackedWidget, QToolButton,
-                               QVBoxLayout, QWidget)
+                               QScrollArea, QSplitter, QStackedWidget,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from .. import __version__
 from .. import chime
@@ -37,7 +37,9 @@ from ..orchestrator_bridge import OrchestratorBridge
 from .activity_panel import ActivityPanel
 from .agent_file_map import AgentFileMapWindow
 from . import ornaments
-from .ornaments import LogoRoundel, PageBorder, PlanUsageBadge
+from .ornaments import (DropDownComboBox, LogoRoundel,
+                        PageBorder, PlanUsageBadge, ToggleSwitch)
+from .options_panel import OptionsPanel
 from .sidebar import SIDEBAR_WIDTH, Sidebar
 
 SIDEBAR_MIN, SIDEBAR_MAX = 170, 700  # drag bounds (ultrawide-friendly)
@@ -122,13 +124,16 @@ GEMINI_USAGE_POLL_MS = 300000
 GEMINI_USAGE_URGENT_POLL_MS = 60000
 
 # The usage readouts the top bar can show, and the order they sit in. PER PILL
-# rather than per provider: the two Gemini windows are separate pills on the
-# bar, so anything coarser would leave the X on one of them closing the other.
-# Persisted per key under ui.usage_trackers, so a user who runs only Claude (or
-# only Gemini) is not made to look at a readout that can never say anything.
-USAGE_TRACKER_KEYS = ("claude", "gemini_five_hour", "gemini_weekly")
+# rather than per provider: each window (Claude 5h/7d, Gemini 5h/7d) is its own
+# pill on the bar, so anything coarser would leave the X on one of them closing
+# another. Persisted per key under ui.usage_trackers, so a user who runs only
+# Claude (or only Gemini) is not made to look at a readout that can never say
+# anything.
+USAGE_TRACKER_KEYS = ("claude_five_hour", "claude_weekly",
+                      "gemini_five_hour", "gemini_weekly")
 USAGE_TRACKER_LABELS = {
-    "claude": "Claude plan usage",
+    "claude_five_hour": "Claude 5 hour usage",
+    "claude_weekly": "Claude weekly usage",
     "gemini_five_hour": "Gemini 5 hour usage",
     "gemini_weekly": "Gemini weekly usage",
 }
@@ -240,6 +245,102 @@ KIND_GROUPS = [
 ]
 
 
+# A CAP on the width the top bar's extras row may demand of the window, not a
+# floor: whatever QAbstractScrollArea asks for is used when it is smaller
+# (measured 54px), and this only stops a future style with a chunkier
+# scrollbar or frame from quietly raising the whole window's minimum width -
+# which is the property the scroll area exists to protect.
+_EXTRAS_MIN_W = 120
+
+
+class _AutoSizingScrollContent(QWidget):
+    """A QScrollArea content widget that keeps itself sized to its own
+    layout's sizeHint, for a QScrollArea built with `setWidgetResizable(False)`.
+
+    Verified live: Qt does NOT do this automatically for such a widget. A
+    usage pill starts hidden and only gains its real (much wider) size once a
+    reading arrives; without this, `_extras` stayed frozen at the narrower
+    size it happened to have when it was last laid out, and its own QHBoxLayout
+    crammed the newly-widened pill into that stale rect, overlapping its
+    neighbour (reported live - two usage pills drawing on top of each other).
+    Catching `QEvent.LayoutRequest` - the event Qt already sends this widget
+    whenever ITS OWN layout invalidates - covers every cause of a size change
+    (a pill's reading, a pill closed or reopened, a theme's font swap)
+    without having to remember each call site."""
+
+    def event(self, e):
+        if e.type() == QEvent.Type.LayoutRequest:
+            self.adjustSize()
+            # ...and tell the scroll area, because the area's own sizeHint is
+            # a function of THIS widget's (see `_HWheelScrollArea.sizeHint`).
+            # Without this the row would keep whatever width the outer layout
+            # gave it before the pill arrived and scroll instead of growing.
+            host = self.parentWidget()
+            while host is not None and not isinstance(host, QScrollArea):
+                host = host.parentWidget()
+            if host is not None:
+                host.updateGeometry()
+        return super().event(e)
+
+
+class _HWheelScrollArea(QScrollArea):
+    """A QScrollArea whose ordinary (vertical) mouse wheel scrolls this row
+    HORIZONTALLY. There is no vertical scrollbar here - the row is one line
+    tall - so the plain wheel gesture would otherwise do nothing at all,
+    leaving a 10px scrollbar handle as the ONLY way to reach whatever scrolled
+    out of view (reported live as controls simply "disappearing"). Just
+    hovering the row and scrolling reaches them instead, no precision
+    drag-and-hunt required.
+
+    It also ASKS FOR ITS CONTENT'S FULL WIDTH, which is the whole point of
+    putting the row in a scroll area rather than a plain widget and is the one
+    thing the first cut of this got wrong. `QAbstractScrollArea.sizeHint()` is
+    a SMALL CONSTANT that has nothing to do with what is inside it (measured:
+    468px whatever the row's real 1860px content), so with a bare stretch
+    holding the layout's slack, EVERY pixel of a wider window went to that
+    stretch and this row stayed frozen at 468px - identically on a 1280px
+    laptop and a 3440px ultrawide. Reported live on a 1440p monitor as most of
+    the top bar's controls simply being gone, behind a permanent scrollbar
+    that looked like a stray divider. (The row carried every settings control
+    then; it holds only the usage pills and their picker now, which is what
+    the Options popup was for - but four pills at their real widths still
+    outrun a laptop's spare bar width, so all of this still applies.)
+
+    So `sizeHint` reports the content's natural width and `minimumSizeHint`
+    stays small. A QHBoxLayout satisfies size HINTS before handing anything to
+    a stretch, so the row now gets its full width whenever the window can
+    afford it and the bar's own `addStretch(1)` absorbs the slack, keeping the
+    cluster right-aligned exactly as it was before the scroll area existed.
+    When the window cannot afford it, the layout shrinks towards minimums -
+    the stretch to nothing first, then this row, which grows its scrollbar.
+    That is what keeps the WINDOW's minimum width a small constant instead of
+    the sum of everything the bar can show."""
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        content = self.widget()
+        if content is not None:
+            hint.setWidth(max(content.sizeHint().width(),
+                              content.minimumSizeHint().width()))
+        return hint
+
+    def minimumSizeHint(self):
+        # deliberately NOT the content's: this is the number that decides how
+        # narrow the whole window may be
+        hint = super().minimumSizeHint()
+        hint.setWidth(min(hint.width(), _EXTRAS_MIN_W))
+        return hint
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y() or event.angleDelta().x()
+        if delta:
+            bar = self.horizontalScrollBar()
+            bar.setValue(bar.value() - delta)
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+
 class TopBar(QFrame):
     addTerminalClicked = Signal()
     sidebarToggleClicked = Signal()
@@ -279,14 +380,12 @@ class TopBar(QFrame):
         self.toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.toggle_btn.clicked.connect(self.sidebarToggleClicked)
 
-        logo = LogoRoundel(self)   # gilt roundel in illuminated themes, ⬡ else
-        logo.setObjectName("Logo")
-        name = QLabel("AI Hive", self)
-        name.setObjectName("AppName")
-        version = QLabel(f"v{__version__}", self)
-        version.setObjectName("VersionBadge")
-        self.breadcrumb = QLabel("", self)
-        self.breadcrumb.setObjectName("Breadcrumb")
+        self._logo = LogoRoundel(self)  # gilt roundel in illuminated themes, ⬡ else
+        self._logo.setObjectName("Logo")
+        self._name = QLabel("AI Hive", self)
+        self._name.setObjectName("AppName")
+        self._version = QLabel(f"v{__version__}", self)
+        self._version.setObjectName("VersionBadge")
 
         self.add_terminal_btn = QToolButton(self)
         self.add_terminal_btn.setObjectName("AddTerminalBtn")
@@ -304,15 +403,31 @@ class TopBar(QFrame):
             b.clicked.connect(lambda: self.globalFontDelta.emit(delta))
             return b
 
-        self.font_dec_btn = font_btn("A−", "Decrease font size (all agents)", -1)
+        self.font_dec_btn = font_btn("A−", "Decrease font size (all agents)",
+                                     -1)
         self.font_inc_btn = font_btn("A+", "Increase font size (all agents)", +1)
 
+        # Every switch below is one row of the Options panel: a plain-words
+        # label (icon + name) on the left, an actual track-and-thumb
+        # `ToggleSwitch` on the right — green/slid-right when armed, grey/
+        # slid-left when off. This replaced a whole-row button carrying an
+        # LED glyph in its own text: it read as a clickable link rather than
+        # a switch (reported live), and a real switch says on/off in a shape
+        # everyone already recognizes without reading the row at all.
+        # `ToggleSwitch` mirrors `QAbstractButton`'s API (`isChecked`,
+        # `setChecked`, `click`, `clicked`), so every caller below is
+        # unchanged beyond the type.
+
+        def toggle_label(text: str) -> QLabel:
+            label = QLabel(text, self)
+            label.setObjectName("OptionsRowLabel")
+            return label
+
         # notification-chime mute toggle: rings when an agent raises "?"
-        # (settles on a question). Reflects state via its glyph (🔔/🔕).
+        # (settles on a question). The bell glyph carries the state too.
         self._sound_on = True
-        self.sound_btn = QToolButton(self)
-        self.sound_btn.setObjectName("SoundToggle")
-        self.sound_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sound_label = toggle_label("")
+        self.sound_btn = ToggleSwitch(self)
         self.sound_btn.clicked.connect(self._on_sound_clicked)
         self._refresh_sound_btn()
 
@@ -320,42 +435,58 @@ class TopBar(QFrame):
         # both are the same kind of thing: a signal that reaches the user when
         # the window is NOT the one they are looking at.
         self._taskbar_badge = True
-        self.taskbar_btn = QToolButton(self)
-        # RecoveryToggle rather than SoundToggle: there is no slashed-window
-        # glyph to carry off-state the way 🔕 does for the chime, so this
-        # borrows the recovery switches' lit/dim + LED treatment instead.
-        self.taskbar_btn.setObjectName("RecoveryToggle")
-        self.taskbar_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.taskbar_label = toggle_label("")
+        self.taskbar_btn = ToggleSwitch(self)
         self.taskbar_btn.clicked.connect(self._on_taskbar_clicked)
         self._refresh_taskbar_btn()
 
         # startup CLI auto-update. Default OFF and one click to arm, like the
         # two recovery switches: it mutates installed software unattended, so
-        # it is the user's decision, made once and persisted. Same LED
-        # treatment, so the top bar has one visual language for "will AI Hive
-        # do this by itself?".
+        # it is the user's decision, made once and persisted.
         self._auto_update = False
         self._install_state = ""
-        self.auto_update_btn = QToolButton(self)
-        self.auto_update_btn.setObjectName("RecoveryToggle")
-        self.auto_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.auto_update_label = toggle_label("")
+        self.auto_update_btn = ToggleSwitch(self)
         self.auto_update_btn.clicked.connect(self._on_auto_update_clicked)
         self._refresh_auto_update_btn()
+
+        # The detected Claude Code install method, under the switch it explains.
+        # It used to be reachable only by hovering the down-arrow; the panel has
+        # room to state it.
+        self.install_label = QLabel("", self)
+        self.install_label.setObjectName("RecoveryLabel")
+        self.install_label.setWordWrap(True)
+        self.install_label.setVisible(False)
+
+        # ...and the everything-about-updates door. Separate from the switch
+        # above because the two do different things: one arms the startup gate,
+        # the other opens the install-method control.
+        self.updates_manage_btn = QToolButton(self)
+        self.updates_manage_btn.setObjectName("OptionsAction")
+        self.updates_manage_btn.setText("Manage...")
+        self.updates_manage_btn.setToolTip(
+            "Open the Updates panel: how Claude Code is installed, and whether "
+            "it may update itself in the background.")
+        self.updates_manage_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.updates_manage_btn.clicked.connect(self.updatesPanelRequested)
 
         # ...and the quiet report from the LAST gated startup. Hidden unless
         # something needs saying (an update that could not apply), never a
         # chime: it answers "why am I still seeing the update banner?" without
         # interrupting, the same principle as the usage badge's can't-read pill.
+        # It lives inside the panel, so `note_update_pending` also lights the
+        # Options button: a warning nobody can see is not a warning.
         self.update_pill = QLabel("", self)
         self.update_pill.setObjectName("UpdatePill")
         self.update_pill.setVisible(False)
 
-        # The three usage readouts: "21% used, resets in 1h20m at 14:49". All
+        # The four usage readouts: "21% used, resets in 1h20m at 14:49". All
         # start hidden and EMPTY - no cached figure is ever painted (see
         # `MainWindow.start_usage_polling`), so a pill appears when polling puts
         # it into its loading state and stays only while it has something to
         # say and the user wants it.
-        self.usage_badge = PlanUsageBadge(self)
+        self.usage_badge = PlanUsageBadge(self, window="five_hour")
+        self.usage_weekly_badge = PlanUsageBadge(self, window="weekly")
         self._scrollback_wanted = True  # AI Hive owns the terminal scrollback
 
         # Gemini rate-limit usage readout (5-hour limit and weekly limit pills)
@@ -364,7 +495,8 @@ class TopBar(QFrame):
         self.gemini_weekly_badge = GeminiUsageBadge(self, window="weekly")
 
         self._usage_pills = {
-            "claude": self.usage_badge,
+            "claude_five_hour": self.usage_badge,
+            "claude_weekly": self.usage_weekly_badge,
             "gemini_five_hour": self.gemini_badge,
             "gemini_weekly": self.gemini_weekly_badge,
         }
@@ -375,22 +507,11 @@ class TopBar(QFrame):
             pill.closeRequested.connect(
                 lambda k=key: self.usageTrackerToggled.emit(k, False))
 
-        # The two auto-recovery switches, beside the readout they belong to.
-        # Both act on agents the plan limit cut off; they differ only in WHEN
-        # the cut-off is discovered — on opening the app, or while it runs.
-        # Deliberately buttons rather than context-menu items: these decide
-        # whether unattended work resumes, so their state has to be visible at
-        # a glance. A caption names what they're for (a bare pair of icon
-        # buttons reads as decoration), and each carries its own LED
-        # (🟢 armed / ⚫ off) alongside the accent-lit checked state, so
-        # "will my work resume by itself?" survives even a glance too quick
-        # to register border color.
-        # The pill picker, immediately LEFT of the recovery caption because it
-        # governs the readouts to its own left. It is the ONLY way back once a
-        # pill has been closed, so it is never hidden: not by a missing
-        # reading, not by every tracker being off, and (unlike the caption and
-        # the two switches beside it) not by `set_recovery_available` either -
-        # a machine with no Claude login still has Gemini pills to manage.
+        # The pill picker, immediately RIGHT of the readouts it governs. It is
+        # the ONLY way back once a pill has been closed, so it is never hidden:
+        # not by a missing reading, not by every tracker being off, and (unlike
+        # the two recovery switches) not by `set_recovery_available` either - a
+        # machine with no Claude login still has Gemini pills to manage.
         self.usage_add_btn = QToolButton(self)
         self.usage_add_btn.setObjectName("UsageTrackerAdd")
         self.usage_add_btn.setText("+")
@@ -398,23 +519,23 @@ class TopBar(QFrame):
         self.usage_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.usage_add_btn.clicked.connect(self._open_tracker_menu)
 
+        # The two auto-recovery switches. Both act on agents the plan limit cut
+        # off; they differ only in WHEN the cut-off is discovered - on opening
+        # the app, or while it runs. They decide whether unattended work
+        # resumes, which is why "will my work resume by itself?" has to be
+        # answerable at a glance from the switch alone, not a border colour.
         self._startup_recovery = True
         self._auto_continue = True
-        self.recovery_label = QLabel(
-            "Auto-restart agents who ran out of usage on:", self)
-        self.recovery_label.setObjectName("RecoveryLabel")
-        self.recover_btn = QToolButton(self)
-        self.recover_btn.setObjectName("RecoveryToggle")
-        self.recover_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.recover_label = toggle_label("")
+        self.recover_btn = ToggleSwitch(self)
         self.recover_btn.clicked.connect(self._on_recover_clicked)
-        self.resume_btn = QToolButton(self)
-        self.resume_btn.setObjectName("RecoveryToggle")
-        self.resume_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.resume_label = toggle_label("")
+        self.resume_btn = ToggleSwitch(self)
         self.resume_btn.clicked.connect(self._on_resume_clicked)
         self._refresh_recovery_btns()
 
         # skin selector (Winamp-style): swaps the whole chrome palette live
-        self.theme_select = QComboBox(self)
+        self.theme_select = DropDownComboBox(self)
         self.theme_select.setObjectName("ThemeSelect")
         self.theme_select.setToolTip("Theme")
         self.theme_select.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -423,38 +544,116 @@ class TopBar(QFrame):
         self.theme_select.currentIndexChanged.connect(
             lambda _i: self.themeChanged.emit(self.theme_select.currentData()))
 
-        lay.addWidget(self.toggle_btn)
-        lay.addWidget(logo)
-        lay.addWidget(name)
-        lay.addWidget(version)
-        lay.addSpacing(12)
-        lay.addWidget(self.breadcrumb)
-        lay.addStretch(1)
+        # ---- the Options panel -------------------------------------------
+        # Every setting that used to compete for room on the bar, stacked with
+        # a label each. `TopBar` still constructs and drives all of these; the
+        # panel supplies only the rows (see options_panel.py).
+        self.options_panel = OptionsPanel(self)
+        self.options_panel.add_section("Automation")
+        self.options_panel.add_switch_row(self.recover_label, self.recover_btn)
+        self.options_panel.add_switch_row(self.resume_label, self.resume_btn)
+        self.options_panel.add_switch_row(self.sound_label, self.sound_btn)
+        self.options_panel.add_switch_row(self.taskbar_label, self.taskbar_btn)
+        self.options_panel.add_switch_row(self.auto_update_label,
+                                          self.auto_update_btn)
+        self.options_panel.add_widget(self.install_label)
+        self.options_panel.add_row("", self.update_pill,
+                                   self.updates_manage_btn)
+        self.options_panel.add_separator()
+        self.options_panel.add_section("Appearance")
+        self.options_panel.add_row("Theme", self.theme_select)
+        self.options_panel.add_row("Font size", self.font_dec_btn,
+                                   self.font_inc_btn)
+
+        self.options_btn = QToolButton(self)
+        self.options_btn.setObjectName("OptionsBtn")
+        # deliberately NOT the hamburger: `toggle_btn` at the far left already
+        # uses that glyph, and two identical ones meaning different things is
+        # worse than either.
+        self.options_btn.setText("⚙ Options")
+        self.options_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.options_btn.clicked.connect(self._open_options)
+        self._refresh_options_btn()
+
+        # The usage readouts are the one thing left on the bar that keeps
+        # changing and is worth glancing at, so they stay - inside a scroll
+        # area, because four pills at their real widths still outrun a laptop's
+        # spare bar width. `QAbstractScrollArea.minimumSizeHint()` is a small
+        # constant regardless of what is inside it (unlike a plain
+        # QWidget-with-layout, whose minimum is the sum of every child's own
+        # minimum), so the WINDOW is free to shrink; the row just grows a thin
+        # horizontal scrollbar instead of forcing the window wider. Nothing is
+        # reparented out of the visible tree: an earlier overflow popup did
+        # that and both crashed (a QWidgetAction deletes its widget once
+        # released from a menu) and broke every `pill.isVisible()` check in the
+        # smoke suite. The Options panel sidesteps that trap by holding its
+        # widgets permanently rather than borrowing them per click.
+        self._extras = _AutoSizingScrollContent(self)
+        self._extras.setObjectName("TopBarExtras")
+        extras_lay = QHBoxLayout(self._extras)
+        extras_lay.setContentsMargins(0, 0, 0, 0)
+        extras_lay.setSpacing(8)
         # The pills and their picker are ONE group and sit on the layout's own
-        # spacing with nothing added, which is the same gap the two recovery
-        # switches below have between them. An extra addSpacing() here read as
-        # three unrelated widgets rather than one readout with a control.
-        lay.addWidget(self.usage_badge)
-        lay.addWidget(self.gemini_badge)
-        lay.addWidget(self.gemini_weekly_badge)
-        lay.addWidget(self.usage_add_btn)
-        lay.addSpacing(10)      # ...and THIS separates that group from the next
-        lay.addWidget(self.recovery_label)
-        lay.addSpacing(6)
-        lay.addWidget(self.recover_btn)
-        lay.addWidget(self.resume_btn)
+        # spacing with nothing added between them, which reads as one readout
+        # with a control rather than unrelated widgets.
+        extras_lay.addWidget(self.usage_badge)
+        extras_lay.addWidget(self.usage_weekly_badge)
+        extras_lay.addWidget(self.gemini_badge)
+        extras_lay.addWidget(self.gemini_weekly_badge)
+        extras_lay.addWidget(self.usage_add_btn)
+
+        self._extras_scroll = _HWheelScrollArea(self)
+        self._extras_scroll.setObjectName("TopBarExtrasScroll")
+        self._extras_scroll.setWidget(self._extras)
+        self._extras_scroll.setWidgetResizable(False)
+        self._extras_scroll.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self._extras_scroll.setFixedHeight(42)
+        self._extras_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._extras_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._extras_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Transparent so it reads as part of the bar, not a separate panel.
+        # Scoped by object name rather than left selector-less so it cannot
+        # reach the row's own scrollbar as this grows; the themed groove and
+        # handle come from `build_qss` and the row must not fight them.
+        self._extras_scroll.setStyleSheet(
+            "#TopBarExtrasScroll { background: transparent; border: none; }")
+        self._extras_scroll.viewport().setStyleSheet("background: transparent;")
+
+        lay.addWidget(self.toggle_btn)
+        lay.addWidget(self._logo)
+        lay.addWidget(self._name)
+        lay.addWidget(self._version)
+        lay.addSpacing(12)
+        # A bare stretch keeps the identity block left-anchored and the extras
+        # row does NOT get one, which only works because
+        # `_HWheelScrollArea.sizeHint()` reports the row's real content width:
+        # a QHBoxLayout satisfies size hints first and only then hands the
+        # leftover to the stretch, so the row gets every pill it can afford
+        # and the stretch absorbs what remains. Giving the stretch to the row
+        # instead would left-anchor the whole cluster against the identity
+        # block and leave the gap on the right, beside Add Terminal.
+        lay.addStretch(1)
+        lay.addWidget(self._extras_scroll)
         lay.addSpacing(8)
-        lay.addWidget(self.theme_select)
-        lay.addSpacing(8)
-        lay.addWidget(self.font_dec_btn)
-        lay.addWidget(self.font_inc_btn)
-        lay.addSpacing(8)
-        lay.addWidget(self.sound_btn)
-        lay.addWidget(self.taskbar_btn)
-        lay.addWidget(self.update_pill)
-        lay.addWidget(self.auto_update_btn)
-        lay.addSpacing(8)
+        lay.addWidget(self.options_btn)
         lay.addWidget(self.add_terminal_btn)
+
+    def _open_options(self) -> None:
+        self.options_panel.toggle_under(self.options_btn)
+
+    def _refresh_options_btn(self) -> None:
+        """The button names what is behind it, and LIGHTS UP when the update
+        pill inside has something to report. That pill used to sit on the bar
+        where it could not be missed; moving it into a panel without this would
+        turn a warning into a secret."""
+        pending = self.update_pill.text()
+        self.options_btn.setToolTip(
+            "Settings: auto-recovery, notifications, updates, theme and font "
+            "size." + ("\n" + pending if pending else ""))
+        self.options_btn.setProperty("attention", bool(pending))
+        ui_theme.repolish(self.options_btn)
 
     def _on_sound_clicked(self) -> None:
         self.set_sound_enabled(not self._sound_on)
@@ -470,11 +669,9 @@ class TopBar(QFrame):
         self._refresh_taskbar_btn()
 
     def _refresh_taskbar_btn(self) -> None:
-        self.taskbar_btn.setCheckable(True)
         self.taskbar_btn.setChecked(self._taskbar_badge)
-        led = "\U0001F7E2" if self._taskbar_badge else "⚫"
-        self.taskbar_btn.setText(f"{led} \U0001FA9F")
-        self.taskbar_btn.setToolTip(
+        self.taskbar_label.setText("\U0001FA9F  Taskbar count")
+        tip = (
             "Taskbar count: ON. The taskbar icon carries a badge with the "
             "number of agents working, blue when one of them is waiting on a "
             "question, and nothing at all when the hive is idle.\n"
@@ -483,20 +680,23 @@ class TopBar(QFrame):
             "Taskbar count: OFF. The taskbar icon stays plain, so you cannot "
             "tell from other apps whether agents are still working.\n"
             "Click to turn on.")
+        self.taskbar_btn.setToolTip(tip)
+        self.taskbar_label.setToolTip(tip)
 
     def _on_auto_update_clicked(self) -> None:
-        """The down-arrow now OPENS the Updates panel instead of toggling.
+        """Arm or disarm the startup update gate, like every other row here.
 
-        Deliberately the same button rather than a new one: the top bar's
-        minimum width is already 2101px, letting Claude Code update itself is a
-        one-time setup action that does not earn a permanent slot, and two
-        adjacent update controls meaning different things is worse than either.
-        The startup-gate preference this button used to carry is a checkbox
-        inside the panel, still routed through `autoUpdateToggled`, so nothing
-        downstream changed. `_refresh_auto_update_btn` puts the checked state
-        back, since a checkable button flips itself on click."""
-        self._refresh_auto_update_btn()
-        self.updatesPanelRequested.emit()
+        On the bar this button could not be a toggle: there was room for ONE
+        update control, so it had to be the door to the Updates panel and the
+        preference lived on a checkbox inside. The panel has room for both, so
+        the switch is a switch again and `updates_manage_btn` is the door.
+
+        This is not a second control for one setting. `open_updates_panel`
+        already wires the Updates panel's checkbox to BOTH `set_auto_update`
+        and the window's handler, so the two are driven from the same signal
+        and cannot disagree."""
+        self.set_auto_update(not self._auto_update)
+        self.autoUpdateToggled.emit(self._auto_update)
 
     def set_auto_update(self, on: bool) -> None:
         """Reflect the CLI auto-update preference (no signal emitted)."""
@@ -507,40 +707,46 @@ class TopBar(QFrame):
         return self._auto_update
 
     def note_install_state(self, text: str) -> None:
-        """Name the detected Claude Code install state on the button, so the
-        answer is available without opening the panel."""
+        """Name the detected Claude Code install state under the switch it
+        explains. It used to be tooltip-only, which meant the answer to "how is
+        my Claude Code installed?" was reachable only by hovering."""
         self._install_state = text or ""
+        self.install_label.setText(self._install_state)
+        self.install_label.setVisible(bool(self._install_state))
         self._refresh_auto_update_btn()
 
     def _refresh_auto_update_btn(self) -> None:
-        self.auto_update_btn.setCheckable(True)
         self.auto_update_btn.setChecked(self._auto_update)
-        led = "\U0001F7E2" if self._auto_update else "⚫"
-        self.auto_update_btn.setText(f"{led} ⬇")
+        self.auto_update_label.setText("⬇  Check for CLI updates at start-up")
         # the tooltip states plainly what the armed switch does, because it
         # changes software on the user's machine rather than anything inside
-        # the app, and names the detected install state so the panel is not the
-        # only way to learn it
-        state = getattr(self, "_install_state", "")
-        self.auto_update_btn.setToolTip(
-            "Updates. " + (state + "\n" if state else "")
-            + ("Startup check: ON. Next time AI Hive starts, it checks for a "
-               "newer Claude Code and Gemini (agy) CLI and installs it BEFORE "
-               "any agent launches, which is the only moment those files are "
-               "not locked."
-               if self._auto_update else
-               "Startup check: OFF. Startup is untouched, so you keep whatever "
-               "CLI version is installed and may keep seeing Claude's own "
-               "'update available' banner. Turning it on lets AI Hive install "
-               "CLI updates at startup, which changes installed software on "
-               "your machine.")
-            + "\nClick to open the Updates panel.")
+        # the app. The detected install state is no longer crammed in here:
+        # `install_label` says it in full, right under this row.
+        tip = (
+            "Startup check: ON. Next time AI Hive starts, it checks for a "
+            "newer Claude Code and Gemini (agy) CLI and installs it BEFORE "
+            "any agent launches, which is the only moment those files are "
+            "not locked.\nClick to turn off."
+            if self._auto_update else
+            "Startup check: OFF. Startup is untouched, so you keep whatever "
+            "CLI version is installed and may keep seeing Claude's own "
+            "'update available' banner. Turning it on lets AI Hive install "
+            "CLI updates at startup, which changes installed software on "
+            "your machine.\nClick to turn on.")
+        self.auto_update_btn.setToolTip(tip)
+        self.auto_update_label.setToolTip(tip)
 
     def note_update_pending(self, text: str, tooltip: str = "") -> None:
-        """Show (or hide, on an empty text) the last gate's report."""
+        """Show (or hide, on an empty text) the last gate's report.
+
+        The pill lives inside the Options panel now, so this also lights the
+        Options button. Without that, an update that could not apply would be
+        reported somewhere nobody has open, which is the same as not reporting
+        it at all."""
         self.update_pill.setText(text or "")
         self.update_pill.setToolTip(tooltip or text or "")
         self.update_pill.setVisible(bool(text))
+        self._refresh_options_btn()
 
     def set_sound_enabled(self, on: bool) -> None:
         """Reflect the chime on/off state in the button (no signal emitted)."""
@@ -548,10 +754,20 @@ class TopBar(QFrame):
         self._refresh_sound_btn()
 
     def _refresh_sound_btn(self) -> None:
-        self.sound_btn.setText("🔔" if self._sound_on else "🔕")
-        self.sound_btn.setToolTip(
-            "Notification chime: ON, click to mute" if self._sound_on
-            else "Notification chime: OFF, click to enable")
+        # the switch itself says on/off; the bell/muted-bell glyph in the
+        # label is still a second, always-visible tell.
+        self.sound_btn.setChecked(self._sound_on)
+        bell = "🔔" if self._sound_on else "🔕"
+        self.sound_label.setText(f"{bell}  Notification chime")
+        tip = (
+            "Notification chime: ON. A soft bell rings when an agent settles "
+            "on a question and needs you, even from another workspace.\n"
+            "Click to mute."
+            if self._sound_on else
+            "Notification chime: OFF. An agent waiting on a question raises "
+            "its \"?\" silently.\nClick to turn on.")
+        self.sound_btn.setToolTip(tip)
+        self.sound_label.setToolTip(tip)
 
     def _on_recover_clicked(self) -> None:
         self.set_startup_recovery(not self._startup_recovery)
@@ -578,32 +794,31 @@ class TopBar(QFrame):
         return self._auto_continue
 
     def _refresh_recovery_btns(self) -> None:
-        # `checked` drives the QSS: lit in the accent when armed, dimmed when
-        # off. The LED (🟢/⚫) repeats that same state as its own glyph, so
-        # "will my work resume by itself?" is answerable even without
-        # registering the border color.
-        self.recover_btn.setCheckable(True)
+        # the switch itself (green/slid-right when armed, grey/slid-left when
+        # off) is the whole tell now - "will my work resume by itself?" is
+        # answerable at a glance without reading a border colour or an LED.
         self.recover_btn.setChecked(self._startup_recovery)
-        led = "\U0001F7E2" if self._startup_recovery else "⚫"
-        self.recover_btn.setText(f"{led} App start-up ⏻")
-        self.recover_btn.setToolTip(
+        self.recover_label.setText("⏻  Recover at start-up")
+        recover_tip = (
             "Recover at startup: ON. When AI Hive opens, agents whose work "
             "stopped because the plan limit ran out are continued "
             "automatically.\nClick to turn off."
             if self._startup_recovery else
             "Recover at startup: OFF. Agents left stuck on a spent plan "
             "limit stay stopped when AI Hive opens.\nClick to turn on.")
-        self.resume_btn.setCheckable(True)
+        self.recover_btn.setToolTip(recover_tip)
+        self.recover_label.setToolTip(recover_tip)
         self.resume_btn.setChecked(self._auto_continue)
-        led = "\U0001F7E2" if self._auto_continue else "⚫"
-        self.resume_btn.setText(f"{led} Usage reset \U0001F504")
-        self.resume_btn.setToolTip(
+        self.resume_label.setText("\U0001F504  Resume on usage reset")
+        resume_tip = (
             "Resume on limit reset: ON. While AI Hive is running, agents cut "
             "off mid-work by the plan limit are continued the moment the "
             "limit resets.\nClick to turn off."
             if self._auto_continue else
             "Resume on limit reset: OFF. Agents cut off by the plan limit "
             "wait for you.\nClick to turn on.")
+        self.resume_btn.setToolTip(resume_tip)
+        self.resume_label.setToolTip(resume_tip)
 
     def build_tracker_menu(self) -> QMenu:
         """The pill picker's menu: one checkable entry per usage readout.
@@ -627,14 +842,21 @@ class TopBar(QFrame):
             QPoint(0, self.usage_add_btn.height())))
 
     def set_usage(self, usage) -> None:
-        """Push a plan-usage reading into the badge."""
+        """Push a plan-usage reading into both Claude pills (5h and 7d)."""
         self.usage_badge.set_usage(usage)
+        self.usage_weekly_badge.set_usage(usage)
         self._sync_usage_pills()
 
     def note_usage_error(self, error: str) -> None:
-        """A poll failed with no earlier reading to fall back on: show the
-        can't-read pill rather than nothing at all."""
-        self.usage_badge.mark_unreadable(error)
+        """A poll failed. Same split as `note_gemini_usage_error`: a pill
+        SHOWING a reading keeps it, greyed, rather than blanking a figure the
+        user is watching; a pill with nothing at all says so rather than
+        vanishing."""
+        for pill in (self.usage_badge, self.usage_weekly_badge):
+            if pill.has_reading():
+                pill.mark_stale(True)
+            else:
+                pill.mark_unreadable(error)
         self._sync_usage_pills()
 
     def set_gemini_usage(self, reading) -> None:
@@ -709,16 +931,16 @@ class TopBar(QFrame):
         self._sync_usage_pills()
 
     def set_recovery_available(self, on: bool) -> None:
-        """Show/hide both recovery toggles (and their caption). They act only
-        on Claude agents cut off by a plan limit, so with no Claude login
-        there is nothing for them to do — hide them with the readout rather
-        than offer dead switches.
+        """Show/hide both recovery toggles. They act only on Claude agents cut
+        off by a plan limit, so with no Claude login there is nothing for them
+        to do — hide them with the readout rather than offer dead switches.
 
         `usage_add_btn` is deliberately NOT hidden with them: it is the only way
         to bring a closed pill back, and a Gemini-only user (who by definition
         has no Claude login) would otherwise be left with no control at all."""
-        self.recovery_label.setVisible(bool(on))
+        self.recover_label.setVisible(bool(on))
         self.recover_btn.setVisible(bool(on))
+        self.resume_label.setVisible(bool(on))
         self.resume_btn.setVisible(bool(on))
 
     def set_terminal_scrollback(self, on: bool) -> None:
@@ -762,10 +984,6 @@ class TopBar(QFrame):
             self.theme_select.blockSignals(True)
             self.theme_select.setCurrentIndex(i)
             self.theme_select.blockSignals(False)
-
-    def set_breadcrumb(self, workspace_name: str) -> None:
-        self.breadcrumb.setText(f"AI Hive  ›  {workspace_name}"
-                                if workspace_name else "")
 
 
 class AddTerminalDialog(QDialog):
@@ -1641,8 +1859,6 @@ class MainWindow(QMainWindow):
         self.sidebar.addRequested.connect(self._on_add_workspace_clicked)
         self.sidebar.workspaceSelected.connect(self.manager.set_active)
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
-        self.sidebar.deleteRequested.connect(self._confirm_delete_workspace)
-        self.sidebar.openFolderRequested.connect(self._open_workspace_folder)
         # inline agent list: the sidebar expands agents under a workspace and
         # reveals a clicked agent's card (no overlapping popup)
         self.sidebar.agents_provider = self._agents_for_ws
@@ -1880,7 +2096,8 @@ class MainWindow(QMainWindow):
         # than blanking a figure the user is watching. Only a machine with no
         # Claude login at all (no-auth) has nothing to show, ever.
         if reading is not None and reading.error == "no-auth" and self._usage is None:
-            self.top_bar.mark_usage_absent("claude")
+            self.top_bar.mark_usage_absent("claude_five_hour")
+            self.top_bar.mark_usage_absent("claude_weekly")
             # no Claude account => no plan limit to recover from; don't leave
             # two switches on the bar that can never do anything
             self.top_bar.set_recovery_available(False)
@@ -1910,6 +2127,7 @@ class MainWindow(QMainWindow):
                 reading.error if reading is not None else "unknown")
             return
         self.top_bar.usage_badge.mark_stale(True)
+        self.top_bar.usage_weekly_badge.mark_stale(True)
 
     def _apply_usage(self, reading) -> None:
         """Adopt a reading: refresh the badge and fire the plan-limit edges.
@@ -2086,7 +2304,7 @@ class MainWindow(QMainWindow):
         self.top_bar.mark_usage_loading(key)
         if not self._polling:
             return              # this window never opted in; never shell out
-        if key == "claude":
+        if key in ("claude_five_hour", "claude_weekly"):
             self._poll_usage()
             return
         if not was_gemini:
@@ -3119,6 +3337,7 @@ class MainWindow(QMainWindow):
         page.focusGained.connect(self._set_focused_card)
         page.addRequested.connect(self._on_add_terminal_clicked)  # empty slot
         page.layoutChosen.connect(self.manager.set_layout)        # persist
+        page.deleteRequested.connect(self._confirm_delete_workspace)
         page.openFolderRequested.connect(self._open_workspace_folder)
         page.changePathRequested.connect(self._change_workspace_folder)
         page.activityToggled.connect(self._toggle_activity)
@@ -3152,8 +3371,6 @@ class MainWindow(QMainWindow):
 
     def _on_workspace_renamed(self, ws_id: str, name: str) -> None:
         self.sidebar.set_row_name(ws_id, name)
-        if ws_id == self.manager.active_id:
-            self.top_bar.set_breadcrumb(name)
 
     def _on_active_changed(self, ws_id: str) -> None:
         page = self._pages.get(ws_id)
@@ -3161,7 +3378,6 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(page)
         self.sidebar.set_active_row(ws_id)
         ws = self.manager.workspace(ws_id)
-        self.top_bar.set_breadcrumb(ws.name if ws else "")
         # keep the activity panel following the active workspace
         if self.activity_panel.is_open() and ws is not None:
             self.activity_panel.set_workspace(ws)

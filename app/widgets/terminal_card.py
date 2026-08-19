@@ -7,6 +7,7 @@ through WorkspaceManager. Call detach() before deleting the card so late
 agent signals can't fire into a dead widget.
 """
 
+import datetime
 import re
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QTimer, Signal
@@ -321,6 +322,16 @@ class TerminalCard(QFrame):
         self.token_label = QLabel("", header)
         self.token_label.setObjectName("CardTokens")
         self.token_label.hide()
+        # walltime the agent last finished a reply (busy -> idle), mirroring
+        # the dated entries the board's log_activity tool writes -- but for a
+        # single agent's own card, live, with no MCP call needed. Refreshed
+        # off the existing activity_changed signal (see _refresh_reply_time);
+        # hidden until the agent has actually replied once. Transient like
+        # the model chip: never persisted, TerminalAgent.last_reply_at() is
+        # the live source of truth.
+        self.reply_time_label = QLabel("", header)
+        self.reply_time_label.setObjectName("CardReplyTime")
+        self.reply_time_label.hide()
         hl.addWidget(self.glyph)
         hl.addWidget(self.title)
         hl.addWidget(self.title_edit)
@@ -332,6 +343,7 @@ class TerminalCard(QFrame):
         hl.addWidget(self.sched_mark)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
         hl.addWidget(self.token_label)
+        hl.addWidget(self.reply_time_label)
 
         def tool(text, obj_name, tip):
             b = QToolButton(header)
@@ -402,6 +414,7 @@ class TerminalCard(QFrame):
     def _wire(self) -> None:
         self.agent.status_changed.connect(self._on_status)
         self.agent.activity_changed.connect(self._on_activity)
+        self._refresh_reply_time()
         self.agent.assignment_changed.connect(self._on_assignment)
         self.agent.role_changed.connect(self._on_role)
         self.agent.name_changed.connect(self._on_name)
@@ -436,6 +449,11 @@ class TerminalCard(QFrame):
             # Ctrl+clicking a file bubbles up so the app can reveal it
             self.terminal.set_base_dir(getattr(self.agent.spec, "cwd", "") or "")
             self.terminal.fileActivated.connect(self.fileActivated)
+            # a click must never drive the child's caret while an interactive
+            # menu (AskUserQuestion/ExitPlanMode/permission prompt) is open --
+            # see TerminalView._reposition_cursor for why. is_waiting() is the
+            # same authoritative signal _on_prompt_submitted already trusts.
+            self.terminal.set_waiting_probe(self.agent.is_waiting)
             # Ctrl+Shift+Enter in the terminal: "send this, but later". The view
             # hands up what is currently typed; the window turns it into the
             # countdown dialog and, only on confirm, clears the input box.
@@ -1215,6 +1233,23 @@ class TerminalCard(QFrame):
 
     def _on_activity(self, _busy: bool) -> None:
         self._on_status(self.agent.status)
+        self._refresh_reply_time()
+
+    def _refresh_reply_time(self) -> None:
+        """Mirror TerminalAgent.last_reply_at() onto the header. Runs off the
+        same activity_changed edge card status already reacts to -- it is set
+        ONLY on a genuine busy -> idle settle (see _on_idle_timeout), so a
+        forced clear on stop/crash just re-displays the last real reply time
+        rather than a bogus 'just replied' stamp."""
+        ts = self.agent.last_reply_at()
+        if ts is None:
+            self.reply_time_label.hide()
+            return
+        dt = datetime.datetime.fromtimestamp(ts)
+        self.reply_time_label.setText(dt.strftime("%H:%M"))
+        self.reply_time_label.setToolTip(
+            "Agent's last reply finished " + dt.strftime("%Y-%m-%d %H:%M:%S"))
+        self.reply_time_label.show()
 
     def _on_status(self, status: AgentStatus) -> None:
         busy = bool(getattr(self.agent, "is_busy", lambda: False)())

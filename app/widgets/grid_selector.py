@@ -8,11 +8,12 @@ suite asserts swatch == parse_layout for every entry (WYSIWYG). Wide
 arrangements are offered generously for ultrawide monitors.
 """
 
-from PySide6.QtCore import QPoint, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import (QApplication, QGridLayout, QToolButton, QWidget)
+from PySide6.QtWidgets import QGridLayout, QToolButton, QWidget
 
 from ..ui_theme import Palette
+from .ornaments import anchored_popup_pos
 
 # (label "W×H", layout string, rows, cols). "auto" draws a special glyph.
 LAYOUTS = [
@@ -118,30 +119,10 @@ class GridButton(QToolButton):
         """Anchor the palette under the button but keep it inside the app
         window (and the screen). The Layout button sits at the right end of the
         header, so left-anchoring the wide palette under it spills past the
-        window's right edge; instead clamp to the tighter of the window and
-        screen — overflow right → right-align to the button (palette grows
-        leftward into the window), overflow bottom → flip above it."""
-        w, h = size.width(), size.height()
-        bl = self.mapToGlobal(self.rect().bottomLeft())
-        br = self.mapToGlobal(self.rect().bottomRight())
-        tl = self.mapToGlobal(self.rect().topLeft())
-        screen = self.screen() or QApplication.primaryScreen()
-        avail = screen.availableGeometry()
-        win = self.window().geometry()  # client area in global coords
-        # bound to the intersection of the window and the screen
-        left = max(avail.x(), win.x())
-        top = max(avail.y(), win.y())
-        right = min(avail.x() + avail.width(), win.x() + win.width())
-        bottom = min(avail.y() + avail.height(), win.y() + win.height())
-        x = bl.x()
-        if x + w > right:
-            x = br.x() - w                       # right-align under the button
-        x = max(left, min(x, right - w))
-        y = bl.y()
-        if y + h > bottom:
-            y = tl.y() - h                        # flip above the button
-        y = max(top, min(y, bottom - h))
-        return QPoint(x, y)
+        window's right edge; the shared helper clamps to the tighter of the
+        window and screen. Kept as a method because the smoke suite drives the
+        placement contract through it."""
+        return anchored_popup_pos(self, size)
 
     def _on_selected(self, layout):
         self._current = layout

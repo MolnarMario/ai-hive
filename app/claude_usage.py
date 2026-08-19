@@ -210,10 +210,40 @@ def headline(usage: Usage | None) -> Limit | None:
     On Pro only `five_hour` is ever non-null so this is simply the session
     limit; on Max it surfaces the weekly/Opus window automatically when that is
     the one about to stop you, with no code change.
+
+    This stays the ACCOUNT-WIDE reading used by the machine hooks (`blocked`,
+    `resets_at`, `planLimitReached`/`Cleared`) — it deliberately does NOT
+    distinguish 5h from 7d. `five_hour`/`weekly` below are for the two SEPARATE
+    top-bar pills, which must never show the same window by coincidence.
     """
     if usage is None or not usage.limits:
         return None
     return max(usage.limits, key=lambda l: l.percent)
+
+
+def five_hour(usage: Usage | None) -> Limit | None:
+    """The 5-hour session window, specifically.
+
+    Unlike `headline`, this never falls back to a different window: the 5h
+    and 7d pills are separate readouts now, and a fallback would let one
+    silently show the other's number.
+    """
+    if usage is None or not usage.limits:
+        return None
+    return next((l for l in usage.limits if l.key == "five_hour"), None)
+
+
+def weekly(usage: Usage | None) -> Limit | None:
+    """The most binding 7-day window: `seven_day` (all models) on most plans,
+    or whichever per-model 7-day window (`seven_day_opus`/`seven_day_sonnet`,
+    the Max-plan breakdown) is closest to biting when there's no all-models
+    figure."""
+    if usage is None or not usage.limits:
+        return None
+    weeklies = [l for l in usage.limits if l.key.startswith("seven_day")]
+    if not weeklies:
+        return None
+    return max(weeklies, key=lambda l: l.percent)
 
 
 # ------------------------------------------------------------- reading ------
@@ -308,6 +338,23 @@ def format_countdown(seconds: float) -> str:
     return f"{total}s"
 
 
+def format_countdown_dh(seconds: float) -> str:
+    """Days+hours only, no minutes: "6d23h" / "6d" / "13h" / "<1h".
+
+    For the 7-day window: a week-long countdown doesn't need to-the-minute
+    precision, and "167h23m" (what `format_countdown` gives a multi-day
+    duration, since it never rolls hours into days) is unreadable at a glance.
+    """
+    total = int(max(0, seconds))
+    if total < 3600:
+        return "<1h"
+    d, rem = divmod(total, 86400)
+    h = rem // 3600
+    if d > 0:
+        return f"{d}d{h}h" if h > 0 else f"{d}d"
+    return f"{h}h"
+
+
 def format_since(seconds: float) -> str:
     """Age of a reading: "just now" / "42s ago" / "3m ago" / "2h ago"."""
     total = int(max(0, seconds))
@@ -323,13 +370,16 @@ def format_since(seconds: float) -> str:
 
 
 def format_limit(limit: Limit, now: float | None = None,
-                 with_label: bool = False) -> str:
+                 with_label: bool = False, days_only: bool = False) -> str:
     """The badge line: "21% used, resets in 1h20m at 14:49".
 
     Countdown FIRST, wall-clock second (the user's chosen order): "how long have
     I got" is the question being asked; the clock time is the follow-up. The
     time is rendered in LOCAL time via `datetime.fromtimestamp` — the payload's
     `resets_at` is UTC, and the whole point is to read it in your own timezone.
+
+    `days_only` drops the countdown to day+hour granularity (no minutes) — set
+    it for a 7-day window, where "3d14h" reads better than "3d14h27m".
     """
     now = time.time() if now is None else now
     # spell the blocked state out rather than showing a bare "100% used" —
@@ -344,4 +394,5 @@ def format_limit(limit: Limit, now: float | None = None,
     when = datetime.fromtimestamp(limit.resets_at).strftime("%H:%M")
     if left <= 0:
         return f"{head}, resets now"
-    return f"{head}, resets in {format_countdown(left)} at {when}"
+    countdown = format_countdown_dh(left) if days_only else format_countdown(left)
+    return f"{head}, resets in {countdown} at {when}"

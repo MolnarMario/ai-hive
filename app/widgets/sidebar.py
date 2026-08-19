@@ -78,13 +78,13 @@ NODE_MIME = "application/x-aihive-sidebar-node"
 
 
 class WorkspaceRow(QFrame):
-    """One sidebar workspace row: status badge, name (+ inline rename), folder,
-    delete, working-count spinner. Initiates a drag past the drag threshold."""
+    """One sidebar workspace row: status badge, name (+ inline rename),
+    working-count spinner. Initiates a drag past the drag threshold. Open
+    folder / delete workspace live in the workspace header bar now (not
+    duplicated here as hover buttons)."""
 
     selected = Signal(str)              # ws_id
     renameCommitted = Signal(str, str)  # ws_id, new name
-    deleteRequested = Signal(str)       # ws_id
-    openFolderRequested = Signal(str)   # ws_id
     agentsRequested = Signal(str)       # ws_id (count-badge clicked; M3)
     filesRequested = Signal(str)        # ws_id (file-tree toggle clicked)
 
@@ -128,12 +128,9 @@ class WorkspaceRow(QFrame):
         text_col.addWidget(self.name_label)
         text_col.addWidget(self.rename_edit)
 
-        # inline file-tree toggle (a caret that turns as the tree opens) — a
-        # SEPARATE control from folder_btn: this expands the file explorer under
-        # the row, folder_btn opens the folder in the OS file manager. Unlike the
-        # hover-only folder/delete buttons, this caret is ALWAYS visible (it sits
-        # between the count badge and the name) so the file explorer is a
-        # first-class, discoverable affordance rather than a hover surprise.
+        # inline file-tree toggle (a caret that turns as the tree opens) —
+        # ALWAYS visible (it sits between the count badge and the name) so the
+        # file explorer is a first-class, discoverable affordance.
         self.tree_btn = QToolButton(self)
         self.tree_btn.setObjectName("WsTreeBtn")
         self.tree_btn.setText("▸")
@@ -141,24 +138,6 @@ class WorkspaceRow(QFrame):
         self.tree_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.tree_btn.clicked.connect(
             lambda: self.filesRequested.emit(self.ws_id))
-
-        self.folder_btn = QToolButton(self)
-        self.folder_btn.setObjectName("WsFolderBtn")
-        self.folder_btn.setText("📁")  # filled folder reads far better than 🗀
-        self.folder_btn.setToolTip("Open workspace folder")
-        self.folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.folder_btn.hide()
-        self.folder_btn.clicked.connect(
-            lambda: self.openFolderRequested.emit(self.ws_id))
-
-        self.delete_btn = QToolButton(self)
-        self.delete_btn.setObjectName("WsDelete")
-        self.delete_btn.setText("✖")  # heavy multiplication x — thicker than ✕
-        self.delete_btn.setToolTip("Delete workspace")
-        self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.delete_btn.hide()
-        self.delete_btn.clicked.connect(
-            lambda: self.deleteRequested.emit(self.ws_id))
 
         # "?" notification: an agent here is waiting for the user (a permission
         # prompt or a question). Clicking it opens the agent dropdown so the
@@ -206,8 +185,7 @@ class WorkspaceRow(QFrame):
         self.bg_badge.clicked.connect(
             lambda: self.agentsRequested.emit(self.ws_id))
 
-        # a sweeping-arc throbber with the WORKING count; pinned far-right, so
-        # the hover folder/delete buttons appear to its LEFT (see layout order)
+        # a sweeping-arc throbber with the WORKING count; pinned far-right
         self.work_spinner = WorkspaceSpinner(self)
         self.work_spinner.setObjectName("WsSpinner")
 
@@ -215,26 +193,24 @@ class WorkspaceRow(QFrame):
         lay.addWidget(self.tree_btn)      # always-visible file-explorer caret
         lay.addLayout(text_col, 1)
 
-        # folder/delete + every status badge live OUTSIDE `lay`, in their own
-        # tiny widget with its own layout, positioned by hand (_position_icon_
-        # stack) pinned to the row's right edge and RAISED above the name. A
-        # shared QHBoxLayout with the name would fight it for width and, once
-        # enough badges lit up at once (measured: folder+delete+one badge
-        # alone already exceeds the 230px sidebar), the layout engine crushes
-        # the losers down to a sliver — small enough that Qt's own button
-        # painter starts eliding their glyph+count text down to a bare "…",
-        # which is the exact "icons collapse under a ...' the user reported
-        # (and had pre-emptively asked to avoid). Living outside `lay` means
-        # this stack is sized ONLY from its own visible children's natural
-        # width, so it is NEVER a party to that squeeze; the name concedes
-        # the space instead by shrinking (down to 0, see name_label above),
-        # up to and including being covered outright.
+        # every status badge lives OUTSIDE `lay`, in their own tiny widget with
+        # its own layout, positioned by hand (_position_icon_stack) pinned to
+        # the row's right edge and RAISED above the name. A shared QHBoxLayout
+        # with the name would fight it for width and, once enough badges lit
+        # up at once (measured: three badges at once already strains the
+        # 230px sidebar), the layout engine crushes the losers down to a
+        # sliver — small enough that Qt's own button painter starts eliding
+        # their glyph+count text down to a bare "…", which is the exact
+        # "icons collapse under a ...' the user reported (and had
+        # pre-emptively asked to avoid). Living outside `lay` means this stack
+        # is sized ONLY from its own visible children's natural width, so it
+        # is NEVER a party to that squeeze; the name concedes the space
+        # instead by shrinking (down to 0, see name_label above), up to and
+        # including being covered outright.
         self._icon_stack = QWidget(self)
         icon_lay = QHBoxLayout(self._icon_stack)
         icon_lay.setContentsMargins(0, 0, 0, 0)
         icon_lay.setSpacing(8)
-        icon_lay.addWidget(self.folder_btn)
-        icon_lay.addWidget(self.delete_btn)
         icon_lay.addWidget(self.sched_badge)
         icon_lay.addWidget(self.limit_badge)
         icon_lay.addWidget(self.bg_badge)
@@ -275,7 +251,6 @@ class WorkspaceRow(QFrame):
         if self.property("active") != active:
             self.setProperty("active", active)
             repolish(self)
-        self._update_hover_buttons(hovered=self.underMouse())
 
     def set_search_hit(self, hit: bool) -> None:
         """Tint the row when it matches the active sidebar search."""
@@ -415,30 +390,10 @@ class WorkspaceRow(QFrame):
         self.start_rename()
         super().mouseDoubleClickEvent(event)
 
-    def enterEvent(self, event):
-        self._update_hover_buttons(hovered=True)
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._update_hover_buttons(hovered=False)
-        super().leaveEvent(event)
-
     def set_files_open(self, is_open: bool) -> None:
         """Reflect the file-tree open state in the toggle caret (▾ open / ▸)."""
         self.tree_btn.setText("▾" if is_open else "▸")
         self.tree_btn.setToolTip("Hide files" if is_open else "Show files")
-
-    def _update_hover_buttons(self, hovered: bool) -> None:
-        # folder/delete appear ONLY while hovering the row (not on the active
-        # row) so the workspace name keeps the full width the rest of the time;
-        # the count badge carries the workspace's status at all times, and the
-        # file-explorer caret (tree_btn) is always visible up front by the name.
-        # These are the ONLY things gated on hover — every status badge and the
-        # working spinner stay governed purely by their own state (see
-        # set_stats), never by hover, so they can never be hidden by it.
-        self.delete_btn.setVisible(hovered)
-        self.folder_btn.setVisible(hovered)
-        self._position_icon_stack()
 
 
 class CategoryRow(QFrame):
@@ -932,8 +887,6 @@ class Sidebar(QFrame):
     addCategoryRequested = Signal()          # M2
     workspaceSelected = Signal(str)
     renameRequested = Signal(str, str)
-    deleteRequested = Signal(str)
-    openFolderRequested = Signal(str)
     agentsRequested = Signal(str)            # ws_id (count badge clicked; M3)
     agentActivated = Signal(str, str)        # ws_id, agent_id (reveal its card)
     agentScheduleRequested = Signal(str, str)  # ws_id, agent_id (⏱ clicked)
@@ -1286,8 +1239,6 @@ class Sidebar(QFrame):
         row = WorkspaceRow(ws_id, data["name"], data["folder"])
         row.selected.connect(self.workspaceSelected)
         row.renameCommitted.connect(self.renameRequested)
-        row.deleteRequested.connect(self.deleteRequested)
-        row.openFolderRequested.connect(self.openFolderRequested)
         row.agentsRequested.connect(self._toggle_agents)  # inline expand/close
         row.filesRequested.connect(self._toggle_files)    # inline file tree
         row.set_files_open(ws_id in self._expanded_files)
