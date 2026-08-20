@@ -928,6 +928,19 @@ class TerminalView(QWidget):
         super().resizeEvent(event)
         self._resize_timer.start()  # debounce retile storms
 
+    def flush_resize(self) -> None:
+        """Apply a pending debounced resize NOW.
+
+        The 120ms debounce exists so a retile storm costs one reprojection, but
+        there is one moment where waiting is wrong: just before a pty child is
+        SPAWNED. A child told its width 120ms late has already painted at the
+        wrong one, and nothing downstream can undo that — the child hard-wraps
+        its own text, so those lines keep the width they were written for no
+        matter how the raw stream is projected afterwards. See
+        `MainWindow.settle_layout`, the only caller."""
+        self._resize_timer.stop()
+        self._apply_resize()
+
     def _apply_resize(self) -> None:
         cols = max(10, int((self.width() - 2 * CELL_PAD_X) / self._cell_w))
         rows = max(2, int((self.height() - 2 * CELL_PAD_Y) / self._cell_h))

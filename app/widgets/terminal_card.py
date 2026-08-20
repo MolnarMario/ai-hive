@@ -249,6 +249,7 @@ class TerminalCard(QFrame):
         self._renaming = False  # inline title-edit in progress
         self._task_full = ""    # untruncated current-task (the label elides it)
         self._pending_replay = ""  # restored screen, re-rendered once at size
+        self._restored_hooked = False  # is _rerender_restored still armed?
         # prompt milestone uid -> absolute line IN THIS VIEW. Per-card because
         # a rebuilt view has a different `pushed` origin; keyed on uid because
         # id() is reused after a FIFO eviction (see PromptMark).
@@ -322,6 +323,7 @@ class TerminalCard(QFrame):
                 # only way that is actually true: the agent's own buffer.
                 self._pending_replay = replay
                 self.terminal.sizeChanged.connect(self._rerender_restored)
+                self._restored_hooked = True
                 # ...and a backstop, because sizeChanged is not guaranteed:
                 # _apply_resize bails when rows/cols are unchanged, so a card
                 # built at exactly its final size would keep the seed forever.
@@ -901,33 +903,59 @@ class TerminalCard(QFrame):
             self._place_overlay()
         return super().eventFilter(obj, event)
 
-    def _drop_restored_screen(self) -> None:
+    def _unhook_restored(self) -> None:
+        """Disarm the one-shot settled-size projection, once.
+
+        Both teardown paths (`drop_restored_screen` and `_rerender_restored`
+        itself) can run for the same card, and PySide warns rather than raises
+        on a disconnect that has already happened -- so the flag, not a
+        try/except, is what makes the second call silent."""
+        if not self._restored_hooked:
+            return
+        self._restored_hooked = False
+        try:
+            self.terminal.sizeChanged.disconnect(self._rerender_restored)
+        except (RuntimeError, TypeError):
+            pass
+
+    def drop_restored_screen(self) -> None:
         """Give the launching child a clean terminal.
 
-        `_pending_replay` still being set means this card has NEVER re-rendered
-        its restored screen at a settled size, so what is on the terminal was
-        drawn at the pre-layout width and pyte cannot reflow it. Both launch
-        paths that start an agent (`autostart_active_workspace` and
-        `recover_blocked_at_startup`) run SYNCHRONOUSLY right after `show()`,
-        while `TerminalView` debounces its resize by 120ms, so this is every
-        agent that comes back running: their cards would sit on a mangled
-        narrow fragment of the old conversation until the TUI finished
-        booting. An empty terminal that fills in a few seconds is what a
-        restored hive looked like before snapshots existed, and snapshots were
-        never meant to change it.
+        A restored screen (`app/screen_snapshot.py`) exists so a card the user
+        left STOPPED reopens showing its conversation instead of a black
+        rectangle. The moment a child is launching behind that card the
+        snapshot has no job left: the TUI paints its own frame within seconds,
+        and the snapshot is the PREVIOUS run's screen — hard-wrapped for
+        whatever width that card had then, which nothing can reflow. An empty
+        terminal that fills in a few seconds is what a restored hive looked
+        like before snapshots existed, and snapshots were never meant to
+        change it.
 
-        A card WOKEN by a keystroke is untouched: it has long since
-        re-rendered (`_pending_replay` is empty by then), so its conversation
-        still scrolls up out of the way as a real terminal's would."""
+        Called EXPLICITLY by `MainWindow.autostart_active_workspace` for the
+        agents it is about to start, because that is the only party that knows
+        a start is the launch restore rather than a wake. It used to infer it
+        from `_pending_replay` still being set — "this card has never rendered
+        at a settled size" — which held only because the autostart ran ahead of
+        `TerminalView`'s 120ms resize debounce. `MainWindow.settle_layout` now
+        deliberately settles those sizes FIRST (a child must never paint at a
+        width its card does not have), so that proxy no longer distinguishes
+        anything and the caller says what it means instead. `_on_status` keeps
+        it as a backstop for a card whose child starts before any layout.
+
+        A card WOKEN by a keystroke is untouched: its conversation still
+        scrolls up out of the way as a real terminal's would.
+
+        Safe to call twice, and safe once the child has drawn: the real guard
+        is `TerminalAgent.drop_seeded_screen`, which drops only a buffer that
+        is still nothing but the snapshot."""
+        if not self.is_pty or self.terminal is None:
+            return          # a line-mode card has no screen to restore
         self._pending_replay = ""
         # the settled-size projection must be cancelled too, not just the
         # signal: its backstop timer would otherwise fire a moment later and
         # re-project the very screen this just decided to drop
         self._settle_timer.stop()
-        try:
-            self.terminal.sizeChanged.disconnect(self._rerender_restored)
-        except (RuntimeError, TypeError):
-            pass
+        self._unhook_restored()
         # drop it on the AGENT too, or a card rebuilt later (a retile, a
         # workspace switch) replays the same stale seed under the child
         if self.agent.drop_seeded_screen():
@@ -965,13 +993,10 @@ class TerminalCard(QFrame):
         since drawn over (`seed_written_over`): that seed is the PREVIOUS run's
         screen, and an agent that comes back running is deliberately given a
         clean terminal it fills itself, so replaying the seed under it would put
-        back the mangled fragment `_drop_restored_screen` exists to remove."""
+        back the mangled fragment `drop_restored_screen` exists to remove."""
         self._pending_replay = ""
         self._settle_timer.stop()
-        try:
-            self.terminal.sizeChanged.disconnect(self._rerender_restored)
-        except (RuntimeError, TypeError):
-            pass
+        self._unhook_restored()
         replay = self.agent.pty_replay()
         if not replay or self.agent.seed_written_over():
             return
@@ -1444,8 +1469,19 @@ class TerminalCard(QFrame):
             tip += f" (code {exit_info[0]})"
         self.glyph.setToolTip(tip)
 
-        if self.is_pty and running and self._pending_replay:
-            self._drop_restored_screen()
+        # A start that RESUMES a conversation reprints that whole conversation
+        # itself, so the snapshot underneath it is a duplicate — and one
+        # hard-wrapped for whatever width the card had in the PREVIOUS session,
+        # which nothing downstream can reflow. That is the same half-width
+        # scrollback `MainWindow.settle_layout` exists to prevent, arriving by
+        # the one door the launch autostart does not cover: a stopped card the
+        # user wakes with a keystroke. `spec.resume` is still readable here —
+        # `start()` clears it just after the worker launches (see
+        # `_begin_boot_veil`). A plain pty shell reprints nothing, so its
+        # conversation is kept and scrolls up as a real terminal's would.
+        if self.is_pty and running and (self._pending_replay
+                                        or self.agent.spec.resume):
+            self.drop_restored_screen()
 
         if self.is_pty:  # stopped terminal shows the wake banner, never black
             self.overlay.setVisible(not running

@@ -546,6 +546,42 @@ this file is the invariants that must survive every change.
     conversation costs one read of each; a `/clear` or pin change rotates the
     key. Everything here stays TRANSIENT and un-persisted — the transcript IS
     the durable record, which is the whole point.
+- **A pty child NEVER paints at a width its card does not have**
+  (`MainWindow.settle_layout`, `PageStack`, `TerminalView.flush_resize`).
+  Re-projection (next bullet) repairs the SCREEN, and it is the only repair
+  there is for lines pyte wrapped — but the child WRAPS ITS OWN TEXT to
+  whatever the pseudo-console reports, and a `--resume` launch dumps the
+  entire past conversation the instant it boots. Lines the CHILD broke stay
+  broken for the width they were broken at, forever; re-projecting the raw
+  stream cannot re-flow them. Reported as "reopen AI Hive, scroll up in a
+  restored conversation and the text is half width, with the live tail below
+  it full width", and confirmed in a saved `.vt` snapshot whose first ~940
+  lines were wrapped narrow and everything after wrapped wide, with the seam
+  mid-sentence. Three holes conspired, all at launch, all closed here and all
+  measured — do not reopen any of them:
+  1. `main()` calls `autostart_active_workspace()` the instant `show()`
+     returns, and a window restoring MAXIMIZED still reports its RESTORE-DOWN
+     geometry there (1249x662 after `show()`, 1536x793 one `processEvents`
+     later, on the reporter's machine). `settle_layout` pumps the queue first.
+  2. `TerminalView` debounces its resize by 120 ms, so `PtyWorker` spawned at
+     `DEFAULT_COLS` (100) and heard the truth ~250 ms later. `flush_resize`
+     applies the pending resize before any spawn.
+  3. `QStackedLayout` lays out the CURRENT page only, so a workspace the user
+     has not opened is never sized at all — and the autostart brings back
+     EVERY workspace's agents, so 6 of 8 in a four-workspace hive ran their
+     whole resumed conversation at 100 columns and only found out when the
+     user first clicked that workspace. `PageStack.layout_hidden_pages` hands
+     each off-screen page the current page's rect via `WA_DontShowOnScreen` +
+     show/hide inside one call (Qt lays out only what it considers VISIBLE;
+     `setGeometry` alone on a hidden page does nothing, measured), debounced
+     because the trigger is a window drag, and also fired when a page or agent
+     is added/removed off screen since a retile changes every sibling's width.
+  `settle_layout` is idempotent (`_apply_resize` returns early when nothing
+  changed) and is what the restored-screen invariant below now depends on.
+  What it does NOT fix, and cannot: a width change MID-conversation (the user
+  resizes the window, closes a sibling agent, solos a card) leaves everything
+  the child already printed wrapped as it was — same as every real terminal
+  emulator does with app-wrapped output.
 - **A width change RE-PROJECTS the scrollback** (`TerminalCard.
   _reproject_on_size`). pyte does not reflow: a history line keeps the column
   count it had when it was pushed. That was invisible while Claude owned its
@@ -586,12 +622,12 @@ this file is the invariants that must survive every change.
   seed_written_over`, which compares the buffer to `_pty_seed`) — that seed is
   the previous run's screen and a running agent is deliberately given a clean
   terminal, so replaying it would put back the mangled fragment
-  `_drop_restored_screen` exists to remove. `is_running()` is NOT the test, for
+  `drop_restored_screen` exists to remove. `is_running()` is NOT the test, for
   the reason that function documents. (3) A `REPLAY_SETTLE_MS` single-shot
   BACKSTOP, because `TerminalView._apply_resize` returns EARLY when rows/cols
   are unchanged, so `sizeChanged` is not guaranteed to fire at all and a card
   built at exactly its final size would keep the seed forever.
-  `_drop_restored_screen` must stop that timer as well as disconnect the
+  `drop_restored_screen` must stop that timer as well as disconnect the
   signal, or it re-projects the very screen that was just dropped.
 - **The transcript behind milestone recovery is cached per conversation**
   (`TerminalCard._recover_key`/`_recover_prompts`). `_recover_marks` runs on
@@ -1573,21 +1609,32 @@ this file is the invariants that must survive every change.
   would otherwise only grow. THE SNAPSHOT SERVES THE STOPPED CARD ONLY: an
   agent that comes back RUNNING gets a CLEAN terminal that its child fills in
   a few seconds, which is what a restored hive looked like before snapshots
-  existed. `TerminalCard._on_status` drops the restored screen (its own, and
-  the agent's via `TerminalAgent.drop_seeded_screen`, or a card rebuilt by a
-  retile would replay the same stale seed under the child) the moment the
-  agent starts while `_pending_replay` is STILL SET — i.e. this card has
-  never re-rendered it at a settled size. Both launch paths that start an
-  agent (`autostart_active_workspace`, `recover_blocked_at_startup`) run
-  SYNCHRONOUSLY right after `show()`, ahead of `TerminalView`'s 120 ms resize
-  debounce, so that is every agent restored running: leaving the seed there
-  parked each of their cards on a mangled ~24-column fragment of last
-  session's screen until the TUI finished booting (reported twice, and the
-  reason it is not enough to fix the RE-RENDER: a launching child writes
+  existed. `TerminalCard.drop_restored_screen` drops it (its own, and the
+  agent's via `TerminalAgent.drop_seeded_screen`, or a card rebuilt by a
+  retile would replay the same stale seed under the child). Leaving the seed
+  there parked each restored-running card on a mangled ~24-column fragment of
+  last session's screen until the TUI finished booting (reported twice, and
+  the reason it is not enough to fix the RE-RENDER: a launching child writes
   within milliseconds, so any guard that defers to a live child leaves the
-  bad frame up). `_pending_replay` is the right test because a card WOKEN by
-  a keystroke has long since consumed it, so the wake path below is
-  untouched. TWO subtleties, both live-found: (1) pyte drops
+  bad frame up). WHO CALLS IT is the part that has changed once already, so
+  read this before touching it. It used to be inferred inside `_on_status`
+  from `_pending_replay` still being set — "this card has never re-rendered
+  at a settled size" — which worked ONLY because both launch paths
+  (`autostart_active_workspace`, `recover_blocked_at_startup`) ran
+  synchronously right after `show()`, ahead of `TerminalView`'s 120 ms resize
+  debounce. `MainWindow.settle_layout` now deliberately settles those sizes
+  FIRST (see the width invariant above — a child must never paint at a width
+  its card does not have), so that proxy stopped distinguishing a launch from
+  a wake, and `autostart_active_workspace` CALLS IT EXPLICITLY for each agent
+  it is about to start instead. `_on_status` keeps the `_pending_replay` test
+  as a backstop for a card whose child starts before any layout, and adds one
+  case of its own: a start that RESUMES a conversation (`spec.resume`, still
+  readable at STARTING) reprints that whole conversation itself, so the
+  snapshot underneath it is a duplicate wrapped for LAST session's width —
+  the same half-width scrollback bug arriving by the one door the autostart
+  does not cover, a stopped card the user wakes with a keystroke. A plain pty
+  shell reprints nothing, so its conversation is kept and scrolls up as a real
+  terminal's would. TWO subtleties, both live-found: (1) pyte drops
   lines off the TOP when it shrinks, and the tiling grid resizes a card AFTER
   it is built, so the newest part of a restored conversation is exactly what
   vanished — `TerminalCard._rerender_restored` re-renders ONCE on the first

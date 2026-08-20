@@ -7060,6 +7060,165 @@ def test_wake_and_resume_all():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_pty_width_at_launch():
+    """Every pty child is SPAWNED at its card's real width, in every workspace.
+
+    The regression this guards, reported as "reopen AI Hive, scroll up in a
+    restored conversation and the text is half width": a terminal's column
+    count is not a cosmetic detail that can be corrected afterwards. The child
+    WRAPS ITS OWN TEXT to whatever the pseudo-console reports, and a `--resume`
+    launch dumps the whole past conversation the instant it boots, so lines
+    broken for the wrong width stay broken for it forever -- pyte cannot reflow
+    them, and neither can `TerminalCard._reproject_on_size`, which only
+    re-projects the raw stream the child already hard-wrapped.
+
+    Three separate holes let that happen at launch, all measured on this
+    suite's own repro before the fix:
+
+      * `PtyWorker` spawned at DEFAULT_COLS (100) and heard the real width
+        ~250ms later, because `TerminalView` debounces its resize by 120ms;
+      * `main()` calls `autostart_active_workspace()` the instant `show()`
+        returns, where a window restoring MAXIMIZED still reports its
+        restore-down geometry (1249x662 measured there, 1536x793 one
+        `processEvents` later);
+      * a workspace the user has not opened is NEVER laid out by
+        `QStackedLayout`, so six of eight agents in a four-workspace hive ran
+        their entire resumed conversation at 100 columns and only found out
+        the truth when the user first clicked that workspace.
+
+    `MainWindow.settle_layout` closes all three, and the width a child is given
+    must then never change again."""
+    import json
+    import shutil
+    import tempfile
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app import pty_worker
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    if not HAS_CONPTY:
+        check("pty width: SKIP (no pywinpty)", True)
+        return
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-ptywidth-"))
+    store = SessionStore(path=tmp / "session.json")
+
+    # every width the pseudo-console is ever told, and the width each child is
+    # SPAWNED at -- the two numbers the bug lived between
+    spawned: list[tuple] = []
+    widths: dict[str, list] = {}
+    orig_resize = pty_worker.PtyWorker.resize
+    orig_start = pty_worker.PtyWorker.start
+
+    def traced_resize(self, rows, cols):
+        before = (self.rows, self.cols)
+        orig_resize(self, rows, cols)
+        if (self.rows, self.cols) != before:
+            widths.setdefault(id(self), []).append(self.cols)
+
+    def traced_start(self):
+        spawned.append((self.spec.name, self.cols))
+        widths.setdefault(id(self), []).append(self.cols)
+        return orig_start(self)
+
+    pty_worker.PtyWorker.resize = traced_resize
+    pty_worker.PtyWorker.start = traced_start
+    try:
+        # -- session 1: four workspaces, two pty agents each, all running ----
+        win = create_main_window(store)
+        win.show()
+        pump(400)
+        mgr = win.manager
+        wss = [mgr.workspaces[0]]
+        for nm in ("Two", "Three", "Four"):
+            wss.append(mgr.create_workspace(nm, str(tmp)))
+        for ws in wss:
+            while len(ws.agents) < 2:
+                mgr.add_terminal(ws.id, build_spec(
+                    AgentKind.POWERSHELL, "A%d" % (len(ws.agents) + 1),
+                    cwd=str(tmp), pty=True), autostart=False)
+            for a in ws.agents:      # all eight RUNNING, so all eight restore
+                if not a.is_running():
+                    a.start()
+        mgr.set_active(wss[0].id)
+        pump(1200)
+        win.close()
+        pump(400)
+
+        # a maximized window whose restore-down geometry is much smaller: the
+        # shape that makes show() report a width the card will not keep
+        data = json.loads((tmp / "session.json").read_text(encoding="utf-8"))
+        data.setdefault("ui", {})["window"] = {"w": 900, "h": 600,
+                                               "maximized": True}
+        (tmp / "session.json").write_text(json.dumps(data), encoding="utf-8")
+
+        spawned.clear()
+        widths.clear()
+
+        # -- session 2: main()'s exact order, no event loop in between -------
+        win2 = create_main_window(SessionStore(path=tmp / "session.json"))
+        win2.show()
+        win2.autostart_active_workspace()
+        pump(2500)
+
+        default_cols = pty_worker.DEFAULT_COLS
+        check("pty width: every restored child was actually started",
+              len(spawned) == 8, spawned)
+        check("pty width: none was spawned at the placeholder default",
+              all(cols != default_cols for _n, cols in spawned), spawned)
+
+        active = win2.manager.active_id
+        check("pty width: the on-screen workspace is honest",
+              all(c.terminal.screen.columns == c.agent.worker.cols
+                  for c in win2._pages[active].cards),
+              [(c.terminal.screen.columns, c.agent.worker.cols)
+               for c in win2._pages[active].cards])
+        # the half of the bug that never corrected itself: Qt lays out the
+        # CURRENT page only, so these six used to sit at DEFAULT_COLS forever
+        hidden = [c for ws in win2.manager.workspaces if ws.id != active
+                  for c in win2._pages[ws.id].cards]
+        check("pty width: ...and so is every workspace still off screen",
+              hidden and all(c.terminal.screen.columns == c.agent.worker.cols
+                             and c.terminal.screen.columns != default_cols
+                             for c in hidden),
+              [(c.agent.spec.name, c.terminal.screen.columns,
+                c.agent.worker.cols) for c in hidden])
+        check("pty width: no child was ever told two different widths",
+              all(len(set(seen)) == 1 for seen in widths.values()),
+              {k: v for k, v in widths.items() if len(set(v)) > 1})
+
+        # -- and opening a workspace must not move its width ----------------
+        others = [ws for ws in win2.manager.workspaces if ws.id != active]
+        before = [(c.agent.id, c.agent.worker.cols)
+                  for c in win2._pages[others[0].id].cards]
+        win2.manager.set_active(others[0].id)
+        pump(600)
+        after = [(c.agent.id, c.agent.worker.cols)
+                 for c in win2._pages[others[0].id].cards]
+        check("pty width: opening a workspace does not re-wrap its terminals",
+              before == after, (before, after))
+
+        win2.close()
+        pump(400)
+    finally:
+        pty_worker.PtyWorker.resize = orig_resize
+        pty_worker.PtyWorker.start = orig_start
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_screen_snapshots():
     """A card left STOPPED reopens showing the conversation it had at close,
     not a black rectangle with a banner over it. (The regression: a reopened
@@ -7267,6 +7426,27 @@ def test_screen_snapshots():
               "KEPT-CONVERSATION" in card6.terminal.screen_text()
               and "KEPT-CONVERSATION" in woken.pty_replay())
         card6.detach(); woken.dispose(); pump(50)
+
+        # ...unless that wake RESUMES a conversation, which reprints the whole
+        # thing itself. Then the snapshot below is a duplicate, hard-wrapped
+        # for the width the card had in the PREVIOUS session -- the half-width
+        # scrollback bug arriving by the one door the launch autostart (which
+        # drops the seed outright) does not cover.
+        resumed = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Resumed", cwd=str(tmp), pty=True))
+        resumed.seed_pty_replay("LAST-SESSION-WIDTH\r\n")
+        card7 = TerminalCard(resumed)
+        card7.resize(640, 400); card7.show(); pump(150)
+        check("screens: precondition - the resumed card settled on the seed",
+              "LAST-SESSION-WIDTH" in card7.terminal.screen_text()
+              and card7._pending_replay == "")
+        resumed.spec.resume = "sess-abc"        # this launch reopens a chat
+        card7._on_status(AgentStatus.STARTING)
+        check("screens: a wake that RESUMES drops the stale-width snapshot "
+              "instead of stacking it above the reprint",
+              "LAST-SESSION-WIDTH" not in card7.terminal.screen_text()
+              and resumed.pty_replay() == "")
+        card7.detach(); resumed.dispose(); pump(50)
 
         # an agent with NOTHING to show keeps the original centred banner:
         # that card really is a dead black screen and must say so
@@ -10265,7 +10445,7 @@ def test_projection_happens_once():
         AgentKind.POWERSHELL, "Dropped", cwd=str(tmp), pty=True))
     dropped.seed_pty_replay(seed)
     card4 = tc.TerminalCard(dropped)
-    card4._drop_restored_screen()
+    card4.drop_restored_screen()
     check("project: dropping the restored screen stops the backstop",
           not card4._settle_timer.isActive())
     pump(tc.REPLAY_SETTLE_MS + 150)
@@ -11312,6 +11492,7 @@ def main():
     test_review_hardening_fixes()
     test_resume_picker()
     test_transcript_backups()
+    test_pty_width_at_launch()
     test_screen_snapshots()
     test_agent_file_map()
     test_fsopen_helpers()
