@@ -600,12 +600,12 @@ class WorkspaceManager(QObject):
         return out
 
     def refresh_ai_titles(self) -> None:
-        """Pull each running Claude/Gemini agent's latest AI conversation title AND its
-        context-window occupancy from the live transcript and adopt both as
-        transient card state (`set_ai_title` / `set_token_usage` never persist).
-        Cheap: both readers re-read only when the transcript changed. Reads
-        spec.session_id, which sync keeps pointed at the conversation the agent
-        is actually writing."""
+        """Pull each running Claude/Gemini agent's latest AI conversation title
+        AND its context-window occupancy from the live transcript and adopt both
+        as transient card state (`set_ai_title` / `set_token_usage` never
+        persist). Cheap: both readers re-read only when the transcript changed.
+        Reads spec.session_id, which sync keeps pointed at the conversation the
+        agent is actually writing."""
         for w in self._workspaces:
             for a in w.agents:
                 spec = a.spec

@@ -702,7 +702,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1711 checks drive the real app headlessly (offscreen Qt platform) with real
+1767 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -716,10 +716,16 @@ a per-agent task summary beside the name, the per-card maximize/restore toggle
 (solo one agent full-area without touching any sibling's process, then restore
 the exact prior tiling), the context-window usage badge beside the summary
 ("N% of 1M/200K", read from the transcript's last usage record — transient,
-never persisted), the last-reply-finished time stamp beside it (set only on
-the genuine busy-to-idle settle, not a forced clear on stop/crash, and never
-persisted — mirrors the dated entries the shared board's `log_activity` tool
-already writes, but live on the agent's own card), deferred "send later" messages (delay/clock parsing, the
+never persisted), and a date-and-time stamp under every finished reply,
+drawn inline in the terminal directly beneath Claude's own "✻ Worked for
+16m 36s" footer (a second FIFO-capped milestone type mirroring the
+scrollbar's prompt marks, captured live on the busy-to-idle settle and
+otherwise READ FROM THE CONVERSATION ON DISK by matching each transcript
+reply's closing line into the scrollback — so reopening the app shows when
+an answer was really generated rather than nothing at all; re-anchored
+across a card rebuild from the pty replay, skipped rather than guessed when
+a reply has scrolled away or a row runs out of room),
+deferred "send later" messages (delay/clock parsing, the
 Ctrl+Shift+Enter gesture sending nothing to the child, delivery by nudge so an
 assignment is never overwritten, a refusal retried then given up on as missed,
 the countdown tick never marking the session dirty, and a message that came due
@@ -818,7 +824,7 @@ app/
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1711 checks)
+tests/smoke_test.py        headless end-to-end suite (1767 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

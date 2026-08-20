@@ -151,6 +151,32 @@ _NAMED = {
 # transcript). Claude Code draws '>'; '❯' covers common shell/other prompts.
 _INPUT_PROMPTS = (">", "❯")
 
+# How far above the freshly-redrawn input box reply_anchor_line() will look
+# for the finished reply's own footer row ("Crunched for Ns" and its many
+# spinner-verb siblings). One blank separator line is the normal case; a few
+# extra rows of slack cover a wrapped/multi-line footer without risking a
+# runaway scan that lands on unrelated, much older content.
+_REPLY_ANCHOR_SCAN = 6
+
+# Claude Code's settled-turn footer: a spinner glyph, a verb, and how long the
+# turn took -- "✻ Worked for 16m 36s", "✻ Cooked for 8m 2s · 1 shell still
+# running". The reply stamp is drawn on the blank row BELOW this rather than
+# beside the reply text above it (see reply_anchor_line). The leading-glyph
+# slot must be followed by a WORD and then " for <duration>", which is what
+# keeps the input box's own footer hints ("? for shortcuts", "← for agents")
+# out: neither has a second "for" after its first word.
+_REPLY_FOOTER_RE = re.compile(
+    r"^\s*[^\w\s]?\s*[A-Za-z][A-Za-z'\-]*\s+for\s+"
+    r"(?:\d+h\s*)?(?:\d+m\s*)?\d+(?:\.\d+)?s\b", re.I)
+
+
+def is_reply_footer(text: str) -> bool:
+    """True when a row is Claude Code's "<verb> for <duration>" turn footer.
+    Shared with TerminalCard._reply_end_row so the live anchor and the
+    transcript-recovered one put a stamp in the SAME place."""
+    return bool(_REPLY_FOOTER_RE.match(text.strip()))
+
+
 # The Unicode Box Drawing block. Claude Code paints a horizontal rule (plain
 # dashes, or a rounded-corner box border) directly between the input box and
 # its footer hint, with no blank line either side -- a row built ENTIRELY
@@ -536,6 +562,11 @@ class TerminalView(QWidget):
         # Pure VIEW data -- the durable copy lives on the agent, because a card
         # rebuild throws this widget away (see TerminalCard._replay_with_marks).
         self._marks: list[tuple[int, str]] = []
+        # reply-finished milestones painted INLINE in the terminal content
+        # itself (a small date/time stamp above the input box, next to
+        # Claude's own "for Ns" footer) rather than on the scrollbar. Same
+        # pure-VIEW-data contract as _marks. (absolute line, stamp text).
+        self._reply_marks: list[tuple[int, str]] = []
         # cached list(history.top) for _view_state, keyed on (pushed, len) --
         # without it, a user parked in scrollback copies up to HISTORY_LINES
         # items on EVERY repaint, which is precisely the state this feature
@@ -678,6 +709,47 @@ class TerminalView(QWidget):
         row = span[0] if span is not None else self.screen.cursor.y
         return self.history_pushed() + row
 
+    def reply_anchor_line(self) -> int | None:
+        """Absolute line of the row a just-finished reply's stamp goes on: the
+        blank row directly UNDER Claude's own "<spinner verb> for Ns" footer,
+        which is left in place once a turn settles. Used at BOTH the live busy -> idle capture
+        (TerminalCard._on_activity) and replay re-anchoring
+        (_replay_with_marks), exactly like anchor_line() -- one function over
+        identical screen state on both sides is what keeps them agreeing.
+
+        Found by scanning up from the input box Claude redraws at settle
+        (`_input_block_span`'s top row), skipping the chrome between the two --
+        blank separators AND the box's own top border, which is what sits
+        directly above the prompt row -- to the nearest real content row -- bounded by _REPLY_ANCHOR_SCAN so a
+        missing footer (an unusual screen shape, or the settle firing before
+        the redraw) can never walk into unrelated older history and mislabel
+        it. None when there is no live input box to scan from at all (e.g. the
+        agent settled parked on a menu) or nothing is found within the bound;
+        the mark is then simply skipped, exactly like an un-anchored
+        PromptMark."""
+        span = self._input_block_span()
+        if span is None:
+            return None
+        bound = span[0] - _REPLY_ANCHOR_SCAN
+        r = span[0] - 1
+        while r >= 0 and r > bound:
+            first, _ = self._row_content(r)
+            # Blanks, rules and the box's hint line are all chrome between
+            # the box and the reply. The box's own top BORDER sits directly
+            # above the prompt row, so a scan that stopped at the first rule
+            # stopped before it had looked at anything -- that bail-out is why
+            # the live stamp silently never appeared on the real screen shape,
+            # while a fixture without that border passed.
+            if (first >= 0 and not self._row_is_rule(r)
+                    and not self._row_is_input_footer(r)):
+                below = r + 1
+                if (below < self.screen.lines
+                        and self._row_content(below) == (-1, -1)):
+                    return self.history_pushed() + below  # UNDER the footer
+                return self.history_pushed() + r    # nothing below to use
+            r -= 1
+        return None
+
     def scroll_to_abs(self, abs_line: int, lead: int = 2) -> None:
         """Put `abs_line` `lead` rows below the top of the view.
 
@@ -696,6 +768,13 @@ class TerminalView(QWidget):
 
     def marks(self) -> list[tuple[int, str]]:
         return list(self._marks)
+
+    def set_reply_marks(self, marks) -> None:
+        self._reply_marks = list(marks)
+        self._notify_view(immediate=True)
+
+    def reply_marks(self) -> list[tuple[int, str]]:
+        return list(self._reply_marks)
 
     def clear_history(self) -> None:
         """Drop the scrollback but leave the LIVE screen alone.
@@ -723,6 +802,7 @@ class TerminalView(QWidget):
     def _on_history_wiped(self) -> None:
         self._scroll_offset = 0
         self._marks = []
+        self._reply_marks = []
         self._vs_cache = None
         self._vs_sig = None
         self.historyCleared.emit()
@@ -847,6 +927,19 @@ class TerminalView(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._resize_timer.start()  # debounce retile storms
+
+    def flush_resize(self) -> None:
+        """Apply a pending debounced resize NOW.
+
+        The 120ms debounce exists so a retile storm costs one reprojection, but
+        there is one moment where waiting is wrong: just before a pty child is
+        SPAWNED. A child told its width 120ms late has already painted at the
+        wrong one, and nothing downstream can undo that — the child hard-wraps
+        its own text, so those lines keep the width they were written for no
+        matter how the raw stream is projected afterwards. See
+        `MainWindow.settle_layout`, the only caller."""
+        self._resize_timer.stop()
+        self._apply_resize()
 
     def _apply_resize(self) -> None:
         cols = max(10, int((self.width() - 2 * CELL_PAD_X) / self._cell_w))
@@ -2238,6 +2331,40 @@ class TerminalView(QWidget):
                             "".join(line[k].data or " " for k in range(i, j)))
                         i = j
                 col = run_end
+
+        # reply-finished stamps: a dim date/time drawn into the RIGHT-hand
+        # blank space of the row reply_anchor_line() picked out (Claude's own
+        # "for Ns" footer), never a new row of our own -- pyte's screen has no
+        # room to insert one without reflowing every anchor below it. Right-
+        # aligned and skipped outright when the row's own content runs too
+        # close to the edge, so a long footer or a narrow terminal never
+        # collides with it (better to miss a stamp than draw over real
+        # output).
+        if self._reply_marks:
+            stamp_map = {ln: txt for ln, txt in self._reply_marks}
+            pushed = self.history_pushed()
+            stamp_font = QFont(self._font)
+            stamp_font.setItalic(True)
+            for row in range(self.screen.lines):
+                text = stamp_map.get(pushed - off + row)
+                if text is None:
+                    continue
+                ln = lines[row]
+                last = -1
+                for c in range(_cols - 1, -1, -1):
+                    if (ln[c].data or " ") != " ":
+                        last = c
+                        break
+                start_col = _cols - len(text) - 1
+                if start_col <= last + 2:
+                    continue
+                painter.setFont(stamp_font)
+                ink = legible_color(QColor(Palette.CARDHEAD_SUB),
+                                    QColor(Palette.BG_CONSOLE))
+                painter.setPen(ink)
+                painter.drawText(int(CELL_PAD_X + start_col * cw),
+                                 int(CELL_PAD_Y + row * ch + self._ascent),
+                                 text)
 
         # every clickable URL/path is underlined so you can spot links in the
         # body text at a glance (a soft 3px accent line); the hovered one is

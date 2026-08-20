@@ -3063,68 +3063,121 @@ def test_agent_busy_activity():
     a.dispose()
 
 
-def test_agent_last_reply_at():
-    """last_reply_at() stamps the moment a reply genuinely ENDS (the busy ->
-    idle settle in _on_idle_timeout) so the card header can show it -- and
-    must NOT be re-stamped by a forced busy clear on stop/crash (_set_status),
-    which is not a reply ending, just the process going away mid-turn."""
+def test_reply_settle_skips_resume_replay():
+    """A --resume launch replays the WHOLE past conversation as real output
+    before it ever goes quiet, so the FIRST busy -> idle settle of a resumed
+    launch is that replay finishing, not a fresh reply -- live-reported bug:
+    reopening the app always showed the CURRENT time next to the last reply
+    (both the header badge and an inline mark), never the actual historical
+    one, because that replay settle stamped "now" unconditionally. Only that
+    one settle is skipped; the very next one (a genuine new reply) stamps
+    normally, and a non-resumed launch -- nothing to replay -- is never
+    suppressed at all."""
     from PySide6.QtWidgets import QApplication
     from app.terminal_agent import TerminalAgent, AgentStatus
     from app.process_worker import AgentKind, build_spec
 
     QApplication.instance() or QApplication([])
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyTime", cwd="."))
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ResumeSettle", cwd=".",
+                                 pty=True))
     a.status = AgentStatus.RUNNING
-    check("reply-at: no reply yet -> None", a.last_reply_at() is None)
-    a._on_pty_output("", "generating tokens...")
-    check("reply-at: still busy -> unset", a.last_reply_at() is None)
+    a._resume_attempt = True          # simulate a --resume launch
+    a._settled_once = False
+
+    # the resume replay arrives as real output, then falls quiet
+    a._on_pty_output("pty", "...replayed conversation...")
+    a._on_idle_timeout()
+    check("reply-settle: a resume's replay settle mints no inline milestone",
+          a.reply_marks() == [], a.reply_marks())
+    check("reply-settle: ...but 'settled once' is now true", a._settled_once)
+
+    # the NEXT settle is a genuine reply and stamps normally
+    a._on_pty_output("pty", "a real new reply")
     before = time.time()
-    a._on_idle_timeout()  # simulate the quiet-window settle: the reply ended
-    stamped = a.last_reply_at()
-    check("reply-at: settle stamps a recent walltime",
-          stamped is not None and before - 1 <= stamped <= time.time() + 1)
-    a._set_status(AgentStatus.EXITED_OK)  # forced clear, not a real reply end
-    check("reply-at: forced exit does not re-stamp",
-          a.last_reply_at() == stamped)
+    a._on_idle_timeout()
+    check("reply-settle: the settle AFTER the replay records one milestone",
+          len(a.reply_marks()) == 1, a.reply_marks())
+    check("reply-settle: ...stamped with a recent walltime",
+          before - 1 <= a.reply_marks()[0].ts <= time.time() + 1)
+
+    # a non-resumed launch has nothing to replay, so its first settle is real
+    b = TerminalAgent(build_spec(AgentKind.CLAUDE, "FreshSettle", cwd=".",
+                                 pty=True))
+    b.status = AgentStatus.RUNNING
+    check("reply-settle: a fresh (non-resume) launch is never suppressed",
+          not b._resume_attempt)
+    b._on_pty_output("pty", "first reply ever")
+    b._on_idle_timeout()
+    check("reply-settle: ...so its first settle stamps immediately",
+          len(b.reply_marks()) == 1, b.reply_marks())
+
     a.dispose()
+    b.dispose()
 
 
-def test_reply_time_card_ui():
-    """The card header's #CardReplyTime label mirrors last_reply_at() LIVE,
-    off the same activity_changed edge the status glyph already reacts to
-    (mirrors test_bg_shell_live_ui's shape for a different marker)."""
-    from PySide6.QtCore import QEventLoop, QTimer
-    from PySide6.QtWidgets import QApplication
-    from app.terminal_agent import TerminalAgent, AgentStatus
-    from app.process_worker import AgentKind, build_spec
-    from app.widgets.terminal_card import TerminalCard
+def test_transcript_reply_times():
+    """transcripts.reply_times reads when each reply ACTUALLY finished out of
+    the conversation on disk -- the only source that survives a restart, since
+    the live stamp is minted from the clock at a settle this process watched.
 
-    QApplication.instance() or QApplication([])
+    The shape that matters: a turn narrates BETWEEN its tool calls, so only the
+    LAST assistant text before the next real user turn is a finished reply, and
+    a tool RESULT (a user record) sits inside a turn rather than ending one."""
+    import datetime as _dt
+    import json
+    import tempfile
 
-    def pump(ms):
-        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+    from app import transcripts
 
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyCard", cwd="."))
-    a.status = AgentStatus.RUNNING
-    card = TerminalCard(a)
-    card.resize(900, 300); card.show(); pump(60)
-    check("reply-time UI: hidden before any reply",
-          not card.reply_time_label.isVisible())
+    def rec(**kw):
+        return json.dumps(kw)
 
-    a._on_pty_output("", "generating tokens...")
-    a._on_idle_timeout()  # busy -> idle settle: a reply just finished
-    pump(30)
-    check("reply-time UI: shown live once the agent settles",
-          card.reply_time_label.isVisible())
-    text = card.reply_time_label.text()
-    check("reply-time UI: label text is a plain HH:MM stamp",
-          len(text) == 5 and text[2] == ":" and
-          text[:2].isdigit() and text[3:].isdigit())
-    card.detach()
-    a.dispose()
+    stamp = "2026-08-19T12:%02d:00.000Z"
 
+    def at(minute):
+        return _dt.datetime.fromisoformat(
+            (stamp % minute).replace("Z", "+00:00")).timestamp()
 
-# ------------------------------------------------------------ ansi parser ---
+    lines = [
+        # turn 1: a prompt, a mid-turn narration, a tool call/result, the reply
+        rec(type="user", timestamp=stamp % 0, promptSource="typed",
+            message={"role": "user", "content": "do the thing"}),
+        rec(type="assistant", timestamp=stamp % 1,
+            message={"content": [{"type": "text", "text": "Looking now."}]}),
+        rec(type="user", timestamp=stamp % 2,
+            message={"content": [{"type": "tool_result", "content": "ok"}]}),
+        rec(type="assistant", timestamp=stamp % 3,
+            message={"content": [{"type": "text", "text": "Done, all green."}]}),
+        # a sub-agent's own turn must never count as this conversation's reply
+        rec(type="assistant", timestamp=stamp % 4, isSidechain=True,
+            message={"content": [{"type": "text", "text": "sidechain noise"}]}),
+        # turn 2
+        rec(type="user", timestamp=stamp % 5, promptSource="typed",
+            message={"role": "user", "content": "and again"}),
+        rec(type="assistant", timestamp=stamp % 6,
+            message={"content": [{"type": "text", "text": "Second reply."}]}),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "conv.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        got = transcripts._read_reply_times(path)
+
+    check("reply-times: one entry per FINISHED reply, not per assistant text",
+          len(got) == 2, got)
+    check("reply-times: a mid-turn narration is not a reply ending",
+          [t for _, t in got] == ["Done, all green.", "Second reply."], got)
+    check("reply-times: each carries the record's OWN timestamp",
+          [w for w, _ in got] == [at(3), at(6)], got)
+    check("reply-times: a tool result does not end a turn",
+          got[0][0] == at(3), got[0])
+    check("reply-times: a sidechain turn is skipped",
+          all("sidechain" not in t for _, t in got), got)
+
+    # a missing / unreadable transcript is "" rather than an exception
+    check("reply-times: no transcript -> empty, never raises",
+          transcripts.reply_times("C:/nope", "no-such-id") == [])
+
 
 def test_ansi():
     from app.ansi_parser import AnsiSgrParser
@@ -7007,6 +7060,165 @@ def test_wake_and_resume_all():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_pty_width_at_launch():
+    """Every pty child is SPAWNED at its card's real width, in every workspace.
+
+    The regression this guards, reported as "reopen AI Hive, scroll up in a
+    restored conversation and the text is half width": a terminal's column
+    count is not a cosmetic detail that can be corrected afterwards. The child
+    WRAPS ITS OWN TEXT to whatever the pseudo-console reports, and a `--resume`
+    launch dumps the whole past conversation the instant it boots, so lines
+    broken for the wrong width stay broken for it forever -- pyte cannot reflow
+    them, and neither can `TerminalCard._reproject_on_size`, which only
+    re-projects the raw stream the child already hard-wrapped.
+
+    Three separate holes let that happen at launch, all measured on this
+    suite's own repro before the fix:
+
+      * `PtyWorker` spawned at DEFAULT_COLS (100) and heard the real width
+        ~250ms later, because `TerminalView` debounces its resize by 120ms;
+      * `main()` calls `autostart_active_workspace()` the instant `show()`
+        returns, where a window restoring MAXIMIZED still reports its
+        restore-down geometry (1249x662 measured there, 1536x793 one
+        `processEvents` later);
+      * a workspace the user has not opened is NEVER laid out by
+        `QStackedLayout`, so six of eight agents in a four-workspace hive ran
+        their entire resumed conversation at 100 columns and only found out
+        the truth when the user first clicked that workspace.
+
+    `MainWindow.settle_layout` closes all three, and the width a child is given
+    must then never change again."""
+    import json
+    import shutil
+    import tempfile
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app import pty_worker
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    if not HAS_CONPTY:
+        check("pty width: SKIP (no pywinpty)", True)
+        return
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-ptywidth-"))
+    store = SessionStore(path=tmp / "session.json")
+
+    # every width the pseudo-console is ever told, and the width each child is
+    # SPAWNED at -- the two numbers the bug lived between
+    spawned: list[tuple] = []
+    widths: dict[str, list] = {}
+    orig_resize = pty_worker.PtyWorker.resize
+    orig_start = pty_worker.PtyWorker.start
+
+    def traced_resize(self, rows, cols):
+        before = (self.rows, self.cols)
+        orig_resize(self, rows, cols)
+        if (self.rows, self.cols) != before:
+            widths.setdefault(id(self), []).append(self.cols)
+
+    def traced_start(self):
+        spawned.append((self.spec.name, self.cols))
+        widths.setdefault(id(self), []).append(self.cols)
+        return orig_start(self)
+
+    pty_worker.PtyWorker.resize = traced_resize
+    pty_worker.PtyWorker.start = traced_start
+    try:
+        # -- session 1: four workspaces, two pty agents each, all running ----
+        win = create_main_window(store)
+        win.show()
+        pump(400)
+        mgr = win.manager
+        wss = [mgr.workspaces[0]]
+        for nm in ("Two", "Three", "Four"):
+            wss.append(mgr.create_workspace(nm, str(tmp)))
+        for ws in wss:
+            while len(ws.agents) < 2:
+                mgr.add_terminal(ws.id, build_spec(
+                    AgentKind.POWERSHELL, "A%d" % (len(ws.agents) + 1),
+                    cwd=str(tmp), pty=True), autostart=False)
+            for a in ws.agents:      # all eight RUNNING, so all eight restore
+                if not a.is_running():
+                    a.start()
+        mgr.set_active(wss[0].id)
+        pump(1200)
+        win.close()
+        pump(400)
+
+        # a maximized window whose restore-down geometry is much smaller: the
+        # shape that makes show() report a width the card will not keep
+        data = json.loads((tmp / "session.json").read_text(encoding="utf-8"))
+        data.setdefault("ui", {})["window"] = {"w": 900, "h": 600,
+                                               "maximized": True}
+        (tmp / "session.json").write_text(json.dumps(data), encoding="utf-8")
+
+        spawned.clear()
+        widths.clear()
+
+        # -- session 2: main()'s exact order, no event loop in between -------
+        win2 = create_main_window(SessionStore(path=tmp / "session.json"))
+        win2.show()
+        win2.autostart_active_workspace()
+        pump(2500)
+
+        default_cols = pty_worker.DEFAULT_COLS
+        check("pty width: every restored child was actually started",
+              len(spawned) == 8, spawned)
+        check("pty width: none was spawned at the placeholder default",
+              all(cols != default_cols for _n, cols in spawned), spawned)
+
+        active = win2.manager.active_id
+        check("pty width: the on-screen workspace is honest",
+              all(c.terminal.screen.columns == c.agent.worker.cols
+                  for c in win2._pages[active].cards),
+              [(c.terminal.screen.columns, c.agent.worker.cols)
+               for c in win2._pages[active].cards])
+        # the half of the bug that never corrected itself: Qt lays out the
+        # CURRENT page only, so these six used to sit at DEFAULT_COLS forever
+        hidden = [c for ws in win2.manager.workspaces if ws.id != active
+                  for c in win2._pages[ws.id].cards]
+        check("pty width: ...and so is every workspace still off screen",
+              hidden and all(c.terminal.screen.columns == c.agent.worker.cols
+                             and c.terminal.screen.columns != default_cols
+                             for c in hidden),
+              [(c.agent.spec.name, c.terminal.screen.columns,
+                c.agent.worker.cols) for c in hidden])
+        check("pty width: no child was ever told two different widths",
+              all(len(set(seen)) == 1 for seen in widths.values()),
+              {k: v for k, v in widths.items() if len(set(v)) > 1})
+
+        # -- and opening a workspace must not move its width ----------------
+        others = [ws for ws in win2.manager.workspaces if ws.id != active]
+        before = [(c.agent.id, c.agent.worker.cols)
+                  for c in win2._pages[others[0].id].cards]
+        win2.manager.set_active(others[0].id)
+        pump(600)
+        after = [(c.agent.id, c.agent.worker.cols)
+                 for c in win2._pages[others[0].id].cards]
+        check("pty width: opening a workspace does not re-wrap its terminals",
+              before == after, (before, after))
+
+        win2.close()
+        pump(400)
+    finally:
+        pty_worker.PtyWorker.resize = orig_resize
+        pty_worker.PtyWorker.start = orig_start
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_screen_snapshots():
     """A card left STOPPED reopens showing the conversation it had at close,
     not a black rectangle with a banner over it. (The regression: a reopened
@@ -7214,6 +7426,27 @@ def test_screen_snapshots():
               "KEPT-CONVERSATION" in card6.terminal.screen_text()
               and "KEPT-CONVERSATION" in woken.pty_replay())
         card6.detach(); woken.dispose(); pump(50)
+
+        # ...unless that wake RESUMES a conversation, which reprints the whole
+        # thing itself. Then the snapshot below is a duplicate, hard-wrapped
+        # for the width the card had in the PREVIOUS session -- the half-width
+        # scrollback bug arriving by the one door the launch autostart (which
+        # drops the seed outright) does not cover.
+        resumed = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Resumed", cwd=str(tmp), pty=True))
+        resumed.seed_pty_replay("LAST-SESSION-WIDTH\r\n")
+        card7 = TerminalCard(resumed)
+        card7.resize(640, 400); card7.show(); pump(150)
+        check("screens: precondition - the resumed card settled on the seed",
+              "LAST-SESSION-WIDTH" in card7.terminal.screen_text()
+              and card7._pending_replay == "")
+        resumed.spec.resume = "sess-abc"        # this launch reopens a chat
+        card7._on_status(AgentStatus.STARTING)
+        check("screens: a wake that RESUMES drops the stale-width snapshot "
+              "instead of stacking it above the reprint",
+              "LAST-SESSION-WIDTH" not in card7.terminal.screen_text()
+              and resumed.pty_replay() == "")
+        card7.detach(); resumed.dispose(); pump(50)
 
         # an agent with NOTHING to show keeps the original centred banner:
         # that card really is a dead black screen and must say so
@@ -10212,7 +10445,7 @@ def test_projection_happens_once():
         AgentKind.POWERSHELL, "Dropped", cwd=str(tmp), pty=True))
     dropped.seed_pty_replay(seed)
     card4 = tc.TerminalCard(dropped)
-    card4._drop_restored_screen()
+    card4.drop_restored_screen()
     check("project: dropping the restored screen stops the backstop",
           not card4._settle_timer.isActive())
     pump(tc.REPLAY_SETTLE_MS + 150)
@@ -10392,15 +10625,13 @@ def test_gemini_usage_poll_is_slower_than_claudes():
     """Gemini rides its OWN, much slower poll clock, because each tick spawns a
     process rather than making a request.
 
-    `gemini_usage.fetch()` shells out to `agy`, and on some runs agy starts a
-    nested helper that asks Windows for its own console. CREATE_NO_WINDOW is
-    passed and is not enough -- spawn flags do not reach a grandchild, measured
-    8/8 visible windows under CREATE_NO_WINDOW, CREATE_NEW_CONSOLE+SW_HIDE and
-    CREATE_NO_WINDOW+SW_HIDE alike -- so with Windows 11 delegating to Windows
-    Terminal a real window flashes over the user's screen on ~6% of polls. No
-    flag suppresses it; asking less often is the only lever, and it is nearly
-    free because only the two pills consume this reading (a Gemini cut-off
-    recovers on its own printed countdown, never on the account reading).
+    `gemini_usage.fetch()` runs a whole CLI (`agy --print /usage`), which costs
+    seconds of a background thread where a Claude tick costs one request. The
+    console window that used to flash on ~1 poll in 20 is fixed at source now
+    (see test_gemini_usage_reads_via_pseudoconsole), so the process cost is what
+    this cadence rations -- and rationing it is nearly free, because only the two
+    pills consume this reading (a Gemini cut-off recovers on its own printed
+    countdown, never on the account reading).
 
     This check exists so nobody "tidies" the Gemini timer back onto
     USAGE_POLL_MS, which is answerable to planLimitReached and the reset poll
@@ -10474,6 +10705,81 @@ def test_gemini_usage_poll_is_slower_than_claudes():
         win.close()
     finally:
         gemini_usage.fetch = real
+
+
+def test_gemini_usage_reads_via_pseudoconsole():
+    """The usage poll must not spawn a child with a console of its own.
+
+    MEASURED from a console-less pythonw parent (the app's own shape): a plain
+    subprocess gives the child its own console every run, and Windows 11 can
+    hand a newly created console to the default terminal app -- observed as a
+    real, visible Windows Terminal frame on roughly one poll in twenty, which is
+    the terminal window the user kept seeing flash over the desktop. No creation
+    flag prevents it (CREATE_NO_WINDOW asks for a windowless console and the
+    handoff happens anyway; DETACHED_PROCESS measured worse), so the read runs
+    under a pseudo-console instead: a ConPTY client never has a console
+    allocated for it, so there is nothing to hand off.
+
+    That change has a consequence worth guarding: on a terminal the CLI
+    pretty-prints its quota table with padded columns instead of the
+    tab-separated one a pipe gets, so a parser that only knew tabs would leave
+    every Gemini pill unreadable. Both samples below are real captured output."""
+    import shutil
+    import subprocess
+
+    from app import gemini_usage
+
+    piped = ("Gemini Models\tWeekly Limit Remaining\t100%\t2026-08-25T10:58:17Z\n"
+             "Gemini Models\tFive Hour Limit Remaining\t42%\t2026-08-20T16:52:27Z\n"
+             "Claude and GPT models\tWeekly Limit Remaining\t100%\t"
+             "2026-08-27T11:52:27Z\n")
+    terminal = gemini_usage._ESCAPES.sub("", (
+        "\x1b[1t\x1b[c\x1b[?1004h\x1b[?9001hQuota:\r\n"
+        "Gemini Models          Weekly Limit Remaining     100%  "
+        "2026-08-25T10:58:17Z\r\n"
+        "Gemini Models          Five Hour Limit Remaining   42%  "
+        "2026-08-20T16:52:27Z\r\n"
+        "Claude and GPT models  Weekly Limit Remaining     100%  "
+        "2026-08-27T11:52:27Z\r\n")).replace("\r\n", "\n")
+
+    real_read, real_which = gemini_usage._read_usage, shutil.which
+    shutil.which = lambda name: "agy.exe"
+    try:
+        for label, text in (("piped", piped), ("terminal", terminal)):
+            gemini_usage._read_usage = lambda exe, t, _t=text: _t
+            usage = gemini_usage.fetch_cli()
+            five = next((l for l in (usage.limits if usage else ())
+                         if l.key == "five_hour"), None)
+            week = next((l for l in (usage.limits if usage else ())
+                         if l.key == "seven_day"), None)
+            check("gemini-console: " + label + " output reads 58% of the 5h window used",
+                  five is not None and abs(five.percent - 58.0) < 0.01, five)
+            check("gemini-console: " + label + " output reads the weekly window too",
+                  week is not None and abs(week.percent - 0.0) < 0.01, week)
+    finally:
+        gemini_usage._read_usage, shutil.which = real_read, real_which
+
+    if os.name != "nt":
+        return
+
+    # ...and on Windows the read never goes near a plain subprocess, which is
+    # the whole point: that is the shape Windows gives a console of its own
+    spawned = []
+
+    def refuse(*a, **k):
+        spawned.append(a)
+        raise AssertionError("the usage read must not spawn a plain subprocess")
+
+    real_run, real_popen = subprocess.run, subprocess.Popen
+    subprocess.run, subprocess.Popen = refuse, refuse
+    try:
+        gemini_usage._read_usage("definitely-not-a-real-binary.exe", 0.2)
+    except Exception:
+        pass  # spawning a missing binary fails; only WHAT it tried matters here
+    finally:
+        subprocess.run, subprocess.Popen = real_run, real_popen
+    check("gemini-console: the Windows read never uses a plain subprocess",
+          spawned == [], spawned)
 
 
 def test_history_screen_wrapper_removed():
@@ -10972,6 +11278,228 @@ def test_terminal_scrollbar():
     c2.deleteLater()
 
 
+def test_reply_marks_recovered_from_transcript():
+    """A reply mark is minted from a busy -> idle settle, so a conversation
+    restored from disk comes back with NONE -- and since a resume's replay
+    settle is deliberately suppressed, a reopened hive showed no reply time
+    anywhere. These are recovered by matching each transcript reply's CLOSING
+    line against the scrollback.
+
+    MEASURED, and it is why the anchor is what it is: Claude's own "for Ns"
+    footer (what a LIVE mark anchors to) does not survive per turn into the
+    scrollback -- across seven real captured screens at five widths, at most
+    ONE was still present in 2000 lines. And matching a reply's HEAD found a
+    stale narrower re-render first (pyte does not reflow, so a card resized
+    mid-session keeps both) and stamped the middle of a paragraph."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.terminal_card import (TerminalCard, _format_reply_stamp,
+                                           _last_content_line, _norm_reply_line,
+                                           _reply_end_row)
+
+    QApplication.instance() or QApplication([])
+
+    # ---- the normalizer drops what the renderer paints rather than prints --
+    check("reply-recover: markdown syntax is dropped from both sides",
+          _norm_reply_line("**Rebuilt `dist/x.zip`** from the *good* files")
+          == "rebuilt dist/x.zip from the good files",
+          _norm_reply_line("**Rebuilt `dist/x.zip`** from the *good* files"))
+    check("reply-recover: the closing line is the last one with content on it",
+          _last_content_line("first\n\nlast line\n\n  \n") == "last line")
+
+    # ---- the anchor: tail on the row, blank row underneath ----------------
+    rows = ["a stale truncated copy of the same rep",   # 0: no tail, no blank
+            "more of the stale copy",                   # 1
+            "the reply, wrapping over",                 # 2: real copy starts
+            "two rows and ending here.",                # 3: the tail lives here
+            "",                                         # 4: <- the anchor
+            "> next prompt"]                            # 5
+    check("reply-recover: anchors the blank row under the reply's last row",
+          _reply_end_row(rows, "ending here.", 0) == 4,
+          _reply_end_row(rows, "ending here.", 0))
+    check("reply-recover: a row with no blank beneath is not a reply ending",
+          _reply_end_row(["tail here", "still going"], "tail here", 0) is None)
+    check("reply-recover: nothing matching -> no stamp rather than a guess",
+          _reply_end_row(rows, "never written", 0) is None)
+
+    # ---- end to end through a real card ----------------------------------
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyRecover", cwd=".",
+                                     pty=True))
+    card = TerminalCard(agent)
+    card.resize(640, 420)
+
+    when = time.time() - 3600
+    # pretend the transcript said this, bypassing the per-conversation cache
+    # read (the reader itself is covered by test_transcript_reply_times)
+    card._recover_key = (agent.spec.cwd, agent.spec.session_id)
+    card._recover_replies = [(when, "All four suites pass now.")]
+    agent._on_pty_output("pty", "All four suites pass now.\r\n\r\n> ")
+    card._recover_reply_marks()
+
+    check("reply-recover: the past reply is located in the scrollback",
+          len(card._recovered_replies) == 1, card._recovered_replies)
+    line, stamped = card._recovered_replies[0]
+    check("reply-recover: ...stamped with the TRANSCRIPT's time, not now",
+          stamped == when, (stamped, when))
+    check("reply-recover: ...on the blank row under the reply",
+          line == agent_row_after(card, "All four suites pass now."), line)
+
+    card._refresh_reply_marks()
+    check("reply-recover: the view carries it as an inline stamp",
+          (line, _format_reply_stamp(when)) in card.terminal.reply_marks(),
+          card.terminal.reply_marks())
+
+    # ---- the same placement when the footer IS in the scrollback ---------
+    from app.widgets.terminal_view import is_reply_footer
+    check("reply-recover: Claude's turn footer is recognised",
+          is_reply_footer("✻ Worked for 16m 36s")
+          and is_reply_footer("✻ Cooked for 8m 2s · 1 shell still running"))
+    check("reply-recover: ...and the input box's own hints are not",
+          not is_reply_footer("? for shortcuts")
+          and not is_reply_footer("← for agents"))
+    footered = ["the reply ends here.", "", "✻ Worked for 3m 13s", "", "> "]
+    check("reply-recover: a footer moves the anchor down BELOW it",
+          _reply_end_row(footered, "reply ends here.", 0) == 3,
+          _reply_end_row(footered, "reply ends here.", 0))
+
+    # a reply that is NOT on screen is skipped, never invented
+    card._recovered_replies = []
+    card._recover_replies = [(when, "a reply that scrolled away long ago")]
+    card._recover_reply_marks()
+    check("reply-recover: a reply not in the scrollback yields no stamp",
+          card._recovered_replies == [], card._recovered_replies)
+
+    # a live mark outranks a recovered one on the same line
+    card._recovered_replies = [(line, when)]
+    card._reply_mark_lines = {}
+    mark = agent.note_reply_settled()
+    card._reply_mark_lines[mark.uid] = line
+    card._refresh_reply_marks()
+    check("reply-recover: a live capture wins the line over a recovered one",
+          card.terminal.reply_marks() == [(line, _format_reply_stamp(mark.ts))],
+          card.terminal.reply_marks())
+
+    card.deleteLater()
+    agent.dispose()
+
+
+def agent_row_after(card, text):
+    """Absolute line of the blank row directly under `text` in a card's
+    terminal -- the row test_reply_marks_recovered_from_transcript expects a
+    recovered stamp to land on."""
+    from app.widgets.terminal_card import _norm_reply_line
+
+    oldest, raw = card._scrollback_rows()
+    lines = [_norm_reply_line(t) for t in raw]
+    needle = _norm_reply_line(text)
+    for i, line in enumerate(lines):
+        if needle and needle in line and i + 1 < len(lines) and not lines[i + 1]:
+            return oldest + i + 1
+    return -1
+
+
+def test_reply_marks_inline():
+    """Reply-finished milestones drawn INLINE in the terminal content -- a dim
+    date-and-time stamp on the blank row directly UNDER Claude's own "for Ns"
+    footer. This is the only reply-time surface there is: the card header's
+    #CardReplyTime badge was removed at the user's request, along with the
+    agent-side reply clock that fed it. Covers the anchor scan
+    (TerminalView.reply_anchor_line), the shared stamp formatter, a card
+    rebuild re-deriving the same anchor, and every reset path that must wipe
+    a reply mark alongside a prompt mark."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import REPLY_MARK_CAP, TerminalAgent
+    from app.widgets.terminal_card import TerminalCard, _format_reply_stamp
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyMarks", cwd=".",
+                                     pty=True))
+    card = TerminalCard(agent)
+    card.resize(640, 420)
+    t = card.terminal
+
+    # A settled turn in the shape Claude Code REALLY leaves on screen: the
+    # reply, a blank, the "for Ns" footer, a blank, then the input box --
+    # whose TOP BORDER (a rule) sits directly above the prompt row. That
+    # border is the point of this fixture. An earlier version fed only
+    # "footer, blank, > " with no border, so the anchor scan never met the
+    # rule it stopped dead on in real use, and the test passed while the
+    # live stamp silently never appeared. Do NOT simplify this back.
+    # Fed through _on_pty_output (not terminal.feed directly) so it lands in
+    # BOTH the live view (via the connected pty_output signal) and the
+    # agent's own replay buffer -- real usage does the same, and the
+    # rebuilt-card check below needs the replay half.
+    agent._on_pty_output("pty", "● Hi!\r\n\r\n✳ Crunched for 58s"
+                         "\r\n\r\n" + "─" * 40 + "\r\n> ")
+    mark = agent.note_reply_settled()
+    check("reply-mark: note_reply_settled records a mark",
+          mark is not None and agent.reply_marks() == [mark])
+    check("reply-mark: the fixture really has the box border in the way",
+          t._row_is_rule(4) and t._input_block_span() == (5, 5),
+          (t._input_block_span(),))
+    # UNDER the footer, on the blank separator below it -- not beside the
+    # footer, not above it wedged between the reply and its own footer
+    # (where the user reported finding it), and not skipped because the
+    # box border got in the way of the scan
+    under_footer = t.abs_line_at_row(3)
+    check("reply-mark: the card anchors it UNDER the footer row",
+          card._reply_mark_lines.get(mark.uid) == under_footer,
+          (card._reply_mark_lines, under_footer))
+    check("reply-mark: the view carries exactly one inline stamp",
+          t.reply_marks() == [(under_footer, _format_reply_stamp(mark.ts))],
+          t.reply_marks())
+    import datetime as _dt
+    check("reply-mark: the stamp carries the DATE as well as the time",
+          _format_reply_stamp(mark.ts) == _dt.datetime.fromtimestamp(
+              mark.ts).strftime("%b %d, %H:%M"), _format_reply_stamp(mark.ts))
+
+    # ---- a rule directly above the box (no footer line) anchors nothing --
+    ruled = TerminalView(rows=10, cols=40)
+    ruled.feed("─" * 20 + "\r\n> ")
+    check("reply-mark: a rule row above the box is never mistaken for a footer",
+          ruled.reply_anchor_line() is None)
+
+    # ---- no live input box at all (e.g. settled on a menu) -> no anchor --
+    menu = TerminalView(rows=10, cols=40)
+    menu.feed("some output\r\n")
+    check("reply-mark: no input box in view -> nothing to anchor to",
+          menu.reply_anchor_line() is None)
+
+    # ---- FIFO cap -----------------------------------------------------
+    for _ in range(REPLY_MARK_CAP + 5):
+        agent.note_reply_settled()
+    check("reply-mark: the mark list is FIFO-capped",
+          len(agent.reply_marks()) == REPLY_MARK_CAP, len(agent.reply_marks()))
+
+    # ---- a rebuilt card re-derives the SAME anchor from the pty replay ---
+    card2 = TerminalCard(agent)
+    card2.resize(640, 420)
+    latest = agent.reply_marks()[-1]
+    check("reply-mark: a rebuilt card recovers the latest mark's anchor",
+          latest.uid in card2._reply_mark_lines, card2._reply_mark_lines)
+    card2.deleteLater()
+
+    # ---- resets: restart and history-clear wipe reply marks too ---------
+    card.terminal.clear_history()
+    check("reply-mark: clearing history wipes the card's reply-mark lines",
+          card._reply_mark_lines == {} and card.terminal.reply_marks() == [])
+    check("reply-mark: ...and the agent's own mark list",
+          agent.reply_marks() == [])
+
+    agent.note_reply_settled()
+    agent.restart()
+    check("reply-mark: a restart clears reply marks too",
+          agent.reply_marks() == [])
+
+    card.deleteLater()
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
@@ -11006,8 +11534,8 @@ def main():
     test_reveal_agent()
     test_new_agent_autofocus()
     test_agent_busy_activity()
-    test_agent_last_reply_at()
-    test_reply_time_card_ui()
+    test_reply_settle_skips_resume_replay()
+    test_transcript_reply_times()
     test_ansi()
     test_terminal_keys()
     test_terminal_image_paste()
@@ -11037,6 +11565,7 @@ def main():
     test_review_hardening_fixes()
     test_resume_picker()
     test_transcript_backups()
+    test_pty_width_at_launch()
     test_screen_snapshots()
     test_agent_file_map()
     test_fsopen_helpers()
@@ -11057,13 +11586,17 @@ def main():
     test_gemini_limit_detection()
     test_startup_limit_recovery()
     test_terminal_scrollbar()
+    test_reply_marks_inline()
+    test_reply_marks_recovered_from_transcript()
     test_history_screen_wrapper_removed()
     test_gemini_usage_polling_is_offthread_and_optin()
     test_gemini_usage_poll_is_slower_than_claudes()
+    test_gemini_usage_reads_via_pseudoconsole()
     test_projection_happens_once()
     test_recovered_prompts_are_cached()
     test_multi_agent_session_isolation()
     test_usage_pill_geometry_and_close()
+    test_usage_pill_never_truncates()
     test_options_panel()
     test_topbar_extras_autosize()
     test_topbar_extras_grow_with_window()
@@ -11092,7 +11625,7 @@ def test_usage_pill_geometry_and_close():
     import os
     import tempfile
     from PySide6.QtWidgets import QApplication
-    from PySide6.QtGui import QColor, QFontMetrics
+    from PySide6.QtGui import QColor, QFont, QFontMetrics
     from app.widgets.gemini_usage_badge import GeminiUsageBadge
     from app.widgets.ornaments import PlanUsageBadge, UsagePillBadge
     from app import gemini_usage
@@ -11136,21 +11669,28 @@ def test_usage_pill_geometry_and_close():
     # primary screen and can disagree with what actually gets painted.
     def want(instance, text):
         fm = QFontMetrics(instance._text_font(), instance)
-        return (instance._PAD * 2 + instance._RING + instance._GAP
-                + fm.horizontalAdvance(text))
+        return instance._chrome_width() + fm.horizontalAdvance(text)
 
     check("usage-pill: width is ring + pads + text, and nothing else",
           badge.width() == want(badge, badge._text))
     check("usage-pill: the X reserves NO width - it floats over the text",
           badge.width()
-          == GeminiUsageBadge._PAD * 2 + GeminiUsageBadge._RING
-          + GeminiUsageBadge._GAP
+          == badge._PAD * 2 + badge._RING + badge._GAP + badge._TEXT_SLACK
           + QFontMetrics(badge._text_font(), badge).horizontalAdvance(
               badge._text))
+    # ONE formula, not a per-subclass copy. The two pills are given the same
+    # font first, deliberately: a measurement follows the pill's OWN font now
+    # (the fix for pills that measured one face and painted another), so two
+    # widgets in different polish states measuring differently is correct
+    # behaviour and would make this a test of nothing.
+    same_font = QFont(plan_badge.font())
+    plan_badge.setFont(same_font)
+    badge.setFont(same_font)
     check("usage-pill: Claude and Gemini measure an identical string alike",
           plan_badge._measure_width("21% used, resets in 1h20m at 14:49")
-          == badge._measure_width(
-              "21% used, resets in 1h20m at 14:49"))
+          == badge._measure_width("21% used, resets in 1h20m at 14:49")
+          and GeminiUsageBadge._measure_width is UsagePillBadge._measure_width
+          and PlanUsageBadge._measure_width is UsagePillBadge._measure_width)
     check("usage-pill: the fixed 315px width is gone",
           not hasattr(GeminiUsageBadge, "_FIXED_WIDTH")
           and badge.width() != weekly_badge.width())
@@ -11234,6 +11774,133 @@ def test_usage_pill_geometry_and_close():
     weekly_badge.deleteLater()
 
 
+def test_usage_pill_never_truncates():
+    """A pill is as wide as the text it PAINTS, whatever the font turns out
+    to be, and it repairs itself if it ever is not.
+
+    Reported live, twice, with screenshots: pills reading "5h 86% used,
+    resets n..." and "5h 0% us..." in a bar with hundreds of free pixels. The
+    mechanism was a font the measurement never saw. `_text_font` used to
+    return a bare `QFont()`, whose family is UNSET, and the two consumers of
+    that font resolve an unset family differently: `QFontMetrics` falls back
+    to the application font, while `QPainter.setFont` resolves it against the
+    widget's own (whatever QSS put there). They agree only while the chrome
+    family IS the application default - and `setup_application` deliberately
+    prefers "Inter" whenever it is installed, so on such a machine every pill
+    measured one face and painted a wider one, and `paintEvent`'s elide (a
+    safety net, never meant to fire) truncated the reading.
+
+    Two independent guarantees are checked here: the measurement now follows
+    the widget's font, and a pill that finds itself too narrow at paint time
+    widens itself using THE PAINTER'S OWN metrics - which is what makes the
+    repair work even when the measurement is the thing that is wrong.
+    """
+    from PySide6.QtCore import QTimer, QEventLoop
+    from PySide6.QtGui import QFont, QFontMetrics, QPainter
+    from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+    from app import claude_usage
+    from app.widgets.ornaments import PlanUsageBadge
+
+    app = QApplication.instance() or QApplication([])
+
+    def spin(ms=60):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    def painted_advance(pill):
+        """What the pill's own painting metrics say the line needs."""
+        return QFontMetrics(pill._text_font(), pill).horizontalAdvance(
+            pill._text)
+
+    def text_room(pill):
+        return pill.width() - (pill._PAD + pill._RING + pill._GAP) - pill._PAD
+
+    host = QWidget()
+    lay = QVBoxLayout(host)
+    pill = PlanUsageBadge(host, window="five_hour")
+    lay.addWidget(pill)
+    host.resize(900, 60)
+    host.show()
+    pill.set_usage(claude_usage.Usage(
+        limits=(claude_usage.Limit(key="five_hour", label="5h", short="5h",
+                                   percent=86.0,
+                                   resets_at=time.time() + 4800),),
+        fetched_at=time.time(), plan="max"))
+    spin()
+
+    check("usage-pill: the text font follows the widget's own family",
+          pill._text_font().family() == pill.font().family()
+          and pill._text_font().pixelSize() == pill._TEXT_PX)
+    check("usage-pill: a fresh reading fits with room to spare",
+          text_room(pill) >= painted_advance(pill))
+
+    # a font swapped under a line that has NOT changed: `_set_text` would
+    # early-return, so only `changeEvent` can keep the width honest
+    before = pill.width()
+    wide = QFont("Courier New")
+    wide.setPixelSize(13)
+    pill.setFont(wide)
+    spin()
+    widened = pill.width()
+    check("usage-pill: a font change re-measures the pill",
+          widened > before and text_room(pill) >= painted_advance(pill))
+
+    # ...and the same the other way, so a narrower face gives the bar its
+    # pixels back rather than leaving a padded pill behind. Measured against
+    # the WIDE width, not the original: what a bare QFont() resolves to
+    # depends on the widget's polish state, which the suite's earlier tests
+    # can have moved - the invariant here is that the pill follows its font
+    # in both directions, not what the default face happens to be.
+    narrow = QFont("Segoe UI")
+    narrow.setPixelSize(11)
+    pill.setFont(narrow)
+    spin()
+    check("usage-pill: a narrower font shrinks the pill back",
+          pill.width() < widened
+          and text_room(pill) >= painted_advance(pill))
+
+    # THE MEASUREMENT ITSELF IS WRONG: the exact shape of the reported bug.
+    # Re-running it would repeat the error, so the repair has to come from
+    # the painter's metrics.
+    class Undersizing(PlanUsageBadge):
+        def _measure_width(self, text):
+            return int(super()._measure_width(text) * 0.62)
+
+    broken = Undersizing(host, window="five_hour")
+    lay.addWidget(broken)
+    broken.set_usage(claude_usage.Usage(
+        limits=(claude_usage.Limit(key="five_hour", label="5h", short="5h",
+                                   percent=86.0,
+                                   resets_at=time.time() + 4800),),
+        fetched_at=time.time(), plan="max"))
+    check("usage-pill: a broken measurement starts out too narrow",
+          text_room(broken) < painted_advance(broken))
+    broken.grab()      # one paint is all the repair needs
+    spin()
+    healed = broken.width()
+    check("usage-pill: painting too narrow widens the pill instead of eliding",
+          text_room(broken) >= painted_advance(broken))
+    broken.grab()
+    spin()
+    check("usage-pill: the repair settles - it never oscillates",
+          broken.width() == healed)
+
+    # and the repair is bounded: a pill that cannot be helped asks once
+    calls = []
+    real = broken._reassert_width
+    broken._reassert_width = lambda: calls.append(1) or real()
+    for _ in range(3):
+        broken.grab()
+        spin()
+    check("usage-pill: a settled pill asks for no further repair",
+          calls == [])
+
+    broken.deleteLater()
+    pill.deleteLater()
+    host.deleteLater()
+
+
 def test_topbar_extras_autosize():
     """The top bar's non-essential controls live in a QScrollArea (so the
     window's minimum width is a small constant, not the sum of everything the
@@ -11252,6 +11919,7 @@ def test_topbar_extras_autosize():
     usage pills.
     """
     import time as _time
+    from PySide6.QtGui import QFontMetrics
     from PySide6.QtWidgets import QApplication
     from app.widgets.main_window import TopBar
     from app import claude_usage as cu
@@ -11281,6 +11949,24 @@ def test_topbar_extras_autosize():
           not bar.usage_badge.geometry().intersects(
               bar.usage_weekly_badge.geometry()),
           (bar.usage_badge.geometry(), bar.usage_weekly_badge.geometry()))
+
+    # The MINIMUM is what makes a squeeze impossible rather than unlikely: a
+    # QHBoxLayout with less room than its children's minimums shrinks them
+    # PAST those minimums, and any moment where this widget is narrower than
+    # its row would truncate a pill that has the pixels to spare. `resize()`
+    # is clamped to `minimumWidth`, so nothing can put it in that state.
+    check("topbar-autosize: the row's minimum is its real content width",
+          bar._extras.minimumWidth()
+          == bar._extras.layout().sizeHint().width())
+    bar._extras.resize(120, bar._extras.height())
+    check("topbar-autosize: the row refuses to be squeezed below its content",
+          bar._extras.width() >= bar._extras.layout().sizeHint().width())
+    for pill in (bar.usage_badge, bar.usage_weekly_badge):
+        room = (pill.width() - (pill._PAD + pill._RING + pill._GAP)
+                - pill._PAD)
+        check("topbar-autosize: a squeezed row still fits each pill's text",
+              room >= QFontMetrics(pill._text_font(),
+                                   pill).horizontalAdvance(pill._text))
     bar.deleteLater()
 
 

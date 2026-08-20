@@ -93,24 +93,20 @@ USAGE_TICK_MS = 20000
 USAGE_RESET_GRACE_MS = 8000
 
 # GEMINI IS POLLED ON A SEPARATE, MUCH SLOWER CLOCK, and the reason is not
-# request cost -- it is that this fetch SPAWNS A PROCESS. `gemini_usage.fetch()`
-# shells out to `agy --print /usage`, and on some runs agy starts a nested
-# helper that asks Windows for its OWN console. AI Hive passes CREATE_NO_WINDOW,
-# which is correct and not enough: spawn flags do not reach a GRANDCHILD.
-# Measured on a deterministic reproducer, a descendant that demands a console
-# gets a visible one 8/8 times under every combination tried -- plain
-# CREATE_NO_WINDOW, CREATE_NEW_CONSOLE + STARTUPINFO(SW_HIDE), and
-# CREATE_NO_WINDOW + STARTUPINFO(SW_HIDE) alike. With Windows 11 delegating to
-# Windows Terminal, that console materializes as a real window which flashes
-# over whatever the user is doing and closes a moment later. Live, it fired on
-# ~6% of polls (2 of 32), i.e. about every quarter hour at a 60s interval,
-# which is exactly often enough to be reported as "a terminal keeps popping up
-# and I can't read it".
+# request cost -- it is that this fetch SPAWNS A PROCESS where a Claude tick
+# makes a request. `gemini_usage.fetch()` runs `agy --print /usage`, which
+# measures several seconds of a background thread and a whole CLI's startup.
 #
-# So there is no flag to fix this with, and the only lever left is asking less
-# often. That is nearly free here, unlike on the Claude side: NOTHING consumes
-# this reading except the two pills. A Gemini cut-off recovers on the countdown
-# its own banner printed, never on the account reading (see the limit
+# It used to cost more than that: the spawned child got a console of its own,
+# which Windows 11 sometimes handed to the default terminal app, flashing a real
+# window over the user's screen on ~1 poll in 20. That is FIXED AT SOURCE now
+# (`gemini_usage._read_usage` runs the CLI under a pseudo-console, which is
+# never allocated a console to hand off), so the slow clock no longer has a
+# flash to ration -- only the process cost, which is reason enough.
+#
+# Slowing this down stays nearly free, unlike on the Claude side: NOTHING
+# consumes this reading except the two pills. A Gemini cut-off recovers on the
+# countdown its own banner printed, never on the account reading (see the limit
 # invariant), so no edge is delayed by a slower poll -- only the number on a
 # pill, describing a 5-hour window that does not move far in five minutes.
 # Do NOT fold this back onto USAGE_POLL_MS: that constant is answerable to
@@ -119,8 +115,7 @@ USAGE_RESET_GRACE_MS = 8000
 GEMINI_USAGE_POLL_MS = 300000
 # The danger zone still buys a fresher READOUT, so it still exists -- but with
 # no cut-off edge hanging off it the way Claude's does, it has no reason to go
-# to Claude's 20s and every reason not to, each fast tick being another chance
-# to flash a console over the user's screen.
+# to Claude's 20s and every reason not to: each fast tick is another CLI launch.
 GEMINI_USAGE_URGENT_POLL_MS = 60000
 
 # The usage readouts the top bar can show, and the order they sit in. PER PILL
@@ -270,6 +265,21 @@ class _AutoSizingScrollContent(QWidget):
 
     def event(self, e):
         if e.type() == QEvent.Type.LayoutRequest:
+            # The MINIMUM is the belt to `adjustSize`'s braces. Resizing to
+            # the sizeHint is a one-shot: anything that sizes this widget
+            # afterwards (a scroll area rebuilding its layout, a future caller
+            # that means well) can still leave it narrower than the row it
+            # holds, and then the pills at its right-hand end are simply cut
+            # off by its edge - the shape of the overlap bug this class was
+            # written for. `resize()` and `setGeometry()` are both clamped to
+            # `minimumWidth`, so pinning it to the row's real width takes that
+            # state off the table instead of relying on nobody reaching for
+            # it. The WINDOW stays free to be narrower than the row, because
+            # the scroll area's own minimum is capped separately (see
+            # `_HWheelScrollArea.minimumSizeHint`) and the row just scrolls.
+            lay = self.layout()
+            if lay is not None:
+                self.setMinimumWidth(lay.sizeHint().width())
             self.adjustSize()
             # ...and tell the scroll area, because the area's own sizeHint is
             # a function of THIS widget's (see `_HWheelScrollArea.sizeHint`).
@@ -339,6 +349,59 @@ class _HWheelScrollArea(QScrollArea):
             event.accept()
         else:
             super().wheelEvent(event)
+
+
+class PageStack(QStackedWidget):
+    """A page stack that gives EVERY workspace a real size, not just the one on
+    screen.
+
+    Qt's `QStackedLayout` lays out the CURRENT page only, so a workspace the
+    user has not opened yet never gets a geometry: its cards keep
+    `TerminalView`'s pre-layout default column count (100), and since the
+    launch autostart brings back EVERY workspace's agents, each of those
+    children paints its whole resumed conversation at a width its card does
+    not have. Nothing downstream can repair that — Claude hard-wraps its own
+    text, so re-projecting the raw stream at the real width (what
+    `TerminalCard._reproject_on_size` does) cannot re-flow lines the child
+    already broke. Opening that workspace a minute later therefore revealed a
+    conversation wrapped for a screen that never existed, using a fraction of
+    the card's width, with the live tail below it in full width.
+
+    Laying a hidden page out needs Qt to consider it visible, and
+    `WA_DontShowOnScreen` grants exactly that without the page ever reaching
+    the screen — it is shown and hidden again inside one call, so nothing
+    paints and the stack's own idea of which page is current is untouched.
+    Debounced, because the trigger is a window drag."""
+
+    LAYOUT_DEBOUNCE_MS = 120
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hidden_layout_timer = QTimer(self)
+        self._hidden_layout_timer.setSingleShot(True)
+        self._hidden_layout_timer.setInterval(self.LAYOUT_DEBOUNCE_MS)
+        self._hidden_layout_timer.timeout.connect(self.layout_hidden_pages)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._hidden_layout_timer.start()
+
+    def layout_hidden_pages(self) -> None:
+        """Hand every off-screen page the current page's rect."""
+        self._hidden_layout_timer.stop()
+        rect = self.contentsRect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return          # not laid out yet; the next resize does it
+        current = self.currentWidget()
+        for i in range(self.count()):
+            page = self.widget(i)
+            if page is current or page.isVisible():
+                continue
+            page.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+            page.setGeometry(rect)
+            page.show()     # the layout pass — never reaches the screen
+            page.hide()
+            page.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, False)
 
 
 class TopBar(QFrame):
@@ -1792,7 +1855,7 @@ class MainWindow(QMainWindow):
         center_lay = QHBoxLayout(center)
         center_lay.setContentsMargins(0, 0, 0, 0)
         center_lay.setSpacing(0)
-        self.stack = QStackedWidget(center)
+        self.stack = PageStack(center)
         self.stack.setObjectName("PageStack")
         self.activity_panel = ActivityPanel(center)
         self.activity_panel.hide()
@@ -3348,6 +3411,10 @@ class MainWindow(QMainWindow):
         page.reorderCommitted.connect(self.manager.reorder_agents)
         self._pages[ws.id] = page
         self.stack.addWidget(page)
+        # a page added while another one is current is added HIDDEN, and Qt
+        # never lays a hidden page out — its cards would keep the terminal's
+        # pre-layout default width (see PageStack)
+        self.stack.layout_hidden_pages()
         self.sidebar.add_row(ws.id, ws.name, os.path.basename(ws.project_path)
                              or ws.project_path)
         self.sidebar.set_stats(ws.id, self.manager.workspace_stats(ws.id))
@@ -3517,6 +3584,11 @@ class MainWindow(QMainWindow):
         page = self._pages.get(ws_id)
         if page is not None and page.card_for(agent.id) is None:
             page.add_agent(agent)
+            if not page.isVisible():
+                # the retile changed every card's width on a page Qt will not
+                # lay out; without this the new card (and its siblings) keep a
+                # width their children would then paint at (see PageStack)
+                self.stack.layout_hidden_pages()
 
     def _on_terminal_removed(self, ws_id: str, agent_id: str) -> None:
         page = self._pages.get(ws_id)
@@ -3525,6 +3597,8 @@ class MainWindow(QMainWindow):
             if card is not None and card is self._focused_card:
                 self._focused_card = None
             page.remove_agent(agent_id)
+            if not page.isVisible():
+                self.stack.layout_hidden_pages()   # the retile widened the rest
 
     def _on_workspace_path_changed(self, ws_id: str, path: str) -> None:
         page = self._pages.get(ws_id)
@@ -3704,14 +3778,69 @@ class MainWindow(QMainWindow):
         user skipped the update splash: its binary is being rewritten right
         now, so starting an agent could execute a half written file. Those wait
         for the user (the top-bar pill says so) rather than being started."""
+        self.settle_layout()
         for ws in self.manager.workspaces:
+            page = self._pages.get(ws.id)
             for agent in ws.agents:
                 if agent.autostart_on_restore and not agent.is_running():
                     if agent.spec.provider in self._update_installing:
                         agent.notice("[not started: a CLI update is still "
                                      "installing]")
                         continue
+                    # this start is the LAUNCH restore, so the card's snapshot
+                    # of last night's screen goes: the child paints its own
+                    # within seconds, and a snapshot wrapped for the width that
+                    # card had yesterday can never be reflowed to today's
+                    card = page.card_for(agent.id) if page is not None else None
+                    if card is not None:
+                        card.drop_restored_screen()
                     agent.start()
+
+    def settle_layout(self) -> None:
+        """Give every card its FINAL width before any pty child is spawned.
+
+        A terminal's width is not a cosmetic detail that can be corrected
+        later: the child WRAPS ITS OWN TEXT to whatever the pseudo-console
+        reports, and a `--resume` launch dumps the entire past conversation the
+        moment it boots. Lines broken for the wrong width stay broken for it
+        forever — pyte cannot re-flow them, and neither can
+        `TerminalCard._reproject_on_size`, which only re-projects the raw
+        stream the child already hard-wrapped. That is the half-width
+        scrollback bug: scroll up in a restored conversation and the text uses
+        a fraction of the card, while everything below it is full width.
+
+        Three things conspire to make launch the worst moment for it, and this
+        closes all three:
+
+        1. `main()` calls `autostart_active_workspace()` the instant `show()`
+           returns, and a window restoring MAXIMIZED still reports its
+           restore-down geometry there (measured: 1249x662 after `show()`,
+           1536x793 one `processEvents` later). Pumping the queue first is what
+           makes the width honest.
+        2. `TerminalView` debounces its resize by 120ms, so even a correctly
+           sized card has not told its pty anything yet — `flush_resize`
+           applies it now.
+        3. A workspace the user has not opened is never laid out at all
+           (`PageStack.layout_hidden_pages`), and the autostart brings back
+           EVERY workspace's agents, not just the visible one's.
+
+        Cheap and idempotent: `_apply_resize` returns early when nothing
+        changed, so calling this again costs a queue pump."""
+        from PySide6.QtCore import QEventLoop
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is not None:
+            # let the window reach its real (possibly maximized) geometry, and
+            # the visible page tile into it
+            app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        self.stack.layout_hidden_pages()
+        if app is not None:
+            app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        for page in self._pages.values():
+            for card in page.cards:
+                if card.is_pty and card.terminal is not None:
+                    card.terminal.flush_resize()
 
     # -------------------------------------------------------- persistence ---
 

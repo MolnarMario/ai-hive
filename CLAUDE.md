@@ -398,6 +398,190 @@ this file is the invariants that must survive every change.
   nothing. Recovered marks are recomputed on every projection and merged BEHIND
   the live ones (a live capture is exact; a recovered one was matched), and
   like every other mark they are never persisted.
+- **A reply-finished stamp is the ONLY reply-time surface, and it sits UNDER
+  Claude's own turn footer** (`ReplyMark`, `TerminalView.reply_anchor_line`,
+  `TerminalCard._reply_end_row`). The card header's `#CardReplyTime` badge is
+  GONE, at the user's request: two surfaces for one reading, and the header one
+  showed only the LATEST reply next to live-updating badges, so it read as a
+  clock. `_format_reply_stamp` therefore always carries the DATE as well as the
+  time ("Aug 19, 19:14") -- with no header left to hold it, a bare HH:MM on a
+  conversation reopened days later reads as "just now". The anchor is the blank
+  row BELOW the "<verb> for Ns" footer (`is_reply_footer`, shared by the live
+  and recovered paths so they land in the same place): anchoring it beside or
+  above that footer wedges the stamp between a reply and its own footer, which
+  is exactly what was reported. CRITICAL, and it cost a silent live failure:
+  the scan up from the input box must SKIP the box's own TOP BORDER (a
+  `_row_is_rule` row sitting directly above the prompt row) and its hint line,
+  not bail on them. `reply_anchor_line` used to `return None` at the first
+  rule, which is the very first row it looks at on the real screen, so the
+  LIVE stamp never appeared at all -- every stamp anyone saw came from the
+  transcript-recovery path, which runs only on a card build or resize, so a
+  fresh reply in an open card showed nothing. The suite missed it because the
+  fixture fed "footer, blank, > " with NO border, a shape Claude never draws.
+  Any fixture for this MUST include the box border (`test_reply_marks_inline`
+  asserts it does, via `_row_is_rule`), or it tests a screen that cannot
+  happen. A blank row is also the only row the stamp
+  always renders on, since `paintEvent` skips a row whose content runs close to
+  the right edge. Painted INLINE rather than on the scrollbar (`ReplyMark` in terminal_agent.py,
+  `TerminalView.reply_anchor_line`/`_reply_marks`, `TerminalCard.
+  _refresh_reply_marks`/`_on_reply_mark_added`). The header's
+  `#CardReplyTime` badge (`TerminalAgent.last_reply_at`,
+  `TerminalCard._refresh_reply_time`) only ever shows the LATEST reply; a
+  user asked to see the date/time under EVERY finished turn, the same way
+  Claude's own "Crunched for Ns" footer marks each one — so this is a full
+  second mark type mirroring `PromptMark`'s
+  shape (`uid`/`pos`/`ts`, FIFO-capped at `REPLY_MARK_CAP`, `pos` a pty-
+  stream character offset because a card rebuild restarts `pushed` at 0),
+  created unconditionally in `_on_idle_timeout`'s busy->idle edge
+  (`note_reply_settled`) rather than card-triggered like a typed prompt —
+  a hidden workspace keeps replying with no card around to notice, and the
+  mark must still be there (via `reply_replay_marks`) whenever one is next
+  built. `reply_anchor_line()` finds the row by scanning UP from the input
+  box Claude redraws at settle (`_input_block_span`'s top row), skipping the
+  blank separator, bounded by `_REPLY_ANCHOR_SCAN` so a missing footer can
+  never walk into unrelated older history and mislabel it; a rule row
+  (`_row_is_rule`) immediately above the box anchors nothing rather than
+  guessing. It is the SAME function at both the live capture
+  (`TerminalCard._on_reply_mark_added`, wired to `reply_marks_changed`) and
+  replay re-anchoring (`_replay_with_marks`), exactly like `anchor_line()` —
+  identical screen state on both sides is what keeps them agreeing.
+  `_replay_with_marks` merges prompt-offsets and reply-offsets into ONE
+  sorted pass over the (capped) replay text rather than feeding it twice: a
+  second full feed per card rebuild would double the pyte cost
+  `_rerender_restored`'s single-projection rule exists to avoid. Rendering
+  is NEVER a new terminal row — pyte has no room to insert one without
+  reflowing every anchor below it — it is a dim, right-aligned stamp drawn
+  into the row's own blank tail in `TerminalView.paintEvent`, and is skipped
+  outright (not clipped, not overlapped) whenever the row's real content
+  runs too close to the right edge: better to silently miss a stamp than
+  draw over real output. Formatting (`_format_reply_stamp` — HH:MM same-day,
+  else date-prefixed) is centralized and shared with `#CardReplyTime` so the
+  two surfaces can never disagree about what "today" means, and it is
+  computed at REFRESH time, not capture time, so a mark made today still
+  reads as date-prefixed once the day turns over. Every reset path that
+  wipes `PromptMark`s wipes `ReplyMark`s the same tick — `restart()`,
+  `note_conversation_replaced()`, `TerminalCard._on_history_cleared` — same
+  transient, never-persisted contract (`reply_marks_changed` must never
+  reach a save) for the same reason: the transcript is the durable record.
+- **The first busy->idle settle of a resumed launch is a REPLAY finishing,
+  not a reply** (`TerminalAgent._settled_once`, checked in
+  `_on_idle_timeout` alongside `_resume_attempt`). A `--resume` launch
+  replays the WHOLE past conversation as real terminal output before the
+  screen ever goes quiet, and that replay settling looks EXACTLY like a
+  fresh reply ending to `_on_idle_timeout` — which used to stamp
+  `_last_reply_ts`/mint a `ReplyMark` unconditionally on every busy->idle
+  edge. Live-reported: reopening the app always showed the CURRENT time
+  next to the last reply (both the header badge and every inline mark),
+  never the actual historical one, because the resume-replay settle fired
+  the instant the app finished redrawing — i.e. "now", at launch time.
+  `_settled_once` (reset `False` in `start()` whenever `spec.resume` was
+  true, forced `True` in `restart()` since a restart is always a fresh,
+  non-resumed conversation with nothing to replay) suppresses ONLY that one
+  settle per launch; the very next settle — a genuine new reply — stamps
+  normally, and a non-resumed launch is never suppressed at all since it has
+  no replay to protect against. `activity_changed.emit(False)` still fires
+  unconditionally on the suppressed settle (the busy/idle UI state itself is
+  still correct); only the reply-time SIDE EFFECTS are skipped.
+- **A reply time is READ OFF THE TRANSCRIPT, because the clock only knows
+  turns this process watched** (`transcripts.reply_times`/`latest_reply_at`,
+  `TerminalAgent.set_transcript_reply_at`, `TerminalCard.
+  _recover_reply_marks`). Suppressing the resume-replay settle above is
+  correct and it left a hole: a restored conversation then has NO live stamp
+  for any past turn, so the header badge hid itself and not one inline mark
+  existed — the user asked "where is the date and timestamp?" three times
+  running, and the honest answer was "nowhere". A live observation
+  structurally cannot serve the reopen case, which is the only case anyone
+  complained about; Claude timestamps every record it writes, so the
+  conversation on disk knows what no settle can. Rules:
+  * **A finished reply is the LAST assistant record carrying text before the
+    next real user turn**, not every assistant text record — a turn NARRATES
+    between its tool calls and those are mid-reply. Tool RESULTS come back as
+    `user` records and are therefore NOT a boundary (`_is_tool_result`);
+    everything else from the user side is, and flushing on it is right either
+    way since the reply had plainly finished before it. Sidechains and records
+    with no parseable timestamp are skipped (a stamp reading 1970 is worse
+    than none).
+  * **Tail-bounded** (`_REPLY_TAIL_BYTES`) with a full-scan fallback, like
+    `latest_model_effort` — MEASURED 0.3-2.7ms on the user's real 1-3 MB
+    transcripts, against the 90-165ms `typed_prompts` pays for its full scan.
+    The bound costs nothing real: both consumers only ever ask about replies
+    still ON SCREEN, and the scrollback reaches back a few turns at most.
+  * **Both surfaces, one reading.** `last_reply_at()` returns `max(live,
+    transcript)`: the settle lands a couple of seconds AFTER the record
+    Claude wrote, so live wins the turn in progress (no waiting a poll to see
+    a reply that just landed) and the transcript wins everything this run
+    never saw. TRANSIENT exactly like the model chip and the plan-usage
+    reading — `set_transcript_reply_at` must NEVER `_touch`/`_schedule_save`,
+    and it emits `reply_time_changed` only when the DISPLAYED walltime moves,
+    so a poll over an idle agent is free. It rides `refresh_ai_titles`
+    (`SESSION_SYNC_MS`, 5s) and NOT the 1.5s model poll, and it is read for
+    STOPPED agents too — a card that is not running is precisely the one with
+    nothing to show without it — but never while `is_busy()`, since nothing in
+    a transcript marks a turn as over and the last assistant text mid-stream
+    is a narration, not a reply.
+  * **The inline stamps are recovered by matching the reply's CLOSING line**,
+    mirroring `PromptMark`'s `_recover_marks` (which an earlier version of
+    this bullet wrongly called impossible). Two measurements shape the anchor
+    and neither is guessable: (1) Claude's own "<verb> for Ns" footer — what a
+    LIVE `ReplyMark` anchors to — does NOT survive per turn into the
+    scrollback; across seven real captured `.vt` screens at five widths, at
+    most ONE was still present in 2000 lines of history and usually none, so
+    footer-anchoring history is a dead end. (2) Matching the reply's HEAD
+    found a STALE narrower re-render first (pyte does not reflow, so a card
+    resized mid-session keeps both copies, the older truncated where the
+    redraw overwrote it) and stamped the middle of a paragraph. So
+    `_reply_end_row` matches the TAIL of the last line and requires the row
+    BELOW to be blank: the tail is usually missing from a truncated copy, the
+    blank-row test rejects it when it is not, and the blank row is also the
+    only place the stamp reliably RENDERS (`paintEvent` skips a row whose own
+    content runs too close to the right edge). Markdown syntax is stripped
+    from both sides (`_norm_reply_line`) because the renderer restyles
+    `code`/**bold** rather than printing the characters. MEASURED end to end
+    against real paired (screen, transcript) samples: 11/15 anchored, up from
+    4/13 with head matching. It fails by being ABSENT, never wrong — a reply
+    that scrolled away yields no stamp rather than a guessed line, and a live
+    capture always outranks a recovered one on the same line
+    (`_refresh_reply_marks`, the same merge `_refresh_marks` does).
+  * Recovered replies share `_recover_key` with the recovered PROMPTS, so one
+    conversation costs one read of each; a `/clear` or pin change rotates the
+    key. Everything here stays TRANSIENT and un-persisted — the transcript IS
+    the durable record, which is the whole point.
+- **A pty child NEVER paints at a width its card does not have**
+  (`MainWindow.settle_layout`, `PageStack`, `TerminalView.flush_resize`).
+  Re-projection (next bullet) repairs the SCREEN, and it is the only repair
+  there is for lines pyte wrapped — but the child WRAPS ITS OWN TEXT to
+  whatever the pseudo-console reports, and a `--resume` launch dumps the
+  entire past conversation the instant it boots. Lines the CHILD broke stay
+  broken for the width they were broken at, forever; re-projecting the raw
+  stream cannot re-flow them. Reported as "reopen AI Hive, scroll up in a
+  restored conversation and the text is half width, with the live tail below
+  it full width", and confirmed in a saved `.vt` snapshot whose first ~940
+  lines were wrapped narrow and everything after wrapped wide, with the seam
+  mid-sentence. Three holes conspired, all at launch, all closed here and all
+  measured — do not reopen any of them:
+  1. `main()` calls `autostart_active_workspace()` the instant `show()`
+     returns, and a window restoring MAXIMIZED still reports its RESTORE-DOWN
+     geometry there (1249x662 after `show()`, 1536x793 one `processEvents`
+     later, on the reporter's machine). `settle_layout` pumps the queue first.
+  2. `TerminalView` debounces its resize by 120 ms, so `PtyWorker` spawned at
+     `DEFAULT_COLS` (100) and heard the truth ~250 ms later. `flush_resize`
+     applies the pending resize before any spawn.
+  3. `QStackedLayout` lays out the CURRENT page only, so a workspace the user
+     has not opened is never sized at all — and the autostart brings back
+     EVERY workspace's agents, so 6 of 8 in a four-workspace hive ran their
+     whole resumed conversation at 100 columns and only found out when the
+     user first clicked that workspace. `PageStack.layout_hidden_pages` hands
+     each off-screen page the current page's rect via `WA_DontShowOnScreen` +
+     show/hide inside one call (Qt lays out only what it considers VISIBLE;
+     `setGeometry` alone on a hidden page does nothing, measured), debounced
+     because the trigger is a window drag, and also fired when a page or agent
+     is added/removed off screen since a retile changes every sibling's width.
+  `settle_layout` is idempotent (`_apply_resize` returns early when nothing
+  changed) and is what the restored-screen invariant below now depends on.
+  What it does NOT fix, and cannot: a width change MID-conversation (the user
+  resizes the window, closes a sibling agent, solos a card) leaves everything
+  the child already printed wrapped as it was — same as every real terminal
+  emulator does with app-wrapped output.
 - **A width change RE-PROJECTS the scrollback** (`TerminalCard.
   _reproject_on_size`). pyte does not reflow: a history line keeps the column
   count it had when it was pushed. That was invisible while Claude owned its
@@ -438,12 +622,12 @@ this file is the invariants that must survive every change.
   seed_written_over`, which compares the buffer to `_pty_seed`) — that seed is
   the previous run's screen and a running agent is deliberately given a clean
   terminal, so replaying it would put back the mangled fragment
-  `_drop_restored_screen` exists to remove. `is_running()` is NOT the test, for
+  `drop_restored_screen` exists to remove. `is_running()` is NOT the test, for
   the reason that function documents. (3) A `REPLAY_SETTLE_MS` single-shot
   BACKSTOP, because `TerminalView._apply_resize` returns EARLY when rows/cols
   are unchanged, so `sizeChanged` is not guaranteed to fire at all and a card
   built at exactly its final size would keep the seed forever.
-  `_drop_restored_screen` must stop that timer as well as disconnect the
+  `drop_restored_screen` must stop that timer as well as disconnect the
   signal, or it re-projects the very screen that was just dropped.
 - **The transcript behind milestone recovery is cached per conversation**
   (`TerminalCard._recover_key`/`_recover_prompts`). `_recover_marks` runs on
@@ -867,19 +1051,36 @@ this file is the invariants that must survive every change.
   armed in `start_usage_polling`, never in `__init__`. Do not "simplify" any of
   those back to an inline `fetch()`. AND IT RIDES ITS OWN, MUCH SLOWER CLOCK
   (`GEMINI_USAGE_POLL_MS` 5 min / `GEMINI_USAGE_URGENT_POLL_MS` 60s), because
-  every Gemini tick SPAWNS A PROCESS where a Claude tick makes a request. On
-  some runs `agy` starts a nested helper that asks Windows for its OWN console;
-  `CREATE_NO_WINDOW` is passed and is NOT ENOUGH, because spawn flags do not
-  reach a GRANDCHILD — MEASURED on a deterministic reproducer, a descendant that
-  demands a console gets a VISIBLE one 8/8 times under `CREATE_NO_WINDOW`,
-  `CREATE_NEW_CONSOLE`+`STARTUPINFO(SW_HIDE)` and `CREATE_NO_WINDOW`+
-  `STARTUPINFO(SW_HIDE)` alike. With Windows 11 delegating to Windows Terminal
-  that console appears as a real window flashing over the user's screen (live:
-  ~6% of polls, 2 of 32, i.e. every quarter hour at 60s — reported as "a
-  terminal keeps popping up and I can't read it"). Since NO flag suppresses it,
-  asking less often is the only lever, and it costs nothing: only the two pills
-  consume this reading, and a Gemini cut-off recovers on its own printed
-  countdown, never on the account reading. Do NOT fold these back onto
+  every Gemini tick SPAWNS A PROCESS where a Claude tick makes a request.
+  THE CONSOLE WINDOW THAT USED TO FLASH IS NOW CLOSED AT SOURCE, and the earlier
+  diagnosis here (a nested helper of `agy` demanding its own console, which no
+  spawn flag could reach) was WRONG: MEASURED from a console-less pythonw parent
+  — the app's own shape — `subprocess` gives the CHILD ITSELF a console of its
+  own (a `conhost.exe` child, 5/5 runs), and Windows 11 can hand a newly created
+  console to the default terminal app. A poll that flashed produced a whole
+  `WindowsTerminal.exe` with a visible `CASCADIA_HOSTING_WINDOW_CLASS` frame AND
+  a `PseudoConsoleWindow` inside `agy.exe` — the signature of a console client
+  being re-hosted by Windows Terminal, i.e. OUR console being delegated. Rate
+  measured at 1 in 20 polls single-file and 1 in 72 under concurrency, matching
+  the live report. `CREATE_NO_WINDOW` is not the bug (it correctly asks for a
+  windowless console; the handoff happens to the console anyway) and no other
+  flag is the cure — `DETACHED_PROCESS` measured WORSE, a console-subsystem
+  child with no console gets one allocated on demand and THAT one is delegated
+  too (3/3 runs), and a hidden desktop does not help because the terminal is
+  COM-activated onto the interactive desktop. So `gemini_usage._read_usage` runs
+  the CLI under a PSEUDO-CONSOLE (pywinpty, the same mechanism every agent
+  already uses): a ConPTY client never has a console allocated for it, so there
+  is nothing to hand off — measured 4/4 console objects the old way, 0/4 the new
+  way. TWO consequences ride along and must not be undone: on a terminal `agy`
+  PRETTY-PRINTS its quota table (padded columns, a "Quota:" heading, CRLF,
+  escape sequences) instead of the tab-separated one a pipe gets, so the parser
+  splits on "a tab OR two-plus spaces" and the output is escape-stripped; and
+  pty reads BLOCK, so they run on their own thread with a join timeout — a hung
+  CLI would otherwise leave `_gemini_usage_inflight` set and freeze the pill for
+  the life of the process. The slow clock therefore no longer rations a flash,
+  only the process cost — which is still reason enough, and still nearly free:
+  only the two pills consume this reading, and a Gemini cut-off recovers on its
+  own printed countdown, never on the account reading. Do NOT fold these back onto
   `USAGE_POLL_MS` — that constant answers to `planLimitReached`/
   `planLimitCleared` and the reset poll they arm, none of which exist for
   Gemini. The BLOCKED state (`Usage.blocked`, utilization >= 100 —
@@ -961,16 +1162,59 @@ this file is the invariants that must survive every change.
     width, and those two classes are the regression fixes for two live-reported
     bugs (pills drawing on top of each other; the row frozen at QScrollArea's
     468px constant). They just have far less to carry now.
+    `_AutoSizingScrollContent` also pins its own `minimumWidth` to its
+    layout's `sizeHint` — belt to `adjustSize`'s braces, since resizing to the
+    hint is a one-shot and anything that sizes the widget afterwards could
+    still leave it narrower than the row, cutting the right-hand pills off at
+    its edge (the overlap bug the class was written for). `resize()` and
+    `setGeometry()` are both clamped to `minimumWidth`, so that state is off
+    the table rather than merely unlikely. The WINDOW stays free to be
+    narrower than the row because the scroll area's OWN `minimumSizeHint` is
+    capped at `_EXTRAS_MIN_W` — do not "tidy" that cap away with this minimum.
   * `ornaments.anchored_popup_pos` is SHARED with `GridButton._popup_position`,
     not copied. Both buttons sit at the right end of a wide strip, so
     left-anchoring a panel under them spills off the window on a narrow window
     and off the display on a wide one; the helper clamps to the INTERSECTION of
     the window and the screen's available geometry.
 - **A usage pill is exactly as wide as its text, by ONE formula**
-  (`ornaments.UsagePillBadge._measure_width`: `_PAD*2 + _RING + _GAP +
-  advance(text)`, measured with `_text_font()` — the font `paintEvent` actually
-  draws with, never the widget's QSS font, or the pill is sized for text of a
-  different size). `PlanUsageBadge` and
+  (`ornaments.UsagePillBadge._measure_width`: `_chrome_width()` — `_PAD*2 +
+  _RING + _GAP + _TEXT_SLACK` — `+ advance(text)`, measured with
+  `_text_font()`, THE FONT `paintEvent` ACTUALLY DRAWS WITH). That last clause
+  is the whole invariant and it was violated for months: `_text_font()`
+  returned a bare `QFont()` whose FAMILY IS UNSET, and the two consumers
+  resolve an unset family DIFFERENTLY — `QFontMetrics` falls back to the
+  application font, `QPainter.setFont` resolves it against the WIDGET's font
+  (whatever QSS put there). Those agree only while the chrome family IS the
+  application default, which is exactly the machine it was written on;
+  `setup_application` deliberately picks `Inter` over `Segoe UI` whenever Inter
+  is installed, so on such a machine every pill measured one face and painted a
+  wider one and `paintEvent`'s elide — insurance, never meant to fire —
+  truncated the reading (reported live with screenshots: `5h 86% used, resets
+  n…` in a bar with hundreds of free pixels). `_text_font()` is therefore an
+  INSTANCE method built from `self.font()`, and a bare `QFont()` must never
+  come back. Two consequences ride along. (1) A measurement has TWO inputs, so
+  re-measuring is not `_set_text`'s business alone: the text can stand still
+  while the FONT moves under it (a QSS re-apply, a theme swap, an application
+  font change), and `_set_text` early-returns on an unchanged line — so
+  `changeEvent` re-measures on `FontChange`/`ApplicationFontChange`/
+  `StyleChange`. (2) `_heal_width`/`_reassert_width`: when painting finds the
+  line wider than the pill, the pill widens itself on the next turn of the
+  event loop instead of sitting there truncated. CRITICAL, and the reason it
+  works at all: the repair is driven by THE ADVANCE THE PAINTER JUST MEASURED,
+  never by re-running `_measure_width` — re-running the measurement is no
+  repair when the measurement is the thing that is wrong, and `p.fontMetrics()`
+  is the one authority that cannot disagree with what was drawn, because it is
+  what drew it. `_heal_key` bounds it to one attempt per (text, width) state so
+  a pill that cannot be helped asks once rather than spinning; a resize inside
+  `paintEvent` would be a repaint loop, hence the deferred single-shot (with
+  the `context` overload, so a deleted pill cancels rather than firing into a
+  dead C++ object). `_TEXT_SLACK` is a rounding cushion, NOT a design margin:
+  the metrics are integers and a fractional device pixel ratio can lay the run
+  out a hair wider than the advance, which would elide a pill sized to the
+  exact pixel. NOTE what is NOT the cause here, because it was checked and
+  ruled out: a parent layout CANNOT squeeze a pill — `QWidget::setGeometry`
+  and `resize()` both clamp to the fixed width — so a narrow window is never
+  the explanation for a truncated pill. `PlanUsageBadge` and
   `GeminiUsageBadge` are both subclasses and supply only the TEXT; the Gemini
   pills previously carried a hardcoded `_FIXED_WIDTH = 315` and elided into it,
   which reserved 630px of the bar for two readouts whose real content is ~215px
@@ -1382,21 +1626,32 @@ this file is the invariants that must survive every change.
   would otherwise only grow. THE SNAPSHOT SERVES THE STOPPED CARD ONLY: an
   agent that comes back RUNNING gets a CLEAN terminal that its child fills in
   a few seconds, which is what a restored hive looked like before snapshots
-  existed. `TerminalCard._on_status` drops the restored screen (its own, and
-  the agent's via `TerminalAgent.drop_seeded_screen`, or a card rebuilt by a
-  retile would replay the same stale seed under the child) the moment the
-  agent starts while `_pending_replay` is STILL SET — i.e. this card has
-  never re-rendered it at a settled size. Both launch paths that start an
-  agent (`autostart_active_workspace`, `recover_blocked_at_startup`) run
-  SYNCHRONOUSLY right after `show()`, ahead of `TerminalView`'s 120 ms resize
-  debounce, so that is every agent restored running: leaving the seed there
-  parked each of their cards on a mangled ~24-column fragment of last
-  session's screen until the TUI finished booting (reported twice, and the
-  reason it is not enough to fix the RE-RENDER: a launching child writes
+  existed. `TerminalCard.drop_restored_screen` drops it (its own, and the
+  agent's via `TerminalAgent.drop_seeded_screen`, or a card rebuilt by a
+  retile would replay the same stale seed under the child). Leaving the seed
+  there parked each restored-running card on a mangled ~24-column fragment of
+  last session's screen until the TUI finished booting (reported twice, and
+  the reason it is not enough to fix the RE-RENDER: a launching child writes
   within milliseconds, so any guard that defers to a live child leaves the
-  bad frame up). `_pending_replay` is the right test because a card WOKEN by
-  a keystroke has long since consumed it, so the wake path below is
-  untouched. TWO subtleties, both live-found: (1) pyte drops
+  bad frame up). WHO CALLS IT is the part that has changed once already, so
+  read this before touching it. It used to be inferred inside `_on_status`
+  from `_pending_replay` still being set — "this card has never re-rendered
+  at a settled size" — which worked ONLY because both launch paths
+  (`autostart_active_workspace`, `recover_blocked_at_startup`) ran
+  synchronously right after `show()`, ahead of `TerminalView`'s 120 ms resize
+  debounce. `MainWindow.settle_layout` now deliberately settles those sizes
+  FIRST (see the width invariant above — a child must never paint at a width
+  its card does not have), so that proxy stopped distinguishing a launch from
+  a wake, and `autostart_active_workspace` CALLS IT EXPLICITLY for each agent
+  it is about to start instead. `_on_status` keeps the `_pending_replay` test
+  as a backstop for a card whose child starts before any layout, and adds one
+  case of its own: a start that RESUMES a conversation (`spec.resume`, still
+  readable at STARTING) reprints that whole conversation itself, so the
+  snapshot underneath it is a duplicate wrapped for LAST session's width —
+  the same half-width scrollback bug arriving by the one door the autostart
+  does not cover, a stopped card the user wakes with a keystroke. A plain pty
+  shell reprints nothing, so its conversation is kept and scrolls up as a real
+  terminal's would. TWO subtleties, both live-found: (1) pyte drops
   lines off the TOP when it shrinks, and the tiling grid resizes a card AFTER
   it is built, so the newest part of a restored conversation is exactly what
   vanished — `TerminalCard._rerender_restored` re-renders ONCE on the first

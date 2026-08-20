@@ -23,6 +23,7 @@ from ..terminal_agent import (STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
                               TerminalAgent)
 from ..ui_theme import Palette, repolish
 from .ornaments import BootVeil, ElidingLabel
+from .terminal_view import is_reply_footer
 
 _LINE_BREAKS = re.compile(r"[\r\n]")
 
@@ -62,6 +63,14 @@ REPLAY_SETTLE_MS = 300
 # that prompt's echo (see TerminalCard._recover_marks)
 _MARK_MATCH_CHARS = 28
 _MARK_WS_RE = re.compile(r"\s+")
+# markdown syntax and drawing glyphs the renderer paints rather than prints,
+# dropped from both sides of a reply match (see _norm_reply_line)
+_MARK_MD_RE = re.compile("[*`_#>❯•⏺─-╿]")
+# how much of the END of a reply's last line must be found on a scrollback row
+# to call it that reply's last row (see _reply_end_row). Shorter than the
+# prompt window: a wrapped line's final row holds only what spilled onto it,
+# which can be a few words.
+_REPLY_TAIL_CHARS = 16
 
 
 def _norm_line(text: str) -> str:
@@ -69,6 +78,77 @@ def _norm_line(text: str) -> str:
     sides of the milestone-recovery match are compared in."""
     return _MARK_WS_RE.sub(" ", text.replace(">", " ").replace("❯", " ")
                            .lower()).strip()
+
+
+def _norm_reply_line(text: str) -> str:
+    """_norm_line, plus the markdown the renderer eats. A reply is written as
+    markdown and PAINTED as styled text -- `code`, **bold** and heading hashes
+    arrive on screen as SGR runs with the syntax characters gone -- so matching
+    a transcript reply against a rendered line has to drop them from both
+    sides. Bullet and box glyphs go too: the renderer draws its own."""
+    return _MARK_WS_RE.sub(" ", _MARK_MD_RE.sub(" ", text).lower()).strip()
+
+
+def _last_content_line(text: str) -> str:
+    """The last line of a reply that has anything on it once normalized -- the
+    line that ends up at the bottom of that reply on screen."""
+    for line in reversed(text.splitlines()):
+        if _norm_reply_line(line):
+            return line
+    return ""
+
+
+def _reply_end_row(lines: list[str], tail: str, start: int) -> int | None:
+    """The blank row directly under where a reply ENDED, at or after `start`.
+
+    Two conditions, and each is load-bearing. The row must contain the TAIL of
+    the reply's last line -- not its head, because a long final line wraps and
+    only its last rendered row carries the tail, which is precisely the row the
+    reply ends on. And the row BELOW must be blank, which is what proves the
+    reply really ended there.
+
+    Both come from the same measured failure. pyte does not reflow, so a card
+    resized mid-session keeps BOTH renders of a reply in its scrollback, the
+    older one truncated wherever the redraw overwrote it. Matching the head
+    found that stale copy first and stamped 4 rows into it, i.e. the middle of
+    a paragraph. The tail is usually missing from a truncated copy, and the
+    blank-row test rejects it outright when it is not, so the scan simply walks
+    on to the real one.
+
+    A footer directly below that blank row moves the anchor down past it, so a
+    recovered stamp and a live one land in the SAME place relative to the
+    "<verb> for Ns" line (see TerminalView.reply_anchor_line).
+
+    The blank row is also the right place to draw: the stamp is painted into a
+    row's empty right-hand tail and skipped when the row's own content runs too
+    close to the edge (see TerminalView.paintEvent), so a full line of prose
+    would silently lose the very stamp this feature exists to show. Nothing
+    matching means no stamp -- the same contract reply_anchor_line() and the
+    paint-time skip already follow."""
+    for i in range(start, len(lines) - 1):
+        if tail not in lines[i] or lines[i + 1]:
+            continue
+        # the blank row under the reply text is only the stamp's home when
+        # Claude's own turn footer is NOT there. When it is (the newest reply,
+        # the one whose footer survived), the stamp belongs UNDER it, beside
+        # nothing rather than wedged between the reply and its own footer --
+        # which is exactly what the user asked to have moved.
+        if (i + 3 < len(lines) and is_reply_footer(lines[i + 2])
+                and not lines[i + 3]):
+            return i + 3
+        return i + 1
+    return None
+
+
+def _format_reply_stamp(ts: float) -> str:
+    """The date AND time a reply finished, e.g. "Aug 19, 19:14".
+
+    Never time-only, not even for a reply from today: this is now the ONLY
+    surface carrying a reply time (the card header's badge was removed at the
+    user's request), and a bare HH:MM on a conversation reopened days later
+    reads as "just now". Computed at REFRESH time rather than capture time,
+    so a stamp minted today still says so once the day turns over."""
+    return datetime.datetime.fromtimestamp(ts).strftime("%b %d, %H:%M")
 
 _GLYPH_STATE = {
     AgentStatus.IDLE: "idle",
@@ -169,21 +249,29 @@ class TerminalCard(QFrame):
         self._renaming = False  # inline title-edit in progress
         self._task_full = ""    # untruncated current-task (the label elides it)
         self._pending_replay = ""  # restored screen, re-rendered once at size
+        self._restored_hooked = False  # is _rerender_restored still armed?
         # prompt milestone uid -> absolute line IN THIS VIEW. Per-card because
         # a rebuilt view has a different `pushed` origin; keyed on uid because
         # id() is reused after a FIFO eviction (see PromptMark).
         self._mark_lines: dict[int, int] = {}
+        # same shape/reasoning as _mark_lines, for reply-finished milestones
+        # (see ReplyMark / TerminalView.reply_anchor_line).
+        self._reply_mark_lines: dict[int, int] = {}
         # milestones located by matching the transcript against a scrollback we
         # did not watch being typed (a restored conversation); recomputed on
         # every projection, never persisted
         self._recovered: list[tuple[int, str]] = []
-        # typed-prompt texts for _recover_marks, cached per conversation. The
+        # same, for reply-finished stamps: (absolute line, epoch)
+        self._recovered_replies: list[tuple[int, float]] = []
+        # typed-prompt texts for _recover_marks and finished-reply times for
+        # _recover_reply_marks, cached per conversation under ONE key. The
         # read is O(transcript) and a live transcript's mtime changes
         # constantly, so transcripts' own mtime cache never hits for exactly
         # the agents that matter. See _recover_marks for why re-reading within
         # one conversation cannot find anything the card doesn't already know.
         self._recover_key: tuple = ()
         self._recover_prompts: list[str] = []
+        self._recover_replies: list[tuple[float, str]] = []
         self.scroll_bar = None
         # the column count the scrollback was last projected at; a change means
         # every history line is wrapped for a screen that no longer exists
@@ -235,6 +323,7 @@ class TerminalCard(QFrame):
                 # only way that is actually true: the agent's own buffer.
                 self._pending_replay = replay
                 self.terminal.sizeChanged.connect(self._rerender_restored)
+                self._restored_hooked = True
                 # ...and a backstop, because sizeChanged is not guaranteed:
                 # _apply_resize bails when rows/cols are unchanged, so a card
                 # built at exactly its final size would keep the seed forever.
@@ -322,16 +411,6 @@ class TerminalCard(QFrame):
         self.token_label = QLabel("", header)
         self.token_label.setObjectName("CardTokens")
         self.token_label.hide()
-        # walltime the agent last finished a reply (busy -> idle), mirroring
-        # the dated entries the board's log_activity tool writes -- but for a
-        # single agent's own card, live, with no MCP call needed. Refreshed
-        # off the existing activity_changed signal (see _refresh_reply_time);
-        # hidden until the agent has actually replied once. Transient like
-        # the model chip: never persisted, TerminalAgent.last_reply_at() is
-        # the live source of truth.
-        self.reply_time_label = QLabel("", header)
-        self.reply_time_label.setObjectName("CardReplyTime")
-        self.reply_time_label.hide()
         hl.addWidget(self.glyph)
         hl.addWidget(self.title)
         hl.addWidget(self.title_edit)
@@ -343,7 +422,6 @@ class TerminalCard(QFrame):
         hl.addWidget(self.sched_mark)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
         hl.addWidget(self.token_label)
-        hl.addWidget(self.reply_time_label)
 
         def tool(text, obj_name, tip):
             b = QToolButton(header)
@@ -414,7 +492,6 @@ class TerminalCard(QFrame):
     def _wire(self) -> None:
         self.agent.status_changed.connect(self._on_status)
         self.agent.activity_changed.connect(self._on_activity)
-        self._refresh_reply_time()
         self.agent.assignment_changed.connect(self._on_assignment)
         self.agent.role_changed.connect(self._on_role)
         self.agent.name_changed.connect(self._on_name)
@@ -470,6 +547,7 @@ class TerminalCard(QFrame):
             # agent isn't a running pty, so no extra guard is needed here.
             self.terminal.staleLayoutDetected.connect(self.agent.request_repaint)
             self.agent.prompt_marks_changed.connect(self._refresh_marks)
+            self.agent.reply_marks_changed.connect(self._on_reply_mark_added)
             self.agent.conversation_replaced.connect(
                 self.terminal.clear_history)
             self.scroll_bar.markActivated.connect(self.terminal.scroll_to_abs)
@@ -825,33 +903,59 @@ class TerminalCard(QFrame):
             self._place_overlay()
         return super().eventFilter(obj, event)
 
-    def _drop_restored_screen(self) -> None:
+    def _unhook_restored(self) -> None:
+        """Disarm the one-shot settled-size projection, once.
+
+        Both teardown paths (`drop_restored_screen` and `_rerender_restored`
+        itself) can run for the same card, and PySide warns rather than raises
+        on a disconnect that has already happened -- so the flag, not a
+        try/except, is what makes the second call silent."""
+        if not self._restored_hooked:
+            return
+        self._restored_hooked = False
+        try:
+            self.terminal.sizeChanged.disconnect(self._rerender_restored)
+        except (RuntimeError, TypeError):
+            pass
+
+    def drop_restored_screen(self) -> None:
         """Give the launching child a clean terminal.
 
-        `_pending_replay` still being set means this card has NEVER re-rendered
-        its restored screen at a settled size, so what is on the terminal was
-        drawn at the pre-layout width and pyte cannot reflow it. Both launch
-        paths that start an agent (`autostart_active_workspace` and
-        `recover_blocked_at_startup`) run SYNCHRONOUSLY right after `show()`,
-        while `TerminalView` debounces its resize by 120ms, so this is every
-        agent that comes back running: their cards would sit on a mangled
-        narrow fragment of the old conversation until the TUI finished
-        booting. An empty terminal that fills in a few seconds is what a
-        restored hive looked like before snapshots existed, and snapshots were
-        never meant to change it.
+        A restored screen (`app/screen_snapshot.py`) exists so a card the user
+        left STOPPED reopens showing its conversation instead of a black
+        rectangle. The moment a child is launching behind that card the
+        snapshot has no job left: the TUI paints its own frame within seconds,
+        and the snapshot is the PREVIOUS run's screen — hard-wrapped for
+        whatever width that card had then, which nothing can reflow. An empty
+        terminal that fills in a few seconds is what a restored hive looked
+        like before snapshots existed, and snapshots were never meant to
+        change it.
 
-        A card WOKEN by a keystroke is untouched: it has long since
-        re-rendered (`_pending_replay` is empty by then), so its conversation
-        still scrolls up out of the way as a real terminal's would."""
+        Called EXPLICITLY by `MainWindow.autostart_active_workspace` for the
+        agents it is about to start, because that is the only party that knows
+        a start is the launch restore rather than a wake. It used to infer it
+        from `_pending_replay` still being set — "this card has never rendered
+        at a settled size" — which held only because the autostart ran ahead of
+        `TerminalView`'s 120ms resize debounce. `MainWindow.settle_layout` now
+        deliberately settles those sizes FIRST (a child must never paint at a
+        width its card does not have), so that proxy no longer distinguishes
+        anything and the caller says what it means instead. `_on_status` keeps
+        it as a backstop for a card whose child starts before any layout.
+
+        A card WOKEN by a keystroke is untouched: its conversation still
+        scrolls up out of the way as a real terminal's would.
+
+        Safe to call twice, and safe once the child has drawn: the real guard
+        is `TerminalAgent.drop_seeded_screen`, which drops only a buffer that
+        is still nothing but the snapshot."""
+        if not self.is_pty or self.terminal is None:
+            return          # a line-mode card has no screen to restore
         self._pending_replay = ""
         # the settled-size projection must be cancelled too, not just the
         # signal: its backstop timer would otherwise fire a moment later and
         # re-project the very screen this just decided to drop
         self._settle_timer.stop()
-        try:
-            self.terminal.sizeChanged.disconnect(self._rerender_restored)
-        except (RuntimeError, TypeError):
-            pass
+        self._unhook_restored()
         # drop it on the AGENT too, or a card rebuilt later (a retile, a
         # workspace switch) replays the same stale seed under the child
         if self.agent.drop_seeded_screen():
@@ -889,13 +993,10 @@ class TerminalCard(QFrame):
         since drawn over (`seed_written_over`): that seed is the PREVIOUS run's
         screen, and an agent that comes back running is deliberately given a
         clean terminal it fills itself, so replaying the seed under it would put
-        back the mangled fragment `_drop_restored_screen` exists to remove."""
+        back the mangled fragment `drop_restored_screen` exists to remove."""
         self._pending_replay = ""
         self._settle_timer.stop()
-        try:
-            self.terminal.sizeChanged.disconnect(self._rerender_restored)
-        except (RuntimeError, TypeError):
-            pass
+        self._unhook_restored()
         replay = self.agent.pty_replay()
         if not replay or self.agent.seed_written_over():
             return
@@ -1044,20 +1145,35 @@ class TerminalCard(QFrame):
             esc = replay.find("\x1b", skip)
             skip = esc if esc >= 0 else skip
         self._mark_lines = {}
+        self._reply_mark_lines = {}
+        # merged into ONE pass over the (capped) replay text -- a second full
+        # feed just for reply marks would double the pyte cost of every card
+        # rebuild, exactly what _rerender_restored's single-projection rule
+        # exists to avoid.
+        tagged = ([(off, "prompt", mark) for off, mark in self.agent.replay_marks()] +
+                  [(off, "reply", mark) for off, mark in self.agent.reply_replay_marks()])
+        tagged.sort(key=lambda t: t[0])
         pos = skip
-        for off, mark in self.agent.replay_marks():
+        for off, kind, mark in tagged:
             off = max(0, min(len(replay), off))
             if off < skip:
                 continue        # its bytes are outside the projected window
             if off > pos:
                 self.terminal.feed(replay[pos:off])
                 pos = off
-            self._mark_lines[mark.uid] = self.terminal.anchor_line()
+            if kind == "prompt":
+                self._mark_lines[mark.uid] = self.terminal.anchor_line()
+            else:
+                line = self.terminal.reply_anchor_line()
+                if line is not None:
+                    self._reply_mark_lines[mark.uid] = line
         if pos < len(replay):
             self.terminal.feed(replay[pos:])
         if recover:
             self._recover_marks()
+            self._recover_reply_marks()
         self._refresh_marks()
+        self._refresh_reply_marks()
 
     def _recover_marks(self) -> None:
         """Find the user's earlier prompts in a scrollback we did not watch
@@ -1099,21 +1215,15 @@ class TerminalCard(QFrame):
             self._recover_key = key
             self._recover_prompts = transcripts.typed_prompts(
                 spec.cwd, spec.session_id)
+            self._recover_replies = transcripts.reply_times(
+                spec.cwd, spec.session_id)
         prompts = self._recover_prompts
         if not prompts:
             return
-        view = self.terminal
-        hist = list(view.screen.history.top)
-        cols = view.screen.columns
-        # history THEN the live screen: their absolute ids are contiguous
-        # (oldest + len(hist) == pushed), and a short conversation may not have
-        # scrolled anything off yet, so history alone would find nothing
-        rows = hist + [view.screen.buffer[r] for r in range(view.screen.lines)]
-        if not rows:
+        oldest, raw = self._scrollback_rows()
+        if not raw:
             return
-        oldest = view.history_pushed() - len(hist)
-        lines = [_norm_line("".join(ln[c].data or " " for c in range(cols)))
-                 for ln in rows]
+        lines = [_norm_line(t) for t in raw]
         heads = []
         for text in prompts:
             head = _norm_line(text)[:_MARK_MATCH_CHARS]
@@ -1128,6 +1238,71 @@ class TerminalCard(QFrame):
                     self._recovered.append((oldest + i, text))
                     at = i + 1
                     break
+
+    def _scrollback_rows(self) -> tuple[int, list[str]]:
+        """(absolute id of the first row, raw text of every row) across history
+        THEN the live screen. Their ids are contiguous (oldest + len(hist) ==
+        pushed) and a short conversation may not have scrolled anything off
+        yet, so history alone would find nothing. Shared by both recoveries so
+        they can never disagree about which line is which."""
+        view = self.terminal
+        hist = list(view.screen.history.top)
+        cols = view.screen.columns
+        rows = hist + [view.screen.buffer[r] for r in range(view.screen.lines)]
+        oldest = view.history_pushed() - len(hist)
+        return oldest, ["".join(ln[c].data or " " for c in range(cols))
+                        for ln in rows]
+
+    def _recover_reply_marks(self) -> None:
+        """Find where each finished reply ENDED in a scrollback we did not
+        watch, and stamp those lines with the time the transcript says that
+        reply finished.
+
+        The counterpart of _recover_marks, and it exists for a sharper reason:
+        a reply mark is minted from a busy -> idle settle, so a conversation
+        restored from disk comes back with NONE, and the resume-replay
+        suppression (_settled_once) means a reopened hive shows no reply time
+        anywhere at all. The transcript is the only record of when those turns
+        actually finished.
+
+        MEASURED, and it shapes the anchor: Claude's own "<verb> for Ns" footer
+        -- what the LIVE mark anchors to -- does NOT survive per turn into the
+        scrollback. Across seven real captured screens at five widths, at most
+        ONE footer was still present in 2000 lines of history and usually none:
+        the renderer erases that region when the next turn starts. So a
+        recovered stamp is anchored to the reply's own last line instead, which
+        is committed output and stays put.
+
+        Matching keeps _recover_marks' discipline -- loose on the line side,
+        strict on the transcript side, first hit wins, the scan carries on
+        below so replies match in file order -- and differs in two ways that
+        _reply_end_row explains: it matches the TAIL of a reply's last line
+        rather than its head, and markdown syntax is dropped from both sides,
+        because the renderer restyles `code`/**bold** rather than printing the
+        characters. The worst case is failing to LOCATE a reply, never
+        inventing a time for one."""
+        self._recovered_replies = []
+        spec = self.agent.spec
+        if not self.is_pty or spec.provider != "claude":
+            return
+        if not self._recover_replies:
+            return
+        oldest, raw = self._scrollback_rows()
+        if not raw:
+            return
+        lines = [_norm_reply_line(t) for t in raw]
+        at = 0
+        for when, text in self._recover_replies:
+            tail = _norm_reply_line(_last_content_line(text))[-_REPLY_TAIL_CHARS:]
+            if len(tail) < 8:   # too short to identify a line safely
+                continue
+            row = _reply_end_row(lines, tail, at)
+            if row is None:
+                continue
+            self._recovered_replies.append((oldest + row, when))
+            # carry on BELOW this reply, so replies match in file order and a
+            # repeated closing line cannot claim an earlier reply's row
+            at = row + 1
 
     def _refresh_marks(self) -> None:
         """Push the agent's milestones to the view in THIS view's coordinates.
@@ -1163,7 +1338,55 @@ class TerminalCard(QFrame):
         """The scrollback was wiped under us (ED 3 / a reset), so every
         milestone anchored into it is meaningless."""
         self._mark_lines = {}
+        self._recovered = []
         self.agent.clear_prompt_marks()
+        self._reply_mark_lines = {}
+        self._recovered_replies = []
+        self.agent.clear_reply_marks()
+
+    def _refresh_reply_marks(self) -> None:
+        """Push the agent's reply-finished milestones to the view, in THIS
+        view's coordinates -- same shape as _refresh_marks. The stamp text is
+        formatted at REFRESH time (not capture time), so a reply from
+        yesterday keeps reading as date-prefixed today rather than freezing
+        whatever "same day" looked like the moment it was captured.
+
+        Live marks and transcript-recovered ones are merged the same way
+        _refresh_marks merges prompts: a live capture anchored the row it was
+        actually looking at, a recovered one was located by matching text, so
+        where both land on a line the live one wins."""
+        if not self.is_pty:
+            return
+        by_uid = {m.uid: m for m in self.agent.reply_marks()}
+        live = [(line, by_uid[uid].ts)
+                for uid, line in self._reply_mark_lines.items()
+                if uid in by_uid]
+        taken = {line for line, _ in live}
+        merged = live + [(line, when) for line, when in self._recovered_replies
+                         if line not in taken]
+        self.terminal.set_reply_marks(
+            sorted((line, _format_reply_stamp(when)) for line, when in merged))
+
+    def _on_reply_mark_added(self) -> None:
+        """A reply-finished milestone was recorded on the agent (or the set
+        was cleared, e.g. a restart). Only the newest mark can ever be new
+        here -- note_reply_settled() appends exactly one mark per call, so
+        the CARD only has to catch up on the tail; an already-anchored mark
+        keeps whatever line _replay_with_marks (or an earlier call here) gave
+        it."""
+        if not self.is_pty:
+            return
+        marks = self.agent.reply_marks()
+        if not marks:
+            self._reply_mark_lines = {}
+            self._refresh_reply_marks()
+            return
+        latest = marks[-1]
+        if latest.uid not in self._reply_mark_lines:
+            line = self.terminal.reply_anchor_line()
+            if line is not None:
+                self._reply_mark_lines[latest.uid] = line
+        self._refresh_reply_marks()
 
     def _place_overlay(self) -> None:
         if not self.is_pty:
@@ -1233,23 +1456,6 @@ class TerminalCard(QFrame):
 
     def _on_activity(self, _busy: bool) -> None:
         self._on_status(self.agent.status)
-        self._refresh_reply_time()
-
-    def _refresh_reply_time(self) -> None:
-        """Mirror TerminalAgent.last_reply_at() onto the header. Runs off the
-        same activity_changed edge card status already reacts to -- it is set
-        ONLY on a genuine busy -> idle settle (see _on_idle_timeout), so a
-        forced clear on stop/crash just re-displays the last real reply time
-        rather than a bogus 'just replied' stamp."""
-        ts = self.agent.last_reply_at()
-        if ts is None:
-            self.reply_time_label.hide()
-            return
-        dt = datetime.datetime.fromtimestamp(ts)
-        self.reply_time_label.setText(dt.strftime("%H:%M"))
-        self.reply_time_label.setToolTip(
-            "Agent's last reply finished " + dt.strftime("%Y-%m-%d %H:%M:%S"))
-        self.reply_time_label.show()
 
     def _on_status(self, status: AgentStatus) -> None:
         busy = bool(getattr(self.agent, "is_busy", lambda: False)())
@@ -1263,8 +1469,19 @@ class TerminalCard(QFrame):
             tip += f" (code {exit_info[0]})"
         self.glyph.setToolTip(tip)
 
-        if self.is_pty and running and self._pending_replay:
-            self._drop_restored_screen()
+        # A start that RESUMES a conversation reprints that whole conversation
+        # itself, so the snapshot underneath it is a duplicate — and one
+        # hard-wrapped for whatever width the card had in the PREVIOUS session,
+        # which nothing downstream can reflow. That is the same half-width
+        # scrollback `MainWindow.settle_layout` exists to prevent, arriving by
+        # the one door the launch autostart does not cover: a stopped card the
+        # user wakes with a keystroke. `spec.resume` is still readable here —
+        # `start()` clears it just after the worker launches (see
+        # `_begin_boot_veil`). A plain pty shell reprints nothing, so its
+        # conversation is kept and scrolls up as a real terminal's would.
+        if self.is_pty and running and (self._pending_replay
+                                        or self.agent.spec.resume):
+            self.drop_restored_screen()
 
         if self.is_pty:  # stopped terminal shows the wake banner, never black
             self.overlay.setVisible(not running

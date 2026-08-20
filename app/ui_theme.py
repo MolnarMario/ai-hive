@@ -583,10 +583,6 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     padding: 0px 4px;
 }}
 /* live "last reply finished at" stamp, same treatment as #CardTokens */
-#CardReplyTime {{
-    color: {p.CARDHEAD_SUB}; font-size: 10px; font-weight: 700;
-    padding: 0px 4px;
-}}
 #CardLimitMark {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
 /* clickable (opens a menu of what to kill) -- transparent by default, like
    #CardSchedule, so it doesn't inherit the platform's default button chrome */
