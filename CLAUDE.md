@@ -1051,19 +1051,36 @@ this file is the invariants that must survive every change.
   armed in `start_usage_polling`, never in `__init__`. Do not "simplify" any of
   those back to an inline `fetch()`. AND IT RIDES ITS OWN, MUCH SLOWER CLOCK
   (`GEMINI_USAGE_POLL_MS` 5 min / `GEMINI_USAGE_URGENT_POLL_MS` 60s), because
-  every Gemini tick SPAWNS A PROCESS where a Claude tick makes a request. On
-  some runs `agy` starts a nested helper that asks Windows for its OWN console;
-  `CREATE_NO_WINDOW` is passed and is NOT ENOUGH, because spawn flags do not
-  reach a GRANDCHILD — MEASURED on a deterministic reproducer, a descendant that
-  demands a console gets a VISIBLE one 8/8 times under `CREATE_NO_WINDOW`,
-  `CREATE_NEW_CONSOLE`+`STARTUPINFO(SW_HIDE)` and `CREATE_NO_WINDOW`+
-  `STARTUPINFO(SW_HIDE)` alike. With Windows 11 delegating to Windows Terminal
-  that console appears as a real window flashing over the user's screen (live:
-  ~6% of polls, 2 of 32, i.e. every quarter hour at 60s — reported as "a
-  terminal keeps popping up and I can't read it"). Since NO flag suppresses it,
-  asking less often is the only lever, and it costs nothing: only the two pills
-  consume this reading, and a Gemini cut-off recovers on its own printed
-  countdown, never on the account reading. Do NOT fold these back onto
+  every Gemini tick SPAWNS A PROCESS where a Claude tick makes a request.
+  THE CONSOLE WINDOW THAT USED TO FLASH IS NOW CLOSED AT SOURCE, and the earlier
+  diagnosis here (a nested helper of `agy` demanding its own console, which no
+  spawn flag could reach) was WRONG: MEASURED from a console-less pythonw parent
+  — the app's own shape — `subprocess` gives the CHILD ITSELF a console of its
+  own (a `conhost.exe` child, 5/5 runs), and Windows 11 can hand a newly created
+  console to the default terminal app. A poll that flashed produced a whole
+  `WindowsTerminal.exe` with a visible `CASCADIA_HOSTING_WINDOW_CLASS` frame AND
+  a `PseudoConsoleWindow` inside `agy.exe` — the signature of a console client
+  being re-hosted by Windows Terminal, i.e. OUR console being delegated. Rate
+  measured at 1 in 20 polls single-file and 1 in 72 under concurrency, matching
+  the live report. `CREATE_NO_WINDOW` is not the bug (it correctly asks for a
+  windowless console; the handoff happens to the console anyway) and no other
+  flag is the cure — `DETACHED_PROCESS` measured WORSE, a console-subsystem
+  child with no console gets one allocated on demand and THAT one is delegated
+  too (3/3 runs), and a hidden desktop does not help because the terminal is
+  COM-activated onto the interactive desktop. So `gemini_usage._read_usage` runs
+  the CLI under a PSEUDO-CONSOLE (pywinpty, the same mechanism every agent
+  already uses): a ConPTY client never has a console allocated for it, so there
+  is nothing to hand off — measured 4/4 console objects the old way, 0/4 the new
+  way. TWO consequences ride along and must not be undone: on a terminal `agy`
+  PRETTY-PRINTS its quota table (padded columns, a "Quota:" heading, CRLF,
+  escape sequences) instead of the tab-separated one a pipe gets, so the parser
+  splits on "a tab OR two-plus spaces" and the output is escape-stripped; and
+  pty reads BLOCK, so they run on their own thread with a join timeout — a hung
+  CLI would otherwise leave `_gemini_usage_inflight` set and freeze the pill for
+  the life of the process. The slow clock therefore no longer rations a flash,
+  only the process cost — which is still reason enough, and still nearly free:
+  only the two pills consume this reading, and a Gemini cut-off recovers on its
+  own printed countdown, never on the account reading. Do NOT fold these back onto
   `USAGE_POLL_MS` — that constant answers to `planLimitReached`/
   `planLimitCleared` and the reset poll they arm, none of which exist for
   Gemini. The BLOCKED state (`Usage.blocked`, utilization >= 100 —

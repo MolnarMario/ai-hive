@@ -12,10 +12,16 @@ than none, because nothing on screen tells the two apart.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+# what a terminal-shaped run of the CLI wraps its output in (see `_read_usage`)
+_ESC = chr(27)
+_ESCAPES = re.compile(_ESC + r"\[[0-9;?<>=]*[ -/]*[@-~]|" + _ESC + r"\][^\x07]*\x07|"
+                      + _ESC + r"[@-Z\\-_]")
 
 _LABELS = {
     "five_hour": "Five Hour Limit (5h)",
@@ -136,11 +142,75 @@ def weekly(usage: GeminiUsage | None) -> GeminiLimit | None:
     return next((l for l in usage.limits if l.key.startswith("seven_day")), None)
 
 
-def fetch_cli(timeout: float = 6.0) -> GeminiUsage | None:
-    """Shell out to `agy --print /usage` to fetch live Gemini rate-limit utilization."""
-    import re
-    import shutil
+def _read_usage(exe: str, timeout: float) -> str:
+    """Run `agy --print /usage` and return what it printed.
+
+    THE CHILD RUNS UNDER A PSEUDO-CONSOLE, and that is the fix for the terminal
+    window that kept flashing over the user's desktop. MEASURED from a
+    console-less pythonw parent (the app's own shape): a plain subprocess gives
+    the child ITS OWN CONSOLE (a conhost.exe child, every run), and Windows 11
+    can hand a newly created console to the default terminal app -- which fired
+    on roughly one poll in twenty as a real Windows Terminal frame. No creation
+    flag prevents it: CREATE_NO_WINDOW correctly asks for a windowless console
+    and the handoff happens to the console anyway, and DETACHED_PROCESS measured
+    WORSE (a console-subsystem child with no console gets one allocated on
+    demand, and that one is delegated too). A ConPTY client never gets a console
+    allocated at all, so there is nothing to hand off -- the same mechanism every
+    AI Hive agent already runs under without ever flashing a window.
+
+    Reads are blocking, so they run on their own thread: a CLI that hung would
+    otherwise park the poll for ever, leaving `_gemini_usage_inflight` set and
+    the pill frozen on its last reading.
+    """
     import subprocess
+    import threading
+
+    if os.name != "nt":
+        res = subprocess.run([exe, "--print", "/usage"], capture_output=True,
+                             text=True, timeout=timeout)
+        return res.stdout if res.returncode == 0 else ""
+
+    from winpty import PtyProcess
+
+    # wide enough that the table never wraps: on a terminal agy pretty-prints
+    # instead of emitting the tab-separated columns a pipe gets
+    proc = PtyProcess.spawn([exe, "--print", "/usage"], dimensions=(50, 400))
+    chunks: list[str] = []
+
+    def pump() -> None:
+        try:
+            while True:
+                data = proc.read(8192)
+                if not data:
+                    break
+                chunks.append(data)
+        except (EOFError, OSError, RuntimeError, ValueError):
+            pass
+
+    reader = threading.Thread(target=pump, daemon=True, name="gemini-usage")
+    reader.start()
+    reader.join(timeout)
+    cut_off = reader.is_alive()
+    try:
+        proc.close(force=True)
+    except Exception:
+        pass
+    if cut_off:
+        # the CLI never finished, so a half-printed table is not a reading:
+        # `headline()` falls back to the highest window it can see, which would
+        # put the WEEKLY number on the 5h pill rather than admit it can't read
+        return ""
+    return _ESCAPES.sub("", "".join(chunks)).replace("\r\n", "\n")
+
+
+def fetch_cli(timeout: float = 20.0) -> GeminiUsage | None:
+    """Read live Gemini rate-limit utilization from `agy --print /usage`.
+
+    The budget is generous because the pseudo-console read in `_read_usage`
+    costs a few seconds more than a pipe did; nothing waits on it but a
+    background thread.
+    """
+    import shutil
 
     exe = shutil.which("agy") or shutil.which("agy.exe")
     if not exe:
@@ -151,19 +221,16 @@ def fetch_cli(timeout: float = 6.0) -> GeminiUsage | None:
         return None
 
     try:
-        kwargs = {}
-        if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-        res = subprocess.run([exe, "--print", "/usage"], capture_output=True, text=True, timeout=timeout, **kwargs)
-        if res.returncode != 0 or not res.stdout:
-            return None
-    except (subprocess.SubprocessError, OSError):
-        return None
+        out = _read_usage(exe, timeout)
+    except Exception:
+        return None  # fetch() turns a missing reading into the can't-read pill
 
     now = time.time()
     limits_map: dict[str, GeminiLimit] = {}
-    for line in res.stdout.strip().splitlines():
-        parts = line.split("\t")
+    for line in out.strip().splitlines():
+        # a tab down a pipe, a run of padding spaces on a terminal; no field
+        # of its own contains more than a single space
+        parts = [p.strip() for p in re.split(r"\t|\s{2,}", line.strip()) if p.strip()]
         if len(parts) >= 4:
             group, limit_name, rem_str, reset_str = parts[0], parts[1], parts[2], parts[3]
             if "gemini" not in group.lower():

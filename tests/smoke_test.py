@@ -10625,15 +10625,13 @@ def test_gemini_usage_poll_is_slower_than_claudes():
     """Gemini rides its OWN, much slower poll clock, because each tick spawns a
     process rather than making a request.
 
-    `gemini_usage.fetch()` shells out to `agy`, and on some runs agy starts a
-    nested helper that asks Windows for its own console. CREATE_NO_WINDOW is
-    passed and is not enough -- spawn flags do not reach a grandchild, measured
-    8/8 visible windows under CREATE_NO_WINDOW, CREATE_NEW_CONSOLE+SW_HIDE and
-    CREATE_NO_WINDOW+SW_HIDE alike -- so with Windows 11 delegating to Windows
-    Terminal a real window flashes over the user's screen on ~6% of polls. No
-    flag suppresses it; asking less often is the only lever, and it is nearly
-    free because only the two pills consume this reading (a Gemini cut-off
-    recovers on its own printed countdown, never on the account reading).
+    `gemini_usage.fetch()` runs a whole CLI (`agy --print /usage`), which costs
+    seconds of a background thread where a Claude tick costs one request. The
+    console window that used to flash on ~1 poll in 20 is fixed at source now
+    (see test_gemini_usage_reads_via_pseudoconsole), so the process cost is what
+    this cadence rations -- and rationing it is nearly free, because only the two
+    pills consume this reading (a Gemini cut-off recovers on its own printed
+    countdown, never on the account reading).
 
     This check exists so nobody "tidies" the Gemini timer back onto
     USAGE_POLL_MS, which is answerable to planLimitReached and the reset poll
@@ -10707,6 +10705,81 @@ def test_gemini_usage_poll_is_slower_than_claudes():
         win.close()
     finally:
         gemini_usage.fetch = real
+
+
+def test_gemini_usage_reads_via_pseudoconsole():
+    """The usage poll must not spawn a child with a console of its own.
+
+    MEASURED from a console-less pythonw parent (the app's own shape): a plain
+    subprocess gives the child its own console every run, and Windows 11 can
+    hand a newly created console to the default terminal app -- observed as a
+    real, visible Windows Terminal frame on roughly one poll in twenty, which is
+    the terminal window the user kept seeing flash over the desktop. No creation
+    flag prevents it (CREATE_NO_WINDOW asks for a windowless console and the
+    handoff happens anyway; DETACHED_PROCESS measured worse), so the read runs
+    under a pseudo-console instead: a ConPTY client never has a console
+    allocated for it, so there is nothing to hand off.
+
+    That change has a consequence worth guarding: on a terminal the CLI
+    pretty-prints its quota table with padded columns instead of the
+    tab-separated one a pipe gets, so a parser that only knew tabs would leave
+    every Gemini pill unreadable. Both samples below are real captured output."""
+    import shutil
+    import subprocess
+
+    from app import gemini_usage
+
+    piped = ("Gemini Models\tWeekly Limit Remaining\t100%\t2026-08-25T10:58:17Z\n"
+             "Gemini Models\tFive Hour Limit Remaining\t42%\t2026-08-20T16:52:27Z\n"
+             "Claude and GPT models\tWeekly Limit Remaining\t100%\t"
+             "2026-08-27T11:52:27Z\n")
+    terminal = gemini_usage._ESCAPES.sub("", (
+        "\x1b[1t\x1b[c\x1b[?1004h\x1b[?9001hQuota:\r\n"
+        "Gemini Models          Weekly Limit Remaining     100%  "
+        "2026-08-25T10:58:17Z\r\n"
+        "Gemini Models          Five Hour Limit Remaining   42%  "
+        "2026-08-20T16:52:27Z\r\n"
+        "Claude and GPT models  Weekly Limit Remaining     100%  "
+        "2026-08-27T11:52:27Z\r\n")).replace("\r\n", "\n")
+
+    real_read, real_which = gemini_usage._read_usage, shutil.which
+    shutil.which = lambda name: "agy.exe"
+    try:
+        for label, text in (("piped", piped), ("terminal", terminal)):
+            gemini_usage._read_usage = lambda exe, t, _t=text: _t
+            usage = gemini_usage.fetch_cli()
+            five = next((l for l in (usage.limits if usage else ())
+                         if l.key == "five_hour"), None)
+            week = next((l for l in (usage.limits if usage else ())
+                         if l.key == "seven_day"), None)
+            check("gemini-console: " + label + " output reads 58% of the 5h window used",
+                  five is not None and abs(five.percent - 58.0) < 0.01, five)
+            check("gemini-console: " + label + " output reads the weekly window too",
+                  week is not None and abs(week.percent - 0.0) < 0.01, week)
+    finally:
+        gemini_usage._read_usage, shutil.which = real_read, real_which
+
+    if os.name != "nt":
+        return
+
+    # ...and on Windows the read never goes near a plain subprocess, which is
+    # the whole point: that is the shape Windows gives a console of its own
+    spawned = []
+
+    def refuse(*a, **k):
+        spawned.append(a)
+        raise AssertionError("the usage read must not spawn a plain subprocess")
+
+    real_run, real_popen = subprocess.run, subprocess.Popen
+    subprocess.run, subprocess.Popen = refuse, refuse
+    try:
+        gemini_usage._read_usage("definitely-not-a-real-binary.exe", 0.2)
+    except Exception:
+        pass  # spawning a missing binary fails; only WHAT it tried matters here
+    finally:
+        subprocess.run, subprocess.Popen = real_run, real_popen
+    check("gemini-console: the Windows read never uses a plain subprocess",
+          spawned == [], spawned)
 
 
 def test_history_screen_wrapper_removed():
@@ -11518,6 +11591,7 @@ def main():
     test_history_screen_wrapper_removed()
     test_gemini_usage_polling_is_offthread_and_optin()
     test_gemini_usage_poll_is_slower_than_claudes()
+    test_gemini_usage_reads_via_pseudoconsole()
     test_projection_happens_once()
     test_recovered_prompts_are_cached()
     test_multi_agent_session_isolation()

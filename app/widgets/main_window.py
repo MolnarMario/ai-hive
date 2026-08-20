@@ -93,24 +93,20 @@ USAGE_TICK_MS = 20000
 USAGE_RESET_GRACE_MS = 8000
 
 # GEMINI IS POLLED ON A SEPARATE, MUCH SLOWER CLOCK, and the reason is not
-# request cost -- it is that this fetch SPAWNS A PROCESS. `gemini_usage.fetch()`
-# shells out to `agy --print /usage`, and on some runs agy starts a nested
-# helper that asks Windows for its OWN console. AI Hive passes CREATE_NO_WINDOW,
-# which is correct and not enough: spawn flags do not reach a GRANDCHILD.
-# Measured on a deterministic reproducer, a descendant that demands a console
-# gets a visible one 8/8 times under every combination tried -- plain
-# CREATE_NO_WINDOW, CREATE_NEW_CONSOLE + STARTUPINFO(SW_HIDE), and
-# CREATE_NO_WINDOW + STARTUPINFO(SW_HIDE) alike. With Windows 11 delegating to
-# Windows Terminal, that console materializes as a real window which flashes
-# over whatever the user is doing and closes a moment later. Live, it fired on
-# ~6% of polls (2 of 32), i.e. about every quarter hour at a 60s interval,
-# which is exactly often enough to be reported as "a terminal keeps popping up
-# and I can't read it".
+# request cost -- it is that this fetch SPAWNS A PROCESS where a Claude tick
+# makes a request. `gemini_usage.fetch()` runs `agy --print /usage`, which
+# measures several seconds of a background thread and a whole CLI's startup.
 #
-# So there is no flag to fix this with, and the only lever left is asking less
-# often. That is nearly free here, unlike on the Claude side: NOTHING consumes
-# this reading except the two pills. A Gemini cut-off recovers on the countdown
-# its own banner printed, never on the account reading (see the limit
+# It used to cost more than that: the spawned child got a console of its own,
+# which Windows 11 sometimes handed to the default terminal app, flashing a real
+# window over the user's screen on ~1 poll in 20. That is FIXED AT SOURCE now
+# (`gemini_usage._read_usage` runs the CLI under a pseudo-console, which is
+# never allocated a console to hand off), so the slow clock no longer has a
+# flash to ration -- only the process cost, which is reason enough.
+#
+# Slowing this down stays nearly free, unlike on the Claude side: NOTHING
+# consumes this reading except the two pills. A Gemini cut-off recovers on the
+# countdown its own banner printed, never on the account reading (see the limit
 # invariant), so no edge is delayed by a slower poll -- only the number on a
 # pill, describing a 5-hour window that does not move far in five minutes.
 # Do NOT fold this back onto USAGE_POLL_MS: that constant is answerable to
@@ -119,8 +115,7 @@ USAGE_RESET_GRACE_MS = 8000
 GEMINI_USAGE_POLL_MS = 300000
 # The danger zone still buys a fresher READOUT, so it still exists -- but with
 # no cut-off edge hanging off it the way Claude's does, it has no reason to go
-# to Claude's 20s and every reason not to, each fast tick being another chance
-# to flash a console over the user's screen.
+# to Claude's 20s and every reason not to: each fast tick is another CLI launch.
 GEMINI_USAGE_URGENT_POLL_MS = 60000
 
 # The usage readouts the top bar can show, and the order they sit in. PER PILL
