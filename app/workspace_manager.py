@@ -160,31 +160,22 @@ class WorkspaceManager(QObject):
                 "idle": len(agents) - active - error}
 
     def next_agent_name(self, ws_id: str) -> str:
-        """Per-workspace numbering: each workspace counts Agent 1, 2, 3…"""
-        return self._next_numbered(ws_id, "Agent")
+        """Per-workspace numbering: each workspace counts Agent 1, 2, 3…,
+        monotonically (max + 1), so a name is never reused after a delete.
 
-    def _next_numbered(self, ws_id: str, base: str) -> str:
-        """A free name for 'base' in the workspace. 'Agent' keeps its historic
-        monotonic 'Agent N' = max+1 numbering; role names go bare then ' 2'."""
+        This used to be one half of a generic _next_numbered(base); the other
+        half minted role names ("Testing Agent 2") for the task-to-role
+        heuristic that has since been removed, and "Agent" is now the only base
+        there is.
+        """
         ws = self.workspace(ws_id)
         agents = ws.agents if ws else []
-        taken = {a.spec.name for a in agents}
-        if base == "Agent":
-            highest = 0
-            for name in taken:
-                m = _AGENT_NAME_RE.fullmatch(name)
-                if m:
-                    highest = max(highest, int(m.group(1)))
-            return f"Agent {highest + 1}"
-        if base not in taken:
-            return base
-        n = 2
-        while f"{base} {n}" in taken:
-            n += 1
-        return f"{base} {n}"
-
-    def assign_role_name(self, ws_id: str, role: str) -> str:
-        return self._next_numbered(ws_id, role or "Worker")
+        highest = 0
+        for a in agents:
+            m = _AGENT_NAME_RE.fullmatch(a.spec.name)
+            if m:
+                highest = max(highest, int(m.group(1)))
+        return f"Agent {highest + 1}"
 
     def resolve_agent(self, ident: str):
         """Find an agent by id or (case-insensitive) display name, any ws."""
@@ -395,22 +386,22 @@ class WorkspaceManager(QObject):
         agent.deleteLater()
 
     # -------------------------------------------------- task assignment ---
-    # The UI card buttons / dialogs drive these (e.g. the card "Reassign"
-    # action -> reassign_agent). They pick a role-based name + model/effort
-    # for a task via app.orchestration's heuristics.
+    # The UI dialogs drive these (e.g. the card "Assign / reassign a task..."
+    # action -> reassign_agent). Only spawn_worker still consults a heuristic,
+    # and only for the model/effort of a brand new agent; assigning a task to
+    # an EXISTING agent changes nothing about that agent except its task.
 
-    def spawn_worker(self, ws_id: str, task: str, role: str = "",
+    def spawn_worker(self, ws_id: str, task: str,
                      model: str = "", effort: str = "",
                      auto_created: bool = True) -> TerminalAgent | None:
-        """Create a NEW Claude worker with a role-based name + selected model,
-        and give it a task. Returns None if the workspace is at its cap."""
+        """Create a NEW Claude worker with a task-appropriate model and give it
+        the task. Returns None if the workspace is at its cap."""
         ws = self.workspace(ws_id)
         if ws is None:
             return None
-        role = role or orchestration.infer_role(task)
-        name = self.assign_role_name(ws_id, role)
-        model, effort = orchestration.resolve_model_effort(task, role, model, effort)
-        spec = build_spec(AgentKind.CLAUDE, name, role=role, cwd=ws.project_path,
+        name = self.next_agent_name(ws_id)
+        model, effort = orchestration.resolve_model_effort(task, model, effort)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=ws.project_path,
                           model=model, effort=effort)
         agent = self.add_terminal(ws_id, spec, autostart=True)
         if agent is None:
@@ -425,31 +416,27 @@ class WorkspaceManager(QObject):
         self._persist_now()
         return agent
 
-    def assign_task(self, ws_id: str, agent_id: str, task: str,
-                    role: str = "") -> bool:
+    def assign_task(self, ws_id: str, agent_id: str, task: str) -> bool:
         agent = self.agent(ws_id, agent_id) or self.resolve_agent(agent_id)
         if agent is None:
             return False
-        wid = self.workspace_of(agent.id)
-        wid = wid.id if wid else ws_id
-        # rename to reflect the (new) role unless the user gave a custom name
-        role = role or orchestration.infer_role(task)
-        if role and (agent.auto_created or agent.spec.role):
-            agent.set_role(self.assign_role_name(wid, role))
         agent.deliver_task(task)
         return True
 
-    def reassign_agent(self, agent_id: str, task: str, role: str = "") -> bool:
+    def reassign_agent(self, agent_id: str, task: str) -> bool:
         """Retask an idle/completed agent, preserving its session (no restart —
-        the task is typed into the existing pty)."""
+        the task is typed into the existing pty).
+
+        Assigning a task NEVER renames the agent. It used to: the task was run
+        through a keyword-matched role heuristic and the result became both the
+        role sublabel and (unless the user had renamed it by hand) the display
+        name, so one dialog silently relabelled the card twice over with a
+        guess."""
         agent = self.resolve_agent(agent_id)
         if agent is None:
             return False
-        wid = self.workspace_of(agent.id)
-        if wid is None:
+        if self.workspace_of(agent.id) is None:
             return False
-        role = role or orchestration.infer_role(task)
-        agent.set_role(self.assign_role_name(wid.id, role))
         if not agent.is_running():
             agent.start()
         agent.deliver_task(task)  # queued if (re)starting, else typed now
@@ -467,14 +454,15 @@ class WorkspaceManager(QObject):
     def _wire_agent(self, ws: Workspace, agent: TerminalAgent) -> None:
         # model-side connections; agent is deleteLater'd on removal so these
         # auto-disconnect. ws.id (a str) is safe to capture. Every one of
-        # these mutations is PERSISTED (running/task/assignment/role), so each
+        # these mutations is PERSISTED (running/task/assignment/name), so each
         # must also mark the session dirty — otherwise a reassignment or
         # completion is lost if the process dies before a graceful close.
+        # spec.role is NOT here: build_spec sets it once from the kind and
+        # nothing mutates it any more, so there is no signal to listen to.
         wid = ws.id
         agent.status_changed.connect(lambda *_: self._touch(wid))
         agent.task_changed.connect(lambda *_: self._touch(wid))
         agent.assignment_changed.connect(lambda *_: self._touch(wid))
-        agent.role_changed.connect(lambda *_: self._touch(wid))
         agent.name_changed.connect(lambda *_: self._touch(wid))
         agent.font_changed.connect(lambda *_: self.dirty.emit())
         # recovery (verify-before-resume) must never land on a peer's

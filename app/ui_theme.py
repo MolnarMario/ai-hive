@@ -207,6 +207,26 @@ DEFAULT_CONSOLE_PX = 13
 CONSOLE_FONT_PX = DEFAULT_CONSOLE_PX
 
 
+# ------------------------------------------------------------ vendor inks ---
+# The live model chip (#CardModel) is coloured by WHOSE agent it is, not by the
+# active skin -- so a hive of mixed agents is readable at a glance and the same
+# agent keeps the same ink after a theme switch. These are FIXED constants and
+# NOT `Palette` reads, for the same reason as ornaments.TASKBAR_WORKING: they
+# identify a vendor rather than decorate our chrome, and a vendor's colour does
+# not change when the user picks another skin. Both are lifted a couple of
+# steps in lightness from the vendor's own value (Claude's #d97757, Google's
+# #4285f4), because every skin's card running-head is dark -- including the
+# manuscript's ultramarine -- and the raw brand colours land at 3.8:1 and 3.3:1
+# there, under the 4.5:1 the theming invariant asks of chrome text. The lifted
+# pair clears 4.5:1 on all four running-heads while staying plainly Claude
+# terracotta and Google blue. A provider with no ink here keeps the default
+# gold-dim rule.
+PROVIDER_INK: dict[str, str] = {
+    "claude": "#df8b70",   # Claude terracotta
+    "gemini": "#72a4f7",   # Google blue
+}
+
+
 def apply_theme(theme_id: str) -> Theme:
     """Make `theme_id` the active skin: rewrite Palette / ANSI_16 / fonts in
     place. Returns the Theme. Unknown id falls back to the default."""
@@ -298,6 +318,9 @@ def build_qss(chrome_family: str = "Segoe UI", console_px: int | None = None) ->
     # string if the write failed -- the accent fill alone still reads as checked.
     _check_icon = _check_icon_path(p.ACCENT_GOLD)
     check_img = f'image: url("{_check_icon}");' if _check_icon else ""
+    # vendor inks for the model chip -- fixed, never skin-derived (PROVIDER_INK)
+    claude_ink = PROVIDER_INK["claude"]
+    gemini_ink = PROVIDER_INK["gemini"]
     return f"""
 * {{
     font-family: "{chrome_family}";
@@ -575,8 +598,12 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 }}
 #CardRole {{ color: {p.CARDHEAD_SUB}; font-size: 11px; }}
 /* live model + effort ("Opus 5 . high"), a shade brighter than the role so it
-   reads as state rather than another label */
+   reads as state rather than another label. The colour is the VENDOR's, set
+   from the `provider` property and held across every skin (see PROVIDER_INK);
+   a provider with no ink falls through to this gold-dim base. */
 #CardModel {{ color: {p.ACCENT_GOLD_DIM}; font-size: 11px; font-weight: 700; }}
+#CardModel[provider="claude"] {{ color: {claude_ink}; }}
+#CardModel[provider="gemini"] {{ color: {gemini_ink}; }}
 #CardTaskSummary {{ color: {p.CARDHEAD_SUB}; font-size: 13px; font-style: italic; }}
 #CardTokens {{
     color: {p.CARDHEAD_SUB}; font-size: 10px; font-weight: 700;
@@ -670,6 +697,9 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
    specificity) */
 #CardFontDec, #CardFontInc {{ font-size: 12px; font-weight: 700; }}
 #CardMaximize {{ font-size: 16px; }}
+/* the collapsed stand-in for A-/A+/maximize: faint enough to read as chrome,
+   visible enough to say "there is something here to hover" */
+#CardToolsHint {{ color: {p.CARDHEAD_SUB}; font-size: 13px; }}
 #WsDelete {{ color: {p.TEXT}; font-size: 17px; font-weight: 900; }}
 #GlobalFontBtn {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;

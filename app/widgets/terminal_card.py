@@ -11,14 +11,15 @@ import datetime
 import re
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import (QAction, QColor, QDrag, QPainter, QPixmap,
+from PySide6.QtGui import (QAction, QColor, QCursor, QDrag, QPainter, QPixmap,
                            QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
-                               QPlainTextEdit, QToolButton, QVBoxLayout)
+                               QPlainTextEdit, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from .. import scheduled_send, transcripts, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
-from ..process_worker import describe_pid
+from ..process_worker import AI_KINDS, describe_pid
 from ..terminal_agent import (STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
                               TerminalAgent)
 from ..ui_theme import Palette, repolish
@@ -225,6 +226,72 @@ class _CardHeader(QFrame):
         event.accept()
 
 
+class _HeaderTools(QWidget):
+    """The header's secondary buttons (A- / A+ / maximize), collapsed to a
+    narrow strip until the pointer is over them.
+
+    They cost ~100px of every header for actions that all have keyboard
+    equivalents, and that width comes straight out of the task summary, which
+    is the thing that tells two agents apart on a split screen. Collapsing
+    them gives it back without hiding them anywhere the user has to go
+    looking for.
+
+    The container sits just LEFT of the usage chip, and the summary carries
+    the layout stretch, so expanding takes its width from the summary alone:
+    nothing to the right of this widget moves as the pointer crosses it.
+
+    Qt sends Leave to a parent when the pointer enters one of its children, so
+    a naive leaveEvent would hide the buttons the instant the user reached for
+    one. The close is therefore deferred by one turn of the event loop and
+    checked against the real cursor position, which is inside this widget's
+    rect for as long as the pointer is over any of its children."""
+
+    _HINT_W = 14
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._open = False
+        self._buttons = []
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self.hint = QLabel("⋯", self)   # midline horizontal ellipsis
+        self.hint.setObjectName("CardToolsHint")
+        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.hint.setFixedWidth(self._HINT_W)
+        self.hint.setToolTip("Font size and maximize")
+        lay.addWidget(self.hint)
+
+    def add(self, btn) -> None:
+        btn.hide()
+        self._buttons.append(btn)
+        self.layout().addWidget(btn)
+
+    def _set_open(self, on: bool) -> None:
+        if on == self._open:
+            return
+        self._open = on
+        self.hint.setVisible(not on)
+        for b in self._buttons:
+            b.setVisible(on)
+
+    def enterEvent(self, event):
+        self._set_open(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        QTimer.singleShot(0, self._recheck)
+        super().leaveEvent(event)
+
+    def _recheck(self) -> None:
+        try:
+            inside = self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+        except RuntimeError:      # widget went away under the timer
+            return
+        if not inside:
+            self._set_open(False)
+
+
 class TerminalCard(QFrame):
     closeRequested = Signal(str)     # agent id
     focusGained = Signal(object)     # self
@@ -362,14 +429,31 @@ class TerminalCard(QFrame):
         self.title_edit = QLineEdit(self.agent.spec.name, header)
         self.title_edit.setObjectName("CardTitleEdit")
         self.title_edit.hide()
-        self.role = QLabel((self.agent.spec.role or "").replace(" (Antigravity CLI)", ""), header)
+        # What this agent RUNS: "PowerShell", "cmd", "python foo.py". Set once
+        # by build_spec from the kind and never mutated (the task-to-role
+        # heuristic that used to rewrite it, and rename the agent with it, is
+        # gone). It is hidden on an AI agent, where it only ever said the
+        # provider name ("Claude Code") that #CardModel says better and more
+        # precisely one widget to its right -- and where the 128px it cost
+        # (121px of text in the chrome serif at 11px, plus the 7px layout gap,
+        # MEASURED) came straight out of the summary, which is the thing that
+        # tells two agents apart on a split screen.
+        self.role = QLabel(self._kind_label(), header)
         self.role.setObjectName("CardRole")
+        self.role.setVisible(bool(self.role.text()))
         # what the agent is RUNNING ON right now. The user can change both from
         # inside the terminal (/model, /effort), so this follows the live
         # conversation rather than the launch flags; hidden when unknown, which
         # is every non-AI shell.
         self.model_label = QLabel("", header)
         self.model_label.setObjectName("CardModel")
+        # WHOSE agent this is, as a QSS property: the chip is inked in the
+        # vendor's own colour (ui_theme.PROVIDER_INK) rather than the skin's,
+        # so Claude reads terracotta and Gemini blue under every theme and two
+        # providers side by side are tellable apart without reading the model
+        # name. The kind never changes for an agent, so this is set once here
+        # and never repolished. A kind with no ink keeps the gold-dim default.
+        self.model_label.setProperty("provider", AI_KINDS.get(self.agent.spec.kind, ""))
         self.model_label.hide()
         # "the usage limit stopped this agent" marker. Visible for as long as
         # the cut-off is latched, so an interrupted agent is identifiable at a
@@ -421,27 +505,38 @@ class TerminalCard(QFrame):
         hl.addWidget(self.bg_mark)
         hl.addWidget(self.sched_mark)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
-        hl.addWidget(self.token_label)
 
-        def tool(text, obj_name, tip):
-            b = QToolButton(header)
+        def tool(text, obj_name, tip, owner=None):
+            b = QToolButton(owner or header)
             b.setText(text)
             b.setObjectName(obj_name)
             b.setToolTip(tip)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
-            hl.addWidget(b)
             return b
 
         # Only the buttons worth their width live here. Start / Stop / Restart /
         # Assign moved to the header's right-click menu: the terminal itself is
         # how this app is driven (any keystroke wakes a stopped card), so those
         # four were spending ~130px of every header on actions nobody clicks.
-        self.btn_font_dec = tool("A−", "CardFontDec", "Smaller font (Ctrl+-)")
-        self.btn_font_inc = tool("A+", "CardFontInc", "Larger font (Ctrl+=)")
+        # The three that remain are hover-revealed (see _HeaderTools): each has
+        # a keyboard equivalent, so their idle width belongs to the summary.
+        self.header_tools = _HeaderTools(header)
+        self.btn_font_dec = tool("A−", "CardFontDec", "Smaller font (Ctrl+-)",
+                                 self.header_tools)
+        self.btn_font_inc = tool("A+", "CardFontInc", "Larger font (Ctrl+=)",
+                                 self.header_tools)
         # solo/restore this card in the workspace grid — a pure view toggle;
         # never touches sibling processes (see WorkspacePage.toggle_solo)
-        self.btn_max = tool("⤢", "CardMaximize", "Maximize (focus this agent)")
+        self.btn_max = tool("⤢", "CardMaximize", "Maximize (focus this agent)",
+                            self.header_tools)
+        for _b in (self.btn_font_dec, self.btn_font_inc, self.btn_max):
+            self.header_tools.add(_b)
+        hl.addWidget(self.header_tools)
+        # the usage chip sits between the collapsed tools and the close button,
+        # so the strip that reveals them is the space to the chip's LEFT
+        hl.addWidget(self.token_label)
         self.btn_close = tool("✕", "CardClose", "Close terminal")
+        hl.addWidget(self.btn_close)
 
         root.addWidget(header)
         if self.is_pty:
@@ -493,7 +588,6 @@ class TerminalCard(QFrame):
         self.agent.status_changed.connect(self._on_status)
         self.agent.activity_changed.connect(self._on_activity)
         self.agent.assignment_changed.connect(self._on_assignment)
-        self.agent.role_changed.connect(self._on_role)
         self.agent.name_changed.connect(self._on_name)
         self.agent.task_changed.connect(self._on_task)
         self.agent.summary_changed.connect(self._on_task)  # incl. live AI title
@@ -628,7 +722,6 @@ class TerminalCard(QFrame):
         pairs = [(self.agent.status_changed, self._on_status),
                  (self.agent.activity_changed, self._on_activity),
                  (self.agent.assignment_changed, self._on_assignment),
-                 (self.agent.role_changed, self._on_role),
                  (self.agent.name_changed, self._on_name),
                  (self.agent.task_changed, self._on_task),
                  (self.agent.summary_changed, self._on_task),
@@ -674,11 +767,16 @@ class TerminalCard(QFrame):
         self.btn_close.setToolTip(
             "Close terminal (agents never close on their own, you decide)")
 
-    def _on_role(self, _name: str) -> None:
-        # the title tracks spec.name (which set_role leaves alone once the user
-        # has manually renamed); only the role sublabel follows the emitted role
-        self.title.setText(self.agent.spec.name)
-        self.role.setText((self.agent.spec.role or "").replace(" (Antigravity CLI)", ""))
+    def _kind_label(self) -> str:
+        """The header's kind sublabel, or "" when it would say nothing new.
+
+        An AI agent gets "": spec.role holds the provider display name there,
+        which is redundant beside the live model chip. Everything else keeps
+        its descriptor, since a shell has no model chip to read instead.
+        """
+        if self.agent.spec.kind in AI_KINDS:
+            return ""
+        return (self.agent.spec.role or "").replace(" (Antigravity CLI)", "")
 
     def _on_name(self, name: str) -> None:
         self.title.setText(name)

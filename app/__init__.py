@@ -9,4 +9,4 @@
 # BUMP THIS ON EVERY PR MERGED TO main — the version must always increase, and
 # there is no CI check enforcing that yet (see CLAUDE.md's Conventions
 # section), so it is on you, not a bot, to remember it before merging.
-__version__ = "0.16.5"
+__version__ = "0.17.2"

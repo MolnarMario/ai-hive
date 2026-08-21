@@ -77,9 +77,13 @@ PTY_ONLY_KINDS = {AgentKind.CLAUDE, AgentKind.OPENAI, AgentKind.GEMINI,
 class AgentSpec:
     kind: AgentKind
     name: str
+    # what this agent RUNS, for the card header's sublabel: the provider
+    # display name for an AI kind, else "PowerShell" / "cmd" / "python x.py".
+    # build_spec sets it once; nothing mutates it afterwards. (It used to also
+    # carry a guessed role -- "Testing Agent" -- inferred from the assigned
+    # task, which renamed the agent as a side effect. That is gone.)
     role: str = ""
-    # user manually renamed the display name: a retask (set_role) then updates
-    # only the role, never clobbers the chosen name
+    # the display name was chosen by the user, not generated as "Agent N"
     custom_name: bool = False
     program: str = ""
     args: list = field(default_factory=list)

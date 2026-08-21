@@ -63,7 +63,7 @@ workspaces keep executing — switching never pauses anything.
   reading its terminal. The same summary shows in the terminal card header,
   where it fits itself to whatever width the row leaves (full text on hover).
 - **Live model, effort and mode on every card** — the header says what the
-  agent is *actually* running, e.g. `Opus 5 · high · plan`, right of its role.
+  agent is *actually* running, e.g. `Opus 5 · high · plan`, right of its name.
   All three are yours to change from inside the terminal (`/model`, `/effort`,
   and `Shift+Tab` for the permission mode), so the readout follows the live
   conversation rather than the flags the agent launched with, and updates a
@@ -521,10 +521,11 @@ awareness* below).
 - **Workspace-scoped** — each agent's mcp config carries its workspace id
   (`AIHIVE_WS`), echoed with every call and enforced GUI-side, so a note always
   lands on the right workspace's board and never crosses into another's.
-- **Dynamic role names** — when you reassign a card, the agent is auto-named for
-  its task (Backend Architect, Database Engineer, Testing Agent, …) and renames
-  as the task changes.
-- **Intelligent model/effort** — a reassigned task auto-selects a model + effort
+- **Your names stay yours** — assigning a task never renames an agent. Earlier
+  versions ran the task through a keyword-to-role heuristic (Backend Architect,
+  Testing Agent, …) and renamed the card to the guess, which also printed the
+  same string twice in the header. Both are gone; only you rename an agent.
+- **Intelligent model/effort** — a new spawned worker auto-selects a model + effort
   (trivial → Haiku/low, mid → Sonnet/medium, architecture → Opus/high); never
   auto-uses top-tier/max. Explicit picks always override. **Ultracode** appears
   in the effort dropdown but greyed out — it's an in-session mode you enable
@@ -533,8 +534,8 @@ awareness* below).
   in the grid so you can review its work, continue the conversation, or retask
   it. Only you close an agent.
 - **Reassign anywhere** — right-click any card header and pick **Assign /
-  reassign a task** to hand it fresh work (role/model adapt) without losing
-  the session.
+  reassign a task** to hand it fresh work without losing the session. Its name,
+  model and effort are left exactly as you set them.
 
 ## Shared agent awareness
 
@@ -578,7 +579,7 @@ Hard-won rules, each with a regression test:
 
 - **Nothing structural is ever only-in-memory.** Adding or removing an agent
   or workspace saves the session *immediately* — a crash or force-kill cannot
-  lose a just-created agent. Metadata changes (task, assignment, role, run
+  lose a just-created agent. Metadata changes (task, assignment, name, run
   state, fonts) mark the session dirty and save on a short debounce. A
   periodic **safety-net autosave**
   re-writes only when the live state has diverged from disk, so even a missed
@@ -702,16 +703,16 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1771 checks drive the real app headlessly (offscreen Qt platform) with real
+1782 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
 trips, the ConPTY path (interactive prompt, Ctrl+C, retention), every v2
 feature (provider flags, per-workspace numbering, the agent-count badge,
 explicit grids, folder changes, fonts, the shared board), task assignment
-(role naming, model/effort selection, the named-pipe `log_activity` MCP
-round-trip, workspace-scoped board notes), inline agent rename in the
-card header (double-click; a custom name survives a retask) plus
+(model/effort selection, a retask never renaming the agent, the named-pipe
+`log_activity` MCP round-trip, workspace-scoped board notes), inline agent
+rename in the card header (double-click) plus
 a per-agent task summary beside the name, the per-card maximize/restore toggle
 (solo one agent full-area without touching any sibling's process, then restore
 the exact prior tiling), the context-window usage badge beside the summary
@@ -730,7 +731,7 @@ Ctrl+Shift+Enter gesture sending nothing to the child, delivery by nudge so an
 assignment is never overwritten, a refusal retried then given up on as missed,
 the countdown tick never marking the session dirty, and a message that came due
 while the app was closed coming back missed rather than firing late), the live
-model/effort/permission-mode readout beside the agent's role
+model/effort/permission-mode readout beside the agent's name
 (normalising `claude-opus-5` to "Opus 5", merging the last turn's model with a
 mid-session `/model` or `/effort` pick, reading the Shift+Tab mode off the
 transcript's permission-mode records and writing it back so a reopened agent
@@ -789,7 +790,7 @@ app/
   ansi_parser.py           stateful SGR parser (line-console rendering)
   providers.py             AI provider registry (Claude + Gemini/agy + Grok wired; OpenAI template)
   coordination.py          per-workspace shared board (.aihive/board.md)
-  orchestration.py         task → role + task → model/effort heuristics (Qt-free)
+  orchestration.py         task → model/effort heuristic (Qt-free)
   process_worker.py        QProcess engine, HybridDecoder, WinJob (line mode)
   pty_worker.py            ConPTY engine via pywinpty (full-terminal mode)
   terminal_agent.py        per-terminal model (worker + log/buffer + lifecycle)
@@ -824,7 +825,7 @@ app/
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1771 checks)
+tests/smoke_test.py        headless end-to-end suite (1782 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
