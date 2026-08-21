@@ -10516,6 +10516,60 @@ def test_recovered_prompts_are_cached():
         transcripts.typed_prompts = real
 
 
+def test_gemini_usage_read_disables_agy_auto_update():
+    """The terminal window that flashed over the desktop during a Gemini poll
+    was agy's OWN auto-updater, not any console AI Hive creates.
+
+    Measured chain: `agy --print /usage` spawns `agy --bg-updater`, which spawns
+    `agy --version`, which gets its own console two levels below us; Windows 11
+    hands that console to the default terminal app and shows a real 1199x616
+    frame for ~280ms. Creation flags never reach a grandchild, so the only lever
+    is asking agy not to run the updater at all. The value is compared as a
+    STRING by agy: "1" and "TRUE" were both tested live and both still flashed.
+    """
+    import os
+    from app import gemini_usage
+
+    check("gemini env: the exact lowercase literal agy compares against",
+          gemini_usage.AUTO_UPDATE_OFF ==
+          {"AGY_CLI_DISABLE_AUTO_UPDATE": "true"},
+          gemini_usage.AUTO_UPDATE_OFF)
+
+    seen = {}
+
+    class _Res:
+        returncode = 0
+        stdout = ""
+
+    import subprocess
+    real = subprocess.run
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        seen["kw"] = kw
+        return _Res()
+
+    subprocess.run = fake_run
+    try:
+        gemini_usage._read_usage("agy.exe", 8.0)
+    finally:
+        subprocess.run = real
+
+    env = seen["kw"].get("env") or {}
+    check("gemini env: the usage read passes the disable flag to the child",
+          env.get("AGY_CLI_DISABLE_AUTO_UPDATE") == "true", env.get(
+              "AGY_CLI_DISABLE_AUTO_UPDATE"))
+    check("gemini env: it INHERITS the rest of the environment rather than "
+          "replacing it (agy needs PATH/APPDATA to find its own state)",
+          all(env.get(k) == v for k, v in os.environ.items()), len(env))
+    check("gemini env: os.environ itself is never mutated, so the user's own "
+          "agy sessions keep auto-updating",
+          "AGY_CLI_DISABLE_AUTO_UPDATE" not in os.environ)
+    if os.name == "nt":
+        check("gemini env: CREATE_NO_WINDOW stays for the child we DO control",
+              seen["kw"].get("creationflags", 0) & 0x08000000)
+
+
 def test_gemini_usage_polling_is_offthread_and_optin():
     """The Gemini readout must never block the GUI thread, and must never poll
     unless main.py asks for it.
@@ -10627,9 +10681,10 @@ def test_gemini_usage_poll_is_slower_than_claudes():
 
     `gemini_usage.fetch()` runs a whole CLI (`agy --print /usage`), which costs
     seconds of a background thread where a Claude tick costs one request. The
-    console window that used to flash on ~1 poll in 20 is fixed at source now
-    (see test_gemini_usage_reads_via_pseudoconsole), so the process cost is what
-    this cadence rations -- and rationing it is nearly free, because only the two
+    console window that flashes on ~1 poll in 20 comes from a nested helper agy
+    starts two levels below us, where no creation flag reaches (see
+    gemini_usage._read_usage), so the cadence is the only lever AI Hive has over
+    it -- and pulling it is nearly free, because only the two
     pills consume this reading (a Gemini cut-off recovers on its own printed
     countdown, never on the account reading).
 
@@ -10707,25 +10762,25 @@ def test_gemini_usage_poll_is_slower_than_claudes():
         gemini_usage.fetch = real
 
 
-def test_gemini_usage_reads_via_pseudoconsole():
-    """The usage poll must not spawn a child with a console of its own.
+def test_gemini_usage_reads_both_cli_output_shapes():
+    """The quota table parses whether the CLI printed it to a pipe or a terminal.
 
-    MEASURED from a console-less pythonw parent (the app's own shape): a plain
-    subprocess gives the child its own console every run, and Windows 11 can
-    hand a newly created console to the default terminal app -- observed as a
-    real, visible Windows Terminal frame on roughly one poll in twenty, which is
-    the terminal window the user kept seeing flash over the desktop. No creation
-    flag prevents it (CREATE_NO_WINDOW asks for a windowless console and the
-    handoff happens anyway; DETACHED_PROCESS measured worse), so the read runs
-    under a pseudo-console instead: a ConPTY client never has a console
-    allocated for it, so there is nothing to hand off.
+    Both samples below are real captured output. Down a pipe agy separates its
+    columns with TABS; on a terminal it pretty-prints, padding columns with runs
+    of spaces, adding a "Quota:" heading, ending lines with CRLF and wrapping
+    the lot in escape sequences.
 
-    That change has a consequence worth guarding: on a terminal the CLI
-    pretty-prints its quota table with padded columns instead of the
-    tab-separated one a pipe gets, so a parser that only knew tabs would leave
-    every Gemini pill unreadable. Both samples below are real captured output."""
+    The terminal shape is not hypothetical, and the reason it is guarded is a
+    MEASURED DEAD END worth not repeating. The usage read briefly ran under a
+    pseudo-console, to stop Windows giving the child a console of its own that
+    Windows 11 could hand to the default terminal app (the window that flashes
+    over the desktop). It fixed nothing: agy starts a NESTED HELPER that asks
+    for its own console two levels down, where creation flags cannot reach --
+    and pywinpty needs a console to build a pty from, which a pythonw app does
+    not have, so every poll had Windows allocate one FOR AI HIVE (44 leaked
+    conhost children in one session, and that allocation's own window was caught
+    being shown). See `gemini_usage._read_usage`."""
     import shutil
-    import subprocess
 
     from app import gemini_usage
 
@@ -10752,34 +10807,12 @@ def test_gemini_usage_reads_via_pseudoconsole():
                          if l.key == "five_hour"), None)
             week = next((l for l in (usage.limits if usage else ())
                          if l.key == "seven_day"), None)
-            check("gemini-console: " + label + " output reads 58% of the 5h window used",
+            check("gemini-shape: " + label + " output reads 58% of the 5h window used",
                   five is not None and abs(five.percent - 58.0) < 0.01, five)
-            check("gemini-console: " + label + " output reads the weekly window too",
+            check("gemini-shape: " + label + " output reads the weekly window too",
                   week is not None and abs(week.percent - 0.0) < 0.01, week)
     finally:
         gemini_usage._read_usage, shutil.which = real_read, real_which
-
-    if os.name != "nt":
-        return
-
-    # ...and on Windows the read never goes near a plain subprocess, which is
-    # the whole point: that is the shape Windows gives a console of its own
-    spawned = []
-
-    def refuse(*a, **k):
-        spawned.append(a)
-        raise AssertionError("the usage read must not spawn a plain subprocess")
-
-    real_run, real_popen = subprocess.run, subprocess.Popen
-    subprocess.run, subprocess.Popen = refuse, refuse
-    try:
-        gemini_usage._read_usage("definitely-not-a-real-binary.exe", 0.2)
-    except Exception:
-        pass  # spawning a missing binary fails; only WHAT it tried matters here
-    finally:
-        subprocess.run, subprocess.Popen = real_run, real_popen
-    check("gemini-console: the Windows read never uses a plain subprocess",
-          spawned == [], spawned)
 
 
 def test_history_screen_wrapper_removed():
@@ -11589,9 +11622,10 @@ def main():
     test_reply_marks_inline()
     test_reply_marks_recovered_from_transcript()
     test_history_screen_wrapper_removed()
+    test_gemini_usage_read_disables_agy_auto_update()
     test_gemini_usage_polling_is_offthread_and_optin()
     test_gemini_usage_poll_is_slower_than_claudes()
-    test_gemini_usage_reads_via_pseudoconsole()
+    test_gemini_usage_reads_both_cli_output_shapes()
     test_projection_happens_once()
     test_recovered_prompts_are_cached()
     test_multi_agent_session_isolation()

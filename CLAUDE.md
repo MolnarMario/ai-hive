@@ -1052,33 +1052,47 @@ this file is the invariants that must survive every change.
   those back to an inline `fetch()`. AND IT RIDES ITS OWN, MUCH SLOWER CLOCK
   (`GEMINI_USAGE_POLL_MS` 5 min / `GEMINI_USAGE_URGENT_POLL_MS` 60s), because
   every Gemini tick SPAWNS A PROCESS where a Claude tick makes a request.
-  THE CONSOLE WINDOW THAT USED TO FLASH IS NOW CLOSED AT SOURCE, and the earlier
-  diagnosis here (a nested helper of `agy` demanding its own console, which no
-  spawn flag could reach) was WRONG: MEASURED from a console-less pythonw parent
-  — the app's own shape — `subprocess` gives the CHILD ITSELF a console of its
-  own (a `conhost.exe` child, 5/5 runs), and Windows 11 can hand a newly created
-  console to the default terminal app. A poll that flashed produced a whole
-  `WindowsTerminal.exe` with a visible `CASCADIA_HOSTING_WINDOW_CLASS` frame AND
-  a `PseudoConsoleWindow` inside `agy.exe` — the signature of a console client
-  being re-hosted by Windows Terminal, i.e. OUR console being delegated. Rate
-  measured at 1 in 20 polls single-file and 1 in 72 under concurrency, matching
-  the live report. `CREATE_NO_WINDOW` is not the bug (it correctly asks for a
-  windowless console; the handoff happens to the console anyway) and no other
-  flag is the cure — `DETACHED_PROCESS` measured WORSE, a console-subsystem
-  child with no console gets one allocated on demand and THAT one is delegated
-  too (3/3 runs), and a hidden desktop does not help because the terminal is
-  COM-activated onto the interactive desktop. So `gemini_usage._read_usage` runs
-  the CLI under a PSEUDO-CONSOLE (pywinpty, the same mechanism every agent
-  already uses): a ConPTY client never has a console allocated for it, so there
-  is nothing to hand off — measured 4/4 console objects the old way, 0/4 the new
-  way. TWO consequences ride along and must not be undone: on a terminal `agy`
-  PRETTY-PRINTS its quota table (padded columns, a "Quota:" heading, CRLF,
-  escape sequences) instead of the tab-separated one a pipe gets, so the parser
-  splits on "a tab OR two-plus spaces" and the output is escape-stripped; and
-  pty reads BLOCK, so they run on their own thread with a join timeout — a hung
-  CLI would otherwise leave `_gemini_usage_inflight` set and freeze the pill for
-  the life of the process. The slow clock therefore no longer rations a flash,
-  only the process cost — which is still reason enough, and still nearly free:
+  THE CONSOLE WINDOW THAT FLASHED OVER THE DESKTOP WAS AGY'S OWN AUTO-UPDATER,
+  and it is FIXED at the source (`gemini_usage.AUTO_UPDATE_OFF`) after three
+  rounds of measurement blamed the wrong process twice. THE CHAIN, captured live
+  with a global `SetWinEventHook` over console/CASCADIA window CREATE+SHOW:
+  `agy --print /usage` spawns `agy --bg-updater`, which spawns `agy --version`,
+  and THAT great-grandchild gets its own console two levels below us; Windows 11
+  hands it to the default terminal app, which shows a real 1199x616
+  `CASCADIA_HOSTING_WINDOW_CLASS` frame for ~280ms, titled with the agy path.
+  OUR OWN CHILD'S CONSOLE WAS NEVER ONCE SHOWN — `CREATE_NO_WINDOW` was already
+  doing its job, and it stays — so every fix aimed at the console WE create was
+  aimed at the wrong window. Creation flags are captured at `CreateProcess` and
+  never reach a grandchild, so no flag could ever have worked. The fix is to ask
+  agy not to run the updater at all: `AGY_CLI_DISABLE_AUTO_UPDATE`, passed in
+  the subprocess `env` alone and NEVER into `os.environ`, so the user's own agy
+  sessions keep updating themselves (a usage READ has no business replacing a
+  285 MB binary, and CLAUDE.md's own CLI-upgrade invariant says a live child is
+  exactly when not to). THE VALUE MUST BE THE LOWERCASE LITERAL `"true"`: agy
+  compares the string rather than parsing a bool, and `"1"` and `"TRUE"` were
+  both tested live and both still flashed. THE REPRODUCER IS THE OTHER HALF OF
+  THIS, and without it nothing here is testable: the updater is time-gated, so
+  it fires on maybe 1 poll in 20, but backdating
+  `~/.gemini/antigravity-cli/last_check.timestamp` forces the check on the very
+  next run. Alternating with the updater forced every time: 4/4 controls spawned
+  `--bg-updater` and showed the window, 4/4 runs with the variable spawned
+  neither, and the suppressed runs were ~2s faster since they skip the network
+  check. Verified again end to end through `fetch_cli()` itself (control flashed,
+  two patched runs produced no updater, no window, and real usage data). TWO
+  DEAD ENDS, both shipped or measured, do not spend a fourth round on either:
+  `DETACHED_PROCESS` measured WORSE (a console-subsystem child with no console
+  gets one allocated on demand and THAT one is delegated too, 3/3 runs), and
+  RUNNING THE CLI UNDER A PSEUDO-CONSOLE was shipped and REVERTED — it removes
+  the console we create, which was never the one flashing, and pywinpty needs a
+  console to build a pty from while AI HIVE HAS NONE (pythonw), so every poll
+  had Windows allocate one FOR US: 44 leaked `conhost.exe` children in a single
+  session, one per poll, its own `ConsoleWindowClass` window caught being SHOWN.
+  That measurement missed the leak because it ran from a console-ATTACHED
+  parent, which already had a console to borrow; any future console measurement
+  MUST run from pythonw. The machine's default terminal app remains a lever
+  nobody needs now (every visible flash observed was a `WindowsTerminal.exe`
+  frame; a classic conhost console was never once seen visible) and it is the
+  user's setting, not ours to change. The slow cadence stays on its own merits:
   only the two pills consume this reading, and a Gemini cut-off recovers on its
   own printed countdown, never on the account reading. Do NOT fold these back onto
   `USAGE_POLL_MS` — that constant answers to `planLimitReached`/

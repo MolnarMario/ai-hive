@@ -142,73 +142,58 @@ def weekly(usage: GeminiUsage | None) -> GeminiLimit | None:
     return next((l for l in usage.limits if l.key.startswith("seven_day")), None)
 
 
+#: Suppresses `agy`'s background auto-updater for one subprocess. That updater
+#: is what pops a terminal window over the desktop during a poll (see
+#: `_read_usage`); the value has to be this exact lowercase string.
+AUTO_UPDATE_OFF = {"AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
+
+
 def _read_usage(exe: str, timeout: float) -> str:
     """Run `agy --print /usage` and return what it printed.
 
-    THE CHILD RUNS UNDER A PSEUDO-CONSOLE, and that is the fix for the terminal
-    window that kept flashing over the user's desktop. MEASURED from a
-    console-less pythonw parent (the app's own shape): a plain subprocess gives
-    the child ITS OWN CONSOLE (a conhost.exe child, every run), and Windows 11
-    can hand a newly created console to the default terminal app -- which fired
-    on roughly one poll in twenty as a real Windows Terminal frame. No creation
-    flag prevents it: CREATE_NO_WINDOW correctly asks for a windowless console
-    and the handoff happens to the console anyway, and DETACHED_PROCESS measured
-    WORSE (a console-subsystem child with no console gets one allocated on
-    demand, and that one is delegated too). A ConPTY client never gets a console
-    allocated at all, so there is nothing to hand off -- the same mechanism every
-    AI Hive agent already runs under without ever flashing a window.
+    THE WINDOW THAT USED TO FLASH OVER THE DESKTOP IS AGY'S OWN AUTO-UPDATER,
+    and `AUTO_UPDATE_OFF` is what stops it. Measured chain, captured live with a
+    global WinEvent hook: `agy --print /usage` spawns `agy --bg-updater`, which
+    spawns `agy --version`, which gets its OWN console two levels below us --
+    Windows 11 hands that console to the default terminal app, and a real
+    1199x616 `CASCADIA_HOSTING_WINDOW_CLASS` frame is shown for ~280ms. Our own
+    child's console was never once shown, so `CREATE_NO_WINDOW` was already
+    doing its job; creation flags are captured at `CreateProcess` and never
+    reach a grandchild, which is why nothing we pass the child could suppress
+    it. (The pseudo-console this briefly used instead is a MEASURED DEAD END --
+    it removed the console we create, which was never the one flashing, and
+    pywinpty needs a console to build a pty from while AI Hive has none under
+    pythonw, so every poll had Windows allocate one FOR US: 44 leaked
+    `conhost.exe` children in one session. Do not reach for it again.)
 
-    Reads are blocking, so they run on their own thread: a CLI that hung would
-    otherwise park the poll for ever, leaving `_gemini_usage_inflight` set and
-    the pill frozen on its last reading.
+    THE VALUE MUST BE THE LOWERCASE LITERAL `"true"`. `agy` compares the string
+    rather than parsing a bool: `"1"` and `"TRUE"` were both tested and both
+    still flashed. Verified by forcing the updater on demand -- backdating
+    `~/.gemini/antigravity-cli/last_check.timestamp` makes the next run check --
+    then alternating: 4/4 controls spawned `--bg-updater` and showed the window,
+    4/4 runs with this variable spawned neither. It is scoped to THIS
+    subprocess, never `os.environ`, so the user's own `agy` sessions keep
+    updating themselves; a usage READ has no business replacing the binary.
+
+    `CREATE_NO_WINDOW` stays for the child we do control.
     """
     import subprocess
-    import threading
 
-    if os.name != "nt":
-        res = subprocess.run([exe, "--print", "/usage"], capture_output=True,
-                             text=True, timeout=timeout)
-        return res.stdout if res.returncode == 0 else ""
-
-    from winpty import PtyProcess
-
-    # wide enough that the table never wraps: on a terminal agy pretty-prints
-    # instead of emitting the tab-separated columns a pipe gets
-    proc = PtyProcess.spawn([exe, "--print", "/usage"], dimensions=(50, 400))
-    chunks: list[str] = []
-
-    def pump() -> None:
-        try:
-            while True:
-                data = proc.read(8192)
-                if not data:
-                    break
-                chunks.append(data)
-        except (EOFError, OSError, RuntimeError, ValueError):
-            pass
-
-    reader = threading.Thread(target=pump, daemon=True, name="gemini-usage")
-    reader.start()
-    reader.join(timeout)
-    cut_off = reader.is_alive()
-    try:
-        proc.close(force=True)
-    except Exception:
-        pass
-    if cut_off:
-        # the CLI never finished, so a half-printed table is not a reading:
-        # `headline()` falls back to the highest window it can see, which would
-        # put the WEEKLY number on the 5h pill rather than admit it can't read
-        return ""
-    return _ESCAPES.sub("", "".join(chunks)).replace("\r\n", "\n")
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW",
+                                          0x08000000)
+    res = subprocess.run([exe, "--print", "/usage"], capture_output=True,
+                         text=True, stdin=subprocess.DEVNULL, timeout=timeout,
+                         env={**os.environ, **AUTO_UPDATE_OFF}, **kwargs)
+    return res.stdout if res.returncode == 0 else ""
 
 
-def fetch_cli(timeout: float = 20.0) -> GeminiUsage | None:
+def fetch_cli(timeout: float = 8.0) -> GeminiUsage | None:
     """Read live Gemini rate-limit utilization from `agy --print /usage`.
 
-    The budget is generous because the pseudo-console read in `_read_usage`
-    costs a few seconds more than a pipe did; nothing waits on it but a
-    background thread.
+    The read measures ~3.4s and runs on a background thread; the budget leaves
+    room for a slow one without letting a hung CLI park the poll for ever.
     """
     import shutil
 
