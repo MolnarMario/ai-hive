@@ -12,7 +12,7 @@ this file is the invariants that must survive every change.
 - **Never `QProcess.terminate()`.** Graceful stop is stdin EOF; hard kill is
   the Windows Job Object (`KILL_ON_JOB_CLOSE`) so grandchildren die too.
 - **Persistence is sacred.** Structural changes (add/remove agent/workspace)
-  save immediately; persisted-metadata changes (task/assignment/role/status/
+  save immediately; persisted-metadata changes (task/assignment/name/status/
   font) must emit `dirty`. If you add a persisted field, wire its mutation
   path to a save AND add a restore in `load_session_dict` AND bump/migrate
   `SESSION_VERSION` if the shape changes. Backstops (added after a live loss
@@ -1339,8 +1339,8 @@ this file is the invariants that must survive every change.
   twice at 05:30 on 2026-08-04. CRITICAL: the text goes
   through `TerminalAgent.nudge`, NEVER `deliver_task` — `deliver_task` is the
   ASSIGN path and would overwrite `current_task` (persisted, shown in the
-  sidebar and on the board), flip the assignment to WORKING and re-infer the
-  role. `nudge` also deliberately does NOT stamp `_last_input_ts` (unlike
+  sidebar and on the board) and flip the assignment to WORKING. `nudge` also
+  deliberately does NOT stamp `_last_input_ts` (unlike
   `write`, which the Esc correctly uses), so the resumed work still pulses the
   sidebar instead of being mistaken for the user's own typing. A nudge is then
   VERIFIED, not assumed (`recheck_limit` after `AUTO_CONTINUE_VERIFY_MS`), with
@@ -1566,8 +1566,8 @@ this file is the invariants that must survive every change.
   AFK. Several rules are load-bearing:
   * **Delivery is `nudge`, NEVER `deliver_task`** — same distinction the
     auto-continue makes, for the same reason: `deliver_task` overwrites the
-    persisted `current_task`, flips the assignment to WORKING and re-infers the
-    role. The user deferred an Enter; they did not assign anything.
+    persisted `current_task` and flips the assignment to WORKING. The user
+    deferred an Enter; they did not assign anything.
   * **The chord cannot be `Ctrl+Enter`** — that inserts a newline
     (`terminal_view._sequence_for`), which is how multi-line input works in
     Claude Code. Hence the third modifier, as with `Ctrl+Shift+A`. The keypress
@@ -1612,6 +1612,21 @@ this file is the invariants that must survive every change.
   ~3:1 contrast up to ~4.5:1 (hue preserved) so a child's dark-tuned output
   can never go invisible on a light theme. When adding a skin, run the suite —
   a low-contrast token fails the contrast test.
+  **The model chip is the ONE chrome token a skin does not own**
+  (`ui_theme.PROVIDER_INK`, `#CardModel[provider="…"]`, set once in
+  `TerminalCard._build_ui` from `AI_KINDS`). Colour is the only channel that
+  says whose agent a card is without reading the model name, so a Claude chip
+  is terracotta and a Gemini chip is blue under every skin, and the same agent
+  keeps its ink across a theme switch. Fixed constants, NOT `Palette` reads —
+  same rule as `ornaments.TASKBAR_WORKING`, and for the same reason: the colour
+  identifies a vendor rather than decorating our chrome. They are LIFTED a
+  couple of steps in lightness from the vendors' own `#d97757` / `#4285f4`,
+  which land at 3.8:1 and 3.3:1 on the manuscript skin's ultramarine
+  running-head; the lifted pair clears 4.5:1 on all four. Because a skin cannot
+  tune this token, the skin has to stay readable under it instead — a new
+  `bg_cardhead` that darkens the chip fails the vendor-ink contrast check
+  rather than shipping washed out. A provider with no ink (OpenAI, Grok) keeps
+  the gold-dim base rule.
   Adding a skin = adding one `Theme(...)`; keep `scriptorium-dark` byte-stable
   (it's the shipped look and the regression baseline). Manuscript fonts
   (Cinzel/EB Garamond/Spectral) are bundled OFL TTFs in `app/assets/fonts`,
@@ -1799,6 +1814,32 @@ this file is the invariants that must survive every change.
   from — the signal and its `WorkspacePage`/`MainWindow` wiring are unchanged.
   The assignment badge is gone from the header too (the terminal says what the
   agent is doing); `AssignmentState` still drives the model and the board.
+- **NOTHING RENAMES AN AGENT EXCEPT THE USER, and `spec.role` is write-once.**
+  `orchestration.infer_role`/`ROLE_KEYWORDS` (a keyword table mapping a task to
+  "Testing Agent", "Security Analyst", …), `WorkspaceManager.assign_role_name`
+  and `TerminalAgent.set_role`/`role_changed` are all REMOVED. The heuristic had
+  exactly one live entry point, the card's "Assign / reassign a task…" dialog,
+  and three things were wrong with it at once: it guessed from substring matches
+  ("design" in a task made an agent a Backend Architect and silently launched it
+  on Opus/high), `set_role` wrote the guess to `spec.name` as well as `spec.role`
+  whenever `custom_name` was unset, so assigning a task RENAMED the card, and the
+  header then printed the same guessed string twice, as the title and again as
+  the sublabel beside it. `spec.role` survives as what `build_spec` sets it to
+  and nothing else: the provider display name for an AI kind, else "PowerShell"
+  / "cmd" / "python foo.py". It is still PERSISTED (an existing session may hold
+  a stale guessed role — harmless, since nothing reads it for behaviour and the
+  header hides it on the AI kinds where it would be wrong), so no
+  `SESSION_VERSION` bump; there is simply no mutation path left to wire to a
+  save, which is why `_wire_agent` no longer connects a role signal. The header
+  sublabel (`#CardRole`, `TerminalCard._kind_label`) now renders ONLY for a
+  non-AI kind: on an AI agent it said the provider name, which `#CardModel`
+  already says beside it with the model, effort and permission mode, and it cost
+  a MEASURED 128px (121px of "Claude Code" in the chrome serif at 11px, plus the
+  7px layout gap) that the task summary needs to tell two agents apart on a
+  split screen. A shell keeps it, because a shell has no model chip
+  to read instead. `custom_name` also stays persisted even though nothing can
+  clobber a name any more: it is how a restore knows a name was chosen rather
+  than generated as "Agent N".
 - **No em dash in text the user sees.** Labels, tooltips, dialog copy, terminal
   notices and the board markdown use other punctuation or a rephrase; a smoke
   check (`test_no_em_dashes_in_visible_text`) parses every module and fails on

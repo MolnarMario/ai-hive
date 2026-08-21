@@ -2623,12 +2623,60 @@ def test_live_model_effort():
           card.model_label.isVisible()
           and card.model_label.text() == "Sonnet 5 · max · auto",
           card.model_label.text())
+    # the kind sublabel (#CardRole) is redundant beside that chip -- on an AI
+    # agent spec.role only ever held the provider display name ("Claude Code"),
+    # and the ~70px it cost came out of the summary. A shell keeps it: there is
+    # no model chip to read instead.
+    check("model: the AI card hides its redundant provider sublabel",
+          not card.role.isVisible() and card.role.text() == "",
+          card.role.text())
+    card_sh = TerminalCard(sh)
+    card_sh.resize(900, 300); card_sh.show(); pump(60)
+    check("model: a shell card keeps its kind sublabel",
+          card_sh.role.isVisible() and card_sh.role.text() == "PowerShell",
+          card_sh.role.text())
+    card_sh.deleteLater()
     card2 = TerminalCard(b)
     b._live_model = ""
     card2._on_model(b.model_badge())
     card2.resize(900, 300); card2.show(); pump(60)
     check("model: card chip hidden when the model is unknown",
           not card2.model_label.isVisible())
+
+    # --- the chip is inked by PROVIDER, and the skin never overrides it ---
+    # Colour is the only thing on a split screen that says whose agent a card
+    # is without reading the model name, so it belongs to the vendor and not
+    # to the theme. Read back the RESOLVED palette rather than the QSS text:
+    # a property selector that never matched would still leave the rule in the
+    # stylesheet, and the chip would quietly keep the gold-dim default.
+    from PySide6.QtGui import QPalette as _QPalette
+    from app import ui_theme as _ui_theme
+
+    def _chip_ink(agent_kind):
+        ag = TerminalAgent(build_spec(agent_kind, "Ink", cwd=""))
+        ag.set_live_model("Opus 5", "high", "auto")
+        c = TerminalCard(ag)
+        c.resize(900, 300); c.show(); pump(40)
+        ink = c.model_label.palette().color(
+            _QPalette.ColorRole.WindowText).name()
+        c.deleteLater(); ag.deleteLater()
+        return ink
+
+    app_inst = QApplication.instance()
+    was_theme = _ui_theme.ACTIVE_THEME.id
+    ink_seen = {}
+    for _tid in _ui_theme.THEMES:
+        _ui_theme.apply_theme(_tid)
+        app_inst.setStyleSheet(_ui_theme.build_qss())
+        ink_seen[_tid] = (_chip_ink(AgentKind.CLAUDE),
+                          _chip_ink(AgentKind.GEMINI))
+    _ui_theme.apply_theme(was_theme)
+    app_inst.setStyleSheet(_ui_theme.build_qss())
+    want = (_ui_theme.PROVIDER_INK["claude"], _ui_theme.PROVIDER_INK["gemini"])
+    check("model: the chip is Claude terracotta / Gemini blue under EVERY skin",
+          all(v == want for v in ink_seen.values()), ink_seen)
+    check("model: Claude and Gemini are never the same ink",
+          want[0] != want[1], want)
 
     # --- the manager's poll adopts it, and never saves for it ---
     from app.workspace_manager import WorkspaceManager
@@ -4995,12 +5043,17 @@ def test_v3_features():
     tv2._sel_anchor, tv2._sel_end = (0, 0), (0, 4)
     check("v3 clipboard: selection text", tv2.selected_text() == "hello", tv2.selected_text())
 
-    # --- #5 model selection + #4 roles (pure) ---
+    # --- #5 model selection (pure) ---
     check("v3 model: trivial to haiku", orchestration.select_model_effort("fix a typo") == ("haiku", "low"))
     check("v3 model: architecture to opus", orchestration.select_model_effort("design the auth architecture") == ("opus", "high"))
     check("v3 model: explicit override wins",
           orchestration.resolve_model_effort("x", model="opus", effort="max") == ("opus", "max"))
-    check("v3 roles: infer testing", orchestration.infer_role("add pytest coverage") == "Testing Agent")
+    # the task-to-role heuristic is REMOVED, not merely unused: it renamed the
+    # agent to its own guess as a side effect of assigning a task, so the card
+    # printed that guess twice (title + sublabel) and the chosen name was lost.
+    check("roles: the task-to-role heuristic is gone",
+          not hasattr(orchestration, "infer_role")
+          and not hasattr(orchestration, "ROLE_KEYWORDS"))
     _, a = providers.build_invocation("claude", effort="ultracode")
     check("v3 ultracode: never a launch flag", "--effort" not in a)
 
@@ -5037,11 +5090,15 @@ def test_v3_features():
           and wait_until(lambda: any("did:build the parser" in t for t in seen), 8000))
     mgr.set_assignment_state(echo.id, AssignmentState.COMPLETED)
     check("v3 assign: set_assignment_state", echo.assignment is AssignmentState.COMPLETED)
-    check("v3 roles: collision numbering",
-          mgr.assign_role_name(ws.id, echo.spec.name) == f"{echo.spec.name} 2")
+    name_before, role_before = echo.spec.name, echo.spec.role
     mgr.reassign_agent(echo.id, "now write the tests")
     check("v3 reassign: delivered to existing session",
           wait_until(lambda: any("did:now write the tests" in t for t in seen), 8000))
+    # regression: assigning a task used to run it through a role heuristic and
+    # rename the agent to the result ("Testing Agent"), clobbering the name.
+    check("v3 reassign: never renames the agent or its kind sublabel",
+          echo.spec.name == name_before and echo.spec.role == role_before,
+          f"name={echo.spec.name} role={echo.spec.role}")
 
     # --- #3/#8 board bridge over the real named pipe: log_activity round-trips
     from app.orchestrator_bridge import OrchestratorBridge, HAS_QTNETWORK
@@ -5558,6 +5615,22 @@ def test_themes():
                 fails.append(f"{t.id}:{label}={r:.2f}<{mn}")
     check("themes: all chrome text meets contrast in every skin", not fails, fails)
 
+    # VENDOR INK. The model chip is coloured by provider and NOT by the skin,
+    # so it is the one chrome token a new theme cannot tune -- every skin has
+    # to stay readable under it instead. Every running-head is dark today,
+    # including the manuscript's ultramarine, which is why the inks are lifted
+    # from the vendors' own #d97757 / #4285f4 (those land at 3.8:1 and 3.3:1
+    # there). A future light running-head fails here rather than shipping a
+    # washed-out chip.
+    ink_fails = []
+    for t in ui_theme.THEMES.values():
+        for key, ink in ui_theme.PROVIDER_INK.items():
+            r = contrast_ratio(QColor(ink), QColor(t.bg_cardhead))
+            if r < 4.5:
+                ink_fails.append(f"{t.id}:{key}={r:.2f}")
+    check("themes: vendor model-chip inks read on every running-head",
+          not ink_fails, ink_fails)
+
     # the checked-checkbox tick must be clearly visible on the accent fill in
     # every skin (the near-invisible-default-tick report). _check_icon_path
     # picks black/white for max contrast; assert the chosen tick clears the 3:1
@@ -5647,40 +5720,36 @@ def test_review_fixes():
     a1.set_assignment(AssignmentState.COMPLETED)
     check("autosave: assignment change marks dirty", dirty_count["n"] > before)
     before = dirty_count["n"]
-    a1.set_role("Docs Writer")
-    check("autosave: role change marks dirty", dirty_count["n"] > before)
+    a1.set_name("Docs Writer")
+    check("autosave: name change marks dirty", dirty_count["n"] > before)
 
-    # --- manual rename (set_name) decouples the display name from the role ---
+    # --- manual rename (set_name) is the ONLY thing that renames an agent ---
     # isolated in its own workspace so it never disturbs the scope tests below,
     # which resolve a1/b1 by their names.
     ws_c = mgr.create_workspace("ScopeC", project_path=str(tmp))
     r1 = mgr.add_terminal(ws_c.id, build_spec(AgentKind.CMD, "Agent 1",
                                               cwd=str(tmp)), autostart=False)
-    r1.set_role("Docs Writer")
     names_seen = []
     r1.name_changed.connect(lambda n: names_seen.append(n))
     before = dirty_count["n"]
     r1.set_name("Scribe")
     check("rename: set_name changes only the display name",
-          r1.spec.name == "Scribe" and r1.spec.role == "Docs Writer",
+          r1.spec.name == "Scribe" and r1.spec.role == "cmd",
           f"name={r1.spec.name} role={r1.spec.role}")
     check("rename: set_name flags the name custom", r1.spec.custom_name)
     check("rename: set_name emits name_changed", names_seen == ["Scribe"],
           names_seen)
     check("rename: set_name marks dirty", dirty_count["n"] > before)
-    # a later retask (set_role) updates the role but NEVER the custom name
-    r1.set_role("Backend Architect")
-    check("rename: set_role keeps a custom name, updates the role",
-          r1.spec.name == "Scribe" and r1.spec.role == "Backend Architect",
-          f"name={r1.spec.name} role={r1.spec.role}")
-    # a NON-custom agent still renames both (no regression to the old coupling)
+    # set_role is GONE along with the heuristic that drove it: nothing renames
+    # an agent except the user, so spec.role is now write-once in build_spec.
+    check("rename: agents have no set_role/role_changed any more",
+          not hasattr(r1, "set_role") and not hasattr(r1, "role_changed"))
+    # next_agent_name still numbers monotonically off the highest "Agent N"
     r2 = mgr.add_terminal(ws_c.id, build_spec(AgentKind.CMD, "Agent 2",
                                               cwd=str(tmp)), autostart=False)
-    r2.set_role("Tester")
-    check("rename: set_role renames both when name is not custom",
-          r2.spec.name == "Tester" and r2.spec.role == "Tester"
-          and not r2.spec.custom_name,
-          f"name={r2.spec.name} custom={r2.spec.custom_name}")
+    check("rename: next_agent_name is max+1, ignoring custom names",
+          mgr.next_agent_name(ws_c.id) == "Agent 3",
+          mgr.next_agent_name(ws_c.id))
     # persistence round-trip: custom_name survives to_dict/from_dict
     restored = AgentSpec.from_dict(r1.spec.to_dict())
     check("rename: custom_name round-trips through to_dict/from_dict",
@@ -6847,9 +6916,11 @@ def test_review_hardening_fixes():
         return a
 
     mgr.add_terminal = fake_add
-    spawned = mgr.spawn_worker(ws6.id, "do the thing", role="coder")
+    spawned = mgr.spawn_worker(ws6.id, "do the thing")
     check("harden: spawn_worker persists immediately via save_now",
           saves["n"] >= 1)
+    check("harden: a spawned worker is named Agent N, not a guessed role",
+          spawned.spec.name == "Agent 1", spawned.spec.name)
     check("harden: the spawned worker has its task + assignment set",
           spawned.current_task == "do the thing"
           and spawned.assignment == AssignmentState.WORKING)

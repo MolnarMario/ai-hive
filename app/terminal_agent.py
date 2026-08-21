@@ -256,7 +256,6 @@ class TerminalAgent(QObject):
     task_changed = Signal(str)          # current-task text
     font_changed = Signal(int)          # per-agent console font px
     assignment_changed = Signal(object)  # AssignmentState
-    role_changed = Signal(str)          # dynamic role/display name
     name_changed = Signal(str)          # user manual display-name rename
     cleared = Signal()                  # console was cleared locally
     activity_changed = Signal(bool)     # busy (streaming output) vs standby
@@ -877,30 +876,16 @@ class TerminalAgent(QObject):
             self.assignment_changed.emit(state)
 
     def set_name(self, name: str) -> None:
-        """User-facing rename of the display NAME only (role untouched). Marks
-        the name custom so a retask (set_role) never clobbers it."""
+        """User-facing rename of the display NAME.
+
+        custom_name is still set, and still persisted, even though nothing
+        renames an agent behind the user's back any more: it is what a restore
+        reads to know the name was chosen rather than generated."""
         name = sanitize_text(name or "").strip()
         if name and name != self.spec.name:
             self.spec.name = name
             self.spec.custom_name = True
             self.name_changed.emit(name)
-
-    def set_role(self, name: str) -> None:
-        """Dynamic role-based rename (Backend Architect, Testing Agent, …).
-
-        Always updates the role label. The display NAME follows the role only
-        while it hasn't been manually set — once the user renames the agent
-        (custom_name), a retask updates the role sublabel but leaves the name."""
-        name = sanitize_text(name or "").strip()
-        if not name:
-            return
-        changed = name != self.spec.role
-        self.spec.role = name
-        if not self.spec.custom_name and name != self.spec.name:
-            self.spec.name = name
-            changed = True
-        if changed:
-            self.role_changed.emit(name)
 
     def set_font(self, px: int) -> None:
         px = int(px)
@@ -944,8 +929,8 @@ class TerminalAgent(QObject):
         persisted metadata. Returns False when the agent can't take it.
 
         The difference from `deliver_task` is the whole point: that path is for
-        ASSIGNING work, so it overwrites `current_task`, flips the assignment to
-        WORKING and re-infers the role from the text. A nudge is a message
+        ASSIGNING work, so it overwrites `current_task` and flips the assignment
+        to WORKING. A nudge is a message
         inside work the agent already has (the auto-continue after a plan-limit
         reset), so none of that may change — `current_task` in particular is
         persisted and shown in the sidebar and on the board.
