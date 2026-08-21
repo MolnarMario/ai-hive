@@ -11,10 +11,11 @@ import datetime
 import re
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import (QAction, QColor, QDrag, QPainter, QPixmap,
+from PySide6.QtGui import (QAction, QColor, QCursor, QDrag, QPainter, QPixmap,
                            QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
-                               QPlainTextEdit, QToolButton, QVBoxLayout)
+                               QPlainTextEdit, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from .. import scheduled_send, transcripts, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
@@ -223,6 +224,72 @@ class _CardHeader(QFrame):
     def contextMenuEvent(self, event):
         self._card.show_actions_menu(event.globalPos())
         event.accept()
+
+
+class _HeaderTools(QWidget):
+    """The header's secondary buttons (A- / A+ / maximize), collapsed to a
+    narrow strip until the pointer is over them.
+
+    They cost ~100px of every header for actions that all have keyboard
+    equivalents, and that width comes straight out of the task summary, which
+    is the thing that tells two agents apart on a split screen. Collapsing
+    them gives it back without hiding them anywhere the user has to go
+    looking for.
+
+    The container sits just LEFT of the usage chip, and the summary carries
+    the layout stretch, so expanding takes its width from the summary alone:
+    nothing to the right of this widget moves as the pointer crosses it.
+
+    Qt sends Leave to a parent when the pointer enters one of its children, so
+    a naive leaveEvent would hide the buttons the instant the user reached for
+    one. The close is therefore deferred by one turn of the event loop and
+    checked against the real cursor position, which is inside this widget's
+    rect for as long as the pointer is over any of its children."""
+
+    _HINT_W = 14
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._open = False
+        self._buttons = []
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self.hint = QLabel("⋯", self)   # midline horizontal ellipsis
+        self.hint.setObjectName("CardToolsHint")
+        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.hint.setFixedWidth(self._HINT_W)
+        self.hint.setToolTip("Font size and maximize")
+        lay.addWidget(self.hint)
+
+    def add(self, btn) -> None:
+        btn.hide()
+        self._buttons.append(btn)
+        self.layout().addWidget(btn)
+
+    def _set_open(self, on: bool) -> None:
+        if on == self._open:
+            return
+        self._open = on
+        self.hint.setVisible(not on)
+        for b in self._buttons:
+            b.setVisible(on)
+
+    def enterEvent(self, event):
+        self._set_open(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        QTimer.singleShot(0, self._recheck)
+        super().leaveEvent(event)
+
+    def _recheck(self) -> None:
+        try:
+            inside = self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+        except RuntimeError:      # widget went away under the timer
+            return
+        if not inside:
+            self._set_open(False)
 
 
 class TerminalCard(QFrame):
@@ -438,27 +505,38 @@ class TerminalCard(QFrame):
         hl.addWidget(self.bg_mark)
         hl.addWidget(self.sched_mark)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
-        hl.addWidget(self.token_label)
 
-        def tool(text, obj_name, tip):
-            b = QToolButton(header)
+        def tool(text, obj_name, tip, owner=None):
+            b = QToolButton(owner or header)
             b.setText(text)
             b.setObjectName(obj_name)
             b.setToolTip(tip)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
-            hl.addWidget(b)
             return b
 
         # Only the buttons worth their width live here. Start / Stop / Restart /
         # Assign moved to the header's right-click menu: the terminal itself is
         # how this app is driven (any keystroke wakes a stopped card), so those
         # four were spending ~130px of every header on actions nobody clicks.
-        self.btn_font_dec = tool("A−", "CardFontDec", "Smaller font (Ctrl+-)")
-        self.btn_font_inc = tool("A+", "CardFontInc", "Larger font (Ctrl+=)")
+        # The three that remain are hover-revealed (see _HeaderTools): each has
+        # a keyboard equivalent, so their idle width belongs to the summary.
+        self.header_tools = _HeaderTools(header)
+        self.btn_font_dec = tool("A−", "CardFontDec", "Smaller font (Ctrl+-)",
+                                 self.header_tools)
+        self.btn_font_inc = tool("A+", "CardFontInc", "Larger font (Ctrl+=)",
+                                 self.header_tools)
         # solo/restore this card in the workspace grid — a pure view toggle;
         # never touches sibling processes (see WorkspacePage.toggle_solo)
-        self.btn_max = tool("⤢", "CardMaximize", "Maximize (focus this agent)")
+        self.btn_max = tool("⤢", "CardMaximize", "Maximize (focus this agent)",
+                            self.header_tools)
+        for _b in (self.btn_font_dec, self.btn_font_inc, self.btn_max):
+            self.header_tools.add(_b)
+        hl.addWidget(self.header_tools)
+        # the usage chip sits between the collapsed tools and the close button,
+        # so the strip that reveals them is the space to the chip's LEFT
+        hl.addWidget(self.token_label)
         self.btn_close = tool("✕", "CardClose", "Close terminal")
+        hl.addWidget(self.btn_close)
 
         root.addWidget(header)
         if self.is_pty:

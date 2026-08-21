@@ -3450,6 +3450,45 @@ def test_app():
     check("tokens: card badge hides again when usage clears",
           not tok_card.token_label.isVisible())
 
+    # -- 4d. header tools collapse until hovered ---------------------------
+    # A-/A+/maximize cost ~100px of every header for actions with keyboard
+    # equivalents, and that width comes out of the task summary. They collapse
+    # to a hint strip and expand on hover; the usage chip and the close button
+    # sit to their RIGHT, and the summary carries the stretch, so nothing to
+    # the right of the strip moves as the pointer crosses it.
+    from PySide6.QtGui import QEnterEvent
+    from PySide6.QtCore import QEvent, QPointF
+    tools = tok_card.header_tools
+    hlay = tok_card.header.layout()
+    check("header tools: buttons hidden while the pointer is elsewhere",
+          not tok_card.btn_font_dec.isVisible()
+          and not tok_card.btn_font_inc.isVisible()
+          and not tok_card.btn_max.isVisible()
+          and tools.hint.isVisibleTo(tools))
+    check("header tools: usage chip and close sit right of the strip",
+          hlay.indexOf(tools) < hlay.indexOf(tok_card.token_label)
+          < hlay.indexOf(tok_card.btn_close))
+    collapsed_w = tools.sizeHint().width()
+    pos = QPointF(2, 2)
+    tools.enterEvent(QEnterEvent(pos, pos, tools.mapToGlobal(pos)))
+    pump(10)
+    check("header tools: hover reveals all three buttons",
+          tok_card.btn_font_dec.isVisibleTo(tools)
+          and tok_card.btn_font_inc.isVisibleTo(tools)
+          and tok_card.btn_max.isVisibleTo(tools)
+          and not tools.hint.isVisibleTo(tools))
+    check("header tools: expanding is what costs width, not the resting state",
+          tools.sizeHint().width() > collapsed_w + 40,
+          (collapsed_w, tools.sizeHint().width()))
+    # the real cursor is nowhere near an offscreen widget, so the deferred
+    # re-check (which is what keeps the buttons up while the pointer is over
+    # one of them) collapses again
+    tools.leaveEvent(QEvent(QEvent.Type.Leave))
+    pump(20)
+    check("header tools: collapse again once the pointer leaves",
+          not tok_card.btn_max.isVisibleTo(tools)
+          and tools.hint.isVisibleTo(tools))
+
     # -- 5. live streaming --------------------------------------------------
     ticker = mgr.add_terminal(alpha.id, build_spec(
         AgentKind.CUSTOM, "Ticker", cwd=str(proj_alpha),

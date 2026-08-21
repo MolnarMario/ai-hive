@@ -697,6 +697,9 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
    specificity) */
 #CardFontDec, #CardFontInc {{ font-size: 12px; font-weight: 700; }}
 #CardMaximize {{ font-size: 16px; }}
+/* the collapsed stand-in for A-/A+/maximize: faint enough to read as chrome,
+   visible enough to say "there is something here to hover" */
+#CardToolsHint {{ color: {p.CARDHEAD_SUB}; font-size: 13px; }}
 #WsDelete {{ color: {p.TEXT}; font-size: 17px; font-weight: 900; }}
 #GlobalFontBtn {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
