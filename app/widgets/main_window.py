@@ -97,12 +97,12 @@ USAGE_RESET_GRACE_MS = 8000
 # makes a request. `gemini_usage.fetch()` runs `agy --print /usage`, which
 # measures several seconds of a background thread and a whole CLI's startup.
 #
-# It used to cost more than that: the spawned child got a console of its own,
-# which Windows 11 sometimes handed to the default terminal app, flashing a real
-# window over the user's screen on ~1 poll in 20. That is FIXED AT SOURCE now
-# (`gemini_usage._read_usage` runs the CLI under a pseudo-console, which is
-# never allocated a console to hand off), so the slow clock no longer has a
-# flash to ration -- only the process cost, which is reason enough.
+# It also, on ~1 poll in 20, flashes a terminal window over the user's screen.
+# That one is NOT ours to fix: agy starts a nested helper that asks Windows for
+# its own console two levels below us, where creation flags do not reach, and
+# Windows 11 hands that console to the default terminal app. Running the CLI
+# under a pseudo-console was tried and reverted (see `gemini_usage._read_usage`
+# for what it measured). So the cadence is the only lever AI Hive has over it.
 #
 # Slowing this down stays nearly free, unlike on the Claude side: NOTHING
 # consumes this reading except the two pills. A Gemini cut-off recovers on the
