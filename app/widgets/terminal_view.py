@@ -712,8 +712,8 @@ class TerminalView(QWidget):
     def reply_anchor_line(self) -> int | None:
         """Absolute line of the row a just-finished reply's stamp goes on: the
         blank row directly UNDER Claude's own "<spinner verb> for Ns" footer,
-        which is left in place once a turn settles. Used at BOTH the live busy -> idle capture
-        (TerminalCard._on_activity) and replay re-anchoring
+        which is left in place once a turn settles. Used at BOTH the live
+        capture (TerminalCard._on_reply_mark_added) and replay re-anchoring
         (_replay_with_marks), exactly like anchor_line() -- one function over
         identical screen state on both sides is what keeps them agreeing.
 

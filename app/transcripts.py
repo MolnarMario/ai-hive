@@ -43,6 +43,15 @@ _GEMINI_USAGE_CACHE: dict[str, tuple[float, int, int, int]] = {}
 # cache for latest_gemini_ai_title: metadata path -> (mtime, size, {session_id: title}).
 _GEMINI_TITLE_CACHE: dict[str, tuple[float, int, dict[str, str]]] = {}
 
+# cache for latest_gemini_model_effort: session_id -> (mtime, size, model, effort, mode).
+_GEMINI_MODEL_CACHE: dict[str, tuple[float, int, str, str, str]] = {}
+
+# cache for gemini_typed_prompts: path -> (mtime, size, [prompt text, ...]).
+_GEMINI_PROMPT_CACHE: dict[str, tuple[float, int, list]] = {}
+
+# cache for gemini_reply_times: path -> (mtime, size, [(epoch, final text), ...]).
+_GEMINI_REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
+
 # cache for limit_cut_off: path -> (mtime, size, verdict dict).
 _LIMIT_CACHE: dict[str, tuple[float, int, dict]] = {}
 
@@ -151,10 +160,9 @@ def _read_latest_ai_title(path: str) -> str:
 
 
 def latest_gemini_ai_title(cwd: str, session_id: str) -> str:
-    """The most recent AI-generated conversation title or preview Gemini
-    (Antigravity CLI) wrote into conversation_metadata.json for this session.
-    "" if none / no file.
-    Cached by (mtime, size) so repeated polling only re-reads on a real change.
+    """The most recent AI conversation title or user task summary for Gemini.
+    Checks conversation_metadata.json, conversation_summaries.db, and falls
+    back to the first user request in transcript.jsonl. Cached by (mtime, size).
     Never raises."""
     if not session_id:
         return ""
@@ -163,28 +171,89 @@ def latest_gemini_ai_title(cwd: str, session_id: str) -> str:
     return _read_gemini_ai_title(meta_path, session_id)
 
 
+def _read_gemini_first_prompt(session_id: str) -> str:
+    """Fallback conversation title: first user request in transcript.jsonl."""
+    from . import session_sync
+    path = os.path.join(session_sync.gemini_dir(), "brain", session_id,
+                        ".system_generated", "logs", "transcript.jsonl")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"USER_INPUT"' not in line:
+                    continue
+                rec = json.loads(line)
+                if rec.get("type") == "USER_INPUT":
+                    content = rec.get("content", "")
+                    if "<USER_REQUEST>" in content:
+                        req = content.split("<USER_REQUEST>")[1].split("</USER_REQUEST>")[0].strip()
+                    else:
+                        req = content.strip()
+                    if req.startswith("/plan"):
+                        req = req[5:].strip()
+                    elif req.startswith("/"):
+                        parts = req.split(" ", 1)
+                        if len(parts) > 1:
+                            req = parts[1]
+                    flat = " ".join(req.split())
+                    if flat:
+                        return flat[:80] + ("…" if len(flat) > 80 else "")
+    except Exception:
+        pass
+    return ""
+
+
 def _read_gemini_ai_title(path: str, session_id: str) -> str:
     try:
-        st = os.stat(path)
+        st = os.stat(path) if (path and os.path.isfile(path)) else None
     except OSError:
-        return ""
-    cached = _GEMINI_TITLE_CACHE.get(path)
-    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
-        return cached[2].get(session_id, "")
+        st = None
+    cached = _GEMINI_TITLE_CACHE.get(path) if path else None
+    if st and cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        cached_title = cached[2].get(session_id, "")
+        if cached_title:
+            return cached_title
+
     titles: dict[str, str] = {}
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        convs = data.get("conversations", {})
-        for sid, info in convs.items():
-            s = info.get("summary") or {}
-            t = s.get("Title") or s.get("Preview") or ""
-            if t:
-                titles[sid] = t
-    except Exception:
-        return cached[2].get(session_id, "") if cached else ""
-    _GEMINI_TITLE_CACHE[path] = (st.st_mtime, st.st_size, titles)
-    return titles.get(session_id, "")
+    if st:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            convs = data.get("conversations", {})
+            for sid, info in convs.items():
+                s = info.get("summary") or {}
+                t = s.get("Title") or s.get("Preview") or ""
+                if t:
+                    titles[sid] = t
+        except Exception:
+            pass
+        _GEMINI_TITLE_CACHE[path] = (st.st_mtime, st.st_size, titles)
+
+    title = titles.get(session_id, "")
+    if title:
+        return title
+
+    # Fallback 1: conversation_summaries.db
+    from . import session_sync
+    sdb_path = os.path.join(session_sync.gemini_dir(), "conversation_summaries.db")
+    if os.path.isfile(sdb_path):
+        try:
+            import sqlite3
+            conn = sqlite3.connect(sdb_path)
+            cur = conn.cursor()
+            cur.execute("SELECT title, preview FROM conversation_summaries WHERE conversation_id = ?;", (session_id,))
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                t = (row[0] or row[1] or "").strip()
+                if t:
+                    return t
+        except Exception:
+            pass
+
+    # Fallback 2: first user request in transcript.jsonl
+    return _read_gemini_first_prompt(session_id)
 
 
 def typed_prompts(cwd: str, session_id: str) -> list[str]:
@@ -247,7 +316,8 @@ def reply_times(cwd: str, session_id: str) -> list[tuple[float, str]]:
     signal cannot be: a reply mark is minted at the busy -> idle settle, so it
     only exists for turns THIS process watched finish. Reopen the app and every
     past turn has no stamp at all -- which is what the user sees, and stamping
-    the current time on them instead (the bug `_settled_once` fixed) was worse.
+    the current time on them instead (the bug the _turn_open latch fixed) was
+    worse.
     Claude timestamps every record it writes, so the transcript knows what no
     live observation can.
 
@@ -328,6 +398,83 @@ def _is_tool_result(rec: dict) -> bool:
         return False
     return any(b.get("type") == "tool_result" for b in content
                if isinstance(b, dict))
+
+
+def gemini_typed_prompts(session_id: str) -> list[str]:
+    """Every prompt the USER typed in this Gemini conversation, oldest first."""
+    if not session_id:
+        return []
+    from . import session_sync
+    path = os.path.join(session_sync.gemini_dir(), "brain", session_id,
+                        ".system_generated", "logs", "transcript.jsonl")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    cached = _GEMINI_PROMPT_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return list(cached[2])
+    out: list[str] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"USER_INPUT"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("type") == "USER_INPUT":
+                    content = rec.get("content", "")
+                    if "<USER_REQUEST>" in content:
+                        req = content.split("<USER_REQUEST>")[1].split("</USER_REQUEST>")[0].strip()
+                    else:
+                        req = content.strip()
+                    if req:
+                        out.append(req)
+    except OSError:
+        return list(cached[2]) if cached else []
+    _GEMINI_PROMPT_CACHE[path] = (st.st_mtime, st.st_size, list(out))
+    return out
+
+
+def gemini_reply_times(session_id: str) -> list[tuple[float, str]]:
+    """Every finished reply in this Gemini conversation as (epoch, text)."""
+    if not session_id:
+        return []
+    from . import session_sync
+    path = os.path.join(session_sync.gemini_dir(), "brain", session_id,
+                        ".system_generated", "logs", "transcript.jsonl")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    cached = _GEMINI_REPLY_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return list(cached[2])
+    out: list[tuple[float, str]] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"PLANNER_RESPONSE"' not in line and '"GENERIC"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("source") == "MODEL" and rec.get("status") == "DONE":
+                    text = (rec.get("content") or "").strip()
+                    ts = rec.get("created_at")
+                    if text and ts:
+                        try:
+                            epoch = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                            out.append((epoch, text))
+                        except ValueError:
+                            pass
+    except OSError:
+        return list(cached[2]) if cached else []
+    _GEMINI_REPLY_CACHE[path] = (st.st_mtime, st.st_size, list(out))
+    return out
 
 
 def ended_on_limit(cwd: str, session_id: str) -> tuple[bool, float, float]:
@@ -563,7 +710,8 @@ def _read_latest_token_usage(path: str) -> tuple[int, int]:
     return (used, window)
 
 
-def _parse_varint(data: bytes, pos: int) -> tuple[int, int]:
+def _parse_varint(data: bytes, pos: int) -> tuple[int | None, int]:
+    """Decode a variable-length integer from protobuf byte stream."""
     res = 0
     shift = 0
     while pos < len(data):
@@ -572,8 +720,72 @@ def _parse_varint(data: bytes, pos: int) -> tuple[int, int]:
         res |= (b & 0x7f) << shift
         shift += 7
         if not (b & 0x80):
+            return res, pos
+    return None, pos
+
+
+def _parse_proto(data: bytes) -> list[tuple[int, int, bytes | int]]:
+    """Decode raw protobuf stream into list of (field_num, wire_type, value)."""
+    pos = 0
+    items = []
+    while pos < len(data):
+        key, pos = _parse_varint(data, pos)
+        if key is None:
             break
-    return res, pos
+        field_num = key >> 3
+        wire_type = key & 0x7
+        if wire_type == 0:  # Varint
+            val, pos = _parse_varint(data, pos)
+            if val is None:
+                break
+            items.append((field_num, wire_type, val))
+        elif wire_type == 2:  # Length-delimited (bytes / string / submessage)
+            length, pos = _parse_varint(data, pos)
+            if length is None or pos + length > len(data):
+                break
+            items.append((field_num, wire_type, data[pos:pos+length]))
+            pos += length
+        elif wire_type == 1:  # 64-bit fixed
+            pos += 8
+        elif wire_type == 5:  # 32-bit fixed
+            pos += 4
+        else:
+            break
+    return items
+
+
+def _extract_gemini_db_metadata(path: str) -> tuple[str, int]:
+    """Extract (raw_model_name, context_tokens) from Gemini SQLite database."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(path)
+        cur = conn.cursor()
+        cur.execute('SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 25;')
+        rows = cur.fetchall()
+        conn.close()
+        for (row_data,) in rows:
+            if not row_data:
+                continue
+            data = bytes(row_data)
+            top = _parse_proto(data)
+            for fnum, wire_type, fval in top:
+                if fnum == 1 and isinstance(fval, bytes):
+                    f1_items = _parse_proto(fval)
+                    model = ""
+                    tokens = 0
+                    for snum, swire, sval in f1_items:
+                        if snum == 19 and isinstance(sval, bytes):
+                            model = sval.decode("utf-8", "replace").strip()
+                        elif snum == 4 and isinstance(sval, bytes):
+                            sub4 = _parse_proto(sval)
+                            for n, _, v in sub4:
+                                if n == 5 and isinstance(v, int):
+                                    tokens = v
+                    if tokens > 0 or model:
+                        return (model, tokens)
+    except Exception:
+        pass
+    return ("", 0)
 
 
 def latest_gemini_token_usage(cwd: str, session_id: str) -> tuple[int, int]:
@@ -597,26 +809,122 @@ def _read_gemini_db_token_usage(path: str) -> tuple[int, int]:
         return (cached[2], cached[3])
     used, window = 0, 1_000_000
     try:
-        import sqlite3
-        conn = sqlite3.connect(path)
-        cur = conn.cursor()
-        cur.execute('SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1;')
-        row = cur.fetchone()
-        conn.close()
-        if row and row[0]:
-            data = bytes(row[0])
-            matches = re.finditer(rb'[\x22][\x00-\xff]{5,150}\x28', data)
-            last_val = 0
-            for m in matches:
-                val, _ = _parse_varint(data, m.end())
-                if 0 < val < 10_000_000:
-                    last_val = val
-            if last_val > 0:
-                used = last_val
+        model, tokens = _extract_gemini_db_metadata(path)
+        if tokens > 0:
+            used = tokens
+            if "pro" in model.lower():
+                window = 2_000_000
+            elif "flash" in model.lower():
+                window = 1_000_000
+            if used > window:
+                window = 2_000_000
     except Exception:
         return (cached[2], cached[3]) if cached else (0, 0)
     _GEMINI_USAGE_CACHE[path] = (st.st_mtime, st.st_size, used, window)
     return (used, window)
+
+
+_GEMINI_MODEL_MAP = {
+    "gemini-3.7-flash-control": "Gemini 3.7 Flash",
+    "gemini-3.7-flash": "Gemini 3.7 Flash",
+    "gemini-3.6-flash": "Gemini 3.6 Flash",
+    "gemini-3.5-flash": "Gemini 3.5 Flash",
+    "gemini-3.1-pro": "Gemini 3.1 Pro",
+}
+
+
+def parse_gemini_model_effort(raw: str) -> tuple[str, str]:
+    """Split a raw Gemini model string into (model_display, effort).
+    'Gemini 3.7 Flash (High)' -> ('Gemini 3.7 Flash', 'high')
+    'gemini-3.7-flash-control' -> ('Gemini 3.7 Flash', '')
+    'Claude Sonnet 4.6 (Thinking)' -> ('Claude Sonnet 4.6', 'thinking')
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ("", "")
+    eff = ""
+    m_eff = re.search(r"\((High|Medium|Low|Thinking)\)", raw, re.IGNORECASE)
+    if m_eff:
+        eff = m_eff.group(1).lower()
+        core = raw[:m_eff.start()].strip()
+    else:
+        core = raw
+
+    c_lower = core.lower()
+    for key, disp in _GEMINI_MODEL_MAP.items():
+        if key in c_lower:
+            return (disp, eff)
+    return (core, eff)
+
+
+def latest_gemini_model_effort(cwd: str, session_id: str) -> tuple[str, str, str]:
+    """Live model, effort, and permission mode for a Gemini/agy agent.
+    Combines settings.json defaults, live SQLite gen_metadata, and transcript.jsonl
+    USER_SETTINGS_CHANGE / /plan records. Cached by (mtime, size)."""
+    if not session_id:
+        return ("", "", "")
+    from . import providers, session_sync
+    base = session_sync.gemini_dir()
+    db_path = os.path.join(base, "conversations", f"{session_id}.db")
+    tpath = os.path.join(base, "brain", session_id, ".system_generated", "logs", "transcript.jsonl")
+
+    st_db = None
+    try:
+        if os.path.isfile(db_path):
+            st_db = os.stat(db_path)
+    except OSError:
+        pass
+
+    cached = _GEMINI_MODEL_CACHE.get(session_id)
+    if st_db and cached and cached[0] == st_db.st_mtime and cached[1] == st_db.st_size:
+        return (cached[2], cached[3], cached[4])
+
+    sett = providers.gemini_user_default_settings()
+    def_raw_model = sett.get("model", "Gemini 3.7 Flash (High)")
+    def_model, def_effort = parse_gemini_model_effort(def_raw_model)
+
+    mode = ""
+    if sett.get("skipPermissionChecks") or sett.get("toolExecutionPolicy") == "always-proceed":
+        mode = "bypass"
+    elif sett.get("agentMode") or sett.get("defaultMode"):
+        raw_mode = sett.get("agentMode") or sett.get("defaultMode")
+        mode = providers.gemini_permission_mode_display(raw_mode)
+
+    live_model = ""
+    if st_db:
+        raw_model, _ = _extract_gemini_db_metadata(db_path)
+        if raw_model:
+            parsed_m, parsed_e = parse_gemini_model_effort(raw_model)
+            live_model = parsed_m
+            if parsed_e:
+                def_effort = parsed_e
+
+    if os.path.isfile(tpath):
+        try:
+            with open(tpath, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    rec = json.loads(line)
+                    content = rec.get("content", "")
+                    if "USER_SETTINGS_CHANGE" in content:
+                        m = re.search(r"Model Selection`\s+from\s+.*?to\s+([^.\n<]+)", content)
+                        if m:
+                            tm, te = parse_gemini_model_effort(m.group(1))
+                            if tm:
+                                def_model = tm
+                            if te:
+                                def_effort = te
+                    if rec.get("type") == "USER_INPUT" and "/plan" in content:
+                        mode = "plan"
+        except Exception:
+            pass
+
+    final_model = live_model or def_model or "Gemini 3.7 Flash"
+    final_effort = def_effort or "high"
+    final_mode = mode or "auto"
+
+    if st_db:
+        _GEMINI_MODEL_CACHE[session_id] = (st_db.st_mtime, st_db.st_size, final_model, final_effort, final_mode)
+    return (final_model, final_effort, final_mode)
 
 
 def model_display(raw: str) -> str:

@@ -291,6 +291,74 @@ def test_sidebar_count_badge():
     row.deleteLater()
 
 
+def test_row_name_fades_under_badges():
+    """The badge stack is painted OVER the name (it owns no layout width, so
+    it can never be squeezed), which used to leave a long workspace name
+    printing its letters through the icons - reported live as a gear and a
+    spinner sitting inside "Video Production", unreadable either way.
+
+    The name now fades out just before the badges: no elision, no reserved
+    width, and nothing at all changes on a row with no badges lit."""
+    from PySide6.QtGui import QImage, QPainter, QColor
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.ornaments import FadingLabel
+    from app.widgets.sidebar import WorkspaceRow, SIDEBAR_WIDTH, ROW_HEIGHT
+
+    QApplication.instance() or QApplication([])
+    row = WorkspaceRow("w1", "Video Production", "C:/proj")
+    row.setGeometry(0, 0, SIDEBAR_WIDTH, ROW_HEIGHT)
+
+    quiet = {"total": 2, "active": 2, "busy": 0, "error": 0, "waiting": 0,
+             "idle": 2, "limit_blocked": 0, "scheduled": 0, "bg_shell": 0}
+    row.set_stats(quiet)
+    row.layout().activate()
+    row._position_icon_stack()
+    check("row name: nothing lit -> no fade at all (plain label, full name)",
+          row.name_label.fade_x() is None, row.name_label.fade_x())
+
+    lit = dict(quiet, busy=1, bg_shell=1)
+    row.set_stats(lit)
+    row.layout().activate()
+    row._icon_stack.layout().activate()
+    row._position_icon_stack()
+    want = max(0, row._icon_stack.x() - row.name_label.x()
+               - WorkspaceRow._ICON_TEXT_GAP)
+    check("row name: badges lit -> fade starts just before the badge stack",
+          row.name_label.fade_x() == want,
+          (row.name_label.fade_x(), want, row._icon_stack.x(),
+           row.name_label.x()))
+    check("row name: the name itself is never truncated to fit the badges",
+          row.name_label.text() == "Video Production", row.name_label.text())
+
+    # ...and the fade is real ink, not just bookkeeping: paint the label at a
+    # width its text overflows and measure how far right the ink reaches.
+    def ink_extent(fade_x):
+        lab = FadingLabel("Video Production Workspace Folder")
+        lab.setStyleSheet("color: rgb(240,240,240); background: transparent;")
+        lab.resize(240, 30)
+        lab.set_fade_x(fade_x)
+        img = QImage(240, 30, QImage.Format.Format_ARGB32)
+        img.fill(QColor(0, 0, 0, 0))
+        p = QPainter(img)
+        lab.render(p, QPoint())
+        p.end()
+        cols = [x for x in range(240)
+                if max(img.pixelColor(x, y).alpha() for y in range(30)) > 30]
+        lab.deleteLater()
+        return cols[-1] if cols else -1
+
+    full = ink_extent(None)
+    faded = ink_extent(120)
+    check("row name: with no fade the text paints to its full length",
+          full > 150, full)
+    check("row name: with a fade the ink stops at the badge edge",
+          0 < faded <= 120, (faded, full))
+    check("row name: a cover at the label's own edge leaves no ink at all",
+          ink_extent(0) == -1, ink_extent(0))
+    row.deleteLater()
+
+
 def test_agent_waiting():
     """A settled Claude prompt/question flags the agent as waiting-for-input;
     fresh output clears it, idle-at-prompt does not flag, exit clears it, and
@@ -3111,56 +3179,107 @@ def test_agent_busy_activity():
     a.dispose()
 
 
-def test_reply_settle_skips_resume_replay():
-    """A --resume launch replays the WHOLE past conversation as real output
-    before it ever goes quiet, so the FIRST busy -> idle settle of a resumed
-    launch is that replay finishing, not a fresh reply -- live-reported bug:
-    reopening the app always showed the CURRENT time next to the last reply
-    (both the header badge and an inline mark), never the actual historical
-    one, because that replay settle stamped "now" unconditionally. Only that
-    one settle is skipped; the very next one (a genuine new reply) stamps
-    normally, and a non-resumed launch -- nothing to replay -- is never
-    suppressed at all."""
+def test_reply_marks_need_a_submitted_turn():
+    """A reply stamp is only minted for a turn somebody actually ASKED for.
+
+    A busy -> idle settle is 2 s of quiet and nothing more, and a launch
+    produces several that are not replies: a --resume launch reprints the whole
+    past conversation as real output, pausing while Claude loads the transcript
+    and again once the reprint ends, and settle_layout then hands every card
+    its real width, which makes the child redraw its entire frame. The old
+    guard suppressed only the FIRST settle of a resumed launch, so reopening
+    the app stamped the CURRENT time over the last reply in every terminal --
+    live-reported, and the check below that settles TWICE is the one that
+    reproduces it.
+
+    Second half: ONE stamp per turn. Claude falls quiet mid-reply whenever a
+    tool runs longer than the idle window, and each of those lulls used to mint
+    its own mark, so a single long reply wore a stamp at every pause it took
+    instead of one where it ended."""
     from PySide6.QtWidgets import QApplication
-    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.terminal_agent import TerminalAgent, AgentStatus, submits_a_line
     from app.process_worker import AgentKind, build_spec
 
     QApplication.instance() or QApplication([])
+
+    # ---- what counts as a submit -----------------------------------------
+    check("reply-turn: a bare CR submits", submits_a_line("hi\r"))
+    check("reply-turn: Shift/Alt+Enter (ESC-CR) inserts a newline, no submit",
+          not submits_a_line("\x1b\r"))
+    check("reply-turn: Ctrl+Enter (LF) inserts a newline, no submit",
+          not submits_a_line("\n"))
+    check("reply-turn: a CR inside a bracketed paste is pasted text, no submit",
+          not submits_a_line("\x1b[200~one\rtwo\x1b[201~"))
+    check("reply-turn: ...but the Enter that follows the paste does submit",
+          submits_a_line("\x1b[200~one\rtwo\x1b[201~\r"))
+
     a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ResumeSettle", cwd=".",
                                  pty=True))
     a.status = AgentStatus.RUNNING
     a._resume_attempt = True          # simulate a --resume launch
-    a._settled_once = False
+    a._turn_open = False              # nothing has been asked of it yet
 
-    # the resume replay arrives as real output, then falls quiet
-    a._on_pty_output("pty", "...replayed conversation...")
-    a._on_idle_timeout()
-    check("reply-settle: a resume's replay settle mints no inline milestone",
+    # the resume replay arrives as real output and falls quiet, TWICE: Claude
+    # pauses while it loads the conversation, then again once it has reprinted
+    # it. The old one-shot guard let the second one through.
+    for burst in ("Claude Code v2.1 ...", "...replayed conversation..."):
+        a._on_pty_output("pty", burst)
+        a._on_idle_timeout()
+    check("reply-turn: a resumed launch's replay settles mint no milestone",
           a.reply_marks() == [], a.reply_marks())
-    check("reply-settle: ...but 'settled once' is now true", a._settled_once)
 
-    # the NEXT settle is a genuine reply and stamps normally
+    # a card being sized into its real width makes the child repaint, which
+    # settles again -- still nobody asked it anything
+    a._on_pty_output("pty", "...full-frame repaint after the resize...")
+    a._on_idle_timeout()
+    check("reply-turn: ...nor does a repaint after the launch resize",
+          a.reply_marks() == [], a.reply_marks())
+
+    # ---- a real turn: submit, output, settle ------------------------------
+    a.write("do the thing\r")
+    check("reply-turn: a submitted line opens a turn", a._turn_open)
+    # the real reply lands well after the pty echoed the keystrokes back, so
+    # _mark_busy reads it as work rather than echo (see INPUT_ECHO_S)
+    a._last_input_ts = 0.0
     a._on_pty_output("pty", "a real new reply")
     before = time.time()
     a._on_idle_timeout()
-    check("reply-settle: the settle AFTER the replay records one milestone",
+    check("reply-turn: the settle after a submit records one milestone",
           len(a.reply_marks()) == 1, a.reply_marks())
-    check("reply-settle: ...stamped with a recent walltime",
-          before - 1 <= a.reply_marks()[0].ts <= time.time() + 1)
+    first = a.reply_marks()[0]
+    check("reply-turn: ...stamped with a recent walltime",
+          before - 1 <= first.ts <= time.time() + 1)
+    first_uid, first_pos, first_ts = first.uid, first.pos, first.ts
 
-    # a non-resumed launch has nothing to replay, so its first settle is real
-    b = TerminalAgent(build_spec(AgentKind.CLAUDE, "FreshSettle", cwd=".",
-                                 pty=True))
-    b.status = AgentStatus.RUNNING
-    check("reply-settle: a fresh (non-resume) launch is never suppressed",
-          not b._resume_attempt)
-    b._on_pty_output("pty", "first reply ever")
-    b._on_idle_timeout()
-    check("reply-settle: ...so its first settle stamps immediately",
-          len(b.reply_marks()) == 1, b.reply_marks())
+    # ---- a lull INSIDE that turn moves the mark, it does not add one ------
+    a._on_pty_output("pty", "...still the same reply, after a slow tool...")
+    a._on_idle_timeout()
+    check("reply-turn: a second settle in the same turn keeps ONE mark",
+          len(a.reply_marks()) == 1, a.reply_marks())
+    moved = a.reply_marks()[0]
+    check("reply-turn: ...and moves it to where the reply really ended",
+          moved.uid == first_uid and moved.pos > first_pos
+          and moved.ts >= first_ts, (first_pos, first_ts, moved))
+
+    # ---- the next submit starts a new turn, and a new mark ---------------
+    a.write("and now this\r")
+    a._last_input_ts = 0.0
+    a._on_pty_output("pty", "the second reply")
+    a._on_idle_timeout()
+    check("reply-turn: a fresh submit starts a fresh mark",
+          len(a.reply_marks()) == 2, a.reply_marks())
+
+    # ---- a restart closes the turn --------------------------------------
+    a.restart()
+    check("reply-turn: a restart closes the open turn",
+          not a._turn_open and a._turn_mark_uid is None)
+    a.status = AgentStatus.RUNNING
+    a._on_pty_output("pty", "output from the fresh session")
+    a._on_idle_timeout()
+    check("reply-turn: ...so its output settles without a stamp",
+          a.reply_marks() == [], a.reply_marks())
 
     a.dispose()
-    b.dispose()
 
 
 def test_transcript_reply_times():
@@ -7683,7 +7802,15 @@ def test_boot_veil():
     pre-layout width, which pyte cannot reflow) until the conversation finished
     replaying. The veil covers exactly the launch-to-prompt window, and must
     ALWAYS lift again: on readiness, on a keystroke, on the agent stopping, or
-    on its own backstop timer."""
+    on its own backstop timer.
+
+    It covers a SECOND window for the same reason: a card built over a restored
+    .vt snapshot projects an 8 KiB cut of it at the pre-layout width, and
+    main.py paints that frame (show()) before autostart_active_workspace raises
+    any veil -- reported as "gibberish in the top left corner, then the loader,
+    then it looks normal". A REBUILD of a live agent must still paint at once,
+    so the gate is TerminalAgent.has_pristine_seed(), not merely "has a
+    replay"."""
     from app.process_worker import AgentKind, build_spec
     from app.terminal_agent import AgentStatus, TerminalAgent
 
@@ -7811,6 +7938,77 @@ def test_boot_veil():
     check("boot-veil: ...and firing it uncovers the terminal",
           not card.boot.is_active())
     card.detach(); booting.dispose(); pump(100)
+
+    # -- the restored snapshot, which is painted BEFORE any child exists ---
+    # main.py seeds every pty agent from screen_snapshot and only then shows
+    # the window, so this frame reaches the user unless the constructor itself
+    # covers it.
+    from app.ui_theme import Palette as _Pal
+
+    restored = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Restored", cwd=os.getcwd(), pty=True))
+    snapshot = "RESTORED-SNAPSHOT-" + "=" * 60 + "\r\n"
+    check("boot-veil: a restored snapshot seeds the agent's buffer",
+          restored.seed_pty_replay(snapshot) and restored.has_pristine_seed())
+    rcard = TerminalCard(restored)
+    check("boot-veil: a card built over a restored snapshot is covered from "
+          "its constructor, before the window ever paints",
+          rcard.boot.is_active() and rcard._boot_seed)
+    rcard.resize(640, 400); rcard.show(); pump(150)
+    # the constructor's own _on_status(IDLE) runs the not-running branch, which
+    # used to dismiss the veil unconditionally -- the wake banner may only own
+    # the screen once there is something readable under it
+    check("boot-veil: ...and the wake banner does not take it away",
+          rcard.boot.is_active())
+    rimg = rcard.terminal.grab().toImage()
+    rground = QColor(_Pal.BG_CONSOLE).rgb()
+    rrows = [rimg.pixel(x, y) for y in (3, 6, 9)
+             for x in range(0, min(240, rimg.width()), 3)]
+    check("boot-veil: ...in pixels: the mangled seed never reaches the user",
+          rrows and all(p == rground for p in rrows))
+    # the settled-width projection IS the stopped card's final picture
+    rcard._rerender_restored()
+    pump(500)  # past the 260ms fade
+    check("boot-veil: the settled-width projection dissolves it",
+          not rcard.boot.is_active() and not rcard._boot_seed)
+    check("boot-veil: ...revealing the conversation it was holding back",
+          "RESTORED-SNAPSHOT" in rcard.terminal.screen_text())
+    rcard.detach(); restored.dispose(); pump(50)
+
+    # an agent that AUTOSTARTS hands the veil straight to the booting child,
+    # with no gap: drop_restored_screen clears the seed, _on_status re-raises
+    auto = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Auto", cwd=os.getcwd(), pty=True))
+    auto.seed_pty_replay(snapshot)
+    acard = TerminalCard(auto)
+    acard.resize(640, 400); acard.show(); pump(50)
+    acard.drop_restored_screen()
+    check("boot-veil: dropping the seed hands ownership to the child branch",
+          not acard._boot_seed)
+    acard._on_status(AgentStatus.STARTING)
+    check("boot-veil: ...and the launching child keeps the terminal covered",
+          acard.boot.is_active())
+    auto._set_prompt_ready(True)
+    pump(500)
+    check("boot-veil: ...until its prompt goes live",
+          not acard.boot.is_active())
+    acard.detach(); auto.dispose(); pump(50)
+
+    # the regression guard for the OTHER half: a retile rebuilds cards over a
+    # LIVE agent's buffer, which must paint instantly and never flash a loader
+    live = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Live", cwd=os.getcwd(), pty=True))
+    live.seed_pty_replay(snapshot)
+    live._on_pty_output("pty", "LIVE-CHILD-OUTPUT\r\n")   # a child drew over it
+    check("boot-veil: a buffer a child has written to is not pristine",
+          not live.has_pristine_seed() and live.seed_written_over())
+    lcard = TerminalCard(live)
+    lcard.resize(640, 400); lcard.show(); pump(150)
+    check("boot-veil: a card rebuilt over a live buffer raises no loader",
+          not lcard.boot.is_active() and not lcard._boot_seed)
+    check("boot-veil: ...and paints its conversation immediately",
+          "LIVE-CHILD-OUTPUT" in lcard.terminal.screen_text())
+    lcard.detach(); live.dispose(); pump(50)
 
 
 def test_resume_fallback():
@@ -10325,8 +10523,25 @@ def test_scheduled_send():
     text, when = dlg.result_message()
     check("schedule: a custom delay resolves to a fire time",
           text == "deploy the thing" and 5300 < when - _time.time() < 5500)
+    # The caption has to name BOTH halves: the wall clock the message goes out
+    # at, and how long that is from now. Assert the MEANING, never one exact
+    # string - _revalidate reads the clock TWICE (once inside _resolve_due to
+    # build the due time, once to subtract for the countdown), so whether a
+    # tick lands between those two reads decides "1:30:00" versus "1:29:59".
+    # Both are correct captions; which one appears is decided by the machine's
+    # timer granularity (15.6ms on Windows, where two adjacent time.time()
+    # calls routinely return the identical float), so pinning either one is a
+    # coin flip. format_countdown's own formatting is pinned deterministically
+    # further up; what is left to test here is that _revalidate wires the label
+    # to the right VALUES.
+    import re as _re
+    when_text = dlg.when_label.text()
+    left = _re.search(r", in (\d+):(\d{2}):(\d{2})\.", when_text)
+    left_s = (int(left[1]) * 3600 + int(left[2]) * 60 + int(left[3])
+              if left else -1)
     check("schedule: the composer says exactly when it will fire",
-          "in 1:29" in dlg.when_label.text(), dlg.when_label.text())
+          ss.format_clock(when) in when_text and 5390 < left_s <= 5400,
+          when_text)
     # the two time fields are alternatives: there must never be a hidden second
     # answer deciding the fire time
     dlg.clock_edit.setText("03:30")
@@ -11514,15 +11729,21 @@ def test_reply_marks_recovered_from_transcript():
     check("reply-recover: a reply not in the scrollback yields no stamp",
           card._recovered_replies == [], card._recovered_replies)
 
-    # a live mark outranks a recovered one on the same line
+    # where a live mark and a recovered one land on the same row, the live
+    # mark keeps the ROW (it anchored the screen it was looking at) and the
+    # transcript supplies the TIME. Claude stamps every record it writes; a
+    # live mark reads the wall clock at the settle, seconds late at best and
+    # wrong outright for a settle that was never a reply. That is what makes a
+    # stray stamp self-correcting on the next projection.
     card._recovered_replies = [(line, when)]
     card._reply_mark_lines = {}
     mark = agent.note_reply_settled()
     card._reply_mark_lines[mark.uid] = line
     card._refresh_reply_marks()
-    check("reply-recover: a live capture wins the line over a recovered one",
-          card.terminal.reply_marks() == [(line, _format_reply_stamp(mark.ts))],
-          card.terminal.reply_marks())
+    check("reply-recover: the transcript's time wins the row over the clock",
+          card.terminal.reply_marks() == [(line, _format_reply_stamp(when))]
+          and abs(mark.ts - when) > 60,
+          (card.terminal.reply_marks(), _format_reply_stamp(when)))
 
     card.deleteLater()
     agent.dispose()
@@ -11616,6 +11837,7 @@ def test_reply_marks_inline():
 
     # ---- FIFO cap -----------------------------------------------------
     for _ in range(REPLY_MARK_CAP + 5):
+        agent._note_submit()      # a new turn each time: one mark apiece
         agent.note_reply_settled()
     check("reply-mark: the mark list is FIFO-capped",
           len(agent.reply_marks()) == REPLY_MARK_CAP, len(agent.reply_marks()))
@@ -11647,6 +11869,7 @@ def main():
     test_tiling()
     test_layout_popup_placement()
     test_sidebar_count_badge()
+    test_row_name_fades_under_badges()
     test_agent_waiting()
     test_notification_chime()
     test_limit_blocked_workspace_stats()
@@ -11677,7 +11900,7 @@ def main():
     test_reveal_agent()
     test_new_agent_autofocus()
     test_agent_busy_activity()
-    test_reply_settle_skips_resume_replay()
+    test_reply_marks_need_a_submitted_turn()
     test_transcript_reply_times()
     test_ansi()
     test_terminal_keys()

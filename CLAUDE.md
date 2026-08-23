@@ -425,8 +425,8 @@ this file is the invariants that must survive every change.
   the right edge. Painted INLINE rather than on the scrollbar (`ReplyMark` in terminal_agent.py,
   `TerminalView.reply_anchor_line`/`_reply_marks`, `TerminalCard.
   _refresh_reply_marks`/`_on_reply_mark_added`). The header's
-  `#CardReplyTime` badge (`TerminalAgent.last_reply_at`,
-  `TerminalCard._refresh_reply_time`) only ever shows the LATEST reply; a
+  `#CardReplyTime` badge (since removed, along with the agent-side reply clock
+  that fed it) only ever showed the LATEST reply; a
   user asked to see the date/time under EVERY finished turn, the same way
   Claude's own "Crunched for Ns" footer marks each one — so this is a full
   second mark type mirroring `PromptMark`'s
@@ -463,33 +463,53 @@ this file is the invariants that must survive every change.
   `note_conversation_replaced()`, `TerminalCard._on_history_cleared` — same
   transient, never-persisted contract (`reply_marks_changed` must never
   reach a save) for the same reason: the transcript is the durable record.
-- **The first busy->idle settle of a resumed launch is a REPLAY finishing,
-  not a reply** (`TerminalAgent._settled_once`, checked in
-  `_on_idle_timeout` alongside `_resume_attempt`). A `--resume` launch
-  replays the WHOLE past conversation as real terminal output before the
-  screen ever goes quiet, and that replay settling looks EXACTLY like a
-  fresh reply ending to `_on_idle_timeout` — which used to stamp
-  `_last_reply_ts`/mint a `ReplyMark` unconditionally on every busy->idle
-  edge. Live-reported: reopening the app always showed the CURRENT time
-  next to the last reply (both the header badge and every inline mark),
-  never the actual historical one, because the resume-replay settle fired
-  the instant the app finished redrawing — i.e. "now", at launch time.
-  `_settled_once` (reset `False` in `start()` whenever `spec.resume` was
-  true, forced `True` in `restart()` since a restart is always a fresh,
-  non-resumed conversation with nothing to replay) suppresses ONLY that one
-  settle per launch; the very next settle — a genuine new reply — stamps
-  normally, and a non-resumed launch is never suppressed at all since it has
-  no replay to protect against. `activity_changed.emit(False)` still fires
-  unconditionally on the suppressed settle (the busy/idle UI state itself is
-  still correct); only the reply-time SIDE EFFECTS are skipped.
+- **A REPLY STAMP NEEDS A TURN SOMEBODY ASKED FOR, and that is a LATCH, not a
+  guess about which settle is a replay** (`TerminalAgent._turn_open`, set by
+  `_note_submit`, read in `_on_idle_timeout`). A busy->idle settle is 2 s of
+  quiet (`BUSY_IDLE_MS`) and NOTHING more, and a launch produces several that
+  are not replies at all: a `--resume` launch reprints the WHOLE past
+  conversation as real terminal output, pausing while Claude loads the
+  transcript and again once the reprint ends, and `settle_layout` then hands
+  every card its real width, which makes a full-screen TUI redraw its entire
+  frame (the same mechanism `request_repaint()` relies on). The FIRST attempt
+  at this was `_settled_once`, which suppressed exactly ONE settle per resumed
+  launch — and every settle after it stamped `time.time()`, anchored by
+  `reply_anchor_line()` to the blank row under the last reply's footer, which
+  is the SAME row `_recover_reply_marks` puts the transcript-recovered stamp
+  on. Since `_refresh_reply_marks` let a live mark win that row, reopening the
+  app rewrote the last reply in EVERY terminal to the minute the app was
+  opened. That was live-reported twice, the second time after `_settled_once`
+  had supposedly fixed it, which is the point: a one-shot classifier cannot
+  survive a second burst. So the precondition is now a fact rather than an
+  inference — a line was SUBMITTED to this child (`submits_a_line`: a bare CR,
+  with a bracketed-paste body and the ESC-CR/LF newline keys dropped, because
+  those INSERT a newline rather than submitting), from the user's own Enter
+  (`write`) or from the delayed CR every `deliver_task`/`nudge` goes through
+  (`_write_task_to_pty`). Reset in `start()` and `restart()`. Nothing else may
+  stamp a time onto a conversation; the launch replay, a resize repaint, and a
+  Claude background-task turn nobody asked for are all left to the transcript
+  recovery below, which knows when they really happened.
+  `activity_changed.emit(False)` still fires on every settle (the busy/idle UI
+  state is correct either way); only the reply-time side effect is gated.
+- **ONE stamp per turn, moved to where the reply ENDED** (`_turn_mark_uid`,
+  `note_reply_settled`). Claude falls quiet mid-reply whenever a tool runs
+  longer than the idle window, and each of those lulls used to mint its own
+  mark, so a single long reply wore a stamp at every pause it happened to take.
+  A settle whose turn already owns the tail mark MUTATES that mark's
+  `pos`/`ts` instead of appending; `_note_submit` clears `_turn_mark_uid` so
+  the next turn starts a fresh one. This is why the latch is NOT cleared when
+  a mark is minted, and why `TerminalCard._on_reply_mark_added` re-anchors the
+  NEWEST mark on every `reply_marks_changed` rather than only the first time it
+  sees a uid — the stamp has to follow the mark forward. When the anchor cannot
+  be found the mark keeps the row it already had, so a settle on an awkward
+  screen never costs a stamp that was already placed.
 - **A reply time is READ OFF THE TRANSCRIPT, because the clock only knows
-  turns this process watched** (`transcripts.reply_times`/`latest_reply_at`,
-  `TerminalAgent.set_transcript_reply_at`, `TerminalCard.
-  _recover_reply_marks`). Suppressing the resume-replay settle above is
-  correct and it left a hole: a restored conversation then has NO live stamp
-  for any past turn, so the header badge hid itself and not one inline mark
-  existed — the user asked "where is the date and timestamp?" three times
-  running, and the honest answer was "nowhere". A live observation
+  turns this process watched** (`transcripts.reply_times`,
+  `TerminalCard._recover_reply_marks`). Gating the live stamp on a submitted
+  turn is correct and it leaves a hole: a restored conversation has NO live
+  stamp for any past turn, so without this not one inline mark would exist —
+  the user asked "where is the date and timestamp?" three times running, and
+  the honest answer was "nowhere". A live observation
   structurally cannot serve the reopen case, which is the only case anyone
   complained about; Claude timestamps every record it writes, so the
   conversation on disk knows what no settle can. Rules:
@@ -506,19 +526,19 @@ this file is the invariants that must survive every change.
     transcripts, against the 90-165ms `typed_prompts` pays for its full scan.
     The bound costs nothing real: both consumers only ever ask about replies
     still ON SCREEN, and the scrollback reaches back a few turns at most.
-  * **Both surfaces, one reading.** `last_reply_at()` returns `max(live,
-    transcript)`: the settle lands a couple of seconds AFTER the record
-    Claude wrote, so live wins the turn in progress (no waiting a poll to see
-    a reply that just landed) and the transcript wins everything this run
-    never saw. TRANSIENT exactly like the model chip and the plan-usage
-    reading — `set_transcript_reply_at` must NEVER `_touch`/`_schedule_save`,
-    and it emits `reply_time_changed` only when the DISPLAYED walltime moves,
-    so a poll over an idle agent is free. It rides `refresh_ai_titles`
-    (`SESSION_SYNC_MS`, 5s) and NOT the 1.5s model poll, and it is read for
-    STOPPED agents too — a card that is not running is precisely the one with
-    nothing to show without it — but never while `is_busy()`, since nothing in
-    a transcript marks a turn as over and the last assistant text mid-stream
-    is a narration, not a reply.
+  * **One row, one reading, and the RECORD outranks the CLOCK.** Where a live
+    mark and a recovered one land on the same row, `_refresh_reply_marks`
+    keeps the live mark's ROW (it anchored the screen it was looking at) and
+    takes the recovered TIME. Claude stamps every record it writes; a live
+    mark reads the wall clock at the settle, which is a couple of seconds late
+    at best and flatly wrong for any settle that was not a reply. That split
+    is also what makes a stray live stamp SELF-CORRECTING: the next projection
+    recovers the same reply and the recorded time replaces the observed one.
+    Do not put the clock back on top — the whole class of bug here is a live
+    observation overwriting a historical fact. (The agent-side reply clock and
+    the header's `#CardReplyTime` badge that used to share this reading are
+    GONE, removed with the badge at the user's request; the inline stamp is
+    the only reply-time surface there is.)
   * **The inline stamps are recovered by matching the reply's CLOSING line**,
     mirroring `PromptMark`'s `_recover_marks` (which an earlier version of
     this bullet wrongly called impossible). Two measurements shape the anchor
@@ -539,9 +559,11 @@ this file is the invariants that must survive every change.
     `code`/**bold** rather than printing the characters. MEASURED end to end
     against real paired (screen, transcript) samples: 11/15 anchored, up from
     4/13 with head matching. It fails by being ABSENT, never wrong — a reply
-    that scrolled away yields no stamp rather than a guessed line, and a live
-    capture always outranks a recovered one on the same line
-    (`_refresh_reply_marks`, the same merge `_refresh_marks` does).
+    that scrolled away yields no stamp rather than a guessed line, and where a
+    live capture and a recovered one share a line the live ROW wins and the
+    recovered TIME wins (`_refresh_reply_marks`; `_refresh_marks` still merges
+    prompts the plain live-wins way, since a prompt mark carries text rather
+    than a time).
   * Recovered replies share `_recover_key` with the recovered PROMPTS, so one
     conversation costs one read of each; a `/clear` or pin change rotates the
     key. Everything here stays TRANSIENT and un-persisted — the transcript IS

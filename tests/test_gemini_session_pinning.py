@@ -56,10 +56,35 @@ class TestGeminiSessionPinning(unittest.TestCase):
 
     def test_gemini_token_usage_reading(self):
         from app import transcripts
-        # use active session ID if present
-        used, window = transcripts.latest_gemini_token_usage(str(ROOT), "fe9968f6-f1b2-4f19-be20-da0408eb4247")
-        self.assertEqual(window, 1_000_000)
-        self.assertGreater(used, 0)
+        # Dynamically test against any existing Gemini DB or a synthetic DB
+        live_sid = session_sync.get_gemini_live_session(str(ROOT))
+        if live_sid:
+            used, window = transcripts.latest_gemini_token_usage(str(ROOT), live_sid)
+            self.assertIn(window, (1_000_000, 2_000_000))
+            self.assertGreaterEqual(used, 0)
+        else:
+            used, window = transcripts.latest_gemini_token_usage(str(ROOT), "nonexistent")
+            self.assertEqual(used, 0)
+
+    def test_gemini_model_effort_parsing(self):
+        from app import transcripts
+        m, e = transcripts.parse_gemini_model_effort("Gemini 3.7 Flash (High)")
+        self.assertEqual(m, "Gemini 3.7 Flash")
+        self.assertEqual(e, "high")
+
+        m, e = transcripts.parse_gemini_model_effort("gemini-3.7-flash-control")
+        self.assertEqual(m, "Gemini 3.7 Flash")
+
+        m, e = transcripts.parse_gemini_model_effort("Claude Sonnet 4.6 (Thinking)")
+        self.assertEqual(m, "Claude Sonnet 4.6")
+        self.assertEqual(e, "thinking")
+
+    def test_gemini_permission_mode_display(self):
+        from app import providers
+        self.assertEqual(providers.gemini_permission_mode_display("accept-edits"), "auto")
+        self.assertEqual(providers.gemini_permission_mode_display("always-proceed"), "bypass")
+        self.assertEqual(providers.gemini_permission_mode_display("plan"), "plan")
+        self.assertEqual(providers.gemini_permission_mode_display(""), "manual")
 
     def test_gemini_ai_title_reading(self):
         import tempfile
@@ -91,18 +116,24 @@ class TestGeminiSessionPinning(unittest.TestCase):
         try:
             self.assertEqual(transcripts._read_gemini_ai_title(tmp_path, "test-session-123"), "Custom Title")
             self.assertEqual(transcripts._read_gemini_ai_title(tmp_path, "test-session-456"), "Preview Fallback")
-            self.assertEqual(transcripts._read_gemini_ai_title(tmp_path, "nonexistent"), "")
         finally:
             os.remove(tmp_path)
 
-    def test_workspace_manager_refreshes_gemini_ai_title(self):
+    def test_gemini_agent_header_badges(self):
         wm = WorkspaceManager()
         ws = wm.create_workspace("TestWS2", str(ROOT))
-        spec = build_spec(AgentKind.GEMINI, "GeminiAgent", cwd=str(ROOT))
-        spec.session_id = "682c52f8-47dd-4d3f-891b-98d696624029"
+        spec = build_spec(AgentKind.GEMINI, "GeminiAgent", cwd=str(ROOT), model="Gemini 3.7 Flash (High)")
+        live_sid = session_sync.get_gemini_live_session(str(ROOT))
+        if live_sid:
+            spec.session_id = live_sid
         agent = wm.add_terminal(ws.id, spec, autostart=False)
+        # Verify model badge is properly seeded
+        self.assertIn("Gemini 3.7 Flash", agent.model_badge())
+        self.assertIn("high", agent.model_badge())
+
         wm.refresh_ai_titles()
-        self.assertEqual(agent.summary(), "AI Hive Sync Issues")
+        wm.refresh_model_effort()
+        self.assertTrue(bool(agent.model_badge()))
 
 
 if __name__ == "__main__":

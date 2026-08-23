@@ -68,6 +68,9 @@ TUI_PROGRAMS = {"vim", "vi", "nano", "htop", "top", "less", "ssh"}
 
 PTY_BUFFER_CAP = 512 * 1024  # raw VT tail kept for fresh-card replay
 PROMPT_MARK_CAP = 200        # prompt milestones kept per agent (FIFO)
+PASTE_ON = "\x1b[200~"    # bracketed paste, opened by the view
+PASTE_OFF = "\x1b[201~"   # ...and closed here (see submits_a_line)
+NEWLINE_KEY = "\x1b\r"    # Shift/Alt+Enter: insert a newline, do not submit
 REPLY_MARK_CAP = 200         # reply-finished milestones kept per agent (FIFO)
 
 # "Busy" = the agent is actively streaming output (thinking, generating,
@@ -249,6 +252,31 @@ class ReplyMark:
     ts: float
 
 
+def submits_a_line(data: str) -> bool:
+    """Does this write actually SUBMIT what is in the child's input box?
+
+    A BARE carriage return does, and nothing else here. Two lookalikes are
+    dropped first because both INSERT a newline instead:
+
+    * a CR inside a bracketed paste -- Claude Code reads it as part of the
+      pasted text, which is the very trap `_write_task_to_pty` sends its own
+      CR a beat later to avoid, and the reason a PromptMark is never minted
+      from `agent.write`;
+    * ESC-CR, what the view sends for Shift/Alt+Enter (see
+      TerminalView._sequence_for), and a plain LF, what it sends for
+      Ctrl+Enter. Those are how a multi-line prompt is typed."""
+    while True:
+        start = data.find(PASTE_ON)
+        if start < 0:
+            break
+        end = data.find(PASTE_OFF, start)
+        if end < 0:
+            data = data[:start]
+            break
+        data = data[:start] + data[end + len(PASTE_OFF):]
+    return "\r" in data.replace(NEWLINE_KEY, "")
+
+
 class TerminalAgent(QObject):
     output_segment = Signal(str, str)   # stream, text (line mode)
     pty_output = Signal(str)            # raw VT stream (pty mode)
@@ -305,13 +333,9 @@ class TerminalAgent(QObject):
         # the card is never blank, then kept true by the manager's transcript
         # poll. Transient: never written back to spec (that is the persisted
         # command line) and never marks the session dirty.
-        self._live_model = self._seed_model()
         self._live_effort = (spec.effort or "").strip()
-        # ...and which permission mode (Shift+Tab) it is in. Same live reading,
-        # with ONE difference: this one IS written back to the spec by the
-        # manager, because the CLI does not carry a permission mode across a
-        # --resume and a reopened agent must come back in the mode it was in.
         self._live_mode = (getattr(spec, "permission_mode", "") or "").strip()
+        self._live_model = self._seed_model()
         self.assignment = AssignmentState.IDLE  # task-assignment lifecycle
         self.auto_created = False           # created with a task via spawn_worker
         self.autostart_on_restore = False  # set from persisted run state
@@ -358,11 +382,12 @@ class TerminalAgent(QObject):
         self._busy = False            # actively streaming output right now
         self._last_output_ts = 0.0    # walltime of the last output burst
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
-        # False until the FIRST busy -> idle settle of the current launch has
-        # happened. See _on_idle_timeout: a --resume launch replays the whole
-        # past conversation as real output before it ever settles, and that
-        # one settle must not be mistaken for a fresh reply finishing NOW.
-        self._settled_once = False
+        # "a line has been submitted to this child since it launched", and the
+        # mark that turn owns. See _note_submit / _on_idle_timeout: a settle is
+        # only a REPLY when something was asked, and nothing else may stamp a
+        # time onto the conversation.
+        self._turn_open = False
+        self._turn_mark_uid: int | None = None
         # latched "the plan limit cut this agent off" + the reset time its own
         # banner stated. Transient like the waiting flags — never persisted.
         self._limit_blocked = False
@@ -445,7 +470,8 @@ class TerminalAgent(QObject):
         self._limit_last_skip = None   # ...so a skip is reported again too
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
-        self._settled_once = False  # see _on_idle_timeout
+        self._turn_open = False        # nothing asked yet, so nothing to stamp
+        self._turn_mark_uid = None
         # a NON-resume start is a new conversation, so it gets a new pinned
         # identity (rotating also avoids --session-id colliding with an
         # existing transcript); a resume keeps its pin
@@ -516,9 +542,10 @@ class TerminalAgent(QObject):
         if self.spec.provider in ("claude", "gemini"):  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
         self._session_started = time.time()
-        # a restart is always a fresh, non-resumed conversation -- there is no
-        # replay to protect the first settle from (see _on_idle_timeout)
-        self._settled_once = True
+        # a restart is a fresh conversation: the next reply worth stamping is
+        # the next one somebody asks for (see _note_submit)
+        self._turn_open = False
+        self._turn_mark_uid = None
         if self.is_pty:
             self._pty_buffer = []
             self._pty_bytes = 0
@@ -540,7 +567,36 @@ class TerminalAgent(QObject):
         # echo of that typing apart from genuine agent output — echo must not
         # light the "working" pulse (see _mark_busy / INPUT_ECHO_S).
         self._last_input_ts = time.time()
+        if submits_a_line(data):
+            self._note_submit()
         return self.worker.write(data)
+
+    def _note_submit(self) -> None:
+        """A line was just submitted to the child, so the reply to it is
+        something this process is entitled to put a time on.
+
+        This is the whole precondition for a reply stamp (see
+        _on_idle_timeout), and it replaced a one-shot "the first settle of a
+        --resume launch is the replay" guess that could not survive reopening
+        the app. A settle is 2 s of quiet (BUSY_IDLE_MS) and nothing more, and
+        a launch produces several that are not replies: Claude prints its
+        banner and pauses while it loads the transcript, then reprints the
+        whole past conversation and pauses again, and settle_layout hands the
+        card its real width right afterwards, which makes a full-screen TUI
+        redraw its frame. Every one of those looks exactly like a reply
+        ending, so reopening the app stamped the CURRENT time over the last
+        reply in every terminal -- the live-reported bug. Nobody asked those
+        "replies" for anything, so none of them opens a turn; the times for
+        turns this process never watched come off the transcript instead
+        (TerminalCard._recover_reply_marks), which is the durable record.
+
+        The latch is deliberately NOT cleared when a mark is minted. A turn can
+        settle several times over (Claude goes quiet mid-reply whenever a tool
+        runs longer than the idle window), and those later settles must keep
+        MOVING that turn's one mark to where the reply really ended, rather
+        than either falling silent or littering the turn with stamps."""
+        self._turn_open = True
+        self._turn_mark_uid = None    # the next settle starts this turn's mark
 
     def resize(self, rows: int, cols: int) -> None:
         if self.is_pty:
@@ -644,16 +700,31 @@ class TerminalAgent(QObject):
         input box (see TerminalView.reply_anchor_line). Returns the mark, or
         None if it was not recorded.
 
-        Called unconditionally from `_on_idle_timeout`, NOT gated on a card
-        existing (unlike a typed prompt, which can only ever originate from
-        one): a hidden workspace keeps executing per the model-owns-processes
+        ONE mark per turn: a turn that settles again (Claude falls quiet
+        whenever a tool runs longer than the idle window, so a single long
+        reply settles several times) MOVES its existing mark to the new
+        position and time instead of appending another. Otherwise one reply
+        wears a stamp at every pause it happened to take rather than one at
+        its end. `_note_submit` is what starts the next turn's mark.
+
+        Called from `_on_idle_timeout` and NOT gated on a card existing
+        (unlike a typed prompt, which can only ever originate from one): a
+        hidden workspace keeps executing per the model-owns-processes
         invariant, and its reply history must still be there — via
         reply_replay_marks() — whenever a card is next built for it."""
         if not self.is_pty:
             return None
+        if (self._turn_mark_uid is not None and self._reply_marks
+                and self._reply_marks[-1].uid == self._turn_mark_uid):
+            mark = self._reply_marks[-1]
+            mark.pos = self._pty_total
+            mark.ts = time.time()
+            self.reply_marks_changed.emit()
+            return mark
         self._reply_mark_seq += 1
         mark = ReplyMark(uid=self._reply_mark_seq, pos=self._pty_total,
                          ts=time.time())
+        self._turn_mark_uid = mark.uid
         self._reply_marks.append(mark)
         while len(self._reply_marks) > REPLY_MARK_CAP:
             self._reply_marks.pop(0)
@@ -668,6 +739,7 @@ class TerminalAgent(QObject):
         if not self._reply_marks:
             return False
         self._reply_marks = []
+        self._turn_mark_uid = None   # nothing left for this turn to move
         self.reply_marks_changed.emit()
         return True
 
@@ -716,6 +788,20 @@ class TerminalAgent(QObject):
         being RUNNING is not, since the launch autostart starts agents
         synchronously, well before any card has a settled size."""
         return bool(self._pty_seed) and self._pty_buffer != [self._pty_seed]
+
+    def has_pristine_seed(self) -> bool:
+        """The inverse: the buffer is EXACTLY a restored snapshot and nothing
+        has been drawn over it.
+
+        True only while a card is being built at launch over last session's
+        screen, since `_pty_seed` is set by `seed_pty_replay` alone (called
+        from `create_main_window`, before the window exists) and cleared by
+        `drop_seeded_screen`/`restart`. That is what lets the card tell a
+        LAUNCH build from a REBUILD of a live agent (a retile, a workspace
+        switch), which must keep painting instantly -- see
+        `TerminalCard.__init__` and the boot veil it raises here.
+        """
+        return bool(self._pty_seed) and self._pty_buffer == [self._pty_seed]
 
     def drop_seeded_screen(self) -> bool:
         """Forget a restored screen that no live child has drawn over.
@@ -806,12 +892,18 @@ class TerminalAgent(QObject):
         """The model label to show before the transcript has said anything.
         Claude agents launched on "Default" pass no --model, so the CLI falls
         back to the user's own saved setting: read that rather than show
-        nothing. Other providers bake effort into their model string already
-        (agy's "Gemini 3.1 Pro (High)"), so it is shown verbatim."""
+        nothing. Gemini agents do the same from ~/.gemini/antigravity-cli/settings.json.
+        Other providers show spec.model verbatim."""
         chosen = (self.spec.model or "").strip()
-        if self.spec.provider != "claude":
-            return chosen
-        return transcripts.model_display(chosen or providers.user_default_model())
+        if self.spec.provider == "claude":
+            return transcripts.model_display(chosen or providers.user_default_model())
+        if self.spec.provider == "gemini":
+            raw = chosen or providers.gemini_user_default_model()
+            model, effort = transcripts.parse_gemini_model_effort(raw)
+            if effort and not self._live_effort:
+                self._live_effort = effort
+            return model or raw
+        return chosen
 
     def set_live_model(self, model: str, effort: str, mode: str = "") -> None:
         """Adopt the model/effort/permission mode the conversation is actually
@@ -846,10 +938,12 @@ class TerminalAgent(QObject):
 
     def permission_mode_label(self) -> str:
         """That mode as it reads on the card, e.g. "auto" / "plan" / "manual".
-        "" for a non-Claude agent, which has no such mode at all."""
-        if self.spec.provider != "claude":
-            return ""
-        return providers.permission_mode_display(self._live_mode)
+        "" for a non-AI agent, which has no such mode at all."""
+        if self.spec.provider == "claude":
+            return providers.permission_mode_display(self._live_mode)
+        if self.spec.provider == "gemini":
+            return providers.gemini_permission_mode_display(self._live_mode)
+        return ""
 
     def model_badge(self) -> str:
         """Compact "what am I running on" string for the card header, e.g.
@@ -1096,7 +1190,10 @@ class TerminalAgent(QObject):
         gen = self._submit_gen
         QTimer.singleShot(350, lambda: self._submit_gen == gen
                           and self.worker.is_running()
-                          and self.worker.write("\r"))
+                          and self.worker.write("\r")
+                          # a delivered task and an auto-continue nudge are
+                          # submits like any other: their replies get a stamp
+                          and (self._note_submit() or True))
 
     def send_command(self, text: str) -> None:
         if self.is_pty:  # pty terminals take raw keystrokes, not line commands
@@ -1371,19 +1468,17 @@ class TerminalAgent(QObject):
     def _on_idle_timeout(self) -> None:
         if self._busy:
             self._busy = False
-            # A --resume launch replays the WHOLE past conversation as real
-            # terminal output before it ever goes quiet, so the FIRST settle
-            # of a resumed launch is that replay finishing, not a fresh reply
-            # -- stamping it "now" is exactly the live-reported bug where
-            # reopening the app showed the CURRENT time next to the last
-            # reply instead of when it actually happened. Only that one
-            # settle is suppressed; every settle after it (including the
-            # very next one, moments later, once the user sends something
-            # new) is a genuine reply and stamps normally. A non-resumed
-            # launch has nothing to replay, so its first settle is real too.
-            replay_settle = self._resume_attempt and not self._settled_once
-            self._settled_once = True
-            if not replay_settle:
+            # A settle is only 2 s of quiet, which is not the same thing as a
+            # reply ending: a --resume launch reprints the WHOLE past
+            # conversation as real terminal output, pausing on the way, and
+            # every card is resized into its real width right afterwards,
+            # which makes the child redraw its entire frame. Stamping those
+            # "now" is exactly the live-reported bug -- reopen the app and the
+            # last reply in every terminal reads the moment it was opened. So
+            # a stamp needs a turn somebody actually asked for (_note_submit),
+            # and the rest are left to the transcript, which knows when they
+            # really happened.
+            if self._turn_open:
                 self.note_reply_settled()
             self.activity_changed.emit(False)
         # the screen has settled (2 s quiet) — is it a prompt awaiting the user?

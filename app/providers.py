@@ -135,6 +135,22 @@ def permission_mode_display(raw: str) -> str:
     token = (raw or "").strip()
     return _MODE_DISPLAY.get(token, token)
 
+
+_GEMINI_MODE_DISPLAY = {
+    "": "manual", "default": "manual", "ask-permission": "manual",
+    "accept-edits": "auto", "auto": "auto", "accept_edits": "auto",
+    "always-proceed": "bypass", "always_proceed": "bypass",
+    "yolo": "bypass", "bypasspermissions": "bypass", "bypass": "bypass",
+    "plan": "plan",
+}
+
+
+def gemini_permission_mode_display(raw: str) -> str:
+    """A Gemini permission mode as a short label for the card header, e.g.
+    'accept-edits' -> 'auto', 'always-proceed' -> 'bypass', 'plan' -> 'plan'."""
+    token = (raw or "").strip().lower()
+    return _GEMINI_MODE_DISPLAY.get(token, token)
+
 PROVIDERS: dict[str, Provider] = {
     "claude": Provider(
         key="claude", display="Claude Code", exe_names=("claude",),
@@ -242,6 +258,40 @@ def user_default_model() -> str:
         return _USER_MODEL_CACHE[2]
     _USER_MODEL_CACHE = (st.st_mtime, st.st_size, model)
     return model
+
+
+_GEMINI_SETTINGS_CACHE: tuple = (0.0, -1, {})
+
+
+def gemini_user_default_settings() -> dict:
+    """Read ~/.gemini/antigravity-cli/settings.json safely. Cached by mtime+size."""
+    global _GEMINI_SETTINGS_CACHE
+    path = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli", "settings.json")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    if _GEMINI_SETTINGS_CACHE[0] == st.st_mtime and _GEMINI_SETTINGS_CACHE[1] == st.st_size:
+        return _GEMINI_SETTINGS_CACHE[2]
+    data = {}
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        return _GEMINI_SETTINGS_CACHE[2]
+    _GEMINI_SETTINGS_CACHE = (st.st_mtime, st.st_size, data)
+    return data
+
+
+def gemini_user_default_model() -> str:
+    """The default model configured in Gemini/agy settings.json, or fallback."""
+    sett = gemini_user_default_settings()
+    model = sett.get("model")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return "Gemini 3.7 Flash (High)"
 
 
 def resolve_program(key: str) -> str:

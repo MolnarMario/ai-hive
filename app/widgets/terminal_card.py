@@ -316,6 +316,11 @@ class TerminalCard(QFrame):
         self._renaming = False  # inline title-edit in progress
         self._task_full = ""    # untruncated current-task (the label elides it)
         self._pending_replay = ""  # restored screen, re-rendered once at size
+        # is the boot veil up because a RESTORED SNAPSHOT has not been
+        # projected at a real width yet? Distinct from the veil being up
+        # because a child is booting, and it decides who is allowed to lower
+        # it (see __init__, _on_status, _rerender_restored).
+        self._boot_seed = False
         self._restored_hooked = False  # is _rerender_restored still armed?
         # prompt milestone uid -> absolute line IN THIS VIEW. Per-card because
         # a rebuilt view has a different `pushed` origin; keyed on uid because
@@ -398,6 +403,20 @@ class TerminalCard(QFrame):
         else:
             self._replay_log()
         self._on_status(agent.status)
+        # ...and cover that seed, because the user WOULD otherwise see it.
+        # main.py shows the window before autostart_active_workspace raises
+        # any veil, so this projection is painted first -- and it can only
+        # ever paint scrambled: REPLAY_SEED_CAP is a cut through the MIDDLE
+        # of a classic-renderer frame (no banner, no known cursor row, column
+        # jumps referring to rows that were never drawn) at a width the card
+        # does not have yet. Measured on real captures: the same bytes render
+        # as clean prose at their capture width and as overlapping fragments
+        # at any other. Reported as "gibberish in the top left corner, then
+        # the loader, then it looks normal". Deliberately AFTER _on_status,
+        # whose not-running branch would dismiss what this raises.
+        if self.is_pty and self.agent.has_pristine_seed():
+            self._boot_seed = True
+            self._begin_boot_veil()
         self._on_assignment(agent.assignment)
         self._on_task()
         self._on_tokens(agent.token_badge())
@@ -1049,6 +1068,10 @@ class TerminalCard(QFrame):
         if not self.is_pty or self.terminal is None:
             return          # a line-mode card has no screen to restore
         self._pending_replay = ""
+        # the seed is gone, so the veil is no longer holding a screen back --
+        # from here it belongs to the booting child (_on_status raises it
+        # again a moment later and lifts it on prompt_ready)
+        self._boot_seed = False
         # the settled-size projection must be cancelled too, not just the
         # signal: its backstop timer would otherwise fire a moment later and
         # re-project the very screen this just decided to drop
@@ -1093,6 +1116,7 @@ class TerminalCard(QFrame):
         clean terminal it fills itself, so replaying the seed under it would put
         back the mangled fragment `drop_restored_screen` exists to remove."""
         self._pending_replay = ""
+        seeded, self._boot_seed = self._boot_seed, False
         self._settle_timer.stop()
         self._unhook_restored()
         replay = self.agent.pty_replay()
@@ -1106,6 +1130,14 @@ class TerminalCard(QFrame):
         self._replay_with_marks(replay)
         self._proj_cols = self.terminal.screen.columns
         self._refresh_overlay()
+        if seeded and not self.agent.is_running():
+            # this projection IS the stopped card's final picture, so it is
+            # the moment to dissolve. A card about to autostart passes through
+            # here too (settle_layout flushes every resize before any child is
+            # spawned), and does NOT flicker: agent.start() re-raises the veil
+            # in the same call stack, and BootVeil.begin() stops the fader and
+            # resets _fade, so the 260ms fade never paints a frame.
+            self._end_boot_veil()
 
     def _refresh_overlay(self) -> None:
         """Pick the banner's shape from what is already on the screen.
@@ -1306,15 +1338,24 @@ class TerminalCard(QFrame):
         (a pin change or /clear), which changes the key and re-reads."""
         self._recovered = []
         spec = self.agent.spec
-        if not self.is_pty or spec.provider != "claude":
+        if not self.is_pty or spec.provider not in ("claude", "gemini"):
             return
-        key = (spec.cwd, spec.session_id)
+        key = (spec.provider, spec.cwd, spec.session_id)
         if key != self._recover_key:
             self._recover_key = key
-            self._recover_prompts = transcripts.typed_prompts(
-                spec.cwd, spec.session_id)
-            self._recover_replies = transcripts.reply_times(
-                spec.cwd, spec.session_id)
+            if spec.provider == "claude":
+                self._recover_prompts = transcripts.typed_prompts(
+                    spec.cwd, spec.session_id)
+                self._recover_replies = transcripts.reply_times(
+                    spec.cwd, spec.session_id)
+            elif spec.provider == "gemini":
+                self._recover_prompts = transcripts.gemini_typed_prompts(
+                    spec.session_id)
+                self._recover_replies = transcripts.gemini_reply_times(
+                    spec.session_id)
+            else:
+                self._recover_prompts = []
+                self._recover_replies = []
         prompts = self._recover_prompts
         if not prompts:
             return
@@ -1357,9 +1398,9 @@ class TerminalCard(QFrame):
         reply finished.
 
         The counterpart of _recover_marks, and it exists for a sharper reason:
-        a reply mark is minted from a busy -> idle settle, so a conversation
-        restored from disk comes back with NONE, and the resume-replay
-        suppression (_settled_once) means a reopened hive shows no reply time
+        a reply mark is minted from a busy -> idle settle of a turn somebody
+        submitted (TerminalAgent._note_submit), so a conversation restored from
+        disk comes back with NONE and a reopened hive would show no reply time
         anywhere at all. The transcript is the only record of when those turns
         actually finished.
 
@@ -1381,7 +1422,7 @@ class TerminalCard(QFrame):
         inventing a time for one."""
         self._recovered_replies = []
         spec = self.agent.spec
-        if not self.is_pty or spec.provider != "claude":
+        if not self.is_pty or spec.provider not in ("claude", "gemini"):
             return
         if not self._recover_replies:
             return
@@ -1449,29 +1490,39 @@ class TerminalCard(QFrame):
         yesterday keeps reading as date-prefixed today rather than freezing
         whatever "same day" looked like the moment it was captured.
 
-        Live marks and transcript-recovered ones are merged the same way
-        _refresh_marks merges prompts: a live capture anchored the row it was
-        actually looking at, a recovered one was located by matching text, so
-        where both land on a line the live one wins."""
+        Live marks and recovered ones are merged by ROW, and where both land
+        on the same one the split is deliberate: the live mark keeps the row
+        (it anchored the screen it was looking at) and the TRANSCRIPT supplies
+        the time. Claude stamps every record it writes, whereas a live mark
+        reads the wall clock at the settle -- a couple of seconds late at best,
+        and flatly wrong for any settle that was not a reply at all. That
+        makes a stray live stamp self-correcting: the next projection recovers
+        the same reply and the recorded time replaces the observed one."""
         if not self.is_pty:
             return
         by_uid = {m.uid: m for m in self.agent.reply_marks()}
-        live = [(line, by_uid[uid].ts)
+        recovered = dict(self._recovered_replies)
+        live = [(line, recovered.get(line, by_uid[uid].ts))
                 for uid, line in self._reply_mark_lines.items()
                 if uid in by_uid]
         taken = {line for line, _ in live}
-        merged = live + [(line, when) for line, when in self._recovered_replies
+        merged = live + [(line, when) for line, when in recovered.items()
                          if line not in taken]
         self.terminal.set_reply_marks(
             sorted((line, _format_reply_stamp(when)) for line, when in merged))
 
     def _on_reply_mark_added(self) -> None:
         """A reply-finished milestone was recorded on the agent (or the set
-        was cleared, e.g. a restart). Only the newest mark can ever be new
-        here -- note_reply_settled() appends exactly one mark per call, so
-        the CARD only has to catch up on the tail; an already-anchored mark
-        keeps whatever line _replay_with_marks (or an earlier call here) gave
-        it."""
+        was cleared, e.g. a restart). Only the newest mark can ever have moved
+        here, so the CARD only has to re-read the tail; every older mark keeps
+        whatever line _replay_with_marks (or an earlier call here) gave it.
+
+        The newest one is re-anchored on EVERY signal rather than only the
+        first time it is seen, because a turn that settles again moves its own
+        mark forward (see TerminalAgent.note_reply_settled) and the stamp has
+        to follow it to where the reply actually ended. When the anchor cannot
+        be found the mark keeps the row it already had, so a settle on an
+        awkward screen never costs a stamp that was already placed."""
         if not self.is_pty:
             return
         marks = self.agent.reply_marks()
@@ -1479,11 +1530,9 @@ class TerminalCard(QFrame):
             self._reply_mark_lines = {}
             self._refresh_reply_marks()
             return
-        latest = marks[-1]
-        if latest.uid not in self._reply_mark_lines:
-            line = self.terminal.reply_anchor_line()
-            if line is not None:
-                self._reply_mark_lines[latest.uid] = line
+        line = self.terminal.reply_anchor_line()
+        if line is not None:
+            self._reply_mark_lines[marks[-1].uid] = line
         self._refresh_reply_marks()
 
     def _place_overlay(self) -> None:
@@ -1591,7 +1640,11 @@ class TerminalCard(QFrame):
             # and the wake banner owns the stopped one
             if running and not self.agent.prompt_ready():
                 self._begin_boot_veil()
-            elif not running:
+            elif not running and not self._boot_seed:
+                # a RESTORED card that stays stopped keeps the veil until its
+                # settled-width projection lands (_rerender_restored); the
+                # wake banner owns the state only once there is something
+                # readable under it
                 self._dismiss_boot_veil()
 
         if status is AgentStatus.STARTING:

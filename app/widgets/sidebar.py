@@ -51,8 +51,8 @@ from ..process_worker import describe_pid
 from ..terminal_agent import AgentStatus
 from ..ui_theme import Palette, repolish
 from .activity_panel import _ICON
-from .ornaments import (AgentCountBadge, ElidingLabel, OrnamentDivider,
-                        WorkspaceSpinner)
+from .ornaments import (AgentCountBadge, ElidingLabel, FadingLabel,
+                        OrnamentDivider, WorkspaceSpinner)
 
 SIDEBAR_WIDTH = 230
 ROW_HEIGHT = 44
@@ -88,6 +88,9 @@ class WorkspaceRow(QFrame):
     agentsRequested = Signal(str)       # ws_id (count-badge clicked; M3)
     filesRequested = Signal(str)        # ws_id (file-tree toggle clicked)
 
+    # clear air kept between the end of the name's ink and the first badge
+    _ICON_TEXT_GAP = 6
+
     def __init__(self, ws_id: str, name: str, folder: str, parent=None):
         super().__init__(parent)
         self.ws_id = ws_id
@@ -113,15 +116,27 @@ class WorkspaceRow(QFrame):
         text_col = QVBoxLayout()
         text_col.setContentsMargins(0, 0, 0, 0)
         text_col.setSpacing(0)
-        self.name_label = QLabel(name, self)
+        self.name_label = FadingLabel(name, self)
         self.name_label.setObjectName("WsName")
         # allowed to shrink all the way to 0: the icons/badges to its right
         # must NEVER be squeezed out or collapsed behind a "..." overflow to
-        # make room for the name — the name concedes the space instead, even
-        # if that means it's fully covered. A workspace's name and position
-        # are static, so a temporarily short name while badges are up front
-        # is a non-issue; a hidden icon (a waiting "?", a working spinner) is not.
+        # make room for the name — the name concedes the space instead. What
+        # it concedes is INK, not width: the badges are painted over the
+        # label's right end (see _icon_stack below), and the label fades its
+        # text out just before them (_fade_name_under_icons), so a long name
+        # dissolves into the row instead of colliding with a gear or a
+        # spinner. Nothing is elided: on a row with no badges lit the name
+        # gets the whole row and paints in full.
         self.name_label.setMinimumWidth(0)
+        # ...and an Ignored width policy so the layout believes it. A plain
+        # QLabel reports its whole text as its minimumSizeHint, which the row
+        # then inherits: the tree column grew to fit the longest NAME (333px
+        # measured against a 230px sidebar) and pushed the badge stack, pinned
+        # to the row's right edge, clean out of the visible column - the same
+        # "an icon is missing" failure the stack exists to prevent, arriving
+        # from the opposite direction.
+        self.name_label.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                      QSizePolicy.Policy.Preferred)
         self.rename_edit = QLineEdit(self)
         self.rename_edit.setObjectName("WsRenameEdit")
         self.rename_edit.hide()
@@ -244,6 +259,24 @@ class WorkspaceRow(QFrame):
         x = max(0, x)
         y = (self.height() - h) // 2
         self._icon_stack.move(x, y)
+        self._fade_name_under_icons(x, w)
+
+    def _fade_name_under_icons(self, stack_x: int, stack_w: int) -> None:
+        """Tell the name where the badge stack starts, so its text dissolves
+        into the row rather than painting through the icons.
+
+        This is the readability half of the overlay above: the stack is raised
+        over the name and owns no layout width, so without it a name long
+        enough to reach the badges renders its letters and their glyphs in the
+        same pixels (live report: a gear and a spinner sitting inside "Video
+        Production"). The fade is driven by the stack's MEASURED position, so
+        it tracks exactly which badges happen to be lit, and it is dropped
+        entirely the moment none are - a quiet row is a plain label again."""
+        if stack_w <= 2:            # nothing lit: the name owns the whole row
+            self.name_label.set_fade_x(None)
+            return
+        left = self.name_label.mapFrom(self, QPoint(stack_x, 0)).x()
+        self.name_label.set_fade_x(left - self._ICON_TEXT_GAP)
 
     # ------------------------------------------------------------- state ---
 
