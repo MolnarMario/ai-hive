@@ -3282,6 +3282,83 @@ def test_reply_marks_need_a_submitted_turn():
     a.dispose()
 
 
+def test_reply_marks_recovered_after_reprint():
+    """A conversation REPRINTED after its card was built still gets its marks.
+
+    Milestone recovery rides a projection, and the launch autostart leaves a
+    restored RUNNING card with none: `drop_restored_screen` cancels the
+    settled-size projection (that snapshot is the previous run's screen, wrapped
+    for a width nothing can reflow) and `_reproject_on_size` bails while the
+    history is empty, which it is, because `settle_layout` sizes the card before
+    the child is spawned. The conversation then arrives seconds later from
+    `--resume`, with nothing left to scan it -- so a reopened hive showed no
+    stamp and no prompt dot anywhere. It went unnoticed only because a phantom
+    live mark used to land on the last reply instead, stamped with the launch
+    time. `_rescan_recovery` looks again once the reprint settles."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.widgets.terminal_card import (_RECOVER_RESCAN_TRIES, TerminalCard,
+                                           _format_reply_stamp)
+
+    QApplication.instance() or QApplication([])
+    spec = build_spec(AgentKind.CLAUDE, "Reopen", cwd=".", pty=True)
+    spec.session_id = "11111111-2222-3333-4444-555555555555"
+    agent = TerminalAgent(spec)
+    card = TerminalCard(agent)
+    card.resize(900, 500)
+    card._proj_cols = card.terminal.screen.columns
+    # the transcript says this conversation's one reply finished two hours ago
+    when = time.time() - 7200
+    card._recover_key = (spec.provider, spec.cwd, spec.session_id)
+    card._recover_prompts = []
+    card._recover_replies = [(when, "Done. The fix is in and the suite passes.")]
+
+    card.drop_restored_screen()      # what autostart does before start()
+    check("reply-reprint: the launch autostart leaves the card with no marks",
+          card.terminal.reply_marks() == [], card.terminal.reply_marks())
+
+    # ...and only THEN does the child reprint the resumed conversation
+    agent.status = AgentStatus.RUNNING
+    agent._on_pty_output("pty", "> do the thing\r\n\r\n"
+                         "● Done. The fix is in and the suite passes."
+                         "\r\n\r\n✳ Crunched for 41s\r\n\r\n"
+                         + "─" * 40 + "\r\n> ")
+    agent._on_idle_timeout()         # the settle after the reprint
+    check("reply-reprint: the settle after the reprint recovers the stamp",
+          card.terminal.reply_marks() == [(5, _format_reply_stamp(when))],
+          card.terminal.reply_marks())
+    check("reply-reprint: ...with the TRANSCRIPT's time, not the launch clock",
+          _format_reply_stamp(when) != _format_reply_stamp(time.time()))
+    check("reply-reprint: a scan that found something never runs again",
+          card._recover_tries < _RECOVER_RESCAN_TRIES)
+    agent._on_idle_timeout()
+    check("reply-reprint: ...and the recovered stamp survives later settles",
+          card.terminal.reply_marks() == [(5, _format_reply_stamp(when))],
+          card.terminal.reply_marks())
+    card._rescan_recovery()          # a settle with marks already anchored
+    check("reply-reprint: ...with the budget closed for good",
+          card._recover_tries == 0)
+
+    # a conversation whose replies are all out of reach stops asking rather
+    # than re-scanning on every settle for the life of the process
+    other = TerminalCard(agent)
+    other.resize(900, 500)
+    other._recover_key = card._recover_key
+    other._recover_prompts = []
+    other._recover_replies = [(when, "a reply that scrolled away long ago")]
+    for _ in range(_RECOVER_RESCAN_TRIES + 3):
+        other._rescan_recovery()
+    check("reply-reprint: an unfindable reply spends a bounded budget",
+          other._recover_tries == 0 and other.terminal.reply_marks() == [],
+          (other._recover_tries, other.terminal.reply_marks()))
+
+    other.deleteLater()
+    card.deleteLater()
+    agent.dispose()
+
+
 def test_transcript_reply_times():
     """transcripts.reply_times reads when each reply ACTUALLY finished out of
     the conversation on disk -- the only source that survives a restart, since
@@ -11901,6 +11978,7 @@ def main():
     test_new_agent_autofocus()
     test_agent_busy_activity()
     test_reply_marks_need_a_submitted_turn()
+    test_reply_marks_recovered_after_reprint()
     test_transcript_reply_times()
     test_ansi()
     test_terminal_keys()

@@ -564,6 +564,28 @@ this file is the invariants that must survive every change.
     recovered TIME wins (`_refresh_reply_marks`; `_refresh_marks` still merges
     prompts the plain live-wins way, since a prompt mark carries text rather
     than a time).
+  * **A REPRINTED conversation is scanned AFTER it arrives, not before**
+    (`TerminalCard._rescan_recovery`, `_RECOVER_RESCAN_TRIES`). Recovery rides
+    a PROJECTION, which is right (the scan has to run against the screen the
+    marks will be drawn on) and leaves the launch autostart with none:
+    `drop_restored_screen` cancels the settled-size projection for every agent
+    it is about to start, and `_reproject_on_size` bails while the history is
+    still empty, which it is, because `settle_layout` sizes the card BEFORE the
+    child is spawned. So a restored RUNNING card's only projection is the
+    constructor's, which runs before the child has printed a byte -- and the
+    conversation then arrives seconds later from `--resume` with nothing left
+    to scan it. NOT ONE stamp or prompt dot existed in a reopened hive, and it
+    went unnoticed only because the phantom live mark above landed on the last
+    reply instead: removing the phantom is what exposed this, so the two fixes
+    ship together or the feature reads as deleted. The re-scan hangs off the
+    settle (`_on_activity`) and is BOUNDED, because the scan is MEASURED at
+    ~35 ms over a full 2000-row history while a settle fires every couple of
+    seconds per working agent: it runs only while nothing has been recovered
+    yet and gives up after `_RECOVER_RESCAN_TRIES`. Stopping on the first
+    success is safe because the reprint lands in one go -- a scan that finds
+    anything found everything findable. Both scans now share ONE
+    `_scrollback_rows()` read (they were each paying for their own, 18.5 ms of
+    the 35), which speeds every projection up as well.
   * Recovered replies share `_recover_key` with the recovered PROMPTS, so one
     conversation costs one read of each; a `/clear` or pin change rotates the
     key. Everything here stays TRANSIENT and un-persisted — the transcript IS

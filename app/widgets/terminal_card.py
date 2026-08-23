@@ -67,6 +67,11 @@ _MARK_WS_RE = re.compile(r"\s+")
 # markdown syntax and drawing glyphs the renderer paints rather than prints,
 # dropped from both sides of a reply match (see _norm_reply_line)
 _MARK_MD_RE = re.compile("[*`_#>❯•⏺─-╿]")
+# settles a card will spend looking for the milestones of a conversation its
+# child reprinted after the card was built (see TerminalCard._rescan_recovery).
+# The scan is ~35 ms over a full history, so this is a handful of attempts, not
+# a poll: it stops on the first one that finds anything.
+_RECOVER_RESCAN_TRIES = 6
 # how much of the END of a reply's last line must be found on a scrollback row
 # to call it that reply's last row (see _reply_end_row). Shorter than the
 # prompt window: a wrapped line's final row holds only what spilled onto it,
@@ -342,6 +347,9 @@ class TerminalCard(QFrame):
         # the agents that matter. See _recover_marks for why re-reading within
         # one conversation cannot find anything the card doesn't already know.
         self._recover_key: tuple = ()
+        # settles left to look for a conversation reprinted after this card was
+        # built (see _rescan_recovery)
+        self._recover_tries = _RECOVER_RESCAN_TRIES
         self._recover_prompts: list[str] = []
         self._recover_replies: list[tuple[float, str]] = []
         self.scroll_bar = None
@@ -1300,12 +1308,13 @@ class TerminalCard(QFrame):
         if pos < len(replay):
             self.terminal.feed(replay[pos:])
         if recover:
-            self._recover_marks()
-            self._recover_reply_marks()
+            rows = self._scrollback_rows()
+            self._recover_marks(rows)
+            self._recover_reply_marks(rows)
         self._refresh_marks()
         self._refresh_reply_marks()
 
-    def _recover_marks(self) -> None:
+    def _recover_marks(self, rows=None) -> None:
         """Find the user's earlier prompts in a scrollback we did not watch
         being typed, and mark those lines too.
 
@@ -1359,7 +1368,7 @@ class TerminalCard(QFrame):
         prompts = self._recover_prompts
         if not prompts:
             return
-        oldest, raw = self._scrollback_rows()
+        oldest, raw = rows if rows is not None else self._scrollback_rows()
         if not raw:
             return
         lines = [_norm_line(t) for t in raw]
@@ -1392,7 +1401,7 @@ class TerminalCard(QFrame):
         return oldest, ["".join(ln[c].data or " " for c in range(cols))
                         for ln in rows]
 
-    def _recover_reply_marks(self) -> None:
+    def _recover_reply_marks(self, rows=None) -> None:
         """Find where each finished reply ENDED in a scrollback we did not
         watch, and stamp those lines with the time the transcript says that
         reply finished.
@@ -1426,7 +1435,7 @@ class TerminalCard(QFrame):
             return
         if not self._recover_replies:
             return
-        oldest, raw = self._scrollback_rows()
+        oldest, raw = rows if rows is not None else self._scrollback_rows()
         if not raw:
             return
         lines = [_norm_reply_line(t) for t in raw]
@@ -1601,8 +1610,52 @@ class TerminalCard(QFrame):
 
     # ------------------------------------------------------------- status ---
 
-    def _on_activity(self, _busy: bool) -> None:
+    def _on_activity(self, busy: bool) -> None:
         self._on_status(self.agent.status)
+        if not busy:
+            self._rescan_recovery()
+
+    def _rescan_recovery(self) -> None:
+        """Look for the milestones of a conversation that was reprinted AFTER
+        the card was built, once the screen has settled.
+
+        Milestone recovery normally rides a PROJECTION (_rerender_restored on a
+        card build, _reproject_on_size on a width change), which is the right
+        place for it: the scan has to run against the screen the marks will be
+        drawn on. The launch autostart has neither. `drop_restored_screen`
+        cancels the settled-size projection for every agent it is about to
+        start (that snapshot is the previous run's screen, hard-wrapped for a
+        width nothing can reflow), and `_reproject_on_size` bails while the
+        history is still empty -- which it is, because `settle_layout` sizes
+        the card BEFORE the child is spawned. So the only projection a restored
+        RUNNING card gets is the constructor's, and that runs before the child
+        has printed a single byte.
+
+        The conversation then arrives seconds later, reprinted by `--resume`,
+        with nothing left to scan it. Every stamp and every prompt dot in a
+        reopened hive was therefore missing -- which went unnoticed only
+        because a phantom live mark used to appear on the last reply instead,
+        stamped with the launch time (see TerminalAgent._note_submit). Fixing
+        that revealed this.
+
+        Bounded, because the scan is MEASURED at ~35 ms over a full 2000-row
+        history and a settle fires every couple of seconds while an agent
+        works: it runs only while nothing has been recovered yet, and gives up
+        after _RECOVER_RESCAN_TRIES settles. A scan that finds anything found
+        everything findable -- the reprint lands in one go -- so success ends
+        it for good, and a conversation whose replies have all scrolled out of
+        reach stops asking rather than re-scanning forever."""
+        if not self.is_pty or self._recover_tries <= 0:
+            return
+        if self._recovered or self._recovered_replies:
+            self._recover_tries = 0     # already anchored: never scan again
+            return
+        self._recover_tries -= 1
+        rows = self._scrollback_rows()
+        self._recover_marks(rows)
+        self._recover_reply_marks(rows)
+        self._refresh_marks()
+        self._refresh_reply_marks()
 
     def _on_status(self, status: AgentStatus) -> None:
         busy = bool(getattr(self.agent, "is_busy", lambda: False)())
