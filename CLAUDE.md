@@ -1753,6 +1753,38 @@ this file is the invariants that must survive every change.
   is `WA_TransparentForMouseEvents` + `NoFocus` so the terminal underneath
   keeps every event, and both animations stop on `dismiss()` so a resting card
   is free.
+  IT ALSO COVERS A SECOND WINDOW, AND THAT ONE IS RAISED FROM THE CONSTRUCTOR
+  (`TerminalCard.__init__`, gated on `TerminalAgent.has_pristine_seed()`,
+  lowered by `_rerender_restored`). The bullet above is about the CHILD's first
+  frames. The frame that actually reached the user first was OURS: `main.py`
+  seeds every pty agent from `screen_snapshot` and the card projects
+  `REPLAY_SEED_CAP` of it, then `show()` paints that projection, and only THEN
+  does `autostart_active_workspace` raise any veil, and `settle_layout` pumps
+  the queue twice on the way, so the frame is guaranteed to land. It cannot
+  look like anything but garbage, for two reasons that are both structural:
+  the seed is a cut through the MIDDLE of a classic-renderer frame (no banner,
+  no known cursor row, column jumps naming rows that were never drawn), and it
+  is projected at the PRE-LAYOUT width. MEASURED on the user's own captures,
+  whose widths are readable off their rule rows (78 and 157 columns): replayed
+  through pyte at its capture width, `439e5565….vt` renders clean prose; at
+  100, 120 or 150 the same bytes render as words piled on top of each other at
+  wrong columns. Reported, exactly, as "gibberish, then the loading part comes
+  on, then when it finishes loading it looks normal". THE GATE IS
+  `has_pristine_seed()` (the buffer is EXACTLY `_pty_seed`), never "this card
+  has a replay": `_pty_seed` is set only by `seed_pty_replay`, which only
+  `create_main_window` calls and only before the window exists, so the
+  predicate is true for a LAUNCH build and false for a REBUILD of a live
+  agent. A retile must keep painting instantly rather than flashing a loader.
+  `_boot_seed` records WHY the veil is up, because the two reasons have
+  different owners: `_on_status`'s not-running branch must NOT dismiss a seed
+  veil (a restored card that stays stopped keeps it until its settled-width
+  projection lands), `drop_restored_screen` hands ownership to the child
+  branch, and `_rerender_restored` dissolves it since that projection IS the
+  stopped card's final picture. The autostart path passes through BOTH
+  (`settle_layout` re-projects before any child is spawned, then
+  `agent.start()` re-raises) and does not flicker, because those run in one
+  call stack with no event-loop turn between them and `BootVeil.begin()` stops
+  the fader and resets `_fade`. `BOOT_VEIL_MAX_MS` is the backstop here too.
 - **Transcripts are backed up by AI Hive** (`app/transcripts.py`): snapshots
   land in `<session-dir>/transcripts/` at app start (in `create_main_window`,
   BEFORE agents launch) and at graceful close (`closeEvent`). The

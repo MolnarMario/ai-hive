@@ -7954,7 +7954,9 @@ def test_boot_veil():
     check("boot-veil: a card built over a restored snapshot is covered from "
           "its constructor, before the window ever paints",
           rcard.boot.is_active() and rcard._boot_seed)
-    rcard.resize(640, 400); rcard.show(); pump(150)
+    # under the view's 120ms resize debounce on purpose: this models the
+    # window's FIRST paint, which is the frame main.py used to leak
+    rcard.resize(640, 400); rcard.show(); pump(30)
     # the constructor's own _on_status(IDLE) runs the not-running branch, which
     # used to dismiss the veil unconditionally -- the wake banner may only own
     # the screen once there is something readable under it
@@ -7967,8 +7969,7 @@ def test_boot_veil():
     check("boot-veil: ...in pixels: the mangled seed never reaches the user",
           rrows and all(p == rground for p in rrows))
     # the settled-width projection IS the stopped card's final picture
-    rcard._rerender_restored()
-    pump(500)  # past the 260ms fade
+    pump(500)  # past the 120ms resize debounce and the 260ms fade
     check("boot-veil: the settled-width projection dissolves it",
           not rcard.boot.is_active() and not rcard._boot_seed)
     check("boot-veil: ...revealing the conversation it was holding back",
@@ -7998,10 +7999,9 @@ def test_boot_veil():
     # LIVE agent's buffer, which must paint instantly and never flash a loader
     live = TerminalAgent(build_spec(
         AgentKind.POWERSHELL, "Live", cwd=os.getcwd(), pty=True))
-    live.seed_pty_replay(snapshot)
-    live._on_pty_output("pty", "LIVE-CHILD-OUTPUT\r\n")   # a child drew over it
-    check("boot-veil: a buffer a child has written to is not pristine",
-          not live.has_pristine_seed() and live.seed_written_over())
+    live._on_pty_output("pty", "LIVE-CHILD-OUTPUT\r\n")   # a live conversation
+    check("boot-veil: a buffer a child wrote is not a restored snapshot",
+          live.pty_replay() and not live.has_pristine_seed())
     lcard = TerminalCard(live)
     lcard.resize(640, 400); lcard.show(); pump(150)
     check("boot-veil: a card rebuilt over a live buffer raises no loader",
