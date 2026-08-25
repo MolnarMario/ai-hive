@@ -77,6 +77,14 @@ _RECOVER_RESCAN_TRIES = 6
 # prompt window: a wrapped line's final row holds only what spilled onto it,
 # which can be a few words.
 _REPLY_TAIL_CHARS = 16
+# how far apart a LIVE reply mark and a RECOVERED one may sit and still be the
+# same reply (see _refresh_reply_marks). The two anchors normally agree exactly
+# -- reply_anchor_line returns the footer row + 1, _reply_end_row returns i + 3
+# where i + 2 is that same footer -- so this only covers the shapes where they
+# fall back differently: recovery to the blank row directly under the reply
+# text, the live path to the footer row itself. Three rows spans that gap and
+# nothing else; a reply is never two turns away from itself.
+_STAMP_MERGE_SLACK = 3
 
 
 def _norm_line(text: str) -> str:
@@ -1499,24 +1507,45 @@ class TerminalCard(QFrame):
         yesterday keeps reading as date-prefixed today rather than freezing
         whatever "same day" looked like the moment it was captured.
 
-        Live marks and recovered ones are merged by ROW, and where both land
-        on the same one the split is deliberate: the live mark keeps the row
+        Live marks and recovered ones are merged by ROW, and where both are
+        the same reply the split is deliberate: the live mark keeps the row
         (it anchored the screen it was looking at) and the TRANSCRIPT supplies
         the time. Claude stamps every record it writes, whereas a live mark
         reads the wall clock at the settle -- a couple of seconds late at best,
         and flatly wrong for any settle that was not a reply at all. That
         makes a stray live stamp self-correcting: the next projection recovers
-        the same reply and the recorded time replaces the observed one."""
+        the same reply and the recorded time replaces the observed one.
+
+        "The same reply" is NEAREST ROW WITHIN _STAMP_MERGE_SLACK, not an exact
+        match, and the difference is a stamp that contradicts itself. The two
+        anchors agree on the ordinary screen, but they fall back to DIFFERENT
+        rows when the row under Claude's turn footer is not blank: recovery
+        takes the blank row above the footer, the live path takes the footer
+        row itself. Requiring equality left both in the merge, so one reply
+        wore two stamps a couple of rows apart reading different times -- and
+        the live one, the one whose time is only an observation, is the one
+        that renders, since a footer row usually has room at its right edge.
+        Matching is greedy over the live marks in row order and each recovered
+        reply is claimed at most once, so a recovered stamp can never be
+        counted twice or absorb a neighbouring turn's."""
         if not self.is_pty:
             return
         by_uid = {m.uid: m for m in self.agent.reply_marks()}
         recovered = dict(self._recovered_replies)
-        live = [(line, recovered.get(line, by_uid[uid].ts))
-                for uid, line in self._reply_mark_lines.items()
-                if uid in by_uid]
-        taken = {line for line, _ in live}
-        merged = live + [(line, when) for line, when in recovered.items()
-                         if line not in taken]
+        claimed: set[int] = set()
+        merged: list[tuple[int, float]] = []
+        for line, uid in sorted((ln, u) for u, ln in
+                                self._reply_mark_lines.items() if u in by_uid):
+            near = [r for r in recovered if r not in claimed
+                    and abs(r - line) <= _STAMP_MERGE_SLACK]
+            if near:
+                match = min(near, key=lambda r: (abs(r - line), r))
+                claimed.add(match)
+                merged.append((line, recovered[match]))
+            else:
+                merged.append((line, by_uid[uid].ts))
+        merged += [(line, when) for line, when in recovered.items()
+                   if line not in claimed]
         self.terminal.set_reply_marks(
             sorted((line, _format_reply_stamp(when)) for line, when in merged))
 

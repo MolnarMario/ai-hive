@@ -527,7 +527,7 @@ this file is the invariants that must survive every change.
     The bound costs nothing real: both consumers only ever ask about replies
     still ON SCREEN, and the scrollback reaches back a few turns at most.
   * **One row, one reading, and the RECORD outranks the CLOCK.** Where a live
-    mark and a recovered one land on the same row, `_refresh_reply_marks`
+    mark and a recovered one are the SAME REPLY, `_refresh_reply_marks`
     keeps the live mark's ROW (it anchored the screen it was looking at) and
     takes the recovered TIME. Claude stamps every record it writes; a live
     mark reads the wall clock at the settle, which is a couple of seconds late
@@ -538,7 +538,34 @@ this file is the invariants that must survive every change.
     observation overwriting a historical fact. (The agent-side reply clock and
     the header's `#CardReplyTime` badge that used to share this reading are
     GONE, removed with the badge at the user's request; the inline stamp is
-    the only reply-time surface there is.)
+    the only reply-time surface there is.) "THE SAME REPLY" IS THE NEAREST ROW
+    WITHIN `_STAMP_MERGE_SLACK`, NEVER AN EXACT MATCH. The two anchors agree
+    on the ordinary screen — `reply_anchor_line` returns the footer row + 1
+    and `_reply_end_row` returns `i + 3` where `i + 2` is that same footer —
+    but they fall back to DIFFERENT rows when the row under the footer is not
+    blank: recovery takes the blank row above the footer, the live path takes
+    the footer row itself. Keying the merge on equality left BOTH in, so one
+    reply wore two stamps a couple of rows apart reading different times, and
+    the one that renders is the LIVE one, whose time is only an observation (a
+    footer row usually has room at its right edge). Matching is greedy over the
+    live marks in row order and each recovered reply is claimed at most once,
+    so a recovered stamp is never counted twice or absorbed by a neighbouring
+    turn.
+  * **Handing the view a mark REPAINTS it.** `TerminalView.set_marks` /
+    `set_reply_marks` call `self.update()` alongside `_notify_view`, and that
+    is not decoration: `_notify_view`'s signature is `(pushed, len(history),
+    scroll_offset, lines)`, which marks are NOT part of, so on a quiet screen
+    it returns at its own guard — and even when it does emit, `viewChanged`
+    goes to the SCROLLBAR, never to the widget's paint queue. A reply stamp is
+    minted `BUSY_IDLE_MS` (2 s) after the last output, by which time the
+    repaint that last `feed()` scheduled has already run, so without the
+    explicit call the stamp sat in `_reply_marks` unpainted until something
+    unrelated repainted the card (the next burst, a resize, a focus change, a
+    scroll). On an agent that has just gone quiet — exactly the moment the
+    stamp is for — that is a long wait, and it reads as the feature being
+    flaky rather than as a bug with an address. Every other state-changing
+    setter in that file (`feed`, `reset`, `clear_history`, `scroll_by`,
+    `set_font_size`) already pairs the two; do not drop it from these.
   * **The inline stamps are recovered by matching the reply's CLOSING line**,
     mirroring `PromptMark`'s `_recover_marks` (which an earlier version of
     this bullet wrongly called impossible). Two measurements shape the anchor

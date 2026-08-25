@@ -763,15 +763,30 @@ class TerminalView(QWidget):
         self.scroll_by(target - self._scroll_offset)
 
     def set_marks(self, marks) -> None:
+        # update() is NOT optional here, and _notify_view cannot stand in for
+        # it: that signature is (pushed, history, offset, lines), which marks
+        # are not part of, so it returns at its own guard on an idle screen --
+        # and even when it does emit, viewChanged goes to the SCROLLBAR, never
+        # to this widget's paint queue. See set_reply_marks for what that cost.
         self._marks = list(marks)
         self._notify_view(immediate=True)
+        self.update()
 
     def marks(self) -> list[tuple[int, str]]:
         return list(self._marks)
 
     def set_reply_marks(self, marks) -> None:
+        # A reply stamp is minted 2 s after the last output (BUSY_IDLE_MS),
+        # by which time the repaint that last feed() scheduled has long since
+        # run -- so without this the stamp sat in _reply_marks unpainted until
+        # something ELSE happened to repaint the widget (the next burst, a
+        # resize, a focus change, a scroll). On an agent that has just gone
+        # quiet, which is exactly the moment the stamp is for, that can be a
+        # long wait, and it reads as the feature being flaky rather than as a
+        # bug with an address.
         self._reply_marks = list(marks)
         self._notify_view(immediate=True)
+        self.update()
 
     def reply_marks(self) -> list[tuple[int, str]]:
         return list(self._reply_marks)

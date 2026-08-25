@@ -3359,6 +3359,117 @@ def test_reply_marks_recovered_after_reprint():
     agent.dispose()
 
 
+def test_reply_stamp_repaint_and_merge():
+    """Two ways a stamp that was recorded correctly still reads wrong.
+
+    First: setting marks has to REPAINT. `_notify_view`'s signature is
+    (pushed, history, offset, lines) and marks are not in it, so on a quiet
+    screen it returns at its own guard, and even when it does emit,
+    `viewChanged` goes to the scrollbar rather than to this widget's paint
+    queue. A reply stamp is minted 2 s after the last output, by which time the
+    repaint that last feed() scheduled has already run, so without an explicit
+    update() the stamp sat unpainted until something unrelated repainted the
+    card -- flaky-looking, on exactly the agent that has just gone quiet.
+
+    Second: a live mark and a recovered one are the SAME reply when they are
+    within _STAMP_MERGE_SLACK, not only when the rows match exactly. The two
+    anchors fall back differently when the row under Claude's footer is not
+    blank (recovery goes above the footer, the live path onto it), and
+    requiring equality kept both -- one reply wearing two stamps with two
+    different times, the wrong one rendering."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.terminal_card import (_STAMP_MERGE_SLACK, TerminalCard,
+                                           _format_reply_stamp)
+
+    QApplication.instance() or QApplication([])
+    # a scratch cwd, never the repo: a card reads the transcripts of whatever
+    # folder its spec names, and this suite runs INSIDE a real conversation
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-stamps-"))
+    spec = build_spec(AgentKind.CLAUDE, "Stamps", cwd=str(tmp), pty=True)
+    spec.session_id = "99999999-8888-7777-6666-555555555555"
+    agent = TerminalAgent(spec)
+    card = TerminalCard(agent)
+    card.resize(900, 500)
+    view = card.terminal
+
+    # counting paints means shadowing update() on the instance. Restore it by
+    # DELETING the attribute, never by assigning the bound method back: that
+    # leaves view.__dict__["update"] holding a method bound to view, i.e. a
+    # reference cycle that outlives deleteLater() and keeps a dead card's
+    # widget tree alive for the rest of the process.
+    painted = []
+    real_update = view.update
+    view.update = lambda *a, **k: (painted.append(1), real_update(*a, **k))[1]
+    view.set_reply_marks([(3, "Aug 19, 19:14")])
+    check("reply-paint: setting a reply stamp asks for a repaint", painted)
+    # the SAME view state twice: _notify_view returns at its signature guard,
+    # so only the explicit update() can carry the second one to the screen
+    before = len(painted)
+    view.set_reply_marks([(4, "Aug 19, 19:15")])
+    check("reply-paint: ...even when the view signature has not moved",
+          len(painted) > before, (before, len(painted)))
+    before = len(painted)
+    view.set_marks([(3, "do the thing")])
+    check("reply-paint: a prompt milestone repaints too",
+          len(painted) > before, (before, len(painted)))
+    del view.update
+    del real_update
+
+    # ---- the merge -------------------------------------------------------
+    when = time.time() - 7200        # what the transcript recorded
+    agent._note_submit()             # a turn somebody asked for
+    mark = agent.note_reply_settled()
+
+    def stamps(live_row, recovered_rows):
+        card._reply_mark_lines = {mark.uid: live_row}
+        card._recovered_replies = [(r, when) for r in recovered_rows]
+        card._refresh_reply_marks()
+        return view.reply_marks()
+
+    check("reply-merge: an exact row match takes the recorded time",
+          stamps(12, [12]) == [(12, _format_reply_stamp(when))],
+          view.reply_marks())
+    check("reply-merge: ...and so does one a footer away",
+          stamps(12, [12 - _STAMP_MERGE_SLACK]) ==
+          [(12, _format_reply_stamp(when))], view.reply_marks())
+    check("reply-merge: ...which is the LIVE row with the RECORDED time",
+          _format_reply_stamp(when) != _format_reply_stamp(mark.ts))
+    out = stamps(12, [12 - _STAMP_MERGE_SLACK - 1])
+    check("reply-merge: a reply further off is a separate turn, not this one",
+          out == sorted([(12 - _STAMP_MERGE_SLACK - 1,
+                          _format_reply_stamp(when)),
+                         (12, _format_reply_stamp(mark.ts))]), out)
+
+    # one recovered reply can only ever be claimed once, so a second live mark
+    # beside it keeps its own clock instead of stamping the same time twice
+    agent._note_submit()
+    second = agent.note_reply_settled()
+    card._reply_mark_lines = {mark.uid: 12, second.uid: 13}
+    card._recovered_replies = [(12, when)]
+    card._refresh_reply_marks()
+    out = view.reply_marks()
+    check("reply-merge: a recovered reply is claimed by ONE live mark",
+          out == sorted([(12, _format_reply_stamp(when)),
+                         (13, _format_reply_stamp(second.ts))]), out)
+
+    # detach() does NOT unhook the two mark signals _wire() connects, so drop
+    # them by hand as well; a card left listening to an agent it no longer
+    # paints is how a torn-down widget keeps taking work in later checks
+    for sig, slot in ((agent.prompt_marks_changed, card._refresh_marks),
+                      (agent.reply_marks_changed, card._on_reply_mark_added)):
+        try:
+            sig.disconnect(slot)
+        except (RuntimeError, TypeError):
+            pass
+    card.detach()
+    card.deleteLater()
+    agent.dispose()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_transcript_reply_times():
     """transcripts.reply_times reads when each reply ACTUALLY finished out of
     the conversation on disk -- the only source that survives a restart, since
@@ -11979,6 +12090,7 @@ def main():
     test_agent_busy_activity()
     test_reply_marks_need_a_submitted_turn()
     test_reply_marks_recovered_after_reprint()
+    test_reply_stamp_repaint_and_merge()
     test_transcript_reply_times()
     test_ansi()
     test_terminal_keys()
