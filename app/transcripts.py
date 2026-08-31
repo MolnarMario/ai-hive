@@ -562,8 +562,8 @@ def _is_synthetic_user_turn(rec: dict) -> bool:
     because Claude Code can turn a background tool's own completion into a
     brand-new turn with NO input from the user or AI Hive at all -- and if the
     account happens to be exhausted right then, that turn eats the SAME
-    "You've hit your session limit" menu a real interruption would, with
-    nothing of substance actually lost."""
+    cut-off notice a real interruption would, with nothing of substance
+    actually lost."""
     content = (rec.get("message") or {}).get("content")
     if not isinstance(content, str):
         return False        # a list of blocks is a real prompt or a tool reply
@@ -584,7 +584,8 @@ def _read_limit_cut_off(path: str) -> dict | None:
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
-                if '"assistant"' not in line and '"user"' not in line:
+                if ('"assistant"' not in line and '"user"' not in line
+                        and '"system"' not in line):
                     continue      # cheap prefilter
                 try:
                     rec = json.loads(line)
@@ -594,11 +595,28 @@ def _read_limit_cut_off(path: str) -> dict | None:
                 if rtype == "user" and not rec.get("isSidechain"):
                     last_user_synthetic = _is_synthetic_user_turn(rec)
                     continue
-                if rtype != "assistant" or rec.get("isSidechain"):
+                if rtype == "system":
+                    # The cut-off notice itself, as of claude.exe 2.1.235+, is
+                    # injected as a standalone system/informational record --
+                    # "Usage limit reached \xb7 continuing automatically at
+                    # 10:10pm \xb7 esc or type to cancel" -- rather than an
+                    # assistant turn (verified against a real transcript; see
+                    # limit_banner's module docstring for the old wording this
+                    # replaced). Other system subtypes (turn_duration, ...)
+                    # carry no plain-string `content`, so they fall through
+                    # the isinstance check below untouched.
+                    if rec.get("isSidechain"):
+                        continue
+                    text = rec.get("content")
+                    if not isinstance(text, str):
+                        continue
+                elif rtype == "assistant" and not rec.get("isSidechain"):
+                    text = _message_text(rec)
+                else:
                     continue
-                text = _message_text(rec)
-                # every assistant turn overwrites the verdict, so only the LAST
-                # one counts -- a banner followed by real output is history
+                # every qualifying record overwrites the verdict, so only the
+                # LAST one counts -- a banner followed by real output (or the
+                # CLI's own "Usage limit reset" notice) is history.
                 # `banner_line`, not a bare regex search: an agent that merely
                 # WROTE ABOUT the limit would otherwise be armed for a resume
                 # it never needed (observed live on an agent working on this

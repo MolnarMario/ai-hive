@@ -21,19 +21,32 @@ TWO signals, in order of reliability:
 
     This is the PRIMARY live signal, because it is the thing that STAYS on
     screen for as long as the agent is stuck. Its disappearance is equally
-    meaningful: it is how we tell a resume actually took.
+    meaningful: it is how we tell a resume actually took. NOT SEEN as the
+    default cut-off UI as of claude.exe 2.1.235+ (see below) — kept for
+    whatever install still shows it.
 
-  * `LIMIT_HIT_RE` — the banner (`You've hit your session limit - resets 3am`).
-    Ordinary scrollback, so on the live screen a 4000-char rolling tail evicts
-    it within a couple of hours of idling — do not rely on it alone there. It
-    IS, however, what lands in the transcript, so it is the only signal
-    available when reconstructing a cut-off from disk.
+  * `LIMIT_HIT_RE` / `_LIMIT_REACHED_RE` — the banner. Two wordings exist:
+    the old `You've hit your session limit - resets 3am`, and the current
+    `Usage limit reached \xb7 continuing automatically at 10:10pm \xb7 esc or
+    type to cancel` (claude.exe 2.1.235+ — the old wording is gone from the
+    binary except for spend/Fast-mode caps, a different feature; read off a
+    real transcript's injected system/informational record, not guessed).
+    Ordinary scrollback, so on the live screen a 4000-char rolling tail
+    evicts it within a couple of hours of idling — do not rely on it alone
+    there. It IS, however, what lands in the transcript, so it is the only
+    signal available when reconstructing a cut-off from disk. The current
+    wording is also Claude Code's OWN auto-continue: verified live, it
+    injects a queued "...usage limit has reset. Continue..." message and
+    logs "Usage limit reset \xb7 continuing automatically" once the window
+    reopens, with no help from AI Hive, PROVIDED the process is still alive
+    to see it — a stopped card or a closed app misses that edge exactly like
+    it always could, which is what the startup-recovery path is for.
 
 Both deliberately EXCLUDE `Approaching ...` and `You've used N% of your ...`:
 those render while the agent is still working, and nudging it would interrupt
-real work. Verified against claude.exe 2.1.220, which builds them from
-`You've hit your ${label}` with {five_hour:"session limit",
-seven_day:"weekly limit", ...}.
+real work. The old wording was verified against claude.exe 2.1.220, built
+from `You've hit your ${label}` with {five_hour:"session limit",
+seven_day:"weekly limit", ...}; the current one against 2.1.251.
 """
 
 import re
@@ -58,13 +71,38 @@ LIMIT_HIT_RE = re.compile(r"you['’]ve hit your\s+"
                           r"(session|weekly|usage|opus|sonnet)\s+limit",
                           re.I)
 
-# The banner states its own reset time ("- resets 8:30pm (Europe/Bucharest)"),
-# already in LOCAL time. This is the network-free half of the trigger: it
-# survives a usage-endpoint 429, a missed API edge, and an app restart, none of
-# which the account-wide reading does. The timezone suffix is ignored on
-# purpose — the clock shown is already the user's own.
-_LIMIT_RESET_RE = re.compile(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
-                             re.I)
+# Claude Code replaced this wording (verified: gone from claude.exe 2.1.235+,
+# where the only "hit your ... limit" strings left are for spend/Fast-mode
+# caps, a different feature). The cut-off notice is now "Usage limit reached
+# (c) continuing automatically at 10:10pm (c) esc or type to cancel" -- read
+# off a REAL transcript's injected system/informational record, not guessed.
+# `LIMIT_HIT_RE` is kept for whatever older installs still print it; this is
+# additive, not a replacement. No window name is captured here -- the new
+# wording never states one (see `banner_window`).
+_LIMIT_REACHED_RE = re.compile(r"usage\s+limit\s+reached\b", re.I)
+
+# Month abbreviations, for the dated form of the new banner (see
+# `_LIMIT_RESET_RE`): a reset more than 24 h out (weekly/opus/sonnet) is
+# rendered with a date -- "continuing automatically at Aug 25, 3:00pm" --
+# rather than a bare clock, verified against claude.exe's own formatter
+# (`month:"short"` once the reset is >24h away). English only, matching the
+# rest of this module's assumption.
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+
+# The banner states its own reset time, already in LOCAL time: the old wording
+# as "- resets 8:30pm (Europe/Bucharest)", the new one as "continuing
+# automatically at 10:10pm" (optionally dated, see `_MONTHS`). This is the
+# network-free half of the trigger: it survives a usage-endpoint 429, a missed
+# API edge, and an app restart, none of which the account-wide reading does.
+# The timezone suffix on the old wording is ignored on purpose — the clock
+# shown is already the user's own.
+_LIMIT_RESET_RE = re.compile(
+    r"(?:resets|continuing\s+automatically\s+at|continuing\s+shortly\s+at)"
+    r"\s+(?:([A-Za-z]{3})\w*\s+(\d{1,2}),\s*)?"
+    r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+    re.I)
 
 
 # Claude's banner is a SHORT injected message ("You've hit your session limit -
@@ -110,7 +148,9 @@ def banner_line(text: str) -> str:
         return found
     for line in text.splitlines():
         line = _strip_gutter(line)
-        if len(line) <= _BANNER_MAX_CHARS and LIMIT_HIT_RE.match(line):
+        if len(line) > _BANNER_MAX_CHARS:
+            continue
+        if LIMIT_HIT_RE.match(line) or _LIMIT_REACHED_RE.match(line):
             found = line
     return found
 
@@ -132,6 +172,12 @@ def banner_window(text: str) -> str:
     days out, so resolving it the same way lands early — by up to a week. A
     caller acting on a weekly cut-off must therefore wait for the account
     reading rather than trusting the clock on screen.
+
+    The current wording (`_LIMIT_REACHED_RE`, "Usage limit reached ...") never
+    names a window at all, so this returns "" for it — not a regression: that
+    wording's own reset clock is dated whenever the reset is >24h out (see
+    `_MONTHS`), so it carries the precision the old "weekly" special-case
+    existed to make up for, and `parse_reset_clock` resolves it directly.
     """
     line = banner_line(text)
     if not line:
@@ -153,7 +199,10 @@ def parse_reset_clock(text: str, now: float | None = None) -> float | None:
 
     A bare clock time carries no date, so it resolves to today if that moment
     is still ahead and tomorrow otherwise — the rollover that matters, since
-    the banner is usually read late at night about a small-hours reset.
+    the banner is usually read late at night about a small-hours reset. The
+    current wording's dated form ("... at Aug 25, 3:00pm") skips that guess
+    entirely and is resolved directly, except across a Dec->Jan boundary,
+    where the named date would otherwise land weeks in the past.
 
     `now` is the ANCHOR, and passing the right one is essential for anything
     read from disk — see `banner_reset_at`.
@@ -161,7 +210,8 @@ def parse_reset_clock(text: str, now: float | None = None) -> float | None:
     m = _LIMIT_RESET_RE.search(text or "")
     if not m:
         return None
-    hour, minute, ampm = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+    mon, day, hour, minute, ampm = m.groups()
+    hour, minute = int(hour), int(minute or 0)
     if ampm:
         ampm = ampm.lower()
         if hour == 12:
@@ -172,6 +222,25 @@ def parse_reset_clock(text: str, now: float | None = None) -> float | None:
         return None
     now = time.time() if now is None else now
     lt = time.localtime(now)
+    if mon and day:
+        month = _MONTHS.get(mon.lower()[:3])
+        if month is None or not (1 <= int(day) <= 31):
+            return None
+        try:
+            target = time.mktime((lt.tm_year, month, int(day), hour, minute,
+                                  0, 0, 0, -1))
+        except (OverflowError, ValueError):
+            return None
+        # a weekly/opus/sonnet reset is at most ~8 days out, so a named date
+        # that lands more than a few days in the past can only mean the
+        # window wraps into next year (a Dec banner naming a January reset).
+        if target < now - 3 * 86400:
+            try:
+                target = time.mktime((lt.tm_year + 1, month, int(day), hour,
+                                      minute, 0, 0, 0, -1))
+            except (OverflowError, ValueError):
+                return None
+        return target
     target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hour, minute, 0,
                           0, 0, -1))
     if target <= now:

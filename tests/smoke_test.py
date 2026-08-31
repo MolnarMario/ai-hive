@@ -8993,6 +8993,32 @@ def test_auto_continue_on_limit_reset():
     check("auto-continue: the banner's own reset time is latched with it",
           a.limit_resets_at() is not None)
 
+    # claude.exe 2.1.235+ replaced the "You've hit your session limit" banner
+    # with "Usage limit reached (c) continuing automatically at ..." and no
+    # longer shows the interactive menu by default -- read off a real
+    # transcript's injected system/informational record, not guessed (see
+    # limit_banner's module docstring). A latch has to survive on the banner
+    # ALONE here, with no menu at all, which is exactly the case that was
+    # silently falling through before this wording was recognised.
+    NEW_BANNER = ("Usage limit reached \xb7 continuing automatically at "
+                  "10:10pm \xb7 esc or type to cancel\n")
+    new_wording = mk("NewWording")
+    settle(new_wording, NEW_BANNER)
+    check("auto-continue: the current 'Usage limit reached' wording IS a "
+          "cut-off, with no menu on screen at all",
+          new_wording.is_limit_blocked())
+    check("auto-continue: its own 'continuing automatically at ...' clock is "
+          "latched with it",
+          new_wording.limit_resets_at() is not None)
+    # the Fast-mode / spend-limit family use similar words but are a DIFFERENT
+    # feature (a per-request throttle, not the account-wide cut-off) and must
+    # not falsely arm a resume for something that never stopped the agent.
+    fast_mode = mk("FastMode")
+    settle(fast_mode, "Fast mode disabled \xb7 usage credit limit reached\n")
+    check("auto-continue: 'usage credit limit reached' (Fast mode, a "
+          "different feature) is NOT the account-wide cut-off",
+          not fast_mode.is_limit_blocked())
+
     # the menu alone is enough — it is what survives on screen when the banner
     # above it has scrolled out of the rolling tail
     menu_only = mk("MenuOnly")
@@ -9947,6 +9973,46 @@ def test_startup_limit_recovery():
           "not a cut-off", not hit2)
     check("startup-recovery: no transcript at all is not a cut-off",
           transcripts.ended_on_limit(cwd, "sid-missing")[0] is False)
+
+    # claude.exe 2.1.235+ injects the cut-off notice as a standalone
+    # system/informational record rather than an assistant turn -- read off a
+    # real transcript, not guessed (see limit_banner's module docstring). A
+    # transcript-based recovery pass that only ever looked at assistant
+    # records would silently pass over every one of these.
+    def system_msg(content, at, subtype="informational"):
+        return {"type": "system", "subtype": subtype, "isSidechain": False,
+                "content": content, "timestamp": iso(at)}
+
+    NEW_BANNER = ("Usage limit reached \xb7 continuing automatically at "
+                  "10:10pm \xb7 esc or type to cancel")
+    write_transcript(cwd, "sid-cut-system", [
+        assistant("working", cut_at - 600),
+        system_msg(NEW_BANNER, cut_at),
+        # a same-record-shape sibling with no plain-string content (the real
+        # turn_duration record right after it in a live transcript) must not
+        # crash the read or be mistaken for a banner
+        {"type": "system", "subtype": "turn_duration", "isSidechain": False,
+         "durationMs": 971179, "timestamp": iso(cut_at + 1)}])
+    hit_sys, when_sys, resets_sys = transcripts.ended_on_limit(
+        cwd, "sid-cut-system")
+    check("startup-recovery: the CURRENT 'Usage limit reached' wording, "
+          "injected as a system/informational record, is recognised as a "
+          "cut-off", hit_sys and abs(when_sys - cut_at) < 2)
+    check("startup-recovery: its own 'continuing automatically at ...' clock "
+          "is resolved, not left unknown", resets_sys > 0)
+
+    # the CLI's own auto-continue logs "Usage limit reset (c) continuing
+    # automatically" once the window reopens (verified live) -- that is
+    # equally real output and must clear the cut-off exactly like an
+    # assistant reply carrying on would.
+    write_transcript(cwd, "sid-cli-self-resumed", [
+        system_msg(NEW_BANNER, cut_at),
+        system_msg("Usage limit reset \xb7 continuing automatically",
+                   cut_at + 9000)])
+    hit_resumed, _, _ = transcripts.ended_on_limit(cwd, "sid-cli-self-resumed")
+    check("startup-recovery: the CLI's own 'Usage limit reset' notice reads "
+          "as history, not a cut-off (it already resumed on its own)",
+          not hit_resumed)
 
     # A cut-off is only real when the turn it stopped was something the user
     # (or a delivered task) actually asked for. Claude Code can turn a
