@@ -10233,7 +10233,11 @@ def test_startup_limit_recovery():
 
 
 def test_limit_recovery_reliability():
-    """The four ways a real cut-off (2026-08-07, CVsummer2026) went unrecovered.
+    """Every way a real cut-off has gone unrecovered, and the screen that did it.
+
+    Sources so far: 2026-08-07 (CVsummer2026) and 2026-08-31
+    (vinted-country-detector). A running count in this docstring only goes
+    stale on the next find, so it names the class instead.
 
     Every one of them is silent by construction — the agent simply sits there —
     so each gets a check that reproduces the exact screen or timing shape that
@@ -10348,7 +10352,44 @@ def test_limit_recovery_reliability():
     check("repaint: and gives the width straight back",
           resizes == [(30, 99), (30, 100)])
 
-    # --- 5. the watchdog stops waiting forever ------------------------------
+    # --- 5. the banner under Claude's own tool-result gutter ----------------
+    # A 429 that lands while a tool is still running is painted as a TOOL-RESULT
+    # ROW, not as a bare line: "\u23bf" in front of it, and a NO-BREAK space
+    # between the two. _GUTTER had neither, so banner_line's .match anchored on
+    # the glyph and returned "", which hid the cut-off from the live scrape AND
+    # from _note_limit_skip, which calls the same function, so not even a
+    # NO-LATCH line was written. Observed live 2026-08-31: an agent sat spent
+    # for 36 minutes with no trace of it anywhere. This fixture has to keep the
+    # gutter glyphs, or it tests a screen the TUI never draws.
+    GUTTERED = (
+        "\u25cf Bash(cd \"C:/Users/molna/...\" && cat > /tmp/slim.mjs)\n"
+        "  \u23bf\xa0raw 37175 b64 14448 chunks@1400 11\n"
+        "  \u23bf\xa0Allowed by auto mode classifier\n"
+        "  \u23bf\xa0" + BANNER + "\n"
+        "    /upgrade or /usage-credits to finish what you're working on.\n"
+        + "\n" * 60 + "> try \"fix the tests\"\n  ? for shortcuts\n")
+
+    g = mk()
+    g._screen_tail = GUTTERED
+    g._scrape_limit()
+    check("limit-gutter: a banner painted as a tool-result row (U+23BF plus a "
+          "no-break space) still latches", g.is_limit_blocked())
+    check("limit-gutter: ...and still carries the reset clock the banner "
+          "stated", g.limit_resets_at() is not None)
+
+    from app import limit_banner as _lb
+    check("limit-gutter: the assistant bullet (U+25CF) is stripped too",
+          _lb.banner_line("\u25cf " + BANNER) == BANNER)
+    check("limit-gutter: a leading no-break space doesn't strand the glyph "
+          "behind it", _lb.banner_line("\xa0\u23bf\xa0" + BANNER) == BANNER)
+    # the start-of-line anchor is still the discriminator: widening _GUTTER
+    # must not let an agent's own sentence about the limit read as a cut-off
+    check("limit-gutter: prose that merely mentions the banner still doesn't "
+          "match",
+          _lb.banner_line("\u25cf I think you've hit your session limit here")
+          == "")
+
+    # --- 6. the watchdog stops waiting forever ------------------------------
     store = SessionStore(path=tmp / "session.json")
     win = create_main_window(store)
     ws = win.manager.create_workspace("W", str(tmp))

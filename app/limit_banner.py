@@ -28,9 +28,13 @@ TWO signals, in order of reliability:
   * `LIMIT_HIT_RE` / `_LIMIT_REACHED_RE` — the banner. Two wordings exist:
     the old `You've hit your session limit - resets 3am`, and the current
     `Usage limit reached \xb7 continuing automatically at 10:10pm \xb7 esc or
-    type to cancel` (claude.exe 2.1.235+ — the old wording is gone from the
-    binary except for spend/Fast-mode caps, a different feature; read off a
-    real transcript's injected system/informational record, not guessed).
+    type to cancel` (claude.exe 2.1.235+, read off a real transcript's
+    injected system/informational record, not guessed). BOTH ARE STILL
+    LIVE on 2.1.251, and they come from different places: the current one
+    is the CLI's own quota UI, which auto-continues; the old one is a raw
+    429 (`error: "rate_limit"`, `rateLimitType: "five_hour"`) surfaced as
+    a synthetic assistant message, which just kills the turn and draws no
+    menu. Do not drop either.
     Ordinary scrollback, so on the live screen a 4000-char rolling tail
     evicts it within a couple of hours of idling — do not rely on it alone
     there. It IS, however, what lands in the transcript, so it is the only
@@ -46,7 +50,8 @@ Both deliberately EXCLUDE `Approaching ...` and `You've used N% of your ...`:
 those render while the agent is still working, and nudging it would interrupt
 real work. The old wording was verified against claude.exe 2.1.220, built
 from `You've hit your ${label}` with {five_hour:"session limit",
-seven_day:"weekly limit", ...}; the current one against 2.1.251.
+seven_day:"weekly limit", ...}; the current one against 2.1.251, which still
+emits the old one too.
 """
 
 import re
@@ -119,7 +124,28 @@ _BANNER_MAX_CHARS = 200
 # which arrives as a separate code point). Stripped before matching so both
 # banners can be anchored at the start of their line, which is the discriminator
 # that keeps an agent's own prose about a limit from being read as one.
-_GUTTER = " \t│┃|>❯⚠✗✘×•*️"
+#
+# THE TWO CLAUDE ONES ARE LOAD-BEARING AND WERE MISSING, which cost a live
+# 5-hour cut-off (2026-08-31, vinted-country-detector/Agent 1, verified in the
+# transcript as a 429 with rateLimitType five_hour). The 429 arrived while a
+# Bash tool was mid-flight, so Claude painted the banner as a TOOL-RESULT ROW:
+#
+#     ● Bash(cd "..." && cat > /tmp/slim.mjs <<'EOF' ...)
+#       ⎿ raw 37175 b64 14448 chunks@1400 11
+#       ⎿ Allowed by auto mode classifier
+#       ⎿ You've hit your session limit · resets 6:40pm (Europe/Bucharest)
+#
+# `⎿` (U+23BF) is the tool-result gutter and `●` (U+25CF) the assistant
+# bullet, and neither was in this set, so `banner_line`'s `.match` anchored on
+# the glyph and returned "". Nothing latched, and nothing was AUDITED either:
+# `_note_limit_skip` calls this same `banner_line`, so the one log line written
+# to explain a miss cannot fire for this kind of miss. A glyph census over 13
+# real screen captures found U+23BF and U+25CF the two dominant line prefixes
+# (up to 48 and 88 rows in a single frame), so this is the ordinary rendering,
+# not a freak frame. U+00A0 rides along because Claude separates that gutter
+# from the text with a NO-BREAK space rather than an ordinary one (read off the
+# raw pty stream), so a leading run can end on one.
+_GUTTER = " \t\xa0│┃⎿●|>❯⚠✗✘×•*️"
 
 
 def _strip_gutter(line: str) -> str:
