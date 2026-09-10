@@ -5086,8 +5086,13 @@ def test_v2_features():
     # template expansion must not depend on whether the CLI is installed on
     # this machine (Codex may legitimately exist here) — detection is only
     # asserted to be a bool, expansion is asserted exactly
-    check("v2 providers: openai template expands",
-          "gpt-5.1" in providers.build_invocation("openai", model="gpt-5.1")[1])
+    check("v2 providers: current openai model template expands",
+          "gpt-5.6" in providers.build_invocation("openai", model="gpt-5.6")[1])
+    openai_models = dict(providers.get("openai").models)
+    check("v2 providers: Codex picker lists current model family",
+          set(openai_models.values()) == {
+              "", "gpt-5.6", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"},
+          openai_models)
     check("v2 providers: detection returns bool (env-independent)",
           isinstance(providers.detected("openai"), bool))
     prog, args = providers.build_invocation(

@@ -161,12 +161,13 @@ PROVIDERS: dict[str, Provider] = {
     "openai": Provider(
         key="openai", display="OpenAI (Codex CLI)", exe_names=("codex",),
         models=(("Default", ""),
-                ("GPT-5.6 Sol", "gpt-5.6-sol"),
+                # Keep the moving flagship on its stable alias.  The OpenAI
+                # model registry currently maps gpt-5.6 to GPT-5.6 Sol; using
+                # the alias lets a new Codex terminal follow that update.
+                ("GPT-5.6 (Sol)", "gpt-5.6"),
                 ("GPT-5.6 Terra", "gpt-5.6-terra"),
                 ("GPT-5.6 Luna", "gpt-5.6-luna"),
-                # Keep prior choices available for restored or pinned agents.
-                ("GPT-5.1", "gpt-5.1"),
-                ("GPT-5.1 Codex", "gpt-5.1-codex")),
+                ("GPT-5.5", "gpt-5.5")),
         base_cmd="codex", model_flag="--model {model}",
         note="Requires the OpenAI Codex CLI (`codex`) on PATH."),
     "gemini": Provider(
