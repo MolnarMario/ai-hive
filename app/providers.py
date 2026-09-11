@@ -61,14 +61,17 @@ CLAUDE_EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
 
 GEMINI_MODELS = (
     ("Default", ""),
+    ("Gemini 3.8 Flash (High)", "Gemini 3.8 Flash (High)"),
+    ("Gemini 3.8 Flash (Medium)", "Gemini 3.8 Flash (Medium)"),
+    ("Gemini 3.8 Flash (Low)", "Gemini 3.8 Flash (Low)"),
+    ("Gemini 3.7 Flash (High)", "Gemini 3.7 Flash (High)"),
+    ("Gemini 3.7 Flash (Medium)", "Gemini 3.7 Flash (Medium)"),
+    ("Gemini 3.7 Flash (Low)", "Gemini 3.7 Flash (Low)"),
     ("Gemini 3.6 Flash (High)", "Gemini 3.6 Flash (High)"),
     ("Gemini 3.6 Flash (Medium)", "Gemini 3.6 Flash (Medium)"),
     ("Gemini 3.6 Flash (Low)", "Gemini 3.6 Flash (Low)"),
     ("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (High)"),
     ("Gemini 3.1 Pro (Low)", "Gemini 3.1 Pro (Low)"),
-    ("Gemini 3.5 Flash (High)", "Gemini 3.5 Flash (High)"),
-    ("Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Medium)"),
-    ("Gemini 3.5 Flash (Low)", "Gemini 3.5 Flash (Low)"),
     ("Claude Sonnet 4.6 (Thinking)", "Claude Sonnet 4.6 (Thinking)"),
     ("Claude Opus 4.6 (Thinking)", "Claude Opus 4.6 (Thinking)"),
     ("GPT-OSS 120B (Medium)", "GPT-OSS 120B (Medium)"),
@@ -292,7 +295,50 @@ def gemini_user_default_model() -> str:
     model = sett.get("model")
     if isinstance(model, str) and model.strip():
         return model.strip()
-    return "Gemini 3.7 Flash (High)"
+    return "Gemini 3.8 Flash (High)"
+
+
+_GEMINI_MODELS_CACHE: tuple | None = None
+
+
+def fetch_gemini_models() -> tuple[tuple[str, str], ...]:
+    """Query `agy models` to fetch the live model list from the CLI."""
+    global _GEMINI_MODELS_CACHE
+    prog = resolve_program("gemini")
+    if not prog or not detected("gemini"):
+        return GEMINI_MODELS
+    try:
+        import subprocess
+        res = subprocess.run(
+            [prog, "models"], capture_output=True, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout:
+            entries = [("Default", "")]
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if not line or line.startswith("Fetching"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    display = parts[1].strip()
+                    if display:
+                        entries.append((display, display))
+                elif line:
+                    entries.append((line, line))
+            if len(entries) > 1:
+                _GEMINI_MODELS_CACHE = tuple(entries)
+                return _GEMINI_MODELS_CACHE
+    except Exception:
+        pass
+    return GEMINI_MODELS
+
+
+def gemini_available_models() -> tuple[tuple[str, str], ...]:
+    """Return available Gemini models. Uses cached CLI output if available,
+    falling back to GEMINI_MODELS."""
+    global _GEMINI_MODELS_CACHE
+    if _GEMINI_MODELS_CACHE is not None:
+        return _GEMINI_MODELS_CACHE
+    return GEMINI_MODELS
 
 
 def resolve_program(key: str) -> str:

@@ -68,6 +68,18 @@ class TestGeminiSessionPinning(unittest.TestCase):
 
     def test_gemini_model_effort_parsing(self):
         from app import transcripts
+        m, e = transcripts.parse_gemini_model_effort("Gemini 3.8 Flash (High)")
+        self.assertEqual(m, "Gemini 3.8 Flash")
+        self.assertEqual(e, "high")
+
+        m, e = transcripts.parse_gemini_model_effort("Gemini 3.8 Flash (Low)")
+        self.assertEqual(m, "Gemini 3.8 Flash")
+        self.assertEqual(e, "low")
+
+        m, e = transcripts.parse_gemini_model_effort("gemini-3.8-flash-medium")
+        self.assertEqual(m, "Gemini 3.8 Flash")
+        self.assertEqual(e, "medium")
+
         m, e = transcripts.parse_gemini_model_effort("Gemini 3.7 Flash (High)")
         self.assertEqual(m, "Gemini 3.7 Flash")
         self.assertEqual(e, "high")
@@ -78,6 +90,21 @@ class TestGeminiSessionPinning(unittest.TestCase):
         m, e = transcripts.parse_gemini_model_effort("Claude Sonnet 4.6 (Thinking)")
         self.assertEqual(m, "Claude Sonnet 4.6")
         self.assertEqual(e, "thinking")
+
+    def test_gemini_build_spec_loads_effort(self):
+        spec = build_spec(AgentKind.GEMINI, "Agent", model="Gemini 3.8 Flash (Low)")
+        self.assertEqual(spec.model, "Gemini 3.8 Flash (Low)")
+        self.assertEqual(spec.effort, "low")
+        self.assertEqual(spec.args, ["--model", "Gemini 3.8 Flash (Low)"])
+
+    def test_gemini_latest_models_list(self):
+        from app import providers
+        labels = [lbl for lbl, _ in providers.GEMINI_MODELS]
+        self.assertIn("Gemini 3.8 Flash (High)", labels)
+        self.assertIn("Gemini 3.8 Flash (Medium)", labels)
+        self.assertIn("Gemini 3.8 Flash (Low)", labels)
+        self.assertIn("Gemini 3.7 Flash (High)", labels)
+        self.assertNotIn("Gemini 3.5 Flash (High)", labels)
 
     def test_gemini_permission_mode_display(self):
         from app import providers

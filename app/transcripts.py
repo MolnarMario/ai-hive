@@ -843,17 +843,22 @@ def _read_gemini_db_token_usage(path: str) -> tuple[int, int]:
 
 
 _GEMINI_MODEL_MAP = {
+    "gemini-3.8-flash": "Gemini 3.8 Flash",
     "gemini-3.7-flash-control": "Gemini 3.7 Flash",
     "gemini-3.7-flash": "Gemini 3.7 Flash",
     "gemini-3.6-flash": "Gemini 3.6 Flash",
     "gemini-3.5-flash": "Gemini 3.5 Flash",
     "gemini-3.1-pro": "Gemini 3.1 Pro",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+    "claude-opus-4-6-thinking": "Claude Opus 4.6",
+    "gpt-oss-120b-medium": "GPT-OSS 120B",
 }
 
 
 def parse_gemini_model_effort(raw: str) -> tuple[str, str]:
     """Split a raw Gemini model string into (model_display, effort).
-    'Gemini 3.7 Flash (High)' -> ('Gemini 3.7 Flash', 'high')
+    'Gemini 3.8 Flash (High)' -> ('Gemini 3.8 Flash', 'high')
+    'gemini-3.8-flash-high' -> ('Gemini 3.8 Flash', 'high')
     'gemini-3.7-flash-control' -> ('Gemini 3.7 Flash', '')
     'Claude Sonnet 4.6 (Thinking)' -> ('Claude Sonnet 4.6', 'thinking')
     """
@@ -866,7 +871,15 @@ def parse_gemini_model_effort(raw: str) -> tuple[str, str]:
         eff = m_eff.group(1).lower()
         core = raw[:m_eff.start()].strip()
     else:
-        core = raw
+        m_slug = re.search(r"-(high|medium|low|thinking)$", raw, re.IGNORECASE)
+        if m_slug:
+            eff = m_slug.group(1).lower()
+            core = raw[:m_slug.start()].strip()
+        elif "thinking" in raw.lower():
+            eff = "thinking"
+            core = raw
+        else:
+            core = raw
 
     c_lower = core.lower()
     for key, disp in _GEMINI_MODEL_MAP.items():
@@ -898,7 +911,7 @@ def latest_gemini_model_effort(cwd: str, session_id: str) -> tuple[str, str, str
         return (cached[2], cached[3], cached[4])
 
     sett = providers.gemini_user_default_settings()
-    def_raw_model = sett.get("model", "Gemini 3.7 Flash (High)")
+    def_raw_model = sett.get("model", "")
     def_model, def_effort = parse_gemini_model_effort(def_raw_model)
 
     mode = ""
@@ -909,13 +922,14 @@ def latest_gemini_model_effort(cwd: str, session_id: str) -> tuple[str, str, str
         mode = providers.gemini_permission_mode_display(raw_mode)
 
     live_model = ""
+    live_effort = ""
     if st_db:
         raw_model, _ = _extract_gemini_db_metadata(db_path)
         if raw_model:
             parsed_m, parsed_e = parse_gemini_model_effort(raw_model)
             live_model = parsed_m
             if parsed_e:
-                def_effort = parsed_e
+                live_effort = parsed_e
 
     if os.path.isfile(tpath):
         try:
@@ -924,20 +938,20 @@ def latest_gemini_model_effort(cwd: str, session_id: str) -> tuple[str, str, str
                     rec = json.loads(line)
                     content = rec.get("content", "")
                     if "USER_SETTINGS_CHANGE" in content:
-                        m = re.search(r"Model Selection`\s+from\s+.*?to\s+([^.\n<]+)", content)
+                        m = re.search(r"Model Selection[^\n]+?from\s+.*?to\s+(.+?)(?:\.\s+[A-Z]|\.\n|\n|<|$)", content)
                         if m:
                             tm, te = parse_gemini_model_effort(m.group(1))
                             if tm:
-                                def_model = tm
+                                live_model = tm
                             if te:
-                                def_effort = te
+                                live_effort = te
                     if rec.get("type") == "USER_INPUT" and "/plan" in content:
                         mode = "plan"
         except Exception:
             pass
 
-    final_model = live_model or def_model or "Gemini 3.7 Flash"
-    final_effort = def_effort or "high"
+    final_model = live_model or def_model or ""
+    final_effort = live_effort or def_effort or ""
     final_mode = mode or "auto"
 
     if st_db:
