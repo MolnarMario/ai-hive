@@ -282,27 +282,69 @@ this file is the invariants that must survive every change.
   `TerminalAgent.request_repaint()`). Because the classic renderer does GENUINE
   terminal scrolling (see the bullet above), Claude's own autocomplete/
   @-mention dropdown growing below the input line can scroll the whole screen
-  up to fit; when the text is cleared and the dropdown is dismissed, Claude
-  erases those rows but never re-emits anything to scroll the viewport back
-  down, leaving the input box and its footer stranded mid-screen above a dead,
+  up to fit; a tall SLASH-COMMAND menu (`/model`, `/effort`) does the same and
+  is the commonest way to hit this. When the menu is dismissed Claude erases
+  those rows but never re-emits anything to scroll the viewport back down,
+  leaving the input box and its footer stranded mid-screen above a dead,
   genuinely-blank run of rows. A raw VT100 terminal fed the identical bytes
   would show the same gap — this is upstream Claude Code CLI behaviour, not an
   AI Hive scroll-offset bug (typing already calls `_snap_to_bottom`, so
   `_scroll_offset` is 0 throughout; the screen buffer itself is blank). The fix
   is the same one a real terminal gets for free on a window resize: ask the
-  child to redraw its whole frame. `_check_input_gap` reuses `_input_block_span`
-  / `_row_is_input_footer` to find the footer row and measures the blank run
-  beneath it against `_INPUT_GAP_TOLERANCE`; it deliberately piggybacks on
-  `_snap_timer` (the EXISTING 600ms debounce that coalesces a typing burst for
-  undo, re-armed by every edit keystroke) rather than adding a second timer —
-  by the time a typing burst has been quiet for 600ms, the child's redraw has
-  long since arrived and been painted. It fires ONLY on the EDGE: `_input_gap_row`
-  remembers the footer row a repaint was last requested for, so a short
-  conversation that legitimately has blank space below its footer is checked
-  once, finds the SAME row next time, and is never repainted again — this is
-  what keeps ordinary use free of any repeated resize blip. Do not lower this
-  to a per-keystroke or per-`feed()` check; the whole point is one silent,
-  debounced repair per genuine occurrence, not a jittery poll.
+  child to redraw its whole frame.
+  THE FIRST VERSION OF THIS NEVER FIRED ONCE ON A REAL SCREEN, and both causes
+  are worth keeping in front of you. (1) It found the footer row and then
+  walked DOWN looking for blank rows, bailing on the first row with content —
+  but the row directly under `> ` is the box's bottom BORDER, and the footer
+  hint WRAPS onto a second row (`• high · /effort`) that matches none of
+  `_CLAUDE_READY_HINTS`, so the scan aborted on the box's own chrome every
+  time. The gap is now measured from `_last_content_row()` (the bottom-most
+  non-blank row on the screen), and the box's chrome is allowed for by
+  `_INPUT_CHROME_ROWS` — more than that below the box means real content is
+  down there and nothing is stranded. (2) Its only trigger was `_snap_timer`,
+  the undo debounce, which is armed by an edit keystroke — and closing a menu
+  with Esc is pure child output, so nothing checked until the user started
+  typing again. `feed()` now re-arms a second single-shot (`_gap_timer`,
+  `_GAP_CHECK_MS`), so a long redraw collapses into one check once the screen
+  is quiet. The `_on_input_settled` call stays as well; the edge guard makes
+  the second call free. The suite missed all of this because the fixture fed
+  `"> \r\n? for shortcuts"` — a box with no border and a one-row footer, which
+  Claude never draws. Same fixture blind spot that hid the `reply_anchor_line`
+  bug, and the same rule applies: a fixture for this MUST draw the border and
+  the wrapped footer.
+  TWO GUARDS ARE WHAT KEEP ORDINARY USE FREE OF REPAINT BLIPS, now that output
+  drives the check. `_input_gap_row` remembers the row a repaint was last
+  requested for, so a conversation that legitimately has blank space below its
+  footer is checked once, finds the SAME row next time, and is never repainted
+  again. And an EMPTY `history.top` returns early: a screen that has never
+  scrolled a line off cannot have been scrolled up by a dropdown, while a fresh
+  or freshly cleared conversation sits high by nature and walks its footer down
+  a row every turn — without that, the output trigger would ask for a resize
+  once per turn. A third guard is about correctness rather than noise: the
+  span's top row must actually start with `>`/`❯`, because `_input_block_span`
+  keeps `top = cy` when there is no prompt glyph, so mid-reply (caret on
+  output, blank rows below) it would otherwise read as a stranded box. The
+  keystroke trigger hid that; the output trigger would not. Do not lower this
+  to a per-keystroke or per-`feed()` check; the point is one silent, debounced
+  repair per genuine occurrence, not a jittery poll.
+  AN OPEN MENU IS NOT AN INPUT BOX, and the prompt-glyph guard alone does not
+  separate them: a menu's HIGHLIGHTED row starts with the same `❯`. Measured on
+  a live `/model` at 30x100, the span came back (22, 23) with the last content
+  row at 27, i.e. inside `_INPUT_CHROME_ROWS`, and the check fired while the
+  menu was still up. The discriminator is the row DIRECTLY BELOW the span:
+  Claude paints the box's bottom border (or, borderless, the footer hint) there
+  with no blank line — which is exactly what `_input_block_span`'s own downward
+  scan stops on — whereas under a menu selection sits another menu row or, as
+  measured, a BLANK row. Requiring `_row_is_rule` or `_row_is_input_footer`
+  there is what keeps a repaint out of an open menu.
+  THE REPAIR ITSELF IS NOW VERIFIED, which it never was while the check could
+  not fire. Driven against a real `claude.exe` 2.1.267 under a pty with
+  `tui: "default"`: three replies, `/model`, Esc, and the box was left at row 18
+  of 29 with eleven dead rows under it (the reported bug, reproduced). The
+  output timer fired once with no keystroke, and `request_repaint()`'s
+  one-column-narrower-and-back resize moved the last content row 18 → 28 with
+  the whole conversation slid back down. So ConPTY's reflow-on-resize is a real
+  repair for this, not a hope.
 - **Readiness is matched WITHOUT WHITESPACE, and that is load-bearing**
   (`TerminalAgent._has_ready_hint`, `_despace`). The classic renderer lays its
   footer out by MOVING THE CURSOR between segments instead of emitting spaces,

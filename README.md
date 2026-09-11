@@ -324,7 +324,11 @@ workspaces keep executing — switching never pauses anything.
   it with the OS default program — absolute paths *and* repo-relative ones like
   `app/widgets/sidebar.py` (resolved against the agent's folder). If that
   workspace's file tree is open, the clicked file is also scrolled to and
-  **highlighted** in it, so you can see where it lives.
+  **highlighted** in it, so you can see where it lives. **Right-click** the same
+  path for Open / Open with... / Reveal in folder / Copy path (a URL gets Open
+  link / Copy link address) — "Reveal in folder" opens Explorer with the file
+  already selected, and "Copy path" copies the resolved **absolute** path, which
+  is what pastes into an address bar.
 - **Search the sidebar** — a 🔍 next to the category button expands an input
   that covers the WORKSPACES title/count; as you type it **highlights every
   match** across workspace names, agent names, and agent summaries, and
@@ -662,7 +666,10 @@ Hard-won rules, each with a regression test:
   absolute local file path under the pointer with the OS default handler —
   hovering such a link underlines it and shows a hand cursor so it's obviously
   clickable. (`Ctrl`+left-click is primary — the left button always registers,
-  while the middle button is often eaten by the OS autoscroll.) **Image
+  while the middle button is often eaten by the OS autoscroll.) **Right-click**
+  a link and the menu gains Open / Open with... / Reveal in folder / Copy path
+  above the usual Copy / Paste / Select all — same wording as the Agent/File
+  Map's menu, and Copy path gives you the absolute path. **Image
   paste**: a `Ctrl+V` with an image on the
   clipboard is spilled to a temp PNG and its path pasted, because Claude Code
   reads images by path and a native-Windows child can't take a raw clipboard
@@ -703,7 +710,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1835 checks drive the real app headlessly (offscreen Qt platform) with real
+1852 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -825,7 +832,7 @@ app/
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1835 checks)
+tests/smoke_test.py        headless end-to-end suite (1852 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

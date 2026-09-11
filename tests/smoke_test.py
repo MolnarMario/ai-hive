@@ -1991,6 +1991,68 @@ def test_terminal_relative_link():
     tv.deleteLater()
 
 
+def test_terminal_link_context_menu():
+    """Right-clicking a path in the output offers Reveal in folder / Copy path,
+    resolved to the ABSOLUTE path (Explorer needs an absolute path, and the
+    token Claude prints is usually repo-relative). Drives _build_context_menu
+    directly: contextMenuEvent's exec() would block the headless suite.
+
+    Only the COPY actions are triggered here -- triggering Open, Open with or
+    Reveal would launch a real program out of the test run."""
+    import os
+    import tempfile
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import TerminalView
+    QApplication.instance() or QApplication([])
+
+    base = tempfile.mkdtemp(prefix="aihive_menu_")
+    os.makedirs(os.path.join(base, "app", "widgets"), exist_ok=True)
+    absf = os.path.join(base, "app", "widgets", "sidebar.py")
+    with open(absf, "w", encoding="utf-8") as fh:
+        fh.write("x = 1\n")
+
+    tv = TerminalView(rows=6, cols=80)
+    tv.resize(700, 200)
+    tv.set_base_dir(base)
+    tv.feed("app/widgets/sidebar.py plainword https://example.com/a\r\n")
+
+    def texts(col):
+        return [a.text() for a in tv._build_context_menu(0, col).actions()
+                if not a.isSeparator()]
+
+    over_path = texts(3)
+    check("link menu: a path offers the file map's four actions first",
+          over_path[:4] == ["Open", "Open with...", "Reveal in folder",
+                            "Copy path"], over_path)
+    check("link menu: the clipboard items survive under the link items",
+          over_path[4:] == ["Copy", "Paste", "Select all"], over_path)
+
+    QGuiApplication.clipboard().setText("")
+    menu = tv._build_context_menu(0, 3)
+    [a for a in menu.actions() if a.text() == "Copy path"][0].trigger()
+    check("link menu: Copy path copies the RESOLVED absolute path",
+          QGuiApplication.clipboard().text() == os.path.abspath(absf),
+          QGuiApplication.clipboard().text())
+
+    # a plain word carries no link items at all -- no greyed-out placeholders
+    plain = texts(26)
+    check("link menu: a plain word offers only the clipboard items",
+          plain == ["Copy", "Paste", "Select all"], plain)
+
+    url_col = len("app/widgets/sidebar.py plainword ") + 4
+    over_url = texts(url_col)
+    check("link menu: a URL offers open + copy, not the four file actions",
+          over_url[:2] == ["Open link", "Copy link address"], over_url)
+    QGuiApplication.clipboard().setText("")
+    menu = tv._build_context_menu(0, url_col)
+    [a for a in menu.actions() if a.text() == "Copy link address"][0].trigger()
+    check("link menu: Copy link address copies the URL",
+          QGuiApplication.clipboard().text() == "https://example.com/a",
+          QGuiApplication.clipboard().text())
+    tv.deleteLater()
+
+
 def test_terminal_block_glyphs():
     """Block Elements (U+2580-U+259F) are painted GEOMETRICALLY on the cell
     grid, not handed to the font.
@@ -3775,25 +3837,54 @@ def test_app():
     check("header tools: usage chip and close sit right of the strip",
           hlay.indexOf(tools) < hlay.indexOf(tok_card.token_label)
           < hlay.indexOf(tok_card.btn_close))
-    collapsed_w = tools.sizeHint().width()
+    collapsed_w = tools.width()
     pos = QPointF(2, 2)
     tools.enterEvent(QEnterEvent(pos, pos, tools.mapToGlobal(pos)))
     pump(10)
     check("header tools: hover reveals all three buttons",
-          tok_card.btn_font_dec.isVisibleTo(tools)
-          and tok_card.btn_font_inc.isVisibleTo(tools)
-          and tok_card.btn_max.isVisibleTo(tools)
+          tok_card.btn_font_dec.isVisibleTo(tools.tray)
+          and tok_card.btn_font_inc.isVisibleTo(tools.tray)
+          and tok_card.btn_max.isVisibleTo(tools.tray)
+          and tools.tray.isVisible()
           and not tools.hint.isVisibleTo(tools))
-    check("header tools: expanding is what costs width, not the resting state",
-          tools.sizeHint().width() > collapsed_w + 40,
-          (collapsed_w, tools.sizeHint().width()))
+    check("header tools: expanding costs the layout nothing",
+          tools.width() == collapsed_w,
+          (collapsed_w, tools.width()))
+    check("header tools: the tray floats left of the strip, inside the header",
+          tools.tray.parentWidget() is tok_card.header
+          and tools.tray.geometry().right() <= tools.geometry().right() + 1
+          and tools.tray.width() > collapsed_w + 40,
+          (tools.tray.geometry(), tools.geometry()))
+    # REGRESSION: past three cards across a 1080p screen the header is already
+    # over-subscribed, and Qt answers a layout it cannot satisfy by shrinking
+    # every item BELOW its minimum -- which used to hand a 65px button 39px
+    # and leave QToolButton eliding "A-" and "A+" to "...", i.e. three
+    # ellipses where two font steppers should be. The tray is not in the
+    # layout, so a narrow card cannot squeeze it.
+    tok_card.header.setFixedWidth(470)   # 4 cards across a 1080p screen
+    pump(10)
+    check("header tools: a narrow card cannot squeeze the buttons",
+          all(b.width() >= b.sizeHint().width()
+              for b in (tok_card.btn_font_dec, tok_card.btn_font_inc,
+                        tok_card.btn_max)),
+          [(b.width(), b.sizeHint().width())
+           for b in (tok_card.btn_font_dec, tok_card.btn_font_inc,
+                     tok_card.btn_max)])
+    check("header tools: the tray stays inside a narrow header",
+          0 <= tools.tray.x()
+          and tools.tray.geometry().right() < tok_card.header.width(),
+          (tools.tray.geometry(), tok_card.header.width()))
+    tok_card.header.setMinimumWidth(0)
+    tok_card.header.setMaximumWidth(16777215)
+    pump(10)
     # the real cursor is nowhere near an offscreen widget, so the deferred
     # re-check (which is what keeps the buttons up while the pointer is over
     # one of them) collapses again
     tools.leaveEvent(QEvent(QEvent.Type.Leave))
     pump(20)
     check("header tools: collapse again once the pointer leaves",
-          not tok_card.btn_max.isVisibleTo(tools)
+          not tok_card.btn_max.isVisibleTo(tools.tray)
+          and not tools.tray.isVisible()
           and tools.hint.isVisibleTo(tools))
 
     # -- 5. live streaming --------------------------------------------------
@@ -4833,52 +4924,130 @@ def test_terminal_input_editor():
 
 def test_input_gap_self_heal():
     """Claude's classic renderer can scroll the screen for a transient
-    dropdown and never scroll back on dismissal, stranding the input box
-    above a dead run of blank rows (see TerminalView._check_input_gap).
-    _on_input_settled is what _snap_timer's 600ms debounce fires; called
-    directly here rather than pumping a real timer, matching the existing
-    _snapshot_input direct-call pattern above."""
+    dropdown or a slash-command menu and never scroll back on dismissal,
+    stranding the input box above a dead run of blank rows (see
+    TerminalView._check_input_gap).
+
+    Every fixture here draws the box Claude REALLY draws -- a top border, the
+    '> ' row, a bottom border, and a footer hint that wraps onto a second row
+    -- because the shipped check never fired once on a real screen: its
+    blank-row scan aborted on that border, and the old fixture ('> ' plus a
+    one-row footer, no border) drew a screen Claude never paints. Same
+    fixture blind spot that hid the reply_anchor_line bug.
+
+    _check_input_gap is called directly rather than pumping the real
+    _gap_timer / _snap_timer debounces, matching the suite's existing
+    settled-handler pattern."""
     from app.widgets.terminal_view import TerminalView
 
-    # a tall terminal with the box parked near the TOP and nothing below --
-    # exactly the shape left once a dropdown's rows are erased but the
-    # viewport is never scrolled back down
-    view = TerminalView(rows=20, cols=40)
-    view.feed("> \r\n? for shortcuts")
-    fired = []
-    view.staleLayoutDetected.connect(lambda: fired.append(1))
-    view._on_input_settled()
-    check("input-gap: a footer stranded far from the bottom fires once",
-          fired == [1], fired)
+    RULE = "─" * 30
+    BOX = f"{RULE}\r\n> \r\n{RULE}\r\n? for shortcuts\r\n  • high · /effort"
 
-    # settling again with nothing changed must NOT refire -- this is what
+    def stranded(rows=20, history=True, trailer=""):
+        """A view whose box sits near the top with nothing below it -- the
+        shape left once a menu's rows are erased but the viewport is never
+        scrolled back down."""
+        view = TerminalView(rows=rows, cols=40)
+        if history:
+            view.feed("x\r\n" * (rows + 10))   # push lines into history
+        # home + erase-down leaves the history alone and repaints the box at
+        # the TOP of the screen: what a menu teardown leaves behind, since
+        # nothing re-scrolls the viewport back down
+        # ...and park the caret back on the '> ' row (row 2, 1-based), where
+        # the real renderer leaves it once the footer is painted -- every
+        # input-box reading starts from the caret
+        view.feed("\x1b[H\x1b[J" + BOX + trailer + "\x1b[2;3H")
+        fired = []
+        view.staleLayoutDetected.connect(lambda: fired.append(1))
+        return view, fired
+
+    view, fired = stranded()
+    view._check_input_gap()
+    check("input-gap: a real box (border + wrapped footer) stranded high fires",
+          fired == [1], fired)
+    # the border and the wrapped hint row are exactly what the old blank scan
+    # aborted on, so assert the fixture really contains them
+    top, bottom = view._input_block_span()
+    check("input-gap: the fixture draws the box border the old scan died on",
+          view._row_is_rule(bottom + 1), bottom)
+    check("input-gap: the fixture's footer wraps past _CLAUDE_READY_HINTS",
+          not view._row_is_input_footer(view._last_content_row()),
+          view._last_content_row())
+
+    # checking again with nothing changed must NOT refire -- this is what
     # keeps a legitimately short conversation free of a repeated resize blip
+    view._check_input_gap()
+    check("input-gap: an unchanged gap does not refire", fired == [1], fired)
+
+    # the typing path still works and shares the same edge guard
     view._on_input_settled()
-    check("input-gap: an unchanged gap does not refire",
+    check("input-gap: the keystroke path does not re-fire the same gap",
           fired == [1], fired)
 
-    # the footer sits right at the bottom (one row of normal padding) --
-    # within tolerance, so nothing is wrong and nothing fires
-    view2 = TerminalView(rows=3, cols=40)
-    view2.feed("> \r\n? for shortcuts")
-    fired2 = []
-    view2.staleLayoutDetected.connect(lambda: fired2.append(1))
-    view2._on_input_settled()
-    check("input-gap: a footer within tolerance of the bottom never fires",
+    # a fresh/cleared conversation legitimately sits high with blank space
+    # under it, and its footer walks down a row every turn -- nothing has
+    # scrolled off, so nothing can have been scrolled away
+    view2, fired2 = stranded(history=False)
+    view2._check_input_gap()
+    check("input-gap: an empty history never fires",
           fired2 == [] and view2._input_gap_row is None,
           (fired2, view2._input_gap_row))
 
-    # no footer line at all (mid-typing) still uses the box's own bottom row
-    # as the edge, and repeated settles with nothing changed still fire once
-    view3 = TerminalView(rows=20, cols=40)
-    view3.feed("hello\r\n> ")
-    fired3 = []
-    view3.staleLayoutDetected.connect(lambda: fired3.append(1))
-    view3._on_input_settled()
-    view3._on_input_settled()
-    view3._on_input_settled()
-    check("input-gap: a stable gap with no footer fires once, not per settle",
-          fired3 == [1], fired3)
+    # a menu is still open below the box: real content down there means the
+    # layout is not stranded, it is just busy
+    view3, fired3 = stranded(trailer="\r\n\r\n  1. Opus 5\r\n  2. Sonnet 5")
+    view3._check_input_gap()
+    check("input-gap: content below the box (an open menu) never fires",
+          fired3 == [] and view3._input_gap_row is None,
+          (fired3, view3._input_gap_row))
+
+    # An OPEN /model menu, transcribed from a live 30x100 capture: it REPLACES
+    # the box, its highlighted row starts with the same '❯' the prompt does,
+    # and it ends close enough to the last content row to clear the chrome
+    # bound -- so the only thing telling it apart from a real box is that the
+    # row under the selection is BLANK rather than the box's border/footer.
+    view3b = TerminalView(rows=30, cols=100)
+    view3b.feed("x\r\n" * 40)
+    view3b.feed("\x1b[H\x1b[J" + RULE + "\r\n  Select model\r\n\r\n"
+                "    1. Default\r\n    2. Sonnet\r\n    3. Fable\r\n"
+                "  ❯ 4. Opus\r\n    5. Haiku\r\n\r\n"
+                "  ● High effort (default)\r\n\r\n"
+                "  Enter to set as default · Esc to cancel"
+                "\x1b[7;5H")
+    fired3b = []
+    view3b.staleLayoutDetected.connect(lambda: fired3b.append(1))
+    span3b = view3b._input_block_span()
+    view3b._check_input_gap()
+    check("input-gap: an open menu's selection caret is not the input box",
+          fired3b == [] and span3b is not None
+          and view3b._row_content(span3b[1] + 1) == (-1, -1),
+          (fired3b, span3b))
+
+    # the box sits right at the bottom, within tolerance: nothing is wrong
+    view4, fired4 = stranded(rows=6)
+    view4._check_input_gap()
+    check("input-gap: a box within tolerance of the bottom never fires",
+          fired4 == [] and view4._input_gap_row is None,
+          (fired4, view4._input_gap_row))
+
+    # mid-reply: the caret is parked on plain output with no '>' above it and
+    # blank rows below. _input_block_span keeps top = cy in that case, so
+    # without the prompt-glyph guard this reads as a stranded box.
+    view5 = TerminalView(rows=20, cols=40)
+    view5.feed("x\r\n" * 30)
+    view5.feed("thinking about it")
+    fired5 = []
+    view5.staleLayoutDetected.connect(lambda: fired5.append(1))
+    view5._check_input_gap()
+    check("input-gap: the caret on plain output is not a stranded box",
+          fired5 == [] and view5._input_gap_row is None,
+          (fired5, view5._input_gap_row))
+
+    # the output path: a feed arms _gap_timer, so a menu closing with no
+    # keystroke at all still gets checked
+    view6, _ = stranded()
+    check("input-gap: output re-arms the settle timer with no keystroke",
+          view6._gap_timer.isActive(), view6._gap_timer.isActive())
 
 
 def test_session_migration():
@@ -8723,18 +8892,19 @@ def test_usage_trackers_preference():
     menu = bar.build_tracker_menu()
     acts = menu.actions()
     check("usage-trackers: one checkable entry per readout",
-          len(acts) == 4 and all(a.isCheckable() for a in acts)
+          len(acts) == len(USAGE_TRACKER_KEYS) and all(a.isCheckable() for a in acts)
           and [a.text() for a in acts]
           == [USAGE_TRACKER_LABELS[k] for k in USAGE_TRACKER_KEYS])
     check("usage-trackers: the entries start checked",
           all(a.isChecked() for a in acts))
 
-    # put content in all four so visibility is decided by the preference alone
+    # put content in all five so visibility is decided by the preference alone
     win._on_usage_ready(good)
     bar.mark_usage_loading()
     app.processEvents()
     check("usage-trackers: loading counts as content, so the bar fills at once",
           bar.gemini_badge.isVisible() and bar.gemini_weekly_badge.isVisible()
+          and bar.codex_badge.isVisible()
           and bar.usage_badge.isVisible() and bar.usage_weekly_badge.isVisible())
 
     # the X closes exactly one pill
@@ -8768,7 +8938,8 @@ def test_usage_trackers_preference():
            bar.usage_add_btn.isVisible()
            and not bar.usage_badge.isVisible()
            and not bar.usage_weekly_badge.isVisible())[-1])
-    check("usage-trackers: the menu now shows all four unchecked",
+    win._on_usage_tracker_toggled("codex_five_hour", False)
+    check("usage-trackers: the menu now shows every readout unchecked",
           not any(a.isChecked() for a in bar.build_tracker_menu().actions()))
 
     # no Claude login hides the recovery switches, but NEVER the picker: a
@@ -12239,6 +12410,7 @@ def main():
     test_fsopen_helpers()
     test_filetypes_icons()
     test_terminal_relative_link()
+    test_terminal_link_context_menu()
     test_terminal_block_glyphs()
     test_terminal_link_underline()
     test_sidebar_file_tree()
@@ -12673,9 +12845,10 @@ def test_options_panel():
     # --- 1. what stayed on the bar, and what left ------------------------
     row = bar._extras.layout()
     on_row = [row.itemAt(i).widget() for i in range(row.count())]
-    check("options: the bar's scrolling row is now the four pills and the +",
+    check("options: the bar's scrolling row is now the five pills and the +",
           on_row == [bar.usage_badge, bar.usage_weekly_badge, bar.gemini_badge,
-                     bar.gemini_weekly_badge, bar.usage_add_btn],
+                     bar.gemini_weekly_badge, bar.codex_badge,
+                     bar.usage_add_btn],
           [w.objectName() or type(w).__name__ for w in on_row])
     moved = [bar.recover_btn, bar.resume_btn, bar.sound_btn, bar.taskbar_btn,
              bar.auto_update_btn, bar.updates_manage_btn, bar.install_label,
