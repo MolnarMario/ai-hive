@@ -700,6 +700,14 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 /* the collapsed stand-in for A-/A+/maximize: faint enough to read as chrome,
    visible enough to say "there is something here to hover" */
 #CardToolsHint {{ color: {p.CARDHEAD_SUB}; font-size: 13px; }}
+/* the hover tray those three buttons expand into. It FLOATS over the header
+   rather than taking layout width (see _HeaderTools), so it has to be opaque
+   or the summary underneath reads straight through it. */
+#CardToolsTray {{
+    background: {p.BG_CARDHEAD};
+    border: 1px solid {p.ACCENT_GOLD_DIM};
+    border-radius: 4px;
+}}
 #WsDelete {{ color: {p.TEXT}; font-size: 17px; font-weight: 900; }}
 #GlobalFontBtn {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;

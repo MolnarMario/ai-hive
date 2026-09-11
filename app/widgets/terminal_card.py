@@ -239,6 +239,33 @@ class _CardHeader(QFrame):
         event.accept()
 
 
+class _ToolsTray(QFrame):
+    """The floating strip that carries A- / A+ / maximize while the pointer is
+    on the header tools.
+
+    It is a child of the HEADER, not of `_HeaderTools`, so it can hang out to
+    the left over the summary and the model chip. Enter/leave are forwarded to
+    the owner: the pointer moving from the hint onto a button crosses a widget
+    boundary Qt reports as a Leave, and the tray is a sibling rather than a
+    child, so `_HeaderTools` never hears the pointer arrive or depart."""
+
+    def __init__(self, owner, parent):
+        super().__init__(parent)
+        self._owner = owner
+        self.setObjectName("CardToolsTray")
+        # a plain QWidget ignores a stylesheet background; the tray covers the
+        # header text underneath it, so an opaque fill is the whole point
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+    def enterEvent(self, event):
+        self._owner._set_open(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        QTimer.singleShot(0, self._owner._recheck)
+        super().leaveEvent(event)
+
+
 class _HeaderTools(QWidget):
     """The header's secondary buttons (A- / A+ / maximize), collapsed to a
     narrow strip until the pointer is over them.
@@ -249,15 +276,26 @@ class _HeaderTools(QWidget):
     them gives it back without hiding them anywhere the user has to go
     looking for.
 
-    The container sits just LEFT of the usage chip, and the summary carries
-    the layout stretch, so expanding takes its width from the summary alone:
-    nothing to the right of this widget moves as the pointer crosses it.
+    THE EXPANDED BUTTONS DO NOT LIVE IN THE HEADER'S LAYOUT, and that is the
+    invariant here. This widget's own footprint is FIXED at the hint width for
+    the life of the card; hovering only shows a `_ToolsTray` floating over the
+    header, right-aligned to this strip. Growing inside the layout worked only
+    while the header had slack to give: past three cards across a 1080p screen
+    the header is already OVER-SUBSCRIBED (the model chip alone asks for
+    ~260px and a QLabel cannot shrink below its own text), and Qt's response
+    to a layout it cannot satisfy is to shrink EVERY item proportionally,
+    minimums included -- measured at a 480px header, 27px for a button whose
+    sizeHint is 65, at which point QToolButton elides "A-" and "A+" to "...".
+    Three ellipses in a row where two font steppers should be, reported live.
+    A widget that is never asked for space cannot be squeezed, so do not put
+    these buttons back in the layout, and do not "fix" this by giving them a
+    minimum width: the over-subscribed path shrinks below the minimum too.
 
     Qt sends Leave to a parent when the pointer enters one of its children, so
     a naive leaveEvent would hide the buttons the instant the user reached for
     one. The close is therefore deferred by one turn of the event loop and
     checked against the real cursor position, which is inside this widget's
-    rect for as long as the pointer is over any of its children."""
+    rect -- or the tray's -- for as long as the pointer is over any of them."""
 
     _HINT_W = 14
 
@@ -274,11 +312,35 @@ class _HeaderTools(QWidget):
         self.hint.setFixedWidth(self._HINT_W)
         self.hint.setToolTip("Font size and maximize")
         lay.addWidget(self.hint)
+        self.setFixedWidth(self._HINT_W)
+        self.tray = _ToolsTray(self, parent)
+        tl = QHBoxLayout(self.tray)
+        tl.setContentsMargins(5, 1, 5, 1)
+        tl.setSpacing(4)
+        self.tray.hide()
 
     def add(self, btn) -> None:
+        btn.setParent(self.tray)
         btn.hide()
         self._buttons.append(btn)
-        self.layout().addWidget(btn)
+        self.tray.layout().addWidget(btn)
+
+    def _place_tray(self) -> None:
+        """Right-align the tray on this strip, inside the header.
+
+        The strip is the thing the pointer is on, so the tray has to reach it;
+        everything else it covers is text the hover is deliberately borrowing.
+        Clamped to the header's left edge so a card too narrow for the tray
+        loses the left end of the header rather than pushing the buttons off
+        the near side."""
+        head = self.parentWidget()
+        if head is None:
+            return
+        size = self.tray.sizeHint()
+        mine = self.geometry()
+        x = max(0, mine.right() + 1 - size.width())
+        y = mine.center().y() - size.height() // 2
+        self.tray.setGeometry(x, max(0, y), size.width(), size.height())
 
     def _set_open(self, on: bool) -> None:
         if on == self._open:
@@ -287,6 +349,12 @@ class _HeaderTools(QWidget):
         self.hint.setVisible(not on)
         for b in self._buttons:
             b.setVisible(on)
+        if on:
+            self._place_tray()          # before show(), or it flashes at 0,0
+            self.tray.show()
+            self.tray.raise_()
+        else:
+            self.tray.hide()
 
     def enterEvent(self, event):
         self._set_open(True)
@@ -296,9 +364,23 @@ class _HeaderTools(QWidget):
         QTimer.singleShot(0, self._recheck)
         super().leaveEvent(event)
 
+    def moveEvent(self, event):
+        if self._open:
+            self._place_tray()
+        super().moveEvent(event)
+
+    def resizeEvent(self, event):
+        if self._open:
+            self._place_tray()
+        super().resizeEvent(event)
+
     def _recheck(self) -> None:
         try:
-            inside = self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+            pos = QCursor.pos()
+            inside = (self.rect().contains(self.mapFromGlobal(pos))
+                      or (self.tray.isVisible()
+                          and self.tray.rect().contains(
+                              self.tray.mapFromGlobal(pos))))
         except RuntimeError:      # widget went away under the timer
             return
         if not inside:
