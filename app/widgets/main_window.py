@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
 from .. import __version__
 from .. import chime
 from .. import claude_usage
+from .. import codex_usage
 from .. import fsopen
 from .. import limit_ledger
 from .. import providers
@@ -118,6 +119,11 @@ GEMINI_USAGE_POLL_MS = 300000
 # to Claude's 20s and every reason not to: each fast tick is another CLI launch.
 GEMINI_USAGE_URGENT_POLL_MS = 60000
 
+# Codex reads the same ChatGPT subscription's primary window. It is a small
+# authenticated request (not a CLI subprocess), and unlike Claude it drives no
+# recovery machinery, so it is only polled while its optional pill is enabled.
+CODEX_USAGE_POLL_MS = 60000
+
 # The usage readouts the top bar can show, and the order they sit in. PER PILL
 # rather than per provider: each window (Claude 5h/7d, Gemini 5h/7d) is its own
 # pill on the bar, so anything coarser would leave the X on one of them closing
@@ -125,12 +131,13 @@ GEMINI_USAGE_URGENT_POLL_MS = 60000
 # Claude (or only Gemini) is not made to look at a readout that can never say
 # anything.
 USAGE_TRACKER_KEYS = ("claude_five_hour", "claude_weekly",
-                      "gemini_five_hour", "gemini_weekly")
+                      "gemini_five_hour", "gemini_weekly", "codex_five_hour")
 USAGE_TRACKER_LABELS = {
     "claude_five_hour": "Claude 5 hour usage",
     "claude_weekly": "Claude weekly usage",
     "gemini_five_hour": "Gemini 5 hour usage",
     "gemini_weekly": "Gemini weekly usage",
+    "codex_five_hour": "ChatGPT/Codex 5 hour usage",
 }
 DEFAULT_USAGE_TRACKERS = {k: True for k in USAGE_TRACKER_KEYS}
 
@@ -556,12 +563,15 @@ class TopBar(QFrame):
         from .gemini_usage_badge import GeminiUsageBadge
         self.gemini_badge = GeminiUsageBadge(self, window="five_hour")
         self.gemini_weekly_badge = GeminiUsageBadge(self, window="weekly")
+        from .codex_usage_badge import CodexUsageBadge
+        self.codex_badge = CodexUsageBadge(self)
 
         self._usage_pills = {
             "claude_five_hour": self.usage_badge,
             "claude_weekly": self.usage_weekly_badge,
             "gemini_five_hour": self.gemini_badge,
             "gemini_weekly": self.gemini_weekly_badge,
+            "codex_five_hour": self.codex_badge,
         }
         self._trackers = dict(DEFAULT_USAGE_TRACKERS)
         for key, pill in self._usage_pills.items():
@@ -663,6 +673,7 @@ class TopBar(QFrame):
         extras_lay.addWidget(self.usage_weekly_badge)
         extras_lay.addWidget(self.gemini_badge)
         extras_lay.addWidget(self.gemini_weekly_badge)
+        extras_lay.addWidget(self.codex_badge)
         extras_lay.addWidget(self.usage_add_btn)
 
         self._extras_scroll = _HWheelScrollArea(self)
@@ -947,6 +958,17 @@ class TopBar(QFrame):
                 pill.mark_unreadable(error)
         self._sync_usage_pills()
 
+    def set_codex_usage(self, reading) -> None:
+        self.codex_badge.set_usage(reading)
+        self._sync_usage_pills()
+
+    def note_codex_usage_error(self, error: str) -> None:
+        if self.codex_badge.has_reading():
+            self.codex_badge.mark_stale(True)
+        else:
+            self.codex_badge.mark_unreadable(error)
+        self._sync_usage_pills()
+
     def tick_usage(self) -> None:
         """Re-render every pill's countdown from the clock alone (no network)."""
         for pill in self._usage_pills.values():
@@ -1204,6 +1226,9 @@ class AddTerminalDialog(QDialog):
         if is_ai:
             prov = providers.get(AI_KINDS[kind])
             detected = providers.detected(AI_KINDS[kind])
+            if AI_KINDS[kind] == "gemini" and providers._GEMINI_MODELS_CACHE is None:
+                import threading
+                threading.Thread(target=providers.fetch_gemini_models, daemon=True).start()
             self._populate_models(prov)
             self._model_label.setVisible(True)
             self.model_combo.setVisible(True)
@@ -1231,7 +1256,10 @@ class AddTerminalDialog(QDialog):
 
     def _populate_models(self, prov) -> None:
         self.model_combo.clear()
-        for label, value in prov.models:
+        models = (providers.gemini_available_models()
+                  if prov and prov.key == "gemini" else
+                  (prov.models if prov else ()))
+        for label, value in models:
             self.model_combo.addItem(label, value)
 
     def _populate_efforts(self, prov) -> None:
@@ -1574,6 +1602,7 @@ class MainWindow(QMainWindow):
     # slot touches (widgets, timers) stays on the main thread.
     _usageReady = Signal(object)
     _geminiUsageReady = Signal(object)
+    _codexUsageReady = Signal(object)
 
     def __init__(self, manager: WorkspaceManager, store: SessionStore,
                  session: dict | None = None):
@@ -1699,6 +1728,13 @@ class MainWindow(QMainWindow):
         # last good Gemini reading, so the countdown tick can retune the poll
         # without shelling out again (that tick fires every 20s)
         self._gemini_usage = None
+        # The ChatGPT/Codex readout is display-only, so unlike Claude it is
+        # fully gated by the user's tracker preference.
+        self._codex_usage = None
+        self._codex_usage_inflight = False
+        self._codex_usage_timer = QTimer(self)
+        self._codex_usage_timer.setInterval(CODEX_USAGE_POLL_MS)
+        self._codex_usage_timer.timeout.connect(self._poll_codex_usage)
         # fires just after a spent limit's stated reset, so the "cleared" edge
         # doesn't wait out a full poll interval
         self._usage_reset_timer = QTimer(self)
@@ -1919,6 +1955,8 @@ class MainWindow(QMainWindow):
                                  Qt.ConnectionType.QueuedConnection)
         self._geminiUsageReady.connect(self._on_gemini_usage_ready,
                                        Qt.ConnectionType.QueuedConnection)
+        self._codexUsageReady.connect(self._on_codex_usage_ready,
+                                      Qt.ConnectionType.QueuedConnection)
         self.sidebar.addRequested.connect(self._on_add_workspace_clicked)
         self.sidebar.workspaceSelected.connect(self.manager.set_active)
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
@@ -2077,6 +2115,9 @@ class MainWindow(QMainWindow):
         if self._gemini_wanted():
             self._gemini_usage_timer.start()
             self._poll_gemini_usage()
+        if self._codex_wanted():
+            self._codex_usage_timer.start()
+            self._poll_codex_usage()
 
     def _poll_usage(self) -> None:
         """Kick a fetch on a daemon thread (the pty_worker/mcp_server pattern).
@@ -2144,6 +2185,7 @@ class MainWindow(QMainWindow):
             self._usage_timer.start()      # restart the interval from now
         self._poll_usage()
         self._poll_gemini_usage()
+        self._poll_codex_usage()
 
     def _on_usage_ready(self, reading) -> None:
         self._usage_inflight = False
@@ -2346,12 +2388,48 @@ class MainWindow(QMainWindow):
         return bool(self._usage_trackers.get("gemini_five_hour")
                     or self._usage_trackers.get("gemini_weekly"))
 
+    def _codex_wanted(self) -> bool:
+        return bool(self._usage_trackers.get("codex_five_hour"))
+
+    def _poll_codex_usage(self) -> None:
+        """Fetch the optional ChatGPT/Codex readout off the GUI thread."""
+        if (self._closing or self._codex_usage_inflight
+                or not self._codex_wanted()):
+            return
+        self._codex_usage_inflight = True
+
+        def worker():
+            try:
+                reading = codex_usage.fetch()
+            except Exception:
+                reading = None
+            self._codexUsageReady.emit(reading)
+
+        threading.Thread(target=worker, daemon=True,
+                         name="aihive-codex-usage").start()
+
+    def _on_codex_usage_ready(self, reading) -> None:
+        self._codex_usage_inflight = False
+        if self._closing:
+            return
+        if reading is None or reading.limit is None:
+            if reading is not None and reading.error == "no-auth" and self._codex_usage is None:
+                self.top_bar.mark_usage_absent("codex_five_hour")
+                self._codex_usage_timer.stop()
+            else:
+                self.top_bar.note_codex_usage_error(
+                    reading.error if reading is not None else "unknown")
+            return
+        self._codex_usage = reading
+        self.top_bar.set_codex_usage(reading)
+
     def _on_usage_tracker_toggled(self, key: str, on: bool) -> None:
         """The X on a pill, or an entry in the + menu. One handler for both, so
         the two controls of the same preference can never disagree."""
         if key not in USAGE_TRACKER_KEYS:
             return
         was_gemini = self._gemini_wanted()
+        was_codex = self._codex_wanted()
         self._usage_trackers[key] = bool(on)
         self.top_bar.set_usage_trackers(self._usage_trackers)
         # a UI PREFERENCE, like sound_enabled. The READING it governs stays
@@ -2360,6 +2438,8 @@ class MainWindow(QMainWindow):
         if not on:
             if was_gemini and not self._gemini_wanted():
                 self._gemini_usage_timer.stop()   # nothing consumes it now
+            if was_codex and not self._codex_wanted():
+                self._codex_usage_timer.stop()
             return
         # Switched back on: load it NOW rather than leave a gap for up to a
         # minute. The loading state goes up first, so the pill is on the bar
@@ -2369,6 +2449,11 @@ class MainWindow(QMainWindow):
             return              # this window never opted in; never shell out
         if key in ("claude_five_hour", "claude_weekly"):
             self._poll_usage()
+            return
+        if key == "codex_five_hour":
+            if not was_codex:
+                self._codex_usage_timer.start()
+            self._poll_codex_usage()
             return
         if not was_gemini:
             self._gemini_usage_timer.start()
