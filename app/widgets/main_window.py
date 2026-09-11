@@ -137,7 +137,7 @@ USAGE_TRACKER_LABELS = {
     "claude_weekly": "Claude weekly usage",
     "gemini_five_hour": "Gemini 5 hour usage",
     "gemini_weekly": "Gemini weekly usage",
-    "codex_five_hour": "ChatGPT/Codex 5 hour usage",
+    "codex_five_hour": "Codex 5 hour usage",
 }
 DEFAULT_USAGE_TRACKERS = {k: True for k in USAGE_TRACKER_KEYS}
 
