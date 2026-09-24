@@ -43,6 +43,15 @@ _GEMINI_USAGE_CACHE: dict[str, tuple[float, int, int, int]] = {}
 # cache for latest_gemini_ai_title: metadata path -> (mtime, size, {session_id: title}).
 _GEMINI_TITLE_CACHE: dict[str, tuple[float, int, dict[str, str]]] = {}
 
+# cache for latest_gemini_model_effort: session_id -> (mtime, size, model, effort, mode).
+_GEMINI_MODEL_CACHE: dict[str, tuple[float, int, str, str, str]] = {}
+
+# cache for gemini_typed_prompts: path -> (mtime, size, [prompt text, ...]).
+_GEMINI_PROMPT_CACHE: dict[str, tuple[float, int, list]] = {}
+
+# cache for gemini_reply_times: path -> (mtime, size, [(epoch, final text), ...]).
+_GEMINI_REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
+
 # cache for limit_cut_off: path -> (mtime, size, verdict dict).
 _LIMIT_CACHE: dict[str, tuple[float, int, dict]] = {}
 
@@ -151,10 +160,9 @@ def _read_latest_ai_title(path: str) -> str:
 
 
 def latest_gemini_ai_title(cwd: str, session_id: str) -> str:
-    """The most recent AI-generated conversation title or preview Gemini
-    (Antigravity CLI) wrote into conversation_metadata.json for this session.
-    "" if none / no file.
-    Cached by (mtime, size) so repeated polling only re-reads on a real change.
+    """The most recent AI conversation title or user task summary for Gemini.
+    Checks conversation_metadata.json, conversation_summaries.db, and falls
+    back to the first user request in transcript.jsonl. Cached by (mtime, size).
     Never raises."""
     if not session_id:
         return ""
@@ -163,28 +171,89 @@ def latest_gemini_ai_title(cwd: str, session_id: str) -> str:
     return _read_gemini_ai_title(meta_path, session_id)
 
 
+def _read_gemini_first_prompt(session_id: str) -> str:
+    """Fallback conversation title: first user request in transcript.jsonl."""
+    from . import session_sync
+    path = os.path.join(session_sync.gemini_dir(), "brain", session_id,
+                        ".system_generated", "logs", "transcript.jsonl")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"USER_INPUT"' not in line:
+                    continue
+                rec = json.loads(line)
+                if rec.get("type") == "USER_INPUT":
+                    content = rec.get("content", "")
+                    if "<USER_REQUEST>" in content:
+                        req = content.split("<USER_REQUEST>")[1].split("</USER_REQUEST>")[0].strip()
+                    else:
+                        req = content.strip()
+                    if req.startswith("/plan"):
+                        req = req[5:].strip()
+                    elif req.startswith("/"):
+                        parts = req.split(" ", 1)
+                        if len(parts) > 1:
+                            req = parts[1]
+                    flat = " ".join(req.split())
+                    if flat:
+                        return flat[:80] + ("…" if len(flat) > 80 else "")
+    except Exception:
+        pass
+    return ""
+
+
 def _read_gemini_ai_title(path: str, session_id: str) -> str:
     try:
-        st = os.stat(path)
+        st = os.stat(path) if (path and os.path.isfile(path)) else None
     except OSError:
-        return ""
-    cached = _GEMINI_TITLE_CACHE.get(path)
-    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
-        return cached[2].get(session_id, "")
+        st = None
+    cached = _GEMINI_TITLE_CACHE.get(path) if path else None
+    if st and cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        cached_title = cached[2].get(session_id, "")
+        if cached_title:
+            return cached_title
+
     titles: dict[str, str] = {}
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        convs = data.get("conversations", {})
-        for sid, info in convs.items():
-            s = info.get("summary") or {}
-            t = s.get("Title") or s.get("Preview") or ""
-            if t:
-                titles[sid] = t
-    except Exception:
-        return cached[2].get(session_id, "") if cached else ""
-    _GEMINI_TITLE_CACHE[path] = (st.st_mtime, st.st_size, titles)
-    return titles.get(session_id, "")
+    if st:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            convs = data.get("conversations", {})
+            for sid, info in convs.items():
+                s = info.get("summary") or {}
+                t = s.get("Title") or s.get("Preview") or ""
+                if t:
+                    titles[sid] = t
+        except Exception:
+            pass
+        _GEMINI_TITLE_CACHE[path] = (st.st_mtime, st.st_size, titles)
+
+    title = titles.get(session_id, "")
+    if title:
+        return title
+
+    # Fallback 1: conversation_summaries.db
+    from . import session_sync
+    sdb_path = os.path.join(session_sync.gemini_dir(), "conversation_summaries.db")
+    if os.path.isfile(sdb_path):
+        try:
+            import sqlite3
+            conn = sqlite3.connect(sdb_path)
+            cur = conn.cursor()
+            cur.execute("SELECT title, preview FROM conversation_summaries WHERE conversation_id = ?;", (session_id,))
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                t = (row[0] or row[1] or "").strip()
+                if t:
+                    return t
+        except Exception:
+            pass
+
+    # Fallback 2: first user request in transcript.jsonl
+    return _read_gemini_first_prompt(session_id)
 
 
 def typed_prompts(cwd: str, session_id: str) -> list[str]:
@@ -247,7 +316,8 @@ def reply_times(cwd: str, session_id: str) -> list[tuple[float, str]]:
     signal cannot be: a reply mark is minted at the busy -> idle settle, so it
     only exists for turns THIS process watched finish. Reopen the app and every
     past turn has no stamp at all -- which is what the user sees, and stamping
-    the current time on them instead (the bug `_settled_once` fixed) was worse.
+    the current time on them instead (the bug the _turn_open latch fixed) was
+    worse.
     Claude timestamps every record it writes, so the transcript knows what no
     live observation can.
 
@@ -330,6 +400,83 @@ def _is_tool_result(rec: dict) -> bool:
                if isinstance(b, dict))
 
 
+def gemini_typed_prompts(session_id: str) -> list[str]:
+    """Every prompt the USER typed in this Gemini conversation, oldest first."""
+    if not session_id:
+        return []
+    from . import session_sync
+    path = os.path.join(session_sync.gemini_dir(), "brain", session_id,
+                        ".system_generated", "logs", "transcript.jsonl")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    cached = _GEMINI_PROMPT_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return list(cached[2])
+    out: list[str] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"USER_INPUT"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("type") == "USER_INPUT":
+                    content = rec.get("content", "")
+                    if "<USER_REQUEST>" in content:
+                        req = content.split("<USER_REQUEST>")[1].split("</USER_REQUEST>")[0].strip()
+                    else:
+                        req = content.strip()
+                    if req:
+                        out.append(req)
+    except OSError:
+        return list(cached[2]) if cached else []
+    _GEMINI_PROMPT_CACHE[path] = (st.st_mtime, st.st_size, list(out))
+    return out
+
+
+def gemini_reply_times(session_id: str) -> list[tuple[float, str]]:
+    """Every finished reply in this Gemini conversation as (epoch, text)."""
+    if not session_id:
+        return []
+    from . import session_sync
+    path = os.path.join(session_sync.gemini_dir(), "brain", session_id,
+                        ".system_generated", "logs", "transcript.jsonl")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    cached = _GEMINI_REPLY_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return list(cached[2])
+    out: list[tuple[float, str]] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"PLANNER_RESPONSE"' not in line and '"GENERIC"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("source") == "MODEL" and rec.get("status") == "DONE":
+                    text = (rec.get("content") or "").strip()
+                    ts = rec.get("created_at")
+                    if text and ts:
+                        try:
+                            epoch = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                            out.append((epoch, text))
+                        except ValueError:
+                            pass
+    except OSError:
+        return list(cached[2]) if cached else []
+    _GEMINI_REPLY_CACHE[path] = (st.st_mtime, st.st_size, list(out))
+    return out
+
+
 def ended_on_limit(cwd: str, session_id: str) -> tuple[bool, float, float]:
     """Did this conversation STOP because the plan limit ran out?
 
@@ -358,7 +505,11 @@ def limit_cut_off(cwd: str, session_id: str) -> dict | None:
     """The same verdict as `ended_on_limit`, but TRI-STATE and detailed.
 
     Returns None when there is no readable transcript at all, and otherwise
-    `{"cut_off", "at", "resets_at", "banner", "window", "synthetic"}`.
+    `{"cut_off", "at", "resets_at", "banner", "window", "synthetic", "exact",
+    "self_resumed"}`. `exact` says `resets_at` came from the record's own
+    `quotaLimits` epoch or a dated clock rather than a bare wall time;
+    `self_resumed` says the conversation's last word on the limit was the
+    CLI's own "Usage limit reset" notice, i.e. it continued without AI Hive.
 
     The distinction between "the conversation carried on" and "there is no
     conversation to read" is what makes this safe to act on. A caller using it
@@ -415,15 +566,86 @@ def _is_synthetic_user_turn(rec: dict) -> bool:
     because Claude Code can turn a background tool's own completion into a
     brand-new turn with NO input from the user or AI Hive at all -- and if the
     account happens to be exhausted right then, that turn eats the SAME
-    "You've hit your session limit" menu a real interruption would, with
-    nothing of substance actually lost."""
+    cut-off notice a real interruption would, with nothing of substance
+    actually lost."""
     content = (rec.get("message") or {}).get("content")
     if not isinstance(content, str):
         return False        # a list of blocks is a real prompt or a tool reply
     return content.lstrip().startswith(_SYNTHETIC_USER_TAGS)
 
 
+def _is_api_error_record(rec: dict) -> bool:
+    """True when an assistant record is one Claude Code SYNTHESIZED from an
+    API error rather than text the model wrote. A real 429 cut-off is always
+    one: `error: "rate_limit"`, `isApiErrorMessage: true`, model
+    `<synthetic>` (all three on every real one on this machine). Requiring it
+    is what keeps an agent that WROTE a line starting "You've hit your session
+    limit" in its own reply from reading as a cut-off on disk."""
+    if rec.get("isApiErrorMessage") or rec.get("error"):
+        return True
+    return (rec.get("message") or {}).get("model") == "<synthetic>"
+
+
+def _quota_reset(rec: dict) -> tuple[float, str]:
+    """`(reset_epoch, window)` from a 429 record's `quotaLimits` block, or
+    (0.0, "") when it has none. The exact epoch the server sent, which beats
+    re-parsing the printed wall clock: it needs no rollover guess and is
+    right for a 7-day window days away."""
+    q = rec.get("quotaLimits")
+    if not isinstance(q, dict):
+        return 0.0, ""
+    try:
+        at = float(q.get("resetsAt") or 0.0)
+    except (TypeError, ValueError):
+        at = 0.0
+    window = limit_banner.RATE_LIMIT_WINDOWS.get(q.get("rateLimitType") or "",
+                                                 "")
+    return at, window
+
+
+def _is_real_prompt(rec: dict) -> bool:
+    """A user record that is a NEW request (typed, delivered, nudged), as
+    opposed to a tool result, injected meta context or CLI plumbing."""
+    if rec.get("isMeta"):
+        return False
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return not _is_synthetic_user_turn(rec)
+    if isinstance(content, list):
+        return any(isinstance(b, dict) and b.get("type") == "text"
+                   for b in content)
+    return False
+
+
+def _no_cut_off(**extra) -> dict:
+    found = {"cut_off": False, "at": 0.0, "resets_at": 0.0, "banner": "",
+             "window": "", "synthetic": False, "exact": False,
+             "self_resumed": False}
+    found.update(extra)
+    return found
+
+
 def _read_limit_cut_off(path: str) -> dict | None:
+    """The verdict behind `limit_cut_off`. A small state machine over the
+    main-chain records, where only the LAST relevant one counts:
+
+      * a cut-off line (see `limit_banner`) in an API-error assistant record,
+        or in a system record (the CLI's own quota notices), OPENS a cut-off;
+      * a grace-window wrap-up note (`usageLimitNote: "wrap_up"` on a meta
+        user record) opens one too, and the wrap-up reply that follows it
+        does NOT close it: that reply is the agent checkpointing because it
+        was stopped;
+      * ordinary assistant output closes it (the conversation carried on), as
+        does the CLI's "Usage limit reset" notice (it continued on its own,
+        reported as `self_resumed`) or a grace "release" note;
+      * every OTHER system record is IGNORED. This is the bug that let a
+        genuine cut-off be dismissed: any system record with text content
+        used to overwrite the verdict, and Claude writes those to idle
+        sessions all the time (`away_summary` recaps, "Remote Control
+        disconnected - /login" into every open session at once), so an agent
+        parked on a spent limit read as "carried on" and was either skipped
+        at startup or dismissed as a PHANTOM at resume time.
+    """
     try:
         st = os.stat(path)
     except OSError:
@@ -431,55 +653,86 @@ def _read_limit_cut_off(path: str) -> dict | None:
     cached = _LIMIT_CACHE.get(path)
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
         return cached[2]
-    found = {"cut_off": False, "at": 0.0, "resets_at": 0.0,
-             "banner": "", "window": "", "synthetic": False}
+    found = _no_cut_off()
     last_user_synthetic = False   # no evidence yet -> assume a real turn
+    grace_hold = False            # inside a grace window's wrap-up turn
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
-                if '"assistant"' not in line and '"user"' not in line:
+                if ('"assistant"' not in line and '"user"' not in line
+                        and '"system"' not in line):
                     continue      # cheap prefilter
                 try:
                     rec = json.loads(line)
                 except ValueError:
                     continue  # a partial last line while Claude is writing
+                if rec.get("isSidechain"):
+                    continue
                 rtype = rec.get("type")
-                if rtype == "user" and not rec.get("isSidechain"):
+                if rtype == "user":
+                    note = rec.get("usageLimitNote")
+                    if note == "wrap_up":
+                        # The grace window: the limit is spent and the agent
+                        # is being let finish its step. Nothing else on disk
+                        # marks this cut-off, so the note IS the record.
+                        found = _no_cut_off(cut_off=True,
+                                            at=_record_epoch(rec),
+                                            banner="Usage limit reached")
+                        grace_hold = True
+                        continue
+                    if note == "release":
+                        found, grace_hold = _no_cut_off(), False
+                        continue
+                    if rec.get("isMeta"):
+                        continue      # injected context, not a turn
                     last_user_synthetic = _is_synthetic_user_turn(rec)
+                    if _is_real_prompt(rec):
+                        grace_hold = False
                     continue
-                if rtype != "assistant" or rec.get("isSidechain"):
+                if rtype == "system":
+                    text = rec.get("content")
+                    if not isinstance(text, str):
+                        continue
+                    if limit_banner.is_reset_notice(text):
+                        found = _no_cut_off(self_resumed=True)
+                        grace_hold = False
+                        continue
+                    banner = limit_banner.banner_line(text)
+                    if not banner:
+                        continue      # away_summary, informational, ...
+                elif rtype == "assistant":
+                    text = _message_text(rec)
+                    banner = (limit_banner.banner_line(text)
+                              if _is_api_error_record(rec) else "")
+                    if not banner:
+                        if not grace_hold:
+                            found = _no_cut_off()
+                        continue
+                else:
                     continue
-                text = _message_text(rec)
-                # every assistant turn overwrites the verdict, so only the LAST
-                # one counts -- a banner followed by real output is history
-                # `banner_line`, not a bare regex search: an agent that merely
-                # WROTE ABOUT the limit would otherwise be armed for a resume
-                # it never needed (observed live on an agent working on this
-                # feature). A real cut-off is a short injected line.
-                banner = limit_banner.banner_line(text)
                 # A banner is only a genuine interruption when the turn it cut
                 # off was one the user (or a delivered task) actually asked
-                # for -- see `_is_synthetic_user_turn`. Otherwise this is the
-                # SAME class of false alarm as the "quoting the banner in
-                # prose" case above: real API exhaustion, but nothing of the
-                # agent's assigned work was actually lost.
-                if banner and not last_user_synthetic:
-                    when = _record_epoch(rec)
-                    found = {
-                        "cut_off": True, "at": when, "banner": banner,
-                        "window": limit_banner.banner_window(banner),
-                        "resets_at": (limit_banner.banner_reset_at(text, when)
-                                      or 0.0),
-                        "synthetic": False}
-                else:
-                    # `synthetic` is POSITIVE evidence and only that: a banner
-                    # we DID see, refuted by the turn behind it. A last turn
-                    # with no banner at all leaves it False, which is what
-                    # keeps "the record isn't written yet" distinguishable
-                    # from "this was never real work" -- see `limit_cut_off`.
-                    found = {"cut_off": False, "at": 0.0, "resets_at": 0.0,
-                             "banner": "", "window": "",
-                             "synthetic": bool(banner)}
+                # for -- see `_is_synthetic_user_turn`. Otherwise nothing of
+                # the agent's assigned work was lost. `synthetic` is POSITIVE
+                # evidence and only that: a banner we DID see, refuted by the
+                # turn behind it, which keeps "the record isn't written yet"
+                # distinguishable from "this was never real work".
+                if last_user_synthetic:
+                    found = _no_cut_off(synthetic=True)
+                    continue
+                when = _record_epoch(rec)
+                resets_at, q_window = _quota_reset(rec)
+                exact = bool(resets_at)
+                if not resets_at and limit_banner.banner_due_now(text):
+                    resets_at, exact = when, True
+                if not resets_at:
+                    resets_at = limit_banner.banner_reset_at(text, when) or 0.0
+                    exact = (bool(resets_at)
+                             and limit_banner.reset_is_dated(text))
+                found = _no_cut_off(
+                    cut_off=True, at=when, banner=banner,
+                    window=q_window or limit_banner.banner_window(banner),
+                    resets_at=resets_at, exact=exact)
     except OSError:
         return cached[2] if cached else None
     _LIMIT_CACHE[path] = (st.st_mtime, st.st_size, found)
@@ -563,7 +816,8 @@ def _read_latest_token_usage(path: str) -> tuple[int, int]:
     return (used, window)
 
 
-def _parse_varint(data: bytes, pos: int) -> tuple[int, int]:
+def _parse_varint(data: bytes, pos: int) -> tuple[int | None, int]:
+    """Decode a variable-length integer from protobuf byte stream."""
     res = 0
     shift = 0
     while pos < len(data):
@@ -572,8 +826,72 @@ def _parse_varint(data: bytes, pos: int) -> tuple[int, int]:
         res |= (b & 0x7f) << shift
         shift += 7
         if not (b & 0x80):
+            return res, pos
+    return None, pos
+
+
+def _parse_proto(data: bytes) -> list[tuple[int, int, bytes | int]]:
+    """Decode raw protobuf stream into list of (field_num, wire_type, value)."""
+    pos = 0
+    items = []
+    while pos < len(data):
+        key, pos = _parse_varint(data, pos)
+        if key is None:
             break
-    return res, pos
+        field_num = key >> 3
+        wire_type = key & 0x7
+        if wire_type == 0:  # Varint
+            val, pos = _parse_varint(data, pos)
+            if val is None:
+                break
+            items.append((field_num, wire_type, val))
+        elif wire_type == 2:  # Length-delimited (bytes / string / submessage)
+            length, pos = _parse_varint(data, pos)
+            if length is None or pos + length > len(data):
+                break
+            items.append((field_num, wire_type, data[pos:pos+length]))
+            pos += length
+        elif wire_type == 1:  # 64-bit fixed
+            pos += 8
+        elif wire_type == 5:  # 32-bit fixed
+            pos += 4
+        else:
+            break
+    return items
+
+
+def _extract_gemini_db_metadata(path: str) -> tuple[str, int]:
+    """Extract (raw_model_name, context_tokens) from Gemini SQLite database."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(path)
+        cur = conn.cursor()
+        cur.execute('SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 25;')
+        rows = cur.fetchall()
+        conn.close()
+        for (row_data,) in rows:
+            if not row_data:
+                continue
+            data = bytes(row_data)
+            top = _parse_proto(data)
+            for fnum, wire_type, fval in top:
+                if fnum == 1 and isinstance(fval, bytes):
+                    f1_items = _parse_proto(fval)
+                    model = ""
+                    tokens = 0
+                    for snum, swire, sval in f1_items:
+                        if snum == 19 and isinstance(sval, bytes):
+                            model = sval.decode("utf-8", "replace").strip()
+                        elif snum == 4 and isinstance(sval, bytes):
+                            sub4 = _parse_proto(sval)
+                            for n, _, v in sub4:
+                                if n == 5 and isinstance(v, int):
+                                    tokens = v
+                    if tokens > 0 or model:
+                        return (model, tokens)
+    except Exception:
+        pass
+    return ("", 0)
 
 
 def latest_gemini_token_usage(cwd: str, session_id: str) -> tuple[int, int]:
@@ -597,26 +915,136 @@ def _read_gemini_db_token_usage(path: str) -> tuple[int, int]:
         return (cached[2], cached[3])
     used, window = 0, 1_000_000
     try:
-        import sqlite3
-        conn = sqlite3.connect(path)
-        cur = conn.cursor()
-        cur.execute('SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1;')
-        row = cur.fetchone()
-        conn.close()
-        if row and row[0]:
-            data = bytes(row[0])
-            matches = re.finditer(rb'[\x22][\x00-\xff]{5,150}\x28', data)
-            last_val = 0
-            for m in matches:
-                val, _ = _parse_varint(data, m.end())
-                if 0 < val < 10_000_000:
-                    last_val = val
-            if last_val > 0:
-                used = last_val
+        model, tokens = _extract_gemini_db_metadata(path)
+        if tokens > 0:
+            used = tokens
+            if "pro" in model.lower():
+                window = 2_000_000
+            elif "flash" in model.lower():
+                window = 1_000_000
+            if used > window:
+                window = 2_000_000
     except Exception:
         return (cached[2], cached[3]) if cached else (0, 0)
     _GEMINI_USAGE_CACHE[path] = (st.st_mtime, st.st_size, used, window)
     return (used, window)
+
+
+_GEMINI_MODEL_MAP = {
+    "gemini-3.8-flash": "Gemini 3.8 Flash",
+    "gemini-3.7-flash-control": "Gemini 3.7 Flash",
+    "gemini-3.7-flash": "Gemini 3.7 Flash",
+    "gemini-3.6-flash": "Gemini 3.6 Flash",
+    "gemini-3.5-flash": "Gemini 3.5 Flash",
+    "gemini-3.1-pro": "Gemini 3.1 Pro",
+    "claude-sonnet-4-6": "Claude Sonnet 4.6",
+    "claude-opus-4-6-thinking": "Claude Opus 4.6",
+    "gpt-oss-120b-medium": "GPT-OSS 120B",
+}
+
+
+def parse_gemini_model_effort(raw: str) -> tuple[str, str]:
+    """Split a raw Gemini model string into (model_display, effort).
+    'Gemini 3.8 Flash (High)' -> ('Gemini 3.8 Flash', 'high')
+    'gemini-3.8-flash-high' -> ('Gemini 3.8 Flash', 'high')
+    'gemini-3.7-flash-control' -> ('Gemini 3.7 Flash', '')
+    'Claude Sonnet 4.6 (Thinking)' -> ('Claude Sonnet 4.6', 'thinking')
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return ("", "")
+    eff = ""
+    m_eff = re.search(r"\((High|Medium|Low|Thinking)\)", raw, re.IGNORECASE)
+    if m_eff:
+        eff = m_eff.group(1).lower()
+        core = raw[:m_eff.start()].strip()
+    else:
+        m_slug = re.search(r"-(high|medium|low|thinking)$", raw, re.IGNORECASE)
+        if m_slug:
+            eff = m_slug.group(1).lower()
+            core = raw[:m_slug.start()].strip()
+        elif "thinking" in raw.lower():
+            eff = "thinking"
+            core = raw
+        else:
+            core = raw
+
+    c_lower = core.lower()
+    for key, disp in _GEMINI_MODEL_MAP.items():
+        if key in c_lower:
+            return (disp, eff)
+    return (core, eff)
+
+
+def latest_gemini_model_effort(cwd: str, session_id: str) -> tuple[str, str, str]:
+    """Live model, effort, and permission mode for a Gemini/agy agent.
+    Combines settings.json defaults, live SQLite gen_metadata, and transcript.jsonl
+    USER_SETTINGS_CHANGE / /plan records. Cached by (mtime, size)."""
+    if not session_id:
+        return ("", "", "")
+    from . import providers, session_sync
+    base = session_sync.gemini_dir()
+    db_path = os.path.join(base, "conversations", f"{session_id}.db")
+    tpath = os.path.join(base, "brain", session_id, ".system_generated", "logs", "transcript.jsonl")
+
+    st_db = None
+    try:
+        if os.path.isfile(db_path):
+            st_db = os.stat(db_path)
+    except OSError:
+        pass
+
+    cached = _GEMINI_MODEL_CACHE.get(session_id)
+    if st_db and cached and cached[0] == st_db.st_mtime and cached[1] == st_db.st_size:
+        return (cached[2], cached[3], cached[4])
+
+    sett = providers.gemini_user_default_settings()
+    def_raw_model = sett.get("model", "")
+    def_model, def_effort = parse_gemini_model_effort(def_raw_model)
+
+    mode = ""
+    if sett.get("skipPermissionChecks") or sett.get("toolExecutionPolicy") == "always-proceed":
+        mode = "bypass"
+    elif sett.get("agentMode") or sett.get("defaultMode"):
+        raw_mode = sett.get("agentMode") or sett.get("defaultMode")
+        mode = providers.gemini_permission_mode_display(raw_mode)
+
+    live_model = ""
+    live_effort = ""
+    if st_db:
+        raw_model, _ = _extract_gemini_db_metadata(db_path)
+        if raw_model:
+            parsed_m, parsed_e = parse_gemini_model_effort(raw_model)
+            live_model = parsed_m
+            if parsed_e:
+                live_effort = parsed_e
+
+    if os.path.isfile(tpath):
+        try:
+            with open(tpath, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    rec = json.loads(line)
+                    content = rec.get("content", "")
+                    if "USER_SETTINGS_CHANGE" in content:
+                        m = re.search(r"Model Selection[^\n]+?from\s+.*?to\s+(.+?)(?:\.\s+[A-Z]|\.\n|\n|<|$)", content)
+                        if m:
+                            tm, te = parse_gemini_model_effort(m.group(1))
+                            if tm:
+                                live_model = tm
+                            if te:
+                                live_effort = te
+                    if rec.get("type") == "USER_INPUT" and "/plan" in content:
+                        mode = "plan"
+        except Exception:
+            pass
+
+    final_model = live_model or def_model or ""
+    final_effort = live_effort or def_effort or ""
+    final_mode = mode or "auto"
+
+    if st_db:
+        _GEMINI_MODEL_CACHE[session_id] = (st_db.st_mtime, st_db.st_size, final_model, final_effort, final_mode)
+    return (final_model, final_effort, final_mode)
 
 
 def model_display(raw: str) -> str:

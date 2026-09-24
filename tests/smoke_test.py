@@ -49,6 +49,26 @@ def check(name, cond, detail=""):
     FAIL += not cond
 
 
+def _as_cli_wrote(rec):
+    """`rec`, with the fields claude.exe ALWAYS puts on a 429 cut-off record
+    when it is an assistant record whose text is a limit banner: `error:
+    "rate_limit"`, `isApiErrorMessage: true`, model `<synthetic>` (read off
+    every real one on this machine). The transcript reader now requires them,
+    because a banner WITHOUT them is an agent writing those words in its own
+    reply, so a fixture that leaves them off describes prose, not a cut-off."""
+    from app import limit_banner as _lb
+    if rec.get("type") != "assistant" or "error" in rec:
+        return rec
+    content = (rec.get("message") or {}).get("content")
+    text = (content if isinstance(content, str) else " ".join(
+        b.get("text", "") for b in (content or []) if isinstance(b, dict)))
+    if not _lb.banner_line(text):
+        return rec
+    rec = dict(rec, error="rate_limit", isApiErrorMessage=True)
+    rec["message"] = dict(rec.get("message") or {}, model="<synthetic>")
+    return rec
+
+
 # ---------------------------------------------------------------- tiling ----
 
 def test_tiling():
@@ -288,6 +308,74 @@ def test_sidebar_count_badge():
     row.limit_badge.click()
     check("limit-badge: click asks for the agent list (open dropdown)",
           asked2 == ["w1"], asked2)
+    row.deleteLater()
+
+
+def test_row_name_fades_under_badges():
+    """The badge stack is painted OVER the name (it owns no layout width, so
+    it can never be squeezed), which used to leave a long workspace name
+    printing its letters through the icons - reported live as a gear and a
+    spinner sitting inside "Video Production", unreadable either way.
+
+    The name now fades out just before the badges: no elision, no reserved
+    width, and nothing at all changes on a row with no badges lit."""
+    from PySide6.QtGui import QImage, QPainter, QColor
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.ornaments import FadingLabel
+    from app.widgets.sidebar import WorkspaceRow, SIDEBAR_WIDTH, ROW_HEIGHT
+
+    QApplication.instance() or QApplication([])
+    row = WorkspaceRow("w1", "Video Production", "C:/proj")
+    row.setGeometry(0, 0, SIDEBAR_WIDTH, ROW_HEIGHT)
+
+    quiet = {"total": 2, "active": 2, "busy": 0, "error": 0, "waiting": 0,
+             "idle": 2, "limit_blocked": 0, "scheduled": 0, "bg_shell": 0}
+    row.set_stats(quiet)
+    row.layout().activate()
+    row._position_icon_stack()
+    check("row name: nothing lit -> no fade at all (plain label, full name)",
+          row.name_label.fade_x() is None, row.name_label.fade_x())
+
+    lit = dict(quiet, busy=1, bg_shell=1)
+    row.set_stats(lit)
+    row.layout().activate()
+    row._icon_stack.layout().activate()
+    row._position_icon_stack()
+    want = max(0, row._icon_stack.x() - row.name_label.x()
+               - WorkspaceRow._ICON_TEXT_GAP)
+    check("row name: badges lit -> fade starts just before the badge stack",
+          row.name_label.fade_x() == want,
+          (row.name_label.fade_x(), want, row._icon_stack.x(),
+           row.name_label.x()))
+    check("row name: the name itself is never truncated to fit the badges",
+          row.name_label.text() == "Video Production", row.name_label.text())
+
+    # ...and the fade is real ink, not just bookkeeping: paint the label at a
+    # width its text overflows and measure how far right the ink reaches.
+    def ink_extent(fade_x):
+        lab = FadingLabel("Video Production Workspace Folder")
+        lab.setStyleSheet("color: rgb(240,240,240); background: transparent;")
+        lab.resize(240, 30)
+        lab.set_fade_x(fade_x)
+        img = QImage(240, 30, QImage.Format.Format_ARGB32)
+        img.fill(QColor(0, 0, 0, 0))
+        p = QPainter(img)
+        lab.render(p, QPoint())
+        p.end()
+        cols = [x for x in range(240)
+                if max(img.pixelColor(x, y).alpha() for y in range(30)) > 30]
+        lab.deleteLater()
+        return cols[-1] if cols else -1
+
+    full = ink_extent(None)
+    faded = ink_extent(120)
+    check("row name: with no fade the text paints to its full length",
+          full > 150, full)
+    check("row name: with a fade the ink stops at the badge edge",
+          0 < faded <= 120, (faded, full))
+    check("row name: a cover at the label's own edge leaves no ink at all",
+          ink_extent(0) == -1, ink_extent(0))
     row.deleteLater()
 
 
@@ -862,7 +950,7 @@ def test_chime_persistence():
     check("chime toggle: defaults to ON (bell glyph, lit)",
           bar._sound_on and bar.sound_btn.isChecked()
           and "\U0001F514" in bar.sound_label.text()
-          and "Notification chime" in bar.sound_label.text(),
+          and "Question chime" in bar.sound_label.text(),
           bar.sound_label.text())
     emitted = []
     bar.soundToggled.connect(emitted.append)
@@ -879,7 +967,145 @@ def test_chime_persistence():
     check("chime toggle: set_sound_enabled updates glyph, no emit",
           not bar._sound_on and emitted == [False, True]
           and not bar.sound_btn.isChecked())
+
+    # the reply-finished chime: its own switch, OFF by default
+    check("reply chime toggle: defaults to OFF (muted glyph, unlit)",
+          not bar._reply_sound_on and not bar.reply_sound_btn.isChecked()
+          and "🔕" in bar.reply_sound_label.text()
+          and "Reply finished chime" in bar.reply_sound_label.text(),
+          bar.reply_sound_label.text())
+    replied = []
+    bar.replySoundToggled.connect(replied.append)
+    bar.reply_sound_btn.click()
+    check("reply chime toggle: click arms it + emits True, question one untouched",
+          replied == [True] and bar._reply_sound_on
+          and bar.reply_sound_btn.isChecked()
+          and emitted == [False, True], (replied, emitted))
+    bar.set_reply_sound_enabled(False)
+    check("reply chime toggle: set_reply_sound_enabled updates, no emit",
+          not bar._reply_sound_on and replied == [True]
+          and not bar.reply_sound_btn.isChecked())
     bar.deleteLater()
+
+
+def test_reply_chime():
+    """The reply-finished chime's cue (TerminalAgent.reply_finished ->
+    WorkspaceManager.agentReplied). Claude's comes from the Stop hook's
+    turn_clear edge; the hookless providers wait REPLY_QUIET_MS past a settle.
+    Either way: only for a turn somebody submitted, once per turn, never when
+    the agent is asking something back, never for a plain shell."""
+    import wave as _wave
+    from PySide6.QtWidgets import QApplication
+    from app import chime
+    from app import session_hook as sh
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+
+    # --- both sounds synthesise, and they are different sounds ---
+    q, r = chime._ensure_chime(chime.QUESTION), chime._ensure_chime(chime.REPLY)
+    check("reply chime: question + reply WAVs are separate files",
+          q and r and q != r and os.path.exists(q) and os.path.exists(r),
+          (q, r))
+    with _wave.open(r, "rb") as w:
+        check("reply chime: reply WAV is 16-bit mono with frames",
+              w.getnchannels() == 1 and w.getsampwidth() == 2
+              and w.getnframes() > 0)
+    check("reply chime: the question sound ends mid-slide UP, the reply on a "
+          "held note",
+          chime._SOUNDS[chime.QUESTION][-1][2][-1][1]
+          > chime._SOUNDS[chime.QUESTION][-1][2][0][1]
+          and len(chime._SOUNDS[chime.REPLY][-1][2]) == 1)
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-reply-"))
+    events = str(tmp / "events.jsonl")
+    sh.reset_events(events)
+    mgr = WorkspaceManager()
+    mgr.prompt_events_path = events
+    ws = mgr.create_workspace("Reply", str(tmp))
+    replies = []
+    mgr.agentReplied.connect(lambda wid, aid: replies.append(aid))
+
+    # --- Claude: the Stop hook's turn_clear is the edge ---
+    cl = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Cl",
+                                            cwd=str(tmp)), autostart=False)
+    cl.status = AgentStatus.RUNNING
+
+    def emit(agent, kind):
+        os.environ[sh.AGENT_ID_ENV] = agent.id
+        try:
+            sh._append_event(events, kind)
+        finally:
+            os.environ.pop(sh.AGENT_ID_ENV, None)
+
+    emit(cl, sh.EV_TURN_CLEAR)
+    mgr.sync_prompt_events()
+    check("reply chime: a Stop with no submitted turn (a --resume) is silent",
+          replies == [], replies)
+    cl._note_submit()
+    cl._busy = True     # the hook lands inside the 2 s idle window
+    emit(cl, sh.EV_TURN_CLEAR)
+    mgr.sync_prompt_events()
+    check("reply chime: Claude Stop (turn_clear) after a submit rings, even "
+          "while still inside the busy window", replies == [cl.id], replies)
+    emit(cl, sh.EV_TURN_CLEAR)
+    mgr.sync_prompt_events()
+    check("reply chime: once per turn", replies == [cl.id], replies)
+    cl._busy = False
+    cl._note_submit()
+    cl._on_idle_timeout()
+    check("reply chime: Claude never arms the quiet timer (the hook is exact)",
+          not cl._reply_timer.isActive())
+    cl._tool_waiting = True
+    cl._emit_waiting()
+    cl.note_turn_ended()
+    check("reply chime: silent while the agent is asking the user something",
+          replies == [cl.id], replies)
+    cl._tool_waiting = False
+    cl._emit_waiting()
+
+    # --- hookless provider: settle arms the quiet timer, output cancels it ---
+    gm = mgr.add_terminal(ws.id, build_spec(AgentKind.GEMINI, "Gm",
+                                            cwd=str(tmp)), autostart=False)
+    gm.status = AgentStatus.RUNNING
+    gm._on_idle_timeout()
+    check("reply chime: Gemini settle with no submitted turn arms nothing",
+          not gm._reply_timer.isActive())
+    gm._note_submit()
+    gm._last_input_ts = 0.0
+    gm._mark_busy()
+    gm._on_idle_timeout()
+    check("reply chime: Gemini settle inside a turn arms the quiet timer",
+          gm._reply_timer.isActive())
+    gm._mark_busy()     # a tool ran long, then more output
+    check("reply chime: fresh output cancels the pending chime (mid-reply)",
+          not gm._reply_timer.isActive())
+    gm._on_idle_timeout()
+    gm._bg_shell = True
+    gm._on_reply_quiet()
+    check("reply chime: silent while a background command still runs",
+          gm.id not in replies, replies)
+    gm._bg_shell = False
+    gm._on_reply_quiet()
+    check("reply chime: quiet timer expiry rings for Gemini",
+          replies.count(gm.id) == 1, replies)
+    gm._idle_timer.stop()
+    gm._reply_timer.stop()
+
+    # --- a plain shell never announces a reply ---
+    sh_agent = mgr.add_terminal(ws.id, build_spec(AgentKind.POWERSHELL, "Sh",
+                                                  cwd=str(tmp)),
+                                autostart=False)
+    sh_agent.status = AgentStatus.RUNNING
+    sh_agent._note_submit()
+    sh_agent._on_reply_quiet()
+    check("reply chime: a plain shell never rings", sh_agent.id not in replies,
+          replies)
+    for a in (cl, gm, sh_agent):
+        a._idle_timer.stop()
+        a._reply_timer.stop()
 
 
 def test_taskbar_badge():
@@ -1849,6 +2075,15 @@ def test_fsopen_helpers():
     fsopen.open_with(missing)          # must not raise
     fsopen.reveal_in_folder(missing)   # must not raise
     check("fsopen: open_with / reveal_in_folder no-op on missing path", True)
+    # Regression: an argv list made subprocess quote the WHOLE
+    # "/select,<path>" token whenever the path had a space, Explorer ignored
+    # the quoted switch and opened Documents instead of the file's folder.
+    spaced = os.path.join(tempfile.gettempdir(), "AI Projects", "a b.txt")
+    cmd = fsopen.explorer_select_cmdline(spaced)
+    check("fsopen: reveal cmdline leaves /select, unquoted",
+          cmd.startswith('explorer /select,"') and '"/select' not in cmd)
+    check("fsopen: reveal cmdline quotes the full spaced path",
+          cmd.endswith(f'"{os.path.normpath(spaced)}"'))
 
 
 def test_filetypes_icons():
@@ -1920,6 +2155,68 @@ def test_terminal_relative_link():
     tv.mousePressEvent(ev)
     check("link: Ctrl+click a path emits fileActivated(abspath)",
           got == [os.path.abspath(absf)], got)
+    tv.deleteLater()
+
+
+def test_terminal_link_context_menu():
+    """Right-clicking a path in the output offers Reveal in folder / Copy path,
+    resolved to the ABSOLUTE path (Explorer needs an absolute path, and the
+    token Claude prints is usually repo-relative). Drives _build_context_menu
+    directly: contextMenuEvent's exec() would block the headless suite.
+
+    Only the COPY actions are triggered here -- triggering Open, Open with or
+    Reveal would launch a real program out of the test run."""
+    import os
+    import tempfile
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import TerminalView
+    QApplication.instance() or QApplication([])
+
+    base = tempfile.mkdtemp(prefix="aihive_menu_")
+    os.makedirs(os.path.join(base, "app", "widgets"), exist_ok=True)
+    absf = os.path.join(base, "app", "widgets", "sidebar.py")
+    with open(absf, "w", encoding="utf-8") as fh:
+        fh.write("x = 1\n")
+
+    tv = TerminalView(rows=6, cols=80)
+    tv.resize(700, 200)
+    tv.set_base_dir(base)
+    tv.feed("app/widgets/sidebar.py plainword https://example.com/a\r\n")
+
+    def texts(col):
+        return [a.text() for a in tv._build_context_menu(0, col).actions()
+                if not a.isSeparator()]
+
+    over_path = texts(3)
+    check("link menu: a path offers the file map's four actions first",
+          over_path[:4] == ["Open", "Open with...", "Reveal in folder",
+                            "Copy path"], over_path)
+    check("link menu: the clipboard items survive under the link items",
+          over_path[4:] == ["Copy", "Paste", "Select all"], over_path)
+
+    QGuiApplication.clipboard().setText("")
+    menu = tv._build_context_menu(0, 3)
+    [a for a in menu.actions() if a.text() == "Copy path"][0].trigger()
+    check("link menu: Copy path copies the RESOLVED absolute path",
+          QGuiApplication.clipboard().text() == os.path.abspath(absf),
+          QGuiApplication.clipboard().text())
+
+    # a plain word carries no link items at all -- no greyed-out placeholders
+    plain = texts(26)
+    check("link menu: a plain word offers only the clipboard items",
+          plain == ["Copy", "Paste", "Select all"], plain)
+
+    url_col = len("app/widgets/sidebar.py plainword ") + 4
+    over_url = texts(url_col)
+    check("link menu: a URL offers open + copy, not the four file actions",
+          over_url[:2] == ["Open link", "Copy link address"], over_url)
+    QGuiApplication.clipboard().setText("")
+    menu = tv._build_context_menu(0, url_col)
+    [a for a in menu.actions() if a.text() == "Copy link address"][0].trigger()
+    check("link menu: Copy link address copies the URL",
+          QGuiApplication.clipboard().text() == "https://example.com/a",
+          QGuiApplication.clipboard().text())
     tv.deleteLater()
 
 
@@ -3111,56 +3408,295 @@ def test_agent_busy_activity():
     a.dispose()
 
 
-def test_reply_settle_skips_resume_replay():
-    """A --resume launch replays the WHOLE past conversation as real output
-    before it ever goes quiet, so the FIRST busy -> idle settle of a resumed
-    launch is that replay finishing, not a fresh reply -- live-reported bug:
-    reopening the app always showed the CURRENT time next to the last reply
-    (both the header badge and an inline mark), never the actual historical
-    one, because that replay settle stamped "now" unconditionally. Only that
-    one settle is skipped; the very next one (a genuine new reply) stamps
-    normally, and a non-resumed launch -- nothing to replay -- is never
-    suppressed at all."""
+def test_reply_marks_need_a_submitted_turn():
+    """A reply stamp is only minted for a turn somebody actually ASKED for.
+
+    A busy -> idle settle is 2 s of quiet and nothing more, and a launch
+    produces several that are not replies: a --resume launch reprints the whole
+    past conversation as real output, pausing while Claude loads the transcript
+    and again once the reprint ends, and settle_layout then hands every card
+    its real width, which makes the child redraw its entire frame. The old
+    guard suppressed only the FIRST settle of a resumed launch, so reopening
+    the app stamped the CURRENT time over the last reply in every terminal --
+    live-reported, and the check below that settles TWICE is the one that
+    reproduces it.
+
+    Second half: ONE stamp per turn. Claude falls quiet mid-reply whenever a
+    tool runs longer than the idle window, and each of those lulls used to mint
+    its own mark, so a single long reply wore a stamp at every pause it took
+    instead of one where it ended."""
     from PySide6.QtWidgets import QApplication
-    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.terminal_agent import TerminalAgent, AgentStatus, submits_a_line
     from app.process_worker import AgentKind, build_spec
 
     QApplication.instance() or QApplication([])
+
+    # ---- what counts as a submit -----------------------------------------
+    check("reply-turn: a bare CR submits", submits_a_line("hi\r"))
+    check("reply-turn: Shift/Alt+Enter (ESC-CR) inserts a newline, no submit",
+          not submits_a_line("\x1b\r"))
+    check("reply-turn: Ctrl+Enter (LF) inserts a newline, no submit",
+          not submits_a_line("\n"))
+    check("reply-turn: a CR inside a bracketed paste is pasted text, no submit",
+          not submits_a_line("\x1b[200~one\rtwo\x1b[201~"))
+    check("reply-turn: ...but the Enter that follows the paste does submit",
+          submits_a_line("\x1b[200~one\rtwo\x1b[201~\r"))
+
     a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ResumeSettle", cwd=".",
                                  pty=True))
     a.status = AgentStatus.RUNNING
     a._resume_attempt = True          # simulate a --resume launch
-    a._settled_once = False
+    a._turn_open = False              # nothing has been asked of it yet
 
-    # the resume replay arrives as real output, then falls quiet
-    a._on_pty_output("pty", "...replayed conversation...")
-    a._on_idle_timeout()
-    check("reply-settle: a resume's replay settle mints no inline milestone",
+    # the resume replay arrives as real output and falls quiet, TWICE: Claude
+    # pauses while it loads the conversation, then again once it has reprinted
+    # it. The old one-shot guard let the second one through.
+    for burst in ("Claude Code v2.1 ...", "...replayed conversation..."):
+        a._on_pty_output("pty", burst)
+        a._on_idle_timeout()
+    check("reply-turn: a resumed launch's replay settles mint no milestone",
           a.reply_marks() == [], a.reply_marks())
-    check("reply-settle: ...but 'settled once' is now true", a._settled_once)
 
-    # the NEXT settle is a genuine reply and stamps normally
+    # a card being sized into its real width makes the child repaint, which
+    # settles again -- still nobody asked it anything
+    a._on_pty_output("pty", "...full-frame repaint after the resize...")
+    a._on_idle_timeout()
+    check("reply-turn: ...nor does a repaint after the launch resize",
+          a.reply_marks() == [], a.reply_marks())
+
+    # ---- a real turn: submit, output, settle ------------------------------
+    a.write("do the thing\r")
+    check("reply-turn: a submitted line opens a turn", a._turn_open)
+    # the real reply lands well after the pty echoed the keystrokes back, so
+    # _mark_busy reads it as work rather than echo (see INPUT_ECHO_S)
+    a._last_input_ts = 0.0
     a._on_pty_output("pty", "a real new reply")
     before = time.time()
     a._on_idle_timeout()
-    check("reply-settle: the settle AFTER the replay records one milestone",
+    check("reply-turn: the settle after a submit records one milestone",
           len(a.reply_marks()) == 1, a.reply_marks())
-    check("reply-settle: ...stamped with a recent walltime",
-          before - 1 <= a.reply_marks()[0].ts <= time.time() + 1)
+    first = a.reply_marks()[0]
+    check("reply-turn: ...stamped with a recent walltime",
+          before - 1 <= first.ts <= time.time() + 1)
+    first_uid, first_pos, first_ts = first.uid, first.pos, first.ts
 
-    # a non-resumed launch has nothing to replay, so its first settle is real
-    b = TerminalAgent(build_spec(AgentKind.CLAUDE, "FreshSettle", cwd=".",
-                                 pty=True))
-    b.status = AgentStatus.RUNNING
-    check("reply-settle: a fresh (non-resume) launch is never suppressed",
-          not b._resume_attempt)
-    b._on_pty_output("pty", "first reply ever")
-    b._on_idle_timeout()
-    check("reply-settle: ...so its first settle stamps immediately",
-          len(b.reply_marks()) == 1, b.reply_marks())
+    # ---- a lull INSIDE that turn moves the mark, it does not add one ------
+    a._on_pty_output("pty", "...still the same reply, after a slow tool...")
+    a._on_idle_timeout()
+    check("reply-turn: a second settle in the same turn keeps ONE mark",
+          len(a.reply_marks()) == 1, a.reply_marks())
+    moved = a.reply_marks()[0]
+    check("reply-turn: ...and moves it to where the reply really ended",
+          moved.uid == first_uid and moved.pos > first_pos
+          and moved.ts >= first_ts, (first_pos, first_ts, moved))
+
+    # ---- the next submit starts a new turn, and a new mark ---------------
+    a.write("and now this\r")
+    a._last_input_ts = 0.0
+    a._on_pty_output("pty", "the second reply")
+    a._on_idle_timeout()
+    check("reply-turn: a fresh submit starts a fresh mark",
+          len(a.reply_marks()) == 2, a.reply_marks())
+
+    # ---- a restart closes the turn --------------------------------------
+    a.restart()
+    check("reply-turn: a restart closes the open turn",
+          not a._turn_open and a._turn_mark_uid is None)
+    a.status = AgentStatus.RUNNING
+    a._on_pty_output("pty", "output from the fresh session")
+    a._on_idle_timeout()
+    check("reply-turn: ...so its output settles without a stamp",
+          a.reply_marks() == [], a.reply_marks())
 
     a.dispose()
-    b.dispose()
+
+
+def test_reply_marks_recovered_after_reprint():
+    """A conversation REPRINTED after its card was built still gets its marks.
+
+    Milestone recovery rides a projection, and the launch autostart leaves a
+    restored RUNNING card with none: `drop_restored_screen` cancels the
+    settled-size projection (that snapshot is the previous run's screen, wrapped
+    for a width nothing can reflow) and `_reproject_on_size` bails while the
+    history is empty, which it is, because `settle_layout` sizes the card before
+    the child is spawned. The conversation then arrives seconds later from
+    `--resume`, with nothing left to scan it -- so a reopened hive showed no
+    stamp and no prompt dot anywhere. It went unnoticed only because a phantom
+    live mark used to land on the last reply instead, stamped with the launch
+    time. `_rescan_recovery` looks again once the reprint settles."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.widgets.terminal_card import (_RECOVER_RESCAN_TRIES, TerminalCard,
+                                           _format_reply_stamp)
+
+    QApplication.instance() or QApplication([])
+    spec = build_spec(AgentKind.CLAUDE, "Reopen", cwd=".", pty=True)
+    spec.session_id = "11111111-2222-3333-4444-555555555555"
+    agent = TerminalAgent(spec)
+    card = TerminalCard(agent)
+    card.resize(900, 500)
+    card._proj_cols = card.terminal.screen.columns
+    # the transcript says this conversation's one reply finished two hours ago
+    when = time.time() - 7200
+    card._recover_key = (spec.provider, spec.cwd, spec.session_id)
+    card._recover_prompts = []
+    card._recover_replies = [(when, "Done. The fix is in and the suite passes.")]
+
+    card.drop_restored_screen()      # what autostart does before start()
+    check("reply-reprint: the launch autostart leaves the card with no marks",
+          card.terminal.reply_marks() == [], card.terminal.reply_marks())
+
+    # ...and only THEN does the child reprint the resumed conversation
+    agent.status = AgentStatus.RUNNING
+    agent._on_pty_output("pty", "> do the thing\r\n\r\n"
+                         "● Done. The fix is in and the suite passes."
+                         "\r\n\r\n✳ Crunched for 41s\r\n\r\n"
+                         + "─" * 40 + "\r\n> ")
+    agent._on_idle_timeout()         # the settle after the reprint
+    check("reply-reprint: the settle after the reprint recovers the stamp",
+          card.terminal.reply_marks() == [(5, _format_reply_stamp(when))],
+          card.terminal.reply_marks())
+    check("reply-reprint: ...with the TRANSCRIPT's time, not the launch clock",
+          _format_reply_stamp(when) != _format_reply_stamp(time.time()))
+    check("reply-reprint: a scan that found something never runs again",
+          card._recover_tries < _RECOVER_RESCAN_TRIES)
+    agent._on_idle_timeout()
+    check("reply-reprint: ...and the recovered stamp survives later settles",
+          card.terminal.reply_marks() == [(5, _format_reply_stamp(when))],
+          card.terminal.reply_marks())
+    card._rescan_recovery()          # a settle with marks already anchored
+    check("reply-reprint: ...with the budget closed for good",
+          card._recover_tries == 0)
+
+    # a conversation whose replies are all out of reach stops asking rather
+    # than re-scanning on every settle for the life of the process
+    other = TerminalCard(agent)
+    other.resize(900, 500)
+    other._recover_key = card._recover_key
+    other._recover_prompts = []
+    other._recover_replies = [(when, "a reply that scrolled away long ago")]
+    for _ in range(_RECOVER_RESCAN_TRIES + 3):
+        other._rescan_recovery()
+    check("reply-reprint: an unfindable reply spends a bounded budget",
+          other._recover_tries == 0 and other.terminal.reply_marks() == [],
+          (other._recover_tries, other.terminal.reply_marks()))
+
+    other.deleteLater()
+    card.deleteLater()
+    agent.dispose()
+
+
+def test_reply_stamp_repaint_and_merge():
+    """Two ways a stamp that was recorded correctly still reads wrong.
+
+    First: setting marks has to REPAINT. `_notify_view`'s signature is
+    (pushed, history, offset, lines) and marks are not in it, so on a quiet
+    screen it returns at its own guard, and even when it does emit,
+    `viewChanged` goes to the scrollbar rather than to this widget's paint
+    queue. A reply stamp is minted 2 s after the last output, by which time the
+    repaint that last feed() scheduled has already run, so without an explicit
+    update() the stamp sat unpainted until something unrelated repainted the
+    card -- flaky-looking, on exactly the agent that has just gone quiet.
+
+    Second: a live mark and a recovered one are the SAME reply when they are
+    within _STAMP_MERGE_SLACK, not only when the rows match exactly. The two
+    anchors fall back differently when the row under Claude's footer is not
+    blank (recovery goes above the footer, the live path onto it), and
+    requiring equality kept both -- one reply wearing two stamps with two
+    different times, the wrong one rendering."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.terminal_card import (_STAMP_MERGE_SLACK, TerminalCard,
+                                           _format_reply_stamp)
+
+    QApplication.instance() or QApplication([])
+    # a scratch cwd, never the repo: a card reads the transcripts of whatever
+    # folder its spec names, and this suite runs INSIDE a real conversation
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-stamps-"))
+    spec = build_spec(AgentKind.CLAUDE, "Stamps", cwd=str(tmp), pty=True)
+    spec.session_id = "99999999-8888-7777-6666-555555555555"
+    agent = TerminalAgent(spec)
+    card = TerminalCard(agent)
+    card.resize(900, 500)
+    view = card.terminal
+
+    # counting paints means shadowing update() on the instance. Restore it by
+    # DELETING the attribute, never by assigning the bound method back: that
+    # leaves view.__dict__["update"] holding a method bound to view, i.e. a
+    # reference cycle that outlives deleteLater() and keeps a dead card's
+    # widget tree alive for the rest of the process.
+    painted = []
+    real_update = view.update
+    view.update = lambda *a, **k: (painted.append(1), real_update(*a, **k))[1]
+    view.set_reply_marks([(3, "Aug 19, 19:14")])
+    check("reply-paint: setting a reply stamp asks for a repaint", painted)
+    # the SAME view state twice: _notify_view returns at its signature guard,
+    # so only the explicit update() can carry the second one to the screen
+    before = len(painted)
+    view.set_reply_marks([(4, "Aug 19, 19:15")])
+    check("reply-paint: ...even when the view signature has not moved",
+          len(painted) > before, (before, len(painted)))
+    before = len(painted)
+    view.set_marks([(3, "do the thing")])
+    check("reply-paint: a prompt milestone repaints too",
+          len(painted) > before, (before, len(painted)))
+    del view.update
+    del real_update
+
+    # ---- the merge -------------------------------------------------------
+    when = time.time() - 7200        # what the transcript recorded
+    agent._note_submit()             # a turn somebody asked for
+    mark = agent.note_reply_settled()
+
+    def stamps(live_row, recovered_rows):
+        card._reply_mark_lines = {mark.uid: live_row}
+        card._recovered_replies = [(r, when) for r in recovered_rows]
+        card._refresh_reply_marks()
+        return view.reply_marks()
+
+    check("reply-merge: an exact row match takes the recorded time",
+          stamps(12, [12]) == [(12, _format_reply_stamp(when))],
+          view.reply_marks())
+    check("reply-merge: ...and so does one a footer away",
+          stamps(12, [12 - _STAMP_MERGE_SLACK]) ==
+          [(12, _format_reply_stamp(when))], view.reply_marks())
+    check("reply-merge: ...which is the LIVE row with the RECORDED time",
+          _format_reply_stamp(when) != _format_reply_stamp(mark.ts))
+    out = stamps(12, [12 - _STAMP_MERGE_SLACK - 1])
+    check("reply-merge: a reply further off is a separate turn, not this one",
+          out == sorted([(12 - _STAMP_MERGE_SLACK - 1,
+                          _format_reply_stamp(when)),
+                         (12, _format_reply_stamp(mark.ts))]), out)
+
+    # one recovered reply can only ever be claimed once, so a second live mark
+    # beside it keeps its own clock instead of stamping the same time twice
+    agent._note_submit()
+    second = agent.note_reply_settled()
+    card._reply_mark_lines = {mark.uid: 12, second.uid: 13}
+    card._recovered_replies = [(12, when)]
+    card._refresh_reply_marks()
+    out = view.reply_marks()
+    check("reply-merge: a recovered reply is claimed by ONE live mark",
+          out == sorted([(12, _format_reply_stamp(when)),
+                         (13, _format_reply_stamp(second.ts))]), out)
+
+    # detach() does NOT unhook the two mark signals _wire() connects, so drop
+    # them by hand as well; a card left listening to an agent it no longer
+    # paints is how a torn-down widget keeps taking work in later checks
+    for sig, slot in ((agent.prompt_marks_changed, card._refresh_marks),
+                      (agent.reply_marks_changed, card._on_reply_mark_added)):
+        try:
+            sig.disconnect(slot)
+        except (RuntimeError, TypeError):
+            pass
+    card.detach()
+    card.deleteLater()
+    agent.dispose()
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_transcript_reply_times():
@@ -3468,25 +4004,54 @@ def test_app():
     check("header tools: usage chip and close sit right of the strip",
           hlay.indexOf(tools) < hlay.indexOf(tok_card.token_label)
           < hlay.indexOf(tok_card.btn_close))
-    collapsed_w = tools.sizeHint().width()
+    collapsed_w = tools.width()
     pos = QPointF(2, 2)
     tools.enterEvent(QEnterEvent(pos, pos, tools.mapToGlobal(pos)))
     pump(10)
     check("header tools: hover reveals all three buttons",
-          tok_card.btn_font_dec.isVisibleTo(tools)
-          and tok_card.btn_font_inc.isVisibleTo(tools)
-          and tok_card.btn_max.isVisibleTo(tools)
+          tok_card.btn_font_dec.isVisibleTo(tools.tray)
+          and tok_card.btn_font_inc.isVisibleTo(tools.tray)
+          and tok_card.btn_max.isVisibleTo(tools.tray)
+          and tools.tray.isVisible()
           and not tools.hint.isVisibleTo(tools))
-    check("header tools: expanding is what costs width, not the resting state",
-          tools.sizeHint().width() > collapsed_w + 40,
-          (collapsed_w, tools.sizeHint().width()))
+    check("header tools: expanding costs the layout nothing",
+          tools.width() == collapsed_w,
+          (collapsed_w, tools.width()))
+    check("header tools: the tray floats left of the strip, inside the header",
+          tools.tray.parentWidget() is tok_card.header
+          and tools.tray.geometry().right() <= tools.geometry().right() + 1
+          and tools.tray.width() > collapsed_w + 40,
+          (tools.tray.geometry(), tools.geometry()))
+    # REGRESSION: past three cards across a 1080p screen the header is already
+    # over-subscribed, and Qt answers a layout it cannot satisfy by shrinking
+    # every item BELOW its minimum -- which used to hand a 65px button 39px
+    # and leave QToolButton eliding "A-" and "A+" to "...", i.e. three
+    # ellipses where two font steppers should be. The tray is not in the
+    # layout, so a narrow card cannot squeeze it.
+    tok_card.header.setFixedWidth(470)   # 4 cards across a 1080p screen
+    pump(10)
+    check("header tools: a narrow card cannot squeeze the buttons",
+          all(b.width() >= b.sizeHint().width()
+              for b in (tok_card.btn_font_dec, tok_card.btn_font_inc,
+                        tok_card.btn_max)),
+          [(b.width(), b.sizeHint().width())
+           for b in (tok_card.btn_font_dec, tok_card.btn_font_inc,
+                     tok_card.btn_max)])
+    check("header tools: the tray stays inside a narrow header",
+          0 <= tools.tray.x()
+          and tools.tray.geometry().right() < tok_card.header.width(),
+          (tools.tray.geometry(), tok_card.header.width()))
+    tok_card.header.setMinimumWidth(0)
+    tok_card.header.setMaximumWidth(16777215)
+    pump(10)
     # the real cursor is nowhere near an offscreen widget, so the deferred
     # re-check (which is what keeps the buttons up while the pointer is over
     # one of them) collapses again
     tools.leaveEvent(QEvent(QEvent.Type.Leave))
     pump(20)
     check("header tools: collapse again once the pointer leaves",
-          not tok_card.btn_max.isVisibleTo(tools)
+          not tok_card.btn_max.isVisibleTo(tools.tray)
+          and not tools.tray.isVisible()
           and tools.hint.isVisibleTo(tools))
 
     # -- 5. live streaming --------------------------------------------------
@@ -4526,52 +5091,130 @@ def test_terminal_input_editor():
 
 def test_input_gap_self_heal():
     """Claude's classic renderer can scroll the screen for a transient
-    dropdown and never scroll back on dismissal, stranding the input box
-    above a dead run of blank rows (see TerminalView._check_input_gap).
-    _on_input_settled is what _snap_timer's 600ms debounce fires; called
-    directly here rather than pumping a real timer, matching the existing
-    _snapshot_input direct-call pattern above."""
+    dropdown or a slash-command menu and never scroll back on dismissal,
+    stranding the input box above a dead run of blank rows (see
+    TerminalView._check_input_gap).
+
+    Every fixture here draws the box Claude REALLY draws -- a top border, the
+    '> ' row, a bottom border, and a footer hint that wraps onto a second row
+    -- because the shipped check never fired once on a real screen: its
+    blank-row scan aborted on that border, and the old fixture ('> ' plus a
+    one-row footer, no border) drew a screen Claude never paints. Same
+    fixture blind spot that hid the reply_anchor_line bug.
+
+    _check_input_gap is called directly rather than pumping the real
+    _gap_timer / _snap_timer debounces, matching the suite's existing
+    settled-handler pattern."""
     from app.widgets.terminal_view import TerminalView
 
-    # a tall terminal with the box parked near the TOP and nothing below --
-    # exactly the shape left once a dropdown's rows are erased but the
-    # viewport is never scrolled back down
-    view = TerminalView(rows=20, cols=40)
-    view.feed("> \r\n? for shortcuts")
-    fired = []
-    view.staleLayoutDetected.connect(lambda: fired.append(1))
-    view._on_input_settled()
-    check("input-gap: a footer stranded far from the bottom fires once",
-          fired == [1], fired)
+    RULE = "─" * 30
+    BOX = f"{RULE}\r\n> \r\n{RULE}\r\n? for shortcuts\r\n  • high · /effort"
 
-    # settling again with nothing changed must NOT refire -- this is what
+    def stranded(rows=20, history=True, trailer=""):
+        """A view whose box sits near the top with nothing below it -- the
+        shape left once a menu's rows are erased but the viewport is never
+        scrolled back down."""
+        view = TerminalView(rows=rows, cols=40)
+        if history:
+            view.feed("x\r\n" * (rows + 10))   # push lines into history
+        # home + erase-down leaves the history alone and repaints the box at
+        # the TOP of the screen: what a menu teardown leaves behind, since
+        # nothing re-scrolls the viewport back down
+        # ...and park the caret back on the '> ' row (row 2, 1-based), where
+        # the real renderer leaves it once the footer is painted -- every
+        # input-box reading starts from the caret
+        view.feed("\x1b[H\x1b[J" + BOX + trailer + "\x1b[2;3H")
+        fired = []
+        view.staleLayoutDetected.connect(lambda: fired.append(1))
+        return view, fired
+
+    view, fired = stranded()
+    view._check_input_gap()
+    check("input-gap: a real box (border + wrapped footer) stranded high fires",
+          fired == [1], fired)
+    # the border and the wrapped hint row are exactly what the old blank scan
+    # aborted on, so assert the fixture really contains them
+    top, bottom = view._input_block_span()
+    check("input-gap: the fixture draws the box border the old scan died on",
+          view._row_is_rule(bottom + 1), bottom)
+    check("input-gap: the fixture's footer wraps past _CLAUDE_READY_HINTS",
+          not view._row_is_input_footer(view._last_content_row()),
+          view._last_content_row())
+
+    # checking again with nothing changed must NOT refire -- this is what
     # keeps a legitimately short conversation free of a repeated resize blip
+    view._check_input_gap()
+    check("input-gap: an unchanged gap does not refire", fired == [1], fired)
+
+    # the typing path still works and shares the same edge guard
     view._on_input_settled()
-    check("input-gap: an unchanged gap does not refire",
+    check("input-gap: the keystroke path does not re-fire the same gap",
           fired == [1], fired)
 
-    # the footer sits right at the bottom (one row of normal padding) --
-    # within tolerance, so nothing is wrong and nothing fires
-    view2 = TerminalView(rows=3, cols=40)
-    view2.feed("> \r\n? for shortcuts")
-    fired2 = []
-    view2.staleLayoutDetected.connect(lambda: fired2.append(1))
-    view2._on_input_settled()
-    check("input-gap: a footer within tolerance of the bottom never fires",
+    # a fresh/cleared conversation legitimately sits high with blank space
+    # under it, and its footer walks down a row every turn -- nothing has
+    # scrolled off, so nothing can have been scrolled away
+    view2, fired2 = stranded(history=False)
+    view2._check_input_gap()
+    check("input-gap: an empty history never fires",
           fired2 == [] and view2._input_gap_row is None,
           (fired2, view2._input_gap_row))
 
-    # no footer line at all (mid-typing) still uses the box's own bottom row
-    # as the edge, and repeated settles with nothing changed still fire once
-    view3 = TerminalView(rows=20, cols=40)
-    view3.feed("hello\r\n> ")
-    fired3 = []
-    view3.staleLayoutDetected.connect(lambda: fired3.append(1))
-    view3._on_input_settled()
-    view3._on_input_settled()
-    view3._on_input_settled()
-    check("input-gap: a stable gap with no footer fires once, not per settle",
-          fired3 == [1], fired3)
+    # a menu is still open below the box: real content down there means the
+    # layout is not stranded, it is just busy
+    view3, fired3 = stranded(trailer="\r\n\r\n  1. Opus 5\r\n  2. Sonnet 5")
+    view3._check_input_gap()
+    check("input-gap: content below the box (an open menu) never fires",
+          fired3 == [] and view3._input_gap_row is None,
+          (fired3, view3._input_gap_row))
+
+    # An OPEN /model menu, transcribed from a live 30x100 capture: it REPLACES
+    # the box, its highlighted row starts with the same '❯' the prompt does,
+    # and it ends close enough to the last content row to clear the chrome
+    # bound -- so the only thing telling it apart from a real box is that the
+    # row under the selection is BLANK rather than the box's border/footer.
+    view3b = TerminalView(rows=30, cols=100)
+    view3b.feed("x\r\n" * 40)
+    view3b.feed("\x1b[H\x1b[J" + RULE + "\r\n  Select model\r\n\r\n"
+                "    1. Default\r\n    2. Sonnet\r\n    3. Fable\r\n"
+                "  ❯ 4. Opus\r\n    5. Haiku\r\n\r\n"
+                "  ● High effort (default)\r\n\r\n"
+                "  Enter to set as default · Esc to cancel"
+                "\x1b[7;5H")
+    fired3b = []
+    view3b.staleLayoutDetected.connect(lambda: fired3b.append(1))
+    span3b = view3b._input_block_span()
+    view3b._check_input_gap()
+    check("input-gap: an open menu's selection caret is not the input box",
+          fired3b == [] and span3b is not None
+          and view3b._row_content(span3b[1] + 1) == (-1, -1),
+          (fired3b, span3b))
+
+    # the box sits right at the bottom, within tolerance: nothing is wrong
+    view4, fired4 = stranded(rows=6)
+    view4._check_input_gap()
+    check("input-gap: a box within tolerance of the bottom never fires",
+          fired4 == [] and view4._input_gap_row is None,
+          (fired4, view4._input_gap_row))
+
+    # mid-reply: the caret is parked on plain output with no '>' above it and
+    # blank rows below. _input_block_span keeps top = cy in that case, so
+    # without the prompt-glyph guard this reads as a stranded box.
+    view5 = TerminalView(rows=20, cols=40)
+    view5.feed("x\r\n" * 30)
+    view5.feed("thinking about it")
+    fired5 = []
+    view5.staleLayoutDetected.connect(lambda: fired5.append(1))
+    view5._check_input_gap()
+    check("input-gap: the caret on plain output is not a stranded box",
+          fired5 == [] and view5._input_gap_row is None,
+          (fired5, view5._input_gap_row))
+
+    # the output path: a feed arms _gap_timer, so a menu closing with no
+    # keystroke at all still gets checked
+    view6, _ = stranded()
+    check("input-gap: output re-arms the settle timer with no keystroke",
+          view6._gap_timer.isActive(), view6._gap_timer.isActive())
 
 
 def test_session_migration():
@@ -4779,8 +5422,13 @@ def test_v2_features():
     # template expansion must not depend on whether the CLI is installed on
     # this machine (Codex may legitimately exist here) — detection is only
     # asserted to be a bool, expansion is asserted exactly
-    check("v2 providers: openai template expands",
-          "gpt-5.1" in providers.build_invocation("openai", model="gpt-5.1")[1])
+    check("v2 providers: current openai model template expands",
+          "gpt-5.6" in providers.build_invocation("openai", model="gpt-5.6")[1])
+    openai_models = dict(providers.get("openai").models)
+    check("v2 providers: Codex picker lists current model family",
+          set(openai_models.values()) == {
+              "", "gpt-5.6", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"},
+          openai_models)
     check("v2 providers: detection returns bool (env-independent)",
           isinstance(providers.detected("openai"), bool))
     prog, args = providers.build_invocation(
@@ -7683,7 +8331,15 @@ def test_boot_veil():
     pre-layout width, which pyte cannot reflow) until the conversation finished
     replaying. The veil covers exactly the launch-to-prompt window, and must
     ALWAYS lift again: on readiness, on a keystroke, on the agent stopping, or
-    on its own backstop timer."""
+    on its own backstop timer.
+
+    It covers a SECOND window for the same reason: a card built over a restored
+    .vt snapshot projects an 8 KiB cut of it at the pre-layout width, and
+    main.py paints that frame (show()) before autostart_active_workspace raises
+    any veil -- reported as "gibberish in the top left corner, then the loader,
+    then it looks normal". A REBUILD of a live agent must still paint at once,
+    so the gate is TerminalAgent.has_pristine_seed(), not merely "has a
+    replay"."""
     from app.process_worker import AgentKind, build_spec
     from app.terminal_agent import AgentStatus, TerminalAgent
 
@@ -7811,6 +8467,77 @@ def test_boot_veil():
     check("boot-veil: ...and firing it uncovers the terminal",
           not card.boot.is_active())
     card.detach(); booting.dispose(); pump(100)
+
+    # -- the restored snapshot, which is painted BEFORE any child exists ---
+    # main.py seeds every pty agent from screen_snapshot and only then shows
+    # the window, so this frame reaches the user unless the constructor itself
+    # covers it.
+    from app.ui_theme import Palette as _Pal
+
+    restored = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Restored", cwd=os.getcwd(), pty=True))
+    snapshot = "RESTORED-SNAPSHOT-" + "=" * 60 + "\r\n"
+    check("boot-veil: a restored snapshot seeds the agent's buffer",
+          restored.seed_pty_replay(snapshot) and restored.has_pristine_seed())
+    rcard = TerminalCard(restored)
+    check("boot-veil: a card built over a restored snapshot is covered from "
+          "its constructor, before the window ever paints",
+          rcard.boot.is_active() and rcard._boot_seed)
+    # under the view's 120ms resize debounce on purpose: this models the
+    # window's FIRST paint, which is the frame main.py used to leak
+    rcard.resize(640, 400); rcard.show(); pump(30)
+    # the constructor's own _on_status(IDLE) runs the not-running branch, which
+    # used to dismiss the veil unconditionally -- the wake banner may only own
+    # the screen once there is something readable under it
+    check("boot-veil: ...and the wake banner does not take it away",
+          rcard.boot.is_active())
+    rimg = rcard.terminal.grab().toImage()
+    rground = QColor(_Pal.BG_CONSOLE).rgb()
+    rrows = [rimg.pixel(x, y) for y in (3, 6, 9)
+             for x in range(0, min(240, rimg.width()), 3)]
+    check("boot-veil: ...in pixels: the mangled seed never reaches the user",
+          rrows and all(p == rground for p in rrows))
+    # the settled-width projection IS the stopped card's final picture
+    pump(500)  # past the 120ms resize debounce and the 260ms fade
+    check("boot-veil: the settled-width projection dissolves it",
+          not rcard.boot.is_active() and not rcard._boot_seed)
+    check("boot-veil: ...revealing the conversation it was holding back",
+          "RESTORED-SNAPSHOT" in rcard.terminal.screen_text())
+    rcard.detach(); restored.dispose(); pump(50)
+
+    # an agent that AUTOSTARTS hands the veil straight to the booting child,
+    # with no gap: drop_restored_screen clears the seed, _on_status re-raises
+    auto = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Auto", cwd=os.getcwd(), pty=True))
+    auto.seed_pty_replay(snapshot)
+    acard = TerminalCard(auto)
+    acard.resize(640, 400); acard.show(); pump(50)
+    acard.drop_restored_screen()
+    check("boot-veil: dropping the seed hands ownership to the child branch",
+          not acard._boot_seed)
+    acard._on_status(AgentStatus.STARTING)
+    check("boot-veil: ...and the launching child keeps the terminal covered",
+          acard.boot.is_active())
+    auto._set_prompt_ready(True)
+    pump(500)
+    check("boot-veil: ...until its prompt goes live",
+          not acard.boot.is_active())
+    acard.detach(); auto.dispose(); pump(50)
+
+    # the regression guard for the OTHER half: a retile rebuilds cards over a
+    # LIVE agent's buffer, which must paint instantly and never flash a loader
+    live = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Live", cwd=os.getcwd(), pty=True))
+    live._on_pty_output("pty", "LIVE-CHILD-OUTPUT\r\n")   # a live conversation
+    check("boot-veil: a buffer a child wrote is not a restored snapshot",
+          live.pty_replay() and not live.has_pristine_seed())
+    lcard = TerminalCard(live)
+    lcard.resize(640, 400); lcard.show(); pump(150)
+    check("boot-veil: a card rebuilt over a live buffer raises no loader",
+          not lcard.boot.is_active() and not lcard._boot_seed)
+    check("boot-veil: ...and paints its conversation immediately",
+          "LIVE-CHILD-OUTPUT" in lcard.terminal.screen_text())
+    lcard.detach(); live.dispose(); pump(50)
 
 
 def test_resume_fallback():
@@ -7948,19 +8675,19 @@ def test_plan_usage():
 
     # --- the badge line: countdown FIRST, then wall-clock, in local time ---
     line = cu.format_limit(limit("five_hour", 21.0, now + 4800), now=now)
-    check("plan-usage: line reads '21% used, resets in 1h20m at HH:MM'",
-          line.startswith("21% used, resets in 1h20m at ")
+    check("plan-usage: line reads 'Claude 21% used, resets in 1h20m at HH:MM'",
+          line.startswith("Claude 21% used, resets in 1h20m at ")
           and len(line.split(" at ")[1]) == 5, line)
     check("plan-usage: local wall-clock, not UTC",
           line.endswith(_time.strftime("%H:%M", _time.localtime(now + 4800))))
     check("plan-usage: window named only when the plan has several",
           cu.format_limit(limit("seven_day", 64.0, now + 600), now=now,
-                          with_label=True).startswith("7d 64% used"))
+                          with_label=True).startswith("7d Claude 64% used"))
     check("plan-usage: a spent window spells out 'limit reached'",
           cu.format_limit(limit("five_hour", 100.0, now + 600),
                           now=now).startswith("limit reached, resets in 10m"))
     check("plan-usage: no reset time degrades to the bare percent",
-          cu.format_limit(limit("five_hour", 21.0)) == "21% used")
+          cu.format_limit(limit("five_hour", 21.0)) == "Claude 21% used")
     check("plan-usage: countdown formats scale",
           (cu.format_countdown(4800), cu.format_countdown(600),
            cu.format_countdown(30)) == ("1h20m", "10m", "30s"))
@@ -7974,11 +8701,11 @@ def test_plan_usage():
     check("plan-usage: format_limit(days_only=True) uses the dh countdown",
           cu.format_limit(limit("seven_day", 40.0, now + 6 * 86400 + 3600),
                           now=now, days_only=True).startswith(
-                              "40% used, resets in 6d1h at "))
+                              "Claude 40% used, resets in 6d1h at "))
     check("plan-usage: format_limit(days_only=False) keeps minutes",
           cu.format_limit(limit("seven_day", 40.0, now + 4800), now=now,
                           days_only=False).startswith(
-                              "40% used, resets in 1h20m at "))
+                              "Claude 40% used, resets in 1h20m at "))
     check("plan-usage: age formats scale",
           (cu.format_since(2), cu.format_since(42), cu.format_since(180),
            cu.format_since(7200)) == ("just now", "42s ago", "3m ago", "2h ago"))
@@ -8056,7 +8783,7 @@ def test_plan_usage():
     check("plan-usage: reading shows the badge with the full line, labelled "
           "5h so it's tellable apart from the 7d pill beside it",
           badge.isVisible()
-          and badge._text.startswith("5h 21% used, resets in"))
+          and badge._text.startswith("5h Claude 21% used, resets in"))
     check("plan-usage: tooltip carries plan, every window, and the age",
           "Pro plan" in badge.toolTip() and "Current session" in badge.toolTip()
           and "Updated" in badge.toolTip())
@@ -8086,11 +8813,11 @@ def test_plan_usage():
     five_cd = _countdown(badge._text)
     weekly_cd = _countdown(weekly_badge._text)
     check("plan-usage: the 5h pill still shows the 5h window, to the minute",
-          badge._text.startswith("5h 21% used, resets in")
+          badge._text.startswith("5h Claude 21% used, resets in")
           and five_cd.endswith("m"))
     check("plan-usage: the 7d pill shows the 7d window, days+hours only "
           "(no minutes)",
-          weekly_badge._text.startswith("7d 40% used, resets in")
+          weekly_badge._text.startswith("7d Claude 40% used, resets in")
           and "m" not in weekly_cd
           and ("d" in weekly_cd or weekly_cd.endswith("h")
                or weekly_cd == "<1h"))
@@ -8188,7 +8915,7 @@ def test_plan_usage():
     # a failed poll keeps the last good number on screen, greyed
     win._on_usage_ready(cu.Usage(error="urlerror"))
     check("plan-usage: a failed poll keeps the last number, marked stale",
-          badge._text.startswith("5h 21% used") and badge._stale)
+          badge._text.startswith("5h Claude 21% used") and badge._stale)
 
     # visibility preference persists; toggling it IS a save (a UI preference)
     win._on_usage_tracker_toggled("claude_five_hour", False)
@@ -8263,7 +8990,7 @@ def test_plan_usage():
     app.processEvents()
     check("plan-usage: a later reading replaces the can't-read pill",
           b4.isVisible() and b4.has_reading()
-          and b4._text.startswith("5h 21% used") and not b4._unreadable)
+          and b4._text.startswith("5h Claude 21% used") and not b4._unreadable)
     # an error is not a reason to force the readout back onto a bar the user
     # deliberately cleared
     win4._on_usage_tracker_toggled("claude_five_hour", False)
@@ -8332,18 +9059,19 @@ def test_usage_trackers_preference():
     menu = bar.build_tracker_menu()
     acts = menu.actions()
     check("usage-trackers: one checkable entry per readout",
-          len(acts) == 4 and all(a.isCheckable() for a in acts)
+          len(acts) == len(USAGE_TRACKER_KEYS) and all(a.isCheckable() for a in acts)
           and [a.text() for a in acts]
           == [USAGE_TRACKER_LABELS[k] for k in USAGE_TRACKER_KEYS])
     check("usage-trackers: the entries start checked",
           all(a.isChecked() for a in acts))
 
-    # put content in all four so visibility is decided by the preference alone
+    # put content in all five so visibility is decided by the preference alone
     win._on_usage_ready(good)
     bar.mark_usage_loading()
     app.processEvents()
     check("usage-trackers: loading counts as content, so the bar fills at once",
           bar.gemini_badge.isVisible() and bar.gemini_weekly_badge.isVisible()
+          and bar.codex_badge.isVisible()
           and bar.usage_badge.isVisible() and bar.usage_weekly_badge.isVisible())
 
     # the X closes exactly one pill
@@ -8377,7 +9105,8 @@ def test_usage_trackers_preference():
            bar.usage_add_btn.isVisible()
            and not bar.usage_badge.isVisible()
            and not bar.usage_weekly_badge.isVisible())[-1])
-    check("usage-trackers: the menu now shows all four unchecked",
+    win._on_usage_tracker_toggled("codex_five_hour", False)
+    check("usage-trackers: the menu now shows every readout unchecked",
           not any(a.isChecked() for a in bar.build_tracker_menu().actions()))
 
     # no Claude login hides the recovery switches, but NEVER the picker: a
@@ -8607,6 +9336,32 @@ def test_auto_continue_on_limit_reset():
     check("auto-continue: the banner's own reset time is latched with it",
           a.limit_resets_at() is not None)
 
+    # claude.exe 2.1.235+ replaced the "You've hit your session limit" banner
+    # with "Usage limit reached (c) continuing automatically at ..." and no
+    # longer shows the interactive menu by default -- read off a real
+    # transcript's injected system/informational record, not guessed (see
+    # limit_banner's module docstring). A latch has to survive on the banner
+    # ALONE here, with no menu at all, which is exactly the case that was
+    # silently falling through before this wording was recognised.
+    NEW_BANNER = ("Usage limit reached \xb7 continuing automatically at "
+                  "10:10pm \xb7 esc or type to cancel\n")
+    new_wording = mk("NewWording")
+    settle(new_wording, NEW_BANNER)
+    check("auto-continue: the current 'Usage limit reached' wording IS a "
+          "cut-off, with no menu on screen at all",
+          new_wording.is_limit_blocked())
+    check("auto-continue: its own 'continuing automatically at ...' clock is "
+          "latched with it",
+          new_wording.limit_resets_at() is not None)
+    # the Fast-mode / spend-limit family use similar words but are a DIFFERENT
+    # feature (a per-request throttle, not the account-wide cut-off) and must
+    # not falsely arm a resume for something that never stopped the agent.
+    fast_mode = mk("FastMode")
+    settle(fast_mode, "Fast mode disabled \xb7 usage credit limit reached\n")
+    check("auto-continue: 'usage credit limit reached' (Fast mode, a "
+          "different feature) is NOT the account-wide cut-off",
+          not fast_mode.is_limit_blocked())
+
     # the menu alone is enough — it is what survives on screen when the banner
     # above it has scrolled out of the rolling tail
     menu_only = mk("MenuOnly")
@@ -8763,7 +9518,7 @@ def test_auto_continue_on_limit_reset():
     # --- the banner's clock -> the next occurrence of that wall time ---------
     from app.terminal_agent import parse_reset_clock
     base = _time.mktime((2026, 8, 2, 23, 50, 0, 0, 0, -1))   # 23:50 local
-    at = parse_reset_clock("\xb7 resets 4:40am (Europe/Bucharest)", base)
+    at = parse_reset_clock("\xb7 resets 4:40am", base)
     lt = _time.localtime(at)
     check("auto-continue: a small-hours reset read late at night rolls over "
           "to tomorrow",
@@ -8805,17 +9560,31 @@ def test_auto_continue_on_limit_reset():
     ws = mgr.workspaces[0]
 
     cut_off, busy, fine = mk("CutOff"), mk("Busy"), mk("Fine")
-    settle(cut_off, BANNER)
+    no_menu, self_cont = mk("NoMenu"), mk("SelfContinue")
+    settle(cut_off, PARKED)
     settle(busy, BANNER)
     busy._busy = True                    # already moving again
     settle(fine, "all done\n")           # was never cut off
-    ws.agents.extend([cut_off, busy, fine])
+    settle(no_menu, BANNER)
+    settle(self_cont, NEW_BANNER)
+    ws.agents.extend([cut_off, busy, fine, no_menu, self_cont])
 
+    from app.widgets.main_window import AUTO_CONTINUE_STAGGER_MS as _STAGGER
     win._resume_blocked_agents()
-    pump(AUTO_CONTINUE_SETTLE_MS)
+    pump(AUTO_CONTINUE_SETTLE_MS + 2 * _STAGGER)
     sent = lambda ag: "".join(writes.get(id(ag.worker), []))
-    check("auto-continue: the cut-off agent got Esc then Continue",
+    check("auto-continue: the cut-off agent parked on the old menu got Esc "
+          "then Continue",
           sent(cut_off).startswith("\x1b") and "Continue" in sent(cut_off))
+    # Current CLIs draw no menu, and there an Esc does harm: under "continuing
+    # automatically at ... \xb7 esc or type to cancel" it CANCELS Claude's own
+    # auto-continue, and on a plain prompt it wipes half-typed input.
+    check("auto-continue: with no menu on screen, no Esc is sent, only the "
+          "Continue", "\x1b" not in sent(no_menu)
+          and "Continue" in sent(no_menu), repr(sent(no_menu)[:40]))
+    check("auto-continue: an Esc never cancels Claude's own 'continuing "
+          "automatically' timer", "\x1b" not in sent(self_cont),
+          repr(sent(self_cont)[:40]))
     check("auto-continue: an agent that is busy again is left alone",
           sent(busy) == "")
     check("auto-continue: an agent that was never cut off is left alone",
@@ -9037,12 +9806,12 @@ def test_auto_continue_on_limit_reset():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             for text, at in records:
-                fh.write(_json.dumps({
+                fh.write(_json.dumps(_as_cli_wrote({
                     "type": "assistant",
                     "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
                                                 _time.gmtime(at)),
                     "message": {"content": [{"type": "text",
-                                             "text": text}]}}) + "\n")
+                                             "text": text}]}})) + "\n")
 
     writes.clear()
     ph_cwd = str(tmp / "phantom")
@@ -9090,7 +9859,7 @@ def test_auto_continue_on_limit_reset():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             for rec in records:
-                fh.write(_json.dumps(rec) + "\n")
+                fh.write(_json.dumps(_as_cli_wrote(rec)) + "\n")
 
     def ts(at):
         return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(at))
@@ -9220,7 +9989,7 @@ def test_auto_continue_on_limit_reset():
     # the limit banner must NOT ring the chime — nothing the sleeper can answer
     rung = {"n": 0}
     import app.chime as _chime
-    real_play, _chime.play = _chime.play, lambda: rung.__setitem__("n", rung["n"] + 1)
+    real_play, _chime.play = _chime.play, lambda *_a: rung.__setitem__("n", rung["n"] + 1)
     try:
         win3 = create_main_window(SessionStore(path=tmp / "chime.json"))
         win3.show(); pump(50)
@@ -9510,7 +10279,7 @@ def test_startup_limit_recovery():
         with open(transcripts.transcript_path(cwd, sid), "w",
                   encoding="utf-8") as fh:
             for r in records:
-                fh.write(_json.dumps(r) + "\n")
+                fh.write(_json.dumps(_as_cli_wrote(r)) + "\n")
 
     def assistant(text, at):
         return {"type": "assistant", "timestamp": iso(at),
@@ -9525,7 +10294,9 @@ def test_startup_limit_recovery():
 
     now = _time.time()
     cwd = str(tmp)
-    BANNER = "You've hit your session limit \xb7 resets 3am (Europe/Bucharest)"
+    # no "(Area/City)": the anchor below is built in LOCAL time, and a named
+    # zone would read "3am" in that zone instead (test_reset_clock_zones)
+    BANNER = "You've hit your session limit \xb7 resets 3am"
 
     # --- reading the durable record -----------------------------------------
     # The MOST RECENT 02:42 local: the wall time matters (it is what makes
@@ -9561,6 +10332,46 @@ def test_startup_limit_recovery():
           "not a cut-off", not hit2)
     check("startup-recovery: no transcript at all is not a cut-off",
           transcripts.ended_on_limit(cwd, "sid-missing")[0] is False)
+
+    # claude.exe 2.1.235+ injects the cut-off notice as a standalone
+    # system/informational record rather than an assistant turn -- read off a
+    # real transcript, not guessed (see limit_banner's module docstring). A
+    # transcript-based recovery pass that only ever looked at assistant
+    # records would silently pass over every one of these.
+    def system_msg(content, at, subtype="informational"):
+        return {"type": "system", "subtype": subtype, "isSidechain": False,
+                "content": content, "timestamp": iso(at)}
+
+    NEW_BANNER = ("Usage limit reached \xb7 continuing automatically at "
+                  "10:10pm \xb7 esc or type to cancel")
+    write_transcript(cwd, "sid-cut-system", [
+        assistant("working", cut_at - 600),
+        system_msg(NEW_BANNER, cut_at),
+        # a same-record-shape sibling with no plain-string content (the real
+        # turn_duration record right after it in a live transcript) must not
+        # crash the read or be mistaken for a banner
+        {"type": "system", "subtype": "turn_duration", "isSidechain": False,
+         "durationMs": 971179, "timestamp": iso(cut_at + 1)}])
+    hit_sys, when_sys, resets_sys = transcripts.ended_on_limit(
+        cwd, "sid-cut-system")
+    check("startup-recovery: the CURRENT 'Usage limit reached' wording, "
+          "injected as a system/informational record, is recognised as a "
+          "cut-off", hit_sys and abs(when_sys - cut_at) < 2)
+    check("startup-recovery: its own 'continuing automatically at ...' clock "
+          "is resolved, not left unknown", resets_sys > 0)
+
+    # the CLI's own auto-continue logs "Usage limit reset (c) continuing
+    # automatically" once the window reopens (verified live) -- that is
+    # equally real output and must clear the cut-off exactly like an
+    # assistant reply carrying on would.
+    write_transcript(cwd, "sid-cli-self-resumed", [
+        system_msg(NEW_BANNER, cut_at),
+        system_msg("Usage limit reset \xb7 continuing automatically",
+                   cut_at + 9000)])
+    hit_resumed, _, _ = transcripts.ended_on_limit(cwd, "sid-cli-self-resumed")
+    check("startup-recovery: the CLI's own 'Usage limit reset' notice reads "
+          "as history, not a cut-off (it already resumed on its own)",
+          not hit_resumed)
 
     # A cut-off is only real when the turn it stopped was something the user
     # (or a delivered task) actually asked for. Claude Code can turn a
@@ -9781,7 +10592,11 @@ def test_startup_limit_recovery():
 
 
 def test_limit_recovery_reliability():
-    """The four ways a real cut-off (2026-08-07, CVsummer2026) went unrecovered.
+    """Every way a real cut-off has gone unrecovered, and the screen that did it.
+
+    Sources so far: 2026-08-07 (CVsummer2026) and 2026-08-31
+    (vinted-country-detector). A running count in this docstring only goes
+    stale on the next find, so it names the class instead.
 
     Every one of them is silent by construction — the agent simply sits there —
     so each gets a check that reproduces the exact screen or timing shape that
@@ -9896,7 +10711,44 @@ def test_limit_recovery_reliability():
     check("repaint: and gives the width straight back",
           resizes == [(30, 99), (30, 100)])
 
-    # --- 5. the watchdog stops waiting forever ------------------------------
+    # --- 5. the banner under Claude's own tool-result gutter ----------------
+    # A 429 that lands while a tool is still running is painted as a TOOL-RESULT
+    # ROW, not as a bare line: "\u23bf" in front of it, and a NO-BREAK space
+    # between the two. _GUTTER had neither, so banner_line's .match anchored on
+    # the glyph and returned "", which hid the cut-off from the live scrape AND
+    # from _note_limit_skip, which calls the same function, so not even a
+    # NO-LATCH line was written. Observed live 2026-08-31: an agent sat spent
+    # for 36 minutes with no trace of it anywhere. This fixture has to keep the
+    # gutter glyphs, or it tests a screen the TUI never draws.
+    GUTTERED = (
+        "\u25cf Bash(cd \"C:/Users/molna/...\" && cat > /tmp/slim.mjs)\n"
+        "  \u23bf\xa0raw 37175 b64 14448 chunks@1400 11\n"
+        "  \u23bf\xa0Allowed by auto mode classifier\n"
+        "  \u23bf\xa0" + BANNER + "\n"
+        "    /upgrade or /usage-credits to finish what you're working on.\n"
+        + "\n" * 60 + "> try \"fix the tests\"\n  ? for shortcuts\n")
+
+    g = mk()
+    g._screen_tail = GUTTERED
+    g._scrape_limit()
+    check("limit-gutter: a banner painted as a tool-result row (U+23BF plus a "
+          "no-break space) still latches", g.is_limit_blocked())
+    check("limit-gutter: ...and still carries the reset clock the banner "
+          "stated", g.limit_resets_at() is not None)
+
+    from app import limit_banner as _lb
+    check("limit-gutter: the assistant bullet (U+25CF) is stripped too",
+          _lb.banner_line("\u25cf " + BANNER) == BANNER)
+    check("limit-gutter: a leading no-break space doesn't strand the glyph "
+          "behind it", _lb.banner_line("\xa0\u23bf\xa0" + BANNER) == BANNER)
+    # the start-of-line anchor is still the discriminator: widening _GUTTER
+    # must not let an agent's own sentence about the limit read as a cut-off
+    check("limit-gutter: prose that merely mentions the banner still doesn't "
+          "match",
+          _lb.banner_line("\u25cf I think you've hit your session limit here")
+          == "")
+
+    # --- 6. the watchdog stops waiting forever ------------------------------
     store = SessionStore(path=tmp / "session.json")
     win = create_main_window(store)
     ws = win.manager.create_workspace("W", str(tmp))
@@ -10325,8 +11177,25 @@ def test_scheduled_send():
     text, when = dlg.result_message()
     check("schedule: a custom delay resolves to a fire time",
           text == "deploy the thing" and 5300 < when - _time.time() < 5500)
+    # The caption has to name BOTH halves: the wall clock the message goes out
+    # at, and how long that is from now. Assert the MEANING, never one exact
+    # string - _revalidate reads the clock TWICE (once inside _resolve_due to
+    # build the due time, once to subtract for the countdown), so whether a
+    # tick lands between those two reads decides "1:30:00" versus "1:29:59".
+    # Both are correct captions; which one appears is decided by the machine's
+    # timer granularity (15.6ms on Windows, where two adjacent time.time()
+    # calls routinely return the identical float), so pinning either one is a
+    # coin flip. format_countdown's own formatting is pinned deterministically
+    # further up; what is left to test here is that _revalidate wires the label
+    # to the right VALUES.
+    import re as _re
+    when_text = dlg.when_label.text()
+    left = _re.search(r", in (\d+):(\d{2}):(\d{2})\.", when_text)
+    left_s = (int(left[1]) * 3600 + int(left[2]) * 60 + int(left[3])
+              if left else -1)
     check("schedule: the composer says exactly when it will fire",
-          "in 1:29" in dlg.when_label.text(), dlg.when_label.text())
+          ss.format_clock(when) in when_text and 5390 < left_s <= 5400,
+          when_text)
     # the two time fields are alternatives: there must never be a hidden second
     # answer deciding the fire time
     dlg.clock_edit.setText("03:30")
@@ -11514,15 +12383,21 @@ def test_reply_marks_recovered_from_transcript():
     check("reply-recover: a reply not in the scrollback yields no stamp",
           card._recovered_replies == [], card._recovered_replies)
 
-    # a live mark outranks a recovered one on the same line
+    # where a live mark and a recovered one land on the same row, the live
+    # mark keeps the ROW (it anchored the screen it was looking at) and the
+    # transcript supplies the TIME. Claude stamps every record it writes; a
+    # live mark reads the wall clock at the settle, seconds late at best and
+    # wrong outright for a settle that was never a reply. That is what makes a
+    # stray stamp self-correcting on the next projection.
     card._recovered_replies = [(line, when)]
     card._reply_mark_lines = {}
     mark = agent.note_reply_settled()
     card._reply_mark_lines[mark.uid] = line
     card._refresh_reply_marks()
-    check("reply-recover: a live capture wins the line over a recovered one",
-          card.terminal.reply_marks() == [(line, _format_reply_stamp(mark.ts))],
-          card.terminal.reply_marks())
+    check("reply-recover: the transcript's time wins the row over the clock",
+          card.terminal.reply_marks() == [(line, _format_reply_stamp(when))]
+          and abs(mark.ts - when) > 60,
+          (card.terminal.reply_marks(), _format_reply_stamp(when)))
 
     card.deleteLater()
     agent.dispose()
@@ -11616,6 +12491,7 @@ def test_reply_marks_inline():
 
     # ---- FIFO cap -----------------------------------------------------
     for _ in range(REPLY_MARK_CAP + 5):
+        agent._note_submit()      # a new turn each time: one mark apiece
         agent.note_reply_settled()
     check("reply-mark: the mark list is FIFO-capped",
           len(agent.reply_marks()) == REPLY_MARK_CAP, len(agent.reply_marks()))
@@ -11643,10 +12519,466 @@ def test_reply_marks_inline():
     card.deleteLater()
 
 
+def test_reset_clock_zones():
+    """A banner's clock is read in the zone it names, and "tomorrow" keeps the
+    wall time on the night the clocks change.
+
+    claude.exe prints "resets 3am (Europe/Bucharest)" in ITS zone, which only
+    matches Python's local zone when nothing sets an IANA `TZ` (Node honours
+    one, the Windows C runtime does not). And the old rollover added 86400 s,
+    which lands an hour off on a 23- or 25-hour night. Every check here pins
+    its zone explicitly, so it holds on a machine in any zone.
+    """
+    import datetime as _dt
+    import time as _time
+    from zoneinfo import ZoneInfo
+    from app import limit_banner as lb
+    from app import scheduled_send as ss
+
+    tokyo, buc = ZoneInfo("Asia/Tokyo"), ZoneInfo("Europe/Bucharest")
+
+    def wall(epoch, tz):
+        d = _dt.datetime.fromtimestamp(epoch, tz)
+        return (d.month, d.day, d.hour, d.minute)
+
+    # --- the named zone wins over the local one -----------------------------
+    now = _dt.datetime(2026, 9, 24, 22, 0, tzinfo=tokyo).timestamp()
+    at = lb.parse_reset_clock("You've hit your session limit \xb7 resets 3am "
+                              "(Asia/Tokyo)", now)
+    check("reset-zone: a bare clock is read in the zone the banner names",
+          at is not None and wall(at, tokyo) == (9, 25, 3, 0)
+          and 0 < at - now <= 5 * 3600, at and wall(at, tokyo))
+    at2 = lb.parse_reset_clock("You'vehityoursessionlimit\xb7resets3am"
+                               "(Asia/Tokyo)", now)
+    check("reset-zone: ...also when the renderer dropped the spaces",
+          at2 == at)
+    wrapped = lb.banner_clock_text(
+        "You've hit your session limit \xb7 resets 3am\n(Asia/Tokyo)\n")
+    check("reset-zone: a zone wrapped onto the next row is still read",
+          lb.parse_reset_clock(wrapped, now) == at, wrapped)
+    dated = lb.parse_reset_clock("You've hit your weekly limit \xb7 resets "
+                                 "Sep 30, 9am (Asia/Tokyo)", now)
+    check("reset-zone: a dated clock is read in the named zone too",
+          dated is not None and wall(dated, tokyo) == (9, 30, 9, 0))
+    local = lb.parse_reset_clock("resets 3am", now)
+    check("reset-zone: an unknown zone falls back to the local one",
+          lb.parse_reset_clock("resets 3am (Mars/Olympus_Mons)", now) == local
+          and lb.parse_reset_clock("resets 3am (esc to cancel)", now) == local)
+
+    # --- DST: tomorrow is the same WALL time, not now + 24 h ----------------
+    # Bucharest leaves summer time at 04:00 on 2026-10-25, so that day is 25 h.
+    eve = _dt.datetime(2026, 10, 24, 23, 0, tzinfo=buc).timestamp()
+    fall = lb.parse_reset_clock("resets 10pm (Europe/Bucharest)", eve)
+    check("reset-zone: a rollover across the autumn change keeps 10pm",
+          fall is not None and wall(fall, buc) == (10, 25, 22, 0),
+          fall and wall(fall, buc))
+    # ...and enters it at 03:00 on 2026-03-29, a 23 h day
+    spring_eve = _dt.datetime(2026, 3, 28, 23, 0, tzinfo=buc).timestamp()
+    spring = lb.parse_reset_clock("resets 9pm (Europe/Bucharest)", spring_eve)
+    check("reset-zone: a rollover across the spring change keeps 9pm",
+          spring is not None and wall(spring, buc) == (3, 29, 21, 0),
+          spring and wall(spring, buc))
+
+    # the local zone's own change, when it has one this year: the same rule
+    # through the local path (no zone printed) and the scheduler's clock field
+    t = _time.mktime((2026, 1, 1, 12, 0, 0, 0, 0, -1))
+    change = None
+    for _ in range(366):
+        if _time.localtime(t).tm_isdst != _time.localtime(t + 86400).tm_isdst:
+            change = t
+            break
+        t += 86400
+    if change is None:
+        check("reset-zone: local zone has no DST change (nothing to roll over)",
+              True)
+    else:
+        lt = _time.localtime(change)
+        eve_local = _time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                  23, 0, 0, 0, 0, -1))
+        for name, got in (
+                ("limit banner", lb.parse_reset_clock("resets 10pm", eve_local)),
+                ("scheduled send", ss.parse_clock("22:00", eve_local))):
+            got_lt = _time.localtime(got)
+            check(f"reset-zone: {name} rollover across the LOCAL clock change "
+                  "keeps the wall time",
+                  (got_lt.tm_hour, got_lt.tm_min) == (22, 0)
+                  and 0 < got - eve_local < 26 * 3600,
+                  (got_lt.tm_hour, got_lt.tm_min))
+
+
+def test_limit_detection_hardening():
+    """The 2026-09-24 audit of the usage-limit flag, one check per finding.
+
+    (1) The live screen check matched regexes needing whitespace against a
+    stream whose spaces are mostly cursor jumps, so a painted banner was a
+    coin flip. (2) claude.exe 2.1.281 prints cut-off wordings the patterns
+    never knew. (3) Prose starting "Usage limit reached" latched a working
+    agent, and the reset clock was read from anywhere in 40 lines. (4) Any
+    later system record with text (an away_summary recap, "Remote Control
+    disconnected") erased a genuine cut-off on disk, which then got it
+    dismissed as a PHANTOM. (5) Nothing caught a cut-off the screen missed.
+    (6) The Esc sent before every Continue cancels Claude's own auto-continue.
+    """
+    import json as _json
+    import time as _time
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import limit_banner as lb
+    from app import limit_ledger, transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import _CSI_RE, AgentStatus, TerminalAgent
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-limit-hard-"))
+    cwd = str(tmp)
+    now = _time.time()
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def jumps(text, col=3):
+        """`text` the way Claude's classic renderer paints it: every word put
+        in place by a `CSI n G` column jump, and no literal space anywhere."""
+        out = []
+        for word in text.split(" "):
+            out.append(f"\x1b[{col}G{word}")
+            col += len(word) + 1
+        return "".join(out)
+
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    bucharest = ZoneInfo("Europe/Bucharest")
+
+    def hm(epoch):
+        """The wall clock of `epoch` in the zone SESSION names, so these
+        checks hold on a machine in any zone."""
+        if not epoch:
+            return None
+        d = _dt.datetime.fromtimestamp(epoch, bucharest)
+        return (d.hour, d.minute)
+
+    SESSION = ("You've hit your session limit \xb7 resets 6:40pm "
+               "(Europe/Bucharest)")
+    AUTO = ("Usage limit reached \xb7 continuing automatically at 10:10pm "
+            "\xb7 esc or type to cancel")
+
+    # --- 1. a banner painted with cursor jumps ------------------------------
+    painted = _CSI_RE.sub("", jumps(SESSION))
+    check("limit-hardening: a jump-painted banner has no spaces left once "
+          "escapes are stripped (the shape the old regex never matched)",
+          " " not in painted, painted)
+    check("limit-hardening: ...and is recognised anyway",
+          lb.banner_line(painted) != "")
+    check("limit-hardening: ...with its window",
+          lb.banner_window(painted) == "session")
+    check("limit-hardening: ...and its clock",
+          hm(lb.parse_reset_clock(lb.banner_clock_text(painted))) == (18, 40))
+    check("limit-hardening: the spaced and the jump-painted rendering are the "
+          "SAME cut-off", lb.same_banner(painted, SESSION))
+    check("limit-hardening: ...while two windows' banners are not",
+          not lb.same_banner(SESSION, SESSION.replace("6:40pm", "11:40pm")))
+    check("limit-hardening: a wrapped first row that already has the clock "
+          "matches the transcript's whole line",
+          lb.same_banner("You've hit your session limit \xb7 resets 6:40pm",
+                         SESSION))
+    check("limit-hardening: ...but one cut before the clock does not",
+          not lb.same_banner("You've hit your session limit \xb7", SESSION))
+    check("limit-hardening: the auto-continue line survives jump-painting",
+          lb.banner_line(_CSI_RE.sub("", jumps(AUTO))) != "")
+
+    # --- 2. every cut-off wording in claude.exe 2.1.281 ---------------------
+    for line, window in [
+            ("You've hit your limit \xb7 resets 3am \xb7 progress saved",
+             "usage"),
+            ("You've hit your Fable limit \xb7 resets Sep 30, 9am "
+             "(Europe/Bucharest)", "fable"),
+            ("You've hit your Opus limit \xb7 resets Oct 1, 2:15pm", "opus"),
+            ("You've hit your usage credit limit", "credit"),
+            ("You've hit your monthly spend limit.", "usage"),
+            ("You're out of usage credits \xb7 resets 3am", "credit"),
+            (AUTO, ""),
+            ("Usage limit reached \xb7 wrapping up", ""),
+            ("Usage limit reached", ""),
+            ("Your usage limit has reset \xb7 press enter to continue", "")]:
+        check(f"limit-hardening: recognised {line[:44]!r}",
+              lb.banner_line("  ⎿\xa0" + line) != ""
+              and lb.banner_window(line) == window, lb.banner_window(line))
+    for line in ['Usage limit reached" cut-off',
+                 "Usage limit reached. I'll pause here.",
+                 "You've hit your limit on retries, so I stopped",
+                 "You've hit your fast limit \xb7 using the standard model",
+                 "Approaching session limit \xb7 resets 3am",
+                 "You've used 90% of your weekly limit \xb7 resets Sep 30, 9am",
+                 "● I think you've hit your session limit here",
+                 "Usage limit reset \xb7 continuing automatically"]:
+        check(f"limit-hardening: NOT a cut-off {line[:44]!r}",
+              lb.banner_line(line) == "")
+    check("limit-hardening: the CLI's own reset notice is recognised as the "
+          "END of a cut-off, spaced or not",
+          lb.is_reset_notice("Usage limit reset \xb7 continuing automatically")
+          and lb.is_reset_notice("Usagelimitreset\xb7continuingautomatically"))
+
+    yr = _time.localtime(lb.parse_reset_clock(
+        "You've hit your weekly limit \xb7 resets Jan 2, 2031, 3:15pm"))
+    check("limit-hardening: a dated clock with a year resolves exactly",
+          (yr.tm_year, yr.tm_mon, yr.tm_mday, yr.tm_hour, yr.tm_min)
+          == (2031, 1, 2, 15, 15))
+    check("limit-hardening: a dated clock is exact, a bare one is not",
+          lb.reset_is_dated("You've hit your Fable limit \xb7 resets Sep 30, "
+                            "9am") and not lb.reset_is_dated(SESSION))
+    check("limit-hardening: 'press enter to continue' and 'continuing "
+          "shortly' are due now",
+          lb.banner_due_now("Your usage limit has reset \xb7 press enter to "
+                            "continue")
+          and lb.banner_due_now("Usage limit reached \xb7 continuing shortly "
+                                "\xb7 esc to cancel")
+          and not lb.banner_due_now(AUTO))
+    region = ("the cache resets 11pm nightly, so rerun after\n"
+              "You've hit your session limit\n  ? for shortcuts\n")
+    check("limit-hardening: the clock comes from the banner, never from "
+          "another 'resets' elsewhere on screen",
+          lb.parse_reset_clock(lb.banner_clock_text(region)) is None)
+    check("limit-hardening: a banner wrapped before its clock still yields "
+          "the clock from the next row",
+          hm(lb.parse_reset_clock(lb.banner_clock_text(
+              "You've hit your session limit \xb7 resets\n"
+              "6:40pm (Europe/Bucharest)"))) == (18, 40))
+
+    # --- 3. the live path, end to end through _on_pty_output ----------------
+    def mk(name):
+        a = TerminalAgent(build_spec(AgentKind.CLAUDE, name, cwd=cwd))
+        a._prompt_ready = True
+        a.status = AgentStatus.RUNNING
+        return a
+
+    live = mk("Live")
+    live._on_pty_output("pty", "\r\n  ⎿" + jumps(SESSION, 5) + "\r\n")
+    check("limit-hardening: a jump-painted banner arriving on the pty "
+          "latches", live.is_limit_blocked())
+    check("limit-hardening: ...with the clock it stated",
+          hm(live.limit_resets_at()) == (18, 40))
+    live.clear_limit_block()             # what a verified resume does
+    live._screen_tail = SESSION + "\n  ? for shortcuts\n"   # repainted spaced
+    live._scrape_limit()
+    check("limit-hardening: the same banner repainted WITH spaces is not a "
+          "new cut-off (no re-latch after a resume)",
+          not live.is_limit_blocked())
+
+    prose = mk("Prose")
+    prose._screen_tail = 'Usage limit reached" cut-off\nmore prose\n'
+    prose._scrape_limit()
+    check("limit-hardening: an agent quoting 'Usage limit reached' is not "
+          "latched (happened twice on 2026-08-31)",
+          not prose.is_limit_blocked())
+
+    unrelated = mk("Unrelated")
+    unrelated._screen_tail = ("the token resets Sep 4, 3:59am\n"
+                              "You've hit your session limit\n")
+    unrelated._scrape_limit()
+    check("limit-hardening: a latch never borrows another line's clock",
+          unrelated.is_limit_blocked()
+          and unrelated.limit_resets_at() is None)
+
+    weekly = mk("WeeklyBare")
+    weekly._screen_tail = "You've hit your weekly limit \xb7 resets 8pm\n"
+    weekly._scrape_limit()
+    check("limit-hardening: a weekly banner with a bare clock is NOT exact",
+          weekly.is_limit_blocked() and weekly.limit_window() == "weekly"
+          and not weekly.limit_reset_exact())
+    fable = mk("FableDated")
+    fable._screen_tail = ("You've hit your Fable limit \xb7 resets Sep 30, "
+                          "9am\n")
+    fable._scrape_limit()
+    check("limit-hardening: a dated 7-day banner IS exact",
+          fable.limit_window() == "fable" and fable.limit_reset_exact())
+    stale = mk("Stale")
+    stale._screen_tail = ("Your usage limit has reset \xb7 press enter to "
+                          "continue\n")
+    stale._scrape_limit()
+    check("limit-hardening: 'press enter to continue' latches as due now",
+          stale.is_limit_blocked()
+          and (stale.limit_resets_at() or 1e18) <= _time.time() + 1)
+
+    # --- 4. the conversation on disk ----------------------------------------
+    def iso(at):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(at))
+
+    def write(sid, records):
+        path = transcripts.transcript_path(cwd, sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for r in records:
+                fh.write(_json.dumps(r) + "\n")
+
+    def user(text, at, **extra):
+        return dict({"type": "user", "timestamp": iso(at),
+                     "message": {"role": "user", "content": text}}, **extra)
+
+    def reply(text, at):
+        return {"type": "assistant", "timestamp": iso(at),
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    def system(text, at, sub="informational"):
+        return {"type": "system", "subtype": sub, "content": text,
+                "timestamp": iso(at)}
+
+    def real_429(text, at, reset, kind="five_hour"):
+        """A cut-off exactly as claude.exe writes it (fields read off a real
+        transcript from 2026-08-31)."""
+        return {"type": "assistant", "timestamp": iso(at),
+                "error": "rate_limit", "isApiErrorMessage": True,
+                "apiErrorStatus": 429,
+                "quotaLimits": {"status": "rejected", "resetsAt": int(reset),
+                                "rateLimitType": kind},
+                "message": {"model": "<synthetic>",
+                            "content": [{"type": "text", "text": text}]}}
+
+    at = now - 600
+    ask = user("build the parser", at - 5)
+    opus = real_429("You've hit your Opus limit \xb7 resets 8pm", at,
+                    now + 3 * 86400, "seven_day_opus")
+    write("sid-quota", [ask, opus])
+    info = transcripts.limit_cut_off(cwd, "sid-quota")
+    check("limit-hardening: a real 429 record's quotaLimits epoch wins over "
+          "the bare printed clock", info["cut_off"]
+          and info["resets_at"] == int(now + 3 * 86400) and info["exact"]
+          and info["window"] == "opus", info)
+    for name, rec in [
+            ("an away_summary recap",
+             system("Was building the parser; the limit stopped it.",
+                    at + 1800, "away_summary")),
+            ("'Remote Control disconnected'",
+             system("Remote Control disconnected — /login", at + 3600)),
+            ("a local slash command's output",
+             system("<local-command-stdout></local-command-stdout>",
+                    at + 60, "local_command"))]:
+        sid = "sid-after-" + str(abs(hash(name)))
+        write(sid, [ask, opus, rec])
+        check(f"limit-hardening: a cut-off followed by {name} is STILL a "
+              f"cut-off", transcripts.limit_cut_off(cwd, sid)["cut_off"])
+    write("sid-prose", [ask, reply(SESSION, at)])
+    check("limit-hardening: an ordinary reply that merely starts with the "
+          "banner's words is not a cut-off on disk",
+          not transcripts.limit_cut_off(cwd, "sid-prose")["cut_off"])
+    write("sid-self", [ask, system(AUTO, at),
+                       system("Usage limit reset \xb7 continuing "
+                              "automatically", at + 3600)])
+    selfinfo = transcripts.limit_cut_off(cwd, "sid-self")
+    check("limit-hardening: the CLI continuing by itself reads as over, and "
+          "says so", not selfinfo["cut_off"] and selfinfo["self_resumed"])
+    wrap = user("[Usage limit reached — grace window active. Wrap up.]",
+                at, isMeta=True, usageLimitNote="wrap_up")
+    write("sid-grace", [ask, wrap, reply("Checkpoint: parser half done.",
+                                         at + 30)])
+    check("limit-hardening: a grace-window wrap-up is a cut-off, and its own "
+          "wrap-up reply does not end it",
+          transcripts.limit_cut_off(cwd, "sid-grace")["cut_off"])
+    write("sid-grace-on", [ask, wrap, reply("Checkpoint.", at + 30),
+                           user("go on", at + 7200), reply("On it.",
+                                                           at + 7210)])
+    check("limit-hardening: ...until a new prompt gets a real reply",
+          not transcripts.limit_cut_off(cwd, "sid-grace-on")["cut_off"])
+
+    # --- 5. the window: the sweep, the 7-day rule, the Esc, self-resume -----
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.show(); pump(50)
+    ws = win.manager.workspaces[0]
+    sent: dict = {}
+
+    def agent_for(name, sid):
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=cwd, pty=True)
+        spec.session_id = sid
+        a = TerminalAgent(spec)
+        buf = sent.setdefault(name, [])
+        a.worker = type("W", (), {
+            "is_running": lambda s: True,
+            "write": lambda s, d: buf.append(d) or True,
+            "job_process_count": lambda s: 0,
+            "start": lambda s: None, "dispose": lambda s: None})()
+        a._prompt_ready = True
+        a.status = AgentStatus.RUNNING
+        ws.agents.append(a)
+        return a
+
+    typed = lambda name: "".join(sent.get(name, []))
+
+    write("sid-missed", [ask, real_429(SESSION, now - 5, now - 300)])
+    missed = agent_for("Missed", "sid-missed")
+    write("sid-before", [ask, real_429(SESSION, win._launched_at - 7200,
+                                       now - 3600)])
+    before = agent_for("Before", "sid-before")
+    busy_sid = "sid-busy"
+    write(busy_sid, [ask, real_429(SESSION, now - 5, now - 300)])
+    busy = agent_for("Busy", busy_sid)
+    busy._busy = True
+    check("limit-hardening: the transcript sweep adopts exactly the missed "
+          "cut-off", win._sweep_transcript_cut_offs() == 1)
+    check("limit-hardening: ...latched as a LIVE cut-off with its exact "
+          "reset", missed.is_limit_blocked()
+          and not missed.limit_from_startup() and missed.limit_reset_exact()
+          and missed.limit_resets_at() == int(now - 300))
+    check("limit-hardening: ...never one from before this run (startup "
+          "recovery's call)", not before.is_limit_blocked())
+    check("limit-hardening: ...never a busy agent", not busy.is_limit_blocked())
+    check("limit-hardening: ...and files it in the ledger as found by the "
+          "sweep", any(r.get("source") == "sweep" and
+                       r.get("session_id") == "sid-missed"
+                       for r in limit_ledger.read_all(str(tmp))))
+    key = win._ledger_key(missed)
+    missed.clear_limit_block()
+    limit_ledger.record_outcome(str(tmp), key, limit_ledger.FAILED, tries=4)
+    check("limit-hardening: a cut-off the ledger already closed is never "
+          "re-armed by the sweep",
+          win._sweep_transcript_cut_offs() == 0
+          and not missed.is_limit_blocked())
+
+    # 7-day windows: a bare clock waits for the account, an exact one does not
+    bare = agent_for("WeeklyBare", "sid-none-1")
+    bare.mark_limit_blocked(now - 3600, from_startup=False, window="weekly",
+                            banner="You've hit your weekly limit \xb7 resets "
+                                   "8pm", exact=False)
+    dated = agent_for("WeeklyDated", "sid-none-2")
+    dated.mark_limit_blocked(now - 3600, from_startup=False, window="weekly",
+                             banner="You've hit your weekly limit \xb7 "
+                                    "resets Sep 30, 9am", exact=True)
+    win._check_limit_resets()
+    pump(2600)
+    check("limit-hardening: a weekly cut-off on a BARE clock is not nudged "
+          "on that clock", typed("WeeklyBare") == "")
+    check("limit-hardening: a weekly cut-off with an EXACT reset is nudged "
+          "once it passes", "Continue" in typed("WeeklyDated"))
+    check("limit-hardening: ...and gets no Esc, since no menu is up",
+          "\x1b" not in typed("WeeklyDated"))
+
+    write("sid-self", [ask, system(AUTO, now - 7200),
+                       system("Usage limit reset \xb7 continuing "
+                              "automatically", now - 60)])
+    selfr = agent_for("SelfResumed", "sid-self")
+    selfr.mark_limit_blocked(now - 120, from_startup=False, banner=AUTO,
+                             exact=True)
+    win._resume_blocked_agents()
+    pump(2600)
+    check("limit-hardening: an agent the CLI already continued is not "
+          "nudged again", typed("SelfResumed") == ""
+          and not selfr.is_limit_blocked())
+    check("limit-hardening: ...and the ledger records it RESUMED by the CLI",
+          any(r.get("event") == limit_ledger.RESUMED
+              and "on its own" in r.get("detail", "")
+              for r in limit_ledger.read_all(str(tmp))))
+
+    win._closing = True
+    win.close()
+    pump(50)
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
     test_sidebar_count_badge()
+    test_row_name_fades_under_badges()
     test_agent_waiting()
     test_notification_chime()
     test_limit_blocked_workspace_stats()
@@ -11656,6 +12988,7 @@ def main():
     test_bg_shell_settle_relearn()
     test_bg_shell_kill_extras()
     test_chime_persistence()
+    test_reply_chime()
     test_hook_prompt_events()
     test_agent_hook_waiting()
     test_manager_prompt_events_sync()
@@ -11677,7 +13010,9 @@ def main():
     test_reveal_agent()
     test_new_agent_autofocus()
     test_agent_busy_activity()
-    test_reply_settle_skips_resume_replay()
+    test_reply_marks_need_a_submitted_turn()
+    test_reply_marks_recovered_after_reprint()
+    test_reply_stamp_repaint_and_merge()
     test_transcript_reply_times()
     test_ansi()
     test_terminal_keys()
@@ -11714,6 +13049,7 @@ def main():
     test_fsopen_helpers()
     test_filetypes_icons()
     test_terminal_relative_link()
+    test_terminal_link_context_menu()
     test_terminal_block_glyphs()
     test_terminal_link_underline()
     test_sidebar_file_tree()
@@ -11728,6 +13064,8 @@ def main():
     test_auto_continue_on_limit_reset()
     test_gemini_limit_detection()
     test_startup_limit_recovery()
+    test_reset_clock_zones()
+    test_limit_detection_hardening()
     test_terminal_scrollbar()
     test_reply_marks_inline()
     test_reply_marks_recovered_from_transcript()
@@ -11741,6 +13079,7 @@ def main():
     test_multi_agent_session_isolation()
     test_usage_pill_geometry_and_close()
     test_usage_pill_never_truncates()
+    test_usage_pill_provider_inks()
     test_options_panel()
     test_topbar_extras_autosize()
     test_topbar_extras_grow_with_window()
@@ -12045,6 +13384,95 @@ def test_usage_pill_never_truncates():
     host.deleteLater()
 
 
+def test_usage_pill_provider_inks():
+    """Each usage pill wears its agent's colour and turns red at 85%.
+
+    Claude terracotta, Gemini blue, GPT in the running-head's title ink, so
+    three agents' pills tell apart at a glance and only the one near its
+    limit changes. The pills sit on the TOP BAR, which is vellum on the light
+    skin, so the inks are checked against every skin's bg_panel: the lifted
+    vendor inks and the near-white title ink both vanish on vellum.
+    """
+    import time as _time
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QColor
+    from app import ui_theme, claude_usage as cu, gemini_usage as gu
+    from app import codex_usage as xu
+    from app.widgets.ornaments import PlanUsageBadge
+    from app.widgets.gemini_usage_badge import GeminiUsageBadge
+    from app.widgets.codex_usage_badge import CodexUsageBadge
+    from app.widgets.terminal_view import contrast_ratio
+
+    QApplication.instance() or QApplication([])
+    reset = _time.time() + 4800
+
+    def claude(pct):
+        b = PlanUsageBadge(window="five_hour")
+        b.set_usage(cu.Usage(limits=(cu.Limit("five_hour", "Session (5h)",
+                                              "5h", pct, reset),)))
+        return b
+
+    def gemini(pct):
+        b = GeminiUsageBadge(window="five_hour")
+        b.set_usage(gu.GeminiUsage(limits=(gu.GeminiLimit(
+            "five_hour", "5-hour", "5h", pct, reset),)))
+        return b
+
+    def gpt(pct):
+        b = CodexUsageBadge()
+        b.set_usage(xu.CodexUsage(limit=xu.CodexLimit(pct, reset)))
+        return b
+
+    check("usage-ink: the Claude pill reads like the Gemini pill",
+          claude(21.0)._text.startswith("5h Claude 21% used, resets in")
+          and gemini(18.0)._text.startswith("5h Gemini 18% used, resets in"),
+          (claude(21.0)._text, gemini(18.0)._text))
+    check("usage-ink: the Codex pill is labelled GPT",
+          gpt(30.0)._text.startswith("GPT 30% used, resets in")
+          and "ChatGPT" not in gpt(30.0)._text, gpt(30.0)._text)
+
+    was = ui_theme.ACTIVE_THEME.id
+    fails, reds, inks_ok = [], [], True
+    try:
+        for tid, t in ui_theme.THEMES.items():
+            ui_theme.apply_theme(tid)
+            want = {"claude": ui_theme.usage_pill_ink("claude"),
+                    "gemini": ui_theme.usage_pill_ink("gemini"),
+                    "codex": ui_theme.usage_pill_ink("codex")}
+            if not t.light:
+                inks_ok &= (want["claude"] == ui_theme.PROVIDER_INK["claude"]
+                            and want["gemini"] == ui_theme.PROVIDER_INK["gemini"]
+                            and want["codex"] == t.cardhead_fg)
+            for key, make in (("claude", claude), ("gemini", gemini),
+                              ("codex", gpt)):
+                low, edge, high = make(84.0), make(85.0), make(97.0)
+                if low._color().name() != QColor(want[key]).name():
+                    fails.append(f"{tid}:{key} at 84%={low._color().name()}")
+                if (edge._color().name() != QColor(t.red).name()
+                        or high._color().name() != QColor(t.red).name()):
+                    reds.append(f"{tid}:{key}")
+                r = contrast_ratio(QColor(want[key]), QColor(t.bg_panel))
+                if r < 4.5:
+                    fails.append(f"{tid}:{key} contrast {r:.2f}")
+                for b in (low, edge, high):
+                    b.deleteLater()
+    finally:
+        ui_theme.apply_theme(was)
+    check("usage-ink: under 85% each pill wears its agent's ink, readable on "
+          "every skin's top bar", not fails, fails)
+    check("usage-ink: dark skins use the card chip's vendor inks and the "
+          "running-head title ink for GPT", inks_ok)
+    check("usage-ink: at 85% and above every pill turns the skin's red",
+          not reds, reds)
+    check("usage-ink: the three agents' resting inks differ on every skin",
+          all(len({ui_theme.apply_theme(tid) and None,
+                   ui_theme.usage_pill_ink("claude"),
+                   ui_theme.usage_pill_ink("gemini"),
+                   ui_theme.usage_pill_ink("codex")} - {None}) == 3
+              for tid in ui_theme.THEMES))
+    ui_theme.apply_theme(was)
+
+
 def test_topbar_extras_autosize():
     """The top bar's non-essential controls live in a QScrollArea (so the
     window's minimum width is a small constant, not the sum of everything the
@@ -12148,9 +13576,10 @@ def test_options_panel():
     # --- 1. what stayed on the bar, and what left ------------------------
     row = bar._extras.layout()
     on_row = [row.itemAt(i).widget() for i in range(row.count())]
-    check("options: the bar's scrolling row is now the four pills and the +",
+    check("options: the bar's scrolling row is now the five pills and the +",
           on_row == [bar.usage_badge, bar.usage_weekly_badge, bar.gemini_badge,
-                     bar.gemini_weekly_badge, bar.usage_add_btn],
+                     bar.gemini_weekly_badge, bar.codex_badge,
+                     bar.usage_add_btn],
           [w.objectName() or type(w).__name__ for w in on_row])
     moved = [bar.recover_btn, bar.resume_btn, bar.sound_btn, bar.taskbar_btn,
              bar.auto_update_btn, bar.updates_manage_btn, bar.install_label,
@@ -12200,6 +13629,9 @@ def test_options_panel():
         ("chime", bar.sound_btn, bar.sound_label,
          bar.soundToggled, bar.set_sound_enabled,
          lambda: bar._sound_on, True),
+        ("reply chime", bar.reply_sound_btn, bar.reply_sound_label,
+         bar.replySoundToggled, bar.set_reply_sound_enabled,
+         lambda: bar._reply_sound_on, False),
         ("taskbar count", bar.taskbar_btn, bar.taskbar_label,
          bar.taskbarBadgeToggled, bar.set_taskbar_badge,
          lambda: bar._taskbar_badge, True),
@@ -12226,7 +13658,7 @@ def test_options_panel():
     # every row says what it does in words, not in a glyph the tooltip
     # explains - that was the whole reason for leaving the 42px strip
     labels = ["Recover at start-up", "Resume on usage reset",
-              "Notification chime", "Taskbar count",
+              "Question chime", "Reply finished chime", "Taskbar count",
               "Check for CLI updates at start-up"]
     check("options: every switch is labelled in plain words",
           all(lab in label.text() for lab, (_n, _b, label, *_r)
@@ -13725,6 +15157,27 @@ def test_multi_agent_session_isolation():
 
 
 
+def _remove_fixture_transcripts():
+    """Delete the conversation folders this suite wrote into the REAL
+    ~/.claude/projects. The limit tests write fixture transcripts through
+    `transcripts.transcript_path`, which has no override, for agents whose
+    cwd is a `tempfile.mkdtemp(prefix="ai-hive-...")` directory. Claude
+    encodes that cwd into the folder name, so every one of them starts with
+    the encoded temp dir plus "-ai-hive-", and nothing else does. Without this
+    they piled up (105 by 2026-09-24) and showed in Claude's /resume picker
+    for those folders."""
+    from app import transcripts
+    root = Path(os.path.expanduser("~")) / ".claude" / "projects"
+    prefix = transcripts.encode_project_dir(tempfile.gettempdir()) + "-ai-hive-"
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_dir() and entry.name.startswith(prefix):
+            shutil.rmtree(entry, ignore_errors=True)
+
+
 if __name__ == "__main__":
     try:
         sys.exit(main())
@@ -13732,3 +15185,5 @@ if __name__ == "__main__":
         traceback.print_exc()
         print(f"\nRESULT: {PASS} passed, {FAIL + 1} failed (crash)", flush=True)
         sys.exit(1)
+    finally:
+        _remove_fixture_transcripts()

@@ -96,10 +96,14 @@ been supplied via set_base_dir() -- so a repo-relative path Claude prints
 (app/widgets/sidebar.py) is clickable too; opening a file also emits
 fileActivated(abspath) so the app can reveal it in the sidebar file tree.
 Ctrl+LEFT-click is primary -- the left button always delivers, while the middle
-button is often eaten by the OS (autoscroll). EVERY such link on the visible
-screen is underlined (a soft accent line) so URLs/paths stand out in the body
-text without hovering; hovering one emphasizes it (solid line) and switches to a
-hand cursor so it reads as the one you'd open. The full-screen scan
+button is often eaten by the OS (autoscroll). RIGHT-clicking that same token
+adds Open / Open with... / Reveal in folder / Copy path to the context menu
+(Open link / Copy link address for a URL), worded as the Agent/File Map's menu
+words them and carrying the RESOLVED absolute path -- 'Reveal in folder' is
+explorer /select, i.e. the folder opens with the file highlighted.
+EVERY such link on the visible screen is underlined (a soft accent line) so
+URLs/paths stand out in the body text without hovering; hovering one
+emphasizes it (solid line) and switches to a hand cursor so it reads as the one you'd open. The full-screen scan
 (_rescan_links) can stat the filesystem, so it runs only when the visible
 content changes (guarded by a per-row-text signature in paintEvent), never per
 repaint; hover then reads the cached spans (_span_at) with no filesystem work.
@@ -188,6 +192,17 @@ _RULE_CHARS = frozenset(chr(c) for c in range(0x2500, 0x2580))
 # _check_input_gap treats it as a stranded layout rather than ordinary
 # spacing. See _check_input_gap for why this exists at all.
 _INPUT_GAP_TOLERANCE = 1
+
+# Rows of Claude's own box chrome allowed between the last typed line and the
+# bottom of the picture: the box's bottom border plus a footer hint that wraps
+# onto a second or third row on a narrow card. More than this below the box
+# means real content is down there, so the layout is not stranded.
+_INPUT_CHROME_ROWS = 4
+
+# Debounce for the output-driven stranded-layout check. Long enough that a
+# menu teardown's whole redraw collapses into one check, short enough that the
+# box comes back within about a second of the menu closing.
+_GAP_CHECK_MS = 500
 
 _KEY_SEQUENCES = {
     Qt.Key.Key_Return: "\r", Qt.Key.Key_Enter: "\r",
@@ -558,6 +573,17 @@ class TerminalView(QWidget):
         self._snap_timer.setInterval(600)
         self._snap_timer.timeout.connect(self._on_input_settled)
 
+        # The stranded-layout check also has to run when the user has typed
+        # NOTHING: closing a slash-command menu is pure child output, and
+        # _snap_timer is armed only by an edit keystroke (see _check_input_gap).
+        # Restarting on every burst means a long redraw collapses into one
+        # check once the screen is quiet, and the _input_gap_row edge guard
+        # keeps it to one repair per occurrence.
+        self._gap_timer = QTimer(self)
+        self._gap_timer.setSingleShot(True)
+        self._gap_timer.setInterval(_GAP_CHECK_MS)
+        self._gap_timer.timeout.connect(self._check_input_gap)
+
         # prompt milestones painted on the scrollbar: (absolute line, tooltip).
         # Pure VIEW data -- the durable copy lives on the agent, because a card
         # rebuild throws this widget away (see TerminalCard._replay_with_marks).
@@ -644,6 +670,7 @@ class TerminalView(QWidget):
             self._on_history_wiped()
         self._notify_view()
         self.update()
+        self._gap_timer.start()
 
     def reset(self) -> None:
         rows, cols = self.screen.lines, self.screen.columns
@@ -712,8 +739,8 @@ class TerminalView(QWidget):
     def reply_anchor_line(self) -> int | None:
         """Absolute line of the row a just-finished reply's stamp goes on: the
         blank row directly UNDER Claude's own "<spinner verb> for Ns" footer,
-        which is left in place once a turn settles. Used at BOTH the live busy -> idle capture
-        (TerminalCard._on_activity) and replay re-anchoring
+        which is left in place once a turn settles. Used at BOTH the live
+        capture (TerminalCard._on_reply_mark_added) and replay re-anchoring
         (_replay_with_marks), exactly like anchor_line() -- one function over
         identical screen state on both sides is what keeps them agreeing.
 
@@ -763,15 +790,30 @@ class TerminalView(QWidget):
         self.scroll_by(target - self._scroll_offset)
 
     def set_marks(self, marks) -> None:
+        # update() is NOT optional here, and _notify_view cannot stand in for
+        # it: that signature is (pushed, history, offset, lines), which marks
+        # are not part of, so it returns at its own guard on an idle screen --
+        # and even when it does emit, viewChanged goes to the SCROLLBAR, never
+        # to this widget's paint queue. See set_reply_marks for what that cost.
         self._marks = list(marks)
         self._notify_view(immediate=True)
+        self.update()
 
     def marks(self) -> list[tuple[int, str]]:
         return list(self._marks)
 
     def set_reply_marks(self, marks) -> None:
+        # A reply stamp is minted 2 s after the last output (BUSY_IDLE_MS),
+        # by which time the repaint that last feed() scheduled has long since
+        # run -- so without this the stamp sat in _reply_marks unpainted until
+        # something ELSE happened to repaint the widget (the next burst, a
+        # resize, a focus change, a scroll). On an agent that has just gone
+        # quiet, which is exactly the moment the stamp is for, that can be a
+        # long wait, and it reads as the feature being flaky rather than as a
+        # bug with an address.
         self._reply_marks = list(marks)
         self._notify_view(immediate=True)
+        self.update()
 
     def reply_marks(self) -> list[tuple[int, str]]:
         return list(self._reply_marks)
@@ -1808,6 +1850,13 @@ class TerminalView(QWidget):
                 last = c
         return first, last
 
+    def _last_content_row(self) -> int:
+        """Bottom-most non-blank screen row, or -1 when the screen is empty."""
+        for r in range(self.screen.lines - 1, -1, -1):
+            if self._row_content(r) != (-1, -1):
+                return r
+        return -1
+
     def _row_is_input_footer(self, r: int) -> bool:
         """True when row r is Claude Code's input-box footer hint (e.g. '? for
         shortcuts') -- painted with NO blank line between it and the box, so
@@ -2006,9 +2055,12 @@ class TerminalView(QWidget):
         _kick_snapshot) -- the "user stopped touching the input" moment. Does
         the existing undo bookkeeping and then checks whether the box got
         left in a stale spot (_check_input_gap): a burst of typing is exactly
-        when Claude's classic renderer can scroll for a dropdown and fail to
-        scroll back, and by the time this fires the child's redraw has long
-        since arrived and been painted."""
+        when Claude's classic renderer can scroll for an autocomplete dropdown
+        and fail to scroll back, and by the time this fires the child's redraw
+        has long since arrived and been painted. The output-driven _gap_timer
+        covers the keystroke-free cases; this call costs nothing on top of it
+        (the edge guard makes the second one a no-op) and keeps the typing
+        path covered if a child ever strands the box and then emits nothing."""
         self._snapshot_input()
         self._check_input_gap()
 
@@ -2025,28 +2077,71 @@ class TerminalView(QWidget):
         recovers from this when its window is resized (TerminalAgent.
         request_repaint, wired to staleLayoutDetected by TerminalCard).
 
-        Fires ONLY on the EDGE: a footer row that moved further from the
-        bottom than the last check. A short conversation that legitimately
-        has blank space below its footer gets checked once, finds nothing to
-        fix next time (same row), and is never repainted again -- this is
-        what keeps normal use free of any repeated resize blip."""
-        if self._scroll_offset:
+        Runs on a debounced OUTPUT settle (_gap_timer, re-armed by every
+        feed) as well as after a typing burst, because the commonest way to
+        strand the box is a slash-command menu (/model, /effort) closing on
+        Esc -- pure child output, not a keystroke this widget ever sees.
+
+        The gap is measured from the bottom-most row with anything on it,
+        NOT by walking down from the box looking for blank rows. The shipped
+        version did the latter and therefore never fired once on a real
+        screen: directly under the '>' row Claude draws the box's bottom
+        BORDER, and the footer hint wraps onto a second row that matches no
+        known hint text, so the blank scan aborted on the box's own chrome
+        every single time. The suite missed it for the same reason
+        reply_anchor_line's bug survived -- the fixture drew a box with no
+        border and a one-row footer, a screen Claude never paints.
+
+        Fires ONLY on the EDGE: a bottom row that moved further from the
+        bottom of the screen than the last check. A short conversation that
+        legitimately has blank space below its footer gets checked once,
+        finds nothing to fix next time (same row), and is never repainted
+        again -- that edge guard plus the empty-history guard below are what
+        keep normal use free of any repeated resize blip."""
+        if self._scroll_offset or self._alt_screen:
             return  # only the live tail can be "stranded"
+        if not len(self.screen.history.top):
+            # A screen that has never scrolled a line off cannot have been
+            # scrolled up by a dropdown. A fresh or freshly cleared
+            # conversation legitimately sits high with blank space under it,
+            # and its footer moves down a row every turn -- without this the
+            # output trigger would ask for a resize once per turn.
+            self._input_gap_row = None
+            return
         span = self._input_block_span()
         if span is None:
             self._input_gap_row = None
             return
-        _, bottom = span
-        footer = bottom + 1
-        edge = footer if (footer < self.screen.lines
-                          and self._row_is_input_footer(footer)) else bottom
+        top, bottom = span
+        first, _ = self._row_content(top)
+        if first < 0 or self.screen.buffer[top][first].data not in _INPUT_PROMPTS:
+            # _input_block_span keeps top = cy when there is no prompt glyph,
+            # so mid-reply -- caret on output, blank rows below -- this would
+            # otherwise read as a stranded box. The keystroke trigger hid
+            # that; the output trigger would not.
+            self._input_gap_row = None
+            return
+        below = bottom + 1
+        if below >= self.screen.lines or not (self._row_is_rule(below)
+                                              or self._row_is_input_footer(below)):
+            # Claude paints the box's bottom border (or, borderless, its footer
+            # hint) DIRECTLY under the input with no blank line between -- that
+            # is what _input_block_span's own scan stops on. An OPEN menu also
+            # ends up looking like a box otherwise: its highlighted row starts
+            # with the same '❯' the prompt does, and a tall one leaves the span
+            # close enough to the last content row to pass the chrome bound
+            # below. Measured on a real /model menu: span bottom 23, row 24
+            # BLANK, so this is the discriminator.
+            self._input_gap_row = None
+            return
+        edge = self._last_content_row()
+        if edge < bottom or edge - bottom > _INPUT_CHROME_ROWS:
+            self._input_gap_row = None
+            return  # real content below the box -- a menu is still open
         gap = (self.screen.lines - 1) - edge
         if gap <= _INPUT_GAP_TOLERANCE:
             self._input_gap_row = None
             return
-        for r in range(edge + 1, self.screen.lines):
-            if self._row_content(r) != (-1, -1):
-                return  # not actually blank all the way down -- leave it
         if self._input_gap_row == edge:
             return  # already asked for a repaint at this exact position
         self._input_gap_row = edge
@@ -2148,25 +2243,52 @@ class TerminalView(QWidget):
             return ""
         return path
 
-    def contextMenuEvent(self, event):
+    def _build_context_menu(self, row: int, col: int) -> QMenu:
+        """Assemble the right-click menu for the cell under the pointer, and
+        return it UNSHOWN -- contextMenuEvent's exec() blocks, so this split is
+        what lets the headless suite read the actions and trigger one.
+
+        A cell carrying a link (the SAME _link_at that Ctrl+click uses, so
+        the two can never disagree about what one is) gets the file actions
+        prepended, worded exactly as the Agent/File Map's menu words them. The
+        path copied is the RESOLVED absolute one _link_at returns, not the token
+        as printed: a repo-relative 'app/widgets/sidebar.py' pastes into
+        Explorer's address bar only as an absolute path. Nothing here sends the
+        child anything, so it needs no waiting_probe() gate."""
+        from .. import fsopen
+
         menu = QMenu(self)
-        has_sel = self._selection_range() is not None
+        target = self._link_at(row, col)
+        if target:
+            kind, value = target
+            if kind == "file":
+                menu.addAction("Open", lambda: fsopen.open_path(value))
+                menu.addAction("Open with...", lambda: fsopen.open_with(value))
+                menu.addAction("Reveal in folder",
+                               lambda: fsopen.reveal_in_folder(value))
+                menu.addAction(
+                    "Copy path",
+                    lambda: QGuiApplication.clipboard().setText(value))
+            else:
+                menu.addAction("Open link", lambda: fsopen.open_url(value))
+                menu.addAction(
+                    "Copy link address",
+                    lambda: QGuiApplication.clipboard().setText(value))
+            menu.addSeparator()
         cb = QGuiApplication.clipboard()
         md = cb.mimeData()
         can_paste = bool(cb.text()) or (md is not None and md.hasImage())
-        act_copy = menu.addAction("Copy")
-        act_copy.setEnabled(has_sel)
-        act_paste = menu.addAction("Paste")
+        act_copy = menu.addAction("Copy", self.copy_selection)
+        act_copy.setEnabled(self._selection_range() is not None)
+        act_paste = menu.addAction("Paste", self.paste_clipboard)
         act_paste.setEnabled(can_paste)
         menu.addSeparator()
-        act_all = menu.addAction("Select all")
-        chosen = menu.exec(event.globalPos())
-        if chosen == act_copy:
-            self.copy_selection()
-        elif chosen == act_paste:
-            self.paste_clipboard()
-        elif chosen == act_all:
-            self.select_all()
+        menu.addAction("Select all", self.select_all)
+        return menu
+
+    def contextMenuEvent(self, event):
+        menu = self._build_context_menu(*self._cell_at(event.pos()))
+        menu.exec(event.globalPos())
 
     # ------------------------------------------------------------- paint ---
 

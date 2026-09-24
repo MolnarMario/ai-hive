@@ -226,6 +226,30 @@ PROVIDER_INK: dict[str, str] = {
     "gemini": "#72a4f7",   # Google blue
 }
 
+# The top-bar usage pills wear the same vendor inks, but they sit on the TOP
+# BAR (bg_panel), and on a light skin that is vellum, where the lifted inks
+# above land near 2:1. A light skin gets these darker cuts of the same two
+# hues instead (5.2:1 and 5.3:1 on the manuscript's #f4ead0).
+PROVIDER_INK_ON_LIGHT: dict[str, str] = {
+    "claude": "#9a4a2c",
+    "gemini": "#2a5db0",
+}
+
+
+def usage_pill_ink(provider: str) -> str | None:
+    """The resting colour of a provider's top-bar usage pill, or None for a
+    provider with no ink (the pill then keeps its generic colour).
+
+    Claude and Gemini get their vendor inks. GPT has no vendor colour in the
+    app, so its pill wears the running-head's title ink (CARDHEAD_FG, the
+    near-white agent name on the dark skins). On a light skin that ink is
+    written for an ultramarine running-head and vanishes on the vellum bar,
+    so the pill falls back to the chrome's body ink there."""
+    light = bool(getattr(ACTIVE_THEME, "light", False))
+    if provider == "codex":
+        return Palette.TEXT if light else Palette.CARDHEAD_FG
+    return (PROVIDER_INK_ON_LIGHT if light else PROVIDER_INK).get(provider)
+
 
 def apply_theme(theme_id: str) -> Theme:
     """Make `theme_id` the active skin: rewrite Palette / ANSI_16 / fonts in
@@ -700,6 +724,14 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 /* the collapsed stand-in for A-/A+/maximize: faint enough to read as chrome,
    visible enough to say "there is something here to hover" */
 #CardToolsHint {{ color: {p.CARDHEAD_SUB}; font-size: 13px; }}
+/* the hover tray those three buttons expand into. It FLOATS over the header
+   rather than taking layout width (see _HeaderTools), so it has to be opaque
+   or the summary underneath reads straight through it. */
+#CardToolsTray {{
+    background: {p.BG_CARDHEAD};
+    border: 1px solid {p.ACCENT_GOLD_DIM};
+    border-radius: 4px;
+}}
 #WsDelete {{ color: {p.TEXT}; font-size: 17px; font-weight: 900; }}
 #GlobalFontBtn {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;

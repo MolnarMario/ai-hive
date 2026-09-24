@@ -65,6 +65,9 @@ class WorkspaceManager(QObject):
     # the "?" just appeared on its row. Transient, never persisted — the UI
     # uses it purely to sound the notification chime.
     agentWaiting = Signal(str, str)          # ws_id, agent_id
+    # an agent finished a reply the user asked for (TerminalAgent.
+    # reply_finished). Transient like agentWaiting: only the reply chime uses it.
+    agentReplied = Signal(str, str)          # ws_id, agent_id
     agentLimitBlocked = Signal(str, str)     # ws_id, agent_id (plan cut-off)
     dirty = Signal()                         # any persistable mutation
 
@@ -480,6 +483,8 @@ class WorkspaceManager(QObject):
         agent.waiting_changed.connect(
             lambda waiting, wid=wid, aid=agent.id:
             self._on_agent_waiting(wid, aid, waiting))
+        agent.reply_finished.connect(
+            lambda wid=wid, aid=agent.id: self.agentReplied.emit(wid, aid))
         # cut off by the plan limit — also transient, but announced so the
         # window can record it. Auto-continue depends on this having been seen,
         # so it must leave a forensic trace: twice now the feature failed
@@ -564,7 +569,10 @@ class WorkspaceManager(QObject):
                 if not agent.is_busy():
                     agent.set_turn_waiting(True)
             elif kind == session_hook.EV_TURN_CLEAR:
+                # the Stop hook's "turn ended on a statement": Claude's exact
+                # reply-finished edge (the other providers time it instead)
                 agent.set_turn_waiting(False)
+                agent.note_turn_ended()
 
     def _touch(self, ws_id: str) -> None:
         """Recompute derived state AND mark the session dirty (persisted
@@ -617,15 +625,15 @@ class WorkspaceManager(QObject):
                         a.set_token_usage(used, window)
 
     def refresh_model_effort(self) -> None:
-        """Pull each running Claude agent's CURRENT model, effort and permission
+        """Pull each running Claude/Gemini agent's CURRENT model, effort and permission
         mode from its transcript, so the card header follows a `/model`,
-        `/effort` or Shift+Tab the user did inside the terminal. Polled far more
+        `/effort` or mode change the user did inside the terminal. Polled far more
         often than `refresh_ai_titles`, which is why its reader only touches the
         tail of the file and re-reads nothing while the transcript is unchanged.
 
         The model and effort are TRANSIENT display state (`set_live_model` never
         persists them; `spec.model`/`spec.effort` stay the launch record). The
-        PERMISSION MODE is the deliberate exception and IS written back, because
+        PERMISSION MODE is the deliberate exception and IS written back for Claude, because
         the CLI does not carry a mode across a `--resume`: an agent whose user
         put it in plan or auto mode came back ask-each-time on every reopen,
         which is exactly what the launch flag exists to set. Like a pin change
@@ -635,17 +643,23 @@ class WorkspaceManager(QObject):
         for w in self._workspaces:
             for a in w.agents:
                 spec = a.spec
-                if spec.provider != "claude" or not a.is_running():
+                if not a.is_running():
                     continue
-                model, effort, mode = transcripts.latest_model_effort(
-                    spec.cwd, spec.session_id)
-                a.set_live_model(model, effort, mode)
-                # the transcript names modes the command line cannot ("default"
-                # is spelled by omitting the flag), so translate before storing:
-                # spec.permission_mode is a LAUNCH flag, not a reading
-                if mode and spec.set_permission_mode(
-                        providers.normalize_permission_mode(mode)):
-                    changed = True
+                if spec.provider == "claude":
+                    model, effort, mode = transcripts.latest_model_effort(
+                        spec.cwd, spec.session_id)
+                    a.set_live_model(model, effort, mode)
+                    # the transcript names modes the command line cannot ("default"
+                    # is spelled by omitting the flag), so translate before storing:
+                    # spec.permission_mode is a LAUNCH flag, not a reading
+                    if mode and spec.set_permission_mode(
+                            providers.normalize_permission_mode(mode)):
+                        changed = True
+                elif spec.provider == "gemini":
+                    model, effort, mode = transcripts.latest_gemini_model_effort(
+                        spec.cwd, spec.session_id)
+                    if model or effort or mode:
+                        a.set_live_model(model, effort, mode)
         if changed:
             self.dirty.emit()
 

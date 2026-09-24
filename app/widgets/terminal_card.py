@@ -67,11 +67,24 @@ _MARK_WS_RE = re.compile(r"\s+")
 # markdown syntax and drawing glyphs the renderer paints rather than prints,
 # dropped from both sides of a reply match (see _norm_reply_line)
 _MARK_MD_RE = re.compile("[*`_#>❯•⏺─-╿]")
+# settles a card will spend looking for the milestones of a conversation its
+# child reprinted after the card was built (see TerminalCard._rescan_recovery).
+# The scan is ~35 ms over a full history, so this is a handful of attempts, not
+# a poll: it stops on the first one that finds anything.
+_RECOVER_RESCAN_TRIES = 6
 # how much of the END of a reply's last line must be found on a scrollback row
 # to call it that reply's last row (see _reply_end_row). Shorter than the
 # prompt window: a wrapped line's final row holds only what spilled onto it,
 # which can be a few words.
 _REPLY_TAIL_CHARS = 16
+# how far apart a LIVE reply mark and a RECOVERED one may sit and still be the
+# same reply (see _refresh_reply_marks). The two anchors normally agree exactly
+# -- reply_anchor_line returns the footer row + 1, _reply_end_row returns i + 3
+# where i + 2 is that same footer -- so this only covers the shapes where they
+# fall back differently: recovery to the blank row directly under the reply
+# text, the live path to the footer row itself. Three rows spans that gap and
+# nothing else; a reply is never two turns away from itself.
+_STAMP_MERGE_SLACK = 3
 
 
 def _norm_line(text: str) -> str:
@@ -226,6 +239,33 @@ class _CardHeader(QFrame):
         event.accept()
 
 
+class _ToolsTray(QFrame):
+    """The floating strip that carries A- / A+ / maximize while the pointer is
+    on the header tools.
+
+    It is a child of the HEADER, not of `_HeaderTools`, so it can hang out to
+    the left over the summary and the model chip. Enter/leave are forwarded to
+    the owner: the pointer moving from the hint onto a button crosses a widget
+    boundary Qt reports as a Leave, and the tray is a sibling rather than a
+    child, so `_HeaderTools` never hears the pointer arrive or depart."""
+
+    def __init__(self, owner, parent):
+        super().__init__(parent)
+        self._owner = owner
+        self.setObjectName("CardToolsTray")
+        # a plain QWidget ignores a stylesheet background; the tray covers the
+        # header text underneath it, so an opaque fill is the whole point
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+    def enterEvent(self, event):
+        self._owner._set_open(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        QTimer.singleShot(0, self._owner._recheck)
+        super().leaveEvent(event)
+
+
 class _HeaderTools(QWidget):
     """The header's secondary buttons (A- / A+ / maximize), collapsed to a
     narrow strip until the pointer is over them.
@@ -236,15 +276,26 @@ class _HeaderTools(QWidget):
     them gives it back without hiding them anywhere the user has to go
     looking for.
 
-    The container sits just LEFT of the usage chip, and the summary carries
-    the layout stretch, so expanding takes its width from the summary alone:
-    nothing to the right of this widget moves as the pointer crosses it.
+    THE EXPANDED BUTTONS DO NOT LIVE IN THE HEADER'S LAYOUT, and that is the
+    invariant here. This widget's own footprint is FIXED at the hint width for
+    the life of the card; hovering only shows a `_ToolsTray` floating over the
+    header, right-aligned to this strip. Growing inside the layout worked only
+    while the header had slack to give: past three cards across a 1080p screen
+    the header is already OVER-SUBSCRIBED (the model chip alone asks for
+    ~260px and a QLabel cannot shrink below its own text), and Qt's response
+    to a layout it cannot satisfy is to shrink EVERY item proportionally,
+    minimums included -- measured at a 480px header, 27px for a button whose
+    sizeHint is 65, at which point QToolButton elides "A-" and "A+" to "...".
+    Three ellipses in a row where two font steppers should be, reported live.
+    A widget that is never asked for space cannot be squeezed, so do not put
+    these buttons back in the layout, and do not "fix" this by giving them a
+    minimum width: the over-subscribed path shrinks below the minimum too.
 
     Qt sends Leave to a parent when the pointer enters one of its children, so
     a naive leaveEvent would hide the buttons the instant the user reached for
     one. The close is therefore deferred by one turn of the event loop and
     checked against the real cursor position, which is inside this widget's
-    rect for as long as the pointer is over any of its children."""
+    rect -- or the tray's -- for as long as the pointer is over any of them."""
 
     _HINT_W = 14
 
@@ -261,11 +312,35 @@ class _HeaderTools(QWidget):
         self.hint.setFixedWidth(self._HINT_W)
         self.hint.setToolTip("Font size and maximize")
         lay.addWidget(self.hint)
+        self.setFixedWidth(self._HINT_W)
+        self.tray = _ToolsTray(self, parent)
+        tl = QHBoxLayout(self.tray)
+        tl.setContentsMargins(5, 1, 5, 1)
+        tl.setSpacing(4)
+        self.tray.hide()
 
     def add(self, btn) -> None:
+        btn.setParent(self.tray)
         btn.hide()
         self._buttons.append(btn)
-        self.layout().addWidget(btn)
+        self.tray.layout().addWidget(btn)
+
+    def _place_tray(self) -> None:
+        """Right-align the tray on this strip, inside the header.
+
+        The strip is the thing the pointer is on, so the tray has to reach it;
+        everything else it covers is text the hover is deliberately borrowing.
+        Clamped to the header's left edge so a card too narrow for the tray
+        loses the left end of the header rather than pushing the buttons off
+        the near side."""
+        head = self.parentWidget()
+        if head is None:
+            return
+        size = self.tray.sizeHint()
+        mine = self.geometry()
+        x = max(0, mine.right() + 1 - size.width())
+        y = mine.center().y() - size.height() // 2
+        self.tray.setGeometry(x, max(0, y), size.width(), size.height())
 
     def _set_open(self, on: bool) -> None:
         if on == self._open:
@@ -274,6 +349,12 @@ class _HeaderTools(QWidget):
         self.hint.setVisible(not on)
         for b in self._buttons:
             b.setVisible(on)
+        if on:
+            self._place_tray()          # before show(), or it flashes at 0,0
+            self.tray.show()
+            self.tray.raise_()
+        else:
+            self.tray.hide()
 
     def enterEvent(self, event):
         self._set_open(True)
@@ -283,9 +364,23 @@ class _HeaderTools(QWidget):
         QTimer.singleShot(0, self._recheck)
         super().leaveEvent(event)
 
+    def moveEvent(self, event):
+        if self._open:
+            self._place_tray()
+        super().moveEvent(event)
+
+    def resizeEvent(self, event):
+        if self._open:
+            self._place_tray()
+        super().resizeEvent(event)
+
     def _recheck(self) -> None:
         try:
-            inside = self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+            pos = QCursor.pos()
+            inside = (self.rect().contains(self.mapFromGlobal(pos))
+                      or (self.tray.isVisible()
+                          and self.tray.rect().contains(
+                              self.tray.mapFromGlobal(pos))))
         except RuntimeError:      # widget went away under the timer
             return
         if not inside:
@@ -316,6 +411,11 @@ class TerminalCard(QFrame):
         self._renaming = False  # inline title-edit in progress
         self._task_full = ""    # untruncated current-task (the label elides it)
         self._pending_replay = ""  # restored screen, re-rendered once at size
+        # is the boot veil up because a RESTORED SNAPSHOT has not been
+        # projected at a real width yet? Distinct from the veil being up
+        # because a child is booting, and it decides who is allowed to lower
+        # it (see __init__, _on_status, _rerender_restored).
+        self._boot_seed = False
         self._restored_hooked = False  # is _rerender_restored still armed?
         # prompt milestone uid -> absolute line IN THIS VIEW. Per-card because
         # a rebuilt view has a different `pushed` origin; keyed on uid because
@@ -337,6 +437,9 @@ class TerminalCard(QFrame):
         # the agents that matter. See _recover_marks for why re-reading within
         # one conversation cannot find anything the card doesn't already know.
         self._recover_key: tuple = ()
+        # settles left to look for a conversation reprinted after this card was
+        # built (see _rescan_recovery)
+        self._recover_tries = _RECOVER_RESCAN_TRIES
         self._recover_prompts: list[str] = []
         self._recover_replies: list[tuple[float, str]] = []
         self.scroll_bar = None
@@ -398,6 +501,20 @@ class TerminalCard(QFrame):
         else:
             self._replay_log()
         self._on_status(agent.status)
+        # ...and cover that seed, because the user WOULD otherwise see it.
+        # main.py shows the window before autostart_active_workspace raises
+        # any veil, so this projection is painted first -- and it can only
+        # ever paint scrambled: REPLAY_SEED_CAP is a cut through the MIDDLE
+        # of a classic-renderer frame (no banner, no known cursor row, column
+        # jumps referring to rows that were never drawn) at a width the card
+        # does not have yet. Measured on real captures: the same bytes render
+        # as clean prose at their capture width and as overlapping fragments
+        # at any other. Reported as "gibberish in the top left corner, then
+        # the loader, then it looks normal". Deliberately AFTER _on_status,
+        # whose not-running branch would dismiss what this raises.
+        if self.is_pty and self.agent.has_pristine_seed():
+            self._boot_seed = True
+            self._begin_boot_veil()
         self._on_assignment(agent.assignment)
         self._on_task()
         self._on_tokens(agent.token_badge())
@@ -1049,6 +1166,10 @@ class TerminalCard(QFrame):
         if not self.is_pty or self.terminal is None:
             return          # a line-mode card has no screen to restore
         self._pending_replay = ""
+        # the seed is gone, so the veil is no longer holding a screen back --
+        # from here it belongs to the booting child (_on_status raises it
+        # again a moment later and lifts it on prompt_ready)
+        self._boot_seed = False
         # the settled-size projection must be cancelled too, not just the
         # signal: its backstop timer would otherwise fire a moment later and
         # re-project the very screen this just decided to drop
@@ -1093,6 +1214,7 @@ class TerminalCard(QFrame):
         clean terminal it fills itself, so replaying the seed under it would put
         back the mangled fragment `drop_restored_screen` exists to remove."""
         self._pending_replay = ""
+        seeded, self._boot_seed = self._boot_seed, False
         self._settle_timer.stop()
         self._unhook_restored()
         replay = self.agent.pty_replay()
@@ -1106,6 +1228,14 @@ class TerminalCard(QFrame):
         self._replay_with_marks(replay)
         self._proj_cols = self.terminal.screen.columns
         self._refresh_overlay()
+        if seeded and not self.agent.is_running():
+            # this projection IS the stopped card's final picture, so it is
+            # the moment to dissolve. A card about to autostart passes through
+            # here too (settle_layout flushes every resize before any child is
+            # spawned), and does NOT flicker: agent.start() re-raises the veil
+            # in the same call stack, and BootVeil.begin() stops the fader and
+            # resets _fade, so the 260ms fade never paints a frame.
+            self._end_boot_veil()
 
     def _refresh_overlay(self) -> None:
         """Pick the banner's shape from what is already on the screen.
@@ -1268,12 +1398,13 @@ class TerminalCard(QFrame):
         if pos < len(replay):
             self.terminal.feed(replay[pos:])
         if recover:
-            self._recover_marks()
-            self._recover_reply_marks()
+            rows = self._scrollback_rows()
+            self._recover_marks(rows)
+            self._recover_reply_marks(rows)
         self._refresh_marks()
         self._refresh_reply_marks()
 
-    def _recover_marks(self) -> None:
+    def _recover_marks(self, rows=None) -> None:
         """Find the user's earlier prompts in a scrollback we did not watch
         being typed, and mark those lines too.
 
@@ -1306,19 +1437,28 @@ class TerminalCard(QFrame):
         (a pin change or /clear), which changes the key and re-reads."""
         self._recovered = []
         spec = self.agent.spec
-        if not self.is_pty or spec.provider != "claude":
+        if not self.is_pty or spec.provider not in ("claude", "gemini"):
             return
-        key = (spec.cwd, spec.session_id)
+        key = (spec.provider, spec.cwd, spec.session_id)
         if key != self._recover_key:
             self._recover_key = key
-            self._recover_prompts = transcripts.typed_prompts(
-                spec.cwd, spec.session_id)
-            self._recover_replies = transcripts.reply_times(
-                spec.cwd, spec.session_id)
+            if spec.provider == "claude":
+                self._recover_prompts = transcripts.typed_prompts(
+                    spec.cwd, spec.session_id)
+                self._recover_replies = transcripts.reply_times(
+                    spec.cwd, spec.session_id)
+            elif spec.provider == "gemini":
+                self._recover_prompts = transcripts.gemini_typed_prompts(
+                    spec.session_id)
+                self._recover_replies = transcripts.gemini_reply_times(
+                    spec.session_id)
+            else:
+                self._recover_prompts = []
+                self._recover_replies = []
         prompts = self._recover_prompts
         if not prompts:
             return
-        oldest, raw = self._scrollback_rows()
+        oldest, raw = rows if rows is not None else self._scrollback_rows()
         if not raw:
             return
         lines = [_norm_line(t) for t in raw]
@@ -1351,15 +1491,15 @@ class TerminalCard(QFrame):
         return oldest, ["".join(ln[c].data or " " for c in range(cols))
                         for ln in rows]
 
-    def _recover_reply_marks(self) -> None:
+    def _recover_reply_marks(self, rows=None) -> None:
         """Find where each finished reply ENDED in a scrollback we did not
         watch, and stamp those lines with the time the transcript says that
         reply finished.
 
         The counterpart of _recover_marks, and it exists for a sharper reason:
-        a reply mark is minted from a busy -> idle settle, so a conversation
-        restored from disk comes back with NONE, and the resume-replay
-        suppression (_settled_once) means a reopened hive shows no reply time
+        a reply mark is minted from a busy -> idle settle of a turn somebody
+        submitted (TerminalAgent._note_submit), so a conversation restored from
+        disk comes back with NONE and a reopened hive would show no reply time
         anywhere at all. The transcript is the only record of when those turns
         actually finished.
 
@@ -1381,11 +1521,11 @@ class TerminalCard(QFrame):
         inventing a time for one."""
         self._recovered_replies = []
         spec = self.agent.spec
-        if not self.is_pty or spec.provider != "claude":
+        if not self.is_pty or spec.provider not in ("claude", "gemini"):
             return
         if not self._recover_replies:
             return
-        oldest, raw = self._scrollback_rows()
+        oldest, raw = rows if rows is not None else self._scrollback_rows()
         if not raw:
             return
         lines = [_norm_reply_line(t) for t in raw]
@@ -1449,29 +1589,60 @@ class TerminalCard(QFrame):
         yesterday keeps reading as date-prefixed today rather than freezing
         whatever "same day" looked like the moment it was captured.
 
-        Live marks and transcript-recovered ones are merged the same way
-        _refresh_marks merges prompts: a live capture anchored the row it was
-        actually looking at, a recovered one was located by matching text, so
-        where both land on a line the live one wins."""
+        Live marks and recovered ones are merged by ROW, and where both are
+        the same reply the split is deliberate: the live mark keeps the row
+        (it anchored the screen it was looking at) and the TRANSCRIPT supplies
+        the time. Claude stamps every record it writes, whereas a live mark
+        reads the wall clock at the settle -- a couple of seconds late at best,
+        and flatly wrong for any settle that was not a reply at all. That
+        makes a stray live stamp self-correcting: the next projection recovers
+        the same reply and the recorded time replaces the observed one.
+
+        "The same reply" is NEAREST ROW WITHIN _STAMP_MERGE_SLACK, not an exact
+        match, and the difference is a stamp that contradicts itself. The two
+        anchors agree on the ordinary screen, but they fall back to DIFFERENT
+        rows when the row under Claude's turn footer is not blank: recovery
+        takes the blank row above the footer, the live path takes the footer
+        row itself. Requiring equality left both in the merge, so one reply
+        wore two stamps a couple of rows apart reading different times -- and
+        the live one, the one whose time is only an observation, is the one
+        that renders, since a footer row usually has room at its right edge.
+        Matching is greedy over the live marks in row order and each recovered
+        reply is claimed at most once, so a recovered stamp can never be
+        counted twice or absorb a neighbouring turn's."""
         if not self.is_pty:
             return
         by_uid = {m.uid: m for m in self.agent.reply_marks()}
-        live = [(line, by_uid[uid].ts)
-                for uid, line in self._reply_mark_lines.items()
-                if uid in by_uid]
-        taken = {line for line, _ in live}
-        merged = live + [(line, when) for line, when in self._recovered_replies
-                         if line not in taken]
+        recovered = dict(self._recovered_replies)
+        claimed: set[int] = set()
+        merged: list[tuple[int, float]] = []
+        for line, uid in sorted((ln, u) for u, ln in
+                                self._reply_mark_lines.items() if u in by_uid):
+            near = [r for r in recovered if r not in claimed
+                    and abs(r - line) <= _STAMP_MERGE_SLACK]
+            if near:
+                match = min(near, key=lambda r: (abs(r - line), r))
+                claimed.add(match)
+                merged.append((line, recovered[match]))
+            else:
+                merged.append((line, by_uid[uid].ts))
+        merged += [(line, when) for line, when in recovered.items()
+                   if line not in claimed]
         self.terminal.set_reply_marks(
             sorted((line, _format_reply_stamp(when)) for line, when in merged))
 
     def _on_reply_mark_added(self) -> None:
         """A reply-finished milestone was recorded on the agent (or the set
-        was cleared, e.g. a restart). Only the newest mark can ever be new
-        here -- note_reply_settled() appends exactly one mark per call, so
-        the CARD only has to catch up on the tail; an already-anchored mark
-        keeps whatever line _replay_with_marks (or an earlier call here) gave
-        it."""
+        was cleared, e.g. a restart). Only the newest mark can ever have moved
+        here, so the CARD only has to re-read the tail; every older mark keeps
+        whatever line _replay_with_marks (or an earlier call here) gave it.
+
+        The newest one is re-anchored on EVERY signal rather than only the
+        first time it is seen, because a turn that settles again moves its own
+        mark forward (see TerminalAgent.note_reply_settled) and the stamp has
+        to follow it to where the reply actually ended. When the anchor cannot
+        be found the mark keeps the row it already had, so a settle on an
+        awkward screen never costs a stamp that was already placed."""
         if not self.is_pty:
             return
         marks = self.agent.reply_marks()
@@ -1479,11 +1650,9 @@ class TerminalCard(QFrame):
             self._reply_mark_lines = {}
             self._refresh_reply_marks()
             return
-        latest = marks[-1]
-        if latest.uid not in self._reply_mark_lines:
-            line = self.terminal.reply_anchor_line()
-            if line is not None:
-                self._reply_mark_lines[latest.uid] = line
+        line = self.terminal.reply_anchor_line()
+        if line is not None:
+            self._reply_mark_lines[marks[-1].uid] = line
         self._refresh_reply_marks()
 
     def _place_overlay(self) -> None:
@@ -1552,8 +1721,52 @@ class TerminalCard(QFrame):
 
     # ------------------------------------------------------------- status ---
 
-    def _on_activity(self, _busy: bool) -> None:
+    def _on_activity(self, busy: bool) -> None:
         self._on_status(self.agent.status)
+        if not busy:
+            self._rescan_recovery()
+
+    def _rescan_recovery(self) -> None:
+        """Look for the milestones of a conversation that was reprinted AFTER
+        the card was built, once the screen has settled.
+
+        Milestone recovery normally rides a PROJECTION (_rerender_restored on a
+        card build, _reproject_on_size on a width change), which is the right
+        place for it: the scan has to run against the screen the marks will be
+        drawn on. The launch autostart has neither. `drop_restored_screen`
+        cancels the settled-size projection for every agent it is about to
+        start (that snapshot is the previous run's screen, hard-wrapped for a
+        width nothing can reflow), and `_reproject_on_size` bails while the
+        history is still empty -- which it is, because `settle_layout` sizes
+        the card BEFORE the child is spawned. So the only projection a restored
+        RUNNING card gets is the constructor's, and that runs before the child
+        has printed a single byte.
+
+        The conversation then arrives seconds later, reprinted by `--resume`,
+        with nothing left to scan it. Every stamp and every prompt dot in a
+        reopened hive was therefore missing -- which went unnoticed only
+        because a phantom live mark used to appear on the last reply instead,
+        stamped with the launch time (see TerminalAgent._note_submit). Fixing
+        that revealed this.
+
+        Bounded, because the scan is MEASURED at ~35 ms over a full 2000-row
+        history and a settle fires every couple of seconds while an agent
+        works: it runs only while nothing has been recovered yet, and gives up
+        after _RECOVER_RESCAN_TRIES settles. A scan that finds anything found
+        everything findable -- the reprint lands in one go -- so success ends
+        it for good, and a conversation whose replies have all scrolled out of
+        reach stops asking rather than re-scanning forever."""
+        if not self.is_pty or self._recover_tries <= 0:
+            return
+        if self._recovered or self._recovered_replies:
+            self._recover_tries = 0     # already anchored: never scan again
+            return
+        self._recover_tries -= 1
+        rows = self._scrollback_rows()
+        self._recover_marks(rows)
+        self._recover_reply_marks(rows)
+        self._refresh_marks()
+        self._refresh_reply_marks()
 
     def _on_status(self, status: AgentStatus) -> None:
         busy = bool(getattr(self.agent, "is_busy", lambda: False)())
@@ -1591,7 +1804,11 @@ class TerminalCard(QFrame):
             # and the wake banner owns the stopped one
             if running and not self.agent.prompt_ready():
                 self._begin_boot_veil()
-            elif not running:
+            elif not running and not self._boot_seed:
+                # a RESTORED card that stays stopped keeps the veil until its
+                # settled-width projection lands (_rerender_restored); the
+                # wake banner owns the state only once there is something
+                # readable under it
                 self._dismiss_boot_veil()
 
         if status is AgentStatus.STARTING:

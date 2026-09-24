@@ -3,141 +3,336 @@
 Shared by two callers that must agree exactly, which is why the patterns live
 here rather than in either of them: `terminal_agent` matches them against the
 LIVE screen, and `transcripts` matches them against the conversation on disk
-(the durable record used to recover agents at startup). Qt-free and stdlib-only
-like `chime.py` / `claude_usage.py`, because `transcripts` is.
+(the durable record used to recover agents at startup, and swept once a
+minute as a second detector). Qt-free and stdlib-only like `chime.py` /
+`claude_usage.py`, because `transcripts` is.
 
 TWO PROVIDERS are recognised, and their cut-offs are not the same shape at all
 (see the Gemini section at the bottom for what that costs). `LIMIT_PROVIDERS`
 is the set every caller should gate on rather than spelling out either name.
 
-TWO signals, in order of reliability:
+EVERY CLAUDE PATTERN IS MATCHED WITH THE WHITESPACE REMOVED. This is the rule
+that matters most in this file, and breaking it silently disables the live
+detector. Claude's classic renderer (`tui: "default"`, the one AI Hive runs)
+places words by jumping the cursor (`CSI n G` / `CSI n C`) instead of printing
+the spaces between them, so once `terminal_agent` strips escapes a row reads
+"You'vehityoursessionlimit\xb7resets6:40pm". Measured 2026-09-24 on the 16
+saved screen streams: roughly two rows in three arrive like that, assistant
+prose included. Every pattern here used to require `\\s+` between words, so a
+banner painted that way never matched, and whether a cut-off was caught was a
+coin flip per frame. `_has_ready_hint` had already learned this for the input
+box footer; the limit detector had not. So: `_despace` both sides, compare,
+and keep `banner_key` (the despaced form) as the identity of a cut-off, since
+the same banner can come back spaced on one repaint and despaced on the next.
 
-  * `LIMIT_MENU_RE` — the interactive menu Claude parks the agent on:
+The cut-off lines, all read off claude.exe 2.1.281's own formatters:
 
-        What do you want to do?
-        > 1. Stop and wait for limit to reset
-          2. Upgrade your plan
-        Enter to confirm - Esc to cancel
+  * the 429 banner, `You've hit your <label>` + optional " \xb7 resets <when>"
+    + optional " \xb7 progress saved". <label> is "session limit" / "weekly
+    limit" / "Opus limit" / "Sonnet limit" / "Fable limit" / "usage limit" /
+    "usage credit limit" / plain "limit" / "monthly spend limit" / "team's
+    shared budget" / ... ("fast limit" is Fast mode falling back, NOT a
+    cut-off). Written to the transcript as a synthetic assistant record with
+    `error: "rate_limit"` and a `quotaLimits` block carrying the exact reset
+    epoch, which `transcripts` prefers over the printed clock.
+  * `You're out of usage credits \xb7 resets <when>`.
+  * the CLI's own auto-continue: `Usage limit reached \xb7 continuing
+    automatically at 10:10pm \xb7 esc or type to cancel` (also "... continuing
+    shortly", "... when it resets", "... again after you continued"), and the
+    grace-window status `Usage limit reached \xb7 wrapping up` / bare `Usage
+    limit reached`. Claude continues by itself when it can, so AI Hive only
+    steps in if the conversation shows it did not.
+  * `Your usage limit has reset \xb7 press enter to continue`: the auto-continue
+    went stale (the reset passed while nothing could fire it) and Claude is
+    now WAITING FOR A KEYPRESS. Due immediately.
 
-    This is the PRIMARY live signal, because it is the thing that STAYS on
-    screen for as long as the agent is stuck. Its disappearance is equally
-    meaningful: it is how we tell a resume actually took.
+`LIMIT_MENU_RE` is the older interactive "Stop and wait for limit to reset"
+menu. Not drawn by current versions, kept for whatever install still shows it.
 
-  * `LIMIT_HIT_RE` — the banner (`You've hit your session limit - resets 3am`).
-    Ordinary scrollback, so on the live screen a 4000-char rolling tail evicts
-    it within a couple of hours of idling — do not rely on it alone there. It
-    IS, however, what lands in the transcript, so it is the only signal
-    available when reconstructing a cut-off from disk.
-
-Both deliberately EXCLUDE `Approaching ...` and `You've used N% of your ...`:
-those render while the agent is still working, and nudging it would interrupt
-real work. Verified against claude.exe 2.1.220, which builds them from
-`You've hit your ${label}` with {five_hour:"session limit",
-seven_day:"weekly limit", ...}.
+All of them deliberately EXCLUDE `Approaching ...` and `You've used N% of your
+...`: those render while the agent is still working, and nudging it would
+interrupt real work. And every one must be the WHOLE start of its own short
+line, which is what keeps an agent's own prose about a limit from latching.
 """
 
+import datetime
+import functools
 import re
 import time
+import zoneinfo
 
 # Providers whose cut-off this module can recognise at all. Everything in the
 # recovery path (the live scrape, the resume pass) gates on this rather than on
 # a literal "claude", so adding a third CLI is a change here plus its patterns.
 LIMIT_PROVIDERS = ("claude", "gemini")
 
-# The parked-on menu — primary, because it persists while the agent is stuck.
-LIMIT_MENU_RE = re.compile(r"stop\s+and\s+wait\s+for\s+limit\s+to\s+reset",
-                           re.I)
+# The old parked-on menu. `\s*` rather than `\s+` for the despacing reason in
+# the module docstring: this one is searched on the raw escape-stripped region.
+LIMIT_MENU_RE = re.compile(
+    r"stop\s*and\s*wait\s*for\s*limit\s*to\s*reset", re.I)
 
-# The banner — secondary on screen (it scrolls), but it is what the transcript
-# records, so it is the startup-recovery signal.
-# The window name is CAPTURED, not just matched: "session" carries a bare clock
-# that is always within 24 h, but a "weekly" window can be days out and its
-# banner still prints only a wall time — so the two cannot be trusted equally.
-# See `banner_window`.
-LIMIT_HIT_RE = re.compile(r"you['’]ve hit your\s+"
-                          r"(session|weekly|usage|opus|sonnet)\s+limit",
-                          re.I)
+# --- the despaced patterns. Each runs on `_despace(line)`: gutter stripped,
+# every whitespace character removed, lower-cased. ---
 
-# The banner states its own reset time ("- resets 8:30pm (Europe/Bucharest)"),
-# already in LOCAL time. This is the network-free half of the trigger: it
-# survives a usage-endpoint 429, a missed API edge, and an app restart, none of
-# which the account-wide reading does. The timezone suffix is ignored on
-# purpose — the clock shown is already the user's own.
-_LIMIT_RESET_RE = re.compile(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
-                             re.I)
+# `You've hit your <label>`. The label is captured so the window can be named.
+# It must END the phrase: followed by the " \xb7 " separator, a full stop, the
+# "(Europe/...)" of a bare reset, or the end of the line. That is what keeps
+# "You've hit your limit on retries, so..." (prose) out. "fast" is excluded:
+# Fast mode's cap switches the model back, it does not stop the agent.
+_HIT_RE = re.compile(
+    r"you['’]vehityour(?!fast)([a-z0-9.'’]{0,40}?)(?:limit|budget)(?=[·•.(]|$)")
 
+_OUT_OF_CREDITS_RE = re.compile(r"you['’]reoutofusagecredits(?=[·•.(]|$)")
 
-# Claude's banner is a SHORT injected message ("You've hit your session limit -
-# resets 3am (Europe/Bucharest)" is ~61 chars). Anything long containing those
-# words is an agent TALKING ABOUT the limit, not being stopped by it — which is
-# not hypothetical: an agent working on this very feature quoted the banner in
-# its own output and was armed for a resume it never needed. A real cut-off is
-# always its own short line.
+# The CLI's own auto-continue and grace-window status lines. Again the phrase
+# must end where Claude ends it: `Usage limit reached" cut-off` (an agent
+# quoting the words, which latched a live agent twice on 2026-08-31) does not.
+_REACHED_RE = re.compile(r"usagelimitreached(?=[·•]|$)")
+
+# The auto-continue went stale and is waiting for Enter.
+_STALE_RE = re.compile(r"yourusagelimithasreset(?=[·•]|$)")
+
+# The CLI logged that it continued by itself. Not a cut-off: the END of one.
+_RESET_NOTICE_RE = re.compile(r"usagelimitreset(?=[·•]|$)")
+
+# The captured 429 label -> the window name the rest of the app uses, first
+# substring match wins. "weekly"/"opus"/"sonnet"/"fable" are all 7-day windows
+# (see `SEVEN_DAY_WINDOWS`); anything unrecognised ("monthly spend", "team's
+# shared", a bare "limit") is "usage", which is treated as an ordinary window.
+_LABEL_WINDOWS = (("session", "session"), ("weekly", "weekly"),
+                  ("opus", "opus"), ("sonnet", "sonnet"), ("fable", "fable"),
+                  ("credit", "credit"))
+
+# Windows that can be days away. A bare clock on one of these cannot be
+# resolved (it names a time, not a day), so only a DATED clock or an exact
+# epoch may be trusted for them; see `reset_is_dated`.
+SEVEN_DAY_WINDOWS = ("weekly", "opus", "sonnet", "fable")
+
+# `quotaLimits.rateLimitType` on a transcript's 429 record, in window names.
+RATE_LIMIT_WINDOWS = {"five_hour": "session", "seven_day": "weekly",
+                      "seven_day_opus": "opus", "seven_day_sonnet": "sonnet",
+                      "seven_day_overage_included": "fable",
+                      "overage": "credit"}
+
+# Month abbreviations, for the dated form of a reset: more than 24 h out,
+# claude.exe renders `toLocaleString("en-US", {month:"short", day:"numeric",
+# hour, minute})` with " AM" folded to "am", so "Sep 30, 9am" or "Sep 30,
+# 3:15pm", plus ", 2027" when the year differs. English only, like the rest of
+# this module.
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+
+# The banner's own reset time. `\s*` throughout so it reads the despaced form
+# too ("resets6:40pm", "continuingautomaticallyatsep30,9am").
+_LIMIT_RESET_RE = re.compile(
+    r"(?:resets|continuing\s*automatically\s*at|continuing\s*shortly\s*at)"
+    r"\s*(?:([a-z]{3})[a-z]*\.?\s*(\d{1,2}),\s*(?:(\d{4}),\s*)?)?"
+    r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+    re.I)
+
+# The IANA zone claude.exe prints after a clock, "(Europe/Bucharest)". It is
+# the zone of the claude.exe process, which is USUALLY this machine's too, but
+# not always: Node honours an IANA `TZ` environment variable, and Python's
+# Windows C runtime cannot parse one, so with TZ=America/New_York set Claude
+# prints New York time while `time.localtime` still reads the system zone.
+# Reading the clock in the zone it names is right either way. Anchored to the
+# clock's end so no other parenthesis on the line can supply it.
+_ZONE_RE = re.compile(r"\s*\(\s*([A-Za-z_]+(?:/[A-Za-z0-9_+\-]+){0,2})\s*\)")
+
+# Claude's banner is a SHORT injected message ("You've hit your session limit
+# \xb7 resets 3am (Europe/Bucharest)" is ~61 chars). Anything long containing
+# those words is an agent TALKING ABOUT the limit, not being stopped by it.
 _BANNER_MAX_CHARS = 200
 
 # Everything a TUI can paint to the LEFT of the message itself: indentation,
 # the box-drawing gutter Claude draws down its output, the selection caret, and
 # the warning glyph agy puts in front of an error (with its variation selector,
-# which arrives as a separate code point). Stripped before matching so both
-# banners can be anchored at the start of their line, which is the discriminator
-# that keeps an agent's own prose about a limit from being read as one.
-_GUTTER = " \t│┃|>❯⚠✗✘×•*️"
+# which arrives as a separate code point). Stripped before matching so the
+# banners can be anchored at the start of their line.
+#
+# `⎿` (U+23BF, the tool-result gutter) and `●` (U+25CF, the assistant bullet)
+# are load-bearing: a 429 that lands while a tool is running is painted as a
+# TOOL-RESULT ROW, "  ⎿ You've hit your session limit \xb7 resets 6:40pm", and
+# missing them cost a live 5-hour cut-off on 2026-08-31. U+00A0 rides along
+# because Claude separates that gutter from the text with a no-break space.
+_GUTTER = " \t\xa0│┃⎿●|>❯⚠✗✘×•*️"
+
+_WS_RE = re.compile(r"\s+")
 
 
 def _strip_gutter(line: str) -> str:
     return line.lstrip(_GUTTER).strip()
 
 
+def _despace(text: str) -> str:
+    """`text` with every whitespace character removed and lower-cased: the one
+    form in which a spaced and a cursor-positioned rendering of the same row
+    compare equal. `\\s` covers U+00A0 and U+202F for `str` patterns."""
+    return _WS_RE.sub("", text or "").lower()
+
+
+def _classify(line: str) -> str:
+    """What kind of cut-off line `line` is (already gutter-stripped), or ""."""
+    if not line or len(line) > _BANNER_MAX_CHARS:
+        return ""
+    d = _despace(line)
+    if not d:
+        return ""
+    if _HIT_RE.match(d):
+        return "hit"
+    if _OUT_OF_CREDITS_RE.match(d):
+        return "credits"
+    if _REACHED_RE.match(d):
+        return "reached"
+    if _STALE_RE.match(d):
+        return "stale"
+    return ""
+
+
+def _find_banner(text: str) -> tuple[str, str]:
+    """`(line, next_line)` for the LAST cut-off line in `text`, or ("", "").
+
+    `next_line` is the following non-blank row, gutter-stripped. A narrow card
+    wraps "... \xb7 resets" / "6:40pm (Europe/Bucharest)" across two rows, and
+    the clock is only readable with both halves."""
+    if not text:
+        return "", ""
+    lines = [_strip_gutter(ln) for ln in text.splitlines()]
+    found = ("", "")
+    for i, line in enumerate(lines):
+        if not _classify(line):
+            continue
+        nxt = next((ln for ln in lines[i + 1:i + 3] if ln), "")
+        found = (line, nxt)
+    return found
+
+
 def banner_line(text: str) -> str:
-    """The banner line itself, normalized, or "" when `text` holds none.
+    """The cut-off line itself (gutter-stripped, otherwise as drawn), or ""
+    when `text` holds none.
 
     Anchoring at the start of the line is the real discriminator: Claude's
     banner is injected as its own line, while an agent discussing the limit
     embeds the same words in a sentence. The length cap is a second guard for
     the case where prose happens to begin with the phrase.
 
-    Returning the LINE rather than a bool is what lets a caller tell one
-    cut-off from another: the banner names its own reset clock, and successive
-    5-hour windows never end at the same wall time, so the text doubles as the
-    identity of the cut-off that produced it. `terminal_agent._scrape_limit`
-    uses that to ignore the banner still sitting on screen after a resume.
+    Returns the LINE rather than a bool so it can double as the identity of
+    the cut-off (it names its own reset clock, and successive 5-hour windows
+    never end at the same wall time). Compare identities with `banner_key`,
+    never with `==` on this: the same row can be spaced on one repaint and
+    despaced on the next.
 
     The LAST match wins: when an old banner and a fresh one are both in view,
     the newest is the one describing the current state.
     """
-    found = ""
-    if not text:
-        return found
-    for line in text.splitlines():
-        line = _strip_gutter(line)
-        if len(line) <= _BANNER_MAX_CHARS and LIMIT_HIT_RE.match(line):
-            found = line
-    return found
+    return _find_banner(text)[0]
+
+
+def banner_key(text: str) -> str:
+    """The comparable identity of a banner line: despaced and lower-cased, so
+    a spaced and a cursor-positioned rendering of one cut-off are equal."""
+    return _despace(_strip_gutter(text or ""))
+
+
+def same_banner(a: str, b: str) -> bool:
+    """Whether two banner lines describe the SAME cut-off.
+
+    Equal `banner_key`s, or one a prefix of the other when the shorter one
+    already states its clock: a narrow card wraps "(Europe/Bucharest)" or
+    "\xb7 progress saved" onto the next row, so the screen's first row is a
+    prefix of the transcript's whole line. A prefix that stops BEFORE the
+    clock is not enough, because it cannot tell two windows apart."""
+    ka, kb = banner_key(a), banner_key(b)
+    if not ka or not kb:
+        return False
+    if ka == kb:
+        return True
+    short, long_ = (ka, kb) if len(ka) < len(kb) else (kb, ka)
+    return long_.startswith(short) and bool(_LIMIT_RESET_RE.search(short))
 
 
 def banner_in(text: str) -> bool:
-    """True when `text` contains the banner AS a banner — a short line that
-    OPENS with it — not prose that merely mentions it mid-sentence."""
+    """True when `text` contains a cut-off line AS one, not prose that merely
+    mentions it mid-sentence."""
     return bool(banner_line(text))
 
 
 def banner_window(text: str) -> str:
-    """Which limit window the banner names — "session" / "weekly" / "opus" /
-    "sonnet" / "usage" — or "" when `text` holds no banner.
+    """Which limit window the banner names ("session" / "weekly" / "opus" /
+    "sonnet" / "fable" / "usage" / "credit"), or "" when it names none (the
+    auto-continue and grace-window lines never do) or `text` holds no banner.
 
-    Worth carrying because the two kinds of window are NOT equally readable off
-    the screen. A session banner's bare "resets 3am" is unambiguous: the next
-    3am is at most 24 h away, which is the only thing `parse_reset_clock` can
-    resolve. A WEEKLY banner prints the same bare clock for a reset that may be
-    days out, so resolving it the same way lands early — by up to a week. A
-    caller acting on a weekly cut-off must therefore wait for the account
-    reading rather than trusting the clock on screen.
+    Worth carrying because a 7-day window's bare clock is not readable off the
+    screen: "resets 8pm" on a weekly banner may be days away. See
+    `SEVEN_DAY_WINDOWS` and `reset_is_dated`.
     """
     line = banner_line(text)
+    kind = _classify(line)
+    if kind == "credits":
+        return "credit"
+    if kind != "hit":
+        return ""
+    label = _HIT_RE.match(_despace(line)).group(1)
+    for key, window in _LABEL_WINDOWS:
+        if key in label:
+            return window
+    return "usage"
+
+
+def banner_clock_text(text: str) -> str:
+    """The text a banner's reset clock should be read from: the banner line,
+    plus its wrapped continuation row when the line itself states no clock.
+    "" when `text` holds no banner. Reading the whole screen region instead is
+    how an unrelated "resets ..." elsewhere on screen (an agent's prose, a
+    usage warning) once dated a cut-off four days out."""
+    line, nxt = _find_banner(text)
     if not line:
         return ""
-    m = LIMIT_HIT_RE.match(line)
-    return m.group(1).lower() if m else ""
+    if not nxt:
+        return line
+    if _LIMIT_RESET_RE.search(line):
+        # a narrow card can wrap the zone alone onto the next row, and without
+        # it the clock falls back to the local zone
+        if _ZONE_RE.match(nxt) and not _ZONE_RE.search(line):
+            return line + " " + nxt
+        return line
+    # Borrow the next row only when this one visibly stops mid-phrase (Ink
+    # wraps at word boundaries, so a clock pushed to the next row leaves
+    # "resets" / "at" / the separator dangling). A banner that simply HAS no
+    # clock ("... usage limit \xb7 contact your admin") must not pick one up
+    # from whatever prose follows it.
+    if not _despace(line).endswith(("resets", "at", "\xb7", "•")):
+        return line
+    return line + " " + nxt
+
+
+def banner_due_now(text: str) -> bool:
+    """True when the banner says the window has ALREADY reopened: the stale
+    "Your usage limit has reset \xb7 press enter to continue" (Claude is waiting
+    for a keypress), or "... continuing shortly" (its own timer is about to
+    fire). Either way there is no clock to wait for."""
+    line = banner_line(text)
+    if not line:
+        return False
+    return (_classify(line) == "stale"
+            or "continuingshortly" in _despace(line))
+
+
+def is_reset_notice(text: str) -> bool:
+    """True when `text` is the CLI's own "Usage limit reset \xb7 continuing
+    automatically" line: the cut-off before it ENDED without AI Hive."""
+    line = _strip_gutter(text or "")
+    return bool(line) and len(line) <= _BANNER_MAX_CHARS \
+        and bool(_RESET_NOTICE_RE.match(_despace(line)))
+
+
+def reset_is_dated(text: str) -> bool:
+    """True when the banner's reset names a DATE ("Sep 30, 9am"), which the CLI
+    does whenever the reset is more than 24 h out. A dated clock resolves
+    exactly; a bare one is only safe for a window that is at most a day long."""
+    m = _LIMIT_RESET_RE.search(banner_clock_text(text) or "")
+    return bool(m and m.group(1) and m.group(2))
 
 
 def is_limit_screen(text: str) -> bool:
@@ -147,13 +342,61 @@ def is_limit_screen(text: str) -> bool:
     return bool(LIMIT_MENU_RE.search(text)) or banner_in(text)
 
 
+@functools.lru_cache(maxsize=16)
+def _zone(name: str) -> zoneinfo.ZoneInfo | None:
+    """The named IANA zone, or None when this Python has no tz database entry
+    for it (Windows has none of its own: the `tzdata` package supplies it).
+    None means "read the clock in the local zone", the pre-zone behaviour."""
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+
+
+def wall_epoch(year: int, month: int, day: int, hour: int, minute: int,
+               tz: datetime.tzinfo | None = None) -> float:
+    """Epoch seconds of a wall-clock moment in `tz`, or in the local zone when
+    `tz` is None. Raises ValueError for a date that doesn't exist."""
+    if tz is None:
+        datetime.date(year, month, day)  # validate: mktime would roll it over
+        return time.mktime((year, month, day, hour, minute, 0, 0, 0, -1))
+    return datetime.datetime(year, month, day, hour, minute,
+                             tzinfo=tz).timestamp()
+
+
+def next_wall_clock(hour: int, minute: int, now: float,
+                    tz: datetime.tzinfo | None = None) -> float:
+    """Epoch seconds of the next `hour:minute` on the wall clock of `tz` (local
+    when None): today if still ahead of `now`, else tomorrow.
+
+    "Tomorrow" is rebuilt from tomorrow's DATE rather than `today + 86400`,
+    because the night the clocks change is 23 or 25 hours long, and adding a
+    fixed day there lands an hour off the wall time that was asked for."""
+    today = datetime.datetime.fromtimestamp(now, tz).date()
+    target = wall_epoch(today.year, today.month, today.day, hour, minute, tz)
+    if target <= now:
+        nxt = today + datetime.timedelta(days=1)
+        target = wall_epoch(nxt.year, nxt.month, nxt.day, hour, minute, tz)
+    return target
+
+
 def parse_reset_clock(text: str, now: float | None = None) -> float | None:
     """Epoch seconds of the NEXT occurrence of the wall clock in a limit
     banner, or None when there is no time in it.
 
     A bare clock time carries no date, so it resolves to today if that moment
     is still ahead and tomorrow otherwise — the rollover that matters, since
-    the banner is usually read late at night about a small-hours reset.
+    the banner is usually read late at night about a small-hours reset. The
+    dated form ("Sep 30, 9am", optionally with a year) skips that guess
+    entirely and is resolved directly, except across a Dec->Jan boundary,
+    where the named date would otherwise land weeks in the past.
+
+    The clock is read in the zone printed after it ("(Europe/Bucharest)", see
+    `_ZONE_RE`), and in the local zone when there is none or it is unknown.
+    "Today" is that zone's today.
+
+    Pass it a banner LINE (`banner_clock_text`), not a whole screen region:
+    this reads the first clock it finds.
 
     `now` is the ANCHOR, and passing the right one is essential for anything
     read from disk — see `banner_reset_at`.
@@ -161,7 +404,8 @@ def parse_reset_clock(text: str, now: float | None = None) -> float | None:
     m = _LIMIT_RESET_RE.search(text or "")
     if not m:
         return None
-    hour, minute, ampm = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+    mon, day, year, hour, minute, ampm = m.groups()
+    hour, minute = int(hour), int(minute or 0)
     if ampm:
         ampm = ampm.lower()
         if hour == 12:
@@ -170,13 +414,30 @@ def parse_reset_clock(text: str, now: float | None = None) -> float | None:
             hour += 12
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return None
+    zm = _ZONE_RE.match(text, m.end())
+    tz = _zone(zm.group(1)) if zm else None
     now = time.time() if now is None else now
-    lt = time.localtime(now)
-    target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hour, minute, 0,
-                          0, 0, -1))
-    if target <= now:
-        target += 86400
-    return target
+    if mon and day:
+        month = _MONTHS.get(mon.lower()[:3])
+        if month is None or not (1 <= int(day) <= 31):
+            return None
+        this_year = datetime.datetime.fromtimestamp(now, tz).year
+        yr = int(year) if year else this_year
+        try:
+            target = wall_epoch(yr, month, int(day), hour, minute, tz)
+        except (OverflowError, ValueError):
+            return None
+        # a 7-day reset is at most ~8 days out, so a named date (with no year)
+        # that lands more than a few days in the past can only mean the window
+        # wraps into next year (a Dec banner naming a January reset).
+        if not year and target < now - 3 * 86400:
+            try:
+                target = wall_epoch(this_year + 1, month, int(day), hour,
+                                    minute, tz)
+            except (OverflowError, ValueError):
+                return None
+        return target
+    return next_wall_clock(hour, minute, now, tz)
 
 
 def banner_reset_at(text: str, written_at: float) -> float | None:
@@ -188,8 +449,13 @@ def banner_reset_at(text: str, written_at: float) -> float | None:
     02:42 saying "resets 3am" means 03:00 THAT DAY — already past, so the agent
     resumes immediately. Resolved against the current clock instead it would
     land on 3am TOMORROW and the agent would sit idle for a full day.
+
+    Reads the banner line only (`banner_clock_text`), so any other "resets"
+    in the same message cannot supply the clock. A `text` with no banner in it
+    at all is parsed as given, for callers that already hold the line.
     """
-    return parse_reset_clock(text, written_at)
+    clock = banner_clock_text(text) or text
+    return parse_reset_clock(clock, written_at)
 
 
 # --------------------------------------------------------------- Gemini ---

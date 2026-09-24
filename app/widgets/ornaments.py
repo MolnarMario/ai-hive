@@ -12,7 +12,7 @@ from functools import lru_cache
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
                             QEvent, QRectF, Qt, QTimer, QVariantAnimation,
                             Signal)
-from PySide6.QtGui import (QColor, QFont, QFontMetrics, QImage,
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage,
                            QLinearGradient, QPainter, QPainterPath, QPen,
                            QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
@@ -627,8 +627,8 @@ class UsagePillBadge(QWidget):
     appears on hover to close the pill.
 
     Painted rather than styled, for the same reason as `AgentCountBadge`: the
-    colour has to switch on utilization (green -> amber -> red) AND track the
-    active skin, and per-state QSS would fight the theme registry. Reading
+    colour has to switch on utilization (provider ink -> red at 85%) AND track
+    the active skin, and per-state QSS would fight the theme registry. Reading
     `Palette` at paint time gives both for free.
 
     THE WIDTH IS THE TEXT'S WIDTH, measured with the font `paintEvent` actually
@@ -683,9 +683,17 @@ class UsagePillBadge(QWidget):
     _FILL_ALPHA, _BORDER_ALPHA = 30, 140          # a live reading
     _FILL_ALPHA_DIM, _BORDER_ALPHA_DIM = 18, 90   # loading or stale
 
-    # utilization thresholds. Deliberately generous: amber is a nudge, red is
-    # "wrap up", because being cut off mid-task is the thing we're avoiding.
-    _AMBER, _RED = 60.0, 85.0
+    # At or above this the pill turns red whatever the provider: "wrap up",
+    # because being cut off mid-task is the thing we're avoiding. Below it a
+    # pill wears its provider's ink (`ui_theme.usage_pill_ink`), so three
+    # agents' pills stay tellable apart and only the one near its limit
+    # changes colour. There is no amber step any more; it would read as a
+    # fourth provider.
+    _RED = 85.0
+
+    # whose pill this is: "claude", "gemini" or "codex". None keeps the
+    # generic green, for a pill with no provider ink.
+    _PROVIDER: str | None = None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -916,12 +924,10 @@ class UsagePillBadge(QWidget):
     def _color(self) -> QColor:
         if self._loading or self._stale or self._limit is None:
             return QColor(Palette.TEXT_DIM)
-        pct = self._limit.percent
-        if pct >= self._RED:
+        if self._limit.percent >= self._RED:
             return QColor(Palette.RED)
-        if pct >= self._AMBER:
-            return QColor(Palette.YELLOW)
-        return QColor(Palette.GREEN)
+        ink = ui_theme.usage_pill_ink(self._PROVIDER) if self._PROVIDER else None
+        return QColor(ink or Palette.GREEN)
 
     def paintEvent(self, event):
         if self._limit is None and not self._unreadable and not self._loading:
@@ -1071,8 +1077,8 @@ class PlanUsageBadge(UsagePillBadge):
     """The top-bar readout of one Claude account plan-usage window (5-hour
     session, or 7-day):
 
-        (o) 5h 21% used, resets in 1h20m at 14:49
-        (o) 7d 40% used, resets in 3d14h at 09:00
+        (o) 5h Claude 21% used, resets in 1h20m at 14:49
+        (o) 7d Claude 40% used, resets in 3d14h at 09:00
 
     A percent ring plus one line, in the order the user asked for — countdown
     first ("how long have I got"), wall-clock second, both in LOCAL time. The
@@ -1082,8 +1088,8 @@ class PlanUsageBadge(UsagePillBadge):
     multi-day duration) is unreadable at a glance.
 
     Painted rather than styled, for the same reason as `AgentCountBadge`: the
-    colour has to switch on utilization (green -> amber -> red) AND track the
-    active skin, and per-state QSS would fight the theme registry. Reading
+    colour has to switch on utilization (provider ink -> red at 85%) AND track
+    the active skin, and per-state QSS would fight the theme registry. Reading
     `Palette` at paint time gives both for free.
 
     The widget is a pure VIEW — it never fetches. `MainWindow` polls off-thread
@@ -1100,6 +1106,8 @@ class PlanUsageBadge(UsagePillBadge):
     error pill keeps the click-to-refresh affordance, which is the one useful
     thing a user can do about it.
     """
+
+    _PROVIDER = "claude"
 
     def __init__(self, parent=None, window: str = "five_hour"):
         super().__init__(parent)
@@ -1419,6 +1427,95 @@ class ElidingLabel(QLabel):
         fm = QFontMetrics(self.font())
         self.setText(fm.elidedText(self._full, Qt.TextElideMode.ElideRight,
                                    avail))
+
+
+class FadingLabel(QLabel):
+    """A label whose text DISSOLVES where something else is painted on top of
+    it, instead of running its glyphs straight through it.
+
+    The sidebar workspace row is the case this exists for. Its status badges
+    are positioned by hand over the row's right end and raised above the name,
+    because sharing a layout with the name lets Qt crush them into slivers
+    (see WorkspaceRow._icon_stack). The name underneath had nothing telling it
+    to stop, so a long name painted through the icons and neither the word nor
+    the glyph was readable - reported live, with "Video Production" wearing a
+    gear and a spinner in the middle of it.
+
+    Eliding to a "..." was rejected: the name is the row's identity, and there
+    is no reason to truncate it on the rows where nothing is lit. So the row
+    hands this label the left edge of whatever covers it (`set_fade_x`) and
+    the text ramps to transparent over the last pixels before that edge.
+    Nothing is truncated, no layout width is reserved, and a row with no
+    badges lit paints through `QLabel.paintEvent` exactly as before.
+
+    The ramp is a GRADIENT PEN, not a masked image: text drawn with a brush
+    pen picks the alpha up per pixel for free. The obvious alternative -
+    render the label into an image and mask it with a DestinationIn gradient -
+    was written first and does NOT work here, because `QWidget.render` is
+    guarded against re-entrancy and a render already in flight (a drag
+    pixmap, `grab()`, any outer `render()`) makes the nested one paint
+    nothing at all, blanking the name. Hand-drawing means this class owns the
+    text layout, so it copies the three things QLabel would have used: the
+    contents rect, the alignment, and the palette's foreground colour (which
+    is where the QSS `#WsName { color }` rule lands).
+    """
+
+    _FADE_W = 24        # px the text takes to disappear
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._fade_x = None
+
+    def fade_x(self):
+        return self._fade_x
+
+    def set_fade_x(self, x) -> None:
+        """Set the left edge, IN THIS LABEL'S COORDINATES, of what is covering
+        it. None means nothing is: paint the whole text."""
+        x = None if x is None else max(0, int(x))
+        if x == self._fade_x:
+            return
+        self._fade_x = x
+        self.update()
+
+    def _fades(self) -> bool:
+        """True when the text genuinely reaches under the cover. A name that
+        stops short of the icons is left completely alone, so the fade only
+        ever shows where there would otherwise be a collision.
+
+        A cover that starts at or before this label (`fade_x` 0, which is what
+        every badge lighting up at once in a 230px sidebar produces) still
+        fades - to nothing. Treating that as "no fade" is what the row was
+        doing wrong in the first place: it puts the whole name back under the
+        icons, exactly where it cannot be read."""
+        if self._fade_x is None or not self.text():
+            return False
+        if self._fade_x >= self.width():
+            return False
+        return (QFontMetrics(self.font()).horizontalAdvance(self.text())
+                > self._fade_x)
+
+    def paintEvent(self, event):
+        if not self._fades():
+            super().paintEvent(event)
+            return
+        if self._fade_x <= 0:
+            return          # the cover starts at our left edge: no ink at all
+        x1 = float(self._fade_x)
+        x0 = max(0.0, x1 - self._FADE_W)
+        ink = self.palette().color(self.foregroundRole())
+        gone = QColor(ink)
+        gone.setAlpha(0)
+        grad = QLinearGradient(x0, 0.0, x1, 0.0)
+        grad.setColorAt(0.0, ink)
+        grad.setColorAt(1.0, gone)   # PadSpread: solid left of x0, gone right of x1
+        p = QPainter(self)
+        p.setFont(self.font())
+        p.setPen(QPen(QBrush(grad), 1))
+        p.drawText(self.contentsRect(),
+                   int(self.alignment() | Qt.TextFlag.TextSingleLine),
+                   self.text())
+        p.end()
 
 
 class ToggleSwitch(QWidget):

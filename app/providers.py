@@ -61,14 +61,17 @@ CLAUDE_EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
 
 GEMINI_MODELS = (
     ("Default", ""),
+    ("Gemini 3.8 Flash (High)", "Gemini 3.8 Flash (High)"),
+    ("Gemini 3.8 Flash (Medium)", "Gemini 3.8 Flash (Medium)"),
+    ("Gemini 3.8 Flash (Low)", "Gemini 3.8 Flash (Low)"),
+    ("Gemini 3.7 Flash (High)", "Gemini 3.7 Flash (High)"),
+    ("Gemini 3.7 Flash (Medium)", "Gemini 3.7 Flash (Medium)"),
+    ("Gemini 3.7 Flash (Low)", "Gemini 3.7 Flash (Low)"),
     ("Gemini 3.6 Flash (High)", "Gemini 3.6 Flash (High)"),
     ("Gemini 3.6 Flash (Medium)", "Gemini 3.6 Flash (Medium)"),
     ("Gemini 3.6 Flash (Low)", "Gemini 3.6 Flash (Low)"),
     ("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (High)"),
     ("Gemini 3.1 Pro (Low)", "Gemini 3.1 Pro (Low)"),
-    ("Gemini 3.5 Flash (High)", "Gemini 3.5 Flash (High)"),
-    ("Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Medium)"),
-    ("Gemini 3.5 Flash (Low)", "Gemini 3.5 Flash (Low)"),
     ("Claude Sonnet 4.6 (Thinking)", "Claude Sonnet 4.6 (Thinking)"),
     ("Claude Opus 4.6 (Thinking)", "Claude Opus 4.6 (Thinking)"),
     ("GPT-OSS 120B (Medium)", "GPT-OSS 120B (Medium)"),
@@ -135,6 +138,22 @@ def permission_mode_display(raw: str) -> str:
     token = (raw or "").strip()
     return _MODE_DISPLAY.get(token, token)
 
+
+_GEMINI_MODE_DISPLAY = {
+    "": "manual", "default": "manual", "ask-permission": "manual",
+    "accept-edits": "auto", "auto": "auto", "accept_edits": "auto",
+    "always-proceed": "bypass", "always_proceed": "bypass",
+    "yolo": "bypass", "bypasspermissions": "bypass", "bypass": "bypass",
+    "plan": "plan",
+}
+
+
+def gemini_permission_mode_display(raw: str) -> str:
+    """A Gemini permission mode as a short label for the card header, e.g.
+    'accept-edits' -> 'auto', 'always-proceed' -> 'bypass', 'plan' -> 'plan'."""
+    token = (raw or "").strip().lower()
+    return _GEMINI_MODE_DISPLAY.get(token, token)
+
 PROVIDERS: dict[str, Provider] = {
     "claude": Provider(
         key="claude", display="Claude Code", exe_names=("claude",),
@@ -145,12 +164,13 @@ PROVIDERS: dict[str, Provider] = {
     "openai": Provider(
         key="openai", display="OpenAI (Codex CLI)", exe_names=("codex",),
         models=(("Default", ""),
-                ("GPT-5.6 Sol", "gpt-5.6-sol"),
+                # Keep the moving flagship on its stable alias.  The OpenAI
+                # model registry currently maps gpt-5.6 to GPT-5.6 Sol; using
+                # the alias lets a new Codex terminal follow that update.
+                ("GPT-5.6 (Sol)", "gpt-5.6"),
                 ("GPT-5.6 Terra", "gpt-5.6-terra"),
                 ("GPT-5.6 Luna", "gpt-5.6-luna"),
-                # Keep prior choices available for restored or pinned agents.
-                ("GPT-5.1", "gpt-5.1"),
-                ("GPT-5.1 Codex", "gpt-5.1-codex")),
+                ("GPT-5.5", "gpt-5.5")),
         base_cmd="codex", model_flag="--model {model}",
         note="Requires the OpenAI Codex CLI (`codex`) on PATH."),
     "gemini": Provider(
@@ -242,6 +262,83 @@ def user_default_model() -> str:
         return _USER_MODEL_CACHE[2]
     _USER_MODEL_CACHE = (st.st_mtime, st.st_size, model)
     return model
+
+
+_GEMINI_SETTINGS_CACHE: tuple = (0.0, -1, {})
+
+
+def gemini_user_default_settings() -> dict:
+    """Read ~/.gemini/antigravity-cli/settings.json safely. Cached by mtime+size."""
+    global _GEMINI_SETTINGS_CACHE
+    path = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli", "settings.json")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    if _GEMINI_SETTINGS_CACHE[0] == st.st_mtime and _GEMINI_SETTINGS_CACHE[1] == st.st_size:
+        return _GEMINI_SETTINGS_CACHE[2]
+    data = {}
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        return _GEMINI_SETTINGS_CACHE[2]
+    _GEMINI_SETTINGS_CACHE = (st.st_mtime, st.st_size, data)
+    return data
+
+
+def gemini_user_default_model() -> str:
+    """The default model configured in Gemini/agy settings.json, or fallback."""
+    sett = gemini_user_default_settings()
+    model = sett.get("model")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    return "Gemini 3.8 Flash (High)"
+
+
+_GEMINI_MODELS_CACHE: tuple | None = None
+
+
+def fetch_gemini_models() -> tuple[tuple[str, str], ...]:
+    """Query `agy models` to fetch the live model list from the CLI."""
+    global _GEMINI_MODELS_CACHE
+    prog = resolve_program("gemini")
+    if not prog or not detected("gemini"):
+        return GEMINI_MODELS
+    try:
+        import subprocess
+        res = subprocess.run(
+            [prog, "models"], capture_output=True, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout:
+            entries = [("Default", "")]
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if not line or line.startswith("Fetching"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    display = parts[1].strip()
+                    if display:
+                        entries.append((display, display))
+                elif line:
+                    entries.append((line, line))
+            if len(entries) > 1:
+                _GEMINI_MODELS_CACHE = tuple(entries)
+                return _GEMINI_MODELS_CACHE
+    except Exception:
+        pass
+    return GEMINI_MODELS
+
+
+def gemini_available_models() -> tuple[tuple[str, str], ...]:
+    """Return available Gemini models. Uses cached CLI output if available,
+    falling back to GEMINI_MODELS."""
+    global _GEMINI_MODELS_CACHE
+    if _GEMINI_MODELS_CACHE is not None:
+        return _GEMINI_MODELS_CACHE
+    return GEMINI_MODELS
 
 
 def resolve_program(key: str) -> str:

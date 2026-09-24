@@ -76,11 +76,17 @@ workspaces keep executing — switching never pauses anything.
   question — a "?" lights up on the row (next to the working count) and beside
   that agent in the expanded list, so you can spot and answer it without hunting
   through terminals. Suppressed for agents launched in bypass-permissions mode
-  (which never prompt). A soft **notification chime** rings the moment that "?"
+  (which never prompt). A **question chime**, a short droid-style "doo-dee-bweep?"
+  whose last note is still sliding up when it stops, plays the moment that "?"
   appears (the standby→waiting rising edge), so you notice an agent needs you
   even while you're heads-down in another workspace — handy when agents you sent
-  into plan mode come back with questions. Toggle it under **⚙ Options** in
-  the top bar (persists across restarts).
+  into plan mode come back with questions. A second **reply finished chime**, a
+  "ta-da!" that steps up and holds its top note, plays when an agent finishes a
+  reply you asked for. Claude's comes from its Stop hook, so it fires once at
+  the real end of the turn; Codex, Gemini and Grok have no such hook and ring
+  after 6 s of silence (2 s settle + `REPLY_QUIET_MS`) instead. Each has its own
+  switch under **⚙ Options** in the top bar; the question chime starts on, the
+  reply chime off, and both persist across restarts.
 - **Taskbar working count** — the same signal, but from *outside* the app. The
   Windows taskbar icon carries a small badge with the number of agents currently
   working, so you can tell at a glance from any other window whether the hive is
@@ -104,14 +110,17 @@ workspaces keep executing — switching never pauses anything.
   all.
 - **Plan usage readout** — two top-bar badges, one
   per Claude rate-limit window, showing how much you've burned and when it
-  comes back: the **5-hour** pill reads `5h 21% used, resets in 1h20m at
-  14:49` — countdown first, then the wall-clock time in your own timezone; the
-  **7-day** pill reads `7d 40% used, resets in 3d14h at 09:00` — same shape,
+  comes back: the **5-hour** pill reads `5h Claude 21% used, resets in 1h20m
+  at 14:49` — countdown first, then the wall-clock time in your own timezone;
+  the **7-day** pill reads `7d Claude 40% used, resets in 3d14h at 09:00` —
+  the same shape as the Gemini pills beside it,
   but its countdown is **days+hours only, no minutes**, since a week-long
   window doesn't need to-the-minute precision (`3d14h` / `3d` / `14h` / `<1h`
-  rather than an unreadable `86h27m`). A percent ring turns amber past 60% and
-  red past 85% on each, so you see a wall coming instead of hitting it
-  mid-task. **Click either to refresh**; hover for every limit window, your
+  rather than an unreadable `86h27m`). Each pill wears its agent's colour
+  (Claude terracotta, Gemini blue, GPT in the card header's light title ink)
+  and turns red at 85%, so you see a wall coming instead of hitting it
+  mid-task, and the red pill tells you which agent is about to hit it.
+  **Click either to refresh**; hover for every limit window, your
   plan, and how old the reading is. The numbers come from the same place the
   CLI's `/usage` gets them, read once a minute in the background — nothing is
   logged or persisted, it's a live readout only. Past 90% *with agents actually
@@ -167,16 +176,30 @@ workspaces keep executing — switching never pauses anything.
   - **⏰ Resume on limit reset** — while the hive is running, agents cut off
     mid-work go back to work the moment the window reopens.
 
-  Either way AI Hive closes the limit's options menu and types `Continue`,
-  staggered so agents don't all pile into a fresh window, then **verifies** —
-  the menu disappearing is how it knows the resume took, and it retries if not.
-  Because the first message after a window expires is what STARTS the next
+  Either way AI Hive types `Continue` (pressing Esc first only when an older
+  CLI's options menu is actually on screen, since on current versions Esc
+  cancels Claude's own "continuing automatically" timer), staggered so agents
+  don't all pile into a fresh window, then **verifies** against the
+  conversation on disk, and retries if the resume didn't take. When Claude Code
+  already continued by itself, the transcript says so and AI Hive stays out of
+  the way. Cut-offs are caught two independent ways: off the live screen (every
+  wording claude.exe 2.1.281 prints, including rows it paints with cursor jumps
+  instead of spaces), and by a once-a-minute sweep of each idle agent's
+  conversation file, which catches anything the screen missed. A weekly, Opus,
+  Sonnet or Fable cut-off is resumed on its own clock only when that clock is
+  exact (a dated reset, or the epoch Claude records with the 429); a bare
+  "resets 8pm" on a 7-day window waits for the account reading instead.
+  A printed clock is read in the zone Claude names after it ("resets 3am
+  (Asia/Tokyo)"), falling back to the machine's zone when there is none, and
+  a reset that rolls over to tomorrow keeps its wall time on the night the
+  clocks change. Because the first message after a window expires is what STARTS the next
   5-hour window, resuming at 4am also means the clock has already rolled over by
   the time you sit down. The cut-off is recorded the instant it appears, along
   with the reset time the limit itself stated, so recovery doesn't depend on the
   usage API being reachable — it fires from the agent's own stated reset even
   when the account readout is rate-limited. Every step is logged to
-  `session.log` (`BLOCKED` / `NUDGE` / `RESUMED` / `STILL-BLOCKED`), each resumed
+  `session.log` (`BLOCKED` / `LATE-LATCH` / `NUDGE` / `RESUMED` /
+  `SELF-RESUMED` / `STILL-BLOCKED`), each resumed
   card shows a `— plan limit reset; auto-continued —` line, and the workspace
   board gets a note. A stopped agent is also visible at a glance, everywhere,
   live: an **⏳ hourglass** sits in the card header and next to the agent in
@@ -324,7 +347,11 @@ workspaces keep executing — switching never pauses anything.
   it with the OS default program — absolute paths *and* repo-relative ones like
   `app/widgets/sidebar.py` (resolved against the agent's folder). If that
   workspace's file tree is open, the clicked file is also scrolled to and
-  **highlighted** in it, so you can see where it lives.
+  **highlighted** in it, so you can see where it lives. **Right-click** the same
+  path for Open / Open with... / Reveal in folder / Copy path (a URL gets Open
+  link / Copy link address) — "Reveal in folder" opens Explorer with the file
+  already selected, and "Copy path" copies the resolved **absolute** path, which
+  is what pastes into an address bar.
 - **Search the sidebar** — a 🔍 next to the category button expands an input
   that covers the WORKSPACES title/count; as you type it **highlights every
   match** across workspace names, agent names, and agent summaries, and
@@ -367,7 +394,7 @@ workspaces keep executing — switching never pauses anything.
   show without file edges; see below.)
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
-  reset**, **Notification chime**, **Taskbar count** and **Check for CLI
+  reset**, **Question chime**, **Reply finished chime**, **Taskbar count** and **Check for CLI
   updates at start-up** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
@@ -662,7 +689,10 @@ Hard-won rules, each with a regression test:
   absolute local file path under the pointer with the OS default handler —
   hovering such a link underlines it and shows a hand cursor so it's obviously
   clickable. (`Ctrl`+left-click is primary — the left button always registers,
-  while the middle button is often eaten by the OS autoscroll.) **Image
+  while the middle button is often eaten by the OS autoscroll.) **Right-click**
+  a link and the menu gains Open / Open with... / Reveal in folder / Copy path
+  above the usual Copy / Paste / Select all — same wording as the Agent/File
+  Map's menu, and Copy path gives you the absolute path. **Image
   paste**: a `Ctrl+V` with an image on the
   clipboard is spilled to a temp PNG and its path pasted, because Claude Code
   reads images by path and a native-Windows child can't take a raw clipboard
@@ -703,7 +733,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1782 checks drive the real app headlessly (offscreen Qt platform) with real
+1951 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -744,9 +774,11 @@ drag workspaces in/out, single-level membership persisted across a v4 session
 round-trip with v3 migration), the count-badge inline agent list +
 click-to-reveal, and the waiting-for-input "?" detection (settled-screen
 prompt/question scrape, gated on the idle timer, suppressed under
-bypassPermissions) plus the notification chime it triggers (WAV synthesis,
+bypassPermissions) plus the question chime it triggers (WAV synthesis,
 the manager's waiting rising-edge `agentWaiting` signal, and the top-bar
-mute toggle persisted in the ui state), the Agent/File Map
+mute toggle persisted in the ui state), the reply finished chime (Claude's
+Stop-hook edge, the hookless providers' quiet timer, once per submitted turn,
+never for a shell or a waiting agent), the Agent/File Map
 visualizer (transcript parsing for edited-vs-read
 attribution, sub-agent detection, shared-file grouping, headless paint, header-
 button wiring, and the drag/zoom/hit-test/click-to-focus interactions) and the
@@ -802,7 +834,7 @@ app/
   screen_snapshot.py       a stopped card's last screen, so reopen shows the conversation (Qt-free)
   session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
   session_hook.py          SessionStart hook: the child reports its live conversation id
-  chime.py                 notification bell (WAV synth + async play, Qt-free) for the "?" alert
+  chime.py                 question + reply finished chimes (WAV synth + async play, Qt-free)
   taskbar_overlay.py       the Windows taskbar corner badge (ITaskbarList3 via ctypes, Qt-free)
   claude_usage.py          live plan-usage reading (/api/oauth/usage) + limit edges (Qt-free)
   limit_banner.py          recognising a usage cut-off + when it resets (Qt-free, shared)
@@ -825,7 +857,7 @@ app/
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1782 checks)
+tests/smoke_test.py        headless end-to-end suite (1951 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

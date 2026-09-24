@@ -56,14 +56,65 @@ def open_with(path: str) -> None:
         pass
 
 
+def explorer_select_cmdline(path: str) -> str:
+    """The raw command line that makes Explorer open `path`'s folder with it
+    selected. Built as a STRING, never an argv list: `subprocess` quotes any
+    argv entry containing a space, so ["explorer", "/select,C:\\AI Projects\\x"]
+    reaches Explorer as `"/select,C:\\AI Projects\\x"`. Explorer does not
+    recognise a quoted switch, ignores it and opens its default location
+    (Documents), which is exactly the reported bug. Only the PATH is quoted."""
+    return f'explorer /select,"{os.path.normpath(os.path.abspath(path))}"'
+
+
+def _shell_select(path: str) -> bool:
+    """Select `path` in its folder through the shell API
+    (SHOpenFolderAndSelectItems). Preferred over the command line because it
+    takes a parsed item, so a comma in a file name (which Explorer's own
+    `/select,` parser splits on) cannot misroute it. Returns False on any
+    failure so the caller can fall back."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        ole32 = ctypes.WinDLL("ole32")  # WinDLL: CoTaskMemFree returns void
+        shell32 = ctypes.WinDLL("shell32")
+        # Qt's GUI thread is already an STA; this returns S_FALSE there, or
+        # RPC_E_CHANGED_MODE on an MTA thread, both fine for this call.
+        ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+        pidl = ctypes.c_void_p()
+        shell32.SHParseDisplayName.argtypes = [
+            wintypes.LPCWSTR, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+            wintypes.ULONG, ctypes.POINTER(wintypes.ULONG)]
+        shell32.SHParseDisplayName.restype = ctypes.c_long
+        hr = shell32.SHParseDisplayName(
+            os.path.normpath(os.path.abspath(path)), None,
+            ctypes.byref(pidl), 0, None)
+        if hr != 0 or not pidl:
+            return False
+        try:
+            shell32.SHOpenFolderAndSelectItems.argtypes = [
+                ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.DWORD]
+            shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+            # cidl=0 with the item's own absolute pidl: open its parent and
+            # select it
+            return shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0) == 0
+        finally:
+            ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+            ole32.CoTaskMemFree.restype = None
+            ole32.CoTaskMemFree(pidl)
+    except (OSError, AttributeError, ImportError):
+        return False
+
+
 def reveal_in_folder(path: str) -> None:
-    """Show the file selected in its containing folder (Explorer /select on
-    Windows; opens the parent directory elsewhere)."""
-    if not os.path.exists(path):
+    """Show the file selected in its containing folder (the shell API on
+    Windows, with an Explorer `/select,` command line as the fallback; opens
+    the parent directory elsewhere)."""
+    if not path or not os.path.exists(path):
         return
     try:
         if os.name == "nt":
-            subprocess.Popen(["explorer", f"/select,{os.path.normpath(path)}"])
+            if not _shell_select(path):
+                subprocess.Popen(explorer_select_cmdline(path))
         else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
     except OSError:

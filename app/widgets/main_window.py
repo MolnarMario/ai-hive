@@ -20,10 +20,11 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
 from .. import __version__
 from .. import chime
 from .. import claude_usage
+from .. import codex_usage
 from .. import fsopen
 from .. import limit_ledger
 from .. import providers
-from ..limit_banner import LIMIT_PROVIDERS
+from ..limit_banner import LIMIT_PROVIDERS, SEVEN_DAY_WINDOWS
 from .. import scheduled_send
 from .. import session_hook
 from .. import transcripts
@@ -118,6 +119,11 @@ GEMINI_USAGE_POLL_MS = 300000
 # to Claude's 20s and every reason not to: each fast tick is another CLI launch.
 GEMINI_USAGE_URGENT_POLL_MS = 60000
 
+# Codex reads the same ChatGPT subscription's primary window. It is a small
+# authenticated request (not a CLI subprocess), and unlike Claude it drives no
+# recovery machinery, so it is only polled while its optional pill is enabled.
+CODEX_USAGE_POLL_MS = 60000
+
 # The usage readouts the top bar can show, and the order they sit in. PER PILL
 # rather than per provider: each window (Claude 5h/7d, Gemini 5h/7d) is its own
 # pill on the bar, so anything coarser would leave the X on one of them closing
@@ -125,12 +131,13 @@ GEMINI_USAGE_URGENT_POLL_MS = 60000
 # Claude (or only Gemini) is not made to look at a readout that can never say
 # anything.
 USAGE_TRACKER_KEYS = ("claude_five_hour", "claude_weekly",
-                      "gemini_five_hour", "gemini_weekly")
+                      "gemini_five_hour", "gemini_weekly", "codex_five_hour")
 USAGE_TRACKER_LABELS = {
     "claude_five_hour": "Claude 5 hour usage",
     "claude_weekly": "Claude weekly usage",
     "gemini_five_hour": "Gemini 5 hour usage",
     "gemini_weekly": "Gemini weekly usage",
+    "codex_five_hour": "Codex 5 hour usage",
 }
 DEFAULT_USAGE_TRACKERS = {k: True for k in USAGE_TRACKER_KEYS}
 
@@ -170,6 +177,13 @@ LIMIT_PHANTOM_CHECK_MS = 3000
 # enough — but it must not become a Continue every minute forever either.
 LIMIT_RETRY_S = 300
 LIMIT_MAX_TRIES = 4
+
+# The transcript sweep (`_sweep_transcript_cut_offs`) only adopts cut-offs that
+# happened while THIS process was running. Anything older belongs to startup
+# recovery, which deliberately arms only the newest window; a sweep that
+# ignored the boundary would revive exactly the conversations it skipped. The
+# slack covers a cut-off written in the seconds before the window came up.
+LIMIT_SWEEP_SLACK_S = 30
 
 # How many consecutive "TUI not ready" watchdog ticks (LIMIT_WATCH_MS apart) a
 # latched agent may spend before we stop waiting for a frame and ask for one —
@@ -409,7 +423,8 @@ class TopBar(QFrame):
     sidebarToggleClicked = Signal()
     globalFontDelta = Signal(int)
     themeChanged = Signal(str)   # theme id
-    soundToggled = Signal(bool)  # notification chime enabled/muted
+    soundToggled = Signal(bool)  # question chime enabled/muted
+    replySoundToggled = Signal(bool)  # reply-finished chime enabled/muted
     # show/hide ONE usage readout: (tracker key, wanted). One signal for both
     # affordances - the X on a pill and the + menu - so the two controls of the
     # same preference can never disagree.
@@ -494,6 +509,15 @@ class TopBar(QFrame):
         self.sound_btn.clicked.connect(self._on_sound_clicked)
         self._refresh_sound_btn()
 
+        # reply-finished chime: the second, rising-then-held sound, for "an
+        # agent finished what you asked". OFF by default, since a busy hive
+        # finishes replies far more often than it asks questions.
+        self._reply_sound_on = False
+        self.reply_sound_label = toggle_label("")
+        self.reply_sound_btn = ToggleSwitch(self)
+        self.reply_sound_btn.clicked.connect(self._on_reply_sound_clicked)
+        self._refresh_reply_sound_btn()
+
         # taskbar working-count overlay toggle. Sits next to the chime because
         # both are the same kind of thing: a signal that reaches the user when
         # the window is NOT the one they are looking at.
@@ -556,12 +580,15 @@ class TopBar(QFrame):
         from .gemini_usage_badge import GeminiUsageBadge
         self.gemini_badge = GeminiUsageBadge(self, window="five_hour")
         self.gemini_weekly_badge = GeminiUsageBadge(self, window="weekly")
+        from .codex_usage_badge import CodexUsageBadge
+        self.codex_badge = CodexUsageBadge(self)
 
         self._usage_pills = {
             "claude_five_hour": self.usage_badge,
             "claude_weekly": self.usage_weekly_badge,
             "gemini_five_hour": self.gemini_badge,
             "gemini_weekly": self.gemini_weekly_badge,
+            "codex_five_hour": self.codex_badge,
         }
         self._trackers = dict(DEFAULT_USAGE_TRACKERS)
         for key, pill in self._usage_pills.items():
@@ -616,6 +643,8 @@ class TopBar(QFrame):
         self.options_panel.add_switch_row(self.recover_label, self.recover_btn)
         self.options_panel.add_switch_row(self.resume_label, self.resume_btn)
         self.options_panel.add_switch_row(self.sound_label, self.sound_btn)
+        self.options_panel.add_switch_row(self.reply_sound_label,
+                                          self.reply_sound_btn)
         self.options_panel.add_switch_row(self.taskbar_label, self.taskbar_btn)
         self.options_panel.add_switch_row(self.auto_update_label,
                                           self.auto_update_btn)
@@ -663,6 +692,7 @@ class TopBar(QFrame):
         extras_lay.addWidget(self.usage_weekly_badge)
         extras_lay.addWidget(self.gemini_badge)
         extras_lay.addWidget(self.gemini_weekly_badge)
+        extras_lay.addWidget(self.codex_badge)
         extras_lay.addWidget(self.usage_add_btn)
 
         self._extras_scroll = _HWheelScrollArea(self)
@@ -721,6 +751,10 @@ class TopBar(QFrame):
     def _on_sound_clicked(self) -> None:
         self.set_sound_enabled(not self._sound_on)
         self.soundToggled.emit(self._sound_on)
+
+    def _on_reply_sound_clicked(self) -> None:
+        self.set_reply_sound_enabled(not self._reply_sound_on)
+        self.replySoundToggled.emit(self._reply_sound_on)
 
     def _on_taskbar_clicked(self) -> None:
         self.set_taskbar_badge(not self._taskbar_badge)
@@ -821,16 +855,35 @@ class TopBar(QFrame):
         # label is still a second, always-visible tell.
         self.sound_btn.setChecked(self._sound_on)
         bell = "🔔" if self._sound_on else "🔕"
-        self.sound_label.setText(f"{bell}  Notification chime")
+        self.sound_label.setText(f"{bell}  Question chime")
         tip = (
-            "Notification chime: ON. A soft bell rings when an agent settles "
-            "on a question and needs you, even from another workspace.\n"
-            "Click to mute."
+            "Question chime: ON. A rising \"bweep?\" plays when an agent "
+            "settles on a question and needs you, even from another "
+            "workspace.\nClick to mute."
             if self._sound_on else
-            "Notification chime: OFF. An agent waiting on a question raises "
+            "Question chime: OFF. An agent waiting on a question raises "
             "its \"?\" silently.\nClick to turn on.")
         self.sound_btn.setToolTip(tip)
         self.sound_label.setToolTip(tip)
+
+    def set_reply_sound_enabled(self, on: bool) -> None:
+        """Reflect the reply chime on/off state in the button (no signal)."""
+        self._reply_sound_on = bool(on)
+        self._refresh_reply_sound_btn()
+
+    def _refresh_reply_sound_btn(self) -> None:
+        self.reply_sound_btn.setChecked(self._reply_sound_on)
+        bell = "🔔" if self._reply_sound_on else "🔕"
+        self.reply_sound_label.setText(f"{bell}  Reply finished chime")
+        tip = (
+            "Reply finished chime: ON. A short \"ta-da!\" plays when an agent "
+            "finishes a reply you asked for, even from another workspace.\n"
+            "Click to mute."
+            if self._reply_sound_on else
+            "Reply finished chime: OFF. Agents finish replies silently.\n"
+            "Click to turn on.")
+        self.reply_sound_btn.setToolTip(tip)
+        self.reply_sound_label.setToolTip(tip)
 
     def _on_recover_clicked(self) -> None:
         self.set_startup_recovery(not self._startup_recovery)
@@ -945,6 +998,17 @@ class TopBar(QFrame):
                 pill.mark_stale(True)
             else:
                 pill.mark_unreadable(error)
+        self._sync_usage_pills()
+
+    def set_codex_usage(self, reading) -> None:
+        self.codex_badge.set_usage(reading)
+        self._sync_usage_pills()
+
+    def note_codex_usage_error(self, error: str) -> None:
+        if self.codex_badge.has_reading():
+            self.codex_badge.mark_stale(True)
+        else:
+            self.codex_badge.mark_unreadable(error)
         self._sync_usage_pills()
 
     def tick_usage(self) -> None:
@@ -1204,6 +1268,9 @@ class AddTerminalDialog(QDialog):
         if is_ai:
             prov = providers.get(AI_KINDS[kind])
             detected = providers.detected(AI_KINDS[kind])
+            if AI_KINDS[kind] == "gemini" and providers._GEMINI_MODELS_CACHE is None:
+                import threading
+                threading.Thread(target=providers.fetch_gemini_models, daemon=True).start()
             self._populate_models(prov)
             self._model_label.setVisible(True)
             self.model_combo.setVisible(True)
@@ -1231,7 +1298,10 @@ class AddTerminalDialog(QDialog):
 
     def _populate_models(self, prov) -> None:
         self.model_combo.clear()
-        for label, value in prov.models:
+        models = (providers.gemini_available_models()
+                  if prov and prov.key == "gemini" else
+                  (prov.models if prov else ()))
+        for label, value in models:
             self.model_combo.addItem(label, value)
 
     def _populate_efforts(self, prov) -> None:
@@ -1574,6 +1644,7 @@ class MainWindow(QMainWindow):
     # slot touches (widgets, timers) stays on the main thread.
     _usageReady = Signal(object)
     _geminiUsageReady = Signal(object)
+    _codexUsageReady = Signal(object)
 
     def __init__(self, manager: WorkspaceManager, store: SessionStore,
                  session: dict | None = None):
@@ -1590,7 +1661,8 @@ class MainWindow(QMainWindow):
         self._ready = False  # suppress save-storms during initial load
         self._last_saved_json = None  # what last reached disk (heartbeat guard)
         self._theme_id = ui_theme.ACTIVE_THEME.id  # active skin (persisted)
-        self._sound_enabled = True  # notification chime on "?" (persisted)
+        self._sound_enabled = True  # question chime on "?" (persisted)
+        self._reply_sound_enabled = False  # reply-finished chime (persisted)
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -1676,6 +1748,9 @@ class MainWindow(QMainWindow):
         # ledger keys already filed this run, so one cut-off is written once
         # however many times its latch is (re)raised
         self._ledger_seen: set[tuple] = set()
+        # when this window came up: the line between the transcript sweep's
+        # cut-offs and startup recovery's (see LIMIT_SWEEP_SLACK_S)
+        self._launched_at = time.time()
         self._auto_continue = True    # user preference (persisted)
         self._startup_recovery = True  # user preference (persisted)
         self._usage_backoff = 0       # consecutive 429s -> exponential poll gap
@@ -1699,6 +1774,13 @@ class MainWindow(QMainWindow):
         # last good Gemini reading, so the countdown tick can retune the poll
         # without shelling out again (that tick fires every 20s)
         self._gemini_usage = None
+        # The ChatGPT/Codex readout is display-only, so unlike Claude it is
+        # fully gated by the user's tracker preference.
+        self._codex_usage = None
+        self._codex_usage_inflight = False
+        self._codex_usage_timer = QTimer(self)
+        self._codex_usage_timer.setInterval(CODEX_USAGE_POLL_MS)
+        self._codex_usage_timer.timeout.connect(self._poll_codex_usage)
         # fires just after a spent limit's stated reset, so the "cleared" edge
         # doesn't wait out a full poll interval
         self._usage_reset_timer = QTimer(self)
@@ -1901,6 +1983,7 @@ class MainWindow(QMainWindow):
         self.top_bar.globalFontDelta.connect(self._change_global_font)
         self.top_bar.themeChanged.connect(self._change_theme)
         self.top_bar.soundToggled.connect(self._on_sound_toggled)
+        self.top_bar.replySoundToggled.connect(self._on_reply_sound_toggled)
         self.top_bar.usageTrackerToggled.connect(self._on_usage_tracker_toggled)
         self.top_bar.terminalScrollbackToggled.connect(
             self._on_terminal_scrollback)
@@ -1919,6 +2002,8 @@ class MainWindow(QMainWindow):
                                  Qt.ConnectionType.QueuedConnection)
         self._geminiUsageReady.connect(self._on_gemini_usage_ready,
                                        Qt.ConnectionType.QueuedConnection)
+        self._codexUsageReady.connect(self._on_codex_usage_ready,
+                                      Qt.ConnectionType.QueuedConnection)
         self.sidebar.addRequested.connect(self._on_add_workspace_clicked)
         self.sidebar.workspaceSelected.connect(self.manager.set_active)
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
@@ -2008,6 +2093,8 @@ class MainWindow(QMainWindow):
         mgr.layoutChanged.connect(self._on_layout_changed)
         # an agent just settled on a question ("?" appeared) -> sound the chime
         mgr.agentWaiting.connect(self._on_agent_waiting)
+        # ...and one finished a reply the user asked for -> the reply chime
+        mgr.agentReplied.connect(self._on_agent_replied)
         mgr.dirty.connect(self._schedule_save)
         # structural changes (add/remove agent or workspace) save IMMEDIATELY,
         # not on the 800 ms debounce — so an abrupt process kill can never lose
@@ -2036,7 +2123,14 @@ class MainWindow(QMainWindow):
         agent = self.manager.agent(ws_id, agent_id)
         if agent is not None and agent.is_limit_blocked():
             return
-        chime.play()
+        chime.play(chime.QUESTION)
+
+    def _on_agent_replied(self, ws_id: str, agent_id: str) -> None:
+        """An agent finished a reply the user asked for (the agent already
+        filtered out questions, limit cut-offs and plain shells; see
+        TerminalAgent._announce_reply). Ring the reply chime if it is on."""
+        if self._reply_sound_enabled:
+            chime.play(chime.REPLY)
 
     # ---------------------------------------------------- plan usage ------
     def plan_usage(self):
@@ -2077,6 +2171,9 @@ class MainWindow(QMainWindow):
         if self._gemini_wanted():
             self._gemini_usage_timer.start()
             self._poll_gemini_usage()
+        if self._codex_wanted():
+            self._codex_usage_timer.start()
+            self._poll_codex_usage()
 
     def _poll_usage(self) -> None:
         """Kick a fetch on a daemon thread (the pty_worker/mcp_server pattern).
@@ -2144,6 +2241,7 @@ class MainWindow(QMainWindow):
             self._usage_timer.start()      # restart the interval from now
         self._poll_usage()
         self._poll_gemini_usage()
+        self._poll_codex_usage()
 
     def _on_usage_ready(self, reading) -> None:
         self._usage_inflight = False
@@ -2346,12 +2444,48 @@ class MainWindow(QMainWindow):
         return bool(self._usage_trackers.get("gemini_five_hour")
                     or self._usage_trackers.get("gemini_weekly"))
 
+    def _codex_wanted(self) -> bool:
+        return bool(self._usage_trackers.get("codex_five_hour"))
+
+    def _poll_codex_usage(self) -> None:
+        """Fetch the optional ChatGPT/Codex readout off the GUI thread."""
+        if (self._closing or self._codex_usage_inflight
+                or not self._codex_wanted()):
+            return
+        self._codex_usage_inflight = True
+
+        def worker():
+            try:
+                reading = codex_usage.fetch()
+            except Exception:
+                reading = None
+            self._codexUsageReady.emit(reading)
+
+        threading.Thread(target=worker, daemon=True,
+                         name="aihive-codex-usage").start()
+
+    def _on_codex_usage_ready(self, reading) -> None:
+        self._codex_usage_inflight = False
+        if self._closing:
+            return
+        if reading is None or reading.limit is None:
+            if reading is not None and reading.error == "no-auth" and self._codex_usage is None:
+                self.top_bar.mark_usage_absent("codex_five_hour")
+                self._codex_usage_timer.stop()
+            else:
+                self.top_bar.note_codex_usage_error(
+                    reading.error if reading is not None else "unknown")
+            return
+        self._codex_usage = reading
+        self.top_bar.set_codex_usage(reading)
+
     def _on_usage_tracker_toggled(self, key: str, on: bool) -> None:
         """The X on a pill, or an entry in the + menu. One handler for both, so
         the two controls of the same preference can never disagree."""
         if key not in USAGE_TRACKER_KEYS:
             return
         was_gemini = self._gemini_wanted()
+        was_codex = self._codex_wanted()
         self._usage_trackers[key] = bool(on)
         self.top_bar.set_usage_trackers(self._usage_trackers)
         # a UI PREFERENCE, like sound_enabled. The READING it governs stays
@@ -2360,6 +2494,8 @@ class MainWindow(QMainWindow):
         if not on:
             if was_gemini and not self._gemini_wanted():
                 self._gemini_usage_timer.stop()   # nothing consumes it now
+            if was_codex and not self._codex_wanted():
+                self._codex_usage_timer.stop()
             return
         # Switched back on: load it NOW rather than leave a gap for up to a
         # minute. The loading state goes up first, so the pill is on the bar
@@ -2369,6 +2505,11 @@ class MainWindow(QMainWindow):
             return              # this window never opted in; never shell out
         if key in ("claude_five_hour", "claude_weekly"):
             self._poll_usage()
+            return
+        if key == "codex_five_hour":
+            if not was_codex:
+                self._codex_usage_timer.start()
+            self._poll_codex_usage()
             return
         if not was_gemini:
             self._gemini_usage_timer.start()
@@ -2406,7 +2547,7 @@ class MainWindow(QMainWindow):
         # 1. LOOK EVERYWHERE. Every agent in every workspace is examined,
         #    running or not, and every cut-off found is filed — the record is
         #    supposed to be complete even where the action is selective.
-        found: list[tuple] = []           # (agent, record)
+        found: list[tuple] = []           # (agent, record, info)
         for agent in self.manager.all_agents():
             spec = agent.spec
             if spec.provider != "claude" or not agent.is_pty:
@@ -2420,20 +2561,20 @@ class MainWindow(QMainWindow):
             record = self._ledger_cut_off(agent, info["at"],
                                           info["resets_at"], info["window"],
                                           info["banner"], source="transcript")
-            found.append((agent, record))
+            found.append((agent, record, info))
         if not found:
             return 0
 
         # 2. ACT ON THE MOST RECENT WINDOW ONLY. Agents stopped by one window
         #    all state the same reset clock, so they group; anything from an
         #    earlier window is history that has already had its chance.
-        newest = limit_ledger.latest_window([r for _a, r in found])
+        newest = limit_ledger.latest_window([r for _a, r, _i in found])
         newest_keys = {tuple(r["key"]) for r in newest}
         closed = limit_ledger.closed_keys(
             limit_ledger.read_all(self._ledger_dir()))
 
         armed = 0
-        for agent, record in found:
+        for agent, record, info in found:
             key = tuple(record["key"])
             name = agent.spec.name
             if key not in newest_keys:
@@ -2465,7 +2606,8 @@ class MainWindow(QMainWindow):
                                      from_startup=True,
                                      cut_off_at=record["at"],
                                      window=record["window"],
-                                     banner=record["banner"])
+                                     banner=record["banner"],
+                                     exact=info.get("exact", False))
             armed += 1
         self._limit_audit(f"STARTUP-SCAN found={len(found)} armed={armed}")
         return armed
@@ -2578,7 +2720,10 @@ class MainWindow(QMainWindow):
         at = agent.limit_resets_at()
         when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(at)) if at
                 else "unknown")
-        self._limit_audit(f"BLOCKED agent={agent.spec.name} resets={when}")
+        exact = "" if agent.limit_reset_exact() else " (bare clock)"
+        self._limit_audit(f"BLOCKED agent={agent.spec.name} resets={when}"
+                          f"{exact if at else ''} "
+                          f"window={agent.limit_window() or '-'}")
         # a fresh cut-off gets the full patience budget again
         self._limit_wait_ticks.pop(agent_id, None)
         # File it durably. Skipped when this cut-off is already on record: the
@@ -2651,6 +2796,9 @@ class MainWindow(QMainWindow):
         """
         if self._closing or not self._ready:
             return
+        # The second detector runs first, so a cut-off it adopts is judged by
+        # the very same `due` below on this same tick.
+        self._sweep_transcript_cut_offs()
         now = time.time()
         # Late-fill a due time for anything still lacking one (the account
         # reading may only have arrived after the cut-off was latched).
@@ -2667,13 +2815,15 @@ class MainWindow(QMainWindow):
         account_clear = usage is not None and usage.blocked is None
 
         def due(a):
-            # A WEEKLY window is not readable off the screen: its banner prints
-            # a bare wall clock ("resets 8pm") for a reset that can be days
-            # away, and `parse_reset_clock` can only ever resolve that to the
-            # next 8pm. Acting on it would nudge days early, every day. The
-            # account reading is the only thing that knows, so a weekly cut-off
-            # waits for it and ignores the clock entirely.
-            if a.limit_window() == "weekly":
+            # A 7-DAY window (weekly, and the Opus/Sonnet/Fable ones) is not
+            # readable off a BARE clock: "resets 8pm" can be days away, and
+            # `parse_reset_clock` can only ever resolve that to the next 8pm.
+            # Acting on it would nudge days early, every day. So unless the
+            # reset is exact (a dated clock, which the CLI prints for anything
+            # >24 h out, or the transcript's quotaLimits epoch), such a
+            # cut-off waits for the account reading instead.
+            if (a.limit_window() in SEVEN_DAY_WINDOWS
+                    and not a.limit_reset_exact()):
                 return account_clear
             at = a.limit_resets_at()
             if at is not None:
@@ -2689,6 +2839,64 @@ class MainWindow(QMainWindow):
                     and now - a.limit_latched_at() >= LIMIT_UNKNOWN_WAIT_S)
 
         self._resume_blocked_agents(due=due)
+
+    def _sweep_transcript_cut_offs(self) -> int:
+        """The SECOND detector: latch any idle Claude agent whose conversation
+        on disk ends on a cut-off the live screen never latched. Returns how
+        many it adopted.
+
+        The screen scrape is fast but fragile. It has missed real cut-offs
+        three separate ways (a banner painted under the tool-result gutter, a
+        banner drawn with cursor jumps instead of spaces, and wordings the CLI
+        added later), and each miss was silent: the agent simply sat on a
+        spent limit. The transcript is written by the CLI itself in a stable
+        JSON shape, so reading it once a minute turns the next such change
+        into a late resume instead of a lost night. Cheap: `limit_cut_off` is
+        cached by (mtime, size), so an unchanged conversation costs one stat.
+
+        Scoped to cut-offs from THIS run (see LIMIT_SWEEP_SLACK_S), to idle
+        agents (a busy one is plainly not parked), and to cut-offs the ledger
+        has not already closed, so a conversation this app gave up on or
+        dismissed is never re-armed.
+        """
+        if self._closing or not self._ready:
+            return 0
+        closed = None
+        adopted = 0
+        for agent in self.manager.all_agents():
+            spec = agent.spec
+            if (spec.provider != "claude" or not agent.is_pty
+                    or not agent.is_running() or agent.is_busy()
+                    or agent.is_limit_blocked() or not spec.session_id):
+                continue
+            info = transcripts.limit_cut_off(spec.cwd, spec.session_id)
+            if not info or not info["cut_off"] or not info["at"]:
+                continue
+            if info["at"] < self._launched_at - LIMIT_SWEEP_SLACK_S:
+                continue        # startup recovery's call, already made
+            key = tuple(limit_ledger.key_of(spec.cwd, spec.session_id,
+                                            info["resets_at"] or 0.0,
+                                            info["at"]))
+            if closed is None:
+                closed = limit_ledger.closed_keys(
+                    limit_ledger.read_all(self._ledger_dir()))
+            if key in closed:
+                continue
+            if key not in self._ledger_seen:
+                self._ledger_cut_off(agent, info["at"], info["resets_at"],
+                                     info["window"], info["banner"],
+                                     source="sweep")
+            self._limit_audit(
+                f"LATE-LATCH agent={spec.name} (the screen never latched it; "
+                f"found in the transcript) banner={info['banner'][:60]!r}")
+            agent.mark_limit_blocked(info["resets_at"] or None,
+                                     from_startup=False,
+                                     cut_off_at=info["at"],
+                                     window=info["window"],
+                                     banner=info["banner"],
+                                     exact=info.get("exact", False))
+            adopted += 1
+        return adopted
 
     def _resume_blocked_agents(self, due=None) -> None:
         """The plan limit reset — put the agents it cut off back to work.
@@ -2798,20 +3006,34 @@ class MainWindow(QMainWindow):
             info = transcripts.limit_cut_off(agent.spec.cwd,
                                              agent.spec.session_id)
             if info is not None and not info["cut_off"]:
-                self._limit_audit(f"PHANTOM agent={agent.spec.name} (the "
-                                  f"conversation carried on, or the interrupted "
-                                  f"turn wasn't real work)")
-                self._ledger_outcome(agent, limit_ledger.DISMISSED,
-                                     detail="transcript shows no real work lost")
+                if info.get("self_resumed"):
+                    # Claude Code's own auto-continue got there first ("Usage
+                    # limit reset \xb7 continuing automatically"), which is the
+                    # outcome this feature wants, just not by our hand.
+                    self._limit_audit(f"SELF-RESUMED agent={agent.spec.name} "
+                                      f"(the CLI continued on its own)")
+                    self._ledger_outcome(agent, limit_ledger.RESUMED,
+                                         detail="the CLI continued on its own")
+                else:
+                    self._limit_audit(f"PHANTOM agent={agent.spec.name} (the "
+                                      f"conversation carried on, or the "
+                                      f"interrupted turn wasn't real work)")
+                    self._ledger_outcome(
+                        agent, limit_ledger.DISMISSED,
+                        detail="transcript shows no real work lost")
                 agent.clear_limit_block()
                 self._resume_pending.discard(agent.id)
                 return
-            # The Esc closes the limit's options menu sitting over the prompt.
-            # agy has no such menu, and an Esc there would clear whatever the
-            # user had half-typed into the input box instead, so it is sent only
-            # where there is something to dismiss. The beat before the text goes
-            # out is kept for both: it costs nothing and staggers the send.
-            agent.write("\x1b")
+            # The Esc closes the OLD limit options menu ("Stop and wait for
+            # limit to reset") when one is actually sitting over the prompt,
+            # and ONLY then. Current CLIs draw no menu, and there an Esc does
+            # harm: "continuing automatically at ... \xb7 esc or type to
+            # cancel" means it CANCELS Claude's own auto-continue, and on a
+            # plain prompt it clears whatever the user had half-typed. agy
+            # never has a menu. The beat before the text goes out is kept
+            # regardless: it costs nothing and staggers the send.
+            if agent.limit_menu_visible():
+                agent.write("\x1b")
 
         def send():
             if self._closing or not agent.is_running():
@@ -3044,6 +3266,12 @@ class MainWindow(QMainWindow):
         """User flipped the top-bar chime toggle. Persist the preference (via
         the debounced save) so it survives a restart."""
         self._sound_enabled = bool(enabled)
+        self._schedule_save()
+
+    def _on_reply_sound_toggled(self, enabled: bool) -> None:
+        """User flipped the reply-finished chime toggle. Persisted like the
+        question chime's."""
+        self._reply_sound_enabled = bool(enabled)
         self._schedule_save()
 
     # ------------------------------------------- taskbar working-count badge ---
@@ -3321,6 +3549,9 @@ class MainWindow(QMainWindow):
         # notification chime preference (default ON if never saved)
         self._sound_enabled = bool(ui.get("sound_enabled", True))
         self.top_bar.set_sound_enabled(self._sound_enabled)
+        # reply-finished chime preference (default OFF if never saved)
+        self._reply_sound_enabled = bool(ui.get("reply_sound_enabled", False))
+        self.top_bar.set_reply_sound_enabled(self._reply_sound_enabled)
         # Which usage readouts to show (default: all of them). A dict rather
         # than a list of enabled keys, so a missing entry defaults ON per key
         # and a fourth tracker added later needs no migration. A new key inside
@@ -3877,6 +4108,7 @@ class MainWindow(QMainWindow):
             "console_font_px": ui_theme.CONSOLE_FONT_PX,
             "theme": self._theme_id,
             "sound_enabled": self._sound_enabled,
+            "reply_sound_enabled": self._reply_sound_enabled,
             "usage_trackers": dict(self._usage_trackers),
             # Legacy mirror, DERIVED, kept for one release so a downgrade to a
             # build that only understands this key does not resurrect three

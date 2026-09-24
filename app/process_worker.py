@@ -270,6 +270,12 @@ def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
     if kind in AI_KINDS:
         spec.provider = AI_KINDS[kind]
         prov = providers.get(spec.provider)
+        if spec.provider == "gemini" and model and not effort:
+            from . import transcripts
+            _, m_eff = transcripts.parse_gemini_model_effort(model)
+            if m_eff:
+                spec.effort = m_eff
+                effort = m_eff
         prog, prov_args = providers.build_invocation(
             spec.provider, model=model, effort=effort,
             custom_command=custom_command, extra_args=args,
