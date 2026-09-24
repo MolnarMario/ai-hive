@@ -1917,6 +1917,15 @@ def test_fsopen_helpers():
     fsopen.open_with(missing)          # must not raise
     fsopen.reveal_in_folder(missing)   # must not raise
     check("fsopen: open_with / reveal_in_folder no-op on missing path", True)
+    # Regression: an argv list made subprocess quote the WHOLE
+    # "/select,<path>" token whenever the path had a space, Explorer ignored
+    # the quoted switch and opened Documents instead of the file's folder.
+    spaced = os.path.join(tempfile.gettempdir(), "AI Projects", "a b.txt")
+    cmd = fsopen.explorer_select_cmdline(spaced)
+    check("fsopen: reveal cmdline leaves /select, unquoted",
+          cmd.startswith('explorer /select,"') and '"/select' not in cmd)
+    check("fsopen: reveal cmdline quotes the full spaced path",
+          cmd.endswith(f'"{os.path.normpath(spaced)}"'))
 
 
 def test_filetypes_icons():
