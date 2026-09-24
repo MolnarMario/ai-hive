@@ -180,7 +180,10 @@ workspaces keep executing — switching never pauses anything.
   Sonnet or Fable cut-off is resumed on its own clock only when that clock is
   exact (a dated reset, or the epoch Claude records with the 429); a bare
   "resets 8pm" on a 7-day window waits for the account reading instead.
-  Because the first message after a window expires is what STARTS the next
+  A printed clock is read in the zone Claude names after it ("resets 3am
+  (Asia/Tokyo)"), falling back to the machine's zone when there is none, and
+  a reset that rolls over to tomorrow keeps its wall time on the night the
+  clocks change. Because the first message after a window expires is what STARTS the next
   5-hour window, resuming at 4am also means the clock has already rolled over by
   the time you sit down. The cut-off is recorded the instant it appears, along
   with the reset time the limit itself stated, so recovery doesn't depend on the

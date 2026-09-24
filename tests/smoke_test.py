@@ -9380,7 +9380,7 @@ def test_auto_continue_on_limit_reset():
     # --- the banner's clock -> the next occurrence of that wall time ---------
     from app.terminal_agent import parse_reset_clock
     base = _time.mktime((2026, 8, 2, 23, 50, 0, 0, 0, -1))   # 23:50 local
-    at = parse_reset_clock("\xb7 resets 4:40am (Europe/Bucharest)", base)
+    at = parse_reset_clock("\xb7 resets 4:40am", base)
     lt = _time.localtime(at)
     check("auto-continue: a small-hours reset read late at night rolls over "
           "to tomorrow",
@@ -10156,7 +10156,9 @@ def test_startup_limit_recovery():
 
     now = _time.time()
     cwd = str(tmp)
-    BANNER = "You've hit your session limit \xb7 resets 3am (Europe/Bucharest)"
+    # no "(Area/City)": the anchor below is built in LOCAL time, and a named
+    # zone would read "3am" in that zone instead (test_reset_clock_zones)
+    BANNER = "You've hit your session limit \xb7 resets 3am"
 
     # --- reading the durable record -----------------------------------------
     # The MOST RECENT 02:42 local: the wall time matters (it is what makes
@@ -12379,6 +12381,93 @@ def test_reply_marks_inline():
     card.deleteLater()
 
 
+def test_reset_clock_zones():
+    """A banner's clock is read in the zone it names, and "tomorrow" keeps the
+    wall time on the night the clocks change.
+
+    claude.exe prints "resets 3am (Europe/Bucharest)" in ITS zone, which only
+    matches Python's local zone when nothing sets an IANA `TZ` (Node honours
+    one, the Windows C runtime does not). And the old rollover added 86400 s,
+    which lands an hour off on a 23- or 25-hour night. Every check here pins
+    its zone explicitly, so it holds on a machine in any zone.
+    """
+    import datetime as _dt
+    import time as _time
+    from zoneinfo import ZoneInfo
+    from app import limit_banner as lb
+    from app import scheduled_send as ss
+
+    tokyo, buc = ZoneInfo("Asia/Tokyo"), ZoneInfo("Europe/Bucharest")
+
+    def wall(epoch, tz):
+        d = _dt.datetime.fromtimestamp(epoch, tz)
+        return (d.month, d.day, d.hour, d.minute)
+
+    # --- the named zone wins over the local one -----------------------------
+    now = _dt.datetime(2026, 9, 24, 22, 0, tzinfo=tokyo).timestamp()
+    at = lb.parse_reset_clock("You've hit your session limit \xb7 resets 3am "
+                              "(Asia/Tokyo)", now)
+    check("reset-zone: a bare clock is read in the zone the banner names",
+          at is not None and wall(at, tokyo) == (9, 25, 3, 0)
+          and 0 < at - now <= 5 * 3600, at and wall(at, tokyo))
+    at2 = lb.parse_reset_clock("You'vehityoursessionlimit\xb7resets3am"
+                               "(Asia/Tokyo)", now)
+    check("reset-zone: ...also when the renderer dropped the spaces",
+          at2 == at)
+    wrapped = lb.banner_clock_text(
+        "You've hit your session limit \xb7 resets 3am\n(Asia/Tokyo)\n")
+    check("reset-zone: a zone wrapped onto the next row is still read",
+          lb.parse_reset_clock(wrapped, now) == at, wrapped)
+    dated = lb.parse_reset_clock("You've hit your weekly limit \xb7 resets "
+                                 "Sep 30, 9am (Asia/Tokyo)", now)
+    check("reset-zone: a dated clock is read in the named zone too",
+          dated is not None and wall(dated, tokyo) == (9, 30, 9, 0))
+    local = lb.parse_reset_clock("resets 3am", now)
+    check("reset-zone: an unknown zone falls back to the local one",
+          lb.parse_reset_clock("resets 3am (Mars/Olympus_Mons)", now) == local
+          and lb.parse_reset_clock("resets 3am (esc to cancel)", now) == local)
+
+    # --- DST: tomorrow is the same WALL time, not now + 24 h ----------------
+    # Bucharest leaves summer time at 04:00 on 2026-10-25, so that day is 25 h.
+    eve = _dt.datetime(2026, 10, 24, 23, 0, tzinfo=buc).timestamp()
+    fall = lb.parse_reset_clock("resets 10pm (Europe/Bucharest)", eve)
+    check("reset-zone: a rollover across the autumn change keeps 10pm",
+          fall is not None and wall(fall, buc) == (10, 25, 22, 0),
+          fall and wall(fall, buc))
+    # ...and enters it at 03:00 on 2026-03-29, a 23 h day
+    spring_eve = _dt.datetime(2026, 3, 28, 23, 0, tzinfo=buc).timestamp()
+    spring = lb.parse_reset_clock("resets 9pm (Europe/Bucharest)", spring_eve)
+    check("reset-zone: a rollover across the spring change keeps 9pm",
+          spring is not None and wall(spring, buc) == (3, 29, 21, 0),
+          spring and wall(spring, buc))
+
+    # the local zone's own change, when it has one this year: the same rule
+    # through the local path (no zone printed) and the scheduler's clock field
+    t = _time.mktime((2026, 1, 1, 12, 0, 0, 0, 0, -1))
+    change = None
+    for _ in range(366):
+        if _time.localtime(t).tm_isdst != _time.localtime(t + 86400).tm_isdst:
+            change = t
+            break
+        t += 86400
+    if change is None:
+        check("reset-zone: local zone has no DST change (nothing to roll over)",
+              True)
+    else:
+        lt = _time.localtime(change)
+        eve_local = _time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                  23, 0, 0, 0, 0, -1))
+        for name, got in (
+                ("limit banner", lb.parse_reset_clock("resets 10pm", eve_local)),
+                ("scheduled send", ss.parse_clock("22:00", eve_local))):
+            got_lt = _time.localtime(got)
+            check(f"reset-zone: {name} rollover across the LOCAL clock change "
+                  "keeps the wall time",
+                  (got_lt.tm_hour, got_lt.tm_min) == (22, 0)
+                  and 0 < got - eve_local < 26 * 3600,
+                  (got_lt.tm_hour, got_lt.tm_min))
+
+
 def test_limit_detection_hardening():
     """The 2026-09-24 audit of the usage-limit flag, one check per finding.
 
@@ -12420,8 +12509,17 @@ def test_limit_detection_hardening():
             col += len(word) + 1
         return "".join(out)
 
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    bucharest = ZoneInfo("Europe/Bucharest")
+
     def hm(epoch):
-        return tuple(_time.localtime(epoch)[3:5]) if epoch else None
+        """The wall clock of `epoch` in the zone SESSION names, so these
+        checks hold on a machine in any zone."""
+        if not epoch:
+            return None
+        d = _dt.datetime.fromtimestamp(epoch, bucharest)
+        return (d.hour, d.minute)
 
     SESSION = ("You've hit your session limit \xb7 resets 6:40pm "
                "(Europe/Bucharest)")
@@ -12827,6 +12925,7 @@ def main():
     test_auto_continue_on_limit_reset()
     test_gemini_limit_detection()
     test_startup_limit_recovery()
+    test_reset_clock_zones()
     test_limit_detection_hardening()
     test_terminal_scrollbar()
     test_reply_marks_inline()

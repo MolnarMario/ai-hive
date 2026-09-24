@@ -55,8 +55,11 @@ interrupt real work. And every one must be the WHOLE start of its own short
 line, which is what keeps an agent's own prose about a limit from latching.
 """
 
+import datetime
+import functools
 import re
 import time
+import zoneinfo
 
 # Providers whose cut-off this module can recognise at all. Everything in the
 # recovery path (the live scrape, the resume pass) gates on this rather than on
@@ -120,15 +123,22 @@ _MONTHS = {m: i for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun",
      "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
 
-# The banner's own reset time, already in LOCAL time. `\s*` throughout so it
-# reads the despaced form too ("resets6:40pm", "continuingautomaticallyat
-# sep30,9am"). The "(Europe/Bucharest)" suffix is ignored on purpose: the
-# clock shown is already the user's own.
+# The banner's own reset time. `\s*` throughout so it reads the despaced form
+# too ("resets6:40pm", "continuingautomaticallyatsep30,9am").
 _LIMIT_RESET_RE = re.compile(
     r"(?:resets|continuing\s*automatically\s*at|continuing\s*shortly\s*at)"
     r"\s*(?:([a-z]{3})[a-z]*\.?\s*(\d{1,2}),\s*(?:(\d{4}),\s*)?)?"
     r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
     re.I)
+
+# The IANA zone claude.exe prints after a clock, "(Europe/Bucharest)". It is
+# the zone of the claude.exe process, which is USUALLY this machine's too, but
+# not always: Node honours an IANA `TZ` environment variable, and Python's
+# Windows C runtime cannot parse one, so with TZ=America/New_York set Claude
+# prints New York time while `time.localtime` still reads the system zone.
+# Reading the clock in the zone it names is right either way. Anchored to the
+# clock's end so no other parenthesis on the line can supply it.
+_ZONE_RE = re.compile(r"\s*\(\s*([A-Za-z_]+(?:/[A-Za-z0-9_+\-]+){0,2})\s*\)")
 
 # Claude's banner is a SHORT injected message ("You've hit your session limit
 # \xb7 resets 3am (Europe/Bucharest)" is ~61 chars). Anything long containing
@@ -279,7 +289,13 @@ def banner_clock_text(text: str) -> str:
     line, nxt = _find_banner(text)
     if not line:
         return ""
-    if _LIMIT_RESET_RE.search(line) or not nxt:
+    if not nxt:
+        return line
+    if _LIMIT_RESET_RE.search(line):
+        # a narrow card can wrap the zone alone onto the next row, and without
+        # it the clock falls back to the local zone
+        if _ZONE_RE.match(nxt) and not _ZONE_RE.search(line):
+            return line + " " + nxt
         return line
     # Borrow the next row only when this one visibly stops mid-phrase (Ink
     # wraps at word boundaries, so a clock pushed to the next row leaves
@@ -326,6 +342,44 @@ def is_limit_screen(text: str) -> bool:
     return bool(LIMIT_MENU_RE.search(text)) or banner_in(text)
 
 
+@functools.lru_cache(maxsize=16)
+def _zone(name: str) -> zoneinfo.ZoneInfo | None:
+    """The named IANA zone, or None when this Python has no tz database entry
+    for it (Windows has none of its own: the `tzdata` package supplies it).
+    None means "read the clock in the local zone", the pre-zone behaviour."""
+    try:
+        return zoneinfo.ZoneInfo(name)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+
+
+def wall_epoch(year: int, month: int, day: int, hour: int, minute: int,
+               tz: datetime.tzinfo | None = None) -> float:
+    """Epoch seconds of a wall-clock moment in `tz`, or in the local zone when
+    `tz` is None. Raises ValueError for a date that doesn't exist."""
+    if tz is None:
+        datetime.date(year, month, day)  # validate: mktime would roll it over
+        return time.mktime((year, month, day, hour, minute, 0, 0, 0, -1))
+    return datetime.datetime(year, month, day, hour, minute,
+                             tzinfo=tz).timestamp()
+
+
+def next_wall_clock(hour: int, minute: int, now: float,
+                    tz: datetime.tzinfo | None = None) -> float:
+    """Epoch seconds of the next `hour:minute` on the wall clock of `tz` (local
+    when None): today if still ahead of `now`, else tomorrow.
+
+    "Tomorrow" is rebuilt from tomorrow's DATE rather than `today + 86400`,
+    because the night the clocks change is 23 or 25 hours long, and adding a
+    fixed day there lands an hour off the wall time that was asked for."""
+    today = datetime.datetime.fromtimestamp(now, tz).date()
+    target = wall_epoch(today.year, today.month, today.day, hour, minute, tz)
+    if target <= now:
+        nxt = today + datetime.timedelta(days=1)
+        target = wall_epoch(nxt.year, nxt.month, nxt.day, hour, minute, tz)
+    return target
+
+
 def parse_reset_clock(text: str, now: float | None = None) -> float | None:
     """Epoch seconds of the NEXT occurrence of the wall clock in a limit
     banner, or None when there is no time in it.
@@ -336,6 +390,10 @@ def parse_reset_clock(text: str, now: float | None = None) -> float | None:
     dated form ("Sep 30, 9am", optionally with a year) skips that guess
     entirely and is resolved directly, except across a Dec->Jan boundary,
     where the named date would otherwise land weeks in the past.
+
+    The clock is read in the zone printed after it ("(Europe/Bucharest)", see
+    `_ZONE_RE`), and in the local zone when there is none or it is unknown.
+    "Today" is that zone's today.
 
     Pass it a banner LINE (`banner_clock_text`), not a whole screen region:
     this reads the first clock it finds.
@@ -356,16 +414,17 @@ def parse_reset_clock(text: str, now: float | None = None) -> float | None:
             hour += 12
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return None
+    zm = _ZONE_RE.match(text, m.end())
+    tz = _zone(zm.group(1)) if zm else None
     now = time.time() if now is None else now
-    lt = time.localtime(now)
     if mon and day:
         month = _MONTHS.get(mon.lower()[:3])
         if month is None or not (1 <= int(day) <= 31):
             return None
-        yr = int(year) if year else lt.tm_year
+        this_year = datetime.datetime.fromtimestamp(now, tz).year
+        yr = int(year) if year else this_year
         try:
-            target = time.mktime((yr, month, int(day), hour, minute,
-                                  0, 0, 0, -1))
+            target = wall_epoch(yr, month, int(day), hour, minute, tz)
         except (OverflowError, ValueError):
             return None
         # a 7-day reset is at most ~8 days out, so a named date (with no year)
@@ -373,16 +432,12 @@ def parse_reset_clock(text: str, now: float | None = None) -> float | None:
         # wraps into next year (a Dec banner naming a January reset).
         if not year and target < now - 3 * 86400:
             try:
-                target = time.mktime((lt.tm_year + 1, month, int(day), hour,
-                                      minute, 0, 0, 0, -1))
+                target = wall_epoch(this_year + 1, month, int(day), hour,
+                                    minute, tz)
             except (OverflowError, ValueError):
                 return None
         return target
-    target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hour, minute, 0,
-                          0, 0, -1))
-    if target <= now:
-        target += 86400
-    return target
+    return next_wall_clock(hour, minute, now, tz)
 
 
 def banner_reset_at(text: str, written_at: float) -> float | None:

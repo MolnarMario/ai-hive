@@ -32,6 +32,8 @@ import re
 import uuid
 from dataclasses import dataclass, field
 
+from .limit_banner import next_wall_clock
+
 PENDING = "pending"
 SENT = "sent"
 MISSED = "missed"
@@ -150,9 +152,10 @@ def parse_clock(text: str, now: float | None = None) -> float | None:
     Deliberately the same rollover rule as `limit_banner.parse_reset_clock`: a
     bare clock carries no date, so a time already past today means tomorrow.
     That is the behaviour someone setting "at 03:00" late in the evening
-    expects. Kept separate from that function rather than shared, because this
-    one parses a whole field the user typed while that one searches inside a
-    banner.
+    expects. The parsing is kept separate from that function, because this one
+    parses a whole field the user typed while that one searches inside a
+    banner, but both roll over through `next_wall_clock`, which keeps the
+    wall time right on the night the clocks change.
     """
     m = _CLOCK_RE.match(text or "")
     if not m:
@@ -167,12 +170,7 @@ def parse_clock(text: str, now: float | None = None) -> float | None:
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return None
     now = time.time() if now is None else now
-    lt = time.localtime(now)
-    target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hour, minute, 0,
-                          0, 0, -1))
-    if target <= now:
-        target += 86400
-    return target
+    return next_wall_clock(hour, minute, now)
 
 
 def format_countdown(seconds: float) -> str:
