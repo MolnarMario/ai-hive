@@ -371,7 +371,8 @@ def format_since(seconds: float) -> str:
 
 def format_limit(limit: Limit, now: float | None = None,
                  with_label: bool = False, days_only: bool = False) -> str:
-    """The badge line: "21% used, resets in 1h20m at 14:49".
+    """The badge line: "Claude 21% used, resets in 1h20m at 14:49", the same
+    shape as `gemini_usage.format_limit` so the pills read alike.
 
     Countdown FIRST, wall-clock second (the user's chosen order): "how long have
     I got" is the question being asked; the clock time is the follow-up. The
@@ -385,7 +386,7 @@ def format_limit(limit: Limit, now: float | None = None,
     # spell the blocked state out rather than showing a bare "100% used" —
     # this is the state the user most needs to read at a glance
     head = ("limit reached" if limit.percent >= EXHAUSTED_PCT
-            else f"{limit.percent:.0f}% used")
+            else f"Claude {limit.percent:.0f}% used")
     if with_label:
         head = f"{limit.short} {head}"
     if limit.resets_at is None:

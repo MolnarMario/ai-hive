@@ -8537,19 +8537,19 @@ def test_plan_usage():
 
     # --- the badge line: countdown FIRST, then wall-clock, in local time ---
     line = cu.format_limit(limit("five_hour", 21.0, now + 4800), now=now)
-    check("plan-usage: line reads '21% used, resets in 1h20m at HH:MM'",
-          line.startswith("21% used, resets in 1h20m at ")
+    check("plan-usage: line reads 'Claude 21% used, resets in 1h20m at HH:MM'",
+          line.startswith("Claude 21% used, resets in 1h20m at ")
           and len(line.split(" at ")[1]) == 5, line)
     check("plan-usage: local wall-clock, not UTC",
           line.endswith(_time.strftime("%H:%M", _time.localtime(now + 4800))))
     check("plan-usage: window named only when the plan has several",
           cu.format_limit(limit("seven_day", 64.0, now + 600), now=now,
-                          with_label=True).startswith("7d 64% used"))
+                          with_label=True).startswith("7d Claude 64% used"))
     check("plan-usage: a spent window spells out 'limit reached'",
           cu.format_limit(limit("five_hour", 100.0, now + 600),
                           now=now).startswith("limit reached, resets in 10m"))
     check("plan-usage: no reset time degrades to the bare percent",
-          cu.format_limit(limit("five_hour", 21.0)) == "21% used")
+          cu.format_limit(limit("five_hour", 21.0)) == "Claude 21% used")
     check("plan-usage: countdown formats scale",
           (cu.format_countdown(4800), cu.format_countdown(600),
            cu.format_countdown(30)) == ("1h20m", "10m", "30s"))
@@ -8563,11 +8563,11 @@ def test_plan_usage():
     check("plan-usage: format_limit(days_only=True) uses the dh countdown",
           cu.format_limit(limit("seven_day", 40.0, now + 6 * 86400 + 3600),
                           now=now, days_only=True).startswith(
-                              "40% used, resets in 6d1h at "))
+                              "Claude 40% used, resets in 6d1h at "))
     check("plan-usage: format_limit(days_only=False) keeps minutes",
           cu.format_limit(limit("seven_day", 40.0, now + 4800), now=now,
                           days_only=False).startswith(
-                              "40% used, resets in 1h20m at "))
+                              "Claude 40% used, resets in 1h20m at "))
     check("plan-usage: age formats scale",
           (cu.format_since(2), cu.format_since(42), cu.format_since(180),
            cu.format_since(7200)) == ("just now", "42s ago", "3m ago", "2h ago"))
@@ -8645,7 +8645,7 @@ def test_plan_usage():
     check("plan-usage: reading shows the badge with the full line, labelled "
           "5h so it's tellable apart from the 7d pill beside it",
           badge.isVisible()
-          and badge._text.startswith("5h 21% used, resets in"))
+          and badge._text.startswith("5h Claude 21% used, resets in"))
     check("plan-usage: tooltip carries plan, every window, and the age",
           "Pro plan" in badge.toolTip() and "Current session" in badge.toolTip()
           and "Updated" in badge.toolTip())
@@ -8675,11 +8675,11 @@ def test_plan_usage():
     five_cd = _countdown(badge._text)
     weekly_cd = _countdown(weekly_badge._text)
     check("plan-usage: the 5h pill still shows the 5h window, to the minute",
-          badge._text.startswith("5h 21% used, resets in")
+          badge._text.startswith("5h Claude 21% used, resets in")
           and five_cd.endswith("m"))
     check("plan-usage: the 7d pill shows the 7d window, days+hours only "
           "(no minutes)",
-          weekly_badge._text.startswith("7d 40% used, resets in")
+          weekly_badge._text.startswith("7d Claude 40% used, resets in")
           and "m" not in weekly_cd
           and ("d" in weekly_cd or weekly_cd.endswith("h")
                or weekly_cd == "<1h"))
@@ -8777,7 +8777,7 @@ def test_plan_usage():
     # a failed poll keeps the last good number on screen, greyed
     win._on_usage_ready(cu.Usage(error="urlerror"))
     check("plan-usage: a failed poll keeps the last number, marked stale",
-          badge._text.startswith("5h 21% used") and badge._stale)
+          badge._text.startswith("5h Claude 21% used") and badge._stale)
 
     # visibility preference persists; toggling it IS a save (a UI preference)
     win._on_usage_tracker_toggled("claude_five_hour", False)
@@ -8852,7 +8852,7 @@ def test_plan_usage():
     app.processEvents()
     check("plan-usage: a later reading replaces the can't-read pill",
           b4.isVisible() and b4.has_reading()
-          and b4._text.startswith("5h 21% used") and not b4._unreadable)
+          and b4._text.startswith("5h Claude 21% used") and not b4._unreadable)
     # an error is not a reason to force the readout back onto a bar the user
     # deliberately cleared
     win4._on_usage_tracker_toggled("claude_five_hour", False)
@@ -12940,6 +12940,7 @@ def main():
     test_multi_agent_session_isolation()
     test_usage_pill_geometry_and_close()
     test_usage_pill_never_truncates()
+    test_usage_pill_provider_inks()
     test_options_panel()
     test_topbar_extras_autosize()
     test_topbar_extras_grow_with_window()
@@ -13242,6 +13243,95 @@ def test_usage_pill_never_truncates():
     broken.deleteLater()
     pill.deleteLater()
     host.deleteLater()
+
+
+def test_usage_pill_provider_inks():
+    """Each usage pill wears its agent's colour and turns red at 85%.
+
+    Claude terracotta, Gemini blue, GPT in the running-head's title ink, so
+    three agents' pills tell apart at a glance and only the one near its
+    limit changes. The pills sit on the TOP BAR, which is vellum on the light
+    skin, so the inks are checked against every skin's bg_panel: the lifted
+    vendor inks and the near-white title ink both vanish on vellum.
+    """
+    import time as _time
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QColor
+    from app import ui_theme, claude_usage as cu, gemini_usage as gu
+    from app import codex_usage as xu
+    from app.widgets.ornaments import PlanUsageBadge
+    from app.widgets.gemini_usage_badge import GeminiUsageBadge
+    from app.widgets.codex_usage_badge import CodexUsageBadge
+    from app.widgets.terminal_view import contrast_ratio
+
+    QApplication.instance() or QApplication([])
+    reset = _time.time() + 4800
+
+    def claude(pct):
+        b = PlanUsageBadge(window="five_hour")
+        b.set_usage(cu.Usage(limits=(cu.Limit("five_hour", "Session (5h)",
+                                              "5h", pct, reset),)))
+        return b
+
+    def gemini(pct):
+        b = GeminiUsageBadge(window="five_hour")
+        b.set_usage(gu.GeminiUsage(limits=(gu.GeminiLimit(
+            "five_hour", "5-hour", "5h", pct, reset),)))
+        return b
+
+    def gpt(pct):
+        b = CodexUsageBadge()
+        b.set_usage(xu.CodexUsage(limit=xu.CodexLimit(pct, reset)))
+        return b
+
+    check("usage-ink: the Claude pill reads like the Gemini pill",
+          claude(21.0)._text.startswith("5h Claude 21% used, resets in")
+          and gemini(18.0)._text.startswith("5h Gemini 18% used, resets in"),
+          (claude(21.0)._text, gemini(18.0)._text))
+    check("usage-ink: the Codex pill is labelled GPT",
+          gpt(30.0)._text.startswith("GPT 30% used, resets in")
+          and "ChatGPT" not in gpt(30.0)._text, gpt(30.0)._text)
+
+    was = ui_theme.ACTIVE_THEME.id
+    fails, reds, inks_ok = [], [], True
+    try:
+        for tid, t in ui_theme.THEMES.items():
+            ui_theme.apply_theme(tid)
+            want = {"claude": ui_theme.usage_pill_ink("claude"),
+                    "gemini": ui_theme.usage_pill_ink("gemini"),
+                    "codex": ui_theme.usage_pill_ink("codex")}
+            if not t.light:
+                inks_ok &= (want["claude"] == ui_theme.PROVIDER_INK["claude"]
+                            and want["gemini"] == ui_theme.PROVIDER_INK["gemini"]
+                            and want["codex"] == t.cardhead_fg)
+            for key, make in (("claude", claude), ("gemini", gemini),
+                              ("codex", gpt)):
+                low, edge, high = make(84.0), make(85.0), make(97.0)
+                if low._color().name() != QColor(want[key]).name():
+                    fails.append(f"{tid}:{key} at 84%={low._color().name()}")
+                if (edge._color().name() != QColor(t.red).name()
+                        or high._color().name() != QColor(t.red).name()):
+                    reds.append(f"{tid}:{key}")
+                r = contrast_ratio(QColor(want[key]), QColor(t.bg_panel))
+                if r < 4.5:
+                    fails.append(f"{tid}:{key} contrast {r:.2f}")
+                for b in (low, edge, high):
+                    b.deleteLater()
+    finally:
+        ui_theme.apply_theme(was)
+    check("usage-ink: under 85% each pill wears its agent's ink, readable on "
+          "every skin's top bar", not fails, fails)
+    check("usage-ink: dark skins use the card chip's vendor inks and the "
+          "running-head title ink for GPT", inks_ok)
+    check("usage-ink: at 85% and above every pill turns the skin's red",
+          not reds, reds)
+    check("usage-ink: the three agents' resting inks differ on every skin",
+          all(len({ui_theme.apply_theme(tid) and None,
+                   ui_theme.usage_pill_ink("claude"),
+                   ui_theme.usage_pill_ink("gemini"),
+                   ui_theme.usage_pill_ink("codex")} - {None}) == 3
+              for tid in ui_theme.THEMES))
+    ui_theme.apply_theme(was)
 
 
 def test_topbar_extras_autosize():

@@ -26,6 +26,8 @@ class GeminiUsageBadge(UsagePillBadge):
         (o) 5h Gemini 18% used, resets in 2h45m at 17:30
     """
 
+    _PROVIDER = "gemini"
+
     def __init__(self, parent=None, window: str = "five_hour"):
         super().__init__(parent)
         self.window = window

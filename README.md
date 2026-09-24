@@ -104,14 +104,17 @@ workspaces keep executing — switching never pauses anything.
   all.
 - **Plan usage readout** — two top-bar badges, one
   per Claude rate-limit window, showing how much you've burned and when it
-  comes back: the **5-hour** pill reads `5h 21% used, resets in 1h20m at
-  14:49` — countdown first, then the wall-clock time in your own timezone; the
-  **7-day** pill reads `7d 40% used, resets in 3d14h at 09:00` — same shape,
+  comes back: the **5-hour** pill reads `5h Claude 21% used, resets in 1h20m
+  at 14:49` — countdown first, then the wall-clock time in your own timezone;
+  the **7-day** pill reads `7d Claude 40% used, resets in 3d14h at 09:00` —
+  the same shape as the Gemini pills beside it,
   but its countdown is **days+hours only, no minutes**, since a week-long
   window doesn't need to-the-minute precision (`3d14h` / `3d` / `14h` / `<1h`
-  rather than an unreadable `86h27m`). A percent ring turns amber past 60% and
-  red past 85% on each, so you see a wall coming instead of hitting it
-  mid-task. **Click either to refresh**; hover for every limit window, your
+  rather than an unreadable `86h27m`). Each pill wears its agent's colour
+  (Claude terracotta, Gemini blue, GPT in the card header's light title ink)
+  and turns red at 85%, so you see a wall coming instead of hitting it
+  mid-task, and the red pill tells you which agent is about to hit it.
+  **Click either to refresh**; hover for every limit window, your
   plan, and how old the reading is. The numbers come from the same place the
   CLI's `/usage` gets them, read once a minute in the background — nothing is
   logged or persisted, it's a live readout only. Past 90% *with agents actually
@@ -724,7 +727,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1916 checks drive the real app headlessly (offscreen Qt platform) with real
+1931 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -846,7 +849,7 @@ app/
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1916 checks)
+tests/smoke_test.py        headless end-to-end suite (1931 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

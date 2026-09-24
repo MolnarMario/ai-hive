@@ -146,7 +146,7 @@ def format_countdown(seconds: float) -> str:
 
 def format_limit(limit: CodexLimit, now: float | None = None) -> str:
     now = time.time() if now is None else now
-    head = "limit reached" if limit.percent >= 100.0 else f"ChatGPT/Codex {limit.percent:.0f}% used"
+    head = "limit reached" if limit.percent >= 100.0 else f"GPT {limit.percent:.0f}% used"
     if limit.resets_at is None:
         return head
     left = limit.resets_at - now

@@ -627,8 +627,8 @@ class UsagePillBadge(QWidget):
     appears on hover to close the pill.
 
     Painted rather than styled, for the same reason as `AgentCountBadge`: the
-    colour has to switch on utilization (green -> amber -> red) AND track the
-    active skin, and per-state QSS would fight the theme registry. Reading
+    colour has to switch on utilization (provider ink -> red at 85%) AND track
+    the active skin, and per-state QSS would fight the theme registry. Reading
     `Palette` at paint time gives both for free.
 
     THE WIDTH IS THE TEXT'S WIDTH, measured with the font `paintEvent` actually
@@ -683,9 +683,17 @@ class UsagePillBadge(QWidget):
     _FILL_ALPHA, _BORDER_ALPHA = 30, 140          # a live reading
     _FILL_ALPHA_DIM, _BORDER_ALPHA_DIM = 18, 90   # loading or stale
 
-    # utilization thresholds. Deliberately generous: amber is a nudge, red is
-    # "wrap up", because being cut off mid-task is the thing we're avoiding.
-    _AMBER, _RED = 60.0, 85.0
+    # At or above this the pill turns red whatever the provider: "wrap up",
+    # because being cut off mid-task is the thing we're avoiding. Below it a
+    # pill wears its provider's ink (`ui_theme.usage_pill_ink`), so three
+    # agents' pills stay tellable apart and only the one near its limit
+    # changes colour. There is no amber step any more; it would read as a
+    # fourth provider.
+    _RED = 85.0
+
+    # whose pill this is: "claude", "gemini" or "codex". None keeps the
+    # generic green, for a pill with no provider ink.
+    _PROVIDER: str | None = None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -916,12 +924,10 @@ class UsagePillBadge(QWidget):
     def _color(self) -> QColor:
         if self._loading or self._stale or self._limit is None:
             return QColor(Palette.TEXT_DIM)
-        pct = self._limit.percent
-        if pct >= self._RED:
+        if self._limit.percent >= self._RED:
             return QColor(Palette.RED)
-        if pct >= self._AMBER:
-            return QColor(Palette.YELLOW)
-        return QColor(Palette.GREEN)
+        ink = ui_theme.usage_pill_ink(self._PROVIDER) if self._PROVIDER else None
+        return QColor(ink or Palette.GREEN)
 
     def paintEvent(self, event):
         if self._limit is None and not self._unreadable and not self._loading:
@@ -1071,8 +1077,8 @@ class PlanUsageBadge(UsagePillBadge):
     """The top-bar readout of one Claude account plan-usage window (5-hour
     session, or 7-day):
 
-        (o) 5h 21% used, resets in 1h20m at 14:49
-        (o) 7d 40% used, resets in 3d14h at 09:00
+        (o) 5h Claude 21% used, resets in 1h20m at 14:49
+        (o) 7d Claude 40% used, resets in 3d14h at 09:00
 
     A percent ring plus one line, in the order the user asked for — countdown
     first ("how long have I got"), wall-clock second, both in LOCAL time. The
@@ -1082,8 +1088,8 @@ class PlanUsageBadge(UsagePillBadge):
     multi-day duration) is unreadable at a glance.
 
     Painted rather than styled, for the same reason as `AgentCountBadge`: the
-    colour has to switch on utilization (green -> amber -> red) AND track the
-    active skin, and per-state QSS would fight the theme registry. Reading
+    colour has to switch on utilization (provider ink -> red at 85%) AND track
+    the active skin, and per-state QSS would fight the theme registry. Reading
     `Palette` at paint time gives both for free.
 
     The widget is a pure VIEW — it never fetches. `MainWindow` polls off-thread
@@ -1100,6 +1106,8 @@ class PlanUsageBadge(UsagePillBadge):
     error pill keeps the click-to-refresh affordance, which is the one useful
     thing a user can do about it.
     """
+
+    _PROVIDER = "claude"
 
     def __init__(self, parent=None, window: str = "five_hour"):
         super().__init__(parent)
