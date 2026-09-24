@@ -222,7 +222,7 @@ CONSOLE_FONT_PX = DEFAULT_CONSOLE_PX
 # terracotta and Google blue. A provider with no ink here keeps the default
 # gold-dim rule.
 PROVIDER_INK: dict[str, str] = {
-    "claude": "#df8b70",   # Claude terracotta
+    "claude": "#e99b81",   # Claude terracotta
     "gemini": "#72a4f7",   # Google blue
 }
 
@@ -779,6 +779,9 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 3px 10px; color: {p.TEXT_DIM}; font-size: 12px;
 }}
+/* the chime rows' note button: as tall as the ToggleSwitch beside it (18px),
+   so those two rows keep the same rhythm as the others */
+#OptionsAction[compact="true"] {{ padding: 0px 7px; font-size: 11px; }}
 #OptionsAction:hover {{
     background: {p.BG_HOVER}; border-color: {p.ACCENT_GOLD}; color: {p.TEXT};
 }}
@@ -794,6 +797,42 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 }}
 #OptionsBtn[attention="true"] {{
     border-color: {p.ACCENT_GOLD}; color: {p.ACCENT_GOLD};
+}}
+/* the event log: its bar button lights up while a question is unanswered */
+#EventLogBtn {{
+    background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
+    padding: 3px 9px; color: {p.TEXT_DIM}; font-size: 12px;
+}}
+#EventLogBtn:hover {{
+    background: {p.BG_HOVER}; border-color: {p.ACCENT_GOLD}; color: {p.TEXT};
+}}
+#EventLogBtn[attention="true"] {{ border-color: {p.YELLOW}; color: {p.YELLOW}; }}
+#EventLogWindow {{ background: {p.BG_ROOT}; }}
+#EventLogList {{
+    background: {p.BG_ROOT}; border: none; color: {p.TEXT}; outline: 0;
+}}
+#LogInfoRow {{ background: {p.BG_ROOT}; border-bottom: 1px solid {p.BORDER_SOFT}; }}
+#LogChip, #LogNeedsBtn, #LogScopeBtn {{
+    background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
+    border-radius: 3px; padding: 3px 8px; color: {p.TEXT_FAINT};
+}}
+#LogChip:hover, #LogNeedsBtn:hover, #LogScopeBtn:hover {{
+    border-color: {p.ACCENT_GOLD};
+}}
+#LogChip:checked {{ border-color: {p.TEXT_DIM}; color: {p.TEXT}; }}
+#LogNeedsBtn:checked {{ border-color: {p.YELLOW}; color: {p.YELLOW}; }}
+#LogScopeBtn {{ color: {p.TEXT}; }}
+#LogScopeBtn[narrowed="true"] {{ border-color: {p.ACCENT_GOLD}; color: {p.ACCENT_GOLD}; }}
+#LogLinkBtn {{
+    background: transparent; border: none; padding: 0 6px;
+    color: {p.ACCENT_GOLD}; font-size: 12px;
+}}
+#LogLinkBtn:hover {{ text-decoration: underline; }}
+#EventLogScope {{
+    background: {p.BG_PANEL}; border: 1px solid {p.BORDER}; border-radius: 4px;
+}}
+#EventLogScope QTreeWidget {{
+    background: {p.BG_PANEL}; border: none; color: {p.TEXT};
 }}
 /* the startup update gate's report. Deliberately quiet: it exists so an
    update that could NOT apply is answerable at a glance, not to nag. */

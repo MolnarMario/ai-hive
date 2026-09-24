@@ -838,6 +838,7 @@ class WorkspaceManager(QObject):
                         "cwd": getattr(spec, "cwd", ""),
                         "provider": getattr(spec, "provider", ""),
                         "session_id": getattr(spec, "session_id", ""),
+                        "uid": getattr(spec, "uid", ""),
                         # everything below is why the degrade is survivable:
                         # pty in particular decides whether the agent comes
                         # back as a terminal at all

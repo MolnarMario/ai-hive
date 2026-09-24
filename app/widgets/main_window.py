@@ -5,6 +5,7 @@ Every dialog lives here so the model API stays headless-testable.
 """
 
 import os
+import shutil
 import threading
 import time
 
@@ -29,14 +30,18 @@ from .. import scheduled_send
 from .. import session_hook
 from .. import transcripts
 from .. import ui_theme
+from .. import usage_poll
 from ..process_worker import (AI_KINDS, PTY_ONLY_KINDS, AgentKind, build_spec)
 from ..pty_worker import HAS_CONPTY
 from ..session_store import SessionStore
 from ..workspace_manager import Workspace, WorkspaceManager
 from .. import coordination
+from .. import event_log
+from ..event_hub import EventHub
 from ..orchestrator_bridge import OrchestratorBridge
 from .activity_panel import ActivityPanel
 from .agent_file_map import AgentFileMapWindow
+from .event_log_window import EventLogWindow
 from . import ornaments
 from .ornaments import (DropDownComboBox, LogoRoundel,
                         PageBorder, PlanUsageBadge, ToggleSwitch)
@@ -72,57 +77,14 @@ MODEL_SYNC_MS = 1500
 # interval is fine.
 BG_SHELL_POLL_MS = 2000
 
-# how often to re-read the Claude account's plan usage from the API. One small
-# HTTPS GET; a minute is well inside the resolution of a 5-hour window.
-USAGE_POLL_MS = 60000
-# ...except in the danger zone, where a minute is NOT fine: from this
-# utilization on, agents that are actively streaming can spend the rest of the
-# window in well under a poll interval, and everything that reacts to being cut
-# off (planLimitReached, the reset poll it arms, the ledger) only starts once a
-# reading reports it. So poll faster - but ONLY while both halves hold (nearly
-# spent AND at least one agent working), which keeps the fast rate to short
-# bursts at the end of a window instead of a permanently tripled request rate.
-# 20s is three requests a minute at the very worst; the ordinary rate is one.
-USAGE_URGENT_POLL_MS = 20000
-USAGE_URGENT_PCT = 90.0
-# how often the readout re-renders its countdown from the clock alone (no
-# network). Repaints only when the displayed string changes.
+# Every usage pill polls on ONE shared policy, in `app.usage_poll`: 90 s while
+# that provider's agents are working, 30 s from 90% used, 6 minutes while none
+# are. The cadence, the quick retry, the 429 backoff, the wake-from-sleep poll
+# and the reset poll all live there, so a pill added later cannot get its own.
+# how often the pills re-render their countdowns from the clock alone (no
+# network). Repaints only when the displayed string changes. The pollers ride
+# the same tick to follow agent activity and to notice the machine waking.
 USAGE_TICK_MS = 20000
-# once a limit is spent, re-poll this soon after its stated reset so the
-# "limit cleared" edge fires promptly (an unattended relaunch shouldn't wait
-# out a whole poll interval at 4am), plus a small cushion for clock skew.
-USAGE_RESET_GRACE_MS = 8000
-
-# GEMINI IS POLLED ON A SEPARATE, MUCH SLOWER CLOCK, and the reason is not
-# request cost -- it is that this fetch SPAWNS A PROCESS where a Claude tick
-# makes a request. `gemini_usage.fetch()` runs `agy --print /usage`, which
-# measures several seconds of a background thread and a whole CLI's startup.
-#
-# It also, on ~1 poll in 20, flashes a terminal window over the user's screen.
-# That one is NOT ours to fix: agy starts a nested helper that asks Windows for
-# its own console two levels below us, where creation flags do not reach, and
-# Windows 11 hands that console to the default terminal app. Running the CLI
-# under a pseudo-console was tried and reverted (see `gemini_usage._read_usage`
-# for what it measured). So the cadence is the only lever AI Hive has over it.
-#
-# Slowing this down stays nearly free, unlike on the Claude side: NOTHING
-# consumes this reading except the two pills. A Gemini cut-off recovers on the
-# countdown its own banner printed, never on the account reading (see the limit
-# invariant), so no edge is delayed by a slower poll -- only the number on a
-# pill, describing a 5-hour window that does not move far in five minutes.
-# Do NOT fold this back onto USAGE_POLL_MS: that constant is answerable to
-# planLimitReached/planLimitCleared and the reset poll they arm, none of which
-# exist for Gemini.
-GEMINI_USAGE_POLL_MS = 300000
-# The danger zone still buys a fresher READOUT, so it still exists -- but with
-# no cut-off edge hanging off it the way Claude's does, it has no reason to go
-# to Claude's 20s and every reason not to: each fast tick is another CLI launch.
-GEMINI_USAGE_URGENT_POLL_MS = 60000
-
-# Codex reads the same ChatGPT subscription's primary window. It is a small
-# authenticated request (not a CLI subprocess), and unlike Claude it drives no
-# recovery machinery, so it is only polled while its optional pill is enabled.
-CODEX_USAGE_POLL_MS = 60000
 
 # The usage readouts the top bar can show, and the order they sit in. PER PILL
 # rather than per provider: each window (Claude 5h/7d, Gemini 5h/7d) is its own
@@ -418,6 +380,36 @@ class PageStack(QStackedWidget):
             page.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, False)
 
 
+def usage_sources() -> tuple:
+    """Every polled usage readout, and the only place one is declared.
+
+    A NEW PILL GOES HERE: its fetch, the agent providers whose work moves its
+    number, and its tracker keys. `usage_poll.UsagePoller` then gives it the
+    same cadence, retries, backoff, wake poll, reset poll and grey rule as
+    every other pill. `MainWindow.__init__` refuses to build if a key in
+    USAGE_TRACKER_KEYS has no source here, so a pill cannot reach the bar
+    with no poll behind it.
+
+    The fetches are looked up at call time, so a test that swaps a module's
+    `fetch` sees its stub used."""
+    from .. import gemini_usage
+    return (
+        usage_poll.UsageSource(
+            name="claude", fetch=lambda: claude_usage.fetch(),
+            agent_providers=("claude",),
+            tracker_keys=("claude_five_hour", "claude_weekly"),
+            always=True),
+        usage_poll.UsageSource(
+            name="gemini", fetch=lambda: gemini_usage.fetch(),
+            agent_providers=("gemini",),
+            tracker_keys=("gemini_five_hour", "gemini_weekly")),
+        usage_poll.UsageSource(
+            name="codex", fetch=lambda: codex_usage.fetch(),
+            agent_providers=("openai",),
+            tracker_keys=("codex_five_hour",)),
+    )
+
+
 class TopBar(QFrame):
     addTerminalClicked = Signal()
     sidebarToggleClicked = Signal()
@@ -425,6 +417,12 @@ class TopBar(QFrame):
     themeChanged = Signal(str)   # theme id
     soundToggled = Signal(bool)  # question chime enabled/muted
     replySoundToggled = Signal(bool)  # reply-finished chime enabled/muted
+    # the chime rows' note-button menu, each carrying the chime kind
+    # (chime.QUESTION / chime.REPLY). TopBar only asks; MainWindow opens the
+    # file dialog, copies the file and persists it.
+    chimeSoundChooseRequested = Signal(str)
+    chimeSoundResetRequested = Signal(str)
+    chimePreviewRequested = Signal(str)
     # show/hide ONE usage readout: (tracker key, wanted). One signal for both
     # affordances - the X on a pill and the + menu - so the two controls of the
     # same preference can never disagree.
@@ -442,6 +440,7 @@ class TopBar(QFrame):
     autoContinueToggled = Signal(bool)     # resume cut-off agents at the reset
     startupRecoveryToggled = Signal(bool)  # recover cut-off agents on startup
     usageRefreshRequested = Signal()       # user clicked the readout
+    eventLogClicked = Signal()             # open the event log window
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -517,6 +516,23 @@ class TopBar(QFrame):
         self.reply_sound_btn = ToggleSwitch(self)
         self.reply_sound_btn.clicked.connect(self._on_reply_sound_clicked)
         self._refresh_reply_sound_btn()
+
+        # ...and a note button beside each of those two switches, for picking
+        # the user's own sound. The file name behind each (empty = built-in)
+        # is only for the tooltips; MainWindow owns the real path.
+        self._custom_sound_names = {chime.QUESTION: "", chime.REPLY: ""}
+        self.chime_sound_btns = {}
+        for kind in chime.KINDS:
+            btn = QToolButton(self)
+            btn.setObjectName("OptionsAction")
+            btn.setProperty("compact", True)
+            btn.setFixedHeight(18)
+            btn.setText("♪")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(
+                lambda _c=False, k=kind: self._open_chime_sound_menu(k))
+            self.chime_sound_btns[kind] = btn
+        self._refresh_chime_sound_btns()
 
         # taskbar working-count overlay toggle. Sits next to the chime because
         # both are the same kind of thing: a signal that reaches the user when
@@ -642,9 +658,12 @@ class TopBar(QFrame):
         self.options_panel.add_section("Automation")
         self.options_panel.add_switch_row(self.recover_label, self.recover_btn)
         self.options_panel.add_switch_row(self.resume_label, self.resume_btn)
-        self.options_panel.add_switch_row(self.sound_label, self.sound_btn)
-        self.options_panel.add_switch_row(self.reply_sound_label,
-                                          self.reply_sound_btn)
+        self.options_panel.add_switch_row(
+            self.sound_label, self.sound_btn,
+            self.chime_sound_btns[chime.QUESTION])
+        self.options_panel.add_switch_row(
+            self.reply_sound_label, self.reply_sound_btn,
+            self.chime_sound_btns[chime.REPLY])
         self.options_panel.add_switch_row(self.taskbar_label, self.taskbar_btn)
         self.options_panel.add_switch_row(self.auto_update_label,
                                           self.auto_update_btn)
@@ -666,6 +685,16 @@ class TopBar(QFrame):
         self.options_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.options_btn.clicked.connect(self._open_options)
         self._refresh_options_btn()
+
+        # the event log: every agent's prompts, questions, replies and limit
+        # cut-offs across all workspaces. It counts the questions nobody has
+        # answered yet, so a "?" in a workspace you are not looking at still
+        # shows up here.
+        self.log_btn = QToolButton(self)
+        self.log_btn.setObjectName("EventLogBtn")
+        self.log_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.log_btn.clicked.connect(self.eventLogClicked)
+        self.set_log_attention(0)
 
         # The usage readouts are the one thing left on the bar that keeps
         # changing and is worth glancing at, so they stay - inside a scroll
@@ -730,11 +759,25 @@ class TopBar(QFrame):
         lay.addStretch(1)
         lay.addWidget(self._extras_scroll)
         lay.addSpacing(8)
+        lay.addWidget(self.log_btn)
         lay.addWidget(self.options_btn)
         lay.addWidget(self.add_terminal_btn)
 
     def _open_options(self) -> None:
         self.options_panel.toggle_under(self.options_btn)
+
+    def set_log_attention(self, open_questions: int) -> None:
+        """The log button reads "Log", or "Log ? 2" while two agents are
+        waiting on an answer."""
+        n = max(0, int(open_questions))
+        self.log_btn.setText("\u2630 Log" + (f"  ? {n}" if n else ""))
+        tip = ("Event log: what every agent in every workspace did "
+               "(Ctrl+Shift+L)")
+        if n:
+            tip += f"\n{n} question{'s' if n != 1 else ''} waiting for you"
+        self.log_btn.setToolTip(tip)
+        self.log_btn.setProperty("attention", bool(n))
+        ui_theme.repolish(self.log_btn)
 
     def _refresh_options_btn(self) -> None:
         """The button names what is behind it, and LIGHTS UP when the update
@@ -863,6 +906,7 @@ class TopBar(QFrame):
             if self._sound_on else
             "Question chime: OFF. An agent waiting on a question raises "
             "its \"?\" silently.\nClick to turn on.")
+        tip += self._sound_tip_line(chime.QUESTION)
         self.sound_btn.setToolTip(tip)
         self.sound_label.setToolTip(tip)
 
@@ -882,8 +926,56 @@ class TopBar(QFrame):
             if self._reply_sound_on else
             "Reply finished chime: OFF. Agents finish replies silently.\n"
             "Click to turn on.")
+        tip += self._sound_tip_line(chime.REPLY)
         self.reply_sound_btn.setToolTip(tip)
         self.reply_sound_label.setToolTip(tip)
+
+    def set_custom_sound(self, kind: str, name: str) -> None:
+        """Reflect which sound a chime plays: a custom file's name, or "" for
+        the built-in one (no signal emitted)."""
+        if kind in self._custom_sound_names:
+            self._custom_sound_names[kind] = name or ""
+            self._refresh_chime_sound_btns()
+            self._refresh_sound_btn()
+            self._refresh_reply_sound_btn()
+
+    def custom_sound_name(self, kind: str) -> str:
+        """The custom file name shown for this chime, "" when built-in."""
+        return self._custom_sound_names.get(kind, "")
+
+    def _sound_tip_line(self, kind: str) -> str:
+        name = getattr(self, "_custom_sound_names", {}).get(kind, "")
+        return (f"\nSound: {name} (your own)." if name
+                else "\nSound: the built-in one.")
+
+    def _refresh_chime_sound_btns(self) -> None:
+        for kind, btn in self.chime_sound_btns.items():
+            name = self._custom_sound_names.get(kind, "")
+            btn.setToolTip(
+                (f"Playing your own sound: {name}" if name
+                 else "Playing the built-in sound")
+                + "\nClick to preview it, choose a WAV or MP3 of your own, "
+                "or go back to the built-in one.")
+
+    def build_chime_sound_menu(self, kind: str) -> QMenu:
+        """The note button's menu for one chime. Built fresh per click, like
+        the tracker menu, so "Use built-in sound" is never stale. Public so
+        the smoke suite can trigger the entries without a modal popup."""
+        menu = QMenu(self)
+        menu.addAction("Play preview").triggered.connect(
+            lambda: self.chimePreviewRequested.emit(kind))
+        menu.addAction("Choose sound file...").triggered.connect(
+            lambda: self.chimeSoundChooseRequested.emit(kind))
+        reset = menu.addAction("Use built-in sound")
+        reset.setEnabled(bool(self._custom_sound_names.get(kind)))
+        reset.triggered.connect(
+            lambda: self.chimeSoundResetRequested.emit(kind))
+        return menu
+
+    def _open_chime_sound_menu(self, kind: str) -> None:
+        btn = self.chime_sound_btns[kind]
+        self.build_chime_sound_menu(kind).exec(
+            btn.mapToGlobal(QPoint(0, btn.height())))
 
     def _on_recover_clicked(self) -> None:
         self.set_startup_recovery(not self._startup_recovery)
@@ -957,58 +1049,25 @@ class TopBar(QFrame):
         menu.exec(self.usage_add_btn.mapToGlobal(
             QPoint(0, self.usage_add_btn.height())))
 
+    def usage_pills_for(self, keys) -> list:
+        """The pills behind these tracker keys, for the poller that feeds
+        them (`usage_poll.UsagePoller` reports poll health to them directly)."""
+        return [self._usage_pills[k] for k in keys if k in self._usage_pills]
+
+    def set_usage_reading(self, keys, reading) -> None:
+        """Push a reading into the pills behind these tracker keys. Each pill
+        picks its own window out of it."""
+        for pill in self.usage_pills_for(keys):
+            pill.set_usage(reading)
+        self._sync_usage_pills()
+
     def set_usage(self, usage) -> None:
         """Push a plan-usage reading into both Claude pills (5h and 7d)."""
-        self.usage_badge.set_usage(usage)
-        self.usage_weekly_badge.set_usage(usage)
-        self._sync_usage_pills()
+        self.set_usage_reading(("claude_five_hour", "claude_weekly"), usage)
 
-    def note_usage_error(self, error: str) -> None:
-        """A poll failed. Same split as `note_gemini_usage_error`: a pill
-        SHOWING a reading keeps it, greyed, rather than blanking a figure the
-        user is watching; a pill with nothing at all says so rather than
-        vanishing."""
-        for pill in (self.usage_badge, self.usage_weekly_badge):
-            if pill.has_reading():
-                pill.mark_stale(True)
-            else:
-                pill.mark_unreadable(error)
-        self._sync_usage_pills()
-
-    def set_gemini_usage(self, reading) -> None:
-        """Push a Gemini reading into both Gemini pills."""
-        self.gemini_badge.set_usage(reading)
-        self.gemini_weekly_badge.set_usage(reading)
-        self._sync_usage_pills()
-
-    def note_gemini_usage_error(self, error: str) -> None:
-        """A Gemini poll failed. Both halves of the Claude pill's rule apply
-        here, and which one depends on whether there is a number already:
-
-        * a pill SHOWING a reading keeps it, greyed, rather than blanking a
-          figure the user is watching;
-        * a pill with nothing at all says so (`mark_unreadable`) rather than
-          vanishing. A readout that silently disappears is indistinguishable
-          from a deleted feature — and this one DID disappear, because the
-          badge used to hide itself whenever a reading carried no usable
-          window, with a blanket try/except hiding that it had.
-        """
-        for pill in (self.gemini_badge, self.gemini_weekly_badge):
-            if pill.has_reading():
-                pill.mark_stale(True)
-            else:
-                pill.mark_unreadable(error)
-        self._sync_usage_pills()
-
-    def set_codex_usage(self, reading) -> None:
-        self.codex_badge.set_usage(reading)
-        self._sync_usage_pills()
-
-    def note_codex_usage_error(self, error: str) -> None:
-        if self.codex_badge.has_reading():
-            self.codex_badge.mark_stale(True)
-        else:
-            self.codex_badge.mark_unreadable(error)
+    def sync_usage_pills(self) -> None:
+        """Re-decide visibility after a poll changed what a pill has to say
+        (a can't-read pill appearing, or a readout going absent)."""
         self._sync_usage_pills()
 
     def tick_usage(self) -> None:
@@ -1639,12 +1698,6 @@ class MainWindow(QMainWindow):
     # `plan_usage()` exposes the latest full reading for polling-style callers.
     planLimitReached = Signal(object)   # claude_usage.Limit
     planLimitCleared = Signal()
-    # private: carries a reading from the fetch thread back to the GUI thread.
-    # Qt marshals a cross-thread emit through the event loop, so everything the
-    # slot touches (widgets, timers) stays on the main thread.
-    _usageReady = Signal(object)
-    _geminiUsageReady = Signal(object)
-    _codexUsageReady = Signal(object)
 
     def __init__(self, manager: WorkspaceManager, store: SessionStore,
                  session: dict | None = None):
@@ -1656,6 +1709,9 @@ class MainWindow(QMainWindow):
 
         self._pages: dict[str, WorkspacePage] = {}
         self._map_window: AgentFileMapWindow | None = None  # lazy, reused
+        self._event_log_window: EventLogWindow | None = None  # lazy, reused
+        self._event_log_state: dict = {}  # its filters/size (persisted)
+        self.event_hub: EventHub | None = None
         self._focused_card: TerminalCard | None = None
         self._closing = False
         self._ready = False  # suppress save-storms during initial load
@@ -1663,6 +1719,9 @@ class MainWindow(QMainWindow):
         self._theme_id = ui_theme.ACTIVE_THEME.id  # active skin (persisted)
         self._sound_enabled = True  # question chime on "?" (persisted)
         self._reply_sound_enabled = False  # reply-finished chime (persisted)
+        # chime kind -> the user's own sound file, copied into sounds_dir()
+        # (persisted; a kind that is absent plays the built-in sound)
+        self._custom_sounds: dict[str, str] = {}
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -1700,8 +1759,8 @@ class MainWindow(QMainWindow):
         # ---- Claude plan usage (top-bar readout + limit-reached edges) ----
         # PURELY TRANSIENT: a reading refreshes the badge and may emit the
         # plan-limit edges, but it must NEVER mark the session dirty — the same
-        # rule as activity_changed/waiting_changed. This polls every minute
-        # forever; wiring it to a save would rewrite session.json 60x an hour.
+        # rule as activity_changed/waiting_changed. This polls every 30 s to
+        # 6 min forever; wiring it to a save would rewrite session.json each time.
         self._usage = None            # latest claude_usage.Usage
         # which usage readouts the user wants, per pill (persisted under
         # ui.usage_trackers). The default MUST be assigned here, above
@@ -1729,7 +1788,6 @@ class MainWindow(QMainWindow):
         # like `_update_installing`: it describes this launch only and is never
         # persisted (a stored version goes stale the moment anything installs).
         self._update_outcomes: tuple = ()
-        self._usage_inflight = False  # one request at a time, never stack
         self._plan_blocked = False    # edge state for planLimitReached/Cleared
         # agent ids with a resume SCHEDULED but not yet delivered. The attempt
         # counter only advances when the nudge actually goes out, up to
@@ -1753,39 +1811,43 @@ class MainWindow(QMainWindow):
         self._launched_at = time.time()
         self._auto_continue = True    # user preference (persisted)
         self._startup_recovery = True  # user preference (persisted)
-        self._usage_backoff = 0       # consecutive 429s -> exponential poll gap
-        self._usage_timer = QTimer(self)
-        self._usage_timer.setInterval(USAGE_POLL_MS)
-        self._usage_timer.timeout.connect(self._poll_usage)
         self._usage_tick_timer = QTimer(self)
         self._usage_tick_timer.setInterval(USAGE_TICK_MS)
         self._usage_tick_timer.timeout.connect(self._tick_usage)
-
-        # Gemini usage timer. NOT started here and NOT polled here: the reading
-        # comes from shelling out to `agy --print /usage`, which measures ~3.0s,
-        # so doing it in the constructor froze every launch (and every window
-        # the smoke suite builds) for that long, and made the suite shell out to
-        # the user's real CLI. Same rule as the Claude readout: polling is
-        # OPT-IN, armed by `start_usage_polling` from main.py only.
-        self._gemini_usage_timer = QTimer(self)
-        self._gemini_usage_timer.setInterval(GEMINI_USAGE_POLL_MS)
-        self._gemini_usage_timer.timeout.connect(self._poll_gemini_usage)
-        self._gemini_usage_inflight = False
-        # last good Gemini reading, so the countdown tick can retune the poll
-        # without shelling out again (that tick fires every 20s)
-        self._gemini_usage = None
-        # The ChatGPT/Codex readout is display-only, so unlike Claude it is
-        # fully gated by the user's tracker preference.
-        self._codex_usage = None
-        self._codex_usage_inflight = False
-        self._codex_usage_timer = QTimer(self)
-        self._codex_usage_timer.setInterval(CODEX_USAGE_POLL_MS)
-        self._codex_usage_timer.timeout.connect(self._poll_codex_usage)
-        # fires just after a spent limit's stated reset, so the "cleared" edge
-        # doesn't wait out a full poll interval
-        self._usage_reset_timer = QTimer(self)
-        self._usage_reset_timer.setSingleShot(True)
-        self._usage_reset_timer.timeout.connect(self._poll_usage)
+        # One poller per usage source, all on the shared policy in
+        # app.usage_poll. None of them fetches until `start_usage_polling`,
+        # which main.py alone calls: the smoke suite builds many windows and
+        # must never touch the network, the user's account or the agy CLI.
+        self._gemini_usage = None     # last Gemini reading with a number in it
+        self._codex_usage = None      # last GPT reading with a number in it
+        self._usage_pollers: dict[str, usage_poll.UsagePoller] = {}
+        sources = usage_sources()
+        covered = [k for src in sources for k in src.tracker_keys]
+        if sorted(covered) != sorted(USAGE_TRACKER_KEYS):
+            raise RuntimeError(
+                "every usage pill needs exactly one entry in usage_sources(): "
+                f"pills {sorted(USAGE_TRACKER_KEYS)}, sources {sorted(covered)}")
+        for source in sources:
+            poller = usage_poll.UsagePoller(
+                source,
+                pills=lambda keys=source.tracker_keys:
+                    self.top_bar.usage_pills_for(keys),
+                active=lambda provs=source.agent_providers:
+                    usage_poll.provider_active(self.manager.all_agents(), provs),
+                wanted=lambda keys=source.tracker_keys:
+                    any(self._usage_trackers.get(k) for k in keys),
+                parent=self)
+            # the poller feeds its own pills; the bar only re-decides which
+            # of them have something to show
+            poller.succeeded.connect(lambda _r: self.top_bar.sync_usage_pills())
+            poller.failed.connect(lambda _r: self.top_bar.sync_usage_pills())
+            self._usage_pollers[source.name] = poller
+        self._usage_pollers["claude"].succeeded.connect(self._apply_usage)
+        self._usage_pollers["claude"].absent.connect(self._on_claude_usage_absent)
+        self._usage_pollers["gemini"].succeeded.connect(
+            lambda r: setattr(self, "_gemini_usage", r))
+        self._usage_pollers["codex"].succeeded.connect(
+            lambda r: setattr(self, "_codex_usage", r))
         # the network-free auto-continue trigger: resume a cut-off agent once
         # the reset time ITS OWN banner stated has passed, whatever the API is
         # doing (or not doing)
@@ -1837,6 +1899,11 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._adopt_existing_model()
         self._wire_model()
+        # after the model is wired: the agents restored with the session are
+        # adopted silently, not logged as "added"
+        self.event_hub = EventHub(self.manager,
+                                  event_log.log_dir(str(session_dir)), self)
+        self.event_hub.openChanged.connect(self.top_bar.set_log_attention)
         self._restore_ui_state(session or {})
         self._apply_page_border()   # frame matches the restored skin
         self._ready = True  # from here on, structural changes save immediately
@@ -1984,6 +2051,11 @@ class MainWindow(QMainWindow):
         self.top_bar.themeChanged.connect(self._change_theme)
         self.top_bar.soundToggled.connect(self._on_sound_toggled)
         self.top_bar.replySoundToggled.connect(self._on_reply_sound_toggled)
+        self.top_bar.chimeSoundChooseRequested.connect(
+            self._on_chime_sound_choose)
+        self.top_bar.chimeSoundResetRequested.connect(
+            self._on_chime_sound_reset)
+        self.top_bar.chimePreviewRequested.connect(self._play_chime)
         self.top_bar.usageTrackerToggled.connect(self._on_usage_tracker_toggled)
         self.top_bar.terminalScrollbackToggled.connect(
             self._on_terminal_scrollback)
@@ -1996,14 +2068,6 @@ class MainWindow(QMainWindow):
         self.planLimitCleared.connect(self._resume_blocked_agents)
         self.manager.agentLimitBlocked.connect(self._on_agent_limit_blocked)
         self.top_bar.usageRefreshRequested.connect(self._on_usage_refresh)
-        # QueuedConnection is the point: the fetch thread emits, and the slot
-        # runs on the GUI thread where touching widgets/timers is legal
-        self._usageReady.connect(self._on_usage_ready,
-                                 Qt.ConnectionType.QueuedConnection)
-        self._geminiUsageReady.connect(self._on_gemini_usage_ready,
-                                       Qt.ConnectionType.QueuedConnection)
-        self._codexUsageReady.connect(self._on_codex_usage_ready,
-                                      Qt.ConnectionType.QueuedConnection)
         self.sidebar.addRequested.connect(self._on_add_workspace_clicked)
         self.sidebar.workspaceSelected.connect(self.manager.set_active)
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
@@ -2031,6 +2095,8 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Shift+N"), self,
                   self._on_add_workspace_clicked)
         QShortcut(QKeySequence("Ctrl+Shift+B"), self, self._toggle_sidebar)
+        QShortcut(QKeySequence("Ctrl+Shift+L"), self, self.open_event_log)
+        self.top_bar.eventLogClicked.connect(self.open_event_log)
 
     # ------------------------------------------------------------- sidebar ---
 
@@ -2123,14 +2189,14 @@ class MainWindow(QMainWindow):
         agent = self.manager.agent(ws_id, agent_id)
         if agent is not None and agent.is_limit_blocked():
             return
-        chime.play(chime.QUESTION)
+        self._play_chime(chime.QUESTION)
 
     def _on_agent_replied(self, ws_id: str, agent_id: str) -> None:
         """An agent finished a reply the user asked for (the agent already
         filtered out questions, limit cut-offs and plain shells; see
         TerminalAgent._announce_reply). Ring the reply chime if it is on."""
         if self._reply_sound_enabled:
-            chime.play(chime.REPLY)
+            self._play_chime(chime.REPLY)
 
     # ---------------------------------------------------- plan usage ------
     def plan_usage(self):
@@ -2141,163 +2207,75 @@ class MainWindow(QMainWindow):
         return self._usage
 
     def start_usage_polling(self) -> None:
-        """Begin polling the account's plan usage. OPT-IN, called by main.py
-        only — exactly like `quit_on_close`, and for the same reason: the smoke
-        suite constructs many windows per process and must never touch the
-        network (or the user's real account). Tests drive `_on_usage_ready`
-        with synthetic readings instead.
+        """Begin polling every usage source a pill (or, for Claude, the
+        plan-limit machinery) wants. OPT-IN, called by main.py only, exactly
+        like `quit_on_close`, and for the same reason: the smoke suite
+        constructs many windows per process and must never touch the network
+        (or the user's real account). Tests feed synthetic readings through
+        `_on_usage_ready` and friends instead.
 
-        THERE IS NO CACHED SEED, on purpose, and the one that used to paint the
-        Claude pill instantly from `~/.claude.json` has been removed (Gemini's
-        own disk cache went with it). A stored reading goes stale exactly where
-        it matters most: a 5-hour window is routinely spent and reopened
-        between one launch and the next, so a restored figure is not merely old,
-        it is wrong in the direction that misleads — and nothing on the bar
-        distinguishes it from a live one. Every enabled pill therefore opens in
-        its LOADING state and only ever shows a number fetched THIS run; the
-        immediate polls below are what fill them in."""
+        THERE IS NO CACHED SEED, on purpose. A stored reading goes stale
+        exactly where it matters most: a 5-hour window is routinely spent and
+        reopened between one launch and the next, so a restored figure is not
+        merely old, it is wrong in the direction that misleads. Every enabled
+        pill therefore opens in its LOADING state and only ever shows a number
+        fetched THIS run.
+
+        The Claude poller runs even with both Claude pills closed:
+        planLimitReached, planLimitCleared and plan_usage() hang off its
+        reading, and auto-continue depends on them. Closing a pill hides a
+        readout; it does not switch a feature off. The other pollers run only
+        while one of their pills is on, since nothing else reads them."""
         self._polling = True
         self.top_bar.mark_usage_loading()   # every enabled pill, from t=0
-        self._usage_timer.start()
         self._usage_tick_timer.start()
-        self._poll_usage()
-        # The Gemini readout rides the same opt-in, for the same reasons, but
-        # NOT the same gating: its poll is skipped entirely when both Gemini
-        # pills are off, because `_gemini_usage` has no other consumer. The
-        # Claude poll is never gated on its pill - planLimitReached,
-        # planLimitCleared, plan_usage() and _arm_reset_poll all hang off that
-        # reading, and auto-continue depends on them. Closing a pill hides a
-        # readout; it does not switch a feature off.
-        if self._gemini_wanted():
-            self._gemini_usage_timer.start()
-            self._poll_gemini_usage()
-        if self._codex_wanted():
-            self._codex_usage_timer.start()
-            self._poll_codex_usage()
+        for poller in self._usage_pollers.values():
+            poller.start()                  # a poller nothing wants stays off
 
-    def _poll_usage(self) -> None:
-        """Kick a fetch on a daemon thread (the pty_worker/mcp_server pattern).
+    def usage_poller(self, name: str) -> usage_poll.UsagePoller:
+        """The poller behind one usage source ("claude", "gemini", "codex")."""
+        return self._usage_pollers[name]
 
-        `_usage_inflight` is the guard that matters: a hung request must never
-        let the minute timer stack threads behind it."""
-        if self._closing or self._usage_inflight:
-            return
-        self._usage_inflight = True
-
-        def worker():
-            reading = claude_usage.fetch()
-            self._usageReady.emit(reading)   # queued -> GUI thread
-
-        threading.Thread(target=worker, daemon=True,
-                         name="aihive-usage").start()
-
-    def _usage_poll_interval(self) -> int:
-        """The poll gap the current situation asks for, BEFORE any 429 backoff.
-
-        A minute is the right ordinary rate: a 5-hour window moves slowly and
-        the readout is a number on a bar. It is the wrong rate for the end of a
-        window with work under way - several agents streaming can burn the last
-        few percent in far less than a minute, and nothing in the app learns it
-        is cut off until a READING says so (the plan-limit edge, the reset poll
-        it arms, the ledger entry all hang off `_apply_usage`). A minute of
-        blindness there is a minute of agents parked on a banner nobody noticed.
-
-        Both halves are required, which is what keeps this cheap. Under
-        URGENT_PCT there is nothing imminent to catch; with every agent idle
-        the number is not moving at all, so a faster poll would only ask the
-        same question more often. And once a window is actually SPENT the fast
-        rate stops again: `_arm_reset_poll` already schedules a poll for the
-        moment it reopens, so hammering the endpoint through the outage adds
-        nothing. Worst case is therefore three requests a minute, only in the
-        last stretch of a window, only while agents are working.
-        """
-        limit = claude_usage.headline(self._usage)
-        if limit is None or not (USAGE_URGENT_PCT <= limit.percent
-                                 < claude_usage.EXHAUSTED_PCT):
-            return USAGE_POLL_MS
-        if not any(a.is_busy() for a in self.manager.all_agents()):
-            return USAGE_POLL_MS
-        return USAGE_URGENT_POLL_MS
-
-    def _retune_usage_poll(self) -> None:
-        """Apply `_usage_poll_interval` (times any backoff) to the timer.
-
-        Only when it CHANGES: `QTimer.setInterval` restarts a running timer, so
-        calling this unconditionally from the tick would keep resetting the
-        countdown and the poll would never come round at all.
-        """
-        want = self._usage_poll_interval() * (2 ** self._usage_backoff)
-        if want != self._usage_timer.interval():
-            self._usage_timer.setInterval(want)
+    def _poller_for(self, key: str) -> usage_poll.UsagePoller | None:
+        return next((p for p in self._usage_pollers.values()
+                     if key in p.source.tracker_keys), None)
 
     def _on_usage_refresh(self) -> None:
-        """The user clicked the readout. Clear any 429 backoff first: they are
-        asking now, and leaving the timer parked at sixteen minutes would make
-        a successful manual refresh look like it fixed nothing when the next
-        automatic poll failed to arrive."""
-        self._usage_backoff = 0
-        self._retune_usage_poll()
-        if self._usage_timer.isActive():
-            self._usage_timer.start()      # restart the interval from now
-        self._poll_usage()
-        self._poll_gemini_usage()
-        self._poll_codex_usage()
+        """The user clicked a readout. Every poller clears its backoff and
+        polls now: they are asking now, and leaving a timer parked sixteen
+        minutes out behind a run of 429s would make a successful manual refresh
+        look like it fixed nothing."""
+        for poller in self._usage_pollers.values():
+            poller.refresh()
 
+    # the three entry points the smoke suite feeds synthetic readings through,
+    # exactly as a finished fetch would arrive
     def _on_usage_ready(self, reading) -> None:
-        self._usage_inflight = False
-        if self._closing:
-            return
-        if reading is not None and reading.ok:
-            self._usage_backoff = 0
-            self._apply_usage(reading)
-            # after adopting it, so the new percentage decides the next gap
-            self._retune_usage_poll()
-            return
-        # A failed poll keeps the last good number on screen, greyed, rather
-        # than blanking a figure the user is watching. Only a machine with no
-        # Claude login at all (no-auth) has nothing to show, ever.
-        if reading is not None and reading.error == "no-auth" and self._usage is None:
-            self.top_bar.mark_usage_absent("claude_five_hour")
-            self.top_bar.mark_usage_absent("claude_weekly")
-            # no Claude account => no plan limit to recover from; don't leave
-            # two switches on the bar that can never do anything
-            self.top_bar.set_recovery_available(False)
-            self._usage_timer.stop()
-            self._usage_tick_timer.stop()
-            return
-        # The endpoint rate-limits (observed: two 429s in a row, then a 200).
-        # Backing off matters beyond politeness — a minute timer that keeps
-        # firing into a 429 is how the app can go hours without ever seeing the
-        # blocked state, which is what the plan-limit edges are derived from.
-        # The auto-continue watchdog is deliberately independent of all this.
-        if reading is not None and reading.error == "http 429":
-            self._usage_backoff = min(self._usage_backoff + 1, 4)
-            # the backoff multiplies whatever the situation asks for, so it
-            # still wins over the urgent rate: being rate-limited is precisely
-            # when polling harder is counterproductive
-            self._retune_usage_poll()
-        if self._usage is None:
-            # Nothing to grey out: there has never been a reading this run, and
-            # since CLI 2.1.220 stopped writing `cachedUsageUtilization` there
-            # is no on-disk seed to cover the gap either. Say the number is
-            # unreadable instead of leaving a hole in the bar — a readout that
-            # silently vanishes is indistinguishable from a deleted feature
-            # (reported as exactly that), and the backoff can keep it away for
-            # sixteen minutes at a stretch.
-            self.top_bar.note_usage_error(
-                reading.error if reading is not None else "unknown")
-            return
-        self.top_bar.usage_badge.mark_stale(True)
-        self.top_bar.usage_weekly_badge.mark_stale(True)
+        self._usage_pollers["claude"].deliver(reading)
+
+    def _on_gemini_usage_ready(self, reading) -> None:
+        self._usage_pollers["gemini"].deliver(reading)
+
+    def _on_codex_usage_ready(self, reading) -> None:
+        self._usage_pollers["codex"].deliver(reading)
+
+    def _on_claude_usage_absent(self) -> None:
+        """No Claude login at all: the poller has cleared both pills and
+        stopped. No Claude account also means no plan limit to recover from,
+        so don't leave two switches on the bar that can never do anything."""
+        self.top_bar.set_recovery_available(False)
+        self.top_bar.sync_usage_pills()
 
     def _apply_usage(self, reading) -> None:
-        """Adopt a reading: refresh the badge and fire the plan-limit edges.
+        """Adopt a Claude reading and fire the plan-limit edges. The poller
+        has already put it into both Claude pills.
 
-        NEVER marks the session dirty — see the transient-signal rule in
-        CLAUDE.md. This runs every minute for the life of the process.
+        NEVER marks the session dirty. See the transient-signal rule in
+        CLAUDE.md: this runs every 90 seconds for the life of the process.
         """
+        if self._closing:
+            return      # a fetch that lands mid-shutdown must not fire edges
         self._usage = reading
-        self.top_bar.set_usage(reading)
         blocked = reading.blocked
         if blocked is not None and not self._plan_blocked:
             self._plan_blocked = True
@@ -2305,215 +2283,43 @@ class MainWindow(QMainWindow):
         elif blocked is None and self._plan_blocked:
             self._plan_blocked = False
             self.planLimitCleared.emit()
-        self._arm_reset_poll(blocked)
-
-    def _arm_reset_poll(self, blocked) -> None:
-        """While cut off, schedule one extra poll just after the stated reset
-        so `planLimitCleared` fires within seconds of the window reopening —
-        an unattended relaunch at 4am shouldn't wait out the minute timer."""
-        if blocked is None or blocked.resets_at is None:
-            self._usage_reset_timer.stop()
-            return
-        delay = int((blocked.resets_at - time.time()) * 1000) + USAGE_RESET_GRACE_MS
-        # QTimer takes a 32-bit interval; a far-future reset is covered by the
-        # ordinary minute poll, so only arm when it's genuinely near.
-        if 0 < delay <= 6 * 3600 * 1000:
-            self._usage_reset_timer.start(delay)
-        else:
-            self._usage_reset_timer.stop()
 
     def _tick_usage(self) -> None:
-        """Re-render the countdown from the clock alone — no network.
-
-        Also the place the poll gap follows the WORK: whether agents are busy
-        changes constantly, and `activity_changed` fires every couple of
-        seconds per agent, so this cheap 20s sweep is where that half of
-        `_usage_poll_interval` is re-evaluated rather than off a signal that
-        would retune (and so restart the poll timer) far more often than the
-        number can move.
-        """
+        """Re-render the countdowns from the clock alone, no network. Also
+        where each poller follows the work (whether agents are busy changes
+        constantly, so a cheap 20 s sweep retunes rather than every
+        activity_changed) and notices the machine waking from sleep."""
         self.top_bar.tick_usage()
-        self._retune_usage_poll()
-        # from the LAST reading, never a fresh fetch: this tick fires every 20s
-        if self._gemini_wanted():
-            self._retune_gemini_usage_poll(self._gemini_usage)
-
-    def _gemini_agents_working(self) -> bool:
-        """True if at least one Gemini agent is currently running."""
-        for ws in self.manager.workspaces:
-            for agent in ws.agents:
-                if agent.spec.provider == "gemini" and agent.is_running():
-                    return True
-        return False
-
-    def _retune_gemini_usage_poll(self, reading) -> None:
-        """Retune the Gemini usage poll: GEMINI_USAGE_URGENT_POLL_MS while
-        Gemini agents are working AND the 5-hour window is >= 90% spent,
-        GEMINI_USAGE_POLL_MS otherwise.
-
-        Both rates are deliberately far slower than the Claude equivalents, and
-        the constants carry the reason: every tick here spawns `agy`, which
-        intermittently flashes a console window no spawn flag can suppress.
-
-        Takes the reading the caller already has. It used to fetch its own,
-        which meant a second ~3.0s CLI subprocess on the GUI thread per tick.
-        """
-        if not hasattr(self, "_gemini_usage_timer") or reading is None:
-            return
-        interval = GEMINI_USAGE_POLL_MS
-        try:
-            five_hour = next((l for l in reading.limits if l.key == "five_hour"), None)
-            pct = five_hour.percent if five_hour else (reading.blocked.percent if reading.blocked else 0.0)
-            if self._gemini_agents_working() and pct >= USAGE_URGENT_PCT:
-                interval = GEMINI_USAGE_URGENT_POLL_MS
-        except Exception:
-            pass
-
-        if interval != self._gemini_usage_timer.interval():
-            self._gemini_usage_timer.setInterval(interval)
-
-    def _poll_gemini_usage(self) -> None:
-        """Kick a Gemini usage fetch on a daemon thread (the `_poll_usage`
-        pattern, for the same reason).
-
-        `gemini_usage.fetch()` shells out to `agy --print /usage` and MEASURES
-        ~3.0 SECONDS. Calling it inline froze the whole GUI for that long on
-        every tick -- and the tick can be as fast as 10s under the urgent rate,
-        so the app spent a large fraction of its life unresponsive with the CPU
-        idle (it is blocked on a subprocess, not computing). Reported as
-        constant stuttering.
-
-        `_gemini_usage_inflight` is the guard that matters: a 6-second CLI
-        timeout is longer than the urgent interval, so without it the timer
-        would stack threads behind a slow call.
-
-        `_gemini_wanted` is the other one: with both Gemini pills closed there
-        is nothing left that consumes the reading, so the subprocess is skipped
-        rather than run for a readout nobody asked for. It is checked HERE as
-        well as at the two call sites, because `_on_usage_refresh` deliberately
-        refreshes everything the user can see without knowing what that is."""
-        if (self._closing or self._gemini_usage_inflight
-                or not self._gemini_wanted()):
-            return
-        self._gemini_usage_inflight = True
-
-        def worker():
-            from app import gemini_usage
-            try:
-                reading = gemini_usage.fetch()
-            except Exception:
-                reading = None
-            self._geminiUsageReady.emit(reading)   # queued -> GUI thread
-
-        threading.Thread(target=worker, daemon=True,
-                         name="aihive-gemini-usage").start()
-
-    def _on_gemini_usage_ready(self, reading) -> None:
-        """Apply a Gemini reading on the GUI thread."""
-        self._gemini_usage_inflight = False
-        if self._closing:
-            return
-        # keyed on having LIMITS, not on `ok`: a reading that carries numbers
-        # AND an error is still the freshest thing we have, and `set_usage`
-        # already greys it. Only a reading with nothing in it is a failure.
-        if reading is None or not reading.limits:
-            # A failed read must never blank the pill. Same rule as the Claude
-            # readout, for the same reason: a figure that silently disappears is
-            # indistinguishable from a deleted feature. It DID disappear before
-            # this - the badge hid itself and a blanket try/except hid that it
-            # had - so with `agy` absent or erroring the Gemini readout simply
-            # ceased to exist, with no way to ask it to try again.
-            self.top_bar.note_gemini_usage_error(
-                reading.error if reading is not None else "unknown")
-            return
-        self._gemini_usage = reading
-        self.top_bar.set_gemini_usage(reading)
-        # retune from the reading we already have: re-fetching here doubled
-        # the freeze, because it shelled out to the CLI a SECOND time on
-        # every single tick
-        self._retune_gemini_usage_poll(reading)
-
-    def _gemini_wanted(self) -> bool:
-        """True while at least one Gemini pill is switched on.
-
-        `_gemini_usage` is consumed ONLY by those two pills and by
-        `_retune_gemini_usage_poll`, so with both off the ~3.0s
-        `agy --print /usage` subprocess has no consumer at all and is skipped
-        rather than run and thrown away. That is the whole point of letting a
-        Claude-only user close them."""
-        return bool(self._usage_trackers.get("gemini_five_hour")
-                    or self._usage_trackers.get("gemini_weekly"))
-
-    def _codex_wanted(self) -> bool:
-        return bool(self._usage_trackers.get("codex_five_hour"))
-
-    def _poll_codex_usage(self) -> None:
-        """Fetch the optional ChatGPT/Codex readout off the GUI thread."""
-        if (self._closing or self._codex_usage_inflight
-                or not self._codex_wanted()):
-            return
-        self._codex_usage_inflight = True
-
-        def worker():
-            try:
-                reading = codex_usage.fetch()
-            except Exception:
-                reading = None
-            self._codexUsageReady.emit(reading)
-
-        threading.Thread(target=worker, daemon=True,
-                         name="aihive-codex-usage").start()
-
-    def _on_codex_usage_ready(self, reading) -> None:
-        self._codex_usage_inflight = False
-        if self._closing:
-            return
-        if reading is None or reading.limit is None:
-            if reading is not None and reading.error == "no-auth" and self._codex_usage is None:
-                self.top_bar.mark_usage_absent("codex_five_hour")
-                self._codex_usage_timer.stop()
-            else:
-                self.top_bar.note_codex_usage_error(
-                    reading.error if reading is not None else "unknown")
-            return
-        self._codex_usage = reading
-        self.top_bar.set_codex_usage(reading)
+        for poller in self._usage_pollers.values():
+            poller.tick()
 
     def _on_usage_tracker_toggled(self, key: str, on: bool) -> None:
         """The X on a pill, or an entry in the + menu. One handler for both, so
         the two controls of the same preference can never disagree."""
         if key not in USAGE_TRACKER_KEYS:
             return
-        was_gemini = self._gemini_wanted()
-        was_codex = self._codex_wanted()
         self._usage_trackers[key] = bool(on)
         self.top_bar.set_usage_trackers(self._usage_trackers)
         # a UI PREFERENCE, like sound_enabled. The READING it governs stays
         # transient and still never reaches a save.
         self._schedule_save()
-        if not on:
-            if was_gemini and not self._gemini_wanted():
-                self._gemini_usage_timer.stop()   # nothing consumes it now
-            if was_codex and not self._codex_wanted():
-                self._codex_usage_timer.stop()
+        poller = self._poller_for(key)
+        if poller is None:
             return
-        # Switched back on: load it NOW rather than leave a gap for up to a
-        # minute. The loading state goes up first, so the pill is on the bar
+        if not on:
+            if not poller.wanted():
+                poller.stop()                # nothing consumes it now
+            return
+        # Switched back on: load it NOW rather than leave a gap until the next
+        # poll. The loading state goes up first, so the pill is on the bar
         # before a fetch that can take ~3s comes back.
         self.top_bar.mark_usage_loading(key)
         if not self._polling:
-            return              # this window never opted in; never shell out
-        if key in ("claude_five_hour", "claude_weekly"):
-            self._poll_usage()
-            return
-        if key == "codex_five_hour":
-            if not was_codex:
-                self._codex_usage_timer.start()
-            self._poll_codex_usage()
-            return
-        if not was_gemini:
-            self._gemini_usage_timer.start()
-        self._poll_gemini_usage()
+            return              # this window never opted in; never fetch
+        if poller.is_running():
+            poller.poll()
+        else:
+            poller.start()
 
     def _on_auto_continue(self, on: bool) -> None:
         """User toggled resume-on-limit-reset from the top bar."""
@@ -2659,6 +2465,15 @@ class MainWindow(QMainWindow):
         limit_ledger.record_outcome(self._ledger_dir(), self._ledger_key(agent),
                                     outcome, tries=agent.limit_attempts(),
                                     detail=detail)
+        self._log_limit_outcome(agent, outcome, agent.limit_attempts(), detail)
+
+    def _log_limit_outcome(self, agent, outcome: str, tries: int = 0,
+                           detail: str = "") -> None:
+        """Mirror a ledger outcome into the event log, beside every
+        `record_outcome` call, so the log's cut-off row closes the moment the
+        ledger's record does."""
+        if self.event_hub is not None:
+            self.event_hub.limit_outcome(agent, outcome, tries, detail)
 
     def _snapshot_screens(self, agents=None) -> int:
         """Persist every pty agent's screen and drop the ones nothing claims.
@@ -2902,8 +2717,8 @@ class MainWindow(QMainWindow):
         """The plan limit reset — put the agents it cut off back to work.
 
         Two triggers land here. `planLimitCleared` (no `due` filter) means the
-        ACCOUNT is provably clear, so every latched agent goes; its
-        `_arm_reset_poll` cushion makes that land within seconds of the window
+        ACCOUNT is provably clear, so every latched agent goes; the usage
+        poller's reset poll makes that land within seconds of the window
         reopening. `_check_limit_resets` passes a `due` predicate so only agents
         whose own stated reset has passed are touched. Promptness is the point
         either way: the first message after a window expires is what STARTS the
@@ -3087,6 +2902,8 @@ class MainWindow(QMainWindow):
                     limit_ledger.record_outcome(
                         self._ledger_dir(), key, limit_ledger.RESUMED,
                         tries=tries)
+                    self._log_limit_outcome(agent, limit_ledger.RESUMED,
+                                            tries)
                     return
                 # keep the latch so the watchdog tries again, carrying the
                 # cut-off's identity so the retry stays the SAME episode
@@ -3105,6 +2922,7 @@ class MainWindow(QMainWindow):
                     limit_ledger.record_outcome(
                         self._ledger_dir(), key, limit_ledger.FAILED,
                         tries=tries)
+                    self._log_limit_outcome(agent, limit_ledger.FAILED, tries)
             QTimer.singleShot(AUTO_CONTINUE_VERIFY_MS, verify)
             # audit trail: on the card, and on the workspace board. The board
             # write goes through the same serialized append the log_activity
@@ -3248,6 +3066,8 @@ class MainWindow(QMainWindow):
         if not blocked and agent.nudge(msg.text):
             agent.mark_scheduled_sent(msg.id)
             agent.notice("[scheduled message sent]")
+            if self.event_hub is not None:
+                self.event_hub.scheduled(agent, True, msg.text)
             self._schedule_audit(f"SENT agent={agent.spec.name} "
                                  f"late={int(now - msg.due_ts)}s")
             return
@@ -3259,6 +3079,8 @@ class MainWindow(QMainWindow):
                    else "the plan limit has it parked" if blocked
                    else "its prompt never became ready")
             agent.notice(f"[scheduled message NOT sent: {why}]")
+            if self.event_hub is not None:
+                self.event_hub.scheduled(agent, False, msg.text, why)
             self._schedule_audit(f"MISSED agent={agent.spec.name} "
                                  f"tries={msg.attempts} ({why})")
 
@@ -3267,6 +3089,77 @@ class MainWindow(QMainWindow):
         the debounced save) so it survives a restart."""
         self._sound_enabled = bool(enabled)
         self._schedule_save()
+
+    # ------------------------------------------------ custom chime sounds ---
+    # The user's own WAV/MP3 per chime. The picked file is COPIED into
+    # sounds_dir() under a fresh name, so moving or deleting the original
+    # breaks nothing, and a replacement never has to overwrite a file the MCI
+    # player may still hold open. chime.play falls back to the built-in sound
+    # whenever the copy is missing or unplayable.
+
+    def sounds_dir(self) -> str:
+        """Where custom chime files live: beside session.json."""
+        return os.path.join(str(self.store.path.parent), "sounds")
+
+    def _play_chime(self, kind: str) -> None:
+        chime.play(kind, self._custom_sounds.get(kind))
+
+    def _on_chime_sound_choose(self, kind: str) -> None:
+        # deferred: the request arrives from inside the note button's
+        # QMenu.exec, and a modal dialog nested in there fights the menu and
+        # the Options popup for the mouse grab
+        QTimer.singleShot(0, lambda: self._choose_chime_sound(kind))
+
+    def _choose_chime_sound(self, kind: str) -> None:
+        self.top_bar.options_panel.hide()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a chime sound", "",
+            "Sounds (*.wav *.mp3);;All files (*)")
+        if path:
+            self.set_custom_chime(kind, path)
+
+    def set_custom_chime(self, kind: str, source: str) -> str | None:
+        """Validate `source`, copy it in, make it this chime's sound and play
+        it once. Returns None on success, else the reason (also shown to the
+        user in a message box)."""
+        reason = chime.validate(source)
+        target = ""
+        if reason is None:
+            ext = os.path.splitext(source)[1].lower()
+            target = os.path.join(
+                self.sounds_dir(), f"{kind}-{int(time.time() * 1000)}{ext}")
+            try:
+                os.makedirs(self.sounds_dir(), exist_ok=True)
+                shutil.copyfile(source, target)
+            except OSError as e:
+                reason = f"The file could not be copied: {e.strerror or e}"
+        if reason is not None:
+            QMessageBox.warning(self, "Chime sound not changed", reason)
+            return reason
+        self._drop_custom_chime_file(kind)
+        self._custom_sounds[kind] = target
+        self.top_bar.set_custom_sound(kind, os.path.basename(source))
+        self._schedule_save()
+        self._play_chime(kind)
+        return None
+
+    def _on_chime_sound_reset(self, kind: str) -> None:
+        self._drop_custom_chime_file(kind)
+        self._custom_sounds.pop(kind, None)
+        self.top_bar.set_custom_sound(kind, "")
+        self._schedule_save()
+
+    def _drop_custom_chime_file(self, kind: str) -> None:
+        """Delete this chime's current custom copy, if it has one. chime.stop
+        first, because the MCI player keeps an MP3 open (locked) after it."""
+        old = self._custom_sounds.get(kind)
+        if not old:
+            return
+        chime.stop()
+        try:
+            os.remove(old)
+        except OSError:
+            pass   # already gone, or still locked: harmless leftover
 
     def _on_reply_sound_toggled(self, enabled: bool) -> None:
         """User flipped the reply-finished chime toggle. Persisted like the
@@ -3551,6 +3444,21 @@ class MainWindow(QMainWindow):
         self.top_bar.set_sound_enabled(self._sound_enabled)
         # reply-finished chime preference (default OFF if never saved)
         self._reply_sound_enabled = bool(ui.get("reply_sound_enabled", False))
+        saved_log = ui.get("event_log")
+        self._event_log_state = saved_log if isinstance(saved_log, dict) else {}
+        # custom chime sounds: keep only kinds we know whose copy still exists
+        saved_sounds = ui.get("custom_sounds")
+        self._custom_sounds = {
+            k: v for k, v in (saved_sounds.items()
+                              if isinstance(saved_sounds, dict) else ())
+            if k in chime.KINDS and isinstance(v, str) and os.path.isfile(v)}
+        names = ui.get("custom_sound_names")
+        names = names if isinstance(names, dict) else {}
+        for kind in chime.KINDS:
+            path = self._custom_sounds.get(kind, "")
+            self.top_bar.set_custom_sound(
+                kind, (str(names.get(kind) or os.path.basename(path)))
+                if path else "")
         self.top_bar.set_reply_sound_enabled(self._reply_sound_enabled)
         # Which usage readouts to show (default: all of them). A dict rather
         # than a list of enabled keys, so a missing entry defaults ON per key
@@ -3723,6 +3631,32 @@ class MainWindow(QMainWindow):
 
     def _focus_agent_from_map(self, ws_id: str, agent_id: str) -> None:
         self._reveal_agent(ws_id, agent_id)
+
+    # ----------------------------------------------------------- event log ---
+
+    def open_event_log(self) -> None:
+        """Show the event log window (created on first use, then reused).
+        Its links go through `_reveal_agent`, like the map's and the
+        sidebar's."""
+        if self.event_hub is None:
+            return
+        if self._event_log_window is None:
+            win = EventLogWindow(self.event_hub, self,
+                                 state=self._event_log_state)
+            win.agentActivated.connect(self._reveal_agent)
+            win.workspaceActivated.connect(self._reveal_workspace)
+            win.stateChanged.connect(self._schedule_save)
+            self._event_log_window = win
+        self._event_log_window.show()
+        self._event_log_window.raise_()
+        self._event_log_window.activateWindow()
+
+    def _reveal_workspace(self, ws_id: str) -> None:
+        if self.manager.workspace(ws_id) is None:
+            return
+        self.manager.set_active(ws_id)
+        self.raise_()
+        self.activateWindow()
 
     def _reveal_agent(self, ws_id: str, agent_id: str) -> None:
         """The single 'click an agent -> reveal its card' primitive (used by the
@@ -4109,7 +4043,16 @@ class MainWindow(QMainWindow):
             "theme": self._theme_id,
             "sound_enabled": self._sound_enabled,
             "reply_sound_enabled": self._reply_sound_enabled,
+            "custom_sounds": dict(self._custom_sounds),
+            # the ORIGINAL file names, for the tooltips (the copies are named
+            # by kind and time)
+            "custom_sound_names": {
+                k: self.top_bar.custom_sound_name(k)
+                for k in self._custom_sounds},
             "usage_trackers": dict(self._usage_trackers),
+            "event_log": (self._event_log_window.state()
+                          if self._event_log_window is not None
+                          else dict(self._event_log_state)),
             # Legacy mirror, DERIVED, kept for one release so a downgrade to a
             # build that only understands this key does not resurrect three
             # pills the user closed. Restore prefers usage_trackers, so the two
@@ -4181,6 +4124,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._closing = True
+        # every agent is about to be stopped, and none of that is news
+        if self.event_hub is not None:
+            self.event_hub.shutdown()
         # take the badge off the button before the window goes: a stale "3
         # working" left on a taskbar icon during the seconds Windows keeps the
         # button alive says the opposite of the truth
@@ -4197,9 +4143,9 @@ class MainWindow(QMainWindow):
         self._model_sync_timer.stop()
         self._bg_shell_timer.stop()
         self._limit_watch_timer.stop()
-        self._usage_timer.stop()
         self._usage_tick_timer.stop()
-        self._usage_reset_timer.stop()
+        for poller in self._usage_pollers.values():
+            poller.stop()
         # capture any last-moment conversation switch BEFORE the final save, so
         # reopen resumes what was actually on screen — not a stale pin. Agents
         # are still alive here (processes are killed further down), so their

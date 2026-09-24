@@ -7,6 +7,7 @@ the design handoff's inline data-URIs.
 """
 
 import os
+import time
 from functools import lru_cache
 
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
@@ -19,7 +20,7 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QComboBox, QLabel, QSizePolicy,
                                QToolButton, QWidget)
 
-from .. import ui_theme
+from .. import ui_theme, usage_poll
 from ..ui_theme import Palette
 
 # --- lifted SVG ornament tiles (transparent grounds; colours are the design's) ---
@@ -123,6 +124,17 @@ _SERVO_CIRCUIT = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 54 54'>
 <g stroke='rgba(90,232,172,0.55)' stroke-width='1' fill='none'>
 <path d='M8 8 h9 v-3'/><path d='M46 8 h-9 v-3'/>
 <path d='M8 46 h9 v3'/><path d='M46 46 h-9 v3'/></g></svg>"""
+
+
+def _since(seconds: float) -> str:
+    """A compact duration for the usage pills' tooltips: "42s", "4m", "1h05m"."""
+    total = int(max(0, seconds))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m"
+    h, m = divmod(total // 60, 60)
+    return f"{h}h{m:02d}m"
 
 
 def _pixmap(svg: str, w: int, h: int) -> QPixmap:
@@ -662,7 +674,9 @@ class UsagePillBadge(QWidget):
     depends on the text alone, and hovering paints, it never re-measures.
 
     The widget is a pure VIEW - it never fetches, and it never decides its own
-    visibility. `MainWindow` polls off-thread and pushes readings in; a click on
+    visibility. A `usage_poll.UsagePoller` fetches off-thread and pushes
+    readings and poll health in (`set_usage`, `note_poll_failed`,
+    `set_stale_after`), and `is_stale` decides the grey from those; a click on
     the body emits `refreshRequested`, a click on the X emits `closeRequested`,
     and `TopBar._sync_usage_pills` is the ONE place `setVisible` is called (see
     the two-axis rule there).
@@ -703,7 +717,15 @@ class UsagePillBadge(QWidget):
         self._limit = None          # the headline Limit
         self._text = ""
         self._sized_for = None      # the text the current width was measured for
-        self._stale = False         # showing an older reading than we'd like
+        # the poll health `usage_poll.UsagePoller` reports, which is what
+        # `is_stale` decides from: the error of the current failing streak
+        # ("" while healthy), when it started, when the poller tries again,
+        # and how old the reading may get before the pill greys
+        self._fail_error = ""
+        self._fail_at = 0.0
+        self._retry_at = 0.0
+        self._stale_after = usage_poll.STALE_FLOOR_S
+        self._painted_stale = False  # so a tick repaints only on a change
         self._label = False         # prefix the window name (multi-limit plans)
         self._unreadable = ""       # last error, when we have NO reading at all
         self._loading = False       # a fetch is in flight and we have nothing yet
@@ -749,7 +771,23 @@ class UsagePillBadge(QWidget):
         paint (a stored reading goes stale exactly where it matters most)."""
         self._loading = True
         self._unreadable = ""
-        self._stale = False
+        self._fail_error = ""
+        self._refresh_text()
+
+    def set_usage(self, usage) -> None:
+        """Adopt a reading. The poller only calls this with a reading that has
+        a number in it, so it also ends any failing streak.
+
+        Never calls `setVisible`: which pills are on the bar is the product of
+        a reading AND the user's per-pill preference, and only `TopBar` knows
+        both. A reading with no window for THIS pill leaves it without content,
+        and `TopBar._sync_usage_pills` hides it for that reason."""
+        self._usage = usage
+        self._limit = self._pick_limit(usage) if usage is not None else None
+        self._unreadable = ""       # a real number supersedes the error pill
+        self._loading = False
+        self._fail_error = ""
+        self._retry_at = 0.0
         self._refresh_text()
 
     def mark_unreadable(self, error: str = "") -> None:
@@ -757,14 +795,48 @@ class UsagePillBadge(QWidget):
         than leave a gap in the bar."""
         self._loading = False
         self._unreadable = str(error) or "unavailable"
-        self._stale = True
         self._refresh_text()
 
-    def mark_stale(self, stale: bool = True) -> None:
-        """A poll failed but we still have a previous reading: keep showing it,
-        greyed, rather than blanking a number the user is watching."""
-        if stale != self._stale:
-            self._stale = bool(stale)
+    def note_poll_failed(self, error: str, at: float, retry_at: float,
+                         stale_after: float) -> None:
+        """A poll failed while this pill shows a reading. Keep the number. It
+        greys only once `is_stale` says so, and the tooltip names the error.
+        `at` is kept from the FIRST failure of the streak, so "failing for
+        4m" means four minutes, not the time since the latest retry."""
+        if not self._fail_error:
+            self._fail_at = at
+        self._fail_error = str(error) or "unknown"
+        self._retry_at = retry_at
+        self._stale_after = stale_after
+        self._refresh_text()
+        self._repaint_if_stale_changed()
+
+    def set_stale_after(self, seconds: float) -> None:
+        """How old the reading may get, while polls fail, before it greys. The
+        poller moves it with the cadence (6-minute idle polls tolerate an older
+        number than 30-second urgent ones)."""
+        self._stale_after = float(seconds)
+        self._repaint_if_stale_changed()
+
+    def is_stale(self, now: float | None = None) -> bool:
+        """True when the number on the pill should not be trusted: polls have
+        been failing and the reading is older than `_stale_after`, or a reset
+        has passed since the reading was taken (the percent then belongs to a
+        window that is over). One failed poll is NOT stale. The number it
+        leaves up is a cadence old at most, and was right when read."""
+        if self._loading or self._limit is None:
+            return False
+        now = time.time() if now is None else now
+        fetched = float(getattr(self._usage, "fetched_at", 0.0) or 0.0)
+        resets_at = getattr(self._limit, "resets_at", None)
+        if resets_at is not None and fetched < resets_at <= now:
+            return True
+        return bool(self._fail_error) and now - fetched > self._stale_after
+
+    def _repaint_if_stale_changed(self) -> None:
+        stale = self.is_stale()
+        if stale != self._painted_stale:
+            self._painted_stale = stale
             self.update()
 
     def mark_absent(self) -> None:
@@ -772,15 +844,29 @@ class UsagePillBadge(QWidget):
         Clears every kind of content, so no later re-sync can resurrect it."""
         self._loading = False
         self._unreadable = ""
+        self._fail_error = ""
         self._limit = None
         self._usage = None
         self._refresh_text()
 
     def tick(self) -> None:
         """Re-render the countdown from the clock alone (no network). Repaints
-        only when the visible string actually changes, so the tick costs nothing
-        while the minute digit is unchanged."""
+        only when the visible string or the stale state actually changes, so
+        the tick costs nothing while the minute digit is unchanged."""
         self._refresh_text()
+        self._repaint_if_stale_changed()
+
+    def _failure_lines(self) -> list[str]:
+        """The tooltip's account of a failing streak: what failed, for how
+        long, and when the next try is. Empty while polls are healthy."""
+        if not self._fail_error:
+            return []
+        now = time.time()
+        lines = [f"Refresh failing for {_since(now - self._fail_at)}: "
+                 f"{self._fail_error}"]
+        if self._retry_at > now:
+            lines.append(f"Next try in {_since(self._retry_at - now)}")
+        return lines
 
     # -- rendering -------------------------------------------------------
     def _refresh_text(self) -> None:
@@ -884,6 +970,10 @@ class UsagePillBadge(QWidget):
     def _loading_text(self) -> str:
         return "usage, reading..."
 
+    def _pick_limit(self, usage):
+        """Which of the reading's windows this pill shows."""
+        raise NotImplementedError
+
     def _format_limit(self) -> str:
         raise NotImplementedError
 
@@ -922,7 +1012,7 @@ class UsagePillBadge(QWidget):
         super().mousePressEvent(event)
 
     def _color(self) -> QColor:
-        if self._loading or self._stale or self._limit is None:
+        if self._loading or self._limit is None or self.is_stale():
             return QColor(Palette.TEXT_DIM)
         if self._limit.percent >= self._RED:
             return QColor(Palette.RED)
@@ -935,7 +1025,8 @@ class UsagePillBadge(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         color = self._color()
-        dim = self._loading or self._stale
+        self._painted_stale = self.is_stale()
+        dim = self._loading or self._limit is None or self._painted_stale
         rect = QRectF(0.5, 0.5, self.width() - 1, self.height() - 1)
         fill = QColor(color)
         fill.setAlpha(self._FILL_ALPHA_DIM if dim else self._FILL_ALPHA)
@@ -1092,8 +1183,8 @@ class PlanUsageBadge(UsagePillBadge):
     the active skin, and per-state QSS would fight the theme registry. Reading
     `Palette` at paint time gives both for free.
 
-    The widget is a pure VIEW — it never fetches. `MainWindow` polls off-thread
-    and pushes readings in via `set_usage`; a click emits `refreshRequested`,
+    The widget is a pure VIEW — it never fetches. Its `usage_poll.UsagePoller`
+    polls off-thread and pushes readings in via `set_usage`; a click emits `refreshRequested`,
     which is the whole refresh affordance (no extra button in the chrome).
 
     When a poll fails and there is NO earlier number to grey out, the pill says
@@ -1118,22 +1209,15 @@ class PlanUsageBadge(UsagePillBadge):
         self._label = True
 
     # -- data in ---------------------------------------------------------
-    def set_usage(self, usage) -> None:
-        """Adopt a reading. `None`, or a reading with no limits, leaves the pill
-        with no content — an API-key user or a logged-out machine has nothing to
-        show, and `TopBar._sync_usage_pills` hides it for that reason. Note the
-        badge never calls `setVisible` itself: which pills are on the bar is the
-        product of a reading AND the user's per-pill preference, and only the
-        top bar knows both."""
+    def _pick_limit(self, usage):
+        """This pill's window, never another's: the 5h and 7d pills sit side
+        by side, and a fallback would let one silently show the other's
+        number. A reading with no such window leaves the pill with no content
+        (an API-key user has nothing to show here)."""
         from .. import claude_usage
 
-        self._usage = usage
-        self._limit = (claude_usage.weekly(usage) if self.window == "weekly"
-                       else claude_usage.five_hour(usage))
-        self._unreadable = ""       # a real number supersedes the error pill
-        self._loading = False
-        self._stale = bool(usage.error) or usage.source == "cache" if usage else False
-        self._refresh_text()
+        return (claude_usage.weekly(usage) if self.window == "weekly"
+                else claude_usage.five_hour(usage))
 
     def _loading_text(self) -> str:
         # deliberately SHORTER than the finished line, so the pill only ever
@@ -1178,8 +1262,7 @@ class PlanUsageBadge(UsagePillBadge):
             age = claude_usage.format_since(_time.time() - self._usage.fetched_at)
             src = " (cached by Claude)" if self._usage.source == "cache" else ""
             lines.append(f"Updated {age}{src}")
-        if self._usage.error:
-            lines.append(f"Last refresh failed: {self._usage.error}")
+        lines.extend(self._failure_lines())
         lines.append("Click to refresh")
         return "\n".join(lines)
 

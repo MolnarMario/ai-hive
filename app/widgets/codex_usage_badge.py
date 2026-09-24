@@ -14,13 +14,8 @@ class CodexUsageBadge(UsagePillBadge):
 
     _PROVIDER = "codex"
 
-    def set_usage(self, usage) -> None:
-        self._loading = False
-        self._usage = usage
-        self._limit = usage.limit if usage else None
-        self._unreadable = ""
-        self._stale = bool(usage.error) if usage else False
-        self._refresh_text()
+    def _pick_limit(self, usage):
+        return usage.limit
 
     def _loading_text(self) -> str:
         return "GPT 5h usage, reading..."
@@ -43,7 +38,6 @@ class CodexUsageBadge(UsagePillBadge):
                  codex_usage.format_limit(self._limit)]
         if self._usage.fetched_at:
             lines.append(f"Updated {codex_usage.format_countdown(time.time() - self._usage.fetched_at)} ago")
-        if self._usage.error:
-            lines.append(f"Last refresh failed: {self._usage.error}")
+        lines.extend(self._failure_lines())
         lines.append("Click to refresh")
         return "\n".join(lines)

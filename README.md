@@ -86,7 +86,11 @@ workspaces keep executing — switching never pauses anything.
   the real end of the turn; Codex, Gemini and Grok have no such hook and ring
   after 6 s of silence (2 s settle + `REPLY_QUIET_MS`) instead. Each has its own
   switch under **⚙ Options** in the top bar; the question chime starts on, the
-  reply chime off, and both persist across restarts.
+  reply chime off, and both persist across restarts. The ♪ button beside each
+  switch plays a preview, swaps in your own WAV or MP3 (5 s and 2 MB at most),
+  or goes back to the built-in sound. AI Hive copies the file into its app-data
+  `sounds` folder, so moving the original breaks nothing, and if the copy ever
+  goes missing or won't play, the built-in chime rings instead.
 - **Taskbar working count** — the same signal, but from *outside* the app. The
   Windows taskbar icon carries a small badge with the number of agents currently
   working, so you can tell at a glance from any other window whether the hive is
@@ -122,13 +126,22 @@ workspaces keep executing — switching never pauses anything.
   mid-task, and the red pill tells you which agent is about to hit it.
   **Click either to refresh**; hover for every limit window, your
   plan, and how old the reading is. The numbers come from the same place the
-  CLI's `/usage` gets them, read once a minute in the background — nothing is
-  logged or persisted, it's a live readout only. Past 90% *with agents actually
-  working* it refreshes every 20 seconds instead: that's the stretch where
-  several busy agents can spend the rest of the window between two ordinary
-  polls, and the recovery features only learn you're cut off from a reading.
-  Idle agents, a window under 90%, or one already spent all go back to the slow
-  rate, so the endpoint is never polled hard for long. When a limit is actually
+  CLI's `/usage` gets them, read in the background. Nothing is logged or
+  persisted; it's a live readout only. **Every pill (Claude, Gemini, GPT)
+  follows the same schedule**, set in `app/usage_poll.py`: every 90 seconds
+  while one of that provider's agents is working (or finished within the last
+  3 minutes), every 30 seconds once a window passes 90% with agents working,
+  and every 6 minutes while none are, since the browser or the official apps
+  can still move the number. A spent window drops back to 90 seconds, because
+  a poll is already armed for a few seconds after its reset. Starting work
+  after an idle stretch polls straight away, and so does waking the PC from
+  sleep. A failed poll retries after 10 seconds; a `429` backs off instead,
+  up to 16 minutes, and a click clears the backoff. **A pill greys only when
+  its number stops being trustworthy**: polls have been failing and the
+  reading is older than two poll intervals (at least 3 minutes, 12 while
+  idle), or the window has reset since it was read. One failed poll leaves
+  the number in colour, and the tooltip says what failed, for how long, and
+  when the next try is. When a limit is actually
   spent its pill reads **`limit reached, resets in …`**, and the window raises
   `planLimitReached` / `planLimitCleared` signals (with the reset time) so
   other features can act on being cut off — e.g. relaunching blocked agents
@@ -149,13 +162,13 @@ workspaces keep executing — switching never pauses anything.
   don't want. Closing a Claude pill only hides that readout: the poll keeps
   running for both Claude windows regardless, because auto-recovery is driven
   from that reading.
-  The two Gemini pills refresh **every five minutes**, not every minute like the
-  Claude one. Reading them means running `agy`, and `agy` occasionally starts a
-  helper that asks Windows for its own console, which Windows 11 grants as a
+  Reading the Gemini pills means running `agy`, and `agy` occasionally starts
+  a helper that asks Windows for its own console, which Windows 11 grants as a
   real terminal window that flashes over whatever you are doing and closes a
   moment later. No launch flag prevents it (the flags we control don't reach
-  that helper), so the fix is to ask less often. Nothing is lost by it: only the
-  pills read this number, and a 5-hour window barely moves in five minutes.
+  that helper). The shared schedule keeps that to one run every 6 minutes
+  while no Gemini agent is working; while one is, it runs every 90 seconds
+  like the others, so the flash can show up more often then.
   **Nothing is remembered between runs except the choice itself.** Every pill
   opens saying `reading...` and fills in from a fresh fetch at startup, because
   a stored number goes stale exactly where it matters most — a 5-hour window is
@@ -390,6 +403,20 @@ workspaces keep executing — switching never pauses anything.
   read-only lines independently, for when you only care about one kind of
   activity (the legend greys the hidden kind). Agent bubbles are opaque and each
   Task sub-agent is labeled with its type.
+- **Event log** (the **Log** button in the top bar, or Ctrl+Shift+L) opens a
+  separate window with one timeline for every agent in every workspace: the
+  prompts you sent, tasks AI Hive handed over, questions, finished replies
+  with how long they took, limit cut-offs with a countdown to the reset,
+  resumes, crashes and missed scheduled messages. Click a workspace name to
+  switch to it, or an agent name to jump to its card. A question row keeps
+  counting ("waiting 12m") until you answer it, then reads "answered after
+  12m"; the Log button shows how many are still waiting. Filter by workspace
+  and agent (a checkable tree, or right-click a row for "Show only this
+  agent"), by event type, by text, or to **Needs you** only. Lifecycle events
+  (started, stopped, added, renamed) and board posts are recorded too but
+  hidden until you switch them on. The log lives in
+  `%APPDATA%/AIHive/AI Hive/event_log/`, one JSONL file per day, pruned after 30
+  days, so what ran overnight is still there after a restart.
   (Sub-agent file work and non-Claude agents can't be attributed — those nodes
   show without file edges; see below.)
 - **⚙ Options** — one button on the top bar opens a panel with everything that
@@ -733,7 +760,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1951 checks drive the real app headlessly (offscreen Qt platform) with real
+2065 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -778,7 +805,13 @@ bypassPermissions) plus the question chime it triggers (WAV synthesis,
 the manager's waiting rising-edge `agentWaiting` signal, and the top-bar
 mute toggle persisted in the ui state), the reply finished chime (Claude's
 Stop-hook edge, the hookless providers' quiet timer, once per submitted turn,
-never for a shell or a waiting agent), the Agent/File Map
+never for a shell or a waiting agent), custom chime sounds (WAV/MP3
+validation, the MCI player thread, fallback to the built-in sound, the copy
+into app data and its session round-trip), the event log (per-day storage,
+torn lines, 30-day pruning, the stable agent uid its links key on, the
+collector's question settle and limit-menu exclusion, answers and resumes
+closing their rows, the window's filters, live rows and link hit-testing),
+the Agent/File Map
 visualizer (transcript parsing for edited-vs-read
 attribution, sub-agent detection, shared-file grouping, headless paint, header-
 button wiring, and the drag/zoom/hit-test/click-to-focus interactions) and the
@@ -834,11 +867,13 @@ app/
   screen_snapshot.py       a stopped card's last screen, so reopen shows the conversation (Qt-free)
   session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
   session_hook.py          SessionStart hook: the child reports its live conversation id
-  chime.py                 question + reply finished chimes (WAV synth + async play, Qt-free)
+  chime.py                 question + reply finished chimes (WAV synth, custom WAV/MP3, async play, Qt-free)
   taskbar_overlay.py       the Windows taskbar corner badge (ITaskbarList3 via ctypes, Qt-free)
   claude_usage.py          live plan-usage reading (/api/oauth/usage) + limit edges (Qt-free)
   limit_banner.py          recognising a usage cut-off + when it resets (Qt-free, shared)
   limit_ledger.py          durable record of cut-offs: who, when, and how it ended (Qt-free)
+  event_log.py             the event log's storage + wording: per-day JSONL, prune (Qt-free)
+  event_hub.py             collects agent/workspace signals into event-log records
   scheduled_send.py        deferred messages: parse a delay/clock, hold it, format the countdown (Qt-free)
   cli_update.py            startup CLI update gate: decide from the FILE's own version (Qt-free)
   cli_install.py           how Claude Code is installed + the switch onto the self-updating build (Qt-free)
@@ -852,12 +887,13 @@ app/
                            (on-screen popup), activity_panel, agent_file_map (tree
                            diagram), ornaments (drop-caps / dividers / count-badge
                            + working-count spinner + taskbar-badge painter),
+                           event_log_window (the event log timeline),
                            update_splash (the startup CLI-update panel + its
                            worker thread), update_panel (the Updates panel +
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1951 checks)
+tests/smoke_test.py        headless end-to-end suite (2065 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
