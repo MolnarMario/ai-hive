@@ -65,6 +65,9 @@ class WorkspaceManager(QObject):
     # the "?" just appeared on its row. Transient, never persisted — the UI
     # uses it purely to sound the notification chime.
     agentWaiting = Signal(str, str)          # ws_id, agent_id
+    # an agent finished a reply the user asked for (TerminalAgent.
+    # reply_finished). Transient like agentWaiting: only the reply chime uses it.
+    agentReplied = Signal(str, str)          # ws_id, agent_id
     agentLimitBlocked = Signal(str, str)     # ws_id, agent_id (plan cut-off)
     dirty = Signal()                         # any persistable mutation
 
@@ -480,6 +483,8 @@ class WorkspaceManager(QObject):
         agent.waiting_changed.connect(
             lambda waiting, wid=wid, aid=agent.id:
             self._on_agent_waiting(wid, aid, waiting))
+        agent.reply_finished.connect(
+            lambda wid=wid, aid=agent.id: self.agentReplied.emit(wid, aid))
         # cut off by the plan limit — also transient, but announced so the
         # window can record it. Auto-continue depends on this having been seen,
         # so it must leave a forensic trace: twice now the feature failed
@@ -564,7 +569,10 @@ class WorkspaceManager(QObject):
                 if not agent.is_busy():
                     agent.set_turn_waiting(True)
             elif kind == session_hook.EV_TURN_CLEAR:
+                # the Stop hook's "turn ended on a statement": Claude's exact
+                # reply-finished edge (the other providers time it instead)
                 agent.set_turn_waiting(False)
+                agent.note_turn_ended()
 
     def _touch(self, ws_id: str) -> None:
         """Recompute derived state AND mark the session dirty (persisted

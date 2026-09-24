@@ -423,7 +423,8 @@ class TopBar(QFrame):
     sidebarToggleClicked = Signal()
     globalFontDelta = Signal(int)
     themeChanged = Signal(str)   # theme id
-    soundToggled = Signal(bool)  # notification chime enabled/muted
+    soundToggled = Signal(bool)  # question chime enabled/muted
+    replySoundToggled = Signal(bool)  # reply-finished chime enabled/muted
     # show/hide ONE usage readout: (tracker key, wanted). One signal for both
     # affordances - the X on a pill and the + menu - so the two controls of the
     # same preference can never disagree.
@@ -507,6 +508,15 @@ class TopBar(QFrame):
         self.sound_btn = ToggleSwitch(self)
         self.sound_btn.clicked.connect(self._on_sound_clicked)
         self._refresh_sound_btn()
+
+        # reply-finished chime: the second, rising-then-held sound, for "an
+        # agent finished what you asked". OFF by default, since a busy hive
+        # finishes replies far more often than it asks questions.
+        self._reply_sound_on = False
+        self.reply_sound_label = toggle_label("")
+        self.reply_sound_btn = ToggleSwitch(self)
+        self.reply_sound_btn.clicked.connect(self._on_reply_sound_clicked)
+        self._refresh_reply_sound_btn()
 
         # taskbar working-count overlay toggle. Sits next to the chime because
         # both are the same kind of thing: a signal that reaches the user when
@@ -633,6 +643,8 @@ class TopBar(QFrame):
         self.options_panel.add_switch_row(self.recover_label, self.recover_btn)
         self.options_panel.add_switch_row(self.resume_label, self.resume_btn)
         self.options_panel.add_switch_row(self.sound_label, self.sound_btn)
+        self.options_panel.add_switch_row(self.reply_sound_label,
+                                          self.reply_sound_btn)
         self.options_panel.add_switch_row(self.taskbar_label, self.taskbar_btn)
         self.options_panel.add_switch_row(self.auto_update_label,
                                           self.auto_update_btn)
@@ -740,6 +752,10 @@ class TopBar(QFrame):
         self.set_sound_enabled(not self._sound_on)
         self.soundToggled.emit(self._sound_on)
 
+    def _on_reply_sound_clicked(self) -> None:
+        self.set_reply_sound_enabled(not self._reply_sound_on)
+        self.replySoundToggled.emit(self._reply_sound_on)
+
     def _on_taskbar_clicked(self) -> None:
         self.set_taskbar_badge(not self._taskbar_badge)
         self.taskbarBadgeToggled.emit(self._taskbar_badge)
@@ -839,16 +855,35 @@ class TopBar(QFrame):
         # label is still a second, always-visible tell.
         self.sound_btn.setChecked(self._sound_on)
         bell = "🔔" if self._sound_on else "🔕"
-        self.sound_label.setText(f"{bell}  Notification chime")
+        self.sound_label.setText(f"{bell}  Question chime")
         tip = (
-            "Notification chime: ON. A soft bell rings when an agent settles "
-            "on a question and needs you, even from another workspace.\n"
-            "Click to mute."
+            "Question chime: ON. A rising \"bweep?\" plays when an agent "
+            "settles on a question and needs you, even from another "
+            "workspace.\nClick to mute."
             if self._sound_on else
-            "Notification chime: OFF. An agent waiting on a question raises "
+            "Question chime: OFF. An agent waiting on a question raises "
             "its \"?\" silently.\nClick to turn on.")
         self.sound_btn.setToolTip(tip)
         self.sound_label.setToolTip(tip)
+
+    def set_reply_sound_enabled(self, on: bool) -> None:
+        """Reflect the reply chime on/off state in the button (no signal)."""
+        self._reply_sound_on = bool(on)
+        self._refresh_reply_sound_btn()
+
+    def _refresh_reply_sound_btn(self) -> None:
+        self.reply_sound_btn.setChecked(self._reply_sound_on)
+        bell = "🔔" if self._reply_sound_on else "🔕"
+        self.reply_sound_label.setText(f"{bell}  Reply finished chime")
+        tip = (
+            "Reply finished chime: ON. A short \"ta-da!\" plays when an agent "
+            "finishes a reply you asked for, even from another workspace.\n"
+            "Click to mute."
+            if self._reply_sound_on else
+            "Reply finished chime: OFF. Agents finish replies silently.\n"
+            "Click to turn on.")
+        self.reply_sound_btn.setToolTip(tip)
+        self.reply_sound_label.setToolTip(tip)
 
     def _on_recover_clicked(self) -> None:
         self.set_startup_recovery(not self._startup_recovery)
@@ -1626,7 +1661,8 @@ class MainWindow(QMainWindow):
         self._ready = False  # suppress save-storms during initial load
         self._last_saved_json = None  # what last reached disk (heartbeat guard)
         self._theme_id = ui_theme.ACTIVE_THEME.id  # active skin (persisted)
-        self._sound_enabled = True  # notification chime on "?" (persisted)
+        self._sound_enabled = True  # question chime on "?" (persisted)
+        self._reply_sound_enabled = False  # reply-finished chime (persisted)
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -1947,6 +1983,7 @@ class MainWindow(QMainWindow):
         self.top_bar.globalFontDelta.connect(self._change_global_font)
         self.top_bar.themeChanged.connect(self._change_theme)
         self.top_bar.soundToggled.connect(self._on_sound_toggled)
+        self.top_bar.replySoundToggled.connect(self._on_reply_sound_toggled)
         self.top_bar.usageTrackerToggled.connect(self._on_usage_tracker_toggled)
         self.top_bar.terminalScrollbackToggled.connect(
             self._on_terminal_scrollback)
@@ -2056,6 +2093,8 @@ class MainWindow(QMainWindow):
         mgr.layoutChanged.connect(self._on_layout_changed)
         # an agent just settled on a question ("?" appeared) -> sound the chime
         mgr.agentWaiting.connect(self._on_agent_waiting)
+        # ...and one finished a reply the user asked for -> the reply chime
+        mgr.agentReplied.connect(self._on_agent_replied)
         mgr.dirty.connect(self._schedule_save)
         # structural changes (add/remove agent or workspace) save IMMEDIATELY,
         # not on the 800 ms debounce — so an abrupt process kill can never lose
@@ -2084,7 +2123,14 @@ class MainWindow(QMainWindow):
         agent = self.manager.agent(ws_id, agent_id)
         if agent is not None and agent.is_limit_blocked():
             return
-        chime.play()
+        chime.play(chime.QUESTION)
+
+    def _on_agent_replied(self, ws_id: str, agent_id: str) -> None:
+        """An agent finished a reply the user asked for (the agent already
+        filtered out questions, limit cut-offs and plain shells; see
+        TerminalAgent._announce_reply). Ring the reply chime if it is on."""
+        if self._reply_sound_enabled:
+            chime.play(chime.REPLY)
 
     # ---------------------------------------------------- plan usage ------
     def plan_usage(self):
@@ -3222,6 +3268,12 @@ class MainWindow(QMainWindow):
         self._sound_enabled = bool(enabled)
         self._schedule_save()
 
+    def _on_reply_sound_toggled(self, enabled: bool) -> None:
+        """User flipped the reply-finished chime toggle. Persisted like the
+        question chime's."""
+        self._reply_sound_enabled = bool(enabled)
+        self._schedule_save()
+
     # ------------------------------------------- taskbar working-count badge ---
     # The one signal AI Hive has that reaches the user in ANOTHER application.
     # Everything else that says "an agent is working" lives inside the window
@@ -3497,6 +3549,9 @@ class MainWindow(QMainWindow):
         # notification chime preference (default ON if never saved)
         self._sound_enabled = bool(ui.get("sound_enabled", True))
         self.top_bar.set_sound_enabled(self._sound_enabled)
+        # reply-finished chime preference (default OFF if never saved)
+        self._reply_sound_enabled = bool(ui.get("reply_sound_enabled", False))
+        self.top_bar.set_reply_sound_enabled(self._reply_sound_enabled)
         # Which usage readouts to show (default: all of them). A dict rather
         # than a list of enabled keys, so a missing entry defaults ON per key
         # and a fourth tracker added later needs no migration. A new key inside
@@ -4053,6 +4108,7 @@ class MainWindow(QMainWindow):
             "console_font_px": ui_theme.CONSOLE_FONT_PX,
             "theme": self._theme_id,
             "sound_enabled": self._sound_enabled,
+            "reply_sound_enabled": self._reply_sound_enabled,
             "usage_trackers": dict(self._usage_trackers),
             # Legacy mirror, DERIVED, kept for one release so a downgrade to a
             # build that only understands this key does not resurrect three

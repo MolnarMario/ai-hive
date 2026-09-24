@@ -950,7 +950,7 @@ def test_chime_persistence():
     check("chime toggle: defaults to ON (bell glyph, lit)",
           bar._sound_on and bar.sound_btn.isChecked()
           and "\U0001F514" in bar.sound_label.text()
-          and "Notification chime" in bar.sound_label.text(),
+          and "Question chime" in bar.sound_label.text(),
           bar.sound_label.text())
     emitted = []
     bar.soundToggled.connect(emitted.append)
@@ -967,7 +967,145 @@ def test_chime_persistence():
     check("chime toggle: set_sound_enabled updates glyph, no emit",
           not bar._sound_on and emitted == [False, True]
           and not bar.sound_btn.isChecked())
+
+    # the reply-finished chime: its own switch, OFF by default
+    check("reply chime toggle: defaults to OFF (muted glyph, unlit)",
+          not bar._reply_sound_on and not bar.reply_sound_btn.isChecked()
+          and "🔕" in bar.reply_sound_label.text()
+          and "Reply finished chime" in bar.reply_sound_label.text(),
+          bar.reply_sound_label.text())
+    replied = []
+    bar.replySoundToggled.connect(replied.append)
+    bar.reply_sound_btn.click()
+    check("reply chime toggle: click arms it + emits True, question one untouched",
+          replied == [True] and bar._reply_sound_on
+          and bar.reply_sound_btn.isChecked()
+          and emitted == [False, True], (replied, emitted))
+    bar.set_reply_sound_enabled(False)
+    check("reply chime toggle: set_reply_sound_enabled updates, no emit",
+          not bar._reply_sound_on and replied == [True]
+          and not bar.reply_sound_btn.isChecked())
     bar.deleteLater()
+
+
+def test_reply_chime():
+    """The reply-finished chime's cue (TerminalAgent.reply_finished ->
+    WorkspaceManager.agentReplied). Claude's comes from the Stop hook's
+    turn_clear edge; the hookless providers wait REPLY_QUIET_MS past a settle.
+    Either way: only for a turn somebody submitted, once per turn, never when
+    the agent is asking something back, never for a plain shell."""
+    import wave as _wave
+    from PySide6.QtWidgets import QApplication
+    from app import chime
+    from app import session_hook as sh
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+
+    # --- both sounds synthesise, and they are different sounds ---
+    q, r = chime._ensure_chime(chime.QUESTION), chime._ensure_chime(chime.REPLY)
+    check("reply chime: question + reply WAVs are separate files",
+          q and r and q != r and os.path.exists(q) and os.path.exists(r),
+          (q, r))
+    with _wave.open(r, "rb") as w:
+        check("reply chime: reply WAV is 16-bit mono with frames",
+              w.getnchannels() == 1 and w.getsampwidth() == 2
+              and w.getnframes() > 0)
+    check("reply chime: the question sound ends mid-slide UP, the reply on a "
+          "held note",
+          chime._SOUNDS[chime.QUESTION][-1][2][-1][1]
+          > chime._SOUNDS[chime.QUESTION][-1][2][0][1]
+          and len(chime._SOUNDS[chime.REPLY][-1][2]) == 1)
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-reply-"))
+    events = str(tmp / "events.jsonl")
+    sh.reset_events(events)
+    mgr = WorkspaceManager()
+    mgr.prompt_events_path = events
+    ws = mgr.create_workspace("Reply", str(tmp))
+    replies = []
+    mgr.agentReplied.connect(lambda wid, aid: replies.append(aid))
+
+    # --- Claude: the Stop hook's turn_clear is the edge ---
+    cl = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Cl",
+                                            cwd=str(tmp)), autostart=False)
+    cl.status = AgentStatus.RUNNING
+
+    def emit(agent, kind):
+        os.environ[sh.AGENT_ID_ENV] = agent.id
+        try:
+            sh._append_event(events, kind)
+        finally:
+            os.environ.pop(sh.AGENT_ID_ENV, None)
+
+    emit(cl, sh.EV_TURN_CLEAR)
+    mgr.sync_prompt_events()
+    check("reply chime: a Stop with no submitted turn (a --resume) is silent",
+          replies == [], replies)
+    cl._note_submit()
+    cl._busy = True     # the hook lands inside the 2 s idle window
+    emit(cl, sh.EV_TURN_CLEAR)
+    mgr.sync_prompt_events()
+    check("reply chime: Claude Stop (turn_clear) after a submit rings, even "
+          "while still inside the busy window", replies == [cl.id], replies)
+    emit(cl, sh.EV_TURN_CLEAR)
+    mgr.sync_prompt_events()
+    check("reply chime: once per turn", replies == [cl.id], replies)
+    cl._busy = False
+    cl._note_submit()
+    cl._on_idle_timeout()
+    check("reply chime: Claude never arms the quiet timer (the hook is exact)",
+          not cl._reply_timer.isActive())
+    cl._tool_waiting = True
+    cl._emit_waiting()
+    cl.note_turn_ended()
+    check("reply chime: silent while the agent is asking the user something",
+          replies == [cl.id], replies)
+    cl._tool_waiting = False
+    cl._emit_waiting()
+
+    # --- hookless provider: settle arms the quiet timer, output cancels it ---
+    gm = mgr.add_terminal(ws.id, build_spec(AgentKind.GEMINI, "Gm",
+                                            cwd=str(tmp)), autostart=False)
+    gm.status = AgentStatus.RUNNING
+    gm._on_idle_timeout()
+    check("reply chime: Gemini settle with no submitted turn arms nothing",
+          not gm._reply_timer.isActive())
+    gm._note_submit()
+    gm._last_input_ts = 0.0
+    gm._mark_busy()
+    gm._on_idle_timeout()
+    check("reply chime: Gemini settle inside a turn arms the quiet timer",
+          gm._reply_timer.isActive())
+    gm._mark_busy()     # a tool ran long, then more output
+    check("reply chime: fresh output cancels the pending chime (mid-reply)",
+          not gm._reply_timer.isActive())
+    gm._on_idle_timeout()
+    gm._bg_shell = True
+    gm._on_reply_quiet()
+    check("reply chime: silent while a background command still runs",
+          gm.id not in replies, replies)
+    gm._bg_shell = False
+    gm._on_reply_quiet()
+    check("reply chime: quiet timer expiry rings for Gemini",
+          replies.count(gm.id) == 1, replies)
+    gm._idle_timer.stop()
+    gm._reply_timer.stop()
+
+    # --- a plain shell never announces a reply ---
+    sh_agent = mgr.add_terminal(ws.id, build_spec(AgentKind.POWERSHELL, "Sh",
+                                                  cwd=str(tmp)),
+                                autostart=False)
+    sh_agent.status = AgentStatus.RUNNING
+    sh_agent._note_submit()
+    sh_agent._on_reply_quiet()
+    check("reply chime: a plain shell never rings", sh_agent.id not in replies,
+          replies)
+    for a in (cl, gm, sh_agent):
+        a._idle_timer.stop()
+        a._reply_timer.stop()
 
 
 def test_taskbar_badge():
@@ -9851,7 +9989,7 @@ def test_auto_continue_on_limit_reset():
     # the limit banner must NOT ring the chime — nothing the sleeper can answer
     rung = {"n": 0}
     import app.chime as _chime
-    real_play, _chime.play = _chime.play, lambda: rung.__setitem__("n", rung["n"] + 1)
+    real_play, _chime.play = _chime.play, lambda *_a: rung.__setitem__("n", rung["n"] + 1)
     try:
         win3 = create_main_window(SessionStore(path=tmp / "chime.json"))
         win3.show(); pump(50)
@@ -12850,6 +12988,7 @@ def main():
     test_bg_shell_settle_relearn()
     test_bg_shell_kill_extras()
     test_chime_persistence()
+    test_reply_chime()
     test_hook_prompt_events()
     test_agent_hook_waiting()
     test_manager_prompt_events_sync()
@@ -13490,6 +13629,9 @@ def test_options_panel():
         ("chime", bar.sound_btn, bar.sound_label,
          bar.soundToggled, bar.set_sound_enabled,
          lambda: bar._sound_on, True),
+        ("reply chime", bar.reply_sound_btn, bar.reply_sound_label,
+         bar.replySoundToggled, bar.set_reply_sound_enabled,
+         lambda: bar._reply_sound_on, False),
         ("taskbar count", bar.taskbar_btn, bar.taskbar_label,
          bar.taskbarBadgeToggled, bar.set_taskbar_badge,
          lambda: bar._taskbar_badge, True),
@@ -13516,7 +13658,7 @@ def test_options_panel():
     # every row says what it does in words, not in a glyph the tooltip
     # explains - that was the whole reason for leaving the 42px strip
     labels = ["Recover at start-up", "Resume on usage reset",
-              "Notification chime", "Taskbar count",
+              "Question chime", "Reply finished chime", "Taskbar count",
               "Check for CLI updates at start-up"]
     check("options: every switch is labelled in plain words",
           all(lab in label.text() for lab, (_n, _b, label, *_r)

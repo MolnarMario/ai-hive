@@ -89,6 +89,13 @@ BUSY_IDLE_MS = 2000
 # pulses a beat later. Seconds, compared against time.time().
 INPUT_ECHO_S = 0.8
 
+# Extra quiet, on top of BUSY_IDLE_MS, before a submitted turn of a provider
+# WITHOUT a Stop hook (Codex, Gemini, Grok) counts as a finished reply and
+# rings the reply chime. A settle alone is 2 s of silence, which every tool
+# call longer than that also produces, so ringing on it would chime mid-reply.
+# Claude needs none of this: its Stop hook marks the real end (note_turn_ended).
+REPLY_QUIET_MS = 4000
+
 # How long a job's process count must stay above this agent's learned resting
 # level, while the agent itself is NOT busy, before it's flagged as "idle but
 # a background command it started is still running." Debounced like
@@ -315,6 +322,11 @@ class TerminalAgent(QObject):
     # transient contract as prompt_marks_changed -- never persisted, never
     # wired to a save.
     reply_marks_changed = Signal()
+    # a turn somebody asked for has ended and the agent is not asking anything
+    # back: the reply chime's cue. At most once per submitted turn. Claude's
+    # comes from its Stop hook (note_turn_ended), the others' from
+    # REPLY_QUIET_MS of silence after a settle (_on_reply_quiet).
+    reply_finished = Signal()
     # the agent's live conversation was REPLACED (/clear, or a /resume onto a
     # different session), so the scrollback behind the current screen belongs
     # to a conversation that is no longer on display. Transient view signal.
@@ -390,6 +402,7 @@ class TerminalAgent(QObject):
         # time onto the conversation.
         self._turn_open = False
         self._turn_mark_uid: int | None = None
+        self._turn_announced = False  # reply_finished already sent this turn
         # latched "the plan limit cut this agent off" + the reset time its own
         # banner stated. Transient like the waiting flags — never persisted.
         self._limit_blocked = False
@@ -453,6 +466,12 @@ class TerminalAgent(QObject):
         self._idle_timer.setSingleShot(True)
         self._idle_timer.setInterval(BUSY_IDLE_MS)
         self._idle_timer.timeout.connect(self._on_idle_timeout)
+        # hookless providers only: armed by a settle inside an open turn,
+        # stopped by the next real output burst (see REPLY_QUIET_MS)
+        self._reply_timer = QTimer(self)
+        self._reply_timer.setSingleShot(True)
+        self._reply_timer.setInterval(REPLY_QUIET_MS)
+        self._reply_timer.timeout.connect(self._on_reply_quiet)
         if self.is_pty:
             self.worker = PtyWorker(spec, parent=self)
             self.worker.output.connect(self._on_pty_output)
@@ -603,6 +622,7 @@ class TerminalAgent(QObject):
         than either falling silent or littering the turn with stamps."""
         self._turn_open = True
         self._turn_mark_uid = None    # the next settle starts this turn's mark
+        self._turn_announced = False  # ...and this turn has not chimed yet
 
     def resize(self, rows: int, cols: int) -> None:
         if self.is_pty:
@@ -1246,6 +1266,38 @@ class TerminalAgent(QObject):
         interactive process idling at its prompt."""
         return self._busy
 
+    def _has_stop_hook(self) -> bool:
+        """Claude reports each turn's end through its Stop hook, which is
+        exact. Everything else has only the output going quiet to go on."""
+        return self.spec.provider == "claude"
+
+    def _announce_reply(self) -> None:
+        """Emit reply_finished for the open turn, once, unless the agent is
+        asking the user something (the question chime covers that) or the plan
+        limit parked it (there is no reply to look at)."""
+        # a plain shell / custom command has no "reply" to announce
+        if self.spec.provider not in providers.AI_PROVIDER_KEYS:
+            return
+        if (not self._turn_open or self._turn_announced or self._waiting
+                or self._limit_blocked
+                or self.status is not AgentStatus.RUNNING):
+            return
+        self._turn_announced = True
+        self.reply_finished.emit()
+
+    def note_turn_ended(self) -> None:
+        """Claude's Stop hook said the turn ended on a statement, not a
+        question (workspace_manager.sync_prompt_events). Deliberately NOT gated
+        on is_busy(): the hook fires the moment the reply ends, which is inside
+        the 2 s idle window, while _busy is still True."""
+        self._announce_reply()
+
+    def _on_reply_quiet(self) -> None:
+        # a background command still running means the agent kicked off work
+        # and is waiting on it, which is not a finished reply
+        if not self._busy and not self._bg_shell:
+            self._announce_reply()
+
     def is_bg_shell_busy(self) -> bool:
         """True when the agent itself is quiet (not is_busy()) but a
         background command it started is still running -- see
@@ -1470,6 +1522,7 @@ class TerminalAgent(QObject):
                 self._busy = True
                 self.activity_changed.emit(True)
             self._idle_timer.start()  # (re)arm; fires once output falls quiet
+            self._reply_timer.stop()  # still replying, so not finished yet
 
     def _on_idle_timeout(self) -> None:
         if self._busy:
@@ -1486,6 +1539,8 @@ class TerminalAgent(QObject):
             # really happened.
             if self._turn_open:
                 self.note_reply_settled()
+                if not self._has_stop_hook():
+                    self._reply_timer.start()
             self.activity_changed.emit(False)
         # the screen has settled (2 s quiet) — is it a prompt awaiting the user?
         self._scrape_waiting = self._screen_waiting()
@@ -2139,6 +2194,7 @@ class TerminalAgent(QObject):
             # even if the idle timer hasn't fired yet (stop/crash/exit)
             if status not in (AgentStatus.RUNNING, AgentStatus.STARTING):
                 self._idle_timer.stop()
+                self._reply_timer.stop()
                 if self._busy:
                     self._busy = False
                     self.activity_changed.emit(False)

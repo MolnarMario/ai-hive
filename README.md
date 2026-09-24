@@ -76,11 +76,17 @@ workspaces keep executing — switching never pauses anything.
   question — a "?" lights up on the row (next to the working count) and beside
   that agent in the expanded list, so you can spot and answer it without hunting
   through terminals. Suppressed for agents launched in bypass-permissions mode
-  (which never prompt). A soft **notification chime** rings the moment that "?"
+  (which never prompt). A **question chime**, a short droid-style "doo-dee-bweep?"
+  whose last note is still sliding up when it stops, plays the moment that "?"
   appears (the standby→waiting rising edge), so you notice an agent needs you
   even while you're heads-down in another workspace — handy when agents you sent
-  into plan mode come back with questions. Toggle it under **⚙ Options** in
-  the top bar (persists across restarts).
+  into plan mode come back with questions. A second **reply finished chime**, a
+  "ta-da!" that steps up and holds its top note, plays when an agent finishes a
+  reply you asked for. Claude's comes from its Stop hook, so it fires once at
+  the real end of the turn; Codex, Gemini and Grok have no such hook and ring
+  after 6 s of silence (2 s settle + `REPLY_QUIET_MS`) instead. Each has its own
+  switch under **⚙ Options** in the top bar; the question chime starts on, the
+  reply chime off, and both persist across restarts.
 - **Taskbar working count** — the same signal, but from *outside* the app. The
   Windows taskbar icon carries a small badge with the number of agents currently
   working, so you can tell at a glance from any other window whether the hive is
@@ -388,7 +394,7 @@ workspaces keep executing — switching never pauses anything.
   show without file edges; see below.)
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
-  reset**, **Notification chime**, **Taskbar count** and **Check for CLI
+  reset**, **Question chime**, **Reply finished chime**, **Taskbar count** and **Check for CLI
   updates at start-up** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
@@ -727,7 +733,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1931 checks drive the real app headlessly (offscreen Qt platform) with real
+1951 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -768,9 +774,11 @@ drag workspaces in/out, single-level membership persisted across a v4 session
 round-trip with v3 migration), the count-badge inline agent list +
 click-to-reveal, and the waiting-for-input "?" detection (settled-screen
 prompt/question scrape, gated on the idle timer, suppressed under
-bypassPermissions) plus the notification chime it triggers (WAV synthesis,
+bypassPermissions) plus the question chime it triggers (WAV synthesis,
 the manager's waiting rising-edge `agentWaiting` signal, and the top-bar
-mute toggle persisted in the ui state), the Agent/File Map
+mute toggle persisted in the ui state), the reply finished chime (Claude's
+Stop-hook edge, the hookless providers' quiet timer, once per submitted turn,
+never for a shell or a waiting agent), the Agent/File Map
 visualizer (transcript parsing for edited-vs-read
 attribution, sub-agent detection, shared-file grouping, headless paint, header-
 button wiring, and the drag/zoom/hit-test/click-to-focus interactions) and the
@@ -826,7 +834,7 @@ app/
   screen_snapshot.py       a stopped card's last screen, so reopen shows the conversation (Qt-free)
   session_sync.py          reconcile a pinned id with the transcript on disk (fallback)
   session_hook.py          SessionStart hook: the child reports its live conversation id
-  chime.py                 notification bell (WAV synth + async play, Qt-free) for the "?" alert
+  chime.py                 question + reply finished chimes (WAV synth + async play, Qt-free)
   taskbar_overlay.py       the Windows taskbar corner badge (ITaskbarList3 via ctypes, Qt-free)
   claude_usage.py          live plan-usage reading (/api/oauth/usage) + limit edges (Qt-free)
   limit_banner.py          recognising a usage cut-off + when it resets (Qt-free, shared)
@@ -849,7 +857,7 @@ app/
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1931 checks)
+tests/smoke_test.py        headless end-to-end suite (1951 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
