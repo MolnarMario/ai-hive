@@ -24,7 +24,7 @@ from .. import codex_usage
 from .. import fsopen
 from .. import limit_ledger
 from .. import providers
-from ..limit_banner import LIMIT_PROVIDERS
+from ..limit_banner import LIMIT_PROVIDERS, SEVEN_DAY_WINDOWS
 from .. import scheduled_send
 from .. import session_hook
 from .. import transcripts
@@ -177,6 +177,13 @@ LIMIT_PHANTOM_CHECK_MS = 3000
 # enough — but it must not become a Continue every minute forever either.
 LIMIT_RETRY_S = 300
 LIMIT_MAX_TRIES = 4
+
+# The transcript sweep (`_sweep_transcript_cut_offs`) only adopts cut-offs that
+# happened while THIS process was running. Anything older belongs to startup
+# recovery, which deliberately arms only the newest window; a sweep that
+# ignored the boundary would revive exactly the conversations it skipped. The
+# slack covers a cut-off written in the seconds before the window came up.
+LIMIT_SWEEP_SLACK_S = 30
 
 # How many consecutive "TUI not ready" watchdog ticks (LIMIT_WATCH_MS apart) a
 # latched agent may spend before we stop waiting for a frame and ask for one —
@@ -1705,6 +1712,9 @@ class MainWindow(QMainWindow):
         # ledger keys already filed this run, so one cut-off is written once
         # however many times its latch is (re)raised
         self._ledger_seen: set[tuple] = set()
+        # when this window came up: the line between the transcript sweep's
+        # cut-offs and startup recovery's (see LIMIT_SWEEP_SLACK_S)
+        self._launched_at = time.time()
         self._auto_continue = True    # user preference (persisted)
         self._startup_recovery = True  # user preference (persisted)
         self._usage_backoff = 0       # consecutive 429s -> exponential poll gap
@@ -2491,7 +2501,7 @@ class MainWindow(QMainWindow):
         # 1. LOOK EVERYWHERE. Every agent in every workspace is examined,
         #    running or not, and every cut-off found is filed — the record is
         #    supposed to be complete even where the action is selective.
-        found: list[tuple] = []           # (agent, record)
+        found: list[tuple] = []           # (agent, record, info)
         for agent in self.manager.all_agents():
             spec = agent.spec
             if spec.provider != "claude" or not agent.is_pty:
@@ -2505,20 +2515,20 @@ class MainWindow(QMainWindow):
             record = self._ledger_cut_off(agent, info["at"],
                                           info["resets_at"], info["window"],
                                           info["banner"], source="transcript")
-            found.append((agent, record))
+            found.append((agent, record, info))
         if not found:
             return 0
 
         # 2. ACT ON THE MOST RECENT WINDOW ONLY. Agents stopped by one window
         #    all state the same reset clock, so they group; anything from an
         #    earlier window is history that has already had its chance.
-        newest = limit_ledger.latest_window([r for _a, r in found])
+        newest = limit_ledger.latest_window([r for _a, r, _i in found])
         newest_keys = {tuple(r["key"]) for r in newest}
         closed = limit_ledger.closed_keys(
             limit_ledger.read_all(self._ledger_dir()))
 
         armed = 0
-        for agent, record in found:
+        for agent, record, info in found:
             key = tuple(record["key"])
             name = agent.spec.name
             if key not in newest_keys:
@@ -2550,7 +2560,8 @@ class MainWindow(QMainWindow):
                                      from_startup=True,
                                      cut_off_at=record["at"],
                                      window=record["window"],
-                                     banner=record["banner"])
+                                     banner=record["banner"],
+                                     exact=info.get("exact", False))
             armed += 1
         self._limit_audit(f"STARTUP-SCAN found={len(found)} armed={armed}")
         return armed
@@ -2663,7 +2674,10 @@ class MainWindow(QMainWindow):
         at = agent.limit_resets_at()
         when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(at)) if at
                 else "unknown")
-        self._limit_audit(f"BLOCKED agent={agent.spec.name} resets={when}")
+        exact = "" if agent.limit_reset_exact() else " (bare clock)"
+        self._limit_audit(f"BLOCKED agent={agent.spec.name} resets={when}"
+                          f"{exact if at else ''} "
+                          f"window={agent.limit_window() or '-'}")
         # a fresh cut-off gets the full patience budget again
         self._limit_wait_ticks.pop(agent_id, None)
         # File it durably. Skipped when this cut-off is already on record: the
@@ -2736,6 +2750,9 @@ class MainWindow(QMainWindow):
         """
         if self._closing or not self._ready:
             return
+        # The second detector runs first, so a cut-off it adopts is judged by
+        # the very same `due` below on this same tick.
+        self._sweep_transcript_cut_offs()
         now = time.time()
         # Late-fill a due time for anything still lacking one (the account
         # reading may only have arrived after the cut-off was latched).
@@ -2752,13 +2769,15 @@ class MainWindow(QMainWindow):
         account_clear = usage is not None and usage.blocked is None
 
         def due(a):
-            # A WEEKLY window is not readable off the screen: its banner prints
-            # a bare wall clock ("resets 8pm") for a reset that can be days
-            # away, and `parse_reset_clock` can only ever resolve that to the
-            # next 8pm. Acting on it would nudge days early, every day. The
-            # account reading is the only thing that knows, so a weekly cut-off
-            # waits for it and ignores the clock entirely.
-            if a.limit_window() == "weekly":
+            # A 7-DAY window (weekly, and the Opus/Sonnet/Fable ones) is not
+            # readable off a BARE clock: "resets 8pm" can be days away, and
+            # `parse_reset_clock` can only ever resolve that to the next 8pm.
+            # Acting on it would nudge days early, every day. So unless the
+            # reset is exact (a dated clock, which the CLI prints for anything
+            # >24 h out, or the transcript's quotaLimits epoch), such a
+            # cut-off waits for the account reading instead.
+            if (a.limit_window() in SEVEN_DAY_WINDOWS
+                    and not a.limit_reset_exact()):
                 return account_clear
             at = a.limit_resets_at()
             if at is not None:
@@ -2774,6 +2793,64 @@ class MainWindow(QMainWindow):
                     and now - a.limit_latched_at() >= LIMIT_UNKNOWN_WAIT_S)
 
         self._resume_blocked_agents(due=due)
+
+    def _sweep_transcript_cut_offs(self) -> int:
+        """The SECOND detector: latch any idle Claude agent whose conversation
+        on disk ends on a cut-off the live screen never latched. Returns how
+        many it adopted.
+
+        The screen scrape is fast but fragile. It has missed real cut-offs
+        three separate ways (a banner painted under the tool-result gutter, a
+        banner drawn with cursor jumps instead of spaces, and wordings the CLI
+        added later), and each miss was silent: the agent simply sat on a
+        spent limit. The transcript is written by the CLI itself in a stable
+        JSON shape, so reading it once a minute turns the next such change
+        into a late resume instead of a lost night. Cheap: `limit_cut_off` is
+        cached by (mtime, size), so an unchanged conversation costs one stat.
+
+        Scoped to cut-offs from THIS run (see LIMIT_SWEEP_SLACK_S), to idle
+        agents (a busy one is plainly not parked), and to cut-offs the ledger
+        has not already closed, so a conversation this app gave up on or
+        dismissed is never re-armed.
+        """
+        if self._closing or not self._ready:
+            return 0
+        closed = None
+        adopted = 0
+        for agent in self.manager.all_agents():
+            spec = agent.spec
+            if (spec.provider != "claude" or not agent.is_pty
+                    or not agent.is_running() or agent.is_busy()
+                    or agent.is_limit_blocked() or not spec.session_id):
+                continue
+            info = transcripts.limit_cut_off(spec.cwd, spec.session_id)
+            if not info or not info["cut_off"] or not info["at"]:
+                continue
+            if info["at"] < self._launched_at - LIMIT_SWEEP_SLACK_S:
+                continue        # startup recovery's call, already made
+            key = tuple(limit_ledger.key_of(spec.cwd, spec.session_id,
+                                            info["resets_at"] or 0.0,
+                                            info["at"]))
+            if closed is None:
+                closed = limit_ledger.closed_keys(
+                    limit_ledger.read_all(self._ledger_dir()))
+            if key in closed:
+                continue
+            if key not in self._ledger_seen:
+                self._ledger_cut_off(agent, info["at"], info["resets_at"],
+                                     info["window"], info["banner"],
+                                     source="sweep")
+            self._limit_audit(
+                f"LATE-LATCH agent={spec.name} (the screen never latched it; "
+                f"found in the transcript) banner={info['banner'][:60]!r}")
+            agent.mark_limit_blocked(info["resets_at"] or None,
+                                     from_startup=False,
+                                     cut_off_at=info["at"],
+                                     window=info["window"],
+                                     banner=info["banner"],
+                                     exact=info.get("exact", False))
+            adopted += 1
+        return adopted
 
     def _resume_blocked_agents(self, due=None) -> None:
         """The plan limit reset — put the agents it cut off back to work.
@@ -2883,20 +2960,34 @@ class MainWindow(QMainWindow):
             info = transcripts.limit_cut_off(agent.spec.cwd,
                                              agent.spec.session_id)
             if info is not None and not info["cut_off"]:
-                self._limit_audit(f"PHANTOM agent={agent.spec.name} (the "
-                                  f"conversation carried on, or the interrupted "
-                                  f"turn wasn't real work)")
-                self._ledger_outcome(agent, limit_ledger.DISMISSED,
-                                     detail="transcript shows no real work lost")
+                if info.get("self_resumed"):
+                    # Claude Code's own auto-continue got there first ("Usage
+                    # limit reset \xb7 continuing automatically"), which is the
+                    # outcome this feature wants, just not by our hand.
+                    self._limit_audit(f"SELF-RESUMED agent={agent.spec.name} "
+                                      f"(the CLI continued on its own)")
+                    self._ledger_outcome(agent, limit_ledger.RESUMED,
+                                         detail="the CLI continued on its own")
+                else:
+                    self._limit_audit(f"PHANTOM agent={agent.spec.name} (the "
+                                      f"conversation carried on, or the "
+                                      f"interrupted turn wasn't real work)")
+                    self._ledger_outcome(
+                        agent, limit_ledger.DISMISSED,
+                        detail="transcript shows no real work lost")
                 agent.clear_limit_block()
                 self._resume_pending.discard(agent.id)
                 return
-            # The Esc closes the limit's options menu sitting over the prompt.
-            # agy has no such menu, and an Esc there would clear whatever the
-            # user had half-typed into the input box instead, so it is sent only
-            # where there is something to dismiss. The beat before the text goes
-            # out is kept for both: it costs nothing and staggers the send.
-            agent.write("\x1b")
+            # The Esc closes the OLD limit options menu ("Stop and wait for
+            # limit to reset") when one is actually sitting over the prompt,
+            # and ONLY then. Current CLIs draw no menu, and there an Esc does
+            # harm: "continuing automatically at ... \xb7 esc or type to
+            # cancel" means it CANCELS Claude's own auto-continue, and on a
+            # plain prompt it clears whatever the user had half-typed. agy
+            # never has a menu. The beat before the text goes out is kept
+            # regardless: it costs nothing and staggers the send.
+            if agent.limit_menu_visible():
+                agent.write("\x1b")
 
         def send():
             if self._closing or not agent.is_running():

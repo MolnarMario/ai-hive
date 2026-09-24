@@ -49,6 +49,26 @@ def check(name, cond, detail=""):
     FAIL += not cond
 
 
+def _as_cli_wrote(rec):
+    """`rec`, with the fields claude.exe ALWAYS puts on a 429 cut-off record
+    when it is an assistant record whose text is a limit banner: `error:
+    "rate_limit"`, `isApiErrorMessage: true`, model `<synthetic>` (read off
+    every real one on this machine). The transcript reader now requires them,
+    because a banner WITHOUT them is an agent writing those words in its own
+    reply, so a fixture that leaves them off describes prose, not a cut-off."""
+    from app import limit_banner as _lb
+    if rec.get("type") != "assistant" or "error" in rec:
+        return rec
+    content = (rec.get("message") or {}).get("content")
+    text = (content if isinstance(content, str) else " ".join(
+        b.get("text", "") for b in (content or []) if isinstance(b, dict)))
+    if not _lb.banner_line(text):
+        return rec
+    rec = dict(rec, error="rate_limit", isApiErrorMessage=True)
+    rec["message"] = dict(rec.get("message") or {}, model="<synthetic>")
+    return rec
+
+
 # ---------------------------------------------------------------- tiling ----
 
 def test_tiling():
@@ -9402,17 +9422,31 @@ def test_auto_continue_on_limit_reset():
     ws = mgr.workspaces[0]
 
     cut_off, busy, fine = mk("CutOff"), mk("Busy"), mk("Fine")
-    settle(cut_off, BANNER)
+    no_menu, self_cont = mk("NoMenu"), mk("SelfContinue")
+    settle(cut_off, PARKED)
     settle(busy, BANNER)
     busy._busy = True                    # already moving again
     settle(fine, "all done\n")           # was never cut off
-    ws.agents.extend([cut_off, busy, fine])
+    settle(no_menu, BANNER)
+    settle(self_cont, NEW_BANNER)
+    ws.agents.extend([cut_off, busy, fine, no_menu, self_cont])
 
+    from app.widgets.main_window import AUTO_CONTINUE_STAGGER_MS as _STAGGER
     win._resume_blocked_agents()
-    pump(AUTO_CONTINUE_SETTLE_MS)
+    pump(AUTO_CONTINUE_SETTLE_MS + 2 * _STAGGER)
     sent = lambda ag: "".join(writes.get(id(ag.worker), []))
-    check("auto-continue: the cut-off agent got Esc then Continue",
+    check("auto-continue: the cut-off agent parked on the old menu got Esc "
+          "then Continue",
           sent(cut_off).startswith("\x1b") and "Continue" in sent(cut_off))
+    # Current CLIs draw no menu, and there an Esc does harm: under "continuing
+    # automatically at ... \xb7 esc or type to cancel" it CANCELS Claude's own
+    # auto-continue, and on a plain prompt it wipes half-typed input.
+    check("auto-continue: with no menu on screen, no Esc is sent, only the "
+          "Continue", "\x1b" not in sent(no_menu)
+          and "Continue" in sent(no_menu), repr(sent(no_menu)[:40]))
+    check("auto-continue: an Esc never cancels Claude's own 'continuing "
+          "automatically' timer", "\x1b" not in sent(self_cont),
+          repr(sent(self_cont)[:40]))
     check("auto-continue: an agent that is busy again is left alone",
           sent(busy) == "")
     check("auto-continue: an agent that was never cut off is left alone",
@@ -9634,12 +9668,12 @@ def test_auto_continue_on_limit_reset():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             for text, at in records:
-                fh.write(_json.dumps({
+                fh.write(_json.dumps(_as_cli_wrote({
                     "type": "assistant",
                     "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
                                                 _time.gmtime(at)),
                     "message": {"content": [{"type": "text",
-                                             "text": text}]}}) + "\n")
+                                             "text": text}]}})) + "\n")
 
     writes.clear()
     ph_cwd = str(tmp / "phantom")
@@ -9687,7 +9721,7 @@ def test_auto_continue_on_limit_reset():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             for rec in records:
-                fh.write(_json.dumps(rec) + "\n")
+                fh.write(_json.dumps(_as_cli_wrote(rec)) + "\n")
 
     def ts(at):
         return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(at))
@@ -10107,7 +10141,7 @@ def test_startup_limit_recovery():
         with open(transcripts.transcript_path(cwd, sid), "w",
                   encoding="utf-8") as fh:
             for r in records:
-                fh.write(_json.dumps(r) + "\n")
+                fh.write(_json.dumps(_as_cli_wrote(r)) + "\n")
 
     def assistant(text, at):
         return {"type": "assistant", "timestamp": iso(at),
@@ -12345,6 +12379,365 @@ def test_reply_marks_inline():
     card.deleteLater()
 
 
+def test_limit_detection_hardening():
+    """The 2026-09-24 audit of the usage-limit flag, one check per finding.
+
+    (1) The live screen check matched regexes needing whitespace against a
+    stream whose spaces are mostly cursor jumps, so a painted banner was a
+    coin flip. (2) claude.exe 2.1.281 prints cut-off wordings the patterns
+    never knew. (3) Prose starting "Usage limit reached" latched a working
+    agent, and the reset clock was read from anywhere in 40 lines. (4) Any
+    later system record with text (an away_summary recap, "Remote Control
+    disconnected") erased a genuine cut-off on disk, which then got it
+    dismissed as a PHANTOM. (5) Nothing caught a cut-off the screen missed.
+    (6) The Esc sent before every Continue cancels Claude's own auto-continue.
+    """
+    import json as _json
+    import time as _time
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import limit_banner as lb
+    from app import limit_ledger, transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import _CSI_RE, AgentStatus, TerminalAgent
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-limit-hard-"))
+    cwd = str(tmp)
+    now = _time.time()
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def jumps(text, col=3):
+        """`text` the way Claude's classic renderer paints it: every word put
+        in place by a `CSI n G` column jump, and no literal space anywhere."""
+        out = []
+        for word in text.split(" "):
+            out.append(f"\x1b[{col}G{word}")
+            col += len(word) + 1
+        return "".join(out)
+
+    def hm(epoch):
+        return tuple(_time.localtime(epoch)[3:5]) if epoch else None
+
+    SESSION = ("You've hit your session limit \xb7 resets 6:40pm "
+               "(Europe/Bucharest)")
+    AUTO = ("Usage limit reached \xb7 continuing automatically at 10:10pm "
+            "\xb7 esc or type to cancel")
+
+    # --- 1. a banner painted with cursor jumps ------------------------------
+    painted = _CSI_RE.sub("", jumps(SESSION))
+    check("limit-hardening: a jump-painted banner has no spaces left once "
+          "escapes are stripped (the shape the old regex never matched)",
+          " " not in painted, painted)
+    check("limit-hardening: ...and is recognised anyway",
+          lb.banner_line(painted) != "")
+    check("limit-hardening: ...with its window",
+          lb.banner_window(painted) == "session")
+    check("limit-hardening: ...and its clock",
+          hm(lb.parse_reset_clock(lb.banner_clock_text(painted))) == (18, 40))
+    check("limit-hardening: the spaced and the jump-painted rendering are the "
+          "SAME cut-off", lb.same_banner(painted, SESSION))
+    check("limit-hardening: ...while two windows' banners are not",
+          not lb.same_banner(SESSION, SESSION.replace("6:40pm", "11:40pm")))
+    check("limit-hardening: a wrapped first row that already has the clock "
+          "matches the transcript's whole line",
+          lb.same_banner("You've hit your session limit \xb7 resets 6:40pm",
+                         SESSION))
+    check("limit-hardening: ...but one cut before the clock does not",
+          not lb.same_banner("You've hit your session limit \xb7", SESSION))
+    check("limit-hardening: the auto-continue line survives jump-painting",
+          lb.banner_line(_CSI_RE.sub("", jumps(AUTO))) != "")
+
+    # --- 2. every cut-off wording in claude.exe 2.1.281 ---------------------
+    for line, window in [
+            ("You've hit your limit \xb7 resets 3am \xb7 progress saved",
+             "usage"),
+            ("You've hit your Fable limit \xb7 resets Sep 30, 9am "
+             "(Europe/Bucharest)", "fable"),
+            ("You've hit your Opus limit \xb7 resets Oct 1, 2:15pm", "opus"),
+            ("You've hit your usage credit limit", "credit"),
+            ("You've hit your monthly spend limit.", "usage"),
+            ("You're out of usage credits \xb7 resets 3am", "credit"),
+            (AUTO, ""),
+            ("Usage limit reached \xb7 wrapping up", ""),
+            ("Usage limit reached", ""),
+            ("Your usage limit has reset \xb7 press enter to continue", "")]:
+        check(f"limit-hardening: recognised {line[:44]!r}",
+              lb.banner_line("  ⎿\xa0" + line) != ""
+              and lb.banner_window(line) == window, lb.banner_window(line))
+    for line in ['Usage limit reached" cut-off',
+                 "Usage limit reached. I'll pause here.",
+                 "You've hit your limit on retries, so I stopped",
+                 "You've hit your fast limit \xb7 using the standard model",
+                 "Approaching session limit \xb7 resets 3am",
+                 "You've used 90% of your weekly limit \xb7 resets Sep 30, 9am",
+                 "● I think you've hit your session limit here",
+                 "Usage limit reset \xb7 continuing automatically"]:
+        check(f"limit-hardening: NOT a cut-off {line[:44]!r}",
+              lb.banner_line(line) == "")
+    check("limit-hardening: the CLI's own reset notice is recognised as the "
+          "END of a cut-off, spaced or not",
+          lb.is_reset_notice("Usage limit reset \xb7 continuing automatically")
+          and lb.is_reset_notice("Usagelimitreset\xb7continuingautomatically"))
+
+    yr = _time.localtime(lb.parse_reset_clock(
+        "You've hit your weekly limit \xb7 resets Jan 2, 2031, 3:15pm"))
+    check("limit-hardening: a dated clock with a year resolves exactly",
+          (yr.tm_year, yr.tm_mon, yr.tm_mday, yr.tm_hour, yr.tm_min)
+          == (2031, 1, 2, 15, 15))
+    check("limit-hardening: a dated clock is exact, a bare one is not",
+          lb.reset_is_dated("You've hit your Fable limit \xb7 resets Sep 30, "
+                            "9am") and not lb.reset_is_dated(SESSION))
+    check("limit-hardening: 'press enter to continue' and 'continuing "
+          "shortly' are due now",
+          lb.banner_due_now("Your usage limit has reset \xb7 press enter to "
+                            "continue")
+          and lb.banner_due_now("Usage limit reached \xb7 continuing shortly "
+                                "\xb7 esc to cancel")
+          and not lb.banner_due_now(AUTO))
+    region = ("the cache resets 11pm nightly, so rerun after\n"
+              "You've hit your session limit\n  ? for shortcuts\n")
+    check("limit-hardening: the clock comes from the banner, never from "
+          "another 'resets' elsewhere on screen",
+          lb.parse_reset_clock(lb.banner_clock_text(region)) is None)
+    check("limit-hardening: a banner wrapped before its clock still yields "
+          "the clock from the next row",
+          hm(lb.parse_reset_clock(lb.banner_clock_text(
+              "You've hit your session limit \xb7 resets\n"
+              "6:40pm (Europe/Bucharest)"))) == (18, 40))
+
+    # --- 3. the live path, end to end through _on_pty_output ----------------
+    def mk(name):
+        a = TerminalAgent(build_spec(AgentKind.CLAUDE, name, cwd=cwd))
+        a._prompt_ready = True
+        a.status = AgentStatus.RUNNING
+        return a
+
+    live = mk("Live")
+    live._on_pty_output("pty", "\r\n  ⎿" + jumps(SESSION, 5) + "\r\n")
+    check("limit-hardening: a jump-painted banner arriving on the pty "
+          "latches", live.is_limit_blocked())
+    check("limit-hardening: ...with the clock it stated",
+          hm(live.limit_resets_at()) == (18, 40))
+    live.clear_limit_block()             # what a verified resume does
+    live._screen_tail = SESSION + "\n  ? for shortcuts\n"   # repainted spaced
+    live._scrape_limit()
+    check("limit-hardening: the same banner repainted WITH spaces is not a "
+          "new cut-off (no re-latch after a resume)",
+          not live.is_limit_blocked())
+
+    prose = mk("Prose")
+    prose._screen_tail = 'Usage limit reached" cut-off\nmore prose\n'
+    prose._scrape_limit()
+    check("limit-hardening: an agent quoting 'Usage limit reached' is not "
+          "latched (happened twice on 2026-08-31)",
+          not prose.is_limit_blocked())
+
+    unrelated = mk("Unrelated")
+    unrelated._screen_tail = ("the token resets Sep 4, 3:59am\n"
+                              "You've hit your session limit\n")
+    unrelated._scrape_limit()
+    check("limit-hardening: a latch never borrows another line's clock",
+          unrelated.is_limit_blocked()
+          and unrelated.limit_resets_at() is None)
+
+    weekly = mk("WeeklyBare")
+    weekly._screen_tail = "You've hit your weekly limit \xb7 resets 8pm\n"
+    weekly._scrape_limit()
+    check("limit-hardening: a weekly banner with a bare clock is NOT exact",
+          weekly.is_limit_blocked() and weekly.limit_window() == "weekly"
+          and not weekly.limit_reset_exact())
+    fable = mk("FableDated")
+    fable._screen_tail = ("You've hit your Fable limit \xb7 resets Sep 30, "
+                          "9am\n")
+    fable._scrape_limit()
+    check("limit-hardening: a dated 7-day banner IS exact",
+          fable.limit_window() == "fable" and fable.limit_reset_exact())
+    stale = mk("Stale")
+    stale._screen_tail = ("Your usage limit has reset \xb7 press enter to "
+                          "continue\n")
+    stale._scrape_limit()
+    check("limit-hardening: 'press enter to continue' latches as due now",
+          stale.is_limit_blocked()
+          and (stale.limit_resets_at() or 1e18) <= _time.time() + 1)
+
+    # --- 4. the conversation on disk ----------------------------------------
+    def iso(at):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(at))
+
+    def write(sid, records):
+        path = transcripts.transcript_path(cwd, sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for r in records:
+                fh.write(_json.dumps(r) + "\n")
+
+    def user(text, at, **extra):
+        return dict({"type": "user", "timestamp": iso(at),
+                     "message": {"role": "user", "content": text}}, **extra)
+
+    def reply(text, at):
+        return {"type": "assistant", "timestamp": iso(at),
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    def system(text, at, sub="informational"):
+        return {"type": "system", "subtype": sub, "content": text,
+                "timestamp": iso(at)}
+
+    def real_429(text, at, reset, kind="five_hour"):
+        """A cut-off exactly as claude.exe writes it (fields read off a real
+        transcript from 2026-08-31)."""
+        return {"type": "assistant", "timestamp": iso(at),
+                "error": "rate_limit", "isApiErrorMessage": True,
+                "apiErrorStatus": 429,
+                "quotaLimits": {"status": "rejected", "resetsAt": int(reset),
+                                "rateLimitType": kind},
+                "message": {"model": "<synthetic>",
+                            "content": [{"type": "text", "text": text}]}}
+
+    at = now - 600
+    ask = user("build the parser", at - 5)
+    opus = real_429("You've hit your Opus limit \xb7 resets 8pm", at,
+                    now + 3 * 86400, "seven_day_opus")
+    write("sid-quota", [ask, opus])
+    info = transcripts.limit_cut_off(cwd, "sid-quota")
+    check("limit-hardening: a real 429 record's quotaLimits epoch wins over "
+          "the bare printed clock", info["cut_off"]
+          and info["resets_at"] == int(now + 3 * 86400) and info["exact"]
+          and info["window"] == "opus", info)
+    for name, rec in [
+            ("an away_summary recap",
+             system("Was building the parser; the limit stopped it.",
+                    at + 1800, "away_summary")),
+            ("'Remote Control disconnected'",
+             system("Remote Control disconnected — /login", at + 3600)),
+            ("a local slash command's output",
+             system("<local-command-stdout></local-command-stdout>",
+                    at + 60, "local_command"))]:
+        sid = "sid-after-" + str(abs(hash(name)))
+        write(sid, [ask, opus, rec])
+        check(f"limit-hardening: a cut-off followed by {name} is STILL a "
+              f"cut-off", transcripts.limit_cut_off(cwd, sid)["cut_off"])
+    write("sid-prose", [ask, reply(SESSION, at)])
+    check("limit-hardening: an ordinary reply that merely starts with the "
+          "banner's words is not a cut-off on disk",
+          not transcripts.limit_cut_off(cwd, "sid-prose")["cut_off"])
+    write("sid-self", [ask, system(AUTO, at),
+                       system("Usage limit reset \xb7 continuing "
+                              "automatically", at + 3600)])
+    selfinfo = transcripts.limit_cut_off(cwd, "sid-self")
+    check("limit-hardening: the CLI continuing by itself reads as over, and "
+          "says so", not selfinfo["cut_off"] and selfinfo["self_resumed"])
+    wrap = user("[Usage limit reached — grace window active. Wrap up.]",
+                at, isMeta=True, usageLimitNote="wrap_up")
+    write("sid-grace", [ask, wrap, reply("Checkpoint: parser half done.",
+                                         at + 30)])
+    check("limit-hardening: a grace-window wrap-up is a cut-off, and its own "
+          "wrap-up reply does not end it",
+          transcripts.limit_cut_off(cwd, "sid-grace")["cut_off"])
+    write("sid-grace-on", [ask, wrap, reply("Checkpoint.", at + 30),
+                           user("go on", at + 7200), reply("On it.",
+                                                           at + 7210)])
+    check("limit-hardening: ...until a new prompt gets a real reply",
+          not transcripts.limit_cut_off(cwd, "sid-grace-on")["cut_off"])
+
+    # --- 5. the window: the sweep, the 7-day rule, the Esc, self-resume -----
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.show(); pump(50)
+    ws = win.manager.workspaces[0]
+    sent: dict = {}
+
+    def agent_for(name, sid):
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=cwd, pty=True)
+        spec.session_id = sid
+        a = TerminalAgent(spec)
+        buf = sent.setdefault(name, [])
+        a.worker = type("W", (), {
+            "is_running": lambda s: True,
+            "write": lambda s, d: buf.append(d) or True,
+            "job_process_count": lambda s: 0,
+            "start": lambda s: None, "dispose": lambda s: None})()
+        a._prompt_ready = True
+        a.status = AgentStatus.RUNNING
+        ws.agents.append(a)
+        return a
+
+    typed = lambda name: "".join(sent.get(name, []))
+
+    write("sid-missed", [ask, real_429(SESSION, now - 5, now - 300)])
+    missed = agent_for("Missed", "sid-missed")
+    write("sid-before", [ask, real_429(SESSION, win._launched_at - 7200,
+                                       now - 3600)])
+    before = agent_for("Before", "sid-before")
+    busy_sid = "sid-busy"
+    write(busy_sid, [ask, real_429(SESSION, now - 5, now - 300)])
+    busy = agent_for("Busy", busy_sid)
+    busy._busy = True
+    check("limit-hardening: the transcript sweep adopts exactly the missed "
+          "cut-off", win._sweep_transcript_cut_offs() == 1)
+    check("limit-hardening: ...latched as a LIVE cut-off with its exact "
+          "reset", missed.is_limit_blocked()
+          and not missed.limit_from_startup() and missed.limit_reset_exact()
+          and missed.limit_resets_at() == int(now - 300))
+    check("limit-hardening: ...never one from before this run (startup "
+          "recovery's call)", not before.is_limit_blocked())
+    check("limit-hardening: ...never a busy agent", not busy.is_limit_blocked())
+    check("limit-hardening: ...and files it in the ledger as found by the "
+          "sweep", any(r.get("source") == "sweep" and
+                       r.get("session_id") == "sid-missed"
+                       for r in limit_ledger.read_all(str(tmp))))
+    key = win._ledger_key(missed)
+    missed.clear_limit_block()
+    limit_ledger.record_outcome(str(tmp), key, limit_ledger.FAILED, tries=4)
+    check("limit-hardening: a cut-off the ledger already closed is never "
+          "re-armed by the sweep",
+          win._sweep_transcript_cut_offs() == 0
+          and not missed.is_limit_blocked())
+
+    # 7-day windows: a bare clock waits for the account, an exact one does not
+    bare = agent_for("WeeklyBare", "sid-none-1")
+    bare.mark_limit_blocked(now - 3600, from_startup=False, window="weekly",
+                            banner="You've hit your weekly limit \xb7 resets "
+                                   "8pm", exact=False)
+    dated = agent_for("WeeklyDated", "sid-none-2")
+    dated.mark_limit_blocked(now - 3600, from_startup=False, window="weekly",
+                             banner="You've hit your weekly limit \xb7 "
+                                    "resets Sep 30, 9am", exact=True)
+    win._check_limit_resets()
+    pump(2600)
+    check("limit-hardening: a weekly cut-off on a BARE clock is not nudged "
+          "on that clock", typed("WeeklyBare") == "")
+    check("limit-hardening: a weekly cut-off with an EXACT reset is nudged "
+          "once it passes", "Continue" in typed("WeeklyDated"))
+    check("limit-hardening: ...and gets no Esc, since no menu is up",
+          "\x1b" not in typed("WeeklyDated"))
+
+    write("sid-self", [ask, system(AUTO, now - 7200),
+                       system("Usage limit reset \xb7 continuing "
+                              "automatically", now - 60)])
+    selfr = agent_for("SelfResumed", "sid-self")
+    selfr.mark_limit_blocked(now - 120, from_startup=False, banner=AUTO,
+                             exact=True)
+    win._resume_blocked_agents()
+    pump(2600)
+    check("limit-hardening: an agent the CLI already continued is not "
+          "nudged again", typed("SelfResumed") == ""
+          and not selfr.is_limit_blocked())
+    check("limit-hardening: ...and the ledger records it RESUMED by the CLI",
+          any(r.get("event") == limit_ledger.RESUMED
+              and "on its own" in r.get("detail", "")
+              for r in limit_ledger.read_all(str(tmp))))
+
+    win._closing = True
+    win.close()
+    pump(50)
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
@@ -12434,6 +12827,7 @@ def main():
     test_auto_continue_on_limit_reset()
     test_gemini_limit_detection()
     test_startup_limit_recovery()
+    test_limit_detection_hardening()
     test_terminal_scrollbar()
     test_reply_marks_inline()
     test_reply_marks_recovered_from_transcript()
@@ -14432,6 +14826,27 @@ def test_multi_agent_session_isolation():
 
 
 
+def _remove_fixture_transcripts():
+    """Delete the conversation folders this suite wrote into the REAL
+    ~/.claude/projects. The limit tests write fixture transcripts through
+    `transcripts.transcript_path`, which has no override, for agents whose
+    cwd is a `tempfile.mkdtemp(prefix="ai-hive-...")` directory. Claude
+    encodes that cwd into the folder name, so every one of them starts with
+    the encoded temp dir plus "-ai-hive-", and nothing else does. Without this
+    they piled up (105 by 2026-09-24) and showed in Claude's /resume picker
+    for those folders."""
+    from app import transcripts
+    root = Path(os.path.expanduser("~")) / ".claude" / "projects"
+    prefix = transcripts.encode_project_dir(tempfile.gettempdir()) + "-ai-hive-"
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_dir() and entry.name.startswith(prefix):
+            shutil.rmtree(entry, ignore_errors=True)
+
+
 if __name__ == "__main__":
     try:
         sys.exit(main())
@@ -14439,3 +14854,5 @@ if __name__ == "__main__":
         traceback.print_exc()
         print(f"\nRESULT: {PASS} passed, {FAIL + 1} failed (crash)", flush=True)
         sys.exit(1)
+    finally:
+        _remove_fixture_transcripts()

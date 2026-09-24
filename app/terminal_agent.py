@@ -210,10 +210,12 @@ _READY_HINTS_DESPACED = tuple(_despace(h) for h in _CLAUDE_READY_HINTS)
 #    one happened. It stays on screen (and is re-emitted by every frame
 #    repaint) long after a resume, so it must never re-latch an agent that has
 #    already been resumed off it — see `_scrape_limit`.
-from .limit_banner import (LIMIT_HIT_RE, LIMIT_MENU_RE,  # noqa: F401
-                           LIMIT_PROVIDERS, banner_line, banner_reset_at,
-                           banner_window, gemini_banner_line, gemini_reset_at,
-                           is_limit_screen, parse_reset_clock)
+from .limit_banner import (LIMIT_MENU_RE, LIMIT_PROVIDERS,  # noqa: F401
+                           banner_clock_text, banner_due_now,
+                           banner_line, banner_reset_at, banner_window,
+                           gemini_banner_line, gemini_reset_at,
+                           is_limit_screen, parse_reset_clock,
+                           reset_is_dated, same_banner)
 
 
 @dataclass
@@ -392,6 +394,10 @@ class TerminalAgent(QObject):
         # banner stated. Transient like the waiting flags — never persisted.
         self._limit_blocked = False
         self._limit_resets_at: float | None = None
+        # True when that reset is EXACT (a dated clock, the transcript's
+        # quotaLimits epoch, or agy's countdown) rather than a bare wall clock,
+        # which is only trustworthy for a window at most a day long
+        self._limit_reset_exact = False
         self._limit_tries = 0          # resume attempts since the cut-off
         self._limit_last_try = 0.0
         self._limit_from_startup = False   # recovered from disk vs seen live
@@ -1612,7 +1618,8 @@ class TerminalAgent(QObject):
         # of characters on a real frame and lost a genuine cut-off — see
         # _tail_lines.
         region = self._tail_lines(40, skip_blank=True)
-        menu, banner, window, resets_at = self._read_limit_screen(region)
+        menu, banner, window, resets_at, exact = \
+            self._read_limit_screen(region)
         from_replay = False
         if banner and self.spec.provider == "gemini" and self._in_launch_replay():
             ok, resets_at = self._replay_cut_off(banner)
@@ -1637,7 +1644,10 @@ class TerminalAgent(QObject):
             # is. A new cut-off also states a different clock — successive
             # 5-hour windows never end at the same wall time — so an identical
             # line with no menu can only be the echo of one we already handled.
-            if not banner or banner == self._limit_last_banner:
+            # Compared by `same_banner`, not `==`: the same row comes back
+            # spaced on one repaint and cursor-positioned (despaced) on the
+            # next, and a plain compare read those as two different cut-offs.
+            if not banner or same_banner(banner, self._limit_last_banner):
                 if banner:
                     self._note_limit_skip("no menu, and the same banner line "
                                           "already produced a latch", banner)
@@ -1653,6 +1663,7 @@ class TerminalAgent(QObject):
         # None simply means "no network-free due time" — the watchdog then
         # leaves this one to the plan-usage edge rather than guessing.
         self._limit_resets_at = resets_at
+        self._limit_reset_exact = bool(exact and resets_at)
         # A cut-off read off a launch REPLAY is a startup recovery in every
         # sense but the source, so it answers to the toggle that owns those.
         self._limit_from_startup = from_replay
@@ -1721,7 +1732,9 @@ class TerminalAgent(QObject):
         return True, time.time()
 
     def _read_limit_screen(self, region: str) -> tuple:
-        """`(menu, banner, window, resets_at)` for whichever CLI this agent is.
+        """`(menu, banner, window, resets_at, exact)` for whichever CLI this
+        agent is. `exact` says the reset can be trusted as stated (see
+        `_limit_reset_exact`).
 
         The two providers cut an agent off in different shapes and only the
         latch itself is common, so the reading is the one place they diverge —
@@ -1747,10 +1760,21 @@ class TerminalAgent(QObject):
         if self.spec.provider == "gemini":
             banner = gemini_banner_line(region)
             return False, banner, ("quota" if banner else ""), \
-                gemini_reset_at(banner)
+                gemini_reset_at(banner), True
+        menu = bool(LIMIT_MENU_RE.search(region))
         banner = banner_line(region)
-        return (bool(LIMIT_MENU_RE.search(region)), banner,
-                banner_window(banner), parse_reset_clock(region))
+        if not banner:
+            return menu, "", "", None, False
+        if banner_due_now(region):
+            # "press enter to continue" / "continuing shortly": the window has
+            # already reopened, so there is no clock to wait for
+            return menu, banner, banner_window(banner), time.time(), True
+        # The clock comes from the BANNER (plus its wrapped continuation row),
+        # never from the whole region: an unrelated "resets ..." anywhere in
+        # 40 lines of prose once dated a cut-off four days out.
+        return (menu, banner, banner_window(banner),
+                parse_reset_clock(banner_clock_text(region)),
+                reset_is_dated(region))
 
     def _note_limit_skip(self, reason: str, banner: str = "") -> None:
         """Record that a plan-limit banner was ON SCREEN and nothing latched.
@@ -1793,7 +1817,7 @@ class TerminalAgent(QObject):
     def mark_limit_blocked(self, resets_at: float | None,
                            from_startup: bool = True,
                            cut_off_at: float = 0.0, window: str = "",
-                           banner: str = "") -> None:
+                           banner: str = "", exact: bool = False) -> None:
         """Seed the latch from OUTSIDE the live screen — startup recovery,
         which reconstructs the cut-off from the transcript on disk because the
         screen shows a replayed conversation rather than a live banner.
@@ -1814,6 +1838,7 @@ class TerminalAgent(QObject):
         self._limit_at = time.time()
         self._limit_cut_off_at = cut_off_at or self._limit_at
         self._limit_resets_at = resets_at
+        self._limit_reset_exact = bool(exact and resets_at)
         self._limit_from_startup = bool(from_startup)
         self._limit_window = window
         self._limit_banner = banner
@@ -1827,11 +1852,10 @@ class TerminalAgent(QObject):
         # mutes the agent's chime for a day and later types a stray Continue
         # into an agent that is working fine.
         #
-        # Comparing the LINE works because both sources normalize through the
-        # same `limit_banner.banner_line`: the transcript record and the live
-        # re-latch above carried byte-identical text. (A banner the TUI wrapped
-        # across two rows would not match — that is equally true of a live
-        # latch today, and is not made worse here.)
+        # The comparison goes through `limit_banner.same_banner` (despaced,
+        # and prefix-tolerant once the clock is in), so the transcript's whole
+        # spaced line and the screen's cursor-positioned, possibly wrapped
+        # first row of the same banner are recognised as one cut-off.
         if banner:
             self._limit_last_banner = banner
         self.limit_blocked_changed.emit(True)
@@ -1844,6 +1868,12 @@ class TerminalAgent(QObject):
         `limit_banner.banner_window`.
         """
         return self._limit_window
+
+    def limit_reset_exact(self) -> bool:
+        """True when `limit_resets_at()` is exact rather than a bare wall
+        clock (see `_limit_reset_exact`). A 7-day window may only be resumed
+        on its own clock when this holds."""
+        return self._limit_reset_exact
 
     def limit_cut_off_at(self) -> float:
         """When the limit actually stopped this agent (epoch), as opposed to
@@ -1902,6 +1932,7 @@ class TerminalAgent(QObject):
         """
         if self._limit_blocked and self._limit_resets_at is None and at:
             self._limit_resets_at = at
+            self._limit_reset_exact = True     # an epoch, not a wall clock
 
     def prompt_ready(self) -> bool:
         """True once the TUI's input prompt is live and will accept typing."""
@@ -1937,6 +1968,7 @@ class TerminalAgent(QObject):
         was_blocked = self._limit_blocked
         self._limit_blocked = False
         self._limit_resets_at = None
+        self._limit_reset_exact = False
         self._limit_tries = 0
         self._limit_last_try = 0.0
         self._limit_from_startup = False
@@ -1965,6 +1997,17 @@ class TerminalAgent(QObject):
         return (self._limit_tries == 0
                 or time.time() - self._limit_last_try >= retry_after_s)
 
+    def limit_menu_visible(self) -> bool:
+        """Whether the OLD "Stop and wait for limit to reset" menu is on
+        screen right now, i.e. whether an Esc has a menu to close. Raw lines
+        and the same 40-line window as `recheck_limit`, for the same reason:
+        the menu is torn down on a resume, and reaching further back would
+        find its earlier renders."""
+        if self.spec.provider != "claude":
+            return False
+        region = self._tail_lines(40)
+        return bool(region and LIMIT_MENU_RE.search(region))
+
     def recheck_limit(self) -> bool:
         """After a resume attempt: is the agent STILL parked? True means retry.
 
@@ -1988,7 +2031,7 @@ class TerminalAgent(QObject):
             return False
         if self.spec.provider == "gemini":
             banner = gemini_banner_line(self._tail_lines(40, skip_blank=True))
-            if banner and banner != self._limit_last_banner:
+            if banner and not same_banner(banner, self._limit_last_banner):
                 self._limit_last_banner = banner
                 self._limit_banner = banner
                 resets_at = gemini_reset_at(banner)

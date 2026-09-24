@@ -167,16 +167,27 @@ workspaces keep executing — switching never pauses anything.
   - **⏰ Resume on limit reset** — while the hive is running, agents cut off
     mid-work go back to work the moment the window reopens.
 
-  Either way AI Hive closes the limit's options menu and types `Continue`,
-  staggered so agents don't all pile into a fresh window, then **verifies** —
-  the menu disappearing is how it knows the resume took, and it retries if not.
+  Either way AI Hive types `Continue` (pressing Esc first only when an older
+  CLI's options menu is actually on screen, since on current versions Esc
+  cancels Claude's own "continuing automatically" timer), staggered so agents
+  don't all pile into a fresh window, then **verifies** against the
+  conversation on disk, and retries if the resume didn't take. When Claude Code
+  already continued by itself, the transcript says so and AI Hive stays out of
+  the way. Cut-offs are caught two independent ways: off the live screen (every
+  wording claude.exe 2.1.281 prints, including rows it paints with cursor jumps
+  instead of spaces), and by a once-a-minute sweep of each idle agent's
+  conversation file, which catches anything the screen missed. A weekly, Opus,
+  Sonnet or Fable cut-off is resumed on its own clock only when that clock is
+  exact (a dated reset, or the epoch Claude records with the 429); a bare
+  "resets 8pm" on a 7-day window waits for the account reading instead.
   Because the first message after a window expires is what STARTS the next
   5-hour window, resuming at 4am also means the clock has already rolled over by
   the time you sit down. The cut-off is recorded the instant it appears, along
   with the reset time the limit itself stated, so recovery doesn't depend on the
   usage API being reachable — it fires from the agent's own stated reset even
   when the account readout is rate-limited. Every step is logged to
-  `session.log` (`BLOCKED` / `NUDGE` / `RESUMED` / `STILL-BLOCKED`), each resumed
+  `session.log` (`BLOCKED` / `LATE-LATCH` / `NUDGE` / `RESUMED` /
+  `SELF-RESUMED` / `STILL-BLOCKED`), each resumed
   card shows a `— plan limit reset; auto-continued —` line, and the workspace
   board gets a note. A stopped agent is also visible at a glance, everywhere,
   live: an **⏳ hourglass** sits in the card header and next to the agent in
@@ -710,7 +721,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-1854 checks drive the real app headlessly (offscreen Qt platform) with real
+1916 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -832,7 +843,7 @@ app/
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (1854 checks)
+tests/smoke_test.py        headless end-to-end suite (1916 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

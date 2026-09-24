@@ -505,7 +505,11 @@ def limit_cut_off(cwd: str, session_id: str) -> dict | None:
     """The same verdict as `ended_on_limit`, but TRI-STATE and detailed.
 
     Returns None when there is no readable transcript at all, and otherwise
-    `{"cut_off", "at", "resets_at", "banner", "window", "synthetic"}`.
+    `{"cut_off", "at", "resets_at", "banner", "window", "synthetic", "exact",
+    "self_resumed"}`. `exact` says `resets_at` came from the record's own
+    `quotaLimits` epoch or a dated clock rather than a bare wall time;
+    `self_resumed` says the conversation's last word on the limit was the
+    CLI's own "Usage limit reset" notice, i.e. it continued without AI Hive.
 
     The distinction between "the conversation carried on" and "there is no
     conversation to read" is what makes this safe to act on. A caller using it
@@ -570,7 +574,78 @@ def _is_synthetic_user_turn(rec: dict) -> bool:
     return content.lstrip().startswith(_SYNTHETIC_USER_TAGS)
 
 
+def _is_api_error_record(rec: dict) -> bool:
+    """True when an assistant record is one Claude Code SYNTHESIZED from an
+    API error rather than text the model wrote. A real 429 cut-off is always
+    one: `error: "rate_limit"`, `isApiErrorMessage: true`, model
+    `<synthetic>` (all three on every real one on this machine). Requiring it
+    is what keeps an agent that WROTE a line starting "You've hit your session
+    limit" in its own reply from reading as a cut-off on disk."""
+    if rec.get("isApiErrorMessage") or rec.get("error"):
+        return True
+    return (rec.get("message") or {}).get("model") == "<synthetic>"
+
+
+def _quota_reset(rec: dict) -> tuple[float, str]:
+    """`(reset_epoch, window)` from a 429 record's `quotaLimits` block, or
+    (0.0, "") when it has none. The exact epoch the server sent, which beats
+    re-parsing the printed wall clock: it needs no rollover guess and is
+    right for a 7-day window days away."""
+    q = rec.get("quotaLimits")
+    if not isinstance(q, dict):
+        return 0.0, ""
+    try:
+        at = float(q.get("resetsAt") or 0.0)
+    except (TypeError, ValueError):
+        at = 0.0
+    window = limit_banner.RATE_LIMIT_WINDOWS.get(q.get("rateLimitType") or "",
+                                                 "")
+    return at, window
+
+
+def _is_real_prompt(rec: dict) -> bool:
+    """A user record that is a NEW request (typed, delivered, nudged), as
+    opposed to a tool result, injected meta context or CLI plumbing."""
+    if rec.get("isMeta"):
+        return False
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return not _is_synthetic_user_turn(rec)
+    if isinstance(content, list):
+        return any(isinstance(b, dict) and b.get("type") == "text"
+                   for b in content)
+    return False
+
+
+def _no_cut_off(**extra) -> dict:
+    found = {"cut_off": False, "at": 0.0, "resets_at": 0.0, "banner": "",
+             "window": "", "synthetic": False, "exact": False,
+             "self_resumed": False}
+    found.update(extra)
+    return found
+
+
 def _read_limit_cut_off(path: str) -> dict | None:
+    """The verdict behind `limit_cut_off`. A small state machine over the
+    main-chain records, where only the LAST relevant one counts:
+
+      * a cut-off line (see `limit_banner`) in an API-error assistant record,
+        or in a system record (the CLI's own quota notices), OPENS a cut-off;
+      * a grace-window wrap-up note (`usageLimitNote: "wrap_up"` on a meta
+        user record) opens one too, and the wrap-up reply that follows it
+        does NOT close it: that reply is the agent checkpointing because it
+        was stopped;
+      * ordinary assistant output closes it (the conversation carried on), as
+        does the CLI's "Usage limit reset" notice (it continued on its own,
+        reported as `self_resumed`) or a grace "release" note;
+      * every OTHER system record is IGNORED. This is the bug that let a
+        genuine cut-off be dismissed: any system record with text content
+        used to overwrite the verdict, and Claude writes those to idle
+        sessions all the time (`away_summary` recaps, "Remote Control
+        disconnected - /login" into every open session at once), so an agent
+        parked on a spent limit read as "carried on" and was either skipped
+        at startup or dismissed as a PHANTOM at resume time.
+    """
     try:
         st = os.stat(path)
     except OSError:
@@ -578,9 +653,9 @@ def _read_limit_cut_off(path: str) -> dict | None:
     cached = _LIMIT_CACHE.get(path)
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
         return cached[2]
-    found = {"cut_off": False, "at": 0.0, "resets_at": 0.0,
-             "banner": "", "window": "", "synthetic": False}
+    found = _no_cut_off()
     last_user_synthetic = False   # no evidence yet -> assume a real turn
+    grace_hold = False            # inside a grace window's wrap-up turn
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -591,60 +666,73 @@ def _read_limit_cut_off(path: str) -> dict | None:
                     rec = json.loads(line)
                 except ValueError:
                     continue  # a partial last line while Claude is writing
+                if rec.get("isSidechain"):
+                    continue
                 rtype = rec.get("type")
-                if rtype == "user" and not rec.get("isSidechain"):
+                if rtype == "user":
+                    note = rec.get("usageLimitNote")
+                    if note == "wrap_up":
+                        # The grace window: the limit is spent and the agent
+                        # is being let finish its step. Nothing else on disk
+                        # marks this cut-off, so the note IS the record.
+                        found = _no_cut_off(cut_off=True,
+                                            at=_record_epoch(rec),
+                                            banner="Usage limit reached")
+                        grace_hold = True
+                        continue
+                    if note == "release":
+                        found, grace_hold = _no_cut_off(), False
+                        continue
+                    if rec.get("isMeta"):
+                        continue      # injected context, not a turn
                     last_user_synthetic = _is_synthetic_user_turn(rec)
+                    if _is_real_prompt(rec):
+                        grace_hold = False
                     continue
                 if rtype == "system":
-                    # The cut-off notice itself, as of claude.exe 2.1.235+, is
-                    # injected as a standalone system/informational record --
-                    # "Usage limit reached \xb7 continuing automatically at
-                    # 10:10pm \xb7 esc or type to cancel" -- rather than an
-                    # assistant turn (verified against a real transcript; see
-                    # limit_banner's module docstring for the old wording this
-                    # replaced). Other system subtypes (turn_duration, ...)
-                    # carry no plain-string `content`, so they fall through
-                    # the isinstance check below untouched.
-                    if rec.get("isSidechain"):
-                        continue
                     text = rec.get("content")
                     if not isinstance(text, str):
                         continue
-                elif rtype == "assistant" and not rec.get("isSidechain"):
+                    if limit_banner.is_reset_notice(text):
+                        found = _no_cut_off(self_resumed=True)
+                        grace_hold = False
+                        continue
+                    banner = limit_banner.banner_line(text)
+                    if not banner:
+                        continue      # away_summary, informational, ...
+                elif rtype == "assistant":
                     text = _message_text(rec)
+                    banner = (limit_banner.banner_line(text)
+                              if _is_api_error_record(rec) else "")
+                    if not banner:
+                        if not grace_hold:
+                            found = _no_cut_off()
+                        continue
                 else:
                     continue
-                # every qualifying record overwrites the verdict, so only the
-                # LAST one counts -- a banner followed by real output (or the
-                # CLI's own "Usage limit reset" notice) is history.
-                # `banner_line`, not a bare regex search: an agent that merely
-                # WROTE ABOUT the limit would otherwise be armed for a resume
-                # it never needed (observed live on an agent working on this
-                # feature). A real cut-off is a short injected line.
-                banner = limit_banner.banner_line(text)
                 # A banner is only a genuine interruption when the turn it cut
                 # off was one the user (or a delivered task) actually asked
-                # for -- see `_is_synthetic_user_turn`. Otherwise this is the
-                # SAME class of false alarm as the "quoting the banner in
-                # prose" case above: real API exhaustion, but nothing of the
-                # agent's assigned work was actually lost.
-                if banner and not last_user_synthetic:
-                    when = _record_epoch(rec)
-                    found = {
-                        "cut_off": True, "at": when, "banner": banner,
-                        "window": limit_banner.banner_window(banner),
-                        "resets_at": (limit_banner.banner_reset_at(text, when)
-                                      or 0.0),
-                        "synthetic": False}
-                else:
-                    # `synthetic` is POSITIVE evidence and only that: a banner
-                    # we DID see, refuted by the turn behind it. A last turn
-                    # with no banner at all leaves it False, which is what
-                    # keeps "the record isn't written yet" distinguishable
-                    # from "this was never real work" -- see `limit_cut_off`.
-                    found = {"cut_off": False, "at": 0.0, "resets_at": 0.0,
-                             "banner": "", "window": "",
-                             "synthetic": bool(banner)}
+                # for -- see `_is_synthetic_user_turn`. Otherwise nothing of
+                # the agent's assigned work was lost. `synthetic` is POSITIVE
+                # evidence and only that: a banner we DID see, refuted by the
+                # turn behind it, which keeps "the record isn't written yet"
+                # distinguishable from "this was never real work".
+                if last_user_synthetic:
+                    found = _no_cut_off(synthetic=True)
+                    continue
+                when = _record_epoch(rec)
+                resets_at, q_window = _quota_reset(rec)
+                exact = bool(resets_at)
+                if not resets_at and limit_banner.banner_due_now(text):
+                    resets_at, exact = when, True
+                if not resets_at:
+                    resets_at = limit_banner.banner_reset_at(text, when) or 0.0
+                    exact = (bool(resets_at)
+                             and limit_banner.reset_is_dated(text))
+                found = _no_cut_off(
+                    cut_off=True, at=when, banner=banner,
+                    window=q_window or limit_banner.banner_window(banner),
+                    resets_at=resets_at, exact=exact)
     except OSError:
         return cached[2] if cached else None
     _LIMIT_CACHE[path] = (st.st_mtime, st.st_size, found)
