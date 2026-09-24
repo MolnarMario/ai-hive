@@ -988,6 +988,199 @@ def test_chime_persistence():
     bar.deleteLater()
 
 
+def test_custom_chime_sounds():
+    """A user's own WAV/MP3 per chime: chime.validate gates the file, play()
+    hands a custom file to the right player and falls back to the built-in
+    sound when it is missing or will not play, and MainWindow copies the file
+    into app data and round-trips it through the session.
+
+    No real audio: winsound and MCI are swapped for recorders, so the suite
+    stays silent and this runs the same off Windows."""
+    import types
+    import wave as _wave
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from app import chime
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-customchime-"))
+
+    def write_wav(name, seconds):
+        path = tmp / name
+        with _wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(8000)
+            w.writeframes(b"\0\0" * int(8000 * seconds))
+        return str(path)
+
+    short = write_wav("ding.wav", 0.5)
+    long_ = write_wav("long.wav", 6.0)
+    fake_wav = tmp / "notes.wav"
+    fake_wav.write_text("not a riff header at all", encoding="utf-8")
+    ogg = tmp / "ding.ogg"
+    ogg.write_bytes(b"OggS" + b"\0" * 100)
+    huge = tmp / "huge.wav"
+    huge.write_bytes(b"\0" * (3 * 1024 * 1024))
+
+    # --- validate ---------------------------------------------------------
+    check("custom chime: a 0.5 s PCM WAV is accepted",
+          chime.validate(short) is None, chime.validate(short))
+    check("custom chime: a 6 s WAV is rejected as too long",
+          "at most" in (chime.validate(long_) or ""), chime.validate(long_))
+    check("custom chime: a text file named .wav is rejected",
+          chime.validate(str(fake_wav)) is not None)
+    check("custom chime: an .ogg is rejected by extension",
+          "WAV and MP3" in (chime.validate(str(ogg)) or ""))
+    check("custom chime: a 3 MB file is rejected by size",
+          "MB" in (chime.validate(str(huge)) or ""),
+          chime.validate(str(huge)))
+    check("custom chime: a missing file is rejected",
+          chime.validate(str(tmp / "gone.wav")) is not None)
+
+    # --- play: recorders instead of real audio ----------------------------
+    played, mci_cmds = [], []
+    fake_ws = types.SimpleNamespace(
+        SND_FILENAME=1, SND_ASYNC=2, SND_NODEFAULT=4, MB_ICONASTERISK=0,
+        PlaySound=lambda p, flags: played.append(p),
+        MessageBeep=lambda *_a: played.append("beep"))
+    mci_ok = [True]
+
+    def fake_mci(cmd):
+        mci_cmds.append(cmd)
+        return (0 if mci_ok[0] else 263), ""
+
+    real_ws, real_mci = chime.winsound, chime._mci
+    chime.winsound, chime._mci = fake_ws, fake_mci
+    chime._mci_open_path = None
+    try:
+        builtin_q = chime._ensure_chime(chime.QUESTION)
+        chime.play(chime.QUESTION, short)
+        check("custom chime: a custom WAV goes to PlaySound as-is",
+              played == [short], played)
+        played.clear()
+        chime.play(chime.QUESTION, str(tmp / "gone.wav"))
+        check("custom chime: a missing custom file falls back to built-in",
+              played == [builtin_q], played)
+
+        mp3 = tmp / "ding.mp3"
+        mp3.write_bytes(b"ID3" + b"\0" * 100)
+        played.clear()
+        chime.play(chime.REPLY, str(mp3))
+        chime._flush()
+        check("custom chime: an MP3 opens and plays on the MCI device",
+              any(c.startswith("open ") and str(mp3) in c for c in mci_cmds)
+              and any(c.startswith("play ") for c in mci_cmds)
+              and played == [None], (mci_cmds, played))
+        mci_cmds.clear()
+        chime.play(chime.REPLY, str(mp3))
+        chime._flush()
+        check("custom chime: a repeat MP3 replays without reopening",
+              not any(c.startswith("open ") for c in mci_cmds), mci_cmds)
+
+        chime.stop()
+        mci_ok[0] = False
+        played.clear()
+        chime.play(chime.REPLY, str(mp3))
+        chime._flush()
+        check("custom chime: an MP3 MCI cannot open falls back to built-in",
+              played[-1:] == [chime._ensure_chime(chime.REPLY)], played)
+        mci_ok[0] = True
+
+        # --- MainWindow: copy, persist, restore, reset -------------------
+        store = SessionStore(path=tmp / "session.json")
+        win = create_main_window(store)
+        warned = []
+        real_warning = QMessageBox.warning
+        QMessageBox.warning = staticmethod(
+            lambda *a, **k: warned.append(a[2] if len(a) > 2 else ""))
+        try:
+            check("custom chime: an invalid pick is refused with a message",
+                  win.set_custom_chime(chime.QUESTION, long_) is not None
+                  and warned and chime.QUESTION not in win._custom_sounds,
+                  warned)
+        finally:
+            QMessageBox.warning = real_warning
+        played.clear()
+        check("custom chime: a valid pick is accepted",
+              win.set_custom_chime(chime.QUESTION, short) is None)
+        copied = win._custom_sounds.get(chime.QUESTION, "")
+        check("custom chime: the file is COPIED into the sounds dir",
+              copied and os.path.isfile(copied)
+              and os.path.dirname(copied) == win.sounds_dir()
+              and copied != short, copied)
+        check("custom chime: accepting it plays a preview of the copy",
+              played == [copied], played)
+        check("custom chime: the Options tooltip names the original file",
+              "ding.wav" in win.top_bar.chime_sound_btns[
+                  chime.QUESTION].toolTip()
+              and "ding.wav" in win.top_bar.sound_btn.toolTip())
+        os.remove(short)
+        played.clear()
+        win._play_chime(chime.QUESTION)
+        check("custom chime: deleting the ORIGINAL changes nothing",
+              played == [copied], played)
+
+        # replacing drops the old copy
+        again_src = write_wav("dong.wav", 0.3)
+        win.set_custom_chime(chime.QUESTION, again_src)
+        second = win._custom_sounds[chime.QUESTION]
+        check("custom chime: a replacement deletes the old copy",
+              second != copied and not os.path.exists(copied)
+              and os.path.isfile(second), (copied, second))
+
+        win._save_session()
+        win._save_timer.stop()
+        win.close()
+        app.processEvents()
+        win2 = create_main_window(SessionStore(path=tmp / "session.json"))
+        check("custom chime: the custom sound survives a reopen",
+              win2._custom_sounds.get(chime.QUESTION) == second
+              and win2.top_bar.custom_sound_name(chime.QUESTION)
+              == "dong.wav", win2._custom_sounds)
+        check("custom chime: the other chime stays built-in",
+              chime.REPLY not in win2._custom_sounds
+              and not win2.top_bar.custom_sound_name(chime.REPLY))
+
+        # the menu: reset is only offered when there is something to reset
+        menu = win2.top_bar.build_chime_sound_menu(chime.REPLY)
+        acts = {a.text(): a for a in menu.actions()}
+        check("custom chime: built-in chime's menu greys out the reset",
+              not acts["Use built-in sound"].isEnabled())
+        asked = []
+        win2.top_bar.chimeSoundChooseRequested.disconnect()
+        win2.top_bar.chimeSoundChooseRequested.connect(asked.append)
+        acts["Choose sound file..."].trigger()
+        check("custom chime: Choose emits the chime's kind",
+              asked == [chime.REPLY], asked)
+        menu = win2.top_bar.build_chime_sound_menu(chime.QUESTION)
+        acts = {a.text(): a for a in menu.actions()}
+        acts["Use built-in sound"].trigger()
+        check("custom chime: Use built-in sound drops the file and the entry",
+              chime.QUESTION not in win2._custom_sounds
+              and not os.path.exists(second)
+              and not win2.top_bar.custom_sound_name(chime.QUESTION))
+
+        # a session pointing at a vanished copy restores as built-in
+        win2._custom_sounds[chime.REPLY] = str(tmp / "sounds" / "nope.wav")
+        win2._save_session()
+        win2._save_timer.stop()
+        win2.close()
+        app.processEvents()
+        win3 = create_main_window(SessionStore(path=tmp / "session.json"))
+        check("custom chime: a missing copy restores as the built-in sound",
+              chime.REPLY not in win3._custom_sounds, win3._custom_sounds)
+        win3._save_timer.stop()
+        win3.close()
+        app.processEvents()
+    finally:
+        chime._flush()
+        chime.winsound, chime._mci = real_ws, real_mci
+        chime._mci_open_path = None
+
+
 def test_reply_chime():
     """The reply-finished chime's cue (TerminalAgent.reply_finished ->
     WorkspaceManager.agentReplied). Claude's comes from the Stop hook's
@@ -8771,8 +8964,9 @@ def test_plan_usage():
     badge = win.top_bar.usage_badge
     weekly_badge = win.top_bar.usage_weekly_badge
 
+    claude_poll = win.usage_poller("claude")
     check("plan-usage: polling is opt-in, so the suite never fetches",
-          not win._usage_timer.isActive() and win.plan_usage() is None)
+          not claude_poll.is_running() and win.plan_usage() is None)
     check("plan-usage: badge hidden until a reading arrives",
           not badge.isVisible() and not badge.has_reading())
 
@@ -8850,72 +9044,100 @@ def test_plan_usage():
     check("plan-usage: blocked badge reads 'limit reached'",
           badge._text.startswith("5h limit reached, resets in"))
     check("plan-usage: an extra poll is armed for just after the reset",
-          win._usage_reset_timer.isActive()
-          and win._usage_reset_timer.remainingTime() > 120000)
+          claude_poll.reset_poll_armed()
+          and claude_poll.reset_poll_remaining_ms() > 120000)
     win._on_usage_ready(good)
     check("plan-usage: planLimitCleared fires once on the falling edge",
           seen["clear"] == 1 and seen["hit"] == 1)
-    check("plan-usage: reset poll disarmed once there is headroom",
-          not win._usage_reset_timer.isActive())
+    check("plan-usage: a reset beyond the next poll arms nothing extra",
+          not claude_poll.reset_poll_armed())
     # a weekly window can reset days out; that is the minute poll's job, not a
     # multi-day QTimer (whose interval is 32-bit anyway)
     win._on_usage_ready(cu.Usage(limits=(limit("seven_day", 100.0,
                                                now + 3 * 86400),),
                                  fetched_at=now, plan="max"))
     check("plan-usage: a far-off reset is left to the ordinary poll",
-          not win._usage_reset_timer.isActive())
+          not claude_poll.reset_poll_armed())
     win._on_usage_ready(good)
 
-    # --- the danger zone: nearly spent AND work under way => poll faster ---
-    # A minute of blindness at 95% is a minute of agents parked on a banner
-    # nobody noticed, because every reaction to a cut-off starts from a READING.
-    from app.widgets.main_window import USAGE_POLL_MS, USAGE_URGENT_POLL_MS
+    # --- the shared cadence (app.usage_poll): idle 6 min, working 90 s,
+    # working and nearly spent 30 s. Only a CLAUDE agent's work counts here.
+    from app import usage_poll as up
     from app.process_worker import AgentKind, build_spec
     hot = cu.Usage(limits=(limit("five_hour", 95.0, now + 600),),
                    fetched_at=now, plan="pro")
     win._on_usage_ready(hot)
-    check("plan-usage: nearly spent but nobody working stays on the slow poll",
-          win._usage_timer.interval() == USAGE_POLL_MS)
+    check("plan-usage: nearly spent but nobody working polls at the idle rate",
+          claude_poll.interval_ms() == up.IDLE_POLL_MS,
+          claude_poll.interval_ms())
 
     ws_hot = win.manager.create_workspace("usage-hot", str(tmp))
     agent_hot = win.manager.add_terminal(
         ws_hot.id, build_spec(AgentKind.CMD, "Hot", cwd=str(tmp)),
         autostart=False)
+    agent_hot.spec.provider = "gemini"
     agent_hot._busy = True            # what _mark_busy sets on an output burst
-    check("plan-usage: nearly spent + an agent working polls faster",
-          (win._on_usage_ready(hot),
-           win._usage_timer.interval() == USAGE_URGENT_POLL_MS)[-1])
-    check("plan-usage: the tick follows the work without a fetch",
-          (setattr(agent_hot, "_busy", False), win._tick_usage(),
-           win._usage_timer.interval() == USAGE_POLL_MS)[-1])
-    agent_hot._busy = True
-    win._tick_usage()
-    check("plan-usage: below the urgent mark the work doesn't matter",
+    check("plan-usage: a Gemini agent working does not speed Claude's poll up",
+          claude_poll.interval_ms() == up.IDLE_POLL_MS)
+    agent_hot.spec.provider = "claude"
+    check("plan-usage: nearly spent + a Claude agent working polls at 30 s",
+          claude_poll.interval_ms() == up.URGENT_POLL_MS,
+          claude_poll.interval_ms())
+    check("plan-usage: below the urgent mark a working agent polls at 90 s",
           (win._on_usage_ready(good),
-           win._usage_timer.interval() == USAGE_POLL_MS)[-1])
+           claude_poll.interval_ms() == up.POLL_MS)[-1])
+    agent_hot._busy = False
+    agent_hot._last_work_ts = time.time() - 30
+    check("plan-usage: a turn that ended 30 s ago still counts as work",
+          claude_poll.interval_ms() == up.POLL_MS)
+    agent_hot._last_work_ts = time.time() - up.ACTIVE_GRACE_S - 5
+    check("plan-usage: quiet past the grace drops back to the idle rate",
+          claude_poll.interval_ms() == up.IDLE_POLL_MS)
+    agent_hot._busy = True
     # a spent window is the reset poll's job, not a reason to hammer the endpoint
     win._on_usage_ready(cu.Usage(limits=(limit("five_hour", 100.0, now + 120),),
                                  fetched_at=now, plan="pro"))
-    check("plan-usage: an already-spent window drops back to the slow poll",
-          win._usage_timer.interval() == USAGE_POLL_MS)
+    check("plan-usage: an already-spent window drops back to the 90 s poll",
+          claude_poll.interval_ms() == up.POLL_MS)
     # and being rate-limited must still win over the urgent rate
     win._on_usage_ready(hot)
     win._on_usage_ready(cu.Usage(error="http 429"))
     check("plan-usage: a 429 backs off even in the danger zone",
-          win._usage_timer.interval() > USAGE_URGENT_POLL_MS
-          and win._usage_backoff == 1)
+          claude_poll.interval_ms() == 2 * up.URGENT_POLL_MS
+          and claude_poll.backoff() == 1)
     win._on_usage_ready(hot)
     check("plan-usage: a good reading clears the backoff back to urgent",
-          win._usage_timer.interval() == USAGE_URGENT_POLL_MS)
+          claude_poll.interval_ms() == up.URGENT_POLL_MS)
     agent_hot._busy = False
     win.manager.remove_workspace(ws_hot.id)
     win._on_usage_ready(good)
     win._save_timer.stop()
 
-    # a failed poll keeps the last good number on screen, greyed
+    # One failed poll keeps the number, IN COLOUR. It was greyed on the spot
+    # before, which made a one-minute-old, still-right figure look broken.
     win._on_usage_ready(cu.Usage(error="urlerror"))
-    check("plan-usage: a failed poll keeps the last number, marked stale",
-          badge._text.startswith("5h Claude 21% used") and badge._stale)
+    check("plan-usage: one failed poll keeps the last number, not greyed",
+          badge._text.startswith("5h Claude 21% used") and not badge.is_stale())
+    check("plan-usage: the tooltip names the failure while it lasts",
+          "urlerror" in badge.toolTip())
+    old = cu.Usage(limits=(limit("five_hour", 21.0, now + 4800),),
+                   fetched_at=time.time() - 3600, plan="pro")
+    win._on_usage_ready(old)
+    check("plan-usage: an old reading with healthy polls is not greyed",
+          not badge.is_stale())
+    win._on_usage_ready(cu.Usage(error="urlerror"))
+    check("plan-usage: failing polls on a reading past stale_after grey it",
+          badge.is_stale())
+    win._on_usage_ready(good)
+    check("plan-usage: a good reading brings the colour back",
+          not badge.is_stale() and "urlerror" not in badge.toolTip())
+    over = cu.Usage(limits=(limit("five_hour", 21.0, time.time() - 5),),
+                    fetched_at=time.time() - 60, plan="pro")
+    win._on_usage_ready(over)
+    check("plan-usage: a window whose reset passed after the reading greys",
+          badge.is_stale())
+    win._on_usage_ready(good)
+    win._save_timer.stop()
 
     # visibility preference persists; toggling it IS a save (a UI preference)
     win._on_usage_tracker_toggled("claude_five_hour", False)
@@ -8947,13 +9169,13 @@ def test_plan_usage():
     # no Claude login at all: hide for good rather than show an empty pill
     win3 = create_main_window(SessionStore(path=tmp / "noauth.json"))
     win3.show()
-    win3._usage_timer.start()
+    win3.usage_poller("claude")._running = True   # as start() leaves it
     win3._on_usage_ready(cu.Usage(error="no-auth"))
     app.processEvents()
     check("plan-usage: no-auth hides both Claude pills and stops polling",
           not win3.top_bar.usage_badge.isVisible()
           and not win3.top_bar.usage_weekly_badge.isVisible()
-          and not win3._usage_timer.isActive())
+          and not win3.usage_poller("claude").is_running())
     win3.close()
 
     # A poll that fails with NO earlier reading used to leave a hole in the bar
@@ -8962,7 +9184,8 @@ def test_plan_usage():
     # seed that used to paint a number instantly). It must say so instead.
     win4 = create_main_window(SessionStore(path=tmp / "unreadable.json"))
     win4.show()
-    win4._usage_timer.start()
+    p4 = win4.usage_poller("claude")
+    p4._running = True                  # as start() leaves it, minus the fetch
     b4 = win4.top_bar.usage_badge
     win4._on_usage_ready(cu.Usage(error="http 429"))
     app.processEvents()
@@ -8977,14 +9200,16 @@ def test_plan_usage():
     check("plan-usage: the can't-read pill paints without a limit to draw",
           not b4.grab().isNull())
     check("plan-usage: polling continues (only no-auth is terminal)",
-          win4._usage_timer.isActive())
+          p4.is_running() and p4.next_poll_at() > 0)
     # a click is the user asking NOW: it must not be left parked behind the
     # backoff a run of 429s just wound up to
-    check("plan-usage: repeated 429s back the poll off",
-          win4._usage_timer.interval() > 60000)
+    check("plan-usage: a 429 backs the poll off",
+          p4.backoff() == 1 and p4.interval_ms() > p4.cadence_ms())
+    p4._inflight = True                 # keep the click from spawning a fetch
     win4._on_usage_refresh()
+    p4._inflight = False
     check("plan-usage: a manual refresh clears the 429 backoff",
-          win4._usage_backoff == 0 and win4._usage_timer.interval() == 60000)
+          p4.backoff() == 0 and p4.interval_ms() == p4.cadence_ms())
     # and a real number supersedes the error pill entirely
     win4._on_usage_ready(good)
     app.processEvents()
@@ -8994,7 +9219,7 @@ def test_plan_usage():
     # an error is not a reason to force the readout back onto a bar the user
     # deliberately cleared
     win4._on_usage_tracker_toggled("claude_five_hour", False)
-    win4.top_bar.note_usage_error("http 429")
+    win4._on_usage_ready(cu.Usage(error="http 429"))
     app.processEvents()
     check("plan-usage: a closed readout stays closed when a poll fails",
           not b4.isVisible())
@@ -11581,24 +11806,24 @@ def test_gemini_usage_polling_is_offthread_and_optin():
         win = create_main_window(SessionStore(path=tmp / "s.json"))
         check("gemini-usage: building a window does NOT shell out to the CLI",
               calls == [], len(calls))
-        check("gemini-usage: ...and does not arm the poll timer either",
-              not win._gemini_usage_timer.isActive())
+        gpoll = win.usage_poller("gemini")
+        check("gemini-usage: ...and does not start the poller either",
+              not gpoll.is_running())
 
-        # the retune must use the reading it is given, never fetch its own
-        win._retune_gemini_usage_poll(None)
-        check("gemini-usage: retuning never fetches", calls == [], len(calls))
+        # the countdown tick retunes from the reading it has, never a fetch
+        win._tick_usage()
+        check("gemini-usage: the tick never fetches", calls == [], len(calls))
 
-        # in-flight guard: a 6s CLI timeout is longer than the urgent interval,
-        # so a stacking timer must not launch a thread per tick
-        win._gemini_usage_inflight = True
-        win._poll_gemini_usage()
+        # in-flight guard: an 8s CLI timeout is longer than the urgent
+        # interval, so a timer must not launch a thread per tick
+        gpoll._inflight = True
+        gpoll.poll()
         check("gemini-usage: a poll already in flight is not stacked",
               calls == [], len(calls))
 
-        win._gemini_usage_inflight = False
         win._on_gemini_usage_ready(None)
         check("gemini-usage: a finished poll clears the in-flight guard",
-              not win._gemini_usage_inflight)
+              not gpoll._inflight)
         check("gemini-usage: building a window puts no pill on the bar",
               not win.top_bar.gemini_badge.isVisible()
               and not win.top_bar.usage_badge.isVisible())
@@ -11626,13 +11851,16 @@ def test_gemini_usage_polling_is_offthread_and_optin():
             calls.clear()
             win2.start_usage_polling()
             check("gemini-usage: both trackers off means the poll never arms",
-                  not win2._gemini_usage_timer.isActive() and calls == [],
+                  not win2.usage_poller("gemini").is_running() and calls == [],
                   len(calls))
             check("gemini-usage: ...but the Claude poll keeps running",
-                  win2._usage_timer.isActive())
+                  win2.usage_poller("claude").is_running())
             win2._on_usage_tracker_toggled("gemini_weekly", True)
+            deadline = time.time() + 5
+            while not calls and time.time() < deadline:
+                time.sleep(0.01)          # the fetch runs on its own thread
             check("gemini-usage: re-enabling arms the timer and fetches at once",
-                  win2._gemini_usage_timer.isActive() and len(calls) == 1,
+                  win2.usage_poller("gemini").is_running() and len(calls) == 1,
                   len(calls))
             check("gemini-usage: a re-enabled pill shows loading, not a gap",
                   win2.top_bar.gemini_weekly_badge.has_content())
@@ -11645,7 +11873,7 @@ def test_gemini_usage_polling_is_offthread_and_optin():
             calls.clear()
             win3._on_usage_tracker_toggled("gemini_five_hour", True)
             check("gemini-usage: a window that never opted in never fetches",
-                  calls == [] and not win3._gemini_usage_timer.isActive(),
+                  calls == [] and not win3.usage_poller("gemini").is_running(),
                   len(calls))
             win3.close()
         finally:
@@ -11654,91 +11882,221 @@ def test_gemini_usage_polling_is_offthread_and_optin():
         gemini_usage.fetch = real
 
 
-def test_gemini_usage_poll_is_slower_than_claudes():
-    """Gemini rides its OWN, much slower poll clock, because each tick spawns a
-    process rather than making a request.
+def test_usage_poll_policy():
+    """Every usage pill polls on ONE policy (app.usage_poll), set by the user:
+    90 s while that provider's agents work, 30 s from 90% used, 6 minutes while
+    none do (the browser or the official apps can still move the number).
 
-    `gemini_usage.fetch()` runs a whole CLI (`agy --print /usage`), which costs
-    seconds of a background thread where a Claude tick costs one request. The
-    console window that flashes on ~1 poll in 20 comes from a nested helper agy
-    starts two levels below us, where no creation flag reaches (see
-    gemini_usage._read_usage), so the cadence is the only lever AI Hive has over
-    it -- and pulling it is nearly free, because only the two
-    pills consume this reading (a Gemini cut-off recovers on its own printed
-    countdown, never on the account reading).
+    The pill greys only when its number stopped being trustworthy: polls
+    failing AND the reading older than two cadences (never under 3 minutes),
+    or a reset passed since it was read. One failed poll used to grey it on the
+    spot, which made a minute-old, still-right number look broken ("caught
+    with our pants down"). A quick retry, a 429 backoff, a poll after waking
+    from sleep and a poll when work starts keep it from getting there.
 
-    This check exists so nobody "tidies" the Gemini timer back onto
-    USAGE_POLL_MS, which is answerable to planLimitReached and the reset poll
-    it arms -- neither of which exists for Gemini."""
+    Gemini used to poll on its own 5-minute clock and GPT had no backoff at
+    all. The last checks make sure every pill on the bar has a source in
+    `usage_sources()` and therefore this policy, so a pill added later cannot
+    quietly roll its own."""
     import pathlib
     import tempfile
 
     from PySide6.QtWidgets import QApplication
 
-    from app import gemini_usage
+    from app import codex_usage as xu
+    from app import usage_poll as up
     from app.session_store import SessionStore
-    from app.widgets.main_window import (GEMINI_USAGE_POLL_MS,
-                                         GEMINI_USAGE_URGENT_POLL_MS,
-                                         USAGE_POLL_MS, USAGE_URGENT_PCT)
+    from app.widgets.codex_usage_badge import CodexUsageBadge
+    from app.widgets.main_window import USAGE_TRACKER_KEYS, usage_sources
+    from app.widgets.ornaments import UsagePillBadge
     from main import create_main_window
 
     QApplication.instance() or QApplication([])
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="ai-hive-gempoll-"))
 
-    check("gemini-poll: the calm rate is well slower than Claude's",
-          GEMINI_USAGE_POLL_MS >= 5 * USAGE_POLL_MS,
-          (GEMINI_USAGE_POLL_MS, USAGE_POLL_MS))
-    check("gemini-poll: even the urgent rate never goes below Claude's calm one",
-          GEMINI_USAGE_URGENT_POLL_MS >= USAGE_POLL_MS,
-          GEMINI_USAGE_URGENT_POLL_MS)
+    class L:
+        def __init__(self, pct, resets_at=None):
+            self.percent, self.resets_at = pct, resets_at
 
-    calls = []
-    real = gemini_usage.fetch
-    gemini_usage.fetch = lambda *a, **k: (calls.append(1), None)[1]
-    try:
-        win = create_main_window(SessionStore(path=tmp / "s.json"))
-        check("gemini-poll: the timer is built on the Gemini interval",
-              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
-              win._gemini_usage_timer.interval())
-        check("gemini-poll: ...and Claude's timer is left alone",
-              win._usage_timer.interval() == USAGE_POLL_MS,
-              win._usage_timer.interval())
+    check("usage-poll: the user's cadence, in ms",
+          (up.POLL_MS, up.URGENT_POLL_MS, up.IDLE_POLL_MS, up.URGENT_PCT)
+          == (90_000, 30_000, 360_000, 90.0))
+    check("usage-poll: no agent working means the idle rate, whatever the %",
+          up.cadence_ms([L(99)], active=False) == up.IDLE_POLL_MS)
+    check("usage-poll: working below 90% polls every 90 s",
+          up.cadence_ms([L(50)], active=True) == up.POLL_MS)
+    check("usage-poll: working at 90% or more polls every 30 s",
+          up.cadence_ms([L(90)], active=True) == up.URGENT_POLL_MS
+          and up.cadence_ms([L(50), L(95)], active=True) == up.URGENT_POLL_MS)
+    check("usage-poll: a spent window is the reset poll's job, not 30 s",
+          up.cadence_ms([L(100)], active=True) == up.POLL_MS)
+    check("usage-poll: stale_after is two cadences, never under 3 minutes",
+          up.stale_after_s(up.IDLE_POLL_MS) == 720
+          and up.stale_after_s(up.POLL_MS) == 180
+          and up.stale_after_s(up.URGENT_POLL_MS) == 180)
 
-        def reading(pct):
-            return gemini_usage.GeminiUsage(limits=(
-                gemini_usage.GeminiLimit(key="five_hour", label="5h", short="5h",
-                                         percent=pct, resets_at=None),))
+    # --- provider_active: only this provider's agents, with a grace ---
+    class A:
+        def __init__(self, provider, busy=False, worked_ago=None):
+            self.spec = type("S", (), {"provider": provider})()
+            self._busy = busy
+            self._at = 0.0 if worked_ago is None else time.time() - worked_ago
 
-        # a calm window stays on the slow clock even with agents working
-        win._gemini_agents_working = lambda: True
-        win._retune_gemini_usage_poll(reading(10.0))
-        check("gemini-poll: a calm window keeps the slow rate",
-              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
-              win._gemini_usage_timer.interval())
+        def is_busy(self):
+            return self._busy
 
-        # the danger zone speeds up, but only to the Gemini urgent rate
-        win._retune_gemini_usage_poll(reading(USAGE_URGENT_PCT + 1))
-        check("gemini-poll: a nearly spent window uses the Gemini urgent rate",
-              win._gemini_usage_timer.interval() == GEMINI_USAGE_URGENT_POLL_MS,
-              win._gemini_usage_timer.interval())
+        def last_work_at(self):
+            return self._at
 
-        # ...and drops back, rather than latching fast for the rest of the run
-        win._retune_gemini_usage_poll(reading(5.0))
-        check("gemini-poll: it drops back to the slow rate afterwards",
-              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
-              win._gemini_usage_timer.interval())
+    check("usage-poll: a busy agent of the provider is activity",
+          up.provider_active([A("claude", busy=True)], ("claude",)))
+    check("usage-poll: another provider's busy agent is not",
+          not up.provider_active([A("gemini", busy=True)], ("claude",)))
+    check("usage-poll: work inside the grace still counts",
+          up.provider_active([A("openai", worked_ago=60)], ("openai",)))
+    check("usage-poll: work older than the grace does not",
+          not up.provider_active(
+              [A("openai", worked_ago=up.ACTIVE_GRACE_S + 5)], ("openai",)))
 
-        # no agents working means nothing is moving the number, so no rush
-        win._gemini_agents_working = lambda: False
-        win._retune_gemini_usage_poll(reading(99.0))
-        check("gemini-poll: no working agents means no urgent rate",
-              win._gemini_usage_timer.interval() == GEMINI_USAGE_POLL_MS,
-              win._gemini_usage_timer.interval())
+    # --- a poller on a fake clock, driven without threads or network ---
+    clock = [time.time()]
+    active = [False]
+    fetched = []
 
-        check("gemini-poll: retuning still never fetches", calls == [], len(calls))
-        win.close()
-    finally:
-        gemini_usage.fetch = real
+    def make(fetch=lambda: None):
+        pill = CodexUsageBadge()
+        src = up.UsageSource(name="t", fetch=fetch, agent_providers=("openai",),
+                             tracker_keys=("codex_five_hour",))
+        poller = up.UsagePoller(src, pills=lambda: [pill],
+                                active=lambda: active[0], wanted=lambda: True,
+                                clock=lambda: clock[0])
+        poller._running = True          # as start() leaves it, minus the fetch
+        return poller, pill
+
+    def good(pct=40.0, age=0.0, resets_in=4 * 3600):
+        return xu.CodexUsage(limit=xu.CodexLimit(pct, clock[0] + resets_in),
+                             fetched_at=clock[0] - age)
+
+    def gap():
+        return round(poller.next_poll_at() - clock[0])
+
+    poller, pill = make()
+    poller.deliver(good())
+    check("usage-poll: a reading schedules the next poll one cadence out",
+          gap() == up.IDLE_POLL_MS // 1000, gap())
+    check("usage-poll: the pill learns the idle stale_after",
+          pill._stale_after == up.stale_after_s(up.IDLE_POLL_MS))
+
+    poller.deliver(xu.CodexUsage(error="urlerror"))
+    check("usage-poll: a transient failure retries in 10 s, not 6 minutes",
+          gap() == up.RETRY_MS // 1000, gap())
+    check("usage-poll: one failure leaves the pill in colour",
+          pill.has_reading() and not pill.is_stale())
+    check("usage-poll: the tooltip says what failed and when it retries",
+          "urlerror" in pill.toolTip() and "Next try in" in pill.toolTip(),
+          pill.toolTip())
+    poller.deliver(xu.CodexUsage(error="urlerror"))
+    check("usage-poll: the retry failing too falls back to the cadence",
+          gap() == up.IDLE_POLL_MS // 1000, gap())
+
+    poller.deliver(good())
+    poller.deliver(xu.CodexUsage(error="http 429"))
+    check("usage-poll: a 429 never quick-retries; it backs off",
+          poller.backoff() == 1 and gap() == 2 * up.IDLE_POLL_MS // 1000, gap())
+    for _ in range(4):
+        poller.deliver(xu.CodexUsage(error="http 429"))
+    check("usage-poll: the backoff is capped at 16 minutes",
+          poller.interval_ms() == up.BACKOFF_CAP_MS, poller.interval_ms())
+    poller._inflight = True             # keep refresh() from spawning a fetch
+    poller.refresh()
+    poller._inflight = False
+    check("usage-poll: a click on the pill clears the backoff",
+          poller.backoff() == 0 and gap() == up.IDLE_POLL_MS // 1000, gap())
+
+    # stale by age, not by one failure
+    poller.deliver(good(age=up.stale_after_s(up.IDLE_POLL_MS) + 60))
+    check("usage-poll: an old reading with healthy polls is not stale",
+          not pill.is_stale())
+    poller.deliver(xu.CodexUsage(error="timeouterror"))
+    check("usage-poll: failing polls on a reading past stale_after grey it",
+          pill.is_stale())
+    poller.deliver(good())
+    check("usage-poll: a good reading clears the failure and the grey",
+          not pill.is_stale() and "timeouterror" not in pill.toolTip())
+
+    # work starting after an idle stretch polls at once when overdue
+    poller.tick()
+    clock[0] += 60
+    poller.tick()
+    check("usage-poll: idle and a minute old, nothing is due yet",
+          gap() == up.IDLE_POLL_MS // 1000 - 60, gap())
+    active[0] = True
+    clock[0] += 40
+    poller.tick()
+    check("usage-poll: work starting makes a 100 s old reading due now",
+          gap() <= 0, gap())
+    poller.deliver(good())
+    check("usage-poll: working, the cadence is 90 s",
+          gap() == up.POLL_MS // 1000, gap())
+    check("usage-poll: ...and the pill's stale_after follows it",
+          pill._stale_after == up.stale_after_s(up.POLL_MS))
+
+    # waking from sleep
+    poller.tick()
+    clock[0] += 2 * 3600
+    poller.tick()
+    check("usage-poll: a wall-clock jump (sleep) polls 5 s later",
+          gap() == up.WAKE_DELAY_MS // 1000, gap())
+    poller.tick()                       # the next tick must not undo that
+    check("usage-poll: the retune leaves the wake poll alone",
+          gap() == up.WAKE_DELAY_MS // 1000, gap())
+
+    # a poll just after the reset when it lands before the next poll
+    poller.deliver(good(resets_in=60))
+    check("usage-poll: a reset inside the cadence arms a poll just after it",
+          poller.reset_poll_armed()
+          and 60_000 < poller.reset_poll_remaining_ms() <= 60_000 + up.RESET_GRACE_MS)
+    poller.deliver(good(resets_in=3 * 3600))
+    check("usage-poll: a reset beyond the next poll arms nothing extra",
+          not poller.reset_poll_armed())
+    poller.deliver(good(pct=100.0, resets_in=3 * 3600))
+    check("usage-poll: a spent window arms its reset poll hours out",
+          poller.reset_poll_armed())
+    poller.stop()
+    active[0] = False
+
+    # no login and nothing ever read: the readout goes away and polling stops
+    fresh, fresh_pill = make()
+    gone = []
+    fresh.absent.connect(lambda: gone.append(1))
+    fresh.deliver(xu.CodexUsage(error="no-auth"))
+    check("usage-poll: no-auth with no reading clears the pill and stops",
+          not fresh.is_running() and not fresh_pill.has_content() and gone == [1])
+    other, other_pill = make()
+    other.deliver(xu.CodexUsage(error="urlerror"))
+    check("usage-poll: a failure with no reading shows the can't-read pill",
+          other_pill.has_content() and not other_pill.has_reading()
+          and other.is_running())
+    other.stop()
+
+    # --- every pill on the bar is on this policy ---
+    covered = sorted(k for src in usage_sources() for k in src.tracker_keys)
+    check("usage-poll: every tracker key has exactly one source",
+          covered == sorted(USAGE_TRACKER_KEYS), covered)
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="ai-hive-usagepoll-"))
+    win = create_main_window(SessionStore(path=tmp / "s.json"))
+    for key in USAGE_TRACKER_KEYS:
+        poller = win._poller_for(key)
+        pills = poller.source.tracker_keys if poller else ()
+        check(f"usage-poll: the {key} pill is fed by a shared poller",
+              poller is not None and key in pills
+              and isinstance(win.top_bar._usage_pills[key], UsagePillBadge))
+    check("usage-poll: Gemini and GPT get the same idle cadence as Claude",
+          {p.cadence_ms() for p in win._usage_pollers.values()}
+          == {up.IDLE_POLL_MS})
+    check("usage-poll: GPT pills follow OpenAI agents, Gemini follow Gemini",
+          win.usage_poller("codex").source.agent_providers == ("openai",)
+          and win.usage_poller("gemini").source.agent_providers == ("gemini",))
+    win.close()
 
 
 def test_gemini_usage_reads_both_cli_output_shapes():
@@ -12974,6 +13332,303 @@ def test_limit_detection_hardening():
     pump(50)
 
 
+def test_event_log():
+    """The app-wide event log: one timeline of every agent in every workspace
+    (app/event_log.py storage, app/event_hub.py collector, the window in
+    app/widgets/event_log_window.py). Records survive a restart, point back
+    at agents through AgentSpec.uid, and the window's links reveal the card."""
+    import json as _json
+    import time as _time
+    from PySide6.QtCore import QEventLoop, QPoint, QRect, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import event_log as el
+    from app.event_hub import EventHub
+    from app.process_worker import AgentKind, AgentSpec, build_spec
+    from app.terminal_agent import AgentStatus
+    from app.widgets.event_log_window import EventLogWindow, LogFilter
+    from app.workspace_manager import WorkspaceManager
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    # --- a stable agent identity ---
+    a = build_spec(AgentKind.CLAUDE, "Agent 1")
+    b = build_spec(AgentKind.CLAUDE, "Agent 1")
+    check("event log: every new spec gets its own uid",
+          a.uid and b.uid and a.uid != b.uid)
+    check("event log: the uid survives to_dict/from_dict",
+          AgentSpec.from_dict(a.to_dict()).uid == a.uid)
+    legacy = a.to_dict()
+    legacy.pop("uid")
+    check("event log: a pre-uid session record still gets one",
+          len(AgentSpec.from_dict(legacy).uid) == 32)
+
+    # --- storage ---
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-eventlog-"))
+    d = str(tmp / "event_log")
+    now = _time.time()
+    check("event log: an absent directory reads as nothing, never raises",
+          el.read_since(d, 0) == [])
+    old = el.make_record(el.REPLY, agent_name="A", at=now - 2 * 86400)
+    new = el.make_record(el.PROMPT, agent_name="A", text="hi", at=now)
+    check("event log: append writes one line to the day's file",
+          el.append(d, old) and el.append(d, new)
+          and len(os.listdir(d)) == 2)
+    with open(os.path.join(d, el._day_name(now)), "a", encoding="utf-8") as f:
+        f.write('{"torn": \n')
+    got = el.read_since(d, now - 3 * 86400)
+    check("event log: records read back oldest first across day files, a "
+          "torn line skipped", [r["id"] for r in got] == [old["id"], new["id"]],
+          got)
+    check("event log: read_since drops what is older than asked",
+          [r["id"] for r in el.read_since(d, now - 3600)] == [new["id"]])
+    for days in (29, 31):
+        el.append(d, el.make_record(el.REPLY, at=now - days * 86400))
+    gone = el.prune(d, keep_days=30, now=now)
+    kept = {n[:-6] for n in os.listdir(d)}
+    check("event log: prune deletes the 31-day-old file and keeps the "
+          "29-day-old one",
+          gone == 1 and _time.strftime("%Y-%m-%d", _time.localtime(
+              now - 29 * 86400)) in kept, (gone, kept))
+    check("event log: durations read like a person wrote them",
+          [el.format_duration(s) for s in (45, 252, 4320, 183600)]
+          == ["45s", "4m 12s", "1h 12m", "2d 3h"])
+    check("event log: a board line parses into agent, stamp and message",
+          el.parse_board_line("- [Agent 5] 2026-09-25 01:46 did a thing")
+          == ("Agent 5", "2026-09-25 01:46", "did a thing"))
+
+    # --- the collector ---
+    wsdir = tmp / "proj"
+    wsdir.mkdir()
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Hive", str(wsdir))
+    old_agent = mgr.add_terminal(ws.id, build_spec(
+        AgentKind.CLAUDE, "Agent 1", cwd=str(wsdir)), autostart=False)
+    logdir = str(tmp / "hub_log")
+    hub = EventHub(mgr, logdir)
+    check("event log: agents that already existed are adopted silently",
+          hub.records == [], hub.records)
+    ag = mgr.add_terminal(ws.id, build_spec(
+        AgentKind.CLAUDE, "Agent 2", cwd=str(wsdir)), autostart=False)
+    check("event log: a new agent is a lifecycle 'added' row",
+          hub.records[-1]["kind"] == el.LIFECYCLE
+          and hub.records[-1]["text"] == "added"
+          and hub.records[-1]["agent_uid"] == ag.spec.uid)
+
+    ag.note_prompt_submitted("fix the parser\nand the tests")
+    rec = hub.records[-1]
+    check("event log: the user's own Enter is a prompt row with its text",
+          rec["kind"] == el.PROMPT and rec["text"].startswith("fix the parser")
+          and rec["ws_name"] == "Hive" and rec["agent_name"] == "Agent 2")
+    ag.reply_finished.emit()
+    rec = hub.records[-1]
+    check("event log: a finished reply says how long it took",
+          rec["kind"] == el.REPLY and "took" in rec["data"]
+          and el.describe(rec).startswith("finished (took "), rec)
+    ag.deliver_task("write the docs")
+    check("event log: a task AI Hive hands over is its own kind",
+          hub.records[-1]["kind"] == el.TASK)
+
+    ag.status = AgentStatus.RUNNING
+    ag._tool_waiting = True
+    ag._emit_waiting()
+    check("event log: a question waits to settle before it is recorded",
+          hub.records[-1]["kind"] != el.QUESTION)
+    hub.flush_pending()
+    q = hub.records[-1]
+    check("event log: a settled question is recorded and counted",
+          q["kind"] == el.QUESTION and hub.open_questions() == 1)
+    check("event log: an open question reads 'waiting'",
+          el.status(q, hub.closer_of(q), _time.time(),
+                    hub.session_start).startswith("waiting "))
+    ag._tool_waiting = False
+    ag._emit_waiting()
+    closer = hub.closer_of(q)
+    check("event log: answering closes the question row in place",
+          closer is not None and closer["kind"] == el.ANSWERED
+          and closer["ref"] == q["id"] and hub.open_questions() == 0
+          and el.status(q, closer, _time.time(), hub.session_start)
+          .startswith("answered after "))
+
+    # the plan-limit menu raises "?" too; it is not a question
+    ag._tool_waiting = True
+    ag._emit_waiting()
+    hub.flush_pending()
+    menu_q = hub.records[-1]
+    ag._limit_blocked = True
+    ag._limit_resets_at = _time.time() + 3600
+    ag.limit_blocked_changed.emit(True)
+    hub.flush_pending()
+    lim = hub.records[-1]
+    check("event log: a cut-off is a limit row carrying its reset time",
+          lim["kind"] == el.LIMIT
+          and abs(lim["data"]["reset_at"] - ag._limit_resets_at) < 1
+          and el.status(lim, None, _time.time(), hub.session_start)
+          .startswith("in "), lim)
+    check("event log: the limit menu's '?' is closed as not-a-question",
+          hub.closer_of(menu_q) is not None
+          and hub.closer_of(menu_q)["data"].get("limit_menu")
+          and hub.open_questions() == 0)
+    n = len(hub.records)
+    ag.limit_blocked_changed.emit(True)   # a failed verify re-latches
+    hub.flush_pending()
+    check("event log: re-latching the same cut-off adds no second row",
+          len(hub.records) == n)
+    ag._tool_waiting = False
+    ag._emit_waiting()
+    ag._limit_blocked = False
+    hub.limit_outcome(ag, "resumed", tries=1)
+    res = hub.records[-1]
+    check("event log: a resume is its own row AND closes the cut-off",
+          res["kind"] == el.LIMIT_RESUMED and res["ref"] == lim["id"]
+          and hub.closer_of(lim) is res
+          and el.status(lim, res, _time.time(), hub.session_start)
+          .startswith("resumed "))
+
+    ag.status = AgentStatus.RUNNING
+    ag._set_status(AgentStatus.CRASHED)
+    check("event log: a crash is a problem row",
+          hub.records[-1]["kind"] == el.CRASHED
+          and hub.records[-1]["text"] == "crashed")
+    ag.status = AgentStatus.STOPPING
+    hub._prev_status[ag.id] = AgentStatus.STOPPING
+    ag._set_status(AgentStatus.EXITED_ERR)
+    check("event log: an error exit after the user's own stop is just "
+          "'stopped'", hub.records[-1]["kind"] == el.LIFECYCLE
+          and hub.records[-1]["text"] == "stopped")
+    hub.scheduled(ag, False, "run the suite", "the agent is stopped")
+    check("event log: a missed scheduled send says why",
+          hub.records[-1]["kind"] == el.SCHED_MISSED
+          and "the agent is stopped" in el.describe(hub.records[-1]))
+
+    ws.board.append_activity("Agent 1", "refactoring the tiler")
+    hub.poll_boards()
+    rec = hub.records[-1]
+    check("event log: a new board line becomes a board row for its agent",
+          rec["kind"] == el.BOARD and rec["text"] == "refactoring the tiler"
+          and rec["agent_uid"] == old_agent.spec.uid, rec)
+
+    on_disk = el.read_since(logdir, 0)
+    check("event log: every record is on disk as it happens",
+          [r["id"] for r in on_disk] == [r["id"] for r in hub.records])
+    hub2 = EventHub(mgr, logdir)
+    check("event log: a restart reads the history and its closers back",
+          len(hub2.records) == len(hub.records)
+          and hub2.closer_of(lim)["id"] == res["id"])
+    check("event log: a question left open by an earlier run is not "
+          "'waiting' forever",
+          el.status(dict(q, at=hub2.session_start - 60), None, _time.time(),
+                    hub2.session_start) == "no answer recorded")
+    hub2.shutdown()
+
+    # --- the window ---
+    win = EventLogWindow(hub)
+    win.show()
+    pump(30)
+    kinds = [p["kind"] for k, p in win.model.rows if k == "event"]
+    newest = next(r for r in reversed(hub.records)
+                  if win.flt.passes(r, hub.closer_of(r), hub.session_start))
+    check("event log window: newest first under one 'Today' header",
+          win.model.rows[0][0] == "header"
+          and win.model.data(win.model.index(0)) == "Today"
+          and win.model.rows[1][1]["id"] == newest["id"])
+    check("event log window: lifecycle and board rows are off by default, "
+          "answers are merged into their question",
+          el.LIFECYCLE not in kinds and el.BOARD not in kinds
+          and el.ANSWERED not in kinds and el.QUESTION in kinds
+          and el.LIMIT_RESUMED in kinds, kinds)
+    win.chips["board"].setChecked(True)
+    kinds = [p["kind"] for k, p in win.model.rows if k == "event"]
+    check("event log window: switching a group on shows its history",
+          el.BOARD in kinds)
+    win.needs_btn.setChecked(True)
+    kinds = {p["kind"] for k, p in win.model.rows if k == "event"}
+    check("event log window: 'Needs you' keeps only problems and open "
+          "questions", kinds <= {el.CRASHED, el.SCHED_MISSED, el.LIMIT_FAILED,
+                                 el.QUESTION} and el.CRASHED in kinds, kinds)
+    win.clear_filters()
+    check("event log window: Clear filters restores the defaults",
+          win.flt.groups == set(el.DEFAULT_GROUPS) and not win.flt.needs_you
+          and not win.clear_btn.isVisibleTo(win))
+    win._only_agent(ws.id, old_agent.spec.uid)
+    uids = {p.get("agent_uid") for k, p in win.model.rows if k == "event"}
+    check("event log window: 'Show only this agent' narrows to it",
+          uids == {old_agent.spec.uid} or not uids, uids)
+    win.clear_filters()
+
+    before = sum(1 for k, _p in win.model.rows if k == "event")
+    ag.note_prompt_submitted("one more thing")
+    check("event log window: a new record appears live at the top",
+          sum(1 for k, _p in win.model.rows if k == "event") == before + 1
+          and win.model.rows[1][1]["text"] == "one more thing")
+
+    jumped = []
+    win.agentActivated.connect(lambda w, aid: jumped.append((w, aid)))
+    prompt_rec = win.model.rows[1][1]
+    win._on_link("agent", prompt_rec)
+    check("event log window: an agent link resolves the uid to the LIVE "
+          "agent id", jumped == [(ws.id, ag.id)], jumped)
+    fm = win.view.fontMetrics()
+    rect = QRect(0, 0, 900, 24)
+    lay = win.delegate._layout(rect, prompt_rec, fm)
+    check("event log window: the painted agent name is a hit target",
+          win.delegate.hit(rect, prompt_rec, lay["agent"].center(), fm)
+          == "agent"
+          and win.delegate.hit(rect, prompt_rec, lay["ws"].center(), fm)
+          == "ws")
+    mgr.remove_terminal(ws.id, ag.id)
+    pump(10)
+    check("event log window: a removed agent's name is no longer a link",
+          hub.resolve(ws.id, prompt_rec["agent_uid"]) is None
+          and win.delegate.hit(rect, prompt_rec, lay["agent"].center(), fm)
+          is None)
+    state = win.state()
+    flt = LogFilter()
+    flt.load(_json.loads(_json.dumps(state["filter"])))
+    check("event log window: filters survive a JSON round trip",
+          flt.to_dict() == win.flt.to_dict())
+    win.close()
+    hub.shutdown()
+    n = len(hub.records)
+    old_agent.note_prompt_submitted("after shutdown")
+    check("event log: nothing is recorded once the app is closing",
+          len(hub.records) == n)
+
+    # --- MainWindow wiring ---
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+    setup_application(app)
+    store = SessionStore(path=tmp / "mw" / "session.json")
+    mw = create_main_window(store)
+    mw.show()
+    pump(100)
+    check("event log: MainWindow owns a hub writing beside session.json",
+          mw.event_hub is not None and mw.event_hub.directory
+          == str(tmp / "mw" / "event_log"))
+    check("event log: the top bar has a Log button",
+          mw.top_bar.log_btn.text().endswith("Log"))
+    mw.top_bar.set_log_attention(2)
+    check("event log: the Log button counts unanswered questions",
+          "? 2" in mw.top_bar.log_btn.text()
+          and mw.top_bar.log_btn.property("attention") is True)
+    mw.top_bar.set_log_attention(0)
+    mw.open_event_log()
+    pump(30)
+    check("event log: Ctrl+Shift+L / the button opens the window",
+          mw._event_log_window is not None
+          and mw._event_log_window.isVisible())
+    mw._event_log_window.chips["lifecycle"].setChecked(True)
+    ui = mw._session_payload()["ui"]
+    check("event log: the window's filters are saved with the session",
+          "lifecycle" in ui["event_log"]["filter"]["groups"])
+    mw._event_log_window.close()
+    mw.close()
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
@@ -12988,6 +13643,7 @@ def main():
     test_bg_shell_settle_relearn()
     test_bg_shell_kill_extras()
     test_chime_persistence()
+    test_custom_chime_sounds()
     test_reply_chime()
     test_hook_prompt_events()
     test_agent_hook_waiting()
@@ -13059,6 +13715,7 @@ def main():
     test_taskbar_badge()
     test_bg_shell_taskbar_state()
     test_limit_ledger()
+    test_event_log()
     test_agent_kind_is_always_an_enum()
     test_limit_recovery_reliability()
     test_auto_continue_on_limit_reset()
@@ -13072,7 +13729,7 @@ def main():
     test_history_screen_wrapper_removed()
     test_gemini_usage_read_disables_agy_auto_update()
     test_gemini_usage_polling_is_offthread_and_optin()
-    test_gemini_usage_poll_is_slower_than_claudes()
+    test_usage_poll_policy()
     test_gemini_usage_reads_both_cli_output_shapes()
     test_projection_happens_once()
     test_recovered_prompts_are_cached()
@@ -13612,6 +14269,36 @@ def test_options_panel():
     app.processEvents()
     check("options: reopening reuses the SAME panel, never a rebuild",
           bar.options_panel is same and panel.isVisible())
+
+    # A second click on the button must CLOSE the panel. The popup grab hands
+    # that press to the panel, which closes as for any outside click, and Qt
+    # then replays the press to the button, whose click reopened the panel.
+    # QTest clicks bypass the grab, so feed the panel the press it would get.
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+
+    def press_at(global_pt):
+        g = QPointF(global_pt)
+        ev = QMouseEvent(QEvent.Type.MouseButtonPress,
+                         QPointF(panel.mapFromGlobal(global_pt)), g,
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(panel, ev)
+        app.processEvents()
+
+    no_replay = Qt.WidgetAttribute.WA_NoMouseReplay
+    press_at(bar.options_btn.mapToGlobal(bar.options_btn.rect().center()))
+    check("options: a press on the button closes the open panel",
+          not panel.isVisible())
+    check("options: ...and is not replayed to the button to reopen it",
+          panel.testAttribute(no_replay))
+    bar.options_btn.click()
+    app.processEvents()
+    check("options: opening again re-arms the replay for other clicks",
+          panel.isVisible() and not panel.testAttribute(no_replay))
+    press_at(bar.toggle_btn.mapToGlobal(bar.toggle_btn.rect().center()))
+    check("options: a press elsewhere closes it and still replays there",
+          not panel.isVisible() and not panel.testAttribute(no_replay))
     panel.hide()
 
     # --- 3. every switch: click emits, set_* reflects and stays silent ----
@@ -13720,9 +14407,11 @@ def test_options_panel():
     # --- 8. one control per setting: no duplicate lives on the bar -------
     bar_buttons = [w for w in bar.findChildren(QToolButton)
                    if w.parent() is bar]
-    check("options: the bar itself carries exactly three buttons",
+    # the Log button is no setting: like Add Terminal it opens something (the
+    # event log window), so it belongs on the bar
+    check("options: the bar itself carries exactly four buttons",
           set(bar_buttons) == {bar.toggle_btn, bar.add_terminal_btn,
-                               bar.options_btn},
+                               bar.options_btn, bar.log_btn},
           [w.objectName() for w in bar_buttons])
     bar.deleteLater()
 

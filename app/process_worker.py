@@ -124,6 +124,11 @@ class AgentSpec:
     # user-facing fields only (program/args are rebuilt from the profile)
     user_program: str = ""   # PYTHON_SCRIPT: script path; CUSTOM: exe
     user_args: list = field(default_factory=list)
+    # a stable identity that survives restarts. `TerminalAgent.id` is a fresh
+    # uuid per load, the display name is not unique and `session_id` changes on
+    # /clear, so anything persisted that must point back at an agent later
+    # (the event log's agent links) keys on this. Minted once, then saved.
+    uid: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def set_permission_mode(self, mode: str) -> bool:
         """Adopt `mode` as the startup permission mode and REBUILD the provider
@@ -206,6 +211,7 @@ class AgentSpec:
             "custom_command": self.custom_command,
             "font_px": self.font_px,
             "session_id": self.session_id,
+            "uid": self.uid,
         }
 
     @staticmethod
@@ -225,6 +231,8 @@ class AgentSpec:
         # resumes via --continue once and gets pinned on its next fresh start)
         spec.session_id = str(d.get("session_id", "") or "")
         spec.custom_name = bool(d.get("custom_name", False))
+        # a pre-uid session keeps the fresh one the dataclass minted, and saves it
+        spec.uid = str(d.get("uid", "") or "") or spec.uid
         return spec
 
 

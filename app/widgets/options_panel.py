@@ -39,7 +39,7 @@ No em dash in any string below: this is all read by the user.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRect, Qt
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from .ornaments import anchored_popup_pos
@@ -57,6 +57,7 @@ class OptionsPanel(QWidget):
         self._lay = QVBoxLayout(self)
         self._lay.setContentsMargins(10, 10, 10, 10)
         self._lay.setSpacing(4)
+        self._anchor = None
 
     # --- building blocks, called by TopBar.__init__ ----------------------
 
@@ -69,7 +70,7 @@ class OptionsPanel(QWidget):
         self._lay.addWidget(label)
         return label
 
-    def add_switch_row(self, label, switch) -> None:
+    def add_switch_row(self, label, switch, *extra) -> None:
         """A named row ending in a `ToggleSwitch`: label left, switch right.
 
         Unlike `add_row`, the label is a widget the caller already built (so
@@ -78,13 +79,17 @@ class OptionsPanel(QWidget):
         widgets are parented straight to the panel, like every other setting
         here - a caller that wants to hide the whole row (`set_recovery_
         available` hiding the two limit-recovery switches for a no-Claude-
-        login user) hides both widgets itself."""
+        login user) hides both widgets itself. `extra` widgets (the chimes'
+        sound button) sit just left of the switch."""
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
         label.setParent(self)
         row.addWidget(label)
         row.addStretch(1)
+        for w in extra:
+            w.setParent(self)
+            row.addWidget(w)
         switch.setParent(self)
         row.addWidget(switch)
         self._lay.addLayout(row)
@@ -125,18 +130,34 @@ class OptionsPanel(QWidget):
     def open_under(self, anchor) -> None:
         """Drop under `anchor`, clamped into the window and the screen by the
         same helper the layout palette uses."""
+        self._anchor = anchor
+        # a close by an anchor click (below) left this set; any other outside
+        # click must still reach whatever it landed on
+        self.setAttribute(Qt.WidgetAttribute.WA_NoMouseReplay, False)
         self.adjustSize()
         self.move(anchored_popup_pos(anchor, self.size()))
         self.show()
         self.raise_()
 
     def toggle_under(self, anchor) -> None:
-        """Click the button again to put the panel away. Qt's popup grab makes
-        a second click on the button arrive as an outside-click that closes the
-        panel first, so by the time the button fires, `isVisible()` is already
-        False and this reads as a plain open. Harmless, and it means the button
-        never gets stuck showing an open panel that is not there."""
         if self.isVisible():
             self.hide()
         else:
             self.open_under(anchor)
+
+    def mousePressEvent(self, event) -> None:
+        """A click on the Options button while the panel is open closes it.
+
+        Qt's popup grab routes that press here first, the base handler closes
+        the panel as an outside click, and then Qt REPLAYS the press to the
+        button. The button fired `clicked`, found the panel hidden and opened
+        it again, so the second click looked like it did nothing.
+        `WA_NoMouseReplay` drops the replay for presses on the anchor only,
+        the same trick QComboBox plays for its own arrow."""
+        anchor = self._anchor
+        if anchor is not None and anchor.isVisible():
+            hit = QRect(anchor.mapToGlobal(anchor.rect().topLeft()),
+                        anchor.size())
+            if hit.contains(event.globalPosition().toPoint()):
+                self.setAttribute(Qt.WidgetAttribute.WA_NoMouseReplay, True)
+        super().mousePressEvent(event)

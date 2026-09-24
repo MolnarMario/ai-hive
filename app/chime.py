@@ -22,14 +22,26 @@ dir (no bundled asset, no external player) and played with SND_ASYNC so the
 UI thread never blocks. Everything degrades to a silent no-op if the platform
 has no `winsound` or audio is unavailable. A missing chime must never break
 the app or a headless test run.
+
+CUSTOM SOUNDS. Each chime can be swapped for the user's own WAV or MP3 (the
+Options panel's note button). The caller owns WHERE that file lives (it copies
+it into app data) and passes its path to `play`; this module only checks a
+file with `validate` and plays it. WAV goes through winsound like the built-in
+sounds. MP3 goes through Windows' MCI (winmm.dll via ctypes), still stdlib,
+run on its own thread because MCI calls block. A custom file that is missing or will not play falls back to the
+built-in sound for that kind, so swapping a sound can never lose a
+notification.
 """
 
 from __future__ import annotations
 
+import ctypes
 import math
 import os
+import queue
 import struct
 import tempfile
+import threading
 import wave
 
 try:  # Windows-only stdlib module; absent on other platforms
@@ -43,6 +55,18 @@ _CHIME_VERSION = 2
 
 QUESTION = "question"
 REPLY = "reply"
+KINDS = (QUESTION, REPLY)
+
+# What a custom sound may be. 5 s keeps a chime a chime (a new one cuts the
+# last off anyway), and 2 MB is far more than 5 s of any sane WAV or MP3.
+CUSTOM_EXTS = (".wav", ".mp3")
+MAX_CUSTOM_BYTES = 2 * 1024 * 1024
+MAX_CUSTOM_SECONDS = 5.0
+
+# the one MCI device custom MP3s play on, and a second one for probing a file
+# in validate() without disturbing a chime that is playing
+_MCI_ALIAS = "aihive_chime"
+_MCI_PROBE = "aihive_probe"
 
 # A note is (start_s, length_s, pitch_path, amp, vibrato). pitch_path is
 # [(t, Hz), ...] relative to the note's start, slid between points on a log
@@ -137,16 +161,147 @@ def available() -> bool:
     return winsound is not None
 
 
-def play(kind: str = QUESTION) -> bool:
-    """Play one of the chimes asynchronously (never blocks the caller).
+def _mci(command: str) -> tuple[int, str]:
+    """Send one MCI command string; return (error code, reply). 0 is success.
+    Anything short of a working winmm (another platform, a broken audio
+    stack) comes back as a non-zero code so every caller takes its fallback."""
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        rc = ctypes.windll.winmm.mciSendStringW(command, buf, 255, None)
+        return int(rc), buf.value
+    except Exception:  # noqa: BLE001 - no winmm means "cannot play this"
+        return -1, ""
 
-    Returns True if playback was dispatched, False if unavailable/failed.
-    Safe to call from the GUI thread: SND_ASYNC hands the WAV to the OS mixer
-    and returns immediately. A second call while one is still playing cuts the
-    first off, which is the most a burst of agents finishing together can do.
+
+# ---- the MCI player thread ----------------------------------------------
+# MCI calls block: measured on this machine, the first open of the mpegvideo
+# device took 414 ms and a replay from 0 took 81 ms. That is a visible freeze
+# on the GUI thread, so every command on _MCI_ALIAS runs on ONE daemon thread
+# fed by a queue. One thread, because MCI binds a device to the thread that
+# opened it. validate() probes on the caller's thread with its own alias,
+# opened and closed there.
+
+_mci_jobs: "queue.Queue | None" = None
+_mci_lock = threading.Lock()
+
+# path currently open on _MCI_ALIAS (touched only on the player thread), so a
+# repeat chime replays it instead of paying the open again
+_mci_open_path: str | None = None
+
+
+def _mci_worker(jobs: "queue.Queue") -> None:
+    while True:
+        job, done = jobs.get()
+        try:
+            job()
+        except Exception:  # noqa: BLE001 - one bad job must not kill the player
+            pass
+        finally:
+            if done is not None:
+                done.set()
+
+
+def _mci_submit(job, wait: float = 0.0) -> None:
+    """Run `job` on the player thread. With `wait`, block up to that many
+    seconds for it to finish (stop() needs the device closed)."""
+    global _mci_jobs
+    with _mci_lock:
+        if _mci_jobs is None:
+            _mci_jobs = queue.Queue()
+            threading.Thread(target=_mci_worker, args=(_mci_jobs,),
+                             name="aihive-chime-mci", daemon=True).start()
+    done = threading.Event() if wait else None
+    _mci_jobs.put((job, done))
+    if done is not None:
+        done.wait(wait)
+
+
+def _flush(timeout: float = 2.0) -> None:
+    """Wait for every queued MCI job to finish. For tests."""
+    _mci_submit(lambda: None, wait=timeout)
+
+
+def _mci_close() -> None:
+    global _mci_open_path
+    if _mci_open_path is not None:
+        _mci(f"close {_MCI_ALIAS}")
+        _mci_open_path = None
+
+
+def _play_mp3(path: str) -> bool:
+    """Player thread only."""
+    global _mci_open_path
+    if _mci_open_path != path:
+        _mci_close()
+        if _mci(f'open "{path}" type mpegvideo alias {_MCI_ALIAS}')[0] != 0:
+            return False
+        _mci_open_path = path
+    return _mci(f"play {_MCI_ALIAS} from 0")[0] == 0
+
+
+def _stop_winsound() -> None:
+    if winsound is not None:
+        try:
+            winsound.PlaySound(None, 0)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def stop() -> None:
+    """Silence whatever is playing and let go of any custom file. Waits (up
+    to 2 s) for the player thread to close its device, so a caller may delete
+    the file straight after."""
+    if _mci_jobs is not None:
+        _mci_submit(_mci_close, wait=2.0)
+    _stop_winsound()
+
+
+def validate(path: str) -> str | None:
+    """Check a file the user picked as a custom chime. Returns None if it is
+    usable, else a short reason to show them (no em dash, the user reads it).
     """
-    if winsound is None:
-        return False
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in CUSTOM_EXTS:
+        return "Only WAV and MP3 files can be used as a chime."
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return "The file could not be read."
+    if size == 0:
+        return "The file is empty."
+    if size > MAX_CUSTOM_BYTES:
+        return (f"The file is {size / 1024 / 1024:.1f} MB. A chime can be at "
+                f"most {MAX_CUSTOM_BYTES // (1024 * 1024)} MB.")
+    if ext == ".wav":
+        try:
+            with wave.open(path, "rb") as w:
+                frames, rate = w.getnframes(), w.getframerate()
+        except Exception:  # noqa: BLE001 - wave.Error, EOFError, OSError...
+            return ("This WAV could not be opened. Only uncompressed (PCM) "
+                    "WAV files play; try saving it as 16-bit PCM or as MP3.")
+        if frames <= 0 or rate <= 0:
+            return "This WAV has no sound in it."
+        seconds = frames / rate
+    else:
+        if _mci(f'open "{path}" type mpegvideo alias {_MCI_PROBE}')[0] != 0:
+            return "Windows could not open this MP3."
+        try:
+            _mci(f"set {_MCI_PROBE} time format milliseconds")
+            rc, length = _mci(f"status {_MCI_PROBE} length")
+        finally:
+            _mci(f"close {_MCI_PROBE}")
+        if rc != 0 or not length.strip().isdigit():
+            return "Windows could not read this MP3's length."
+        seconds = int(length) / 1000.0
+        if seconds <= 0:
+            return "This MP3 has no sound in it."
+    if seconds > MAX_CUSTOM_SECONDS:
+        return (f"The sound is {seconds:.1f} s long. A chime can be at most "
+                f"{MAX_CUSTOM_SECONDS:g} s.")
+    return None
+
+
+def _play_builtin(kind: str) -> bool:
     path = _ensure_chime(kind)
     try:
         if path is not None:
@@ -159,3 +314,36 @@ def play(kind: str = QUESTION) -> bool:
         return True
     except Exception:  # noqa: BLE001 - audio glitches must stay silent, not crash
         return False
+
+
+def play(kind: str = QUESTION, path: str | None = None) -> bool:
+    """Play one of the chimes asynchronously (never blocks the caller).
+
+    `path` is the user's custom sound for this kind, if they chose one. It
+    falls back to the built-in sound when the file is gone or will not play.
+    Returns True if playback was dispatched, False if unavailable/failed.
+    WAVs go to winsound with SND_ASYNC, which hands the file to the OS mixer
+    and returns at once. MP3s go to the MCI player thread, which rings the
+    built-in sound itself if the MP3 will not open. A second call while one is
+    still playing cuts the first off, which is the most a burst of agents
+    finishing together can do.
+    """
+    if winsound is None:
+        return False
+    ext = os.path.splitext(path)[1].lower() if path else ""
+    if path and ext == ".mp3" and os.path.isfile(path):
+        _stop_winsound()   # the two players never overlap
+        _mci_submit(lambda: _play_mp3(path) or _play_builtin(kind))
+        return True
+    if _mci_jobs is not None:
+        _mci_submit(_mci_close)
+    if path and ext == ".wav" and os.path.isfile(path):
+        try:
+            winsound.PlaySound(
+                path,
+                winsound.SND_FILENAME | winsound.SND_ASYNC
+                | winsound.SND_NODEFAULT)
+            return True
+        except Exception:  # noqa: BLE001 - e.g. a WAV winsound rejects
+            pass
+    return _play_builtin(kind)

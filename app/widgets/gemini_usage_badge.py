@@ -35,19 +35,12 @@ class GeminiUsageBadge(UsagePillBadge):
         # on the bar, and "which one is the weekly?" is the whole question
         self._label = True
 
-    def set_usage(self, usage) -> None:
-        """Adopt a reading. Never calls `setVisible` — a pill is on the bar when
-        it has content AND the user wants it, and only `TopBar` knows both. This
-        used to hide ITSELF whenever a reading carried no matching window, which
-        is the same silent-disappearance the Claude pill's can't-read state
-        exists to prevent; failures now route through `mark_unreadable`."""
-        self._loading = False
-        self._usage = usage
-        self._limit = (gemini_usage.weekly(usage) if self.window == "weekly"
-                       else gemini_usage.headline(usage))
-        self._unreadable = ""
-        self._stale = bool(usage.error) if usage else False
-        self._refresh_text()
+    def _pick_limit(self, usage):
+        """This pill's window. The pill used to hide ITSELF when a reading
+        carried no matching window, the same silent disappearance the
+        can't-read state exists to prevent; `TopBar` alone decides visibility."""
+        return (gemini_usage.weekly(usage) if self.window == "weekly"
+                else gemini_usage.headline(usage))
 
     # -- wording ---------------------------------------------------------
     def _loading_text(self) -> str:
@@ -78,7 +71,6 @@ class GeminiUsageBadge(UsagePillBadge):
             age = gemini_usage.format_countdown(
                 time.time() - self._usage.fetched_at)
             lines.append(f"Updated {age} ago")
-        if self._usage.error:
-            lines.append(f"Last refresh failed: {self._usage.error}")
+        lines.extend(self._failure_lines())
         lines.append("Click to refresh")
         return "\n".join(lines)

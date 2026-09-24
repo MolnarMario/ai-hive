@@ -327,6 +327,11 @@ class TerminalAgent(QObject):
     # comes from its Stop hook (note_turn_ended), the others' from
     # REPLY_QUIET_MS of silence after a settle (_on_reply_quiet).
     reply_finished = Signal()
+    # the user pressed Enter on a prompt of their own (note_prompt_submitted),
+    # and AI Hive handed the agent a task (deliver_task). Transient, for the
+    # event log only; neither is ever wired to a save.
+    user_prompted = Signal(str)
+    task_delivered = Signal(str)
     # the agent's live conversation was REPLACED (/clear, or a /resume onto a
     # different session), so the scrollback behind the current screen belongs
     # to a conversation that is no longer on display. Transient view signal.
@@ -395,6 +400,9 @@ class TerminalAgent(QObject):
         self._scheduled: list[ScheduledMessage] = []
         self._busy = False            # actively streaming output right now
         self._last_output_ts = 0.0    # walltime of the last output burst
+        # walltime of the last burst that counted as WORK (not typing echo);
+        # the usage poll's cadence follows it (see usage_poll.provider_active)
+        self._last_work_ts = 0.0
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
         # "a line has been submitted to this child since it launched", and the
         # mark that turn owns. See _note_submit / _on_idle_timeout: a settle is
@@ -670,6 +678,7 @@ class TerminalAgent(QObject):
         Called from TerminalCard, off TerminalView.promptSubmitted -- which
         fires ONLY on a bare Enter in the terminal, so AI Hive's own writes
         (deliver_task, nudge, scheduled sends) can never land here."""
+        self.user_prompted.emit(text)
         if not self.is_pty:
             return None
         self._mark_seq += 1
@@ -1036,6 +1045,7 @@ class TerminalAgent(QObject):
             return
         self.set_task(text)
         self.set_assignment(AssignmentState.WORKING)
+        self.task_delivered.emit(text)
         if not self.is_pty:
             self.send_command(text)
             return
@@ -1265,6 +1275,11 @@ class TerminalAgent(QObject):
         'working' signal, as opposed to is_running() which stays True for an
         interactive process idling at its prompt."""
         return self._busy
+
+    def last_work_at(self) -> float:
+        """Wall time this agent last produced output that counted as work
+        (keystroke echo excluded), or 0.0 if it never has."""
+        return self._last_work_ts
 
     def _has_stop_hook(self) -> bool:
         """Claude reports each turn's end through its Stop hook, which is
@@ -1518,6 +1533,7 @@ class TerminalAgent(QObject):
         # a pulse left over from real work still drops on schedule instead of
         # being held alive by the typing). Genuine work outlasts the window.
         if now - self._last_input_ts >= INPUT_ECHO_S:
+            self._last_work_ts = now
             if not self._busy:
                 self._busy = True
                 self.activity_changed.emit(True)
