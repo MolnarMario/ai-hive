@@ -9990,7 +9990,7 @@ def test_auto_continue_on_limit_reset():
     restarted = mk("Restarted")
     settle(restarted, BANNER)
     restarted.clear_limit_block()
-    restarted._limit_last_banner = ""    # what start()/restart() do
+    restarted._forget_limit_echo()       # what start()/restart() do
     restarted._on_pty_output("pty", BANNER)
     check("auto-continue: a (re)start forgets the echo guard",
           restarted.is_limit_blocked())
@@ -13332,6 +13332,229 @@ def test_limit_detection_hardening():
     pump(50)
 
 
+def test_limit_echo_after_self_continue():
+    """2026-09-25: the hourglass stayed on the Lifting App and TBE Site agents
+    after Claude Code continued on its own at the 5:50am reset.
+
+    Claude draws a cut-off twice: "You've hit your session limit \xb7 resets
+    5:50am" in the conversation, and the status row "Usage limit reached \xb7
+    continuing automatically at 5:50am" below it. The screen latched on the
+    status row. At the reset the CLI removed that row and got back to work,
+    so the older line became the last banner in view. Its wording differs, so
+    `same_banner` called it a NEW cut-off, and with its clock just passed it
+    was dated 24 h out. Nothing re-checked the latch before then.
+    """
+    import json as _json
+    import time as _time
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from app import limit_banner as lb
+    from app import limit_ledger, transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.widgets.main_window import MainWindow
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-limit-echo-"))
+    cwd = str(tmp)
+    now = int(_time.time())
+
+    def clock(at):
+        return _time.strftime("%I:%M%p", _time.localtime(at)).lstrip("0").lower()
+
+    def hit(at):
+        return f"You've hit your session limit \xb7 resets {clock(at)}"
+
+    def status(at):
+        return (f"Usage limit reached \xb7 continuing automatically at "
+                f"{clock(at)} \xb7 esc to cancel")
+
+    def mk(name):
+        a = TerminalAgent(build_spec(AgentKind.CLAUDE, name, cwd=cwd))
+        a._prompt_ready = True
+        a.status = AgentStatus.RUNNING
+        a.spec.session_id = "sid-" + name.lower()
+        return a
+
+    def show(agent, text):
+        agent._screen_tail = text + "\n  ? for shortcuts\n"
+        agent._scrape_limit()
+
+    reset = now + 60
+    PARKED = hit(reset) + "\n" + status(reset)
+    WORKING = hit(reset) + "\nMoved the date row into the Today tab."
+
+    # --- the clock identity -------------------------------------------------
+    check("limit-echo: the status row and the conversation's line name the "
+          "same clock", lb.banner_clock_key(hit(reset))
+          == lb.banner_clock_key(status(reset)) != "")
+    check("limit-echo: ...which same_banner alone cannot see",
+          not lb.same_banner(hit(reset), status(reset)))
+    check("limit-echo: '5am' and '5:00am' are one clock",
+          lb.banner_clock_key("resets 5am") == lb.banner_clock_key(
+              "resets 5:00am") == "5:00am")
+    check("limit-echo: a jump-painted row keys like a spaced one",
+          lb.banner_clock_key("You'vehityoursessionlimit\xb7resets5:50am")
+          == lb.banner_clock_key("You've hit your session limit \xb7 "
+                                 "resets 5:50am"))
+    check("limit-echo: a dated clock keeps its date",
+          lb.banner_clock_key("resets Sep 30, 9am") == "sep30,9:00am")
+    check("limit-echo: a clockless banner has no key",
+          lb.banner_clock_key("You've hit your session limit") == "")
+
+    # --- the live screen ----------------------------------------------------
+    a = mk("Echo")
+    show(a, PARKED)
+    check("limit-echo: the parked agent latches on the status row",
+          a.is_limit_blocked() and lb.banner_key(
+              a.limit_banner_text()).startswith("usagelimitreached"),
+          a.limit_banner_text())
+    a.clear_limit_block()                  # the PHANTOM dismissal at 5:50
+    show(a, WORKING)                       # the CLI continued, row gone
+    check("limit-echo: the conversation's own line, left as the last banner "
+          "after the CLI continues, does NOT re-latch", not a.is_limit_blocked())
+    show(a, hit(now + 3 * 3600))
+    check("limit-echo: a banner with a different clock still latches",
+          a.is_limit_blocked())
+
+    b = mk("NextDay")
+    show(b, PARKED)
+    b.clear_limit_block()
+    b._limit_last_reset -= 20 * 3600       # that reset was 20 h ago
+    show(b, WORKING)
+    check("limit-echo: the same clock a day later is a genuine new cut-off",
+          b.is_limit_blocked())
+
+    r = mk("Restart")
+    show(r, PARKED)
+    r.clear_limit_block()
+    r._forget_limit_echo()                 # what start()/restart() do
+    show(r, WORKING)
+    check("limit-echo: a (re)start forgets the clock too", r.is_limit_blocked())
+
+    d = mk("Disk")
+    d.mark_limit_blocked(float(reset), banner=hit(reset) + " (Europe/Bucharest)")
+    d.clear_limit_block()
+    show(d, status(reset))
+    check("limit-echo: a latch recovered from disk arms the clock guard too",
+          not d.is_limit_blocked())
+
+    # --- the conversation on disk -------------------------------------------
+    def iso(at):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(at))
+
+    def write(sid, records):
+        path = transcripts.transcript_path(cwd, sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(_json.dumps(_as_cli_wrote(rec)) + "\n")
+
+    def user(text, at):
+        return {"type": "user", "timestamp": iso(at),
+                "message": {"role": "user", "content": text}}
+
+    def reply(text, at):
+        return {"type": "assistant", "timestamp": iso(at),
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    def notice(at):
+        return {"type": "system", "subtype": "informational", "timestamp":
+                iso(at), "content": "Usage limit reset \xb7 continuing "
+                                    "automatically"}
+
+    ask, cut = user("fix the date row", now - 300), reply(hit(reset), now - 290)
+    write("sid-tx-on", [ask, cut, notice(now + 50), reply("Moved it.", now + 70)])
+    info = transcripts.limit_cut_off(cwd, "sid-tx-on")
+    check("limit-echo: work after a cut-off dates when it carried on",
+          not info["cut_off"] and info["carried_on_at"] == now + 70, info)
+    write("sid-tx-stuck", [ask, cut])
+    check("limit-echo: a conversation still on its cut-off never carried on",
+          transcripts.limit_cut_off(cwd, "sid-tx-stuck")["carried_on_at"]
+          == 0.0)
+    write("sid-tx-self", [ask, cut, notice(now + 50)])
+    info = transcripts.limit_cut_off(cwd, "sid-tx-self")
+    check("limit-echo: the CLI's reset notice counts as carrying on",
+          info["self_resumed"] and info["carried_on_at"] == now + 50, info)
+
+    # --- a background task hitting the same spent limit later ---------------
+    # The same morning: the real cut-off at 03:16 stopped work, a background
+    # command's notification hit the limit again at 05:16, and the reader
+    # let that plumbing turn replace the real cut-off. AI Hive then dismissed
+    # all three agents as PHANTOM and would never have resumed them.
+    def notif(at):
+        return user("<task-notification> <task-id>b1</task-id> "
+                    "</task-notification>", at)
+
+    def quota(at, reset):
+        return dict(reply(hit(reset), at), quotaLimits={
+            "status": "rejected", "resetsAt": int(reset),
+            "rateLimitType": "five_hour"})
+
+    write("sid-tx-bg", [ask, cut, notif(now - 100), reply(hit(reset), now - 99)])
+    info = transcripts.limit_cut_off(cwd, "sid-tx-bg")
+    check("limit-echo: a background task hitting the limit again does not "
+          "cancel the real cut-off before it", info["cut_off"]
+          and not info["synthetic"] and info["at"] == now - 290, info)
+    write("sid-tx-bg-later", [ask, quota(now - 290, now + 60), notif(now - 100),
+                              quota(now - 99, now + 7200)])
+    info = transcripts.limit_cut_off(cwd, "sid-tx-bg-later")
+    check("limit-echo: ...and takes the later reset the refusal stated",
+          info["cut_off"] and info["resets_at"] == now + 7200
+          and info["at"] == now - 290, info)
+    write("sid-tx-bg-only", [ask, reply("Done.", now - 290), notif(now - 100),
+                             reply(hit(reset), now - 99)])
+    info = transcripts.limit_cut_off(cwd, "sid-tx-bg-only")
+    check("limit-echo: with nothing open, a background task's cut-off is "
+          "still synthetic", not info["cut_off"] and info["synthetic"], info)
+    write("sid-tx-bg-work", [ask, cut, reply("Picked it back up.", now - 200),
+                             notif(now - 100), reply(hit(reset), now - 99)])
+    info = transcripts.limit_cut_off(cwd, "sid-tx-bg-work")
+    check("limit-echo: real work between the two means the first cut-off "
+          "was over", not info["cut_off"] and info["synthetic"], info)
+
+    # --- the minute watchdog clears a latch the conversation moved past -----
+    agents, audits, outcomes = [], [], []
+    stub = SimpleNamespace(
+        manager=SimpleNamespace(all_agents=lambda: agents),
+        _resume_pending=set(), _limit_audit=audits.append,
+        _ledger_outcome=lambda ag, o, detail="":
+            outcomes.append((ag.spec.name, o)))
+
+    def latched(name, records):
+        ag = mk(name)
+        write(ag.spec.session_id, records)
+        show(ag, PARKED)
+        agents.append(ag)
+        return ag
+
+    on = latched("On", [ask, cut, reply("Moved it.", now + 60)])
+    selfr = latched("Self", [ask, cut, notice(now + 60)])
+    unflushed = latched("Unflushed", [ask, reply("working", now - 100)])
+    stuck = latched("Stuck", [ask, cut])
+    nudged = latched("Nudged", [ask, cut, reply("Moved it.", now + 60)])
+    nudged.note_limit_attempt()
+    pending = latched("Pending", [ask, cut, reply("Moved it.", now + 60)])
+    stub._resume_pending.add(pending.id)
+    cleared = MainWindow._clear_carried_on_latches(stub)
+    check("limit-echo: a latch with work written after it is cleared",
+          not on.is_limit_blocked()
+          and ("On", limit_ledger.DISMISSED) in outcomes, outcomes)
+    check("limit-echo: ...and one the CLI resumed itself is filed as resumed",
+          not selfr.is_limit_blocked()
+          and ("Self", limit_ledger.RESUMED) in outcomes, outcomes)
+    check("limit-echo: work from BEFORE the latch (banner not flushed yet) "
+          "keeps it", unflushed.is_limit_blocked())
+    check("limit-echo: a conversation still ending on the cut-off keeps it",
+          stuck.is_limit_blocked())
+    check("limit-echo: a nudge already sent is left to its verify",
+          nudged.is_limit_blocked() and pending.is_limit_blocked())
+    check("limit-echo: exactly those two, each with an audit line",
+          cleared == 2 and len(audits) == 2
+          and any("CARRIED-ON" in x for x in audits), audits)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_event_log():
     """The app-wide event log: one timeline of every agent in every workspace
     (app/event_log.py storage, app/event_hub.py collector, the window in
@@ -13723,6 +13946,7 @@ def main():
     test_startup_limit_recovery()
     test_reset_clock_zones()
     test_limit_detection_hardening()
+    test_limit_echo_after_self_continue()
     test_terminal_scrollbar()
     test_reply_marks_inline()
     test_reply_marks_recovered_from_transcript()

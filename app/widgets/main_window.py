@@ -2614,6 +2614,7 @@ class MainWindow(QMainWindow):
         # The second detector runs first, so a cut-off it adopts is judged by
         # the very same `due` below on this same tick.
         self._sweep_transcript_cut_offs()
+        self._clear_carried_on_latches()
         now = time.time()
         # Late-fill a due time for anything still lacking one (the account
         # reading may only have arrived after the cut-off was latched).
@@ -2712,6 +2713,52 @@ class MainWindow(QMainWindow):
                                      exact=info.get("exact", False))
             adopted += 1
         return adopted
+
+    def _clear_carried_on_latches(self) -> int:
+        """Drop any Claude latch the conversation on disk has already moved
+        past. Returns how many it cleared.
+
+        Before this, a stale latch was only noticed at its own reset time, by
+        the pre-nudge transcript check. That is fine for a genuine cut-off and
+        bad for a false one: an echo latch is dated a DAY out (its clock has
+        just passed), so the hourglass sat on a working agent and muted its "?"
+        chime for 24 h. It happened on 2026-08-04, 08-07 and 09-25, each time
+        by a different route past the screen's echo guard.
+
+        The evidence is strictly positive: a record that closed the cut-off
+        (ordinary output, or the CLI's own reset notice) written AFTER the
+        latch. "Not cut off" alone is not enough, because a banner Claude has
+        drawn but not flushed yet reads that way too (see
+        `transcripts.limit_cut_off`). An agent with a nudge in flight or
+        already sent is left to its verify, which owns that outcome.
+        """
+        cleared = 0
+        for agent in self.manager.all_agents():
+            spec = agent.spec
+            if (spec.provider != "claude" or not agent.is_limit_blocked()
+                    or agent.limit_attempts() or not spec.session_id
+                    or agent.id in self._resume_pending):
+                continue
+            info = transcripts.limit_cut_off(spec.cwd, spec.session_id)
+            if (not info or info["cut_off"]
+                    or info.get("carried_on_at", 0.0)
+                    <= agent.limit_latched_at()):
+                continue
+            if info.get("self_resumed"):
+                self._limit_audit(f"SELF-RESUMED agent={spec.name} (the CLI "
+                                  f"continued on its own after the latch)")
+                self._ledger_outcome(agent, limit_ledger.RESUMED,
+                                     detail="the CLI continued on its own")
+            else:
+                self._limit_audit(f"CARRIED-ON agent={spec.name} (the "
+                                  f"conversation has new work after the "
+                                  f"latch)")
+                self._ledger_outcome(
+                    agent, limit_ledger.DISMISSED,
+                    detail="the conversation carried on after the latch")
+            agent.clear_limit_block()
+            cleared += 1
+        return cleared
 
     def _resume_blocked_agents(self, due=None) -> None:
         """The plan limit reset — put the agents it cut off back to work.

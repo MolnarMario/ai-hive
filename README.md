@@ -212,14 +212,16 @@ workspaces keep executing — switching never pauses anything.
   usage API being reachable — it fires from the agent's own stated reset even
   when the account readout is rate-limited. Every step is logged to
   `session.log` (`BLOCKED` / `LATE-LATCH` / `NUDGE` / `RESUMED` /
-  `SELF-RESUMED` / `STILL-BLOCKED`), each resumed
+  `SELF-RESUMED` / `CARRIED-ON` / `STILL-BLOCKED`), each resumed
   card shows a `— plan limit reset; auto-continued —` line, and the workspace
   board gets a note. A stopped agent is also visible at a glance, everywhere,
   live: an **⏳ hourglass** sits in the card header and next to the agent in
   the sidebar's expanded workspace dropdown, and the workspace row itself
   carries an **⏳N** badge counting how many of its agents are currently
   stuck — all three clear the instant that agent resumes, whether that was
-  auto-continue or you restarting it yourself.
+  auto-continue or you restarting it yourself. If Claude Code continues on
+  its own, the hourglass clears within a minute of the conversation
+  writing new work.
 
   **Gemini agents are covered too**, with the differences their CLI forces.
   agy refuses a turn with `⚠ Individual quota reached … Resets in 1h40m21s`
@@ -760,7 +762,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-2065 checks drive the real app headlessly (offscreen Qt platform) with real
+2090 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -893,7 +895,7 @@ app/
                            its consent modal + its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (2065 checks)
+tests/smoke_test.py        headless end-to-end suite (2090 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

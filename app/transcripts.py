@@ -506,10 +506,13 @@ def limit_cut_off(cwd: str, session_id: str) -> dict | None:
 
     Returns None when there is no readable transcript at all, and otherwise
     `{"cut_off", "at", "resets_at", "banner", "window", "synthetic", "exact",
-    "self_resumed"}`. `exact` says `resets_at` came from the record's own
-    `quotaLimits` epoch or a dated clock rather than a bare wall time;
-    `self_resumed` says the conversation's last word on the limit was the
-    CLI's own "Usage limit reset" notice, i.e. it continued without AI Hive.
+    "self_resumed", "carried_on_at"}`. `exact` says `resets_at` came from the
+    record's own `quotaLimits` epoch or a dated clock rather than a bare wall
+    time; `self_resumed` says the conversation's last word on the limit was
+    the CLI's own "Usage limit reset" notice, i.e. it continued without AI
+    Hive. `carried_on_at` is the epoch of the record that last closed a
+    cut-off (0.0 when none did): work written AFTER a screen latch is positive
+    proof the latch is stale, which "not cut off" alone never is.
 
     The distinction between "the conversation carried on" and "there is no
     conversation to read" is what makes this safe to act on. A caller using it
@@ -620,7 +623,7 @@ def _is_real_prompt(rec: dict) -> bool:
 def _no_cut_off(**extra) -> dict:
     found = {"cut_off": False, "at": 0.0, "resets_at": 0.0, "banner": "",
              "window": "", "synthetic": False, "exact": False,
-             "self_resumed": False}
+             "self_resumed": False, "carried_on_at": 0.0}
     found.update(extra)
     return found
 
@@ -638,6 +641,10 @@ def _read_limit_cut_off(path: str) -> dict | None:
       * ordinary assistant output closes it (the conversation carried on), as
         does the CLI's "Usage limit reset" notice (it continued on its own,
         reported as `self_resumed`) or a grace "release" note;
+      * a cut-off line behind a plumbing turn (`_is_synthetic_user_turn`)
+        reads as `synthetic` only when no cut-off is open. Behind an open one
+        it is the same spent limit refusing again, and the open cut-off
+        stands;
       * every OTHER system record is IGNORED. This is the bug that let a
         genuine cut-off be dismissed: any system record with text content
         used to overwrite the verdict, and Claude writes those to idle
@@ -656,6 +663,11 @@ def _read_limit_cut_off(path: str) -> dict | None:
     found = _no_cut_off()
     last_user_synthetic = False   # no evidence yet -> assume a real turn
     grace_hold = False            # inside a grace window's wrap-up turn
+    # the record that last closed a cut-off (ordinary output, or the CLI's
+    # reset notice); its timestamp becomes `carried_on_at`. Kept as the record
+    # and parsed once at the end, because an active transcript is re-read
+    # every minute and has thousands of assistant records.
+    closer = None
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -678,10 +690,10 @@ def _read_limit_cut_off(path: str) -> dict | None:
                         found = _no_cut_off(cut_off=True,
                                             at=_record_epoch(rec),
                                             banner="Usage limit reached")
-                        grace_hold = True
+                        grace_hold, closer = True, None
                         continue
                     if note == "release":
-                        found, grace_hold = _no_cut_off(), False
+                        found, grace_hold, closer = _no_cut_off(), False, None
                         continue
                     if rec.get("isMeta"):
                         continue      # injected context, not a turn
@@ -695,7 +707,7 @@ def _read_limit_cut_off(path: str) -> dict | None:
                         continue
                     if limit_banner.is_reset_notice(text):
                         found = _no_cut_off(self_resumed=True)
-                        grace_hold = False
+                        grace_hold, closer = False, rec
                         continue
                     banner = limit_banner.banner_line(text)
                     if not banner:
@@ -706,7 +718,7 @@ def _read_limit_cut_off(path: str) -> dict | None:
                               if _is_api_error_record(rec) else "")
                     if not banner:
                         if not grace_hold:
-                            found = _no_cut_off()
+                            found, closer = _no_cut_off(), rec
                         continue
                 else:
                     continue
@@ -717,9 +729,7 @@ def _read_limit_cut_off(path: str) -> dict | None:
                 # evidence and only that: a banner we DID see, refuted by the
                 # turn behind it, which keeps "the record isn't written yet"
                 # distinguishable from "this was never real work".
-                if last_user_synthetic:
-                    found = _no_cut_off(synthetic=True)
-                    continue
+                closer = None     # a banner: whatever carried on came before it
                 when = _record_epoch(rec)
                 resets_at, q_window = _quota_reset(rec)
                 exact = bool(resets_at)
@@ -729,12 +739,32 @@ def _read_limit_cut_off(path: str) -> dict | None:
                     resets_at = limit_banner.banner_reset_at(text, when) or 0.0
                     exact = (bool(resets_at)
                              and limit_banner.reset_is_dated(text))
+                window = q_window or limit_banner.banner_window(banner)
+                if last_user_synthetic:
+                    # A cut-off still OPEN from an earlier real turn stays
+                    # open. The plumbing turn hit the same spent limit, and
+                    # it refutes nothing: no real work has run since that
+                    # earlier cut-off, or it would have closed. On 2026-09-25
+                    # three agents stopped mid-task at 03:16, background
+                    # commands finished at 05:16 and hit the limit again, and
+                    # this branch replaced the real cut-off with the
+                    # synthetic one. AI Hive dismissed all three as PHANTOM
+                    # and would have left them idle if Claude Code had not
+                    # continued them itself. Only the later reset is kept,
+                    # since a still-spent limit answers with the current one.
+                    if not found["cut_off"]:
+                        found = _no_cut_off(synthetic=True)
+                    elif resets_at > found["resets_at"]:
+                        found.update(resets_at=resets_at, exact=exact,
+                                     window=window or found["window"])
+                    continue
                 found = _no_cut_off(
-                    cut_off=True, at=when, banner=banner,
-                    window=q_window or limit_banner.banner_window(banner),
+                    cut_off=True, at=when, banner=banner, window=window,
                     resets_at=resets_at, exact=exact)
     except OSError:
         return cached[2] if cached else None
+    if closer is not None:
+        found["carried_on_at"] = _record_epoch(closer)
     _LIMIT_CACHE[path] = (st.st_mtime, st.st_size, found)
     return found
 
