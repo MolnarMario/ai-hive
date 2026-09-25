@@ -151,6 +151,11 @@ LIMIT_REPLAY_S = 120.0
 # searches: anything further up has real work after it and is history.
 LIMIT_REPLAY_TAIL_LINES = 12
 
+# How close to a latched cut-off's reset another banner naming the SAME clock
+# still counts as that cut-off redrawn rather than a new one. See
+# `_echoes_last_clock` for why 12 h is safe in both directions.
+LIMIT_ECHO_WINDOW_S = 12 * 3600
+
 # strips escape sequences so on-screen TEXT can be matched: the raw stream
 # positions words individually ("trust\x1b[20Gthis\x1b[25Gfolder"), so a
 # phrase can never be matched against raw bytes
@@ -218,7 +223,7 @@ _READY_HINTS_DESPACED = tuple(_despace(h) for h in _CLAUDE_READY_HINTS)
 #    repaint) long after a resume, so it must never re-latch an agent that has
 #    already been resumed off it — see `_scrape_limit`.
 from .limit_banner import (LIMIT_MENU_RE, LIMIT_PROVIDERS,  # noqa: F401
-                           banner_clock_text, banner_due_now,
+                           banner_clock_key, banner_clock_text, banner_due_now,
                            banner_line, banner_reset_at, banner_window,
                            gemini_banner_line, gemini_reset_at,
                            is_limit_screen, parse_reset_clock,
@@ -433,6 +438,11 @@ class TerminalAgent(QObject):
         # cut-off, kept ACROSS clear_limit_block so the same line still on
         # screen can't re-latch the agent we just resumed (see _scrape_limit)
         self._limit_last_banner = ""
+        # ...and the reset clock that latch stated plus the epoch it resolved
+        # to. A second line naming the same clock around that time is the same
+        # cut-off drawn a different way (see `_echoes_last_clock`).
+        self._limit_last_clock = ""
+        self._limit_last_reset = 0.0
         # optional hook (set by WorkspaceManager._wire_agent): a line into
         # session.log. Only used by _note_limit_skip; None is a no-op.
         self.audit = None
@@ -499,8 +509,7 @@ class TerminalAgent(QObject):
         self._reset_waiting()
         self._reset_bg_shell()
         self.clear_limit_block()
-        self._limit_last_banner = ""   # a new screen: nothing is an echo yet
-        self._limit_last_skip = None   # ...so a skip is reported again too
+        self._forget_limit_echo()      # a new screen: nothing is an echo yet
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         self._turn_open = False        # nothing asked yet, so nothing to stamp
@@ -569,8 +578,7 @@ class TerminalAgent(QObject):
         self._reset_waiting()
         self._reset_bg_shell()
         self.clear_limit_block()
-        self._limit_last_banner = ""   # a new screen: nothing is an echo yet
-        self._limit_last_skip = None   # ...so a skip is reported again too
+        self._forget_limit_echo()      # a new screen: nothing is an echo yet
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         if self.spec.provider in ("claude", "gemini"):  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
@@ -1718,15 +1726,22 @@ class TerminalAgent(QObject):
             # Compared by `same_banner`, not `==`: the same row comes back
             # spaced on one repaint and cursor-positioned (despaced) on the
             # next, and a plain compare read those as two different cut-offs.
-            if not banner or same_banner(banner, self._limit_last_banner):
-                if banner:
-                    self._note_limit_skip("no menu, and the same banner line "
-                                          "already produced a latch", banner)
+            if not banner:
+                return
+            if same_banner(banner, self._limit_last_banner):
+                self._note_limit_skip("no menu, and the same banner line "
+                                      "already produced a latch", banner)
+                return
+            if self._echoes_last_clock(banner_clock_text(region) or banner):
+                self._note_limit_skip("no menu, and the banner names the "
+                                      "reset clock of the cut-off already "
+                                      "latched", banner)
                 return
         self._limit_blocked = True
         self._limit_at = time.time()
         self._limit_cut_off_at = self._limit_at   # seen as it happened
-        self._limit_last_banner = banner
+        self._remember_limit_echo(banner, banner_clock_text(region) or banner,
+                                  resets_at)
         self._limit_banner = banner
         self._limit_window = window
         # The reset clock lives in the banner, not the menu, so it may be
@@ -1739,6 +1754,38 @@ class TerminalAgent(QObject):
         # sense but the source, so it answers to the toggle that owns those.
         self._limit_from_startup = from_replay
         self.limit_blocked_changed.emit(True)
+
+    def _remember_limit_echo(self, banner: str, clock_text: str,
+                             resets_at: float | None) -> None:
+        """Arm the echo guard with the cut-off just latched: its banner line,
+        and the reset clock it stated with the epoch that clock resolved to."""
+        self._limit_last_banner = banner
+        self._limit_last_clock = banner_clock_key(clock_text)
+        self._limit_last_reset = resets_at or 0.0
+
+    def _forget_limit_echo(self) -> None:
+        """Disarm the echo guard. Only for a screen that starts over
+        (start/restart); `clear_limit_block` must NOT call this."""
+        self._limit_last_banner = ""
+        self._limit_last_clock = ""
+        self._limit_last_reset = 0.0
+        self._limit_last_skip = None   # ...so a skip is reported again too
+
+    def _echoes_last_clock(self, clock_text: str) -> bool:
+        """Whether a banner naming this clock is the last latched cut-off drawn
+        another way (see `limit_banner.banner_clock_key`).
+
+        Bounded in time because a wall clock does come round again. The echo
+        shows up around the reset itself, when the CLI continues on its own.
+        A genuine new cut-off naming the same clock resets a day after the old
+        one, so it latches at least 19 h after that reset (a session window is
+        at most 5 h long). LIMIT_ECHO_WINDOW_S sits between the two, and the
+        transcript sweep still catches anything this lets pass."""
+        clock = banner_clock_key(clock_text)
+        return bool(clock and clock == self._limit_last_clock
+                    and self._limit_last_reset
+                    and abs(time.time() - self._limit_last_reset)
+                    <= LIMIT_ECHO_WINDOW_S)
 
     def _in_launch_replay(self) -> bool:
         """Whether output arriving now can still be a previous session being
@@ -1928,7 +1975,7 @@ class TerminalAgent(QObject):
         # spaced line and the screen's cursor-positioned, possibly wrapped
         # first row of the same banner are recognised as one cut-off.
         if banner:
-            self._limit_last_banner = banner
+            self._remember_limit_echo(banner, banner, resets_at)
         self.limit_blocked_changed.emit(True)
 
     def limit_window(self) -> str:
