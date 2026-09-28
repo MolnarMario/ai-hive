@@ -193,15 +193,15 @@ def _home() -> str:
     return os.environ.get("USERPROFILE") or os.path.expanduser("~")
 
 
-def native_launcher_path() -> str:
+def native_launcher_path(home: str | None = None) -> str:
     """`%USERPROFILE%\\.local\\bin\\claude.exe`, whether or not it exists."""
-    return os.path.join(_home(), *_NATIVE_BIN, "claude.exe")
+    return os.path.join(home or _home(), *_NATIVE_BIN, "claude.exe")
 
 
-def native_share_dir() -> str:
+def native_share_dir(home: str | None = None) -> str:
     """`%USERPROFILE%\\.local\\share\\claude`, the payload directory the
     documented uninstall removes."""
-    return os.path.join(_home(), *_NATIVE_SHARE)
+    return os.path.join(home or _home(), *_NATIVE_SHARE)
 
 
 def native_versions_dir() -> str:
@@ -821,7 +821,8 @@ def _alive_detail(alive: int) -> str:
 
 
 def revert(runner, on_event=None,
-           timeout: float = cli_update.INSTALL_TIMEOUT_S) -> Result:
+           timeout: float = cli_update.INSTALL_TIMEOUT_S,
+           home: str | None = None) -> Result:
     """The FULL undo: put the WinGet package back, then remove the native one.
 
     Deliberately secondary to pause/resume in the panel, because it is a second
@@ -831,8 +832,12 @@ def revert(runner, on_event=None,
     Order matters and is not interchangeable: the WinGet copy is installed and
     VERIFIED FIRST, so a failed reinstall leaves the user with the working
     native install rather than with nothing. The native files come off only
-    after that, and only when nothing is running them."""
-    launcher = native_launcher_path()
+    after that, and only when nothing is running them.
+
+    `home` pins the profile whose native install is deleted. The panel leaves
+    it to %USERPROFILE%; the smoke test passes its temp folder explicitly, so
+    a change to how _home() resolves can never aim this at a real install."""
+    launcher = native_launcher_path(home)
     alive = cli_update.count_processes((_image_name(launcher),), runner,
                                        cli_update.CHECK_TIMEOUT_S, exe=launcher)
     if alive != 0:
@@ -853,7 +858,7 @@ def revert(runner, on_event=None,
                       detail="the restored WinGet copy could not report a "
                              "version, so the native install was left in place")
 
-    removed, problem = _remove_native()
+    removed, problem = _remove_native(home)
     if problem:
         return Result(False, "revert", after=after,
                       detail=f"WinGet Claude Code {after} is back, but the "
@@ -861,11 +866,11 @@ def revert(runner, on_event=None,
     return Result(True, "revert", after=after, detail=removed)
 
 
-def _remove_native() -> tuple:
+def _remove_native(home: str | None = None) -> tuple:
     """Delete the documented native install (`~\\.local\\bin\\claude.exe` and
     `~\\.local\\share\\claude`). Returns (what was removed, problem)."""
     removed = []
-    launcher, share = native_launcher_path(), native_share_dir()
+    launcher, share = native_launcher_path(home), native_share_dir(home)
     try:
         if os.path.isfile(launcher):
             os.remove(launcher)

@@ -356,7 +356,7 @@ class TerminalAgent(QObject):
         self._live_mode = (getattr(spec, "permission_mode", "") or "").strip()
         self._live_model = self._seed_model()
         self.assignment = AssignmentState.IDLE  # task-assignment lifecycle
-        self.auto_created = False           # created with a task via spawn_worker
+        self.auto_created = False  # only ever restored from older sessions
         self.autostart_on_restore = False  # set from persisted run state
         self.log: deque = deque(maxlen=LOG_CAP)  # line-mode segments
         self._pty_buffer: list[str] = []         # pty raw tail (for replay)
@@ -1033,7 +1033,7 @@ class TerminalAgent(QObject):
         }
 
     def deliver_task(self, text: str) -> None:
-        """Give this agent a task to work on (spawn_worker/reassign path).
+        """Give this agent a task to work on (the reassign path).
 
         For a pty agent (Claude Code) the task is delivered only once the TUI
         is prompt-ready (we watch its output stream for bracketed-paste-enable,

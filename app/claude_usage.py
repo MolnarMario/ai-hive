@@ -14,12 +14,10 @@ bearer token (the binary logs it verbatim: "fetchUtilization: GET
 of limit-window name -> {utilization, resets_at} (plus `limits[]`, `extra_usage`
 and `spend`, which we ignore).
 
-The same payload is ALSO cached on disk by the CLI at `~/.claude.json` ->
-`cachedUsageUtilization`, and `read_cached()` parses it with the very same
-`parse_utilization`. That copy is only a COLD-START SEED and an offline
-fallback, never the primary source: the CLI rewrites it opportunistically, so it
-goes stale for days (observed 1.5 days / 10 points out of date while the live
-endpoint was correct). Always prefer `fetch()`; fall back to the cache.
+The CLI used to cache the same payload at `~/.claude.json` ->
+`cachedUsageUtilization`. AI Hive no longer reads it: it went stale for days
+(observed 1.5 days / 10 points out of date while the live endpoint was
+correct), and CLI 2.1.220 stopped writing it. `fetch()` is the only source.
 
 TOKEN HANDLING IS STRICTLY READ-ONLY. The bearer token is re-read from
 `.credentials.json` on every call — AI Hive keeps Claude agents running, and
@@ -143,18 +141,6 @@ def config_dir() -> Path:
 
 def credentials_path() -> Path:
     return config_dir() / ".credentials.json"
-
-
-def cache_path() -> Path:
-    """The CLI's global config blob, which holds `cachedUsageUtilization`.
-
-    Note this is `~/.claude.json` (a FILE beside the config dir), not a file
-    inside it — and it follows CLAUDE_CONFIG_DIR when that is set.
-    """
-    env = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
-    if env:
-        return Path(env) / ".claude.json"
-    return Path.home() / ".claude.json"
 
 
 def _read_json(path: Path) -> dict:
@@ -302,27 +288,6 @@ def fetch(timeout: float = 6.0) -> Usage:
     limits = parse_utilization(payload if isinstance(payload, dict) else {})
     return Usage(limits=limits, fetched_at=time.time(), source="live",
                  plan=_plan(), error="" if limits else "no-limits")
-
-
-def read_cached() -> Usage | None:
-    """The CLI's own last reading, for an instant first paint at startup.
-
-    Returns None when there is no usable cache. `fetched_at` is the CLI's
-    timestamp, NOT now — so a caller can tell the user how old this is and
-    replace it the moment a live fetch lands.
-    """
-    try:
-        blob = _read_json(cache_path()).get("cachedUsageUtilization")
-    except (OSError, ValueError):
-        return None
-    if not isinstance(blob, dict):
-        return None
-    limits = parse_utilization(blob.get("utilization") or {})
-    if not limits:
-        return None
-    fetched = blob.get("fetchedAtMs")
-    at = float(fetched) / 1000.0 if isinstance(fetched, (int, float)) else 0.0
-    return Usage(limits=limits, fetched_at=at, source="cache", plan=_plan())
 
 
 # ----------------------------------------------------------- formatting -----
