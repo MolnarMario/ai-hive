@@ -295,6 +295,10 @@ def main() -> int:
     # this one installs software and rewrites the user's own
     # ~/.claude/settings.json, so the runner is armed here and nowhere else.
     window.arm_cli_install()
+    # ...and to the version button fetching from GitHub and fast-forwarding
+    # this clone. The suite runs FROM this clone, so it must never be armed
+    # there.
+    window.arm_self_update()
     window.refresh_install_state()
     if gate is not None:
         window.note_update_outcomes(gate.outcomes, gate.installing)

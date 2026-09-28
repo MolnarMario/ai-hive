@@ -441,6 +441,7 @@ class TopBar(QFrame):
     startupRecoveryToggled = Signal(bool)  # recover cut-off agents on startup
     usageRefreshRequested = Signal()       # user clicked the readout
     eventLogClicked = Signal()             # open the event log window
+    appUpdateClicked = Signal()            # check for / show an AI Hive update
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -463,6 +464,11 @@ class TopBar(QFrame):
         self._name.setObjectName("AppName")
         self._version = QLabel(f"v{__version__}", self)
         self._version.setObjectName("VersionBadge")
+        self.app_update_btn = QToolButton(self)
+        self.app_update_btn.setObjectName("AppUpdateBtn")
+        self.app_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.app_update_btn.clicked.connect(self.appUpdateClicked)
+        self.set_app_update_state()
 
         self.add_terminal_btn = QToolButton(self)
         self.add_terminal_btn.setObjectName("AddTerminalBtn")
@@ -747,6 +753,7 @@ class TopBar(QFrame):
         lay.addWidget(self._logo)
         lay.addWidget(self._name)
         lay.addWidget(self._version)
+        lay.addWidget(self.app_update_btn)
         lay.addSpacing(12)
         # A bare stretch keeps the identity block left-anchored and the extras
         # row does NOT get one, which only works because
@@ -765,6 +772,18 @@ class TopBar(QFrame):
 
     def _open_options(self) -> None:
         self.options_panel.toggle_under(self.options_btn)
+
+    APP_UPDATE_IDLE_TEXT = "↻"
+    APP_UPDATE_IDLE_TIP = "Check GitHub for a newer AI Hive"
+
+    def set_app_update_state(self, text: str = "", tooltip: str = "",
+                             attention: bool = False) -> None:
+        """The button beside the version badge. No arguments is the idle
+        refresh glyph; anything else is what the last check found."""
+        self.app_update_btn.setText(text or self.APP_UPDATE_IDLE_TEXT)
+        self.app_update_btn.setToolTip(tooltip or self.APP_UPDATE_IDLE_TIP)
+        self.app_update_btn.setProperty("attention", bool(attention))
+        ui_theme.repolish(self.app_update_btn)
 
     def set_log_attention(self, open_questions: int) -> None:
         """The log button reads "Log", or "Log ? 2" while two agents are
@@ -2097,6 +2116,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Shift+B"), self, self._toggle_sidebar)
         QShortcut(QKeySequence("Ctrl+Shift+L"), self, self.open_event_log)
         self.top_bar.eventLogClicked.connect(self.open_event_log)
+        self.top_bar.appUpdateClicked.connect(self.check_for_app_update)
 
     # ------------------------------------------------------------- sidebar ---
 
@@ -3298,6 +3318,114 @@ class MainWindow(QMainWindow):
         gate runs before the window exists."""
         self._auto_update = bool(enabled)
         self._schedule_save()
+
+    # ------------------------------------------------ updating AI Hive ---
+    # `app/self_update.py` decides and `self_update_dialog.py` shows. Nothing
+    # here is persisted (the state is re-derived by every check) and nothing
+    # here closes the window: after an update lands, the user restarts when
+    # their agents are at a good point.
+
+    APP_UPDATE_FLASH_MS = 6000  # how long "Up to date" / "Check failed" stay
+
+    def arm_self_update(self, runner=None, repo: str = "") -> None:
+        """Let the version button reach GitHub. Called from `main.py` alone:
+        the offscreen suite shares `create_main_window` and must never fetch
+        or merge into the clone it runs from. `repo` is for tests."""
+        from app import self_update
+        self._self_update_runner = runner or self_update.subprocess_runner
+        self._self_update_repo = repo or self_update.REPO_DIR
+
+    def check_for_app_update(self) -> None:
+        """The button beside the version: fetch main off the GUI thread, then
+        show what was found. A click while the dialog is open raises it."""
+        from app import self_update
+        from .self_update_dialog import Job
+
+        dialog = getattr(self, "_self_update_dialog", None)
+        if dialog is not None:
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        runner = getattr(self, "_self_update_runner", None)
+        if runner is None or getattr(self, "_app_update_job", None) is not None:
+            return
+        self._app_update_flash().stop()
+        self.top_bar.set_app_update_state(
+            "Checking...", "Asking GitHub for the latest AI Hive")
+        self.top_bar.app_update_btn.setEnabled(False)
+        repo = self._self_update_repo
+        job = Job(lambda: self_update.check(runner, repo, __version__), self)
+        job.finished.connect(self._on_app_update_checked)
+        self._app_update_job = job
+        job.start()
+
+    def _app_update_flash(self) -> QTimer:
+        timer = getattr(self, "_app_update_flash_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(self.APP_UPDATE_FLASH_MS)
+            timer.timeout.connect(self.top_bar.set_app_update_state)
+            self._app_update_flash_timer = timer
+        return timer
+
+    def _on_app_update_checked(self, check) -> None:
+        from app import self_update
+        from app.self_update import Status
+
+        self._app_update_job = None
+        self.top_bar.app_update_btn.setEnabled(True)
+        if not isinstance(check, self_update.Check):
+            check = self_update.Check(
+                Status.ERROR, running=__version__,
+                detail=f"The check stopped unexpectedly: {check}")
+        self._audit_install(self_update.audit_line(check))
+        bar = self.top_bar
+        if check.status is Status.UPDATE_AVAILABLE:
+            bar.set_app_update_state(
+                f"⬆ v{check.remote}",
+                f"AI Hive v{check.remote} is available. Click to see what "
+                "changed and update.", attention=True)
+        elif check.status is Status.RESTART_PENDING:
+            self._note_app_restart_pending(check.installed)
+        elif check.status is Status.UP_TO_DATE:
+            bar.set_app_update_state(
+                "✓ Up to date",
+                f"v{__version__} is the latest AI Hive on GitHub")
+            self._app_update_flash().start()
+            return
+        else:
+            bar.set_app_update_state("Check failed", check.detail)
+            self._app_update_flash().start()
+        self._open_self_update_dialog(check)
+
+    def _note_app_restart_pending(self, version: str) -> None:
+        self.top_bar.set_app_update_state(
+            "Restart to update",
+            (f"AI Hive v{version} is installed. " if version else "")
+            + "Close the window and open AI Hive again to use it.",
+            attention=True)
+
+    def _open_self_update_dialog(self, check) -> None:
+        from .self_update_dialog import SelfUpdateDialog
+
+        dialog = SelfUpdateDialog(check, runner=self._self_update_runner,
+                                  repo=self._self_update_repo, parent=self)
+        dialog.auditRequested.connect(self._audit_install)
+        dialog.applied.connect(self._on_app_update_applied)
+        dialog.finished.connect(self._on_self_update_dialog_closed)
+        self._self_update_dialog = dialog
+        dialog.open()
+
+    def _on_self_update_dialog_closed(self, _code=0) -> None:
+        dialog = getattr(self, "_self_update_dialog", None)
+        self._self_update_dialog = None
+        if dialog is not None:
+            dialog.deleteLater()
+
+    def _on_app_update_applied(self, result) -> None:
+        if result.ok:
+            self._note_app_restart_pending(result.version)
 
     # ------------------------------------------------- the Updates panel ---
     # The install-method control (`app/cli_install.py`). Everything here is

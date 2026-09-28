@@ -64,8 +64,9 @@ pollute resume ordering. Use a scratch cwd.
 
 ## Conventions
 
-- Every PR merged to `main` bumps `__version__` in `app/__init__.py`. Nothing
-  enforces it, so it is part of done.
+- Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds
+  a matching `## x.y.z` section to `CHANGELOG.md`, written for users (the
+  in-app updater shows it). A smoke check fails if the two disagree.
 - Keep README.md's check count and feature list current.
 - `app/orchestration.py`, `app/providers.py` and `app/mcp_server.py` stay
   Qt-free. `mcp_server` must not import PySide6 at all.

@@ -13629,6 +13629,342 @@ def test_event_log():
     mw.close()
 
 
+def test_self_update():
+    """Updating AI Hive from GitHub main (app/self_update.py + the version
+    button). Every git/pip call goes through a scripted fake runner against a
+    temp folder: the suite runs FROM this clone and must never fetch or merge
+    into it."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import __version__, self_update
+    from app.self_update import Status
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    def wait_until(pred, timeout_ms=5000):
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if pred():
+                return True
+            pump(20)
+        return pred()
+
+    # --- the repo's own CHANGELOG.md -----------------------------------------
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    sections = self_update.parse_changelog(changelog)
+    check("self-update: CHANGELOG.md's newest section is the current "
+          "__version__ (bump both together)",
+          bool(sections) and sections[0][0] == __version__,
+          sections[0][0] if sections else "no sections")
+    check("self-update: CHANGELOG.md sections run newest first",
+          [s[0] for s in sections] == sorted(
+              (s[0] for s in sections), key=self_update.version_tuple,
+              reverse=True), [s[0] for s in sections])
+    check("self-update: CHANGELOG.md has no em dash (the app shows it)",
+          "—" not in changelog)
+    check("self-update: the __version__ line parses from source",
+          self_update.version_from_source(
+              (ROOT / "app" / "__init__.py").read_text(encoding="utf-8"))
+          == __version__)
+
+    # --- notes_between -------------------------------------------------------
+    log = ("# Changelog\n\npreamble\n\n## 0.4.0\n- four\n\n## v0.3.1 (fix)\n"
+           "- three one\n\n## 0.3.0\n- three\n\n## 0.2.0\n- two\n")
+    notes = self_update.notes_between(log, "0.3.0", "0.4.0")
+    check("self-update: notes cover every version in (installed, remote], "
+          "newest first",
+          "four" in notes and "three one" in notes
+          and "### v0.3.0" not in notes and "two" not in notes
+          and notes.index("v0.4.0") < notes.index("v0.3.1"), notes)
+    check("self-update: notes skip the preamble and accept a v prefix",
+          "preamble" not in notes and "### v0.3.1" in notes)
+    check("self-update: no matching section gives no notes",
+          self_update.notes_between(log, "0.4.0", "0.5.0") == ""
+          and self_update.notes_between("", "0.1.0", "0.2.0") == ""
+          and self_update.notes_between(log, "junk", "0.4.0") == "")
+
+    # --- a scripted git ------------------------------------------------------
+    def make_repo(installed, changelog_text=log):
+        d = Path(tempfile.mkdtemp(prefix="ai-hive-selfupd-"))
+        (d / "app").mkdir()
+        (d / "app" / "__init__.py").write_text(
+            f'__version__ = "{installed}"\n', encoding="utf-8")
+        (d / "CHANGELOG.md").write_text(changelog_text, encoding="utf-8")
+        return d
+
+    class FakeGit:
+        def __init__(self, repo, remote="0.4.0", branch="main", dirty="",
+                     ancestor=0, fetch=(0, ""), remote_log=log,
+                     merge_rc=0, deps_changed=False, pip_rc=0, delay=0.0):
+            self.repo, self.remote, self.branch = repo, remote, branch
+            self.dirty, self.ancestor, self.fetch = dirty, ancestor, fetch
+            self.remote_log, self.merge_rc = remote_log, merge_rc
+            self.deps_changed, self.pip_rc = deps_changed, pip_rc
+            self.delay = delay
+            self.calls = []
+
+        def __call__(self, argv, timeout=0):
+            self.calls.append(list(argv))
+            if self.delay:
+                time.sleep(self.delay)
+            if argv[0] != "git":
+                return (self.pip_rc, "pip output")
+            cmd = argv[3:]
+            if cmd[0] == "fetch":
+                return self.fetch
+            if cmd[0] == "show" and cmd[1].endswith(":app/__init__.py"):
+                return (0, f'__version__ = "{self.remote}"\n')
+            if cmd[0] == "show" and cmd[1].endswith(":CHANGELOG.md"):
+                return ((0, self.remote_log) if self.remote_log is not None
+                        else (128, "fatal: path does not exist"))
+            if cmd[0] == "log":
+                return (0, "feat: a\nfix: b\n")
+            if cmd[:2] == ["rev-parse", "--abbrev-ref"]:
+                return (0, self.branch + "\n")
+            if cmd[0] == "rev-parse":
+                return (0, "abc123\n")
+            if cmd[0] == "status":
+                return (0, self.dirty)
+            if cmd[0] == "merge-base":
+                return (self.ancestor, "")
+            if cmd[0] == "merge":
+                if self.merge_rc == 0:
+                    (Path(self.repo) / "app" / "__init__.py").write_text(
+                        f'__version__ = "{self.remote}"\n', encoding="utf-8")
+                    return (0, "")
+                return (self.merge_rc, "error: Your local changes would be "
+                                       "overwritten by merge")
+            if cmd[0] == "diff":
+                return (1 if self.deps_changed else 0, "")
+            return (0, "")
+
+        def writes(self):
+            return [c for c in self.calls if c[0] != "git" or c[3] in (
+                "merge", "reset", "stash", "checkout", "pull", "rebase",
+                "clean", "switch")]
+
+    repo = make_repo("0.3.0")
+    git = FakeGit(str(repo))
+    c = self_update.check(git, str(repo), running="0.3.0")
+    check("self-update: a higher version on main is offered, with its notes",
+          c.status is Status.UPDATE_AVAILABLE and c.remote == "0.4.0"
+          and c.installed == "0.3.0" and "four" in c.notes and not c.blocked,
+          c)
+    check("self-update: checking never writes to the folder",
+          git.writes() == [], git.writes())
+    check("self-update: every git call is pinned to the repo folder",
+          all(cl[:3] == ["git", "-C", str(repo)] for cl in git.calls))
+
+    same = self_update.check(FakeGit(str(repo), remote="0.3.0"), str(repo),
+                             running="0.3.0")
+    ahead = self_update.check(FakeGit(str(repo), remote="0.2.0"), str(repo),
+                              running="0.3.0")
+    check("self-update: the same version, or a local clone ahead of main, is "
+          "up to date (never an update backwards)",
+          same.status is Status.UP_TO_DATE
+          and ahead.status is Status.UP_TO_DATE, (same.status, ahead.status))
+
+    def fetch_error(rc, out):
+        return self_update.check(FakeGit(str(repo), fetch=(rc, out)),
+                                 str(repo), running="0.3.0")
+
+    failed = fetch_error(128, "fatal: unable to access 'https://github.com/'")
+    slow = fetch_error(self_update.RC_TIMEOUT, "")
+    nogit = fetch_error(127, "")
+    check("self-update: a failed fetch is an error that says why",
+          failed.status is Status.ERROR and "unable to access" in failed.detail
+          and "too long" in slow.detail and "Git was not found" in nogit.detail,
+          (failed.detail, slow.detail, nogit.detail))
+
+    pulled = make_repo("0.4.0")
+    offline = self_update.check(FakeGit(str(pulled), fetch=(128, "offline")),
+                                str(pulled), running="0.3.0")
+    online = self_update.check(FakeGit(str(pulled)), str(pulled),
+                               running="0.3.0")
+    check("self-update: files newer than the running app read as restart "
+          "pending, even offline, with the notes from disk",
+          offline.status is Status.RESTART_PENDING
+          and online.status is Status.RESTART_PENDING
+          and "four" in offline.notes and "two" not in offline.notes,
+          (offline, online.status))
+
+    fallback = self_update.check(FakeGit(str(repo), remote_log=None),
+                                 str(repo), running="0.3.0")
+    check("self-update: without a changelog section the commit subjects "
+          "stand in, so the notes are never blank",
+          "- feat: a" in fallback.notes, fallback.notes)
+
+    def blocked(**kw):
+        return self_update.check(FakeGit(str(repo), **kw), str(repo),
+                                 running="0.3.0").blocked
+
+    on_branch = blocked(branch="feature/x")
+    dirty = blocked(dirty=" M app/widgets/main_window.py\n")
+    diverged = blocked(ancestor=1)
+    check("self-update: another branch, local changes and local commits "
+          "each block the update, with a reason",
+          "feature/x" in on_branch and "local changes" in dirty
+          and "not on GitHub" in diverged, (on_branch, dirty, diverged))
+
+    # --- apply ---------------------------------------------------------------
+    all_calls = []
+    for what, kw in (("on another branch", dict(branch="feature/x")),
+                     ("with local changes", dict(dirty=" M main.py\n")),
+                     ("with local commits", dict(ancestor=1))):
+        g = FakeGit(str(make_repo("0.3.0")), **kw)
+        r = self_update.apply(g, g.repo)
+        all_calls += g.calls
+        check(f"self-update: apply refuses and writes nothing {what}",
+              not r.ok and r.detail and g.writes() == [], (r, g.writes()))
+
+    g = FakeGit(str(make_repo("0.3.0")))
+    r = self_update.apply(g, g.repo, python="py.exe")
+    all_calls += g.calls
+    merges = [c for c in g.calls if c[0] == "git" and c[3] == "merge"]
+    check("self-update: apply is one fast-forward-only merge of origin/main",
+          r.ok and merges == [["git", "-C", g.repo, "merge", "--ff-only",
+                               "--quiet", "origin/main"]], (r, merges))
+    check("self-update: apply reports the new version and asks for a restart",
+          r.version == "0.4.0" and "Restart AI Hive" in r.detail
+          and not r.deps_changed
+          and not any(c[0] == "py.exe" for c in g.calls), r)
+
+    g = FakeGit(str(make_repo("0.3.0")), deps_changed=True)
+    r = self_update.apply(g, g.repo, python="py.exe")
+    all_calls += g.calls
+    pip = [c for c in g.calls if c[0] == "py.exe"]
+    check("self-update: changed requirements are installed with pip",
+          r.ok and r.deps_changed and r.deps_ok and len(pip) == 1
+          and pip[0][1:4] == ["-m", "pip", "install"], pip)
+
+    g = FakeGit(str(make_repo("0.3.0")), deps_changed=True, pip_rc=1)
+    r = self_update.apply(g, g.repo, python="py.exe")
+    all_calls += g.calls
+    check("self-update: a failed pip keeps the update but says what to run",
+          r.ok and not r.deps_ok
+          and "pip install -r requirements.txt" in r.detail, r.detail)
+
+    g = FakeGit(str(make_repo("0.3.0")), merge_rc=1)
+    r = self_update.apply(g, g.repo)
+    all_calls += g.calls
+    check("self-update: a refused merge is reported, not retried another way",
+          not r.ok and "overwritten" in r.detail, r.detail)
+    risky = [c for c in all_calls if c[0] == "git" and c[3] in (
+        "reset", "stash", "checkout", "clean", "switch", "rebase", "pull")]
+    check("self-update: nothing ever resets, stashes or checks out",
+          risky == [], risky)
+    check("self-update: audit lines name the outcome",
+          self_update.audit_line(r).startswith("SELF-UPDATE apply ok=False")
+          and "status=update_available" in self_update.audit_line(c))
+
+    # --- the button and the dialog -------------------------------------------
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+    setup_application(app)
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-selfupd-mw-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    pump(50)
+    btn = win.top_bar.app_update_btn
+    check("self-update: a check button sits beside the version badge",
+          btn.isVisible() and btn.text() == "↻"
+          and "GitHub" in btn.toolTip(), btn.text())
+    btn.click()
+    pump(50)
+    check("self-update: unarmed (the suite, any test window) the button "
+          "cannot reach git",
+          getattr(win, "_app_update_job", None) is None
+          and getattr(win, "_self_update_dialog", None) is None)
+
+    audits = []
+    win._audit_install = audits.append
+    wrepo = make_repo(__version__)
+    major, minor, patch = self_update.version_tuple(__version__)[:3]
+    newer = f"{major}.{minor}.{patch + 1}"
+    wlog = f"# Changelog\n\n## {newer}\n- the shiny thing\n"
+    git = FakeGit(str(wrepo), remote=newer, remote_log=wlog, delay=0.05)
+    win.arm_self_update(git, repo=str(wrepo))
+    btn.click()
+    check("self-update: the check runs off the GUI thread and says so",
+          btn.text() == "Checking..." and not btn.isEnabled(), btn.text())
+    wait_until(lambda: getattr(win, "_self_update_dialog", None) is not None)
+    dlg = win._self_update_dialog
+    check("self-update: an update lights the button and opens the notes",
+          dlg is not None and btn.property("attention") is True
+          and newer in btn.text() and btn.isEnabled()
+          and "the shiny thing" in dlg.notes.toPlainText()
+          and dlg.update_btn.isEnabled(), btn.text())
+    check("self-update: the check was audited",
+          any(a.startswith("SELF-UPDATE check") for a in audits), audits)
+    dlg.update_btn.click()
+    check("self-update: the dialog cannot be closed mid-update",
+          dlg.update_btn.text() == "Updating..."
+          and not dlg.close_btn.isEnabled())
+    dlg.reject()
+    check("self-update: ...even by Escape", dlg.isVisible())
+    wait_until(lambda: dlg._result is not None)
+    check("self-update: after updating, the user is told to restart and the "
+          "window stays open",
+          dlg._result is not None and dlg._result.ok
+          and "Restart AI Hive" in dlg.body_label.text()
+          and not dlg.update_btn.isVisible() and win.isVisible()
+          and btn.text() == "Restart to update"
+          and btn.property("attention") is True, dlg.body_label.text())
+    dlg.reject()
+    pump(30)
+    check("self-update: closing the dialog forgets it",
+          win._self_update_dialog is None)
+
+    # the running process is still the old version, the files are new
+    win.arm_self_update(FakeGit(str(wrepo), remote=newer, remote_log=wlog),
+                        repo=str(wrepo))
+    btn.click()
+    wait_until(lambda: getattr(win, "_self_update_dialog", None) is not None)
+    dlg = win._self_update_dialog
+    check("self-update: checking again before a restart says restart, and "
+          "offers no second update",
+          dlg is not None and dlg._check.status is Status.RESTART_PENDING
+          and not dlg.update_btn.isVisible()
+          and btn.text() == "Restart to update", btn.text())
+    if dlg is not None:
+        dlg.reject()
+    pump(30)
+
+    blocked_repo = make_repo(__version__)
+    win.arm_self_update(FakeGit(str(blocked_repo), remote=newer,
+                                remote_log=wlog, branch="feature/wip"),
+                        repo=str(blocked_repo))
+    btn.click()
+    wait_until(lambda: getattr(win, "_self_update_dialog", None) is not None)
+    dlg = win._self_update_dialog
+    check("self-update: a blocked update shows why and cannot be clicked",
+          dlg is not None and not dlg.update_btn.isEnabled()
+          and "feature/wip" in dlg.blocked_label.text()
+          and not dlg.blocked_label.isHidden())
+    if dlg is not None:
+        dlg.reject()
+    pump(30)
+
+    current = make_repo(__version__)
+    win.arm_self_update(FakeGit(str(current), remote=__version__),
+                        repo=str(current))
+    btn.click()
+    wait_until(lambda: getattr(win, "_app_update_job", None) is None)
+    check("self-update: up to date is a quiet flash on the button, no dialog",
+          "Up to date" in btn.text() and win._self_update_dialog is None
+          and win._app_update_flash().isActive(), btn.text())
+    win._app_update_flash().timeout.emit()
+    check("self-update: ...that returns to the check glyph",
+          btn.text() == "↻" and btn.property("attention") is False)
+    win.close()
+
+
 def main():
     test_tiling()
     test_layout_popup_placement()
@@ -13743,6 +14079,7 @@ def main():
     test_scheduled_send()
     test_cli_auto_update()
     test_cli_native_migration()
+    test_self_update()
     test_lifecycle_e2e()  # slowest last: launches a real claude once
     print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
     return 1 if FAIL else 0
@@ -14408,10 +14745,12 @@ def test_options_panel():
     bar_buttons = [w for w in bar.findChildren(QToolButton)
                    if w.parent() is bar]
     # the Log button is no setting: like Add Terminal it opens something (the
-    # event log window), so it belongs on the bar
-    check("options: the bar itself carries exactly four buttons",
+    # event log window), so it belongs on the bar. So is the AI Hive update
+    # button beside the version badge: an action, not a preference.
+    check("options: the bar itself carries exactly five buttons",
           set(bar_buttons) == {bar.toggle_btn, bar.add_terminal_btn,
-                               bar.options_btn, bar.log_btn},
+                               bar.options_btn, bar.log_btn,
+                               bar.app_update_btn},
           [w.objectName() for w in bar_buttons])
     bar.deleteLater()
 

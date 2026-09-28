@@ -6,7 +6,9 @@
 # to go live: bump y for fixes/small changes, x for notable features; 1.0.0 is
 # reserved for the first public-ready release.
 #
-# BUMP THIS ON EVERY PR MERGED TO main — the version must always increase, and
-# there is no CI check enforcing that yet (see CLAUDE.md's Conventions
-# section), so it is on you, not a bot, to remember it before merging.
-__version__ = "0.21.1"
+# BUMP THIS ON EVERY PR MERGED TO main, and add the matching `## x.y.z`
+# section to CHANGELOG.md in the same change. The in-app updater
+# (app/self_update.py) offers an update only when main's version is HIGHER than
+# this one, and shows the CHANGELOG sections in between. The smoke suite checks
+# that CHANGELOG.md's newest section equals this value.
+__version__ = "0.22.0"

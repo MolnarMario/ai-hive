@@ -390,6 +390,17 @@ QMenu::indicator:checked {{
     border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 1px 6px; font-size: 11px;
 }}
+/* check for / install an AI Hive update, beside the version it would change */
+#AppUpdateBtn {{
+    background: transparent; border: 1px solid transparent; border-radius: 3px;
+    padding: 1px 6px; color: {p.TEXT_DIM}; font-size: 11px;
+}}
+#AppUpdateBtn:hover {{
+    background: {p.BG_HOVER}; border-color: {p.BORDER}; color: {p.TEXT};
+}}
+#AppUpdateBtn[attention="true"] {{
+    border-color: {p.ACCENT_GOLD}; color: {p.ACCENT_GOLD};
+}}
 #ThemeSelect {{
     background: {p.BG_INPUT}; border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 2px 8px; color: {p.TEXT}; font-size: 11px;

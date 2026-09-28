@@ -238,6 +238,18 @@ workspaces keep executing — switching never pauses anything.
   is back it carries on, and if it isn't, agy says so with a fresh countdown that
   *is* accurate and the retry waits for that instead. Claude's account readout is
   never used to resume a Gemini agent (it knows nothing about a Google quota).
+- **Update AI Hive itself** from GitHub: the **↻ button** beside the version
+  badge fetches `main` and compares versions (a clone *ahead* of main is never
+  told to go backwards). If a newer version exists the button lights up and a
+  dialog shows every `CHANGELOG.md` section since your version (or the commit
+  subjects, if a section is missing). **Update** runs `git merge --ff-only
+  origin/main` and, if `requirements.txt` changed, `pip install`. It never
+  resets, stashes or checks out: on another branch, with local changes to
+  tracked files, or with local commits it explains why and does nothing. It
+  **never closes the app**: the button reads *Restart to update* until you
+  close and reopen AI Hive yourself, so your agents keep working until you
+  choose to restart. That state is read from the files on disk, so it also
+  covers a `git pull` you ran by hand.
 - **Let Claude Code update itself** — the **⬇ button** beside the taskbar toggle
   opens a small **Updates** panel, and what it offers depends on how Claude Code
   is actually installed on your machine (it re-reads that every time, so it is
@@ -760,7 +772,7 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py
 ```
 
-2065 checks drive the real app headlessly (offscreen Qt platform) with real
+2109 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -877,6 +889,7 @@ app/
   scheduled_send.py        deferred messages: parse a delay/clock, hold it, format the countdown (Qt-free)
   cli_update.py            startup CLI update gate: decide from the FILE's own version (Qt-free)
   cli_install.py           how Claude Code is installed + the switch onto the self-updating build (Qt-free)
+  self_update.py           update AI Hive from GitHub main: version check, changelog, ff-only merge (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
@@ -890,10 +903,12 @@ app/
                            event_log_window (the event log timeline),
                            update_splash (the startup CLI-update panel + its
                            worker thread), update_panel (the Updates panel +
-                           its consent modal + its worker thread)
+                           its consent modal + its worker thread),
+                           self_update_dialog (the AI Hive update dialog +
+                           its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (2065 checks)
+tests/smoke_test.py        headless end-to-end suite (2109 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —
