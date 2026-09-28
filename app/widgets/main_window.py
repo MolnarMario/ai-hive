@@ -44,7 +44,8 @@ from .agent_file_map import AgentFileMapWindow
 from .event_log_window import EventLogWindow
 from . import ornaments
 from .ornaments import (DropDownComboBox, LogoRoundel,
-                        PageBorder, PlanUsageBadge, ToggleSwitch)
+                        PageBorder, PlanUsageBadge, RefreshGlyphButton,
+                        ToggleSwitch)
 from .options_panel import OptionsPanel
 from .sidebar import SIDEBAR_WIDTH, Sidebar
 
@@ -464,9 +465,13 @@ class TopBar(QFrame):
         self._name.setObjectName("AppName")
         self._version = QLabel(f"v{__version__}", self)
         self._version.setObjectName("VersionBadge")
-        self.app_update_btn = QToolButton(self)
+        self.app_update_btn = RefreshGlyphButton(self)
         self.app_update_btn.setObjectName("AppUpdateBtn")
-        self.app_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.app_update_btn.setAccessibleName("Check for AI Hive updates")
+        # as tall as the 42px bar allows while keeping 4px clear above and
+        # below, so the hover frame never touches the bar's gilt bottom rule
+        self.app_update_btn.setFixedHeight(self.APP_UPDATE_BTN_SIDE)
+        self.app_update_btn.setMinimumWidth(self.APP_UPDATE_BTN_SIDE)
         self.app_update_btn.clicked.connect(self.appUpdateClicked)
         self.set_app_update_state()
 
@@ -773,17 +778,26 @@ class TopBar(QFrame):
     def _open_options(self) -> None:
         self.options_panel.toggle_under(self.options_btn)
 
-    APP_UPDATE_IDLE_TEXT = "↻"
+    APP_UPDATE_BTN_SIDE = 34
     APP_UPDATE_IDLE_TIP = "Check GitHub for a newer AI Hive"
 
     def set_app_update_state(self, text: str = "", tooltip: str = "",
-                             attention: bool = False) -> None:
+                             attention: bool = False,
+                             interactive: bool = True) -> None:
         """The button beside the version badge. No arguments is the idle
-        refresh glyph; anything else is what the last check found."""
-        self.app_update_btn.setText(text or self.APP_UPDATE_IDLE_TEXT)
-        self.app_update_btn.setToolTip(tooltip or self.APP_UPDATE_IDLE_TIP)
-        self.app_update_btn.setProperty("attention", bool(attention))
-        ui_theme.repolish(self.app_update_btn)
+        refresh glyph (painted by `RefreshGlyphButton` when the text is
+        empty); anything else is what the last check found. A
+        non-interactive state is a notice, not a control: disabled, no hand
+        cursor, and only the tooltip the caller passes."""
+        btn = self.app_update_btn
+        idle = not text
+        btn.setText(text)
+        btn.setToolTip(tooltip or (self.APP_UPDATE_IDLE_TIP if idle else ""))
+        btn.setProperty("attention", bool(attention))
+        btn.setEnabled(interactive)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor if interactive
+                      else Qt.CursorShape.ArrowCursor)
+        ui_theme.repolish(btn)
 
     def set_log_attention(self, open_questions: int) -> None:
         """The log button reads "Log", or "Log ? 2" while two agents are
@@ -3324,7 +3338,8 @@ class MainWindow(QMainWindow):
     # here closes the window: after an update lands, the user restarts when
     # their agents are at a good point.
 
-    APP_UPDATE_FLASH_MS = 6000  # how long "Up to date" / "Check failed" stay
+    APP_UPDATE_FLASH_MS = 6000     # how long "Check failed" stays
+    APP_UPDATE_QUIET_MS = 4000     # how long the "Up to date" notice stays
 
     def arm_self_update(self, runner=None, repo: str = "") -> None:
         """Let the version button reach GitHub. Called from `main.py` alone:
@@ -3350,8 +3365,8 @@ class MainWindow(QMainWindow):
             return
         self._app_update_flash().stop()
         self.top_bar.set_app_update_state(
-            "Checking...", "Asking GitHub for the latest AI Hive")
-        self.top_bar.app_update_btn.setEnabled(False)
+            "Checking...", "Asking GitHub for the latest AI Hive",
+            interactive=False)
         repo = self._self_update_repo
         job = Job(lambda: self_update.check(runner, repo, __version__), self)
         job.finished.connect(self._on_app_update_checked)
@@ -3363,7 +3378,6 @@ class MainWindow(QMainWindow):
         if timer is None:
             timer = QTimer(self)
             timer.setSingleShot(True)
-            timer.setInterval(self.APP_UPDATE_FLASH_MS)
             timer.timeout.connect(self.top_bar.set_app_update_state)
             self._app_update_flash_timer = timer
         return timer
@@ -3373,7 +3387,6 @@ class MainWindow(QMainWindow):
         from app.self_update import Status
 
         self._app_update_job = None
-        self.top_bar.app_update_btn.setEnabled(True)
         if not isinstance(check, self_update.Check):
             check = self_update.Check(
                 Status.ERROR, running=__version__,
@@ -3388,14 +3401,14 @@ class MainWindow(QMainWindow):
         elif check.status is Status.RESTART_PENDING:
             self._note_app_restart_pending(check.installed)
         elif check.status is Status.UP_TO_DATE:
-            bar.set_app_update_state(
-                "✓ Up to date",
-                f"v{__version__} is the latest AI Hive on GitHub")
-            self._app_update_flash().start()
+            # a notice, not a control: nothing to click or hover for 4s,
+            # then the glyph comes back on its own
+            bar.set_app_update_state("✓ Up to date", interactive=False)
+            self._app_update_flash().start(self.APP_UPDATE_QUIET_MS)
             return
         else:
             bar.set_app_update_state("Check failed", check.detail)
-            self._app_update_flash().start()
+            self._app_update_flash().start(self.APP_UPDATE_FLASH_MS)
         self._open_self_update_dialog(check)
 
     def _note_app_restart_pending(self, version: str) -> None:

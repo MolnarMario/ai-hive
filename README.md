@@ -238,7 +238,7 @@ workspaces keep executing — switching never pauses anything.
   is back it carries on, and if it isn't, agy says so with a fresh countdown that
   *is* accurate and the retry waits for that instead. Claude's account readout is
   never used to resume a Gemini agent (it knows nothing about a Google quota).
-- **Update AI Hive itself** from GitHub: the **↻ button** beside the version
+- **Update AI Hive itself** from GitHub: the **refresh button** beside the version
   badge fetches `main` and compares versions (a clone *ahead* of main is never
   told to go backwards). If a newer version exists the button lights up and a
   dialog shows every `CHANGELOG.md` section since your version (or the commit
@@ -777,7 +777,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2082 checks drive the real app headlessly (offscreen Qt platform) with real
+2088 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -912,7 +912,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2082 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2088 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

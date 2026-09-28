@@ -1332,6 +1332,50 @@ class LogoRoundel(QWidget):
         p.end()
 
 
+# Two open-ended arcs chasing each other, each tipped with a square chevron
+# (24-unit grid, round caps). Stroke colour is substituted at paint time.
+_REFRESH_GLYPH = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'
+ fill='none' stroke='{ink}' stroke-width='1.9' stroke-linecap='round'
+ stroke-linejoin='round'>
+<path d='M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8'/>
+<path d='M21 3v5h-5'/>
+<path d='M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16'/>
+<path d='M8 16H3v5'/>
+</svg>"""
+
+
+@lru_cache(maxsize=16)
+def _refresh_renderer(ink: str) -> QSvgRenderer:
+    return QSvgRenderer(QByteArray(_REFRESH_GLYPH.format(ink=ink).encode()))
+
+
+class RefreshGlyphButton(QToolButton):
+    """The "check for an AI Hive update" button. With no text it paints the
+    refresh glyph itself, in the theme's ink: a font glyph (the old "↻") is
+    drawn at the chrome's 11px and comes out thin and off-style. With text
+    ("Checking...", "Up to date") the stylesheet draws it like any button."""
+
+    GLYPH_INSET = 2   # px between the hover frame and the glyph's box
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.text():
+            return
+        if self.property("attention"):
+            ink = Palette.ACCENT_GOLD
+        elif self.isEnabled() and self.underMouse():
+            ink = Palette.TEXT
+        else:
+            ink = Palette.TEXT_DIM
+        side = min(self.width(), self.height()) - 2 * self.GLYPH_INSET
+        box = QRectF((self.width() - side) / 2, (self.height() - side) / 2,
+                     side, side)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        _refresh_renderer(ink).render(p, box)
+        p.end()
+
+
 class PageBorder(QWidget):
     """A mouse-transparent overlay that frames the whole page with the active
     theme's ornament: the manuscript's foliate vine strips + gilt corner

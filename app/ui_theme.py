@@ -401,6 +401,10 @@ QMenu::indicator:checked {{
 #AppUpdateBtn[attention="true"] {{
     border-color: {p.ACCENT_GOLD}; color: {p.ACCENT_GOLD};
 }}
+/* "Checking..." / "Up to date" are notices: readable, but no hover frame */
+#AppUpdateBtn:disabled, #AppUpdateBtn:disabled:hover {{
+    background: transparent; border-color: transparent; color: {p.TEXT_DIM};
+}}
 #ThemeSelect {{
     background: {p.BG_INPUT}; border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 2px 8px; color: {p.TEXT}; font-size: 11px;
