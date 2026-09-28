@@ -777,7 +777,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2071 checks drive the real app headlessly (offscreen Qt platform) with real
+2077 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -912,7 +912,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (2071 checks)
+tests/smoke_test.py        headless end-to-end suite (2077 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

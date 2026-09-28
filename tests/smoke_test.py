@@ -3033,11 +3033,31 @@ def test_live_model_effort():
              ("claude-sonnet-5[1m]", "Sonnet 5 (1M)"),
              ("opus", "Opus"),
              ("Opus 4.8 (1M context)", "Opus 4.8 (1M)"),
+             ("fable[1m]", "Fable (1M)"),
+             ("opusplan", "Opus Plan"),
              ("", "")]
     for raw, want in cases:
         check(f"model: {raw or 'empty'} displays as {want or 'empty'}",
               transcripts.model_display(raw) == want,
               transcripts.model_display(raw))
+
+    # --- the New Terminal model picker offers the CLI's current aliases ---
+    claude_prov = providers.get("claude")
+    picker_values = [v for _, v in claude_prov.models]
+    check("model picker: Default first, then every current CLI alias",
+          picker_values[0] == "" and set(picker_values) >= {
+              "fable", "fable[1m]", "opus", "opus[1m]", "sonnet",
+              "sonnet[1m]", "haiku", "opusplan"}, picker_values)
+    check("model picker: labels carry the model version",
+          all(any(ch.isdigit() for ch in label)
+              for label, v in claude_prov.models if v in (
+                  "fable", "opus", "sonnet", "haiku")),
+          [label for label, _ in claude_prov.models])
+    check("model picker: a 1M alias launches as --model <alias>[1m]",
+          providers.build_invocation("claude", model="opus[1m]")[1][:2]
+          == ["--model", "opus[1m]"])
+    check("model picker: efforts match claude --effort exactly",
+          claude_prov.efforts == ("", "low", "medium", "high", "xhigh", "max"))
 
     # --- transcript parsing ---
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-model-"))

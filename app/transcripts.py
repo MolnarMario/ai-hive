@@ -1077,6 +1077,8 @@ def model_display(raw: str) -> str:
         return f"{family} {version}" + (" (1M)" if big else "")
     if core in ("opus", "sonnet", "haiku", "fable"):
         return core.title() + (" (1M)" if big else "")
+    if core == "opusplan":
+        return "Opus Plan" + (" (1M)" if big else "")
     # already friendly ("Opus 4.8 (1M context)"): only shorten the window note
     return text.replace("(1M context)", "(1M)").strip()
 

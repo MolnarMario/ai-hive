@@ -8,6 +8,12 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.22.2
+
+- The model list in the New Terminal dialog is current: Fable 5.1, Opus 5.5,
+  Sonnet 5 and Haiku 4.5, plus the 1M-context versions and Opus Plan (Opus
+  plans, Sonnet executes).
+
 ## 0.22.1
 
 - Conversations are found when Claude Code keeps its data somewhere other
