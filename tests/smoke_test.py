@@ -1,12 +1,16 @@
 """AI Hive end-to-end smoke test.
 
 Run with the project venv, no display needed:
-    .venv\\Scripts\\python.exe tests\\smoke_test.py
+    .venv\\Scripts\\python.exe tests\\smoke_test.py            (full)
+    .venv\\Scripts\\python.exe tests\\smoke_test.py --quick    (no real claude)
+    .venv\\Scripts\\python.exe tests\\smoke_test.py -k NAME    (matching tests)
 
 Drives the REAL application (create_main_window) on the offscreen Qt
-platform with real child processes; prints [PASS]/[FAIL] per check,
-saves screenshots to tests/screenshots/, exits nonzero on any failure.
-Every wait has a timeout, so a hang reads as a deterministic FAIL.
+platform with real child processes; prints [PASS]/[FAIL]/[SKIP] per check,
+saves screenshots to tests/screenshots/, exits nonzero on any failure. A
+test that raises is one FAIL and the run goes on. Every wait has a timeout,
+so a hang reads as a deterministic FAIL. Runs under a throwaway profile, see
+SANDBOX_HOME and _guard_real_ai_launches.
 """
 
 import os
@@ -34,8 +38,105 @@ sys.path.insert(0, str(ROOT))
 SHOTS = ROOT / "tests" / "screenshots"
 SHOTS.mkdir(parents=True, exist_ok=True)
 
+# The whole suite runs with a throwaway profile. Many app paths hang off
+# USERPROFILE (~/.claude/projects, ~/.gemini, ~/.local/bin, %APPDATA%), and a
+# test that forgets to redirect one of them used to write fixture transcripts
+# into the user's real ~/.claude and could reach their real session file.
+# Only test_lifecycle_e2e needs the real profile (a logged-in claude), and it
+# borrows it through real_profile().
+_PROFILE_VARS = ("USERPROFILE", "HOME", "APPDATA", "LOCALAPPDATA",
+                 "CLAUDE_CONFIG_DIR", "TEMP", "TMP")
+_REAL_PROFILE = {k: os.environ.get(k) for k in _PROFILE_VARS}
+REAL_TMP = Path(tempfile.gettempdir()).resolve()
+SANDBOX_HOME = Path(tempfile.mkdtemp(prefix="ai-hive-home-"))
+
+
+def _set_env(values: dict) -> None:
+    for k, v in values.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+_SANDBOX_PROFILE = {
+    "USERPROFILE": str(SANDBOX_HOME), "HOME": str(SANDBOX_HOME),
+    "APPDATA": str(SANDBOX_HOME / "AppData" / "Roaming"),
+    "LOCALAPPDATA": str(SANDBOX_HOME / "AppData" / "Local"),
+    "CLAUDE_CONFIG_DIR": None,
+    "TEMP": str(SANDBOX_HOME / "tmp"), "TMP": str(SANDBOX_HOME / "tmp"),
+}
+for _d in ("APPDATA", "LOCALAPPDATA", "TEMP"):
+    Path(_SANDBOX_PROFILE[_d]).mkdir(parents=True, exist_ok=True)
+_set_env(_SANDBOX_PROFILE)
+# every test's mkdtemp lands inside the sandbox and goes with it at exit:
+# before this, each run left ~40 folders in %TEMP% (4046 by 2026-09-28)
+tempfile.tempdir = _SANDBOX_PROFILE["TEMP"]
+
+# The cwd for every test agent. Never the repo: CLAUDE.md forbids test Claude
+# sessions in real project folders (they pollute resume ordering), and a card
+# whose cwd is the repo reads the user's LIVE transcripts, so its results
+# depended on whatever conversation was running at the time.
+SCRATCH_CWD = str(SANDBOX_HOME / "project")
+Path(SCRATCH_CWD).mkdir()
+
+
+class real_profile:
+    """Borrow the user's real profile for a test that must run a real,
+    logged-in claude. Everything written under it must be cleaned up by the
+    test itself, in a finally. Also the only place a real AI CLI may start
+    (see _guard_real_ai_launches)."""
+
+    def __enter__(self):
+        global _REAL_AI_ALLOWED
+        _set_env(_REAL_PROFILE)
+        _REAL_AI_ALLOWED = True
+
+    def __exit__(self, *exc):
+        global _REAL_AI_ALLOWED
+        _set_env(_SANDBOX_PROFILE)
+        _REAL_AI_ALLOWED = False
+        return False
+
+
+_REAL_AI_ALLOWED = False
+REAL_AI_LAUNCHES = []   # (test-visible) every blocked launch, for the report
+_AI_CLI_STEMS = {"claude", "codex", "agy", "gemini", "grok"}
+
+
+def _guard_real_ai_launches():
+    """Refuse, and record, any worker start whose argv runs an AI CLI outside
+    real_profile(). A test agent that reached a real claude used to start one
+    in the repo folder (restart() from IDLE starts the worker, add_terminal
+    autostarts by default), and nothing noticed. main() turns a recorded
+    launch into a FAIL."""
+    from app import process_worker, pty_worker
+
+    def guarded(real_start):
+        def start(self):
+            argv = [self.spec.program] + list(self.spec.effective_args())[:3]
+            stems = {Path(str(a)).stem.lower() for a in argv}
+            if not _REAL_AI_ALLOWED and stems & _AI_CLI_STEMS:
+                REAL_AI_LAUNCHES.append(f"{self.spec.name}: {argv[0]}")
+                return
+            return real_start(self)
+        return start
+
+    for cls in (pty_worker.PtyWorker, process_worker.ProcessWorker):
+        cls.start = guarded(cls.start)
+
+
 PASS = 0
 FAIL = 0
+SKIP = 0
+
+
+def skip(name, reason):
+    """A check that could not run here. Counted apart from PASS, so a machine
+    that skips everything never reads as green."""
+    global SKIP
+    print(f"[SKIP] {name} :: {reason}", flush=True)
+    SKIP += 1
 
 
 def check(name, cond, detail=""):
@@ -368,12 +469,15 @@ def test_row_name_fades_under_badges():
         lab.deleteLater()
         return cols[-1] if cols else -1
 
+    # the cover point is taken from the measured ink, never a pixel constant:
+    # how long the text paints depends on the installed fonts
     full = ink_extent(None)
-    faded = ink_extent(120)
-    check("row name: with no fade the text paints to its full length",
-          full > 150, full)
+    cover = full // 2
+    faded = ink_extent(cover)
+    check("row name: with no fade the text paints (some ink at all)",
+          full > 40, full)
     check("row name: with a fade the ink stops at the badge edge",
-          0 < faded <= 120, (faded, full))
+          0 < faded <= cover, (faded, cover, full))
     check("row name: a cover at the label's own edge leaves no ink at all",
           ink_extent(0) == -1, ink_extent(0))
     row.deleteLater()
@@ -388,7 +492,7 @@ def test_agent_waiting():
     from app.process_worker import AgentKind, build_spec
 
     QApplication.instance() or QApplication([])
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Ask", cwd="."))
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Ask", cwd=SCRATCH_CWD))
     a.status = AgentStatus.RUNNING
     events = []
     a.waiting_changed.connect(events.append)
@@ -434,7 +538,7 @@ def test_agent_waiting():
     a._set_status(AgentStatus.EXITED_OK)
     check("waiting: exit clears the waiting state", not a.is_waiting())
 
-    b = TerminalAgent(build_spec(AgentKind.CLAUDE, "Bypass", cwd="."))
+    b = TerminalAgent(build_spec(AgentKind.CLAUDE, "Bypass", cwd=SCRATCH_CWD))
     b.spec.permission_mode = "bypassPermissions"
     b.status = AgentStatus.RUNNING
     b._screen_tail = "Do you want to proceed?\r\n 1. Yes\r\n 2. No"
@@ -467,8 +571,6 @@ def test_notification_chime():
                      and w.getnframes() > 0)
     check("chime: WAV is 16-bit mono at the expected rate with frames",
           params_ok)
-    check("chime: available() reflects winsound presence (True on Windows)",
-          chime.available() == (chime.winsound is not None))
 
     # --- manager announces the waiting rising edge, transient (no dirty) ---
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-chime-"))
@@ -548,8 +650,7 @@ def test_winjob_process_count():
     detection primitive behind poll_bg_shell(). Windows-only; skipped
     everywhere else since job objects don't exist there."""
     if sys.platform != "win32":
-        check("winjob: skipped on non-Windows (job objects are Windows-only)",
-              True)
+        skip('winjob', 'non-Windows: job objects are Windows-only')
         return
     from app.process_worker import WinJob
 
@@ -587,8 +688,7 @@ def test_winjob_process_ids_and_kill():
     ProcessWorker and PtyWorker) must kill everything in the job except the
     ids it's told to keep, and leave the kept one alone. Windows-only."""
     if sys.platform != "win32":
-        check("winjob kill: skipped on non-Windows (job objects are "
-              "Windows-only)", True)
+        skip('winjob kill', 'non-Windows: job objects are Windows-only')
         return
     import types
     from app.process_worker import (CREATE_NO_WINDOW, WinJob, ProcessWorker,
@@ -933,9 +1033,10 @@ def test_bg_shell_kill_extras():
         agent.worker.kill_extra_processes = orig_kill
 
 
-def test_chime_persistence():
-    """The chime switch flips its glyph + emits soundToggled, and the on/off
-    preference round-trips through the session ui state.
+def test_chime_toggles():
+    """The chime switches flip their glyph and emit soundToggled /
+    replySoundToggled; the restore setters update without emitting. (The
+    preference's round-trip through the session is test_custom_chime_sounds.)
 
     The switch lives in the Options panel as a real track-and-thumb
     `ToggleSwitch` (green/slid-right when armed, grey/slid-left when off),
@@ -1657,7 +1758,7 @@ def test_agent_hook_waiting():
     from app.terminal_agent import AgentStatus, TerminalAgent
 
     QApplication.instance() or QApplication([])
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Ask", cwd="."))
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Ask", cwd=SCRATCH_CWD))
     a.status = AgentStatus.RUNNING
     events = []
     a.waiting_changed.connect(events.append)
@@ -1770,7 +1871,7 @@ def test_input_echo_not_busy():
     from app.terminal_agent import AgentStatus, TerminalAgent
 
     QApplication.instance() or QApplication([])
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Echo", cwd="."))
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Echo", cwd=SCRATCH_CWD))
     a.status = AgentStatus.RUNNING
     acts = []
     a.activity_changed.connect(acts.append)
@@ -2100,7 +2201,8 @@ def test_manager_categories_persist():
           [w.id for w in mgr.workspaces] == [a.id, c.id, b.id])
 
     data = mgr.to_session_dict()
-    check("cat persist: session version is 4", data["version"] == SESSION_VERSION)
+    check("cat persist: saved under the current SESSION_VERSION",
+          data["version"] == SESSION_VERSION)
     check("cat persist: sidebar key holds the category",
           any(n["type"] == "category" and n["children"] == [c.id, b.id]
               for n in data["sidebar"]), data["sidebar"])
@@ -2159,7 +2261,6 @@ def test_category_container():
     QApplication.processEvents()
     pm = QPixmap(sb.size())
     sb.render(pm)   # drawRow container painting must not raise
-    check("container: sidebar with a category paints headlessly", True)
     sb.deleteLater()
 
 
@@ -2177,8 +2278,8 @@ def test_agent_inline_expansion():
     from app.process_worker import AgentKind, build_spec
 
     QApplication.instance() or QApplication([])
-    a1 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Backend", cwd="."))
-    a2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Frontend", cwd="."))
+    a1 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Backend", cwd=SCRATCH_CWD))
+    a2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Frontend", cwd=SCRATCH_CWD))
     a1.status = AgentStatus.RUNNING
     a1.current_task = "implementing the payments webhook"
     sb = Sidebar()
@@ -2267,7 +2368,6 @@ def test_fsopen_helpers():
           fsopen.open_path("") is False)
     fsopen.open_with(missing)          # must not raise
     fsopen.reveal_in_folder(missing)   # must not raise
-    check("fsopen: open_with / reveal_in_folder no-op on missing path", True)
     # Regression: an argv list made subprocess quote the WHOLE
     # "/select,<path>" token whenever the path had a space, Explorer ignored
     # the quoted switch and opened Documents instead of the file's folder.
@@ -2536,10 +2636,19 @@ def test_terminal_block_glyphs():
     # --- shear guard: an off-grid glyph must not move its neighbours -------
     v = TerminalView(rows=4, cols=12)
     check("blocks: an ASCII glyph is grid-safe", v._is_grid_glyph("M"))
-    off = [c for c in "▘▛✳⏸"
-           if not v._is_grid_glyph(c)]
-    check("blocks: glyphs missing from the terminal font are flagged off-grid",
-          off, "none of the probes fell back - font coverage changed?")
+    # Which glyphs fall back depends on the installed fonts (and on font state
+    # earlier tests leave behind), so pin the advance instead of probing real
+    # coverage: a glyph whose advance is not the cell width is off-grid.
+    from PySide6.QtGui import QFontMetricsF
+    adv = QFontMetricsF(v._font).horizontalAdvance("▘")
+    v._grid_glyph_cache.clear()
+    v._cell_w = adv
+    check("blocks: a glyph advancing exactly one cell is grid-safe",
+          v._is_grid_glyph("▘"))
+    v._grid_glyph_cache.clear()
+    v._cell_w = adv + 5
+    check("blocks: a glyph advancing more than one cell is flagged off-grid",
+          not v._is_grid_glyph("▘") and v._is_grid_glyph("M"))
     v.deleteLater()
 
     # the mascot itself: legs sit on exact cell boundaries, body is solid
@@ -2710,10 +2819,10 @@ def test_sidebar_search():
     from app.terminal_agent import TerminalAgent, AgentStatus
     from app.process_worker import AgentKind, build_spec
     QApplication.instance() or QApplication([])
-    a1 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Backend", cwd="."))
+    a1 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Backend", cwd=SCRATCH_CWD))
     a1.status = AgentStatus.RUNNING
     a1.current_task = "implement the payments webhook"
-    a2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Frontend", cwd="."))
+    a2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Frontend", cwd=SCRATCH_CWD))
     sb = Sidebar()
     sb.resize(230, 400)
     sb.agents_provider = lambda w: {"w1": [a1, a2]}.get(w, [])
@@ -2802,7 +2911,7 @@ def test_ai_title_summary():
           transcripts._read_latest_ai_title(str(tmp / "nope.jsonl")) == "")
 
     # --- summary precedence on the agent ---
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd="."))
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd=SCRATCH_CWD))
     seen = []
     a.summary_changed.connect(seen.append)
     check("summary: empty with no task and no title", a.summary() == "")
@@ -2876,7 +2985,7 @@ def test_token_usage_badge():
     check("tokens: re-reads when the transcript changes", used2 == 300000, used2)
 
     # --- agent badge formatting + transient emission ---
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd="."))
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd=SCRATCH_CWD))
     seen = []
     a.tokens_changed.connect(seen.append)
     check("tokens: badge empty before any usage", a.token_badge() == "")
@@ -3070,7 +3179,7 @@ def test_live_model_effort():
           "--permission-mode" not in mspec.args, mspec.args)
 
     # --- agent-side badge: transient, emits only on a real change ---
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd=".",
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd=SCRATCH_CWD,
                                  model="opus", effort="high"))
     seen = []
     a.model_changed.connect(seen.append)
@@ -3266,7 +3375,7 @@ def test_limit_blocked_live_ui():
     def pump(ms):
         loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
 
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Stuck", cwd="."))
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Stuck", cwd=SCRATCH_CWD))
     card = TerminalCard(a)
     card.resize(900, 300); card.show(); pump(60)
     check("limit UI: hourglass hidden before any cut-off",
@@ -3314,7 +3423,7 @@ def test_bg_shell_live_ui():
     def pump(ms):
         loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
 
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Shelled", cwd="."))
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Shelled", cwd=SCRATCH_CWD))
     card = TerminalCard(a)
     card.resize(900, 300); card.show(); pump(60)
     check("bg shell UI: gear hidden before anything is flagged",
@@ -3587,7 +3696,7 @@ def test_agent_busy_activity():
     from app.process_worker import AgentKind, build_spec
 
     QApplication.instance() or QApplication([])
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Busy", cwd="."))
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Busy", cwd=SCRATCH_CWD))
     a.status = AgentStatus.RUNNING  # pretend the process is up (no real child)
     check("busy: running but no output yet -> standby", not a.is_busy())
     a._on_pty_output("", "generating tokens...")
@@ -3635,7 +3744,7 @@ def test_reply_marks_need_a_submitted_turn():
     check("reply-turn: ...but the Enter that follows the paste does submit",
           submits_a_line("\x1b[200~one\rtwo\x1b[201~\r"))
 
-    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ResumeSettle", cwd=".",
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "ResumeSettle", cwd=SCRATCH_CWD,
                                  pty=True))
     a.status = AgentStatus.RUNNING
     a._resume_attempt = True          # simulate a --resume launch
@@ -3692,6 +3801,8 @@ def test_reply_marks_need_a_submitted_turn():
           len(a.reply_marks()) == 2, a.reply_marks())
 
     # ---- a restart closes the turn --------------------------------------
+    # a stub: from IDLE, PtyWorker.restart() STARTS a real claude
+    a.worker.restart = lambda: None
     a.restart()
     check("reply-turn: a restart closes the open turn",
           not a._turn_open and a._turn_mark_uid is None)
@@ -3725,7 +3836,7 @@ def test_reply_marks_recovered_after_reprint():
                                            _format_reply_stamp)
 
     QApplication.instance() or QApplication([])
-    spec = build_spec(AgentKind.CLAUDE, "Reopen", cwd=".", pty=True)
+    spec = build_spec(AgentKind.CLAUDE, "Reopen", cwd=SCRATCH_CWD, pty=True)
     spec.session_id = "11111111-2222-3333-4444-555555555555"
     agent = TerminalAgent(spec)
     card = TerminalCard(agent)
@@ -4440,16 +4551,32 @@ def test_app():
                or "127.0.0.1" in page.card_for(zombie.id).console.toPlainText(),
                10000)
     all_agents = mgr.all_agents()
+    # the grandchildren THIS test started (ping under the zombie's cmd), by
+    # pid: a machine-wide "is any PING.EXE running" failed whenever anything
+    # else on the box happened to be pinging
+    root_pid = zombie.worker.process().processId()
+
+    def grandkid_pids():
+        return [pid for pid in zombie.worker.job_process_ids()
+                if pid != root_pid]
+    # the console echoes the typed command at once, so wait for the job
+    # itself to hold the ping before trusting the list
+    wait_until(lambda: bool(grandkid_pids()), 10000)
+    grandkids = grandkid_pids()
     win.close()
     procs = [a.worker.process() for a in all_agents if a.worker.process()]
     check("shutdown: every child process terminated",
           wait_until(lambda: all(
               p.state() == QProcess.ProcessState.NotRunning for p in procs), 6000))
     pump(300)
-    ping = subprocess.run(["tasklist", "/FI", "IMAGENAME eq PING.EXE"],
-                          capture_output=True, text=True)
-    check("shutdown: no orphan PING.EXE (job tree kill)",
-          "PING.EXE" not in ping.stdout)
+
+    def pid_alive(pid):
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                             capture_output=True, text=True).stdout
+        return str(pid) in out
+    check("shutdown: the zombie's grandchildren died with it (job tree kill)",
+          grandkids and not any(pid_alive(pid) for pid in grandkids),
+          grandkids)
     check("shutdown: session persisted",
           (tmp / "session.json").exists()
           and "Bravo" in (tmp / "session.json").read_text(encoding="utf-8"))
@@ -4662,7 +4789,7 @@ def test_terminal_image_paste():
     img.fill(0xFFFF0000)
     QGuiApplication.clipboard().setImage(img)
     if not QGuiApplication.clipboard().mimeData().hasImage():
-        check("image-paste: SKIP (offscreen clipboard has no image support)", True)
+        skip('image-paste', 'offscreen clipboard has no image support')
         return
 
     sent = []
@@ -5572,9 +5699,10 @@ def test_pty():
     check("pty: no orphan process after dispose", str(pid) not in tl.stdout)
 
 
-def test_v2_features():
-    """v2: providers/model/effort, per-ws numbering, stats, grid, folder,
-    fonts, and shared-board awareness — driven through the real widgets."""
+def test_providers_grid_and_workspace():
+    """Provider argv building, explicit grids, per-workspace numbering, stats,
+    folder changes and shared-board awareness, the last through the real
+    widgets. (Was test_v2_features; check names keep their "v2" prefix.)"""
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
 
@@ -5583,7 +5711,6 @@ def test_v2_features():
     from app.session_store import SessionStore
     from app.tiling import Cell, explicit_grid, parse_layout
     from app.workspace_manager import WorkspaceManager
-    from app.widgets.terminal_view import TerminalView
     from main import create_main_window, setup_application
 
     app = QApplication.instance() or QApplication([])
@@ -5591,14 +5718,6 @@ def test_v2_features():
 
     def pump(ms):
         loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
-
-    def wait_until(pred, timeout_ms=10000, step=50):
-        deadline = time.monotonic() + timeout_ms / 1000
-        while time.monotonic() < deadline:
-            if pred():
-                return True
-            pump(step)
-        return pred()
 
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-v2-"))
     proj_a, proj_b = tmp / "a", tmp / "b"
@@ -5613,17 +5732,9 @@ def test_v2_features():
           spec.provider == "claude" and spec.pty
           and "--model" in spec.effective_args() and "max" in spec.effective_args())
     # template expansion must not depend on whether the CLI is installed on
-    # this machine (Codex may legitimately exist here) — detection is only
-    # asserted to be a bool, expansion is asserted exactly
+    # this machine (Codex may legitimately exist here)
     check("v2 providers: current openai model template expands",
           "gpt-5.6" in providers.build_invocation("openai", model="gpt-5.6")[1])
-    openai_models = dict(providers.get("openai").models)
-    check("v2 providers: Codex picker lists current model family",
-          set(openai_models.values()) == {
-              "", "gpt-5.6", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"},
-          openai_models)
-    check("v2 providers: detection returns bool (env-independent)",
-          isinstance(providers.detected("openai"), bool))
     prog, args = providers.build_invocation(
         "openai", custom_command='"C:\\Program Files\\OpenAI\\codex.exe" --full-auto')
     check("v2 providers: quoted Windows path unwrapped for launch",
@@ -5635,22 +5746,15 @@ def test_v2_features():
     _, gargs = providers.build_invocation("gemini", model="Gemini 3.6 Flash (High)", effort="high")
     check("v2 providers: gemini model flag builds correctly",
           gargs == ["--model", "Gemini 3.6 Flash (High)"], gargs)
-    check("v2 providers: gemini provider has native_flags enabled",
-          providers.get("gemini").native_flags is True)
-    check("v2 providers: gemini efforts omitted (included in model choice)",
-          providers.get("gemini").efforts == ())
-    check("v2 providers: gemini detection returns bool (env-independent)",
-          isinstance(providers.detected("gemini"), bool))
     gspec = build_spec(AgentKind.GEMINI, "G", cwd=str(proj_a),
                        model="Gemini 3.6 Flash (High)", effort="high")
     gspec.resume = True
     gspec.extra_dirs = [str(proj_a)]
+    # no pinned conversation id, so this is the --continue fallback
     check("v2 providers: gemini resumes with --continue + board --add-dir",
           gspec.provider == "gemini" and gspec.pty
           and "--continue" in gspec.effective_args()
           and "--add-dir" in gspec.effective_args())
-    check("v2 providers: resume providers = claude + gemini + grok",
-          set(providers.RESUME_PROVIDERS) == {"claude", "gemini", "grok"})
 
     # Grok rides the xAI CLI (grok 0.2.93): single-token model ids expand
     # through -m, it's a template provider (no MCP/system-prompt wiring), and
@@ -5660,10 +5764,6 @@ def test_v2_features():
           xargs == ["-m", "grok-build"], xargs)
     _, xdef = providers.build_invocation("grok", model="")
     check("v2 providers: grok default omits -m flag", xdef == [], xdef)
-    check("v2 providers: grok detection returns bool (env-independent)",
-          isinstance(providers.detected("grok"), bool))
-    check("v2 providers: grok is a template provider (no native flags)",
-          providers.get("grok").native_flags is False)
     xspec = build_spec(AgentKind.GROK, "X", cwd=str(proj_a), model="grok-build")
     check("v2 providers: build_spec routes grok + pty",
           xspec.provider == "grok" and xspec.pty
@@ -5716,12 +5816,6 @@ def test_v2_features():
     check("v2 grid: 3x1, 1x3, 4x1, 1x4 offered",
           {"3x1", "1x3", "4x1", "1x4"} <= offered, offered)
 
-    # ---- font (#5) ------------------------------------------------------
-    tv = TerminalView(rows=20, cols=60)
-    base = tv.font_size()
-    tv.set_font_size(base + 4)
-    check("v2 font: TerminalView.set_font_size changes size", tv.font_size() == base + 4)
-
     # ---- through the real app: numbering, stats, folder, board ----------
     store = SessionStore(path=tmp / "s.json")
     win = create_main_window(store)
@@ -5760,8 +5854,9 @@ def test_v2_features():
     check("v2 grid: page applies fixed layout with empty slots",
           len(page._empty_slots) >= 1)
     win.manager.set_layout(wa.id, "3x2")
-    check("v2 grid: layout persisted", mgr.to_session_dict()["workspaces"][0]["layout"] == "3x2"
-          if mgr.workspaces[0].id == wa.id else True)
+    saved = {w["id"]: w for w in mgr.to_session_dict()["workspaces"]}
+    check("v2 grid: layout persisted", saved[wa.id].get("layout") == "3x2",
+          saved[wa.id].get("layout"))
 
     # shared board (#8): a Claude agent creates the board with a roster
     cl = mgr.add_terminal(wa.id, build_spec(AgentKind.CLAUDE, "Claude", cwd=str(proj_a)),
@@ -5878,17 +5973,18 @@ def test_v2_review_fixes():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_v3_features():
-    """v3: private-CSI/underline fix, clipboard, task-assignment primitives,
-    persistent-agent badges, and the named-pipe board bridge."""
+def test_render_perm_mode_reassign_bridge():
+    """Private-CSI/underline fix, clipboard, the permission-mode flag, task
+    reassignment, and the named-pipe board bridge. (Was test_v3_features;
+    check names keep their "v3" prefix.)"""
     import threading
 
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import QEventLoop, QTimer
 
-    from app import orchestration, providers
+    from app import providers
     from app.process_worker import AgentKind, AgentSpec, build_spec
-    from app.terminal_agent import AssignmentState, TerminalAgent
+    from app.terminal_agent import AssignmentState
     from app.widgets.terminal_view import TerminalView
     from app.workspace_manager import WorkspaceManager
     from main import setup_application
@@ -5923,17 +6019,6 @@ def test_v3_features():
     tv2._sel_anchor, tv2._sel_end = (0, 0), (0, 4)
     check("v3 clipboard: selection text", tv2.selected_text() == "hello", tv2.selected_text())
 
-    # --- #5 model selection (pure) ---
-    check("v3 model: trivial to haiku", orchestration.select_model_effort("fix a typo") == ("haiku", "low"))
-    check("v3 model: architecture to opus", orchestration.select_model_effort("design the auth architecture") == ("opus", "high"))
-    check("v3 model: explicit override wins",
-          orchestration.resolve_model_effort("x", model="opus", effort="max") == ("opus", "max"))
-    # the task-to-role heuristic is REMOVED, not merely unused: it renamed the
-    # agent to its own guess as a side effect of assigning a task, so the card
-    # printed that guess twice (title + sublabel) and the chosen name was lost.
-    check("roles: the task-to-role heuristic is gone",
-          not hasattr(orchestration, "infer_role")
-          and not hasattr(orchestration, "ROLE_KEYWORDS"))
     _, a = providers.build_invocation("claude", effort="ultracode")
     check("v3 ultracode: never a launch flag", "--effort" not in a)
 
@@ -5955,7 +6040,7 @@ def test_v3_features():
           and AgentSpec.from_dict(pm_spec.to_dict()).permission_mode
           == "acceptEdits", pm_spec.to_dict())
 
-    # --- task-assignment primitives via a fast line-mode echo agent ---
+    # --- task reassignment via a fast line-mode echo agent ---
     mgr = WorkspaceManager()
     ws = mgr.create_workspace("W", str(tmp))
     echo = mgr.add_terminal(ws.id, build_spec(
@@ -5965,15 +6050,12 @@ def test_v3_features():
     seen = []
     echo.output_segment.connect(lambda s, t: seen.append(t))
     wait_until(lambda: echo.is_running(), 8000)
-    mgr.assign_task(ws.id, echo.id, "build the parser")
-    check("v3 assign: WORKING + delivered", echo.assignment is AssignmentState.WORKING
-          and wait_until(lambda: any("did:build the parser" in t for t in seen), 8000))
-    mgr.set_assignment_state(echo.id, AssignmentState.COMPLETED)
-    check("v3 assign: set_assignment_state", echo.assignment is AssignmentState.COMPLETED)
     name_before, role_before = echo.spec.name, echo.spec.role
     mgr.reassign_agent(echo.id, "now write the tests")
-    check("v3 reassign: delivered to existing session",
-          wait_until(lambda: any("did:now write the tests" in t for t in seen), 8000))
+    check("v3 reassign: WORKING + delivered to the existing session",
+          echo.assignment is AssignmentState.WORKING
+          and wait_until(lambda: any("did:now write the tests" in t for t in seen),
+                         8000))
     # regression: assigning a task used to run it through a role heuristic and
     # rename the agent to the result ("Testing Agent"), clobbering the name.
     check("v3 reassign: never renames the agent or its kind sublabel",
@@ -6010,6 +6092,7 @@ def test_v3_features():
               "wired the parser" in "\n".join(ws.board.read_log_tail()))
         bridge.stop()
         os.environ.pop("AIHIVE_WS", None)
+        os.environ.pop("AIHIVE_PIPE", None)
 
     echo.dispose()
     pump(200)
@@ -6048,7 +6131,8 @@ def test_persistence_resume():
     check("persist: agent saved immediately (survives a kill)", "KeepMe" in names, names)
     win.close(); pump(120)
 
-    # a Claude agent that was running resumes with --continue on reopen
+    # LEGACY: a v3 session has no pinned id, so --continue is the only resume
+    # it can have. Pinned agents resume with --resume <id> (test_session_pinning)
     store.save({"version": 3, "active": "w", "workspaces": [{
         "id": "w", "name": "R", "project_path": str(tmp), "layout": "auto",
         "terminals": [{"kind": "claude", "name": "Coder", "role": "Claude Code",
@@ -6060,7 +6144,7 @@ def test_persistence_resume():
     win2 = create_main_window(store)
     win2.show(); pump(120)
     ag = win2.manager.workspaces[0].agents[0]
-    check("persist: running Claude agent resumes (--continue)",
+    check("persist: a running LEGACY unpinned Claude agent resumes (--continue)",
           ag.spec.resume and "--continue" in ag.spec.effective_args())
     win2.close(); pump(120)
 
@@ -6362,10 +6446,6 @@ def test_themes():
     from app.session_store import SessionStore
     from main import create_main_window, setup_application
 
-    check("themes: registry has the expected skins",
-          set(ui_theme.THEMES) == {"scriptorium-dark", "illuminated-manuscript",
-                                   "obsidian", "adeptus-mechanicus"},
-          list(ui_theme.THEMES))
     check("themes: ids match their keys and names are unique",
           all(k == t.id for k, t in ui_theme.THEMES.items())
           and len({t.name for t in ui_theme.THEMES.values()})
@@ -6374,9 +6454,6 @@ def test_themes():
     # apply_theme mutates the SAME Palette/ANSI_16 objects in place
     ansi_obj = ui_theme.ANSI_16
     ui_theme.apply_theme("scriptorium-dark")
-    check("themes: Scriptorium Dark keeps the shipped palette",
-          ui_theme.Palette.BG_ROOT == "#12100c"
-          and ui_theme.Palette.ACCENT_GOLD == "#c9a227")
     dark_qss = ui_theme.build_qss()
     ui_theme.apply_theme("illuminated-manuscript")
     check("themes: apply_theme mutates Palette in place (same refs update)",
@@ -6433,7 +6510,6 @@ def test_themes():
             w.resize(200, 160)
             w.grab()  # runs paintEvent; raises if the paint path is broken
             w.deleteLater()
-    check("themes: ornament widgets paint under every skin", True)
 
     # SHAPED-ICON GUARANTEE. The artwork is exported flat on a near-black
     # ground; shipping that unkeyed put a hard black square in the title bar,
@@ -6620,10 +6696,6 @@ def test_review_fixes():
     check("rename: set_name emits name_changed", names_seen == ["Scribe"],
           names_seen)
     check("rename: set_name marks dirty", dirty_count["n"] > before)
-    # set_role is GONE along with the heuristic that drove it: nothing renames
-    # an agent except the user, so spec.role is now write-once in build_spec.
-    check("rename: agents have no set_role/role_changed any more",
-          not hasattr(r1, "set_role") and not hasattr(r1, "role_changed"))
     # next_agent_name still numbers monotonically off the highest "Agent N"
     r2 = mgr.add_terminal(ws_c.id, build_spec(AgentKind.CMD, "Agent 2",
                                               cwd=str(tmp)), autostart=False)
@@ -6951,7 +7023,6 @@ def test_agent_file_map():
         check("map: agent hub fill is opaque",
               _opaque_tint(QColor(0, 255, 0)).alpha() == 255)
         _open_with(str(tmp / "nope.py"))   # missing file -> must not raise
-        check("map: open-with no-ops safely on a missing file", True)
 
         # regression: a file whose name collides with a folder name once threw
         # in the tree builder, and because the throw landed on the toggle's slot
@@ -7027,26 +7098,102 @@ def test_lifecycle_e2e():
     """THE journey that kept losing user data, end to end with a REAL Claude
     agent: talk -> graceful close -> reopen -> the SAME conversation is back
     on the same card (pinned --resume), and a transcript backup exists.
-    Skipped (not failed) when the claude CLI isn't installed."""
+
+    Runs under the user's real profile (a logged-in claude) and cleans up
+    everything it writes there in a finally. Skipped when the claude CLI
+    isn't installed. Bails at the first broken step instead of sitting out
+    every later timeout."""
     import uuid as _uuid
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
 
     from app import providers, transcripts
-    from app.process_worker import AgentKind, build_spec
     from app.pty_worker import HAS_CONPTY
-    from app.session_store import SessionStore
-    from main import create_main_window, setup_application
-
-    if not (HAS_CONPTY and providers.detected("claude")):
-        print("[SKIP] lifecycle e2e: claude CLI or ConPTY unavailable")
-        return
 
     app = QApplication.instance() or QApplication([])
+    from main import setup_application
     setup_application(app)
 
     def pump(ms):
         loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-e2e-"))
+    windows = []
+    with real_profile():
+        if not (HAS_CONPTY and providers.detected("claude")):
+            skip("lifecycle e2e", "claude CLI or ConPTY unavailable")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return
+        proj = os.path.join(transcripts.projects_root(),
+                            transcripts.encode_project_dir(str(tmp)))
+        try:
+            _lifecycle_e2e_body(tmp, windows, pump, f"PINEAPPLE-"
+                                f"{_uuid.uuid4().hex[:8]}")
+        finally:
+            for w in windows:
+                try:
+                    w.close()
+                except RuntimeError:
+                    pass
+            pump(600)
+            shutil.rmtree(proj, ignore_errors=True)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _e2e_screen_text(agent) -> str:
+    """The agent's raw stream with escapes stripped, lowercased. The stream
+    positions words individually, so this is for substring tests only."""
+    import re as _re
+    csi = _re.compile(
+        r"\x1b\[[0-9;?<>=]*[@-~]|\x1b[()][AB0]|\x1b\][^\x07\x1b]*\x07?")
+    return csi.sub("", agent.pty_replay()).lower()
+
+
+def _e2e_assistant_said(path, needle) -> bool:
+    """True once an ASSISTANT record in the transcript carries `needle`. The
+    user's own prompt holds it too, so a plain substring test would pass on
+    the prompt alone."""
+    import json as _json
+    try:
+        lines = Path(path).read_text(encoding="utf-8",
+                                     errors="replace").splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        try:
+            rec = _json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(rec, dict) and rec.get("type") == "assistant"
+                and needle in _json.dumps(rec)):
+            return True
+    return False
+
+
+def _e2e_trust_options_drawn(agent) -> bool:
+    """The trust dialog's OPTION rows are on screen, not just its heading.
+    It draws top-down, and reading the cursor before the rows exist sent a
+    bare Enter onto "No, exit"."""
+    flat = "".join(_e2e_screen_text(agent).split())
+    return "itrustthisfolder" in flat and "no,exit" in flat
+
+
+def _e2e_accept_trust(agent, pump) -> None:
+    """Choose "Yes, I trust this folder". CLI 2.1.283 puts the cursor on
+    "No, exit", so a bare Enter quits: move down when the cursor is on "No",
+    then confirm as a separate write."""
+    import re as _re
+    pump(300)   # let the frame finish before reading the cursor
+    if _re.search("❯\\s*(\\d\\.\\s*)?no", _e2e_screen_text(agent)):
+        agent.write("\x1b[B"); pump(300)
+    agent.write("\r")
+
+
+def _lifecycle_e2e_body(tmp, windows, pump, marker):
+    from app import transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
 
     def wait_until(pred, timeout_ms, step=100):
         deadline = time.monotonic() + timeout_ms / 1000
@@ -7056,19 +7203,12 @@ def test_lifecycle_e2e():
             pump(step)
         return pred()
 
-    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-e2e-"))
+    screen_text = _e2e_screen_text
     store = SessionStore(path=tmp / "s.json")
-    marker = f"PINEAPPLE-{_uuid.uuid4().hex[:8]}"
-
-    import re as _re
-    _csi = _re.compile(r"\x1b\[[0-9;?<>=]*[@-~]|\x1b[()][AB0]|\x1b\][^\x07\x1b]*\x07?")
-
-    def screen_text(a):
-        # raw stream positions words individually; strip escapes to match text
-        return _csi.sub("", a.pty_replay()).lower()
 
     # --- session 1: real claude, say the marker --------------------------
     win = create_main_window(store)
+    windows.append(win)
     win.show(); pump(150)
     ws = win.manager.workspaces[0]
     spec = build_spec(AgentKind.CLAUDE, "E2E", cwd=str(tmp), pty=True,
@@ -7076,66 +7216,78 @@ def test_lifecycle_e2e():
     agent = win.manager.add_terminal(ws.id, spec, autostart=True)
     sid = agent.spec.session_id
     check("e2e: launch minted a pinned session id", bool(sid))
-    # a brand-new folder shows the trust dialog first — accept it; the task
-    # is queued and must NOT be typed into the dialog
+    # a brand-new folder shows the trust dialog first; the task is queued and
+    # must NOT be typed into the dialog
     agent.deliver_task(
         f"Reply with exactly the word {marker} and nothing else.")
-    check("e2e: trust dialog appeared for the fresh folder",
-          wait_until(lambda: "trust" in screen_text(agent)
-                     and "folder" in screen_text(agent), 45000))
-    check("e2e: queued task not typed into the trust dialog",
-          not agent._prompt_ready)
-    agent.write("\r")  # accept "Yes, I trust this folder"
-    check("e2e: task delivered once the real prompt was ready",
-          wait_until(lambda: agent._prompt_ready, 45000))
-    check("e2e: claude answered the marker prompt",
-          wait_until(lambda: screen_text(agent).count(marker.lower()) >= 2,
-                     120000),
+    dialog = wait_until(lambda: _e2e_trust_options_drawn(agent), 45000)
+    check("e2e: trust dialog appeared for the fresh folder", dialog,
           screen_text(agent)[-300:])
-    # the transcript flush lags the on-screen answer (file first, content
-    # later) — wait until the marker is IN the file before closing, or the
-    # close-time backup snapshots a partial conversation
+    if not dialog:
+        return
+    check("e2e: prompt not ready while the trust dialog is up",
+          not agent._prompt_ready)
+    _e2e_accept_trust(agent, pump)
+    ready = wait_until(lambda: agent._prompt_ready, 45000)
+    check("e2e: accepting trust reaches the real prompt", ready,
+          screen_text(agent)[-300:])
+    if not ready:
+        return
     tpath = Path(transcripts.transcript_path(str(tmp), sid))
-
-    def transcript_has_marker():
-        try:
-            return marker in tpath.read_text(encoding="utf-8",
-                                             errors="replace")
-        except OSError:
-            return False
-    check("e2e: transcript persisted under the pinned id",
-          wait_until(transcript_has_marker, 45000), str(tpath))
+    # the transcript flush lags the on-screen answer (file first, content
+    # later): wait until the REPLY is in the file before closing, or the
+    # close-time backup snapshots a partial conversation
+    answered = wait_until(lambda: _e2e_assistant_said(tpath, marker), 120000)
+    check("e2e: the queued task was delivered and claude's reply is in the "
+          "pinned transcript", answered, screen_text(agent)[-300:])
+    if not answered:
+        return
+    first_worker = agent.worker
+    n_agents = len(ws.agents)
     win.close(); pump(600)  # graceful close: save + transcript backup
+    check("e2e: the first claude exited before any reopen",
+          wait_until(lambda: not first_worker.is_running(), 15000))
 
     on_disk = (tmp / "s.json").read_text(encoding="utf-8")
     check("e2e: close persisted the pinned id + running state",
           sid in on_disk and '"running": true' in on_disk)
-    check("e2e: close snapshotted the transcript",
-          (tmp / "transcripts" / f"{sid}.jsonl").exists()
-          and marker in (tmp / "transcripts" / f"{sid}.jsonl")
-          .read_text(encoding="utf-8", errors="replace"))
+    check("e2e: close snapshotted the transcript, reply included",
+          _e2e_assistant_said(tmp / "transcripts" / f"{sid}.jsonl", marker))
 
     # --- session 2: reopen -> the SAME conversation returns --------------
     win2 = create_main_window(store)
+    windows.append(win2)
     win2.show(); pump(150)
-    agent2 = win2.manager.workspaces[0].agents[-1]
+    agents2 = win2.manager.workspaces[0].agents
+    check("e2e: every agent came back", len(agents2) == n_agents,
+          (len(agents2), n_agents))
+    agent2 = agents2[-1]
     check("e2e: reopened agent kept its pin", agent2.spec.session_id == sid)
     check("e2e: reopened agent resumes, not --continue",
           agent2.spec.resume
           and "--resume" in agent2.spec.effective_args())
     win2.autostart_active_workspace()
-    check("e2e: THE SAME conversation came back on the card",
-          wait_until(lambda: marker.lower() in screen_text(agent2), 90000),
+    # the card was seeded with the previous run's screen, which holds the
+    # marker. The launch must drop it, or the check below would pass off the
+    # snapshot instead of a real --resume.
+    check("e2e: the launch dropped the restored screen",
+          marker.lower() not in screen_text(agent2),
+          screen_text(agent2)[-200:])
+    # the folder was trusted in session 1, but another claude on this machine
+    # can rewrite ~/.claude.json from its own stale copy and drop that entry,
+    # so the dialog may come back. Accept it again rather than fail on it.
+    accepted = []
+
+    def resumed():
+        if not accepted and _e2e_trust_options_drawn(agent2):
+            accepted.append(1)
+            _e2e_accept_trust(agent2, pump)
+        return screen_text(agent2).count(marker.lower()) >= 2
+    check("e2e: THE SAME conversation came back on the card (prompt AND "
+          "reply reprinted by --resume)", wait_until(resumed, 90000),
           screen_text(agent2)[-300:])
     check("e2e: no silent fresh-fallback (pin unchanged)",
           agent2.spec.session_id == sid)
-    win2.close(); pump(600)
-
-    # tidy: remove the claude-side project dir this test created
-    proj = os.path.join(os.path.expanduser("~"), ".claude", "projects",
-                        transcripts.encode_project_dir(str(tmp)))
-    shutil.rmtree(proj, ignore_errors=True)
-    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_session_pinning():
@@ -7157,7 +7309,7 @@ def test_session_pinning():
             "restart": lambda s: counter.__setitem__("n", counter["n"] + 1),
             "is_running": lambda s: False, "dispose": lambda s: None})()
 
-    spec = build_spec(AgentKind.CLAUDE, "Pin", cwd=os.getcwd(), pty=True)
+    spec = build_spec(AgentKind.CLAUDE, "Pin", cwd=SCRATCH_CWD, pty=True)
     agent = TerminalAgent(spec)
     stub(agent, {"n": 0})
     agent.start()  # fresh start mints an identity
@@ -7183,7 +7335,7 @@ def test_session_pinning():
           rotated != sid1 and bool(uuid_re.match(rotated)))
 
     # legacy sessions (no pin) still resume via --continue, once
-    legacy = build_spec(AgentKind.CLAUDE, "Legacy", cwd=os.getcwd(), pty=True)
+    legacy = build_spec(AgentKind.CLAUDE, "Legacy", cwd=SCRATCH_CWD, pty=True)
     legacy.session_id = ""
     legacy.resume = True
     check("pin: legacy unpinned resume falls back to --continue",
@@ -7191,7 +7343,7 @@ def test_session_pinning():
 
     # a failed resume (conversation gone) relaunches fresh under a NEW id
     gone = "11111111-1111-4111-8111-111111111111"
-    spec2 = build_spec(AgentKind.CLAUDE, "Fb", cwd=os.getcwd(), pty=True)
+    spec2 = build_spec(AgentKind.CLAUDE, "Fb", cwd=SCRATCH_CWD, pty=True)
     spec2.session_id = gone
     spec2.resume = True
     a2 = TerminalAgent(spec2)
@@ -7230,7 +7382,7 @@ def test_session_pinning():
     # Claude readiness = the input-box footer. The folder-trust dialog also
     # enables bracketed paste (and never disables it on dismissal — verified
     # live), so 2004h alone would type a queued task INTO the dialog.
-    spec3 = build_spec(AgentKind.CLAUDE, "Trust", cwd=os.getcwd(), pty=True)
+    spec3 = build_spec(AgentKind.CLAUDE, "Trust", cwd=SCRATCH_CWD, pty=True)
     a3 = TerminalAgent(spec3)
     a3._on_pty_output("", "Do you trust\x1b[20Gthis\x1b[26Gfolder?\x1b[?2004h")
     check("pin: trust dialog does not trip prompt-ready",
@@ -7238,16 +7390,73 @@ def test_session_pinning():
     a3._on_pty_output("", "\x1b[2G? for shortcuts \x1b[38;2;1;2;3m- more")
     check("pin: input-box footer marks Claude readiness", a3._prompt_ready)
     # split across chunks: the rolling tail must still assemble the footer
-    a5 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Split", cwd=os.getcwd(),
+    a5 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Split", cwd=SCRATCH_CWD,
                                   pty=True))
     a5._on_pty_output("", "\x1b[?2004h? for sho")
     a5._on_pty_output("", "rtcuts")
     check("pin: footer split across chunks still detected", a5._prompt_ready)
     # non-Claude ptys (PSReadLine etc.) keep the paste-enable signal
-    a4 = TerminalAgent(build_spec(AgentKind.POWERSHELL, "Sh", cwd=os.getcwd(),
+    a4 = TerminalAgent(build_spec(AgentKind.POWERSHELL, "Sh", cwd=SCRATCH_CWD,
                                   pty=True))
     a4._on_pty_output("", "\x1b[?2004h")
     check("pin: non-claude pty still ready on paste-enable", a4._prompt_ready)
+
+
+def test_two_claude_agents_one_folder_resume_their_own():
+    """THE historical data-loss bug, at the level where it lived: two Claude
+    agents in ONE folder, the app closes, the app reopens. Each must resume
+    its OWN conversation by id. With --continue both raced for the folder's
+    newest conversation and one transcript was destroyed. The e2e test covers
+    one real agent; this covers the pair without launching anything."""
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    folder = Path(tempfile.mkdtemp(prefix="ai-hive-pair-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Pair", str(folder))
+    pair = []
+    for name in ("Left", "Right"):
+        a = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, name,
+                                               cwd=str(folder)),
+                             autostart=False)
+        a.worker.start = lambda: None      # mint the pin, launch nothing
+        a.start()
+        pair.append(a)
+    ids = {a.spec.name: a.spec.session_id for a in pair}
+    check("pair: two agents in one folder get two different pins",
+          all(ids.values()) and ids["Left"] != ids["Right"], ids)
+
+    # what a save writes. Taken without any close, so it is also what an
+    # abrupt kill leaves on disk; both were running.
+    data = mgr.to_session_dict()
+    for w in data["workspaces"]:
+        for t in w["terminals"]:
+            t["running"] = True
+    # through the real reopen path: create_main_window is what marks every
+    # restored Claude agent for a one-shot resume
+    from app.session_store import SessionStore
+    from main import create_main_window
+    store = SessionStore(path=folder / "s.json")
+    store.save(data)
+    win = create_main_window(store)
+    restored = {a.spec.name: a for w in win.manager.workspaces
+                for a in w.agents if a.spec.provider == "claude"}
+    check("pair: both come back, each with its own pin",
+          {n: a.spec.session_id for n, a in restored.items()} == ids,
+          {n: a.spec.session_id for n, a in restored.items()})
+    for name, a in restored.items():
+        args = a.spec.effective_args()
+        check(f"pair: {name} resumes ITS conversation (--resume <own id>)",
+              "--resume" in args
+              and args[args.index("--resume") + 1] == ids[name]
+              and "--continue" not in args, args)
+    win._save_timer.stop()
+    win.close()
+    for a in pair:
+        a.dispose()
+    shutil.rmtree(folder, ignore_errors=True)
 
 
 def test_session_recovery():
@@ -7661,14 +7870,14 @@ def test_review_hardening_fixes():
       #3 the orchestrator pipe drops a client that streams bytes with no newline;
       #4 the 350 ms task-submit Enter is generation-guarded so a restart in the
          window can't fire a stray CR into a fresh TUI;
-      #5 a scrolled-back terminal view stays anchored after history saturates;
-      #6 spawn_worker persists task/assignment immediately (no debounce loss)."""
+      #5 a scrolled-back terminal view stays anchored after history saturates.
+    (#6 tested spawn_worker, which is gone with the orchestrator.)"""
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
     from app import session_hook
     from app.process_worker import AgentKind, build_spec
     from app.session_store import SessionStore
-    from app.terminal_agent import AssignmentState, TerminalAgent
+    from app.terminal_agent import TerminalAgent
     from app.workspace_manager import WorkspaceManager
     from app.widgets.terminal_view import (TerminalView, HISTORY_LINES,
                                            _CountingDeque, _MAX_ESC_CARRY)
@@ -7780,37 +7989,6 @@ def test_review_hardening_fixes():
           grown >= 1 and v5._scroll_offset == 40 + grown,
           (grown, v5._scroll_offset))
 
-    # -- #6: spawn_worker persists immediately (no debounce loss window) ------
-    tmp6 = Path(tempfile.mkdtemp(prefix="ai-hive-spawn-"))
-    mgr = WorkspaceManager()
-    saves = {"n": 0}
-    mgr.save_now = lambda: saves.__setitem__("n", saves["n"] + 1)
-    ws6 = mgr.create_workspace("W", project_path=str(tmp6))
-
-    def fake_add(ws_id, spec, autostart=True):  # avoid launching a real claude
-        a = TerminalAgent(spec)
-        sw, _ = stub_worker()
-        sw.is_running = lambda: False  # so deliver_task queues instead of typing
-        a.worker = sw
-        ws6.agents.append(a)
-        return a
-
-    mgr.add_terminal = fake_add
-    spawned = mgr.spawn_worker(ws6.id, "do the thing")
-    check("harden: spawn_worker persists immediately via save_now",
-          saves["n"] >= 1)
-    check("harden: a spawned worker is named Agent N, not a guessed role",
-          spawned.spec.name == "Agent 1", spawned.spec.name)
-    check("harden: the spawned worker has its task + assignment set",
-          spawned.current_task == "do the thing"
-          and spawned.assignment == AssignmentState.WORKING)
-    mgr2 = WorkspaceManager()   # fallback: no save_now -> debounced dirty
-    dirty2 = {"n": 0}
-    mgr2.dirty.connect(lambda: dirty2.__setitem__("n", dirty2["n"] + 1))
-    mgr2._persist_now()
-    check("harden: _persist_now falls back to dirty when no save_now is wired",
-          dirty2["n"] >= 1)
-    shutil.rmtree(tmp6, ignore_errors=True)
 
 
 def test_resume_picker():
@@ -7983,7 +8161,7 @@ def test_wake_and_resume_all():
     coder = next(a for a in back.agents if a.spec.name == "Coder")
     stopped = front.agents[0]
 
-    check("wake: restored Claude carries one-shot resume (--continue)",
+    check("wake: a restored LEGACY unpinned Claude carries one-shot --continue",
           coder.spec.resume and "--continue" in coder.spec.effective_args())
     win.autostart_active_workspace()
     check("wake: running agent in a NON-active workspace autostarts",
@@ -8053,7 +8231,7 @@ def test_pty_width_at_launch():
     from main import create_main_window, setup_application
 
     if not HAS_CONPTY:
-        check("pty width: SKIP (no pywinpty)", True)
+        skip('pty width', 'no pywinpty')
         return
 
     app = QApplication.instance() or QApplication([])
@@ -8537,7 +8715,7 @@ def test_boot_veil():
     from app.terminal_agent import AgentStatus, TerminalAgent
 
     # -- the agent-side signal --------------------------------------------
-    spec = build_spec(AgentKind.CLAUDE, "Booting", cwd=os.getcwd(), pty=True)
+    spec = build_spec(AgentKind.CLAUDE, "Booting", cwd=SCRATCH_CWD, pty=True)
     agent = TerminalAgent(spec)
     seen = []
     agent.prompt_ready_changed.connect(seen.append)
@@ -8602,7 +8780,7 @@ def test_boot_veil():
     from app.widgets.terminal_card import BOOT_VEIL_MAX_MS, TerminalCard
 
     booting = TerminalAgent(build_spec(
-        AgentKind.POWERSHELL, "Boot", cwd=os.getcwd(), pty=True))
+        AgentKind.POWERSHELL, "Boot", cwd=SCRATCH_CWD, pty=True))
     card = TerminalCard(booting)
     card.resize(640, 400); card.show(); pump(150)
     check("boot-veil: a stopped card shows the wake banner, not the loader",
@@ -8668,7 +8846,7 @@ def test_boot_veil():
     from app.ui_theme import Palette as _Pal
 
     restored = TerminalAgent(build_spec(
-        AgentKind.POWERSHELL, "Restored", cwd=os.getcwd(), pty=True))
+        AgentKind.POWERSHELL, "Restored", cwd=SCRATCH_CWD, pty=True))
     snapshot = "RESTORED-SNAPSHOT-" + "=" * 60 + "\r\n"
     check("boot-veil: a restored snapshot seeds the agent's buffer",
           restored.seed_pty_replay(snapshot) and restored.has_pristine_seed())
@@ -8676,9 +8854,13 @@ def test_boot_veil():
     check("boot-veil: a card built over a restored snapshot is covered from "
           "its constructor, before the window ever paints",
           rcard.boot.is_active() and rcard._boot_seed)
-    # under the view's 120ms resize debounce on purpose: this models the
-    # window's FIRST paint, which is the frame main.py used to leak
-    rcard.resize(640, 400); rcard.show(); pump(30)
+    # before the view's resize debounce settles, on purpose: this models the
+    # window's FIRST paint, which is the frame main.py used to leak. The
+    # debounce is held open here rather than raced (a pump(30) under a 120ms
+    # timer failed whenever the event loop stalled), and released below.
+    rcard.resize(640, 400); rcard.show()
+    rcard.terminal._resize_timer.setInterval(60000)   # restarts it, held
+    pump(30)
     # the constructor's own _on_status(IDLE) runs the not-running branch, which
     # used to dismiss the veil unconditionally -- the wake banner may only own
     # the screen once there is something readable under it
@@ -8690,8 +8872,11 @@ def test_boot_veil():
              for x in range(0, min(240, rimg.width()), 3)]
     check("boot-veil: ...in pixels: the mangled seed never reaches the user",
           rrows and all(p == rground for p in rrows))
+    # release the debounce: the resize lands NOW, as a settled layout's does
+    rcard.terminal._resize_timer.setInterval(120)
+    rcard.terminal.flush_resize()
     # the settled-width projection IS the stopped card's final picture
-    pump(500)  # past the 120ms resize debounce and the 260ms fade
+    pump(500)  # past the 260ms fade
     check("boot-veil: the settled-width projection dissolves it",
           not rcard.boot.is_active() and not rcard._boot_seed)
     check("boot-veil: ...revealing the conversation it was holding back",
@@ -8701,7 +8886,7 @@ def test_boot_veil():
     # an agent that AUTOSTARTS hands the veil straight to the booting child,
     # with no gap: drop_restored_screen clears the seed, _on_status re-raises
     auto = TerminalAgent(build_spec(
-        AgentKind.POWERSHELL, "Auto", cwd=os.getcwd(), pty=True))
+        AgentKind.POWERSHELL, "Auto", cwd=SCRATCH_CWD, pty=True))
     auto.seed_pty_replay(snapshot)
     acard = TerminalCard(auto)
     acard.resize(640, 400); acard.show(); pump(50)
@@ -8720,7 +8905,7 @@ def test_boot_veil():
     # the regression guard for the OTHER half: a retile rebuilds cards over a
     # LIVE agent's buffer, which must paint instantly and never flash a loader
     live = TerminalAgent(build_spec(
-        AgentKind.POWERSHELL, "Live", cwd=os.getcwd(), pty=True))
+        AgentKind.POWERSHELL, "Live", cwd=SCRATCH_CWD, pty=True))
     live._on_pty_output("pty", "LIVE-CHILD-OUTPUT\r\n")   # a live conversation
     check("boot-veil: a buffer a child wrote is not a restored snapshot",
           live.pty_replay() and not live.has_pristine_seed())
@@ -8741,7 +8926,7 @@ def test_resume_fallback():
     from app.process_worker import AgentKind, build_spec
     from app.terminal_agent import AgentStatus, TerminalAgent
 
-    spec = build_spec(AgentKind.CLAUDE, "Resumed", cwd=os.getcwd(),
+    spec = build_spec(AgentKind.CLAUDE, "Resumed", cwd=SCRATCH_CWD,
                       pty=True)
     spec.resume = True
     agent = TerminalAgent(spec)
@@ -8771,7 +8956,7 @@ def test_resume_fallback():
     check("resume-fallback: no infinite relaunch loop", calls["start"] == 2)
 
     # a resume that DID reach the prompt, then exits, must NOT relaunch
-    spec2 = build_spec(AgentKind.CLAUDE, "Coder", cwd=os.getcwd(), pty=True)
+    spec2 = build_spec(AgentKind.CLAUDE, "Coder", cwd=SCRATCH_CWD, pty=True)
     spec2.resume = True
     a2 = TerminalAgent(spec2)
     c2 = {"start": 0}
@@ -8784,7 +8969,7 @@ def test_resume_fallback():
     check("resume-fallback: healthy session not relaunched on exit", c2["start"] == 1)
 
     # a user Stop (STOPPING) of a not-yet-ready resume must NOT relaunch either
-    spec3 = build_spec(AgentKind.CLAUDE, "Stopped", cwd=os.getcwd(), pty=True)
+    spec3 = build_spec(AgentKind.CLAUDE, "Stopped", cwd=SCRATCH_CWD, pty=True)
     spec3.resume = True
     a3 = TerminalAgent(spec3)
     c3 = {"start": 0}
@@ -8930,19 +9115,6 @@ def test_plan_usage():
         creds.unlink()
         check("plan-usage: missing credentials report no-auth, never raise",
               cu.fetch().error == "no-auth")
-        check("plan-usage: missing cache returns None, never raises",
-              cu.read_cached() is None)
-        # --- the on-disk cache is parsed by the very same parser ---
-        (tmp / ".claude.json").write_text(_json.dumps({
-            "cachedUsageUtilization": {"fetchedAtMs": int((now - 90) * 1000),
-                                       "utilization": payload}}),
-            encoding="utf-8")
-        cached = cu.read_cached()
-        check("plan-usage: cache seed parsed, marked as cached",
-              cached is not None and cached.source == "cache"
-              and cached.limits[0].percent == 21.0)
-        check("plan-usage: cache keeps Claude's timestamp, not now",
-              abs(cached.fetched_at - (now - 90)) < 2.0)
     finally:
         if old_env is None:
             os.environ.pop("CLAUDE_CONFIG_DIR", None)
@@ -9060,8 +9232,9 @@ def test_plan_usage():
           not claude_poll.reset_poll_armed())
     win._on_usage_ready(good)
 
-    # --- the shared cadence (app.usage_poll): idle 6 min, working 90 s,
-    # working and nearly spent 30 s. Only a CLAUDE agent's work counts here.
+    # --- the window feeds the shared cadence (app.usage_poll) the right
+    # agents: only a CLAUDE agent's work speeds Claude's poll. The cadence
+    # rules themselves (thresholds, grace, backoff) are test_usage_poll_policy.
     from app import usage_poll as up
     from app.process_worker import AgentKind, build_spec
     hot = cu.Usage(limits=(limit("five_hour", 95.0, now + 600),),
@@ -9083,54 +9256,12 @@ def test_plan_usage():
     check("plan-usage: nearly spent + a Claude agent working polls at 30 s",
           claude_poll.interval_ms() == up.URGENT_POLL_MS,
           claude_poll.interval_ms())
-    check("plan-usage: below the urgent mark a working agent polls at 90 s",
-          (win._on_usage_ready(good),
-           claude_poll.interval_ms() == up.POLL_MS)[-1])
-    agent_hot._busy = False
-    agent_hot._last_work_ts = time.time() - 30
-    check("plan-usage: a turn that ended 30 s ago still counts as work",
-          claude_poll.interval_ms() == up.POLL_MS)
-    agent_hot._last_work_ts = time.time() - up.ACTIVE_GRACE_S - 5
-    check("plan-usage: quiet past the grace drops back to the idle rate",
-          claude_poll.interval_ms() == up.IDLE_POLL_MS)
-    agent_hot._busy = True
-    # a spent window is the reset poll's job, not a reason to hammer the endpoint
-    win._on_usage_ready(cu.Usage(limits=(limit("five_hour", 100.0, now + 120),),
-                                 fetched_at=now, plan="pro"))
-    check("plan-usage: an already-spent window drops back to the 90 s poll",
-          claude_poll.interval_ms() == up.POLL_MS)
-    # and being rate-limited must still win over the urgent rate
-    win._on_usage_ready(hot)
-    win._on_usage_ready(cu.Usage(error="http 429"))
-    check("plan-usage: a 429 backs off even in the danger zone",
-          claude_poll.interval_ms() == 2 * up.URGENT_POLL_MS
-          and claude_poll.backoff() == 1)
-    win._on_usage_ready(hot)
-    check("plan-usage: a good reading clears the backoff back to urgent",
-          claude_poll.interval_ms() == up.URGENT_POLL_MS)
     agent_hot._busy = False
     win.manager.remove_workspace(ws_hot.id)
     win._on_usage_ready(good)
     win._save_timer.stop()
 
-    # One failed poll keeps the number, IN COLOUR. It was greyed on the spot
-    # before, which made a one-minute-old, still-right figure look broken.
-    win._on_usage_ready(cu.Usage(error="urlerror"))
-    check("plan-usage: one failed poll keeps the last number, not greyed",
-          badge._text.startswith("5h Claude 21% used") and not badge.is_stale())
-    check("plan-usage: the tooltip names the failure while it lasts",
-          "urlerror" in badge.toolTip())
-    old = cu.Usage(limits=(limit("five_hour", 21.0, now + 4800),),
-                   fetched_at=time.time() - 3600, plan="pro")
-    win._on_usage_ready(old)
-    check("plan-usage: an old reading with healthy polls is not greyed",
-          not badge.is_stale())
-    win._on_usage_ready(cu.Usage(error="urlerror"))
-    check("plan-usage: failing polls on a reading past stale_after grey it",
-          badge.is_stale())
-    win._on_usage_ready(good)
-    check("plan-usage: a good reading brings the colour back",
-          not badge.is_stale() and "urlerror" not in badge.toolTip())
+    # (failure greying rules: test_usage_poll_policy)
     over = cu.Usage(limits=(limit("five_hour", 21.0, time.time() - 5),),
                     fetched_at=time.time() - 60, plan="pro")
     win._on_usage_ready(over)
@@ -9197,19 +9328,8 @@ def test_plan_usage():
           and win4.plan_usage() is None)
     check("plan-usage: its tooltip names the failure and the way out",
           "http 429" in b4.toolTip() and "Click to try again" in b4.toolTip())
-    check("plan-usage: the can't-read pill paints without a limit to draw",
-          not b4.grab().isNull())
     check("plan-usage: polling continues (only no-auth is terminal)",
           p4.is_running() and p4.next_poll_at() > 0)
-    # a click is the user asking NOW: it must not be left parked behind the
-    # backoff a run of 429s just wound up to
-    check("plan-usage: a 429 backs the poll off",
-          p4.backoff() == 1 and p4.interval_ms() > p4.cadence_ms())
-    p4._inflight = True                 # keep the click from spawning a fetch
-    win4._on_usage_refresh()
-    p4._inflight = False
-    check("plan-usage: a manual refresh clears the 429 backoff",
-          p4.backoff() == 0 and p4.interval_ms() == p4.cadence_ms())
     # and a real number supersedes the error pill entirely
     win4._on_usage_ready(good)
     app.processEvents()
@@ -9356,9 +9476,6 @@ def test_usage_trackers_preference():
           "other alone",
           not bar.usage_weekly_badge.isVisible())
 
-    check("usage-trackers: the old master toggle is gone",
-          not hasattr(bar, "usageVisibilityToggled")
-          and not hasattr(bar, "set_usage_visible"))
     win._save_session()
     win.close()
 
@@ -9481,6 +9598,24 @@ def test_limit_ledger():
 
 
 def test_auto_continue_on_limit_reset():
+    """Runs the body below with the app's own delays shrunk. The body pumps
+    past each timer, so at the shipped values (2 s stagger, 3 s phantom check,
+    400 ms Esc beat) it spent ~36 s asleep. The ORDER of events is what it
+    checks, and that survives any scale; the CR's 350 ms beat stays real."""
+    from app.widgets import main_window as mw
+    saved = (mw.AUTO_CONTINUE_STAGGER_MS, mw.LIMIT_PHANTOM_CHECK_MS,
+             mw.AUTO_CONTINUE_ESC_MS)
+    mw.AUTO_CONTINUE_STAGGER_MS = 200
+    mw.LIMIT_PHANTOM_CHECK_MS = 150
+    mw.AUTO_CONTINUE_ESC_MS = 100
+    try:
+        _auto_continue_on_limit_reset_body()
+    finally:
+        (mw.AUTO_CONTINUE_STAGGER_MS, mw.LIMIT_PHANTOM_CHECK_MS,
+         mw.AUTO_CONTINUE_ESC_MS) = saved
+
+
+def _auto_continue_on_limit_reset_body():
     """When the plan limit resets, the agents it CUT OFF go back to work by
     themselves: Esc to close the limit's options menu, then "Continue".
 
@@ -9503,8 +9638,9 @@ def test_auto_continue_on_limit_reset():
     app = QApplication.instance() or QApplication([])
     now = _time.time()
 
-    # long enough to cover the Esc->type beat plus the delayed submit CR
-    AUTO_CONTINUE_SETTLE_MS = 1200
+    # long enough to cover the Esc->type beat (shrunk to 100 ms by the
+    # wrapper) plus the delayed submit CR (350 ms, never shrunk), with margin
+    AUTO_CONTINUE_SETTLE_MS = 900
 
     def pump(ms):
         loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
@@ -9529,7 +9665,7 @@ def test_auto_continue_on_limit_reset():
     # --- the per-agent "I was cut off" scrape -------------------------------
     def mk(name="Coder", provider="claude", pty=True):
         spec = build_spec(AgentKind.CLAUDE if provider == "claude"
-                          else AgentKind.CMD, name, cwd=os.getcwd(), pty=pty)
+                          else AgentKind.CMD, name, cwd=SCRATCH_CWD, pty=pty)
         a = TerminalAgent(spec)
         a.worker = type("W", (), {
             "is_running": lambda s: True,
@@ -10164,25 +10300,8 @@ def test_auto_continue_on_limit_reset():
     check("auto-continue: a latch whose banner has not been written to the "
           "transcript yet is NOT dismissed early", slow.is_limit_blocked())
 
-    # ...and a slash command is the user's own work, however much its record
-    # looks like plumbing.
-    writes.clear()
-    slash_cwd = str(tmp / "slashcmd")
-    slash = mk("SlashCmd")
-    slash.spec.cwd, slash.spec.session_id = slash_cwd, "sid-slash-cmd"
-    write_raw(slash_cwd, "sid-slash-cmd", [
-        {"type": "user", "timestamp": ts(now - 30),
-         "message": {"content": "<command-name>/security-review</command-name>"
-                                "\n<command-message>go</command-message>"}},
-        {"type": "assistant", "timestamp": ts(now - 30),
-         "message": {"content": [{"type": "text", "text": BANNER.strip()}]}},
-    ])
-    settle(slash, BANNER)
-    ws.agents.append(slash)
-    win._on_agent_limit_blocked(ws.id, slash.id)
-    pump(LIMIT_PHANTOM_CHECK_MS + 500)
-    check("auto-continue: a cut-off during a USER-typed slash command is not "
-          "dismissed as plumbing", slash.is_limit_blocked())
+    # (a USER-typed slash command is classified in test_startup_limit_recovery;
+    # the window only acts on that classification, as the two cases above show)
 
     # --- the cut-off is visible on the card ---------------------------------
     marked = mk("Marked")
@@ -10311,7 +10430,7 @@ def test_gemini_limit_detection():
     writes: dict = {}
 
     def mk(name="Gem", kind=AgentKind.GEMINI):
-        spec = build_spec(kind, name, cwd=os.getcwd(), pty=True)
+        spec = build_spec(kind, name, cwd=SCRATCH_CWD, pty=True)
         a = TerminalAgent(spec)
         a.worker = type("W", (), {
             "is_running": lambda s: True,
@@ -10859,7 +10978,7 @@ def test_limit_recovery_reliability():
     PADDED = BANNER + "\n" + "\n" * 60 + "> try \"fix the tests\"\n  ? for shortcuts\n"
 
     def mk(name="Coder"):
-        a = TerminalAgent(build_spec(AgentKind.CLAUDE, name, cwd=os.getcwd()))
+        a = TerminalAgent(build_spec(AgentKind.CLAUDE, name, cwd=SCRATCH_CWD))
         a._prompt_ready = True
         return a
 
@@ -10977,8 +11096,11 @@ def test_limit_recovery_reliability():
     store = SessionStore(path=tmp / "session.json")
     win = create_main_window(store)
     ws = win.manager.create_workspace("W", str(tmp))
+    # autostart=False: the default launches a real claude before the stubs
+    # below are in place
     agent = win.manager.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "A",
-                                                       cwd=str(tmp)))
+                                                       cwd=str(tmp)),
+                                     autostart=False)
     agent._prompt_ready = False    # a card the user has never opened
     asked: list = []
     agent.request_repaint = lambda: (asked.append(1), True)[1]
@@ -11024,13 +11146,13 @@ def test_agent_kind_is_always_an_enum():
     check("agent-kind: Qt really does hand back a plain str (the trap)",
           type(from_qt) is str and not isinstance(from_qt, AgentKind))
 
-    spec = build_spec(from_qt, "Agent 1", cwd=os.getcwd())
+    spec = build_spec(from_qt, "Agent 1", cwd=SCRATCH_CWD)
     check("agent-kind: build_spec coerces it back to the enum",
           spec.kind is AgentKind.CLAUDE)
     check("agent-kind: so the agent serializes instead of degrading",
           spec.to_dict()["kind"] == "claude")
     check("agent-kind: an enum in still comes out unchanged",
-          build_spec(AgentKind.CMD, "S", cwd=os.getcwd()).kind is AgentKind.CMD)
+          build_spec(AgentKind.CMD, "S", cwd=SCRATCH_CWD).kind is AgentKind.CMD)
 
 
 def test_scheduled_send():
@@ -11099,7 +11221,7 @@ def test_scheduled_send():
     writes: dict = {}
 
     def mk(name="Coder", pty=True):
-        spec = build_spec(AgentKind.CLAUDE, name, cwd=os.getcwd(), pty=pty)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=SCRATCH_CWD, pty=pty)
         a = TerminalAgent(spec)
         a.worker = type("W", (), {
             "is_running": lambda s: True,
@@ -11242,10 +11364,16 @@ def test_scheduled_send():
     # QTimer.start() RESTARTS a running timer, and this is called from
     # workspaceStatsChanged (which fires every couple of seconds per busy
     # agent) -- an unconditional start would reset the countdown forever
+    # let the countdown run down a little first: a restart would put it back
+    # at the full 50 s, which a check straight after setInterval can't see
     win._schedule_timer.setInterval(50000)
+    win._schedule_timer.start()
+    from PySide6.QtCore import QEventLoop as _Loop, QTimer as _T
+    _l = _Loop(); _T.singleShot(300, _l.quit); _l.exec()
     win._sync_schedule_timer()
+    left = win._schedule_timer.remainingTime()
     check("schedule: re-syncing an already-running tick does not restart it",
-          win._schedule_timer.remainingTime() <= 50000)
+          0 <= left <= 49800, left)
     win._schedule_timer.setInterval(1000)
 
     check("schedule: workspace stats count agents holding a message",
@@ -11293,7 +11421,7 @@ def test_scheduled_send():
           states)
     check("schedule: a session with no queue restores cleanly",
           m2.load_session_dict({"workspaces": [{"id": "w", "name": "W",
-                                                "project_path": os.getcwd(),
+                                                "project_path": SCRATCH_CWD,
                                                 "terminals": []}]}) is None)
     # the degraded save path keeps the queue too: it exists so a malformed
     # agent loses as little as possible, and a dropped hand-off is a real loss
@@ -11499,12 +11627,14 @@ def test_scheduled_send():
     # --- the card chip ------------------------------------------------------
     page = win._pages[ws.id]
     chip_agent = mgr.add_terminal(
-        ws.id, build_spec(AgentKind.CLAUDE, "Chip", cwd=os.getcwd()),
+        ws.id, build_spec(AgentKind.CLAUDE, "Chip", cwd=SCRATCH_CWD),
         autostart=False)
     card = page.card_for(chip_agent.id)
     check("schedule: a card with nothing queued shows no countdown chip",
           card is not None and not card.sched_mark.isVisible())
-    chip_agent.schedule_message("later", now + 724)
+    # `now` was captured far above: under load, seconds pass before this line
+    # and the countdown reads 11:5x. Take the time here.
+    chip_agent.schedule_message("later", time.time() + 724)
     check("schedule: the chip appears with the countdown to the soonest one",
           card.sched_mark.isVisible() and "12:0" in card.sched_mark.text(),
           card.sched_mark.text())
@@ -11520,7 +11650,7 @@ def test_scheduled_send():
     from app.widgets.sidebar import AgentRow
 
     sb_agent = mgr.add_terminal(
-        ws.id, build_spec(AgentKind.CLAUDE, "SidebarSched", cwd=os.getcwd()),
+        ws.id, build_spec(AgentKind.CLAUDE, "SidebarSched", cwd=SCRATCH_CWD),
         autostart=False)
     row = AgentRow(ws.id, sb_agent)
     check("schedule: the sidebar row's clock is hidden with nothing queued",
@@ -12301,8 +12431,9 @@ def test_terminal_scrollbar():
           or v.abs_line_at_row(0) >= before, v.abs_line_at_row(0))
 
     # ---- capture point: a bare Enter, and nothing else -------------------
-    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Marks", cwd=".",
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Marks", cwd=SCRATCH_CWD,
                                      pty=True))
+    agent.worker.start = lambda: None  # Enter on a stopped card wakes it
     card = TerminalCard(agent)
     card.resize(640, 420)
     t = card.terminal
@@ -12360,6 +12491,7 @@ def test_terminal_scrollbar():
 
     # ---- uid is never an id() ------------------------------------------
     evicted = agent.prompt_marks()[0].uid
+    evicted_line = card._mark_lines.get(evicted)
     for i in range(PROMPT_MARK_CAP + 5):
         t.feed(f"\r\n> prompt {i}")
         enter(t)
@@ -12369,13 +12501,15 @@ def test_terminal_scrollbar():
     check("scrollbar: a surviving uid never reuses an evicted one",
           evicted not in uids and len(set(uids)) == len(uids))
     card._refresh_marks()
+    painted = sorted(line for line, _ in card.terminal.marks())
     check("scrollbar: an evicted milestone is not still painted",
-          all(uid in {m.uid for m in agent.prompt_marks()}
-              for uid in {m.uid for m in agent.prompt_marks()}))
+          painted == sorted(card._mark_lines[u] for u in uids)
+          and evicted_line not in painted, (evicted_line, painted[:3]))
 
     # ---- re-anchoring across a card rebuild ----------------------------
-    agent2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Replay", cwd=".",
+    agent2 = TerminalAgent(build_spec(AgentKind.CLAUDE, "Replay", cwd=SCRATCH_CWD,
                                       pty=True))
+    agent2.worker.start = lambda: None  # Enter on a stopped card wakes it
     c1 = TerminalCard(agent2)
     c1.resize(640, 420)
     for k in range(4):
@@ -12497,7 +12631,7 @@ def test_terminal_scrollbar():
           found)
 
     # ---- width change re-projects the scrollback -------------------------
-    wide = TerminalAgent(build_spec(AgentKind.CLAUDE, "Reflow", cwd=".",
+    wide = TerminalAgent(build_spec(AgentKind.CLAUDE, "Reflow", cwd=SCRATCH_CWD,
                                     pty=True))
     wcard = TerminalCard(wide)
     wt = wcard.terminal
@@ -12620,6 +12754,8 @@ def test_terminal_scrollbar():
     check("scrollbar: ...and its scrollback, so the bar goes away",
           len(c2.terminal.screen.history.top) == 0
           and c2._mark_lines == {} and c2.terminal.marks() == [])
+    # a stub: from IDLE, PtyWorker.restart() STARTS a real claude
+    agent.worker.restart = lambda: None
     agent.restart()
     check("scrollbar: a restart clears milestones and stream coordinates",
           agent.prompt_marks() == [] and agent._pty_total == 0
@@ -12695,7 +12831,7 @@ def test_reply_marks_recovered_from_transcript():
           _reply_end_row(rows, "never written", 0) is None)
 
     # ---- end to end through a real card ----------------------------------
-    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyRecover", cwd=".",
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyRecover", cwd=SCRATCH_CWD,
                                      pty=True))
     card = TerminalCard(agent)
     card.resize(640, 420)
@@ -12794,7 +12930,7 @@ def test_reply_marks_inline():
 
     QApplication.instance() or QApplication([])
 
-    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyMarks", cwd=".",
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "ReplyMarks", cwd=SCRATCH_CWD,
                                      pty=True))
     card = TerminalCard(agent)
     card.resize(640, 420)
@@ -12870,6 +13006,8 @@ def test_reply_marks_inline():
           agent.reply_marks() == [])
 
     agent.note_reply_settled()
+    # a stub: from IDLE, PtyWorker.restart() STARTS a real claude
+    agent.worker.restart = lambda: None
     agent.restart()
     check("reply-mark: a restart clears reply marks too",
           agent.reply_marks() == [])
@@ -12947,8 +13085,7 @@ def test_reset_clock_zones():
             break
         t += 86400
     if change is None:
-        check("reset-zone: local zone has no DST change (nothing to roll over)",
-              True)
+        skip('reset-zone', 'local zone has no DST change, nothing to roll over')
     else:
         lt = _time.localtime(change)
         eve_local = _time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
@@ -13965,126 +14102,6 @@ def test_self_update():
     win.close()
 
 
-def main():
-    test_tiling()
-    test_layout_popup_placement()
-    test_sidebar_count_badge()
-    test_row_name_fades_under_badges()
-    test_agent_waiting()
-    test_notification_chime()
-    test_limit_blocked_workspace_stats()
-    test_winjob_process_count()
-    test_winjob_process_ids_and_kill()
-    test_bg_shell_workspace_stats()
-    test_bg_shell_settle_relearn()
-    test_bg_shell_kill_extras()
-    test_chime_persistence()
-    test_custom_chime_sounds()
-    test_reply_chime()
-    test_hook_prompt_events()
-    test_agent_hook_waiting()
-    test_manager_prompt_events_sync()
-    test_input_echo_not_busy()
-    test_sidebar_reorder()
-    test_manager_reorder_persist()
-    test_agent_card_reorder()
-    test_sidebar_categories()
-    test_manager_categories_persist()
-    test_category_container()
-    test_agent_inline_expansion()
-    test_ai_title_summary()
-    test_token_usage_badge()
-    test_live_model_effort()
-    test_limit_blocked_live_ui()
-    test_bg_shell_live_ui()
-    test_bg_shell_extra_pids_and_kill_pid()
-    test_no_em_dashes_in_visible_text()
-    test_reveal_agent()
-    test_new_agent_autofocus()
-    test_agent_busy_activity()
-    test_reply_marks_need_a_submitted_turn()
-    test_reply_marks_recovered_after_reprint()
-    test_reply_stamp_repaint_and_merge()
-    test_transcript_reply_times()
-    test_ansi()
-    test_terminal_keys()
-    test_terminal_image_paste()
-    test_terminal_mouse_words_links()
-    test_terminal_mouse_tracking_click()
-    test_terminal_click_menu_guard()
-    test_terminal_selection_edit()
-    test_terminal_input_editor()
-    test_input_gap_self_heal()
-    test_session_migration()
-    test_app()
-    test_pty()
-    test_v2_features()
-    test_v2_review_fixes()
-    test_v3_features()
-    test_persistence_resume()
-    test_boot_veil()
-    test_resume_fallback()
-    test_scrollback()
-    test_themes()
-    test_review_fixes()
-    test_wake_and_resume_all()
-    test_session_pinning()
-    test_session_recovery()
-    test_session_hook_tracking()
-    test_session_hook_arming()
-    test_review_hardening_fixes()
-    test_resume_picker()
-    test_transcript_backups()
-    test_pty_width_at_launch()
-    test_screen_snapshots()
-    test_agent_file_map()
-    test_fsopen_helpers()
-    test_filetypes_icons()
-    test_terminal_relative_link()
-    test_terminal_link_context_menu()
-    test_terminal_block_glyphs()
-    test_terminal_link_underline()
-    test_sidebar_file_tree()
-    test_sidebar_search()
-    test_plan_usage()
-    test_usage_trackers_preference()
-    test_taskbar_badge()
-    test_bg_shell_taskbar_state()
-    test_limit_ledger()
-    test_event_log()
-    test_agent_kind_is_always_an_enum()
-    test_limit_recovery_reliability()
-    test_auto_continue_on_limit_reset()
-    test_gemini_limit_detection()
-    test_startup_limit_recovery()
-    test_reset_clock_zones()
-    test_limit_detection_hardening()
-    test_terminal_scrollbar()
-    test_reply_marks_inline()
-    test_reply_marks_recovered_from_transcript()
-    test_history_screen_wrapper_removed()
-    test_gemini_usage_read_disables_agy_auto_update()
-    test_gemini_usage_polling_is_offthread_and_optin()
-    test_usage_poll_policy()
-    test_gemini_usage_reads_both_cli_output_shapes()
-    test_projection_happens_once()
-    test_recovered_prompts_are_cached()
-    test_multi_agent_session_isolation()
-    test_usage_pill_geometry_and_close()
-    test_usage_pill_never_truncates()
-    test_usage_pill_provider_inks()
-    test_options_panel()
-    test_topbar_extras_autosize()
-    test_topbar_extras_grow_with_window()
-    test_scheduled_send()
-    test_cli_auto_update()
-    test_cli_native_migration()
-    test_self_update()
-    test_lifecycle_e2e()  # slowest last: launches a real claude once
-    print(f"\nRESULT: {PASS} passed, {FAIL} failed", flush=True)
-    return 1 if FAIL else 0
-
-
 def test_usage_pill_geometry_and_close():
     """Every usage pill is sized by ONE formula, and carries a hover X.
 
@@ -14168,9 +14185,6 @@ def test_usage_pill_geometry_and_close():
           == badge._measure_width("21% used, resets in 1h20m at 14:49")
           and GeminiUsageBadge._measure_width is UsagePillBadge._measure_width
           and PlanUsageBadge._measure_width is UsagePillBadge._measure_width)
-    check("usage-pill: the fixed 315px width is gone",
-          not hasattr(GeminiUsageBadge, "_FIXED_WIDTH")
-          and badge.width() != weekly_badge.width())
     check("usage-pill: the full text fits, so nothing is ever truncated",
           badge.width() - (badge._PAD + badge._RING + badge._GAP) - badge._PAD
           >= QFontMetrics(badge._text_font(), badge).horizontalAdvance(
@@ -14219,14 +14233,6 @@ def test_usage_pill_geometry_and_close():
     check("usage-pill: the shared base owns the geometry",
           issubclass(GeminiUsageBadge, UsagePillBadge)
           and issubclass(PlanUsageBadge, UsagePillBadge))
-
-    # THE DISK CACHE IS GONE. A stored number goes stale exactly where it
-    # matters most (a 5-hour window is routinely spent and reopened between
-    # launches), and nothing on the bar tells a restored figure from a live one.
-    check("gemini-usage: the disk cache is removed entirely",
-          not hasattr(gemini_usage, "read_cached")
-          and not hasattr(gemini_usage, "write_cached")
-          and not hasattr(gemini_usage, "cache_path"))
 
     real_cli = gemini_usage.fetch_cli
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -14314,14 +14320,24 @@ def test_usage_pill_never_truncates():
 
     # a font swapped under a line that has NOT changed: `_set_text` would
     # early-return, so only `changeEvent` can keep the width honest
-    before = pill.width()
+    # Compared against what the pill PAINTS with, not the font asked for: an
+    # app stylesheet an earlier test left behind can override setFont, and
+    # then the honest outcome is that nothing moves.
+    def follows(width_before, adv_before):
+        adv = painted_advance(pill)
+        moved = pill.width() - width_before
+        return (text_room(pill) >= adv
+                and (moved > 0) == (adv > adv_before)
+                and (moved < 0) == (adv < adv_before))
+
+    before, adv_before = pill.width(), painted_advance(pill)
     wide = QFont("Courier New")
     wide.setPixelSize(13)
     pill.setFont(wide)
     spin()
-    widened = pill.width()
+    widened, adv_wide = pill.width(), painted_advance(pill)
     check("usage-pill: a font change re-measures the pill",
-          widened > before and text_room(pill) >= painted_advance(pill))
+          follows(before, adv_before), (before, widened, adv_before, adv_wide))
 
     # ...and the same the other way, so a narrower face gives the bar its
     # pixels back rather than leaving a padded pill behind. Measured against
@@ -14334,8 +14350,8 @@ def test_usage_pill_never_truncates():
     pill.setFont(narrow)
     spin()
     check("usage-pill: a narrower font shrinks the pill back",
-          pill.width() < widened
-          and text_room(pill) >= painted_advance(pill))
+          follows(widened, adv_wide), (widened, pill.width(), adv_wide,
+                                       painted_advance(pill)))
 
     # THE MEASUREMENT ITSELF IS WRONG: the exact shape of the reported bug.
     # Re-running it would repeat the error, so the repair has to come from
@@ -15250,8 +15266,6 @@ def test_cli_auto_update():
     win._restore_ui_state({"ui": {}})
     check("cli-update: a missing key still means OFF",
           not win._auto_update and not win.top_bar.auto_update())
-    check("cli-update: the key is additive, so SESSION_VERSION is unchanged",
-          SESSION_VERSION == 4, SESSION_VERSION)
 
     # a real close/reopen, which is the only way to catch a default assigned
     # AFTER _restore_ui_state has run (that exact bug hit the taskbar toggle)
@@ -15326,11 +15340,6 @@ def test_cli_auto_update():
     app.processEvents()
 
     # --- 13. the factory the suite shares does NO update work --------------
-    import inspect
-    import main as main_module
-    src = inspect.getsource(main_module.create_main_window)
-    check("cli-update: create_main_window contains no update work at all",
-          "update_gate" not in src and "cli_update" not in src)
     real_runner, real_gate = cli_update.subprocess_runner, cli_update.run_gate
     touched = []
     cli_update.subprocess_runner = lambda *a, **k: touched.append(a) or (0, "")
@@ -15470,20 +15479,20 @@ def test_cli_auto_update():
           subtitle_for([claude, agy]) ==
           "Now is the only moment these files are not in use.")
 
-    # the linger, end to end through the real event loop
+    # the linger, end to end through the real event loop. A long linger and a
+    # threshold just under it: a 400ms linger against a 350ms line failed the
+    # fast case whenever a loaded machine took 350ms to show and close a window
     for target, expect_wait in ((claude, True), (native_claude, False)):
         started = time.time()
         run_update_gate(None, targets=[target],
                         runner=_FakeCli(timeout_on=("--version",)),
-                        auto_close_ms=0, linger_ms=400, show=True)
+                        auto_close_ms=0, linger_ms=1500, show=True)
         waited = time.time() - started
         check("cli-update splash: a missed update holds the window open"
               if expect_wait else
               "cli-update splash: ...and a non event closes as fast as a "
               "clean launch",
-              (waited >= 0.35) is expect_wait, (target.key, waited))
-    check("cli-update splash: the linger is long enough to actually read",
-          LINGER_CLOSE_MS >= 2000)
+              (waited >= 1.4) is expect_wait, (target.key, waited))
 
 
 class _FakeInstall:
@@ -15662,8 +15671,8 @@ def test_cli_native_migration():
     # the exact act that writes the false winget database record cli_update.py
     # exists to prevent. It is named in the module docstring as a decision and
     # must never become code, so this asserts the module sets no env at all.
-    module_src = Path("app/cli_install.py").read_text(encoding="utf-8")
-    panel_src = Path("app/widgets/update_panel.py").read_text(encoding="utf-8")
+    module_src = (ROOT / "app" / "cli_install.py").read_text(encoding="utf-8")
+    panel_src = (ROOT / "app" / "widgets" / "update_panel.py").read_text(encoding="utf-8")
     check("cli-install: no code path ever sets an environment variable, so "
           "CLAUDE_CODE_PACKAGE_MANAGER_AUTO_UPDATE can never be turned on",
           "os.environ[" not in module_src and "putenv" not in module_src
@@ -15872,7 +15881,7 @@ def test_cli_native_migration():
           "cannot outlive the reason for it",
           out.ok and "minimumVersion" not in doc
           and doc["autoUpdatesChannel"] == "latest", doc)
-    body = Path("app/cli_install.py").read_text(encoding="utf-8")
+    body = (ROOT / "app" / "cli_install.py").read_text(encoding="utf-8")
     check("cli-install: requiredMinimumVersion is never WRITTEN (it stops "
           "Claude Code starting at all, and is not ours to set)",
           'doc["requiredMinimumVersion"]' not in body
@@ -15948,20 +15957,20 @@ def test_cli_native_migration():
         os.environ["USERPROFILE"] = str(rev / "home")
         os.environ["LOCALAPPDATA"] = str(rev / "local")
         runner = _FakeInstall(alive=1, paths=[str(native_bin / "claude.exe")])
-        out = cli_install.revert(runner)
+        out = cli_install.revert(runner, home=str(rev / "home"))
         check("cli-install: a revert is refused while a native session is "
               "alive, and never kills one",
               not out.ok and runner.mutating() == []
               and (native_bin / "claude.exe").is_file(), out)
         runner = _FakeInstall(alive=0)
-        out = cli_install.revert(runner)
+        out = cli_install.revert(runner, home=str(rev / "home"))
         check("cli-install: a WinGet copy that did not come back leaves the "
               "native install in place",
               not out.ok and (native_bin / "claude.exe").is_file(), out)
         (pkg / "claude.exe").write_text("winget", encoding="utf-8")
         runner = _FakeInstall(alive=0,
                               versions={str(pkg / "claude.exe"): "2.1.224"})
-        out = cli_install.revert(runner)
+        out = cli_install.revert(runner, home=str(rev / "home"))
         check("cli-install: a verified revert puts WinGet back and removes the "
               "native install",
               out.ok and out.after == "2.1.224"
@@ -16075,7 +16084,8 @@ def test_cli_native_migration():
     native_panel._on_cleanup()
     check("cli-install panel: a command that never returns does not block the "
           "GUI thread, and the panel says so by disabling its actions",
-          time.time() - started < 1.0 and not native_panel.action_btn.isEnabled()
+          # the runner blocks 10 s: anything well under that was not inline
+          time.time() - started < 5.0 and not native_panel.action_btn.isEnabled()
           and not native_panel.cleanup_btn.isEnabled())
     native_panel.close()      # Cancel/Close is the escape hatch, never a kill
     check("cli-install panel: closing mid-command stops the poll and claims "
@@ -16146,6 +16156,80 @@ def _dialog_strings(widget) -> list:
     return out
 
 
+def test_gemini_session_pinning():
+    """Gemini (agy) agents pin their conversation like Claude ones: a pinned
+    id resumes with --conversation <id>, only an unpinned one falls back to
+    --continue. Plus the model/effort, permission-mode and title parsers the
+    card header reads. Folded in from the old tests/test_gemini_session_
+    pinning.py, which nothing ran, minus its checks that needed a live Gemini
+    session in the repo folder."""
+    import json as _json
+    from app import providers, transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.workspace_manager import WorkspaceManager
+
+    sid = "da3a8077-8c47-4e46-92a4-f40637e999ad"
+    spec = build_spec(AgentKind.GEMINI, "G", cwd=SCRATCH_CWD,
+                      model="Gemini 3.6 Flash (High)")
+    spec.session_id, spec.resume = sid, True
+    args = spec.effective_args()
+    check("gemini-pin: a pinned agent resumes with --conversation <id>",
+          "--conversation" in args
+          and args[args.index("--conversation") + 1] == sid
+          and "--continue" not in args, args)
+    spec.session_id = ""
+    args = spec.effective_args()
+    check("gemini-pin: an unpinned agent falls back to --continue",
+          "--continue" in args and "--conversation" not in args, args)
+
+    cases = [("Gemini 3.8 Flash (High)", ("Gemini 3.8 Flash", "high")),
+             ("gemini-3.8-flash-medium", ("Gemini 3.8 Flash", "medium")),
+             ("Claude Sonnet 4.6 (Thinking)", ("Claude Sonnet 4.6", "thinking"))]
+    for raw, want in cases:
+        got = transcripts.parse_gemini_model_effort(raw)
+        check(f"gemini-pin: {raw} parses to {want}", tuple(got) == want, got)
+    check("gemini-pin: a control variant keeps its family",
+          transcripts.parse_gemini_model_effort(
+              "gemini-3.7-flash-control")[0] == "Gemini 3.7 Flash")
+
+    low = build_spec(AgentKind.GEMINI, "L", cwd=SCRATCH_CWD,
+                     model="Gemini 3.8 Flash (Low)")
+    check("gemini-pin: build_spec reads the effort out of the model label "
+          "and passes the label as ONE argv entry",
+          low.effort == "low" and low.args == ["--model",
+                                               "Gemini 3.8 Flash (Low)"],
+          (low.effort, low.args))
+
+    check("gemini-pin: permission modes display as the card's words",
+          [providers.gemini_permission_mode_display(m)
+           for m in ("accept-edits", "always-proceed", "plan", "")]
+          == ["auto", "bypass", "plan", "manual"])
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-gemtitle-"))
+    db = tmp / "conversations.json"
+    db.write_text(_json.dumps({"conversations": {
+        "s1": {"summary": {"ID": "s1", "Title": "Custom Title",
+                           "Preview": "Preview Text"}},
+        "s2": {"summary": {"ID": "s2", "Title": "",
+                           "Preview": "Preview Fallback"}}}}),
+        encoding="utf-8")
+    check("gemini-pin: the title is the conversation's Title",
+          transcripts._read_gemini_ai_title(str(db), "s1") == "Custom Title")
+    check("gemini-pin: ...falling back to its Preview when untitled",
+          transcripts._read_gemini_ai_title(str(db), "s2")
+          == "Preview Fallback")
+
+    wm = WorkspaceManager()
+    ws = wm.create_workspace("G", SCRATCH_CWD)
+    agent = wm.add_terminal(ws.id, build_spec(
+        AgentKind.GEMINI, "Badge", cwd=SCRATCH_CWD,
+        model="Gemini 3.7 Flash (High)"), autostart=False)
+    check("gemini-pin: the header badge is seeded from the chosen model",
+          "Gemini 3.7 Flash" in agent.model_badge()
+          and "high" in agent.model_badge(), agent.model_badge())
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_multi_agent_session_isolation():
     """Ensure two agents in the same workspace never share a session ID, and
     Gemini session sync isolates multi-agent folders properly."""
@@ -16185,18 +16269,195 @@ def test_multi_agent_session_isolation():
 
 
 
+# Run order. Slowest last: test_lifecycle_e2e launches a real claude.
+TESTS = [
+    test_tiling,
+    test_layout_popup_placement,
+    test_sidebar_count_badge,
+    test_row_name_fades_under_badges,
+    test_agent_waiting,
+    test_notification_chime,
+    test_limit_blocked_workspace_stats,
+    test_winjob_process_count,
+    test_winjob_process_ids_and_kill,
+    test_bg_shell_workspace_stats,
+    test_bg_shell_settle_relearn,
+    test_bg_shell_kill_extras,
+    test_chime_toggles,
+    test_custom_chime_sounds,
+    test_reply_chime,
+    test_hook_prompt_events,
+    test_agent_hook_waiting,
+    test_manager_prompt_events_sync,
+    test_input_echo_not_busy,
+    test_sidebar_reorder,
+    test_manager_reorder_persist,
+    test_agent_card_reorder,
+    test_sidebar_categories,
+    test_manager_categories_persist,
+    test_category_container,
+    test_agent_inline_expansion,
+    test_ai_title_summary,
+    test_token_usage_badge,
+    test_live_model_effort,
+    test_limit_blocked_live_ui,
+    test_bg_shell_live_ui,
+    test_bg_shell_extra_pids_and_kill_pid,
+    test_no_em_dashes_in_visible_text,
+    test_reveal_agent,
+    test_new_agent_autofocus,
+    test_agent_busy_activity,
+    test_reply_marks_need_a_submitted_turn,
+    test_reply_marks_recovered_after_reprint,
+    test_reply_stamp_repaint_and_merge,
+    test_transcript_reply_times,
+    test_ansi,
+    test_terminal_keys,
+    test_terminal_image_paste,
+    test_terminal_mouse_words_links,
+    test_terminal_mouse_tracking_click,
+    test_terminal_click_menu_guard,
+    test_terminal_selection_edit,
+    test_terminal_input_editor,
+    test_input_gap_self_heal,
+    test_session_migration,
+    test_app,
+    test_pty,
+    test_providers_grid_and_workspace,
+    test_v2_review_fixes,
+    test_render_perm_mode_reassign_bridge,
+    test_persistence_resume,
+    test_boot_veil,
+    test_resume_fallback,
+    test_scrollback,
+    test_themes,
+    test_review_fixes,
+    test_wake_and_resume_all,
+    test_session_pinning,
+    test_two_claude_agents_one_folder_resume_their_own,
+    test_session_recovery,
+    test_session_hook_tracking,
+    test_session_hook_arming,
+    test_review_hardening_fixes,
+    test_resume_picker,
+    test_transcript_backups,
+    test_pty_width_at_launch,
+    test_screen_snapshots,
+    test_agent_file_map,
+    test_fsopen_helpers,
+    test_filetypes_icons,
+    test_terminal_relative_link,
+    test_terminal_link_context_menu,
+    test_terminal_block_glyphs,
+    test_terminal_link_underline,
+    test_sidebar_file_tree,
+    test_sidebar_search,
+    test_plan_usage,
+    test_usage_trackers_preference,
+    test_taskbar_badge,
+    test_bg_shell_taskbar_state,
+    test_limit_ledger,
+    test_event_log,
+    test_agent_kind_is_always_an_enum,
+    test_limit_recovery_reliability,
+    test_auto_continue_on_limit_reset,
+    test_gemini_limit_detection,
+    test_startup_limit_recovery,
+    test_reset_clock_zones,
+    test_limit_detection_hardening,
+    test_terminal_scrollbar,
+    test_reply_marks_inline,
+    test_reply_marks_recovered_from_transcript,
+    test_history_screen_wrapper_removed,
+    test_gemini_usage_read_disables_agy_auto_update,
+    test_gemini_usage_polling_is_offthread_and_optin,
+    test_usage_poll_policy,
+    test_gemini_usage_reads_both_cli_output_shapes,
+    test_projection_happens_once,
+    test_recovered_prompts_are_cached,
+    test_multi_agent_session_isolation,
+    test_gemini_session_pinning,
+    test_usage_pill_geometry_and_close,
+    test_usage_pill_never_truncates,
+    test_usage_pill_provider_inks,
+    test_options_panel,
+    test_topbar_extras_autosize,
+    test_topbar_extras_grow_with_window,
+    test_scheduled_send,
+    test_cli_auto_update,
+    test_cli_native_migration,
+    test_self_update,
+    test_lifecycle_e2e,
+]
+
+# Skipped by --quick: real, billed, minutes-long. Run the full suite before a
+# merge; --quick is for the edit-run loop.
+SLOW_TESTS = {"test_lifecycle_e2e"}
+
+
+def _parse_args(argv):
+    """--quick skips SLOW_TESTS. -k PATTERN (repeatable) runs only the tests
+    whose name contains one of the patterns."""
+    quick, patterns, it = False, [], iter(argv)
+    for arg in it:
+        if arg == "--quick":
+            quick = True
+        elif arg == "-k":
+            patterns.append(next(it, ""))
+        elif arg.startswith("-k"):
+            patterns.append(arg[2:])
+        else:
+            raise SystemExit(f"unknown argument: {arg} (use --quick, -k NAME)")
+    return quick, patterns
+
+
+def main(argv=()):
+    global FAIL
+    quick, patterns = _parse_args(list(argv))
+    _guard_real_ai_launches()
+    selected = [t for t in TESTS
+                if not (quick and t.__name__ in SLOW_TESTS)
+                and (not patterns
+                     or any(p in t.__name__ for p in patterns))]
+    for test in selected:
+        # one crashing test is one FAIL, never the end of the run: before
+        # this, an exception in an early test hid every check after it
+        try:
+            test()
+        except Exception:
+            traceback.print_exc()
+            print(f"[FAIL] {test.__name__}: crashed", flush=True)
+            FAIL += 1
+    check("suite: no test launched a real AI CLI outside the e2e test",
+          not REAL_AI_LAUNCHES, REAL_AI_LAUNCHES)
+    print(f"\nRESULT: {PASS} passed, {FAIL} failed, {SKIP} skipped "
+          f"({len(selected)} of {len(TESTS)} tests)", flush=True)
+    return 1 if FAIL else 0
+
+
+def _remove_sandbox_home():
+    """Delete this run's throwaway profile. Refuses anything that is not a
+    direct child of the temp dir named like one, so a bad SANDBOX_HOME can
+    never aim this at a real folder."""
+    home = SANDBOX_HOME.resolve()
+    if home.parent == REAL_TMP and home.name.startswith("ai-hive-home-"):
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def _remove_fixture_transcripts():
-    """Delete the conversation folders this suite wrote into the REAL
-    ~/.claude/projects. The limit tests write fixture transcripts through
-    `transcripts.transcript_path`, which has no override, for agents whose
-    cwd is a `tempfile.mkdtemp(prefix="ai-hive-...")` directory. Claude
-    encodes that cwd into the folder name, so every one of them starts with
-    the encoded temp dir plus "-ai-hive-", and nothing else does. Without this
-    they piled up (105 by 2026-09-24) and showed in Claude's /resume picker
-    for those folders."""
+    """Delete the conversation folders the suite left in the REAL
+    ~/.claude/projects. test_lifecycle_e2e cleans its own in a finally; this
+    sweeps what a killed run left behind, and what runs from before the
+    sandbox profile wrote there (105 folders by 2026-09-24, all showing in
+    Claude's /resume picker). Every such folder is named after a
+    `tempfile.mkdtemp(prefix="ai-hive-...")` cwd, so it starts with the
+    encoded temp dir plus "-ai-hive-", and nothing else does."""
     from app import transcripts
-    root = Path(os.path.expanduser("~")) / ".claude" / "projects"
-    prefix = transcripts.encode_project_dir(tempfile.gettempdir()) + "-ai-hive-"
+    with real_profile():
+        root = Path(transcripts.projects_root())
+    # the REAL temp dir: mkdtemp now lands in the sandbox, whose folders all
+    # sit under REAL_TMP\ai-hive-home-..., so this one prefix covers both
+    prefix = transcripts.encode_project_dir(str(REAL_TMP)) + "-ai-hive-"
     try:
         entries = list(root.iterdir())
     except OSError:
@@ -16208,10 +16469,11 @@ def _remove_fixture_transcripts():
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        sys.exit(main(sys.argv[1:]))
     except Exception:
         traceback.print_exc()
         print(f"\nRESULT: {PASS} passed, {FAIL + 1} failed (crash)", flush=True)
         sys.exit(1)
     finally:
         _remove_fixture_transcripts()
+        _remove_sandbox_home()

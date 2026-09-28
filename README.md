@@ -769,17 +769,22 @@ Hard-won rules, each with a regression test:
 ## Verify
 
 ```powershell
-.venv\Scripts\python.exe tests\smoke_test.py
+.venv\Scripts\python.exe tests\smoke_test.py            # everything
+.venv\Scripts\python.exe tests\smoke_test.py --quick    # skip the real-claude e2e
+.venv\Scripts\python.exe tests\smoke_test.py -k NAME    # only tests matching NAME
 ```
 
-2109 checks drive the real app headlessly (offscreen Qt platform) with real
+The suite runs under a throwaway profile and a scratch project folder, and
+fails if any test other than the e2e one starts a real AI CLI.
+
+2071 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
 trips, the ConPTY path (interactive prompt, Ctrl+C, retention), every v2
 feature (provider flags, per-workspace numbering, the agent-count badge,
 explicit grids, folder changes, fonts, the shared board), task assignment
-(model/effort selection, a retask never renaming the agent, the named-pipe
+(a retask never renaming the agent, the named-pipe
 `log_activity` MCP round-trip, workspace-scoped board notes), inline agent
 rename in the card header (double-click) plus
 a per-agent task summary beside the name, the per-card maximize/restore toggle
@@ -867,7 +872,6 @@ app/
   ansi_parser.py           stateful SGR parser (line-console rendering)
   providers.py             AI provider registry (Claude + Gemini/agy + Grok wired; OpenAI template)
   coordination.py          per-workspace shared board (.aihive/board.md)
-  orchestration.py         task → model/effort heuristic (Qt-free)
   process_worker.py        QProcess engine, HybridDecoder, WinJob (line mode)
   pty_worker.py            ConPTY engine via pywinpty (full-terminal mode)
   terminal_agent.py        per-terminal model (worker + log/buffer + lifecycle)
@@ -908,7 +912,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        headless end-to-end suite (2109 checks)
+tests/smoke_test.py        headless end-to-end suite (2071 checks)
 ```
 
 Model/view rule: widgets subscribe to model signals and never own processes —

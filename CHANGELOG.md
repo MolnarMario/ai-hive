@@ -8,6 +8,16 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.22.1
+
+- Conversations are found when Claude Code keeps its data somewhere other
+  than your user folder (the CLAUDE_CONFIG_DIR setting).
+- Fixed an error that could be logged when a label was removed right after
+  its text changed.
+- Internal: the test suite runs in a throwaway profile, can never start a
+  real Claude in your project folders, and finishes in about a third of the
+  time. Unused code for spawning agents automatically was removed.
+
 ## 0.22.0
 
 - Update AI Hive from inside the app. The button beside the version badge

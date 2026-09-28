@@ -1910,7 +1910,6 @@ class MainWindow(QMainWindow):
             self._hook_settings_path = ""  # degrade: fall back to fs correlation
         self.manager.session_map_path = self._session_map_path
         self.manager.prompt_events_path = self._prompt_events_path
-        manager.save_now = self._save_now  # immediate persistence for spawn_worker
         manager.arm_agent = self._arm_agent_mcp  # arm new agents before they start
         manager.audit = self._store_audit   # so a degraded save leaves a trace
         self._rearm_agent_configs()  # restored claude agents re-acquire MCP tools

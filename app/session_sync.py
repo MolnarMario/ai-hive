@@ -120,7 +120,7 @@ def conversation_previews(cwd: str) -> list:
 
 
 def project_dir(cwd: str) -> str:
-    return os.path.join(os.path.expanduser("~"), ".claude", "projects",
+    return os.path.join(transcripts.projects_root(),
                         transcripts.encode_project_dir(cwd))
 
 

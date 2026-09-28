@@ -1484,7 +1484,7 @@ class ElidingLabel(QLabel):
             # width may still be settling (first layout, a retile in flight):
             # re-fit once the event loop has caught up, which is cheap and
             # makes the truncation match the final geometry
-            QTimer.singleShot(0, self._refit)
+            QTimer.singleShot(0, self, self._refit)  # dies with the label
 
     def minimumSizeHint(self):
         hint = super().minimumSizeHint()

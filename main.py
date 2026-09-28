@@ -151,7 +151,7 @@ def create_main_window(store: SessionStore | None = None) -> MainWindow:
             for agent in ws.agents:
                 # everything that was running comes back in EVERY workspace,
                 # and every restored Claude/Gemini agent reclaims its prior
-                # conversation (--continue) on its NEXT start — whether that
+                # conversation (--resume <id>) on its NEXT start — whether that
                 # is the launch autostart or a later press-any-key wake.
                 # resume is one-shot: consumed at first start, so a manual
                 # restart after that is a deliberate fresh session.
