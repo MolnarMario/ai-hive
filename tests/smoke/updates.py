@@ -266,6 +266,13 @@ def test_self_update():
                 and glyph.pixelColor(x, y).lightness() > 80)
     check("self-update: the button paints the refresh glyph, not a font char",
           inked > 60, inked)
+    ink_rows = [y for y in range(glyph.height())
+                if any(glyph.pixelColor(x, y).alpha() > 0
+                       and glyph.pixelColor(x, y).lightness() > 80
+                       for x in range(glyph.width()))]
+    ink_h = (ink_rows[-1] - ink_rows[0] + 1) if ink_rows else 0
+    check("self-update: the refresh glyph is ~70% of the button, not full size",
+          0 < ink_h <= 0.75 * btn.height(), (ink_h, btn.height()))
     btn.click()
     pump(50)
     check("self-update: unarmed (the suite, any test window) the button "

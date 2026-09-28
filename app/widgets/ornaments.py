@@ -1356,6 +1356,9 @@ class RefreshGlyphButton(QToolButton):
     ("Checking...", "Up to date") the stylesheet draws it like any button."""
 
     GLYPH_INSET = 2   # px between the hover frame and the glyph's box
+    # The glyph fills 70% of that box. At full size it dwarfed the header's
+    # text; the button (hover frame, click target) stays header-sized.
+    GLYPH_SCALE = 0.7
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -1367,7 +1370,8 @@ class RefreshGlyphButton(QToolButton):
             ink = Palette.TEXT
         else:
             ink = Palette.TEXT_DIM
-        side = min(self.width(), self.height()) - 2 * self.GLYPH_INSET
+        side = ((min(self.width(), self.height()) - 2 * self.GLYPH_INSET)
+                * self.GLYPH_SCALE)
         box = QRectF((self.width() - side) / 2, (self.height() - side) / 2,
                      side, side)
         p = QPainter(self)

@@ -10,7 +10,7 @@ em dashes: this text is shown in the app.
 
 ## 0.22.4
 
-- The update button beside the version is a larger, cleaner refresh icon.
+- The update button beside the version is a cleaner refresh icon.
 - "Up to date" now shows for 4 seconds and then the button returns on its
   own. While it shows it is just a message, not something to click.
 
