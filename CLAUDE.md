@@ -55,7 +55,9 @@ This file holds only the rules that protect user data or fail silently.
 .venv\Scripts\python.exe tests\smoke_test.py -k scrollbar  # tests whose name matches
 ```
 
-Every bug fix gets a regression check in `tests/smoke_test.py`. The suite is
+Every bug fix gets a regression check in `tests/smoke/<area>.py`. Any
+`test_*` function there runs; `tests/smoke_test.py` is only the runner. Import
+`tests/smoke/harness.py` before `app`, it sets up the sandbox. The suite is
 headless and uses only temp `SessionStore` paths. A test that touches the real
 `%APPDATA%` session wipes the user's workspaces. Keep check names ASCII
 (cp1252 console). The final e2e test launches a real claude for about two

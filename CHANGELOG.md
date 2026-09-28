@@ -8,6 +8,11 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.22.3
+
+- Internal: the test suite is split into one file per area of the app, and a
+  test can no longer be left out of the run by mistake.
+
 ## 0.22.2
 
 - The model list in the New Terminal dialog is current: Fable 5.1, Opus 5.5,
