@@ -658,3 +658,130 @@ def test_reply_marks_inline():
           agent.reply_marks() == [])
 
     card.deleteLater()
+
+
+def test_reply_stamp_time_comes_from_stop_hook():
+    """A Claude reply's stamp reads the moment its Stop hook fired, and later
+    settles cannot move it.
+
+    Live-reported: a reply that finished at 18:21 (the Stop hook's own line
+    right above it said "18:21:47", Claude's footer said "done 6:21 PM") wore
+    "Sep 29, 22:27", the moment its workspace was next opened. A settle is only
+    2 s of quiet after ANY output, the turn stayed open until the next submit,
+    and a workspace switch resizes the card so the full-screen TUI redraws its
+    frame; every one of those settles moved the mark to the clock.
+
+    Second half, same report, other workspace: NO stamps at all. A user-level
+    Stop hook prints a "⎿  Stop says: ..." row directly under every reply, and
+    transcript recovery required the very next row to be blank, so it never
+    located a single reply. The rows below are the real shape, taken from the
+    user's saved screen."""
+    import json
+
+    from PySide6.QtWidgets import QApplication
+
+    from app import session_hook as sh
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.widgets.terminal_card import _norm_reply_line, _reply_end_row
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+
+    # ---- recovery: a hook row between the reply and its blank row ---------
+    raw = ["  in docs/RELEASE-CHECKLIST.md.",
+           "  ⎿ \xa0Stop says: · 2026-09-29 18:21:47",
+           "",
+           "  Worked for 21m 39s · done 6:21 PM",
+           "",
+           "  recap: You asked me to finish the split.",
+           "> "]
+    rows = [_norm_reply_line(t) for t in raw]
+    check("stop-stamp: a Stop hook row under the reply no longer hides it",
+          _reply_end_row(rows, "release-checklist.md.", 0) == 4,
+          _reply_end_row(rows, "release-checklist.md.", 0))
+    no_footer = rows[:3] + ["> "]
+    check("stop-stamp: ...and without a footer the blank row under the hook",
+          _reply_end_row(no_footer, "release-checklist.md.", 0) == 2,
+          _reply_end_row(no_footer, "release-checklist.md.", 0))
+    check("stop-stamp: a reply that carries on below is still not an ending",
+          _reply_end_row(["tail here", "more prose", ""], "tail here", 0)
+          is None)
+
+    # ---- live: the hook's time, and nothing moves it afterwards -----------
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "StopStamp", cwd=SCRATCH_CWD,
+                                 pty=True))
+    a.status = AgentStatus.RUNNING
+    ended = time.time() - 4 * 3600      # 18:21, seen from 22:27
+
+    # the usual order: the hook is polled in while the reply is still drawing
+    a._note_submit()
+    a._busy = True
+    a.note_reply_stopped(ended)
+    check("stop-stamp: a Stop before the settle mints nothing yet",
+          a.reply_marks() == [], a.reply_marks())
+    a._busy = False
+    mark = a.note_reply_settled()
+    check("stop-stamp: the settle after the hook carries the HOOK's time",
+          mark is not None and mark.ts == ended, mark and mark.ts)
+    pos = mark.pos
+    a._on_pty_output("pty", "redrawn frame after a workspace switch")
+    a._busy = True
+    a._on_idle_timeout()
+    check("stop-stamp: a later settle (a redraw, a recap) keeps the time",
+          a.reply_marks() == [mark] and mark.ts == ended, mark.ts)
+    check("stop-stamp: ...and the position", mark.pos == pos, (mark.pos, pos))
+
+    # the other order: the agent had already settled when the hook arrived
+    a._note_submit()
+    first = a.note_reply_settled()
+    a.note_reply_stopped(ended + 60)
+    check("stop-stamp: a Stop after the settle rewrites that mark's time",
+          first.ts == ended + 60, first.ts)
+    a._on_pty_output("pty", "recap: ...")
+    a._busy = True
+    a._on_idle_timeout()
+    check("stop-stamp: ...and freezes it", first.ts == ended + 60, first.ts)
+
+    # Claude replying on its own (a background task finished): a new ending
+    a.note_reply_stopped(ended + 120)
+    check("stop-stamp: a later Stop in the same turn moves it to that ending",
+          first.ts == ended + 120 and len(a.reply_marks()) == 2,
+          (first.ts, len(a.reply_marks())))
+
+    # nobody asked: a Stop with no submitted turn stamps nothing
+    b = TerminalAgent(build_spec(AgentKind.CLAUDE, "StopNoTurn",
+                                 cwd=SCRATCH_CWD, pty=True))
+    b.note_reply_stopped(ended)
+    b._busy = True
+    b._on_idle_timeout()
+    check("stop-stamp: a Stop with no submitted turn stamps nothing",
+          b.reply_marks() == [], b.reply_marks())
+
+    # ---- the manager hands the hook's own time over, not the poll's ------
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-stopstamp-"))
+    events = str(tmp / "events.jsonl")
+    sh.reset_events(events)
+    mgr = WorkspaceManager()
+    mgr.prompt_events_path = events
+    ws = mgr.create_workspace("StopStamp", str(tmp))
+    cl = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Cl",
+                                            cwd=SCRATCH_CWD, pty=True),
+                          autostart=False)
+    cl.status = AgentStatus.RUNNING
+    for kind in (sh.EV_TURN_CLEAR, sh.EV_TURN_SET):
+        cl._note_submit()
+        cl.note_reply_settled()
+        # the record _append_event writes, backdated to when the hook fired
+        with open(events, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"agent_id": cl.id, "kind": kind,
+                                 "ts": ended}) + "\n")
+        mgr.sync_prompt_events()
+        check(f"stop-stamp: the manager passes the hook's time ({kind})",
+              cl.reply_marks()[-1].ts == ended, cl.reply_marks()[-1].ts)
+    for ag in (a, b, cl):
+        ag._idle_timer.stop()
+        ag._reply_timer.stop()
+    a.dispose()
+    b.dispose()
+    shutil.rmtree(tmp, ignore_errors=True)

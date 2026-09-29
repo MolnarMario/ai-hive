@@ -15,7 +15,7 @@ def test_self_update():
     button). Every git/pip call goes through a scripted fake runner against a
     temp folder: the suite runs FROM this clone and must never fetch or merge
     into it."""
-    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtCore import QEventLoop, Qt, QTimer
     from PySide6.QtWidgets import QApplication
     from app import __version__, self_update
     from app.self_update import Status
@@ -254,8 +254,25 @@ def test_self_update():
     pump(50)
     btn = win.top_bar.app_update_btn
     check("self-update: a check button sits beside the version badge",
-          btn.isVisible() and btn.text() == "↻"
+          btn.isVisible() and btn.text() == ""
           and "GitHub" in btn.toolTip(), btn.text())
+    bar_h = win.top_bar.height()
+    check("self-update: the idle glyph is header-sized with clearance",
+          bar_h - 12 <= btn.height() <= bar_h - 6
+          and btn.width() >= btn.height(), (btn.size(), bar_h))
+    glyph = btn.grab().toImage()
+    inked = sum(1 for x in range(glyph.width()) for y in range(glyph.height())
+                if glyph.pixelColor(x, y).alpha() > 0
+                and glyph.pixelColor(x, y).lightness() > 80)
+    check("self-update: the button paints the refresh glyph, not a font char",
+          inked > 60, inked)
+    ink_rows = [y for y in range(glyph.height())
+                if any(glyph.pixelColor(x, y).alpha() > 0
+                       and glyph.pixelColor(x, y).lightness() > 80
+                       for x in range(glyph.width()))]
+    ink_h = (ink_rows[-1] - ink_rows[0] + 1) if ink_rows else 0
+    check("self-update: the refresh glyph is ~70% of the button, not full size",
+          0 < ink_h <= 0.75 * btn.height(), (ink_h, btn.height()))
     btn.click()
     pump(50)
     check("self-update: unarmed (the suite, any test window) the button "
@@ -337,12 +354,38 @@ def test_self_update():
                         repo=str(current))
     btn.click()
     wait_until(lambda: getattr(win, "_app_update_job", None) is None)
+    flash = win._app_update_flash()
     check("self-update: up to date is a quiet flash on the button, no dialog",
           "Up to date" in btn.text() and win._self_update_dialog is None
-          and win._app_update_flash().isActive(), btn.text())
-    win._app_update_flash().timeout.emit()
-    check("self-update: ...that returns to the check glyph",
-          btn.text() == "↻" and btn.property("attention") is False)
+          and flash.isActive(), btn.text())
+    check("self-update: ...shown for 4 seconds",
+          flash.interval() == 4000, flash.interval())
+    check("self-update: ...and not interactive while it shows",
+          not btn.isEnabled() and btn.toolTip() == ""
+          and btn.cursor().shape() == Qt.CursorShape.ArrowCursor)
+    btn.click()
+    pump(30)
+    check("self-update: ...a click on the notice starts no new check",
+          getattr(win, "_app_update_job", None) is None
+          and "Up to date" in btn.text() and flash.isActive(), btn.text())
+    flash.timeout.emit()
+    check("self-update: ...that returns to the clickable check glyph",
+          btn.text() == "" and btn.property("attention") is False
+          and btn.isEnabled() and "GitHub" in btn.toolTip()
+          and btn.cursor().shape() == Qt.CursorShape.PointingHandCursor)
+
+    win.arm_self_update(FakeGit(str(current), remote=__version__,
+                                fetch=(1, "fatal: unable to access")),
+                        repo=str(current))
+    btn.click()
+    wait_until(lambda: getattr(win, "_self_update_dialog", None) is not None)
+    check("self-update: a failed check stays clickable (only up to date is "
+          "a bare notice)",
+          btn.text() == "Check failed" and btn.isEnabled()
+          and flash.interval() == win.APP_UPDATE_FLASH_MS, btn.text())
+    if win._self_update_dialog is not None:
+        win._self_update_dialog.reject()
+    pump(30)
     win.close()
 
 

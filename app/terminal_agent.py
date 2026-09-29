@@ -410,6 +410,10 @@ class TerminalAgent(QObject):
         # time onto the conversation.
         self._turn_open = False
         self._turn_mark_uid: int | None = None
+        # when Claude's Stop hook said this turn's reply ended, and whether the
+        # turn's mark has settled on that ending (see note_reply_stopped)
+        self._turn_end_ts: float | None = None
+        self._turn_mark_final = False
         self._turn_announced = False  # reply_finished already sent this turn
         # latched "the plan limit cut this agent off" + the reset time its own
         # banner stated. Transient like the waiting flags — never persisted.
@@ -505,6 +509,8 @@ class TerminalAgent(QObject):
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         self._turn_open = False        # nothing asked yet, so nothing to stamp
         self._turn_mark_uid = None
+        self._turn_end_ts = None
+        self._turn_mark_final = False
         # a NON-resume start is a new conversation, so it gets a new pinned
         # identity (rotating also avoids --session-id colliding with an
         # existing transcript); a resume keeps its pin
@@ -579,6 +585,8 @@ class TerminalAgent(QObject):
         # the next one somebody asks for (see _note_submit)
         self._turn_open = False
         self._turn_mark_uid = None
+        self._turn_end_ts = None
+        self._turn_mark_final = False
         if self.is_pty:
             self._pty_buffer = []
             self._pty_bytes = 0
@@ -627,9 +635,12 @@ class TerminalAgent(QObject):
         settle several times over (Claude goes quiet mid-reply whenever a tool
         runs longer than the idle window), and those later settles must keep
         MOVING that turn's one mark to where the reply really ended, rather
-        than either falling silent or littering the turn with stamps."""
+        than either falling silent or littering the turn with stamps. For
+        Claude that movement ends at the Stop hook: see note_reply_stopped."""
         self._turn_open = True
         self._turn_mark_uid = None    # the next settle starts this turn's mark
+        self._turn_end_ts = None
+        self._turn_mark_final = False
         self._turn_announced = False  # ...and this turn has not chimed yet
 
     def resize(self, rows: int, cols: int) -> None:
@@ -746,25 +757,69 @@ class TerminalAgent(QObject):
         (unlike a typed prompt, which can only ever originate from one): a
         hidden workspace keeps executing per the model-owns-processes
         invariant, and its reply history must still be there — via
-        reply_replay_marks() — whenever a card is next built for it."""
-        if not self.is_pty:
+        reply_replay_marks() — whenever a card is next built for it.
+
+        Once Claude's Stop hook has ended the turn, the time is the hook's,
+        not the clock's, and the first settle after it is the LAST one the
+        mark follows (see note_reply_stopped). None once the mark is final."""
+        if not self.is_pty or self._turn_mark_final:
             return None
-        if (self._turn_mark_uid is not None and self._reply_marks
-                and self._reply_marks[-1].uid == self._turn_mark_uid):
-            mark = self._reply_marks[-1]
+        ts = self._turn_end_ts if self._turn_end_ts is not None else time.time()
+        if self._turn_end_ts is not None:
+            self._turn_mark_final = True   # the settle that closes this reply
+        mark = self._turn_mark()
+        if mark is not None:
             mark.pos = self._pty_total
-            mark.ts = time.time()
+            mark.ts = ts
             self.reply_marks_changed.emit()
             return mark
         self._reply_mark_seq += 1
-        mark = ReplyMark(uid=self._reply_mark_seq, pos=self._pty_total,
-                         ts=time.time())
+        mark = ReplyMark(uid=self._reply_mark_seq, pos=self._pty_total, ts=ts)
         self._turn_mark_uid = mark.uid
         self._reply_marks.append(mark)
         while len(self._reply_marks) > REPLY_MARK_CAP:
             self._reply_marks.pop(0)
         self.reply_marks_changed.emit()
         return mark
+
+    def _turn_mark(self):
+        """The open turn's reply mark, or None if it has not settled yet."""
+        if (self._turn_mark_uid is not None and self._reply_marks
+                and self._reply_marks[-1].uid == self._turn_mark_uid):
+            return self._reply_marks[-1]
+        return None
+
+    def note_reply_stopped(self, ts: float) -> None:
+        """Claude's Stop hook fired at `ts`: the reply of the open turn ended
+        then, whether on a statement or a question. Called for every Stop by
+        workspace_manager.sync_prompt_events.
+
+        Without this a turn's mark followed EVERY later settle, and a settle is
+        only 2 s of quiet after any output at all. A card resized by a
+        workspace switch makes the full-screen TUI redraw its frame, and Claude
+        prints a "recap" block when the user comes back to an idle session;
+        both settle like a reply ending. Measured live: a reply that finished
+        at 18:21 wore "22:27", the moment its workspace was next opened, while
+        the Stop hook's own line right above it said 18:21:47.
+
+        So the hook's time IS the stamp time, and the mark moves once more, to
+        the settle that follows the hook (the reply's footer is drawn by
+        then), and never again. If the agent has already settled when the hook
+        is polled in, that settle was the last one and the mark is final now.
+        A later Stop with no submit in between is Claude replying on its own
+        (a background task finished), which is a new ending for the same
+        turn, so it reopens the mark to follow that one instead."""
+        if not self.is_pty or not self._turn_open:
+            return
+        self._turn_end_ts = ts
+        self._turn_mark_final = False
+        mark = self._turn_mark()
+        if mark is None:
+            return      # the next settle mints it, with this time
+        mark.ts = ts
+        if not self._busy:
+            self._turn_mark_final = True
+        self.reply_marks_changed.emit()
 
     def reply_marks(self) -> list:
         return list(self._reply_marks)

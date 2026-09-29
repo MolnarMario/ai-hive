@@ -8,6 +8,7 @@ can drive the real app.
 
 import os
 import re
+import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -36,6 +37,13 @@ _AGENT_NAME_RE = re.compile(r"Agent (\d+)$")
 
 _ACTIVE = {AgentStatus.RUNNING, AgentStatus.STARTING}
 _ERROR = {AgentStatus.EXITED_ERR, AgentStatus.CRASHED, AgentStatus.FAILED}
+
+
+def _event_ts(rec: dict) -> float:
+    """When the hook wrote `rec`. The poll runs up to PROMPT_SYNC_MS behind
+    it, and a reply stamp should read the hook's moment, not the poll's."""
+    ts = rec.get("ts")
+    return float(ts) if isinstance(ts, (int, float)) and ts > 0 else time.time()
 
 
 @dataclass
@@ -512,11 +520,15 @@ class WorkspaceManager(QObject):
             elif kind == session_hook.EV_TOOL_CLEAR:
                 agent.set_tool_waiting(False)
             elif kind == session_hook.EV_TURN_SET:
+                # every Stop writes exactly one TURN_SET or TURN_CLEAR, and
+                # either way the reply ended then (a question is a reply too)
+                agent.note_reply_stopped(_event_ts(rec))
                 if not agent.is_busy():
                     agent.set_turn_waiting(True)
             elif kind == session_hook.EV_TURN_CLEAR:
                 # the Stop hook's "turn ended on a statement": Claude's exact
                 # reply-finished edge (the other providers time it instead)
+                agent.note_reply_stopped(_event_ts(rec))
                 agent.set_turn_waiting(False)
                 agent.note_turn_ended()
 

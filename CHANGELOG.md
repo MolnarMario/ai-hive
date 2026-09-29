@@ -8,6 +8,20 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.22.5
+
+- A reply's date and time stamp now shows when Claude actually finished the
+  reply. It used to jump to whenever the terminal was next redrawn, for
+  example when you switched to its workspace hours later.
+- Reply stamps no longer go missing in terminals where a Stop hook prints a
+  line under every reply (such as a hook that echoes the time).
+
+## 0.22.4
+
+- The update button beside the version is a cleaner refresh icon.
+- "Up to date" now shows for 4 seconds and then the button returns on its
+  own. While it shows it is just a message, not something to click.
+
 ## 0.22.3
 
 - Internal: the test suite is split into one file per area of the app, and a
