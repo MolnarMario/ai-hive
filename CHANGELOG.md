@@ -8,6 +8,15 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.22.6
+
+- When Claude Code continues on its own after a usage limit resets, the
+  hourglass no longer comes back and stays for a day. Any leftover hourglass
+  also clears within a minute once the conversation shows new work.
+- An agent stopped by a usage limit is now resumed even if a background task
+  hit the same limit again later. Before, AI Hive could decide there was
+  nothing to resume and leave it idle.
+
 ## 0.22.5
 
 - A reply's date and time stamp now shows when Claude actually finished the

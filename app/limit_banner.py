@@ -252,6 +252,26 @@ def same_banner(a: str, b: str) -> bool:
     return long_.startswith(short) and bool(_LIMIT_RESET_RE.search(short))
 
 
+def banner_clock_key(text: str) -> str:
+    """The reset clock `text` states, normalised ("5:50am", "sep30,9:00am"),
+    or "" when it states none.
+
+    Two lines that differ in wording but name the same clock are two
+    renderings of ONE cut-off. Claude draws both at once: the status row
+    "Usage limit reached \xb7 continuing automatically at 5:50am" and, in the
+    conversation above it, "You've hit your session limit \xb7 resets 5:50am".
+    When the CLI continues on its own the status row goes away and the older
+    line becomes the last banner in view, which `same_banner` cannot match to
+    the status row it latched on. That re-latched two agents on 2026-09-25,
+    dated a day out."""
+    m = _LIMIT_RESET_RE.search(_despace(text))
+    if not m:
+        return ""
+    mon, day, _year, hour, minute, ampm = m.groups()
+    date = f"{mon}{int(day)}," if mon and day else ""
+    return f"{date}{int(hour)}:{minute or '00'}{ampm or ''}"
+
+
 def banner_in(text: str) -> bool:
     """True when `text` contains a cut-off line AS one, not prose that merely
     mentions it mid-sentence."""
