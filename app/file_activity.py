@@ -19,7 +19,7 @@ ephemeral and not addressable by AI Hive — so sub-agents are surfaced as label
 nodes only, with no file attribution (files roll up to the parent agent).
 
 Qt-free (pure stdlib + transcripts.py) so tests and the model layer can use it
-headlessly, like coordination.py / orchestration.py.
+headlessly, like coordination.py.
 """
 
 import json

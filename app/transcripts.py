@@ -115,9 +115,18 @@ def encode_project_dir(cwd: str) -> str:
     return _ENCODE_RE.sub("-", os.path.normpath(cwd))
 
 
+def projects_root() -> str:
+    """Where Claude writes conversations: <config dir>/projects. The config dir
+    is CLAUDE_CONFIG_DIR when set, as the CLI itself resolves it, else ~/.claude
+    (claude_usage.config_dir applies the same rule)."""
+    env = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    base = env or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "projects")
+
+
 def transcript_path(cwd: str, session_id: str) -> str:
-    return os.path.join(os.path.expanduser("~"), ".claude", "projects",
-                        encode_project_dir(cwd), f"{session_id}.jsonl")
+    return os.path.join(projects_root(), encode_project_dir(cwd),
+                        f"{session_id}.jsonl")
 
 
 def latest_ai_title(cwd: str, session_id: str) -> str:
@@ -1098,6 +1107,8 @@ def model_display(raw: str) -> str:
         return f"{family} {version}" + (" (1M)" if big else "")
     if core in ("opus", "sonnet", "haiku", "fable"):
         return core.title() + (" (1M)" if big else "")
+    if core == "opusplan":
+        return "Opus Plan" + (" (1M)" if big else "")
     # already friendly ("Opus 4.8 (1M context)"): only shorten the window note
     return text.replace("(1M context)", "(1M)").strip()
 

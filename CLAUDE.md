@@ -50,25 +50,38 @@ This file holds only the rules that protect user data or fail silently.
 ## Verifying changes
 
 ```powershell
-.venv\Scripts\python.exe tests\smoke_test.py
+.venv\Scripts\python.exe tests\smoke_test.py             # full, before a merge
+.venv\Scripts\python.exe tests\smoke_test.py --quick     # skips the real-claude e2e
+.venv\Scripts\python.exe tests\smoke_test.py -k scrollbar  # tests whose name matches
 ```
 
-Every bug fix gets a regression check in `tests/smoke_test.py`. The suite is
+Every bug fix gets a regression check in `tests/smoke/<area>.py`. Any
+`test_*` function there runs; `tests/smoke_test.py` is only the runner. Import
+`tests/smoke/harness.py` before `app`, it sets up the sandbox. The suite is
 headless and uses only temp `SessionStore` paths. A test that touches the real
 `%APPDATA%` session wipes the user's workspaces. Keep check names ASCII
 (cp1252 console). The final e2e test launches a real claude for about two
 minutes. Don't shorten its timeouts, it guards close/reopen data loss.
+
+The suite runs under a throwaway profile (`USERPROFILE`, `APPDATA`,
+`LOCALAPPDATA` and `TEMP` point into one temp dir, deleted at exit) and every
+test agent's cwd is `SCRATCH_CWD`. It also refuses to start any AI CLI
+outside `real_profile()`, which only the e2e test uses, and a blocked launch
+fails the run. Don't route around either one: stub the worker instead.
+`restart()` from IDLE and a keypress on a stopped card both START a real
+child.
 
 Never run test Claude sessions inside the user's real project folders. They
 pollute resume ordering. Use a scratch cwd.
 
 ## Conventions
 
-- Every PR merged to `main` bumps `__version__` in `app/__init__.py`. Nothing
-  enforces it, so it is part of done.
+- Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds
+  a matching `## x.y.z` section to `CHANGELOG.md`, written for users (the
+  in-app updater shows it). A smoke check fails if the two disagree.
 - Keep README.md's check count and feature list current.
-- `app/orchestration.py`, `app/providers.py` and `app/mcp_server.py` stay
-  Qt-free. `mcp_server` must not import PySide6 at all.
+- `app/providers.py` and `app/mcp_server.py` stay Qt-free. `mcp_server` must
+  not import PySide6 at all.
 - Comments explain constraints the code can't show. Update module docstrings
   when behavior changes.
 

@@ -8,6 +8,7 @@ can drive the real app.
 
 import os
 import re
+import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -15,12 +16,11 @@ from dataclasses import dataclass, field
 from PySide6.QtCore import QObject, Signal
 
 from . import coordination
-from . import orchestration
 from . import providers
 from . import session_hook
 from . import session_sync
 from . import transcripts
-from .process_worker import AgentKind, AgentSpec, build_spec
+from .process_worker import AgentSpec
 from .pty_worker import HAS_CONPTY
 from .terminal_agent import AgentStatus, AssignmentState, TerminalAgent
 
@@ -37,6 +37,13 @@ _AGENT_NAME_RE = re.compile(r"Agent (\d+)$")
 
 _ACTIVE = {AgentStatus.RUNNING, AgentStatus.STARTING}
 _ERROR = {AgentStatus.EXITED_ERR, AgentStatus.CRASHED, AgentStatus.FAILED}
+
+
+def _event_ts(rec: dict) -> float:
+    """When the hook wrote `rec`. The poll runs up to PROMPT_SYNC_MS behind
+    it, and a reply stamp should read the hook's moment, not the poll's."""
+    ts = rec.get("ts")
+    return float(ts) if isinstance(ts, (int, float)) and ts > 0 else time.time()
 
 
 @dataclass
@@ -98,18 +105,6 @@ class WorkspaceManager(QObject):
         # have consumed, so a stale edge is never re-applied after a local clear.
         self.prompt_events_path = ""
         self._prompt_offset = 0
-        # optional immediate-save hook (set by MainWindow to _save_now): for
-        # mutations that must persist NOW rather than on the dirty debounce
-        self.save_now = None
-
-    def _persist_now(self) -> None:
-        """Persist immediately if a hook is wired, else fall back to the
-        debounced dirty save. Used where a debounce window would be a loss
-        window (a hard kill before the heartbeat)."""
-        if self.save_now is not None:
-            self.save_now()
-        else:
-            self.dirty.emit()
 
     # ------------------------------------------------------------- reads ---
 
@@ -389,42 +384,8 @@ class WorkspaceManager(QObject):
         agent.deleteLater()
 
     # -------------------------------------------------- task assignment ---
-    # The UI dialogs drive these (e.g. the card "Assign / reassign a task..."
-    # action -> reassign_agent). Only spawn_worker still consults a heuristic,
-    # and only for the model/effort of a brand new agent; assigning a task to
-    # an EXISTING agent changes nothing about that agent except its task.
-
-    def spawn_worker(self, ws_id: str, task: str,
-                     model: str = "", effort: str = "",
-                     auto_created: bool = True) -> TerminalAgent | None:
-        """Create a NEW Claude worker with a task-appropriate model and give it
-        the task. Returns None if the workspace is at its cap."""
-        ws = self.workspace(ws_id)
-        if ws is None:
-            return None
-        name = self.next_agent_name(ws_id)
-        model, effort = orchestration.resolve_model_effort(task, model, effort)
-        spec = build_spec(AgentKind.CLAUDE, name, cwd=ws.project_path,
-                          model=model, effort=effort)
-        agent = self.add_terminal(ws_id, spec, autostart=True)
-        if agent is None:
-            return None  # limit_reached — caller should reassign a completed one
-        agent.auto_created = auto_created
-        agent.set_assignment(AssignmentState.AWAITING)
-        agent.deliver_task(task)  # queued until the TUI is prompt-ready
-        # add_terminal's immediate structural save fired BEFORE auto_created/
-        # assignment/task were set above — persist NOW (not on the debounce) so
-        # a hard kill before the heartbeat can't resurrect this worker with no
-        # task and let it go dormant.
-        self._persist_now()
-        return agent
-
-    def assign_task(self, ws_id: str, agent_id: str, task: str) -> bool:
-        agent = self.agent(ws_id, agent_id) or self.resolve_agent(agent_id)
-        if agent is None:
-            return False
-        agent.deliver_task(task)
-        return True
+    # The card's "Assign / reassign a task..." action drives this. Assigning a
+    # task to an agent changes nothing about that agent except its task.
 
     def reassign_agent(self, agent_id: str, task: str) -> bool:
         """Retask an idle/completed agent, preserving its session (no restart —
@@ -443,13 +404,6 @@ class WorkspaceManager(QObject):
         if not agent.is_running():
             agent.start()
         agent.deliver_task(task)  # queued if (re)starting, else typed now
-        return True
-
-    def set_assignment_state(self, agent_id: str, state) -> bool:
-        agent = self.resolve_agent(agent_id)
-        if agent is None:
-            return False
-        agent.set_assignment(state)
         return True
 
     # ------------------------------------------------ stats + coordination ---
@@ -566,11 +520,15 @@ class WorkspaceManager(QObject):
             elif kind == session_hook.EV_TOOL_CLEAR:
                 agent.set_tool_waiting(False)
             elif kind == session_hook.EV_TURN_SET:
+                # every Stop writes exactly one TURN_SET or TURN_CLEAR, and
+                # either way the reply ended then (a question is a reply too)
+                agent.note_reply_stopped(_event_ts(rec))
                 if not agent.is_busy():
                     agent.set_turn_waiting(True)
             elif kind == session_hook.EV_TURN_CLEAR:
                 # the Stop hook's "turn ended on a statement": Claude's exact
                 # reply-finished edge (the other providers time it instead)
+                agent.note_reply_stopped(_event_ts(rec))
                 agent.set_turn_waiting(False)
                 agent.note_turn_ended()
 
