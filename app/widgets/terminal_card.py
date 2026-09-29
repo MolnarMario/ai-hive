@@ -77,6 +77,10 @@ _RECOVER_RESCAN_TRIES = 6
 # prompt window: a wrapped line's final row holds only what spilled onto it,
 # which can be a few words.
 _REPLY_TAIL_CHARS = 16
+# rows of hook output allowed between a reply's last line and the blank row
+# under it: a Stop hook's "⎿  Stop says: ..." message plus the rows it wraps
+# onto (see _reply_end_row)
+_HOOK_ROWS = 4
 # how far apart a LIVE reply mark and a RECOVERED one may sit and still be the
 # same reply (see _refresh_reply_marks). The two anchors normally agree exactly
 # -- reply_anchor_line returns the footer row + 1, _reply_end_row returns i + 3
@@ -138,19 +142,34 @@ def _reply_end_row(lines: list[str], tail: str, start: int) -> int | None:
     close to the edge (see TerminalView.paintEvent), so a full line of prose
     would silently lose the very stamp this feature exists to show. Nothing
     matching means no stamp -- the same contract reply_anchor_line() and the
-    paint-time skip already follow."""
+    paint-time skip already follow.
+
+    One thing may sit between the reply and that blank row: a hook's message,
+    which Claude prints as a "⎿" row directly under the reply. A user-level
+    Stop hook that echoes the time puts one under EVERY reply, and requiring
+    the very next row to be blank lost every recovered stamp in every
+    terminal (measured on the user's saved screens). Only a row that STARTS
+    with that glyph opens the allowance, so a reply that simply carries on
+    below its matched row is still rejected."""
     for i in range(start, len(lines) - 1):
-        if tail not in lines[i] or lines[i + 1]:
+        if tail not in lines[i]:
+            continue
+        blank = i + 1
+        if lines[blank].startswith("⎿"):
+            while (blank < len(lines) - 1 and lines[blank]
+                   and blank - i <= _HOOK_ROWS):
+                blank += 1
+        if lines[blank]:
             continue
         # the blank row under the reply text is only the stamp's home when
         # Claude's own turn footer is NOT there. When it is (the newest reply,
         # the one whose footer survived), the stamp belongs UNDER it, beside
         # nothing rather than wedged between the reply and its own footer --
         # which is exactly what the user asked to have moved.
-        if (i + 3 < len(lines) and is_reply_footer(lines[i + 2])
-                and not lines[i + 3]):
-            return i + 3
-        return i + 1
+        if (blank + 2 < len(lines) and is_reply_footer(lines[blank + 1])
+                and not lines[blank + 2]):
+            return blank + 2
+        return blank
     return None
 
 
