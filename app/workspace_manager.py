@@ -910,11 +910,21 @@ class WorkspaceManager(QObject):
                 agent.autostart_on_restore = bool(td.get("running", False))
                 # Codex owns its transcript and thread id. Restore the saved
                 # thread for both running agents (which autostart) and stopped
-                # cards (which resume when the user wakes them). A missing pin
-                # stays a fresh Codex terminal; never guess with --last when
-                # several Codex agents can share a project folder.
-                if spec.provider == "openai" and spec.session_id:
-                    spec.resume = True
+                # cards (which resume when the user wakes them). Older builds
+                # failed to pin the id because they expected Codex's metadata
+                # under payload.meta; recover those running cards by cwd and
+                # latest rollout, excluding ids already claimed by siblings.
+                if spec.provider == "openai":
+                    if not spec.session_id and agent.autostart_on_restore:
+                        excluded = {a.spec.session_id for a in ws.agents
+                                    if a.spec.provider == "openai"
+                                    and a.spec.session_id}
+                        sid, _ = transcripts.latest_codex_session(
+                            spec.cwd, 0.0, excluded)
+                        if sid:
+                            spec.session_id = sid
+                    if spec.session_id:
+                        spec.resume = True
                 ws.agents.append(agent)
                 self._wire_agent(ws, agent)
                 self._apply_coordination(ws, agent)

@@ -1226,7 +1226,7 @@ def _scan_model_effort(lines) -> tuple[str, str, str]:
 def codex_home() -> str:
     """Codex's local state directory (CODEX_HOME or ~/.codex)."""
     return os.path.expandvars(os.path.expanduser(
-        os.environ.get("CODEX_HOME", "~/.codex")))
+        os.environ.get("CODEX_HOME") or "~/.codex"))
 
 
 def codex_user_defaults() -> tuple[str, str]:
@@ -1249,41 +1249,57 @@ def latest_codex_session(cwd: str, started_at: float,
     Codex does not accept a caller-supplied session id, so correlate its
     rollout metadata by cwd and creation time. The session id is then pinned
     in the same transient session field used by the other provider readers.
+    A zero start time requests legacy restore recovery by latest cwd session.
     """
     if not cwd:
         return ("", "")
     excluded = excluded or set()
     root = os.path.join(codex_home(), "sessions")
-    now = datetime.now(timezone.utc)
-    # A Codex thread can start in the previous UTC date near midnight.
-    dirs = [(now - timedelta(days=i)).strftime("%Y/%m/%d") for i in range(2)]
+    if started_at > 0:
+        now = datetime.now(timezone.utc)
+        # A Codex thread can start in the previous UTC date near midnight.
+        dirs = [(now - timedelta(days=i)).strftime("%Y/%m/%d")
+                for i in range(2)]
+        paths = (path for day in dirs for path in
+                 glob.glob(os.path.join(root, day, "rollout-*.jsonl")))
+    else:
+        # A running card with no saved id is an older AI Hive session whose
+        # first rollout poll was missed. Recover from Codex's full history.
+        paths = glob.iglob(os.path.join(root, "**", "rollout-*.jsonl"),
+                           recursive=True)
     candidates = []
     normalized_cwd = os.path.normcase(os.path.normpath(cwd))
-    for day in dirs:
-        for path in glob.glob(os.path.join(root, day, "rollout-*.jsonl")):
-            try:
-                if os.path.getmtime(path) < started_at - 20:
-                    continue
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    first = json.loads(f.readline())
-                meta = first.get("payload", {}).get("meta", {})
-                if first.get("type") != "session_meta":
-                    continue
-                rec_cwd = meta.get("cwd", "")
-                sid = str(meta.get("id") or meta.get("session_id") or "")
-                if (not sid or sid in excluded or not rec_cwd or
-                        os.path.normcase(os.path.normpath(rec_cwd)) != normalized_cwd):
-                    continue
-                stamp = meta.get("timestamp") or first.get("timestamp") or ""
-                try:
-                    created = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
-                except (ValueError, TypeError):
-                    created = os.path.getmtime(path)
-                if created < started_at - 20:
-                    continue
-                candidates.append((abs(created - started_at), created, sid, path))
-            except (OSError, ValueError, TypeError):
+    for path in paths:
+        try:
+            mtime = os.path.getmtime(path)
+            if started_at > 0 and mtime < started_at - 20:
                 continue
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                first = json.loads(f.readline())
+            payload = first.get("payload", {})
+            # Codex rollout files put cwd/id directly in payload. Accept the
+            # older nested shape too, so a format change cannot strand cards.
+            meta = payload.get("meta", payload)
+            sid = str(meta.get("id") or meta.get("session_id") or "")
+            rec_cwd = meta.get("cwd", "")
+            if (first.get("type") != "session_meta" or not sid or
+                    sid in excluded or not rec_cwd or
+                    os.path.normcase(os.path.normpath(rec_cwd)) != normalized_cwd):
+                continue
+            stamp = meta.get("timestamp") or first.get("timestamp") or ""
+            try:
+                created = datetime.fromisoformat(
+                    stamp.replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError):
+                created = mtime
+            if started_at > 0 and created < started_at - 20:
+                continue
+            # Fresh launches pick the rollout closest to their start edge;
+            # legacy restore recovery chooses Codex's newest cwd session.
+            rank = abs(created - started_at) if started_at > 0 else -created
+            candidates.append((rank, created, sid, path))
+        except (OSError, ValueError, TypeError):
+            continue
     if not candidates:
         return ("", "")
     _, _, sid, path = min(candidates)
@@ -1300,6 +1316,17 @@ def latest_codex_state(cwd: str, session_id: str, started_at: float,
     a useful short summary until the user sets an explicit task in AI Hive.
     """
     sid, path = session_id, _CODEX_PATHS.get(session_id, "") if session_id else ""
+    if sid and (not path or not os.path.isfile(path)):
+        # _CODEX_PATHS only lasts for this AI Hive process. Codex names rollout
+        # files with the thread id, so a restored pin can be resolved directly
+        # even when its conversation started days ago.
+        root = os.path.join(codex_home(), "sessions")
+        matches = glob.glob(os.path.join(
+            root, "**", f"rollout-*-{glob.escape(sid)}.jsonl"),
+            recursive=True)
+        if matches:
+            path = max(matches, key=os.path.getmtime)
+            _CODEX_PATHS[sid] = path
     if not path or not os.path.isfile(path):
         if sid:
             path = _CODEX_PATHS.get(sid, "")
