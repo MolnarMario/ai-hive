@@ -30,13 +30,15 @@ from PySide6.QtCore import (QAbstractAnimation, QEasingCurve,
                             QSize, Qt, Signal)
 from PySide6.QtGui import QColor, QFontMetrics, QPainter
 from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel,
-                               QScrollArea, QToolButton, QVBoxLayout, QWidget)
+                               QMenu, QScrollArea, QStyle, QToolButton, QVBoxLayout,
+                               QWidget)
 
 from ..terminal_agent import TerminalAgent
 from ..tiling import compute_grid, explicit_grid, parse_layout
 from ..ui_theme import Palette
 from ..workspace_manager import Workspace
 from .grid_selector import GridButton
+from .ornaments import anchored_popup_pos
 from .terminal_card import CARD_REORDER_MIME, TerminalCard
 
 
@@ -117,6 +119,8 @@ class WorkspacePage(QWidget):
     layoutChosen = Signal(str, str)     # ws_id, layout
     deleteRequested = Signal(str)       # ws_id
     openFolderRequested = Signal(str)   # ws_id
+    openRepoRequested = Signal(str)     # ws_id
+    repoActivityRequested = Signal(str)  # ws_id
     changePathRequested = Signal(str)   # ws_id
     activityToggled = Signal(str)       # ws_id (wired in Phase 6)
     mapRequested = Signal(str)          # ws_id (open the Agent/File Map window)
@@ -207,7 +211,26 @@ class WorkspacePage(QWidget):
         # delete sits LEFT of open/change — the sidebar used to duplicate both
         # open-folder and delete as hover buttons on the workspace row; both
         # actions now live here, once, next to the folder they act on.
-        self.delete_btn = tool("✖", "Delete workspace", "WsDelete")
+        self.delete_btn = tool("", "Delete workspace", "WsDelete")
+        self.delete_btn.setAccessibleName("Delete workspace")
+        self.delete_btn.setIcon(self.delete_btn.style().standardIcon(
+            QStyle.StandardPixmap.SP_TrashIcon))
+        self.delete_btn.setIconSize(QSize(15, 15))
+        self.repo_btn = tool("Open repo", "Open this workspace's GitHub repository in a browser",
+                             "RepoOpenButton")
+        self.repo_activity_btn = tool("▾", "Show recent GitHub pull requests and commits",
+                                      "RepoActivityMenuButton")
+        # Treat the activity menu as the dropdown half of the repository
+        # action. A zero-spacing host keeps the two controls visually joined
+        # while preserving separate click targets.
+        repo_actions = QWidget(header)
+        repo_actions_lay = QHBoxLayout(repo_actions)
+        repo_actions_lay.setContentsMargins(0, 0, 0, 0)
+        repo_actions_lay.setSpacing(0)
+        repo_actions_lay.addWidget(self.repo_btn)
+        repo_actions_lay.addWidget(self.repo_activity_btn)
+        self.repo_activity_menu = QMenu(self.repo_activity_btn)
+        self.repo_activity_menu.addAction("Recent GitHub activity loads when opened…")
         self.open_btn = tool("Open folder", "Open this workspace's folder")
         self.change_btn = tool("Change…", "Change the workspace folder")
         self.grid_button = GridButton(header)
@@ -221,6 +244,7 @@ class WorkspacePage(QWidget):
         hl.addWidget(folder_icon)
         hl.addWidget(self.path_label, 1)
         hl.addWidget(self.delete_btn)
+        hl.addWidget(repo_actions)
         hl.addWidget(self.open_btn)
         hl.addWidget(self.change_btn)
         hl.addSpacing(8)
@@ -235,6 +259,9 @@ class WorkspacePage(QWidget):
             lambda: self.deleteRequested.emit(self.workspace.id))
         self.open_btn.clicked.connect(
             lambda: self.openFolderRequested.emit(self.workspace.id))
+        self.repo_btn.clicked.connect(
+            lambda: self.openRepoRequested.emit(self.workspace.id))
+        self.repo_activity_btn.clicked.connect(self._show_repo_activity_menu)
         self.change_btn.clicked.connect(
             lambda: self.changePathRequested.emit(self.workspace.id))
         self.grid_button.layoutChosen.connect(self._on_layout_chosen)
@@ -244,6 +271,60 @@ class WorkspacePage(QWidget):
         self.activity_btn.clicked.connect(
             lambda: self.activityToggled.emit(self.workspace.id))
         return header
+
+    def _show_repo_activity_menu(self) -> None:
+        menu = self.repo_activity_menu
+        # Measure it before showing so Qt never paints it at the raw anchor
+        # first and then visibly shifts it back onto the screen.
+        menu.ensurePolished()
+        menu.adjustSize()
+        menu.popup(anchored_popup_pos(self.repo_activity_btn, menu.sizeHint(),
+                                      align_right=True))
+        self.repoActivityRequested.emit(self.workspace.id)
+
+    def show_repo_activity(self, pull_requests: list, commits: list,
+                           error: str = "", repo_url: str = "") -> None:
+        """Replace the loading menu with GitHub activity for this workspace."""
+        menu = self.repo_activity_menu
+        menu.clear()
+        if error:
+            menu.addAction(error).setEnabled(False)
+            return
+        if not repo_url:
+            menu.addAction("No recent activity found").setEnabled(False)
+            return
+
+        menu.addSection("Pull requests")
+        for item in pull_requests:
+            label = f"#{item['number']}  {item['title']}"
+            if item.get("state") == "closed" and item.get("merged"):
+                label += "  (merged)"
+            elif item.get("state") == "closed":
+                label += "  (closed)"
+            menu.addAction(label, lambda url=item["url"]: self._open_activity_url(url))
+        if not pull_requests:
+            menu.addAction("No pull requests found").setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Open all pull requests",
+                       lambda url=repo_url + "/pulls?q=is%3Apr":
+                       self._open_activity_url(url))
+
+        menu.addSection("Commits")
+        for item in commits:
+            message = item["message"].splitlines()[0]
+            label = f"{item['sha'][:7]}  {message}"
+            menu.addAction(label, lambda url=item["url"]: self._open_activity_url(url))
+        if not commits:
+            menu.addAction("No commits found").setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Open all commits",
+                       lambda url=repo_url + "/commits":
+                       self._open_activity_url(url))
+
+    @staticmethod
+    def _open_activity_url(url: str) -> None:
+        from .. import fsopen
+        fsopen.open_url(url)
 
     def set_path_text(self, path: str) -> None:
         self.path_label.setToolTip(path)

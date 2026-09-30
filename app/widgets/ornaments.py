@@ -1755,7 +1755,7 @@ class OrnamentDivider(QWidget):
         p.end()
 
 
-def anchored_popup_pos(anchor, size):
+def anchored_popup_pos(anchor, size, align_right=False):
     """Where to put a popup dropped under `anchor`, kept inside the app window
     AND the screen.
 
@@ -1765,8 +1765,10 @@ def anchored_popup_pos(anchor, size):
     end of a wide strip, so left-anchoring a panel under it spills past the
     window's right edge on a narrow window and off the display on a wide one.
 
-    Overflow right -> right-align to the button (the panel grows leftward, back
-    into the window); overflow bottom -> flip above it. The bound is the
+    `align_right` keeps a dropdown's right edge attached to the button even
+    when it would otherwise fit to the button's right. Overflow right ->
+    right-align to the button (the panel grows leftward, back into the window);
+    overflow bottom -> flip above it. The bound is the
     INTERSECTION of the window and the screen's available geometry, so neither
     a window pushed off-screen nor a taskbar can strand the panel.
     """
@@ -1785,7 +1787,7 @@ def anchored_popup_pos(anchor, size):
     right = min(avail.x() + avail.width(), win.x() + win.width())
     bottom = min(avail.y() + avail.height(), win.y() + win.height())
     x = bl.x()
-    if x + w > right:
+    if align_right or x + w > right:
         x = br.x() - w                        # right-align under the button
     x = max(left, min(x, right - w))
     y = bl.y()
@@ -1796,34 +1798,10 @@ def anchored_popup_pos(anchor, size):
 
 
 class DropDownComboBox(QComboBox):
-    """A `QComboBox` whose popup always opens directly under it.
+    """Use Qt's native popup placement, which clamps before first paint.
 
-    Qt's native combo popup aligns the CURRENTLY SELECTED row with the box
-    (so the list can land above, below, or straddling it depending on which
-    item happens to be picked) - normal for a native OS combo, but every combo
-    here is styled to read as an ordinary list-style dropdown, where that
-    reads as the menu jumping around each time the selection changes (live-
-    reported on the theme selector). `showPopup` lets Qt do its own layout and
-    sizing, then repositions just the popup window's top-left corner under the
-    box afterwards, so nothing about the list itself (size, scroll position)
-    changes. Clamped to the SCREEN only, not `anchored_popup_pos`'s window
-    bound: a combo living inside another `Qt.Popup` (the Options panel) has a
-    tiny host window, and bounding the list to it would truncate a dropdown
-    taller than that panel.
+    Moving the native popup after ``super().showPopup()`` produced a visible
+    slide when the combo sat near the right edge. Qt already positions the
+    popup within the available screen geometry, so leave its initial placement
+    intact and avoid a second post-show correction.
     """
-
-    def showPopup(self) -> None:
-        super().showPopup()
-        popup = self.view().window()
-        screen = self.screen() or QApplication.primaryScreen()
-        avail = screen.availableGeometry()
-        bl = self.mapToGlobal(self.rect().bottomLeft())
-        tl = self.mapToGlobal(self.rect().topLeft())
-        w, h = popup.width(), popup.height()
-        x = min(bl.x(), avail.x() + avail.width() - w)
-        x = max(avail.x(), x)
-        y = bl.y()
-        if y + h > avail.y() + avail.height():
-            y = tl.y() - h                    # flip above when short on room
-        y = max(avail.y(), y)
-        popup.move(x, y)

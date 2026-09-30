@@ -388,7 +388,7 @@ QMenu::indicator:checked {{
 #VersionBadge {{
     background: {p.BG_HOVER}; color: {p.TEXT_DIM};
     border: 1px solid {p.BORDER}; border-radius: 3px;
-    padding: 1px 6px; font-size: 11px;
+    padding: 1px 6px; font-size: 12px;
 }}
 /* check for / install an AI Hive update, beside the version it would change */
 #AppUpdateBtn {{
@@ -945,6 +945,21 @@ QScrollArea {{ background: transparent; border: none; }}
 }}
 #HeaderFolderIcon {{ color: {p.TEXT_DIM}; font-size: 13px; }}
 #HeaderPath {{ color: {p.TEXT_DIM}; font-size: 12px; }}
+#RepoOpenButton, #RepoActivityMenuButton {{
+    background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
+    border-radius: 0; padding: 3px 8px; color: {p.TEXT};
+}}
+#RepoOpenButton {{
+    border-top-left-radius: 3px; border-bottom-left-radius: 3px;
+    border-right: 0;
+}}
+#RepoActivityMenuButton {{
+    border-top-right-radius: 3px; border-bottom-right-radius: 3px;
+    padding-left: 7px; padding-right: 7px;
+}}
+#RepoOpenButton:hover, #RepoActivityMenuButton:hover {{
+    background: {p.BG_ACTIVE}; border-color: {p.ACCENT_BLUE};
+}}
 #GridButton, #ActivityToggle {{
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
     border-radius: 3px; padding: 3px 8px; color: {p.TEXT};
