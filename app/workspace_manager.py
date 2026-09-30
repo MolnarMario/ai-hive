@@ -618,6 +618,24 @@ class WorkspaceManager(QObject):
                         spec.cwd, spec.session_id)
                     if model or effort or mode:
                         a.set_live_model(model, effort, mode)
+                elif spec.provider == "openai":
+                    # Codex assigns its own thread id only after launch. Match
+                    # its rollout by cwd + launch time, then keep the id pinned
+                    # so later polls read the same session unambiguously.
+                    excluded = self.sibling_session_ids(a)
+                    sid, model, effort, mode, used, window, summary = (
+                        transcripts.latest_codex_state(
+                            spec.cwd, spec.session_id, a._session_started,
+                            excluded))
+                    if sid and sid != spec.session_id:
+                        spec.session_id = sid
+                        changed = True
+                    if model or effort or mode:
+                        a.set_live_model(model, effort, mode)
+                    if summary:
+                        a.set_ai_title(summary)
+                    if used and window:
+                        a.set_token_usage(used, window)
         if changed:
             self.dirty.emit()
 
@@ -890,6 +908,13 @@ class WorkspaceManager(QObject):
                 except ValueError:
                     agent.assignment = AssignmentState.IDLE
                 agent.autostart_on_restore = bool(td.get("running", False))
+                # Codex owns its transcript and thread id. Restore the saved
+                # thread for both running agents (which autostart) and stopped
+                # cards (which resume when the user wakes them). A missing pin
+                # stays a fresh Codex terminal; never guess with --last when
+                # several Codex agents can share a project folder.
+                if spec.provider == "openai" and spec.session_id:
+                    spec.resume = True
                 ws.agents.append(agent)
                 self._wire_agent(ws, agent)
                 self._apply_coordination(ws, agent)

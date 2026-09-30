@@ -70,6 +70,9 @@ workspaces keep executing — switching never pauses anything.
   second or two after you pick. The **permission mode is remembered**: an agent
   you put in plan or auto mode comes back in that mode the next time you open
   AI Hive, instead of reverting to ask-each-time.
+  Codex cards read the effective model and reasoning level from Codex's live
+  session log, show its context-window usage, and use the opening prompt as the
+  summary when no task was assigned in AI Hive.
   Click any agent to jump straight
   to its terminal card (switching workspace first if needed). When an agent is
   actually **waiting for you** — a permission prompt or an interactive

@@ -23,7 +23,8 @@ import json
 import os
 import re
 import shutil
-from datetime import datetime
+import glob
+from datetime import datetime, timedelta, timezone
 
 from . import limit_banner
 
@@ -60,6 +61,11 @@ _PROMPT_CACHE: dict[str, tuple[float, int, list]] = {}
 
 # cache for latest_model_effort: path -> (mtime, size, model, effort, mode).
 _MODEL_CACHE: dict[str, tuple[float, int, str, str, str]] = {}
+
+# Codex rollout JSONL readers are deliberately transient display data. The CLI
+# owns these files; cache them by path metadata just like Claude's transcript.
+_CODEX_CACHE: dict[str, tuple] = {}
+_CODEX_PATHS: dict[str, str] = {}
 
 # cache for reply_times: path -> (mtime, size, [(epoch, final text), ...]).
 _REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
@@ -1215,6 +1221,159 @@ def _scan_model_effort(lines) -> tuple[str, str, str]:
         if m:
             effort = m.group(1).lower()
     return (model, effort, mode)
+
+
+def codex_home() -> str:
+    """Codex's local state directory (CODEX_HOME or ~/.codex)."""
+    return os.path.expandvars(os.path.expanduser(
+        os.environ.get("CODEX_HOME", "~/.codex")))
+
+
+def codex_user_defaults() -> tuple[str, str]:
+    """Read Codex's configured default model and reasoning effort, if set."""
+    path = os.path.join(codex_home(), "config.toml")
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            config = tomllib.load(f)
+        return (str(config.get("model") or ""),
+                str(config.get("model_reasoning_effort") or ""))
+    except (OSError, ValueError, ImportError):
+        return ("", "")
+
+
+def latest_codex_session(cwd: str, started_at: float,
+                         excluded: set[str] | None = None) -> tuple[str, str]:
+    """Find the rollout created for a running Codex terminal.
+
+    Codex does not accept a caller-supplied session id, so correlate its
+    rollout metadata by cwd and creation time. The session id is then pinned
+    in the same transient session field used by the other provider readers.
+    """
+    if not cwd:
+        return ("", "")
+    excluded = excluded or set()
+    root = os.path.join(codex_home(), "sessions")
+    now = datetime.now(timezone.utc)
+    # A Codex thread can start in the previous UTC date near midnight.
+    dirs = [(now - timedelta(days=i)).strftime("%Y/%m/%d") for i in range(2)]
+    candidates = []
+    normalized_cwd = os.path.normcase(os.path.normpath(cwd))
+    for day in dirs:
+        for path in glob.glob(os.path.join(root, day, "rollout-*.jsonl")):
+            try:
+                if os.path.getmtime(path) < started_at - 20:
+                    continue
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    first = json.loads(f.readline())
+                meta = first.get("payload", {}).get("meta", {})
+                if first.get("type") != "session_meta":
+                    continue
+                rec_cwd = meta.get("cwd", "")
+                sid = str(meta.get("id") or meta.get("session_id") or "")
+                if (not sid or sid in excluded or not rec_cwd or
+                        os.path.normcase(os.path.normpath(rec_cwd)) != normalized_cwd):
+                    continue
+                stamp = meta.get("timestamp") or first.get("timestamp") or ""
+                try:
+                    created = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+                except (ValueError, TypeError):
+                    created = os.path.getmtime(path)
+                if created < started_at - 20:
+                    continue
+                candidates.append((abs(created - started_at), created, sid, path))
+            except (OSError, ValueError, TypeError):
+                continue
+    if not candidates:
+        return ("", "")
+    _, _, sid, path = min(candidates)
+    _CODEX_PATHS[sid] = path
+    return (sid, path)
+
+
+def latest_codex_state(cwd: str, session_id: str, started_at: float,
+                       excluded: set[str] | None = None) -> tuple[str, str, str, str, int, int, str]:
+    """Return (session id, model, effort, mode, used, window, summary).
+
+    Codex's `turn_context` is the per-turn source for model/reasoning effort;
+    `event_msg/token_count` supplies context occupancy. User messages provide
+    a useful short summary until the user sets an explicit task in AI Hive.
+    """
+    sid, path = session_id, _CODEX_PATHS.get(session_id, "") if session_id else ""
+    if not path or not os.path.isfile(path):
+        if sid:
+            path = _CODEX_PATHS.get(sid, "")
+        if not path or not os.path.isfile(path):
+            sid, path = latest_codex_session(cwd, started_at, excluded)
+    if not path:
+        return (sid, "", "", "", 0, 0, "")
+    try:
+        st = os.stat(path)
+        cached = _CODEX_CACHE.get(path)
+        if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+            return (sid, *cached[2:])
+        model = effort = mode = summary = ""
+        used = window = 0
+        with open(path, "rb") as f:
+            f.seek(max(0, st.st_size - 131072))
+            data = f.read().decode("utf-8", "replace")
+        lines = data.splitlines()
+        # Keep earliest user text as the stable conversation summary; latest
+        # turn context and usage are the live values and win as the file grows.
+        for line in lines:
+            if '"type":"' not in line and '"type": "' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            kind = rec.get("type")
+            payload = rec.get("payload") or {}
+            if kind == "turn_context":
+                model = str(payload.get("model") or model)
+                effort = str(payload.get("effort") or effort)
+                if not effort:
+                    effort = str((payload.get("collaboration_mode") or {}).get("settings", {}).get("reasoning_effort") or "")
+                approval = payload.get("approval_policy")
+                sandbox = payload.get("sandbox_policy")
+                if approval == "never":
+                    mode = "auto"
+                elif approval:
+                    mode = "approve"
+                if isinstance(sandbox, dict) and sandbox.get("type") == "read-only":
+                    mode = "read-only"
+            elif kind == "event_msg" and payload.get("type") == "token_count":
+                info = payload.get("info") or {}
+                usage = info.get("last_token_usage") or info.get("total_token_usage") or {}
+                used = int(usage.get("total_tokens") or 0)
+                window = int(info.get("model_context_window") or window or 0)
+            elif kind == "event_msg" and payload.get("type") == "user_message" and not summary:
+                summary = str(payload.get("message") or "").strip()
+            elif kind == "response_item":
+                item = payload
+                if item.get("type") == "message" and item.get("role") == "user" and not summary:
+                    content = item.get("content") or []
+                    summary = " ".join(str(x.get("text", "")) for x in content if isinstance(x, dict)).strip()
+        model = codex_model_display(model)
+        summary = re.sub(r"\s+", " ", summary)
+        if len(summary) > 240:
+            summary = summary[:237].rstrip() + "..."
+        result = (model, effort, mode, used, window, summary)
+        _CODEX_CACHE[path] = (st.st_mtime, st.st_size, *result)
+        return (sid, *result)
+    except (OSError, ValueError, TypeError):
+        return (sid, "", "", "", 0, 0, "")
+
+
+def codex_model_display(raw: str) -> str:
+    """Make Codex model ids readable while leaving unknown model ids intact."""
+    token = (raw or "").strip()
+    if not token:
+        return ""
+    m = re.match(r"(?i)^gpt-(\d+(?:\.\d+)?)(?:-(sol|terra|luna))?$", token)
+    if m:
+        return f"GPT-{m.group(1)}" + (f" {m.group(2).title()}" if m.group(2) else "")
+    return token
 
 
 def _parse_set_model(content: str) -> tuple[str, str]:

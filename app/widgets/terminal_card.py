@@ -1006,8 +1006,8 @@ class TerminalCard(QFrame):
         repolish(self.sched_mark)
 
     def _on_tokens(self, badge: str = "") -> None:
-        # context-window usage badge beside the summary; hidden when empty so a
-        # fresh or non-Claude agent shows nothing (never a misleading "0%")
+        # context-window usage badge beside the summary; hidden until the
+        # provider reports an actual context size and token count.
         if badge:
             self.token_label.setText(badge)
             self.token_label.setToolTip(
@@ -1031,8 +1031,12 @@ class TerminalCard(QFrame):
                         "\nKept for the next launch, so this agent reopens"
                         " in the same mode")
             self.model_label.setText(badge)
-            self.model_label.setToolTip(
-                tip + "\nFollows /model, /effort and Shift+Tab in this terminal")
+            provider = self.agent.spec.provider
+            if provider == "openai":
+                tip += "\nFollows the model and reasoning level used in Codex turns"
+            else:
+                tip += "\nFollows /model, /effort and Shift+Tab in this terminal"
+            self.model_label.setToolTip(tip)
         else:
             self.model_label.clear()
         self.model_label.setVisible(bool(badge))
