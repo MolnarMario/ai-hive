@@ -5,9 +5,13 @@ Every dialog lives here so the model API stays headless-testable.
 """
 
 import os
+import json
 import shutil
+import subprocess
 import threading
 import time
+import urllib.request
+from urllib.parse import urlparse, urlunparse
 
 from PySide6.QtCore import QEvent, QPoint, QProcess, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
@@ -758,7 +762,7 @@ class TopBar(QFrame):
         lay.addWidget(self._logo)
         lay.addWidget(self._name)
         lay.addWidget(self._version)
-        lay.addWidget(self.app_update_btn)
+        lay.addWidget(self.app_update_btn, 0, Qt.AlignmentFlag.AlignVCenter)
         lay.addSpacing(12)
         # A bare stretch keeps the identity block left-anchored and the extras
         # row does NOT get one, which only works because
@@ -1731,6 +1735,7 @@ class MainWindow(QMainWindow):
     # `plan_usage()` exposes the latest full reading for polling-style callers.
     planLimitReached = Signal(object)   # claude_usage.Limit
     planLimitCleared = Signal()
+    repoActivityLoaded = Signal(str, object, object, str, str)
 
     def __init__(self, manager: WorkspaceManager, store: SessionStore,
                  session: dict | None = None):
@@ -1741,6 +1746,7 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
 
         self._pages: dict[str, WorkspacePage] = {}
+        self.repoActivityLoaded.connect(self._on_repo_activity_loaded)
         self._map_window: AgentFileMapWindow | None = None  # lazy, reused
         self._event_log_window: EventLogWindow | None = None  # lazy, reused
         self._event_log_state: dict = {}  # its filters/size (persisted)
@@ -3728,6 +3734,8 @@ class MainWindow(QMainWindow):
         page.layoutChosen.connect(self.manager.set_layout)        # persist
         page.deleteRequested.connect(self._confirm_delete_workspace)
         page.openFolderRequested.connect(self._open_workspace_folder)
+        page.openRepoRequested.connect(self._open_workspace_repo)
+        page.repoActivityRequested.connect(self._load_repo_activity)
         page.changePathRequested.connect(self._change_workspace_folder)
         page.activityToggled.connect(self._toggle_activity)
         page.mapRequested.connect(self._open_agent_map)
@@ -3978,6 +3986,119 @@ class MainWindow(QMainWindow):
         elif ws:
             QMessageBox.warning(self, "AI Hive",
                                 f"Folder not found:\n{ws.project_path}")
+
+    def _open_workspace_repo(self, ws_id: str) -> None:
+        ws = self.manager.workspace(ws_id)
+        if ws is None:
+            return
+        if not os.path.isdir(ws.project_path):
+            QMessageBox.warning(self, "AI Hive",
+                                f"Folder not found:\n{ws.project_path}")
+            return
+        try:
+            result = subprocess.run(
+                ["git", "-C", ws.project_path, "remote", "get-url", "origin"],
+                capture_output=True, text=True, timeout=3,
+                creationflags=0x08000000)  # CREATE_NO_WINDOW
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        remote = result.stdout.strip() if result and result.returncode == 0 else ""
+        url = self._repo_remote_url(remote)
+        if url:
+            if not fsopen.open_url(url):
+                QMessageBox.warning(self, "AI Hive",
+                                    f"Could not open repository in a browser:\n{url}")
+        else:
+            QMessageBox.information(
+                self, "AI Hive",
+                f"No GitHub origin remote found for:\n{ws.project_path}")
+
+    def _load_repo_activity(self, ws_id: str) -> None:
+        """Fetch recent public GitHub activity without blocking the UI."""
+        ws = self.manager.workspace(ws_id)
+        if ws is None:
+            return
+        project_path = ws.project_path
+
+        def fetch() -> None:
+            pull_requests, commits, error = [], [], ""
+            try:
+                result = subprocess.run(
+                    ["git", "-C", project_path, "remote", "get-url", "origin"],
+                    capture_output=True, text=True, timeout=3,
+                    creationflags=0x08000000)
+                remote_url = self._repo_remote_url(
+                    result.stdout.strip() if result.returncode == 0 else "")
+                if not remote_url:
+                    error = "No GitHub origin remote found"
+                else:
+                    parts = [part for part in urlparse(remote_url).path.split("/")
+                             if part]
+                    if len(parts) != 2:
+                        error = "Could not identify this GitHub repository"
+                    else:
+                        api_base = f"https://api.github.com/repos/{parts[0]}/{parts[1]}"
+
+                        def get_json(endpoint: str):
+                            request = urllib.request.Request(
+                                endpoint,
+                                headers={"Accept": "application/vnd.github+json",
+                                         "User-Agent": "AI-Hive"})
+                            with urllib.request.urlopen(request, timeout=8) as response:
+                                return json.loads(response.read().decode("utf-8"))
+
+                        prs = get_json(api_base + "/pulls?state=all&sort=updated&direction=desc&per_page=10")
+                        recent_commits = get_json(api_base + "/commits?per_page=10")
+                        pull_requests = [{
+                            "number": item["number"],
+                            "title": item["title"],
+                            "state": item["state"],
+                            "merged": bool(item.get("merged_at")),
+                            "url": item["html_url"],
+                        } for item in prs]
+                        commits = [{
+                            "sha": item["sha"],
+                            "message": item["commit"]["message"],
+                            "url": item["html_url"],
+                        } for item in recent_commits]
+            except (OSError, subprocess.SubprocessError, ValueError,
+                    KeyError, TypeError) as exc:
+                error = f"Could not load GitHub activity: {exc}"
+            self.repoActivityLoaded.emit(ws_id, pull_requests, commits, error,
+                                         remote_url if not error else "")
+
+        threading.Thread(target=fetch, name="github-repo-activity",
+                         daemon=True).start()
+
+    def _on_repo_activity_loaded(self, ws_id: str, pull_requests: list,
+                                 commits: list, error: str,
+                                 repo_url: str) -> None:
+        page = self._pages.get(ws_id)
+        if page is not None:
+            page.show_repo_activity(pull_requests, commits, error, repo_url)
+
+    @staticmethod
+    def _repo_remote_url(remote: str) -> str:
+        """Convert a GitHub origin URL (HTTPS or SSH) to its browser URL."""
+        remote = (remote or "").strip()
+        if not remote:
+            return ""
+        # Git's SCP-like SSH syntax is not accepted by urlparse as a URL.
+        if remote.startswith("git@github.com:"):
+            path = remote.partition(":")[2]
+            parsed = urlparse(f"https://github.com/{path}")
+        else:
+            parsed = urlparse(remote)
+            if parsed.scheme in ("ssh", "git") and parsed.hostname == "github.com":
+                parsed = parsed._replace(scheme="https", netloc="github.com")
+        if parsed.scheme not in ("http", "https") or parsed.hostname != "github.com":
+            return ""
+        path = parsed.path.rstrip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        if not path.strip("/"):
+            return ""
+        return urlunparse(("https", "github.com", path, "", "", ""))
 
     def _change_workspace_folder(self, ws_id: str) -> None:
         ws = self.manager.workspace(ws_id)
