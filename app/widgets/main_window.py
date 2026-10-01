@@ -39,7 +39,8 @@ from .. import usage_poll
 from ..process_worker import (AI_KINDS, PTY_ONLY_KINDS, AgentKind, build_spec)
 from ..pty_worker import HAS_CONPTY
 from ..session_store import SessionStore
-from ..workspace_manager import Workspace, WorkspaceManager
+from ..workspace_manager import (MAX_AGENTS_PER_WORKSPACE, Workspace,
+                                 WorkspaceManager)
 from .. import coordination
 from .. import event_log
 from ..event_hub import EventHub
@@ -1213,18 +1214,26 @@ class TopBar(QFrame):
 class AddTerminalDialog(QDialog):
     """Configure a new agent: type, and for AI agents provider/model/effort.
 
-    Model stays dialog-free — the dialog only produces an AgentSpec via
-    result_spec(); headless tests build specs directly.
+    Model stays dialog-free — the dialog only produces AgentSpecs via
+    result_spec() / result_specs(); headless tests build specs directly.
+
+    The Count stepper launches several identical agents in one go. It is
+    capped at the workspace's free slots (max_count) and pinned to 1 while a
+    past conversation is picked: two agents resuming one transcript race for
+    it and one of them destroys it.
     """
 
     def __init__(self, default_name: str, parent=None,
-                 cwd: str = "", busy_ids=()):
+                 cwd: str = "", busy_ids=(),
+                 max_count: int = MAX_AGENTS_PER_WORKSPACE):
         super().__init__(parent)
         self.setWindowTitle("New Agent")
         self.setMinimumWidth(420)
         self._cwd = cwd
         self._busy_ids = set(busy_ids)  # conversations a running agent holds
         self._resume_loaded = False
+        self._count = 1
+        self._max_count = max(1, max_count)
 
         form = QFormLayout()
         self.name_edit = QLineEdit(default_name, self)
@@ -1278,10 +1287,33 @@ class AddTerminalDialog(QDialog):
         self.pty_check.setChecked(HAS_CONPTY)
         self.pty_check.setEnabled(HAS_CONPTY)
 
+        # how many agents to open: [-] n [+]
+        self.count_minus = QPushButton("-", self)
+        self.count_value = QLabel(self)
+        self.count_plus = QPushButton("+", self)
+        for btn in (self.count_minus, self.count_plus):
+            btn.setObjectName("CountStepBtn")
+            # a dialog's QPushButtons are autoDefault, so Enter would step
+            # the count instead of pressing OK
+            btn.setAutoDefault(False)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.count_value.setObjectName("CountValue")
+        self.count_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.count_value.setMinimumWidth(28)
+        count_row = QHBoxLayout()
+        count_row.setSpacing(6)
+        count_row.addWidget(self.count_minus)
+        count_row.addWidget(self.count_value)
+        count_row.addWidget(self.count_plus)
+        count_row.addStretch(1)
+        self.count_minus.clicked.connect(lambda: self._set_count(self._count - 1))
+        self.count_plus.clicked.connect(lambda: self._set_count(self._count + 1))
+
         form.addRow("Name", self.name_edit)
         form.addRow("Type", self.kind_combo)
         self._note_row = self.provider_note
         form.addRow("", self.provider_note)
+        form.addRow("Count", count_row)
         self._model_label = QLabel("Model", self)
         form.addRow(self._model_label, self.model_combo)
         self._effort_label = QLabel("Effort", self)
@@ -1321,7 +1353,35 @@ class AddTerminalDialog(QDialog):
         self.program_edit.textChanged.connect(self._validate)
         self.command_edit.textChanged.connect(self._validate)
         self.browse_btn.clicked.connect(self._browse)
+        self.resume_combo.currentIndexChanged.connect(
+            lambda _i: self._set_count(self._count))
         self._on_kind_changed(0)
+
+    def count(self) -> int:
+        """How many agents OK opens (1 unless the stepper was used)."""
+        return self._count
+
+    def _count_cap(self) -> int:
+        # a resumed conversation can only be held by one agent
+        if not self.resume_combo.isHidden() and self.resume_combo.currentData():
+            return 1
+        return self._max_count
+
+    def _set_count(self, n: int) -> None:
+        cap = self._count_cap()
+        self._count = max(1, min(n, cap))
+        self.count_value.setText(str(self._count))
+        self.count_minus.setEnabled(self._count > 1)
+        self.count_plus.setEnabled(self._count < cap)
+        if cap == 1 and self._max_count > 1:
+            self.count_plus.setToolTip(
+                "A past conversation can only be resumed by one agent.")
+        elif self._count >= cap:
+            self.count_plus.setToolTip(
+                f"This workspace has room for {cap} more agent"
+                f"{'' if cap == 1 else 's'}.")
+        else:
+            self.count_plus.setToolTip("")
 
     def _kind(self) -> AgentKind:
         return self.kind_combo.currentData()
@@ -1392,6 +1452,7 @@ class AddTerminalDialog(QDialog):
         else:
             self.pty_check.setEnabled(HAS_CONPTY)
         self._validate()
+        self._set_count(self._count)  # the resume picker may have come or gone
 
     def _populate_models(self, prov) -> None:
         self.model_combo.clear()
@@ -1490,6 +1551,17 @@ class AddTerminalDialog(QDialog):
         args = QProcess.splitCommand(self.args_edit.text().strip())
         pty = self.pty_check.isChecked() and HAS_CONPTY
         return build_spec(kind, name, cwd=cwd, program=program, args=args, pty=pty)
+
+    def result_specs(self, cwd: str) -> list:
+        """One fresh spec per agent the stepper asked for. The first keeps the
+        typed name; the rest count on from it ("Agent 4" -> "Agent 5", 6...;
+        "Reviewer" -> "Reviewer 2", 3...)."""
+        specs = [self.result_spec(cwd=cwd) for _ in range(self._count)]
+        m = re.fullmatch(r"(.*\S)\s+(\d+)", specs[0].name)
+        base, first = (m.group(1), int(m.group(2))) if m else (specs[0].name, 1)
+        for i, spec in enumerate(specs[1:], start=1):
+            spec.name = f"{base} {first + i}"
+        return specs
 
 
 class ScheduleMessageDialog(QDialog):
@@ -4313,18 +4385,23 @@ class MainWindow(QMainWindow):
         # them for resume (two agents on one transcript race/truncate it)
         busy_ids = {a.spec.session_id for a in ws.agents
                     if a.is_running() and a.spec.session_id}
+        free = MAX_AGENTS_PER_WORKSPACE - len(ws.agents)
         dialog = AddTerminalDialog(self.manager.next_agent_name(ws.id), self,
-                                   cwd=ws.project_path, busy_ids=busy_ids)
+                                   cwd=ws.project_path, busy_ids=busy_ids,
+                                   max_count=free)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        spec = dialog.result_spec(cwd=ws.project_path)
-        agent = self.manager.add_terminal(ws.id, spec)
-        if agent is None:
-            QMessageBox.warning(self, "AI Hive",
-                                "This workspace is at its agent limit.")
-            return
+        first = None
+        for spec in dialog.result_specs(cwd=ws.project_path):
+            agent = self.manager.add_terminal(ws.id, spec)
+            if agent is None:
+                QMessageBox.warning(self, "AI Hive",
+                                    "This workspace is at its agent limit.")
+                break
+            first = first or agent
         # opening a terminal is for typing into it right away
-        self._reveal_agent(ws.id, agent.id)
+        if first is not None:
+            self._reveal_agent(ws.id, first.id)
 
     def _confirm_delete_workspace(self, ws_id: str) -> None:
         ws = self.manager.workspace(ws_id)

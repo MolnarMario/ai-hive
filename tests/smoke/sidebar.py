@@ -1069,6 +1069,118 @@ def test_new_agent_autofocus():
     win.close()
 
 
+def test_new_agent_count():
+    """The New Agent dialog's [-] n [+] stepper opens n agents at once: it
+    starts at 1 with minus disabled, caps at the workspace's free slots, is
+    pinned to 1 while a past conversation is being resumed (two agents on one
+    transcript destroy it), and Enter still means OK, not a step."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app.session_store import SessionStore
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    dlg = AddTerminalDialog("Agent 4", cwd=str(SCRATCH_CWD), max_count=3)
+    check("count: defaults to 1", dlg.count() == 1
+          and dlg.count_value.text() == "1")
+    check("count: minus is disabled at 1", not dlg.count_minus.isEnabled())
+    check("count: plus is enabled at 1", dlg.count_plus.isEnabled())
+    check("count: minus never goes below 1", (dlg._set_count(0),
+                                              dlg.count())[1] == 1)
+    dlg.count_plus.click()
+    dlg.count_plus.click()
+    check("count: plus steps the value", dlg.count() == 3
+          and dlg.count_value.text() == "3")
+    check("count: minus is enabled above 1", dlg.count_minus.isEnabled())
+    check("count: plus is disabled at the free-slot cap",
+          not dlg.count_plus.isEnabled())
+    dlg.count_plus.click()
+    check("count: plus can't pass the cap", dlg.count() == 3)
+    check("count: stepper buttons are not autoDefault (Enter = OK)",
+          not dlg.count_minus.autoDefault() and not dlg.count_plus.autoDefault())
+
+    specs = dlg.result_specs(cwd=str(SCRATCH_CWD))
+    check("count: one spec per agent", len(specs) == 3, len(specs))
+    check("count: names count on from the default",
+          [s.name for s in specs] == ["Agent 4", "Agent 5", "Agent 6"],
+          [s.name for s in specs])
+    check("count: specs are distinct objects of the chosen kind",
+          len({id(s) for s in specs}) == 3
+          and all(s.kind == specs[0].kind for s in specs))
+    dlg.name_edit.setText("Reviewer")
+    check("count: a custom name gets numbered copies",
+          [s.name for s in dlg.result_specs(cwd=str(SCRATCH_CWD))]
+          == ["Reviewer", "Reviewer 2", "Reviewer 3"])
+    dlg.count_minus.click()
+    check("count: minus steps down", dlg.count() == 2)
+
+    # resuming a past conversation pins the count to 1
+    dlg.resume_combo.clear()
+    dlg.resume_combo.addItem("New conversation", "")
+    dlg.resume_combo.addItem("old chat", "11111111-1111-1111-1111-111111111111")
+    dlg.resume_combo.show()
+    dlg.resume_combo.setCurrentIndex(1)
+    check("count: a resumed conversation pins the count to 1",
+          dlg.count() == 1 and not dlg.count_plus.isEnabled())
+    check("count: resume yields a single spec",
+          len(dlg.result_specs(cwd=str(SCRATCH_CWD))) == 1)
+    dlg.resume_combo.setCurrentIndex(0)
+    check("count: back to a new conversation re-enables plus",
+          dlg.count_plus.isEnabled())
+    dlg.deleteLater()
+
+    full = AddTerminalDialog("Agent 1", cwd=str(SCRATCH_CWD), max_count=0)
+    check("count: a full workspace still shows 1 with both buttons off",
+          full.count() == 1 and not full.count_plus.isEnabled()
+          and not full.count_minus.isEnabled())
+    full.deleteLater()
+
+    # the window opens every requested agent, revealing the first
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-count-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    pump(150)
+    ws = win.manager.workspaces[0]
+    before = len(ws.agents)
+
+    def accept_three(self):
+        self.count_plus.click()
+        self.count_plus.click()
+        return QDialog.DialogCode.Accepted
+
+    orig_exec = AddTerminalDialog.exec
+    orig_result_spec = AddTerminalDialog.result_spec
+    AddTerminalDialog.exec = accept_three
+    AddTerminalDialog.result_spec = lambda self, cwd="": build_spec(
+        AgentKind.CMD, "Shell 1", cwd=cwd, pty=True)
+    try:
+        win._on_add_terminal_clicked(ws.id)
+    finally:
+        AddTerminalDialog.exec = orig_exec
+        AddTerminalDialog.result_spec = orig_result_spec
+    pump(200)
+    new = ws.agents[before:]
+    check("count: the window opened 3 agents", len(new) == 3, len(new))
+    check("count: the opened agents are numbered",
+          [a.spec.name for a in new] == ["Shell 1", "Shell 2", "Shell 3"],
+          [a.spec.name for a in new])
+    first_card = win._pages[ws.id].card_for(new[0].id) if new else None
+    check("count: the first new agent is focused",
+          first_card is not None and win._focused_card is first_card)
+    win.close()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_agent_file_map():
     """The Agent/File Map visualizer: (1) the transcript parser attributes
     edited vs read files and detects Task sub-agents while skipping malformed

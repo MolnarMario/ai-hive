@@ -8,6 +8,15 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.24.0
+
+- The New Agent dialog has a Count stepper: pick Claude Code (or any type),
+  press + to choose how many, and that many agents open at once, numbered on
+  from the name you gave. It starts at 1 and can't go past the workspace's
+  free slots. Resuming a past conversation keeps it at 1.
+- New Workspace can start from a GitHub repository: paste its URL and AI Hive
+  clones the main branch into a new folder and opens a workspace there.
+
 ## 0.23.0
 
 - Codex cards now resume their own conversation when you reopen AI Hive, and
