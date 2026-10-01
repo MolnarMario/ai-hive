@@ -23,7 +23,8 @@ import json
 import os
 import re
 import shutil
-from datetime import datetime
+import glob
+from datetime import datetime, timedelta, timezone
 
 from . import limit_banner
 
@@ -60,6 +61,11 @@ _PROMPT_CACHE: dict[str, tuple[float, int, list]] = {}
 
 # cache for latest_model_effort: path -> (mtime, size, model, effort, mode).
 _MODEL_CACHE: dict[str, tuple[float, int, str, str, str]] = {}
+
+# Codex rollout JSONL readers are deliberately transient display data. The CLI
+# owns these files; cache them by path metadata just like Claude's transcript.
+_CODEX_CACHE: dict[str, tuple] = {}
+_CODEX_PATHS: dict[str, str] = {}
 
 # cache for reply_times: path -> (mtime, size, [(epoch, final text), ...]).
 _REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
@@ -1215,6 +1221,197 @@ def _scan_model_effort(lines) -> tuple[str, str, str]:
         if m:
             effort = m.group(1).lower()
     return (model, effort, mode)
+
+
+def codex_home() -> str:
+    """Codex's local state directory (CODEX_HOME or ~/.codex)."""
+    return os.path.expandvars(os.path.expanduser(
+        os.environ.get("CODEX_HOME") or "~/.codex"))
+
+
+def codex_user_defaults() -> tuple[str, str]:
+    """Read Codex's configured default model and reasoning effort, if set."""
+    path = os.path.join(codex_home(), "config.toml")
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            config = tomllib.load(f)
+        return (str(config.get("model") or ""),
+                str(config.get("model_reasoning_effort") or ""))
+    except (OSError, ValueError, ImportError):
+        return ("", "")
+
+
+def latest_codex_session(cwd: str, started_at: float,
+                         excluded: set[str] | None = None) -> tuple[str, str]:
+    """Find the rollout created for a running Codex terminal.
+
+    Codex does not accept a caller-supplied session id, so correlate its
+    rollout metadata by cwd and creation time. The session id is then pinned
+    in the same transient session field used by the other provider readers.
+    A zero start time requests legacy restore recovery by latest cwd session.
+    """
+    if not cwd:
+        return ("", "")
+    excluded = excluded or set()
+    root = os.path.join(codex_home(), "sessions")
+    if started_at > 0:
+        now = datetime.now(timezone.utc)
+        # A Codex thread can start in the previous UTC date near midnight.
+        dirs = [(now - timedelta(days=i)).strftime("%Y/%m/%d")
+                for i in range(2)]
+        paths = (path for day in dirs for path in
+                 glob.glob(os.path.join(root, day, "rollout-*.jsonl")))
+    else:
+        # A running card with no saved id is an older AI Hive session whose
+        # first rollout poll was missed. Recover from Codex's full history.
+        paths = glob.iglob(os.path.join(root, "**", "rollout-*.jsonl"),
+                           recursive=True)
+    candidates = []
+    normalized_cwd = os.path.normcase(os.path.normpath(cwd))
+    for path in paths:
+        try:
+            mtime = os.path.getmtime(path)
+            if started_at > 0 and mtime < started_at - 20:
+                continue
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                first = json.loads(f.readline())
+            payload = first.get("payload", {})
+            # Codex rollout files put cwd/id directly in payload. Accept the
+            # older nested shape too, so a format change cannot strand cards.
+            meta = payload.get("meta", payload)
+            sid = str(meta.get("id") or meta.get("session_id") or "")
+            rec_cwd = meta.get("cwd", "")
+            if (first.get("type") != "session_meta" or not sid or
+                    sid in excluded or not rec_cwd or
+                    os.path.normcase(os.path.normpath(rec_cwd)) != normalized_cwd):
+                continue
+            stamp = meta.get("timestamp") or first.get("timestamp") or ""
+            try:
+                created = datetime.fromisoformat(
+                    stamp.replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError):
+                created = mtime
+            if started_at > 0 and created < started_at - 20:
+                continue
+            # Fresh launches pick the rollout closest to their start edge;
+            # legacy restore recovery chooses Codex's newest cwd session.
+            rank = abs(created - started_at) if started_at > 0 else -created
+            candidates.append((rank, created, sid, path))
+        except (OSError, ValueError, TypeError):
+            continue
+    if not candidates:
+        return ("", "")
+    _, _, sid, path = min(candidates)
+    _CODEX_PATHS[sid] = path
+    return (sid, path)
+
+
+def latest_codex_state(cwd: str, session_id: str, started_at: float,
+                       excluded: set[str] | None = None) -> tuple[str, str, str, str, int, int, str]:
+    """Return (session id, model, effort, mode, used, window, summary).
+
+    Codex's `turn_context` is the per-turn source for model/reasoning effort;
+    `event_msg/token_count` supplies context occupancy. User messages provide
+    the summary, matching the conversation's entry in Codex's resume list.
+    """
+    sid, path = session_id, _CODEX_PATHS.get(session_id, "") if session_id else ""
+    if sid and (not path or not os.path.isfile(path)):
+        # _CODEX_PATHS only lasts for this AI Hive process. Codex names rollout
+        # files with the thread id, so a restored pin can be resolved directly
+        # even when its conversation started days ago.
+        root = os.path.join(codex_home(), "sessions")
+        matches = glob.glob(os.path.join(
+            root, "**", f"rollout-*-{glob.escape(sid)}.jsonl"),
+            recursive=True)
+        if matches:
+            path = max(matches, key=os.path.getmtime)
+            _CODEX_PATHS[sid] = path
+    if not path or not os.path.isfile(path):
+        if sid:
+            path = _CODEX_PATHS.get(sid, "")
+        if not path or not os.path.isfile(path):
+            sid, path = latest_codex_session(cwd, started_at, excluded)
+    if not path:
+        return (sid, "", "", "", 0, 0, "")
+    try:
+        st = os.stat(path)
+        cached = _CODEX_CACHE.get(path)
+        if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+            return (sid, *cached[2:])
+        model = effort = mode = summary = ""
+        used = window = 0
+        # Read the beginning for the stable conversation summary and the tail
+        # for live model/usage state. Looking only at the tail made the first
+        # user message within that window look like the latest prompt.
+        with open(path, "rb") as f:
+            head = f.read(262144).decode("utf-8", "replace")
+            if st.st_size > 262144:
+                f.seek(max(0, st.st_size - 131072))
+                tail = f.read().decode("utf-8", "replace")
+            else:
+                tail = head
+        lines = head.splitlines() + (tail.splitlines() if tail != head else [])
+        # Keep the earliest user text as the stable conversation summary; live
+        # turn context and usage are allowed to update from the tail.
+        for line in lines:
+            if '"type":"' not in line and '"type": "' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            kind = rec.get("type")
+            payload = rec.get("payload") or {}
+            if kind == "turn_context":
+                model = str(payload.get("model") or model)
+                effort = str(payload.get("effort") or effort)
+                if not effort:
+                    effort = str((payload.get("collaboration_mode") or {}).get("settings", {}).get("reasoning_effort") or "")
+                approval = payload.get("approval_policy")
+                sandbox = payload.get("sandbox_policy")
+                if approval == "never":
+                    mode = "auto"
+                elif approval:
+                    mode = "approve"
+                if isinstance(sandbox, dict) and sandbox.get("type") == "read-only":
+                    mode = "read-only"
+            elif kind == "event_msg" and payload.get("type") == "token_count":
+                info = payload.get("info") or {}
+                usage = info.get("last_token_usage") or info.get("total_token_usage") or {}
+                used = int(usage.get("total_tokens") or 0)
+                window = int(info.get("model_context_window") or window or 0)
+            elif kind == "event_msg" and payload.get("type") == "user_message" and not summary:
+                candidate = str(payload.get("message") or "").strip()
+                if candidate and "<environment_context>" not in candidate and "<image" not in candidate:
+                    summary = candidate
+            elif kind == "response_item":
+                item = payload
+                if item.get("type") == "message" and item.get("role") == "user" and not summary:
+                    content = item.get("content") or []
+                    candidate = " ".join(str(x.get("text", "")) for x in content if isinstance(x, dict)).strip()
+                    if candidate and "<environment_context>" not in candidate and "<image" not in candidate:
+                        summary = candidate
+        model = codex_model_display(model)
+        summary = re.sub(r"\s+", " ", summary)
+        if len(summary) > 240:
+            summary = summary[:237].rstrip() + "..."
+        result = (model, effort, mode, used, window, summary)
+        _CODEX_CACHE[path] = (st.st_mtime, st.st_size, *result)
+        return (sid, *result)
+    except (OSError, ValueError, TypeError):
+        return (sid, "", "", "", 0, 0, "")
+
+
+def codex_model_display(raw: str) -> str:
+    """Make Codex model ids readable while leaving unknown model ids intact."""
+    token = (raw or "").strip()
+    if not token:
+        return ""
+    m = re.match(r"(?i)^gpt-(\d+(?:\.\d+)?)(?:-(sol|terra|luna))?$", token)
+    if m:
+        return f"GPT-{m.group(1)}" + (f" {m.group(2).title()}" if m.group(2) else "")
+    return token
 
 
 def _parse_set_model(content: str) -> tuple[str, str]:

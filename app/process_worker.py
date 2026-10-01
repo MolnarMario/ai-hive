@@ -198,6 +198,11 @@ class AgentSpec:
             # board wiring — like Gemini it's an interactive agent only.
             if self.resume:
                 args += ["--continue"]
+        elif self.provider == "openai" and self.resume and self.session_id:
+            # Codex persists threads itself. `codex resume <id>` reopens this
+            # terminal's exact conversation instead of starting an empty one
+            # or relying on a folder-wide "most recent" choice.
+            args += ["resume", self.session_id]
         return args
 
     def to_dict(self) -> dict:

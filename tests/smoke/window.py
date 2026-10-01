@@ -14,10 +14,9 @@ from .harness import ROOT, SCRATCH_CWD, SHOTS, check
 
 
 def test_ai_title_summary():
-    """The per-agent summary is the assigned task, else Claude's latest
-    AI-generated conversation title read from the transcript (the same title
-    shown in /resume). latest-title parsing takes the LAST ai-title record and
-    re-reads when the file changes; task always wins over the AI title."""
+    """The per-agent summary follows Claude's /resume title when available,
+    using an assigned task only until that title is reported. Latest-title
+    parsing takes the LAST ai-title record and re-reads when the file changes."""
     import json as _json
     from PySide6.QtWidgets import QApplication
     from app import transcripts
@@ -55,16 +54,13 @@ def test_ai_title_summary():
     check("summary: falls back to the AI title", a.summary() == "Recolor the badge"
           and seen[-1] == "Recolor the badge", (a.summary(), seen))
     a.set_task("Fix the parser")
-    check("summary: assigned task overrides the AI title",
-          a.summary() == "Fix the parser" and seen[-1] == "Fix the parser")
+    check("summary: AI Hive task does not replace the /resume title",
+          a.summary() == "Recolor the badge" and seen[-1] == "Recolor the badge")
     n = len(seen)
-    a.set_ai_title("A newer title")   # title changes but task still wins
-    check("summary: no signal when the DISPLAYED summary is unchanged",
-          a.summary() == "Fix the parser" and len(seen) == n, (a.summary(), seen))
-    a.set_task("")                    # task cleared -> falls back to AI title
-    check("summary: clearing the task reveals the AI title",
-          a.summary() == "A newer title" and seen[-1] == "A newer title",
-          (a.summary(), seen))
+    a.set_ai_title("A newer title")
+    check("summary: follows the latest /resume title",
+          a.summary() == "A newer title" and len(seen) == n + 1
+          and seen[-1] == "A newer title", (a.summary(), seen))
     a.deleteLater()
 
 

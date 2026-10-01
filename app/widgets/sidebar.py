@@ -806,7 +806,7 @@ class AgentRow(QFrame):
                 f"{len(held)} scheduled message(s)"
                 + (f", {missed} missed" if missed else "")
                 + " -- click to view or edit")
-        # summary = assigned task, else Claude's live AI conversation title
+        # summary = the CLI's live conversation title, else the assigned task
         get = getattr(agent, "summary", None)
         self._full = (get() if callable(get) else agent.current_task or "").strip()
         self.summary.set_full_text(self._full)

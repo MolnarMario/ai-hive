@@ -8,6 +8,15 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.23.0
+
+- Codex cards now resume their own conversation when you reopen AI Hive, and
+  show the model, reasoning level and context-window usage live in the header.
+- A card's summary is now the conversation title you see in the CLI's resume
+  list. A task assigned in AI Hive shows only until that title exists.
+- A Codex card's summary stays on the conversation's opening prompt instead of
+  jumping to a later message once the conversation gets long.
+
 ## 0.22.6
 
 - When Claude Code continues on its own after a usage limit resets, the

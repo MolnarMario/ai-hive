@@ -56,10 +56,10 @@ workspaces keep executing — switching never pauses anything.
   restarts.
 - **Inline agent list + "?" waiting alerts** — click a row's count badge to
   **expand its agents inline**, folder-tree style — each agent's name on the
-  left with a one-line **summary** beside it. The summary is the agent's
-  assigned task, or, when none is set, **Claude Code's own AI conversation
-  title** read live from the transcript (the same short summary you see in
-  `/resume`) — so you can tell at a glance what each agent is working on without
+  left with a one-line **summary** beside it. The summary is **the CLI's own
+  conversation title** read live from the transcript (the same short summary
+  you see in `/resume`), or the task assigned in AI Hive until that title
+  exists — so you can tell at a glance what each agent is working on without
   reading its terminal. The same summary shows in the terminal card header,
   where it fits itself to whatever width the row leaves (full text on hover).
 - **Live model, effort and mode on every card** — the header says what the
@@ -70,6 +70,9 @@ workspaces keep executing — switching never pauses anything.
   second or two after you pick. The **permission mode is remembered**: an agent
   you put in plan or auto mode comes back in that mode the next time you open
   AI Hive, instead of reverting to ask-each-time.
+  Codex cards read the effective model and reasoning level from Codex's live
+  session log, show its context-window usage, and use the opening prompt as the
+  summary, like Codex's own resume list.
   Click any agent to jump straight
   to its terminal card (switching workspace first if needed). When an agent is
   actually **waiting for you** — a permission prompt or an interactive
@@ -779,7 +782,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2127 checks drive the real app headlessly (offscreen Qt platform) with real
+2129 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -914,7 +917,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2127 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2129 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

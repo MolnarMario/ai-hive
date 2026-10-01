@@ -302,7 +302,7 @@ class TerminalAgent(QObject):
     cleared = Signal()                  # console was cleared locally
     activity_changed = Signal(bool)     # busy (streaming output) vs standby
     waiting_changed = Signal(bool)      # waiting for the user (prompt/question)
-    summary_changed = Signal(str)       # displayed summary (task or AI title)
+    summary_changed = Signal(str)       # displayed summary (AI title or task)
     tokens_changed = Signal(str)        # context-usage badge text ("" = hide)
     model_changed = Signal(str)         # live model/effort badge text ("" = hide)
     limit_blocked_changed = Signal(bool)  # cut off by the plan limit (latched)
@@ -360,6 +360,9 @@ class TerminalAgent(QObject):
         self._live_effort = (spec.effort or "").strip()
         self._live_mode = (getattr(spec, "permission_mode", "") or "").strip()
         self._live_model = self._seed_model()
+        if spec.provider == "openai" and not self._live_effort:
+            _, configured_effort = transcripts.codex_user_defaults()
+            self._live_effort = configured_effort.strip()
         self.assignment = AssignmentState.IDLE  # task-assignment lifecycle
         self.auto_created = False  # only ever restored from older sessions
         self.autostart_on_restore = False  # set from persisted run state
@@ -525,6 +528,10 @@ class TerminalAgent(QObject):
         # existing transcript); a resume keeps its pin
         if self.spec.provider in ("claude", "gemini") and not self.spec.resume:
             self.spec.session_id = str(uuid.uuid4())
+        elif self.spec.provider == "openai" and not self.spec.resume:
+            # Codex creates its thread id itself; let the rollout poll bind the
+            # new id once Codex has written the session metadata.
+            self.spec.session_id = ""
         elif (self.spec.provider in ("claude", "gemini") and self.spec.resume
               and self._verify_resume_target):
             self._recover_missing_resume_target()
@@ -588,6 +595,8 @@ class TerminalAgent(QObject):
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         if self.spec.provider in ("claude", "gemini"):  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
+        elif self.spec.provider == "openai":
+            self.spec.session_id = ""  # Codex chooses its own new thread id
         self._session_started = time.time()
         # a restart is a fresh conversation: the next reply worth stamping is
         # the next one somebody asks for (see _note_submit)
@@ -946,13 +955,16 @@ class TerminalAgent(QObject):
                 self.summary_changed.emit(self.summary())
 
     def summary(self) -> str:
-        """One-line 'what this agent is working on': the assigned task if set,
-        otherwise Claude Code's own AI-generated conversation title (the same
-        summary shown in `/resume`, read from the live transcript)."""
-        return self.current_task or self._ai_title
+        """One-line conversation summary, matching the provider's resume menu.
+
+        The live conversation title is the authoritative summary for the
+        header; an AI Hive task is only a fallback until the provider reports
+        that title (or for agents without one).
+        """
+        return self._ai_title or self.current_task
 
     def set_ai_title(self, text: str) -> None:
-        """Adopt Claude's latest AI conversation title (from the transcript).
+        """Adopt the provider's latest conversation summary.
         Transient — never persisted; refreshed by the manager's poll."""
         text = sanitize_text(text or "").strip()
         if text == self._ai_title:
@@ -963,7 +975,7 @@ class TerminalAgent(QObject):
             self.summary_changed.emit(self.summary())
 
     def set_token_usage(self, used: int, window: int) -> None:
-        """Adopt the latest context-window occupancy read from the transcript.
+        """Adopt the latest context-window occupancy read from the session log.
         Transient — never persisted, never marks the session dirty (like the AI
         title); emits only when the DISPLAYED badge text actually changes."""
         if used == self._token_used and window == self._token_window:
@@ -976,7 +988,7 @@ class TerminalAgent(QObject):
 
     def token_badge(self) -> str:
         """Compact context-usage string for the card header, e.g. "20% of 1M".
-        "" when there is no usage data yet (fresh / non-Claude agent)."""
+        Empty until a provider reports actual context usage."""
         if self._token_used <= 0 or self._token_window <= 0:
             return ""
         pct = min(100, round(self._token_used * 100 / self._token_window))
@@ -1001,6 +1013,9 @@ class TerminalAgent(QObject):
             if effort and not self._live_effort:
                 self._live_effort = effort
             return model or raw
+        if self.spec.provider == "openai":
+            raw = chosen or transcripts.codex_user_defaults()[0]
+            return transcripts.codex_model_display(raw)
         return chosen
 
     def set_live_model(self, model: str, effort: str, mode: str = "") -> None:
@@ -1041,6 +1056,8 @@ class TerminalAgent(QObject):
             return providers.permission_mode_display(self._live_mode)
         if self.spec.provider == "gemini":
             return providers.gemini_permission_mode_display(self._live_mode)
+        if self.spec.provider == "openai":
+            return self._live_mode
         return ""
 
     def model_badge(self) -> str:
