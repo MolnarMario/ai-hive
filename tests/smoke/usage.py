@@ -1428,3 +1428,53 @@ def test_usage_pill_provider_inks():
                    ui_theme.usage_pill_ink("codex")} - {None}) == 3
               for tid in ui_theme.THEMES))
     ui_theme.apply_theme(was)
+
+
+def test_codex_summary_reads_first_real_prompt():
+    """A Codex card's summary is the conversation's first real user prompt,
+    even after the rollout grows past the tail window the live usage is read
+    from. Reading only the tail made a later prompt look like the summary,
+    and Codex's injected <environment_context> turn must never be the summary."""
+    import json as _json
+    from app import transcripts
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-codex-"))
+    path = tmp / "rollout-2026-01-01T00-00-00-test-sid.jsonl"
+
+    def _rec(kind, payload):
+        return _json.dumps({"timestamp": "2026-01-01T00:00:00Z",
+                            "type": kind, "payload": payload})
+
+    lines = [
+        _rec("session_meta", {"id": "test-sid", "cwd": SCRATCH_CWD}),
+        _rec("event_msg", {"type": "user_message", "message":
+                           "<environment_context>cwd</environment_context>"}),
+        _rec("event_msg", {"type": "user_message",
+                           "message": "Fix the header summary"}),
+    ]
+    filler = _rec("event_msg", {"type": "agent_message", "message": "x" * 1000})
+    lines += [filler] * 400   # pushes the first prompt out of the tail window
+    lines += [
+        _rec("event_msg", {"type": "user_message", "message": "A later prompt"}),
+        _rec("turn_context", {"model": "gpt-5", "effort": "high",
+                              "approval_policy": "on-request"}),
+        _rec("event_msg", {"type": "token_count", "info": {
+            "last_token_usage": {"total_tokens": 1234},
+            "model_context_window": 200000}}),
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    check("codex summary: test rollout is larger than the head window",
+          path.stat().st_size > 262144 + 131072, path.stat().st_size)
+
+    transcripts._CODEX_PATHS["test-sid"] = str(path)
+    try:
+        sid, model, effort, mode, used, window, summary = \
+            transcripts.latest_codex_state(SCRATCH_CWD, "test-sid", 0)
+    finally:
+        transcripts._CODEX_PATHS.pop("test-sid", None)
+        transcripts._CODEX_CACHE.pop(str(path), None)
+    check("codex summary: first real prompt, not a later one or env context",
+          summary == "Fix the header summary", summary)
+    check("codex summary: live usage still comes from the tail",
+          used == 1234 and window == 200000 and effort == "high",
+          (used, window, effort))

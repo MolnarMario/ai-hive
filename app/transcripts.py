@@ -1341,12 +1341,19 @@ def latest_codex_state(cwd: str, session_id: str, started_at: float,
             return (sid, *cached[2:])
         model = effort = mode = summary = ""
         used = window = 0
+        # Read the beginning for the stable conversation summary and the tail
+        # for live model/usage state. Looking only at the tail made the first
+        # user message within that window look like the latest prompt.
         with open(path, "rb") as f:
-            f.seek(max(0, st.st_size - 131072))
-            data = f.read().decode("utf-8", "replace")
-        lines = data.splitlines()
-        # Keep earliest user text as the stable conversation summary; latest
-        # turn context and usage are the live values and win as the file grows.
+            head = f.read(262144).decode("utf-8", "replace")
+            if st.st_size > 262144:
+                f.seek(max(0, st.st_size - 131072))
+                tail = f.read().decode("utf-8", "replace")
+            else:
+                tail = head
+        lines = head.splitlines() + (tail.splitlines() if tail != head else [])
+        # Keep the earliest user text as the stable conversation summary; live
+        # turn context and usage are allowed to update from the tail.
         for line in lines:
             if '"type":"' not in line and '"type": "' not in line:
                 continue
@@ -1375,12 +1382,16 @@ def latest_codex_state(cwd: str, session_id: str, started_at: float,
                 used = int(usage.get("total_tokens") or 0)
                 window = int(info.get("model_context_window") or window or 0)
             elif kind == "event_msg" and payload.get("type") == "user_message" and not summary:
-                summary = str(payload.get("message") or "").strip()
+                candidate = str(payload.get("message") or "").strip()
+                if candidate and "<environment_context>" not in candidate and "<image" not in candidate:
+                    summary = candidate
             elif kind == "response_item":
                 item = payload
                 if item.get("type") == "message" and item.get("role") == "user" and not summary:
                     content = item.get("content") or []
-                    summary = " ".join(str(x.get("text", "")) for x in content if isinstance(x, dict)).strip()
+                    candidate = " ".join(str(x.get("text", "")) for x in content if isinstance(x, dict)).strip()
+                    if candidate and "<environment_context>" not in candidate and "<image" not in candidate:
+                        summary = candidate
         model = codex_model_display(model)
         summary = re.sub(r"\s+", " ", summary)
         if len(summary) > 240:
