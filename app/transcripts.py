@@ -1313,7 +1313,7 @@ def latest_codex_state(cwd: str, session_id: str, started_at: float,
 
     Codex's `turn_context` is the per-turn source for model/reasoning effort;
     `event_msg/token_count` supplies context occupancy. User messages provide
-    a useful short summary until the user sets an explicit task in AI Hive.
+    the summary, matching the conversation's entry in Codex's resume list.
     """
     sid, path = session_id, _CODEX_PATHS.get(session_id, "") if session_id else ""
     if sid and (not path or not os.path.isfile(path)):

@@ -918,8 +918,8 @@ class TerminalCard(QFrame):
         self.title.setText(name)
 
     def _on_task(self, *_ignore) -> None:
-        # show the agent's summary — its assigned task, else Claude's live AI
-        # conversation title. The label collapses it to one line, fits it to
+        # show the agent's summary — the CLI's live conversation title, else
+        # its assigned task. The label collapses it to one line, fits it to
         # whatever width the header leaves and keeps the full text on hover.
         # It stays IN the layout even when empty (it carries the header's
         # stretch): hidden, the stretch vanishes and the status glyph absorbs

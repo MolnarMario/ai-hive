@@ -56,10 +56,10 @@ workspaces keep executing — switching never pauses anything.
   restarts.
 - **Inline agent list + "?" waiting alerts** — click a row's count badge to
   **expand its agents inline**, folder-tree style — each agent's name on the
-  left with a one-line **summary** beside it. The summary is the agent's
-  assigned task, or, when none is set, **Claude Code's own AI conversation
-  title** read live from the transcript (the same short summary you see in
-  `/resume`) — so you can tell at a glance what each agent is working on without
+  left with a one-line **summary** beside it. The summary is **the CLI's own
+  conversation title** read live from the transcript (the same short summary
+  you see in `/resume`), or the task assigned in AI Hive until that title
+  exists — so you can tell at a glance what each agent is working on without
   reading its terminal. The same summary shows in the terminal card header,
   where it fits itself to whatever width the row leaves (full text on hover).
 - **Live model, effort and mode on every card** — the header says what the
@@ -72,7 +72,7 @@ workspaces keep executing — switching never pauses anything.
   AI Hive, instead of reverting to ask-each-time.
   Codex cards read the effective model and reasoning level from Codex's live
   session log, show its context-window usage, and use the opening prompt as the
-  summary when no task was assigned in AI Hive.
+  summary, like Codex's own resume list.
   Click any agent to jump straight
   to its terminal card (switching workspace first if needed). When an agent is
   actually **waiting for you** — a permission prompt or an interactive

@@ -302,7 +302,7 @@ class TerminalAgent(QObject):
     cleared = Signal()                  # console was cleared locally
     activity_changed = Signal(bool)     # busy (streaming output) vs standby
     waiting_changed = Signal(bool)      # waiting for the user (prompt/question)
-    summary_changed = Signal(str)       # displayed summary (task or AI title)
+    summary_changed = Signal(str)       # displayed summary (AI title or task)
     tokens_changed = Signal(str)        # context-usage badge text ("" = hide)
     model_changed = Signal(str)         # live model/effort badge text ("" = hide)
     limit_blocked_changed = Signal(bool)  # cut off by the plan limit (latched)
@@ -955,9 +955,13 @@ class TerminalAgent(QObject):
                 self.summary_changed.emit(self.summary())
 
     def summary(self) -> str:
-        """One-line 'what this agent is working on': assigned task if set,
-        otherwise the provider's live conversation title or first prompt."""
-        return self.current_task or self._ai_title
+        """One-line conversation summary, matching the provider's resume menu.
+
+        The live conversation title is the authoritative summary for the
+        header; an AI Hive task is only a fallback until the provider reports
+        that title (or for agents without one).
+        """
+        return self._ai_title or self.current_task
 
     def set_ai_title(self, text: str) -> None:
         """Adopt the provider's latest conversation summary.
