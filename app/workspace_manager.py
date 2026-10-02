@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from PySide6.QtCore import QObject, Signal
 
 from . import coordination
+from . import lanes
 from . import providers
 from . import session_hook
 from . import session_sync
@@ -25,7 +26,9 @@ from .pty_worker import HAS_CONPTY
 from .terminal_agent import AgentStatus, AssignmentState, TerminalAgent
 
 MAX_AGENTS_PER_WORKSPACE = 12
-SESSION_VERSION = 4  # v4: sidebar layout (workspace order + categories)
+SESSION_VERSION = 5  # v5: agent lanes (AgentSpec.lane); v4: sidebar layout
+# the first version whose agents may carry a lane record
+LANES_SESSION_VERSION = 5
 DEFAULT_LAYOUT = "auto"
 
 # Shell kinds whose pre-v2 (line-mode-default) instances are upgraded to
@@ -105,6 +108,10 @@ class WorkspaceManager(QObject):
         # have consumed, so a stale edge is never re-applied after a local clear.
         self.prompt_events_path = ""
         self._prompt_offset = 0
+        # laned agents whose lane folder was missing at load: (ws_id, agent_id).
+        # Their cwd is NOT moved to the workspace folder; MainWindow repairs
+        # the lane at the same path (take_lane_repairs) and they wait for it.
+        self._lane_repairs: list[tuple[str, str]] = []
 
     # ------------------------------------------------------------- reads ---
 
@@ -290,6 +297,44 @@ class WorkspaceManager(QObject):
         ws.agents.sort(key=lambda a: rank.get(a.id, len(rank)))
         if [a.id for a in ws.agents] != before:
             self.dirty.emit()
+
+    # ------------------------------------------------------- agent lanes ---
+    # A lane is the agent's private git worktree (app/lanes.py). The record is
+    # persisted, so both mutations mark the session dirty, and both re-apply
+    # coordination: the system prompt carries the lane's branch and base.
+
+    def set_agent_lane(self, ws_id: str, agent_id: str, lane: dict,
+                       cwd: str = "") -> bool:
+        ws = self.workspace(ws_id)
+        agent = self.agent(ws_id, agent_id)
+        lane = lanes.clean_lane(lane)
+        if ws is None or agent is None or not lane:
+            return False
+        agent.spec.lane = lane
+        if cwd:
+            agent.spec.cwd = cwd
+        self._apply_coordination(ws, agent)
+        self._touch(ws_id)
+        return True
+
+    def clear_agent_lane(self, ws_id: str, agent_id: str) -> bool:
+        """The agent has no lane after all (creation failed): it works in the
+        workspace folder, exactly like an agent made with lanes off."""
+        ws = self.workspace(ws_id)
+        agent = self.agent(ws_id, agent_id)
+        if ws is None or agent is None:
+            return False
+        agent.spec.lane = {}
+        agent.spec.cwd = ws.project_path
+        self._apply_coordination(ws, agent)
+        self._touch(ws_id)
+        return True
+
+    def take_lane_repairs(self) -> list:
+        """The (ws_id, agent_id) pairs load_session_dict found with a missing
+        lane folder, once. Each of those agents is holding its start."""
+        out, self._lane_repairs = self._lane_repairs, []
+        return out
 
     # -------------------------------------------------- sidebar layout ---
 
@@ -736,7 +781,8 @@ class WorkspaceManager(QObject):
             # every Claude agent gets the peer-etiquette prompt: read the board
             # before starting work, and log_activity as it goes
             agent.spec.system_prompt = coordination.system_prompt_text(
-                ws.name, agent.spec.name, ws.board.path)
+                ws.name, agent.spec.name, ws.board.path,
+                lane=agent.spec.lane)
 
     def _recompute(self, ws_id: str) -> None:
         ws = self.workspace(ws_id)
@@ -824,6 +870,10 @@ class WorkspaceManager(QObject):
                         "permission_mode": getattr(spec, "permission_mode", ""),
                         "role": getattr(spec, "role", ""),
                         "font_px": getattr(spec, "font_px", 0),
+                        # a laned agent that lost this would come back in its
+                        # lane folder with no record of it: never cleaned up,
+                        # never repaired, and treated as a workspace agent
+                        "lane": self._lane_safe(spec),
                         "task": getattr(a, "current_task", ""),
                         "scheduled": self._scheduled_safe(a),
                         "running": True}
@@ -831,6 +881,15 @@ class WorkspaceManager(QObject):
                 self._audit(f"SAVE-DROP agent (even the minimal record failed) "
                             f"{type(exc2).__name__}: {exc2}")
                 return None
+
+    @staticmethod
+    def _lane_safe(spec) -> dict:
+        """The lane record for the DEGRADED record, read without anything
+        that could throw a second time."""
+        try:
+            return lanes.clean_lane(getattr(spec, "lane", None))
+        except Exception:
+            return {}
 
     @staticmethod
     def _scheduled_safe(a) -> list:
@@ -880,6 +939,8 @@ class WorkspaceManager(QObject):
         # (its original threshold) so later SESSION_VERSION bumps never
         # re-trigger it and flip a user's deliberately line-mode shell to pty.
         migrate_shells = data.get("version", 1) < 3 and HAS_CONPTY
+        # lanes arrived in v5: an older file has none, whatever it holds
+        with_lanes = data.get("version", 1) >= LANES_SESSION_VERSION
         for wd in data.get("workspaces", []):
             path = wd.get("project_path", "")
             if not path or not os.path.isdir(path):
@@ -898,8 +959,19 @@ class WorkspaceManager(QObject):
                     spec = AgentSpec.from_dict(td)
                 except Exception:
                     continue
-                spec.cwd = spec.cwd if os.path.isdir(spec.cwd) else ws.project_path
+                if not with_lanes:
+                    spec.lane = {}
+                # a laned agent's folder is never swapped for the workspace
+                # folder: its conversation and its work belong to the lane.
+                # A missing lane is repaired at the same path before it starts.
+                lane_missing = bool(spec.lane) and not os.path.isdir(spec.cwd)
+                if not lane_missing:
+                    spec.cwd = (spec.cwd if os.path.isdir(spec.cwd)
+                                else ws.project_path)
                 agent = TerminalAgent(spec, parent=self)
+                if lane_missing:
+                    agent.hold_start("[restoring this agent's lane folder...]")
+                    self._lane_repairs.append((ws.id, agent.id))
                 agent.current_task = td.get("task", "")
                 agent.restore_scheduled(td.get("scheduled") or [])
                 agent.auto_created = bool(td.get("auto_created", False))

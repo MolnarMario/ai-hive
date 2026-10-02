@@ -43,6 +43,14 @@ This file holds only the rules that protect user data or fail silently.
 - Claude task delivery sends Enter 350 ms after the text
   (`_write_task_to_pty`). A CR in the same burst counts as part of the paste
   and the task never runs.
+- Agent lanes (`app/lanes.py`): `git worktree remove` FOLLOWS directory
+  junctions and empties their targets (measured: a lane's `.venv` junction
+  wiped the real `.venv`). `remove_lane` unlinks the lane's junctions first
+  and refuses while any directory link is left. Never pass `--force` to
+  `worktree remove` or `-D` to `branch`. A laned agent's cwd never leaves its
+  lane: a missing folder is repaired in place, never swapped for the
+  workspace folder. Every lane git mutation goes through `MainWindow.lane_ops`
+  (one queue per repo), and only `lanes_enabled()` gates creating one.
 - Nothing renames an agent except the user.
 - No em dash in any string the user sees. `test_no_em_dashes_in_visible_text`
   enforces it for non-docstring literals.

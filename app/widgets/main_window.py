@@ -28,6 +28,7 @@ from .. import chime
 from .. import claude_usage
 from .. import codex_usage
 from .. import fsopen
+from .. import lanes
 from .. import limit_ledger
 from .. import providers
 from ..limit_banner import LIMIT_PROVIDERS, SEVEN_DAY_WINDOWS
@@ -44,6 +45,7 @@ from ..workspace_manager import (MAX_AGENTS_PER_WORKSPACE, Workspace,
 from .. import coordination
 from .. import event_log
 from ..event_hub import EventHub
+from ..lane_ops import LaneOps
 from ..orchestrator_bridge import OrchestratorBridge
 from .activity_panel import ActivityPanel
 from .agent_file_map import AgentFileMapWindow
@@ -441,6 +443,8 @@ class TopBar(QFrame):
     # install newer Claude Code / agy CLIs at the NEXT startup, before any
     # agent launches (the only moment those binaries are not locked)
     autoUpdateToggled = Signal(bool)
+    # the Agent lanes master switch: may new agents get their own git worktree
+    agentLanesToggled = Signal(bool)
     # the down-arrow button: open the Updates panel (the install-method control
     # and the startup-check checkbox live there, so the bar gains no button)
     updatesPanelRequested = Signal()
@@ -570,6 +574,15 @@ class TopBar(QFrame):
         self.auto_update_btn.clicked.connect(self._on_auto_update_clicked)
         self._refresh_auto_update_btn()
 
+        # Agent lanes master switch (.scratch/agent-lanes/spec-v2.md). Default
+        # OFF: armed, it runs `git worktree add` in the user's repo for every
+        # new agent, so it is the user's decision, made once and persisted.
+        self._agent_lanes = False
+        self.agent_lanes_label = toggle_label("")
+        self.agent_lanes_btn = ToggleSwitch(self)
+        self.agent_lanes_btn.clicked.connect(self._on_agent_lanes_clicked)
+        self._refresh_agent_lanes_btn()
+
         # The detected Claude Code install method, under the switch it explains.
         # It used to be reachable only by hovering the down-arrow; the panel has
         # room to state it.
@@ -687,6 +700,10 @@ class TopBar(QFrame):
         self.options_panel.add_widget(self.install_label)
         self.options_panel.add_row("", self.update_pill,
                                    self.updates_manage_btn)
+        self.options_panel.add_separator()
+        self.options_panel.add_section("Agents")
+        self.options_panel.add_switch_row(self.agent_lanes_label,
+                                          self.agent_lanes_btn)
         self.options_panel.add_separator()
         self.options_panel.add_section("Appearance")
         self.options_panel.add_row("Theme", self.theme_select)
@@ -861,6 +878,32 @@ class TopBar(QFrame):
             "Click to turn on.")
         self.taskbar_btn.setToolTip(tip)
         self.taskbar_label.setToolTip(tip)
+
+    def _on_agent_lanes_clicked(self) -> None:
+        self.set_agent_lanes(not self._agent_lanes)
+        self.agentLanesToggled.emit(self._agent_lanes)
+
+    def set_agent_lanes(self, on: bool) -> None:
+        """Reflect the Agent lanes master switch (no signal emitted)."""
+        self._agent_lanes = bool(on)
+        self._refresh_agent_lanes_btn()
+
+    def _refresh_agent_lanes_btn(self) -> None:
+        self.agent_lanes_btn.setChecked(self._agent_lanes)
+        self.agent_lanes_label.setText("⎇  Agent lanes")
+        # "off" must read as safe for agents that already have a lane: the
+        # switch governs NEW lanes only, never moves or deletes an existing one
+        tip = (
+            "Agent lanes: ON. A new Claude agent in a git workspace gets its "
+            "own git worktree and branch, so agents cannot overwrite or reset "
+            "each other's work. The New Agent dialog can opt one out.\n"
+            "Click to turn off. Agents that already have a lane keep it."
+            if self._agent_lanes else
+            "Agent lanes: OFF. Every agent works in the workspace folder, "
+            "sharing one checkout. Agents that already have a lane keep "
+            "it.\nClick to turn on.")
+        self.agent_lanes_btn.setToolTip(tip)
+        self.agent_lanes_label.setToolTip(tip)
 
     def _on_auto_update_clicked(self) -> None:
         """Arm or disarm the startup update gate, like every other row here.
@@ -1221,11 +1264,20 @@ class AddTerminalDialog(QDialog):
     capped at the workspace's free slots (max_count) and pinned to 1 while a
     past conversation is picked: two agents resuming one transcript race for
     it and one of them destroys it.
+
+    Agent lanes (app/lanes.py): the "Own lane (git worktree)" checkbox exists
+    only while the Options switch is on (`lanes_on`), and is checked by
+    default for Claude in a git workspace. The Conversation picker also lists
+    conversations that started in one of the repo's lanes, switch on or off:
+    picking one revives that lane at its identical path (`revive_lane`).
+    Lanes of agents that still have a card (`live_lane_roots`) are left out.
     """
 
     def __init__(self, default_name: str, parent=None,
                  cwd: str = "", busy_ids=(),
-                 max_count: int = MAX_AGENTS_PER_WORKSPACE):
+                 max_count: int = MAX_AGENTS_PER_WORKSPACE,
+                 lanes_on: bool = False, repo_root: str = "",
+                 live_lane_roots=()):
         super().__init__(parent)
         self.setWindowTitle("New Agent")
         self.setMinimumWidth(420)
@@ -1234,6 +1286,12 @@ class AddTerminalDialog(QDialog):
         self._resume_loaded = False
         self._count = 1
         self._max_count = max(1, max_count)
+        self._repo_root = repo_root
+        self._live_lane_roots = set(live_lane_roots)
+        # resumable lane conversations by session id (lanes.LaneConversation)
+        self._lane_convs: dict = {}
+        # the user's own tick, kept while Type is flipped away and back
+        self._lane_wanted = True
 
         form = QFormLayout()
         self.name_edit = QLineEdit(default_name, self)
@@ -1287,6 +1345,13 @@ class AddTerminalDialog(QDialog):
         self.pty_check.setChecked(HAS_CONPTY)
         self.pty_check.setEnabled(HAS_CONPTY)
 
+        # with the lanes switch off there is no checkbox at all: the dialog
+        # then behaves exactly as it did before lanes existed
+        self.lane_check = None
+        if lanes_on:
+            self.lane_check = QCheckBox("Own lane (git worktree)", self)
+            self.lane_check.toggled.connect(self._on_lane_toggled)
+
         # how many agents to open: [-] n [+]
         self.count_minus = QPushButton("-", self)
         self.count_value = QLabel(self)
@@ -1322,6 +1387,8 @@ class AddTerminalDialog(QDialog):
         form.addRow(self._mode_label, self.mode_combo)
         self._resume_label = QLabel("Conversation", self)
         form.addRow(self._resume_label, self.resume_combo)
+        if self.lane_check is not None:
+            form.addRow("", self.lane_check)
         self._cmd_label = QLabel("Command", self)
         form.addRow(self._cmd_label, self.command_edit)
         self._prog_label = QLabel("Program", self)
@@ -1355,6 +1422,8 @@ class AddTerminalDialog(QDialog):
         self.browse_btn.clicked.connect(self._browse)
         self.resume_combo.currentIndexChanged.connect(
             lambda _i: self._set_count(self._count))
+        self.resume_combo.currentIndexChanged.connect(
+            lambda _i: self._refresh_lane_check())
         self._on_kind_changed(0)
 
     def count(self) -> int:
@@ -1453,6 +1522,7 @@ class AddTerminalDialog(QDialog):
             self.pty_check.setEnabled(HAS_CONPTY)
         self._validate()
         self._set_count(self._count)  # the resume picker may have come or gone
+        self._refresh_lane_check()
 
     def _populate_models(self, prov) -> None:
         self.model_combo.clear()
@@ -1485,25 +1555,89 @@ class AddTerminalDialog(QDialog):
 
     def _ensure_resume_loaded(self) -> None:
         """Populate the resume picker once: 'New conversation' plus every past
-        conversation in this workspace's folder (newest first), skipping any a
-        running agent still holds (resuming that would race/truncate it)."""
+        conversation in this workspace's folder and in the repo's lanes
+        (newest first), skipping any a running agent still holds (resuming
+        that would race/truncate it) and any lane that still has a card."""
         if self._resume_loaded:
             return
         self._resume_loaded = True
         self.resume_combo.clear()
         self.resume_combo.addItem("New conversation", "")
-        if not self._cwd:
-            return
 
         from app import session_sync
-        for conv in session_sync.conversation_previews(self._cwd):
-            if conv.session_id in self._busy_ids:
-                continue  # in use by a running agent — unsafe to double-resume
-            when = time.strftime("%b %d %H:%M", time.localtime(conv.mtime))
-            preview = conv.preview or "(empty session)"
+        rows = []                      # (mtime, preview, session id, lane)
+        if self._cwd:
+            for conv in session_sync.conversation_previews(self._cwd):
+                if conv.session_id in self._busy_ids:
+                    continue  # in use by a running agent — unsafe to double-resume
+                rows.append((conv.mtime, conv.preview, conv.session_id, ""))
+        if self._repo_root:
+            for conv in lanes.lane_conversations(
+                    self._repo_root, exclude_roots=self._live_lane_roots,
+                    exclude_ids=self._busy_ids):
+                self._lane_convs[conv.session_id] = conv
+                rows.append((conv.mtime, conv.preview, conv.session_id,
+                             conv.lane_name))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        for mtime, preview, sid, lane_name in rows:
+            when = time.strftime("%b %d %H:%M", time.localtime(mtime))
+            preview = preview or "(empty session)"
             if len(preview) > 48:
                 preview = preview[:47] + "…"
-            self.resume_combo.addItem(f"{when}  ·  {preview}", conv.session_id)
+            where = f"lane {lane_name}  ·  " if lane_name else ""
+            self.resume_combo.addItem(f"{when}  ·  {where}{preview}", sid)
+
+    def _resume_id(self) -> str:
+        return (self.resume_combo.currentData() or ""
+                if not self.resume_combo.isHidden() else "")
+
+    def revive_lane(self):
+        """The lane conversation picked under Conversation
+        (lanes.LaneConversation), or None. Works with the lanes switch off:
+        it restores existing work, it creates no new isolation."""
+        return self._lane_convs.get(self._resume_id())
+
+    def wants_lane(self) -> bool:
+        """True when OK should give each new agent its own lane."""
+        return (self.lane_check is not None and self.lane_check.isEnabled()
+                and self.lane_check.isChecked() and self.revive_lane() is None)
+
+    def _on_lane_toggled(self, on: bool) -> None:
+        if self.lane_check is not None and self.lane_check.isEnabled():
+            self._lane_wanted = bool(on)
+
+    def _refresh_lane_check(self) -> None:
+        cb = self.lane_check
+        if cb is None:
+            return
+        resume_id = self._resume_id()
+        conv = self._lane_convs.get(resume_id) if resume_id else None
+        cb.blockSignals(True)
+        if conv is not None:
+            cb.setText("Resumes in its own lane")
+            cb.setChecked(True)
+            cb.setEnabled(False)
+            tip = (f"This conversation started in the lane {conv.root} "
+                   f"(branch {conv.branch}) and resumes there.")
+        else:
+            cb.setText("Own lane (git worktree)")
+            if self._kind() != AgentKind.CLAUDE:
+                reason = "Lanes are for Claude agents for now."
+            elif not self._repo_root:
+                reason = "This workspace folder is not in a git repository."
+            elif resume_id:
+                reason = ("A past conversation from the workspace folder "
+                          "resumes there, without a lane.")
+            else:
+                reason = ""
+            cb.setChecked(not reason and self._lane_wanted)
+            cb.setEnabled(not reason)
+            tip = reason or (
+                "Give this agent its own git worktree and branch beside the "
+                "repository, so agents cannot overwrite or reset each other's "
+                "work. Each agent opened at once gets its own lane.")
+        cb.setToolTip(tip)
+        cb.blockSignals(False)
 
     def _validate(self) -> None:
         ok = True
@@ -1546,6 +1680,12 @@ class AddTerminalDialog(QDialog):
             if resume_id:
                 spec.session_id = resume_id
                 spec.resume = True
+                conv = self._lane_convs.get(resume_id)
+                if conv is not None:
+                    # a lane conversation resumes in its lane, at the path it
+                    # started in, never in the workspace folder
+                    spec.lane = conv.lane_dict()
+                    spec.cwd = conv.cwd
             return spec
         program = self.program_edit.text().strip()
         args = QProcess.splitCommand(self.args_edit.text().strip())
@@ -1988,6 +2128,18 @@ class MainWindow(QMainWindow):
         # and like every other preference here the default MUST be assigned
         # above _restore_ui_state or the restored value is clobbered.
         self._auto_update = False     # user preference (persisted)
+        # Agent lanes master switch. Default OFF, assigned here for the same
+        # reason. Read it only through lanes_enabled().
+        self._agent_lanes = False     # user preference (persisted)
+        # every mutating lane git operation runs here, one at a time per repo
+        # (app/lane_ops.py). Created whatever the switch says: repairing,
+        # retiring and reviving an existing lane work with the switch off.
+        self.lane_ops = LaneOps(self, audit=self._store_audit)
+        # uids of agents with a lane create/repair in flight. A card closed
+        # meanwhile is retired by that operation's callback, never by the
+        # close itself (a failed create must not touch a folder it doesn't own)
+        self._lane_pending: set[str] = set()
+        self._lane_boxes: list = []   # open "lane kept" notices
         # providers whose CLI was STILL INSTALLING when the user skipped the
         # update splash. Their agents are held out of the autostart, because
         # launching one now could execute a half written binary. Transient by
@@ -2108,6 +2260,9 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._adopt_existing_model()
         self._wire_model()
+        # restored laned agents whose folder is missing: repaired in place
+        # before they may start (they are holding their start until then)
+        self._start_lane_repairs()
         # after the model is wired: the agents restored with the session are
         # adopted silently, not logged as "added"
         self.event_hub = EventHub(self.manager,
@@ -2270,6 +2425,7 @@ class MainWindow(QMainWindow):
             self._on_terminal_scrollback)
         self.top_bar.taskbarBadgeToggled.connect(self._on_taskbar_badge_toggled)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
+        self.top_bar.agentLanesToggled.connect(self._on_agent_lanes_toggled)
         self.top_bar.updatesPanelRequested.connect(self.open_updates_panel)
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
         self.top_bar.startupRecoveryToggled.connect(self._on_startup_recovery)
@@ -3556,6 +3712,240 @@ class MainWindow(QMainWindow):
         self._auto_update = bool(enabled)
         self._schedule_save()
 
+    # ------------------------------------------------------- agent lanes ---
+    # The master switch for per-agent git worktrees
+    # (.scratch/agent-lanes/spec-v2.md, "Master switch"). It governs only NEW
+    # lanes and the optional lane machinery. An agent that already has a lane
+    # keeps it whatever the switch says: its conversation is keyed by the lane
+    # folder, so moving it back would lose the conversation.
+
+    def _on_agent_lanes_toggled(self, enabled: bool) -> None:
+        """User flipped the Agent lanes switch. An ordinary UI preference
+        (additive key under "ui", debounced save, no SESSION_VERSION bump,
+        like `auto_update`). Takes effect at once: every caller asks
+        `lanes_enabled()` at the moment it acts."""
+        self._agent_lanes = bool(enabled)
+        self._schedule_save()
+
+    def lanes_enabled(self) -> bool:
+        """The ONLY gate for creating lanes. Lane code asks this, never
+        `_agent_lanes`, so the switch has one meaning everywhere."""
+        return self._agent_lanes
+
+    # Lane lifetime (spec "Lane lifetime"). LIVE from creation until the card
+    # closes: the path never changes, a missing folder is repaired in place.
+    # RETIRED on close: removed when it holds nothing, otherwise kept and the
+    # user told so. REVIVED by resuming one of its conversations from the New
+    # Agent dialog. Only creation asks lanes_enabled(); repair, retire and
+    # revive protect lanes that already exist and run with the switch off.
+    # Every git mutation goes through self.lane_ops, never inline.
+
+    def _live_lane_roots(self) -> set:
+        return {a.spec.lane.get("root", "") for a in self.manager.all_agents()
+                if a.spec.lane}
+
+    def _create_lane(self, ws_id: str, agent, plan) -> None:
+        """Create a new agent's lane, then start it. The agent was added
+        unstarted with its lane already recorded; it holds its start (a
+        waking keystroke included) until the worktree exists."""
+        agent.hold_start("[creating this agent's lane (git worktree)...]")
+        agent.notice("[creating this agent's lane (git worktree)...]")
+        self._lane_pending.add(agent.spec.uid)
+        lane, cwd, t0 = plan.lane_dict(), plan.cwd, time.monotonic()
+        self.lane_ops.submit(
+            plan.repo, lanes.create_lane, lane, label="create",
+            callback=lambda res, err, a=agent.id, u=agent.spec.uid,
+            n=agent.spec.name: self._on_lane_created(
+                ws_id, a, u, n, lane, cwd, t0, res, err))
+
+    def _on_lane_created(self, ws_id, agent_id, uid, name, lane, cwd, t0,
+                         result, error) -> None:
+        self._lane_pending.discard(uid)
+        ms = int((time.monotonic() - t0) * 1000)
+        agent = self.manager.agent(ws_id, agent_id)
+        if error is not None:
+            self._store_audit(
+                f"LANE-FAIL {getattr(error, 'code', 'error')} create "
+                f"agent={name!r} root={lane['root']} branch={lane['branch']}: "
+                f"{error}")
+            if agent is not None:
+                # a lane problem never blocks the agent itself
+                self.manager.clear_agent_lane(ws_id, agent_id)
+                agent.notice(f"[no lane: {error}. This agent works in the "
+                             f"workspace folder.]")
+                agent.release_start(run=True)
+            return
+        self._store_audit(
+            f"LANE-CREATE agent={name!r} root={result['root']} "
+            f"branch={result['branch']} base={result['base']} ms={ms}")
+        if agent is None:
+            # closed while its lane was being made: the new lane holds nothing
+            self._retire_lane(result, (), name)
+            return
+        self.manager.set_agent_lane(ws_id, agent_id, result, cwd)
+        agent.release_start(run=True)
+
+    def _start_lane_repairs(self) -> None:
+        """Repair, at the same path, every restored lane whose folder was
+        missing (WorkspaceManager.load_session_dict queued them). Never moves
+        the agent to the workspace folder."""
+        for ws_id, agent_id in self.manager.take_lane_repairs():
+            agent = self.manager.agent(ws_id, agent_id)
+            if agent is not None:
+                self._repair_lane(ws_id, agent, revive=False)
+
+    def _revive_lane(self, ws_id: str, agent) -> None:
+        """A past lane conversation picked in the New Agent dialog: bring its
+        lane back at the identical path, then resume it there."""
+        agent.hold_start("[restoring this conversation's lane...]")
+        agent.notice("[restoring this conversation's lane...]")
+        self._repair_lane(ws_id, agent, revive=True)
+
+    def _repair_lane(self, ws_id: str, agent, revive: bool) -> None:
+        lane = dict(agent.spec.lane)
+        self._lane_pending.add(agent.spec.uid)
+        self.lane_ops.submit(
+            lane["repo"], lanes.repair_lane, lane,
+            label="revive" if revive else "repair",
+            callback=lambda res, err, a=agent.id, u=agent.spec.uid,
+            n=agent.spec.name: self._on_lane_repaired(
+                ws_id, a, u, n, lane, revive, res, err))
+
+    def _on_lane_repaired(self, ws_id, agent_id, uid, name, lane, revive,
+                          result, error) -> None:
+        self._lane_pending.discard(uid)
+        what = "revive" if revive else "repair"
+        agent = self.manager.agent(ws_id, agent_id)
+        if error is not None:
+            self._store_audit(
+                f"LANE-FAIL {getattr(error, 'code', 'error')} {what} "
+                f"agent={name!r} root={lane['root']} branch={lane['branch']}: "
+                f"{error}")
+            if agent is None:
+                return
+            if revive:
+                # never resumed in the workspace folder instead: the agent
+                # would work in the main checkout while its conversation says
+                # it is in its lane. The card goes, and the user is told why.
+                agent.spec.lane = {}            # nothing of ours to retire
+                self.manager.remove_terminal(ws_id, agent_id)
+                self._lane_message(
+                    "Conversation not resumed",
+                    f"The lane this conversation started in could not be "
+                    f"restored, so it was not resumed.\n\n{lane['root']}\n"
+                    f"{error}")
+                return
+            reason = (f"[this agent's lane could not be restored: {error}. It "
+                      f"stays stopped rather than work in another folder. "
+                      f"Close the card to retire it.]")
+            agent.notice(reason)
+            agent.hold_start(reason)
+            return
+        new_lane, recreated = result
+        self._store_audit(
+            f"LANE-{'REVIVE' if revive else 'REPAIR'} agent={name!r} "
+            f"root={new_lane['root']} branch={new_lane['branch']} "
+            f"recreated_branch={recreated}")
+        if agent is None:
+            self._retire_lane(new_lane, (), name)
+            return
+        cwd = agent.spec.cwd if os.path.isdir(agent.spec.cwd) \
+            else new_lane["root"]
+        self.manager.set_agent_lane(ws_id, agent_id, new_lane, cwd)
+        if recreated:
+            agent.notice(f"[its branch {new_lane['branch']} was merged and "
+                         f"deleted, so it was recreated from "
+                         f"{new_lane['base']}: this lane starts fresh]")
+        agent.release_start(run=revive)
+
+    def _lane_retire_args(self, agent) -> tuple:
+        """(lane, pids, name) for retiring `agent`'s lane, read BEFORE the
+        agent is disposed: the retire waits for those processes to exit."""
+        pids = []
+        try:
+            worker = agent.worker
+            pid = worker.pid() if hasattr(worker, "pid") else None
+            pids = list(getattr(worker, "job_process_ids", lambda: [])())
+            if pid and pid not in pids:
+                pids.append(pid)
+        except Exception:
+            pass
+        return dict(agent.spec.lane), pids, agent.spec.name
+
+    def _close_agent(self, ws_id: str, agent_id: str) -> None:
+        """A card's close button. A laned agent's lane is retired after the
+        agent is gone, whatever the lanes switch says."""
+        agent = self.manager.agent(ws_id, agent_id)
+        retire = None
+        if (agent is not None and agent.spec.lane
+                and agent.spec.uid not in self._lane_pending):
+            retire = self._lane_retire_args(agent)
+        self.manager.remove_terminal(ws_id, agent_id)
+        if retire is not None:
+            self._retire_lane(*retire)
+
+    def _retire_lane(self, lane: dict, pids, name: str) -> None:
+        self.lane_ops.submit(
+            lane["repo"], lanes.retire_lane, lane, tuple(pids), label="retire",
+            callback=lambda res, err: self._on_lane_retired(lane, name, res,
+                                                            err))
+
+    def _on_lane_retired(self, lane, name, result, error) -> None:
+        where = f"agent={name!r} root={lane['root']} branch={lane['branch']}"
+        if error is not None or result is None:
+            self._store_audit(f"LANE-FAIL retire {where}: {error}")
+            self._show_lane_kept(name, lane, None, str(error))
+            return
+        if result.removed:
+            kept = (f" branch_kept={result.branch_error!r}"
+                    if result.branch_error else "")
+            self._store_audit(f"LANE-REMOVE {where}{kept}")
+            return
+        st = result.status
+        detail = (f" ahead={st.ahead} dirty={len(st.dirty)} merged={st.merged}"
+                  if st is not None else "")
+        why = f" reason={result.reason!r}" if result.reason else ""
+        self._store_audit(f"LANE-KEEP {where}{detail}{why}")
+        self._show_lane_kept(name, lane, st, result.reason)
+
+    def _show_lane_kept(self, name: str, lane: dict, status,
+                        reason: str) -> None:
+        """Non-blocking notice that a closed agent's lane was kept, because
+        it holds work (or could not be checked). There is deliberately no
+        delete button: unmerged work is only ever removed by the user."""
+        held = status.describe() if status is not None else ""
+        if held:
+            text = f"{name}'s lane has {held}. The lane folder is kept."
+        else:
+            text = (f"{name}'s lane could not be removed ({reason}). "
+                    f"The lane folder is kept.")
+        box = QMessageBox(QMessageBox.Icon.Information, "Lane kept", text,
+                          parent=self)
+        box.setInformativeText(
+            f"Folder: {lane['root']}\nBranch: {lane['branch']}\n\nTo keep "
+            f"working on it, pick its conversation under Conversation in "
+            f"the New Agent dialog.")
+        keep = box.addButton("Keep", QMessageBox.ButtonRole.AcceptRole)
+        open_btn = box.addButton("Open folder",
+                                 QMessageBox.ButtonRole.ActionRole)
+        box.setDefaultButton(keep)
+        box.setModal(False)
+        open_btn.clicked.connect(
+            lambda _=False, p=lane["root"]: fsopen.open_path(p))
+        self._track_lane_box(box)
+
+    def _lane_message(self, title: str, text: str) -> None:
+        box = QMessageBox(QMessageBox.Icon.Warning, title, text, parent=self)
+        box.setModal(False)
+        self._track_lane_box(box)
+
+    def _track_lane_box(self, box) -> None:
+        self._lane_boxes.append(box)
+        box.finished.connect(
+            lambda _r, b=box: self._lane_boxes.remove(b)
+            if b in self._lane_boxes else None)
+        box.show()
+
     # ------------------------------------------------ updating AI Hive ---
     # `app/self_update.py` decides and `self_update_dialog.py` shows. Nothing
     # here is persisted (the state is re-derived by every check) and nothing
@@ -3849,6 +4239,10 @@ class MainWindow(QMainWindow):
         # armed deliberately, once, exactly like the recovery switches were)
         self._auto_update = bool(ui.get("auto_update", False))
         self.top_bar.set_auto_update(self._auto_update)
+        # Agent lanes (default OFF: it runs git worktree commands in the
+        # user's repo, so it is armed deliberately)
+        self._agent_lanes = bool(ui.get("agent_lanes", False))
+        self.top_bar.set_agent_lanes(self._agent_lanes)
         self._auto_continue = bool(ui.get("auto_continue", True))
         self.top_bar.set_auto_continue(self._auto_continue)
         self._startup_recovery = bool(ui.get("startup_recovery", True))
@@ -3898,8 +4292,7 @@ class MainWindow(QMainWindow):
             return
         page = WorkspacePage(ws)
         page.closeRequested.connect(
-            lambda agent_id, ws_id=ws.id:
-            self.manager.remove_terminal(ws_id, agent_id))
+            lambda agent_id, ws_id=ws.id: self._close_agent(ws_id, agent_id))
         page.focusGained.connect(self._set_focused_card)
         page.addRequested.connect(self._on_add_terminal_clicked)  # empty slot
         page.layoutChosen.connect(self.manager.set_layout)        # persist
@@ -4386,18 +4779,47 @@ class MainWindow(QMainWindow):
         busy_ids = {a.spec.session_id for a in ws.agents
                     if a.is_running() and a.spec.session_id}
         free = MAX_AGENTS_PER_WORKSPACE - len(ws.agents)
+        # found by a folder walk, not git: with the lanes switch off this
+        # dialog must run no git command at all
+        repo = lanes.find_repo_root(ws.project_path)
         dialog = AddTerminalDialog(self.manager.next_agent_name(ws.id), self,
                                    cwd=ws.project_path, busy_ids=busy_ids,
-                                   max_count=free)
+                                   max_count=free,
+                                   lanes_on=self.lanes_enabled(),
+                                   repo_root=repo,
+                                   live_lane_roots=self._live_lane_roots())
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        revive = dialog.revive_lane()
+        # the gate is asked again at the moment of acting
+        new_lanes = dialog.wants_lane() and self.lanes_enabled() and bool(repo)
         first = None
         for spec in dialog.result_specs(cwd=ws.project_path):
-            agent = self.manager.add_terminal(ws.id, spec)
+            plan = None
+            if new_lanes:
+                try:
+                    plan = lanes.plan_lane(repo, ws.project_path, spec.name,
+                                           spec.uid)
+                except lanes.LaneError as exc:
+                    self._store_audit(f"LANE-FAIL {exc.code} agent="
+                                      f"{spec.name!r}: {exc}")
+                if plan is not None:
+                    # set BEFORE the add, so the add's own save carries it
+                    spec.lane = plan.lane_dict()
+                    spec.cwd = plan.cwd
+            agent = self.manager.add_terminal(ws.id, spec,
+                                              autostart=not spec.lane)
             if agent is None:
                 QMessageBox.warning(self, "AI Hive",
                                     "This workspace is at its agent limit.")
                 break
+            if plan is not None:
+                self._create_lane(ws.id, agent, plan)
+            elif revive is not None and spec.lane:
+                self._revive_lane(ws.id, agent)
+            elif new_lanes:
+                agent.notice("[no lane: this agent works in the workspace "
+                             "folder]")
             first = first or agent
         # opening a terminal is for typing into it right away
         if first is not None:
@@ -4418,7 +4840,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Cancel)
             if answer != QMessageBox.StandardButton.Yes:
                 return
+        # the workspace's laned agents retire their lanes like a closed card
+        retiring = [self._lane_retire_args(a) for a in ws.agents
+                    if a.spec.lane and a.spec.uid not in self._lane_pending]
         self.manager.remove_workspace(ws_id)
+        for lane, pids, name in retiring:
+            self._retire_lane(lane, pids, name)
 
     def _change_global_font(self, delta: int) -> None:
         from PySide6.QtWidgets import QApplication
@@ -4619,6 +5046,7 @@ class MainWindow(QMainWindow):
             "usage_visible": any(self._usage_trackers.values()),
             "taskbar_badge": self._taskbar_badge,
             "auto_update": self._auto_update,
+            "agent_lanes": self._agent_lanes,
             "auto_continue": self._auto_continue,
             "startup_recovery": self._startup_recovery,
             "terminal_scrollback": self._terminal_scrollback,

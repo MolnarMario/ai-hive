@@ -1,0 +1,129 @@
+"""LaneOps: every mutating lane operation, one at a time per repository.
+
+`git worktree add`, `worktree remove`, `worktree prune` and `branch -d` take
+locks in the repo's shared git dir, so two of them at once fail on
+`index.lock` or a ref lock. Two dialog submits, a Count of 3, or two
+workspaces on one repo would do exactly that. So there is ONE LaneOps, owned
+by MainWindow for the app's lifetime, and it keeps one FIFO queue and one
+worker thread per repository, keyed by the repo's git common dir (the same
+for the main checkout and every worktree of it). Different repos run in
+parallel.
+
+Callers `submit(repo, fn, *args, callback=...)`. `fn` runs on the repo's
+worker thread and must not touch Qt; the result comes back to the GUI thread
+through a queued signal (the `app/usage_poll.py` pattern) and `callback(result,
+error)` runs there. `drain()` lets tests wait for every submitted operation
+to finish and be delivered.
+
+Read-only lane queries are not required to queue here, but nothing in Phase 1
+needs one outside an operation.
+"""
+
+from __future__ import annotations
+
+import os
+import queue
+import threading
+import time
+from dataclasses import dataclass
+from typing import Callable
+
+from PySide6.QtCore import QCoreApplication, QObject, Qt, Signal
+
+from . import lanes
+
+
+@dataclass
+class _Job:
+    fn: Callable
+    args: tuple
+    callback: Callable | None
+    label: str = ""
+    result: object = None
+    error: BaseException | None = None
+    key: str = ""
+    started: float = 0.0
+    ended: float = 0.0
+
+
+class LaneOps(QObject):
+    """One FIFO + one worker thread per repository."""
+
+    _done = Signal(object)              # worker thread -> GUI thread
+
+    def __init__(self, parent: QObject | None = None,
+                 audit: Callable[[str], None] | None = None):
+        super().__init__(parent)
+        self._audit = audit
+        self._queues: dict[str, queue.Queue] = {}
+        self._keys: dict[str, str] = {}     # normcased repo path -> queue key
+        self._lock = threading.Lock()
+        self._pending = 0                   # submitted, not yet delivered
+        self._done.connect(self._deliver, Qt.ConnectionType.QueuedConnection)
+
+    def key_for(self, repo: str) -> str:
+        """The queue a repo's operations share: its git common dir, so every
+        checkout of one repository lands in the same queue. Cached; the first
+        lookup per repo runs one quick `git rev-parse`."""
+        norm = os.path.normcase(os.path.normpath(repo or ""))
+        key = self._keys.get(norm)
+        if key is None:
+            key = (lanes.common_dir(repo) if repo and os.path.isdir(repo)
+                   else "") or norm
+            self._keys[norm] = key
+        return key
+
+    def submit(self, repo: str, fn: Callable, *args,
+               callback: Callable | None = None, label: str = "") -> None:
+        job = _Job(fn=fn, args=args, callback=callback, label=label,
+                   key=self.key_for(repo))
+        with self._lock:
+            self._pending += 1
+            q = self._queues.get(job.key)
+            if q is None:
+                q = self._queues[job.key] = queue.Queue()
+                threading.Thread(target=self._run, args=(q,), daemon=True,
+                                 name="aihive-lanes").start()
+        q.put(job)
+
+    def _run(self, q: queue.Queue) -> None:
+        while True:
+            job = q.get()
+            job.started = time.monotonic()
+            try:
+                job.result = job.fn(*job.args)
+            except BaseException as exc:    # report, never kill the worker
+                job.error = exc
+            job.ended = time.monotonic()
+            try:
+                self._done.emit(job)
+            except RuntimeError:
+                return                      # the owner is gone (app quit)
+
+    def _deliver(self, job: _Job) -> None:
+        self._pending -= 1
+        if job.callback is None:
+            return
+        try:
+            job.callback(job.result, job.error)
+        except Exception as exc:
+            if self._audit is not None:
+                try:
+                    self._audit(f"LANE-FAIL callback {job.label} "
+                                f"{type(exc).__name__}: {exc}")
+                except Exception:
+                    pass
+
+    def busy(self) -> bool:
+        return self._pending > 0
+
+    def drain(self, timeout: float = 60.0) -> bool:
+        """Pump events until every submitted operation has run and its
+        callback has been delivered (callbacks may submit more). For tests;
+        the app never blocks on lanes."""
+        deadline = time.monotonic() + timeout
+        while self._pending and time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            time.sleep(0.005)
+        QCoreApplication.processEvents()
+        return not self._pending

@@ -29,6 +29,7 @@ from enum import Enum
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
 
 from . import providers
+from .lanes import clean_lane
 
 DEFAULT_FONT_PX = 13
 
@@ -129,6 +130,11 @@ class AgentSpec:
     # /clear, so anything persisted that must point back at an agent later
     # (the event log's agent links) keys on this. Minted once, then saved.
     uid: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # this agent's private git worktree (app/lanes.py): {root, branch, base,
+    # repo}, or {} for an agent that works in the workspace folder. Recorded
+    # once when the lane is created and never recomputed from the name; while
+    # it is set, `cwd` is inside `root` and must never be moved out of it.
+    lane: dict = field(default_factory=dict)
 
     def set_permission_mode(self, mode: str) -> bool:
         """Adopt `mode` as the startup permission mode and REBUILD the provider
@@ -217,6 +223,7 @@ class AgentSpec:
             "font_px": self.font_px,
             "session_id": self.session_id,
             "uid": self.uid,
+            "lane": dict(self.lane),
         }
 
     @staticmethod
@@ -238,6 +245,7 @@ class AgentSpec:
         spec.custom_name = bool(d.get("custom_name", False))
         # a pre-uid session keeps the fresh one the dataclass minted, and saves it
         spec.uid = str(d.get("uid", "") or "") or spec.uid
+        spec.lane = clean_lane(d.get("lane"))
         return spec
 
 

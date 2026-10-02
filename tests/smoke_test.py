@@ -20,13 +20,13 @@ import sys
 import traceback
 
 from smoke import harness  # first: sets up the sandbox profile
-from smoke import (attention, e2e, limits, processes, reply_marks, sessions,
-                   sidebar, terminal, updates, usage, window)
+from smoke import (attention, e2e, lanes, limits, processes, reply_marks,
+                   sessions, sidebar, terminal, updates, usage, window)
 from smoke.harness import check
 
 # Run order. e2e last: it launches a real claude.
 MODULES = [sidebar, attention, processes, terminal, reply_marks, sessions,
-           limits, usage, window, updates, e2e]
+           limits, usage, window, updates, lanes, e2e]
 
 # Skipped by --quick: real, billed, minutes-long. Run the full suite before a
 # merge; --quick is for the edit-run loop.

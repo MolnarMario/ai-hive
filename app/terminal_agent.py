@@ -398,6 +398,11 @@ class TerminalAgent(QObject):
         # so recovery never lands on a peer's conversation
         self._sibling_sessions = None
         self._disposing = False       # teardown in progress (suppress retry)
+        # why this agent may not start yet: its lane (git worktree) is being
+        # created or repaired, or could not be restored. "" = free to start.
+        # Transient, never persisted. See hold_start.
+        self._start_hold = ""
+        self._start_deferred = False  # a start was asked for while held
         # bumped on every (re)start so a queued task-submit Enter from a prior
         # session is never delivered into a fresh, not-yet-ready TUI
         self._submit_gen = 0
@@ -509,7 +514,38 @@ class TerminalAgent(QObject):
 
     # ------------------------------------------------------------ control ---
 
+    def hold_start(self, reason: str) -> None:
+        """Keep every start (the dialog's, the launch autostart, a waking
+        keystroke, a restart) from launching the child until `release_start`.
+        Used while the agent's lane folder is being created or repaired: a
+        child started before its cwd exists fails, and one started anywhere
+        else would work in the wrong checkout. `reason` is shown as a notice
+        when something tries to start it meanwhile."""
+        self._start_hold = reason or "[waiting for this agent's folder]"
+
+    def release_start(self, run: bool = False) -> None:
+        """Lift the hold. Starts the agent when `run`, or when a start was
+        asked for while it was held."""
+        deferred = self._start_deferred
+        self._start_hold = ""
+        self._start_deferred = False
+        if (run or deferred) and not self._disposing and not self.is_running():
+            self.start()
+
+    def start_hold(self) -> str:
+        return self._start_hold
+
+    def _held(self) -> bool:
+        if not self._start_hold:
+            return False
+        if not self._start_deferred:
+            self.notice(self._start_hold)
+        self._start_deferred = True
+        return True
+
     def start(self) -> None:
+        if self._held():
+            return
         self._set_prompt_ready(False)  # re-armed for the fresh TUI
         self._ready_tail = ""
         self._screen_tail = ""
@@ -585,6 +621,8 @@ class TerminalAgent(QObject):
         self.worker.kill()
 
     def restart(self) -> None:
+        if self._held():
+            return
         self._set_prompt_ready(False)
         self._ready_tail = ""
         self._screen_tail = ""
