@@ -5,7 +5,7 @@ Status: needs-triage
 Author: Agent 47, 2026-10-02. Supersedes `spec.md` (v1), which is kept for
 history. v2 folds in the first review (see "Changes from v1" at the bottom).
 Code so far: Phase 0 in PR #35 (`feat/board-rotation`); the master switch and
-Phase 1 on `feat/agent-lanes`. Phases 2 to 4 are still a plan. Implementation
+Phase 1 in PR #36 (`feat/agent-lanes`). Phases 2 to 4 are still a plan. Implementation
 notes and Step 0 results are under `## Comments` at the bottom.
 
 Note: an earlier draft by another agent, `docs/ISOLATED-AGENT-TASKS-PLAN.md`,
@@ -661,8 +661,7 @@ Implementation notes, plus three Step 0 results that correct the plan body.
 `feat/new-agent-count`@bd2707d), on top of Agent 47's master switch.
 Committed as 3856a86 (lanes, 0.25.0), followed by a commit carrying Agent 47's
 GitHub-clone default-branch fix (taken from the shared checkout, where it was
-uncommitted) and one adding these specs to git. Pushed, with a PR to main (see
-the board for its number). That PR also carries 8bb4321 (GitHub clone) and
+uncommitted) and one adding these specs to git. PR #36 to main. That PR also carries 8bb4321 (GitHub clone) and
 bd2707d (Count stepper, 0.24.0), which were never on origin/main. Quick
 suite: 2268 pass, 1 fail (`pty width`, the known failure that also happens on
 clean main). The real-claude e2e passed 15/0. Its first run failed once at
