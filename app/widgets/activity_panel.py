@@ -12,14 +12,23 @@ branch, commits ahead/behind, uncommitted files and overlaps, and the
 changed-files list is per checkout: the workspace folder's own `git status`,
 then each lane's uncommitted files. Lane data comes from MainWindow
 (`set_lanes`, fed by app/lane_service.py), so the panel runs no git for it.
+
+The Integration section is the approved integration queue
+(app/integration.py): the integrator, then one row per submitted lane with
+the buttons its state allows (Approve merge, Recheck, Resend brief, Open PR,
+Skip). A button only asks (`queueAction`); MainWindow does the work, so this
+is the one place the user approves a merge.
 """
 
 from PySide6.QtCore import (QEasingCurve, QPropertyAnimation, Qt, Signal)
-from PySide6.QtWidgets import (QFrame, QLabel, QLineEdit, QScrollArea,
-                               QSizePolicy, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit,
+                               QPushButton, QScrollArea, QSizePolicy,
+                               QVBoxLayout, QWidget)
 
 from .. import coordination
+from .. import integration as integ
 from ..terminal_agent import AgentStatus
+from ..ui_theme import repolish
 
 _ICON = {
     AgentStatus.RUNNING: "🟢", AgentStatus.STARTING: "🟡",
@@ -64,8 +73,98 @@ class AgentRosterItem(QFrame):
             self.task_edit.setText(agent.current_task)
 
 
+# the buttons each queue state offers, in order: (action, label)
+_QUEUE_BUTTONS = {
+    integ.QUEUED: (("skip", "Skip"),),
+    integ.INTEGRATING: (("recheck", "Recheck"), ("skip", "Skip")),
+    integ.AWAITING: (("approve", "Approve merge"), ("recheck", "Recheck"),
+                     ("open", "Open PR"), ("skip", "Skip")),
+    integ.MERGING: (),
+    integ.NEEDS_YOU: (("recheck", "Recheck"), ("resend", "Resend brief"),
+                      ("open", "Open PR"), ("skip", "Skip")),
+    integ.MERGED: (("open", "Open PR"),),
+    integ.SKIPPED: (),
+}
+_QUEUE_TIPS = {
+    "approve": ("Merge this pull request now. AI Hive refuses if it changed "
+                "since the integrator tested it, and sends it back to the "
+                "integrator if the base branch moved since then."),
+    "recheck": "Read the pull request's state again.",
+    "resend": "Send the integration brief to the integrator again.",
+    "open": "Open the pull request in the browser.",
+    "skip": ("Take this lane out of the queue. Its branch and commits stay "
+             "where they are."),
+}
+
+
+class QueueRow(QFrame):
+    """One submitted lane in the Integration section."""
+
+    actionRequested = Signal(str, str)  # item id, action
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("QueueRow")
+        self.item_id = ""
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(3)
+        self.text = QLabel(self)
+        self.text.setObjectName("QueueRowText")
+        self.text.setWordWrap(True)
+        self.text.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self.text)
+        self.buttons_row = QHBoxLayout()
+        self.buttons_row.setSpacing(4)
+        lay.addLayout(self.buttons_row)
+        self.buttons: dict[str, QPushButton] = {}
+
+    def show_item(self, item, position: int, since: int,
+                  enabled: bool) -> None:
+        self.item_id = item.id
+        if self.property("state") != item.state:
+            self.setProperty("state", item.state)
+            repolish(self)
+        where = f"{item.agent}  ⎇ {item.branch} @ {item.short}"
+        lines = [f"{position}. {where}" if position else where]
+        status = [integ.STATE_LABEL.get(item.state, item.state)]
+        if item.pr:
+            status.append(f"PR #{item.pr}")
+        if since > 0 and item.is_open:
+            status.append(f"+{since} since submit")
+        lines.append(" · ".join(status))
+        if item.note:
+            lines.append(item.note)
+        self.text.setText("\n".join(lines))
+        wanted = [(a, label) for a, label in _QUEUE_BUTTONS.get(item.state, ())
+                  if a != "open" or item.pr_url]
+        if [a for a, _ in wanted] != list(self.buttons):
+            for btn in self.buttons.values():
+                btn.setParent(None)
+                btn.deleteLater()
+            self.buttons = {}
+            for action, label in wanted:
+                btn = QPushButton(label, self)
+                btn.setObjectName("QueueBtn")
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.setToolTip(_QUEUE_TIPS.get(action, ""))
+                btn.clicked.connect(
+                    lambda _=False, a=action: self.actionRequested.emit(
+                        self.item_id, a))
+                self.buttons_row.addWidget(btn)
+                self.buttons[action] = btn
+        for action, btn in self.buttons.items():
+            # opening the PR is read-only; everything else waits for the
+            # Agent lanes switch, like the rest of the queue
+            btn.setEnabled(enabled or action == "open")
+
+
 class ActivityPanel(QFrame):
     taskEdited = Signal(str, str)  # agent_id, task
+    # a queue row's button: item id, action (approve | recheck | resend |
+    # open | skip). MainWindow acts on the panel's workspace.
+    queueAction = Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -119,6 +218,22 @@ class ActivityPanel(QFrame):
         self.inner_lay.addWidget(self.lanes_label)
         self.lanes_header.hide()
         self.lanes_label.hide()
+
+        # the integration queue: hidden until the workspace has a lane, an
+        # integrator or a queued item
+        self.queue_header = QLabel("Integration", inner)
+        self.queue_header.setObjectName("ActivitySection")
+        self.inner_lay.addWidget(self.queue_header)
+        self.queue_info = QLabel("", inner)
+        self.queue_info.setObjectName("ActivityLanes")
+        self.queue_info.setWordWrap(True)
+        self.inner_lay.addWidget(self.queue_info)
+        self.queue_box = QVBoxLayout()
+        self.queue_box.setSpacing(4)
+        self.inner_lay.addLayout(self.queue_box)
+        self.queue_rows: list[QueueRow] = []
+        self.queue_header.hide()
+        self.queue_info.hide()
 
         self.log_header = QLabel("Shared log", inner)
         self.log_header.setObjectName("ActivitySection")
@@ -185,6 +300,51 @@ class ActivityPanel(QFrame):
         self._lane_views = dict(views or {})
         if self._workspace is not None:
             self._render_lanes(self._workspace)
+
+    def set_integration(self, state: dict | None) -> None:
+        """The workspace's queue, from MainWindow: {"paused", "integrator"
+        (a name or ""), "laned" (the workspace has a lane), "items"
+        [QueueItem], "since" {item id: commits on the lane since submit},
+        "reason" (why a lane can't be submitted now, or "")}. None hides the
+        section."""
+        state = state or {}
+        visible = bool(state.get("items") or state.get("integrator")
+                       or state.get("laned"))
+        self.queue_header.setVisible(visible)
+        self.queue_info.setVisible(visible)
+        items = list(state.get("items") or []) if visible else []
+        while len(self.queue_rows) > len(items):
+            row = self.queue_rows.pop()
+            row.setParent(None)
+            row.deleteLater()
+        while len(self.queue_rows) < len(items):
+            row = QueueRow(self)
+            row.actionRequested.connect(self.queueAction)
+            self.queue_box.addWidget(row)
+            self.queue_rows.append(row)
+        if not visible:
+            return
+        paused = bool(state.get("paused"))
+        waiting = sum(1 for i in items if i.is_open)
+        self.queue_header.setText(
+            "Integration: paused" if paused else
+            f"Integration: {waiting} in line" if waiting else "Integration")
+        who = state.get("integrator") or ""
+        info = [f"Integrator: {who}" if who else
+                "No integrator yet. Right-click a laned Claude agent's "
+                "header and pick Make integrator."]
+        if paused:
+            info.append("Paused while Agent lanes is off. Nothing is sent "
+                        "and nothing is merged; the queue is kept.")
+        elif state.get("reason"):
+            info.append(state["reason"])
+        self.queue_info.setText("\n".join(info))
+        since = state.get("since") or {}
+        position = 0
+        for row, item in zip(self.queue_rows, items):
+            position = position + 1 if item.is_open else 0
+            row.show_item(item, position, int(since.get(item.id, 0)),
+                          not paused)
 
     def _laned(self, workspace) -> list:
         return [a for a in workspace.agents

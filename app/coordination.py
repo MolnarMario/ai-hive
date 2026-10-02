@@ -29,7 +29,7 @@ _STATUS_ICON = {
 
 def system_prompt_text(workspace_name: str, agent_name: str,
                        board_path: str, lane: dict | None = None,
-                       aware: bool = False) -> str:
+                       aware: bool = False, integrator: bool = False) -> str:
     """The board etiquette every Claude agent gets, plus a lane section for
     an agent with its own git worktree (app/lanes.py). The board path is
     always the workspace's own absolute one: a lane has no board of its own.
@@ -39,7 +39,11 @@ def system_prompt_text(workspace_name: str, agent_name: str,
     swap "read the board first" for "skim the roster": AI Hive tells it
     about a real overlap when one exists, and reading every note is the
     token cost the feature exists to remove. Every other agent keeps the
-    full instruction, because the board is its only awareness."""
+    full instruction, because the board is its only awareness.
+
+    `integrator`: this laned agent is the workspace's integrator
+    (app/integration.py). It owns the version, CHANGELOG and README count
+    that every other lane is told to leave alone, and it never merges."""
     laned = bool(lane and lane.get("root") and lane.get("branch"))
     if laned and aware:
         read = ("Before starting substantial work, skim the roster at the "
@@ -61,7 +65,22 @@ def system_prompt_text(workspace_name: str, agent_name: str,
         f"\"implementing auth in login.py\"). Do NOT edit board.md directly; "
         f"AI Hive serializes those writes through the tool so concurrent agents "
         f"can't clobber each other's entries.")
-    if laned:
+    if laned and integrator:
+        base = lane.get("base") or "the base branch"
+        text += (
+            f" You are this workspace's INTEGRATOR, working in your own git "
+            f"worktree at {lane['root']}. When the user submits another "
+            f"agent's lane, AI Hive types an integration brief into your "
+            f"prompt. For each brief: create the integrate/ branch it names "
+            f"from the pinned commit, merge {base} into it, resolve "
+            f"conflicts, run the full test suite, bump the version and the "
+            f"CHANGELOG and README count once for that pull request, push, "
+            f"and open the pull request with gh pr create, then end your "
+            f"turn. Never rebase or force-push, never edit other worktrees or "
+            f"the main checkout at {lane.get('repo', '')}, never commit to "
+            f"{base} directly, and NEVER run gh pr merge: the user approves "
+            f"every merge in AI Hive.")
+    elif laned:
         base = lane.get("base") or "the base branch"
         text += (
             f" You work in your own git worktree (your lane) at {lane['root']}, "

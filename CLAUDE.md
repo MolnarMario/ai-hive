@@ -56,6 +56,13 @@ This file holds only the rules that protect user data or fail silently.
   reads off the queue (`app/lane_service.py`) hold `lane_ops.lock_for(repo)`
   around each lane: Windows won't delete a folder that is some process's cwd,
   so a poll inside a lane being removed leaves a half-deleted worktree.
+- The integration queue (`app/integration.py`): only a user click picks the
+  integrator, submits a lane or approves a merge. No bridge op may do any of
+  it, and agents never run `gh pr merge`. AI Hive runs the merge itself, and
+  only for the PR head the integrator tested, with `--match-head-commit`,
+  after checking the base has not moved since. An item is merged only when
+  GitHub says MERGED (a squash leaves the tested commit out of the base), and
+  the queue never skips an item by itself.
 - Nothing renames an agent except the user.
 - No em dash in any string the user sees. `test_no_em_dashes_in_visible_text`
   enforces it for non-docstring literals.
@@ -91,7 +98,9 @@ pollute resume ordering. Use a scratch cwd.
 
 - Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds
   a matching `## x.y.z` section to `CHANGELOG.md`, written for users (the
-  in-app updater shows it). A smoke check fails if the two disagree.
+  in-app updater shows it). A smoke check fails if the two disagree. An agent
+  working in a lane doesn't: the integrator does it once per PR
+  (`docs/agents/integration.md`).
 - Keep README.md's check count and feature list current.
 - `app/providers.py` and `app/mcp_server.py` stay Qt-free. `mcp_server` must
   not import PySide6 at all.
@@ -102,4 +111,6 @@ pollute resume ordering. Use a scratch cwd.
 
 Issues live as markdown under `.scratch/<feature-slug>/`, see
 `docs/agents/issue-tracker.md`. Triage labels are in
-`docs/agents/triage-labels.md`, domain docs in `docs/agents/domain.md`.
+`docs/agents/triage-labels.md`, domain docs in `docs/agents/domain.md`. The
+integrator's checklist is `docs/agents/integration.md`; AI Hive embeds it in
+every integration brief, read from the base branch.

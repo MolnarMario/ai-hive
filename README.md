@@ -432,6 +432,26 @@ workspaces keep executing — switching never pauses anything.
   and lists changed files per lane, the Agent/File Map shows one tree for the
   repo however many lanes touched a file, and first overlaps and conflicts
   land in the event log. Turning the switch off silences all of it at once.
+  A lane with no work of its own whose agent is idle is fast-forwarded to the
+  base by itself when the base moves, and the agent is told on its next
+  prompt.
+- **Integration queue** (while Agent lanes is on; needs a GitHub remote and a
+  logged-in `gh`): right-click a laned Claude agent's header and pick **Make
+  integrator** (one per workspace). **Submit to integrator** on another lane's
+  chip pins that lane's newest commit and queues it. One lane at a time, once
+  the integrator is idle, AI Hive types it a short brief (the pinned commit,
+  its log and files, a merge check against the base and the other queued
+  lanes, the test command and the checklist from the base branch's
+  `docs/agents/integration.md`). The integrator merges the base into
+  `integrate/<lane>`, runs the suite, bumps the version and opens a pull
+  request, and never merges it. When its turn ends AI Hive reads the PR, and
+  the Activity panel's **Integration** section shows **Approve merge**. Only
+  that click merges, and AI Hive runs the merge itself: it refuses when the PR
+  changed since it was tested, sends it back to the integrator when the base
+  moved since then, and merges with `gh pr merge --match-head-commit`. Then
+  the next lane goes. Anything unexpected waits for you (Recheck, Resend
+  brief, Skip) with the "?" chime; nothing is skipped by itself. Every step is
+  a `QUEUE-*` line in `session.log`, and the queue survives a restart.
 - **Per-workspace agent numbering** — each workspace counts Agent 1, 2, 3…
   independently.
 - **Agent/File Map** — a **◆ Map** button in the workspace header opens a
@@ -820,7 +840,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2424 checks drive the real app headlessly (offscreen Qt platform) with real
+2511 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -918,6 +938,7 @@ app/
   lanes.py                 agent lanes: a git worktree per agent, create/repair/retire (Qt-free)
   lane_ops.py              runs lane git operations one at a time per repo, off the GUI thread
   lane_service.py          lane awareness: polls every lane, overlaps, lanes.json, lane notices
+  integration.py           the approved integration queue: briefs, PR reads, the guarded merge (Qt-free)
   process_worker.py        QProcess engine, HybridDecoder, WinJob (line mode)
   pty_worker.py            ConPTY engine via pywinpty (full-terminal mode)
   terminal_agent.py        per-terminal model (worker + log/buffer + lifecycle)
@@ -958,7 +979,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2424 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2511 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

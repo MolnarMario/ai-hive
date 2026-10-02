@@ -145,6 +145,9 @@ class WorkspacePage(QWidget):
         # in-flight reflow animation so it isn't garbage-collected mid-flight.
         self._drag_card: "TerminalCard | None" = None
         self._reflow_anim = None
+        # MainWindow's integration-queue view of an agent, for the cards'
+        # menus: callable(agent) -> dict (see TerminalCard.integration_info)
+        self.integration_info = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -393,6 +396,7 @@ class WorkspacePage(QWidget):
         card.laneActionRequested.connect(
             lambda aid, action: self.laneActionRequested.emit(
                 self.workspace.id, aid, action))
+        card.integration_info = self._integration_info_for
         self.cards.append(card)
         # a freshly added agent must never be born invisible behind a maximized
         # sibling — adding one exits solo so the new card is seen
@@ -400,6 +404,10 @@ class WorkspacePage(QWidget):
         self._retile()
         self._update_empty_state()
         return card
+
+    def _integration_info_for(self, agent):
+        fn = self.integration_info
+        return fn(agent) if fn is not None else None
 
     def remove_agent(self, agent_id: str) -> None:
         card = next((c for c in self.cards if c.agent.id == agent_id), None)
