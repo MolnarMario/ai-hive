@@ -12,6 +12,15 @@ question the agent ended its turn on. These prompt events are EDGES appended to
 a separate events file and read incrementally by the manager; SessionStart
 records stay in the mapping file. See write_settings_file / read_prompt_events.
 
+A third family, the agent-lanes hooks, goes ONLY to laned agents while the
+Agent lanes switch is on (its own settings file, `lanes=True`): PostToolUse on
+the edit tools warns when another lane changed the same file, and
+UserPromptSubmit injects unread lane notices. Both print
+hookSpecificOutput.additionalContext, the only output this script ever
+prints. Their data files (lanes.json, notices, seen) are written by
+app/lane_service.py; the formats live here, next to their reader. See the
+"agent lanes" section below.
+
 
 AI Hive pins each Claude agent to a conversation with `--session-id`/`--resume`,
 but the LIVE conversation can drift out from under that pin: the user runs
@@ -60,6 +69,27 @@ AGENT_ID_ENV = "AIHIVE_AGENT_ID"
 WAITING_TOOLS = "AskUserQuestion|ExitPlanMode"
 _WAITING_TOOL_SET = set(WAITING_TOOLS.split("|"))
 
+# Agent lanes (app/lanes.py, app/lane_service.py). The edit tools whose
+# PostToolUse runs the overlap check, and the per-run env vars that arm the
+# lane hooks. MainWindow._arm_agent_mcp sets them ONLY for a laned Claude
+# agent while the Agent lanes switch is on, never persisted; every path is
+# absolute and lives in the workspace's own .aihive folder (never a lane's).
+EDIT_TOOLS = "Edit|Write|MultiEdit|NotebookEdit"
+_EDIT_TOOL_SET = set(EDIT_TOOLS.split("|"))
+LANE_UID_ENV = "AIHIVE_AGENT_UID"        # AgentSpec.uid
+LANE_ROOT_ENV = "AIHIVE_LANE_ROOT"       # the agent's own worktree
+LANE_REPO_ENV = "AIHIVE_LANE_REPO"       # the main checkout
+LANES_INDEX_ENV = "AIHIVE_LANES_INDEX"   # <ws>/.aihive/lanes.json
+LANE_NOTICES_ENV = "AIHIVE_NOTICES"      # <ws>/.aihive/notices/<uid>.jsonl
+LANE_SEEN_ENV = "AIHIVE_LANE_SEEN"       # <ws>/.aihive/seen/<uid>.json
+LANE_ENV_KEYS = (LANE_UID_ENV, LANE_ROOT_ENV, LANE_REPO_ENV, LANES_INDEX_ENV,
+                 LANE_NOTICES_ENV, LANE_SEEN_ENV)
+LANES_INDEX_VERSION = 1
+# a notice that sat unread this long describes a state that has moved on
+NOTICE_MAX_AGE_S = 6 * 3600
+NOTICE_MAX_SHOWN = 8
+SEEN_KEYS_CAP = 2000
+
 
 def _hook_command(mapping_path: str, events_path: str | None = None,
                   python_exe: str | None = None) -> str:
@@ -81,7 +111,7 @@ def _hook_command(mapping_path: str, events_path: str | None = None,
 def write_settings_file(settings_path: str, mapping_path: str,
                         events_path: str | None = None,
                         python_exe: str | None = None,
-                        tui: str = "") -> None:
+                        tui: str = "", lanes: bool = False) -> None:
     """Write the shared `--settings` file carrying our hooks, and optionally
     the terminal-renderer choice.
 
@@ -107,6 +137,15 @@ def write_settings_file(settings_path: str, mapping_path: str,
         session (never at launch, never on prompt-submit), so they don't touch
         the timing-sensitive first-task-submit path the SessionStart `startup`
         matcher famously broke.
+
+    `lanes` adds the agent-lanes family (a SEPARATE settings file, given only
+    to laned agents while the Agent lanes switch is on, so no other agent
+    pays a Python start-up per edit): PostToolUse on the edit tools warns
+    about a real overlap with another lane, and UserPromptSubmit injects
+    unread lane notices. Both print `additionalContext` and stay silent
+    without the lane env vars. Verified live on Claude Code 2.1.287: both
+    reach the model, and a UserPromptSubmit hook does NOT drop the first
+    delivered task (it fires after the submit, unlike SessionStart/startup).
     """
     cmd = _hook_command(mapping_path, events_path, python_exe)
     hooks: dict = {
@@ -141,6 +180,11 @@ def write_settings_file(settings_path: str, mapping_path: str,
                 {"hooks": [{"type": "command", "command": cmd, "timeout": 30}]}
             ],
         })
+    if lanes:
+        lane_hook = [{"type": "command", "command": cmd, "timeout": 10}]
+        hooks.setdefault("PostToolUse", []).append(
+            {"matcher": EDIT_TOOLS, "hooks": lane_hook})
+        hooks["UserPromptSubmit"] = [{"hooks": lane_hook}]
     payload: dict = {"hooks": hooks}
     if tui:
         # deliberately a sibling of `hooks`, never folded into it: the matchers
@@ -279,15 +323,245 @@ def _append_record(mapping_path: str, payload: dict) -> None:
         fh.write(line)
 
 
-def _dispatch(mapping_path, events_path, payload: dict) -> None:
-    """Route one hook payload to the right file/record by its event name."""
+# ------------------------------------------------------------ agent lanes ---
+# The overlap hook and lane notices (.scratch/agent-lanes/spec-v2.md, Phase
+# 2). AI Hive's LaneService WRITES lanes.json and the notices; the hooks
+# below READ them, so the file formats live here, in one place, next to
+# their reader. Everything is best-effort: a hook problem prints nothing.
+
+def _write_json_atomic(path: str, data) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, path)
+
+
+def write_lanes_index(path: str, data: dict) -> None:
+    """lanes.json: {version, enabled, ts, repo, lanes: {uid: {...}},
+    files: {repo path: [{uid, agent, branch, state}]}}. `enabled` False
+    (the switch went off) silences every lane hook at once, mid-run."""
+    _write_json_atomic(path, data)
+
+
+def read_lanes_index(path: str):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def append_notice(path: str, key: str, text: str, ts: float = 0.0) -> None:
+    """One lane notice for one agent, injected on its next prompt. `key`
+    dedupes against overlap warnings the agent already got (see _seen)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    line = json.dumps({"ts": ts or time.time(), "key": key, "text": text})
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def read_seen(path: str) -> dict:
+    """{"keys": [...], "offset": int}: what this agent was already told
+    (overlap warnings and notices share the keys) and how far into its
+    notices file it has read. Never raises."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    keys = data.get("keys")
+    offset = data.get("offset")
+    return {"keys": [k for k in keys if isinstance(k, str)]
+            if isinstance(keys, list) else [],
+            "offset": offset if isinstance(offset, int) and offset >= 0
+            else 0}
+
+
+def _save_seen(path: str, seen: dict) -> None:
+    seen["keys"] = seen["keys"][-SEEN_KEYS_CAP:]
+    _write_json_atomic(path, seen)
+
+
+def _lane_env(env) -> dict | None:
+    """The lane env vars, or None when this agent's lane hooks are not
+    armed (no lane, or the Agent lanes switch was off at launch)."""
+    vals = {k: env.get(k, "") for k in LANE_ENV_KEYS}
+    return vals if all(vals.values()) else None
+
+
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _inside(path: str, folder: str) -> bool:
+    try:
+        rel = os.path.relpath(path, folder)
+    except ValueError:
+        return False
+    return not (rel == os.pardir or rel.startswith(os.pardir + os.sep))
+
+
+def lane_overlap_context(payload: dict, env=None) -> str:
+    """PostToolUse on an edit tool: text to put in front of the agent when
+    the file it just edited is one another lane also changed, or one its
+    base changed since the lane forked, or when it edited outside its own
+    lane (the main checkout or another agent's lane). "" otherwise, and
+    once per (file, peer, level): repeats are tracked in the seen file."""
+    lane = _lane_env(os.environ if env is None else env)
+    if lane is None:
+        return ""
+    index = read_lanes_index(lane[LANES_INDEX_ENV])
+    if not index or not index.get("enabled"):
+        return ""
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return ""
+    target = tool_input.get("file_path") or tool_input.get("notebook_path")
+    if not isinstance(target, str) or not target:
+        return ""
+    if not os.path.isabs(target):
+        target = os.path.join(str(payload.get("cwd") or lane[LANE_ROOT_ENV]),
+                              target)
+    target = os.path.normpath(target)
+    root, repo = lane[LANE_ROOT_ENV], lane[LANE_REPO_ENV]
+    uid = lane[LANE_UID_ENV]
+    seen = read_seen(lane[LANE_SEEN_ENV])
+    known = set(seen["keys"])
+    lines = []
+    if _inside(target, root):
+        rel = os.path.relpath(target, root).replace(os.sep, "/")
+        for owner in index.get("files", {}).get(rel, []) or []:
+            if not isinstance(owner, dict) or owner.get("uid") == uid:
+                continue
+            level = ("conflicts" if owner.get("state") == "conflicts"
+                     else "overlap")
+            key = f"{rel}|{owner.get('uid')}|{level}"
+            if key in known:
+                continue
+            known.add(key)
+            seen["keys"].append(key)
+            who = f"{owner.get('agent', 'another agent')} " \
+                  f"({owner.get('branch', '?')})"
+            if level == "conflicts":
+                lines.append(f"{who} changed {rel} too, and the two versions "
+                             f"would CONFLICT when merged. Keep your change "
+                             f"there minimal and coordinate through the "
+                             f"board.")
+            else:
+                how = ("uncommitted" if owner.get("state") == "dirty"
+                       else "committed")
+                lines.append(f"{who} also changed {rel} ({how}). Keep your "
+                             f"change there small and local; the integrator "
+                             f"merges both.")
+        mine = (index.get("lanes") or {}).get(uid) or {}
+        base = mine.get("base_ref") or "the base branch"
+        if rel in (mine.get("base_changed") or []):
+            key = f"{rel}|base|overlap"
+            if key not in known:
+                known.add(key)
+                seen["keys"].append(key)
+                lines.append(f"{base} changed {rel} since your lane started. "
+                             f"Merge {base} into your branch before you "
+                             f"change it much further.")
+    elif _inside(target, repo) or _inside(
+            target, os.path.normpath(repo) + ".lanes"):
+        key = f"outside|{_norm(target)}"
+        if key not in known:
+            seen["keys"].append(key)
+            lines.append(f"You edited {target}, which is OUTSIDE your lane "
+                         f"{root}. Make your changes in your own lane, never "
+                         f"in the main checkout or another agent's lane.")
+    if not lines:
+        return ""
+    try:
+        _save_seen(lane[LANE_SEEN_ENV], seen)
+    except OSError:
+        pass
+    return "AI Hive lane notice: " + " ".join(lines)
+
+
+def lane_notice_context(env=None, now: float = 0.0) -> str:
+    """UserPromptSubmit: the agent's unread lane notices (written by
+    AI Hive's LaneService: the base moved under a file it changed, another
+    lane started changing one of its files). Skips what the overlap hook
+    already told it, drops stale ones, and remembers how far it read."""
+    lane = _lane_env(os.environ if env is None else env)
+    if lane is None:
+        return ""
+    index = read_lanes_index(lane[LANES_INDEX_ENV])
+    if not index or not index.get("enabled"):
+        return ""
+    seen = read_seen(lane[LANE_SEEN_ENV])
+    path = lane[LANE_NOTICES_ENV]
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return ""
+    offset = seen["offset"] if seen["offset"] <= size else 0
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            data = fh.read()
+    except OSError:
+        return ""
+    nl = data.rfind(b"\n")
+    if nl < 0:
+        return ""
+    seen["offset"] = offset + nl + 1
+    known = set(seen["keys"])
+    now = now or time.time()
+    texts = []
+    for raw in data[:nl + 1].decode("utf-8", "replace").splitlines():
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or not isinstance(rec.get("text"), str):
+            continue
+        key = str(rec.get("key") or "")
+        if key and key in known:
+            continue
+        ts = rec.get("ts")
+        if isinstance(ts, (int, float)) and now - ts > NOTICE_MAX_AGE_S:
+            continue
+        if key:
+            known.add(key)
+            seen["keys"].append(key)
+        texts.append(rec["text"])
+    try:
+        _save_seen(lane[LANE_SEEN_ENV], seen)
+    except OSError:
+        pass
+    if not texts:
+        return ""
+    more = len(texts) - NOTICE_MAX_SHOWN
+    shown = texts[:NOTICE_MAX_SHOWN]
+    body = "\n".join(f"- {t}" for t in shown)
+    if more > 0:
+        body += f"\n- ...and {more} more like these."
+    return ("AI Hive lane notices (other agents' lanes and the base branch "
+            "changed files you also changed):\n" + body)
+
+
+def _dispatch(mapping_path, events_path, payload: dict) -> str:
+    """Route one hook payload to the right file/record by its event name.
+    Returns context for the model ("" for none): only the lane hooks add
+    any."""
     event = payload.get("hook_event_name")
     if event == "SessionStart":
         if mapping_path:
             _append_record(mapping_path, payload)
-        return
+        return ""
+    if event == "UserPromptSubmit":
+        return lane_notice_context()
+    if event == "PostToolUse" and payload.get("tool_name") in _EDIT_TOOL_SET:
+        return lane_overlap_context(payload)
     if not events_path:
-        return
+        return ""
     if event == "PreToolUse":
         if payload.get("tool_name") in _WAITING_TOOL_SET:
             _append_event(events_path, EV_TOOL_SET,
@@ -305,26 +579,37 @@ def _dispatch(mapping_path, events_path, payload: dict) -> None:
             _append_event(events_path, EV_TURN_SET)
         else:
             _append_event(events_path, EV_TURN_CLEAR)
+    return ""
 
 
 def main(argv) -> int:
     """Hook entrypoint: read the hook JSON from stdin, stamp it with the
     per-agent env id, append the matching record(s). argv[1] is the SessionStart
     mapping file; argv[2] (optional) is the prompt-events file. Silent + best-
-    effort: a hook must NEVER break the Claude session it is attached to."""
+    effort: a hook must NEVER break the Claude session it is attached to, so
+    it always exits 0, and prints only the lane hooks' context (as
+    hookSpecificOutput.additionalContext, which the CLI hands the model)."""
     mapping_path = argv[1] if len(argv) > 1 else None
     events_path = argv[2] if len(argv) > 2 else None
     try:
         raw = sys.stdin.read()
     except Exception:
         raw = ""
+    context, event = "", ""
     try:
         payload = json.loads(raw) if raw.strip() else {}
         if isinstance(payload, dict):
-            _dispatch(mapping_path, events_path, payload)
+            event = str(payload.get("hook_event_name") or "")
+            context = _dispatch(mapping_path, events_path, payload) or ""
     except Exception:
-        pass
-    # hooks may print context for the model on stdout; we add none.
+        context = ""
+    if context and event:
+        try:
+            sys.stdout.write(json.dumps({"hookSpecificOutput": {
+                "hookEventName": event, "additionalContext": context}}))
+            sys.stdout.flush()
+        except Exception:
+            pass
     return 0
 
 

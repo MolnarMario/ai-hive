@@ -16,6 +16,8 @@ Most events are already announced somewhere; the hub only collects them:
     crashed/lifecycle  TerminalAgent.status_changed, name_changed, and the
                        manager's structural signals
     board              a poll of each workspace's board.md activity section
+    lane               MainWindow calls lane_event() when a lane is created,
+                       and for the overlaps LaneService sees first
 
 Two edges are SETTLED before they are recorded (QUESTION_SETTLE_MS). An agent
 parked on the plan-limit menu raises "?" too, and which of the two latches
@@ -133,6 +135,11 @@ class EventHub(QObject):
         ref = self._open_limit.pop(uid, None)
         self._record(kind, agent, ref=ref,
                      data={"tries": tries, "detail": detail})
+
+    def lane_event(self, agent, text: str, data: dict | None = None) -> None:
+        """An agent-lanes event: its lane was created, or it first overlaps
+        or conflicts with another lane or its base (app/lane_service.py)."""
+        self._record(el.LANE, agent, text=text, data=data)
 
     def scheduled(self, agent, sent: bool, text: str, why: str = "") -> None:
         """MainWindow delivered (or gave up on) a scheduled message."""

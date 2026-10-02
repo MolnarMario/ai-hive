@@ -28,6 +28,13 @@ agent to jump to its terminal card, double-click a file to open it with the OS
 default program, right-click a file for Open / Open with… / Reveal in folder /
 Copy path.
 
+Agent lanes (app/lanes.py): a laned agent edits its own copy of each file,
+in its lane folder beside the repo. `lanes.to_repo_path` maps those copies
+back onto the main checkout's paths, so the tree stays rooted at the repo
+and one file touched in three lanes is ONE row with three connectors.
+Opening a file opens the lane's own copy (`_FileVis.copies`); the
+right-click menu offers each agent's copy when they differ.
+
 The window is a TRANSIENT view: it only reads model state and must never mark
 the session dirty. Custom painting reads `Palette.*` at paint time so it follows
 the active skin; MainWindow._change_theme repaints it (it is parented there).
@@ -45,7 +52,7 @@ from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QMenu,
                                QPushButton, QScrollArea, QToolTip, QVBoxLayout,
                                QWidget)
 
-from .. import file_activity, fsopen
+from .. import file_activity, fsopen, lanes
 from ..filetypes import DEFAULT_ICON as _DEFAULT_ICON
 from ..filetypes import EMOJI_FONT as _EMOJI_FONT
 from ..filetypes import file_icon as _file_icon
@@ -81,6 +88,17 @@ class _FileVis:
     basename: str
     edited: bool
     owners: list = field(default_factory=list)   # [(agent_index, edited)]
+    # agent_index -> the path that agent actually touched, when it differs
+    # from `path` (a laned agent's own copy, see lanes.to_repo_path)
+    copies: dict = field(default_factory=dict)
+
+    def open_path(self) -> str:
+        """The copy to open: the first agent that EDITED it, else the first
+        that read it, else the repo path."""
+        for idx, edited in sorted(self.owners, key=lambda o: not o[1]):
+            if idx in self.copies:
+                return self.copies[idx]
+        return self.path
 
 
 @dataclass
@@ -480,15 +498,27 @@ class AgentFileMapCanvas(QWidget):
     def mouseDoubleClickEvent(self, event):
         hit = self._hit(self._scene(event.position()))
         if hit and hit[0] == "file":
-            fsopen.open_path(hit[1].path)
+            fsopen.open_path(hit[1].open_path())
 
     def contextMenuEvent(self, event):
         hit = self._hit(self._scene(event.position()))
         if not hit or hit[0] != "file":
             return
-        path = hit[1].path
+        fv = hit[1]
+        path = fv.open_path()
         menu = QMenu(self)
         menu.addAction("Open", lambda: fsopen.open_path(path))
+        # one row per lane copy when agents changed it in different lanes
+        copies = {}
+        for idx, _edited in fv.owners:
+            copy = fv.copies.get(idx, fv.path)
+            if idx < len(self._agents):
+                copies.setdefault(os.path.normcase(copy),
+                                  (self._agents[idx].name, copy))
+        if len(copies) > 1:
+            for name, copy in copies.values():
+                menu.addAction(f"Open {name}'s copy",
+                               lambda c=copy: fsopen.open_path(c))
         menu.addAction("Open with…", lambda: fsopen.open_with(path))
         menu.addAction("Reveal in folder", lambda: fsopen.reveal_in_folder(path))
         menu.addAction("Copy path", lambda: QApplication.clipboard().setText(path))
@@ -718,14 +748,22 @@ class AgentFileMapWindow(QWidget):
             return
 
         acts = [(a, file_activity.activity_for_agent(a)) for a in agents]
+        # lane copies map back onto the repo's own paths (see module docstring)
+        roots = {a.spec.lane["root"]: a.spec.lane["repo"] for a in agents
+                 if (getattr(a.spec, "lane", None) or {}).get("root")}
         # every touched file, with the (agent_index, edited) owners that touched
         # it — a file touched by 2+ agents simply carries multiple owners and so
         # gets a connector from each (no separate "shared band" any more)
         key_owners = defaultdict(list)
+        repo_paths: dict = {}
         for idx, (_agent, act) in enumerate(acts):
             if not act:
                 continue
             for k, fa in act.files.items():
+                if roots:
+                    shown = lanes.to_repo_path(fa.path, roots)
+                    k = file_activity._key(shown)
+                    repo_paths.setdefault(k, shown)
                 key_owners[k].append((idx, fa))
 
         avs: list[_AgentVis] = []
@@ -747,8 +785,12 @@ class AgentFileMapWindow(QWidget):
             rep = owners[0][1]
             owner_pairs = [(idx, fa.edited) for idx, fa in owners]
             any_edit = any(e for _, e in owner_pairs)
-            files_all.append(_FileVis(path=rep.path, basename=rep.basename,
-                                      edited=any_edit, owners=owner_pairs))
+            path = repo_paths.get(k, rep.path)
+            copies = {idx: fa.path for idx, fa in owners
+                      if file_activity._key(fa.path) != k}
+            files_all.append(_FileVis(path=path, basename=rep.basename,
+                                      edited=any_edit, owners=owner_pairs,
+                                      copies=copies))
 
         self.canvas.set_model(avs, files_all)
 

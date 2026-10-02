@@ -15,8 +15,13 @@ through a queued signal (the `app/usage_poll.py` pattern) and `callback(result,
 error)` runs there. `drain()` lets tests wait for every submitted operation
 to finish and be delivered.
 
-Read-only lane queries are not required to queue here, but nothing in Phase 1
-needs one outside an operation.
+Read-only lane queries do not queue here (app/lane_service.py polls on its
+own threads), but they take the repo's `lock_for` around each lane they read,
+and every queued job holds it while it runs. Windows refuses to delete a
+folder that is any process's working directory, so a poll's `git status`
+running inside a lane at the moment `git worktree remove` deletes it would
+leave a half-deleted worktree. A job that never touches a lane folder (the
+base fetch) passes `exclusive=False` so a slow network does not stall polls.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ class _Job:
     args: tuple
     callback: Callable | None
     label: str = ""
+    exclusive: bool = True
     result: object = None
     error: BaseException | None = None
     key: str = ""
@@ -57,6 +63,7 @@ class LaneOps(QObject):
         self._audit = audit
         self._queues: dict[str, queue.Queue] = {}
         self._keys: dict[str, str] = {}     # normcased repo path -> queue key
+        self._repo_locks: dict[str, threading.Lock] = {}   # queue key -> lock
         self._lock = threading.Lock()
         self._pending = 0                   # submitted, not yet delivered
         self._done.connect(self._deliver, Qt.ConnectionType.QueuedConnection)
@@ -73,25 +80,38 @@ class LaneOps(QObject):
             self._keys[norm] = key
         return key
 
+    def lock_for(self, repo: str) -> threading.Lock:
+        """The repo's folder lock: held by every exclusive job while it
+        runs, and by the lane poller around each lane it reads."""
+        key = self.key_for(repo)
+        with self._lock:
+            return self._repo_locks.setdefault(key, threading.Lock())
+
     def submit(self, repo: str, fn: Callable, *args,
-               callback: Callable | None = None, label: str = "") -> None:
+               callback: Callable | None = None, label: str = "",
+               exclusive: bool = True) -> None:
         job = _Job(fn=fn, args=args, callback=callback, label=label,
-                   key=self.key_for(repo))
+                   exclusive=exclusive, key=self.key_for(repo))
+        lock = self.lock_for(repo)
         with self._lock:
             self._pending += 1
             q = self._queues.get(job.key)
             if q is None:
                 q = self._queues[job.key] = queue.Queue()
-                threading.Thread(target=self._run, args=(q,), daemon=True,
+                threading.Thread(target=self._run, args=(q, lock), daemon=True,
                                  name="aihive-lanes").start()
         q.put(job)
 
-    def _run(self, q: queue.Queue) -> None:
+    def _run(self, q: queue.Queue, lock: threading.Lock) -> None:
         while True:
             job = q.get()
             job.started = time.monotonic()
             try:
-                job.result = job.fn(*job.args)
+                if job.exclusive:
+                    with lock:
+                        job.result = job.fn(*job.args)
+                else:
+                    job.result = job.fn(*job.args)
             except BaseException as exc:    # report, never kill the worker
                 job.error = exc
             job.ended = time.monotonic()

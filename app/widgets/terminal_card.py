@@ -413,6 +413,8 @@ class TerminalCard(QFrame):
     maximizeRequested = Signal(object)  # self (toggle solo view of this card)
     fileActivated = Signal(str)      # abs path Ctrl+clicked in the conversation
     scheduleRequested = Signal(str, str)  # agent id, text to prefill (may be "")
+    # the lane chip's menu: agent id, "open" | "refresh" (app/lanes.py)
+    laneActionRequested = Signal(str, str)
 
     def __init__(self, agent: TerminalAgent, parent=None):
         super().__init__(parent)
@@ -428,6 +430,9 @@ class TerminalCard(QFrame):
         self._fmt_cache: dict = {}
         self._cr_pending = False
         self._renaming = False  # inline title-edit in progress
+        # what the lane poller last saw in this agent's lane (lanes.LaneView),
+        # or None while the Agent lanes switch is off. Transient view state.
+        self._lane_view = None
         self._task_full = ""    # untruncated current-task (the label elides it)
         self._pending_replay = ""  # restored screen, re-rendered once at size
         # is the boot veil up because a RESTORED SNAPSHOT has not been
@@ -618,6 +623,16 @@ class TerminalCard(QFrame):
         self.sched_mark.setObjectName("CardSchedule")
         self.sched_mark.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sched_mark.hide()
+        # "this agent works in its own git worktree" (agent lanes): branch
+        # glyph, commits ahead, uncommitted files. Neutral when the lane is
+        # quiet, amber when another lane or the base changed one of its files,
+        # red when a real merge of the two would conflict. Clickable for the
+        # lane's actions; hidden for an agent without a lane.
+        self.lane_mark = QToolButton(header)
+        self.lane_mark.setObjectName("CardLane")
+        self.lane_mark.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lane_mark.setProperty("lane", "clean")
+        self.lane_mark.hide()
         # one-line summary of what this agent is working on (its current task),
         # so several agents in a workspace are tellable apart at a glance
         # without reading each terminal. It takes every pixel the fixed chrome
@@ -640,6 +655,7 @@ class TerminalCard(QFrame):
         hl.addWidget(self.limit_mark)
         hl.addWidget(self.bg_mark)
         hl.addWidget(self.sched_mark)
+        hl.addWidget(self.lane_mark)
         hl.addWidget(self.task_summary, 1)  # takes the middle space, elides
 
         def tool(text, obj_name, tip, owner=None):
@@ -738,6 +754,8 @@ class TerminalCard(QFrame):
         self.sched_mark.clicked.connect(
             lambda: self.scheduleRequested.emit(self.agent.id, ""))
         self.refresh_schedule()
+        self.lane_mark.clicked.connect(self._show_lane_menu)
+        self.refresh_lane()
         self.title.installEventFilter(self)        # double-click to rename
         self.title_edit.installEventFilter(self)   # Esc cancels, focus-out commits
         self.title_edit.returnPressed.connect(self._commit_rename)
@@ -995,6 +1013,105 @@ class TerminalCard(QFrame):
                 f"Click to send one now or dismiss it.")
             self._set_sched_missed(True)
         self.sched_mark.setVisible(msg is not None or bool(missed))
+
+    # ------------------------------------------------------------ lane chip ---
+
+    def set_lane_view(self, view) -> None:
+        """What the lane poller saw (lanes.LaneView), or None when it is not
+        running (the Agent lanes switch is off). View state only."""
+        self._lane_view = view
+        self.refresh_lane()
+
+    def refresh_lane(self) -> None:
+        """Repaint the lane chip from the agent's lane record and the last
+        view. Called on every poll that changed something, and whenever the
+        lane record itself changed (created, failed, revived)."""
+        lane = getattr(self.agent.spec, "lane", None) or {}
+        if not lane.get("branch"):
+            self.lane_mark.hide()
+            return
+        view = self._lane_view
+        text = "⎇"
+        if view is not None:
+            if view.ahead:
+                text += f" ↑{view.ahead}"
+            if view.dirty:
+                text += f" ±{len(view.dirty)}"
+        state = view.state if view is not None else "clean"
+        self.lane_mark.setText(text)
+        self.lane_mark.setToolTip(self._lane_tooltip(lane, view))
+        if self.lane_mark.property("lane") != state:
+            self.lane_mark.setProperty("lane", state)
+            repolish(self.lane_mark)
+        self.lane_mark.show()
+
+    @staticmethod
+    def _lane_tooltip(lane: dict, view) -> str:
+        base = lane.get("base") or "the base branch"
+        lines = [f"Own lane: {lane['branch']} (from {base})",
+                 f"Folder: {lane.get('root', '')}"]
+        if view is None:
+            lines.append("Turn on Agent lanes in Options to see what this "
+                         "lane holds and where it overlaps other lanes.")
+        elif not view.exists:
+            lines.append("The lane folder is missing.")
+        else:
+            ref = view.base_ref or base
+            lines.append(f"{view.ahead} commit{'s' if view.ahead != 1 else ''}"
+                         f" ahead of {ref}, {view.behind} behind")
+            n = len(view.dirty)
+            lines.append(f"{n} uncommitted file{'s' if n != 1 else ''}")
+            if view.overlaps:
+                lines.append("")
+                lines.append("Overlaps:")
+                for o in view.overlaps[:12]:
+                    if not o.peer_uid:
+                        what = ("CONFLICTS with " if o.level == "conflicts"
+                                else "also changed on ") + o.peer
+                    elif o.level == "conflicts":
+                        what = f"CONFLICTS with {o.peer}"
+                    else:
+                        what = (f"{o.peer} changed it too ("
+                                f"{'uncommitted' if o.state == 'dirty' else 'committed'})")
+                    lines.append(f"  {o.path}: {what}")
+                if len(view.overlaps) > 12:
+                    lines.append(f"  ...and {len(view.overlaps) - 12} more")
+        lines.append("")
+        lines.append("Click for lane actions")
+        return "\n".join(lines)
+
+    def _show_lane_menu(self) -> None:
+        lane = getattr(self.agent.spec, "lane", None) or {}
+        if not lane.get("branch"):
+            return
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+        act_open = QAction("Open lane folder", menu)
+        act_open.triggered.connect(
+            lambda: self.laneActionRequested.emit(self.agent.id, "open"))
+        menu.addAction(act_open)
+        view = self._lane_view
+        base = (view.base_ref if view is not None and view.base_ref
+                else lane.get("base") or "the base branch")
+        act_refresh = QAction(f"Update lane to {base} (fast-forward)", menu)
+        act_refresh.triggered.connect(
+            lambda: self.laneActionRequested.emit(self.agent.id, "refresh"))
+        ok = view is not None and view.can_refresh()
+        act_refresh.setEnabled(ok)
+        if view is None:
+            why = "Turn on Agent lanes in Options first."
+        elif view.dirty or view.ahead:
+            why = ("Only a lane with no commits and no uncommitted changes of "
+                   "its own is updated this way.")
+        elif not view.behind:
+            why = f"The lane is already at {base}."
+        else:
+            why = (f"Moves this lane to the newest {base} without a merge "
+                   f"commit. Nothing of its own can be lost.")
+        act_refresh.setToolTip(why)
+        menu.addAction(act_refresh)
+        menu.exec(self.lane_mark.mapToGlobal(
+            self.lane_mark.rect().bottomLeft()))
 
     def _set_sched_missed(self, missed: bool) -> None:
         """Flip the chip's warning state, restyling ONLY on a real change.

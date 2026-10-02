@@ -882,3 +882,772 @@ def test_lanes_window():
     check("lanes window: the real .venv survived every removal",
           (work / ".venv" / "marker.txt").read_text() == "real venv")
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ------------------------------------------------- Phase 2: awareness ---
+
+def _lane_for(work: Path, name: str, uid: str) -> dict:
+    """A real lane created the way the app does it (create_lane)."""
+    from app import lanes
+    plan = lanes.plan_lane(str(work), str(work), name, uid)
+    return lanes.create_lane(plan.lane_dict())
+
+
+def _commit(cwd, path: str, text: str, msg: str = "change") -> None:
+    p = Path(cwd) / path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+    _git(cwd, "add", "-A")
+    _git(cwd, "commit", "-q", "-m", msg)
+
+
+def _entry(uid: str, name: str, lane: dict, ws_id: str = "ws") -> dict:
+    return {"uid": uid, "agent": name, "ws_id": ws_id, "lane": lane}
+
+
+def _push_to_base(tmp: Path, work: Path, path: str, text: str) -> None:
+    """Someone else lands a commit on origin/main (from a separate clone)."""
+    other = tmp / f"other-{len(list(tmp.iterdir()))}"
+    _git(tmp, "clone", "-q", str(tmp / "proj-origin.git"), str(other))
+    _commit(other, path, text, "landed on main")
+    _git(other, "push", "-q", "origin", "main")
+
+
+def test_lane_awareness_core():
+    """app/lanes.py Phase 2, on real temp repos: what a lane holds
+    (committed, uncommitted, what the base changed since the fork), overlap
+    and real-merge conflict detection between lanes and with the base, the
+    old-git fallback, the merge cache, the fast-forward refresh, the repo
+    path mapping for the File Map, and .worktreeinclude copies."""
+    from app import lanes
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-aware-"))
+    work = _make_repo(tmp)
+    a = _lane_for(work, "Agent A", "aaaaaa" + "0" * 26)
+    b = _lane_for(work, "Agent B", "bbbbbb" + "0" * 26)
+    c = _lane_for(work, "Agent C", "cccccc" + "0" * 26)
+    ea, eb, ec = (_entry("A", "Agent A", a), _entry("B", "Agent B", b),
+                  _entry("C", "Agent C", c))
+
+    # --- status parsing: modified, untracked with a space, a rename --------
+    (Path(a["root"]) / "a.txt").write_text("a edited\n")
+    (Path(a["root"]) / "new file.txt").write_text("n\n")
+    _git(a["root"], "mv", "sub/b.txt", "sub/renamed.txt")
+    paths = lanes.status_paths(a["root"])
+    check("lanes aware: status lists a modified file", "a.txt" in paths, paths)
+    check("lanes aware: ...an untracked file, spaces intact",
+          "new file.txt" in paths, paths)
+    check("lanes aware: ...and the new name of a rename",
+          "sub/renamed.txt" in paths and "sub/b.txt" not in paths, paths)
+    _git(a["root"], "mv", "sub/renamed.txt", "sub/b.txt")
+    os.remove(Path(a["root"]) / "new file.txt")
+    _git(a["root"], "checkout", "--", "a.txt")
+    check("lanes aware: a clean lane lists nothing",
+          lanes.status_paths(a["root"]) == [])
+
+    snap = lanes.snapshot_repo(str(work), [ea, eb, ec])
+    check("lanes aware: fresh lanes overlap nowhere",
+          snap.overlaps == {} and all(s.exists and s.head for s in snap.lanes),
+          snap.overlaps)
+    check("lanes aware: git here supports the in-memory merge",
+          snap.merge_tree)
+
+    # --- A commits a.txt, B has it uncommitted: an overlap, not a conflict --
+    _commit(a["root"], "a.txt", "A's version\n")
+    (Path(b["root"]) / "a.txt").write_text("B's draft\n")
+    snap = lanes.snapshot_repo(str(work), [ea, eb, ec])
+    sa, sb = snap.lane("A"), snap.lane("B")
+    check("lanes aware: committed files and ahead count",
+          sa.committed == ["a.txt"] and sa.ahead == 1, (sa.committed, sa.ahead))
+    check("lanes aware: uncommitted files", sb.dirty == ["a.txt"], sb.dirty)
+    ova = snap.overlaps.get("A", [])
+    check("lanes aware: A sees B's uncommitted change to a.txt",
+          [(o.path, o.peer_uid, o.state) for o in ova]
+          == [("a.txt", "B", "dirty")], ova)
+    check("lanes aware: B sees A's committed change",
+          [(o.path, o.peer_uid, o.state) for o in snap.overlaps.get("B", [])]
+          == [("a.txt", "A", "committed")])
+    check("lanes aware: C, which touched nothing, sees nothing",
+          "C" not in snap.overlaps)
+    idx = snap.index()
+    check("lanes aware: lanes.json index has both owners of a.txt",
+          sorted(o["uid"] for o in idx.get("a.txt", [])) == ["A", "B"], idx)
+    view = snap.view("A")
+    check("lanes aware: the view reads as an overlap",
+          view.state == "overlap" and view.touching() == ["a.txt"])
+
+    # --- B commits a clashing version: a real conflict ---------------------
+    _git(b["root"], "add", "a.txt")
+    _git(b["root"], "commit", "-q", "-m", "B")
+    cache = {}
+    with _record_git() as g:
+        snap = lanes.snapshot_repo(str(work), [ea, eb, ec], cache)
+    check("lanes aware: two committed clashing changes CONFLICT",
+          [o.state for o in snap.overlaps["A"]] == ["conflicts"]
+          and snap.view("B").state == "conflict", snap.overlaps)
+    check("lanes aware: the index marks both sides conflicts",
+          {o["state"] for o in snap.index()["a.txt"]} == {"conflicts"})
+    check("lanes aware: the conflict came from a real merge-tree run",
+          any(c[:1] == ["merge-tree"] for c in g.calls))
+    with _record_git() as g:
+        lanes.snapshot_repo(str(work), [ea, eb, ec], cache)
+    check("lanes aware: unchanged heads reuse the cached merge result",
+          not any(c[:1] == ["merge-tree"] for c in g.calls))
+
+    # --- old git: file overlap only, never a made-up conflict --------------
+    saved = list(lanes._git_version)
+    lanes._git_version[:] = [(2, 30)]
+    try:
+        old = lanes.snapshot_repo(str(work), [ea, eb, ec])
+    finally:
+        lanes._git_version[:] = saved
+    check("lanes aware: git < 2.38 still reports the overlap, as committed",
+          not old.merge_tree
+          and [o.state for o in old.overlaps["A"]] == ["committed"])
+
+    # --- the base moves under C and A ---------------------------------------
+    _commit(c["root"], "sub/b.txt", "C's b\n")
+    _push_to_base(tmp, work, "sub/b.txt", "main's b\n")
+    check("lanes aware: fetch_base fetches origin's base",
+          lanes.fetch_base(str(work), "main"))
+    snap = lanes.snapshot_repo(str(work), [ea, eb, ec])
+    scc = snap.lane("C")
+    check("lanes aware: the base's changes since the fork are seen",
+          scc.behind == 1 and scc.base_changed == ["sub/b.txt"],
+          (scc.behind, scc.base_changed))
+    ovc = snap.overlaps.get("C", [])
+    check("lanes aware: C conflicts with origin/main on sub/b.txt",
+          [(o.path, o.peer_uid, o.peer, o.state) for o in ovc]
+          == [("sub/b.txt", "", "origin/main", "conflicts")], ovc)
+    check("lanes aware: A, which never touched sub/b.txt, is not told",
+          all(o.peer_uid for o in snap.overlaps.get("A", [])))
+    text = lanes.describe_overlap(ovc[0])
+    check("lanes aware: the base notice names the file and says merge",
+          "sub/b.txt" in text and "Merge origin/main" in text
+          and "—" not in text, text)
+    peer_text = lanes.describe_overlap(snap.overlaps["A"][0])
+    check("lanes aware: a peer notice names the agent, branch and file",
+          "Agent B" in peer_text and b["branch"] in peer_text
+          and "a.txt" in peer_text and "—" not in peer_text, peer_text)
+
+    # --- a missing lane is reported, never raised ---------------------------
+    gone = _entry("G", "Gone", {**c, "root": str(tmp / "proj.lanes" / "x")})
+    snap = lanes.snapshot_repo(str(work), [ea, gone])
+    check("lanes aware: a lane whose folder is gone reads as missing",
+          not snap.lane("G").exists and snap.view("G").state == "clean")
+
+    # --- the fast-forward refresh -------------------------------------------
+    d = _lane_for(work, "Agent D", "dddddd" + "0" * 26)
+    _push_to_base(tmp, work, "a.txt", "main moved\n")
+    lanes.fetch_base(str(work), "main")
+    st = lanes.lane_status(d)
+    check("lanes aware: an empty lane falls behind when the base moves",
+          st.behind == 1 and st.ahead == 0, (st.behind, st.ahead))
+    moved = lanes.refresh_lane(d)
+    check("lanes aware: refresh fast-forwards an empty lane to its base",
+          moved == "origin/main"
+          and _git(d["root"], "rev-parse", "HEAD")
+          == _git(work, "rev-parse", "origin/main"))
+    check("lanes aware: refreshing again is a no-op", lanes.refresh_lane(d) == "")
+    (Path(d["root"]) / "a.txt").write_text("wip\n")
+    try:
+        lanes.refresh_lane(d)
+        refused = ""
+    except lanes.LaneError as exc:
+        refused = exc.code
+    check("lanes aware: refresh refuses a dirty lane", refused == "dirty")
+    try:
+        lanes.refresh_lane(a)
+        refused = ""
+    except lanes.LaneError as exc:
+        refused = exc.code
+    check("lanes aware: refresh refuses a lane with commits of its own",
+          refused == "unmerged")
+
+    # --- File Map path mapping ----------------------------------------------
+    roots = {a["root"]: str(work)}
+    check("lanes aware: a lane file maps to the repo's own path",
+          lanes.to_repo_path(os.path.join(a["root"], "sub", "b.txt"), roots)
+          == os.path.join(str(work), "sub", "b.txt"))
+    near = a["root"] + "x"
+    check("lanes aware: a sibling folder with a longer name is not the lane",
+          lanes.to_repo_path(os.path.join(near, "f.txt"), roots)
+          == os.path.join(near, "f.txt"))
+    check("lanes aware: a path outside every lane is left alone",
+          lanes.to_repo_path(str(tmp / "f.txt"), roots) == str(tmp / "f.txt"))
+
+    # --- .worktreeinclude ---------------------------------------------------
+    _push_to_base(tmp, work, ".gitignore",
+                  ".venv/\nnode_modules/\nbuild/\n.env\nsecrets/\n")
+    _git(work, "pull", "-q", "--ff-only")
+    (work / ".env").write_text("TOKEN=1\n")
+    (work / "secrets").mkdir()
+    (work / "secrets" / "key.txt").write_text("k\n")
+    (work / "build").mkdir(exist_ok=True)
+    (work / "build" / "out.bin").write_text("big\n")
+    (work / ".venv" / "lib.txt").write_text("venv file\n")
+    (work / ".worktreeinclude").write_text(".env\nsecrets/\n.venv/\na.txt\n")
+    e = _lane_for(work, "Agent E", "eeeeee" + "0" * 26)
+    er = Path(e["root"])
+    check("lanes aware: .worktreeinclude copies an ignored .env",
+          (er / ".env").read_text() == "TOKEN=1\n")
+    check("lanes aware: ...and an ignored folder's files",
+          (er / "secrets" / "key.txt").is_file())
+    check("lanes aware: ...but not an ignored file it does not name",
+          not (er / "build").exists())
+    check("lanes aware: ...nor anything under a junction (the lane's .venv "
+          "is still the link, not a copied folder)",
+          lanes.is_junction(str(er / ".venv")))
+    check("lanes aware: ...and a tracked file stays git's",
+          (er / "a.txt").read_text() == "main moved\n")
+    check("lanes aware: the copies do not show as lane changes",
+          lanes.status_paths(e["root"]) == [], lanes.status_paths(e["root"]))
+
+
+def _run_hook(payload, env_extra: dict, stdin_raw: str | None = None):
+    """app/session_hook.py exactly as Claude runs it: a subprocess, JSON on
+    stdin. Returns (exit code, stdout)."""
+    import sys
+    from app import session_hook
+    env = {k: v for k, v in os.environ.items()
+           if k not in session_hook.LANE_ENV_KEYS}
+    env.update(env_extra)
+    raw = stdin_raw if stdin_raw is not None else json.dumps(payload)
+    r = subprocess.run([sys.executable, session_hook.__file__, "", ""],
+                       input=raw, capture_output=True, text=True, env=env,
+                       timeout=30, creationflags=_NO_WINDOW)
+    return r.returncode, r.stdout.strip()
+
+
+def _context(out: str) -> str:
+    if not out:
+        return ""
+    try:
+        return json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    except (ValueError, KeyError, TypeError):
+        return f"<unparsable: {out!r}>"
+
+
+def test_lane_hooks():
+    """The overlap hook and lane notices (app/session_hook.py), run as the
+    subprocess Claude runs: additionalContext only on a real overlap, once
+    per (file, peer, level), a base warning, an outside-the-lane warning,
+    silence without the env vars, with the switch off and on garbage, and
+    the notices injected once, skipping stale ones and ones already told.
+    Plus the lane settings file: the SessionStart matcher never gains
+    `startup`, and the lane hooks exist only in the lane file."""
+    from app import session_hook
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-hook-"))
+    repo, root, peer_root = tmp / "proj", tmp / "proj.lanes" / "me-aaaaaa", \
+        tmp / "proj.lanes" / "peer-bbbbbb"
+    for d in (repo, root, peer_root):
+        d.mkdir(parents=True)
+    aihive = repo / ".aihive"
+    index = aihive / "lanes.json"
+    notices = aihive / "notices" / "me.jsonl"
+    seen = aihive / "seen" / "me.json"
+    env = {session_hook.LANE_UID_ENV: "me",
+           session_hook.LANE_ROOT_ENV: str(root),
+           session_hook.LANE_REPO_ENV: str(repo),
+           session_hook.LANES_INDEX_ENV: str(index),
+           session_hook.LANE_NOTICES_ENV: str(notices),
+           session_hook.LANE_SEEN_ENV: str(seen)}
+    data = {"version": 1, "enabled": True,
+            "lanes": {"me": {"base_ref": "origin/main",
+                             "base_changed": ["app/base.py"]}},
+            "files": {"app/x.py": [
+                {"uid": "me", "agent": "Me", "branch": "hive/me-aaaaaa",
+                 "state": "dirty"},
+                {"uid": "peer", "agent": "Agent 6",
+                 "branch": "hive/agent-6-bbbbbb", "state": "dirty"}],
+                "app/mine.py": [{"uid": "me", "agent": "Me",
+                                 "branch": "hive/me-aaaaaa",
+                                 "state": "committed"}]}}
+    session_hook.write_lanes_index(str(index), data)
+
+    def edit(path, tool="Edit"):
+        return {"hook_event_name": "PostToolUse", "tool_name": tool,
+                "cwd": str(root), "tool_input": {"file_path": str(path)}}
+
+    rc, out = _run_hook(edit(root / "app" / "x.py"), env)
+    ctx = _context(out)
+    check("lane hook: an edit of a file another lane changed warns",
+          rc == 0 and "Agent 6" in ctx and "app/x.py" in ctx
+          and "uncommitted" in ctx, (rc, out))
+    check("lane hook: ...as PostToolUse additionalContext",
+          json.loads(out)["hookSpecificOutput"]["hookEventName"]
+          == "PostToolUse" if out else False)
+    rc, out = _run_hook(edit(root / "app" / "x.py", "Write"), env)
+    check("lane hook: the same overlap is not repeated", rc == 0 and out == "",
+          out)
+    data["files"]["app/x.py"][1]["state"] = "conflicts"
+    session_hook.write_lanes_index(str(index), data)
+    rc, out = _run_hook(edit(root / "app" / "x.py", "MultiEdit"), env)
+    check("lane hook: the overlap turning into a conflict warns again",
+          "CONFLICT" in _context(out), out)
+    rc, out = _run_hook(edit(root / "app" / "mine.py"), env)
+    check("lane hook: a file only this lane changed is silent", out == "", out)
+    rc, out = _run_hook({"hook_event_name": "PostToolUse",
+                         "tool_name": "Edit", "cwd": str(root),
+                         "tool_input": {"file_path": "app/base.py"}}, env)
+    ctx = _context(out)
+    check("lane hook: a relative path to a file the base changed warns to "
+          "merge the base", "origin/main" in ctx and "app/base.py" in ctx,
+          out)
+    rc, out = _run_hook(edit(repo / "app" / "x.py"), env)
+    check("lane hook: editing the main checkout warns it is outside the lane",
+          "OUTSIDE your lane" in _context(out), out)
+    rc, out = _run_hook(edit(peer_root / "app" / "x.py"), env)
+    check("lane hook: ...and so does editing another agent's lane",
+          "OUTSIDE your lane" in _context(out), out)
+    rc, out = _run_hook(edit(tmp / "notes.txt"), env)
+    check("lane hook: a file outside the repo and its lanes is silent",
+          out == "", out)
+    rc, out = _run_hook({"hook_event_name": "PostToolUse",
+                         "tool_name": "NotebookEdit", "cwd": str(root),
+                         "tool_input": {"notebook_path": str(
+                             peer_root / "n.ipynb")}}, env)
+    check("lane hook: a notebook edit is checked too",
+          "OUTSIDE" in _context(out), out)
+
+    fresh = {**data, "files": {"app/y.py": [
+        {"uid": "peer", "agent": "Agent 6", "branch": "b", "state": "dirty"}]}}
+    session_hook.write_lanes_index(str(index), fresh)
+    rc, out = _run_hook(edit(root / "app" / "y.py"), {})
+    check("lane hook: silent without the lane env vars", rc == 0 and out == "")
+    session_hook.write_lanes_index(str(index), {**fresh, "enabled": False})
+    rc, out = _run_hook(edit(root / "app" / "y.py"), env)
+    check("lane hook: silent when lanes.json says the switch is off",
+          rc == 0 and out == "")
+    session_hook.write_lanes_index(str(index), fresh)
+    rc, out = _run_hook(None, env, stdin_raw="{not json")
+    check("lane hook: garbage on stdin exits 0, silently", rc == 0 and out == "")
+    rc, out = _run_hook(None, env, stdin_raw="[1, 2]")
+    check("lane hook: a non-object payload exits 0, silently",
+          rc == 0 and out == "")
+    os.remove(index)
+    rc, out = _run_hook(edit(root / "app" / "y.py"), env)
+    check("lane hook: silent when there is no lanes.json yet",
+          rc == 0 and out == "")
+    session_hook.write_lanes_index(str(index), fresh)
+
+    # --- UserPromptSubmit: unread notices, once -----------------------------
+    prompt = {"hook_event_name": "UserPromptSubmit", "prompt": "go",
+              "cwd": str(root)}
+    rc, out = _run_hook(prompt, env)
+    check("lane notices: no notices file is silent", rc == 0 and out == "")
+    session_hook.append_notice(str(notices), "app/x.py|peer|overlap",
+                               "ALREADY TOLD by the overlap hook")
+    session_hook.append_notice(str(notices), "old|base|overlap", "STALE one",
+                               ts=time.time() - 7 * 3600)
+    session_hook.append_notice(str(notices), "app/z.py|base|overlap",
+                               "origin/main changed app/z.py")
+    rc, out = _run_hook(prompt, env)
+    ctx = _context(out)
+    check("lane notices: an unread notice is injected on the next prompt",
+          rc == 0 and "origin/main changed app/z.py" in ctx, out)
+    check("lane notices: ...as UserPromptSubmit additionalContext",
+          json.loads(out)["hookSpecificOutput"]["hookEventName"]
+          == "UserPromptSubmit" if out else False)
+    check("lane notices: what the overlap hook already said is skipped",
+          "ALREADY TOLD" not in ctx)
+    check("lane notices: a stale notice is dropped", "STALE" not in ctx)
+    rc, out = _run_hook(prompt, env)
+    check("lane notices: a notice is injected once", out == "", out)
+    session_hook.append_notice(str(notices), "app/w.py|peer|conflicts",
+                               "a new one")
+    rc, out = _run_hook(prompt, env)
+    check("lane notices: a later notice is injected on the prompt after",
+          "a new one" in _context(out) and "app/z.py" not in _context(out),
+          out)
+    for i in range(12):
+        session_hook.append_notice(str(notices), f"bulk{i}|p|overlap",
+                                   f"bulk {i}")
+    ctx = _context(_run_hook(prompt, env)[1])
+    check("lane notices: a burst is capped, with a count of the rest",
+          "bulk 0" in ctx and "bulk 11" not in ctx and "4 more" in ctx, ctx)
+    s = session_hook.read_seen(str(seen))
+    check("lane notices: the seen file records keys and the read offset",
+          "app/w.py|peer|conflicts" in s["keys"]
+          and s["offset"] == os.path.getsize(notices))
+
+    # --- the settings files ---------------------------------------------------
+    base_p, lane_p = tmp / "base.json", tmp / "lane.json"
+    session_hook.write_settings_file(str(base_p), "m", "e")
+    session_hook.write_settings_file(str(lane_p), "m", "e", lanes=True)
+    bh = json.loads(base_p.read_text())["hooks"]
+    lh = json.loads(lane_p.read_text())["hooks"]
+    check("lane settings: the shared file has no lane hooks",
+          "UserPromptSubmit" not in bh
+          and [m["matcher"] for m in bh["PostToolUse"]]
+          == [session_hook.WAITING_TOOLS])
+    check("lane settings: the lane file adds the edit matcher and "
+          "UserPromptSubmit", [m["matcher"] for m in lh["PostToolUse"]]
+          == [session_hook.WAITING_TOOLS, session_hook.EDIT_TOOLS]
+          and len(lh["UserPromptSubmit"]) == 1)
+    check("lane settings: SessionStart still never matches startup",
+          lh["SessionStart"][0]["matcher"] == "resume|clear|compact"
+          and bh["SessionStart"][0]["matcher"] == "resume|clear|compact")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lane_roster_columns():
+    """The board roster gains Lane, Ahead/Dirty and Touching columns only in
+    a workspace with laned agents; any other board keeps its table shape."""
+    from PySide6.QtWidgets import QApplication
+    from app import coordination, lanes
+
+    app = QApplication.instance() or QApplication([])
+    board = coordination.WorkspaceBoard(tempfile.mkdtemp())
+    plain = [{"name": "A", "role": "", "model": "m", "status": "running",
+              "task": "t"}]
+    out = board._render_roster(plain)
+    check("lane roster: no lanes, no new columns",
+          "| Lane |" not in out and out.splitlines()[2]
+          == "| Agent | Role | Model | Status | Current task |", out)
+    rows = plain + [{"name": "B", "role": "", "model": "m",
+                     "status": "running", "task": "",
+                     "lane": "hive/b-bbbbbb", "ahead_dirty": "+2 1 dirty",
+                     "touching": "app/x.py, app/y|z.py"}]
+    out = board._render_roster(rows).splitlines()
+    check("lane roster: a laned workspace gets the lane columns",
+          out[2].endswith("| Lane | Ahead/Dirty | Touching |")
+          and out[3] == "|---|---|---|---|---|---|---|---|", out[2:4])
+    check("lane roster: an agent without a lane shows dashes there",
+          out[4].endswith("| - | - | - |"), out[4])
+    check("lane roster: a laned agent's cells, pipes escaped",
+          out[5].endswith("| hive/b-bbbbbb | +2 1 dirty | app/x.py, app/y/z.py |")
+          and out[5].count("|") == 9, out[5])
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+    spec = build_spec(AgentKind.CLAUDE, "C")
+    spec.lane = {"root": "r", "branch": "hive/c-cccccc", "base": "main",
+                 "repo": "p"}
+    agent = TerminalAgent(spec)
+    row = agent.roster_row()
+    check("lane roster: a laned agent's row names its branch before any poll",
+          row["lane"] == "hive/c-cccccc" and "touching" not in row)
+    agent.lane_view = lanes.LaneView(
+        uid=spec.uid, branch="hive/c-cccccc", root="r", ahead=3,
+        dirty=["b.py"], committed=["a.py", "c.py", "d.py"])
+    row = agent.roster_row()
+    check("lane roster: ...and its counts and files after one",
+          row["ahead_dirty"] == "+3 1 dirty"
+          and row["touching"] == "a.py, b.py, c.py (+1)", row)
+    agent.deleteLater()
+
+
+def test_lane_file_map():
+    """The Agent/File Map maps every lane's copy of a file back onto the
+    repo's own path: one row per repo file, one connector per agent, and
+    opening it opens the editing agent's own copy."""
+    from PySide6.QtWidgets import QApplication
+    from app import file_activity
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.agent_file_map import AgentFileMapWindow
+
+    app = QApplication.instance() or QApplication([])
+    repo = os.path.normpath(os.path.join(tempfile.gettempdir(), "proj"))
+    la = repo + ".lanes\\a-aaaaaa"
+    lb = repo + ".lanes\\b-bbbbbb"
+    agents = []
+    for name, root in (("A", la), ("B", lb), ("Main", "")):
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=root or repo)
+        spec.session_id = "s"
+        if root:
+            spec.lane = {"root": root, "branch": f"hive/{name}", "base": "main",
+                         "repo": repo}
+        agents.append(TerminalAgent(spec))
+    acts = {"A": [(la + "\\app\\x.py", True)],
+            "B": [(lb + "\\app\\x.py", False), (lb + "\\app\\only_b.py", True)],
+            "Main": [(repo + "\\app\\x.py", False),
+                     (repo + "\\README.md", False)]}
+
+    def fake(agent):
+        act = file_activity.AgentActivity()
+        for path, edited in acts[agent.spec.name]:
+            file_activity._note_file(act, path, edited)
+        return act
+
+    class _Ws:
+        id, name = "ws", "Repo"
+    _Ws.agents = agents
+    orig = file_activity.activity_for_agent
+    file_activity.activity_for_agent = fake
+    try:
+        win = AgentFileMapWindow()
+        win.set_workspace(_Ws())
+        files = {os.path.normcase(f.path): f for f in win.canvas._files_all}
+    finally:
+        file_activity.activity_for_agent = orig
+    x = files.get(os.path.normcase(repo + "\\app\\x.py"))
+    check("lane map: three copies of one file are ONE row at the repo path",
+          x is not None and len(files) == 3, list(files))
+    check("lane map: ...with a connector from each agent",
+          x is not None and sorted(i for i, _e in x.owners) == [0, 1, 2])
+    check("lane map: opening it opens the editing agent's own copy",
+          x is not None and os.path.normcase(x.open_path())
+          == os.path.normcase(la + "\\app\\x.py"))
+    only_b = files.get(os.path.normcase(repo + "\\app\\only_b.py"))
+    check("lane map: a file one lane touched opens that lane's copy",
+          only_b is not None and os.path.normcase(only_b.open_path())
+          == os.path.normcase(lb + "\\app\\only_b.py"))
+    rows = [r.name for r in win.canvas._tree_rows]
+    check("lane map: the tree is rooted at the repo, not the lanes' parent",
+          rows[:1] == ["proj"], rows)
+    win.close()
+    win.deleteLater()
+    for a in agents:
+        a.deleteLater()
+
+
+def test_lane_service_window():
+    """Lane awareness through the real window, on real lanes: per-run hook
+    arming only for laned agents while the switch is on, the "skim the
+    roster" prompt, the poller's chips, lanes.json, notices, event-log
+    rows, roster columns and Activity panel, the fast-forward action, the
+    folder lock the poller shares with LaneOps, and the switch going off
+    silencing all of it at once."""
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app import event_log as el
+    from app import lanes, session_hook
+    from app import lane_service as svc
+    from app.session_store import SessionStore
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-svc-"))
+    work = _make_repo(tmp)
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    win.manager.set_active(ws.id)
+
+    def run_dialog(setup=None):
+        orig = AddTerminalDialog.exec
+
+        def fake_exec(dlg):
+            if setup is not None:
+                setup(dlg)
+            return QDialog.DialogCode.Accepted
+        AddTerminalDialog.exec = fake_exec
+        try:
+            before = list(ws.agents)
+            win._on_add_terminal_clicked(ws.id)
+        finally:
+            AddTerminalDialog.exec = orig
+        return [a for a in ws.agents if a not in before]
+
+    def poll():
+        win.lane_service.poll()
+        win.lane_service.drain(30)
+        win.lane_service.poll()     # a poll asked for meanwhile runs after
+        win.lane_service.drain(30)
+
+    with _stub_starts():
+        with _record_git() as g:
+            win.lane_service.poll()
+        check("lane service: with the switch off it polls nothing",
+              not win.lane_service.is_running() and g.calls == [])
+        plain = run_dialog()[0]
+        check("lane service: switch off, no lane hooks for anyone",
+              not any(k in plain.spec.env for k in session_hook.LANE_ENV_KEYS)
+              and plain.spec.settings_path == win._hook_settings_path)
+
+        win.top_bar.agent_lanes_btn.click()
+        check("lane service: the switch starts the poller at once",
+              win.lane_service.is_running() and win.manager.lane_awareness)
+        duo = run_dialog(lambda d: d.count_plus.click())
+        solo = run_dialog(lambda d: d.lane_check.click())[0]
+        win.lane_ops.drain(60)
+        a, b = duo
+        check("lane service: two laned agents and one opted out",
+              a.spec.lane and b.spec.lane and not solo.spec.lane)
+        env = a.spec.env
+        check("lane service: a laned agent gets the lane settings file",
+              a.spec.settings_path == win._lane_settings_path
+              and os.path.isfile(win._lane_settings_path))
+        board_dir = os.path.normcase(ws.board.dir)
+        lane_paths = [env.get(k, "") for k in (
+            session_hook.LANES_INDEX_ENV, session_hook.LANE_NOTICES_ENV,
+            session_hook.LANE_SEEN_ENV)]
+        check("lane service: ...and its hook env vars, every shared path "
+              "absolute and in the workspace's own .aihive",
+              all(os.path.isabs(p) and os.path.normcase(p).startswith(board_dir)
+                  for p in lane_paths)
+              and env.get(session_hook.LANE_ROOT_ENV) == a.spec.lane["root"]
+              and env.get(session_hook.LANE_UID_ENV) == a.spec.uid, env)
+        check("lane service: the opted-out agent keeps the shared settings and "
+              "no lane env", solo.spec.settings_path == win._hook_settings_path
+              and not any(k in solo.spec.env
+                          for k in session_hook.LANE_ENV_KEYS))
+        check("lane service: a laned agent is told to skim the roster",
+              "skim the roster" in a.spec.system_prompt
+              and "lane notice" in a.spec.system_prompt)
+        check("lane service: an agent without a lane still reads the board",
+              "BEFORE starting substantial work" in solo.spec.system_prompt
+              and "skim" not in solo.spec.system_prompt)
+
+        poll()
+        index_file = Path(svc.index_path(ws))
+        idx = json.loads(index_file.read_text(encoding="utf-8"))
+        check("lane service: lanes.json is written in the workspace's .aihive",
+              idx.get("enabled") is True
+              and set(idx["lanes"]) == {a.spec.uid, b.spec.uid})
+        card_a = win._pages[ws.id].card_for(a.id)
+        card_b = win._pages[ws.id].card_for(b.id)
+        check("lane service: a quiet lane's chip is neutral",
+              card_a.lane_mark.isVisibleTo(card_a)
+              and card_a.lane_mark.property("lane") == "clean"
+              and a.spec.lane["branch"] in card_a.lane_mark.toolTip())
+        check("lane service: an agent without a lane has no chip",
+              not win._pages[ws.id].card_for(solo.id).lane_mark.isVisibleTo(
+                  win._pages[ws.id].card_for(solo.id)))
+
+        # --- an overlap appears: A commits a.txt, B edits it ----------------
+        _commit(a.spec.lane["root"], "a.txt", "A's\n")
+        (Path(b.spec.lane["root"]) / "a.txt").write_text("B's draft\n")
+        poll()
+        check("lane service: both chips go amber on the overlap",
+              card_a.lane_mark.property("lane") == "overlap"
+              and card_b.lane_mark.property("lane") == "overlap",
+              (card_a.lane_mark.property("lane"),
+               card_b.lane_mark.property("lane")))
+        check("lane service: the chip counts commits and uncommitted files",
+              "↑1" in card_a.lane_mark.text()
+              and "±1" in card_b.lane_mark.text(),
+              (card_a.lane_mark.text(), card_b.lane_mark.text()))
+        check("lane service: the tooltip names the file and the peer",
+              "a.txt" in card_a.lane_mark.toolTip()
+              and b.spec.name in card_a.lane_mark.toolTip())
+        idx = json.loads(index_file.read_text(encoding="utf-8"))
+        check("lane service: lanes.json lists both owners of a.txt",
+              sorted(o["uid"] for o in idx["files"].get("a.txt", []))
+              == sorted([a.spec.uid, b.spec.uid]), idx.get("files"))
+        na = Path(svc.notices_path(ws, a.spec.uid))
+        check("lane service: each agent gets a notice for the new overlap",
+              na.is_file() and "a.txt" in na.read_text(encoding="utf-8")
+              and Path(svc.notices_path(ws, b.spec.uid)).is_file())
+        before = na.read_text(encoding="utf-8")
+        poll()
+        check("lane service: the same overlap is not noticed twice",
+              na.read_text(encoding="utf-8") == before)
+        rows = [r for r in win.event_hub.records if r["kind"] == el.LANE]
+        check("lane service: lane creation is in the event log",
+              sum("got its own lane" in r["text"] for r in rows) == 2, rows)
+        overlap_rows = [r for r in rows if "same files" in r["text"]]
+        check("lane service: the overlap is ONE event-log row for the pair",
+              len(overlap_rows) == 1 and "a.txt" in overlap_rows[0]["text"],
+              rows)
+        board = Path(ws.board.path).read_text(encoding="utf-8")
+        check("lane service: the board roster gains the lane columns",
+              "| Lane | Ahead/Dirty | Touching |" in board
+              and a.spec.lane["branch"] in board and "a.txt" in board)
+
+        # --- it becomes a conflict ------------------------------------------
+        _git(b.spec.lane["root"], "add", "a.txt")
+        _git(b.spec.lane["root"], "commit", "-q", "-m", "B's")
+        poll()
+        check("lane service: a real conflict turns the chips red",
+              card_a.lane_mark.property("lane") == "conflict"
+              and card_b.lane_mark.property("lane") == "conflict")
+        rows = [r for r in win.event_hub.records if r["kind"] == el.LANE]
+        check("lane service: the conflict gets its own event-log row",
+              sum("would conflict" in r["text"] for r in rows) == 1, rows)
+        check("lane service: event-log lane rows show by default",
+              "lanes" in el.DEFAULT_GROUPS
+              and el.describe(rows[-1]) == rows[-1]["text"])
+
+        # --- the Activity panel ---------------------------------------------
+        win._toggle_activity(ws.id)
+        panel = win.activity_panel
+        check("lane service: the Activity panel lists the lanes",
+              panel.lanes_label.isVisibleTo(panel)
+              and a.spec.lane["branch"] in panel.lanes_label.text()
+              and "conflicts with" in panel.lanes_label.text())
+        check("lane service: changed files are listed per lane",
+              f"{b.spec.name}'s lane:" in panel.files_label.text()
+              and "Workspace folder:" in panel.files_label.text())
+        win._toggle_activity(ws.id)
+
+        # --- the folder lock --------------------------------------------------
+        lock = win.lane_ops.lock_for(str(work))
+        done = threading.Event()
+        lock.acquire()
+        try:
+            t = threading.Thread(target=lambda: (lanes.snapshot_repo(
+                str(work), [_entry("A", "A", a.spec.lane)], lock=lock),
+                done.set()), daemon=True)
+            t.start()
+            time.sleep(0.4)
+            waited = not done.is_set()
+        finally:
+            lock.release()
+        t.join(30)
+        check("lane service: a poll waits while a lane job holds the folder "
+              "lock (so no git runs inside a lane being removed)",
+              waited and done.is_set())
+
+        # --- the fast-forward action ------------------------------------------
+        c = run_dialog()[0]
+        win.lane_ops.drain(60)
+        _push_to_base(tmp, work, "sub/b.txt", "landed\n")
+        win.lane_service.fetch()
+        win.lane_ops.drain(60)
+        poll()
+        view_c = win.lane_service.view(c.spec.uid)
+        check("lane service: the periodic fetch sees the base move",
+              view_c is not None and view_c.behind == 1 and view_c.can_refresh(),
+              view_c)
+        win._on_lane_action(ws.id, c.id, "refresh")
+        win.lane_ops.drain(30)
+        check("lane service: Update lane fast-forwards an empty lane",
+              _git(c.spec.lane["root"], "rev-parse", "HEAD")
+              == _git(work, "rev-parse", "origin/main"))
+        check("lane service: ...audited, and the agent is told on its next "
+              "prompt", "LANE-REFRESH" in _log(store)
+              and "fast-forwarded" in Path(svc.notices_path(
+                  ws, c.spec.uid)).read_text(encoding="utf-8"))
+        win._on_lane_action(ws.id, a.id, "refresh")
+        win.lane_ops.drain(30)
+        check("lane service: ...and refuses a lane with its own commits",
+              "LANE-FAIL unmerged refresh" in _log(store))
+        check("lane service: nothing was written inside a lane's .aihive",
+              not any(os.path.exists(os.path.join(x.spec.lane["root"],
+                                                  ".aihive"))
+                      for x in (a, b, c)))
+
+        # --- the switch goes off ----------------------------------------------
+        win.top_bar.agent_lanes_btn.click()
+        check("lane service: switching off stops the poller",
+              not win.lane_service.is_running())
+        idx = json.loads(index_file.read_text(encoding="utf-8"))
+        check("lane service: ...and silences running agents' hooks at once",
+              idx.get("enabled") is False)
+        check("lane service: ...chips go neutral and say the switch is off",
+              card_a.lane_mark.property("lane") == "clean"
+              and "Turn on Agent lanes" in card_a.lane_mark.toolTip()
+              and card_a.lane_mark.isVisibleTo(card_a))
+        check("lane service: ...the lane env and settings are taken back",
+              not any(k in a.spec.env for k in session_hook.LANE_ENV_KEYS)
+              and a.spec.settings_path == win._hook_settings_path)
+        check("lane service: ...and laned agents read the whole board again",
+              "BEFORE starting substantial work" in a.spec.system_prompt
+              and "skim" not in a.spec.system_prompt
+              and a.spec.lane["branch"] in a.spec.system_prompt)
+        check("lane service: ...nothing on the board says lanes are moving",
+              all(x.lane_view is None for x in (a, b, c)))
+        for agent in list(ws.agents):
+            win._close_agent(ws.id, agent.id)
+        win.lane_ops.drain(60)
+    for box in list(win._lane_boxes):
+        box.close()
+    win.close()
+    win.deleteLater()
+    check("lane service: the real .venv survived",
+          (work / ".venv" / "marker.txt").read_text() == "real venv")

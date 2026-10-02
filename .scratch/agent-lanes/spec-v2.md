@@ -5,8 +5,10 @@ Status: needs-triage
 Author: Agent 47, 2026-10-02. Supersedes `spec.md` (v1), which is kept for
 history. v2 folds in the first review (see "Changes from v1" at the bottom).
 Code so far: Phase 0 in PR #35 (`feat/board-rotation`); the master switch and
-Phase 1 in PR #36 (`feat/agent-lanes`). Phases 2 to 4 are still a plan. Implementation
-notes and Step 0 results are under `## Comments` at the bottom.
+Phase 1 in PR #36 (`feat/agent-lanes`); Phase 2 (except other providers) on
+`feat/lane-awareness`, stacked on Phase 1, uncommitted. Phases 3 and 4 are
+still a plan. Implementation notes and Step 0 results are under `## Comments`
+at the bottom.
 
 Note: an earlier draft by another agent, `docs/ISOLATED-AGENT-TASKS-PLAN.md`,
 covers the same ground (task worktrees, advisory file claims, reviewer agent,
@@ -792,3 +794,150 @@ notices, roster columns, event-log rows, other providers,
   checkout still has untracked copies, and git will refuse to check out or
   merge this branch there until they are moved aside. Once it is merged,
   append review comments to the tracked copy.
+
+### Phase 2 implemented (Agent 47, 2026-10-02)
+
+Implementation notes, the Step 0 check 2 result, and one finding that
+matters before Phase 3.
+
+**Where:** worktree `..\ai-hive-lanes2`, branch `feat/lane-awareness`, cut
+from `feat/agent-lanes`@344a96b (PR #36). Uncommitted, not pushed. Version
+0.26.0 with a matching CHANGELOG section, README count 2408 (+116 checks).
+Quick suite 2393 pass, 1 fail (the known `pty width`, also failing on clean
+main). Phase 0's `feat/board-rotation` is NOT merged in: this branch touches
+`_render_roster` and `roster_row` too, so expect a small conflict there when
+both land (keep Phase 0's whitespace collapse and task fallback, add the lane
+columns after them).
+
+**Step 0 check 2, run live (Claude Code 2.1.287, haiku, AI Hive's real
+delivery path, scratch folder):**
+- PostToolUse `hookSpecificOutput.additionalContext` reaches the model (the
+  transcript records it as a `hook_additional_context` attachment).
+- UserPromptSubmit `additionalContext` reaches the model too.
+- A UserPromptSubmit hook does NOT drop the first delivered task: it fires
+  after the submit, unlike SessionStart/`startup`. 3 of 3 runs delivered.
+- Then the real implementation, live: a laned haiku agent, a stubbed peer
+  lane with an uncommitted `a.txt`, and one notice queued before the first
+  prompt. The notice arrived with the prompt, the edit of `a.txt` drew the
+  overlap warning naming the peer and its branch, the agent quoted both, and
+  both keys landed in its seen file.
+
+**Finding, pre-existing and NOT lane-specific: a task delivered at launch is
+lost in a fresh git folder.** In a git repo, after the trust dialog, Claude
+draws the footer `_has_ready_hint` keys on ("... ← for agents") before its
+input box accepts text, so `_write_task_to_pty` types the task into a dead
+spot below the box and it is never submitted. Reproduced 3/3 in a fresh git
+folder with no lanes and no lane hooks, and 0/3 in a plain folder (the e2e
+test uses a plain folder, so the suite can't see it). A user typing is fine;
+programmatic delivery (`deliver_task` at launch) is not. Every new lane is a
+fresh git folder, and Phase 3 delivers the integrator's brief through exactly
+this path, so fix it before Phase 3: a settle delay after the first ready
+hint in a git folder, or a stricter ready signal. My live check worked by
+delivering 6 s after ready.
+
+**What exists now (names Phase 3 can rely on):**
+- `app/lanes.py`, Phase 2 section (Qt-free, read-only, lock-free):
+  `status_paths` (porcelain v2 `-z`: the runner strips output, and v1's
+  leading space would be eaten), `committed_paths`, `base_paths`,
+  `merge_conflicts` (`merge-tree --write-tree --name-only -z`: rc 0 clean,
+  1 conflicts, else None), `snapshot_repo(repo, entries, cache, lock=)`
+  -> `RepoSnapshot` (`lanes`, `overlaps`, `view(uid)`, `index()`),
+  `LaneSnap`, `Overlap` (`level`, `key`), `LaneView` (`state`, `touching()`,
+  `can_refresh()`), `describe_overlap`, `to_repo_path`. Writes refs, so
+  queued: `fetch_base`, `refresh_lane` (`--ff-only` only). Plus
+  `copy_worktree_includes`, called by `create_lane` and by `repair_lane` when
+  it re-adds a folder.
+- `app/lane_service.py`: `LaneService` (`start`, `stop`, `shutdown`, `poke`,
+  `poll`, `fetch`, `views(ws_id)`, `view(uid)`, `drain()` for tests),
+  signals `lanesChanged(ws_id, {uid: LaneView})` and
+  `overlapFound(ws_id, uid, {peer, peer_uid, level, paths})`. Helpers
+  `index_path(ws)`, `notices_path(ws, uid)`, `seen_path(ws, uid)`: all under
+  `ws.board.dir`, absolute.
+- `app/lane_ops.py`: `lock_for(repo)`, and `submit(..., exclusive=False)`
+  for a job that never touches a lane folder (the fetch).
+- `app/session_hook.py`: `EDIT_TOOLS`, `LANE_*_ENV`, `LANE_ENV_KEYS`,
+  `write_lanes_index`, `read_lanes_index`, `append_notice`, `read_seen`,
+  `lane_overlap_context`, `lane_notice_context`,
+  `write_settings_file(..., lanes=True)`.
+- `MainWindow`: `lane_service`, `_lane_settings_path`, `_arm_lane_hooks`,
+  `_apply_lane_machinery` (the one place the switch takes effect),
+  `_on_lanes_changed`, `_push_lane_view`, `_on_lane_overlap`,
+  `_on_lane_action`. `WorkspaceManager`: `lane_awareness`,
+  `reapply_coordination()`, `set_lane_views()`. `TerminalAgent.lane_view`
+  (transient). `TerminalCard.lane_mark` (`#CardLane`), `set_lane_view`,
+  `laneActionRequested`. `event_log.LANE` and the "Lanes" filter group (on
+  by default). `EventHub.lane_event`.
+
+**Choices the plan did not spell out, or that differ from it:**
+- **Other providers are NOT done.** Codex gets no board and has no hook
+  equivalent, Gemini reads the board through project context files, and the
+  revive picker (`lane_conversations`) only reads Claude transcripts. Each
+  needs its own live Step 0 run and a provider-specific revive. Left for a
+  follow-up; the dialog still offers lanes to Claude only.
+- **Lane hooks live in a separate settings file** (`aihive_lane_hook.json`),
+  given only to laned Claude agents while the switch is on. Nobody else pays
+  for a hook process per edit, and the shared file keeps exactly today's
+  hooks. Measured cost: about 40 ms per edit once warm (the first run took
+  about 200 ms).
+- **The switch takes effect at once where it can.** Off: the poller stops,
+  every lanes.json it wrote gets `"enabled": false` (running agents' hooks go
+  quiet mid-run), chips go neutral, and env, settings and prompt are rebuilt
+  for each agent's next launch. On: the same, the other way. A laned agent
+  that was already running when the switch went on gets its hooks at its
+  next launch (Claude snapshots hooks at start).
+- **Dedupe key is (file, peer, LEVEL)**, level being overlap or conflicts,
+  not the raw state. A peer committing a change it already had uncommitted is
+  not news; the change becoming a conflict is. The overlap hook and the
+  notices share one seen file, so an agent is told once whichever path got
+  there first.
+- **The overlap hook also warns about edits OUTSIDE the agent's own lane**
+  (the main checkout, another lane), once per file. Files outside the repo
+  and its lanes (memory, scratchpads) stay silent. Cheap, and it enforces
+  the "never touch other worktrees" line in the lane prompt.
+- **"Clean up lane" is "Update lane to origin/main (fast-forward)".** A live
+  lane can't be removed under its agent, so the useful action for a clean,
+  merged lane is to move it to the newest base. `--ff-only`, refused for a
+  dirty lane or one with commits. The agent gets a notice that its files may
+  have changed. This is Phase 3's "keeping idle lanes fresh", by hand.
+- **The folder lock** (`lock_for`). Not in the plan, needed on Windows: the
+  poller's `git status` running inside a lane at the moment
+  `git worktree remove` deletes it would leave a half-deleted worktree.
+  Exclusive LaneOps jobs hold the repo's lock; the poller takes it per lane
+  read, so a create waits for at most one lane's read. Mutation-tested: the
+  test fails without it.
+- **Notices on the first poll after a start** skip keys already in the
+  agent's seen file. Event-log rows on that first poll are only seeded, never
+  written: those overlaps were news in the run that first saw them.
+- **Event-log rows** come one per unordered pair and level ("changed the
+  same files as Agent 6: a.txt", "would conflict with Agent 6 on a.txt"),
+  plus one per lane created. Not one per file.
+- **lanes.json covers the whole repo.** Two workspaces on one repo see each
+  other's lanes, so each workspace's lanes.json gets the same index.
+- **Roster columns appear only when the workspace has a laned agent**, so
+  every other board keeps its old table shape.
+- **The File Map** keys files by their repo path (`to_repo_path`), so one file
+  edited in three lanes is one row with three connectors. Opening a file
+  opens the editing agent's own copy, and the right-click menu lists each
+  agent's copy when they differ.
+
+**Tests** (`tests/smoke/lanes.py`, 5 new tests, 116 checks, real temp repos,
+stubbed workers): `test_lane_awareness_core`, `test_lane_hooks` (the hook
+run as a subprocess), `test_lane_roster_columns`, `test_lane_file_map`,
+`test_lane_service_window`. New helpers: `_lane_for` (a real lane via
+`create_lane`), `_commit`, `_entry`, `_push_to_base` (lands a commit on
+origin/main from a separate clone), `_run_hook`, `_context`. Mutation-checked:
+dropping the folder lock, or arming lane hooks with the switch off, each
+fails a check.
+
+**For whoever builds Phase 3 on this:**
+- Fix the git-folder first-task delivery above first; the integrator's brief
+  depends on it.
+- `LaneService.view(uid)` already has what the queue row needs (ahead,
+  behind, dirty, overlaps), and `lanes.merge_conflicts(repo, a, b)` is the
+  precomputed merge-tree result the brief wants. The "base moved" check
+  should resolve the base with `lanes.start_ref` like everything else.
+- A queued notice is the way to tell an agent something without retasking
+  it: `session_hook.append_notice(lane_service.notices_path(ws, uid), key,
+  text)`. It arrives with the agent's next prompt, once.
+- Every new lane git mutation: through `lane_ops`, exclusive unless it never
+  touches a lane folder.

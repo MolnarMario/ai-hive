@@ -45,7 +45,18 @@ shared `info/exclude`, so a stray copy inside a lane can never be committed.
 Junctions: `.venv`, `venv` and `node_modules` are linked into a new lane when
 they exist at the repo root AND git ignores them, so the project's usual test
 command works unchanged in a lane. They point at the main checkout's copy: an
-install run inside a lane writes there.
+install run inside a lane writes there. Other gitignored local files (a
+`.env`) are COPIED into a new lane when the repo's `.worktreeinclude` names
+them (gitignore syntax, the same file and rule Claude Code's own worktrees
+use).
+
+Awareness (Phase 2, bottom of this file): `snapshot_repo` reads every lane
+of a repo (head, ahead/behind, committed and uncommitted files, what the
+base changed since the fork) and finds overlaps: files two lanes both
+changed, and files a lane changed that the base changed too. When both
+sides committed, a real in-memory merge (`git merge-tree --write-tree`, git
+2.38+) says whether they CONFLICT. All of it is read-only and lock-free, so
+app/lane_service.py polls it off the LaneOps queue.
 """
 
 from __future__ import annotations
@@ -417,6 +428,7 @@ def create_lane(lane: dict) -> dict:
                                     f": {exc}")
     _git_or_fail(["worktree", "add", "--track", "-b", branch, root, start], repo)
     link_junctions(repo, root)
+    copy_worktree_includes(repo, root)
     ensure_exclude(repo)
     return {**clean_lane(lane), "base": base}
 
@@ -456,6 +468,7 @@ def repair_lane(lane: dict) -> tuple:
                      repo)
         recreated = True
     link_junctions(repo, root)
+    copy_worktree_includes(repo, root)      # the re-added folder lost them
     ensure_exclude(repo)
     return {**clean_lane(lane), "base": base}, recreated
 
@@ -712,3 +725,467 @@ def lane_conversations(repo: str, exclude_roots=(), exclude_ids=()) -> list:
                 repo=os.path.normpath(repo)))
     out.sort(key=lambda c: c.mtime, reverse=True)
     return out
+
+
+# --------------------------------------------- awareness (Phase 2) ---
+# What each lane holds and where lanes overlap, for app/lane_service.py's
+# poller. All read-only and lock-free, so the poller calls them directly,
+# off the LaneOps queue: status and diff run with --no-optional-locks (no
+# index refresh, so no index.lock), and `merge-tree --write-tree` only adds
+# objects to the object store (atomic files; no index, no refs). Anything
+# that writes refs (fetch, the fast-forward refresh) is further down and
+# goes through LaneOps like every other mutation.
+
+# `merge-tree --write-tree` (a real three-way merge with no checkout)
+# arrived in git 2.38. Older git falls back to file overlap only.
+MERGE_TREE_MIN = (2, 38)
+# a lane with a huge untracked tree must not make every poll slow and every
+# lanes.json huge: past this many paths the rest are ignored
+PATHS_CAP = 2000
+MERGE_TIMEOUT = 60.0
+FETCH_TIMEOUT = 120.0
+
+_git_version: list = []         # cached (major, minor); tests may clear it
+
+
+def git_version() -> tuple:
+    if not _git_version:
+        r = git(["version"], "")
+        m = re.search(r"(\d+)\.(\d+)", r.out or "")
+        _git_version.append((int(m.group(1)), int(m.group(2))) if m
+                            else (0, 0))
+    return _git_version[0]
+
+
+def merge_tree_supported() -> bool:
+    return git_version() >= MERGE_TREE_MIN
+
+
+def _z_list(out: str) -> list:
+    return [p for p in (out or "").split("\0") if p][:PATHS_CAP]
+
+
+def status_paths(root: str) -> list:
+    """Repo-relative paths with uncommitted changes in a checkout (modified,
+    staged, untracked, the new name of a rename). Porcelain v2 with -z: no
+    quoting, and no line starts with a space (the runner strips output)."""
+    r = git(["--no-optional-locks", "status", "--porcelain=v2", "-z",
+             "--untracked-files=all"], root)
+    if not r.ok:
+        raise LaneError("git", f"could not read the lane's status: {r.err}")
+    toks, out, i = r.out.split("\0"), [], 0
+    while i < len(toks) and len(out) < PATHS_CAP:
+        tok = toks[i]
+        i += 1
+        if tok.startswith("1 "):
+            parts = tok.split(" ", 8)
+        elif tok.startswith("2 "):
+            parts = tok.split(" ", 9)
+            i += 1                      # the next token is the old name
+        elif tok.startswith("u "):
+            parts = tok.split(" ", 10)
+        elif tok.startswith("? "):
+            parts = ["", tok[2:]]
+        else:
+            continue                    # "! ignored" or noise
+        if parts and parts[-1]:
+            out.append(parts[-1])
+    return out
+
+
+def committed_paths(root: str, base_ref: str) -> list:
+    """Paths the lane's own commits changed since it forked from the base."""
+    r = git(["--no-optional-locks", "diff", "--name-only", "-z",
+             f"{base_ref}...HEAD"], root)
+    return _z_list(r.out) if r.ok else []
+
+
+def base_paths(root: str, base_ref: str) -> list:
+    """Paths the BASE changed since the lane forked from it: what a merge of
+    the base into the lane would bring in."""
+    r = git(["--no-optional-locks", "diff", "--name-only", "-z",
+             f"HEAD...{base_ref}"], root)
+    return _z_list(r.out) if r.ok else []
+
+
+def merge_conflicts(cwd: str, a: str, b: str):
+    """Paths that would conflict if commits `a` and `b` were merged, from a
+    real three-way merge done in memory (`git merge-tree --write-tree`). []
+    when they merge cleanly, None when git can't say (old git, an error)."""
+    r = git(["merge-tree", "--write-tree", "--name-only", "--no-messages",
+             "-z", a, b], cwd, MERGE_TIMEOUT)
+    if r.rc == 0:
+        return []
+    if r.rc == 1:
+        return _z_list(r.out)[1:]       # the first entry is the tree id
+    return None
+
+
+@dataclass
+class LaneSnap:
+    """One lane at one poll. Paths are repo-relative with "/" separators."""
+    uid: str
+    agent: str
+    ws_id: str
+    branch: str
+    root: str
+    base: str = ""
+    base_ref: str = ""
+    exists: bool = True
+    head: str = ""
+    ahead: int = 0
+    behind: int = 0
+    dirty: list = field(default_factory=list)        # uncommitted
+    committed: list = field(default_factory=list)    # own commits since fork
+    base_changed: list = field(default_factory=list)  # base, since the fork
+    error: str = ""
+
+    def files(self) -> dict:
+        """path -> "committed" | "dirty" (uncommitted wins: it is newest)."""
+        out = {p: "committed" for p in self.committed}
+        out.update({p: "dirty" for p in self.dirty})
+        return out
+
+
+OVERLAP = "overlap"
+CONFLICTS = "conflicts"
+
+
+@dataclass
+class Overlap:
+    """A file this lane changed that someone else changed too. `peer_uid` is
+    "" when the someone is the base branch (it moved since the lane forked).
+    `state` is the peer's: "dirty" or "committed", or "conflicts" when a
+    real merge of the two sides conflicts on this file."""
+    path: str
+    peer_uid: str
+    peer: str
+    peer_branch: str
+    state: str
+
+    @property
+    def level(self) -> str:
+        return CONFLICTS if self.state == CONFLICTS else OVERLAP
+
+    @property
+    def key(self) -> str:
+        """Dedupe key for notices and warnings. Uses the level, not the raw
+        state: a peer committing a change it already had uncommitted is not
+        news, the change turning into a conflict is."""
+        return f"{self.path}|{self.peer_uid or 'base'}|{self.level}"
+
+
+@dataclass
+class LaneView:
+    """What the UI shows for one laned agent: the card chip, the Activity
+    panel, the roster columns. Built from a RepoSnapshot."""
+    uid: str
+    branch: str
+    root: str
+    base: str = ""
+    base_ref: str = ""
+    exists: bool = True
+    ahead: int = 0
+    behind: int = 0
+    dirty: list = field(default_factory=list)
+    committed: list = field(default_factory=list)
+    overlaps: list = field(default_factory=list)
+    error: str = ""
+
+    @property
+    def state(self) -> str:
+        """"conflict", "overlap" or "clean", for the chip's colour."""
+        if any(o.level == CONFLICTS for o in self.overlaps):
+            return "conflict"
+        return "overlap" if self.overlaps else "clean"
+
+    def touching(self) -> list:
+        """Every file this lane changed, committed or not, sorted."""
+        return sorted(set(self.committed) | set(self.dirty))
+
+    def can_refresh(self) -> bool:
+        """A fast-forward to the base is safe and useful: nothing of its own
+        (no commits, nothing uncommitted) and the base has moved on."""
+        return (self.exists and not self.dirty and not self.ahead
+                and self.behind > 0 and bool(self.base_ref))
+
+
+@dataclass
+class RepoSnapshot:
+    repo: str
+    lanes: list = field(default_factory=list)       # [LaneSnap]
+    overlaps: dict = field(default_factory=dict)    # uid -> [Overlap]
+    merge_tree: bool = False
+    ts: float = 0.0
+
+    def lane(self, uid: str):
+        return next((s for s in self.lanes if s.uid == uid), None)
+
+    def view(self, uid: str):
+        s = self.lane(uid)
+        if s is None:
+            return None
+        return LaneView(uid=s.uid, branch=s.branch, root=s.root, base=s.base,
+                        base_ref=s.base_ref, exists=s.exists, ahead=s.ahead,
+                        behind=s.behind, dirty=list(s.dirty),
+                        committed=list(s.committed),
+                        overlaps=list(self.overlaps.get(uid, [])),
+                        error=s.error)
+
+    def index(self) -> dict:
+        """repo path -> [{uid, agent, branch, state}] over every lane, for
+        lanes.json (what the overlap hook reads). An owner's state is its own
+        "dirty"/"committed", or "conflicts" when its side of that file
+        conflicts with someone's."""
+        conflicted = {(uid, o.path) for uid, ovs in self.overlaps.items()
+                      for o in ovs if o.level == CONFLICTS}
+        out: dict = {}
+        for s in self.lanes:
+            for path, state in s.files().items():
+                if (s.uid, path) in conflicted:
+                    state = CONFLICTS
+                out.setdefault(path, []).append(
+                    {"uid": s.uid, "agent": s.agent, "branch": s.branch,
+                     "state": state})
+        return out
+
+
+def lane_snap(entry: dict) -> LaneSnap:
+    """Read one lane for a poll. Never raises: a lane that can't be read
+    comes back with `exists` False or an `error`."""
+    lane = entry["lane"]
+    root, repo = lane["root"], lane["repo"]
+    snap = LaneSnap(uid=entry["uid"], agent=entry.get("agent", ""),
+                    ws_id=entry.get("ws_id", ""), branch=lane["branch"],
+                    root=root, base=lane.get("base") or "")
+    try:
+        if not _is_worktree(root):
+            snap.exists = False
+            return snap
+        snap.base = snap.base or default_base(repo)
+        snap.base_ref = start_ref(repo, snap.base)
+        r = git(["rev-parse", "HEAD"], root)
+        if not r.ok:
+            raise LaneError("git", f"could not read the lane's HEAD: {r.err}")
+        snap.head = r.out
+        snap.dirty = status_paths(root)
+        if snap.base_ref:
+            r = git(["rev-list", "--left-right", "--count",
+                     f"{snap.base_ref}...HEAD"], root)
+            if r.ok:
+                try:
+                    snap.behind, snap.ahead = (int(x) for x in r.out.split())
+                except ValueError:
+                    pass
+            if snap.ahead:
+                snap.committed = committed_paths(root, snap.base_ref)
+            if snap.behind:
+                snap.base_changed = base_paths(root, snap.base_ref)
+    except LaneError as exc:
+        snap.error = str(exc)
+    return snap
+
+
+def _cached_conflicts(cache, cwd: str, a: str, b: str):
+    key = (a, b) if a <= b else (b, a)
+    if cache is not None and key in cache:
+        return cache[key]
+    found = merge_conflicts(cwd, a, b)
+    if cache is not None:
+        if len(cache) > 500:            # heads move on; old pairs are dead
+            cache.clear()
+        cache[key] = found
+    return found
+
+
+def snapshot_repo(repo: str, entries: list, cache: dict | None = None,
+                  now: float = 0.0, lock=None) -> RepoSnapshot:
+    """Every lane of one repository, and every overlap between them and with
+    their base. `entries` are {uid, agent, ws_id, lane} dicts.
+
+    Two lanes overlap on a file both changed (committed or not). When both
+    committed changes to it, a real merge of the two heads decides whether it
+    CONFLICTS. A lane overlaps its base on a file it changed that the base
+    also changed since the fork. `cache` maps a head pair to its merge result
+    (commits are immutable, so a result never goes stale); the poller keeps
+    one per repo. The base is compared by its ref name, which moves, so that
+    pair is cached under the base's resolved sha. `lock` (LaneOps.lock_for)
+    is held around each lane read, so no git process sits inside a lane
+    folder while a queued job removes it. Never raises for one bad lane."""
+    import contextlib
+    import time as _time
+    snap = RepoSnapshot(repo=repo, merge_tree=merge_tree_supported(),
+                        ts=now or _time.time())
+    for e in entries:
+        with lock if lock is not None else contextlib.nullcontext():
+            snap.lanes.append(lane_snap(e))
+    live = [s for s in snap.lanes if s.exists and s.head and not s.error]
+    files = {s.uid: s.files() for s in live}
+    ovs: dict = {}
+
+    def add(uid, overlap):
+        ovs.setdefault(uid, []).append(overlap)
+
+    for i, a in enumerate(live):
+        for b in live[i + 1:]:
+            shared = set(files[a.uid]) & set(files[b.uid])
+            if not shared:
+                continue
+            conflicts = set()
+            if (snap.merge_tree and a.head != b.head
+                    and set(a.committed) & set(b.committed)):
+                conflicts = set(_cached_conflicts(cache, repo, a.head,
+                                                  b.head) or ())
+            for path in sorted(shared):
+                hot = path in conflicts
+                add(a.uid, Overlap(path, b.uid, b.agent, b.branch,
+                                   CONFLICTS if hot else files[b.uid][path]))
+                add(b.uid, Overlap(path, a.uid, a.agent, a.branch,
+                                   CONFLICTS if hot else files[a.uid][path]))
+    base_heads: dict = {}
+    for s in live:
+        shared = set(files[s.uid]) & set(s.base_changed)
+        if not shared or not s.base_ref:
+            continue
+        conflicts = set()
+        if snap.merge_tree and set(s.committed) & shared:
+            if s.base_ref not in base_heads:
+                r = git(["rev-parse", s.base_ref], repo)
+                base_heads[s.base_ref] = r.out if r.ok else ""
+            if base_heads[s.base_ref]:
+                conflicts = set(_cached_conflicts(
+                    cache, repo, s.head, base_heads[s.base_ref]) or ())
+        for path in sorted(shared):
+            add(s.uid, Overlap(path, "", s.base_ref, s.base_ref,
+                               CONFLICTS if path in conflicts else "committed"))
+    snap.overlaps = ovs
+    return snap
+
+
+def describe_overlap(o: Overlap) -> str:
+    """One sentence for the agent that owns the lane, as a notice or a hook
+    warning. No em dashes: agents quote these back to the user."""
+    if not o.peer_uid:
+        if o.level == CONFLICTS:
+            return (f"{o.peer} changed {o.path} in a way that CONFLICTS with "
+                    f"your commits. Merge {o.peer} into your branch now and "
+                    f"resolve it while it is small.")
+        return (f"{o.peer} changed {o.path}, which you also changed. Merge "
+                f"{o.peer} into your branch now, while any conflict is small.")
+    who = f"{o.peer} ({o.peer_branch})"
+    if o.level == CONFLICTS:
+        return (f"Your commits and those of {who} both change {o.path} and "
+                f"would CONFLICT when merged. Keep your change there minimal "
+                f"and coordinate through the board.")
+    how = "uncommitted" if o.state == "dirty" else "committed"
+    return (f"{who} also changed {o.path} ({how}). Keep your change there "
+            f"small and local; the integrator merges both.")
+
+
+def to_repo_path(path: str, roots: dict) -> str:
+    """The main checkout's path for a file inside a lane (`roots` maps lane
+    root -> repo root); any other path comes back unchanged. Lets the File
+    Map show one tree for a repo, however many lanes touched it."""
+    if not path:
+        return path
+    norm = os.path.normpath(path)
+    for root, repo in roots.items():
+        try:
+            rel = os.path.relpath(norm, root)
+        except ValueError:                  # another drive
+            continue
+        if rel == os.curdir or rel == os.pardir or \
+                rel.startswith(os.pardir + os.sep):
+            continue
+        return os.path.join(repo, rel)
+    return path
+
+
+def fetch_base(repo: str, base: str) -> bool:
+    """`git fetch origin <base>`, so overlap checks see what landed on the
+    base. Writes refs: runs through LaneOps. False when there is no origin
+    or the fetch failed (offline is normal, not an error worth a dialog).
+    An empty `base` is looked up here, on the LaneOps worker."""
+    if not git(["remote", "get-url", "origin"], repo).ok:
+        return False
+    base = base or default_base(repo)
+    if not base:
+        return False
+    return git(["fetch", "--quiet", "--no-tags", "origin", base], repo,
+               FETCH_TIMEOUT).ok
+
+
+def refresh_lane(lane: dict) -> str:
+    """Fast-forward a lane that holds nothing of its own to its base, so the
+    agent starts its next task from the current base. Refuses a dirty lane
+    and a lane with commits of its own (only ever `--ff-only`: no merge
+    commit, no rewrite, nothing to lose). Returns the ref it moved to, ""
+    when it was already there. Writes refs: runs through LaneOps."""
+    st = lane_status(lane)
+    if not st.exists:
+        raise LaneError("missing", f"the lane folder {lane['root']} is gone")
+    if st.dirty:
+        raise LaneError("dirty", st.describe())
+    if st.ahead or not st.merged:
+        raise LaneError("unmerged", "the lane has commits of its own")
+    if not st.base_ref:
+        raise LaneError("base", "the lane has no base branch to follow")
+    if not st.behind:
+        return ""
+    _git_or_fail(["merge", "--ff-only", "--quiet", st.base_ref], lane["root"])
+    return st.base_ref
+
+
+# -------------------------------------------------- .worktreeinclude ---
+
+WORKTREEINCLUDE = ".worktreeinclude"
+INCLUDE_MAX_FILES = 200
+INCLUDE_MAX_BYTES = 50 * 1024 * 1024
+
+
+def copy_worktree_includes(repo: str, root: str) -> list:
+    """Copy the repo's gitignored local files that `.worktreeinclude`
+    (gitignore syntax, at the repo root) names into a new lane: a `.env`, a
+    local config. Only files git IGNORES are copied (a tracked file is
+    already in the lane), never anything under a junction, never over an
+    existing file, and at most INCLUDE_MAX_FILES / INCLUDE_MAX_BYTES.
+    Best-effort: returns the repo paths copied, never raises."""
+    import shutil
+    spec = os.path.join(repo, WORKTREEINCLUDE)
+    if not os.path.isfile(spec):
+        return []
+    r = git(["ls-files", "-z", "--others", "--ignored",
+             f"--exclude-from={spec}"], repo)
+    if not r.ok:
+        return []
+    cands = [p for p in _z_list(r.out)
+             if p.replace("\\", "/").split("/")[0] not in JUNCTION_NAMES]
+    cands = cands[:INCLUDE_MAX_FILES * 2]
+    ignored = []
+    for i in range(0, len(cands), 50):
+        chunk = cands[i:i + 50]
+        # -z needs --stdin, which the runner has no pipe for: read lines, and
+        # keep only exact matches (a name git had to quote is skipped)
+        r = git(["-c", "core.quotepath=off", "check-ignore", "--", *chunk],
+                repo)
+        if r.rc in (0, 1):          # 1 = none of these is ignored
+            wanted = set(chunk)
+            ignored.extend(ln for ln in r.out.splitlines() if ln in wanted)
+    copied, total = [], 0
+    for rel in ignored:
+        if len(copied) >= INCLUDE_MAX_FILES:
+            break
+        src, dst = os.path.join(repo, rel), os.path.join(root, rel)
+        try:
+            if not os.path.isfile(src) or os.path.lexists(dst):
+                continue
+            size = os.path.getsize(src)
+            if total + size > INCLUDE_MAX_BYTES:
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            total += size
+            copied.append(rel.replace("\\", "/"))
+        except OSError:
+            continue
+    return copied

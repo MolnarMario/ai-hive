@@ -403,6 +403,10 @@ class TerminalAgent(QObject):
         # Transient, never persisted. See hold_start.
         self._start_hold = ""
         self._start_deferred = False  # a start was asked for while held
+        # what AI Hive's lane poller last saw in this agent's lane
+        # (lanes.LaneView: ahead, dirty, overlaps), for the board roster.
+        # Transient: set by WorkspaceManager.set_lane_views, never persisted.
+        self.lane_view = None
         # bumped on every (re)start so a queued task-submit Enter from a prior
         # session is never delivered into a fresh, not-yet-ready TUI
         self._submit_gen = 0
@@ -1141,7 +1145,7 @@ class TerminalAgent(QObject):
             self.font_changed.emit(px)
 
     def roster_row(self) -> dict:
-        return {
+        row = {
             "name": self.spec.name, "role": self.spec.role,
             "provider": self.spec.provider,
             # match the Activity panel's fallback so both roster views agree
@@ -1149,6 +1153,21 @@ class TerminalAgent(QObject):
             "status": self.status.value, "task": self.current_task,
             "assignment": ASSIGNMENT_LABEL.get(self.assignment, ""),
         }
+        # the roster's lane columns (coordination._with_lane_columns): a laned
+        # agent is told to skim this table instead of the whole log
+        lane = getattr(self.spec, "lane", None) or {}
+        if lane.get("branch"):
+            row["lane"] = lane["branch"]
+            view = self.lane_view
+            if view is not None:
+                parts = [f"+{view.ahead}" if view.ahead else "",
+                         f"{len(view.dirty)} dirty" if view.dirty else ""]
+                row["ahead_dirty"] = " ".join(p for p in parts if p)
+                files = view.touching()
+                shown = ", ".join(files[:3])
+                row["touching"] = (shown + f" (+{len(files) - 3})"
+                                   if len(files) > 3 else shown)
+        return row
 
     def deliver_task(self, text: str) -> None:
         """Give this agent a task to work on (the reassign path).

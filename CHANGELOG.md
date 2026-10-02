@@ -8,6 +8,24 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.26.0
+
+- Agent lanes now keep agents aware of each other without reading the whole
+  board. Each laned agent's card shows its branch, commits ahead and
+  uncommitted files, and turns amber when another agent's lane (or the base
+  branch) changed one of the same files, red when the two would conflict.
+- A laned agent is warned the moment it edits a file another lane changed,
+  or edits outside its own lane, and is told on its next prompt when the base
+  branch changed a file it changed. Each warning comes once.
+- The board roster shows each agent's lane, how far ahead it is and which
+  files it is touching. The Activity panel lists lanes and their changed
+  files, the Agent/File Map shows one tree for the whole repository, and new
+  overlaps and conflicts appear in the event log.
+- The lane chip's menu opens the lane folder, and updates a lane with no work
+  of its own to the newest base branch.
+- A `.worktreeinclude` file in the repository names ignored local files (like
+  a `.env`) to copy into every new lane.
+
 ## 0.25.0
 
 - New in Options: Agent lanes, off by default. Turned on, every new Claude

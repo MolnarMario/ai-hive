@@ -50,7 +50,10 @@ This file holds only the rules that protect user data or fail silently.
   `worktree remove` or `-D` to `branch`. A laned agent's cwd never leaves its
   lane: a missing folder is repaired in place, never swapped for the
   workspace folder. Every lane git mutation goes through `MainWindow.lane_ops`
-  (one queue per repo), and only `lanes_enabled()` gates creating one.
+  (one queue per repo), and only `lanes_enabled()` gates creating one. Lane
+  reads off the queue (`app/lane_service.py`) hold `lane_ops.lock_for(repo)`
+  around each lane: Windows won't delete a folder that is some process's cwd,
+  so a poll inside a lane being removed leaves a half-deleted worktree.
 - Nothing renames an agent except the user.
 - No em dash in any string the user sees. `test_no_em_dashes_in_visible_text`
   enforces it for non-docstring literals.

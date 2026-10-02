@@ -6,6 +6,12 @@ log and a best-effort git changed-files list. This is the human-facing half
 of the shared-awareness feature; the agent-facing half is the board file
 (.aihive/board.md) that Claude agents read and write via their appended
 system prompt.
+
+With agent lanes (app/lanes.py) a Lanes section lists each laned agent's
+branch, commits ahead/behind, uncommitted files and overlaps, and the
+changed-files list is per checkout: the workspace folder's own `git status`,
+then each lane's uncommitted files. Lane data comes from MainWindow
+(`set_lanes`, fed by app/lane_service.py), so the panel runs no git for it.
 """
 
 from PySide6.QtCore import (QEasingCurve, QPropertyAnimation, Qt, Signal)
@@ -70,6 +76,8 @@ class ActivityPanel(QFrame):
         self._items: dict[str, AgentRosterItem] = {}
         self._project_path = ""
         self._git_cache: list[str] = []  # last git result (git is blocking)
+        self._lane_views: dict = {}      # agent uid -> lanes.LaneView
+        self._workspace = None
         self._open = False  # logical state, correct instantly (anim lags it)
         self._anim = QPropertyAnimation(self, b"maximumWidth", self)
         self._anim.setDuration(160)
@@ -98,6 +106,19 @@ class ActivityPanel(QFrame):
         self.roster_box = QVBoxLayout()
         self.roster_box.setSpacing(4)
         self.inner_lay.addLayout(self.roster_box)
+
+        # agent lanes: hidden until the workspace has a laned agent
+        self.lanes_header = QLabel("Lanes", inner)
+        self.lanes_header.setObjectName("ActivitySection")
+        self.inner_lay.addWidget(self.lanes_header)
+        self.lanes_label = QLabel("", inner)
+        self.lanes_label.setObjectName("ActivityLanes")
+        self.lanes_label.setWordWrap(True)
+        self.lanes_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.inner_lay.addWidget(self.lanes_label)
+        self.lanes_header.hide()
+        self.lanes_label.hide()
 
         self.log_header = QLabel("Shared log", inner)
         self.log_header.setObjectName("ActivitySection")
@@ -158,6 +179,74 @@ class ActivityPanel(QFrame):
             self._items[agent.id] = item
         self.refresh(workspace, with_git=True)
 
+    def set_lanes(self, views: dict) -> None:
+        """The lane poller's latest {agent uid: lanes.LaneView} for the shown
+        workspace ({} while Agent lanes is off). Cheap: no git."""
+        self._lane_views = dict(views or {})
+        if self._workspace is not None:
+            self._render_lanes(self._workspace)
+
+    def _laned(self, workspace) -> list:
+        return [a for a in workspace.agents
+                if (getattr(a.spec, "lane", None) or {}).get("branch")]
+
+    def _render_lanes(self, workspace) -> None:
+        laned = self._laned(workspace)
+        self.lanes_header.setVisible(bool(laned))
+        self.lanes_label.setVisible(bool(laned))
+        if laned:
+            self.lanes_header.setText(f"Lanes: {len(laned)}")
+            self.lanes_label.setText("\n".join(
+                self._lane_lines(a) for a in laned))
+        self._render_files(workspace)
+
+    def _lane_lines(self, agent) -> str:
+        lane = agent.spec.lane
+        view = self._lane_views.get(agent.spec.uid)
+        head = f"{agent.spec.name}  ⎇ {lane['branch']}"
+        if view is None:
+            return head + "\n  (details while Agent lanes is on)"
+        if not view.exists:
+            return head + "\n  (lane folder missing)"
+        counts = [f"↑{view.ahead}", f"↓{view.behind}",
+                  f"{len(view.dirty)} uncommitted"]
+        lines = [f"{head}  {' '.join(counts)}"]
+        for o in view.overlaps[:6]:
+            mark = "✖" if o.level == "conflicts" else "⚠"
+            if not o.peer_uid:
+                who = f"{o.peer} changed it too"
+            elif o.level == "conflicts":
+                who = f"conflicts with {o.peer}"
+            else:
+                who = f"{o.peer} changed it too"
+            lines.append(f"  {mark} {o.path}: {who}")
+        if len(view.overlaps) > 6:
+            lines.append(f"  ...and {len(view.overlaps) - 6} more overlaps")
+        return "\n".join(lines)
+
+    def _render_files(self, workspace) -> None:
+        main = ("\n".join(self._git_cache) if self._git_cache
+                else "(not a git repo, or no changes)")
+        laned = self._laned(workspace)
+        if not laned:
+            self.files_label.setText(main)
+            return
+        parts = ["Workspace folder:", main]
+        for agent in laned:
+            view = self._lane_views.get(agent.spec.uid)
+            parts.append("")
+            parts.append(f"{agent.spec.name}'s lane:")
+            if view is None:
+                parts.append("(details while Agent lanes is on)")
+            elif view.dirty:
+                shown = view.dirty[:30]
+                parts.extend(shown)
+                if len(view.dirty) > 30:
+                    parts.append(f"...and {len(view.dirty) - 30} more")
+            else:
+                parts.append("(no uncommitted changes)")
+        self.files_label.setText("\n".join(parts))
+
     def refresh(self, workspace, with_git: bool = False) -> None:
         """Update the roster + shared-board log (both cheap). The git changed-
         files scan is blocking, so it only runs when with_git=True — i.e. from
@@ -188,5 +277,5 @@ class ActivityPanel(QFrame):
                                else "_No shared activity logged yet._")
         if with_git:  # blocking git call — only on the slow path
             self._git_cache = coordination.git_changed_files(workspace.project_path)
-        self.files_label.setText("\n".join(self._git_cache) if self._git_cache
-                                 else "(not a git repo, or no changes)")
+        self._workspace = workspace
+        self._render_lanes(workspace)

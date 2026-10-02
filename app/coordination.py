@@ -28,22 +28,40 @@ _STATUS_ICON = {
 
 
 def system_prompt_text(workspace_name: str, agent_name: str,
-                       board_path: str, lane: dict | None = None) -> str:
+                       board_path: str, lane: dict | None = None,
+                       aware: bool = False) -> str:
     """The board etiquette every Claude agent gets, plus a lane section for
     an agent with its own git worktree (app/lanes.py). The board path is
-    always the workspace's own absolute one: a lane has no board of its own."""
+    always the workspace's own absolute one: a lane has no board of its own.
+
+    `aware`: the lane machinery runs for this agent (the Agent lanes switch
+    is on, so its overlap hooks are armed). Only then does a laned agent
+    swap "read the board first" for "skim the roster": AI Hive tells it
+    about a real overlap when one exists, and reading every note is the
+    token cost the feature exists to remove. Every other agent keeps the
+    full instruction, because the board is its only awareness."""
+    laned = bool(lane and lane.get("root") and lane.get("branch"))
+    if laned and aware:
+        read = ("Before starting substantial work, skim the roster at the "
+                "top of it to see who is working on what. You do not need "
+                "to read the whole log: AI Hive tells you when another "
+                "agent's lane or the base branch changes a file you changed "
+                "(an \"AI Hive lane notice\" in your context), so act on "
+                "those notices.")
+    else:
+        read = ("BEFORE starting substantial work, read it to see what the "
+                "other agents are doing and what is already done, so you "
+                "avoid duplicating their work.")
     text = (
         f"You are the agent \"{agent_name}\", one of several AI Hive agents "
         f"working together in the \"{workspace_name}\" workspace. A shared "
-        f"coordination board is at {board_path}. BEFORE starting substantial "
-        f"work, read it to see what the other agents are doing and what is "
-        f"already done, so you avoid duplicating their work. When you start a "
+        f"coordination board is at {board_path}. {read} When you start a "
         f"task, finish one, or change an important file, record it by calling "
         f"the `log_activity` MCP tool with a terse one-line message (e.g. "
         f"\"implementing auth in login.py\"). Do NOT edit board.md directly; "
         f"AI Hive serializes those writes through the tool so concurrent agents "
         f"can't clobber each other's entries.")
-    if lane and lane.get("root") and lane.get("branch"):
+    if laned:
         base = lane.get("base") or "the base branch"
         text += (
             f" You work in your own git worktree (your lane) at {lane['root']}, "
@@ -55,6 +73,21 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"count: that is done once per pull request, when your work is "
             f"integrated.")
     return text
+
+
+def _with_lane_columns(lines: list, rows: list) -> list:
+    """Add Lane, Ahead/Dirty and Touching to a rendered roster table, for a
+    workspace with laned agents (app/lanes.py). A laned agent is told to
+    skim this roster instead of reading the log, so the columns say who is
+    changing what. Without lanes the table keeps its old shape."""
+    head, sep, body = lines[:2], lines[2:4], lines[4:]
+    out = head + [sep[0] + " Lane | Ahead/Dirty | Touching |",
+                  sep[1] + "---|---|---|"]
+    for line, r in zip(body, rows):
+        cells = [(r.get(k) or "").replace("|", "/").strip() or "-"
+                 for k in ("lane", "ahead_dirty", "touching")]
+        out.append(line + " " + " | ".join(cells) + " |")
+    return out
 
 
 def sanitize_text(text: str) -> str:
@@ -133,6 +166,8 @@ class WorkspaceBoard:
             task = (r.get("task") or "").replace("|", "/") or "-"
             lines.append(f"| {r.get('name','?')} | {r.get('role','')} | "
                          f"{model} | {icon} {r.get('status','')} | {task} |")
+        if any(r.get("lane") for r in rows):
+            lines = _with_lane_columns(lines, rows)
         return "\n".join(lines)
 
     def _write(self, text: str) -> bool:

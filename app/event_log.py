@@ -51,6 +51,7 @@ SCHED_MISSED = "sched_missed"    # ...or could not be delivered in time
 CRASHED = "crashed"              # the process crashed or exited with an error
 LIFECYCLE = "lifecycle"          # started/stopped/added/removed/renamed
 BOARD = "board"                  # a line an agent posted to the shared board
+LANE = "lane"                    # agent lanes: created, overlap/conflict seen
 
 # Closing kinds render into the row they close rather than as rows of their
 # own. The limit outcomes are deliberately NOT here: "Agent 3 resumed at 17:31"
@@ -74,6 +75,7 @@ GROUPS = (
     ("scheduled", "Scheduled", (SCHED_SENT,), False),
     ("lifecycle", "Lifecycle", (LIFECYCLE,), False),
     ("board", "Board", (BOARD,), False),
+    ("lanes", "Lanes", (LANE,), True),
 )
 GROUP_OF = {k: g for g, _l, kinds, _d in GROUPS for k in kinds}
 DEFAULT_GROUPS = frozenset(g for g, _l, _k, on in GROUPS if on)
@@ -242,7 +244,7 @@ def describe(rec: dict) -> str:
         return f'scheduled message NOT sent{why}: "{first_line(text)}"'
     if kind == CRASHED:
         return text or "crashed"
-    if kind in (LIFECYCLE, BOARD):
+    if kind in (LIFECYCLE, BOARD, LANE):
         return text
     return text or kind
 
