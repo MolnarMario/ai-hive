@@ -29,7 +29,8 @@ em dashes: this text is shown in the app.
   from the name you gave. It starts at 1 and can't go past the workspace's
   free slots. Resuming a past conversation keeps it at 1.
 - New Workspace can start from a GitHub repository: paste its URL and AI Hive
-  clones the main branch into a new folder and opens a workspace there.
+  clones its default branch (main, master or any other name) into a new folder
+  and opens a workspace there.
 
 ## 0.23.0
 

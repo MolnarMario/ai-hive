@@ -512,8 +512,8 @@ error dialog instead of silently closing. Packaging to a distributable
 - **Workspaces** — `+` in the sidebar (or `Ctrl+Shift+N`). Every workspace is
   tied to a project folder you pick at creation; terminals open there.
   The New Workspace dialog can also take a GitHub repository URL instead: it
-  clones the repo's `main` branch into a new folder and opens the workspace
-  there.
+  clones the repo's default branch (`main`, `master` or whatever it is
+  called) into a new folder and opens the workspace there.
   Double-click a row to rename, `✕` deletes (confirmation appears only when
   terminals are running). `☰` / `Ctrl+Shift+B` collapses the sidebar.
 - **Agents** — `+ Terminal` (or `Ctrl+Shift+T`), or click any empty grid slot.
@@ -802,7 +802,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2283 checks drive the real app headlessly (offscreen Qt platform) with real
+2292 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -939,7 +939,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2283 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2292 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
