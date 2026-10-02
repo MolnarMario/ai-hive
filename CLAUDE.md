@@ -40,9 +40,11 @@ This file holds only the rules that protect user data or fail silently.
 - Pinned agents resume with `--resume <id>`, never `--continue`. `--continue`
   picks the newest conversation in the folder, so two agents in one folder
   raced for the same one and a transcript got destroyed.
-- Claude task delivery sends Enter 350 ms after the text
-  (`_write_task_to_pty`). A CR in the same burst counts as part of the paste
-  and the task never runs.
+- Claude task delivery types the text, then sends Enter once Claude has drawn
+  that text, never sooner than 350 ms after it (`_write_task_to_pty`). A CR
+  that Claude reads in the same chunk as the text counts as part of the paste
+  and the task never runs. A fixed beat alone lost every first task in a fresh
+  git folder, where Claude stalls about 570 ms after its first frame.
 - Agent lanes (`app/lanes.py`): `git worktree remove` FOLLOWS directory
   junctions and empties their targets (measured: a lane's `.venv` junction
   wiped the real `.venv`). `remove_lane` unlinks the lane's junctions first

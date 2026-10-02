@@ -8,6 +8,13 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.26.1
+
+- A task given to a Claude agent as it starts is now always submitted. In a
+  fresh git folder (every new agent lane is one) Claude could take the task's
+  text and its Enter as one paste, so the task sat typed in the input box and
+  never ran. AI Hive now presses Enter only once Claude shows the text.
+
 ## 0.26.0
 
 - Agent lanes now keep agents aware of each other without reading the whole

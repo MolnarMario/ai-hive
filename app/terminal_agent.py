@@ -203,6 +203,49 @@ def _despace(text: str) -> str:
 _WS_RE = re.compile(r"\s+")
 _READY_HINTS_DESPACED = tuple(_despace(h) for h in _CLAUDE_READY_HINTS)
 
+# --- submitting a typed task ---
+# A task is typed, then submitted with a SEPARATE Enter. Claude Code reads a
+# CR that arrives in the same stdin chunk as the text as part of a paste: it
+# inserts a newline into the input box and the task never runs. A fixed beat
+# between the two writes is not enough on its own. Right after its first frame
+# in a fresh git folder, Claude's event loop can stall for longer than the
+# beat (measured 570 ms on CLI 2.1.288, 6 of 6 runs), so text and CR pile up
+# unread and arrive as one chunk. So for Claude the Enter waits until Claude
+# has drawn the typed text in its input box, which proves it consumed the text
+# in an earlier read, and never goes sooner than TASK_SUBMIT_MS. If the echo
+# matcher misses, the Enter goes after TASK_ECHO_TIMEOUT_MS anyway, which is
+# the old fixed-beat behavior. Other TUIs keep the plain beat.
+TASK_SUBMIT_MS = 350
+TASK_ECHO_TIMEOUT_MS = 5000
+# How much of the task's first line must show up. Short, so an input box that
+# wraps the line still draws it in one piece.
+TASK_ECHO_CHARS = 12
+# What Claude draws instead of the text when it collapses a long paste
+# ("[Pasted text #1 +12 lines]"), despaced like the output it is matched in.
+_PASTED_PLACEHOLDER = "[pastedtext"
+
+
+def _echo_needle(text: str) -> str:
+    """The part of `text` Claude's input box must show before Enter may
+    follow: the start of its first non-blank line, despaced like the output
+    it is compared with (the classic renderer moves the cursor instead of
+    writing spaces, see TerminalAgent._has_ready_hint)."""
+    for line in text.splitlines():
+        if line.strip():
+            return _despace(line)[:TASK_ECHO_CHARS]
+    return ""
+
+
+@dataclass(eq=False)
+class _PendingSubmit:
+    """One typed task waiting for its Enter. Compared by identity: two
+    deliveries of the same text are still two Enters."""
+    gen: int          # TerminalAgent._submit_gen when it was typed
+    needle: str
+    tail: str = ""    # escape-stripped output since it was typed
+    echoed: bool = False
+    floor: bool = False   # TASK_SUBMIT_MS has passed
+
 # --- "this agent was cut off by the plan limit" detection ---
 # WHICH agents to resume when the window reopens. The plan-usage reading
 # (app/claude_usage.py) is ACCOUNT-wide — it says the account is out and until
@@ -384,6 +427,8 @@ class TerminalAgent(QObject):
         self._prompt_ready = False    # the TUI's input prompt is interactive
         self._ready_tail = ""         # rolling stripped tail (pre-ready only)
         self._pending_task = None     # task queued until the TUI is ready
+        # typed tasks still waiting for their Enter (see TASK_SUBMIT_MS)
+        self._pending_submits: list[_PendingSubmit] = []
         self._resume_attempt = False  # last start() launched with --continue
         self._resume_fallback_done = False  # already retried fresh once
         # set by the restore path (main.py): the NEXT resume start should
@@ -558,6 +603,7 @@ class TerminalAgent(QObject):
         self.clear_limit_block()
         self._forget_limit_echo()      # a new screen: nothing is an echo yet
         self._submit_gen += 1  # invalidate any pending task-submit Enter
+        self._pending_submits.clear()
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         self._turn_open = False        # nothing asked yet, so nothing to stamp
         self._turn_mark_uid = None
@@ -635,6 +681,7 @@ class TerminalAgent(QObject):
         self.clear_limit_block()
         self._forget_limit_echo()      # a new screen: nothing is an echo yet
         self._submit_gen += 1  # invalidate any pending task-submit Enter
+        self._pending_submits.clear()
         if self.spec.provider in ("claude", "gemini"):  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
         elif self.spec.provider == "openai":
@@ -1351,22 +1398,60 @@ class TerminalAgent(QObject):
             self.worker.write("\x1b[200~" + body + "\x1b[201~")
         else:
             self.worker.write(body)
-        # submit AFTER a beat: a CR arriving in the same input burst as the
-        # text reads as part of a paste (verified live against Claude Code) —
-        # it inserts a newline into the input box instead of submitting, and
-        # the task never runs. Guard on the submit generation so a restart inside
-        # the 350 ms window (which bumps _submit_gen) can't fire this stray CR
-        # into a fresh session. We deliberately do NOT also gate on _prompt_ready:
-        # in the normal path it is always True here, and adding it only risks
-        # suppressing a legitimate submit on this timing-sensitive path — the
-        # generation check alone fully covers the restart race.
+        # submit AFTER a beat, and for Claude only once it has drawn the text:
+        # a CR it reads in the same chunk as the text counts as part of a paste
+        # (see TASK_SUBMIT_MS). Guard on the submit generation so a restart
+        # inside the window (which bumps _submit_gen) can't fire this stray CR
+        # into a fresh session. We deliberately do NOT also gate on
+        # _prompt_ready: in the normal path it is always True here, and adding
+        # it only risks suppressing a legitimate submit on this timing-
+        # sensitive path. The generation check alone covers the restart race.
         gen = self._submit_gen
-        QTimer.singleShot(350, lambda: self._submit_gen == gen
-                          and self.worker.is_running()
-                          and self.worker.write("\r")
-                          # a delivered task and an auto-continue nudge are
-                          # submits like any other: their replies get a stamp
-                          and (self._note_submit() or True))
+        if self.spec.provider != "claude":
+            QTimer.singleShot(TASK_SUBMIT_MS, lambda: self._submit_typed(gen))
+            return
+        pending = _PendingSubmit(gen, _echo_needle(text))
+        self._pending_submits.append(pending)
+        QTimer.singleShot(TASK_SUBMIT_MS, lambda: self._submit_floor(pending))
+        QTimer.singleShot(TASK_ECHO_TIMEOUT_MS,
+                          lambda: self._submit_pending(pending))
+
+    def _submit_typed(self, gen: int) -> None:
+        """The Enter that submits a typed task, unless a restart came first."""
+        if (self._submit_gen == gen and self.worker.is_running()
+                and self.worker.write("\r")):
+            # a delivered task and an auto-continue nudge are submits like
+            # any other: their replies get a stamp
+            self._note_submit()
+
+    def _submit_floor(self, pending: _PendingSubmit) -> None:
+        pending.floor = True
+        if pending.echoed:
+            self._submit_pending(pending)
+
+    def _submit_pending(self, pending: _PendingSubmit) -> None:
+        """Send `pending`'s Enter once. Called by the echo, after the floor,
+        or by the fallback timer, whichever is first; a restart has already
+        dropped it from the list."""
+        if pending not in self._pending_submits:
+            return
+        self._pending_submits.remove(pending)
+        self._submit_typed(pending.gen)
+
+    def _watch_task_echo(self, stripped: str) -> None:
+        """Mark typed tasks whose text Claude has now drawn. Only output that
+        arrived AFTER the text was typed counts, so a screen that already
+        showed the same words can't release the Enter early."""
+        for pending in list(self._pending_submits):
+            if pending.echoed:
+                continue
+            pending.tail = (pending.tail + stripped)[-2000:]
+            low = _despace(pending.tail)
+            if (pending.needle and pending.needle in low) \
+                    or _PASTED_PLACEHOLDER in low:
+                pending.echoed = True
+                if pending.floor:
+                    self._submit_pending(pending)
 
     def send_command(self, text: str) -> None:
         if self.is_pty:  # pty terminals take raw keystrokes, not line commands
@@ -2317,7 +2402,10 @@ class TerminalAgent(QObject):
             self._pty_dropped += len(dropped)
         # rolling escape-stripped tail for waiting-for-input detection (the idle
         # timer scans it once output settles — see _screen_waiting)
-        self._screen_tail = (self._screen_tail + _CSI_RE.sub("", text))[-4000:]
+        stripped = _CSI_RE.sub("", text)
+        self._screen_tail = (self._screen_tail + stripped)[-4000:]
+        if self._pending_submits:
+            self._watch_task_echo(stripped)
         # latch a plan-limit cut-off the INSTANT it is drawn — see _scrape_limit
         # for why this must not wait for the idle-timer settle
         if not self._limit_blocked:
@@ -2341,8 +2429,7 @@ class TerminalAgent(QObject):
         # future CLI renames these, this tuple is the one place to fix.
         if not self._prompt_ready:
             if self.spec.provider == "claude":
-                self._ready_tail = (self._ready_tail
-                                    + _CSI_RE.sub("", text))[-600:]
+                self._ready_tail = (self._ready_tail + stripped)[-600:]
                 ready = self._has_ready_hint(self._ready_tail)
             else:
                 ready = "\x1b[?2004h" in text
