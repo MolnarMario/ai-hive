@@ -1398,3 +1398,84 @@ def test_agent_file_map():
     finally:
         transcripts.transcript_path = real_tp
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+# -------------------------------------------------- GitHub workspace clone ----
+
+def test_workspace_clone_default_branch():
+    """New Workspace from a GitHub URL clones the remote's DEFAULT branch,
+    whatever it is named. It used to pass `--branch main`, so a repo whose
+    default is `master` failed with "Remote branch main not found". Local
+    bare repos stand in for GitHub so this runs offline."""
+    import subprocess
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.main_window import NewWorkspaceDialog, clone_default_branch
+
+    QApplication.instance() or QApplication([])
+    tmp = tempfile.mkdtemp(prefix="aihive-clone-")
+
+    def git(*args, cwd=None):
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t",
+             "-c", "init.defaultBranch=scratch", *args],
+            cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
+
+    def bare_repo(tag, branches, default):
+        """A bare remote holding `branches` (each with its own file), whose
+        HEAD points at `default`."""
+        work = os.path.join(tmp, tag + "-work")
+        git("init", work)
+        for branch in branches:
+            git("checkout", "-q", "-b", branch, cwd=work)
+            Path(work, branch + ".txt").write_text(branch)
+            git("add", ".", cwd=work)
+            git("commit", "-q", "-m", branch, cwd=work)
+        bare = os.path.join(tmp, tag + ".git")
+        git("clone", "-q", "--bare", work, bare)
+        git("symbolic-ref", "HEAD", "refs/heads/" + default, cwd=bare)
+        return bare
+
+    try:
+        # A `master`-default repo: the reported failure.
+        dest = os.path.join(tmp, "master-clone")
+        err = clone_default_branch(bare_repo("master", ["master"], "master"), dest)
+        check("clone: a master-default repo clones", err == "", err)
+        check("clone: master repo checks out master",
+              os.path.isdir(dest) and git("branch", "--show-current", cwd=dest) == "master")
+
+        # Default `trunk` while a `main` exists too: follow the remote's HEAD,
+        # not the naming convention.
+        dest = os.path.join(tmp, "trunk-clone")
+        err = clone_default_branch(
+            bare_repo("trunk", ["main", "trunk"], "trunk"), dest)
+        check("clone: an unusually named default branch clones", err == "", err)
+        check("clone: checks out the remote default, not main",
+              os.path.isdir(dest)
+              and git("branch", "--show-current", cwd=dest) == "trunk"
+              and os.path.isfile(os.path.join(dest, "trunk.txt")))
+        remote_branches = (git("branch", "-r", "--format=%(refname)", cwd=dest)
+                           .split() if os.path.isdir(dest) else [])
+        check("clone: fetches only the default branch",
+              "refs/remotes/origin/trunk" in remote_branches
+              and "refs/remotes/origin/main" not in remote_branches,
+              remote_branches)
+
+        # A plain `main` repo keeps working.
+        dest = os.path.join(tmp, "main-clone")
+        err = clone_default_branch(bare_repo("main", ["main"], "main"), dest)
+        check("clone: a main-default repo still clones",
+              err == "" and git("branch", "--show-current", cwd=dest) == "main", err)
+
+        # A failure reports git's text and leaves no folder behind.
+        dest = os.path.join(tmp, "missing-clone")
+        err = clone_default_branch(os.path.join(tmp, "no-such.git"), dest)
+        check("clone: a bad remote returns git's error", bool(err), err)
+        check("clone: a failed clone leaves no folder", not os.path.exists(dest))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    dlg = NewWorkspaceDialog(str(SCRATCH_CWD))
+    note = dlg.repo_note.text()
+    check("clone: dialog says it clones the default branch",
+          "default branch" in note and "main branch" not in note, note)
+    dlg.deleteLater()

@@ -1798,8 +1798,34 @@ class ScheduleMessageDialog(QDialog):
         return text, self._due_ts
 
 
+def clone_default_branch(remote: str, destination: str) -> str:
+    """Clone `remote`'s default branch into `destination`; return git's error
+    text, or "" on success. A failed clone leaves no folder behind.
+
+    No `--branch`: git then checks out whatever the remote's HEAD points at,
+    so `main`, `master`, `trunk` or any other default name all work. Naming
+    `main` here made every repo whose default is `master` fail with "Remote
+    branch main not found". `--single-branch` still fetches only that branch.
+    """
+    error = ""
+    try:
+        result = subprocess.run(
+            ["git", "clone", "--single-branch", remote, destination],
+            capture_output=True, text=True, timeout=900,
+            creationflags=0x08000000)
+        if result.returncode:
+            error = (result.stderr or result.stdout or
+                     "Git could not clone the repository.").strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        error = str(exc)
+    if error and os.path.isdir(destination):
+        shutil.rmtree(destination, ignore_errors=True)
+    return error
+
+
 class NewWorkspaceDialog(QDialog):
-    """Choose an existing project folder or clone a GitHub main branch."""
+    """Choose an existing project folder or clone a GitHub repository's
+    default branch (see `clone_default_branch`)."""
 
     def __init__(self, start_dir: str, parent=None):
         super().__init__(parent)
@@ -1841,8 +1867,10 @@ class NewWorkspaceDialog(QDialog):
         parent_row.addWidget(self.parent_edit, 1)
         parent_row.addWidget(parent_browse)
         repo_form.addRow("Clone into", parent_row)
-        note = QLabel("AI Hive will clone the latest main branch into a new folder.",
+        note = QLabel("AI Hive will clone the repository's default branch "
+                      "(main, master or whatever it is called) into a new folder.",
                       repo_page)
+        self.repo_note = note
         note.setWordWrap(True)
         repo_form.addRow("", note)
         self.pages.addWidget(repo_page)
@@ -4329,7 +4357,7 @@ class MainWindow(QMainWindow):
             return
 
         progress = QProgressDialog(
-            f"Cloning {repo_url} from main…", "", 0, 0, self)
+            f"Cloning {repo_url}…", "", 0, 0, self)
         progress.setWindowTitle("Creating GitHub workspace")
         progress.setCancelButton(None)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -4338,20 +4366,7 @@ class MainWindow(QMainWindow):
         self._clone_progress = progress
 
         def clone() -> None:
-            error = ""
-            try:
-                result = subprocess.run(
-                    ["git", "clone", "--branch", "main", "--single-branch",
-                     remote, destination],
-                    capture_output=True, text=True, timeout=900,
-                    creationflags=0x08000000)
-                if result.returncode:
-                    error = (result.stderr or result.stdout or
-                             "Git could not clone the repository.").strip()
-            except (OSError, subprocess.SubprocessError) as exc:
-                error = str(exc)
-            if error and os.path.isdir(destination):
-                shutil.rmtree(destination, ignore_errors=True)
+            error = clone_default_branch(remote, destination)
             self.workspaceCloneFinished.emit(name, destination, repo_url, error)
 
         threading.Thread(target=clone, name="github-workspace-clone",
