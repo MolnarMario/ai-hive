@@ -48,7 +48,9 @@ command works unchanged in a lane. They point at the main checkout's copy: an
 install run inside a lane writes there. Other gitignored local files (a
 `.env`) are COPIED into a new lane when the repo's `.worktreeinclude` names
 them (gitignore syntax, the same file and rule Claude Code's own worktrees
-use).
+use). The lane records which ones it got, in its own git folder, so closing
+a card keeps a lane whose copy was edited OR deleted (`local_changes`), and
+keeps it too when that check can't finish.
 
 Awareness (Phase 2, bottom of this file): `snapshot_repo` reads every lane
 of a repo (head, ahead/behind, committed and uncommitted files, what the
@@ -560,7 +562,8 @@ class LaneStatus:
     dirty: list = field(default_factory=list)
     merged: bool = False        # head is in the base: removing loses nothing
     base_ref: str = ""
-    # ignored `.worktreeinclude` files changed in the lane (local_changes)
+    # ignored `.worktreeinclude` files changed or deleted in the lane, plus
+    # LOCAL_UNCHECKED when they could not all be checked (local_changes)
     local: list = field(default_factory=list)
 
     def describe(self) -> str:
@@ -574,11 +577,13 @@ class LaneStatus:
         if self.dirty:
             n = len(self.dirty)
             parts.append(f"{n} modified file{'' if n == 1 else 's'}")
-        if self.local:
-            more = (f" (+{len(self.local) - 3} more)"
-                    if len(self.local) > 3 else "")
+        files = [p for p in self.local if p != LOCAL_UNCHECKED]
+        if files:
+            more = f" (+{len(files) - 3} more)" if len(files) > 3 else ""
             parts.append(f"local files changed: "
-                         f"{', '.join(self.local[:3])}{more}")
+                         f"{', '.join(files[:3])}{more}")
+        if len(files) < len(self.local):
+            parts.append("local files that could not be checked")
         return " and ".join(parts)
 
 
@@ -1351,22 +1356,31 @@ def refresh_lane(lane: dict) -> str:
 WORKTREEINCLUDE = ".worktreeinclude"
 INCLUDE_MAX_FILES = 200
 INCLUDE_MAX_BYTES = 50 * 1024 * 1024
+# the record of what copy_worktree_includes copied into a lane, kept in the
+# lane's own git folder (_include_manifest_path)
+INCLUDE_MANIFEST = "aihive-worktreeinclude.json"
+# the local_changes entry for files it could not check. `<` and `>` can't be
+# in a Windows file name, so no real path reads the same.
+LOCAL_UNCHECKED = "<unchecked>"
 
 
-def _include_candidates(cwd: str, spec: str) -> list:
-    """Untracked files under `cwd` that `spec` (a `.worktreeinclude`) names
-    AND git ignores, repo-relative. The junction folders are pruned from the
-    walk by pathspec exclusion. `--exclude=node_modules/` would not do it: it
-    marks every file under node_modules ignored, so git lists all of them
-    (10,001 paths on a 10,000-file node_modules, against 1 with the
+def _include_candidates(cwd: str, spec: str) -> tuple:
+    """(paths, complete): untracked files under `cwd` that `spec` (a
+    `.worktreeinclude`) names AND git ignores, repo-relative. `complete` is
+    False when git failed or there were more candidates than the walk checks:
+    the list may then leave files out. The junction folders are pruned from
+    the walk by pathspec exclusion. `--exclude=node_modules/` would not do
+    it: it marks every file under node_modules ignored, so git lists all of
+    them (10,001 paths on a 10,000-file node_modules, against 1 with the
     pathspec, measured)."""
     r = git(["ls-files", "-z", "--others", "--ignored",
              f"--exclude-from={spec}", "--", ".",
              *(f":(exclude){name}" for name in JUNCTION_NAMES)], cwd)
     if not r.ok:
-        return []
+        return [], False
     cands = [p for p in _z_list(r.out)
              if p.replace("\\", "/").split("/")[0] not in JUNCTION_NAMES]
+    complete = len(cands) <= INCLUDE_MAX_FILES * 2
     cands = cands[:INCLUDE_MAX_FILES * 2]
     ignored = []
     for i in range(0, len(cands), 50):
@@ -1378,29 +1392,102 @@ def _include_candidates(cwd: str, spec: str) -> list:
         if r.rc in (0, 1):          # 1 = none of these is ignored
             wanted = set(chunk)
             ignored.extend(ln for ln in r.out.splitlines() if ln in wanted)
-    return ignored
+        else:
+            complete = False
+    return ignored, complete
+
+
+def _include_manifest_path(root: str) -> str:
+    """Where the lane at `root` records the files copied into it: its own
+    git folder, `<repo>/.git/worktrees/<id>/`. No commit can reach it, and
+    `git worktree remove` deletes it with the lane. "" when `root` is not
+    the top folder of a linked worktree (its `.git` is then no file), so
+    the main checkout's git folder is never written."""
+    if not os.path.isfile(os.path.join(root, ".git")):
+        return ""
+    r = git(["rev-parse", "--show-toplevel", "--git-path", INCLUDE_MANIFEST],
+            root)
+    lines = r.out.splitlines() if r.ok else []
+    if len(lines) != 2 or not same_path(lines[0], root):
+        return ""
+    return os.path.join(root, lines[1])     # --git-path may be cwd-relative
+
+
+def _write_include_manifest(root: str, copied: list) -> bool:
+    path = _include_manifest_path(root)
+    if not path:
+        return False
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"copied": copied}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def _read_include_manifest(root: str):
+    """The repo paths copy_worktree_includes recorded copying into the lane
+    at `root`, or None without a readable record: a lane made before AI Hive
+    kept one, or git or the file failed."""
+    path = _include_manifest_path(root)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    paths = data.get("copied") if isinstance(data, dict) else None
+    if not isinstance(paths, list) or not all(
+            isinstance(p, str) and p for p in paths):
+        return None
+    return paths
 
 
 def local_changes(repo: str, root: str) -> list:
     """The lane's `.worktreeinclude` files that differ from the main
-    checkout's copy, or that the main checkout doesn't have: a `.env` the
-    agent edited in its lane. They are ignored, so `git status` never shows
-    them, and `git worktree remove` deletes ignored files without asking. []
-    when the repo has no `.worktreeinclude`."""
+    checkout's copy: a `.env` the agent edited in its lane, one the main
+    checkout doesn't have, or a copy the agent deleted (listed as
+    "<path> (deleted)"). They are ignored, so `git status` never shows
+    them, and `git worktree remove` deletes ignored files without asking.
+
+    A deletion is judged against the record copy_worktree_includes left, so
+    a file the main checkout gained after the lane was made is not taken
+    for one. A lane without a readable record counts every file the main
+    checkout would copy as copied.
+
+    Fails closed: when a listing can't be completed (git failed, or more
+    files than the walk checks) the result holds LOCAL_UNCHECKED, which
+    keeps the lane like any change does. [] when the repo has no
+    `.worktreeinclude` and the lane recorded no copies."""
     import filecmp
     spec = os.path.join(repo, WORKTREEINCLUDE)
-    if not os.path.isfile(spec):
-        return []
+    copied = _read_include_manifest(root)
+    present, complete = [], True
+    if os.path.isfile(spec):
+        present, complete = _include_candidates(root, spec)
+        if copied is None:
+            copied, main_complete = _include_candidates(repo, spec)
+            complete = complete and main_complete
     out = []
-    for rel in _include_candidates(root, spec):
+    for rel in dict.fromkeys([*present, *(copied or ())]):
         mine, theirs = os.path.join(root, rel), os.path.join(repo, rel)
+        name = rel.replace("\\", "/")
         try:
+            if not os.path.lexists(mine):
+                if os.path.lexists(theirs):
+                    out.append(f"{name} (deleted)")
+                continue
             same = (os.path.isfile(theirs)
                     and filecmp.cmp(mine, theirs, shallow=False))
         except OSError:
             same = False            # can't compare: keep the lane
         if not same:
-            out.append(rel.replace("\\", "/"))
+            out.append(name)
+    if not complete:
+        out.append(LOCAL_UNCHECKED)
     return out
 
 
@@ -1410,12 +1497,14 @@ def copy_worktree_includes(repo: str, root: str) -> list:
     local config. Only files git IGNORES are copied (a tracked file is
     already in the lane), never anything under a junction, never over an
     existing file, and at most INCLUDE_MAX_FILES / INCLUDE_MAX_BYTES.
-    Best-effort: returns the repo paths copied, never raises."""
+    Records what it copied in the lane's git folder, an empty record
+    without a `.worktreeinclude`, so local_changes can tell a copy the agent
+    deleted from a file the lane never got. Best-effort: returns the repo
+    paths copied, never raises."""
     import shutil
     spec = os.path.join(repo, WORKTREEINCLUDE)
-    if not os.path.isfile(spec):
-        return []
-    ignored = _include_candidates(repo, spec)
+    ignored = (_include_candidates(repo, spec)[0] if os.path.isfile(spec)
+               else [])
     copied, total = [], 0
     for rel in ignored:
         if len(copied) >= INCLUDE_MAX_FILES:
@@ -1433,4 +1522,5 @@ def copy_worktree_includes(repo: str, root: str) -> list:
             copied.append(rel.replace("\\", "/"))
         except OSError:
             continue
+    _write_include_manifest(root, copied)
     return copied

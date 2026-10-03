@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.27.1
+
+- Closing a laned agent now keeps its lane when the agent deleted one of the
+  local files that `.worktreeinclude` copied in (a `.env`), the same as when
+  it edited one. Before, the lane was removed and the deletion with it.
+- When AI Hive can't finish checking a lane's local files, it now keeps the
+  lane and says so, instead of taking the lane for clean and removing it.
+
 ## 0.27.0
 
 - Agent lanes get an integration queue. Right-click a laned Claude agent's

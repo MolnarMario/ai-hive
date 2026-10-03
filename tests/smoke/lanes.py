@@ -2326,6 +2326,156 @@ def test_lane_include_local_changes():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_lane_include_deletions():
+    """The code review's P2: a `.worktreeinclude` copy the agent DELETED in
+    its lane was no local change (only files still there were compared), so
+    closing the card removed the lane and the deletion with it. A failed
+    listing read as "nothing changed" too. Both keep the lane now. The lane
+    records what it was given, so a file the main checkout gained later is
+    not taken for a deletion."""
+    from app import lanes
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-incdel-"))
+    work = _make_repo(tmp)
+    with open(work / ".gitignore", "a") as fh:
+        fh.write(".env\n.env.local\ncache/\n")
+    (work / ".worktreeinclude").write_text(".env\n.env.local\ncache/\n")
+    _git(work, "add", ".gitignore", ".worktreeinclude")
+    _git(work, "commit", "-q", "-m", "ignore local files")
+    _git(work, "push", "-q", "origin", "main")
+    (work / ".env").write_text("SECRET=1\n")
+
+    def removed(lane):
+        res = lanes.retire_lane(lane)
+        return res.removed and not Path(lane["root"]).exists(), res
+
+    # deleted in the lane, still in the main checkout
+    gone = _lane_for(work, "Gone", "90e90e" + "0" * 26)
+    groot = Path(gone["root"])
+    os.remove(groot / ".env")
+    res = lanes.retire_lane(gone)
+    check("lanes-incdel: a deleted .env copy keeps the lane on close",
+          not res.removed and groot.is_dir(), res)
+    check("lanes-incdel: ...and the notice says it was deleted",
+          res.status is not None and "local files changed: .env (deleted)"
+          in res.status.describe(),
+          res.status.describe() if res.status is not None else None)
+    try:
+        lanes.remove_lane(gone)
+        code = ""
+    except lanes.LaneError as exc:
+        code = exc.code
+    check("lanes-incdel: ...and remove_lane refuses it", code == "dirty", code)
+    (groot / ".env").write_text("SECRET=1\n")
+    ok, res = removed(gone)
+    check("lanes-incdel: with the copy back the lane goes", ok, res)
+
+    # the record: in the lane's git folder, out of every commit's reach
+    rec = _lane_for(work, "Record", "4ec04d" + "0" * 26)
+    path = Path(lanes._include_manifest_path(rec["root"]))
+    admin = (work / ".git" / "worktrees").resolve()
+    check("lanes-incdel: the lane records the copy it got",
+          path.is_file() and json.loads(path.read_text("utf-8"))
+          == {"copied": [".env"]}, path)
+    check("lanes-incdel: ...in its own git folder, not the lane's files",
+          path.resolve().is_relative_to(admin)
+          and lanes.status_paths(rec["root"]) == [], path)
+    check("lanes-incdel: the main checkout gets no record",
+          lanes._include_manifest_path(str(work)) == "")
+    ok, res = removed(rec)
+    check("lanes-incdel: the record goes with the lane",
+          ok and not path.exists(), res)
+
+    # a file the main checkout gained after the lane was made
+    late = _lane_for(work, "Late", "1a7e1a" + "0" * 26)
+    (work / ".env.local").write_text("LOCAL=1\n")
+    ok, res = removed(late)
+    check("lanes-incdel: a file the main checkout gained later is no "
+          "deletion", ok, res)
+    os.remove(work / ".env.local")
+
+    # deleted on both sides: nothing differs, nothing to keep
+    both = _lane_for(work, "Both", "b07b07" + "0" * 26)
+    os.remove(Path(both["root"]) / ".env")
+    os.rename(work / ".env", work / ".env.away")
+    ok, res = removed(both)
+    check("lanes-incdel: a copy deleted in both checkouts lets the lane go",
+          ok, res)
+    os.rename(work / ".env.away", work / ".env")
+
+    # a lane made before the record existed: the main checkout's files count
+    old = _lane_for(work, "Old", "01d01d" + "0" * 26)
+    oroot = Path(old["root"])
+    os.remove(lanes._include_manifest_path(old["root"]))
+    os.remove(oroot / ".env")
+    st = lanes.lane_status(old)
+    check("lanes-incdel: without a record a deleted copy still counts",
+          st.local == [".env (deleted)"], st.local)
+    (oroot / ".env").write_text("SECRET=1\n")
+    st = lanes.lane_status(old)
+    check("lanes-incdel: ...and an intact lane without one has nothing",
+          st.local == [], st.local)
+
+    # a listing that fails or can't finish keeps the lane
+    orig = lanes.RUNNER
+
+    def failing(when):
+        def runner(args, cwd, timeout):
+            if when(args, cwd):
+                return lanes.GitResult(128, "", "fatal: simulated")
+            return orig(args, cwd, timeout)
+        return runner
+
+    def lane_listing(args, cwd):
+        return args[:1] == ["ls-files"] and any(
+            a.startswith("--exclude-from=") for a in args)
+    cases = [
+        ("the lane's listing fails", lane_listing),
+        ("check-ignore fails", lambda a, c: "check-ignore" in a),
+        ("the main checkout's listing fails for a lane without a record",
+         lambda a, c: lane_listing(a, c) and lanes.same_path(c, str(work))),
+    ]
+    for label, when in cases:
+        lanes.RUNNER = failing(when)
+        try:
+            res = lanes.retire_lane(old)
+        finally:
+            lanes.RUNNER = orig
+        check(f"lanes-incdel: {label}: the lane is kept",
+              not res.removed and oroot.is_dir()
+              and res.status is not None
+              and res.status.local == [lanes.LOCAL_UNCHECKED], res)
+        check(f"lanes-incdel: {label}: ...and the notice says so",
+              res.status is not None and res.status.describe()
+              == "local files that could not be checked",
+              res.status.describe() if res.status is not None else None)
+
+    ok, res = removed(old)
+    check("lanes-incdel: the lane without a record goes once git answers",
+          ok, res)
+
+    # more files than the walk checks, every one identical to the main copy
+    cache = work / "cache"
+    cache.mkdir()
+    for i in range(6):
+        (cache / f"f{i}.txt").write_text(f"{i}\n")
+    cap = lanes.INCLUDE_MAX_FILES
+    lanes.INCLUDE_MAX_FILES = 2         # the walk checks 2 * 2 candidates
+    try:
+        many = _lane_for(work, "Many", "3a4e3a" + "0" * 26)
+        mroot = Path(many["root"])
+        for i in range(6):
+            shutil.copy2(cache / f"f{i}.txt", mroot / "cache" / f"f{i}.txt")
+        st = lanes.lane_status(many)
+    finally:
+        lanes.INCLUDE_MAX_FILES = cap
+    check("lanes-incdel: more files than the walk checks keeps the lane",
+          st.local == [lanes.LOCAL_UNCHECKED], st.local)
+    ok, res = removed(many)
+    check("lanes-incdel: ...and at the normal cap the same lane goes",
+          ok, res)
+    shutil.rmtree(tmp, ignore_errors=True)
+
 def test_lane_include_walk():
     """The .worktreeinclude walk prunes the junction folders with pathspec
     exclusion: `--exclude=node_modules/` would list every file in it."""
