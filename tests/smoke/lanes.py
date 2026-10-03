@@ -1621,6 +1621,9 @@ def test_lane_service_window():
         check("lane service: a busy agent's empty lane is not fast-forwarded "
               "under it", _git(c.spec.lane["root"], "rev-parse", "HEAD")
               != _git(work, "rev-parse", "origin/main"))
+        # its turn ends: the user's Update lane now runs (it refuses a
+        # working agent), before any poll could refresh it automatically
+        del c.is_busy
         win._on_lane_action(ws.id, c.id, "refresh")
         win.lane_ops.drain(30)
         check("lane service: Update lane fast-forwards an empty lane",
@@ -1630,7 +1633,6 @@ def test_lane_service_window():
               "prompt", "LANE-REFRESH" in _log(store)
               and "fast-forwarded" in Path(svc.notices_path(
                   ws, c.spec.uid)).read_text(encoding="utf-8"))
-        del c.is_busy
         # ...and once it is idle, the next base move needs nobody
         _push_to_base(tmp, work, "sub/b.txt", "landed again\n")
         win.lane_service.fetch()
@@ -2424,12 +2426,15 @@ def test_lane_window_37_fixes():
         # --- Update lane while the agent works -------------------------------
         agent = run_dialog()[0]
         win.lane_ops.drain(60)
+        # working BEFORE the base moves, so no automatic refresh (Phase 3
+        # keeps idle lanes fresh by itself) moves the lane first
+        agent.is_busy = lambda: True
         _push_to_base(tmp, work, "sub/b.txt", "landed\n")
         _git(work, "fetch", "-q", "origin")
         win.lane_service.poll()
         win.lane_service.drain(30)
+        win.lane_ops.drain(30)
         card = win._pages[ws.id].card_for(agent.id)
-        agent.is_busy = lambda: True
         shown = []
 
         class RecordingMenu(QMenu):
