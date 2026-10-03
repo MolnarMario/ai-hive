@@ -1292,8 +1292,13 @@ class AddTerminalDialog(QDialog):
         self._live_lane_roots = set(live_lane_roots)
         # resumable lane conversations by session id (lanes.LaneConversation)
         self._lane_convs: dict = {}
-        # the user's own tick, kept while Type is flipped away and back
-        self._lane_wanted = True
+        # the user's own tick, kept while Type is flipped away and back. A
+        # workspace inside a larger repository starts unticked: its lane
+        # would copy the whole repository (a dotfiles repo in the home
+        # folder, say), which the user should choose knowingly.
+        self._nested_in = ("" if not repo_root or lanes.same_path(repo_root, cwd)
+                           else repo_root)
+        self._lane_wanted = not self._nested_in
 
         form = QFormLayout()
         self.name_edit = QLineEdit(default_name, self)
@@ -1638,6 +1643,10 @@ class AddTerminalDialog(QDialog):
                 "Give this agent its own git worktree and branch beside the "
                 "repository, so agents cannot overwrite or reset each other's "
                 "work. Each agent opened at once gets its own lane.")
+            if not reason and self._nested_in:
+                tip = (f"This folder is inside the repository at "
+                       f"{self._nested_in}. A lane copies the whole "
+                       f"repository.\n\n{tip}")
         cb.setToolTip(tip)
         cb.blockSignals(False)
 
@@ -2169,6 +2178,10 @@ class MainWindow(QMainWindow):
         # meanwhile is retired by that operation's callback, never by the
         # close itself (a failed create must not touch a folder it doesn't own)
         self._lane_pending: set[str] = set()
+        # roots of closed agents' lanes whose retire is still being retried
+        # (a program held the folder). Hidden from the picker meanwhile, so a
+        # revive can't race the retry for the same lane.
+        self._lane_retiring: set[str] = set()
         self._lane_boxes: list = []   # open "lane kept" notices
         # what every lane holds and where lanes overlap (app/lane_service.py):
         # card chips, Activity panel, roster columns, lanes.json for the
@@ -3833,9 +3846,13 @@ class MainWindow(QMainWindow):
     # revive protect lanes that already exist and run with the switch off.
     # Every git mutation goes through self.lane_ops, never inline.
 
+    # a retire that found a program still running in the lane tries again
+    LANE_RETIRE_TRIES = 3
+    LANE_RETIRE_RETRY_MS = 30_000
+
     def _live_lane_roots(self) -> set:
-        return {a.spec.lane.get("root", "") for a in self.manager.all_agents()
-                if a.spec.lane}
+        return ({a.spec.lane.get("root", "") for a in self.manager.all_agents()
+                 if a.spec.lane} | self._lane_retiring)
 
     def _create_lane(self, ws_id: str, agent, plan) -> None:
         """Create a new agent's lane, then start it. The agent was added
@@ -3846,7 +3863,7 @@ class MainWindow(QMainWindow):
         self._lane_pending.add(agent.spec.uid)
         lane, cwd, t0 = plan.lane_dict(), plan.cwd, time.monotonic()
         self.lane_ops.submit(
-            plan.repo, lanes.create_lane, lane, label="create",
+            plan.repo, lanes.create_lane, lane, cwd, label="create",
             callback=lambda res, err, a=agent.id, u=agent.spec.uid,
             n=agent.spec.name: self._on_lane_created(
                 ws_id, a, u, n, lane, cwd, t0, res, err))
@@ -3985,29 +4002,57 @@ class MainWindow(QMainWindow):
         if retire is not None:
             self._retire_lane(*retire)
 
-    def _retire_lane(self, lane: dict, pids, name: str) -> None:
+    def _retire_lane(self, lane: dict, pids, name: str,
+                     attempt: int = 1) -> None:
         self.lane_ops.submit(
             lane["repo"], lanes.retire_lane, lane, tuple(pids), label="retire",
-            callback=lambda res, err: self._on_lane_retired(lane, name, res,
-                                                            err))
+            callback=lambda res, err: self._on_lane_retired(
+                lane, name, res, err, pids, attempt))
 
-    def _on_lane_retired(self, lane, name, result, error) -> None:
+    def _on_lane_retired(self, lane, name, result, error, pids=(),
+                         attempt: int = 1) -> None:
         where = f"agent={name!r} root={lane['root']} branch={lane['branch']}"
         if error is not None or result is None:
             self._store_audit(f"LANE-FAIL retire {where}: {error}")
             self._show_lane_kept(name, lane, None, str(error))
             return
         if result.removed:
-            kept = (f" branch_kept={result.branch_error!r}"
-                    if result.branch_error else "")
-            self._store_audit(f"LANE-REMOVE {where}{kept}")
+            ignored = ""
+            if result.ignored:
+                more = len(result.ignored) - 20
+                extra = f" +{more} more" if more > 0 else ""
+                ignored = (f" ignored={len(result.ignored)} "
+                           f"[{' '.join(result.ignored[:20])}{extra}]")
+            self._store_audit(f"LANE-REMOVE {where}{ignored}")
             return
         st = result.status
         detail = (f" ahead={st.ahead} dirty={len(st.dirty)} merged={st.merged}"
                   if st is not None else "")
-        why = f" reason={result.reason!r}" if result.reason else ""
-        self._store_audit(f"LANE-KEEP {where}{detail}{why}")
+        if result.code == "busy":
+            self._store_audit(f"LANE-KEEP {where}{detail} reason=busy "
+                              f"attempt={attempt}")
+            if attempt < self.LANE_RETIRE_TRIES:
+                self._lane_retiring.add(lane["root"])
+                QTimer.singleShot(
+                    self.LANE_RETIRE_RETRY_MS, self,
+                    lambda: self._retry_retire(lane, pids, name, attempt + 1))
+                return
+        elif result.code in ("git", "moved"):
+            # git itself refused: a process outside the agent (Explorer, an
+            # editor, a terminal) holds the folder. Never retried with --force.
+            self._store_audit(f"LANE-FAIL retire {where}: {result.reason}")
+        else:
+            why = f" reason={result.reason!r}" if result.reason else ""
+            self._store_audit(f"LANE-KEEP {where}{detail}{why}")
         self._show_lane_kept(name, lane, st, result.reason)
+
+    def _retry_retire(self, lane, pids, name, attempt: int) -> None:
+        self._lane_retiring.discard(lane["root"])
+        # revived meanwhile: the lane is live again and not ours to retire
+        if any(lanes.same_path(a.spec.lane.get("root", ""), lane["root"])
+               for a in self.manager.all_agents() if a.spec.lane):
+            return
+        self._retire_lane(lane, pids, name, attempt)
 
     # Lane awareness (spec Phase 2). LaneService polls; these put what it saw
     # on the cards, the Activity panel, the roster and the event log, and run
@@ -4110,11 +4155,12 @@ class MainWindow(QMainWindow):
         it holds work (or could not be checked). There is deliberately no
         delete button: unmerged work is only ever removed by the user."""
         held = status.describe() if status is not None else ""
+        kept = ("The lane folder is kept." if os.path.isdir(lane["root"])
+                else "Its branch is kept.")
         if held:
-            text = f"{name}'s lane has {held}. The lane folder is kept."
+            text = f"{name}'s lane has {held}. {kept}"
         else:
-            text = (f"{name}'s lane could not be removed ({reason}). "
-                    f"The lane folder is kept.")
+            text = f"{name}'s lane could not be removed ({reason}). {kept}"
         box = QMessageBox(QMessageBox.Icon.Information, "Lane kept", text,
                           parent=self)
         box.setInformativeText(
@@ -5163,6 +5209,13 @@ class MainWindow(QMainWindow):
         3. A workspace the user has not opened is never laid out at all
            (`PageStack.layout_hidden_pages`), and the autostart brings back
            EVERY workspace's agents, not just the visible one's.
+        4. A window whose minimum width is wider than its screen (a narrow or
+           heavily scaled display: the workspace header alone needs about
+           720px) is maximized to the screen first and only grows to its
+           minimum on a LATER layout pass, which the single pump above does
+           not reach. Measured on an 800px screen: every card spawned at 40
+           columns and was widened to 46 a moment later. So the hidden pages
+           are laid out and the window pumped until its size stops changing.
 
         Cheap and idempotent: `_apply_resize` returns early when nothing
         changed, so calling this again costs a queue pump."""
@@ -5174,9 +5227,20 @@ class MainWindow(QMainWindow):
             # let the window reach its real (possibly maximized) geometry, and
             # the visible page tile into it
             app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-        self.stack.layout_hidden_pages()
-        if app is not None:
+        # Hidden pages first, then the layout pass that may grow the window to
+        # its minimum (point 4), and again if it did: a never-laid-out page
+        # reports a much wider minimum than its real one, so the window only
+        # learns its true minimum from the pages' first layout. Bounded: a
+        # pass either changes the window's size or ends the loop.
+        for _ in range(5):
+            before = self.size()
+            self.stack.layout_hidden_pages()
+            if app is None:
+                break
+            QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
             app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            if self.size() == before:
+                break
         for page in self._pages.values():
             for card in page.cards:
                 if card.is_pty and card.terminal is not None:

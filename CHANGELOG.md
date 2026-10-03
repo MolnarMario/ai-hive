@@ -34,9 +34,13 @@ em dashes: this text is shown in the app.
   longer overwrite, reset or accidentally commit each other's changes. Untick
   "Own lane" in the New Agent dialog to keep an agent in the workspace folder.
 - Closing a laned agent cleans its lane up only when nothing in it is
-  unsaved or unmerged. Otherwise the lane is kept and AI Hive tells you what
-  is in it; its conversation stays in the New Agent dialog's Conversation
-  list, and picking it brings the lane back where it was.
+  unsaved or unmerged, and only once no program is still running in it (AI
+  Hive tries again for a minute). Otherwise the lane is kept and AI Hive tells
+  you what is in it; its conversation stays in the New Agent dialog's
+  Conversation list, and picking it brings the lane back where it was.
+- A workspace inside a larger repository starts with "Own lane" unticked,
+  since its lane would copy the whole repository. A workspace folder that is
+  not part of the repository's files gets no lane at all.
 - Turning Agent lanes off stops new lanes. Agents that already have one keep
   working in it.
 
@@ -49,6 +53,20 @@ em dashes: this text is shown in the app.
 - New Workspace can start from a GitHub repository: paste its URL and AI Hive
   clones its default branch (main, master or any other name) into a new folder
   and opens a workspace there.
+
+## 0.23.2
+
+- The shared board now keeps only its newest 40 activity notes. Older ones
+  move to board-archive.md next to it, so agents spend fewer tokens reading
+  the board before each task. Nothing is deleted.
+- The board's agent list shows what each agent is working on (its
+  conversation title) instead of "-" when it has no assigned task.
+
+## 0.23.1
+
+- Terminals restored after a reopen keep the width they started at, also on a
+  small or heavily scaled screen. Before, a resumed conversation there could
+  be wrapped narrower than its card.
 
 ## 0.23.0
 

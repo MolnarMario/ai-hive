@@ -1651,3 +1651,354 @@ def test_lane_service_window():
     win.deleteLater()
     check("lane service: the real .venv survived",
           (work / ".venv" / "marker.txt").read_text() == "real venv")
+
+
+def _commit_on(repo, parent: str, message: str) -> str:
+    """A new commit object on top of `parent`, without touching any
+    checkout: what a stray last commit landing on a branch looks like."""
+    tree = _git(repo, "rev-parse", f"{parent}^{{tree}}")
+    return _git(repo, "commit-tree", tree, "-p", parent, "-m", message)
+
+
+def test_lanes_no_upstream():
+    """A lane branch has no upstream, so git never tells a laned agent to
+    `push origin HEAD:main`. Leaving out --track is not enough: git sets the
+    upstream itself for a remote-tracking start point. With no upstream,
+    `branch -d` can't judge "merged", so the branch goes by compare-and-
+    delete with the verified head, and a branch that moved is kept."""
+    import re as _re
+    from app import lanes
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-track-"))
+    work = _make_repo(tmp)
+    plan = lanes.plan_lane(str(work), str(work), "Agent 5", "5a5a5a" + "0" * 26)
+    lane = lanes.create_lane(plan.lane_dict())
+    root = Path(lane["root"])
+    upstream = subprocess.run(
+        ["git", "config", "--get", f"branch.{plan.branch}.merge"], cwd=root,
+        capture_output=True, text=True, creationflags=_NO_WINDOW)
+    check("lanes-track: a new lane branch has no upstream",
+          upstream.returncode != 0 and not upstream.stdout.strip(),
+          upstream.stdout)
+    status = _git(root, "status")
+    check("lanes-track: git status in a lane never mentions origin/",
+          "origin/" not in status, status)
+    (root / "a.txt").write_text("lane work\n")
+    _git(root, "commit", "-q", "-am", "lane work")
+    push = subprocess.run(["git", "push", "--dry-run"], cwd=root,
+                          capture_output=True, text=True,
+                          creationflags=_NO_WINDOW)
+    hint = push.stdout + push.stderr
+    check("lanes-track: a bare git push never suggests pushing to main",
+          push.returncode != 0 and "HEAD:main" not in hint
+          and f"origin {plan.branch}" in hint, hint)
+
+    # merged into origin/main while the main checkout sits on an older
+    # branch: `branch -d` would call it "not fully merged"
+    _git(root, "push", "-q", "origin", "HEAD:main")
+    _git(work, "fetch", "-q", "origin")
+    _git(work, "switch", "-q", "-c", "older", "main")
+    result = lanes.remove_lane(lane)
+    check("lanes-track: a lane merged into the base is removed with the "
+          "main checkout on another branch",
+          not root.exists() and result.branch_deleted
+          and plan.branch not in _git(work, "branch", "--list", "hive/*"),
+          result)
+    _git(work, "switch", "-q", "main")
+
+    # the recreated branch of a repair has no upstream either
+    back, recreated = lanes.repair_lane(lane)
+    up = subprocess.run(["git", "config", "--get",
+                         f"branch.{plan.branch}.merge"], cwd=str(work),
+                        capture_output=True, text=True,
+                        creationflags=_NO_WINDOW)
+    check("lanes-track: a branch a repair recreates has no upstream",
+          recreated and up.returncode != 0, up.stdout)
+    lanes.remove_lane(back)
+
+    # a lane made by an older build, tracking origin/main
+    old = lanes.plan_lane(str(work), str(work), "Old", "01d01d" + "0" * 26)
+    _git(work, "worktree", "add", "-q", "--track", "-b", old.branch, old.root,
+         "origin/main")
+    lanes.repair_lane(old.lane_dict())
+    up = subprocess.run(["git", "config", "--get", f"branch.{old.branch}.merge"],
+                        cwd=str(work), capture_output=True, text=True,
+                        creationflags=_NO_WINDOW)
+    check("lanes-track: repair drops the base upstream an older build set",
+          up.returncode != 0, up.stdout)
+
+    # the branch moves between the status read and the delete
+    moved_plan = lanes.plan_lane(str(work), str(work), "Moved",
+                                 "30ed30" + "0" * 26)
+    moved = lanes.create_lane(moved_plan.lane_dict())
+    ref = f"refs/heads/{moved_plan.branch}"
+    stray = {}
+    orig = lanes.RUNNER
+
+    def mover(args, cwd, timeout):
+        deleting = (args[:2] == ["update-ref", "-d"]
+                    or (args[:1] == ["branch"] and "-d" in args))
+        if deleting and not stray:
+            head = _git(work, "rev-parse", ref)
+            stray["sha"] = _commit_on(work, head, "a last commit")
+            _git(work, "update-ref", ref, stray["sha"])
+        return orig(args, cwd, timeout)
+    lanes.RUNNER = mover
+    try:
+        lanes.remove_lane(moved)
+        refused = None
+    except lanes.LaneError as exc:
+        refused = exc
+    finally:
+        lanes.RUNNER = orig
+    check("lanes-track: a branch that moved during removal raises LaneError",
+          refused is not None and refused.code == "moved", refused)
+    check("lanes-track: ...and the branch is kept, at its new commit",
+          bool(stray) and _git(work, "rev-parse", ref) == stray["sha"])
+
+    src = Path(lanes.__file__).read_text(encoding="utf-8")
+    bad = _re.findall(r'"(--track|-D|--force)"', src)
+    check("lanes-track: app/lanes.py passes no --track, -D or --force to git",
+          bad == [], bad)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lanes_retire_busy():
+    """Retire never removes a lane while a program still runs in it. Windows
+    can delete the files but not the folder a process sits in, which leaves
+    a half-deleted worktree. The lane is kept as "busy", and MainWindow tries
+    again later."""
+    import sys
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import lanes
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-busy-"))
+    work = _make_repo(tmp)
+
+    def sleeper(cwd):
+        return subprocess.Popen([sys.executable, "-c",
+                                 "import time; time.sleep(60)"], cwd=str(cwd),
+                                creationflags=_NO_WINDOW)
+
+    lane = lanes.create_lane(lanes.plan_lane(
+        str(work), str(work), "Busy", "b05b05" + "0" * 26).lane_dict())
+    root = Path(lane["root"])
+    proc = sleeper(root)
+    try:
+        res = lanes.retire_lane(lane, [proc.pid], wait_s=0.3)
+        check("lanes-busy: a lane a program still runs in is kept",
+              not res.removed and root.is_dir() and (root / "a.txt").exists()
+              and lane["branch"] in _git(work, "branch", "--list", "hive/*"),
+              res)
+        check("lanes-busy: ...and the reason is busy",
+              getattr(res, "code", "") == "busy", res)
+    finally:
+        proc.kill()
+        proc.wait(10)
+    res = lanes.retire_lane(lane, [proc.pid], wait_s=0.3)
+    check("lanes-busy: once it exits, the retire removes the lane",
+          res.removed and not root.exists(), res)
+
+    # through the window: kept as busy, retried, then removed
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    lane = lanes.create_lane(lanes.plan_lane(
+        str(work), str(work), "Retry", "4e7a4e" + "0" * 26).lane_dict())
+    root = Path(lane["root"])
+    saved_wait = lanes.EXIT_WAIT_S
+    lanes.EXIT_WAIT_S = 0.3
+    win.LANE_RETIRE_RETRY_MS = 300
+    proc = sleeper(root)
+    try:
+        win._retire_lane(lane, [proc.pid], "Retry")
+        win.lane_ops.drain(30)
+        check("lanes-busy: the window keeps a busy lane and audits it",
+              root.is_dir() and "reason=busy attempt=1" in _log(store),
+              _log(store)[-400:])
+        check("lanes-busy: ...and says nothing yet (it will try again)",
+              not win._lane_boxes)
+    finally:
+        proc.kill()
+        proc.wait(10)
+    deadline = time.monotonic() + 15
+    while root.exists() and time.monotonic() < deadline:
+        loop = QEventLoop()
+        QTimer.singleShot(100, loop.quit)
+        loop.exec()
+        win.lane_ops.drain(5)
+    check("lanes-busy: the retry removes the lane once the program exits",
+          not root.exists() and "LANE-REMOVE" in _log(store),
+          _log(store)[-400:])
+    lanes.EXIT_WAIT_S = saved_wait
+    win._save_timer.stop()
+    win.close()
+    app.processEvents()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lanes_window_fixes():
+    """Lane review fixes that need the real window: a workspace folder the
+    lane would not contain gets no lane (not a missing cwd), a nested
+    workspace starts with the box unticked, the prompt names the push rule
+    and the shared links, and a removal lists the ignored files it took."""
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app.session_store import SessionStore
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-fix-"))
+    work = _make_repo(tmp)
+    lanes_dir = tmp / "proj.lanes"
+    ignored_ws = work / "build" / "ws"
+    ignored_ws.mkdir(parents=True)
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    win.top_bar.agent_lanes_btn.click()
+
+    def run_dialog(ws, setup=None):
+        orig = AddTerminalDialog.exec
+
+        def fake_exec(dlg):
+            if setup is not None:
+                setup(dlg)
+            return QDialog.DialogCode.Accepted
+        AddTerminalDialog.exec = fake_exec
+        try:
+            before = list(ws.agents)
+            win._on_add_terminal_clicked(ws.id)
+        finally:
+            AddTerminalDialog.exec = orig
+        return [a for a in ws.agents if a not in before]
+
+    def tick(dlg):
+        dlg.lane_check.setChecked(True)
+
+    def lane_folders():
+        return sorted(p.name for p in lanes_dir.iterdir()) \
+            if lanes_dir.exists() else []
+
+    with _stub_starts() as starts:
+        # --- an ignored subfolder: the lane would not contain it -----------
+        ws_ign = win.manager.create_workspace("Ignored", str(ignored_ws))
+        agent = run_dialog(ws_ign, tick)[0]
+        win.lane_ops.drain(60)
+        check("lanes-fix: a workspace in an ignored folder starts in that "
+              "folder", starts.cwds(agent.spec.name) == [str(ignored_ws)],
+              starts.calls)
+        check("lanes-fix: ...with LANE-FAIL location audited",
+              "LANE-FAIL location create" in _log(store), _log(store)[-500:])
+        check("lanes-fix: ...and no lane folder or branch left behind",
+              lane_folders() == []
+              and _git(work, "branch", "--list", "hive/*") == "",
+              (lane_folders(), _git(work, "branch", "--list", "hive/*")))
+
+        # --- a tracked subfolder: the lane holds it ------------------------
+        ws_sub = win.manager.create_workspace("Sub", str(work / "sub"))
+        starts.calls.clear()     # both workspaces number from "Agent 1"
+        sub_agent = run_dialog(ws_sub, tick)[0]
+        win.lane_ops.drain(60)
+        sub_cwd = os.path.join(sub_agent.spec.lane.get("root", "?"), "sub")
+        check("lanes-fix: a tracked subfolder gets a lane, started in its "
+              "own copy of the folder",
+              os.path.isdir(sub_cwd)
+              and starts.cwds(sub_agent.spec.name) == [sub_cwd], starts.calls)
+
+        # --- the prompt: no push to the base, shared links -----------------
+        prompt = sub_agent.spec.system_prompt
+        check("lanes-fix: the lane prompt forbids pushing to the base",
+              "push your lane branch to main" in prompt, prompt[-700:])
+        check("lanes-fix: the lane prompt says .venv and node_modules are "
+              "shared links", "link to the main checkout" in prompt
+              and "node_modules" in prompt, prompt[-700:])
+
+        # --- removal lists the ignored files it deletes --------------------
+        lane_root = Path(sub_agent.spec.lane["root"])
+        (lane_root / "build").mkdir()
+        (lane_root / "build" / "secret.env").write_text("SECRET")
+        win._close_agent(ws_sub.id, sub_agent.id)
+        win.lane_ops.drain(30)
+        removed = [ln for ln in _log(store).splitlines()
+                   if "LANE-REMOVE" in ln and str(lane_root) in ln]
+        check("lanes-fix: the removal audit names the ignored files it took",
+              not lane_root.exists() and bool(removed)
+              and "build/" in removed[-1], removed)
+
+        # --- a workspace inside a larger repository ------------------------
+        dlg = AddTerminalDialog("Agent 9", cwd=str(work / "sub"),
+                                lanes_on=True, repo_root=str(work))
+        cb = dlg.lane_check
+        check("lanes-fix: a nested workspace offers a lane, unticked",
+              cb.isEnabled() and not cb.isChecked() and not dlg.wants_lane())
+        check("lanes-fix: ...and says the lane copies the whole repository",
+              "inside the repository" in cb.toolTip(), cb.toolTip())
+        cb.setChecked(True)
+        check("lanes-fix: ...which the user can still tick", dlg.wants_lane())
+        dlg.deleteLater()
+        top = AddTerminalDialog("Agent 9", cwd=str(work), lanes_on=True,
+                                repo_root=str(work))
+        check("lanes-fix: at the repo root the box stays ticked",
+              top.lane_check.isChecked()
+              and "inside the repository" not in top.lane_check.toolTip())
+        top.deleteLater()
+
+    win._save_timer.stop()
+    win.close()
+    app.processEvents()
+    check("lanes-fix: the real .venv survived",
+          (work / ".venv" / "marker.txt").read_text() == "real venv")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lanes_gui_thread_git():
+    """No git on the GUI thread: LaneOps keys its queues by the git common
+    dir read from the .git entries, and the key matches what git says, for
+    the main checkout and for a lane of it. The git environment never lets
+    a credential prompt or Git Credential Manager window appear."""
+    from PySide6.QtWidgets import QApplication
+    from app import lanes
+    from app.lane_ops import LaneOps
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-key-"))
+    work = _make_repo(tmp)
+    lane = lanes.create_lane(lanes.plan_lane(
+        str(work), str(work), "Key", "6e6e6e" + "0" * 26).lane_dict())
+    ops = LaneOps()
+    with _record_git() as gitlog:
+        k_main = ops.key_for(str(work))
+        k_sub = ops.key_for(str(work / "sub"))
+        k_lane = ops.key_for(lane["root"])
+    check("laneops: key_for runs no git command", gitlog.calls == [],
+          gitlog.calls)
+    truth = os.path.normcase(os.path.normpath(_git(
+        work, "rev-parse", "--path-format=absolute", "--git-common-dir")))
+    check("laneops: the key is git's common dir, for the main checkout, a "
+          "subfolder and a lane", k_main == k_sub == k_lane == truth,
+          (k_main, k_sub, k_lane, truth))
+    ops.deleteLater()
+
+    seen = {}
+    real_run = lanes.subprocess.run
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs.get("env") or {})
+        return real_run(*args, **kwargs)
+    lanes.subprocess.run = spy
+    try:
+        lanes._subprocess_git(["--version"], str(work), 15)
+    finally:
+        lanes.subprocess.run = real_run
+    check("lanes: git runs with GCM_INTERACTIVE=never and no terminal prompt",
+          seen.get("GCM_INTERACTIVE") == "never"
+          and seen.get("GIT_TERMINAL_PROMPT") == "0",
+          {k: seen.get(k) for k in ("GCM_INTERACTIVE", "GIT_TERMINAL_PROMPT")})
+    lanes.remove_lane(lane)
+    app.processEvents()
+    shutil.rmtree(tmp, ignore_errors=True)

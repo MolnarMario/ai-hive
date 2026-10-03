@@ -86,7 +86,8 @@ CREATE_NO_WINDOW = 0x08000000
 
 class LaneError(Exception):
     """A lane operation that did not happen. `code` says why, for the audit
-    line: exists, base, git, dirty, unmerged, links, missing, location."""
+    line: exists, base, git, dirty, unmerged, links, missing, location,
+    moved."""
 
     def __init__(self, code: str, message: str = ""):
         super().__init__(message or code)
@@ -107,6 +108,9 @@ class GitResult:
 def _subprocess_git(args: list, cwd: str, timeout: float) -> GitResult:
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"     # never wait on a credential prompt
+    # Git Credential Manager ignores GIT_TERMINAL_PROMPT and can open a GUI
+    # sign-in window from a background fetch
+    env["GCM_INTERACTIVE"] = "never"
     try:
         proc = subprocess.run(
             ["git", *args], cwd=cwd or None, capture_output=True, text=True,
@@ -165,6 +169,35 @@ def common_dir(path: str) -> str:
     the repo, normalized for use as a key. "" when git can't say."""
     r = git(["rev-parse", "--path-format=absolute", "--git-common-dir"], path)
     return _norm(r.out) if r.ok and r.out else ""
+
+
+def read_common_dir(path: str) -> str:
+    """`common_dir` without running git, for callers on the GUI thread. A
+    `.git` folder is the common dir. A `.git` file (a worktree) names its
+    gitdir, whose `commondir` file, when present, points at the shared one,
+    relative to the gitdir. "" when `path` is in no repo or a file is
+    unreadable."""
+    root = find_repo_root(path)
+    if not root:
+        return ""
+    dot = os.path.join(root, ".git")
+    if os.path.isdir(dot):
+        return _norm(dot)
+    try:
+        with open(dot, encoding="utf-8", errors="replace") as fh:
+            line = fh.readline().strip()
+        if not line.startswith("gitdir:"):
+            return ""
+        gitdir = os.path.normpath(os.path.join(root, line[len("gitdir:"):]
+                                               .strip()))
+        common = os.path.join(gitdir, "commondir")
+        if os.path.isfile(common):
+            with open(common, encoding="utf-8", errors="replace") as fh:
+                rel = fh.readline().strip()
+            return _norm(os.path.join(gitdir, rel)) if rel else _norm(gitdir)
+        return _norm(gitdir)
+    except OSError:
+        return ""
 
 
 def ref_exists(repo: str, ref: str) -> bool:
@@ -400,16 +433,26 @@ def _is_worktree(root: str) -> bool:
     return r.ok and same_path(r.out, root)
 
 
-def create_lane(lane: dict) -> dict:
-    """Create a NEW lane: `git worktree add --track -b <branch> <root>
+def create_lane(lane: dict, cwd: str = "") -> dict:
+    """Create a NEW lane: `git worktree add --no-track -b <branch> <root>
     <start>`, then the junctions and the exclude line. Returns the lane
     record with its base filled in.
 
     Collisions fail and never reuse: an existing folder or branch raises
     LaneError("exists") and touches nothing. Attaching a new agent to an
-    existing branch could hand it someone else's work. (`--track` makes the
-    branch's upstream the base, so `git branch -d` later accepts it once it
-    is merged there, whatever the main checkout has checked out.)"""
+    existing branch could hand it someone else's work.
+
+    The branch gets NO upstream. Leaving out `--track` is not enough: from a
+    remote-tracking start point git sets one anyway (`branch.autoSetupMerge`).
+    With `origin/<base>` as its upstream, `git status` and a bare `git push`
+    in the lane suggest `git push origin HEAD:<base>`, a push straight to the
+    base that skips every review. `remove_lane` judges merged-ness itself.
+
+    `cwd` is where the agent will start: the lane root, or the subfolder of
+    it that matches a workspace in a subfolder of the repo. When the
+    worktree doesn't contain that folder (it is untracked or ignored), the
+    fresh lane is removed again and LaneError("location") raised, so the
+    agent starts in the workspace folder rather than in a missing one."""
     root, branch, repo = lane["root"], lane["branch"], lane["repo"]
     if os.path.lexists(root):
         raise LaneError("exists", f"the folder {root} already exists")
@@ -426,11 +469,44 @@ def create_lane(lane: dict) -> dict:
     except OSError as exc:
         raise LaneError("location", f"could not create {os.path.dirname(root)}"
                                     f": {exc}")
-    _git_or_fail(["worktree", "add", "--track", "-b", branch, root, start], repo)
+    _git_or_fail(["worktree", "add", "--no-track", "-b", branch, root, start],
+                 repo)
+    if cwd and not os.path.isdir(cwd):
+        _discard_fresh_lane(root, branch, repo)
+        raise LaneError("location", f"{os.path.relpath(cwd, root)} is not "
+                                    f"tracked in the repository, so a lane "
+                                    f"would not contain it")
     link_junctions(repo, root)
     copy_worktree_includes(repo, root)
     ensure_exclude(repo)
     return {**clean_lane(lane), "base": base}
+
+
+def _discard_fresh_lane(root: str, branch: str, repo: str) -> None:
+    """Undo a create that turned out unusable. The lane is moments old and
+    holds nothing, but the removal rules still apply: links first, no
+    `--force`, and the branch only by compare-and-delete."""
+    head = git(["rev-parse", "HEAD"], root)
+    try:
+        unlink_junctions(root)
+    except LaneError:
+        return
+    if directory_links(root):
+        return
+    if git(["worktree", "remove", root], repo, WRITE_TIMEOUT).ok and head.ok:
+        git(["update-ref", "-d", f"refs/heads/{branch}", head.out], repo)
+    try:
+        os.rmdir(os.path.dirname(root))     # only if it is now empty
+    except OSError:
+        pass
+
+
+def _drop_base_upstream(repo: str, branch: str, base: str) -> None:
+    """Lanes made before `--no-track` track the base: unset that, so git
+    stops suggesting a push to it. Any other upstream is the user's."""
+    r = git(["rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"], repo)
+    if r.ok and base and r.out in (base, f"origin/{base}"):
+        git(["branch", "--unset-upstream", branch], repo)
 
 
 def repair_lane(lane: dict) -> tuple:
@@ -447,6 +523,7 @@ def repair_lane(lane: dict) -> tuple:
     git(["worktree", "prune"], repo, WRITE_TIMEOUT)
     base = lane.get("base") or default_base(repo)
     if _is_worktree(root):
+        _drop_base_upstream(repo, branch, base)
         link_junctions(repo, root)
         ensure_exclude(repo)
         return {**clean_lane(lane), "base": base}, False
@@ -459,13 +536,14 @@ def repair_lane(lane: dict) -> tuple:
     os.makedirs(os.path.dirname(root), exist_ok=True)
     if ref_exists(repo, f"refs/heads/{branch}"):
         _git_or_fail(["worktree", "add", root, branch], repo)
+        _drop_base_upstream(repo, branch, base)
         recreated = False
     else:
         start = start_ref(repo, base)
         if not start:
             raise LaneError("base", "the repository has no branch to start from")
-        _git_or_fail(["worktree", "add", "--track", "-b", branch, root, start],
-                     repo)
+        _git_or_fail(["worktree", "add", "--no-track", "-b", branch, root,
+                      start], repo)
         recreated = True
     link_junctions(repo, root)
     copy_worktree_includes(repo, root)      # the re-added folder lost them
@@ -543,23 +621,54 @@ def _in_base(cwd: str, head: str, base: str, base_ref: str) -> bool:
 class RemoveResult:
     status: LaneStatus
     branch_deleted: bool = False
-    branch_error: str = ""
+    # the ignored files and folders (`dir/`) that went with the worktree
+    ignored: list = field(default_factory=list)
+
+
+def ignored_files(root: str) -> list:
+    """The lane's ignored files, with an ignored folder listed once as
+    `dir/` and never walked, leaving out the junctions. `git worktree remove`
+    deletes these without asking, so the removal's audit line names them."""
+    r = git(["ls-files", "-z", "--others", "--ignored", "--exclude-standard",
+             "--directory", "--", ".",
+             *(f":(exclude){name}" for name in JUNCTION_NAMES)], root)
+    return [p for p in r.out.split("\0") if p] if r.ok else []
 
 
 def remove_lane(lane: dict) -> RemoveResult:
     """Remove a lane that holds nothing: worktree and branch.
 
-    Refuses unless the lane is clean AND its head is in the base. Unlinks
-    its junctions first and refuses while any directory link remains (see
-    the module docstring: git follows them). Never `--force`, never `-D`:
-    git's own refusal is the last line of defense, and it stays armed."""
+    Refuses unless the lane is clean AND both its head and its branch are in
+    the base. Unlinks its junctions first and refuses while any directory
+    link remains (see the module docstring: git follows them). Never
+    `--force`, never `-D`: git's own refusal is the last line of defense,
+    and it stays armed.
+
+    The branch goes by compare-and-delete, `update-ref -d <ref> <sha>`, with
+    the sha checked here. `branch -d` can't be used: it judges "merged"
+    against the branch's upstream or the main checkout's HEAD, and lanes
+    have no upstream (see create_lane). If the branch moved meanwhile, git
+    refuses, the branch is kept, and LaneError("moved") says so.
+
+    Ignored files (`.env`, build output) go with the worktree. They are
+    listed first, into RemoveResult.ignored, so nothing goes silently."""
     st = lane_status(lane)
     if st.dirty:
         raise LaneError("dirty", st.describe())
     if not st.merged:
         raise LaneError("unmerged", st.describe())
     root, branch, repo = lane["root"], lane["branch"], lane["repo"]
+    ref = f"refs/heads/{branch}"
+    r = git(["rev-parse", "--verify", "--quiet", ref], repo)
+    branch_head = r.out if r.ok else ""
+    # a lane whose agent switched branches: its own branch was not measured
+    if (branch_head and branch_head != st.head and not _in_base(
+            repo, branch_head, lane.get("base") or "", st.base_ref)):
+        raise LaneError("unmerged", f"the branch {branch} has commits that "
+                                    f"are not in the base branch")
+    result = RemoveResult(status=st)
     if st.exists:
+        result.ignored = ignored_files(root)
         unlink_junctions(root)
         links = directory_links(root)
         if links:
@@ -568,11 +677,13 @@ def remove_lane(lane: dict) -> RemoveResult:
         _git_or_fail(["worktree", "remove", root], repo)
     else:
         git(["worktree", "prune"], repo, WRITE_TIMEOUT)
-    result = RemoveResult(status=st)
-    if ref_exists(repo, f"refs/heads/{branch}"):
-        r = git(["branch", "-d", branch], repo)
-        result.branch_deleted = r.ok
-        result.branch_error = "" if r.ok else (r.err or r.out)
+    if branch_head:
+        r = git(["update-ref", "-d", ref, branch_head], repo)
+        if not r.ok:
+            raise LaneError("moved", f"the branch {branch} changed while its "
+                                     f"lane was removed, so it was kept: "
+                                     f"{r.err or r.out}")
+        result.branch_deleted = True
     try:
         os.rmdir(os.path.dirname(root))     # only if it is now empty
     except OSError:
@@ -585,46 +696,61 @@ class RetireResult:
     removed: bool
     status: LaneStatus | None = None
     reason: str = ""
-    branch_error: str = ""
+    code: str = ""          # the LaneError code, or "busy"
+    ignored: list = field(default_factory=list)
 
 
-def retire_lane(lane: dict, pids=(), wait_s: float = EXIT_WAIT_S) -> RetireResult:
+def retire_lane(lane: dict, pids=(), wait_s: float | None = None) -> RetireResult:
     """Closing a laned card: remove the lane when it holds nothing, keep it
-    otherwise. Waits for the closed agent's processes to exit first, since
-    Windows won't delete a folder that is still a working directory, and a
-    half-deleted worktree can no longer be removed cleanly."""
-    wait_for_exit(pids, wait_s)
+    otherwise.
+
+    Waits for the closed agent's processes to exit first, since Windows
+    won't delete a folder that is still a working directory, and a
+    half-deleted worktree can no longer be removed cleanly. If one is still
+    running when the wait ends, nothing is touched: the result is "busy",
+    and the caller may try again later."""
+    exited = wait_for_exit(pids, EXIT_WAIT_S if wait_s is None else wait_s)
     try:
         st = lane_status(lane)
     except LaneError as exc:
-        return RetireResult(False, None, str(exc))
+        return RetireResult(False, None, str(exc), exc.code)
     if st.dirty or not st.merged:
         return RetireResult(False, st, "")
+    if not exited:
+        return RetireResult(False, st, "a program is still running in it",
+                            "busy")
     try:
         res = remove_lane(lane)
     except LaneError as exc:
-        return RetireResult(False, st, str(exc))
-    return RetireResult(True, res.status, "", res.branch_error)
+        return RetireResult(False, st, str(exc), exc.code)
+    return RetireResult(True, res.status, ignored=res.ignored)
 
 
-def wait_for_exit(pids, timeout: float) -> None:
-    """Block until every pid has exited or `timeout` passed (Windows)."""
+def wait_for_exit(pids, timeout: float) -> bool:
+    """Block until every pid has exited or `timeout` passed (Windows). True
+    when all of them are gone."""
     pids = [p for p in (pids or ()) if p]
     if not pids or sys.platform != "win32":
-        return
+        return True
     import ctypes
     import time
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     deadline = time.monotonic() + max(0.0, timeout)
+    gone = True
     for pid in pids:
         handle = kernel32.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
         if not handle:
-            continue                    # already gone
+            # ERROR_ACCESS_DENIED: it exists, we just may not wait on it
+            if ctypes.get_last_error() == 5:
+                gone = False
+            continue
         try:
             left = max(0, int((deadline - time.monotonic()) * 1000))
-            kernel32.WaitForSingleObject(handle, left)
+            if kernel32.WaitForSingleObject(handle, left) != 0:  # WAIT_OBJECT_0
+                gone = False
         finally:
             kernel32.CloseHandle(handle)
+    return gone
 
 
 # --------------------------------------------------- lane conversations ---
