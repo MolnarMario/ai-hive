@@ -402,6 +402,24 @@ workspaces keep executing — switching never pauses anything.
   The board keeps the newest 40 notes (older ones move to
   `.aihive/board-archive.md`), so reading it stays cheap. Scoped per
   workspace; workspaces stay isolated.
+- **Agent lanes** (⚙ Options > Agents, off by default): with the switch on, a
+  new Claude agent in a git workspace gets its own git worktree and branch
+  beside the repository (`<repo>.lanes\<name>-<id>`, branch `hive/<name>-<id>`),
+  so agents can no longer reset, restage or commit each other's work. The New
+  Agent dialog's **Own lane** checkbox opts one out; with Count 3 you get three
+  lanes. The ignored `.venv` / `venv` / `node_modules` are linked in, so the
+  usual test command works in a lane. Closing a card removes its lane only when
+  it holds nothing (clean, and its commits are already in the base branch);
+  otherwise the lane is kept and AI Hive says what is in it. A lane a program
+  still runs in is not touched; the removal is retried for a minute. A kept
+  lane's conversation stays in the New Agent dialog's Conversation list, and
+  picking it brings the lane back at the same path. Turning the switch off
+  stops new lanes; agents that already have one keep it. Lane branches have
+  no upstream, so git never suggests pushing a lane to the base branch. A
+  workspace inside a larger repository starts with the box unticked. Git
+  operations on one repo run one at a time (none on the GUI thread), every
+  step is logged as a `LANE-*` line in `session.log` (a removal names the
+  ignored files it took), and lane removal never uses `--force` or `-D`.
 - **Per-workspace agent numbering** — each workspace counts Agent 1, 2, 3…
   independently.
 - **Agent/File Map** — a **◆ Map** button in the workspace header opens a
@@ -801,7 +819,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2200 checks drive the real app headlessly (offscreen Qt platform) with real
+2363 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -897,6 +915,8 @@ app/
   providers.py             AI provider registry (Claude + Gemini/agy + Grok wired; OpenAI template)
   coordination.py          per-workspace shared board (.aihive/board.md) and
                            its log rotation into board-archive.md
+  lanes.py                 agent lanes: a git worktree per agent, create/repair/retire (Qt-free)
+  lane_ops.py              runs lane git operations one at a time per repo, off the GUI thread
   process_worker.py        QProcess engine, HybridDecoder, WinJob (line mode)
   pty_worker.py            ConPTY engine via pywinpty (full-terminal mode)
   terminal_agent.py        per-terminal model (worker + log/buffer + lifecycle)
@@ -937,7 +957,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2200 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2363 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

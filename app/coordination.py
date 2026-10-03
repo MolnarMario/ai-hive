@@ -45,8 +45,11 @@ _STATUS_ICON = {
 
 
 def system_prompt_text(workspace_name: str, agent_name: str,
-                       board_path: str) -> str:
-    return (
+                       board_path: str, lane: dict | None = None) -> str:
+    """The board etiquette every Claude agent gets, plus a lane section for
+    an agent with its own git worktree (app/lanes.py). The board path is
+    always the workspace's own absolute one: a lane has no board of its own."""
+    text = (
         f"You are the agent \"{agent_name}\", one of several AI Hive agents "
         f"working together in the \"{workspace_name}\" workspace. A shared "
         f"coordination board is at {board_path}. BEFORE starting substantial "
@@ -57,6 +60,22 @@ def system_prompt_text(workspace_name: str, agent_name: str,
         f"\"implementing auth in login.py\"). Do NOT edit board.md directly; "
         f"AI Hive serializes those writes through the tool so concurrent agents "
         f"can't clobber each other's entries.")
+    if lane and lane.get("root") and lane.get("branch"):
+        base = lane.get("base") or "the base branch"
+        text += (
+            f" You work in your own git worktree (your lane) at {lane['root']}, "
+            f"on the branch {lane['branch']}, which starts from {base}. Commit "
+            f"your work there, on that branch. Never edit files in other "
+            f"worktrees or in the main checkout at {lane.get('repo', '')} "
+            f"(reading its board is fine), and never commit to {base}. Never "
+            f"push your lane branch to {base}, even when git suggests it: "
+            f"your work reaches {base} through a pull request. Any .venv, "
+            f"venv or node_modules folder in your lane is a link to the main "
+            f"checkout's copy, so installing packages there changes them for "
+            f"every lane. Do not bump the version or edit the CHANGELOG or "
+            f"the README check count: that is done once per pull request, "
+            f"when your work is integrated.")
+    return text
 
 
 def sanitize_text(text: str) -> str:

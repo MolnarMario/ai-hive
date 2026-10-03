@@ -8,6 +8,24 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.25.0
+
+- New in Options: Agent lanes, off by default. Turned on, every new Claude
+  agent in a git workspace works in its own copy of the repository (a git
+  worktree on its own branch, next to your project folder), so agents can no
+  longer overwrite, reset or accidentally commit each other's changes. Untick
+  "Own lane" in the New Agent dialog to keep an agent in the workspace folder.
+- Closing a laned agent cleans its lane up only when nothing in it is
+  unsaved or unmerged, and only once no program is still running in it (AI
+  Hive tries again for a minute). Otherwise the lane is kept and AI Hive tells
+  you what is in it; its conversation stays in the New Agent dialog's
+  Conversation list, and picking it brings the lane back where it was.
+- A workspace inside a larger repository starts with "Own lane" unticked,
+  since its lane would copy the whole repository. A workspace folder that is
+  not part of the repository's files gets no lane at all.
+- Turning Agent lanes off stops new lanes. Agents that already have one keep
+  working in it.
+
 ## 0.24.0
 
 - The New Agent dialog has a Count stepper: pick Claude Code (or any type),
