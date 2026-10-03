@@ -3244,13 +3244,16 @@ def test_integration_fixes_core():
         check("integ-fix: Approve refuses when GitHub's base differs from "
               "the fetched one", out.state == integ.NEEDS_YOU
               and gh.merges() == [], out)
-        gh.base_sha = None
+        # GitHub agrees with the local copy, but the fetch itself fails: the
+        # local copy may be stale, so nothing merges either
+        gh.base_sha = _git(work, "rev-parse", "origin/main")
         url = _git(work, "remote", "get-url", "origin")
         _git(work, "remote", "set-url", "origin", str(tmp / "gone.git"))
         out = integ.approve_merge(repo, item)
         check("integ-fix: Approve refuses when the base can't be fetched",
               out.state == integ.NEEDS_YOU and gh.merges() == [], out)
         _git(work, "remote", "set-url", "origin", url)
+        gh.base_sha = None
         out = integ.approve_merge(repo, item)
         check("integ-fix: with the base confirmed, Approve merges",
               out.state == integ.MERGED and len(gh.merges()) == 1, out)
@@ -3304,6 +3307,7 @@ def test_integrator_lane_not_a_peer():
         return mgr.add_terminal(ws.id, spec, autostart=False)
     a = laned("Agent A", "aa" * 16)
     b = laned("Agent B", "bb" * 16)
+    c = laned("Agent C", "cc" * 16)
     i = laned("Integrator", "ee" * 16)
     mgr.set_integrator(ws.id, i.id)
     ops = LaneOps()
@@ -3324,6 +3328,16 @@ def test_integrator_lane_not_a_peer():
         ri = i.spec.lane["root"]
         _git(ri, "switch", "-q", "-c", "integrate/agent-a-x", sha_a)
         _commit(ri, "VERSION", "1.1\n", "bump the version")
+        # C took A's commit as it is (a merge of A's branch): the same work
+        _git(c.spec.lane["root"], "merge", "-q", "--ff-only", sha_a)
+        poll()
+        check("integ-peer: a lane that holds another lane's commits as they "
+              "are is not its overlap peer", not [
+                  k for k in _notice_keys(notices_a) if c.spec.uid in k],
+              _notice_keys(notices_a))
+        # A goes on working after its submit: no longer related to the
+        # integrator's branch by ancestry, so only the role keeps it quiet
+        _commit(a.spec.lane["root"], "a.txt", "A's next\n", "A goes on")
         poll()
         check("integ-peer: the lane being integrated gets no notice about "
               "the integrator", not [k for k in _notice_keys(notices_a)
@@ -3570,6 +3584,9 @@ def test_queue_refused_head_window():
               item.state == integ.NEEDS_YOU
               and "changed after it was tested" in item.note
               and not q.gh.merges(), item)
+        # the integrator even claims it tested the new head: still only the
+        # user's Recheck may put it up for approval again
+        pr["body"] = f"Tested-commit: {pr['head']}\n"
         awaiting = q.log().count("QUEUE-AWAITING")
         q.turn_end()
         check("queue-f6: the integrator's next turn end leaves it with the "
