@@ -1069,6 +1069,118 @@ def test_new_agent_autofocus():
     win.close()
 
 
+def test_new_agent_count():
+    """The New Agent dialog's [-] n [+] stepper opens n agents at once: it
+    starts at 1 with minus disabled, caps at the workspace's free slots, is
+    pinned to 1 while a past conversation is being resumed (two agents on one
+    transcript destroy it), and Enter still means OK, not a step."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app.session_store import SessionStore
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    dlg = AddTerminalDialog("Agent 4", cwd=str(SCRATCH_CWD), max_count=3)
+    check("count: defaults to 1", dlg.count() == 1
+          and dlg.count_value.text() == "1")
+    check("count: minus is disabled at 1", not dlg.count_minus.isEnabled())
+    check("count: plus is enabled at 1", dlg.count_plus.isEnabled())
+    check("count: minus never goes below 1", (dlg._set_count(0),
+                                              dlg.count())[1] == 1)
+    dlg.count_plus.click()
+    dlg.count_plus.click()
+    check("count: plus steps the value", dlg.count() == 3
+          and dlg.count_value.text() == "3")
+    check("count: minus is enabled above 1", dlg.count_minus.isEnabled())
+    check("count: plus is disabled at the free-slot cap",
+          not dlg.count_plus.isEnabled())
+    dlg.count_plus.click()
+    check("count: plus can't pass the cap", dlg.count() == 3)
+    check("count: stepper buttons are not autoDefault (Enter = OK)",
+          not dlg.count_minus.autoDefault() and not dlg.count_plus.autoDefault())
+
+    specs = dlg.result_specs(cwd=str(SCRATCH_CWD))
+    check("count: one spec per agent", len(specs) == 3, len(specs))
+    check("count: names count on from the default",
+          [s.name for s in specs] == ["Agent 4", "Agent 5", "Agent 6"],
+          [s.name for s in specs])
+    check("count: specs are distinct objects of the chosen kind",
+          len({id(s) for s in specs}) == 3
+          and all(s.kind == specs[0].kind for s in specs))
+    dlg.name_edit.setText("Reviewer")
+    check("count: a custom name gets numbered copies",
+          [s.name for s in dlg.result_specs(cwd=str(SCRATCH_CWD))]
+          == ["Reviewer", "Reviewer 2", "Reviewer 3"])
+    dlg.count_minus.click()
+    check("count: minus steps down", dlg.count() == 2)
+
+    # resuming a past conversation pins the count to 1
+    dlg.resume_combo.clear()
+    dlg.resume_combo.addItem("New conversation", "")
+    dlg.resume_combo.addItem("old chat", "11111111-1111-1111-1111-111111111111")
+    dlg.resume_combo.show()
+    dlg.resume_combo.setCurrentIndex(1)
+    check("count: a resumed conversation pins the count to 1",
+          dlg.count() == 1 and not dlg.count_plus.isEnabled())
+    check("count: resume yields a single spec",
+          len(dlg.result_specs(cwd=str(SCRATCH_CWD))) == 1)
+    dlg.resume_combo.setCurrentIndex(0)
+    check("count: back to a new conversation re-enables plus",
+          dlg.count_plus.isEnabled())
+    dlg.deleteLater()
+
+    full = AddTerminalDialog("Agent 1", cwd=str(SCRATCH_CWD), max_count=0)
+    check("count: a full workspace still shows 1 with both buttons off",
+          full.count() == 1 and not full.count_plus.isEnabled()
+          and not full.count_minus.isEnabled())
+    full.deleteLater()
+
+    # the window opens every requested agent, revealing the first
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-count-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    pump(150)
+    ws = win.manager.workspaces[0]
+    before = len(ws.agents)
+
+    def accept_three(self):
+        self.count_plus.click()
+        self.count_plus.click()
+        return QDialog.DialogCode.Accepted
+
+    orig_exec = AddTerminalDialog.exec
+    orig_result_spec = AddTerminalDialog.result_spec
+    AddTerminalDialog.exec = accept_three
+    AddTerminalDialog.result_spec = lambda self, cwd="": build_spec(
+        AgentKind.CMD, "Shell 1", cwd=cwd, pty=True)
+    try:
+        win._on_add_terminal_clicked(ws.id)
+    finally:
+        AddTerminalDialog.exec = orig_exec
+        AddTerminalDialog.result_spec = orig_result_spec
+    pump(200)
+    new = ws.agents[before:]
+    check("count: the window opened 3 agents", len(new) == 3, len(new))
+    check("count: the opened agents are numbered",
+          [a.spec.name for a in new] == ["Shell 1", "Shell 2", "Shell 3"],
+          [a.spec.name for a in new])
+    first_card = win._pages[ws.id].card_for(new[0].id) if new else None
+    check("count: the first new agent is focused",
+          first_card is not None and win._focused_card is first_card)
+    win.close()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_agent_file_map():
     """The Agent/File Map visualizer: (1) the transcript parser attributes
     edited vs read files and detects Task sub-agents while skipping malformed
@@ -1286,3 +1398,84 @@ def test_agent_file_map():
     finally:
         transcripts.transcript_path = real_tp
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+# -------------------------------------------------- GitHub workspace clone ----
+
+def test_workspace_clone_default_branch():
+    """New Workspace from a GitHub URL clones the remote's DEFAULT branch,
+    whatever it is named. It used to pass `--branch main`, so a repo whose
+    default is `master` failed with "Remote branch main not found". Local
+    bare repos stand in for GitHub so this runs offline."""
+    import subprocess
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.main_window import NewWorkspaceDialog, clone_default_branch
+
+    QApplication.instance() or QApplication([])
+    tmp = tempfile.mkdtemp(prefix="aihive-clone-")
+
+    def git(*args, cwd=None):
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t",
+             "-c", "init.defaultBranch=scratch", *args],
+            cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
+
+    def bare_repo(tag, branches, default):
+        """A bare remote holding `branches` (each with its own file), whose
+        HEAD points at `default`."""
+        work = os.path.join(tmp, tag + "-work")
+        git("init", work)
+        for branch in branches:
+            git("checkout", "-q", "-b", branch, cwd=work)
+            Path(work, branch + ".txt").write_text(branch)
+            git("add", ".", cwd=work)
+            git("commit", "-q", "-m", branch, cwd=work)
+        bare = os.path.join(tmp, tag + ".git")
+        git("clone", "-q", "--bare", work, bare)
+        git("symbolic-ref", "HEAD", "refs/heads/" + default, cwd=bare)
+        return bare
+
+    try:
+        # A `master`-default repo: the reported failure.
+        dest = os.path.join(tmp, "master-clone")
+        err = clone_default_branch(bare_repo("master", ["master"], "master"), dest)
+        check("clone: a master-default repo clones", err == "", err)
+        check("clone: master repo checks out master",
+              os.path.isdir(dest) and git("branch", "--show-current", cwd=dest) == "master")
+
+        # Default `trunk` while a `main` exists too: follow the remote's HEAD,
+        # not the naming convention.
+        dest = os.path.join(tmp, "trunk-clone")
+        err = clone_default_branch(
+            bare_repo("trunk", ["main", "trunk"], "trunk"), dest)
+        check("clone: an unusually named default branch clones", err == "", err)
+        check("clone: checks out the remote default, not main",
+              os.path.isdir(dest)
+              and git("branch", "--show-current", cwd=dest) == "trunk"
+              and os.path.isfile(os.path.join(dest, "trunk.txt")))
+        remote_branches = (git("branch", "-r", "--format=%(refname)", cwd=dest)
+                           .split() if os.path.isdir(dest) else [])
+        check("clone: fetches only the default branch",
+              "refs/remotes/origin/trunk" in remote_branches
+              and "refs/remotes/origin/main" not in remote_branches,
+              remote_branches)
+
+        # A plain `main` repo keeps working.
+        dest = os.path.join(tmp, "main-clone")
+        err = clone_default_branch(bare_repo("main", ["main"], "main"), dest)
+        check("clone: a main-default repo still clones",
+              err == "" and git("branch", "--show-current", cwd=dest) == "main", err)
+
+        # A failure reports git's text and leaves no folder behind.
+        dest = os.path.join(tmp, "missing-clone")
+        err = clone_default_branch(os.path.join(tmp, "no-such.git"), dest)
+        check("clone: a bad remote returns git's error", bool(err), err)
+        check("clone: a failed clone leaves no folder", not os.path.exists(dest))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    dlg = NewWorkspaceDialog(str(SCRATCH_CWD))
+    note = dlg.repo_note.text()
+    check("clone: dialog says it clones the default branch",
+          "default branch" in note and "main branch" not in note, note)
+    dlg.deleteLater()

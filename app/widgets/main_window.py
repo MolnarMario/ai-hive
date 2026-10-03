@@ -6,6 +6,7 @@ Every dialog lives here so the model API stays headless-testable.
 
 import os
 import json
+import re
 import shutil
 import subprocess
 import threading
@@ -19,7 +20,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QLabel, QLineEdit, QMainWindow, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton,
-                               QScrollArea, QSplitter, QStackedWidget,
+                               QProgressDialog, QScrollArea, QSplitter, QStackedWidget,
                                QToolButton, QVBoxLayout, QWidget)
 
 from .. import __version__
@@ -38,7 +39,8 @@ from .. import usage_poll
 from ..process_worker import (AI_KINDS, PTY_ONLY_KINDS, AgentKind, build_spec)
 from ..pty_worker import HAS_CONPTY
 from ..session_store import SessionStore
-from ..workspace_manager import Workspace, WorkspaceManager
+from ..workspace_manager import (MAX_AGENTS_PER_WORKSPACE, Workspace,
+                                 WorkspaceManager)
 from .. import coordination
 from .. import event_log
 from ..event_hub import EventHub
@@ -1212,18 +1214,26 @@ class TopBar(QFrame):
 class AddTerminalDialog(QDialog):
     """Configure a new agent: type, and for AI agents provider/model/effort.
 
-    Model stays dialog-free — the dialog only produces an AgentSpec via
-    result_spec(); headless tests build specs directly.
+    Model stays dialog-free — the dialog only produces AgentSpecs via
+    result_spec() / result_specs(); headless tests build specs directly.
+
+    The Count stepper launches several identical agents in one go. It is
+    capped at the workspace's free slots (max_count) and pinned to 1 while a
+    past conversation is picked: two agents resuming one transcript race for
+    it and one of them destroys it.
     """
 
     def __init__(self, default_name: str, parent=None,
-                 cwd: str = "", busy_ids=()):
+                 cwd: str = "", busy_ids=(),
+                 max_count: int = MAX_AGENTS_PER_WORKSPACE):
         super().__init__(parent)
         self.setWindowTitle("New Agent")
         self.setMinimumWidth(420)
         self._cwd = cwd
         self._busy_ids = set(busy_ids)  # conversations a running agent holds
         self._resume_loaded = False
+        self._count = 1
+        self._max_count = max(1, max_count)
 
         form = QFormLayout()
         self.name_edit = QLineEdit(default_name, self)
@@ -1277,10 +1287,33 @@ class AddTerminalDialog(QDialog):
         self.pty_check.setChecked(HAS_CONPTY)
         self.pty_check.setEnabled(HAS_CONPTY)
 
+        # how many agents to open: [-] n [+]
+        self.count_minus = QPushButton("-", self)
+        self.count_value = QLabel(self)
+        self.count_plus = QPushButton("+", self)
+        for btn in (self.count_minus, self.count_plus):
+            btn.setObjectName("CountStepBtn")
+            # a dialog's QPushButtons are autoDefault, so Enter would step
+            # the count instead of pressing OK
+            btn.setAutoDefault(False)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.count_value.setObjectName("CountValue")
+        self.count_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.count_value.setMinimumWidth(28)
+        count_row = QHBoxLayout()
+        count_row.setSpacing(6)
+        count_row.addWidget(self.count_minus)
+        count_row.addWidget(self.count_value)
+        count_row.addWidget(self.count_plus)
+        count_row.addStretch(1)
+        self.count_minus.clicked.connect(lambda: self._set_count(self._count - 1))
+        self.count_plus.clicked.connect(lambda: self._set_count(self._count + 1))
+
         form.addRow("Name", self.name_edit)
         form.addRow("Type", self.kind_combo)
         self._note_row = self.provider_note
         form.addRow("", self.provider_note)
+        form.addRow("Count", count_row)
         self._model_label = QLabel("Model", self)
         form.addRow(self._model_label, self.model_combo)
         self._effort_label = QLabel("Effort", self)
@@ -1320,7 +1353,35 @@ class AddTerminalDialog(QDialog):
         self.program_edit.textChanged.connect(self._validate)
         self.command_edit.textChanged.connect(self._validate)
         self.browse_btn.clicked.connect(self._browse)
+        self.resume_combo.currentIndexChanged.connect(
+            lambda _i: self._set_count(self._count))
         self._on_kind_changed(0)
+
+    def count(self) -> int:
+        """How many agents OK opens (1 unless the stepper was used)."""
+        return self._count
+
+    def _count_cap(self) -> int:
+        # a resumed conversation can only be held by one agent
+        if not self.resume_combo.isHidden() and self.resume_combo.currentData():
+            return 1
+        return self._max_count
+
+    def _set_count(self, n: int) -> None:
+        cap = self._count_cap()
+        self._count = max(1, min(n, cap))
+        self.count_value.setText(str(self._count))
+        self.count_minus.setEnabled(self._count > 1)
+        self.count_plus.setEnabled(self._count < cap)
+        if cap == 1 and self._max_count > 1:
+            self.count_plus.setToolTip(
+                "A past conversation can only be resumed by one agent.")
+        elif self._count >= cap:
+            self.count_plus.setToolTip(
+                f"This workspace has room for {cap} more agent"
+                f"{'' if cap == 1 else 's'}.")
+        else:
+            self.count_plus.setToolTip("")
 
     def _kind(self) -> AgentKind:
         return self.kind_combo.currentData()
@@ -1391,6 +1452,7 @@ class AddTerminalDialog(QDialog):
         else:
             self.pty_check.setEnabled(HAS_CONPTY)
         self._validate()
+        self._set_count(self._count)  # the resume picker may have come or gone
 
     def _populate_models(self, prov) -> None:
         self.model_combo.clear()
@@ -1489,6 +1551,17 @@ class AddTerminalDialog(QDialog):
         args = QProcess.splitCommand(self.args_edit.text().strip())
         pty = self.pty_check.isChecked() and HAS_CONPTY
         return build_spec(kind, name, cwd=cwd, program=program, args=args, pty=pty)
+
+    def result_specs(self, cwd: str) -> list:
+        """One fresh spec per agent the stepper asked for. The first keeps the
+        typed name; the rest count on from it ("Agent 4" -> "Agent 5", 6...;
+        "Reviewer" -> "Reviewer 2", 3...)."""
+        specs = [self.result_spec(cwd=cwd) for _ in range(self._count)]
+        m = re.fullmatch(r"(.*\S)\s+(\d+)", specs[0].name)
+        base, first = (m.group(1), int(m.group(2))) if m else (specs[0].name, 1)
+        for i, spec in enumerate(specs[1:], start=1):
+            spec.name = f"{base} {first + i}"
+        return specs
 
 
 class ScheduleMessageDialog(QDialog):
@@ -1725,6 +1798,129 @@ class ScheduleMessageDialog(QDialog):
         return text, self._due_ts
 
 
+def clone_default_branch(remote: str, destination: str) -> str:
+    """Clone `remote`'s default branch into `destination`; return git's error
+    text, or "" on success. A failed clone leaves no folder behind.
+
+    No `--branch`: git then checks out whatever the remote's HEAD points at,
+    so `main`, `master`, `trunk` or any other default name all work. Naming
+    `main` here made every repo whose default is `master` fail with "Remote
+    branch main not found". `--single-branch` still fetches only that branch.
+    """
+    error = ""
+    try:
+        result = subprocess.run(
+            ["git", "clone", "--single-branch", remote, destination],
+            capture_output=True, text=True, timeout=900,
+            creationflags=0x08000000)
+        if result.returncode:
+            error = (result.stderr or result.stdout or
+                     "Git could not clone the repository.").strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        error = str(exc)
+    if error and os.path.isdir(destination):
+        shutil.rmtree(destination, ignore_errors=True)
+    return error
+
+
+class NewWorkspaceDialog(QDialog):
+    """Choose an existing project folder or clone a GitHub repository's
+    default branch (see `clone_default_branch`)."""
+
+    def __init__(self, start_dir: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Workspace")
+        self.setMinimumWidth(480)
+
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self.source_combo = QComboBox(self)
+        self.source_combo.addItems(["Existing folder", "GitHub repository"])
+        form.addRow("Source", self.source_combo)
+        root.addLayout(form)
+
+        self.pages = QStackedWidget(self)
+        folder_page = QWidget(self.pages)
+        folder_form = QFormLayout(folder_page)
+        folder_row = QHBoxLayout()
+        self.folder_edit = QLineEdit(start_dir, folder_page)
+        folder_browse = QPushButton("Browse…", folder_page)
+        folder_browse.clicked.connect(self._browse_folder)
+        folder_row.addWidget(self.folder_edit, 1)
+        folder_row.addWidget(folder_browse)
+        folder_form.addRow("Project folder", folder_row)
+        self.pages.addWidget(folder_page)
+
+        repo_page = QWidget(self.pages)
+        repo_form = QFormLayout(repo_page)
+        self.repo_edit = QLineEdit(repo_page)
+        self.repo_edit.setPlaceholderText("https://github.com/owner/repository.git")
+        repo_form.addRow("GitHub URL", self.repo_edit)
+        self.repo_name_edit = QLineEdit(repo_page)
+        self.repo_name_edit.setPlaceholderText("Repository name")
+        self._suggested_name = ""
+        repo_form.addRow("Workspace name", self.repo_name_edit)
+        parent_row = QHBoxLayout()
+        self.parent_edit = QLineEdit(start_dir, repo_page)
+        parent_browse = QPushButton("Browse…", repo_page)
+        parent_browse.clicked.connect(self._browse_parent)
+        parent_row.addWidget(self.parent_edit, 1)
+        parent_row.addWidget(parent_browse)
+        repo_form.addRow("Clone into", parent_row)
+        note = QLabel("AI Hive will clone the repository's default branch "
+                      "(main, master or whatever it is called) into a new folder.",
+                      repo_page)
+        self.repo_note = note
+        note.setWordWrap(True)
+        repo_form.addRow("", note)
+        self.pages.addWidget(repo_page)
+        root.addWidget(self.pages)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel |
+            QDialogButtonBox.StandardButton.Ok, parent=self)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Create workspace")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.source_combo.currentIndexChanged.connect(self.pages.setCurrentIndex)
+        self.repo_edit.textChanged.connect(self._suggest_repo_name)
+
+    def _browse_folder(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Choose the project folder", self.folder_edit.text())
+        if path:
+            self.folder_edit.setText(path)
+
+    def _browse_parent(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Choose where to clone the repository", self.parent_edit.text())
+        if path:
+            self.parent_edit.setText(path)
+
+    def _suggest_repo_name(self, value: str):
+        if (self.repo_name_edit.text().strip()
+                and self.repo_name_edit.text() != self._suggested_name):
+            return
+        path = urlparse(value.strip()).path.rstrip("/")
+        name = path.rsplit("/", 1)[-1]
+        if name.endswith(".git"):
+            name = name[:-4]
+        if name:
+            self._suggested_name = name
+            self.repo_name_edit.setText(name)
+
+    def result_data(self) -> dict:
+        if self.source_combo.currentIndex() == 0:
+            path = self.folder_edit.text().strip()
+            return {"mode": "folder", "path": path,
+                    "name": os.path.basename(os.path.normpath(path)) or "Workspace"}
+        return {"mode": "github", "url": self.repo_edit.text().strip(),
+                "name": self.repo_name_edit.text().strip(),
+                "parent": self.parent_edit.text().strip()}
+
+
 class MainWindow(QMainWindow):
     # Plan-usage edges, for features that need to ACT on the account being cut
     # off rather than just display it (e.g. relaunching agents that died on a
@@ -1736,6 +1932,7 @@ class MainWindow(QMainWindow):
     planLimitReached = Signal(object)   # claude_usage.Limit
     planLimitCleared = Signal()
     repoActivityLoaded = Signal(str, object, object, str, str)
+    workspaceCloneFinished = Signal(str, str, str, str)
 
     def __init__(self, manager: WorkspaceManager, store: SessionStore,
                  session: dict | None = None):
@@ -1747,6 +1944,8 @@ class MainWindow(QMainWindow):
 
         self._pages: dict[str, WorkspacePage] = {}
         self.repoActivityLoaded.connect(self._on_repo_activity_loaded)
+        self.workspaceCloneFinished.connect(self._on_workspace_clone_finished)
+        self._clone_progress: QProgressDialog | None = None
         self._map_window: AgentFileMapWindow | None = None  # lazy, reused
         self._event_log_window: EventLogWindow | None = None  # lazy, reused
         self._event_log_state: dict = {}  # its filters/size (persisted)
@@ -4118,14 +4317,76 @@ class MainWindow(QMainWindow):
         active = self.manager.workspace(self.manager.active_id)
         if active and os.path.isdir(active.project_path):
             start_dir = active.project_path
-        path = QFileDialog.getExistingDirectory(
-            self, "Choose the project folder for the new workspace", start_dir)
-        if not path:
-            return  # mandatory: cancel aborts creation
-        name = os.path.basename(os.path.normpath(path)) or "Workspace"
+        dialog = NewWorkspaceDialog(start_dir, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        data = dialog.result_data()
+        if data["mode"] == "folder":
+            path = data["path"]
+            if not os.path.isdir(path):
+                QMessageBox.warning(self, "AI Hive",
+                                    "Choose an existing project folder.")
+                return
+            ws = self.manager.create_workspace(data["name"], path)
+            self.manager.set_active(ws.id)
+            self.sidebar.begin_rename(ws.id)
+            return
+
+        remote = data["url"]
+        repo_url = self._repo_remote_url(remote)
+        parts = [part for part in urlparse(repo_url).path.split("/") if part]
+        name = data["name"].strip()
+        parent = data["parent"].strip()
+        if not repo_url or len(parts) != 2:
+            QMessageBox.warning(self, "AI Hive",
+                                "Enter a GitHub repository URL with an owner and repository name.")
+            return
+        if not name or not parent or not os.path.isdir(parent):
+            QMessageBox.warning(self, "AI Hive",
+                                "Enter a workspace name and choose an existing clone folder.")
+            return
+        folder_name = re.sub(r'[<>:"/\\|?*]', "_", name).rstrip(" .")
+        if not folder_name or folder_name in {".", ".."}:
+            QMessageBox.warning(self, "AI Hive", "Enter a valid workspace name.")
+            return
+        destination = os.path.abspath(os.path.join(parent, folder_name))
+        if os.path.exists(destination):
+            QMessageBox.warning(
+                self, "AI Hive",
+                f"The clone destination already exists:\n{destination}")
+            return
+
+        progress = QProgressDialog(
+            f"Cloning {repo_url}…", "", 0, 0, self)
+        progress.setWindowTitle("Creating GitHub workspace")
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        self._clone_progress = progress
+
+        def clone() -> None:
+            error = clone_default_branch(remote, destination)
+            self.workspaceCloneFinished.emit(name, destination, repo_url, error)
+
+        threading.Thread(target=clone, name="github-workspace-clone",
+                         daemon=True).start()
+
+    def _on_workspace_clone_finished(self, name: str, path: str,
+                                     repo_url: str, error: str) -> None:
+        if self._clone_progress is not None:
+            self._clone_progress.close()
+            self._clone_progress.deleteLater()
+            self._clone_progress = None
+        if error:
+            QMessageBox.warning(self, "GitHub clone failed", error)
+            return
+        if not os.path.isdir(path):
+            QMessageBox.warning(self, "GitHub clone failed",
+                                "Git reported success, but the cloned folder was not found.")
+            return
         ws = self.manager.create_workspace(name, path)
         self.manager.set_active(ws.id)
-        self.sidebar.begin_rename(ws.id)
 
     def _on_add_terminal_clicked(self, ws_id: str = "") -> None:
         # ws_id lets an empty grid slot request an agent for its own workspace;
@@ -4139,18 +4400,23 @@ class MainWindow(QMainWindow):
         # them for resume (two agents on one transcript race/truncate it)
         busy_ids = {a.spec.session_id for a in ws.agents
                     if a.is_running() and a.spec.session_id}
+        free = MAX_AGENTS_PER_WORKSPACE - len(ws.agents)
         dialog = AddTerminalDialog(self.manager.next_agent_name(ws.id), self,
-                                   cwd=ws.project_path, busy_ids=busy_ids)
+                                   cwd=ws.project_path, busy_ids=busy_ids,
+                                   max_count=free)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        spec = dialog.result_spec(cwd=ws.project_path)
-        agent = self.manager.add_terminal(ws.id, spec)
-        if agent is None:
-            QMessageBox.warning(self, "AI Hive",
-                                "This workspace is at its agent limit.")
-            return
+        first = None
+        for spec in dialog.result_specs(cwd=ws.project_path):
+            agent = self.manager.add_terminal(ws.id, spec)
+            if agent is None:
+                QMessageBox.warning(self, "AI Hive",
+                                    "This workspace is at its agent limit.")
+                break
+            first = first or agent
         # opening a terminal is for typing into it right away
-        self._reveal_agent(ws.id, agent.id)
+        if first is not None:
+            self._reveal_agent(ws.id, first.id)
 
     def _confirm_delete_workspace(self, ws_id: str) -> None:
         ws = self.manager.workspace(ws_id)

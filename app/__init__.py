@@ -11,4 +11,4 @@
 # (app/self_update.py) offers an update only when main's version is HIGHER than
 # this one, and shows the CHANGELOG sections in between. The smoke suite checks
 # that CHANGELOG.md's newest section equals this value.
-__version__ = "0.23.2"
+__version__ = "0.24.0"

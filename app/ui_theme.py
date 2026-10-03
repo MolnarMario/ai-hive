@@ -991,6 +991,10 @@ QScrollArea {{ background: transparent; border: none; }}
     border-color: {p.ACCENT_BLUE}; color: {p.TEXT};
 }}
 #ProviderNote {{ color: {p.TEXT_DIM}; font-size: 11px; }}
+#CountStepBtn {{
+    padding: 2px 0; min-width: 26px; max-width: 26px; font-size: 14px;
+}}
+#CountValue {{ font-size: 13px; color: {p.TEXT}; }}
 
 /* -------------------------------------------------- activity panel (v2) --- */
 #ActivityPanel {{
