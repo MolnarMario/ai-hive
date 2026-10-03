@@ -16,7 +16,8 @@ em dashes: this text is shown in the app.
   branch) changed one of the same files, red when the two would conflict.
 - A laned agent is warned the moment it edits a file another lane changed,
   or edits outside its own lane, and is told on its next prompt when the base
-  branch changed a file it changed. Each warning comes once.
+  branch changed a file it changed. Each warning comes once per round of
+  work. Laned agents read a small roster file instead of the whole board.
 - The board roster shows each agent's lane, how far ahead it is and which
   files it is touching. The Activity panel lists lanes and their changed
   files, the Agent/File Map shows one tree for the whole repository, and new
@@ -24,7 +25,10 @@ em dashes: this text is shown in the app.
 - The lane chip's menu opens the lane folder, and updates a lane with no work
   of its own to the newest base branch.
 - A `.worktreeinclude` file in the repository names ignored local files (like
-  a `.env`) to copy into every new lane.
+  a `.env`) to copy into every new lane. A lane whose copy you edited is kept
+  when its agent closes, not deleted with it.
+- Turning Agent lanes off now always reaches agents that are running, even
+  when one of them is reading the lane file at that moment.
 
 ## 0.25.0
 
