@@ -8,6 +8,12 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.23.1
+
+- Terminals restored after a reopen keep the width they started at, also on a
+  small or heavily scaled screen. Before, a resumed conversation there could
+  be wrapped narrower than its card.
+
 ## 0.23.0
 
 - Codex cards now resume their own conversation when you reopen AI Hive, and
