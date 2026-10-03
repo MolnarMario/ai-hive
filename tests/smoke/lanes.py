@@ -3355,32 +3355,65 @@ def test_integrator_lane_not_a_peer():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_integration_fixes_window():
-    """The queue review fixes through the real window, with stubbed workers
-    and the fake gh: a lane submitted again gets its own integrate branch,
-    so its turn end can't find the previous item's merged PR (F2); a PR
-    merged on github.com holds the queue until the user's Mark merged, which
-    checks with GitHub (F1); a head Approve refused never re-approves on a
-    turn end, and the reason is saved (F6); and a squash-merged lane can be
-    removed from its "lane kept" notice (F20)."""
-    from PySide6.QtWidgets import QApplication, QDialog
-    from app import integration as integ
-    from app.session_store import SessionStore
-    from app.widgets.main_window import AddTerminalDialog
-    from app.workspace_manager import WorkspaceManager
-    from main import create_main_window
+class _QueueRig:
+    """A real window with the Agent lanes switch on, three laned (stubbed)
+    agents a, b and the integrator i, the fake gh, and the integrator's
+    deliveries recorded. For the queue review-fix tests; used as a context
+    manager so the stubs and the fake come off whatever happens."""
 
-    app = QApplication.instance() or QApplication([])
-    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-queuefix-"))
-    work = _make_repo(tmp)
-    store = SessionStore(path=tmp / "session.json")
-    win = create_main_window(store)
-    win._save_timer.stop()
-    win._queue_timer.stop()
-    ws = win.manager.create_workspace("Repo", str(work))
-    win.manager.set_active(ws.id)
+    def __init__(self, prefix: str):
+        self.tmp = Path(tempfile.mkdtemp(prefix=prefix))
 
-    def run_dialog(setup=None):
+    def __enter__(self):
+        from PySide6.QtWidgets import QApplication
+        from app.session_store import SessionStore
+        from main import create_main_window
+        self.app = QApplication.instance() or QApplication([])
+        self.work = _make_repo(self.tmp)
+        self.store = SessionStore(path=self.tmp / "session.json")
+        self.win = win = create_main_window(self.store)
+        win._save_timer.stop()
+        win._queue_timer.stop()
+        self.ws = win.manager.create_workspace("Repo", str(self.work))
+        win.manager.set_active(self.ws.id)
+        self._starts = _stub_starts()
+        self._starts.__enter__()
+        self._gh = _fake_gh()
+        self.gh = self._gh.__enter__()
+        win.top_bar.agent_lanes_btn.click()
+        self.a, self.b, self.i = self.add(lambda d: (d.count_plus.click(),
+                                                     d.count_plus.click()))
+        self.settle()
+        self.poll()
+        win._on_lane_action(self.ws.id, self.i.id, "integrator")
+        self.settle()
+        self.delivered = []
+        self.i.deliver_task = lambda text, title="": self.delivered.append(
+            (text, title))
+        self.i.is_running = lambda: True
+        self.i._prompt_ready = True
+        self.ri = self.i.spec.lane["root"]
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            for x in list(self.ws.agents):
+                self.win._close_agent(self.ws.id, x.id)
+            self.settle()
+            for box in list(self.win._lane_boxes):
+                box.close()
+            self.win.close()
+            self.win.deleteLater()
+            self.app.processEvents()
+        finally:
+            self._gh.__exit__(*exc)
+            self._starts.__exit__(*exc)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        return False
+
+    def add(self, setup=None):
+        from PySide6.QtWidgets import QDialog
+        from app.widgets.main_window import AddTerminalDialog
         orig = AddTerminalDialog.exec
 
         def fake_exec(dlg):
@@ -3389,211 +3422,225 @@ def test_integration_fixes_window():
             return QDialog.DialogCode.Accepted
         AddTerminalDialog.exec = fake_exec
         try:
-            before = list(ws.agents)
-            win._on_add_terminal_clicked(ws.id)
+            before = list(self.ws.agents)
+            self.win._on_add_terminal_clicked(self.ws.id)
         finally:
             AddTerminalDialog.exec = orig
-        return [x for x in ws.agents if x not in before]
+        return [x for x in self.ws.agents if x not in before]
 
-    def settle():
+    def settle(self):
         for _ in range(3):
-            win.lane_ops.drain(60)
-            app.processEvents()
-        win.lane_ops.drain(60)
+            self.win.lane_ops.drain(60)
+            self.app.processEvents()
+        self.win.lane_ops.drain(60)
 
-    def poll():
+    def poll(self):
         for _ in range(2):
-            win.lane_service.poll()
-            win.lane_service.drain(30)
-        settle()
+            self.win.lane_service.poll()
+            self.win.lane_service.drain(30)
+        self.settle()
 
-    with _stub_starts(), _fake_gh() as gh:
-        win.top_bar.agent_lanes_btn.click()
-        a, b, i = run_dialog(lambda d: (d.count_plus.click(),
-                                        d.count_plus.click()))
-        settle()
-        poll()
-        win._on_lane_action(ws.id, i.id, "integrator")
-        settle()
-        delivered = []
-        i.deliver_task = lambda text, title="": delivered.append((text, title))
-        i.is_running = lambda: True
-        i._prompt_ready = True
-        ri = i.spec.lane["root"]
+    def submit(self, agent):
+        self.win._on_lane_action(self.ws.id, agent.id, "submit")
+        self.settle()
+        return self.win.manager.queue(self.ws.id)[-1]
 
-        def integrate(item):
-            """The integrator's part: branch, bump, the tested commit, PR."""
-            _git(ri, "switch", "-q", "-c", item.integrate_branch, item.sha)
-            _commit(ri, "VERSION", f"{item.id}\n", "bump the version")
-            sha = _git(ri, "rev-parse", "HEAD")
-            return gh.open_pr(item.integrate_branch, sha), sha
+    def deliver(self):
+        self.win._advance_queues()
+        self.settle()
 
-        def turn_end():
-            win.manager.agentReplied.emit(ws.id, i.id)
-            settle()
+    def integrate(self, item):
+        """The integrator's part: branch, bump, the tested commit, the PR."""
+        _git(self.ri, "switch", "-q", "-c", item.integrate_branch, item.sha)
+        _commit(self.ri, "VERSION", f"{item.id}\n", "bump the version")
+        sha = _git(self.ri, "rev-parse", "HEAD")
+        return self.gh.open_pr(item.integrate_branch, sha), sha
 
-        def submit(agent):
-            win._on_lane_action(ws.id, agent.id, "submit")
-            settle()
-            return win.manager.queue(ws.id)[-1]
+    def turn_end(self):
+        self.win.manager.agentReplied.emit(self.ws.id, self.i.id)
+        self.settle()
 
-        # --- F2: the same lane submitted again ---------------------------------
-        _commit(a.spec.lane["root"], "a.txt", "A1\n", "A: first")
-        poll()
-        item1 = submit(a)
-        win._advance_queues()
-        settle()
-        pr1, tested1 = integrate(item1)
-        turn_end()
-        win._on_queue_action(item1.id, "approve")
-        settle()
-        check("queue-fix: the lane's first item is merged",
+    def log(self) -> str:
+        return _log(self.store)
+
+
+def test_queue_resubmit_window():
+    """F2: a lane submitted again after its first item merged gets its own
+    integrate branch, so the integrator's turn end can't find the previous
+    item's merged pull request under the same name and call it merged."""
+    from app import integration as integ
+    with _QueueRig("ai-hive-queue-f2-") as q:
+        _commit(q.a.spec.lane["root"], "a.txt", "A1\n", "A: first")
+        q.poll()
+        item1 = q.submit(q.a)
+        q.deliver()
+        q.integrate(item1)
+        q.turn_end()
+        q.win._on_queue_action(item1.id, "approve")
+        q.settle()
+        check("queue-f2: the lane's first item is merged",
               item1.state == integ.MERGED, item1)
-        _commit(a.spec.lane["root"], "a.txt", "A2\n", "A: second")
-        poll()
-        item2 = submit(a)
-        win._advance_queues()
-        settle()
-        check("queue-fix: a resubmitted lane's item gets its own integrate "
+        _commit(q.a.spec.lane["root"], "a.txt", "A2\n", "A: second")
+        q.poll()
+        item2 = q.submit(q.a)
+        q.deliver()
+        check("queue-f2: a resubmitted lane's item gets its own integrate "
               "branch, named in its brief",
               item2.id != item1.id
               and item2.integrate_branch != item1.integrate_branch
-              and bool(delivered)
-              and item2.integrate_branch in delivered[-1][0],
+              and bool(q.delivered)
+              and item2.integrate_branch in q.delivered[-1][0],
               (item1.integrate_branch, item2.integrate_branch))
-        turn_end()
-        check("queue-fix: ...and a turn end with no new PR needs the user "
+        q.turn_end()
+        check("queue-f2: ...and a turn end with no new PR needs the user "
               "instead of taking the first item's merged PR",
               item2.state == integ.NEEDS_YOU and "No pull request" in
               item2.note and item2.integrate_branch in item2.note, item2)
 
-        # --- F1: merged on github.com, not with Approve merge -------------------
-        pr2, tested2 = integrate(item2)
-        _commit(b.spec.lane["root"], "sub/b.txt", "B\n", "B: change b")
-        poll()
-        item3 = submit(b)
-        sent = len(delivered)
-        pr2["state"] = "MERGED"         # someone merged it on github.com
-        turn_end()
-        check("queue-fix: a PR merged outside Approve merge needs the user",
-              item2.state == integ.NEEDS_YOU
-              and "outside Approve merge" in item2.note, item2)
-        check("queue-fix: ...and the next lane is NOT sent meanwhile",
-              len(delivered) == sent and item3.state == integ.QUEUED, item3)
-        win._toggle_activity(ws.id)
-        row = next((r for r in win.activity_panel.queue_rows
-                    if r.item_id == item2.id), None)
-        check("queue-fix: its row offers Mark merged",
+
+def test_queue_merged_outside_window():
+    """F1: a PR merged on github.com, not with Approve merge, holds the queue
+    until the user's Mark merged, which accepts it only when GitHub's PR
+    holds the submitted commit."""
+    from app import integration as integ
+    with _QueueRig("ai-hive-queue-f1-") as q:
+        _commit(q.a.spec.lane["root"], "a.txt", "A\n", "A: change a")
+        _commit(q.b.spec.lane["root"], "sub/b.txt", "B\n", "B: change b")
+        q.poll()
+        item_a = q.submit(q.a)
+        item_b = q.submit(q.b)
+        q.deliver()
+        pr, tested = q.integrate(item_a)
+        sent = len(q.delivered)
+        pr["state"] = "MERGED"          # someone merged it on github.com
+        q.turn_end()
+        check("queue-f1: a PR merged outside Approve merge needs the user",
+              item_a.state == integ.NEEDS_YOU
+              and "outside Approve merge" in item_a.note, item_a)
+        check("queue-f1: ...and the next lane is NOT sent meanwhile",
+              len(q.delivered) == sent and item_b.state == integ.QUEUED,
+              item_b)
+        q.win._toggle_activity(q.ws.id)
+        row = next((r for r in q.win.activity_panel.queue_rows
+                    if r.item_id == item_a.id), None)
+        check("queue-f1: its row offers Mark merged",
               row is not None and "mark-merged" in row.buttons,
               list(row.buttons) if row is not None else None)
-        win._toggle_activity(ws.id)
-        pr2["head"] = _git(str(work), "rev-parse", "origin/main")
-        win._on_queue_action(item2.id, "mark-merged")
-        settle()
-        check("queue-fix: Mark merged refuses a merged PR without the "
-              "submitted commit", item2.state == integ.NEEDS_YOU
-              and "manual=1" not in _log(store), item2)
-        pr2["head"] = tested2
-        win._on_queue_action(item2.id, "recheck")
-        settle()
-        win._on_queue_action(item2.id, "mark-merged")
-        settle()
-        check("queue-fix: ...and accepts it once GitHub's PR holds the "
-              "commit, audited as manual", item2.state == integ.MERGED
-              and "manual=1" in _log(store), item2)
-        check("queue-fix: then the next lane goes",
-              item3.state == integ.INTEGRATING and len(delivered) == sent + 1,
-              item3)
+        q.win._toggle_activity(q.ws.id)
+        pr["head"] = _git(str(q.work), "rev-parse", "origin/main")
+        q.win._on_queue_action(item_a.id, "mark-merged")
+        q.settle()
+        check("queue-f1: Mark merged refuses a merged PR without the "
+              "submitted commit", item_a.state == integ.NEEDS_YOU
+              and "manual=1" not in q.log(), item_a)
+        pr["head"] = tested
+        q.win._on_queue_action(item_a.id, "recheck")
+        q.settle()
+        q.win._on_queue_action(item_a.id, "mark-merged")
+        q.settle()
+        check("queue-f1: ...and accepts it once GitHub's PR holds the "
+              "commit, audited as manual", item_a.state == integ.MERGED
+              and "manual=1" in q.log(), item_a)
+        check("queue-f1: then the next lane goes",
+              item_b.state == integ.INTEGRATING
+              and len(q.delivered) == sent + 1, item_b)
 
-        # --- F6: a refused head never re-approves itself ------------------------
-        pr3, tested3 = integrate(item3)
-        turn_end()
-        check("queue-fix: setup, the next PR awaits approval",
-              item3.state == integ.AWAITING, item3)
-        _commit(ri, "app/late.py", "late = 1\n", "a change after the test")
-        pr3["head"] = _git(ri, "rev-parse", "HEAD")
-        win._on_queue_action(item3.id, "approve")
-        settle()
-        check("queue-fix: Approve refuses the changed head",
-              item3.state == integ.NEEDS_YOU
-              and "changed after it was tested" in item3.note
-              and len(gh.merges()) == 1, item3)
-        awaiting = _log(store).count("QUEUE-AWAITING")
-        turn_end()
-        check("queue-fix: the integrator's next turn end leaves it with the "
-              "user", item3.state == integ.NEEDS_YOU
-              and _log(store).count("QUEUE-AWAITING") == awaiting, item3)
-        check("queue-fix: ...with the reason recorded",
-              getattr(item3, "reason", None) == "head-moved", item3)
-        win._save_now()
+
+def test_queue_refused_head_window():
+    """F6: a head Approve refused ("changed after it was tested") stays with
+    the user: the integrator's next turn end does not put it up for approval
+    again. The reason is saved, and an item from before reasons loads with
+    none."""
+    from app import integration as integ
+    from app.workspace_manager import WorkspaceManager
+    with _QueueRig("ai-hive-queue-f6-") as q:
+        _commit(q.a.spec.lane["root"], "a.txt", "A\n", "A: change a")
+        q.poll()
+        item = q.submit(q.a)
+        q.deliver()
+        pr, tested = q.integrate(item)
+        q.turn_end()
+        check("queue-f6: setup, the PR awaits approval",
+              item.state == integ.AWAITING, item)
+        _commit(q.ri, "app/late.py", "late = 1\n", "a change after the test")
+        pr["head"] = _git(q.ri, "rev-parse", "HEAD")
+        q.win._on_queue_action(item.id, "approve")
+        q.settle()
+        check("queue-f6: Approve refuses the changed head",
+              item.state == integ.NEEDS_YOU
+              and "changed after it was tested" in item.note
+              and not q.gh.merges(), item)
+        awaiting = q.log().count("QUEUE-AWAITING")
+        q.turn_end()
+        check("queue-f6: the integrator's next turn end leaves it with the "
+              "user", item.state == integ.NEEDS_YOU
+              and q.log().count("QUEUE-AWAITING") == awaiting, item)
+        check("queue-f6: ...with the reason recorded",
+              getattr(item, "reason", None) == "head-moved", item)
+        q.win._save_now()
         back = WorkspaceManager()
-        back.load_session_dict(json.loads(store.path.read_text("utf-8")))
-        loaded = back.queue_item(ws.id, item3.id)
-        check("queue-fix: the reason survives a save and a load",
+        back.load_session_dict(json.loads(q.store.path.read_text("utf-8")))
+        loaded = back.queue_item(q.ws.id, item.id)
+        check("queue-f6: the reason survives a save and a load",
               loaded is not None
               and getattr(loaded, "reason", None) == "head-moved", loaded)
-        bare = {k: v for k, v in item3.to_dict().items() if k != "reason"}
-        check("queue-fix: an item saved before reasons existed loads with "
-              "none", getattr(integ.QueueItem.from_dict(bare), "reason",
-                              None) == "")
         for w in back.workspaces:
             for x in list(w.agents):
                 back.remove_terminal(w.id, x.id)
-        win._on_queue_action(item3.id, "skip")
-        settle()
+        bare = {k: v for k, v in item.to_dict().items() if k != "reason"}
+        check("queue-f6: an item saved before reasons existed loads with "
+              "none", getattr(integ.QueueItem.from_dict(bare), "reason",
+                              None) == "")
 
-        # --- F20: a squash-merged lane, removed by the user ---------------------
-        def merged_lane(name_commit):
-            c = run_dialog()[0]
-            settle()
-            _commit(c.spec.lane["root"], f"{name_commit}.txt", "x\n",
-                    f"{name_commit}: change")
-            sha = _git(c.spec.lane["root"], "rev-parse", "HEAD")
-            it = win.manager.submit_to_integrator(ws.id, c.id, sha, 1)
-            pr = gh.open_pr(it.integrate_branch, sha)
+
+def test_queue_squash_lane_window():
+    """F20: a lane whose work was squash-merged through the queue is kept on
+    close (ancestry can't see it in the base). Its "lane kept" notice offers
+    Remove lane (merged as #N), which removes it after checking with GitHub.
+    A lane that moved past the merged commit gets no such button."""
+    from app import integration as integ
+    with _QueueRig("ai-hive-queue-f20-") as q:
+        def merged_lane(agent, name):
+            _commit(agent.spec.lane["root"], f"{name}.txt", "x\n",
+                    f"{name}: change")
+            sha = _git(agent.spec.lane["root"], "rev-parse", "HEAD")
+            it = q.win.manager.submit_to_integrator(q.ws.id, agent.id, sha, 1)
+            pr = q.gh.open_pr(it.integrate_branch, sha)
             pr["state"] = "MERGED"      # a squash: the commit is not in main
-            win.manager.update_queue_item(ws.id, it.id, state=integ.MERGED,
-                                          pr=pr["number"], pr_url=pr["url"])
-            return c, it, pr
+            q.win.manager.update_queue_item(q.ws.id, it.id,
+                                            state=integ.MERGED,
+                                            pr=pr["number"], pr_url=pr["url"])
+            return pr
 
-        c, item_c, prc = merged_lane("cfile")
-        lane_c = dict(c.spec.lane)
-        win._close_agent(ws.id, c.id)
-        settle()
-        box = win._lane_boxes[-1] if win._lane_boxes else None
+        pr = merged_lane(q.a, "afile")
+        lane_a = dict(q.a.spec.lane)
+        q.win._close_agent(q.ws.id, q.a.id)
+        q.settle()
+        box = q.win._lane_boxes[-1] if q.win._lane_boxes else None
         labels = [x.text() for x in box.buttons()] if box is not None else []
-        want = f"Remove lane (merged as #{prc['number']})"
-        check("queue-fix: a squash-merged lane is kept, and its notice offers "
-              "Remove lane (merged as #N)", os.path.isdir(lane_c["root"])
+        want = f"Remove lane (merged as #{pr['number']})"
+        check("queue-f20: a squash-merged lane is kept, and its notice offers "
+              "Remove lane (merged as #N)", os.path.isdir(lane_a["root"])
               and want in labels, labels)
         btn = next((x for x in (box.buttons() if box is not None else [])
                     if x.text() == want), None)
         if btn is not None:
             btn.click()
-            settle()
-        check("queue-fix: ...which removes the lane and its branch after "
-              "checking with GitHub", not os.path.exists(lane_c["root"])
-              and lane_c["branch"] not in _git(str(work), "branch", "--list")
-              and f"merged_as=#{prc['number']}" in _log(store),
-              _log(store)[-600:])
-        d, item_d, prd = merged_lane("dfile")
-        lane_d = dict(d.spec.lane)
-        _commit(lane_d["root"], "dfile.txt", "after\n", "D: after the merge")
-        win._close_agent(ws.id, d.id)
-        settle()
-        box = win._lane_boxes[-1] if win._lane_boxes else None
+            q.settle()
+        check("queue-f20: ...which removes the lane and its branch after "
+              "checking with GitHub", not os.path.exists(lane_a["root"])
+              and lane_a["branch"] not in _git(str(q.work), "branch",
+                                               "--list")
+              and f"merged_as=#{pr['number']}" in q.log(), q.log()[-600:])
+
+        merged_lane(q.b, "bfile")
+        lane_b = dict(q.b.spec.lane)
+        _commit(lane_b["root"], "bfile.txt", "after\n", "B: after the merge")
+        q.win._close_agent(q.ws.id, q.b.id)
+        q.settle()
+        box = q.win._lane_boxes[-1] if q.win._lane_boxes else None
         labels = [x.text() for x in box.buttons()] if box is not None else []
-        check("queue-fix: a lane that moved past its merged commit gets no "
-              "Remove button", os.path.isdir(lane_d["root"])
+        check("queue-f20: a lane that moved past its merged commit gets no "
+              "Remove button", os.path.isdir(lane_b["root"])
               and not [t for t in labels if t.startswith("Remove lane")],
               labels)
-        for x in list(ws.agents):
-            win._close_agent(ws.id, x.id)
-        settle()
-    for box in list(win._lane_boxes):
-        box.close()
-    win.close()
-    win.deleteLater()
-    app.processEvents()
-    check("queue-fix: the real .venv survived",
-          (work / ".venv" / "marker.txt").read_text() == "real venv")
