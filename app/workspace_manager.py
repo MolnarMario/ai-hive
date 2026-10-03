@@ -112,6 +112,11 @@ class WorkspaceManager(QObject):
         # Their cwd is NOT moved to the workspace folder; MainWindow repairs
         # the lane at the same path (take_lane_repairs) and they wait for it.
         self._lane_repairs: list[tuple[str, str]] = []
+        # is the lane machinery running (MainWindow's Agent lanes switch)? A
+        # laned agent's system prompt then says "skim the roster" instead of
+        # "read the board", because its overlap hooks tell it what matters.
+        # Set by MainWindow, transient, followed by reapply_coordination().
+        self.lane_awareness = False
 
     # ------------------------------------------------------------- reads ---
 
@@ -314,6 +319,7 @@ class WorkspaceManager(QObject):
         if cwd:
             agent.spec.cwd = cwd
         self._apply_coordination(ws, agent)
+        self._rearm(ws, agent)
         self._touch(ws_id)
         return True
 
@@ -325,8 +331,10 @@ class WorkspaceManager(QObject):
         if ws is None or agent is None:
             return False
         agent.spec.lane = {}
+        agent.lane_view = None
         agent.spec.cwd = ws.project_path
         self._apply_coordination(ws, agent)
+        self._rearm(ws, agent)
         self._touch(ws_id)
         return True
 
@@ -335,6 +343,36 @@ class WorkspaceManager(QObject):
         lane folder, once. Each of those agents is holding its start."""
         out, self._lane_repairs = self._lane_repairs, []
         return out
+
+    def _rearm(self, ws, agent) -> None:
+        # the lane hooks' env vars and settings file follow the lane record
+        if self.arm_agent is not None:
+            self.arm_agent(ws, agent)
+
+    def reapply_coordination(self) -> None:
+        """Rebuild every agent's coordination config (system prompt, board
+        dir) after `lane_awareness` changed. Takes effect at each agent's
+        next launch, like every other launch flag."""
+        for ws in self._workspaces:
+            for agent in ws.agents:
+                self._apply_coordination(ws, agent)
+
+    def set_lane_views(self, ws_id: str, views: dict) -> None:
+        """What the lane poller saw ({uid: lanes.LaneView}) onto this
+        workspace's agents, for the board roster's lane columns. Transient
+        status like busy/idle: rewrites the roster, never marks the session
+        dirty (a 15 s poll must never rewrite session.json)."""
+        ws = self.workspace(ws_id)
+        if ws is None:
+            return
+        changed = False
+        for agent in ws.agents:
+            view = views.get(agent.spec.uid) if agent.spec.lane else None
+            if view != agent.lane_view:
+                agent.lane_view = view
+                changed = True
+        if changed:
+            self._recompute(ws_id)
 
     # -------------------------------------------------- sidebar layout ---
 
@@ -785,7 +823,7 @@ class WorkspaceManager(QObject):
             # before starting work, and log_activity as it goes
             agent.spec.system_prompt = coordination.system_prompt_text(
                 ws.name, agent.spec.name, ws.board.path,
-                lane=agent.spec.lane)
+                lane=agent.spec.lane, aware=self.lane_awareness)
 
     def _recompute(self, ws_id: str) -> None:
         ws = self.workspace(ws_id)

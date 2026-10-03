@@ -420,6 +420,29 @@ workspaces keep executing — switching never pauses anything.
   operations on one repo run one at a time (none on the GUI thread), every
   step is logged as a `LANE-*` line in `session.log` (a removal names the
   ignored files it took), and lane removal never uses `--force` or `-D`.
+  A `.worktreeinclude` file at the repo root (gitignore syntax) names
+  ignored local files, like a `.env`, to copy into each new lane.
+- **Lane awareness** (while Agent lanes is on): AI Hive reads every lane about
+  every 15 seconds and right after an agent's turn ends, and fetches the base
+  branch every 5 minutes. Each laned card gets a chip (`⎇ ↑2 ±3`: commits
+  ahead, uncommitted files) that turns amber when another lane or the base
+  branch changed one of its files, and red when a real merge of the two would
+  conflict (`git merge-tree`, git 2.38+). Its menu opens the lane folder and
+  fast-forwards an empty lane to the newest base (not while the agent is
+  working). The agents hear about it only when it matters: a hook warns an
+  agent the moment it edits a file another lane changed (or edits outside its
+  own lane), and lane notices ("origin/main changed a file you changed, merge
+  it now") arrive with its next prompt, once per round of work: the same
+  overlap after the other lane landed its work and moved on is news again.
+  Laned agents are then told to read `.aihive/roster.md` (the roster table
+  alone) instead of the whole board, and the roster gains Lane, Ahead/Dirty
+  and Touching columns. The Activity panel gets a Lanes section and lists
+  changed files per lane, the Agent/File Map shows one tree for the repo
+  however many lanes touched a file, and first overlaps and conflicts land in
+  the event log. Turning the switch off silences all of it at once, retried
+  until it sticks, and the hooks also go quiet on their own once AI Hive
+  stops refreshing `lanes.json`. A lane whose `.worktreeinclude` copy (a
+  `.env`) was edited is kept when its card closes.
 - **Per-workspace agent numbering** — each workspace counts Agent 1, 2, 3…
   independently.
 - **Agent/File Map** — a **◆ Map** button in the workspace header opens a
@@ -819,7 +842,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2363 checks drive the real app headlessly (offscreen Qt platform) with real
+2513 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -917,6 +940,7 @@ app/
                            its log rotation into board-archive.md
   lanes.py                 agent lanes: a git worktree per agent, create/repair/retire (Qt-free)
   lane_ops.py              runs lane git operations one at a time per repo, off the GUI thread
+  lane_service.py          lane awareness: polls every lane, overlaps, lanes.json, lane notices
   process_worker.py        QProcess engine, HybridDecoder, WinJob (line mode)
   pty_worker.py            ConPTY engine via pywinpty (full-terminal mode)
   terminal_agent.py        per-terminal model (worker + log/buffer + lifecycle)
@@ -957,7 +981,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2363 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2513 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

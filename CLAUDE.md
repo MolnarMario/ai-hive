@@ -56,7 +56,10 @@ This file holds only the rules that protect user data or fail silently.
   through `MainWindow.lane_ops` (one queue per repo), and only
   `lanes_enabled()` gates creating one. A lane operation in flight owns its
   lane: if the card closes meanwhile, the operation's callback retires the
-  lane, never the close.
+  lane, never the close. Lane reads off the queue (`app/lane_service.py`)
+  hold `lane_ops.lock_for(repo)` around each lane: Windows won't delete a
+  folder that is some process's cwd, so a poll inside a lane being removed
+  leaves a half-deleted worktree.
 - Nothing renames an agent except the user.
 - No em dash in any string the user sees. `test_no_em_dashes_in_visible_text`
   enforces it for non-docstring literals.

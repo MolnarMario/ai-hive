@@ -46,6 +46,8 @@ from .. import coordination
 from .. import event_log
 from ..event_hub import EventHub
 from ..lane_ops import LaneOps
+from .. import lane_service as lane_svc
+from ..lane_service import LaneService
 from ..orchestrator_bridge import OrchestratorBridge
 from .activity_panel import ActivityPanel
 from .agent_file_map import AgentFileMapWindow
@@ -897,7 +899,8 @@ class TopBar(QFrame):
             "Agent lanes: ON. A new Claude agent in a git workspace gets its "
             "own git worktree and branch, so agents cannot overwrite or reset "
             "each other's work. The New Agent dialog can opt one out.\n"
-            "Click to turn off. Agents that already have a lane keep it."
+            "Click to turn off. Lane warnings stop at once; existing lanes "
+            "stay."
             if self._agent_lanes else
             "Agent lanes: OFF. Every agent works in the workspace folder, "
             "sharing one checkout. Agents that already have a lane keep "
@@ -2181,6 +2184,14 @@ class MainWindow(QMainWindow):
         # revive can't race the retry for the same lane.
         self._lane_retiring: set[str] = set()
         self._lane_boxes: list = []   # open "lane kept" notices
+        # what every lane holds and where lanes overlap (app/lane_service.py):
+        # card chips, Activity panel, roster columns, lanes.json for the
+        # overlap hook, lane notices. Runs only while the switch is on
+        # (_apply_lane_machinery starts and stops it).
+        self.lane_service = LaneService(
+            self.manager, self.lane_ops,
+            skip=lambda uid: uid in self._lane_pending,
+            audit=self._store_audit, parent=self)
         # providers whose CLI was STILL INSTALLING when the user skipped the
         # update splash. Their agents are held out of the autostart, because
         # launching one now could execute a half written binary. Transient by
@@ -2278,6 +2289,10 @@ class MainWindow(QMainWindow):
         # started; reset each run because agent ids are minted fresh per run.
         session_dir = self.store.path.parent
         self._hook_settings_path = str(session_dir / "aihive_session_hook.json")
+        # the same hooks plus the agent-lanes family (overlap warnings, lane
+        # notices). A separate file, given only to laned Claude agents while
+        # the Agent lanes switch is on, so nobody else pays for those hooks.
+        self._lane_settings_path = str(session_dir / "aihive_lane_hook.json")
         self._session_map_path = str(session_dir / "live_sessions.jsonl")
         self._prompt_events_path = str(session_dir / "prompt_events.jsonl")
         # Seeded here rather than in _restore_ui_state because the settings
@@ -2292,6 +2307,7 @@ class MainWindow(QMainWindow):
         except OSError as e:
             self.store.audit(f"HOOK-SETUP-FAIL {type(e).__name__}: {e}")
             self._hook_settings_path = ""  # degrade: fall back to fs correlation
+            self._lane_settings_path = ""
         self.manager.session_map_path = self._session_map_path
         self.manager.prompt_events_path = self._prompt_events_path
         manager.arm_agent = self._arm_agent_mcp  # arm new agents before they start
@@ -2301,6 +2317,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._adopt_existing_model()
         self._wire_model()
+        self.lane_service.lanesChanged.connect(self._on_lanes_changed)
+        self.lane_service.overlapFound.connect(self._on_lane_overlap)
         # restored laned agents whose folder is missing: repaired in place
         # before they may start (they are holding their start until then)
         self._start_lane_repairs()
@@ -2340,9 +2358,33 @@ class MainWindow(QMainWindow):
             # AIHIVE_AGENT_ID == TerminalAgent.id, the same key sync_live_sessions
             # matches on, so a hook line maps straight back to this agent.
             agent.spec.env["AIHIVE_AGENT_ID"] = agent.id
+        self._arm_lane_hooks(ws, agent)
         if not self.bridge.enabled:
             return
         agent.spec.mcp_config_path = self.bridge.mcp_config_path_for(ws.id)
+
+    def _arm_lane_hooks(self, ws, agent) -> None:
+        """The agent-lanes hooks, per run: a laned Claude agent launched while
+        the switch is on gets the lane settings file and the env vars that
+        point its hooks at this workspace's lanes.json, its notices and its
+        seen file (all absolute, all in the workspace's own .aihive). Anyone
+        else has them removed, so an installed lane hook exits silently.
+        Never persisted (spec.env and settings_path are per run)."""
+        env = agent.spec.env
+        for key in session_hook.LANE_ENV_KEYS:
+            env.pop(key, None)
+        lane = agent.spec.lane
+        if (not lane or not self.lanes_enabled() or ws.board is None
+                or not self._lane_settings_path or not self._hook_settings_path):
+            return
+        uid = agent.spec.uid
+        agent.spec.settings_path = self._lane_settings_path
+        env[session_hook.LANE_UID_ENV] = uid
+        env[session_hook.LANE_ROOT_ENV] = lane["root"]
+        env[session_hook.LANE_REPO_ENV] = lane["repo"]
+        env[session_hook.LANES_INDEX_ENV] = lane_svc.index_path(ws)
+        env[session_hook.LANE_NOTICES_ENV] = lane_svc.notices_path(ws, uid)
+        env[session_hook.LANE_SEEN_ENV] = lane_svc.seen_path(ws, uid)
 
     def _write_hook_settings(self) -> None:
         """(Re)write the shared `--settings` file every Claude agent launches
@@ -2355,6 +2397,12 @@ class MainWindow(QMainWindow):
             self._hook_settings_path, self._session_map_path,
             self._prompt_events_path,
             tui="default" if self._terminal_scrollback else "")
+        if self._lane_settings_path:
+            session_hook.write_settings_file(
+                self._lane_settings_path, self._session_map_path,
+                self._prompt_events_path,
+                tui="default" if self._terminal_scrollback else "",
+                lanes=True)
 
     def _on_terminal_scrollback(self, on: bool) -> None:
         """Toggle: should Claude agents run the classic renderer so their
@@ -3767,6 +3815,24 @@ class MainWindow(QMainWindow):
         `lanes_enabled()` at the moment it acts."""
         self._agent_lanes = bool(enabled)
         self._schedule_save()
+        self._apply_lane_machinery()
+
+    def _apply_lane_machinery(self) -> None:
+        """Make everything the switch governs match it, at once: the lane
+        poller, the laned agents' "skim the roster" prompt and their lane
+        hooks (both take effect at each agent's next launch, like any launch
+        flag), and the chips. Turning it off also writes "enabled": false
+        into lanes.json, which silences already-running agents' hooks."""
+        on = self.lanes_enabled()
+        self.manager.lane_awareness = on
+        self.manager.reapply_coordination()
+        self._rearm_agent_configs()
+        if on:
+            self.lane_service.start()
+        else:
+            self.lane_service.stop()
+        for ws in self.manager.workspaces:
+            self._on_lanes_changed(ws.id, self.lane_service.views(ws.id))
 
     def lanes_enabled(self) -> bool:
         """The ONLY gate for creating lanes. Lane code asks this, never
@@ -3818,6 +3884,7 @@ class MainWindow(QMainWindow):
                 self.manager.clear_agent_lane(ws_id, agent_id)
                 agent.notice(f"[no lane: {error}. This agent works in the "
                              f"workspace folder.]")
+                self._push_lane_view(ws_id, agent)
                 agent.release_start(run=True)
             return
         self._store_audit(
@@ -3828,6 +3895,12 @@ class MainWindow(QMainWindow):
             self._retire_lane(result, (), name)
             return
         self.manager.set_agent_lane(ws_id, agent_id, result, cwd)
+        if self.event_hub is not None:
+            self.event_hub.lane_event(
+                agent, f"got its own lane {result['branch']} (from "
+                       f"{result['base'] or 'the base branch'})",
+                {"root": result["root"], "branch": result["branch"]})
+        self._push_lane_view(ws_id, agent)
         agent.release_start(run=True)
 
     def _start_lane_repairs(self) -> None:
@@ -3897,10 +3970,30 @@ class MainWindow(QMainWindow):
         cwd = agent.spec.cwd if os.path.isdir(agent.spec.cwd) \
             else new_lane["root"]
         self.manager.set_agent_lane(ws_id, agent_id, new_lane, cwd)
+        self._push_lane_view(ws_id, agent)
         if recreated:
             agent.notice(f"[its branch {new_lane['branch']} was merged and "
                          f"deleted, so it was recreated from "
                          f"{new_lane['base']}: this lane starts fresh]")
+            # the card log is for the user; the model still believes its old
+            # commits are on its branch. A lane notice reaches it with its
+            # next prompt (only while the switch is on: off, the lane hooks
+            # are not armed and the card log is all there is).
+            ws = self.manager.workspace(ws_id)
+            if ws is not None and ws.board is not None:
+                try:
+                    session_hook.append_notice(
+                        lane_svc.notices_path(ws, uid),
+                        f"revive|{new_lane['branch']}|{time.time():.3f}",
+                        f"Your lane's branch {new_lane['branch']} was merged "
+                        f"into {new_lane['base'] or 'the base branch'} and "
+                        f"deleted while you were away, so it was recreated "
+                        f"from {new_lane['base'] or 'the base branch'}. Your "
+                        f"earlier commits are not on it any more: they are "
+                        f"in the base branch. Read files again before you "
+                        f"edit them.")
+                except OSError:
+                    pass
         agent.release_start(run=revive)
 
     def _lane_retire_args(self, agent) -> tuple:
@@ -3953,7 +4046,8 @@ class MainWindow(QMainWindow):
             self._store_audit(f"LANE-REMOVE {where}{ignored}")
             return
         st = result.status
-        detail = (f" ahead={st.ahead} dirty={len(st.dirty)} merged={st.merged}"
+        detail = (f" ahead={st.ahead} dirty={len(st.dirty)} "
+                  f"local={len(st.local)} merged={st.merged}"
                   if st is not None else "")
         if result.code == "busy":
             self._store_audit(f"LANE-KEEP {where}{detail} reason=busy "
@@ -3980,6 +4074,106 @@ class MainWindow(QMainWindow):
                for a in self.manager.all_agents() if a.spec.lane):
             return
         self._retire_lane(lane, pids, name, attempt)
+
+    # Lane awareness (spec Phase 2). LaneService polls; these put what it saw
+    # on the cards, the Activity panel, the roster and the event log, and run
+    # the chip's actions. All transient: nothing here reaches a save.
+
+    def _on_lanes_changed(self, ws_id: str, views: dict) -> None:
+        self.manager.set_lane_views(ws_id, views)
+        page = self._pages.get(ws_id)
+        if page is not None:
+            for card in page.cards:
+                card.set_lane_view(views.get(card.agent.spec.uid)
+                                   if card.agent.spec.lane else None)
+        if self.activity_panel.is_open() and ws_id == self.manager.active_id:
+            self.activity_panel.set_lanes(views)
+
+    def _push_lane_view(self, ws_id: str, agent) -> None:
+        """One agent's lane record changed (created, failed, revived): repaint
+        its chip now and poll soon, rather than wait for the next tick."""
+        page = self._pages.get(ws_id)
+        card = page.card_for(agent.id) if page is not None else None
+        if card is not None:
+            card.set_lane_view(self.lane_service.view(agent.spec.uid)
+                               if agent.spec.lane else None)
+        self.lane_service.poke()
+
+    def _on_lane_overlap(self, ws_id: str, uid: str, info: dict) -> None:
+        """First sighting of an overlap: one event-log row per pair."""
+        ws = self.manager.workspace(ws_id)
+        agent = next((a for a in (ws.agents if ws is not None else [])
+                      if a.spec.uid == uid), None)
+        if agent is None or self.event_hub is None:
+            return
+        paths = list(info.get("paths") or [])
+        files = ", ".join(paths[:3])
+        if len(paths) > 3:
+            files += f" (+{len(paths) - 3} more)"
+        peer = info.get("peer", "")
+        if not info.get("peer_uid"):
+            text = (f"{peer} changed files its lane also changed, in a way "
+                    f"that conflicts: {files}"
+                    if info.get("level") == lanes.CONFLICTS else
+                    f"{peer} changed files its lane also changed: {files}")
+        elif info.get("level") == lanes.CONFLICTS:
+            text = f"would conflict with {peer} on {files}"
+        else:
+            text = f"changed the same files as {peer}: {files}"
+        self.event_hub.lane_event(agent, text, dict(info))
+
+    def _on_lane_action(self, ws_id: str, agent_id: str, action: str) -> None:
+        """The card chip's menu. Opening is read-only; updating writes refs
+        and goes through lane_ops like every other lane mutation."""
+        agent = self.manager.agent(ws_id, agent_id)
+        lane = dict(agent.spec.lane) if agent is not None else {}
+        if not lane:
+            return
+        if action == "open":
+            if os.path.isdir(lane["root"]):
+                fsopen.open_path(lane["root"])
+            else:
+                self._lane_message("Lane folder missing",
+                                   f"The lane folder is missing:\n"
+                                   f"{lane['root']}")
+        elif action == "refresh":
+            # the menu may have been opened before the agent started a turn
+            if agent.is_busy() or agent.is_waiting():
+                agent.notice("[lane not updated: this agent is working. "
+                             "Update it once its turn is over.]")
+                return
+            uid, name = agent.spec.uid, agent.spec.name
+            self.lane_ops.submit(
+                lane["repo"], lanes.refresh_lane, lane, label="refresh",
+                callback=lambda res, err: self._on_lane_refreshed(
+                    ws_id, agent_id, uid, name, lane, res, err))
+
+    def _on_lane_refreshed(self, ws_id, agent_id, uid, name, lane, result,
+                           error) -> None:
+        where = f"agent={name!r} root={lane['root']} branch={lane['branch']}"
+        agent = self.manager.agent(ws_id, agent_id)
+        if error is not None:
+            self._store_audit(f"LANE-FAIL {getattr(error, 'code', 'error')} "
+                              f"refresh {where}: {error}")
+            if agent is not None:
+                agent.notice(f"[lane not updated: {error}]")
+            return
+        self._store_audit(f"LANE-REFRESH {where} to={result or 'unchanged'}")
+        ws = self.manager.workspace(ws_id)
+        if agent is not None and result:
+            agent.notice(f"[this lane was fast-forwarded to {result}]")
+            if ws is not None and ws.board is not None:
+                # the agent's files changed under it: say so on its next prompt
+                try:
+                    session_hook.append_notice(
+                        lane_svc.notices_path(ws, uid),
+                        f"refresh|{time.time():.3f}",
+                        f"The user fast-forwarded your lane to {result}. "
+                        f"Files in your lane may have changed since you read "
+                        f"them; read a file again before you edit it.")
+                except OSError:
+                    pass
+        self.lane_service.poke()
 
     def _show_lane_kept(self, name: str, lane: dict, status,
                         reason: str) -> None:
@@ -4317,6 +4511,7 @@ class MainWindow(QMainWindow):
         # user's repo, so it is armed deliberately)
         self._agent_lanes = bool(ui.get("agent_lanes", False))
         self.top_bar.set_agent_lanes(self._agent_lanes)
+        self._apply_lane_machinery()
         self._auto_continue = bool(ui.get("auto_continue", True))
         self.top_bar.set_auto_continue(self._auto_continue)
         self._startup_recovery = bool(ui.get("startup_recovery", True))
@@ -4381,6 +4576,7 @@ class MainWindow(QMainWindow):
         page.scheduleRequested.connect(self._on_schedule_message)
         page.fileActivated.connect(self._reveal_file_in_tree)
         page.reorderCommitted.connect(self.manager.reorder_agents)
+        page.laneActionRequested.connect(self._on_lane_action)
         self._pages[ws.id] = page
         self.stack.addWidget(page)
         # a page added while another one is current is added HIDDEN, and Qt
@@ -4419,6 +4615,7 @@ class MainWindow(QMainWindow):
         ws = self.manager.workspace(ws_id)
         # keep the activity panel following the active workspace
         if self.activity_panel.is_open() and ws is not None:
+            self.activity_panel.set_lanes(self.lane_service.views(ws.id))
             self.activity_panel.set_workspace(ws)
         # the agent/file map (if open) tracks the active workspace too
         if (self._map_window is not None and self._map_window.isVisible()
@@ -4443,6 +4640,7 @@ class MainWindow(QMainWindow):
             self.activity_panel.conceal()
             self._activity_timer.stop()
         else:
+            self.activity_panel.set_lanes(self.lane_service.views(ws.id))
             self.activity_panel.set_workspace(ws)
             self.activity_panel.reveal()
             self._activity_timer.start()
@@ -4581,7 +4779,9 @@ class MainWindow(QMainWindow):
     def _on_terminal_added(self, ws_id: str, agent) -> None:
         page = self._pages.get(ws_id)
         if page is not None and page.card_for(agent.id) is None:
-            page.add_agent(agent)
+            card = page.add_agent(agent)
+            if agent.spec.lane:
+                card.set_lane_view(self.lane_service.view(agent.spec.uid))
             if not page.isVisible():
                 # the retile changed every card's width on a page Qt will not
                 # lay out; without this the new card (and its siblings) keep a
@@ -5193,6 +5393,7 @@ class MainWindow(QMainWindow):
         # every agent is about to be stopped, and none of that is news
         if self.event_hub is not None:
             self.event_hub.shutdown()
+        self.lane_service.shutdown()
         # take the badge off the button before the window goes: a stale "3
         # working" left on a taskbar icon during the seconds Windows keeps the
         # button alive says the opposite of the truth

@@ -677,6 +677,24 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     background: rgba(190,60,60,0.30); color: {p.TEXT};
     border-color: {p.RED};
 }}
+/* agent lanes: the agent's own git worktree ("(branch glyph) +2 3~"),
+   clickable for lane actions. Quiet by default; an OVERLAP with another lane
+   or the base turns it into an amber pill and a CONFLICT into a red one, both
+   in primary text for the same readability reason as the missed schedule. */
+#CardLane {{
+    background: transparent; color: {p.CARDHEAD_SUB};
+    border: 1px solid transparent; border-radius: 8px;
+    font-size: 11px; font-weight: 700; padding: 0 5px;
+}}
+#CardLane:hover {{ border-color: {p.ACCENT_GOLD_DIM}; }}
+#CardLane[lane="overlap"] {{
+    background: rgba(232,152,58,0.28); color: {p.TEXT};
+    border-color: {p.ACCENT_ORANGE};
+}}
+#CardLane[lane="conflict"] {{
+    background: rgba(190,60,60,0.30); color: {p.TEXT};
+    border-color: {p.RED};
+}}
 /* the "send later" composer: preset delay buttons + the resolved fire time */
 #SchedulePreset {{
     background: {p.BG_INPUT}; color: {p.TEXT};
@@ -1020,7 +1038,7 @@ QScrollArea {{ background: transparent; border: none; }}
     padding: 2px 6px; font-size: 11px; color: {p.CONSOLE_FG};
 }}
 #RosterTask:focus {{ border-color: {p.ACCENT_BLUE}; }}
-#ActivityLog, #ActivityFiles {{
+#ActivityLog, #ActivityFiles, #ActivityLanes {{
     font-family: {CONSOLE_FONT}; font-size: 11px; color: {p.TEXT_DIM};
 }}
 
