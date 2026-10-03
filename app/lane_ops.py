@@ -21,7 +21,11 @@ and every queued job holds it while it runs. Windows refuses to delete a
 folder that is any process's working directory, so a poll's `git status`
 running inside a lane at the moment `git worktree remove` deletes it would
 leave a half-deleted worktree. A job that never touches a lane folder (the
-base fetch) passes `exclusive=False` so a slow network does not stall polls.
+base fetch) passes `exclusive=False`: it takes no folder lock, so a slow
+network does not stall polls, and it runs on the repo's SECOND worker, in
+its own FIFO, so a fetch that hangs for its whole timeout never makes a
+lane create wait. (A fetch writes refs/remotes and FETCH_HEAD; a create
+writes refs/heads/hive/... and the worktree list: different ref locks.)
 """
 
 from __future__ import annotations
@@ -70,13 +74,13 @@ class LaneOps(QObject):
 
     def key_for(self, repo: str) -> str:
         """The queue a repo's operations share: its git common dir, so every
-        checkout of one repository lands in the same queue. Cached; the first
-        lookup per repo runs one quick `git rev-parse`."""
+        checkout of one repository lands in the same queue. Read from the
+        `.git` entries, never by running git: this runs on the GUI thread.
+        Cached."""
         norm = os.path.normcase(os.path.normpath(repo or ""))
         key = self._keys.get(norm)
         if key is None:
-            key = (lanes.common_dir(repo) if repo and os.path.isdir(repo)
-                   else "") or norm
+            key = (lanes.read_common_dir(repo) if repo else "") or norm
             self._keys[norm] = key
         return key
 
@@ -93,13 +97,16 @@ class LaneOps(QObject):
         job = _Job(fn=fn, args=args, callback=callback, label=label,
                    exclusive=exclusive, key=self.key_for(repo))
         lock = self.lock_for(repo)
+        # exclusive jobs share the repo's main FIFO; the others get their own
+        qkey = job.key if exclusive else job.key + "|side"
         with self._lock:
             self._pending += 1
-            q = self._queues.get(job.key)
+            q = self._queues.get(qkey)
             if q is None:
-                q = self._queues[job.key] = queue.Queue()
+                q = self._queues[qkey] = queue.Queue()
                 threading.Thread(target=self._run, args=(q, lock), daemon=True,
-                                 name="aihive-lanes").start()
+                                 name="aihive-lanes" if exclusive
+                                 else "aihive-lanes-fetch").start()
         q.put(job)
 
     def _run(self, q: queue.Queue, lock: threading.Lock) -> None:

@@ -8,6 +8,13 @@ tells them to read the board for peer awareness and post their own updates —
 so agents in the same workspace coordinate and avoid duplicate work. The
 board lives inside the workspace folder, so different workspaces are isolated.
 
+The board stays small. Every agent reads it before substantial work, so its
+size is paid in tokens on every task: an unrotated board reached ~80 KB. Each
+append keeps the newest LOG_KEEP entries in board.md and moves older ones to
+board-archive.md next to it. The archive is append-only and written BEFORE the
+board, so a rotation can never lose an entry; a failed board write truncates
+the archive back, so it doesn't leave a copy in both files either.
+
 Qt-free (pure filesystem) so the model layer and tests can use it headlessly.
 """
 
@@ -17,9 +24,23 @@ import subprocess
 
 BOARD_DIRNAME = ".aihive"
 BOARD_FILENAME = "board.md"
+ARCHIVE_FILENAME = "board-archive.md"
+# the roster alone, for laned agents: the Read tool returns a whole file, so
+# "skim the top of board.md" still paid for every note in it
+ROSTER_FILENAME = "roster.md"
+TASK_CELL_MAX = 80      # a pasted multi-paragraph task stays one short cell
 ROSTER_BEGIN = "<!-- AIHIVE:ROSTER:BEGIN -->"
 ROSTER_END = "<!-- AIHIVE:ROSTER:END -->"
 LOG_HEADER = "## Activity log"
+LOG_KEEP = 40   # activity-log entries kept in board.md, newest last
+# "only if": every agent reads the board before a task, and an agent told
+# where the history is tends to go and read it, paying the tokens the archive
+# exists to save
+ARCHIVE_NOTE = (f"_Older entries are moved to {ARCHIVE_FILENAME} in this "
+                f"folder. Read it only if you need history._")
+ARCHIVE_HEADER = ("# AI Hive: board archive\n\n"
+                  "Activity-log entries moved out of board.md, oldest first. "
+                  "AI Hive only ever appends to this file.\n\n")
 
 _STATUS_ICON = {
     "running": "🟢", "starting": "🟡", "idle": "⚪", "stopping": "🟡",
@@ -36,22 +57,25 @@ def system_prompt_text(workspace_name: str, agent_name: str,
 
     `aware`: the lane machinery runs for this agent (the Agent lanes switch
     is on, so its overlap hooks are armed). Only then does a laned agent
-    swap "read the board first" for "skim the roster": AI Hive tells it
+    swap "read the board first" for "read roster.md": AI Hive tells it
     about a real overlap when one exists, and reading every note is the
-    token cost the feature exists to remove. Every other agent keeps the
-    full instruction, because the board is its only awareness.
+    token cost the feature exists to remove. roster.md (written next to
+    board.md by `update_roster`) is the roster table alone, because the Read
+    tool returns a whole file. Every other agent keeps the full instruction,
+    because the board is its only awareness.
 
     `integrator`: this laned agent is the workspace's integrator
     (app/integration.py). It owns the version, CHANGELOG and README count
     that every other lane is told to leave alone, and it never merges."""
     laned = bool(lane and lane.get("root") and lane.get("branch"))
     if laned and aware:
-        read = ("Before starting substantial work, skim the roster at the "
-                "top of it to see who is working on what. You do not need "
-                "to read the whole log: AI Hive tells you when another "
-                "agent's lane or the base branch changes a file you changed "
-                "(an \"AI Hive lane notice\" in your context), so act on "
-                "those notices.")
+        roster = os.path.join(os.path.dirname(board_path), ROSTER_FILENAME)
+        read = (f"Before starting substantial work, read the roster at "
+                f"{roster} to see who is working on what. Do not read the "
+                f"board's activity log: AI Hive tells you when another "
+                f"agent's lane or the base branch changes a file you changed "
+                f"(an \"AI Hive lane notice\" in your context), so act on "
+                f"those notices.")
     else:
         read = ("BEFORE starting substantial work, read it to see what the "
                 "other agents are doing and what is already done, so you "
@@ -87,10 +111,14 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"on the branch {lane['branch']}, which starts from {base}. Commit "
             f"your work there, on that branch. Never edit files in other "
             f"worktrees or in the main checkout at {lane.get('repo', '')} "
-            f"(reading its board is fine), and never commit to {base}. Do not "
-            f"bump the version or edit the CHANGELOG or the README check "
-            f"count: that is done once per pull request, when your work is "
-            f"integrated.")
+            f"(reading its board is fine), and never commit to {base}. Never "
+            f"push your lane branch to {base}, even when git suggests it: "
+            f"your work reaches {base} through a pull request. Any .venv, "
+            f"venv or node_modules folder in your lane is a link to the main "
+            f"checkout's copy, so installing packages there changes them for "
+            f"every lane. Do not bump the version or edit the CHANGELOG or "
+            f"the README check count: that is done once per pull request, "
+            f"when your work is integrated.")
     return text
 
 
@@ -120,6 +148,35 @@ def sanitize_text(text: str) -> str:
         return text
 
 
+def split_log(text: str, keep: int = LOG_KEEP) -> tuple[str, list[str]]:
+    """Split board text into (the board keeping its newest `keep` log
+    entries, the lines moved out of it, oldest first). Nothing to move gives
+    (text, []).
+
+    An entry is a top-level "- " line plus every line under it up to the next
+    one, so an entry an agent wrote by hand over several lines moves whole.
+    The roster and the log's preamble (the lines above its first entry) stay.
+    Every input line lands in exactly one output; the only line added is
+    ARCHIVE_NOTE, put in the preamble the first time anything moves."""
+    if LOG_HEADER not in text:
+        return text, []
+    head, log = text.split(LOG_HEADER, 1)
+    # lines[0] is the rest of the header's own line, never an entry
+    lines = log.split("\n")
+    starts = [i for i, ln in enumerate(lines) if i and ln.startswith("- ")]
+    keep = max(1, keep)
+    if len(starts) <= keep:
+        return text, []
+    first, cut = starts[0], starts[-keep]
+    preamble = lines[:first]
+    if not any(ARCHIVE_FILENAME in ln for ln in preamble):
+        last = max((i for i, ln in enumerate(preamble) if i and ln.strip()),
+                   default=0)
+        preamble.insert(last + 1, ARCHIVE_NOTE)
+    kept = head + LOG_HEADER + "\n".join(preamble + lines[cut:])
+    return kept, lines[first:cut]
+
+
 class WorkspaceBoard:
     """Owns board.md for one workspace: roster (app-written) + log (agents)."""
 
@@ -133,6 +190,14 @@ class WorkspaceBoard:
     @property
     def path(self) -> str:
         return os.path.join(self.dir, BOARD_FILENAME)
+
+    @property
+    def archive_path(self) -> str:
+        return os.path.join(self.dir, ARCHIVE_FILENAME)
+
+    @property
+    def roster_path(self) -> str:
+        return os.path.join(self.dir, ROSTER_FILENAME)
 
     def ensure(self) -> bool:
         """Create the board scaffold if missing. Returns False on failure
@@ -148,13 +213,27 @@ class WorkspaceBoard:
     def _scaffold(self) -> str:
         return (f"# AI Hive: workspace coordination board\n\n"
                 f"{ROSTER_BEGIN}\n{ROSTER_END}\n\n"
-                f"{LOG_HEADER}\n\n_Agents append their activity below._\n")
+                f"{LOG_HEADER}\n\n_Agents append their activity below._\n"
+                f"{ARCHIVE_NOTE}\n")
 
     def update_roster(self, rows: list[dict]) -> bool:
         """rows: [{name, role, provider, model, status, task}]. Rewrites only
-        the roster block, preserving the agent-written activity log."""
+        the roster block, preserving the agent-written activity log.
+
+        The manager calls this on every status or title tick, so an unchanged
+        roster is not written again: board.md is replaced only when its
+        roster block actually differs.
+
+        A board whose markers were lost (an agent edited it by hand) gets the
+        roster back at the top, and every other line is kept. Rebuilding the
+        scaffold here once dropped the whole activity log.
+
+        The same table also goes to roster.md, in this same (serialized)
+        call, for laned agents to read instead of the whole board."""
         if not self.ensure():
             return False
+        block = self._render_roster(rows)
+        self._write_roster_file(block)
         try:
             # tolerant read: a foreign agent writing mangled bytes to the
             # board must degrade its own entry, never break the roster
@@ -162,15 +241,27 @@ class WorkspaceBoard:
                 text = f.read()
         except (OSError, UnicodeError):
             return False
-        block = self._render_roster(rows)
-        if ROSTER_BEGIN in text and ROSTER_END in text:
+        fresh = f"{ROSTER_BEGIN}\n{block}\n{ROSTER_END}"
+        if ROSTER_BEGIN in text and ROSTER_END in text.split(ROSTER_BEGIN, 1)[1]:
             head, rest = text.split(ROSTER_BEGIN, 1)
-            _, tail = rest.split(ROSTER_END, 1)
-            text = f"{head}{ROSTER_BEGIN}\n{block}\n{ROSTER_END}{tail}"
-        else:  # board lost its markers; rebuild scaffold, keep any log
-            text = self._scaffold().replace(
-                f"{ROSTER_BEGIN}\n{ROSTER_END}",
-                f"{ROSTER_BEGIN}\n{block}\n{ROSTER_END}")
+            current, tail = rest.split(ROSTER_END, 1)
+            if current == f"\n{block}\n":
+                return True
+            text = f"{head}{fresh}{tail}"
+        elif not text.strip():
+            text = self._scaffold().replace(f"{ROSTER_BEGIN}\n{ROSTER_END}",
+                                            fresh)
+        else:
+            # a lone marker is AI Hive's own line, not content: drop it, or
+            # the next split would pair it with the wrong partner
+            body = "\n".join(ln for ln in text.split("\n")
+                             if ln.strip() not in (ROSTER_BEGIN, ROSTER_END))
+            if body.startswith("# "):     # keep the title line on top
+                title, _, rest = body.partition("\n")
+                rest = rest.lstrip("\n")
+                text = f"{title}\n\n{fresh}\n\n{rest}"
+            else:
+                text = f"{fresh}\n\n{body}"
         return self._write(text)
 
     def _render_roster(self, rows: list[dict]) -> str:
@@ -182,12 +273,35 @@ class WorkspaceBoard:
         for r in rows:
             icon = _STATUS_ICON.get(r.get("status", ""), "⚪")
             model = r.get("model") or r.get("provider") or ""
-            task = (r.get("task") or "").replace("|", "/") or "-"
+            # one line: a delivered task can span several, which would end
+            # the table row early
+            task = " ".join((r.get("task") or "").split()).replace("|", "/") or "-"
+            if len(task) > TASK_CELL_MAX:
+                task = task[:TASK_CELL_MAX - 3].rstrip() + "..."
             lines.append(f"| {r.get('name','?')} | {r.get('role','')} | "
                          f"{model} | {icon} {r.get('status','')} | {task} |")
         if any(r.get("lane") for r in rows):
             lines = _with_lane_columns(lines, rows)
         return "\n".join(lines)
+
+    def _write_roster_file(self, block: str) -> bool:
+        """roster.md: the roster table alone. Rewritten only when it changed."""
+        text = sanitize_text(block + "\n")
+        try:
+            with open(self.roster_path, encoding="utf-8",
+                      errors="replace") as f:
+                if f.read() == text:
+                    return True
+        except OSError:
+            pass
+        try:
+            tmp = self.roster_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8", errors="replace") as f:
+                f.write(text)
+            os.replace(tmp, self.roster_path)
+            return True
+        except (OSError, UnicodeError):
+            return False
 
     def _write(self, text: str) -> bool:
         try:
@@ -205,7 +319,12 @@ class WorkspaceBoard:
         log_activity MCP tool instead of editing board.md directly, so
         concurrent writers can't interleave or clobber each other. The roster
         block (above the log) is never touched — the entry always lands at the
-        end of the file, after all prior log content."""
+        end of the file, after all prior log content.
+
+        The rotation to the archive happens here too, so it is serialized by
+        the same thing that serializes the append: every caller (the bridge's
+        log_activity executor, the auto-continue note) runs on the GUI
+        thread."""
         message = " ".join(sanitize_text(message or "").split())  # one clean line
         name = sanitize_text(agent_name or "agent").strip() or "agent"
         if not message:
@@ -219,10 +338,61 @@ class WorkspaceBoard:
             return False
         stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         entry = f"- [{name}] {stamp} {message}"
-        if LOG_HEADER not in text:            # board lost its log section
-            text = self._scaffold().rstrip("\n") + "\n"
+        if not text.strip():
+            text = self._scaffold()
+        elif LOG_HEADER not in text:
+            # the board lost its log heading (edited by hand): start a fresh
+            # log at the end and keep everything above it. Replacing the file
+            # with the scaffold here once dropped the whole board.
+            text = text.rstrip("\n") + f"\n\n{LOG_HEADER}\n"
         text = text.rstrip("\n") + "\n" + entry + "\n"
-        return self._write(text)
+        return self._write_rotated(text)
+
+    def _write_rotated(self, text: str) -> bool:
+        """Write the board keeping only its newest LOG_KEEP entries, after the
+        older ones are safely in the archive. A rotation that can't reach the
+        archive is skipped, never the append: the board just stays longer
+        until the next one."""
+        kept, moved = split_log(text)
+        if not moved:
+            return self._write(text)
+        size = self._archive_append(moved)
+        if size is None:
+            return self._write(text)
+        if self._write(kept):
+            return True
+        self._archive_truncate(size)   # the board still holds those entries
+        return False
+
+    def _archive_append(self, lines: list[str]) -> int | None:
+        """Append `lines` to the archive, with its header when the file is new.
+        Returns the archive's size before the append (what _archive_truncate
+        restores), or None when nothing was appended."""
+        path = self.archive_path
+        try:
+            size = os.path.getsize(path) if os.path.isfile(path) else 0
+        except OSError:
+            return None
+        body = "\n".join(lines) + "\n"
+        if size == 0:
+            body = ARCHIVE_HEADER + body
+        try:
+            with open(path, "a", encoding="utf-8", errors="replace") as f:
+                f.write(sanitize_text(body))
+                f.flush()
+                # on disk before board.md is replaced without these lines
+                os.fsync(f.fileno())
+            return size
+        except (OSError, UnicodeError):
+            self._archive_truncate(size)   # never leave half an append behind
+            return None
+
+    def _archive_truncate(self, size: int) -> None:
+        try:
+            with open(self.archive_path, "r+b") as f:
+                f.truncate(size)
+        except OSError:
+            pass   # the entries are then in both files: duplicated, not lost
 
     def read_log_tail(self, max_lines: int = 40) -> list[str]:
         try:

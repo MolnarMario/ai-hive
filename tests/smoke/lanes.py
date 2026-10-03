@@ -726,6 +726,8 @@ def test_lanes_window():
         check("lanes window: no relative .aihive path is handed to an agent",
               all(os.path.isabs(d) for d in laned.spec.extra_dirs)
               and ".aihive" not in prompt.replace(ws.board.path, "")
+              .replace(ws.board.roster_path, "")
+              and os.path.isabs(ws.board.roster_path)
               and not os.path.exists(os.path.join(laned.spec.lane["root"],
                                                   ".aihive")))
         check("lanes window: an agent with no lane keeps the plain prompt",
@@ -1148,6 +1150,11 @@ def test_lane_hooks():
     index = aihive / "lanes.json"
     notices = aihive / "notices" / "me.jsonl"
     seen = aihive / "seen" / "me.json"
+    def write_index(d):
+        # stamped like LaneService does: a lanes.json older than
+        # LANES_STALE_S counts as switched off
+        session_hook.write_lanes_index(str(index), {**d, "ts": time.time()})
+
     env = {session_hook.LANE_UID_ENV: "me",
            session_hook.LANE_ROOT_ENV: str(root),
            session_hook.LANE_REPO_ENV: str(repo),
@@ -1165,7 +1172,7 @@ def test_lane_hooks():
                 "app/mine.py": [{"uid": "me", "agent": "Me",
                                  "branch": "hive/me-aaaaaa",
                                  "state": "committed"}]}}
-    session_hook.write_lanes_index(str(index), data)
+    write_index(data)
 
     def edit(path, tool="Edit"):
         return {"hook_event_name": "PostToolUse", "tool_name": tool,
@@ -1183,7 +1190,7 @@ def test_lane_hooks():
     check("lane hook: the same overlap is not repeated", rc == 0 and out == "",
           out)
     data["files"]["app/x.py"][1]["state"] = "conflicts"
-    session_hook.write_lanes_index(str(index), data)
+    write_index(data)
     rc, out = _run_hook(edit(root / "app" / "x.py", "MultiEdit"), env)
     check("lane hook: the overlap turning into a conflict warns again",
           "CONFLICT" in _context(out), out)
@@ -1214,14 +1221,14 @@ def test_lane_hooks():
 
     fresh = {**data, "files": {"app/y.py": [
         {"uid": "peer", "agent": "Agent 6", "branch": "b", "state": "dirty"}]}}
-    session_hook.write_lanes_index(str(index), fresh)
+    write_index(fresh)
     rc, out = _run_hook(edit(root / "app" / "y.py"), {})
     check("lane hook: silent without the lane env vars", rc == 0 and out == "")
-    session_hook.write_lanes_index(str(index), {**fresh, "enabled": False})
+    write_index({**fresh, "enabled": False})
     rc, out = _run_hook(edit(root / "app" / "y.py"), env)
     check("lane hook: silent when lanes.json says the switch is off",
           rc == 0 and out == "")
-    session_hook.write_lanes_index(str(index), fresh)
+    write_index(fresh)
     rc, out = _run_hook(None, env, stdin_raw="{not json")
     check("lane hook: garbage on stdin exits 0, silently", rc == 0 and out == "")
     rc, out = _run_hook(None, env, stdin_raw="[1, 2]")
@@ -1231,14 +1238,15 @@ def test_lane_hooks():
     rc, out = _run_hook(edit(root / "app" / "y.py"), env)
     check("lane hook: silent when there is no lanes.json yet",
           rc == 0 and out == "")
-    session_hook.write_lanes_index(str(index), fresh)
+    write_index(fresh)
 
     # --- UserPromptSubmit: unread notices, once -----------------------------
     prompt = {"hook_event_name": "UserPromptSubmit", "prompt": "go",
               "cwd": str(root)}
     rc, out = _run_hook(prompt, env)
     check("lane notices: no notices file is silent", rc == 0 and out == "")
-    session_hook.append_notice(str(notices), "app/x.py|peer|overlap",
+    session_hook.append_notice(str(notices), session_hook.overlap_key(
+                               "app/x.py", "peer", "overlap"),
                                "ALREADY TOLD by the overlap hook")
     session_hook.append_notice(str(notices), "old|base|overlap", "STALE one",
                                ts=time.time() - 7 * 3600)
@@ -1487,12 +1495,12 @@ def test_lane_service_window():
               "no lane env", solo.spec.settings_path == win._hook_settings_path
               and not any(k in solo.spec.env
                           for k in session_hook.LANE_ENV_KEYS))
-        check("lane service: a laned agent is told to skim the roster",
-              "skim the roster" in a.spec.system_prompt
+        check("lane service: a laned agent is told to read roster.md",
+              ws.board.roster_path in a.spec.system_prompt
               and "lane notice" in a.spec.system_prompt)
         check("lane service: an agent without a lane still reads the board",
               "BEFORE starting substantial work" in solo.spec.system_prompt
-              and "skim" not in solo.spec.system_prompt)
+              and "roster.md" not in solo.spec.system_prompt)
 
         poll()
         index_file = Path(svc.index_path(ws))
@@ -1662,7 +1670,7 @@ def test_lane_service_window():
               and a.spec.settings_path == win._hook_settings_path)
         check("lane service: ...and laned agents read the whole board again",
               "BEFORE starting substantial work" in a.spec.system_prompt
-              and "skim" not in a.spec.system_prompt
+              and "roster.md" not in a.spec.system_prompt
               and a.spec.lane["branch"] in a.spec.system_prompt)
         check("lane service: ...nothing on the board says lanes are moving",
               all(x.lane_view is None for x in (a, b, c)))
@@ -1675,6 +1683,818 @@ def test_lane_service_window():
     win.deleteLater()
     check("lane service: the real .venv survived",
           (work / ".venv" / "marker.txt").read_text() == "real venv")
+
+
+def _commit_on(repo, parent: str, message: str) -> str:
+    """A new commit object on top of `parent`, without touching any
+    checkout: what a stray last commit landing on a branch looks like."""
+    tree = _git(repo, "rev-parse", f"{parent}^{{tree}}")
+    return _git(repo, "commit-tree", tree, "-p", parent, "-m", message)
+
+
+def test_lanes_no_upstream():
+    """A lane branch has no upstream, so git never tells a laned agent to
+    `push origin HEAD:main`. Leaving out --track is not enough: git sets the
+    upstream itself for a remote-tracking start point. With no upstream,
+    `branch -d` can't judge "merged", so the branch goes by compare-and-
+    delete with the verified head, and a branch that moved is kept."""
+    import re as _re
+    from app import lanes
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-track-"))
+    work = _make_repo(tmp)
+    plan = lanes.plan_lane(str(work), str(work), "Agent 5", "5a5a5a" + "0" * 26)
+    lane = lanes.create_lane(plan.lane_dict())
+    root = Path(lane["root"])
+    upstream = subprocess.run(
+        ["git", "config", "--get", f"branch.{plan.branch}.merge"], cwd=root,
+        capture_output=True, text=True, creationflags=_NO_WINDOW)
+    check("lanes-track: a new lane branch has no upstream",
+          upstream.returncode != 0 and not upstream.stdout.strip(),
+          upstream.stdout)
+    status = _git(root, "status")
+    check("lanes-track: git status in a lane never mentions origin/",
+          "origin/" not in status, status)
+    (root / "a.txt").write_text("lane work\n")
+    _git(root, "commit", "-q", "-am", "lane work")
+    push = subprocess.run(["git", "push", "--dry-run"], cwd=root,
+                          capture_output=True, text=True,
+                          creationflags=_NO_WINDOW)
+    hint = push.stdout + push.stderr
+    check("lanes-track: a bare git push never suggests pushing to main",
+          push.returncode != 0 and "HEAD:main" not in hint
+          and f"origin {plan.branch}" in hint, hint)
+
+    # merged into origin/main while the main checkout sits on an older
+    # branch: `branch -d` would call it "not fully merged"
+    _git(root, "push", "-q", "origin", "HEAD:main")
+    _git(work, "fetch", "-q", "origin")
+    _git(work, "switch", "-q", "-c", "older", "main")
+    result = lanes.remove_lane(lane)
+    check("lanes-track: a lane merged into the base is removed with the "
+          "main checkout on another branch",
+          not root.exists() and result.branch_deleted
+          and plan.branch not in _git(work, "branch", "--list", "hive/*"),
+          result)
+    _git(work, "switch", "-q", "main")
+
+    # the recreated branch of a repair has no upstream either
+    back, recreated = lanes.repair_lane(lane)
+    up = subprocess.run(["git", "config", "--get",
+                         f"branch.{plan.branch}.merge"], cwd=str(work),
+                        capture_output=True, text=True,
+                        creationflags=_NO_WINDOW)
+    check("lanes-track: a branch a repair recreates has no upstream",
+          recreated and up.returncode != 0, up.stdout)
+    lanes.remove_lane(back)
+
+    # a lane made by an older build, tracking origin/main
+    old = lanes.plan_lane(str(work), str(work), "Old", "01d01d" + "0" * 26)
+    _git(work, "worktree", "add", "-q", "--track", "-b", old.branch, old.root,
+         "origin/main")
+    lanes.repair_lane(old.lane_dict())
+    up = subprocess.run(["git", "config", "--get", f"branch.{old.branch}.merge"],
+                        cwd=str(work), capture_output=True, text=True,
+                        creationflags=_NO_WINDOW)
+    check("lanes-track: repair drops the base upstream an older build set",
+          up.returncode != 0, up.stdout)
+
+    # the branch moves between the status read and the delete
+    moved_plan = lanes.plan_lane(str(work), str(work), "Moved",
+                                 "30ed30" + "0" * 26)
+    moved = lanes.create_lane(moved_plan.lane_dict())
+    ref = f"refs/heads/{moved_plan.branch}"
+    stray = {}
+    orig = lanes.RUNNER
+
+    def mover(args, cwd, timeout):
+        deleting = (args[:2] == ["update-ref", "-d"]
+                    or (args[:1] == ["branch"] and "-d" in args))
+        if deleting and not stray:
+            head = _git(work, "rev-parse", ref)
+            stray["sha"] = _commit_on(work, head, "a last commit")
+            _git(work, "update-ref", ref, stray["sha"])
+        return orig(args, cwd, timeout)
+    lanes.RUNNER = mover
+    try:
+        lanes.remove_lane(moved)
+        refused = None
+    except lanes.LaneError as exc:
+        refused = exc
+    finally:
+        lanes.RUNNER = orig
+    check("lanes-track: a branch that moved during removal raises LaneError",
+          refused is not None and refused.code == "moved", refused)
+    check("lanes-track: ...and the branch is kept, at its new commit",
+          bool(stray) and _git(work, "rev-parse", ref) == stray["sha"])
+
+    src = Path(lanes.__file__).read_text(encoding="utf-8")
+    bad = _re.findall(r'"(--track|-D|--force)"', src)
+    check("lanes-track: app/lanes.py passes no --track, -D or --force to git",
+          bad == [], bad)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lanes_retire_busy():
+    """Retire never removes a lane while a program still runs in it. Windows
+    can delete the files but not the folder a process sits in, which leaves
+    a half-deleted worktree. The lane is kept as "busy", and MainWindow tries
+    again later."""
+    import sys
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import lanes
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-busy-"))
+    work = _make_repo(tmp)
+
+    def sleeper(cwd):
+        return subprocess.Popen([sys.executable, "-c",
+                                 "import time; time.sleep(60)"], cwd=str(cwd),
+                                creationflags=_NO_WINDOW)
+
+    lane = lanes.create_lane(lanes.plan_lane(
+        str(work), str(work), "Busy", "b05b05" + "0" * 26).lane_dict())
+    root = Path(lane["root"])
+    proc = sleeper(root)
+    try:
+        res = lanes.retire_lane(lane, [proc.pid], wait_s=0.3)
+        check("lanes-busy: a lane a program still runs in is kept",
+              not res.removed and root.is_dir() and (root / "a.txt").exists()
+              and lane["branch"] in _git(work, "branch", "--list", "hive/*"),
+              res)
+        check("lanes-busy: ...and the reason is busy",
+              getattr(res, "code", "") == "busy", res)
+    finally:
+        proc.kill()
+        proc.wait(10)
+    res = lanes.retire_lane(lane, [proc.pid], wait_s=0.3)
+    check("lanes-busy: once it exits, the retire removes the lane",
+          res.removed and not root.exists(), res)
+
+    # through the window: kept as busy, retried, then removed
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    lane = lanes.create_lane(lanes.plan_lane(
+        str(work), str(work), "Retry", "4e7a4e" + "0" * 26).lane_dict())
+    root = Path(lane["root"])
+    saved_wait = lanes.EXIT_WAIT_S
+    lanes.EXIT_WAIT_S = 0.3
+    win.LANE_RETIRE_RETRY_MS = 300
+    proc = sleeper(root)
+    try:
+        win._retire_lane(lane, [proc.pid], "Retry")
+        win.lane_ops.drain(30)
+        check("lanes-busy: the window keeps a busy lane and audits it",
+              root.is_dir() and "reason=busy attempt=1" in _log(store),
+              _log(store)[-400:])
+        check("lanes-busy: ...and says nothing yet (it will try again)",
+              not win._lane_boxes)
+    finally:
+        proc.kill()
+        proc.wait(10)
+    deadline = time.monotonic() + 15
+    while root.exists() and time.monotonic() < deadline:
+        loop = QEventLoop()
+        QTimer.singleShot(100, loop.quit)
+        loop.exec()
+        win.lane_ops.drain(5)
+    check("lanes-busy: the retry removes the lane once the program exits",
+          not root.exists() and "LANE-REMOVE" in _log(store),
+          _log(store)[-400:])
+    lanes.EXIT_WAIT_S = saved_wait
+    win._save_timer.stop()
+    win.close()
+    app.processEvents()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lanes_window_fixes():
+    """Lane review fixes that need the real window: a workspace folder the
+    lane would not contain gets no lane (not a missing cwd), a nested
+    workspace starts with the box unticked, the prompt names the push rule
+    and the shared links, and a removal lists the ignored files it took."""
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app.session_store import SessionStore
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-fix-"))
+    work = _make_repo(tmp)
+    lanes_dir = tmp / "proj.lanes"
+    ignored_ws = work / "build" / "ws"
+    ignored_ws.mkdir(parents=True)
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    win.top_bar.agent_lanes_btn.click()
+
+    def run_dialog(ws, setup=None):
+        orig = AddTerminalDialog.exec
+
+        def fake_exec(dlg):
+            if setup is not None:
+                setup(dlg)
+            return QDialog.DialogCode.Accepted
+        AddTerminalDialog.exec = fake_exec
+        try:
+            before = list(ws.agents)
+            win._on_add_terminal_clicked(ws.id)
+        finally:
+            AddTerminalDialog.exec = orig
+        return [a for a in ws.agents if a not in before]
+
+    def tick(dlg):
+        dlg.lane_check.setChecked(True)
+
+    def lane_folders():
+        return sorted(p.name for p in lanes_dir.iterdir()) \
+            if lanes_dir.exists() else []
+
+    with _stub_starts() as starts:
+        # --- an ignored subfolder: the lane would not contain it -----------
+        ws_ign = win.manager.create_workspace("Ignored", str(ignored_ws))
+        agent = run_dialog(ws_ign, tick)[0]
+        win.lane_ops.drain(60)
+        check("lanes-fix: a workspace in an ignored folder starts in that "
+              "folder", starts.cwds(agent.spec.name) == [str(ignored_ws)],
+              starts.calls)
+        check("lanes-fix: ...with LANE-FAIL location audited",
+              "LANE-FAIL location create" in _log(store), _log(store)[-500:])
+        check("lanes-fix: ...and no lane folder or branch left behind",
+              lane_folders() == []
+              and _git(work, "branch", "--list", "hive/*") == "",
+              (lane_folders(), _git(work, "branch", "--list", "hive/*")))
+
+        # --- a tracked subfolder: the lane holds it ------------------------
+        ws_sub = win.manager.create_workspace("Sub", str(work / "sub"))
+        starts.calls.clear()     # both workspaces number from "Agent 1"
+        sub_agent = run_dialog(ws_sub, tick)[0]
+        win.lane_ops.drain(60)
+        sub_cwd = os.path.join(sub_agent.spec.lane.get("root", "?"), "sub")
+        check("lanes-fix: a tracked subfolder gets a lane, started in its "
+              "own copy of the folder",
+              os.path.isdir(sub_cwd)
+              and starts.cwds(sub_agent.spec.name) == [sub_cwd], starts.calls)
+
+        # --- the prompt: no push to the base, shared links -----------------
+        prompt = sub_agent.spec.system_prompt
+        check("lanes-fix: the lane prompt forbids pushing to the base",
+              "push your lane branch to main" in prompt, prompt[-700:])
+        check("lanes-fix: the lane prompt says .venv and node_modules are "
+              "shared links", "link to the main checkout" in prompt
+              and "node_modules" in prompt, prompt[-700:])
+
+        # --- removal lists the ignored files it deletes --------------------
+        lane_root = Path(sub_agent.spec.lane["root"])
+        (lane_root / "build").mkdir()
+        (lane_root / "build" / "secret.env").write_text("SECRET")
+        win._close_agent(ws_sub.id, sub_agent.id)
+        win.lane_ops.drain(30)
+        removed = [ln for ln in _log(store).splitlines()
+                   if "LANE-REMOVE" in ln and str(lane_root) in ln]
+        check("lanes-fix: the removal audit names the ignored files it took",
+              not lane_root.exists() and bool(removed)
+              and "build/" in removed[-1], removed)
+
+        # --- a workspace inside a larger repository ------------------------
+        dlg = AddTerminalDialog("Agent 9", cwd=str(work / "sub"),
+                                lanes_on=True, repo_root=str(work))
+        cb = dlg.lane_check
+        check("lanes-fix: a nested workspace offers a lane, unticked",
+              cb.isEnabled() and not cb.isChecked() and not dlg.wants_lane())
+        check("lanes-fix: ...and says the lane copies the whole repository",
+              "inside the repository" in cb.toolTip(), cb.toolTip())
+        cb.setChecked(True)
+        check("lanes-fix: ...which the user can still tick", dlg.wants_lane())
+        dlg.deleteLater()
+        top = AddTerminalDialog("Agent 9", cwd=str(work), lanes_on=True,
+                                repo_root=str(work))
+        check("lanes-fix: at the repo root the box stays ticked",
+              top.lane_check.isChecked()
+              and "inside the repository" not in top.lane_check.toolTip())
+        top.deleteLater()
+
+    win._save_timer.stop()
+    win.close()
+    app.processEvents()
+    check("lanes-fix: the real .venv survived",
+          (work / ".venv" / "marker.txt").read_text() == "real venv")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lanes_gui_thread_git():
+    """No git on the GUI thread: LaneOps keys its queues by the git common
+    dir read from the .git entries, and the key matches what git says, for
+    the main checkout and for a lane of it. The git environment never lets
+    a credential prompt or Git Credential Manager window appear."""
+    from PySide6.QtWidgets import QApplication
+    from app import lanes
+    from app.lane_ops import LaneOps
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-key-"))
+    work = _make_repo(tmp)
+    lane = lanes.create_lane(lanes.plan_lane(
+        str(work), str(work), "Key", "6e6e6e" + "0" * 26).lane_dict())
+    ops = LaneOps()
+    with _record_git() as gitlog:
+        k_main = ops.key_for(str(work))
+        k_sub = ops.key_for(str(work / "sub"))
+        k_lane = ops.key_for(lane["root"])
+    check("laneops: key_for runs no git command", gitlog.calls == [],
+          gitlog.calls)
+    truth = os.path.normcase(os.path.normpath(_git(
+        work, "rev-parse", "--path-format=absolute", "--git-common-dir")))
+    check("laneops: the key is git's common dir, for the main checkout, a "
+          "subfolder and a lane", k_main == k_sub == k_lane == truth,
+          (k_main, k_sub, k_lane, truth))
+    ops.deleteLater()
+
+    seen = {}
+    real_run = lanes.subprocess.run
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs.get("env") or {})
+        return real_run(*args, **kwargs)
+    lanes.subprocess.run = spy
+    try:
+        lanes._subprocess_git(["--version"], str(work), 15)
+    finally:
+        lanes.subprocess.run = real_run
+    check("lanes: git runs with GCM_INTERACTIVE=never and no terminal prompt",
+          seen.get("GCM_INTERACTIVE") == "never"
+          and seen.get("GIT_TERMINAL_PROMPT") == "0",
+          {k: seen.get(k) for k in ("GCM_INTERACTIVE", "GIT_TERMINAL_PROMPT")})
+    lanes.remove_lane(lane)
+    app.processEvents()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------- Phase 2 review fixes (PR #37) ---
+
+def _service_rig(tmp: Path, names=("Agent A", "Agent B")):
+    """A WorkspaceManager on a real repo with laned (stubbed) agents and a
+    running LaneService, without a window: (work, mgr, ws, ops, svc,
+    agents)."""
+    from app import lanes
+    from app.lane_ops import LaneOps
+    from app.lane_service import LaneService
+    from app.process_worker import AgentKind, build_spec
+    from app.workspace_manager import WorkspaceManager
+
+    work = _make_repo(tmp)
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Repo", str(work))
+    agents = []
+    for i, name in enumerate(names):
+        uid = f"{i + 1:x}" * 6 + "0" * 26
+        lane = _lane_for(work, name, uid)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"])
+        spec.uid = uid
+        spec.lane = lane
+        agents.append(mgr.add_terminal(ws.id, spec, autostart=False))
+    ops = LaneOps()
+    svc = LaneService(mgr, ops)
+    svc.start()
+    return work, mgr, ws, ops, svc, agents
+
+
+def _lane_hook_env(ws, agent) -> dict:
+    from app import lane_service as svc_mod
+    from app import session_hook
+    lane = agent.spec.lane
+    return {session_hook.LANE_UID_ENV: agent.spec.uid,
+            session_hook.LANE_ROOT_ENV: lane["root"],
+            session_hook.LANE_REPO_ENV: lane["repo"],
+            session_hook.LANES_INDEX_ENV: svc_mod.index_path(ws),
+            session_hook.LANE_NOTICES_ENV: svc_mod.notices_path(ws,
+                                                                agent.spec.uid),
+            session_hook.LANE_SEEN_ENV: svc_mod.seen_path(ws, agent.spec.uid)}
+
+
+def _notice_keys(path) -> list:
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return [json.loads(ln).get("key", "") for ln in lines if ln.strip()]
+
+
+def test_lane_overlap_rounds():
+    """An overlap is news once per ROUND of work, not once per lane
+    lifetime: the same two lanes overlapping on the same file again after
+    the peer landed its work and moved on is a new notice and a new hook
+    warning. Within a round it is never repeated, and a restarted service
+    that finds the agent already told stays quiet."""
+    from PySide6.QtWidgets import QApplication
+    from app import lane_service as svc_mod
+    from app.lane_service import LaneService
+    from app import session_hook
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-rounds-"))
+    work, mgr, ws, ops, svc, (a, b) = _service_rig(tmp)
+    ra, rb = Path(a.spec.lane["root"]), Path(b.spec.lane["root"])
+    notices_a = svc_mod.notices_path(ws, a.spec.uid)
+    env_a = _lane_hook_env(ws, a)
+
+    def poll(service=svc):
+        service.poll()
+        service.drain(30)
+
+    def about_b():
+        return [k for k in _notice_keys(notices_a) if f"|{b.spec.uid}|" in k]
+
+    def edit_a():
+        return _context(_run_hook({
+            "hook_event_name": "PostToolUse", "tool_name": "Edit",
+            "cwd": str(ra), "tool_input": {"file_path": str(ra / "a.txt")}},
+            env_a)[1])
+
+    try:
+        _commit(ra, "a.txt", "A's\n", "A's change")
+        (rb / "a.txt").write_text("B's draft\n")
+        poll()
+        check("lanes-rounds: an overlap gives one notice", len(about_b()) == 1,
+              _notice_keys(notices_a))
+        poll()
+        check("lanes-rounds: the same overlap on the next poll gives none",
+              len(about_b()) == 1, _notice_keys(notices_a))
+        check("lanes-rounds: the overlap hook warns A once",
+              b.spec.name in edit_a() and edit_a() == "")
+
+        # B lands its work on the base and moves on to the new base
+        _git(rb, "commit", "-q", "-am", "B's change")
+        _git(rb, "push", "-q", "origin", "HEAD:main")
+        _git(work, "fetch", "-q", "origin")
+        poll()
+        (rb / "a.txt").write_text("B's second round\n")
+        poll()
+        check("lanes-rounds: the peer's next round on the same file is a "
+              "new notice", len(about_b()) == 2, _notice_keys(notices_a))
+        check("lanes-rounds: ...and the overlap hook warns A again",
+              b.spec.name in edit_a())
+
+        # the agent reads its notices; a fresh service finds it told
+        _run_hook({"hook_event_name": "UserPromptSubmit", "prompt": "go",
+                   "cwd": str(ra)}, env_a)
+        svc.stop()
+        before = _notice_keys(notices_a)
+        again = LaneService(mgr, ops)
+        again.start()
+        poll(again)
+        check("lanes-rounds: a restarted service repeats nothing the agent "
+              "was told", _notice_keys(notices_a) == before,
+              _notice_keys(notices_a)[len(before):])
+        again.stop()
+        again.deleteLater()
+    finally:
+        svc.stop()
+        for agent in mgr.all_agents():
+            agent.dispose()
+        svc.deleteLater()
+        ops.deleteLater()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lane_switch_off_sticks():
+    """Turning the switch off reaches running agents' hooks even when a hook
+    has lanes.json open at that moment (Windows refuses the replace then):
+    the write is retried until it lands. And a lanes.json nobody refreshed
+    for LANES_STALE_S counts as off, so a lost write or a closed AI Hive can
+    never leave hooks warning from a frozen snapshot."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import lane_service as svc_mod
+    from app import session_hook
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-off-"))
+    work, mgr, ws, ops, svc, (a, b) = _service_rig(tmp)
+    index = Path(svc_mod.index_path(ws))
+    try:
+        svc.poll()
+        svc.drain(30)
+        check("lanes-off: the running service wrote lanes.json",
+              json.loads(index.read_text(encoding="utf-8")).get("enabled"))
+        holder = open(index, encoding="utf-8")     # a hook reading it
+        try:
+            svc.stop()
+            held = json.loads(index.read_text(encoding="utf-8"))
+            check("lanes-off: while a hook holds lanes.json the disable "
+                  "can't land yet", held.get("enabled") is True, held)
+            check("lanes-off: a failed replace leaves no .tmp file behind",
+                  not [p for p in index.parent.iterdir()
+                       if p.name.endswith(".tmp")],
+                  [p.name for p in index.parent.iterdir()])
+        finally:
+            holder.close()
+        loop = QEventLoop()
+        QTimer.singleShot(1000, loop.quit)
+        loop.exec()
+        after = json.loads(index.read_text(encoding="utf-8"))
+        check("lanes-off: once the hook lets go, lanes.json says disabled",
+              after.get("enabled") is False, after)
+
+        # a lanes.json nobody refreshed is off, whatever it says
+        ra, rb = Path(a.spec.lane["root"]), Path(b.spec.lane["root"])
+        stale = {"version": 1, "enabled": True, "ts": time.time() - 120,
+                 "lanes": {}, "files": {"a.txt": [
+                     {"uid": b.spec.uid, "agent": b.spec.name,
+                      "branch": b.spec.lane["branch"], "state": "dirty"}]}}
+        session_hook.write_lanes_index(str(index), stale)
+        rc, out = _run_hook({"hook_event_name": "PostToolUse",
+                             "tool_name": "Edit", "cwd": str(ra),
+                             "tool_input": {"file_path": str(ra / "a.txt")}},
+                            _lane_hook_env(ws, a))
+        check("lanes-off: a lanes.json older than LANES_STALE_S silences the "
+              "hook on a real overlap", rc == 0 and out == "", out)
+        session_hook.write_lanes_index(str(index),
+                                       {**stale, "ts": time.time()})
+        rc, out = _run_hook({"hook_event_name": "PostToolUse",
+                             "tool_name": "Edit", "cwd": str(ra),
+                             "tool_input": {"file_path": str(ra / "a.txt")}},
+                            _lane_hook_env(ws, a))
+        check("lanes-off: ...and the same overlap in a fresh one warns",
+              b.spec.name in _context(out), out)
+    finally:
+        svc.stop()
+        for agent in mgr.all_agents():
+            agent.dispose()
+        svc.deleteLater()
+        ops.deleteLater()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lane_roster_file():
+    """A laned agent reads roster.md, the roster alone, instead of being
+    told to skim board.md (the Read tool returns the whole board either
+    way). roster.md follows the roster and stays small."""
+    from app import coordination
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-roster-"))
+    board = coordination.WorkspaceBoard(str(tmp / "ws"))
+    lane = {"root": str(tmp / "ws.lanes" / "a-1"), "branch": "hive/a-1",
+            "base": "main", "repo": str(tmp / "ws")}
+    prompt = coordination.system_prompt_text("WS", "Agent 1", board.path,
+                                             lane=lane, aware=True)
+    roster = os.path.join(board.dir, "roster.md")
+    check("lanes-roster: a laned agent's prompt names the absolute roster.md",
+          roster in prompt and os.path.isabs(roster), prompt[:400])
+    check("lanes-roster: ...and does not tell it to read board.md",
+          "read it to see what the other agents" not in prompt
+          and "skim" not in prompt, prompt[:400])
+    plain = coordination.system_prompt_text("WS", "Agent 2", board.path)
+    check("lanes-roster: an agent without a lane still reads the board",
+          "read it to see what the other agents" in plain
+          and "roster.md" not in plain)
+
+    def row(i, task):
+        return {"name": f"Agent {i}", "role": "", "provider": "claude",
+                "model": "claude-opus-5-5", "status": "running", "task": task,
+                "lane": f"hive/agent-{i}-{i:06d}", "ahead_dirty": "+3 2 dirty",
+                "touching": "app/widgets/main_window.py, app/lanes.py, "
+                            "tests/smoke/lanes.py (+4)"}
+    board.update_roster([row(1, "Fix the parser")])
+    path = Path(roster)
+    check("lanes-roster: update_roster writes roster.md next to the board",
+          path.is_file() and "Fix the parser" in path.read_text("utf-8"))
+    board.update_roster([row(1, "Recolor the badge")])
+    check("lanes-roster: roster.md follows roster changes",
+          "Recolor the badge" in path.read_text("utf-8")
+          and "Fix the parser" not in path.read_text("utf-8"))
+    long_task = "step " * 120
+    board.update_roster([row(i, long_task) for i in range(1, 11)])
+    size = len(path.read_bytes())
+    check("lanes-roster: with 10 laned agents roster.md stays under 3 KB",
+          size < 3 * 1024, size)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lane_include_local_changes():
+    """A50's repro: a lane's ignored `.env` (copied in by .worktreeinclude)
+    was deleted with the lane, edits and all, because `git status` hides
+    ignored files. An unedited copy goes with the lane, listed; an edited
+    one keeps the lane."""
+    from app import lanes
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-local-"))
+    work = _make_repo(tmp)
+    with open(work / ".gitignore", "a") as fh:
+        fh.write(".env\n")
+    (work / ".worktreeinclude").write_text(".env\n")
+    _git(work, "add", ".gitignore", ".worktreeinclude")
+    _git(work, "commit", "-q", "-m", "ignore .env")
+    _git(work, "push", "-q", "origin", "main")
+    (work / ".env").write_text("SECRET=1\n")
+
+    clean = _lane_for(work, "Clean", "c1ea11" + "0" * 26)
+    check("lanes-local: the lane got its .env copy",
+          (Path(clean["root"]) / ".env").read_text() == "SECRET=1\n")
+    res = lanes.retire_lane(clean)
+    check("lanes-local: an unedited copy goes with the lane",
+          res.removed and not Path(clean["root"]).exists(), res)
+    check("lanes-local: ...and the removal lists it",
+          ".env" in (getattr(res, "ignored", None) or []), res)
+
+    edited = _lane_for(work, "Edited", "ed17ed" + "0" * 26)
+    (Path(edited["root"]) / ".env").write_text("SECRET=mine\n")
+    res = lanes.retire_lane(edited)
+    check("lanes-local: an edited .env keeps the lane",
+          not res.removed
+          and (Path(edited["root"]) / ".env").read_text() == "SECRET=mine\n",
+          res)
+    check("lanes-local: ...and says which local file changed",
+          res.status is not None
+          and "local files changed: .env" in res.status.describe(),
+          res.status.describe() if res.status is not None else None)
+    (Path(edited["root"]) / ".env").write_text("SECRET=1\n")
+    new_file = _lane_for(work, "Extra", "e47e47" + "0" * 26)
+    os.remove(work / ".env")
+    res = lanes.retire_lane(new_file)
+    check("lanes-local: a copy the main checkout no longer has keeps the "
+          "lane", not res.removed and (Path(new_file["root"]) / ".env")
+          .exists(), res)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lane_include_walk():
+    """The .worktreeinclude walk prunes the junction folders with pathspec
+    exclusion: `--exclude=node_modules/` would list every file in it."""
+    from app import lanes
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-walk-"))
+    work = _make_repo(tmp)
+    with open(work / ".gitignore", "a") as fh:
+        fh.write(".env\n")              # only files git ignores are copied
+    (work / ".worktreeinclude").write_text(".env\n")
+    (work / ".env").write_text("SECRET=1\n")
+    nm = work / "node_modules" / "pkg"
+    nm.mkdir(parents=True)
+    for i in range(2000):
+        (nm / f"f{i}.js").write_text("x")
+    root = tmp / "dest"
+    root.mkdir()
+    with _record_git() as g:
+        copied = lanes.copy_worktree_includes(str(work), str(root))
+    check("lanes-walk: exactly .env is copied", copied == [".env"], copied)
+    walk = [c for c in g.calls if c[:1] == ["ls-files"]]
+    check("lanes-walk: the walk excludes the junction folders by pathspec",
+          bool(walk) and all(f":(exclude){n}" in walk[0]
+                             for n in lanes.JUNCTION_NAMES), walk)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lane_fetch_side_queue():
+    """A base fetch never makes a lane create wait: it runs outside the
+    repo's create/remove FIFO, so a fetch hanging on the network does not
+    hold up a new agent."""
+    from PySide6.QtWidgets import QApplication
+    from app.lane_ops import LaneOps
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-fetchq-"))
+    repo = _make_repo(tmp, remote=False)
+    ops = LaneOps()
+    done = []
+
+    def slow_fetch():
+        time.sleep(2.0)
+        return "fetch"
+    ops.submit(str(repo), slow_fetch, label="fetch", exclusive=False,
+               callback=lambda r, e: done.append(r))
+    time.sleep(0.1)
+    ops.submit(str(repo), lambda: "create", label="create",
+               callback=lambda r, e: done.append(r))
+    ops.drain(30)
+    check("lanes-fetchq: a create submitted after a slow fetch finishes "
+          "first", done == ["create", "fetch"], done)
+    ops.deleteLater()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lane_window_37_fixes():
+    """Through the real window: "Update lane" is refused while the agent is
+    working (the menu item disabled, and the action itself re-checks); a
+    revive that had to recreate the branch tells the AGENT on its next
+    prompt, not just the card log; the switch tooltip says what turning it
+    off does."""
+    from PySide6.QtWidgets import QApplication, QDialog, QMenu
+    from app import lane_service as svc_mod
+    from app.session_store import SessionStore
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-37-"))
+    work = _make_repo(tmp)
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    win.manager.set_active(ws.id)
+    win.top_bar.agent_lanes_btn.click()
+    check("lanes-37: the switch tooltip says warnings stop and lanes stay",
+          "Lane warnings stop at once; existing lanes stay"
+          in win.top_bar.agent_lanes_btn.toolTip(),
+          win.top_bar.agent_lanes_btn.toolTip())
+
+    def run_dialog(setup=None):
+        orig = AddTerminalDialog.exec
+
+        def fake_exec(dlg):
+            if setup is not None:
+                setup(dlg)
+            return QDialog.DialogCode.Accepted
+        AddTerminalDialog.exec = fake_exec
+        try:
+            before = list(ws.agents)
+            win._on_add_terminal_clicked(ws.id)
+        finally:
+            AddTerminalDialog.exec = orig
+        return [a for a in ws.agents if a not in before]
+
+    with _stub_starts():
+        # --- Update lane while the agent works -------------------------------
+        agent = run_dialog()[0]
+        win.lane_ops.drain(60)
+        _push_to_base(tmp, work, "sub/b.txt", "landed\n")
+        _git(work, "fetch", "-q", "origin")
+        win.lane_service.poll()
+        win.lane_service.drain(30)
+        card = win._pages[ws.id].card_for(agent.id)
+        agent.is_busy = lambda: True
+        shown = []
+
+        class RecordingMenu(QMenu):
+            """Records the chip menu's actions instead of showing it."""
+            def exec(self, *a, **k):
+                shown.append([(act.text(), act.isEnabled())
+                              for act in self.actions()])
+
+        from app.widgets import terminal_card as tc_mod
+        orig_menu = tc_mod.QMenu
+        tc_mod.QMenu = RecordingMenu
+        try:
+            card._show_lane_menu()
+        finally:
+            tc_mod.QMenu = orig_menu
+        update = [e for t, e in (shown[0] if shown else []) if "Update" in t]
+        check("lanes-37: Update lane is disabled while the agent works",
+              update == [False], shown)
+        told = []
+        real_notice = agent.notice
+        agent.notice = lambda text: (told.append(text), real_notice(text))
+        head = _git(agent.spec.lane["root"], "rev-parse", "HEAD")
+        with _record_git() as g:
+            win._on_lane_action(ws.id, agent.id, "refresh")
+            win.lane_ops.drain(30)
+        check("lanes-37: ...and the action refuses a working agent itself",
+              g.calls == [] and _git(agent.spec.lane["root"], "rev-parse",
+                                     "HEAD") == head, g.calls)
+        check("lanes-37: ...with a notice saying why",
+              any("working" in t for t in told), told)
+        agent.is_busy = lambda: False
+
+        # --- a revive that recreates the branch tells the agent --------------
+        sid = "eeeeeeee-0000-4000-8000-000000000005"
+        lane = dict(agent.spec.lane)
+        _write_transcript(lane["root"], sid, lane["branch"], "my old task")
+        win._close_agent(ws.id, agent.id)
+        win.lane_ops.drain(30)
+        check("lanes-37: the clean lane and its branch are gone",
+              not os.path.exists(lane["root"])
+              and lane["branch"] not in _git(work, "branch", "--list"))
+        revived = run_dialog(lambda d: d.resume_combo.setCurrentIndex(
+            d.resume_combo.findData(sid)))[0]
+        win.lane_ops.drain(60)
+        win.lane_service.poll()
+        win.lane_service.drain(30)
+        notices = svc_mod.notices_path(ws, revived.spec.uid)
+        keys = [k for k in _notice_keys(notices) if k.startswith("revive|")]
+        check("lanes-37: a recreated branch puts one notice in the agent's "
+              "notices", len(keys) == 1, _notice_keys(notices))
+        rc, out = _run_hook({"hook_event_name": "UserPromptSubmit",
+                             "prompt": "go", "cwd": lane["root"]},
+                            _lane_hook_env(ws, revived))
+        check("lanes-37: ...which the prompt hook hands the model",
+              lane["branch"] in _context(out)
+              and "recreated" in _context(out), out)
+        for a in list(ws.agents):
+            win._close_agent(ws.id, a.id)
+        win.lane_ops.drain(60)
+    for box in list(win._lane_boxes):
+        box.close()
+    win.close()
+    win.deleteLater()
+    app.processEvents()
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ------------------------------------- Phase 3: the integration queue ---

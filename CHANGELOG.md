@@ -40,7 +40,8 @@ em dashes: this text is shown in the app.
   branch) changed one of the same files, red when the two would conflict.
 - A laned agent is warned the moment it edits a file another lane changed,
   or edits outside its own lane, and is told on its next prompt when the base
-  branch changed a file it changed. Each warning comes once.
+  branch changed a file it changed. Each warning comes once per round of
+  work. Laned agents read a small roster file instead of the whole board.
 - The board roster shows each agent's lane, how far ahead it is and which
   files it is touching. The Activity panel lists lanes and their changed
   files, the Agent/File Map shows one tree for the whole repository, and new
@@ -48,7 +49,10 @@ em dashes: this text is shown in the app.
 - The lane chip's menu opens the lane folder, and updates a lane with no work
   of its own to the newest base branch.
 - A `.worktreeinclude` file in the repository names ignored local files (like
-  a `.env`) to copy into every new lane.
+  a `.env`) to copy into every new lane. A lane whose copy you edited is kept
+  when its agent closes, not deleted with it.
+- Turning Agent lanes off now always reaches agents that are running, even
+  when one of them is reading the lane file at that moment.
 
 ## 0.25.0
 
@@ -58,9 +62,13 @@ em dashes: this text is shown in the app.
   longer overwrite, reset or accidentally commit each other's changes. Untick
   "Own lane" in the New Agent dialog to keep an agent in the workspace folder.
 - Closing a laned agent cleans its lane up only when nothing in it is
-  unsaved or unmerged. Otherwise the lane is kept and AI Hive tells you what
-  is in it; its conversation stays in the New Agent dialog's Conversation
-  list, and picking it brings the lane back where it was.
+  unsaved or unmerged, and only once no program is still running in it (AI
+  Hive tries again for a minute). Otherwise the lane is kept and AI Hive tells
+  you what is in it; its conversation stays in the New Agent dialog's
+  Conversation list, and picking it brings the lane back where it was.
+- A workspace inside a larger repository starts with "Own lane" unticked,
+  since its lane would copy the whole repository. A workspace folder that is
+  not part of the repository's files gets no lane at all.
 - Turning Agent lanes off stops new lanes. Agents that already have one keep
   working in it.
 
@@ -73,6 +81,20 @@ em dashes: this text is shown in the app.
 - New Workspace can start from a GitHub repository: paste its URL and AI Hive
   clones its default branch (main, master or any other name) into a new folder
   and opens a workspace there.
+
+## 0.23.2
+
+- The shared board now keeps only its newest 40 activity notes. Older ones
+  move to board-archive.md next to it, so agents spend fewer tokens reading
+  the board before each task. Nothing is deleted.
+- The board's agent list shows what each agent is working on (its
+  conversation title) instead of "-" when it has no assigned task.
+
+## 0.23.1
+
+- Terminals restored after a reopen keep the width they started at, also on a
+  small or heavily scaled screen. Before, a resumed conversation there could
+  be wrapped narrower than its card.
 
 ## 0.23.0
 

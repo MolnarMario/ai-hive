@@ -86,7 +86,8 @@ CREATE_NO_WINDOW = 0x08000000
 
 class LaneError(Exception):
     """A lane operation that did not happen. `code` says why, for the audit
-    line: exists, base, git, dirty, unmerged, links, missing, location."""
+    line: exists, base, git, dirty, unmerged, links, missing, location,
+    moved."""
 
     def __init__(self, code: str, message: str = ""):
         super().__init__(message or code)
@@ -107,6 +108,9 @@ class GitResult:
 def _subprocess_git(args: list, cwd: str, timeout: float) -> GitResult:
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"     # never wait on a credential prompt
+    # Git Credential Manager ignores GIT_TERMINAL_PROMPT and can open a GUI
+    # sign-in window from a background fetch
+    env["GCM_INTERACTIVE"] = "never"
     try:
         proc = subprocess.run(
             ["git", *args], cwd=cwd or None, capture_output=True, text=True,
@@ -165,6 +169,35 @@ def common_dir(path: str) -> str:
     the repo, normalized for use as a key. "" when git can't say."""
     r = git(["rev-parse", "--path-format=absolute", "--git-common-dir"], path)
     return _norm(r.out) if r.ok and r.out else ""
+
+
+def read_common_dir(path: str) -> str:
+    """`common_dir` without running git, for callers on the GUI thread. A
+    `.git` folder is the common dir. A `.git` file (a worktree) names its
+    gitdir, whose `commondir` file, when present, points at the shared one,
+    relative to the gitdir. "" when `path` is in no repo or a file is
+    unreadable."""
+    root = find_repo_root(path)
+    if not root:
+        return ""
+    dot = os.path.join(root, ".git")
+    if os.path.isdir(dot):
+        return _norm(dot)
+    try:
+        with open(dot, encoding="utf-8", errors="replace") as fh:
+            line = fh.readline().strip()
+        if not line.startswith("gitdir:"):
+            return ""
+        gitdir = os.path.normpath(os.path.join(root, line[len("gitdir:"):]
+                                               .strip()))
+        common = os.path.join(gitdir, "commondir")
+        if os.path.isfile(common):
+            with open(common, encoding="utf-8", errors="replace") as fh:
+                rel = fh.readline().strip()
+            return _norm(os.path.join(gitdir, rel)) if rel else _norm(gitdir)
+        return _norm(gitdir)
+    except OSError:
+        return ""
 
 
 def ref_exists(repo: str, ref: str) -> bool:
@@ -400,16 +433,26 @@ def _is_worktree(root: str) -> bool:
     return r.ok and same_path(r.out, root)
 
 
-def create_lane(lane: dict) -> dict:
-    """Create a NEW lane: `git worktree add --track -b <branch> <root>
+def create_lane(lane: dict, cwd: str = "") -> dict:
+    """Create a NEW lane: `git worktree add --no-track -b <branch> <root>
     <start>`, then the junctions and the exclude line. Returns the lane
     record with its base filled in.
 
     Collisions fail and never reuse: an existing folder or branch raises
     LaneError("exists") and touches nothing. Attaching a new agent to an
-    existing branch could hand it someone else's work. (`--track` makes the
-    branch's upstream the base, so `git branch -d` later accepts it once it
-    is merged there, whatever the main checkout has checked out.)"""
+    existing branch could hand it someone else's work.
+
+    The branch gets NO upstream. Leaving out `--track` is not enough: from a
+    remote-tracking start point git sets one anyway (`branch.autoSetupMerge`).
+    With `origin/<base>` as its upstream, `git status` and a bare `git push`
+    in the lane suggest `git push origin HEAD:<base>`, a push straight to the
+    base that skips every review. `remove_lane` judges merged-ness itself.
+
+    `cwd` is where the agent will start: the lane root, or the subfolder of
+    it that matches a workspace in a subfolder of the repo. When the
+    worktree doesn't contain that folder (it is untracked or ignored), the
+    fresh lane is removed again and LaneError("location") raised, so the
+    agent starts in the workspace folder rather than in a missing one."""
     root, branch, repo = lane["root"], lane["branch"], lane["repo"]
     if os.path.lexists(root):
         raise LaneError("exists", f"the folder {root} already exists")
@@ -426,11 +469,44 @@ def create_lane(lane: dict) -> dict:
     except OSError as exc:
         raise LaneError("location", f"could not create {os.path.dirname(root)}"
                                     f": {exc}")
-    _git_or_fail(["worktree", "add", "--track", "-b", branch, root, start], repo)
+    _git_or_fail(["worktree", "add", "--no-track", "-b", branch, root, start],
+                 repo)
+    if cwd and not os.path.isdir(cwd):
+        _discard_fresh_lane(root, branch, repo)
+        raise LaneError("location", f"{os.path.relpath(cwd, root)} is not "
+                                    f"tracked in the repository, so a lane "
+                                    f"would not contain it")
     link_junctions(repo, root)
     copy_worktree_includes(repo, root)
     ensure_exclude(repo)
     return {**clean_lane(lane), "base": base}
+
+
+def _discard_fresh_lane(root: str, branch: str, repo: str) -> None:
+    """Undo a create that turned out unusable. The lane is moments old and
+    holds nothing, but the removal rules still apply: links first, no
+    `--force`, and the branch only by compare-and-delete."""
+    head = git(["rev-parse", "HEAD"], root)
+    try:
+        unlink_junctions(root)
+    except LaneError:
+        return
+    if directory_links(root):
+        return
+    if git(["worktree", "remove", root], repo, WRITE_TIMEOUT).ok and head.ok:
+        git(["update-ref", "-d", f"refs/heads/{branch}", head.out], repo)
+    try:
+        os.rmdir(os.path.dirname(root))     # only if it is now empty
+    except OSError:
+        pass
+
+
+def _drop_base_upstream(repo: str, branch: str, base: str) -> None:
+    """Lanes made before `--no-track` track the base: unset that, so git
+    stops suggesting a push to it. Any other upstream is the user's."""
+    r = git(["rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"], repo)
+    if r.ok and base and r.out in (base, f"origin/{base}"):
+        git(["branch", "--unset-upstream", branch], repo)
 
 
 def repair_lane(lane: dict) -> tuple:
@@ -447,6 +523,7 @@ def repair_lane(lane: dict) -> tuple:
     git(["worktree", "prune"], repo, WRITE_TIMEOUT)
     base = lane.get("base") or default_base(repo)
     if _is_worktree(root):
+        _drop_base_upstream(repo, branch, base)
         link_junctions(repo, root)
         ensure_exclude(repo)
         return {**clean_lane(lane), "base": base}, False
@@ -459,13 +536,14 @@ def repair_lane(lane: dict) -> tuple:
     os.makedirs(os.path.dirname(root), exist_ok=True)
     if ref_exists(repo, f"refs/heads/{branch}"):
         _git_or_fail(["worktree", "add", root, branch], repo)
+        _drop_base_upstream(repo, branch, base)
         recreated = False
     else:
         start = start_ref(repo, base)
         if not start:
             raise LaneError("base", "the repository has no branch to start from")
-        _git_or_fail(["worktree", "add", "--track", "-b", branch, root, start],
-                     repo)
+        _git_or_fail(["worktree", "add", "--no-track", "-b", branch, root,
+                      start], repo)
         recreated = True
     link_junctions(repo, root)
     copy_worktree_includes(repo, root)      # the re-added folder lost them
@@ -482,6 +560,8 @@ class LaneStatus:
     dirty: list = field(default_factory=list)
     merged: bool = False        # head is in the base: removing loses nothing
     base_ref: str = ""
+    # ignored `.worktreeinclude` files changed in the lane (local_changes)
+    local: list = field(default_factory=list)
 
     def describe(self) -> str:
         """"3 unmerged commits and 2 modified files", for the close prompt."""
@@ -494,6 +574,11 @@ class LaneStatus:
         if self.dirty:
             n = len(self.dirty)
             parts.append(f"{n} modified file{'' if n == 1 else 's'}")
+        if self.local:
+            more = (f" (+{len(self.local) - 3} more)"
+                    if len(self.local) > 3 else "")
+            parts.append(f"local files changed: "
+                         f"{', '.join(self.local[:3])}{more}")
         return " and ".join(parts)
 
 
@@ -519,6 +604,7 @@ def lane_status(lane: dict) -> LaneStatus:
     if not r.ok:
         raise LaneError("git", f"could not read the lane's status: {r.err}")
     st.dirty = [ln for ln in r.out.splitlines() if ln.strip()]
+    st.local = local_changes(repo, root)
     if base_ref:
         r = git(["rev-list", "--left-right", "--count", f"{base_ref}...HEAD"],
                 root)
@@ -543,23 +629,54 @@ def _in_base(cwd: str, head: str, base: str, base_ref: str) -> bool:
 class RemoveResult:
     status: LaneStatus
     branch_deleted: bool = False
-    branch_error: str = ""
+    # the ignored files and folders (`dir/`) that went with the worktree
+    ignored: list = field(default_factory=list)
+
+
+def ignored_files(root: str) -> list:
+    """The lane's ignored files, with an ignored folder listed once as
+    `dir/` and never walked, leaving out the junctions. `git worktree remove`
+    deletes these without asking, so the removal's audit line names them."""
+    r = git(["ls-files", "-z", "--others", "--ignored", "--exclude-standard",
+             "--directory", "--", ".",
+             *(f":(exclude){name}" for name in JUNCTION_NAMES)], root)
+    return [p for p in r.out.split("\0") if p] if r.ok else []
 
 
 def remove_lane(lane: dict) -> RemoveResult:
     """Remove a lane that holds nothing: worktree and branch.
 
-    Refuses unless the lane is clean AND its head is in the base. Unlinks
-    its junctions first and refuses while any directory link remains (see
-    the module docstring: git follows them). Never `--force`, never `-D`:
-    git's own refusal is the last line of defense, and it stays armed."""
+    Refuses unless the lane is clean AND both its head and its branch are in
+    the base. Unlinks its junctions first and refuses while any directory
+    link remains (see the module docstring: git follows them). Never
+    `--force`, never `-D`: git's own refusal is the last line of defense,
+    and it stays armed.
+
+    The branch goes by compare-and-delete, `update-ref -d <ref> <sha>`, with
+    the sha checked here. `branch -d` can't be used: it judges "merged"
+    against the branch's upstream or the main checkout's HEAD, and lanes
+    have no upstream (see create_lane). If the branch moved meanwhile, git
+    refuses, the branch is kept, and LaneError("moved") says so.
+
+    Ignored files (`.env`, build output) go with the worktree. They are
+    listed first, into RemoveResult.ignored, so nothing goes silently."""
     st = lane_status(lane)
-    if st.dirty:
+    if st.dirty or st.local:
         raise LaneError("dirty", st.describe())
     if not st.merged:
         raise LaneError("unmerged", st.describe())
     root, branch, repo = lane["root"], lane["branch"], lane["repo"]
+    ref = f"refs/heads/{branch}"
+    r = git(["rev-parse", "--verify", "--quiet", ref], repo)
+    branch_head = r.out if r.ok else ""
+    # a lane whose agent switched branches: its own branch was not measured
+    if (branch_head and branch_head != st.head and not _in_base(
+            repo, branch_head, lane.get("base") or "", st.base_ref)):
+        raise LaneError("unmerged", f"the branch {branch} has commits that "
+                                    f"are not in the base branch")
+    result = RemoveResult(status=st)
     if st.exists:
+        result.ignored = ignored_files(root)
         unlink_junctions(root)
         links = directory_links(root)
         if links:
@@ -568,11 +685,13 @@ def remove_lane(lane: dict) -> RemoveResult:
         _git_or_fail(["worktree", "remove", root], repo)
     else:
         git(["worktree", "prune"], repo, WRITE_TIMEOUT)
-    result = RemoveResult(status=st)
-    if ref_exists(repo, f"refs/heads/{branch}"):
-        r = git(["branch", "-d", branch], repo)
-        result.branch_deleted = r.ok
-        result.branch_error = "" if r.ok else (r.err or r.out)
+    if branch_head:
+        r = git(["update-ref", "-d", ref, branch_head], repo)
+        if not r.ok:
+            raise LaneError("moved", f"the branch {branch} changed while its "
+                                     f"lane was removed, so it was kept: "
+                                     f"{r.err or r.out}")
+        result.branch_deleted = True
     try:
         os.rmdir(os.path.dirname(root))     # only if it is now empty
     except OSError:
@@ -585,46 +704,61 @@ class RetireResult:
     removed: bool
     status: LaneStatus | None = None
     reason: str = ""
-    branch_error: str = ""
+    code: str = ""          # the LaneError code, or "busy"
+    ignored: list = field(default_factory=list)
 
 
-def retire_lane(lane: dict, pids=(), wait_s: float = EXIT_WAIT_S) -> RetireResult:
+def retire_lane(lane: dict, pids=(), wait_s: float | None = None) -> RetireResult:
     """Closing a laned card: remove the lane when it holds nothing, keep it
-    otherwise. Waits for the closed agent's processes to exit first, since
-    Windows won't delete a folder that is still a working directory, and a
-    half-deleted worktree can no longer be removed cleanly."""
-    wait_for_exit(pids, wait_s)
+    otherwise.
+
+    Waits for the closed agent's processes to exit first, since Windows
+    won't delete a folder that is still a working directory, and a
+    half-deleted worktree can no longer be removed cleanly. If one is still
+    running when the wait ends, nothing is touched: the result is "busy",
+    and the caller may try again later."""
+    exited = wait_for_exit(pids, EXIT_WAIT_S if wait_s is None else wait_s)
     try:
         st = lane_status(lane)
     except LaneError as exc:
-        return RetireResult(False, None, str(exc))
-    if st.dirty or not st.merged:
+        return RetireResult(False, None, str(exc), exc.code)
+    if st.dirty or st.local or not st.merged:
         return RetireResult(False, st, "")
+    if not exited:
+        return RetireResult(False, st, "a program is still running in it",
+                            "busy")
     try:
         res = remove_lane(lane)
     except LaneError as exc:
-        return RetireResult(False, st, str(exc))
-    return RetireResult(True, res.status, "", res.branch_error)
+        return RetireResult(False, st, str(exc), exc.code)
+    return RetireResult(True, res.status, ignored=res.ignored)
 
 
-def wait_for_exit(pids, timeout: float) -> None:
-    """Block until every pid has exited or `timeout` passed (Windows)."""
+def wait_for_exit(pids, timeout: float) -> bool:
+    """Block until every pid has exited or `timeout` passed (Windows). True
+    when all of them are gone."""
     pids = [p for p in (pids or ()) if p]
     if not pids or sys.platform != "win32":
-        return
+        return True
     import ctypes
     import time
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     deadline = time.monotonic() + max(0.0, timeout)
+    gone = True
     for pid in pids:
         handle = kernel32.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
         if not handle:
-            continue                    # already gone
+            # ERROR_ACCESS_DENIED: it exists, we just may not wait on it
+            if ctypes.get_last_error() == 5:
+                gone = False
+            continue
         try:
             left = max(0, int((deadline - time.monotonic()) * 1000))
-            kernel32.WaitForSingleObject(handle, left)
+            if kernel32.WaitForSingleObject(handle, left) != 0:  # WAIT_OBJECT_0
+                gone = False
         finally:
             kernel32.CloseHandle(handle)
+    return gone
 
 
 # --------------------------------------------------- lane conversations ---
@@ -838,6 +972,9 @@ class LaneSnap:
     dirty: list = field(default_factory=list)        # uncommitted
     committed: list = field(default_factory=list)    # own commits since fork
     base_changed: list = field(default_factory=list)  # base, since the fork
+    # `git merge-base HEAD <base_ref>`: where this round of work forked from
+    # the base. It moves when the lane merges or fast-forwards to the base.
+    fork: str = ""
     error: str = ""
 
     def files(self) -> dict:
@@ -862,6 +999,8 @@ class Overlap:
     peer: str
     peer_branch: str
     state: str
+    fork: str = ""          # this lane's fork from the base (LaneSnap.fork)
+    peer_fork: str = ""     # the peer lane's; "" for the base
 
     @property
     def level(self) -> str:
@@ -869,10 +1008,14 @@ class Overlap:
 
     @property
     def key(self) -> str:
-        """Dedupe key for notices and warnings. Uses the level, not the raw
+        """Dedupe key for notices and warnings, built exactly like the
+        overlap hook's (session_hook.overlap_key). Uses the level, not the raw
         state: a peer committing a change it already had uncommitted is not
-        news, the change turning into a conflict is."""
-        return f"{self.path}|{self.peer_uid or 'base'}|{self.level}"
+        news, the change turning into a conflict is. Carries both forks: the
+        same file overlapping again in a later round of work is news too."""
+        from .session_hook import overlap_key
+        return overlap_key(self.path, self.peer_uid or "base", self.level,
+                           self.fork, self.peer_fork)
 
 
 @dataclass
@@ -950,9 +1093,10 @@ class RepoSnapshot:
         return out
 
 
-def lane_snap(entry: dict) -> LaneSnap:
+def lane_snap(entry: dict, cache: dict | None = None) -> LaneSnap:
     """Read one lane for a poll. Never raises: a lane that can't be read
-    comes back with `exists` False or an `error`."""
+    comes back with `exists` False or an `error`. `cache` (the poller's, per
+    repo) keeps each lane's fork by (head, base sha)."""
     lane = entry["lane"]
     root, repo = lane["root"], lane["repo"]
     snap = LaneSnap(uid=entry["uid"], agent=entry.get("agent", ""),
@@ -981,9 +1125,26 @@ def lane_snap(entry: dict) -> LaneSnap:
                 snap.committed = committed_paths(root, snap.base_ref)
             if snap.behind:
                 snap.base_changed = base_paths(root, snap.base_ref)
+            snap.fork = _fork(root, snap.head, snap.base_ref, cache)
     except LaneError as exc:
         snap.error = str(exc)
     return snap
+
+
+def _fork(root: str, head: str, base_ref: str, cache) -> str:
+    """`git merge-base <head> <base_ref>`, cached by (head, base sha): both
+    are commits, so the answer never changes for that pair."""
+    r = git(["rev-parse", base_ref], root)
+    if not r.ok:
+        return ""
+    key = ("fork", head, r.out)
+    if cache is not None and key in cache:
+        return cache[key]
+    m = git(["merge-base", head, r.out], root)
+    fork = m.out if m.ok else ""
+    if cache is not None:
+        cache[key] = fork
+    return fork
 
 
 def _cached_conflicts(cache, cwd: str, a: str, b: str):
@@ -1018,7 +1179,7 @@ def snapshot_repo(repo: str, entries: list, cache: dict | None = None,
                         ts=now or _time.time())
     for e in entries:
         with lock if lock is not None else contextlib.nullcontext():
-            snap.lanes.append(lane_snap(e))
+            snap.lanes.append(lane_snap(e, cache))
     live = [s for s in snap.lanes if s.exists and s.head and not s.error]
     files = {s.uid: s.files() for s in live}
     ovs: dict = {}
@@ -1039,9 +1200,11 @@ def snapshot_repo(repo: str, entries: list, cache: dict | None = None,
             for path in sorted(shared):
                 hot = path in conflicts
                 add(a.uid, Overlap(path, b.uid, b.agent, b.branch,
-                                   CONFLICTS if hot else files[b.uid][path]))
+                                   CONFLICTS if hot else files[b.uid][path],
+                                   a.fork, b.fork))
                 add(b.uid, Overlap(path, a.uid, a.agent, a.branch,
-                                   CONFLICTS if hot else files[a.uid][path]))
+                                   CONFLICTS if hot else files[a.uid][path],
+                                   b.fork, a.fork))
     base_heads: dict = {}
     for s in live:
         shared = set(files[s.uid]) & set(s.base_changed)
@@ -1057,7 +1220,8 @@ def snapshot_repo(repo: str, entries: list, cache: dict | None = None,
                     cache, repo, s.head, base_heads[s.base_ref]) or ())
         for path in sorted(shared):
             add(s.uid, Overlap(path, "", s.base_ref, s.base_ref,
-                               CONFLICTS if path in conflicts else "committed"))
+                               CONFLICTS if path in conflicts else "committed",
+                               s.fork))
     snap.overlaps = ovs
     return snap
 
@@ -1143,19 +1307,16 @@ INCLUDE_MAX_FILES = 200
 INCLUDE_MAX_BYTES = 50 * 1024 * 1024
 
 
-def copy_worktree_includes(repo: str, root: str) -> list:
-    """Copy the repo's gitignored local files that `.worktreeinclude`
-    (gitignore syntax, at the repo root) names into a new lane: a `.env`, a
-    local config. Only files git IGNORES are copied (a tracked file is
-    already in the lane), never anything under a junction, never over an
-    existing file, and at most INCLUDE_MAX_FILES / INCLUDE_MAX_BYTES.
-    Best-effort: returns the repo paths copied, never raises."""
-    import shutil
-    spec = os.path.join(repo, WORKTREEINCLUDE)
-    if not os.path.isfile(spec):
-        return []
+def _include_candidates(cwd: str, spec: str) -> list:
+    """Untracked files under `cwd` that `spec` (a `.worktreeinclude`) names
+    AND git ignores, repo-relative. The junction folders are pruned from the
+    walk by pathspec exclusion. `--exclude=node_modules/` would not do it: it
+    marks every file under node_modules ignored, so git lists all of them
+    (10,001 paths on a 10,000-file node_modules, against 1 with the
+    pathspec, measured)."""
     r = git(["ls-files", "-z", "--others", "--ignored",
-             f"--exclude-from={spec}"], repo)
+             f"--exclude-from={spec}", "--", ".",
+             *(f":(exclude){name}" for name in JUNCTION_NAMES)], cwd)
     if not r.ok:
         return []
     cands = [p for p in _z_list(r.out)
@@ -1167,10 +1328,48 @@ def copy_worktree_includes(repo: str, root: str) -> list:
         # -z needs --stdin, which the runner has no pipe for: read lines, and
         # keep only exact matches (a name git had to quote is skipped)
         r = git(["-c", "core.quotepath=off", "check-ignore", "--", *chunk],
-                repo)
+                cwd)
         if r.rc in (0, 1):          # 1 = none of these is ignored
             wanted = set(chunk)
             ignored.extend(ln for ln in r.out.splitlines() if ln in wanted)
+    return ignored
+
+
+def local_changes(repo: str, root: str) -> list:
+    """The lane's `.worktreeinclude` files that differ from the main
+    checkout's copy, or that the main checkout doesn't have: a `.env` the
+    agent edited in its lane. They are ignored, so `git status` never shows
+    them, and `git worktree remove` deletes ignored files without asking. []
+    when the repo has no `.worktreeinclude`."""
+    import filecmp
+    spec = os.path.join(repo, WORKTREEINCLUDE)
+    if not os.path.isfile(spec):
+        return []
+    out = []
+    for rel in _include_candidates(root, spec):
+        mine, theirs = os.path.join(root, rel), os.path.join(repo, rel)
+        try:
+            same = (os.path.isfile(theirs)
+                    and filecmp.cmp(mine, theirs, shallow=False))
+        except OSError:
+            same = False            # can't compare: keep the lane
+        if not same:
+            out.append(rel.replace("\\", "/"))
+    return out
+
+
+def copy_worktree_includes(repo: str, root: str) -> list:
+    """Copy the repo's gitignored local files that `.worktreeinclude`
+    (gitignore syntax, at the repo root) names into a new lane: a `.env`, a
+    local config. Only files git IGNORES are copied (a tracked file is
+    already in the lane), never anything under a junction, never over an
+    existing file, and at most INCLUDE_MAX_FILES / INCLUDE_MAX_BYTES.
+    Best-effort: returns the repo paths copied, never raises."""
+    import shutil
+    spec = os.path.join(repo, WORKTREEINCLUDE)
+    if not os.path.isfile(spec):
+        return []
+    ignored = _include_candidates(repo, spec)
     copied, total = [], 0
     for rel in ignored:
         if len(copied) >= INCLUDE_MAX_FILES:

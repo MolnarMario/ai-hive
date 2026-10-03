@@ -399,7 +399,9 @@ workspaces keep executing — switching never pauses anything.
   shared board (`.aihive/board.md`): Claude agents launch with `--add-dir` +
   an appended system prompt so they can read peers' status and post their own,
   and a live **Activity** panel shows the roster, shared log, and git changes.
-  Scoped per workspace; workspaces stay isolated.
+  The board keeps the newest 40 notes (older ones move to
+  `.aihive/board-archive.md`), so reading it stays cheap. Scoped per
+  workspace; workspaces stay isolated.
 - **Agent lanes** (⚙ Options > Agents, off by default): with the switch on, a
   new Claude agent in a git workspace gets its own git worktree and branch
   beside the repository (`<repo>.lanes\<name>-<id>`, branch `hive/<name>-<id>`),
@@ -408,30 +410,39 @@ workspaces keep executing — switching never pauses anything.
   lanes. The ignored `.venv` / `venv` / `node_modules` are linked in, so the
   usual test command works in a lane. Closing a card removes its lane only when
   it holds nothing (clean, and its commits are already in the base branch);
-  otherwise the lane is kept and AI Hive says what is in it. A kept lane's
-  conversation stays in the New Agent dialog's Conversation list, and picking
-  it brings the lane back at the same path. Turning the switch off stops new
-  lanes; agents that already have one keep it. Git operations on one repo run
-  one at a time, every step is logged as a `LANE-*` line in `session.log`, and
-  lane removal never uses `--force` or `-D`. A `.worktreeinclude` file at the
-  repo root (gitignore syntax) names ignored local files, like a `.env`, to
-  copy into each new lane.
+  otherwise the lane is kept and AI Hive says what is in it. A lane a program
+  still runs in is not touched; the removal is retried for a minute. A kept
+  lane's conversation stays in the New Agent dialog's Conversation list, and
+  picking it brings the lane back at the same path. Turning the switch off
+  stops new lanes; agents that already have one keep it. Lane branches have
+  no upstream, so git never suggests pushing a lane to the base branch. A
+  workspace inside a larger repository starts with the box unticked. Git
+  operations on one repo run one at a time (none on the GUI thread), every
+  step is logged as a `LANE-*` line in `session.log` (a removal names the
+  ignored files it took), and lane removal never uses `--force` or `-D`.
+  A `.worktreeinclude` file at the repo root (gitignore syntax) names
+  ignored local files, like a `.env`, to copy into each new lane.
 - **Lane awareness** (while Agent lanes is on): AI Hive reads every lane about
   every 15 seconds and right after an agent's turn ends, and fetches the base
   branch every 5 minutes. Each laned card gets a chip (`⎇ ↑2 ±3`: commits
   ahead, uncommitted files) that turns amber when another lane or the base
   branch changed one of its files, and red when a real merge of the two would
   conflict (`git merge-tree`, git 2.38+). Its menu opens the lane folder and
-  fast-forwards an empty lane to the newest base. The agents hear about it
-  only when it matters: a hook warns an agent the moment it edits a file
-  another lane changed (or edits outside its own lane), and lane notices
-  ("origin/main changed a file you changed, merge it now") arrive with its
-  next prompt, once each. Laned agents are then told to skim the board's
-  roster instead of reading the whole log, and the roster gains Lane,
-  Ahead/Dirty and Touching columns. The Activity panel gets a Lanes section
-  and lists changed files per lane, the Agent/File Map shows one tree for the
-  repo however many lanes touched a file, and first overlaps and conflicts
-  land in the event log. Turning the switch off silences all of it at once.
+  fast-forwards an empty lane to the newest base (not while the agent is
+  working). The agents hear about it only when it matters: a hook warns an
+  agent the moment it edits a file another lane changed (or edits outside its
+  own lane), and lane notices ("origin/main changed a file you changed, merge
+  it now") arrive with its next prompt, once per round of work: the same
+  overlap after the other lane landed its work and moved on is news again.
+  Laned agents are then told to read `.aihive/roster.md` (the roster table
+  alone) instead of the whole board, and the roster gains Lane, Ahead/Dirty
+  and Touching columns. The Activity panel gets a Lanes section and lists
+  changed files per lane, the Agent/File Map shows one tree for the repo
+  however many lanes touched a file, and first overlaps and conflicts land in
+  the event log. Turning the switch off silences all of it at once, retried
+  until it sticks, and the hooks also go quiet on their own once AI Hive
+  stops refreshing `lanes.json`. A lane whose `.worktreeinclude` copy (a
+  `.env`) was edited is kept when its card closes.
   A lane with no work of its own whose agent is idle is fast-forwarded to the
   base by itself when the base moves, and the agent is told on its next
   prompt.
@@ -670,7 +681,8 @@ awareness* below).
 
 Agents in the same workspace coordinate through a shared board at
 `<project>/.aihive/board.md`. AI Hive maintains an app-owned roster block
-(each agent's name, model, status, and current task); agents append to an
+(each agent's name, model, status, and what it is working on: its live
+conversation title, as on its card, else its assigned task); agents append to an
 `## Activity log` section below it. Claude agents launch with `--add-dir
 <.aihive>` and an appended system prompt instructing them to read the board
 for peer awareness and post their own updates — so they can see what others
@@ -678,6 +690,16 @@ are doing and avoid duplicate work. The **Activity** panel shows the roster,
 the log tail, and a best-effort `git status` view. Awareness is **scoped to
 the workspace** (the board lives in its folder); different workspaces are
 isolated.
+
+**The board stays small.** Every agent reads it before substantial work, so its
+size is paid in tokens on every task. The log keeps the newest 40 entries;
+each new note moves older ones to `.aihive/board-archive.md` beside it. The
+archive is append-only and written before the board, so a note is never lost
+(a failed board write rolls the archive back, so none is doubled either).
+Agents are told to read the archive only if they need history. A board an
+agent edited by hand keeps every line: a lost roster comes back under the
+title, a lost log heading is added again at the end, and an unchanged roster
+is not rewritten.
 
 **What the board is (and isn't).** The board shares the *roster* and the *terse
 one-line notes* agents choose to log — **not** the text of your conversations.
@@ -840,7 +862,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2511 checks drive the real app headlessly (offscreen Qt platform) with real
+2513 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -934,7 +956,8 @@ app/
   tiling.py                pure grid math: compute_grid + explicit_grid
   ansi_parser.py           stateful SGR parser (line-console rendering)
   providers.py             AI provider registry (Claude + Gemini/agy + Grok wired; OpenAI template)
-  coordination.py          per-workspace shared board (.aihive/board.md)
+  coordination.py          per-workspace shared board (.aihive/board.md) and
+                           its log rotation into board-archive.md
   lanes.py                 agent lanes: a git worktree per agent, create/repair/retire (Qt-free)
   lane_ops.py              runs lane git operations one at a time per repo, off the GUI thread
   lane_service.py          lane awareness: polls every lane, overlaps, lanes.json, lane notices
@@ -979,7 +1002,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2511 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2513 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

@@ -23,8 +23,12 @@ reading the whole board:
 
 It runs only while the Agent lanes switch is on (MainWindow starts and
 stops it). Stopping writes `"enabled": false` into every lanes.json it
-wrote, which silences already-running agents' hooks at once. Lane state is
-transient: nothing here marks the session dirty.
+wrote, which silences already-running agents' hooks at once. On Windows
+that write fails while a hook has the file open, so a failed one is retried
+every STOP_RETRY_MS. As a backstop, every poll rewrites lanes.json with a
+fresh `ts` even when nothing changed, and the hooks treat a lanes.json older
+than session_hook.LANES_STALE_S as switched off. Lane state is transient:
+nothing here marks the session dirty.
 
 Polls are read-only and lock-free (see the awareness section of
 app/lanes.py), so they run on their own daemon thread per repository, one
@@ -48,6 +52,8 @@ POLL_MS = 15000
 FETCH_MS = 5 * 60 * 1000
 FETCH_FIRST_MS = 20000      # the first fetch after the service starts
 POKE_MS = 1500              # coalesce a burst of turn-ends into one poll
+STOP_RETRY_MS = 250         # retrying a "switched off" write that failed
+STOP_RETRIES = 20
 INDEX_NAME = "lanes.json"
 NOTICES_DIR = "notices"
 SEEN_DIR = "seen"
@@ -93,6 +99,10 @@ class LaneService(QObject):
         self._repos: dict[str, tuple] = {}       # repo key -> (repo, base)
         self._ws_views: dict[str, dict] = {}     # ws_id -> {uid: LaneView}
         self._written: dict[str, str] = {}       # index path -> last content
+        self._index_failing: set[str] = set()    # audited once until it works
+        # "enabled": false writes that failed at stop(), retried on a timer
+        self._disable_pending: set[str] = set()
+        self._disable_tries = 0
         self._noticed: set[tuple] = set()        # (uid, key) appended
         self._events: set[tuple] = set()         # (a, b, level) logged
         self._seeded: set[str] = set()           # repo keys past 1st poll
@@ -113,6 +123,9 @@ class LaneService(QObject):
         self._first_fetch.setSingleShot(True)
         self._first_fetch.setInterval(FETCH_FIRST_MS)
         self._first_fetch.timeout.connect(self.fetch)
+        self._disable_timer = QTimer(self)
+        self._disable_timer.setInterval(STOP_RETRY_MS)
+        self._disable_timer.timeout.connect(self._retry_disable)
 
         for ws in manager.workspaces:
             for agent in ws.agents:
@@ -130,6 +143,9 @@ class LaneService(QObject):
         if self._running:
             return
         self._running = True
+        # a "switched off" write still being retried must not land after this
+        self._disable_timer.stop()
+        self._disable_pending.clear()
         self._seeded.clear()
         self._poll_timer.start()
         self._fetch_timer.start()
@@ -146,26 +162,51 @@ class LaneService(QObject):
         for t in (self._poll_timer, self._poke_timer, self._fetch_timer,
                   self._first_fetch):
             t.stop()
-        for path in list(self._written):
-            try:
-                session_hook.write_lanes_index(
-                    path, {"version": session_hook.LANES_INDEX_VERSION,
-                           "enabled": False, "ts": time.time()})
-            except OSError:
-                pass
+        self._disable_pending = set(self._written)
+        self._disable_tries = 0
         self._written.clear()
+        self._retry_disable()
         self._snaps.clear()
         self._again.clear()
         for ws_id in list(self._ws_views):
             self._ws_views[ws_id] = {}
             self.lanesChanged.emit(ws_id, {})
 
+    def _retry_disable(self) -> None:
+        """Write "enabled": false into every lanes.json still pending. On
+        Windows the replace fails while a hook process has the file open,
+        so a failure is retried every STOP_RETRY_MS, STOP_RETRIES times."""
+        for path in sorted(self._disable_pending):
+            try:
+                session_hook.write_lanes_index(
+                    path, {"version": session_hook.LANES_INDEX_VERSION,
+                           "enabled": False, "ts": time.time()})
+                self._disable_pending.discard(path)
+            except OSError:
+                pass
+        if not self._disable_pending:
+            self._disable_timer.stop()
+            return
+        self._disable_tries += 1
+        if self._disable_tries > STOP_RETRIES:
+            self._disable_timer.stop()
+            if self._audit is not None:
+                for path in sorted(self._disable_pending):
+                    self._audit(f"LANE-FAIL disable {path}: still locked "
+                                f"after {STOP_RETRIES} tries; its hooks go "
+                                f"quiet once it is "
+                                f"{int(session_hook.LANES_STALE_S)} s old")
+            self._disable_pending.clear()
+            return
+        if not self._disable_timer.isActive():
+            self._disable_timer.start()
+
     def shutdown(self) -> None:
         """The app is closing: stop polling, write nothing (the agents die
         with the app, so their hooks need no silencing)."""
         self._running = False
         for t in (self._poll_timer, self._poke_timer, self._fetch_timer,
-                  self._first_fetch):
+                  self._first_fetch, self._disable_timer):
             t.stop()
 
     def poke(self) -> None:
@@ -324,23 +365,28 @@ class LaneService(QObject):
                 "agent": s.agent, "branch": s.branch, "root": s.root,
                 "base_ref": s.base_ref, "ahead": s.ahead, "behind": s.behind,
                 "dirty": len(s.dirty), "exists": s.exists,
-                "base_changed": s.base_changed[:500]}
+                "fork": s.fork, "base_changed": s.base_changed[:500]}
         data = {"version": session_hook.LANES_INDEX_VERSION, "enabled": True,
                 "repo": snap.repo, "merge_tree": snap.merge_tree,
                 "lanes": lanes_part, "files": snap.index()}
         body = json.dumps(data, sort_keys=True)
         for ws in self._workspaces_of(snap):
             path = index_path(ws)
-            if self._written.get(path) == body:
-                continue
+            # written on every poll, changed or not: the fresh `ts` is what
+            # keeps the hooks listening (session_hook.lanes_index_live)
             try:
                 ws.board.ensure()
                 session_hook.write_lanes_index(path, {**data,
-                                                      "ts": snap.ts})
+                                                      "ts": time.time()})
                 self._written[path] = body
+                self._index_failing.discard(path)
             except OSError as exc:
-                if self._audit is not None:
+                # a hook reading the file at that moment: the next poll
+                # writes it again, so only a lasting failure is worth a line
+                if path not in self._index_failing and self._audit is not None:
                     self._audit(f"LANE-FAIL index {path}: {exc}")
+                self._index_failing.add(path)
+                self._written.setdefault(path, "")
 
     def _write_notices(self, snap, first: bool) -> None:
         """One notice per new (agent, file, peer, level) overlap. On the first
