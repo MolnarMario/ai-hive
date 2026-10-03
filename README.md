@@ -614,8 +614,8 @@ awareness* below).
 
 Agents in the same workspace coordinate through a shared board at
 `<project>/.aihive/board.md`. AI Hive maintains an app-owned roster block
-(each agent's name, model, status, and current task, or its live conversation
-title when it has no assigned task); agents append to an
+(each agent's name, model, status, and what it is working on: its live
+conversation title, as on its card, else its assigned task); agents append to an
 `## Activity log` section below it. Claude agents launch with `--add-dir
 <.aihive>` and an appended system prompt instructing them to read the board
 for peer awareness and post their own updates — so they can see what others
@@ -629,6 +629,10 @@ size is paid in tokens on every task. The log keeps the newest 40 entries;
 each new note moves older ones to `.aihive/board-archive.md` beside it. The
 archive is append-only and written before the board, so a note is never lost
 (a failed board write rolls the archive back, so none is doubled either).
+Agents are told to read the archive only if they need history. A board an
+agent edited by hand keeps every line: a lost roster comes back under the
+title, a lost log heading is added again at the end, and an unchanged roster
+is not rewritten.
 
 **What the board is (and isn't).** The board shares the *roster* and the *terse
 one-line notes* agents choose to log — **not** the text of your conversations.
@@ -791,7 +795,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2160 checks drive the real app headlessly (offscreen Qt platform) with real
+2170 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -927,7 +931,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2160 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2170 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
