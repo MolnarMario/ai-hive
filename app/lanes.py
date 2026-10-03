@@ -560,6 +560,8 @@ class LaneStatus:
     dirty: list = field(default_factory=list)
     merged: bool = False        # head is in the base: removing loses nothing
     base_ref: str = ""
+    # ignored `.worktreeinclude` files changed in the lane (local_changes)
+    local: list = field(default_factory=list)
 
     def describe(self) -> str:
         """"3 unmerged commits and 2 modified files", for the close prompt."""
@@ -572,6 +574,11 @@ class LaneStatus:
         if self.dirty:
             n = len(self.dirty)
             parts.append(f"{n} modified file{'' if n == 1 else 's'}")
+        if self.local:
+            more = (f" (+{len(self.local) - 3} more)"
+                    if len(self.local) > 3 else "")
+            parts.append(f"local files changed: "
+                         f"{', '.join(self.local[:3])}{more}")
         return " and ".join(parts)
 
 
@@ -597,6 +604,7 @@ def lane_status(lane: dict) -> LaneStatus:
     if not r.ok:
         raise LaneError("git", f"could not read the lane's status: {r.err}")
     st.dirty = [ln for ln in r.out.splitlines() if ln.strip()]
+    st.local = local_changes(repo, root)
     if base_ref:
         r = git(["rev-list", "--left-right", "--count", f"{base_ref}...HEAD"],
                 root)
@@ -653,7 +661,7 @@ def remove_lane(lane: dict) -> RemoveResult:
     Ignored files (`.env`, build output) go with the worktree. They are
     listed first, into RemoveResult.ignored, so nothing goes silently."""
     st = lane_status(lane)
-    if st.dirty:
+    if st.dirty or st.local:
         raise LaneError("dirty", st.describe())
     if not st.merged:
         raise LaneError("unmerged", st.describe())
@@ -714,7 +722,7 @@ def retire_lane(lane: dict, pids=(), wait_s: float | None = None) -> RetireResul
         st = lane_status(lane)
     except LaneError as exc:
         return RetireResult(False, None, str(exc), exc.code)
-    if st.dirty or not st.merged:
+    if st.dirty or st.local or not st.merged:
         return RetireResult(False, st, "")
     if not exited:
         return RetireResult(False, st, "a program is still running in it",
@@ -964,6 +972,9 @@ class LaneSnap:
     dirty: list = field(default_factory=list)        # uncommitted
     committed: list = field(default_factory=list)    # own commits since fork
     base_changed: list = field(default_factory=list)  # base, since the fork
+    # `git merge-base HEAD <base_ref>`: where this round of work forked from
+    # the base. It moves when the lane merges or fast-forwards to the base.
+    fork: str = ""
     error: str = ""
 
     def files(self) -> dict:
@@ -988,6 +999,8 @@ class Overlap:
     peer: str
     peer_branch: str
     state: str
+    fork: str = ""          # this lane's fork from the base (LaneSnap.fork)
+    peer_fork: str = ""     # the peer lane's; "" for the base
 
     @property
     def level(self) -> str:
@@ -995,10 +1008,14 @@ class Overlap:
 
     @property
     def key(self) -> str:
-        """Dedupe key for notices and warnings. Uses the level, not the raw
+        """Dedupe key for notices and warnings, built exactly like the
+        overlap hook's (session_hook.overlap_key). Uses the level, not the raw
         state: a peer committing a change it already had uncommitted is not
-        news, the change turning into a conflict is."""
-        return f"{self.path}|{self.peer_uid or 'base'}|{self.level}"
+        news, the change turning into a conflict is. Carries both forks: the
+        same file overlapping again in a later round of work is news too."""
+        from .session_hook import overlap_key
+        return overlap_key(self.path, self.peer_uid or "base", self.level,
+                           self.fork, self.peer_fork)
 
 
 @dataclass
@@ -1076,9 +1093,10 @@ class RepoSnapshot:
         return out
 
 
-def lane_snap(entry: dict) -> LaneSnap:
+def lane_snap(entry: dict, cache: dict | None = None) -> LaneSnap:
     """Read one lane for a poll. Never raises: a lane that can't be read
-    comes back with `exists` False or an `error`."""
+    comes back with `exists` False or an `error`. `cache` (the poller's, per
+    repo) keeps each lane's fork by (head, base sha)."""
     lane = entry["lane"]
     root, repo = lane["root"], lane["repo"]
     snap = LaneSnap(uid=entry["uid"], agent=entry.get("agent", ""),
@@ -1107,9 +1125,26 @@ def lane_snap(entry: dict) -> LaneSnap:
                 snap.committed = committed_paths(root, snap.base_ref)
             if snap.behind:
                 snap.base_changed = base_paths(root, snap.base_ref)
+            snap.fork = _fork(root, snap.head, snap.base_ref, cache)
     except LaneError as exc:
         snap.error = str(exc)
     return snap
+
+
+def _fork(root: str, head: str, base_ref: str, cache) -> str:
+    """`git merge-base <head> <base_ref>`, cached by (head, base sha): both
+    are commits, so the answer never changes for that pair."""
+    r = git(["rev-parse", base_ref], root)
+    if not r.ok:
+        return ""
+    key = ("fork", head, r.out)
+    if cache is not None and key in cache:
+        return cache[key]
+    m = git(["merge-base", head, r.out], root)
+    fork = m.out if m.ok else ""
+    if cache is not None:
+        cache[key] = fork
+    return fork
 
 
 def _cached_conflicts(cache, cwd: str, a: str, b: str):
@@ -1144,7 +1179,7 @@ def snapshot_repo(repo: str, entries: list, cache: dict | None = None,
                         ts=now or _time.time())
     for e in entries:
         with lock if lock is not None else contextlib.nullcontext():
-            snap.lanes.append(lane_snap(e))
+            snap.lanes.append(lane_snap(e, cache))
     live = [s for s in snap.lanes if s.exists and s.head and not s.error]
     files = {s.uid: s.files() for s in live}
     ovs: dict = {}
@@ -1165,9 +1200,11 @@ def snapshot_repo(repo: str, entries: list, cache: dict | None = None,
             for path in sorted(shared):
                 hot = path in conflicts
                 add(a.uid, Overlap(path, b.uid, b.agent, b.branch,
-                                   CONFLICTS if hot else files[b.uid][path]))
+                                   CONFLICTS if hot else files[b.uid][path],
+                                   a.fork, b.fork))
                 add(b.uid, Overlap(path, a.uid, a.agent, a.branch,
-                                   CONFLICTS if hot else files[a.uid][path]))
+                                   CONFLICTS if hot else files[a.uid][path],
+                                   b.fork, a.fork))
     base_heads: dict = {}
     for s in live:
         shared = set(files[s.uid]) & set(s.base_changed)
@@ -1183,7 +1220,8 @@ def snapshot_repo(repo: str, entries: list, cache: dict | None = None,
                     cache, repo, s.head, base_heads[s.base_ref]) or ())
         for path in sorted(shared):
             add(s.uid, Overlap(path, "", s.base_ref, s.base_ref,
-                               CONFLICTS if path in conflicts else "committed"))
+                               CONFLICTS if path in conflicts else "committed",
+                               s.fork))
     snap.overlaps = ovs
     return snap
 
@@ -1269,19 +1307,16 @@ INCLUDE_MAX_FILES = 200
 INCLUDE_MAX_BYTES = 50 * 1024 * 1024
 
 
-def copy_worktree_includes(repo: str, root: str) -> list:
-    """Copy the repo's gitignored local files that `.worktreeinclude`
-    (gitignore syntax, at the repo root) names into a new lane: a `.env`, a
-    local config. Only files git IGNORES are copied (a tracked file is
-    already in the lane), never anything under a junction, never over an
-    existing file, and at most INCLUDE_MAX_FILES / INCLUDE_MAX_BYTES.
-    Best-effort: returns the repo paths copied, never raises."""
-    import shutil
-    spec = os.path.join(repo, WORKTREEINCLUDE)
-    if not os.path.isfile(spec):
-        return []
+def _include_candidates(cwd: str, spec: str) -> list:
+    """Untracked files under `cwd` that `spec` (a `.worktreeinclude`) names
+    AND git ignores, repo-relative. The junction folders are pruned from the
+    walk by pathspec exclusion. `--exclude=node_modules/` would not do it: it
+    marks every file under node_modules ignored, so git lists all of them
+    (10,001 paths on a 10,000-file node_modules, against 1 with the
+    pathspec, measured)."""
     r = git(["ls-files", "-z", "--others", "--ignored",
-             f"--exclude-from={spec}"], repo)
+             f"--exclude-from={spec}", "--", ".",
+             *(f":(exclude){name}" for name in JUNCTION_NAMES)], cwd)
     if not r.ok:
         return []
     cands = [p for p in _z_list(r.out)
@@ -1293,10 +1328,48 @@ def copy_worktree_includes(repo: str, root: str) -> list:
         # -z needs --stdin, which the runner has no pipe for: read lines, and
         # keep only exact matches (a name git had to quote is skipped)
         r = git(["-c", "core.quotepath=off", "check-ignore", "--", *chunk],
-                repo)
+                cwd)
         if r.rc in (0, 1):          # 1 = none of these is ignored
             wanted = set(chunk)
             ignored.extend(ln for ln in r.out.splitlines() if ln in wanted)
+    return ignored
+
+
+def local_changes(repo: str, root: str) -> list:
+    """The lane's `.worktreeinclude` files that differ from the main
+    checkout's copy, or that the main checkout doesn't have: a `.env` the
+    agent edited in its lane. They are ignored, so `git status` never shows
+    them, and `git worktree remove` deletes ignored files without asking. []
+    when the repo has no `.worktreeinclude`."""
+    import filecmp
+    spec = os.path.join(repo, WORKTREEINCLUDE)
+    if not os.path.isfile(spec):
+        return []
+    out = []
+    for rel in _include_candidates(root, spec):
+        mine, theirs = os.path.join(root, rel), os.path.join(repo, rel)
+        try:
+            same = (os.path.isfile(theirs)
+                    and filecmp.cmp(mine, theirs, shallow=False))
+        except OSError:
+            same = False            # can't compare: keep the lane
+        if not same:
+            out.append(rel.replace("\\", "/"))
+    return out
+
+
+def copy_worktree_includes(repo: str, root: str) -> list:
+    """Copy the repo's gitignored local files that `.worktreeinclude`
+    (gitignore syntax, at the repo root) names into a new lane: a `.env`, a
+    local config. Only files git IGNORES are copied (a tracked file is
+    already in the lane), never anything under a junction, never over an
+    existing file, and at most INCLUDE_MAX_FILES / INCLUDE_MAX_BYTES.
+    Best-effort: returns the repo paths copied, never raises."""
+    import shutil
+    spec = os.path.join(repo, WORKTREEINCLUDE)
+    if not os.path.isfile(spec):
+        return []
+    ignored = _include_candidates(repo, spec)
     copied, total = [], 0
     for rel in ignored:
         if len(copied) >= INCLUDE_MAX_FILES:

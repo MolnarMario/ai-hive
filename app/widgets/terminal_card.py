@@ -1081,9 +1081,16 @@ class TerminalCard(QFrame):
         return "\n".join(lines)
 
     def _show_lane_menu(self) -> None:
+        menu = self._lane_menu()
+        if menu is not None:
+            menu.exec(self.lane_mark.mapToGlobal(
+                self.lane_mark.rect().bottomLeft()))
+
+    def _lane_menu(self):
+        """The chip's menu, built but not shown (tests read it)."""
         lane = getattr(self.agent.spec, "lane", None) or {}
         if not lane.get("branch"):
-            return
+            return None
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
         act_open = QAction("Open lane folder", menu)
@@ -1096,10 +1103,14 @@ class TerminalCard(QFrame):
         act_refresh = QAction(f"Update lane to {base} (fast-forward)", menu)
         act_refresh.triggered.connect(
             lambda: self.laneActionRequested.emit(self.agent.id, "refresh"))
-        ok = view is not None and view.can_refresh()
+        # moving files under a working agent changes what it just read
+        working = self.agent.is_busy() or self.agent.is_waiting()
+        ok = view is not None and view.can_refresh() and not working
         act_refresh.setEnabled(ok)
         if view is None:
             why = "Turn on Agent lanes in Options first."
+        elif working:
+            why = "Wait until this agent has finished its turn."
         elif view.dirty or view.ahead:
             why = ("Only a lane with no commits and no uncommitted changes of "
                    "its own is updated this way.")
@@ -1110,8 +1121,7 @@ class TerminalCard(QFrame):
                    f"commit. Nothing of its own can be lost.")
         act_refresh.setToolTip(why)
         menu.addAction(act_refresh)
-        menu.exec(self.lane_mark.mapToGlobal(
-            self.lane_mark.rect().bottomLeft()))
+        return menu
 
     def _set_sched_missed(self, missed: bool) -> None:
         """Flip the chip's warning state, restyling ONLY on a real change.

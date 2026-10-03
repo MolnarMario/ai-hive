@@ -25,6 +25,10 @@ import subprocess
 BOARD_DIRNAME = ".aihive"
 BOARD_FILENAME = "board.md"
 ARCHIVE_FILENAME = "board-archive.md"
+# the roster alone, for laned agents: the Read tool returns a whole file, so
+# "skim the top of board.md" still paid for every note in it
+ROSTER_FILENAME = "roster.md"
+TASK_CELL_MAX = 80      # a pasted multi-paragraph task stays one short cell
 ROSTER_BEGIN = "<!-- AIHIVE:ROSTER:BEGIN -->"
 ROSTER_END = "<!-- AIHIVE:ROSTER:END -->"
 LOG_HEADER = "## Activity log"
@@ -53,18 +57,21 @@ def system_prompt_text(workspace_name: str, agent_name: str,
 
     `aware`: the lane machinery runs for this agent (the Agent lanes switch
     is on, so its overlap hooks are armed). Only then does a laned agent
-    swap "read the board first" for "skim the roster": AI Hive tells it
+    swap "read the board first" for "read roster.md": AI Hive tells it
     about a real overlap when one exists, and reading every note is the
-    token cost the feature exists to remove. Every other agent keeps the
-    full instruction, because the board is its only awareness."""
+    token cost the feature exists to remove. roster.md (written next to
+    board.md by `update_roster`) is the roster table alone, because the Read
+    tool returns a whole file. Every other agent keeps the full instruction,
+    because the board is its only awareness."""
     laned = bool(lane and lane.get("root") and lane.get("branch"))
     if laned and aware:
-        read = ("Before starting substantial work, skim the roster at the "
-                "top of it to see who is working on what. You do not need "
-                "to read the whole log: AI Hive tells you when another "
-                "agent's lane or the base branch changes a file you changed "
-                "(an \"AI Hive lane notice\" in your context), so act on "
-                "those notices.")
+        roster = os.path.join(os.path.dirname(board_path), ROSTER_FILENAME)
+        read = (f"Before starting substantial work, read the roster at "
+                f"{roster} to see who is working on what. Do not read the "
+                f"board's activity log: AI Hive tells you when another "
+                f"agent's lane or the base branch changes a file you changed "
+                f"(an \"AI Hive lane notice\" in your context), so act on "
+                f"those notices.")
     else:
         read = ("BEFORE starting substantial work, read it to see what the "
                 "other agents are doing and what is already done, so you "
@@ -169,6 +176,10 @@ class WorkspaceBoard:
     def archive_path(self) -> str:
         return os.path.join(self.dir, ARCHIVE_FILENAME)
 
+    @property
+    def roster_path(self) -> str:
+        return os.path.join(self.dir, ROSTER_FILENAME)
+
     def ensure(self) -> bool:
         """Create the board scaffold if missing. Returns False on failure
         (e.g. read-only or non-existent project dir)."""
@@ -196,9 +207,14 @@ class WorkspaceBoard:
 
         A board whose markers were lost (an agent edited it by hand) gets the
         roster back at the top, and every other line is kept. Rebuilding the
-        scaffold here once dropped the whole activity log."""
+        scaffold here once dropped the whole activity log.
+
+        The same table also goes to roster.md, in this same (serialized)
+        call, for laned agents to read instead of the whole board."""
         if not self.ensure():
             return False
+        block = self._render_roster(rows)
+        self._write_roster_file(block)
         try:
             # tolerant read: a foreign agent writing mangled bytes to the
             # board must degrade its own entry, never break the roster
@@ -206,7 +222,6 @@ class WorkspaceBoard:
                 text = f.read()
         except (OSError, UnicodeError):
             return False
-        block = self._render_roster(rows)
         fresh = f"{ROSTER_BEGIN}\n{block}\n{ROSTER_END}"
         if ROSTER_BEGIN in text and ROSTER_END in text.split(ROSTER_BEGIN, 1)[1]:
             head, rest = text.split(ROSTER_BEGIN, 1)
@@ -242,11 +257,32 @@ class WorkspaceBoard:
             # one line: a delivered task can span several, which would end
             # the table row early
             task = " ".join((r.get("task") or "").split()).replace("|", "/") or "-"
+            if len(task) > TASK_CELL_MAX:
+                task = task[:TASK_CELL_MAX - 3].rstrip() + "..."
             lines.append(f"| {r.get('name','?')} | {r.get('role','')} | "
                          f"{model} | {icon} {r.get('status','')} | {task} |")
         if any(r.get("lane") for r in rows):
             lines = _with_lane_columns(lines, rows)
         return "\n".join(lines)
+
+    def _write_roster_file(self, block: str) -> bool:
+        """roster.md: the roster table alone. Rewritten only when it changed."""
+        text = sanitize_text(block + "\n")
+        try:
+            with open(self.roster_path, encoding="utf-8",
+                      errors="replace") as f:
+                if f.read() == text:
+                    return True
+        except OSError:
+            pass
+        try:
+            tmp = self.roster_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8", errors="replace") as f:
+                f.write(text)
+            os.replace(tmp, self.roster_path)
+            return True
+        except (OSError, UnicodeError):
+            return False
 
     def _write(self, text: str) -> bool:
         try:

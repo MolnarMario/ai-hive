@@ -89,6 +89,11 @@ LANES_INDEX_VERSION = 1
 NOTICE_MAX_AGE_S = 6 * 3600
 NOTICE_MAX_SHOWN = 8
 SEEN_KEYS_CAP = 2000
+# lanes.json older than this (three of LaneService's 15 s polls) counts as
+# switched off. AI Hive refreshes `ts` on every poll, so a write of
+# "enabled": false that lost a race with a hook reading the file, or an AI
+# Hive that is gone, still silences the hooks within this long.
+LANES_STALE_S = 45.0
 
 
 def _hook_command(mapping_path: str, events_path: str | None = None,
@@ -334,14 +339,46 @@ def _write_json_atomic(path: str, data) -> None:
     tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh)
-    os.replace(tmp, path)
+    try:
+        # Windows refuses the replace while another process (a hook reading
+        # lanes.json) has the target open
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def write_lanes_index(path: str, data: dict) -> None:
-    """lanes.json: {version, enabled, ts, repo, lanes: {uid: {...}},
+    """lanes.json: {version, enabled, ts, repo, lanes: {uid: {..., fork}},
     files: {repo path: [{uid, agent, branch, state}]}}. `enabled` False
-    (the switch went off) silences every lane hook at once, mid-run."""
+    (the switch went off) silences every lane hook at once, mid-run, and so
+    does a `ts` older than LANES_STALE_S."""
     _write_json_atomic(path, data)
+
+
+def lanes_index_live(index, now: float = 0.0) -> bool:
+    """Should the lane hooks act on this lanes.json? Only when it says
+    enabled and was written within LANES_STALE_S."""
+    if not isinstance(index, dict) or not index.get("enabled"):
+        return False
+    ts = index.get("ts")
+    if not isinstance(ts, (int, float)):
+        return False
+    return (now or time.time()) - ts <= LANES_STALE_S
+
+
+def overlap_key(path: str, peer: str, level: str, fork: str = "",
+                peer_fork: str = "") -> str:
+    """The dedupe key of one overlap, shared by LaneService's notices
+    (lanes.Overlap.key) and the overlap hook, so an agent is told once
+    whichever got there first. `peer` is a lane uid or "base". The forks
+    (`git merge-base` of each lane with its base) are the round of work: a
+    lane that landed its work and moved on to the new base has a new fork,
+    so the same file overlapping again later is news again."""
+    return f"{path}|{peer}|{level}|{fork[:12]}|{peer_fork[:12]}"
 
 
 def read_lanes_index(path: str):
@@ -415,7 +452,7 @@ def lane_overlap_context(payload: dict, env=None) -> str:
     if lane is None:
         return ""
     index = read_lanes_index(lane[LANES_INDEX_ENV])
-    if not index or not index.get("enabled"):
+    if not lanes_index_live(index):
         return ""
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -432,6 +469,13 @@ def lane_overlap_context(payload: dict, env=None) -> str:
     seen = read_seen(lane[LANE_SEEN_ENV])
     known = set(seen["keys"])
     lines = []
+    lanes_info = index.get("lanes") or {}
+    mine = lanes_info.get(uid) or {}
+
+    def fork_of(info) -> str:
+        fork = info.get("fork") if isinstance(info, dict) else ""
+        return fork if isinstance(fork, str) else ""
+
     if _inside(target, root):
         rel = os.path.relpath(target, root).replace(os.sep, "/")
         for owner in index.get("files", {}).get(rel, []) or []:
@@ -439,7 +483,9 @@ def lane_overlap_context(payload: dict, env=None) -> str:
                 continue
             level = ("conflicts" if owner.get("state") == "conflicts"
                      else "overlap")
-            key = f"{rel}|{owner.get('uid')}|{level}"
+            key = overlap_key(rel, str(owner.get("uid")), level,
+                              fork_of(mine),
+                              fork_of(lanes_info.get(owner.get("uid"))))
             if key in known:
                 continue
             known.add(key)
@@ -457,10 +503,9 @@ def lane_overlap_context(payload: dict, env=None) -> str:
                 lines.append(f"{who} also changed {rel} ({how}). Keep your "
                              f"change there small and local; the integrator "
                              f"merges both.")
-        mine = (index.get("lanes") or {}).get(uid) or {}
         base = mine.get("base_ref") or "the base branch"
         if rel in (mine.get("base_changed") or []):
-            key = f"{rel}|base|overlap"
+            key = overlap_key(rel, "base", "overlap", fork_of(mine))
             if key not in known:
                 known.add(key)
                 seen["keys"].append(key)
@@ -493,7 +538,7 @@ def lane_notice_context(env=None, now: float = 0.0) -> str:
     if lane is None:
         return ""
     index = read_lanes_index(lane[LANES_INDEX_ENV])
-    if not index or not index.get("enabled"):
+    if not lanes_index_live(index, now):
         return ""
     seen = read_seen(lane[LANE_SEEN_ENV])
     path = lane[LANE_NOTICES_ENV]

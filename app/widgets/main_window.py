@@ -899,7 +899,8 @@ class TopBar(QFrame):
             "Agent lanes: ON. A new Claude agent in a git workspace gets its "
             "own git worktree and branch, so agents cannot overwrite or reset "
             "each other's work. The New Agent dialog can opt one out.\n"
-            "Click to turn off. Agents that already have a lane keep it."
+            "Click to turn off. Lane warnings stop at once; existing lanes "
+            "stay."
             if self._agent_lanes else
             "Agent lanes: OFF. Every agent works in the workspace folder, "
             "sharing one checkout. Agents that already have a lane keep "
@@ -3974,6 +3975,25 @@ class MainWindow(QMainWindow):
             agent.notice(f"[its branch {new_lane['branch']} was merged and "
                          f"deleted, so it was recreated from "
                          f"{new_lane['base']}: this lane starts fresh]")
+            # the card log is for the user; the model still believes its old
+            # commits are on its branch. A lane notice reaches it with its
+            # next prompt (only while the switch is on: off, the lane hooks
+            # are not armed and the card log is all there is).
+            ws = self.manager.workspace(ws_id)
+            if ws is not None and ws.board is not None:
+                try:
+                    session_hook.append_notice(
+                        lane_svc.notices_path(ws, uid),
+                        f"revive|{new_lane['branch']}|{time.time():.3f}",
+                        f"Your lane's branch {new_lane['branch']} was merged "
+                        f"into {new_lane['base'] or 'the base branch'} and "
+                        f"deleted while you were away, so it was recreated "
+                        f"from {new_lane['base'] or 'the base branch'}. Your "
+                        f"earlier commits are not on it any more: they are "
+                        f"in the base branch. Read files again before you "
+                        f"edit them.")
+                except OSError:
+                    pass
         agent.release_start(run=revive)
 
     def _lane_retire_args(self, agent) -> tuple:
@@ -4026,7 +4046,8 @@ class MainWindow(QMainWindow):
             self._store_audit(f"LANE-REMOVE {where}{ignored}")
             return
         st = result.status
-        detail = (f" ahead={st.ahead} dirty={len(st.dirty)} merged={st.merged}"
+        detail = (f" ahead={st.ahead} dirty={len(st.dirty)} "
+                  f"local={len(st.local)} merged={st.merged}"
                   if st is not None else "")
         if result.code == "busy":
             self._store_audit(f"LANE-KEEP {where}{detail} reason=busy "
@@ -4116,6 +4137,11 @@ class MainWindow(QMainWindow):
                                    f"The lane folder is missing:\n"
                                    f"{lane['root']}")
         elif action == "refresh":
+            # the menu may have been opened before the agent started a turn
+            if agent.is_busy() or agent.is_waiting():
+                agent.notice("[lane not updated: this agent is working. "
+                             "Update it once its turn is over.]")
+                return
             uid, name = agent.spec.uid, agent.spec.name
             self.lane_ops.submit(
                 lane["repo"], lanes.refresh_lane, lane, label="refresh",
