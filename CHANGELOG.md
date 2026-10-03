@@ -18,6 +18,20 @@ em dashes: this text is shown in the app.
   clones its default branch (main, master or any other name) into a new folder
   and opens a workspace there.
 
+## 0.23.2
+
+- The shared board now keeps only its newest 40 activity notes. Older ones
+  move to board-archive.md next to it, so agents spend fewer tokens reading
+  the board before each task. Nothing is deleted.
+- The board's agent list shows what each agent is working on (its
+  conversation title) instead of "-" when it has no assigned task.
+
+## 0.23.1
+
+- Terminals restored after a reopen keep the width they started at, also on a
+  small or heavily scaled screen. Before, a resumed conversation there could
+  be wrapped narrower than its card.
+
 ## 0.23.0
 
 - Codex cards now resume their own conversation when you reopen AI Hive, and

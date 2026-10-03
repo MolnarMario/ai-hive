@@ -4562,6 +4562,13 @@ class MainWindow(QMainWindow):
         3. A workspace the user has not opened is never laid out at all
            (`PageStack.layout_hidden_pages`), and the autostart brings back
            EVERY workspace's agents, not just the visible one's.
+        4. A window whose minimum width is wider than its screen (a narrow or
+           heavily scaled display: the workspace header alone needs about
+           720px) is maximized to the screen first and only grows to its
+           minimum on a LATER layout pass, which the single pump above does
+           not reach. Measured on an 800px screen: every card spawned at 40
+           columns and was widened to 46 a moment later. So the hidden pages
+           are laid out and the window pumped until its size stops changing.
 
         Cheap and idempotent: `_apply_resize` returns early when nothing
         changed, so calling this again costs a queue pump."""
@@ -4573,9 +4580,20 @@ class MainWindow(QMainWindow):
             # let the window reach its real (possibly maximized) geometry, and
             # the visible page tile into it
             app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-        self.stack.layout_hidden_pages()
-        if app is not None:
+        # Hidden pages first, then the layout pass that may grow the window to
+        # its minimum (point 4), and again if it did: a never-laid-out page
+        # reports a much wider minimum than its real one, so the window only
+        # learns its true minimum from the pages' first layout. Bounded: a
+        # pass either changes the window's size or ends the loop.
+        for _ in range(5):
+            before = self.size()
+            self.stack.layout_hidden_pages()
+            if app is None:
+                break
+            QApplication.sendPostedEvents(None, QEvent.Type.LayoutRequest)
             app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            if self.size() == before:
+                break
         for page in self._pages.values():
             for card in page.cards:
                 if card.is_pty and card.terminal is not None:
