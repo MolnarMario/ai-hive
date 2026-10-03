@@ -1108,11 +1108,12 @@ class TerminalAgent(QObject):
             "provider": self.spec.provider,
             # match the Activity panel's fallback so both roster views agree
             "model": self.spec.model or self.spec.provider or self.spec.kind.value,
-            # an assigned task first (it is what a peer was asked to do), else
-            # the live conversation title. Most agents are never assigned a
-            # task, and with only the task this column was almost always "-".
+            # the same text the card header shows: the live conversation
+            # title, else the assigned task. An assigned task goes stale once
+            # it is done, while the title follows the work. With only the task
+            # this column read "-" for almost every agent.
             "status": self.status.value,
-            "task": self.current_task or self._ai_title,
+            "task": self.summary(),
             "assignment": ASSIGNMENT_LABEL.get(self.assignment, ""),
         }
 

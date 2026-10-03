@@ -134,10 +134,18 @@ def test_board_rotation():
     check("board-rotate: the legacy preamble stays and gains the archive note",
           preamble + co.ARCHIVE_NOTE + "\n- " in body, body[:400])
     header_lines = len(co.ARCHIVE_HEADER.splitlines())
+    check("board-rotate: the first rotation's note says to read the archive "
+          "only if needed", "only if you need history" in body, body[:400])
     check("board-rotate: legacy line count is conserved",
           _line_count(legacy.path, legacy.archive_path)
           == lines + 1 + 1 + header_lines,   # the entry, the note, the header
           (_line_count(legacy.path, legacy.archive_path), lines))
+
+    scaffolded = co.WorkspaceBoard(str(tmp / "scaffold"))
+    scaffolded.ensure()
+    check("board-rotate: a new board says to read the archive only if needed",
+          "only if you need history"
+          in Path(scaffolded.path).read_text(encoding="utf-8"))
 
     # --- an archive that can't be written skips the rotation, not the note ---
     blocked = co.WorkspaceBoard(str(tmp / "blocked"))
@@ -195,10 +203,11 @@ def test_board_rotation():
 
 
 def test_board_roster_task():
-    """The roster's task column shows an assigned task, else the agent's live
-    AI title (it read "-" for almost every agent). A title change rewrites
-    the roster without marking the session dirty, since the title is
-    transient. A multi-line task stays on its table row."""
+    """The roster's task column shows what the card header shows: the live AI
+    title, else the assigned task (it read "-" for almost every agent). A
+    title change rewrites the roster without marking the session dirty,
+    since the title is transient. A multi-line task stays on its table row.
+    A recompute that changes nothing does not rewrite board.md."""
     from PySide6.QtWidgets import QApplication
     from app.process_worker import AgentKind, build_spec
     from app.workspace_manager import WorkspaceManager
@@ -218,26 +227,109 @@ def test_board_roster_task():
 
     check("roster: no task and no title renders as -", task_cell() == "-",
           task_cell())
+    a.set_task("Fix the parser")
+    check("roster: with no AI title, the assigned task shows",
+          a.roster_row()["task"] == "Fix the parser"
+          and task_cell() == "Fix the parser", task_cell())
     dirty = []
     mgr.dirty.connect(lambda: dirty.append(1))
     a.set_ai_title("Recolor the badge")
-    check("roster: falls back to the live AI title",
-          a.roster_row()["task"] == "Recolor the badge")
+    check("roster: the live AI title wins over an assigned task, like the card",
+          a.roster_row()["task"] == "Recolor the badge" == a.summary())
     check("roster: a title change rewrites the board roster",
           task_cell() == "Recolor the badge", task_cell())
     check("roster: a title change never marks the session dirty", not dirty)
-    a.set_task("Fix the parser")
-    check("roster: an assigned task wins over the AI title",
-          a.roster_row()["task"] == "Fix the parser"
-          and task_cell() == "Fix the parser", task_cell())
     a.set_task("")
-    check("roster: clearing the task shows the AI title again",
+    check("roster: clearing the task keeps the AI title",
           task_cell() == "Recolor the badge", task_cell())
+    a.set_ai_title("")
+    check("roster: no title and no task renders as - again",
+          task_cell() == "-", task_cell())
     a.set_task("step one\nstep two | three")
     check("roster: a multi-line task stays on one table row",
           task_cell() == "step one step two / three", task_cell())
 
+    # every status and title tick recomputes the roster; only a change writes
+    writes = []
+    real_write = ws.board._write
+    ws.board._write = lambda text: writes.append(1) or real_write(text)
+    mgr._recompute(ws.id)
+    check("roster: a recompute that changes no row does not rewrite the board",
+          writes == [], len(writes))
+    a.set_ai_title("Tidy the parser")
+    check("roster: a row change rewrites the board once",
+          len(writes) == 1 and task_cell() == "Tidy the parser",
+          (len(writes), task_cell()))
+    del ws.board._write
+
     for agent in mgr.all_agents():
         agent.dispose()
     mgr.remove_workspace(ws.id)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_board_survives_hand_edits():
+    """An agent that edits board.md by hand can remove the roster markers or
+    the log heading. The next roster update or append must keep every line
+    it finds. Both used to rebuild the scaffold and drop the whole log."""
+    from app import coordination as co
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-boardedit-"))
+    title = "# AI Hive: workspace coordination board"
+    rows = [{"name": "A1", "role": "", "provider": "claude", "model": "",
+             "status": "idle", "task": "roster is back"}]
+
+    # --- roster markers removed, five entries in the log ---
+    board = co.WorkspaceBoard(str(tmp / "nomarkers"))
+    os.makedirs(board.dir)
+    entries = [f"- [Agent 2] 2026-10-01 10:0{i} kept entry {i}"
+               for i in range(5)]
+    Path(board.path).write_text(
+        f"{title}\n\n## Agents\n\nan agent's own note\n\n## Activity log\n\n"
+        + "\n".join(entries) + "\n", encoding="utf-8")
+    board.update_roster(rows)
+    body = Path(board.path).read_text(encoding="utf-8")
+    check("board-edit: a roster update keeps every entry when the markers "
+          "are gone", all(e in body for e in entries)
+          and "an agent's own note" in body, body)
+    check("board-edit: ...and puts the roster back once, under the title",
+          body.startswith(title + "\n\n" + co.ROSTER_BEGIN)
+          and body.count(co.ROSTER_BEGIN) == 1
+          and body.count(co.ROSTER_END) == 1 and "roster is back" in body,
+          body[:300])
+    board.append_activity("A1", "after the repair")
+    check("board-edit: the repaired board still takes appends",
+          _entries(board.path)[:5] == entries
+          and _message(_entries(board.path)[-1]) == "after the repair")
+
+    # --- a lone marker left behind does not pair with the new roster ---
+    lone = co.WorkspaceBoard(str(tmp / "lone"))
+    os.makedirs(lone.dir)
+    Path(lone.path).write_text(
+        f"{title}\n\n## Activity log\n\n{entries[0]}\n{co.ROSTER_END}\n"
+        f"{entries[1]}\n", encoding="utf-8")
+    lone.update_roster(rows)
+    lone.update_roster(rows)
+    body = Path(lone.path).read_text(encoding="utf-8")
+    check("board-edit: a lone marker is replaced, not paired",
+          body.count(co.ROSTER_BEGIN) == 1 and body.count(co.ROSTER_END) == 1
+          and entries[0] in body and entries[1] in body
+          and body.index(co.ROSTER_END) < body.index(co.LOG_HEADER), body)
+
+    # --- the log heading removed: a fresh one goes at the end ---
+    nohead = co.WorkspaceBoard(str(tmp / "noheading"))
+    os.makedirs(nohead.dir)
+    original = (f"{title}\n\n{co.ROSTER_BEGIN}\n## Agents\n{co.ROSTER_END}\n\n"
+                "notes an agent wrote by hand\n"
+                "- [Agent 3] 2026-10-01 09:00 an entry under no heading\n")
+    Path(nohead.path).write_text(original, encoding="utf-8")
+    nohead.append_activity("A1", "after the heading was lost")
+    body = Path(nohead.path).read_text(encoding="utf-8")
+    check("board-edit: an append keeps a board that lost its log heading",
+          body.startswith(original), body)
+    tail = body[len(original):]
+    check("board-edit: ...and adds a fresh heading, then the entry",
+          tail.startswith("\n" + co.LOG_HEADER + "\n- [A1] ")
+          and tail.rstrip("\n").endswith("after the heading was lost"), tail)
+
     shutil.rmtree(tmp, ignore_errors=True)

@@ -29,7 +29,11 @@ ROSTER_BEGIN = "<!-- AIHIVE:ROSTER:BEGIN -->"
 ROSTER_END = "<!-- AIHIVE:ROSTER:END -->"
 LOG_HEADER = "## Activity log"
 LOG_KEEP = 40   # activity-log entries kept in board.md, newest last
-ARCHIVE_NOTE = f"_Older entries are moved to {ARCHIVE_FILENAME} in this folder._"
+# "only if": every agent reads the board before a task, and an agent told
+# where the history is tends to go and read it, paying the tokens the archive
+# exists to save
+ARCHIVE_NOTE = (f"_Older entries are moved to {ARCHIVE_FILENAME} in this "
+                f"folder. Read it only if you need history._")
 ARCHIVE_HEADER = ("# AI Hive: board archive\n\n"
                   "Activity-log entries moved out of board.md, oldest first. "
                   "AI Hive only ever appends to this file.\n\n")
@@ -132,7 +136,15 @@ class WorkspaceBoard:
 
     def update_roster(self, rows: list[dict]) -> bool:
         """rows: [{name, role, provider, model, status, task}]. Rewrites only
-        the roster block, preserving the agent-written activity log."""
+        the roster block, preserving the agent-written activity log.
+
+        The manager calls this on every status or title tick, so an unchanged
+        roster is not written again: board.md is replaced only when its
+        roster block actually differs.
+
+        A board whose markers were lost (an agent edited it by hand) gets the
+        roster back at the top, and every other line is kept. Rebuilding the
+        scaffold here once dropped the whole activity log."""
         if not self.ensure():
             return False
         try:
@@ -143,14 +155,27 @@ class WorkspaceBoard:
         except (OSError, UnicodeError):
             return False
         block = self._render_roster(rows)
-        if ROSTER_BEGIN in text and ROSTER_END in text:
+        fresh = f"{ROSTER_BEGIN}\n{block}\n{ROSTER_END}"
+        if ROSTER_BEGIN in text and ROSTER_END in text.split(ROSTER_BEGIN, 1)[1]:
             head, rest = text.split(ROSTER_BEGIN, 1)
-            _, tail = rest.split(ROSTER_END, 1)
-            text = f"{head}{ROSTER_BEGIN}\n{block}\n{ROSTER_END}{tail}"
-        else:  # board lost its markers; rebuild scaffold, keep any log
-            text = self._scaffold().replace(
-                f"{ROSTER_BEGIN}\n{ROSTER_END}",
-                f"{ROSTER_BEGIN}\n{block}\n{ROSTER_END}")
+            current, tail = rest.split(ROSTER_END, 1)
+            if current == f"\n{block}\n":
+                return True
+            text = f"{head}{fresh}{tail}"
+        elif not text.strip():
+            text = self._scaffold().replace(f"{ROSTER_BEGIN}\n{ROSTER_END}",
+                                            fresh)
+        else:
+            # a lone marker is AI Hive's own line, not content: drop it, or
+            # the next split would pair it with the wrong partner
+            body = "\n".join(ln for ln in text.split("\n")
+                             if ln.strip() not in (ROSTER_BEGIN, ROSTER_END))
+            if body.startswith("# "):     # keep the title line on top
+                title, _, rest = body.partition("\n")
+                rest = rest.lstrip("\n")
+                text = f"{title}\n\n{fresh}\n\n{rest}"
+            else:
+                text = f"{fresh}\n\n{body}"
         return self._write(text)
 
     def _render_roster(self, rows: list[dict]) -> str:
@@ -204,8 +229,13 @@ class WorkspaceBoard:
             return False
         stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
         entry = f"- [{name}] {stamp} {message}"
-        if LOG_HEADER not in text:            # board lost its log section
-            text = self._scaffold().rstrip("\n") + "\n"
+        if not text.strip():
+            text = self._scaffold()
+        elif LOG_HEADER not in text:
+            # the board lost its log heading (edited by hand): start a fresh
+            # log at the end and keep everything above it. Replacing the file
+            # with the scaffold here once dropped the whole board.
+            text = text.rstrip("\n") + f"\n\n{LOG_HEADER}\n"
         text = text.rstrip("\n") + "\n" + entry + "\n"
         return self._write_rotated(text)
 

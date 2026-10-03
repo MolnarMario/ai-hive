@@ -455,8 +455,8 @@ class WorkspaceManager(QObject):
         # idle-but-a-shell-is-still-running is transient like busy/waiting:
         # refresh the badge only, never mark dirty
         agent.bg_shell_changed.connect(lambda *_, wid=wid: self._recompute(wid))
-        # the live AI title is transient too, and the board roster falls back
-        # to it: rewrite the roster, never mark dirty
+        # the live AI title is transient too, and the board roster shows it:
+        # rewrite the roster, never mark dirty
         agent.summary_changed.connect(lambda *_, wid=wid: self._recompute(wid))
         # Dis-allocate any duplicate session_id already held by a sibling agent
         # in the same project directory (e.g. from an old un-isolated sync).
