@@ -93,9 +93,10 @@ GH_TIMEOUT = 60.0
 MERGE_TIMEOUT = 180.0
 LOG_LINES = 30
 STAT_LINES = 40
-# the PR body line naming the commit the suite ran on
-TESTED_RE = re.compile(r"^\s*Tested-commit:\s*`?([0-9a-fA-F]{7,40})`?\s*$",
-                       re.MULTILINE)
+# the PR body line naming the commit the suite ran on. Anything after the
+# sha on that line is ignored ("Tested-commit: 1a2b3c... (full suite)").
+TESTED_RE = re.compile(r"^\s*\**Tested-commit:?\**:?\s*`?([0-9a-fA-F]{7,40})\b",
+                       re.MULTILINE | re.IGNORECASE)
 # what may change between the tested commit and the PR head: the test count
 AFTER_TEST_OK = ("README.md",)
 

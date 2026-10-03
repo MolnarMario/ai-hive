@@ -3661,3 +3661,23 @@ def test_queue_squash_lane_window():
               "Remove button", os.path.isdir(lane_b["root"])
               and not [t for t in labels if t.startswith("Remove lane")],
               labels)
+
+
+def test_tested_commit_line():
+    """The PR body's Tested-commit line is read the way integrators write
+    it: plain, bold, in backticks, with words after the sha; the last one
+    wins, and a line that only mentions it in passing does not count."""
+    from app import integration as integ
+    sha = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+    cases = {
+        f"Tested-commit: {sha}": sha,
+        f"Tested-commit: `{sha}` (full suite, incl. e2e)": sha,
+        f"**Tested-commit:** {sha.upper()}": sha,
+        f"tested-commit: {sha[:7]}\nRESULT: 3 passed": sha[:7],
+        f"Tested-commit: {'0' * 40}\nTested-commit: {sha}": sha,
+        f"The Tested-commit: {sha} line is below.": "",
+        "no line at all": "",
+    }
+    got = {body: integ.tested_commit(body) for body in cases}
+    check("integ: the Tested-commit line is read in every usual form",
+          got == cases, {b: g for b, g in got.items() if g != cases[b]})
