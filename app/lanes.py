@@ -643,7 +643,7 @@ def ignored_files(root: str) -> list:
     return [p for p in r.out.split("\0") if p] if r.ok else []
 
 
-def remove_lane(lane: dict) -> RemoveResult:
+def remove_lane(lane: dict, merged_as: str = "") -> RemoveResult:
     """Remove a lane that holds nothing: worktree and branch.
 
     Refuses unless the lane is clean AND both its head and its branch are in
@@ -659,18 +659,31 @@ def remove_lane(lane: dict) -> RemoveResult:
     refuses, the branch is kept, and LaneError("moved") says so.
 
     Ignored files (`.env`, build output) go with the worktree. They are
-    listed first, into RemoveResult.ignored, so nothing goes silently."""
+    listed first, into RemoveResult.ignored, so nothing goes silently.
+
+    `merged_as` is a commit a squash or rebase merge took into the base
+    (integration.remove_merged_lane checked that with GitHub): the lane
+    then counts as merged only while its head AND its branch are exactly
+    that commit. Ancestry can't say so: a squash leaves the commit out."""
     st = lane_status(lane)
     if st.dirty or st.local:
         raise LaneError("dirty", st.describe())
-    if not st.merged:
+    if merged_as:
+        if st.head != merged_as:
+            raise LaneError("moved", f"the lane is at {st.head[:7]}, no "
+                                     f"longer at the merged {merged_as[:7]}")
+    elif not st.merged:
         raise LaneError("unmerged", st.describe())
     root, branch, repo = lane["root"], lane["branch"], lane["repo"]
     ref = f"refs/heads/{branch}"
     r = git(["rev-parse", "--verify", "--quiet", ref], repo)
     branch_head = r.out if r.ok else ""
+    if merged_as:
+        if branch_head and branch_head != merged_as:
+            raise LaneError("moved", f"the branch {branch} is no longer at "
+                                     f"the merged {merged_as[:7]}")
     # a lane whose agent switched branches: its own branch was not measured
-    if (branch_head and branch_head != st.head and not _in_base(
+    elif (branch_head and branch_head != st.head and not _in_base(
             repo, branch_head, lane.get("base") or "", st.base_ref)):
         raise LaneError("unmerged", f"the branch {branch} has commits that "
                                     f"are not in the base branch")
@@ -975,6 +988,9 @@ class LaneSnap:
     # `git merge-base HEAD <base_ref>`: where this round of work forked from
     # the base. It moves when the lane merges or fast-forwards to the base.
     fork: str = ""
+    # "integrator" for the workspace integrator's lane: it holds other
+    # lanes' commits by design, so it is never anyone's overlap peer
+    role: str = ""
     error: str = ""
 
     def files(self) -> dict:
@@ -986,6 +1002,7 @@ class LaneSnap:
 
 OVERLAP = "overlap"
 CONFLICTS = "conflicts"
+INTEGRATOR_ROLE = "integrator"
 
 
 @dataclass
@@ -1034,6 +1051,7 @@ class LaneView:
     committed: list = field(default_factory=list)
     overlaps: list = field(default_factory=list)
     error: str = ""
+    head: str = ""
 
     @property
     def state(self) -> str:
@@ -1073,7 +1091,7 @@ class RepoSnapshot:
                         behind=s.behind, dirty=list(s.dirty),
                         committed=list(s.committed),
                         overlaps=list(self.overlaps.get(uid, [])),
-                        error=s.error)
+                        error=s.error, head=s.head)
 
     def index(self) -> dict:
         """repo path -> [{uid, agent, branch, state}] over every lane, for
@@ -1084,6 +1102,8 @@ class RepoSnapshot:
                       for o in ovs if o.level == CONFLICTS}
         out: dict = {}
         for s in self.lanes:
+            if s.role == INTEGRATOR_ROLE:
+                continue
             for path, state in s.files().items():
                 if (s.uid, path) in conflicted:
                     state = CONFLICTS
@@ -1101,7 +1121,8 @@ def lane_snap(entry: dict, cache: dict | None = None) -> LaneSnap:
     root, repo = lane["root"], lane["repo"]
     snap = LaneSnap(uid=entry["uid"], agent=entry.get("agent", ""),
                     ws_id=entry.get("ws_id", ""), branch=lane["branch"],
-                    root=root, base=lane.get("base") or "")
+                    root=root, base=lane.get("base") or "",
+                    role=entry.get("role", ""))
     try:
         if not _is_worktree(root):
             snap.exists = False
@@ -1147,6 +1168,21 @@ def _fork(root: str, head: str, base_ref: str, cache) -> str:
     return fork
 
 
+def _related(cache, cwd: str, a: str, b: str) -> bool:
+    """Is one of the two commits an ancestor of the other (or the same)?
+    Cached like the merge results: commits never change."""
+    if a == b:
+        return True
+    key = ("related",) + ((a, b) if a <= b else (b, a))
+    if cache is not None and key in cache:
+        return cache[key]
+    found = (git(["merge-base", "--is-ancestor", a, b], cwd).ok
+             or git(["merge-base", "--is-ancestor", b, a], cwd).ok)
+    if cache is not None:
+        cache[key] = found
+    return found
+
+
 def _cached_conflicts(cache, cwd: str, a: str, b: str):
     key = (a, b) if a <= b else (b, a)
     if cache is not None and key in cache:
@@ -1180,7 +1216,10 @@ def snapshot_repo(repo: str, entries: list, cache: dict | None = None,
     for e in entries:
         with lock if lock is not None else contextlib.nullcontext():
             snap.lanes.append(lane_snap(e, cache))
-    live = [s for s in snap.lanes if s.exists and s.head and not s.error]
+    # the integrator's lane is left out: it merges the submitted lanes, so
+    # "it changed your files too" would be about the integrator itself
+    live = [s for s in snap.lanes if s.exists and s.head and not s.error
+            and s.role != INTEGRATOR_ROLE]
     files = {s.uid: s.files() for s in live}
     ovs: dict = {}
 
@@ -1197,7 +1236,14 @@ def snapshot_repo(repo: str, entries: list, cache: dict | None = None,
                     and set(a.committed) & set(b.committed)):
                 conflicts = set(_cached_conflicts(cache, repo, a.head,
                                                   b.head) or ())
+            # one lane's commits already contain the other's (it merged that
+            # lane): their committed changes are the same work, not news
+            related = (set(a.committed) & set(b.committed)
+                       and _related(cache, repo, a.head, b.head))
             for path in sorted(shared):
+                if (related and files[a.uid][path] == "committed"
+                        and files[b.uid][path] == "committed"):
+                    continue
                 hot = path in conflicts
                 add(a.uid, Overlap(path, b.uid, b.agent, b.branch,
                                    CONFLICTS if hot else files[b.uid][path],

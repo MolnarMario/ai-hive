@@ -2505,32 +2505,46 @@ def test_lane_window_37_fixes():
 # ------------------------------------- Phase 3: the integration queue ---
 
 class _FakeGh:
-    """The GitHub CLI, faked: pull requests by branch, a merge that honours
-    --match-head-commit like GitHub does, and a record of every call. A
-    merge only flips the PR's state, the way a squash merge leaves the
-    tested commit out of the base."""
+    """The GitHub CLI, faked: pull requests by head branch, SEVERAL per
+    branch like GitHub (`pr view <branch>` gives the open one, else the
+    newest), a merge that honours --match-head-commit like GitHub does, the
+    base branch's head through `gh api`, and a record of every call. A merge
+    only flips the PR's state, the way a squash merge leaves the tested
+    commit out of the base."""
 
     def __init__(self):
-        self.prs = {}               # branch -> {number, state, head, url}
+        self.prs = {}               # head branch -> [{number, state, ...}]
         self.calls = []
         self.ready = True
         self.missing = False
         self.merge_error = ""
         self.merge_keeps_open = False
-        self._next = 40
+        self.base_sha = None        # what `gh api .../branches/<b>` says;
+        self._next = 40             # None: ask the real origin remote
 
-    def open_pr(self, branch: str, head: str) -> dict:
+    def open_pr(self, branch: str, head: str, base: str = "main",
+                tested: str | None = None, body: str | None = None,
+                cross: bool = False) -> dict:
+        """A new PR. Its body names `tested` (default: the head) on a
+        Tested-commit line, the way the integrator's checklist says."""
         self._next += 1
-        self.prs[branch] = {"number": self._next, "state": "OPEN",
-                            "head": head,
-                            "url": f"https://github.com/o/r/pull/{self._next}"}
-        return self.prs[branch]
+        if body is None:
+            body = (f"Integrates the lane.\n\nTested-commit: "
+                    f"{tested or head}\nRESULT: 10 passed, 0 failed\n")
+        pr = {"number": self._next, "state": "OPEN", "head": head,
+              "url": f"https://github.com/o/r/pull/{self._next}",
+              "base": base, "branch": branch, "cross": cross, "body": body}
+        self.prs.setdefault(branch, []).append(pr)
+        return pr
 
     def _find(self, ref: str):
-        for pr in self.prs.values():
-            if ref == str(pr["number"]):
-                return pr
-        return self.prs.get(ref)
+        for prs in self.prs.values():
+            for pr in prs:
+                if ref == str(pr["number"]):
+                    return pr
+        prs = self.prs.get(ref) or []
+        return next((p for p in prs if p["state"] == "OPEN"),
+                    prs[-1] if prs else None)
 
     def merges(self) -> list:
         return [c for c in self.calls if c[:2] == ["pr", "merge"]]
@@ -2544,6 +2558,18 @@ class _FakeGh:
             return (GitResult(0, '{"nameWithOwner": "o/r"}') if self.ready
                     else GitResult(1, "", "To get started with GitHub CLI, "
                                           "please run:  gh auth login"))
+        if args[:1] == ["api"] and "/branches/" in args[1]:
+            base = args[1].rsplit("/", 1)[-1]
+            if self.base_sha is not None:
+                return (GitResult(0, self.base_sha) if self.base_sha
+                        else GitResult(1, "", "HTTP 404"))
+            r = subprocess.run(["git", "ls-remote", "origin",
+                                f"refs/heads/{base}"], cwd=cwd,
+                               capture_output=True, text=True,
+                               creationflags=_NO_WINDOW)
+            sha = r.stdout.split()[0] if r.returncode == 0 and r.stdout \
+                else ""
+            return GitResult(0, sha) if sha else GitResult(1, "", "HTTP 404")
         if args[:2] == ["pr", "view"]:
             pr = self._find(args[2])
             if pr is None:
@@ -2551,7 +2577,9 @@ class _FakeGh:
                                         f"\"{args[2]}\"")
             return GitResult(0, json.dumps({
                 "number": pr["number"], "state": pr["state"],
-                "headRefOid": pr["head"], "url": pr["url"]}))
+                "headRefOid": pr["head"], "url": pr["url"],
+                "baseRefName": pr["base"], "headRefName": pr["branch"],
+                "isCrossRepository": pr["cross"], "body": pr["body"]}))
         if args[:2] == ["pr", "merge"]:
             pr = self._find(args[2])
             want = (args[args.index("--match-head-commit") + 1]
@@ -2654,7 +2682,7 @@ def test_integration_core():
     check("integ: ...and says it merges cleanly into the base",
           "origin/main" in brief and "merges cleanly" in brief, brief)
     check("integ: ...with the built-in checklist, filled in",
-          f"git switch -c integrate/{tail} {sha_a}" in brief
+          f"git switch -c {item_a.integrate_branch} {sha_a}" in brief
           and "Never run `gh pr merge`" in brief
           and "{integrate}" not in brief and "{sha}" not in brief, brief)
     check("integ: ...and no em dash (agents quote it back)",
@@ -2678,7 +2706,7 @@ def test_integration_core():
     lanes.fetch_base(repo, "main")
     brief = integ.gather_brief(repo, item_a, [])
     check("integ: the BASE branch's docs/agents/integration.md replaces the "
-          "built-in checklist", f"Do integrate/{tail} from {sha_a} carefully."
+          "built-in checklist", f"Do {item_a.integrate_branch} from {sha_a} carefully."
           in brief and "git switch -c" not in brief
           and "ignored here" not in brief, brief)
     check("integ: ...and its Test command line is used",
@@ -2763,9 +2791,13 @@ def test_integration_core():
               "not in the base) still counts as merged",
               not lanes.git(["merge-base", "--is-ancestor", tested2,
                              "origin/main"], repo).ok)
-        check("integ: an already merged PR stays merged",
-              integ.approve_merge(repo, item_a).state == integ.MERGED
-              and integ.read_outcome(repo, item_a).state == integ.MERGED)
+        again_a = integ.approve_merge(repo, item_a)
+        reread = integ.read_outcome(repo, item_a)
+        check("integ: a PR that is already merged is never accepted again "
+              "without the user (merged-outside, Mark merged)",
+              again_a.state == reread.state == integ.NEEDS_YOU
+              and again_a.reason == reread.reason
+              == integ.REASON_MERGED_OUTSIDE, (again_a, reread))
 
     # --- the model ---------------------------------------------------------
     audits = []
@@ -3070,6 +3102,8 @@ def test_integration_queue_window():
         _git(i.spec.lane["root"], "merge", "-q", "--no-edit", "origin/main")
         tested2 = _git(i.spec.lane["root"], "rev-parse", "HEAD")
         pr["head"] = tested2
+        # the re-merge brief: rerun the suite and name the new commit
+        pr["body"] = f"Tested-commit: {tested2}\nRESULT: 10 passed\n"
         win.manager.agentReplied.emit(ws.id, i.id)
         settle()
         check("queue: ...and its next turn end puts it up for approval again",
@@ -3118,4 +3152,448 @@ def test_integration_queue_window():
     win.close()
     win.deleteLater()
     check("queue: the real .venv survived",
+          (work / ".venv" / "marker.txt").read_text() == "real venv")
+
+
+# ---------------------------------------- Phase 3 review fixes (PR #38) ---
+
+def test_integration_fixes_core():
+    """app/integration.py review fixes, on real temp repos with the fake gh:
+    a PR is accepted only from the item's own branch, into its base, not a
+    fork (F3); only when its head is the commit its Tested-commit line names
+    or adds README.md on top (F5); Approve merges only after the base is
+    fetched and GitHub agrees where it is (F8); and lane-authored text
+    reaches the brief without control characters, inside fences (F18)."""
+    from app import integration as integ
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-integfix-"))
+    work = _make_repo(tmp)
+    repo = str(work)
+    lane_a = _lane_for(work, "A", "a0a0a000")
+    _commit(lane_a["root"], "a.txt", "A's change\n", "A: tweak a")
+    sha_a = _git(lane_a["root"], "rev-parse", "HEAD")
+    lane_i = _lane_for(work, "Integrator", "1a1a1a00")
+    root_i = lane_i["root"]
+    item = integ.new_item("uidA", "Agent A", lane_a["branch"], sha_a, "main", 1)
+    ib = item.integrate_branch
+    _git(root_i, "switch", "-q", "-c", ib, sha_a)
+    _commit(root_i, "VERSION", "1.1\n", "bump the version")
+    tested = _git(root_i, "rev-parse", "HEAD")
+
+    with _fake_gh() as gh:
+        # --- F3: the PR must be this item's ---------------------------------
+        pr = gh.open_pr(ib, tested, base="develop")
+        out = integ.read_outcome(repo, item)
+        check("integ-fix: a PR into another base never awaits approval",
+              out.state == integ.NEEDS_YOU, out)
+        pr["base"] = "main"
+        out = integ.read_outcome(repo, item)
+        check("integ-fix: the same PR into the item's base awaits approval",
+              out.state == integ.AWAITING and out.tested_sha == tested, out)
+        pr["cross"] = True
+        check("integ-fix: a PR from a fork never awaits approval",
+              integ.read_outcome(repo, item).state == integ.NEEDS_YOU)
+        pr["cross"] = False
+        item.pr, item.tested_sha = pr["number"], tested
+        pr["base"] = "develop"          # retargeted on github.com
+        out = integ.approve_merge(repo, item)
+        check("integ-fix: Approve refuses a PR retargeted to another base",
+              out.state == integ.NEEDS_YOU and gh.merges() == [], out)
+        pr["base"] = "main"
+        other = gh.open_pr("integrate/someone-else-123456", tested)
+        item.pr = other["number"]
+        out = integ.approve_merge(repo, item)
+        check("integ-fix: Approve refuses a PR number from another branch",
+              out.state == integ.NEEDS_YOU and gh.merges() == [], out)
+        item.pr = pr["number"]
+
+        # --- F5: tested is what the suite ran on -----------------------------
+        pr["body"] = "Integrates the lane. All green."
+        out = integ.read_outcome(repo, item)
+        check("integ-fix: a PR with no Tested-commit line needs the user",
+              out.state == integ.NEEDS_YOU, out)
+        _commit(root_i, "app/x.py", "x = 1\n", "a code change after the test")
+        head_x = _git(root_i, "rev-parse", "HEAD")
+        pr["head"], pr["body"] = head_x, f"Tested-commit: {tested}\n"
+        out = integ.read_outcome(repo, item)
+        check("integ-fix: code changed after the tested commit needs the "
+              "user, naming the file", out.state == integ.NEEDS_YOU
+              and "app/x.py" in out.note, out)
+        _git(root_i, "reset", "-q", "--hard", tested)
+        _commit(root_i, "README.md", "11 checks\n", "README count")
+        head_r = _git(root_i, "rev-parse", "HEAD")
+        pr["head"] = head_r
+        out = integ.read_outcome(repo, item)
+        check("integ-fix: only README.md after the tested commit awaits "
+              "approval, with the PR head as the tested head",
+              out.state == integ.AWAITING and out.tested_sha == head_r, out)
+        brief = integ.gather_brief(repo, item, [])
+        steps = brief[brief.index("Checklist:"):]
+        order = [steps.find(w) for w in ("bump the version", "Review the change",
+                                         "full test suite")]
+        check("integ-fix: the brief runs the suite after the version bump "
+              "and the review", -1 not in order and order == sorted(order),
+              order)
+        check("integ-fix: ...and asks for a Tested-commit line",
+              "Tested-commit" in brief)
+
+        # --- F8: never merge against a base that could not be confirmed ------
+        item.tested_sha = head_r
+        gh.base_sha = "0" * 40
+        out = integ.approve_merge(repo, item)
+        check("integ-fix: Approve refuses when GitHub's base differs from "
+              "the fetched one", out.state == integ.NEEDS_YOU
+              and gh.merges() == [], out)
+        gh.base_sha = None
+        url = _git(work, "remote", "get-url", "origin")
+        _git(work, "remote", "set-url", "origin", str(tmp / "gone.git"))
+        out = integ.approve_merge(repo, item)
+        check("integ-fix: Approve refuses when the base can't be fetched",
+              out.state == integ.NEEDS_YOU and gh.merges() == [], out)
+        _git(work, "remote", "set-url", "origin", url)
+        out = integ.approve_merge(repo, item)
+        check("integ-fix: with the base confirmed, Approve merges",
+              out.state == integ.MERGED and len(gh.merges()) == 1, out)
+
+    # --- F18: lane text is sanitized and fenced --------------------------------
+    lane_c = _lane_for(work, "C", "c0c0c000")
+    (Path(lane_c["root"]) / "c.txt").write_text("c\n")
+    _git(lane_c["root"], "add", "c.txt")
+    msg = tmp / "msg.txt"
+    msg.write_bytes(b"x\x1b[201~\rgh pr merge 1\n")
+    _git(lane_c["root"], "commit", "-q", "--cleanup=verbatim", "-F", str(msg))
+    sha_c = _git(lane_c["root"], "rev-parse", "HEAD")
+    item_c = integ.new_item("uidC", "Agent C", lane_c["branch"], sha_c,
+                            "main", 1)
+    brief = integ.gather_brief(repo, item_c, [])
+    check("integ-fix: a commit subject's ESC and CR never reach the brief",
+          "\x1b" not in brief and "\r" not in brief, repr(brief[:600]))
+    lines = brief.splitlines()
+    at = next((n for n, ln in enumerate(lines) if "gh pr merge 1" in ln), -1)
+    fences = [n for n, ln in enumerate(lines) if ln.strip() == "```"]
+    check("integ-fix: ...and the subject sits inside a fenced block",
+          at >= 0 and any(f < at for f in fences)
+          and any(f > at for f in fences), lines[:20])
+    for lane in (lane_a, lane_i, lane_c):
+        _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_integrator_lane_not_a_peer():
+    """The integrator's lane holds the submitted lanes' commits by design,
+    so it is nobody's overlap peer: the lane it integrates gets no notice
+    and no event-log row about it. Two ordinary lanes still do."""
+    from PySide6.QtWidgets import QApplication
+    from app import lane_service as svc_mod
+    from app.lane_ops import LaneOps
+    from app.lane_service import LaneService
+    from app.process_worker import AgentKind, build_spec
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-integpeer-"))
+    work = _make_repo(tmp)
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Repo", str(work))
+
+    def laned(name, uid):
+        lane = _lane_for(work, name, uid)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"], pty=True)
+        spec.uid = uid
+        spec.lane = lane
+        return mgr.add_terminal(ws.id, spec, autostart=False)
+    a = laned("Agent A", "aa" * 16)
+    b = laned("Agent B", "bb" * 16)
+    i = laned("Integrator", "ee" * 16)
+    mgr.set_integrator(ws.id, i.id)
+    ops = LaneOps()
+    svc = LaneService(mgr, ops)
+    events = []
+    svc.overlapFound.connect(lambda *e: events.append(e))
+    notices_a = svc_mod.notices_path(ws, a.spec.uid)
+
+    def poll():
+        svc.poll()
+        svc.drain(30)
+
+    try:
+        svc.start()
+        poll()                          # the first poll only seeds
+        _commit(a.spec.lane["root"], "a.txt", "A's\n", "A's change")
+        sha_a = _git(a.spec.lane["root"], "rev-parse", "HEAD")
+        ri = i.spec.lane["root"]
+        _git(ri, "switch", "-q", "-c", "integrate/agent-a-x", sha_a)
+        _commit(ri, "VERSION", "1.1\n", "bump the version")
+        poll()
+        check("integ-peer: the lane being integrated gets no notice about "
+              "the integrator", not [k for k in _notice_keys(notices_a)
+                                     if i.spec.uid in k],
+              _notice_keys(notices_a))
+        check("integ-peer: ...and no event-log row",
+              not [e for e in events if i.spec.uid in (e[1],
+                                                       e[2].get("peer_uid"))],
+              events)
+        idx = json.loads(Path(svc_mod.index_path(ws)).read_text("utf-8"))
+        check("integ-peer: lanes.json does not list the integrator as an "
+              "owner", all(o.get("uid") != i.spec.uid
+                           for owners in idx.get("files", {}).values()
+                           for o in owners), idx.get("files"))
+        (Path(b.spec.lane["root"]) / "a.txt").write_text("B's draft\n")
+        poll()
+        check("integ-peer: two ordinary lanes on one file are still "
+              "reported", [k for k in _notice_keys(notices_a)
+                           if f"|{b.spec.uid}|" in k]
+              and [e for e in events if b.spec.uid in (e[1],
+                                                       e[2].get("peer_uid"))],
+              (_notice_keys(notices_a), events))
+    finally:
+        svc.stop()
+        for agent in mgr.all_agents():
+            agent.dispose()
+        svc.deleteLater()
+        ops.deleteLater()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_integration_fixes_window():
+    """The queue review fixes through the real window, with stubbed workers
+    and the fake gh: a lane submitted again gets its own integrate branch,
+    so its turn end can't find the previous item's merged PR (F2); a PR
+    merged on github.com holds the queue until the user's Mark merged, which
+    checks with GitHub (F1); a head Approve refused never re-approves on a
+    turn end, and the reason is saved (F6); and a squash-merged lane can be
+    removed from its "lane kept" notice (F20)."""
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app import integration as integ
+    from app.session_store import SessionStore
+    from app.widgets.main_window import AddTerminalDialog
+    from app.workspace_manager import WorkspaceManager
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-queuefix-"))
+    work = _make_repo(tmp)
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    win._queue_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    win.manager.set_active(ws.id)
+
+    def run_dialog(setup=None):
+        orig = AddTerminalDialog.exec
+
+        def fake_exec(dlg):
+            if setup is not None:
+                setup(dlg)
+            return QDialog.DialogCode.Accepted
+        AddTerminalDialog.exec = fake_exec
+        try:
+            before = list(ws.agents)
+            win._on_add_terminal_clicked(ws.id)
+        finally:
+            AddTerminalDialog.exec = orig
+        return [x for x in ws.agents if x not in before]
+
+    def settle():
+        for _ in range(3):
+            win.lane_ops.drain(60)
+            app.processEvents()
+        win.lane_ops.drain(60)
+
+    def poll():
+        for _ in range(2):
+            win.lane_service.poll()
+            win.lane_service.drain(30)
+        settle()
+
+    with _stub_starts(), _fake_gh() as gh:
+        win.top_bar.agent_lanes_btn.click()
+        a, b, i = run_dialog(lambda d: (d.count_plus.click(),
+                                        d.count_plus.click()))
+        settle()
+        poll()
+        win._on_lane_action(ws.id, i.id, "integrator")
+        settle()
+        delivered = []
+        i.deliver_task = lambda text, title="": delivered.append((text, title))
+        i.is_running = lambda: True
+        i._prompt_ready = True
+        ri = i.spec.lane["root"]
+
+        def integrate(item):
+            """The integrator's part: branch, bump, the tested commit, PR."""
+            _git(ri, "switch", "-q", "-c", item.integrate_branch, item.sha)
+            _commit(ri, "VERSION", f"{item.id}\n", "bump the version")
+            sha = _git(ri, "rev-parse", "HEAD")
+            return gh.open_pr(item.integrate_branch, sha), sha
+
+        def turn_end():
+            win.manager.agentReplied.emit(ws.id, i.id)
+            settle()
+
+        def submit(agent):
+            win._on_lane_action(ws.id, agent.id, "submit")
+            settle()
+            return win.manager.queue(ws.id)[-1]
+
+        # --- F2: the same lane submitted again ---------------------------------
+        _commit(a.spec.lane["root"], "a.txt", "A1\n", "A: first")
+        poll()
+        item1 = submit(a)
+        win._advance_queues()
+        settle()
+        pr1, tested1 = integrate(item1)
+        turn_end()
+        win._on_queue_action(item1.id, "approve")
+        settle()
+        check("queue-fix: the lane's first item is merged",
+              item1.state == integ.MERGED, item1)
+        _commit(a.spec.lane["root"], "a.txt", "A2\n", "A: second")
+        poll()
+        item2 = submit(a)
+        win._advance_queues()
+        settle()
+        check("queue-fix: a resubmitted lane's item gets its own integrate "
+              "branch, named in its brief",
+              item2.id != item1.id
+              and item2.integrate_branch != item1.integrate_branch
+              and bool(delivered)
+              and item2.integrate_branch in delivered[-1][0],
+              (item1.integrate_branch, item2.integrate_branch))
+        turn_end()
+        check("queue-fix: ...and a turn end with no new PR needs the user "
+              "instead of taking the first item's merged PR",
+              item2.state == integ.NEEDS_YOU and "No pull request" in
+              item2.note and item2.integrate_branch in item2.note, item2)
+
+        # --- F1: merged on github.com, not with Approve merge -------------------
+        pr2, tested2 = integrate(item2)
+        _commit(b.spec.lane["root"], "sub/b.txt", "B\n", "B: change b")
+        poll()
+        item3 = submit(b)
+        sent = len(delivered)
+        pr2["state"] = "MERGED"         # someone merged it on github.com
+        turn_end()
+        check("queue-fix: a PR merged outside Approve merge needs the user",
+              item2.state == integ.NEEDS_YOU
+              and "outside Approve merge" in item2.note, item2)
+        check("queue-fix: ...and the next lane is NOT sent meanwhile",
+              len(delivered) == sent and item3.state == integ.QUEUED, item3)
+        win._toggle_activity(ws.id)
+        row = next((r for r in win.activity_panel.queue_rows
+                    if r.item_id == item2.id), None)
+        check("queue-fix: its row offers Mark merged",
+              row is not None and "mark-merged" in row.buttons,
+              list(row.buttons) if row is not None else None)
+        win._toggle_activity(ws.id)
+        pr2["head"] = _git(str(work), "rev-parse", "origin/main")
+        win._on_queue_action(item2.id, "mark-merged")
+        settle()
+        check("queue-fix: Mark merged refuses a merged PR without the "
+              "submitted commit", item2.state == integ.NEEDS_YOU
+              and "manual=1" not in _log(store), item2)
+        pr2["head"] = tested2
+        win._on_queue_action(item2.id, "recheck")
+        settle()
+        win._on_queue_action(item2.id, "mark-merged")
+        settle()
+        check("queue-fix: ...and accepts it once GitHub's PR holds the "
+              "commit, audited as manual", item2.state == integ.MERGED
+              and "manual=1" in _log(store), item2)
+        check("queue-fix: then the next lane goes",
+              item3.state == integ.INTEGRATING and len(delivered) == sent + 1,
+              item3)
+
+        # --- F6: a refused head never re-approves itself ------------------------
+        pr3, tested3 = integrate(item3)
+        turn_end()
+        check("queue-fix: setup, the next PR awaits approval",
+              item3.state == integ.AWAITING, item3)
+        _commit(ri, "app/late.py", "late = 1\n", "a change after the test")
+        pr3["head"] = _git(ri, "rev-parse", "HEAD")
+        win._on_queue_action(item3.id, "approve")
+        settle()
+        check("queue-fix: Approve refuses the changed head",
+              item3.state == integ.NEEDS_YOU
+              and "changed after it was tested" in item3.note
+              and len(gh.merges()) == 1, item3)
+        awaiting = _log(store).count("QUEUE-AWAITING")
+        turn_end()
+        check("queue-fix: the integrator's next turn end leaves it with the "
+              "user", item3.state == integ.NEEDS_YOU
+              and _log(store).count("QUEUE-AWAITING") == awaiting, item3)
+        check("queue-fix: ...with the reason recorded",
+              getattr(item3, "reason", None) == "head-moved", item3)
+        win._save_now()
+        back = WorkspaceManager()
+        back.load_session_dict(json.loads(store.path.read_text("utf-8")))
+        loaded = back.queue_item(ws.id, item3.id)
+        check("queue-fix: the reason survives a save and a load",
+              loaded is not None
+              and getattr(loaded, "reason", None) == "head-moved", loaded)
+        bare = {k: v for k, v in item3.to_dict().items() if k != "reason"}
+        check("queue-fix: an item saved before reasons existed loads with "
+              "none", getattr(integ.QueueItem.from_dict(bare), "reason",
+                              None) == "")
+        for w in back.workspaces:
+            for x in list(w.agents):
+                back.remove_terminal(w.id, x.id)
+        win._on_queue_action(item3.id, "skip")
+        settle()
+
+        # --- F20: a squash-merged lane, removed by the user ---------------------
+        def merged_lane(name_commit):
+            c = run_dialog()[0]
+            settle()
+            _commit(c.spec.lane["root"], f"{name_commit}.txt", "x\n",
+                    f"{name_commit}: change")
+            sha = _git(c.spec.lane["root"], "rev-parse", "HEAD")
+            it = win.manager.submit_to_integrator(ws.id, c.id, sha, 1)
+            pr = gh.open_pr(it.integrate_branch, sha)
+            pr["state"] = "MERGED"      # a squash: the commit is not in main
+            win.manager.update_queue_item(ws.id, it.id, state=integ.MERGED,
+                                          pr=pr["number"], pr_url=pr["url"])
+            return c, it, pr
+
+        c, item_c, prc = merged_lane("cfile")
+        lane_c = dict(c.spec.lane)
+        win._close_agent(ws.id, c.id)
+        settle()
+        box = win._lane_boxes[-1] if win._lane_boxes else None
+        labels = [x.text() for x in box.buttons()] if box is not None else []
+        want = f"Remove lane (merged as #{prc['number']})"
+        check("queue-fix: a squash-merged lane is kept, and its notice offers "
+              "Remove lane (merged as #N)", os.path.isdir(lane_c["root"])
+              and want in labels, labels)
+        btn = next((x for x in (box.buttons() if box is not None else [])
+                    if x.text() == want), None)
+        if btn is not None:
+            btn.click()
+            settle()
+        check("queue-fix: ...which removes the lane and its branch after "
+              "checking with GitHub", not os.path.exists(lane_c["root"])
+              and lane_c["branch"] not in _git(str(work), "branch", "--list")
+              and f"merged_as=#{prc['number']}" in _log(store),
+              _log(store)[-600:])
+        d, item_d, prd = merged_lane("dfile")
+        lane_d = dict(d.spec.lane)
+        _commit(lane_d["root"], "dfile.txt", "after\n", "D: after the merge")
+        win._close_agent(ws.id, d.id)
+        settle()
+        box = win._lane_boxes[-1] if win._lane_boxes else None
+        labels = [x.text() for x in box.buttons()] if box is not None else []
+        check("queue-fix: a lane that moved past its merged commit gets no "
+              "Remove button", os.path.isdir(lane_d["root"])
+              and not [t for t in labels if t.startswith("Remove lane")],
+              labels)
+        for x in list(ws.agents):
+            win._close_agent(ws.id, x.id)
+        settle()
+    for box in list(win._lane_boxes):
+        box.close()
+    win.close()
+    win.deleteLater()
+    app.processEvents()
+    check("queue-fix: the real .venv survived",
           (work / ".venv" / "marker.txt").read_text() == "real venv")

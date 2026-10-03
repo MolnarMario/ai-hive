@@ -257,9 +257,11 @@ class LaneService(QObject):
                 if not lane or self._skip(agent.spec.uid):
                     continue
                 key = _repo_key(lane["repo"])
+                role = (lanes.INTEGRATOR_ROLE
+                        if self.manager.is_integrator(agent) else "")
                 groups.setdefault(key, (lane["repo"], []))[1].append(
                     {"uid": agent.spec.uid, "agent": agent.spec.name,
-                     "ws_id": ws.id, "lane": dict(lane)})
+                     "ws_id": ws.id, "lane": dict(lane), "role": role})
         return groups
 
     def poll(self) -> None:

@@ -66,9 +66,13 @@ This file holds only the rules that protect user data or fail silently.
   integrator, submits a lane or approves a merge. No bridge op may do any of
   it, and agents never run `gh pr merge`. AI Hive runs the merge itself, and
   only for the PR head the integrator tested, with `--match-head-commit`,
-  after checking the base has not moved since. An item is merged only when
-  GitHub says MERGED (a squash leaves the tested commit out of the base), and
-  the queue never skips an item by itself.
+  after checking the base has not moved since. An item becomes merged only
+  through Approve merge or the user's Mark merged, and only when GitHub says
+  MERGED (a squash leaves the tested commit out of the base). The queue never
+  skips an item by itself, and only a "no pull request yet" item is rechecked
+  without a user click. Lane-authored text (commit subjects, file names)
+  reaches the integrator only inside the brief's fenced blocks, with control
+  characters stripped.
 - Nothing renames an agent except the user.
 - No em dash in any string the user sees. `test_no_em_dashes_in_visible_text`
   enforces it for non-docstring literals.

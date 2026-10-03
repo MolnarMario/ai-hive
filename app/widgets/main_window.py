@@ -4179,6 +4179,15 @@ class MainWindow(QMainWindow):
                     ws_id, agent_id, uid, name, lane, res, err))
         elif action == "submit":
             self._submit_lane(ws_id, agent)
+        elif action == "remove-merged":
+            view = self.lane_service.view(agent.spec.uid)
+            item = self._merged_item_for(lane, view.head if view else "")
+            if item is None or agent.spec.uid in self._lane_pending:
+                return
+            # the user asked to close this card and remove its lane
+            lane, pids, name = self._lane_retire_args(agent)
+            self.manager.remove_terminal(ws_id, agent.id)
+            self._remove_merged_lane(lane, item, name, pids)
         elif action == "integrator":
             self._toggle_integrator(ws_id, agent)
 
@@ -4245,6 +4254,19 @@ class MainWindow(QMainWindow):
         if agent.spec.lane and not is_integrator:
             info["submit"] = ("Submit to integrator",) + \
                 self._submit_state(ws, agent)
+        view = self.lane_service.view(agent.spec.uid) \
+            if agent.spec.lane else None
+        merged = self._merged_item_for(agent.spec.lane,
+                                       view.head if view is not None else "")
+        if (merged is not None and view is not None and not view.dirty
+                and not agent.is_busy()):
+            info["remove_merged"] = (
+                f"Close and remove lane (merged as #{merged.pr})", True,
+                f"Pull request #{merged.pr} merged this lane's commit "
+                f"{merged.short} by squash or rebase, so git can't see it in "
+                f"the base. Closes this card, then removes the lane once "
+                f"GitHub confirms the merge and the lane still holds "
+                f"exactly that commit.")
         return info
 
     def _submit_state(self, ws, agent) -> tuple:
@@ -4480,8 +4502,15 @@ class MainWindow(QMainWindow):
                 or not self.manager.is_integrator(agent)):
             return
         item = self.manager.queue_head(ws_id)
-        if item is not None and item.state in (integration.INTEGRATING,
-                                               integration.NEEDS_YOU):
+        # only an item the integrator is working on, or one still waiting
+        # for its pull request. Any other NEEDS_YOU (Approve refused it, it
+        # was merged outside, its head is untested) waits for the user's
+        # Recheck: rechecking it here re-approved what the user's own
+        # Approve had just refused, with no user in the loop.
+        if item is not None and (
+                item.state == integration.INTEGRATING
+                or (item.state == integration.NEEDS_YOU
+                    and item.reason in integration.AUTO_RECHECK_REASONS)):
             self._recheck_item(ws_id, item.id)
         else:
             self._schedule_queue_tick()
@@ -4548,15 +4577,19 @@ class MainWindow(QMainWindow):
                                           f"Not merged: {error}")
         self._apply_outcome(ws_id, item, outcome)
 
-    def _apply_outcome(self, ws_id: str, item, outcome) -> None:
+    def _apply_outcome(self, ws_id: str, item, outcome,
+                       manual: bool = False) -> None:
         """Move an item to where git and gh said it is. A base that moved
         after the test run sends it back to the integrator with the short
-        re-merge brief: the same item continues, nothing new is assigned."""
+        re-merge brief: the same item continues, nothing new is assigned.
+        `manual`: the user's Mark merged."""
         state = outcome.state
-        changes = {"state": state, "note": outcome.note}
+        changes = {"state": state, "note": outcome.note,
+                   "reason": outcome.reason if state == integration.NEEDS_YOU
+                   else ""}
         if state == integration.INTEGRATING:
             changes.update(state=integration.QUEUED, rebrief=True)
-        for key in ("pr", "pr_url", "tested_sha"):
+        for key in ("pr", "pr_url", "tested_sha", "suite_sha"):
             value = getattr(outcome, key)
             if value:
                 changes[key] = value
@@ -4572,9 +4605,13 @@ class MainWindow(QMainWindow):
                integration.INTEGRATING: "QUEUE-BASE-MOVED"}.get(
                    state, "QUEUE-NEEDS-YOU")
         pr = outcome.pr or item.pr
+        suite = outcome.suite_sha or item.suite_sha
         self._store_audit(
             f"{tag} item={item.id} branch={item.branch} sha={item.short} "
             f"pr={pr} tested={(outcome.tested_sha or item.tested_sha)[:7]}"
+            + (f" suite={suite[:7]}" if suite else "")
+            + (" manual=1" if manual and state == integration.MERGED else "")
+            + (f" reason={outcome.reason}" if outcome.reason else "")
             + (f" note={outcome.note!r}" if outcome.note else ""))
         text = {
             integration.AWAITING: f"pull request #{pr} is waiting for your "
@@ -4605,10 +4642,13 @@ class MainWindow(QMainWindow):
             self._approve_item(ws_id, item_id)
         elif action == "recheck":
             self._recheck_item(ws_id, item_id)
+        elif (action == "mark-merged" and item.state == integration.NEEDS_YOU
+              and item.reason == integration.REASON_MERGED_OUTSIDE):
+            self._mark_merged_item(ws_id, item_id)
         elif action == "resend" and item.state == integration.NEEDS_YOU:
             self.manager.update_queue_item(ws_id, item_id,
                                            state=integration.QUEUED,
-                                           note="")
+                                           note="", reason="")
             self._store_audit(f"QUEUE-RESEND item={item_id} "
                               f"branch={item.branch}")
             self._queue_changed(ws_id)
@@ -4621,6 +4661,74 @@ class MainWindow(QMainWindow):
                               f"branch={item.branch}")
             self._queue_event(ws_id, item, "was taken out of the queue")
             self._queue_changed(ws_id)
+
+    def _mark_merged_item(self, ws_id: str, item_id: str) -> None:
+        """The user's Mark merged, for a PR merged outside Approve merge.
+        GitHub has the last word (integration.mark_merged), on LaneOps."""
+        item = self.manager.queue_item(ws_id, item_id)
+        if item is None or ws_id in self._queue_jobs:
+            return
+        repo = self._queue_repo(ws_id, item)
+        if not repo:
+            return
+        self._queue_jobs.add(ws_id)
+        self._store_audit(f"QUEUE-MARK item={item_id} branch={item.branch} "
+                          f"pr={item.pr}")
+        self.lane_ops.submit(
+            repo, integration.mark_merged, repo, dc_replace(item),
+            label="mark", exclusive=False,
+            callback=lambda res, err: self._on_marked(ws_id, item_id, res,
+                                                      err))
+
+    def _on_marked(self, ws_id, item_id, outcome, error) -> None:
+        self._queue_jobs.discard(ws_id)
+        item = self.manager.queue_item(ws_id, item_id)
+        if item is None or item.state != integration.NEEDS_YOU:
+            return
+        if error is not None or outcome is None:
+            outcome = integration.Outcome(
+                integration.NEEDS_YOU,
+                f"Could not read the pull request: {error}",
+                reason=integration.REASON_MERGED_OUTSIDE)
+        self._apply_outcome(ws_id, item, outcome, manual=True)
+
+    def _merged_item_for(self, lane: dict, head: str):
+        """The MERGED queue item that pinned exactly this lane commit, for a
+        lane a squash or rebase merge left unmerged by ancestry."""
+        if not lane or not head:
+            return None
+        for ws in self.manager.workspaces:
+            for item in self.manager.queue(ws.id):
+                if (item.state == integration.MERGED and item.pr
+                        and item.branch == lane.get("branch")
+                        and item.sha == head):
+                    return item
+        return None
+
+    def _remove_merged_lane(self, lane: dict, item, name: str,
+                            pids=()) -> None:
+        """The user's "Remove lane (merged as #N)": checked with GitHub and
+        removed on LaneOps (integration.remove_merged_lane)."""
+        repo = lane["repo"]
+        self.lane_ops.submit(
+            repo, integration.remove_merged_lane, repo, dict(lane),
+            dc_replace(item), tuple(pids), label="remove-merged",
+            callback=lambda res, err: self._on_merged_lane_removed(
+                lane, item, name, res, err))
+
+    def _on_merged_lane_removed(self, lane, item, name, result,
+                                error) -> None:
+        where = (f"agent={name!r} root={lane['root']} "
+                 f"branch={lane['branch']} merged_as=#{item.pr}")
+        if error is not None or result is None:
+            self._store_audit(f"LANE-FAIL {getattr(error, 'code', 'error')} "
+                              f"remove-merged {where}: {error}")
+            self._lane_message("Lane not removed",
+                               f"{name}'s lane was not removed: {error}\n\n"
+                               f"{lane['root']}")
+            return
+        ignored = f" ignored={len(result.ignored)}" if result.ignored else ""
+        self._store_audit(f"LANE-REMOVE {where}{ignored}")
 
     def _queue_event(self, ws_id: str, item, text: str) -> None:
         """An event-log row for the submitted lane's agent (the integrator
@@ -4749,6 +4857,16 @@ class MainWindow(QMainWindow):
         keep = box.addButton("Keep", QMessageBox.ButtonRole.AcceptRole)
         open_btn = box.addButton("Open folder",
                                  QMessageBox.ButtonRole.ActionRole)
+        # squash- or rebase-merged through the queue: ancestry says unmerged,
+        # GitHub says merged. Removing it is the user's call, never automatic.
+        merged = self._merged_item_for(
+            lane, status.head if status is not None else "")
+        if merged is not None and not status.dirty and not status.local:
+            remove_btn = box.addButton(f"Remove lane (merged as #{merged.pr})",
+                                       QMessageBox.ButtonRole.ActionRole)
+            remove_btn.clicked.connect(
+                lambda _=False, it=merged: self._remove_merged_lane(
+                    lane, it, name))
         box.setDefaultButton(keep)
         box.setModal(False)
         open_btn.clicked.connect(

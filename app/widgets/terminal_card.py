@@ -1162,6 +1162,16 @@ class TerminalCard(QFrame):
             act_submit.triggered.connect(
                 lambda: self.laneActionRequested.emit(self.agent.id, "submit"))
             menu.addAction(act_submit)
+        remove = self._integration().get("remove_merged")
+        if remove:
+            label, enabled, tip = remove
+            act_remove = QAction(label, menu)
+            act_remove.setEnabled(enabled)
+            act_remove.setToolTip(tip)
+            act_remove.triggered.connect(
+                lambda: self.laneActionRequested.emit(self.agent.id,
+                                                      "remove-merged"))
+            menu.addAction(act_remove)
         return menu
 
     def _set_sched_missed(self, missed: bool) -> None:

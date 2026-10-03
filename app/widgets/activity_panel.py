@@ -94,6 +94,9 @@ _QUEUE_TIPS = {
     "open": "Open the pull request in the browser.",
     "skip": ("Take this lane out of the queue. Its branch and commits stay "
              "where they are."),
+    "mark-merged": ("Its pull request was merged on GitHub, not with Approve "
+                    "merge. AI Hive checks with GitHub that it is merged and "
+                    "holds this lane's commit, then marks it merged."),
 }
 
 
@@ -133,12 +136,17 @@ class QueueRow(QFrame):
             status.append(f"PR #{item.pr}")
         if since > 0 and item.is_open:
             status.append(f"+{since} since submit")
+        if item.suite_sha and item.suite_sha != item.tested_sha:
+            status.append(f"tested at {item.suite_sha[:7]}")
         lines.append(" · ".join(status))
         if item.note:
             lines.append(item.note)
         self.text.setText("\n".join(lines))
         wanted = [(a, label) for a, label in _QUEUE_BUTTONS.get(item.state, ())
                   if a != "open" or item.pr_url]
+        if (item.state == integ.NEEDS_YOU
+                and item.reason == integ.REASON_MERGED_OUTSIDE):
+            wanted.insert(0, ("mark-merged", "Mark merged"))
         if [a for a, _ in wanted] != list(self.buttons):
             for btn in self.buttons.values():
                 btn.setParent(None)
