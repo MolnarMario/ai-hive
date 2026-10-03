@@ -67,10 +67,14 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"on the branch {lane['branch']}, which starts from {base}. Commit "
             f"your work there, on that branch. Never edit files in other "
             f"worktrees or in the main checkout at {lane.get('repo', '')} "
-            f"(reading its board is fine), and never commit to {base}. Do not "
-            f"bump the version or edit the CHANGELOG or the README check "
-            f"count: that is done once per pull request, when your work is "
-            f"integrated.")
+            f"(reading its board is fine), and never commit to {base}. Never "
+            f"push your lane branch to {base}, even when git suggests it: "
+            f"your work reaches {base} through a pull request. Any .venv, "
+            f"venv or node_modules folder in your lane is a link to the main "
+            f"checkout's copy, so installing packages there changes them for "
+            f"every lane. Do not bump the version or edit the CHANGELOG or "
+            f"the README check count: that is done once per pull request, "
+            f"when your work is integrated.")
     return text
 
 

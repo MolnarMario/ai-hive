@@ -63,13 +63,13 @@ class LaneOps(QObject):
 
     def key_for(self, repo: str) -> str:
         """The queue a repo's operations share: its git common dir, so every
-        checkout of one repository lands in the same queue. Cached; the first
-        lookup per repo runs one quick `git rev-parse`."""
+        checkout of one repository lands in the same queue. Read from the
+        `.git` entries, never by running git: this runs on the GUI thread.
+        Cached."""
         norm = os.path.normcase(os.path.normpath(repo or ""))
         key = self._keys.get(norm)
         if key is None:
-            key = (lanes.common_dir(repo) if repo and os.path.isdir(repo)
-                   else "") or norm
+            key = (lanes.read_common_dir(repo) if repo else "") or norm
             self._keys[norm] = key
         return key
 

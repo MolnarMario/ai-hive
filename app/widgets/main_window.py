@@ -1290,8 +1290,13 @@ class AddTerminalDialog(QDialog):
         self._live_lane_roots = set(live_lane_roots)
         # resumable lane conversations by session id (lanes.LaneConversation)
         self._lane_convs: dict = {}
-        # the user's own tick, kept while Type is flipped away and back
-        self._lane_wanted = True
+        # the user's own tick, kept while Type is flipped away and back. A
+        # workspace inside a larger repository starts unticked: its lane
+        # would copy the whole repository (a dotfiles repo in the home
+        # folder, say), which the user should choose knowingly.
+        self._nested_in = ("" if not repo_root or lanes.same_path(repo_root, cwd)
+                           else repo_root)
+        self._lane_wanted = not self._nested_in
 
         form = QFormLayout()
         self.name_edit = QLineEdit(default_name, self)
@@ -1636,6 +1641,10 @@ class AddTerminalDialog(QDialog):
                 "Give this agent its own git worktree and branch beside the "
                 "repository, so agents cannot overwrite or reset each other's "
                 "work. Each agent opened at once gets its own lane.")
+            if not reason and self._nested_in:
+                tip = (f"This folder is inside the repository at "
+                       f"{self._nested_in}. A lane copies the whole "
+                       f"repository.\n\n{tip}")
         cb.setToolTip(tip)
         cb.blockSignals(False)
 
@@ -2167,6 +2176,10 @@ class MainWindow(QMainWindow):
         # meanwhile is retired by that operation's callback, never by the
         # close itself (a failed create must not touch a folder it doesn't own)
         self._lane_pending: set[str] = set()
+        # roots of closed agents' lanes whose retire is still being retried
+        # (a program held the folder). Hidden from the picker meanwhile, so a
+        # revive can't race the retry for the same lane.
+        self._lane_retiring: set[str] = set()
         self._lane_boxes: list = []   # open "lane kept" notices
         # providers whose CLI was STILL INSTALLING when the user skipped the
         # update splash. Their agents are held out of the autostart, because
@@ -3768,9 +3781,13 @@ class MainWindow(QMainWindow):
     # revive protect lanes that already exist and run with the switch off.
     # Every git mutation goes through self.lane_ops, never inline.
 
+    # a retire that found a program still running in the lane tries again
+    LANE_RETIRE_TRIES = 3
+    LANE_RETIRE_RETRY_MS = 30_000
+
     def _live_lane_roots(self) -> set:
-        return {a.spec.lane.get("root", "") for a in self.manager.all_agents()
-                if a.spec.lane}
+        return ({a.spec.lane.get("root", "") for a in self.manager.all_agents()
+                 if a.spec.lane} | self._lane_retiring)
 
     def _create_lane(self, ws_id: str, agent, plan) -> None:
         """Create a new agent's lane, then start it. The agent was added
@@ -3781,7 +3798,7 @@ class MainWindow(QMainWindow):
         self._lane_pending.add(agent.spec.uid)
         lane, cwd, t0 = plan.lane_dict(), plan.cwd, time.monotonic()
         self.lane_ops.submit(
-            plan.repo, lanes.create_lane, lane, label="create",
+            plan.repo, lanes.create_lane, lane, cwd, label="create",
             callback=lambda res, err, a=agent.id, u=agent.spec.uid,
             n=agent.spec.name: self._on_lane_created(
                 ws_id, a, u, n, lane, cwd, t0, res, err))
@@ -3912,29 +3929,57 @@ class MainWindow(QMainWindow):
         if retire is not None:
             self._retire_lane(*retire)
 
-    def _retire_lane(self, lane: dict, pids, name: str) -> None:
+    def _retire_lane(self, lane: dict, pids, name: str,
+                     attempt: int = 1) -> None:
         self.lane_ops.submit(
             lane["repo"], lanes.retire_lane, lane, tuple(pids), label="retire",
-            callback=lambda res, err: self._on_lane_retired(lane, name, res,
-                                                            err))
+            callback=lambda res, err: self._on_lane_retired(
+                lane, name, res, err, pids, attempt))
 
-    def _on_lane_retired(self, lane, name, result, error) -> None:
+    def _on_lane_retired(self, lane, name, result, error, pids=(),
+                         attempt: int = 1) -> None:
         where = f"agent={name!r} root={lane['root']} branch={lane['branch']}"
         if error is not None or result is None:
             self._store_audit(f"LANE-FAIL retire {where}: {error}")
             self._show_lane_kept(name, lane, None, str(error))
             return
         if result.removed:
-            kept = (f" branch_kept={result.branch_error!r}"
-                    if result.branch_error else "")
-            self._store_audit(f"LANE-REMOVE {where}{kept}")
+            ignored = ""
+            if result.ignored:
+                more = len(result.ignored) - 20
+                extra = f" +{more} more" if more > 0 else ""
+                ignored = (f" ignored={len(result.ignored)} "
+                           f"[{' '.join(result.ignored[:20])}{extra}]")
+            self._store_audit(f"LANE-REMOVE {where}{ignored}")
             return
         st = result.status
         detail = (f" ahead={st.ahead} dirty={len(st.dirty)} merged={st.merged}"
                   if st is not None else "")
-        why = f" reason={result.reason!r}" if result.reason else ""
-        self._store_audit(f"LANE-KEEP {where}{detail}{why}")
+        if result.code == "busy":
+            self._store_audit(f"LANE-KEEP {where}{detail} reason=busy "
+                              f"attempt={attempt}")
+            if attempt < self.LANE_RETIRE_TRIES:
+                self._lane_retiring.add(lane["root"])
+                QTimer.singleShot(
+                    self.LANE_RETIRE_RETRY_MS, self,
+                    lambda: self._retry_retire(lane, pids, name, attempt + 1))
+                return
+        elif result.code in ("git", "moved"):
+            # git itself refused: a process outside the agent (Explorer, an
+            # editor, a terminal) holds the folder. Never retried with --force.
+            self._store_audit(f"LANE-FAIL retire {where}: {result.reason}")
+        else:
+            why = f" reason={result.reason!r}" if result.reason else ""
+            self._store_audit(f"LANE-KEEP {where}{detail}{why}")
         self._show_lane_kept(name, lane, st, result.reason)
+
+    def _retry_retire(self, lane, pids, name, attempt: int) -> None:
+        self._lane_retiring.discard(lane["root"])
+        # revived meanwhile: the lane is live again and not ours to retire
+        if any(lanes.same_path(a.spec.lane.get("root", ""), lane["root"])
+               for a in self.manager.all_agents() if a.spec.lane):
+            return
+        self._retire_lane(lane, pids, name, attempt)
 
     def _show_lane_kept(self, name: str, lane: dict, status,
                         reason: str) -> None:
@@ -3942,11 +3987,12 @@ class MainWindow(QMainWindow):
         it holds work (or could not be checked). There is deliberately no
         delete button: unmerged work is only ever removed by the user."""
         held = status.describe() if status is not None else ""
+        kept = ("The lane folder is kept." if os.path.isdir(lane["root"])
+                else "Its branch is kept.")
         if held:
-            text = f"{name}'s lane has {held}. The lane folder is kept."
+            text = f"{name}'s lane has {held}. {kept}"
         else:
-            text = (f"{name}'s lane could not be removed ({reason}). "
-                    f"The lane folder is kept.")
+            text = f"{name}'s lane could not be removed ({reason}). {kept}"
         box = QMessageBox(QMessageBox.Icon.Information, "Lane kept", text,
                           parent=self)
         box.setInformativeText(
