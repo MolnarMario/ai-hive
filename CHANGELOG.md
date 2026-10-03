@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.23.2
+
+- The shared board now keeps only its newest 40 activity notes. Older ones
+  move to board-archive.md next to it, so agents spend fewer tokens reading
+  the board before each task. Nothing is deleted.
+- The board's agent list shows what each agent is working on (its
+  conversation title) instead of "-" when it has no assigned task.
+
 ## 0.23.1
 
 - Terminals restored after a reopen keep the width they started at, also on a
