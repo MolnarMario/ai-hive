@@ -1041,6 +1041,24 @@ QScrollArea {{ background: transparent; border: none; }}
 #ActivityLog, #ActivityFiles, #ActivityLanes {{
     font-family: {CONSOLE_FONT}; font-size: 11px; color: {p.TEXT_DIM};
 }}
+/* the integration queue (app/integration.py): one row per submitted lane.
+   A row waiting on the user (approval, or something went wrong) gets the
+   accent border so it reads as the one to act on. */
+#QueueRow {{
+    background: {p.BG_CARD}; border: 1px solid {p.BORDER}; border-radius: 4px;
+}}
+#QueueRow[state="awaiting-approval"], #QueueRow[state="needs-you"] {{
+    border-color: {p.ACCENT_ORANGE};
+}}
+#QueueRowText {{
+    font-family: {CONSOLE_FONT}; font-size: 11px; color: {p.CONSOLE_FG};
+}}
+#QueueBtn {{
+    background: {p.BG_INPUT}; color: {p.TEXT}; font-size: 11px;
+    border: 1px solid {p.BORDER}; border-radius: 3px; padding: 2px 7px;
+}}
+#QueueBtn:hover {{ border-color: {p.ACCENT_GOLD}; background: {p.BG_HOVER}; }}
+#QueueBtn:disabled {{ color: {p.TEXT_FAINT}; }}
 
 /* -------------------------------------------------- empty grid slot (v2) --- */
 #EmptySlot {{

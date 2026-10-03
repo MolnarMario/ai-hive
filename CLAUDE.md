@@ -40,9 +40,11 @@ This file holds only the rules that protect user data or fail silently.
 - Pinned agents resume with `--resume <id>`, never `--continue`. `--continue`
   picks the newest conversation in the folder, so two agents in one folder
   raced for the same one and a transcript got destroyed.
-- Claude task delivery sends Enter 350 ms after the text
-  (`_write_task_to_pty`). A CR in the same burst counts as part of the paste
-  and the task never runs.
+- Claude task delivery types the text, then sends Enter once Claude has drawn
+  that text, never sooner than 350 ms after it (`_write_task_to_pty`). A CR
+  that Claude reads in the same chunk as the text counts as part of the paste
+  and the task never runs. A fixed beat alone lost every first task in a fresh
+  git folder, where Claude stalls about 570 ms after its first frame.
 - Agent lanes (`app/lanes.py`): `git worktree remove` FOLLOWS directory
   junctions and empties their targets (measured: a lane's `.venv` junction
   wiped the real `.venv`). `remove_lane` unlinks the lane's junctions first
@@ -60,6 +62,17 @@ This file holds only the rules that protect user data or fail silently.
   hold `lane_ops.lock_for(repo)` around each lane: Windows won't delete a
   folder that is some process's cwd, so a poll inside a lane being removed
   leaves a half-deleted worktree.
+- The integration queue (`app/integration.py`): only a user click picks the
+  integrator, submits a lane or approves a merge. No bridge op may do any of
+  it, and agents never run `gh pr merge`. AI Hive runs the merge itself, and
+  only for the PR head the integrator tested, with `--match-head-commit`,
+  after checking the base has not moved since. An item becomes merged only
+  through Approve merge or the user's Mark merged, and only when GitHub says
+  MERGED (a squash leaves the tested commit out of the base). The queue never
+  skips an item by itself, and only a "no pull request yet" item is rechecked
+  without a user click. Lane-authored text (commit subjects, file names)
+  reaches the integrator only inside the brief's fenced blocks, with control
+  characters stripped.
 - Nothing renames an agent except the user.
 - No em dash in any string the user sees. `test_no_em_dashes_in_visible_text`
   enforces it for non-docstring literals.
@@ -95,7 +108,9 @@ pollute resume ordering. Use a scratch cwd.
 
 - Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds
   a matching `## x.y.z` section to `CHANGELOG.md`, written for users (the
-  in-app updater shows it). A smoke check fails if the two disagree.
+  in-app updater shows it). A smoke check fails if the two disagree. An agent
+  working in a lane doesn't: the integrator does it once per PR
+  (`docs/agents/integration.md`).
 - Keep README.md's check count and feature list current.
 - `app/providers.py` and `app/mcp_server.py` stay Qt-free. `mcp_server` must
   not import PySide6 at all.
@@ -106,4 +121,6 @@ pollute resume ordering. Use a scratch cwd.
 
 Issues live as markdown under `.scratch/<feature-slug>/`, see
 `docs/agents/issue-tracker.md`. Triage labels are in
-`docs/agents/triage-labels.md`, domain docs in `docs/agents/domain.md`.
+`docs/agents/triage-labels.md`, domain docs in `docs/agents/domain.md`. The
+integrator's checklist is `docs/agents/integration.md`; AI Hive embeds it in
+every integration brief, read from the base branch.

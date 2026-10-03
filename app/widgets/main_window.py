@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+from dataclasses import replace as dc_replace
 from urllib.parse import urlparse, urlunparse
 
 from PySide6.QtCore import QEvent, QPoint, QProcess, Qt, QTimer, Signal
@@ -28,6 +29,7 @@ from .. import chime
 from .. import claude_usage
 from .. import codex_usage
 from .. import fsopen
+from .. import integration
 from .. import lanes
 from .. import limit_ledger
 from .. import providers
@@ -207,6 +209,11 @@ LIMIT_UNKNOWN_WAIT_S = 5 * 3600 + 600
 # it was the LAST thing that happened. `limit_ledger.latest_window` answers
 # that instead, and a fixed bound had already begun silently skipping real
 # cut-offs.)
+
+# the integration queue (app/integration.py): how often an idle integrator is
+# checked for the next brief, and how long gh's readiness answer is trusted
+QUEUE_TICK_MS = 5000
+GH_STALE_S = 600.0
 
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [
@@ -2192,6 +2199,18 @@ class MainWindow(QMainWindow):
             self.manager, self.lane_ops,
             skip=lambda uid: uid in self._lane_pending,
             audit=self._store_audit, parent=self)
+        # the approved integration queue (app/integration.py): workspaces
+        # with a brief, PR read or merge in flight (one at a time each),
+        # lanes being fast-forwarded on their own, and what gh last said per
+        # repo (key -> (ok, reason, monotonic time)). gh is a subprocess, so
+        # it is only ever asked on the LaneOps worker, never on this thread.
+        self._queue_jobs: set[str] = set()
+        self._auto_refreshing: set[str] = set()
+        self._gh_status: dict[str, tuple] = {}
+        self._gh_checking: set[str] = set()
+        self._queue_timer = QTimer(self)
+        self._queue_timer.setInterval(QUEUE_TICK_MS)
+        self._queue_timer.timeout.connect(self._advance_queues)
         # providers whose CLI was STILL INSTALLING when the user skipped the
         # update splash. Their agents are held out of the autostart, because
         # launching one now could execute a half written binary. Transient by
@@ -2319,6 +2338,9 @@ class MainWindow(QMainWindow):
         self._wire_model()
         self.lane_service.lanesChanged.connect(self._on_lanes_changed)
         self.lane_service.overlapFound.connect(self._on_lane_overlap)
+        self.activity_panel.queueAction.connect(self._on_queue_action)
+        self.manager.agentReplied.connect(self._on_integrator_turn_ended)
+        self._queue_timer.start()
         # restored laned agents whose folder is missing: repaired in place
         # before they may start (they are holding their start until then)
         self._start_lane_repairs()
@@ -3833,6 +3855,12 @@ class MainWindow(QMainWindow):
             self.lane_service.stop()
         for ws in self.manager.workspaces:
             self._on_lanes_changed(ws.id, self.lane_service.views(ws.id))
+            integrator = self.manager.integrator(ws.id)
+            if on and integrator is not None:
+                self._check_gh(integrator.spec.lane["repo"])
+        # the queue is paused while the switch is off, and resumes at once
+        self._refresh_queue_ui()
+        self._schedule_queue_tick()
 
     def lanes_enabled(self) -> bool:
         """The ONLY gate for creating lanes. Lane code asks this, never
@@ -4088,6 +4116,8 @@ class MainWindow(QMainWindow):
                                    if card.agent.spec.lane else None)
         if self.activity_panel.is_open() and ws_id == self.manager.active_id:
             self.activity_panel.set_lanes(views)
+            self._push_queue_panel()
+        self._refresh_idle_lanes(ws_id, views)
 
     def _push_lane_view(self, ws_id: str, agent) -> None:
         """One agent's lane record changed (created, failed, revived): repaint
@@ -4147,6 +4177,19 @@ class MainWindow(QMainWindow):
                 lane["repo"], lanes.refresh_lane, lane, label="refresh",
                 callback=lambda res, err: self._on_lane_refreshed(
                     ws_id, agent_id, uid, name, lane, res, err))
+        elif action == "submit":
+            self._submit_lane(ws_id, agent)
+        elif action == "remove-merged":
+            view = self.lane_service.view(agent.spec.uid)
+            item = self._merged_item_for(lane, view.head if view else "")
+            if item is None or agent.spec.uid in self._lane_pending:
+                return
+            # the user asked to close this card and remove its lane
+            lane, pids, name = self._lane_retire_args(agent)
+            self.manager.remove_terminal(ws_id, agent.id)
+            self._remove_merged_lane(lane, item, name, pids)
+        elif action == "integrator":
+            self._toggle_integrator(ws_id, agent)
 
     def _on_lane_refreshed(self, ws_id, agent_id, uid, name, lane, result,
                            error) -> None:
@@ -4175,6 +4218,624 @@ class MainWindow(QMainWindow):
                     pass
         self.lane_service.poke()
 
+    # The approved integration queue (spec Phase 3, app/integration.py). The
+    # USER submits a lane, picks the integrator and approves every merge.
+    # AI Hive types the brief into an idle integrator, reads the PR when its
+    # turn ends and runs the guarded merge. One job at a time per workspace
+    # (_queue_jobs); everything that runs git or gh does so on the repo's
+    # LaneOps worker; all of it pauses while the Agent lanes switch is off.
+
+    def _integration_info(self, agent) -> dict:
+        """What a card's menus show for the queue (see
+        TerminalCard.integration_info). Never runs git or gh on this thread:
+        a stale gh answer only starts a background check."""
+        ws = self.manager.workspace_of(agent.id)
+        if ws is None:
+            return {}
+        is_integrator = self.manager.is_integrator(agent)
+        info = {"integrator": is_integrator}
+        if is_integrator:
+            info["role"] = ("Stop being the integrator", True,
+                            "AI Hive stops sending this agent integration "
+                            "briefs. The queue keeps its items.")
+        elif (agent.spec.provider == "claude" and agent.is_pty
+              and self.lanes_enabled()):
+            # with the switch off the menu is exactly what it was before
+            # lanes; only a current integrator keeps its way to step down
+            why = self.manager.can_integrate(agent)
+            current = self.manager.integrator(ws.id)
+            tip = why or (
+                (f"Replaces {current.spec.name} as this workspace's "
+                 f"integrator. " if current is not None else "")
+                + "AI Hive types each lane you submit into this agent as an "
+                  "integration brief. It merges and tests the lane and opens "
+                  "a pull request; you approve the merge.")
+            info["role"] = ("Make integrator", not why, tip)
+        if agent.spec.lane and not is_integrator:
+            info["submit"] = ("Submit to integrator",) + \
+                self._submit_state(ws, agent)
+        view = self.lane_service.view(agent.spec.uid) \
+            if agent.spec.lane else None
+        merged = self._merged_item_for(agent.spec.lane,
+                                       view.head if view is not None else "")
+        if (merged is not None and view is not None and not view.dirty
+                and not agent.is_busy()):
+            info["remove_merged"] = (
+                f"Close and remove lane (merged as #{merged.pr})", True,
+                f"Pull request #{merged.pr} merged this lane's commit "
+                f"{merged.short} by squash or rebase, so git can't see it in "
+                f"the base. Closes this card, then removes the lane once "
+                f"GitHub confirms the merge and the lane still holds "
+                f"exactly that commit.")
+        return info
+
+    def _submit_state(self, ws, agent) -> tuple:
+        """(enabled, tooltip) for a lane's Submit to integrator."""
+        if not self.lanes_enabled():
+            return False, "Turn on Agent lanes in Options first."
+        if self.manager.integrator(ws.id) is None:
+            return False, ("Pick an integrator first: right-click a laned "
+                           "Claude agent's header and choose Make integrator.")
+        ok, reason = self._gh_state(agent.spec.lane["repo"])
+        if not ok:
+            return False, reason
+        view = self.lane_service.view(agent.spec.uid)
+        if view is None:
+            return False, "Waiting for the lane's first status read."
+        if not view.ahead:
+            return False, ("Nothing to submit: the lane has no commits of its "
+                           "own.")
+        item = self.manager.open_item_for(ws.id, agent.spec.uid)
+        if item is not None and item.state not in (integration.QUEUED,
+                                                   integration.NEEDS_YOU):
+            return False, (f"Already in the queue "
+                           f"({integration.STATE_LABEL[item.state]}).")
+        tip = ("Queues this lane's newest commit for the integrator. Later "
+               "commits stay on the lane, and uncommitted changes are not "
+               "included.")
+        if item is not None:
+            tip = "Moves this lane's queued item to its newest commit. " + tip
+        return True, tip
+
+    @staticmethod
+    def _repo_key(repo: str) -> str:
+        return os.path.normcase(os.path.normpath(repo or ""))
+
+    def _gh_state(self, repo: str) -> tuple:
+        """(ok, reason) for opening and merging pull requests in `repo`, from
+        the last background check. Unknown or stale starts a check."""
+        key = self._repo_key(repo)
+        known = self._gh_status.get(key)
+        if known is None or time.monotonic() - known[2] > GH_STALE_S:
+            self._check_gh(repo)
+        if known is None:
+            return False, "Checking the GitHub CLI (gh)..."
+        return known[0], known[1]
+
+    def _check_gh(self, repo: str) -> None:
+        key = self._repo_key(repo)
+        if not repo or key in self._gh_checking:
+            return
+        self._gh_checking.add(key)
+        self.lane_ops.submit(
+            repo, integration.gh_ready, repo, label="gh", exclusive=False,
+            callback=lambda res, err, k=key: self._on_gh_checked(k, res, err))
+
+    def _on_gh_checked(self, key: str, result, error) -> None:
+        self._gh_checking.discard(key)
+        if error is None and isinstance(result, tuple) and len(result) == 2:
+            ok, reason = bool(result[0]), str(result[1] or "")
+        else:
+            ok, reason = False, f"Could not run gh: {error}"
+        before = self._gh_status.get(key)
+        self._gh_status[key] = (ok, reason, time.monotonic())
+        if before is None or before[:2] != (ok, reason):
+            self._store_audit(f"QUEUE-GH repo={key} ok={ok}"
+                              + (f" {reason}" if reason else ""))
+            self._push_queue_panel()
+
+    def _queue_repo(self, ws_id: str, item=None) -> str:
+        """The repository a workspace's queue works in: the integrator's lane
+        repo, else the submitted lane's, else the workspace folder's."""
+        ws = self.manager.workspace(ws_id)
+        if ws is None:
+            return ""
+        integrator = self.manager.integrator(ws_id)
+        if integrator is not None and integrator.spec.lane:
+            return integrator.spec.lane["repo"]
+        for agent in ws.agents:
+            if agent.spec.lane and (item is None
+                                    or agent.spec.uid == item.lane_uid):
+                return agent.spec.lane["repo"]
+        return lanes.find_repo_root(ws.project_path)
+
+    @staticmethod
+    def _integrator_idle(agent) -> bool:
+        """Ready for a brief: running, at its prompt, not working, not asking
+        anything, not parked on a usage limit."""
+        return (agent.is_running() and agent.prompt_ready()
+                and not agent.is_busy() and not agent.is_waiting()
+                and not agent.is_limit_blocked())
+
+    def _toggle_integrator(self, ws_id: str, agent) -> None:
+        """The card header's Make integrator / Stop being the integrator."""
+        if self.manager.is_integrator(agent):
+            self.manager.set_integrator(ws_id, "")
+            self._store_audit(f"QUEUE-INTEGRATOR ws={ws_id} none "
+                              f"(was {agent.spec.name!r})")
+        else:
+            why = self.manager.can_integrate(agent) or (
+                "" if self.lanes_enabled()
+                else "Turn on Agent lanes in Options first.")
+            if why:
+                self._lane_message("Not the integrator", why)
+                return
+            self.manager.set_integrator(ws_id, agent.id)
+            self._store_audit(f"QUEUE-INTEGRATOR ws={ws_id} "
+                              f"agent={agent.spec.name!r}")
+            if self.event_hub is not None:
+                self.event_hub.lane_event(
+                    agent, "is now this workspace's integrator",
+                    {"integrator": agent.spec.uid})
+            self._check_gh(agent.spec.lane["repo"])
+        self._queue_changed(ws_id)
+
+    def _submit_lane(self, ws_id: str, agent) -> None:
+        """The lane chip's Submit to integrator: pin the lane's head (read on
+        the LaneOps worker, inside the lane folder), then queue it."""
+        ws = self.manager.workspace(ws_id)
+        ok, why = self._submit_state(ws, agent) if ws is not None \
+            else (False, "")
+        if not ok:
+            if why:
+                self._lane_message("Not submitted", why)
+            return
+        lane, agent_id, name = dict(agent.spec.lane), agent.id, agent.spec.name
+        self.lane_ops.submit(
+            lane["repo"], integration.lane_head, lane, label="submit",
+            callback=lambda res, err: self._on_lane_head(
+                ws_id, agent_id, name, lane, res, err))
+
+    def _on_lane_head(self, ws_id, agent_id, name, lane, result,
+                      error) -> None:
+        if error is not None or not result:
+            self._store_audit(f"QUEUE-FAIL submit agent={name!r} "
+                              f"branch={lane['branch']}: {error}")
+            self._lane_message("Not submitted",
+                               f"{name}'s lane could not be read: {error}")
+            return
+        sha, ahead = result
+        if not ahead:
+            self._lane_message("Not submitted",
+                               f"{name}'s lane has no commits of its own.")
+            return
+        if self.manager.agent(ws_id, agent_id) is None:
+            return                      # its card was closed meanwhile
+        item = self.manager.submit_to_integrator(ws_id, agent_id, sha, ahead)
+        if item is None:
+            self._lane_message("Not submitted",
+                               f"{name}'s lane could not be queued: it is "
+                               f"being integrated or merged right now, or "
+                               f"{name} is the integrator.")
+            return
+        self._store_audit(f"QUEUE-SUBMIT item={item.id} agent={name!r} "
+                          f"branch={item.branch} sha={item.short} "
+                          f"ahead={ahead}")
+        self._queue_event(ws_id, item,
+                          f"submitted its lane at {item.short} to the "
+                          f"integrator")
+        self._queue_changed(ws_id)
+
+    def _schedule_queue_tick(self) -> None:
+        QTimer.singleShot(0, self._advance_queues)
+
+    def _advance_queues(self) -> None:
+        for ws in self.manager.workspaces:
+            self._advance_queue(ws.id)
+
+    def _advance_queue(self, ws_id: str) -> None:
+        """Send the head item's brief once the integrator is idle. Nothing
+        else in the queue moves by itself: an item that needs the user
+        holds the line until the user acts."""
+        if not self.lanes_enabled() or ws_id in self._queue_jobs:
+            return
+        item = self.manager.queue_head(ws_id)
+        agent = self.manager.integrator(ws_id)
+        if (item is None or item.state != integration.QUEUED or agent is None
+                or not self._integrator_idle(agent)):
+            return
+        repo = self._queue_repo(ws_id, item)
+        if not repo:
+            return
+        self._queue_jobs.add(ws_id)
+        snapshot = dc_replace(item)     # the worker never sees the live one
+        if item.rebrief:
+            fn, args = integration.gather_rebrief, (repo, snapshot)
+        else:
+            peers = [dc_replace(i) for i in self.manager.queue(ws_id)
+                     if i.is_open and i.id != item.id]
+            fn, args = integration.gather_brief, (repo, snapshot, peers)
+        self.lane_ops.submit(
+            repo, fn, *args, label="brief", exclusive=False,
+            callback=lambda res, err, i=item.id: self._on_brief_ready(
+                ws_id, i, res, err))
+
+    def _on_brief_ready(self, ws_id, item_id, brief, error) -> None:
+        self._queue_jobs.discard(ws_id)
+        item = self.manager.queue_item(ws_id, item_id)
+        if item is None or item.state != integration.QUEUED:
+            return                      # skipped while the brief was built
+        if error is not None or not brief:
+            note = f"Could not build the brief: {error}"
+            self.manager.update_queue_item(ws_id, item_id,
+                                           state=integration.NEEDS_YOU,
+                                           note=note)
+            self._store_audit(f"QUEUE-FAIL brief item={item_id}: {error}")
+            self._queue_event(ws_id, item, note)
+            self._queue_changed(ws_id, alert=True)
+            return
+        agent = self.manager.integrator(ws_id)
+        if (not self.lanes_enabled() or agent is None
+                or not self._integrator_idle(agent)):
+            return                      # the next tick tries again
+        rebrief = item.rebrief
+        agent.deliver_task(brief, title=f"Integrating {item.agent}'s lane "
+                                        f"{item.branch}")
+        self.manager.update_queue_item(ws_id, item_id,
+                                       state=integration.INTEGRATING,
+                                       rebrief=False, note="")
+        self._store_audit(f"QUEUE-DELIVER item={item_id} "
+                          f"branch={item.branch} sha={item.short} "
+                          f"integrator={agent.spec.name!r}"
+                          + (" rebrief" if rebrief else ""))
+        self._queue_event(ws_id, item,
+                          f"lane {item.short} went to the integrator "
+                          f"{agent.spec.name}"
+                          + (" again (the base moved)" if rebrief else ""))
+        self._queue_changed(ws_id)
+
+    def _on_integrator_turn_ended(self, ws_id: str, agent_id: str) -> None:
+        """The integrator finished a turn: read the pull request of the item
+        it was working on (or one that was waiting for it to finish)."""
+        agent = self.manager.agent(ws_id, agent_id)
+        if (agent is None or not self.lanes_enabled()
+                or not self.manager.is_integrator(agent)):
+            return
+        item = self.manager.queue_head(ws_id)
+        # only an item the integrator is working on, or one still waiting
+        # for its pull request. Any other NEEDS_YOU (Approve refused it, it
+        # was merged outside, its head is untested) waits for the user's
+        # Recheck: rechecking it here re-approved what the user's own
+        # Approve had just refused, with no user in the loop.
+        if item is not None and (
+                item.state == integration.INTEGRATING
+                or (item.state == integration.NEEDS_YOU
+                    and item.reason in integration.AUTO_RECHECK_REASONS)):
+            self._recheck_item(ws_id, item.id)
+        else:
+            self._schedule_queue_tick()
+
+    def _recheck_item(self, ws_id: str, item_id: str) -> None:
+        item = self.manager.queue_item(ws_id, item_id)
+        if (item is None or not item.is_open
+                or item.state == integration.MERGING
+                or ws_id in self._queue_jobs):
+            return
+        repo = self._queue_repo(ws_id, item)
+        if not repo:
+            return
+        self._queue_jobs.add(ws_id)
+        self.lane_ops.submit(
+            repo, integration.read_outcome, repo, dc_replace(item),
+            label="pr", exclusive=False,
+            callback=lambda res, err: self._on_outcome(ws_id, item_id, res,
+                                                       err))
+
+    def _on_outcome(self, ws_id, item_id, outcome, error) -> None:
+        self._queue_jobs.discard(ws_id)
+        item = self.manager.queue_item(ws_id, item_id)
+        if (item is None or not item.is_open
+                or item.state == integration.MERGING):
+            return
+        if error is not None or outcome is None:
+            outcome = integration.Outcome(
+                integration.NEEDS_YOU,
+                f"Could not read the pull request: {error}")
+        self._apply_outcome(ws_id, item, outcome)
+
+    def _approve_item(self, ws_id: str, item_id: str) -> None:
+        """The user's Approve merge. AI Hive, never an agent, runs the
+        guarded merge (integration.approve_merge) on the LaneOps worker."""
+        item = self.manager.queue_item(ws_id, item_id)
+        if (item is None or item.state != integration.AWAITING
+                or not self.lanes_enabled() or ws_id in self._queue_jobs):
+            return
+        repo = self._queue_repo(ws_id, item)
+        if not repo:
+            return
+        snapshot = dc_replace(item)
+        self.manager.update_queue_item(ws_id, item_id,
+                                       state=integration.MERGING, note="")
+        self._store_audit(f"QUEUE-APPROVE item={item_id} "
+                          f"branch={item.branch} pr={item.pr} "
+                          f"tested={item.tested_sha[:7]}")
+        self._queue_jobs.add(ws_id)
+        self._queue_changed(ws_id)
+        self.lane_ops.submit(
+            repo, integration.approve_merge, repo, snapshot, label="merge",
+            exclusive=False,
+            callback=lambda res, err: self._on_approved(ws_id, item_id, res,
+                                                        err))
+
+    def _on_approved(self, ws_id, item_id, outcome, error) -> None:
+        self._queue_jobs.discard(ws_id)
+        item = self.manager.queue_item(ws_id, item_id)
+        if item is None or item.state != integration.MERGING:
+            return
+        if error is not None or outcome is None:
+            outcome = integration.Outcome(integration.NEEDS_YOU,
+                                          f"Not merged: {error}")
+        self._apply_outcome(ws_id, item, outcome)
+
+    def _apply_outcome(self, ws_id: str, item, outcome,
+                       manual: bool = False) -> None:
+        """Move an item to where git and gh said it is. A base that moved
+        after the test run sends it back to the integrator with the short
+        re-merge brief: the same item continues, nothing new is assigned.
+        `manual`: the user's Mark merged."""
+        state = outcome.state
+        changes = {"state": state, "note": outcome.note,
+                   "reason": outcome.reason if state == integration.NEEDS_YOU
+                   else ""}
+        if state == integration.INTEGRATING:
+            changes.update(state=integration.QUEUED, rebrief=True)
+        for key in ("pr", "pr_url", "tested_sha", "suite_sha"):
+            value = getattr(outcome, key)
+            if value:
+                changes[key] = value
+        # the integrator's every turn end re-reads a head that needs the
+        # user; saying the same thing again would chime on each one
+        news = any(getattr(item, k) != v for k, v in changes.items())
+        self.manager.update_queue_item(ws_id, item.id, **changes)
+        if not news:
+            self._queue_changed(ws_id)
+            return
+        tag = {integration.AWAITING: "QUEUE-AWAITING",
+               integration.MERGED: "QUEUE-MERGED",
+               integration.INTEGRATING: "QUEUE-BASE-MOVED"}.get(
+                   state, "QUEUE-NEEDS-YOU")
+        pr = outcome.pr or item.pr
+        suite = outcome.suite_sha or item.suite_sha
+        self._store_audit(
+            f"{tag} item={item.id} branch={item.branch} sha={item.short} "
+            f"pr={pr} tested={(outcome.tested_sha or item.tested_sha)[:7]}"
+            + (f" suite={suite[:7]}" if suite else "")
+            + (" manual=1" if manual and state == integration.MERGED else "")
+            + (f" reason={outcome.reason}" if outcome.reason else "")
+            + (f" note={outcome.note!r}" if outcome.note else ""))
+        text = {
+            integration.AWAITING: f"pull request #{pr} is waiting for your "
+                                  f"approval",
+            integration.MERGED: f"merged (pull request #{pr})",
+            integration.INTEGRATING: outcome.note,
+        }.get(state, f"needs you: {outcome.note}")
+        self._queue_event(ws_id, item, text)
+        self._queue_changed(ws_id, alert=state in (integration.AWAITING,
+                                                   integration.NEEDS_YOU))
+        if state == integration.MERGED:
+            # the base moved: every lane sees it, idle empty ones catch up
+            self.lane_service.fetch()
+
+    def _on_queue_action(self, item_id: str, action: str) -> None:
+        """A queue row's button in the Activity panel (active workspace)."""
+        ws_id = self.manager.active_id
+        item = self.manager.queue_item(ws_id, item_id)
+        if item is None:
+            return
+        if action == "open":
+            if item.pr_url:
+                fsopen.open_url(item.pr_url)
+            return
+        if not self.lanes_enabled():
+            return
+        if action == "approve":
+            self._approve_item(ws_id, item_id)
+        elif action == "recheck":
+            self._recheck_item(ws_id, item_id)
+        elif (action == "mark-merged" and item.state == integration.NEEDS_YOU
+              and item.reason == integration.REASON_MERGED_OUTSIDE):
+            self._mark_merged_item(ws_id, item_id)
+        elif action == "resend" and item.state == integration.NEEDS_YOU:
+            self.manager.update_queue_item(ws_id, item_id,
+                                           state=integration.QUEUED,
+                                           note="", reason="")
+            self._store_audit(f"QUEUE-RESEND item={item_id} "
+                              f"branch={item.branch}")
+            self._queue_changed(ws_id)
+        elif (action == "skip" and item.is_open
+              and item.state != integration.MERGING):
+            self.manager.update_queue_item(ws_id, item_id,
+                                           state=integration.SKIPPED,
+                                           note="Skipped by you.")
+            self._store_audit(f"QUEUE-SKIP item={item_id} "
+                              f"branch={item.branch}")
+            self._queue_event(ws_id, item, "was taken out of the queue")
+            self._queue_changed(ws_id)
+
+    def _mark_merged_item(self, ws_id: str, item_id: str) -> None:
+        """The user's Mark merged, for a PR merged outside Approve merge.
+        GitHub has the last word (integration.mark_merged), on LaneOps."""
+        item = self.manager.queue_item(ws_id, item_id)
+        if item is None or ws_id in self._queue_jobs:
+            return
+        repo = self._queue_repo(ws_id, item)
+        if not repo:
+            return
+        self._queue_jobs.add(ws_id)
+        self._store_audit(f"QUEUE-MARK item={item_id} branch={item.branch} "
+                          f"pr={item.pr}")
+        self.lane_ops.submit(
+            repo, integration.mark_merged, repo, dc_replace(item),
+            label="mark", exclusive=False,
+            callback=lambda res, err: self._on_marked(ws_id, item_id, res,
+                                                      err))
+
+    def _on_marked(self, ws_id, item_id, outcome, error) -> None:
+        self._queue_jobs.discard(ws_id)
+        item = self.manager.queue_item(ws_id, item_id)
+        if item is None or item.state != integration.NEEDS_YOU:
+            return
+        if error is not None or outcome is None:
+            outcome = integration.Outcome(
+                integration.NEEDS_YOU,
+                f"Could not read the pull request: {error}",
+                reason=integration.REASON_MERGED_OUTSIDE)
+        self._apply_outcome(ws_id, item, outcome, manual=True)
+
+    def _merged_item_for(self, lane: dict, head: str):
+        """The MERGED queue item that pinned exactly this lane commit, for a
+        lane a squash or rebase merge left unmerged by ancestry."""
+        if not lane or not head:
+            return None
+        for ws in self.manager.workspaces:
+            for item in self.manager.queue(ws.id):
+                if (item.state == integration.MERGED and item.pr
+                        and item.branch == lane.get("branch")
+                        and item.sha == head):
+                    return item
+        return None
+
+    def _remove_merged_lane(self, lane: dict, item, name: str,
+                            pids=()) -> None:
+        """The user's "Remove lane (merged as #N)": checked with GitHub and
+        removed on LaneOps (integration.remove_merged_lane)."""
+        repo = lane["repo"]
+        self.lane_ops.submit(
+            repo, integration.remove_merged_lane, repo, dict(lane),
+            dc_replace(item), tuple(pids), label="remove-merged",
+            callback=lambda res, err: self._on_merged_lane_removed(
+                lane, item, name, res, err))
+
+    def _on_merged_lane_removed(self, lane, item, name, result,
+                                error) -> None:
+        where = (f"agent={name!r} root={lane['root']} "
+                 f"branch={lane['branch']} merged_as=#{item.pr}")
+        if error is not None or result is None:
+            self._store_audit(f"LANE-FAIL {getattr(error, 'code', 'error')} "
+                              f"remove-merged {where}: {error}")
+            self._lane_message("Lane not removed",
+                               f"{name}'s lane was not removed: {error}\n\n"
+                               f"{lane['root']}")
+            return
+        ignored = f" ignored={len(result.ignored)}" if result.ignored else ""
+        self._store_audit(f"LANE-REMOVE {where}{ignored}")
+
+    def _queue_event(self, ws_id: str, item, text: str) -> None:
+        """An event-log row for the submitted lane's agent (the integrator
+        when that agent's card is gone)."""
+        if self.event_hub is None:
+            return
+        ws = self.manager.workspace(ws_id)
+        agent = next((a for a in (ws.agents if ws is not None else [])
+                      if a.spec.uid == item.lane_uid), None)
+        if agent is None:
+            agent = self.manager.integrator(ws_id)
+            text = f"{item.agent}'s lane {item.branch}: {text}"
+        if agent is not None:
+            self.event_hub.lane_event(agent, text, {
+                "item": item.id, "branch": item.branch, "sha": item.sha,
+                "state": item.state, "pr": item.pr})
+
+    def _queue_changed(self, ws_id: str, alert: bool = False) -> None:
+        """The queue or the integrator changed: repaint, ring the "?" chime
+        when the user is now needed, and give the queue a chance to move."""
+        self._refresh_queue_ui(ws_id)
+        if alert and self._sound_enabled:
+            self._play_chime(chime.QUESTION)
+        self._schedule_queue_tick()
+
+    def _refresh_queue_ui(self, ws_id: str = "") -> None:
+        for wid, page in self._pages.items():
+            if ws_id and wid != ws_id:
+                continue
+            for card in page.cards:
+                card.refresh_lane()
+        self._push_queue_panel()
+
+    def _push_queue_panel(self) -> None:
+        if not self.activity_panel.is_open():
+            return
+        ws = self.manager.workspace(self.manager.active_id)
+        self.activity_panel.set_integration(
+            self._queue_panel_state(ws) if ws is not None else None)
+
+    def _queue_panel_state(self, ws) -> dict:
+        integrator = self.manager.integrator(ws.id)
+        items = self.manager.queue(ws.id)
+        since = {}
+        for item in items:
+            view = self.lane_service.view(item.lane_uid)
+            if view is not None and item.is_open:
+                since[item.id] = max(0, view.ahead - item.submit_ahead)
+        reason = ""
+        if integrator is not None and self.lanes_enabled():
+            ok, why = self._gh_state(integrator.spec.lane["repo"])
+            reason = "" if ok else why
+        return {"paused": not self.lanes_enabled(),
+                "integrator": integrator.spec.name if integrator else "",
+                "laned": any(a.spec.lane for a in ws.agents),
+                "items": items, "since": since, "reason": reason}
+
+    def _refresh_idle_lanes(self, ws_id: str, views: dict) -> None:
+        """Keep idle lanes fresh (spec Phase 3): a lane with nothing of its
+        own (clean, no commits) whose agent is not working is fast-forwarded
+        once its base moves. Only --ff-only, through lane_ops, so nothing can
+        be lost; the agent hears about it on its next prompt. A lane with
+        commits of its own is never touched, only told (Phase 2 notices)."""
+        if not self.lanes_enabled():
+            return
+        ws = self.manager.workspace(ws_id)
+        for agent in (ws.agents if ws is not None else []):
+            uid = agent.spec.uid
+            view = views.get(uid) if agent.spec.lane else None
+            if (view is None or not view.can_refresh()
+                    or uid in self._auto_refreshing
+                    or uid in self._lane_pending
+                    or agent.is_busy() or agent.is_waiting()):
+                continue
+            self._auto_refreshing.add(uid)
+            lane = dict(agent.spec.lane)
+            self.lane_ops.submit(
+                lane["repo"], lanes.refresh_lane, lane, label="auto-refresh",
+                callback=lambda res, err, u=uid, n=agent.spec.name, ln=lane:
+                self._on_lane_auto_refreshed(ws_id, u, n, ln, res, err))
+
+    def _on_lane_auto_refreshed(self, ws_id, uid, name, lane, result,
+                                error) -> None:
+        self._auto_refreshing.discard(uid)
+        where = f"agent={name!r} root={lane['root']} branch={lane['branch']}"
+        if error is not None:
+            # it gained work of its own since the poll: then it stays put
+            if getattr(error, "code", "") not in ("dirty", "unmerged"):
+                self._store_audit(f"LANE-FAIL {getattr(error, 'code', 'error')}"
+                                  f" auto-refresh {where}: {error}")
+            return
+        if not result:
+            return
+        self._store_audit(f"LANE-REFRESH auto {where} to={result}")
+        ws = self.manager.workspace(ws_id)
+        if ws is not None and ws.board is not None:
+            try:
+                session_hook.append_notice(
+                    lane_svc.notices_path(ws, uid), f"refresh|{time.time():.3f}",
+                    f"AI Hive fast-forwarded your lane to {result}, because it "
+                    f"had no work of its own and {result} moved on. Files in "
+                    f"your lane may have changed since you read them; read a "
+                    f"file again before you edit it.")
+            except OSError:
+                pass
+        self.lane_service.poke()
+
     def _show_lane_kept(self, name: str, lane: dict, status,
                         reason: str) -> None:
         """Non-blocking notice that a closed agent's lane was kept, because
@@ -4196,6 +4857,16 @@ class MainWindow(QMainWindow):
         keep = box.addButton("Keep", QMessageBox.ButtonRole.AcceptRole)
         open_btn = box.addButton("Open folder",
                                  QMessageBox.ButtonRole.ActionRole)
+        # squash- or rebase-merged through the queue: ancestry says unmerged,
+        # GitHub says merged. Removing it is the user's call, never automatic.
+        merged = self._merged_item_for(
+            lane, status.head if status is not None else "")
+        if merged is not None and not status.dirty and not status.local:
+            remove_btn = box.addButton(f"Remove lane (merged as #{merged.pr})",
+                                       QMessageBox.ButtonRole.ActionRole)
+            remove_btn.clicked.connect(
+                lambda _=False, it=merged: self._remove_merged_lane(
+                    lane, it, name))
         box.setDefaultButton(keep)
         box.setModal(False)
         open_btn.clicked.connect(
@@ -4577,6 +5248,7 @@ class MainWindow(QMainWindow):
         page.fileActivated.connect(self._reveal_file_in_tree)
         page.reorderCommitted.connect(self.manager.reorder_agents)
         page.laneActionRequested.connect(self._on_lane_action)
+        page.integration_info = self._integration_info
         self._pages[ws.id] = page
         self.stack.addWidget(page)
         # a page added while another one is current is added HIDDEN, and Qt
@@ -4617,6 +5289,7 @@ class MainWindow(QMainWindow):
         if self.activity_panel.is_open() and ws is not None:
             self.activity_panel.set_lanes(self.lane_service.views(ws.id))
             self.activity_panel.set_workspace(ws)
+            self._push_queue_panel()
         # the agent/file map (if open) tracks the active workspace too
         if (self._map_window is not None and self._map_window.isVisible()
                 and ws is not None):
@@ -4643,6 +5316,7 @@ class MainWindow(QMainWindow):
             self.activity_panel.set_lanes(self.lane_service.views(ws.id))
             self.activity_panel.set_workspace(ws)
             self.activity_panel.reveal()
+            self._push_queue_panel()
             self._activity_timer.start()
         self._sync_activity_buttons()
 
@@ -4740,6 +5414,9 @@ class MainWindow(QMainWindow):
             ws = self.manager.workspace(ws_id)
             if ws is not None:
                 self.activity_panel.refresh(ws, with_git=False)
+                # every persisted queue change goes through _touch, which
+                # recomputes stats: this is the edge that always covers it
+                self._push_queue_panel()
 
     def _refresh_activity(self) -> None:
         if not self.activity_panel.is_open():

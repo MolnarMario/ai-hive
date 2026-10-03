@@ -1,12 +1,14 @@
 # Agent Lanes v2: a private worktree per agent, plus an approved merge queue
 
-Status: needs-triage
+Status: superseded by spec-v3.md (2026-10-03). Kept as history: its
+`## Comments` hold the implementation notes of Phases 0 to 3.
 
 Author: Agent 47, 2026-10-02. Supersedes `spec.md` (v1), which is kept for
 history. v2 folds in the first review (see "Changes from v1" at the bottom).
 Code so far: Phase 0 in PR #35 (`feat/board-rotation`); the master switch and
-Phase 1 in PR #36 (`feat/agent-lanes`); Phase 2 (except other providers) on
-`feat/lane-awareness`, stacked on Phase 1, uncommitted. Phases 3 and 4 are
+Phase 1 in PR #36 (`feat/agent-lanes`); Phase 2 (except other providers) in
+PR #37 (`feat/lane-awareness`), stacked on Phase 1; the pre-Phase-3 delivery
+fix and Phase 3 on `feat/integration-queue`, stacked on Phase 2. Phase 4 is
 still a plan. Implementation notes and Step 0 results are under `## Comments`
 at the bottom.
 
@@ -941,3 +943,127 @@ fails a check.
   text)`. It arrives with the agent's next prompt, once.
 - Every new lane git mutation: through `lane_ops`, exclusive unless it never
   touches a lane folder.
+
+### Pre-Phase-3 delivery fix and Phase 3 implemented (Agent 49, 2026-10-03)
+
+**Where:** worktree `..\ai-hive-lanes3`, branch `feat/integration-queue`, cut
+from `feat/lane-awareness`@f7ea8e8 (PR #37). Two commits: the delivery fix
+(0.26.1), then Phase 3 (0.27.0). Merge order: #36, #37, then this one.
+
+**The lost first task: the finding was right, the suspected cause was not.**
+Readiness is fine: the footer the ready hint matches is real and the text was
+typed into a live box. What breaks is the Enter. In a fresh git folder,
+Claude's event loop stalls right after its first frame (measured 570 ms,
+CLI 2.1.288), so the task text and the Enter sent 350 ms later sit unread and
+reach Claude as ONE stdin chunk, and a CR inside a chunk counts as part of a
+paste. The task lands in the box with an extra newline and is never
+submitted. Agent 47's driver reproduced it 6 of 6 times. A plain repro with
+default or acceptEdits permissions passed 6 of 6, so what triggers the stall
+varies with setup; the fix does not depend on it. `_write_task_to_pty` now
+sends the Enter for Claude once Claude has drawn the typed text (or its
+`[Pasted text` placeholder) in output that arrived after the typing, never
+sooner than 350 ms, with a 5 s fallback that is the old behavior. Other TUIs
+keep the plain beat. The same driver then delivered 6 of 6, the Enter going
+530 to 690 ms after the text. CLAUDE.md's 350 ms invariant says this now.
+Test: `test_task_submit_waits_for_echo` (tests/smoke/window.py), which fails
+with the gate removed.
+
+**Step 0 check 4, again:** gh 2.89.0 has `pr merge --match-head-commit`, and
+`gh pr view <branch|number> --json number,state,headRefOid,url` gives what the
+queue reads.
+
+**What exists now (names Phase 4 can rely on):**
+- `app/integration.py` (Qt-free): `QueueItem` (`to_dict`/`from_dict`,
+  validated), states `QUEUED .. SKIPPED`, `OPEN_STATES`, `head`, `prune`,
+  `restored`, `integrate_branch`; `GH_RUNNER`/`gh`, `gh_ready`, `pr_view`;
+  `checklist_for` (the BASE branch's `docs/agents/integration.md`: its
+  `## Checklist` section and `Test command:` line), `gather_brief`,
+  `gather_rebrief`, `integration_brief`, `base_moved_brief`; `read_outcome`,
+  `approve_merge` -> `Outcome`; `lane_head`.
+- `Workspace.integrator_uid`, `integration_queue`, `base_branch`, persisted
+  as `integrator`, `integration_queue`, `base_branch` per workspace.
+  `SESSION_VERSION` 6, `INTEGRATION_SESSION_VERSION`; a v5 file loads with
+  no queue. `_queue_safe` audits and drops one bad row (`SAVE-DEGRADE queue
+  item`).
+- `WorkspaceManager`: `integrator`, `is_integrator`, `can_integrate`,
+  `set_integrator`, `queue`, `queue_item`, `queue_head`, `open_item_for`,
+  `submit_to_integrator`, `update_queue_item`.
+  `coordination.system_prompt_text(..., integrator=)` adds the integrator
+  section. `TerminalAgent.deliver_task(text, title=)`.
+- `MainWindow`: `_integration_info` (the cards' menus), `_submit_lane`,
+  `_toggle_integrator`, `_advance_queues` (on `_queue_timer`, 5 s, and after
+  every change), `_on_integrator_turn_ended`, `_recheck_item`,
+  `_approve_item`, `_apply_outcome`, `_on_queue_action`, `_gh_state`,
+  `_refresh_idle_lanes`. `ActivityPanel.set_integration` / `queueAction`,
+  `QueueRow`. `TerminalCard.integration_info` (set by `WorkspacePage`).
+- Audit lines: `QUEUE-INTEGRATOR`, `QUEUE-SUBMIT`, `QUEUE-DELIVER`,
+  `QUEUE-AWAITING`, `QUEUE-NEEDS-YOU`, `QUEUE-APPROVE`, `QUEUE-BASE-MOVED`,
+  `QUEUE-MERGED`, `QUEUE-RESEND`, `QUEUE-SKIP`, `QUEUE-FAIL`, `QUEUE-GH`;
+  `LANE-REFRESH auto`.
+
+**Choices the plan did not spell out, or that differ from it:**
+- **Strictly one item at a time.** The head is the first open item, and only
+  a QUEUED head is delivered: an item awaiting approval or needing the user
+  holds the line. That is what the manual check describes (the second lane
+  is integrated against the new main), and it means no PR is ever built on a
+  base that is about to move.
+- **"Base moved" goes through QUEUED with `rebrief`**, not straight to
+  INTEGRATING: the short brief is sent when the integrator is idle, then the
+  item is INTEGRATING. Same item, same PR, nothing new assigned.
+- **Turn end reads the PR for INTEGRATING and NEEDS_YOU heads.** An
+  integrator often ends a turn early (a question, a permission) and finishes
+  later; its next turn end picks the PR up without a click. It can only ever
+  reach awaiting-approval that way.
+- **Recheck takes the PR's current head as the tested commit.** It is the
+  user's explicit call (typically after the integrator reran the suite), and
+  Approve still refuses a head that moves after that and a base that moved.
+- **One open item per lane.** Submitting again re-pins a QUEUED or
+  NEEDS_YOU item in place; while it is integrating, awaiting approval or
+  merging, a resubmit is refused.
+- **The integrator needs its own lane and must be Claude.** Closing its card
+  or moving the role orphans an INTEGRATING item to NEEDS_YOU (the old
+  integrator may have pushed a branch already); nothing is redelivered
+  silently. A MERGING item restored after a restart is NEEDS_YOU (Recheck).
+- **gh readiness** is `gh repo view` (installed, logged in, GitHub remote, in
+  one call) on the LaneOps worker, cached 10 minutes, and asked only once a
+  workspace has an integrator, so lanes without the queue never run gh.
+- **Merge method `--merge`**, so a lane's commits stay ancestors of the base
+  and its empty lane can fast-forward and be cleaned up. A squash or rebase
+  merge done elsewhere is still detected (the state, not ancestry).
+- **Keeping idle lanes fresh** is automatic for a lane that is clean, has no
+  commits of its own and is behind, while its agent is neither busy nor
+  waiting and the lane is not being created or repaired. It runs on each poll
+  that shows it, through `lane_ops` (`--ff-only`), and the agent gets a lane
+  notice. A busy agent's lane is left alone (tested).
+- **Brief delivery uses `deliver_task(..., title=)`** so the sidebar and the
+  board roster show "Integrating <agent>'s lane <branch>" instead of the
+  30-line brief.
+- **Paused means paused:** with the switch off nothing is delivered, read or
+  merged, and the panel's buttons (except Open PR) are disabled. Items are
+  kept.
+
+**Tests** (`tests/smoke/lanes.py`): `test_integration_core` (real temp repos,
+`_FakeGh`) and `test_integration_queue_window` (real window, real lanes,
+stubbed workers, fake gh). Mutation-checked: removing the head-changed guard,
+the base-moved guard, the pinned-commit check, "merged only on GitHub's
+word", the idle check, the paused check, the resubmit refusal or the orphan
+rule each fails a check. `test_lane_service_window` gained the busy-lane and
+automatic-refresh checks.
+
+**Live check, run end to end (Claude Code 2.1.288, haiku, a scratch repo
+with a local origin, a fake gh whose "PR" for integrate/<x> is that local
+branch):** a real integrator in a fresh lane got the brief from the queue
+timer 2 s after Submit, followed the scratch checklist (`git switch -c`,
+`git merge`, the test command) and ended its turn. The Stop hook's turn end
+made AI Hive read the PR: awaiting approval, tested head recorded. Approve
+merge then ran exactly `gh pr merge 100 --merge --match-head-commit <tested
+sha>` and the item went to merged, 27 s from launch in all. Two things
+learned: on Windows the integrator runs git through Claude's PowerShell tool,
+so a permission allowance for it must name `PowerShell(git:*)` as well as
+`Bash(git:*)` (otherwise it waits on a prompt, which is the "?" the user
+answers); and Claude Code keeps auto-memory per MAIN checkout, so every lane
+of a repo shares the main checkout's memory folder.
+
+**Not done:** Phase 2's other providers (Codex, Gemini, Grok still run
+without lanes), Phase 4 (auto-merge), and the manual check against a real
+GitHub PR (it would open and merge a pull request in a real repository).

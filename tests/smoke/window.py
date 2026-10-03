@@ -1849,12 +1849,14 @@ def test_review_hardening_fixes():
     a4.worker = w
     a4._prompt_ready = True
     a4._write_task_to_pty("hello")   # schedules the delayed Enter
+    a4._on_pty_output("", "hello")   # Claude draws it in the box
     pump(500)
     check("harden: the task-submit Enter fires in the normal case",
           "\r" in writes)
     writes.clear()
     a4._prompt_ready = True
     a4._write_task_to_pty("world")   # schedule again...
+    a4._on_pty_output("", "world")
     a4.restart()                      # ...then restart inside the 350 ms window
     pump(500)
     check("harden: a restart in the submit window suppresses the stray Enter",
@@ -1876,6 +1878,125 @@ def test_review_hardening_fixes():
     check("harden: scrolled-back offset tracks pushes even after saturation",
           grown >= 1 and v5._scroll_offset == 40 + grown,
           (grown, v5._scroll_offset))
+
+
+def test_task_submit_waits_for_echo():
+    """A task delivered at launch in a fresh git folder was typed but never
+    submitted (agent lanes, Phase 2 finding). Claude stalled ~570 ms after its
+    first frame, so the text and the Enter sent 350 ms later reached it as one
+    chunk, and a CR inside a chunk is part of a paste. The Enter now waits
+    until Claude has drawn the text, never sooner than TASK_SUBMIT_MS, with
+    TASK_ECHO_TIMEOUT_MS as the fallback. Reproduced live 6/6 before the fix,
+    0/6 after."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import terminal_agent as ta
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def agent(kind=AgentKind.CLAUDE):
+        writes = []
+        a = TerminalAgent(build_spec(kind, "Echo", cwd=SCRATCH_CWD, pty=True))
+        a.worker = type("W", (), {
+            "write": lambda s, d: (writes.append(d), True)[1],
+            "is_running": lambda s: True, "start": lambda s: None,
+            "restart": lambda s: None, "dispose": lambda s: None,
+            "send_line": lambda s, t: True})()
+        a._prompt_ready = True
+        return a, writes
+
+    task = "Use the Write tool to create a file named out.txt"
+    # what the classic renderer actually sent in the live run: cursor moves
+    # stand in for the spaces, so only a despaced match finds it
+    drawn = ("\x1b[?25l\x1b[2D\x1b[3B\r\x1b[2C\x1b[3AUse the Write tool to "
+             "create\x1b[32Ga\x1b[34Gfile\x1b[39Gnamed\x1b[45Gout.txt")
+
+    floor = ta.TASK_SUBMIT_MS + 150   # past the floor, well short of the fallback
+
+    a, writes = agent()
+    a.deliver_task(task)
+    check("submit-echo: the text is typed at once", writes == [task], writes)
+    pump(floor)
+    check("submit-echo: no Enter while Claude has not drawn the text (the "
+          "stalled-event-loop case)", "\r" not in writes, writes)
+    a._on_pty_output("", drawn)
+    check("submit-echo: the Enter follows the echo at once past the floor",
+          writes[-1:] == ["\r"], writes)
+    check("submit-echo: ...and opens a turn like any submit", a._turn_open)
+    pump(ta.TASK_SUBMIT_MS)
+    check("submit-echo: exactly one Enter", writes.count("\r") == 1, writes)
+
+    a, writes = agent()
+    a.deliver_task(task)
+    a._on_pty_output("", drawn)
+    pump(100)
+    check("submit-echo: an early echo still waits for the floor",
+          "\r" not in writes, writes)
+    pump(floor)
+    check("submit-echo: ...then the Enter goes", writes.count("\r") == 1,
+          writes)
+
+    a, writes = agent()
+    a._on_pty_output("", "Use the Write tool to create a file named out.txt")
+    a.deliver_task(task)
+    pump(floor)
+    check("submit-echo: the same words on screen BEFORE the typing don't "
+          "count", "\r" not in writes, writes)
+    a._on_pty_output("", "\x1b[2K")
+    check("submit-echo: ...nor does unrelated output after it",
+          "\r" not in writes, writes)
+
+    a, writes = agent()
+    a.deliver_task("line one of a plan\nline two\nline three")
+    check("submit-echo: a multi-line task is one bracketed paste",
+          writes and writes[0].startswith(ta.PASTE_ON), writes)
+    pump(floor)
+    a._on_pty_output("", "\x1b[3A\x1b[2C[Pasted\x1b[11Gtext\x1b[16G#1 +2 lines]")
+    check("submit-echo: Claude's collapsed-paste placeholder counts as the "
+          "echo", writes[-1:] == ["\r"], writes)
+
+    saved = ta.TASK_ECHO_TIMEOUT_MS
+    ta.TASK_ECHO_TIMEOUT_MS = 600
+    try:
+        a, writes = agent()
+        a.deliver_task(task)
+        pump(800)
+        check("submit-echo: with no echo at all the Enter still goes after "
+              "the fallback (the old behavior, never worse)",
+              writes.count("\r") == 1, writes)
+        a._on_pty_output("", drawn)
+        pump(floor)
+        check("submit-echo: ...and a late echo adds no second Enter",
+              writes.count("\r") == 1, writes)
+
+        a, writes = agent()
+        a.deliver_task(task)
+        a.restart()
+        a._on_pty_output("", drawn)
+        pump(800)
+        check("submit-echo: a restart drops the pending Enter, echo or "
+              "fallback", "\r" not in writes, writes)
+    finally:
+        ta.TASK_ECHO_TIMEOUT_MS = saved
+
+    a, writes = agent()
+    a.nudge("Continue")
+    a.nudge("Continue")
+    a._on_pty_output("", "\x1b[3A\x1b[2CContinueContinue")
+    pump(floor)
+    check("submit-echo: two deliveries in one window each get their Enter",
+          writes.count("\r") == 2, writes)
+
+    a, writes = agent(AgentKind.POWERSHELL)
+    a.deliver_task("Get-ChildItem")
+    pump(floor)
+    check("submit-echo: other TUIs keep the plain fixed beat",
+          writes[-1:] == ["\r"], writes)
 
 
 def test_scheduled_send():

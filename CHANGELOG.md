@@ -8,6 +8,36 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.27.0
+
+- Agent lanes get an integration queue. Right-click a laned Claude agent's
+  header and pick Make integrator, then choose Submit to integrator on
+  another lane's chip. One lane at a time, AI Hive sends the integrator a
+  short brief: it merges the newest base branch into that lane's work, bumps
+  the version, runs the tests on exactly that commit and opens a pull request
+  that names it. It never merges.
+- The Activity panel's new Integration section lists every submitted lane.
+  Approve merge there is the only way a pull request gets merged, and AI Hive
+  does it itself: it refuses if the pull request changed since it was tested
+  or the base branch can't be confirmed with GitHub, and sends it back to the
+  integrator if the base branch moved since then. Anything unexpected waits
+  for you with the reason and the "?" chime, and is never approved again by
+  itself.
+- A pull request merged on GitHub instead of with Approve merge waits for you:
+  Mark merged checks with GitHub, then moves the queue on. A lane whose work
+  was squash-merged can be removed from its "lane kept" notice.
+- A lane with no work of its own now catches up with the base branch by
+  itself while its agent is idle, and the agent is told.
+- The integration queue needs a GitHub remote and a logged-in GitHub CLI
+  (gh). It pauses while Agent lanes is off and survives a restart.
+
+## 0.26.1
+
+- A task given to a Claude agent as it starts is now always submitted. In a
+  fresh git folder (every new agent lane is one) Claude could take the task's
+  text and its Enter as one paste, so the task sat typed in the input box and
+  never ran. AI Hive now presses Enter only once Claude shows the text.
+
 ## 0.26.0
 
 - Agent lanes now keep agents aware of each other without reading the whole
