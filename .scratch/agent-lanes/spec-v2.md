@@ -1,6 +1,7 @@
 # Agent Lanes v2: a private worktree per agent, plus an approved merge queue
 
-Status: needs-triage
+Status: superseded by spec-v3.md (2026-10-03). Kept as history: its
+`## Comments` hold the implementation notes of Phases 0 to 3.
 
 Author: Agent 47, 2026-10-02. Supersedes `spec.md` (v1), which is kept for
 history. v2 folds in the first review (see "Changes from v1" at the bottom).

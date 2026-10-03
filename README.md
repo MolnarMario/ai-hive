@@ -454,15 +454,25 @@ workspaces keep executing — switching never pauses anything.
   its log and files, a merge check against the base and the other queued
   lanes, the test command and the checklist from the base branch's
   `docs/agents/integration.md`). The integrator merges the base into
-  `integrate/<lane>`, runs the suite, bumps the version and opens a pull
-  request, and never merges it. When its turn ends AI Hive reads the PR, and
-  the Activity panel's **Integration** section shows **Approve merge**. Only
-  that click merges, and AI Hive runs the merge itself: it refuses when the PR
-  changed since it was tested, sends it back to the integrator when the base
-  moved since then, and merges with `gh pr merge --match-head-commit`. Then
-  the next lane goes. Anything unexpected waits for you (Recheck, Resend
-  brief, Skip) with the "?" chime; nothing is skipped by itself. Every step is
-  a `QUEUE-*` line in `session.log`, and the queue survives a restart.
+  `integrate/<lane>-<item>` (one branch per submitted item), bumps the
+  version, commits, runs the suite on that commit and opens a pull request
+  whose body names it (`Tested-commit:`), and never merges it. When its turn
+  ends AI Hive reads the PR: it waits for your approval only when the PR comes
+  from that branch into the base, holds the submitted commit, and its head is
+  the tested commit (plus README.md at most). The Activity panel's
+  **Integration** section then shows **Approve merge**. Only that click
+  merges, and AI Hive runs the merge itself: it refuses when the PR changed
+  since it was tested or the base can't be confirmed with GitHub, sends it
+  back to the integrator when the base moved since then, and merges with
+  `gh pr merge --match-head-commit`. Then the next lane goes. A PR merged on
+  github.com instead waits for your **Mark merged**, which checks with GitHub
+  first. Anything unexpected waits for you (Recheck, Resend brief, Skip) with
+  the "?" chime and the reason; nothing is skipped or re-approved by itself.
+  A lane whose work was squash-merged gets **Remove lane (merged as #N)**.
+  Every step is a `QUEUE-*` line in `session.log`, and the queue survives a
+  restart. The integrator needs `Bash(git:*)` and `PowerShell(git:*)` allowed,
+  and every lane of a repository shares the main checkout's Claude
+  auto-memory.
 - **Per-workspace agent numbering** — each workspace counts Agent 1, 2, 3…
   independently.
 - **Agent/File Map** — a **◆ Map** button in the workspace header opens a

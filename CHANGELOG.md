@@ -13,13 +13,19 @@ em dashes: this text is shown in the app.
 - Agent lanes get an integration queue. Right-click a laned Claude agent's
   header and pick Make integrator, then choose Submit to integrator on
   another lane's chip. One lane at a time, AI Hive sends the integrator a
-  short brief: it merges the newest base branch into that lane's work, runs
-  the tests, bumps the version and opens a pull request. It never merges.
+  short brief: it merges the newest base branch into that lane's work, bumps
+  the version, runs the tests on exactly that commit and opens a pull request
+  that names it. It never merges.
 - The Activity panel's new Integration section lists every submitted lane.
   Approve merge there is the only way a pull request gets merged, and AI Hive
-  does it itself: it refuses if the pull request changed since it was
-  tested, and sends it back to the integrator if the base branch moved since
-  then. Anything unexpected waits for you, with the "?" chime.
+  does it itself: it refuses if the pull request changed since it was tested
+  or the base branch can't be confirmed with GitHub, and sends it back to the
+  integrator if the base branch moved since then. Anything unexpected waits
+  for you with the reason and the "?" chime, and is never approved again by
+  itself.
+- A pull request merged on GitHub instead of with Approve merge waits for you:
+  Mark merged checks with GitHub, then moves the queue on. A lane whose work
+  was squash-merged can be removed from its "lane kept" notice.
 - A lane with no work of its own now catches up with the base branch by
   itself while its agent is idle, and the agent is told.
 - The integration queue needs a GitHub remote and a logged-in GitHub CLI
