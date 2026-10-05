@@ -55,8 +55,15 @@ This file holds only the rules that protect user data or fail silently.
   deleted only by `update-ref -d` with the head `remove_lane` verified. A
   laned agent's cwd never leaves its lane: a missing folder is repaired in
   place, never swapped for the workspace folder. Every lane git mutation goes
-  through `MainWindow.lane_ops` (one queue per repo), and only
-  `lanes_enabled()` gates creating one. A lane operation in flight owns its
+  through `MainWindow.lane_ops` (one queue per repo). A lane is created
+  only by the user's tick in the New Agent dialog or the card's Restart in
+  own lane; `lane_default(ws)` (the Options switch or the workspace toggle)
+  only sets where the tick starts. The lane machinery (service, hooks,
+  queue) follows the lanes, never a toggle (`_sync_lane_service`), so no
+  toggle may silence or pause an existing lane. Restart in own lane holds
+  the start, waits for the worker to end, and clears `session_id` BEFORE
+  `set_agent_lane`: otherwise a crash in between resumes the main-folder
+  conversation inside the lane. A lane operation in flight owns its
   lane: if the card closes meanwhile, the operation's callback retires the
   lane, never the close. Lane reads off the queue (`app/lane_service.py`)
   hold `lane_ops.lock_for(repo)` around each lane: Windows won't delete a

@@ -963,6 +963,13 @@ QScrollArea {{ background: transparent; border: none; }}
 }}
 #HeaderFolderIcon {{ color: {p.TEXT_DIM}; font-size: 13px; }}
 #HeaderPath {{ color: {p.TEXT_DIM}; font-size: 12px; }}
+#HeaderLanesLabel {{ color: {p.TEXT}; font-size: 12px; }}
+#HeaderLanesLabel[forced="true"] {{ color: {p.TEXT_DIM}; }}
+#HeaderLanesHelp {{
+    background: transparent; border: 1px solid {p.BORDER};
+    border-radius: 8px; padding: 0 5px; color: {p.TEXT_DIM}; font-size: 11px;
+}}
+#HeaderLanesHelp:hover {{ border-color: {p.ACCENT_BLUE}; color: {p.TEXT}; }}
 #RepoOpenButton, #RepoActivityMenuButton {{
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
     border-radius: 0; padding: 3px 8px; color: {p.TEXT};

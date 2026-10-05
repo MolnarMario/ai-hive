@@ -146,8 +146,9 @@ def find_repo_root(path: str) -> str:
 
     Found by walking up to the first folder holding a `.git` entry (a folder
     in a main checkout, a file in a worktree or submodule), WITHOUT running
-    git. The New Agent dialog asks this to decide whether to offer a lane,
-    and with the master switch off AI Hive must run no git command at all."""
+    git. The New Agent dialog and the workspace header ask this to decide
+    whether to offer a lane, and with no lane anywhere AI Hive must start no
+    git process at all."""
     try:
         cur = os.path.abspath(path)
     except (TypeError, ValueError):

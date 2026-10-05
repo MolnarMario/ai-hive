@@ -92,6 +92,12 @@ everyone on one index. Worktrees separate the agents physically.
 
 ## Master switch
 
+**Replaced by `spec-v4-lane-scopes.md`.** The switch became "Lanes in every
+workspace", each workspace got its own toggle, and both only set the New
+Agent dialog's starting tick. The lane machinery now follows the lanes
+themselves, so no switch pauses the queue or silences a lane. What follows
+is history.
+
 - A row in Options > Agents: "⎇  Agent lanes", a `ToggleSwitch` with a
   tooltip saying what ON and OFF mean, ending "Lane warnings stop at once;
   existing lanes stay." OFF by default.

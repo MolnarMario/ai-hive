@@ -1,0 +1,72 @@
+"""The "What are lanes?" explainer (.scratch/agent-lanes/spec-v4-lane-
+scopes.md, Phase B).
+
+Lanes, the integrator and the queue map one to one onto how a developer
+worked before AI agents: a branch per person, merge main in, run the
+tests, open a pull request, someone approves the merge. The explainer says
+that in one table, because nothing else in the app does. Opened from the
+workspace header's ⎇ Lanes toggle and from the New Agent dialog.
+"""
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QMessageBox
+
+TITLE = "What are lanes?"
+
+_ROWS = (
+    ("Lane",
+     "A feature branch in its own folder (git worktree), beside the repo "
+     "in <i>repo</i>.lanes. Its agent can't overwrite or reset anyone "
+     "else's work."),
+    ("Lane chip ⎇ ↑2 ±3",
+     "A glance at git status: 2 commits of its own, 3 uncommitted files. "
+     "Amber or red means another lane, or main, changed the same files."),
+    ("Lane notices",
+     "A colleague saying \"I changed that file an hour ago\". AI Hive "
+     "reads every lane every 15 seconds and runs a real merge in memory, "
+     "so the agent hears about a conflict before anyone merges."),
+    ("Integrator",
+     "The teammate who owns the merge: an agent you pick with Make "
+     "integrator. It merges current main into a finished lane, fixes "
+     "conflicts, bumps the version, runs the full test suite and opens "
+     "the pull request."),
+    ("Integration queue",
+     "The order pull requests land in, one at a time, so each one is "
+     "tested on top of the main it will land on."),
+    ("Approve merge",
+     "Pressing Merge on GitHub. AI Hive merges only the exact commit the "
+     "integrator tested."),
+)
+
+
+def explainer_html() -> str:
+    rows = "".join(
+        f"<tr><td style='padding:3px 10px 3px 0'><b>{term}</b></td>"
+        f"<td style='padding:3px 0'>{what}</td></tr>"
+        for term, what in _ROWS)
+    return (
+        "<p>A lane is how a developer worked before AI: a branch per "
+        "person, merge main in, run the tests, open a pull request, "
+        "someone approves the merge. AI Hive does the same for agents.</p>"
+        f"<table>{rows}</table>"
+        "<p>Working with one agent at a time, or agents in different "
+        "repositories? A lane is then just a branch, and you can open the "
+        "pull request from it yourself.</p>"
+        "<p>The ⎇ Lanes toggles only decide whether a new agent starts with "
+        "its own lane. An agent keeps its lane until you close its card, "
+        "which removes the lane when it holds nothing unmerged.</p>")
+
+
+def show_lanes_explainer(parent=None) -> QMessageBox:
+    """Open the explainer without blocking (like the lane notices) and
+    return it. It deletes itself when closed."""
+    box = QMessageBox(QMessageBox.Icon.Information, TITLE, "", parent=parent)
+    box.setTextFormat(Qt.TextFormat.RichText)
+    box.setText(explainer_html())
+    # QMessageBox wraps at a narrow default; the table needs the room
+    box.setStyleSheet("QLabel#qt_msgbox_label { min-width: 560px; }")
+    box.setModal(False)
+    box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+    box.setObjectName("LanesExplainer")
+    box.show()
+    return box

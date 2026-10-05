@@ -415,6 +415,7 @@ class TerminalCard(QFrame):
     scheduleRequested = Signal(str, str)  # agent id, text to prefill (may be "")
     # the lane chip's and the header menu's lane actions: agent id, "open" |
     # "refresh" (app/lanes.py) | "submit" | "integrator" (app/integration.py)
+    # | "adopt" (Restart in own lane)
     laneActionRequested = Signal(str, str)
 
     def __init__(self, agent: TerminalAgent, parent=None):
@@ -432,11 +433,12 @@ class TerminalCard(QFrame):
         self._cr_pending = False
         self._renaming = False  # inline title-edit in progress
         # what the lane poller last saw in this agent's lane (lanes.LaneView),
-        # or None while the Agent lanes switch is off. Transient view state.
+        # or None before its first read. Transient view state.
         self._lane_view = None
         # the integration queue's view of this agent, asked when a menu opens
         # or the lane chip repaints: callable(agent) -> dict with "integrator"
-        # (bool), "role" and "submit" ((label, enabled, tooltip) or absent).
+        # (bool), "role", "submit", "remove_merged" and "adopt" ((label,
+        # enabled, tooltip) or absent).
         # Set by WorkspacePage; None when nothing provides it.
         self.integration_info = None
         self._task_full = ""    # untruncated current-task (the label elides it)
@@ -839,7 +841,19 @@ class TerminalCard(QFrame):
             lambda: self.reassignRequested.emit(self.agent.id))
         for act in (act_start, act_stop, act_restart, act_assign):
             menu.addAction(act)
-        role = self._integration().get("role")
+        info = self._integration()
+        adopt = info.get("adopt")
+        if adopt:
+            # lane scopes: an existing agent moves into its own worktree
+            menu.setToolTipsVisible(True)
+            label, enabled, tip = adopt
+            act_adopt = QAction(label, menu)
+            act_adopt.setEnabled(enabled)
+            act_adopt.setToolTip(tip)
+            act_adopt.triggered.connect(
+                lambda: self.laneActionRequested.emit(self.agent.id, "adopt"))
+            menu.addAction(act_adopt)
+        role = info.get("role")
         if role:
             # agent lanes Phase 3: one integrator per workspace
             menu.setToolTipsVisible(True)
@@ -1035,8 +1049,8 @@ class TerminalCard(QFrame):
     # ------------------------------------------------------------ lane chip ---
 
     def set_lane_view(self, view) -> None:
-        """What the lane poller saw (lanes.LaneView), or None when it is not
-        running (the Agent lanes switch is off). View state only."""
+        """What the lane poller saw (lanes.LaneView), or None before its
+        first read of this lane. View state only."""
         self._lane_view = view
         self.refresh_lane()
 
@@ -1083,8 +1097,8 @@ class TerminalCard(QFrame):
         lines = [f"Own lane: {lane['branch']} (from {base})",
                  f"Folder: {lane.get('root', '')}"]
         if view is None:
-            lines.append("Turn on Agent lanes in Options to see what this "
-                         "lane holds and where it overlaps other lanes.")
+            lines.append("Reading what this lane holds and where it overlaps "
+                         "other lanes...")
         elif not view.exists:
             lines.append("The lane folder is missing.")
         else:
@@ -1140,7 +1154,7 @@ class TerminalCard(QFrame):
         ok = view is not None and view.can_refresh() and not working
         act_refresh.setEnabled(ok)
         if view is None:
-            why = "Turn on Agent lanes in Options first."
+            why = "Waiting for the lane's first status read."
         elif working:
             why = "Wait until this agent has finished its turn."
         elif view.dirty or view.ahead:

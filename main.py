@@ -154,8 +154,13 @@ def create_main_window(store: SessionStore | None = None) -> MainWindow:
                 # conversation (--resume <id>) on its NEXT start — whether that
                 # is the launch autostart or a later press-any-key wake.
                 # resume is one-shot: consumed at first start, so a manual
-                # restart after that is a deliberate fresh session.
-                if agent.spec.provider in RESUME_PROVIDERS:
+                # restart after that is a deliberate fresh session. A laned
+                # agent with no pin is the exception: it was moved into its
+                # lane (Restart in own lane) and closed before its first
+                # start there, so it has no conversation of its own and
+                # starts fresh rather than trying `--continue`.
+                if (agent.spec.provider in RESUME_PROVIDERS
+                        and not (agent.spec.lane and not agent.spec.session_id)):
                     agent.spec.resume = True
                     # this resume is a RESTORE: verify the pinned conversation
                     # still exists and recover it if a stale/never-used id

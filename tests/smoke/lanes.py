@@ -127,15 +127,15 @@ def _log(store) -> str:
 
 
 def test_agent_lanes_switch():
-    """The Options master switch for agent lanes.
+    """The Options switch "Lanes in every workspace".
 
-    OFF by default, because armed it runs `git worktree add` in the user's
-    repo for every new agent. It is an ordinary UI preference (an additive
-    key under "ui", no SESSION_VERSION bump), and `MainWindow.lanes_enabled()`
-    is the only gate lane code may ask, so the switch means one thing
-    everywhere. The real close/reopen at the end is the check that matters:
-    a default assigned after `_restore_ui_state` would silently switch it back
-    off at every launch (the taskbar badge once had exactly that bug).
+    OFF by default, because armed it ticks Own lane for every new Claude
+    agent in every git workspace. It is an ordinary UI preference (an
+    additive key under "ui", no SESSION_VERSION bump), and it only feeds
+    `MainWindow.lane_default(ws)`, the dialog's starting tick. The real
+    close/reopen at the end is the check that matters: a default assigned
+    after `_restore_ui_state` would silently switch it back off at every
+    launch (the taskbar badge once had exactly that bug).
     """
     from PySide6.QtWidgets import QApplication
     from app.session_store import SessionStore
@@ -151,12 +151,14 @@ def test_agent_lanes_switch():
     check("lanes switch: it lives in the Options panel, not on the bar",
           bar.agent_lanes_btn.parent() is bar.options_panel
           and bar.agent_lanes_label.parent() is bar.options_panel)
-    check("lanes switch: the label names the feature",
-          "Agent lanes" in bar.agent_lanes_label.text(),
+    check("lanes switch: the label says it covers every workspace",
+          "Lanes in every workspace" in bar.agent_lanes_label.text(),
           bar.agent_lanes_label.text())
-    check("lanes switch: OFF tooltip promises existing lanes are kept",
+    check("lanes switch: OFF tooltip hands over to each workspace and "
+          "promises existing lanes are never touched",
           "OFF" in bar.agent_lanes_btn.toolTip()
-          and "keep it" in bar.agent_lanes_btn.toolTip(),
+          and "workspace's" in bar.agent_lanes_btn.toolTip()
+          and "never touched" in bar.agent_lanes_btn.toolTip(),
           bar.agent_lanes_btn.toolTip())
     emitted = []
     bar.agentLanesToggled.connect(emitted.append)
@@ -175,32 +177,38 @@ def test_agent_lanes_switch():
           and emitted == [True, False], emitted)
     bar.deleteLater()
 
-    # --- the window: gate, save, restore ----------------------------------
+    # --- the window: default, save, restore --------------------------------
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-"))
     store = SessionStore(path=tmp / "session.json")
     win = create_main_window(store)
     app.processEvents()
-    check("lanes switch: a fresh install has lanes disabled",
-          win.lanes_enabled() is False and not win.top_bar._agent_lanes)
+    ws = win.manager.create_workspace("Plain", str(tmp))
+    check("lanes switch: a fresh install starts every new agent without a "
+          "lane", win.lane_default(ws) is False and not win.top_bar._agent_lanes)
     check("lanes switch: the saved payload records OFF",
           win._session_payload()["ui"]["agent_lanes"] is False)
 
     win._save_timer.stop()
     win.top_bar.agent_lanes_btn.click()   # the real signal path, end to end
-    check("lanes switch: clicking it enables the gate at once (no restart)",
-          win.lanes_enabled() is True)
+    check("lanes switch: clicking it sets the default at once (no restart)",
+          win.lane_default(ws) is True)
+    check("lanes switch: ...without touching the workspace's own toggle",
+          ws.lanes is False)
     check("lanes switch: flipping it marks the session dirty",
           win._save_timer.isActive())
     check("lanes switch: the preference is persisted under ui",
           win._session_payload()["ui"]["agent_lanes"] is True,
           win._session_payload()["ui"])
+    check("lanes switch: ...and starts no lane machinery (no lane exists)",
+          not win.lane_service.is_running())
 
     win._restore_ui_state({"ui": {"agent_lanes": False}})
     check("lanes switch: restore reflects OFF onto the window and the switch",
-          not win.lanes_enabled() and not win.top_bar.agent_lanes_btn.isChecked())
+          not win.lane_default(ws)
+          and not win.top_bar.agent_lanes_btn.isChecked())
     win._restore_ui_state({"ui": {}})
     check("lanes switch: a session that predates the switch loads it OFF",
-          not win.lanes_enabled())
+          not win.lane_default(ws))
 
     # ON must survive a real close and reopen
     win._agent_lanes = True
@@ -211,8 +219,9 @@ def test_agent_lanes_switch():
     app.processEvents()
     again = create_main_window(SessionStore(path=tmp / "session.json"))
     app.processEvents()
+    ws2 = next(w for w in again.manager.workspaces if w.name == "Plain")
     check("lanes switch: ON survives a close and reopen",
-          again.lanes_enabled() and again.top_bar.agent_lanes_btn.isChecked())
+          again.lane_default(ws2) and again.top_bar.agent_lanes_btn.isChecked())
     again._save_timer.stop()
     again.close()
     app.processEvents()
@@ -585,13 +594,13 @@ def lanes_same(a, b) -> bool:
 
 
 def test_lanes_window():
-    """Lanes through the real window: the switch gates everything new (OFF
-    runs no git at all and shows no checkbox), Count 3 makes 3 lanes, a lane
-    failure still starts the agent in the workspace folder, closing removes
-    an empty lane and keeps one with work, the picker revives a retired
-    lane's conversation at its identical path, a failed revive never runs in
-    the workspace folder, and with the switch off an existing lane still
-    repairs and retires."""
+    """Lanes through the real window: with every toggle off a git workspace
+    offers the box unticked and runs no git at all, Count 3 makes 3 lanes,
+    a lane failure still starts the agent in the workspace folder, closing
+    removes an empty lane and keeps one with work, the picker revives a
+    retired lane's conversation at its identical path, a failed revive never
+    runs in the workspace folder, and with the switch off an existing lane
+    still repairs and retires."""
     from PySide6.QtWidgets import QApplication, QDialog
     from app import coordination, lanes
     from app.process_worker import AgentKind, build_spec
@@ -627,12 +636,15 @@ def test_lanes_window():
         return [a for a in ws.agents if a not in before]
 
     with _stub_starts() as starts:
-        # --- switch OFF: exactly today's behavior, no git ------------------
+        # --- every toggle OFF: the box is offered, unticked, no git --------
         with _record_git() as gitlog:
             new = run_dialog()
+            app.processEvents()
         agent = new[0]
-        check("lanes window: OFF shows no lane checkbox",
-              seen[-1].lane_check is None)
+        check("lanes window: OFF still offers the lane box in a git workspace, "
+              "unticked", seen[-1].lane_check is not None
+              and seen[-1].lane_check.isEnabled()
+              and not seen[-1].lane_check.isChecked())
         check("lanes window: OFF runs no git command at all",
               gitlog.calls == [], gitlog.calls)
         check("lanes window: OFF starts a Claude agent in the workspace folder",
@@ -640,12 +652,14 @@ def test_lanes_window():
               and starts.cwds(agent.spec.name) == [str(work)],
               starts.calls)
         check("lanes window: OFF leaves no lanes folder", not lanes_dir.exists())
+        check("lanes window: ...and no lane machinery runs",
+              not win.lane_service.is_running())
 
         # --- the dialog with the switch ON ---------------------------------
         win.top_bar.agent_lanes_btn.click()
-        check("lanes window: the switch turns lanes on without a restart",
-              win.lanes_enabled())
-        dlg = AddTerminalDialog("Agent 9", cwd=str(work), lanes_on=True,
+        check("lanes window: the switch ticks lanes without a restart",
+              win.lane_default(ws))
+        dlg = AddTerminalDialog("Agent 9", cwd=str(work), lane_default=True,
                                 repo_root=str(work))
         cb = dlg.lane_check
         check("lanes dialog: ON shows the checkbox, ticked for Claude in a git "
@@ -669,15 +683,14 @@ def test_lanes_window():
         check("lanes dialog: the user's untick survives a Type change",
               not cb.isChecked() and cb.isEnabled() and not dlg.wants_lane())
         dlg.deleteLater()
-        nogit = AddTerminalDialog("Agent 9", cwd=str(tmp), lanes_on=True,
+        nogit = AddTerminalDialog("Agent 9", cwd=str(tmp), lane_default=True,
                                   repo_root="")
-        check("lanes dialog: a folder outside git gets no lane, with a reason",
-              not nogit.lane_check.isEnabled()
-              and "git" in nogit.lane_check.toolTip())
+        check("lanes dialog: a folder outside git has no lane box at all",
+              nogit.lane_check is None and not nogit.wants_lane())
         nogit.deleteLater()
         sid_ws = "aaaaaaaa-0000-4000-8000-000000000001"
         _write_transcript(str(work), sid_ws, "main", "an old main chat")
-        dlg = AddTerminalDialog("Agent 9", cwd=str(work), lanes_on=True,
+        dlg = AddTerminalDialog("Agent 9", cwd=str(work), lane_default=True,
                                 repo_root=str(work))
         dlg.resume_combo.setCurrentIndex(dlg.resume_combo.findData(sid_ws))
         check("lanes dialog: resuming a workspace-folder conversation unticks "
@@ -854,7 +867,7 @@ def test_lanes_window():
 
         # --- switch OFF: an existing lane still loads, repairs, retires ----
         win.top_bar.agent_lanes_btn.click()
-        check("lanes window: the switch is off again", not win.lanes_enabled())
+        check("lanes window: the switch is off again", not win.lane_default(ws))
         live_lane = dict(live.spec.lane)
         win._save_session()
         win._save_timer.stop()
@@ -867,7 +880,9 @@ def test_lanes_window():
         back = next((a for a in ws2.agents
                      if a.spec.lane.get("root") == live_lane["root"]), None)
         check("lanes window: with the switch off a laned agent still loads with "
-              "its lane", back is not None and not again.lanes_enabled())
+              "its lane", back is not None and not again.lane_default(ws2))
+        check("lanes window: ...and the restored lane runs the lane service",
+              again.lane_service.is_running())
         check("lanes window: ...in its lane folder, not the workspace folder",
               back is not None and lanes_same(back.spec.cwd, live_lane["root"]))
         again.lane_ops.drain(30)
@@ -879,6 +894,18 @@ def test_lanes_window():
         again.lane_ops.drain(30)
         check("lanes window: ...and closing it retires the lane",
               not os.path.exists(live_lane["root"]))
+        others = [a for a in again.manager.all_agents() if a.spec.lane]
+        check("lanes window: the service keeps running while another lane "
+              "exists", bool(others) and again.lane_service.is_running(),
+              [a.spec.name for a in others])
+        for other in others:
+            again._close_agent(again.manager.workspace_of(other.id).id,
+                               other.id)
+        again.lane_ops.drain(30)
+        check("lanes window: ...and closing the last laned card stops it",
+              not again.lane_service.is_running())
+        for b in list(again._lane_boxes):
+            b.close()
         again._save_timer.stop()
         again.close()
         app.processEvents()
@@ -1415,11 +1442,12 @@ def test_lane_file_map():
 
 def test_lane_service_window():
     """Lane awareness through the real window, on real lanes: per-run hook
-    arming only for laned agents while the switch is on, the "skim the
-    roster" prompt, the poller's chips, lanes.json, notices, event-log
-    rows, roster columns and Activity panel, the fast-forward action, the
-    folder lock the poller shares with LaneOps, and the switch going off
-    silencing all of it at once."""
+    arming only for laned agents, the "skim the roster" prompt, the poller
+    (started by the first lane, not by a switch), its chips, lanes.json,
+    notices, event-log rows, roster columns and Activity panel, the
+    fast-forward action, the folder lock the poller shares with LaneOps, the
+    switch going off changing nothing for lanes that exist, and the last
+    laned card's close silencing all of it at once."""
     from PySide6.QtWidgets import QApplication, QDialog
     from app import event_log as el
     from app import lanes, session_hook
@@ -1461,19 +1489,23 @@ def test_lane_service_window():
     with _stub_starts():
         with _record_git() as g:
             win.lane_service.poll()
-        check("lane service: with the switch off it polls nothing",
+        check("lane service: with no lane anywhere it polls nothing",
               not win.lane_service.is_running() and g.calls == [])
         plain = run_dialog()[0]
-        check("lane service: switch off, no lane hooks for anyone",
+        app.processEvents()
+        check("lane service: no lane, no lane hooks for anyone",
               not any(k in plain.spec.env for k in session_hook.LANE_ENV_KEYS)
               and plain.spec.settings_path == win._hook_settings_path)
 
         win.top_bar.agent_lanes_btn.click()
-        check("lane service: the switch starts the poller at once",
-              win.lane_service.is_running() and win.manager.lane_awareness)
+        check("lane service: the switch alone starts nothing",
+              not win.lane_service.is_running())
         duo = run_dialog(lambda d: d.count_plus.click())
         solo = run_dialog(lambda d: d.lane_check.click())[0]
         win.lane_ops.drain(60)
+        app.processEvents()
+        check("lane service: the first lane starts the poller",
+              win.lane_service.is_running())
         a, b = duo
         check("lane service: two laned agents and one opted out",
               a.spec.lane and b.spec.lane and not solo.spec.lane)
@@ -1656,26 +1688,34 @@ def test_lane_service_window():
                                                   ".aihive"))
                       for x in (a, b, c)))
 
-        # --- the switch goes off ----------------------------------------------
+        # --- the switch goes off: lanes that exist carry on ------------------
         win.top_bar.agent_lanes_btn.click()
-        check("lane service: switching off stops the poller",
-              not win.lane_service.is_running())
+        check("lane service: switching off leaves the poller running",
+              win.lane_service.is_running() and not win.lane_default(ws))
+        poll()
         idx = json.loads(index_file.read_text(encoding="utf-8"))
-        check("lane service: ...and silences running agents' hooks at once",
-              idx.get("enabled") is False)
-        check("lane service: ...chips go neutral and say the switch is off",
-              card_a.lane_mark.property("lane") == "clean"
-              and "Turn on Agent lanes" in card_a.lane_mark.toolTip()
+        check("lane service: ...lanes.json stays live for the running hooks",
+              idx.get("enabled") is True)
+        check("lane service: ...the chips keep their warnings",
+              card_a.lane_mark.property("lane") == "conflict"
               and card_a.lane_mark.isVisibleTo(card_a))
-        check("lane service: ...the lane env and settings are taken back",
-              not any(k in a.spec.env for k in session_hook.LANE_ENV_KEYS)
-              and a.spec.settings_path == win._hook_settings_path)
-        check("lane service: ...and laned agents read the whole board again",
-              "BEFORE starting substantial work" in a.spec.system_prompt
-              and "roster.md" not in a.spec.system_prompt
-              and a.spec.lane["branch"] in a.spec.system_prompt)
+        check("lane service: ...a laned agent keeps its lane env and settings",
+              a.spec.env.get(session_hook.LANE_UID_ENV) == a.spec.uid
+              and a.spec.settings_path == win._lane_settings_path)
+        check("lane service: ...and keeps skimming the roster",
+              "roster.md" in a.spec.system_prompt)
+
+        # --- closing the laned cards is what quiets them -----------------------
+        for agent in (a, b, c):
+            win._close_agent(ws.id, agent.id)
+        win.lane_ops.drain(60)
+        idx = json.loads(index_file.read_text(encoding="utf-8"))
+        check("lane service: the last laned card's close stops the poller",
+              not win.lane_service.is_running())
+        check("lane service: ...and writes lanes.json disabled, at once",
+              idx.get("enabled") is False, idx)
         check("lane service: ...nothing on the board says lanes are moving",
-              all(x.lane_view is None for x in (a, b, c)))
+              all(x.lane_view is None for x in ws.agents))
         for agent in list(ws.agents):
             win._close_agent(ws.id, agent.id)
         win.lane_ops.drain(60)
@@ -1966,7 +2006,7 @@ def test_lanes_window_fixes():
 
         # --- a workspace inside a larger repository ------------------------
         dlg = AddTerminalDialog("Agent 9", cwd=str(work / "sub"),
-                                lanes_on=True, repo_root=str(work))
+                                lane_default=True, repo_root=str(work))
         cb = dlg.lane_check
         check("lanes-fix: a nested workspace offers a lane, unticked",
               cb.isEnabled() and not cb.isChecked() and not dlg.wants_lane())
@@ -1975,7 +2015,7 @@ def test_lanes_window_fixes():
         cb.setChecked(True)
         check("lanes-fix: ...which the user can still tick", dlg.wants_lane())
         dlg.deleteLater()
-        top = AddTerminalDialog("Agent 9", cwd=str(work), lanes_on=True,
+        top = AddTerminalDialog("Agent 9", cwd=str(work), lane_default=True,
                                 repo_root=str(work))
         check("lanes-fix: at the repo root the box stays ticked",
               top.lane_check.isChecked()
@@ -2552,9 +2592,9 @@ def test_lane_window_37_fixes():
     ws = win.manager.create_workspace("Repo", str(work))
     win.manager.set_active(ws.id)
     win.top_bar.agent_lanes_btn.click()
-    check("lanes-37: the switch tooltip says warnings stop and lanes stay",
-          "Lane warnings stop at once; existing lanes stay"
-          in win.top_bar.agent_lanes_btn.toolTip(),
+    check("lanes-37: the switch tooltip says what turning it off does",
+          "Each workspace's own toggle decides again; existing lanes are "
+          "never touched" in win.top_bar.agent_lanes_btn.toolTip(),
           win.top_bar.agent_lanes_btn.toolTip())
 
     def run_dialog(setup=None):
@@ -3035,7 +3075,7 @@ def test_integration_queue_window():
     lanes with stubbed workers and a fake gh: picking the integrator,
     Submit pinning a lane's head, the brief going to an IDLE integrator via
     deliver_task one item at a time, the PR read when its turn ends, the
-    Activity panel's rows, the pause while the switch is off, Approve merge
+    Activity panel's rows, no pause when the switch is off, Approve merge
     refusing a changed head and re-briefing a moved base, the next lane
     following a merge, and no agent-side way to enqueue or approve."""
     from PySide6.QtWidgets import QApplication, QDialog
@@ -3139,6 +3179,10 @@ def test_integration_queue_window():
         poll()
         check("queue: Submit is offered once the lane has commits",
               win._integration_info(a)["submit"][1])
+        tip = win._integration_info(a)["submit"][2]
+        check("queue: ...and its tooltip names what the integrator will do",
+              "merges the current base" in tip
+              and "runs the full test suite" in tip and "approve" in tip, tip)
         win._on_lane_action(ws.id, a.id, "submit")
         settle()
         sha_a = _git(a.spec.lane["root"], "rev-parse", "HEAD")
@@ -3212,18 +3256,20 @@ def test_integration_queue_window():
               i.spec.name in panel.queue_info.text())
 
         win.top_bar.agent_lanes_btn.click()
-        check("queue: switch off pauses the queue panel",
-              "paused" in panel.queue_header.text()
-              and not rows[0].buttons["approve"].isEnabled())
-        win._on_queue_action(item_a.id, "approve")
         settle()
-        check("queue: ...and nothing is merged while paused",
-              item_a.state == integ.AWAITING and not gh.merges())
-        check("queue: with the switch off a card's menu has no Make "
-              "integrator; the integrator can still step down",
-              "role" not in win._integration_info(a)
+        check("queue: switch off does not pause the queue",
+              "paused" not in panel.queue_header.text()
+              and rows[0].buttons["approve"].isEnabled()
+              and "Paused" not in panel.queue_info.text(),
+              panel.queue_header.text())
+        check("queue: ...a laned agent is still offered Make integrator and "
+              "the integrator can still step down",
+              win._integration_info(a)["role"][0] == "Make integrator"
               and win._integration_info(i)["role"][0]
               == "Stop being the integrator")
+        check("queue: ...and Submit stays offered",
+              "submit" in win._integration_info(b)
+              and "Turn on" not in win._integration_info(b)["submit"][2])
         win.top_bar.agent_lanes_btn.click()
         settle()
 
@@ -3831,3 +3877,719 @@ def test_tested_commit_line():
     got = {body: integ.tested_commit(body) for body in cases}
     check("integ: the Tested-commit line is read in every usual form",
           got == cases, {b: g for b, g in got.items() if g != cases[b]})
+
+
+# ---------------------------------------- lane scopes (spec-v4) ---
+
+def _hook_line(map_path: str, agent_id: str, sid: str, cwd: str,
+               ts: float) -> None:
+    """One SessionStart record, the way session_hook appends it."""
+    with open(map_path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"agent_id": agent_id, "session_id": sid,
+                             "cwd": cwd, "source": "resume", "ts": ts})
+                 + "\n")
+
+
+def test_lane_scopes_model():
+    """Lane scopes in the model, without a window: the workspace's lanes
+    toggle (persisted as an additive key, OFF by default), awareness that
+    follows the agent's own lane on every path that changes it, and the
+    live-map guard that keeps an old SessionStart record from pinning its
+    id back onto a new run (a plain restart had that gap too)."""
+    from PySide6.QtWidgets import QApplication
+    from app import session_hook
+    from app.process_worker import AgentKind, build_spec
+    from app.workspace_manager import WorkspaceManager
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-scopes-model-"))
+    work = _make_repo(tmp)
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Repo", str(work))
+
+    # --- the workspace toggle ---------------------------------------------
+    check("scopes: a new workspace starts with its lanes toggle OFF",
+          ws.lanes is False)
+    dirty, toggled = [], []
+    mgr.dirty.connect(lambda: dirty.append(1))
+    mgr.workspaceLanesChanged.connect(lambda w, on: toggled.append((w, on)))
+    mgr.set_workspace_lanes(ws.id, True)
+    check("scopes: turning it on marks the session dirty and says so",
+          ws.lanes is True and bool(dirty) and toggled == [(ws.id, True)],
+          (dirty, toggled))
+    dirty.clear()
+    toggled.clear()
+    mgr.set_workspace_lanes(ws.id, True)
+    check("scopes: setting the same value again is no change",
+          not dirty and not toggled)
+    data = mgr.to_session_dict()
+    check("scopes: the toggle is saved on the workspace record",
+          data["workspaces"][0].get("lanes") is True, data["workspaces"][0])
+    again = WorkspaceManager()
+    again.load_session_dict(json.loads(json.dumps(data)))
+    check("scopes: ...and survives a save and load",
+          again.workspaces[0].lanes is True)
+    old = json.loads(json.dumps(data))
+    del old["workspaces"][0]["lanes"]
+    older = WorkspaceManager()
+    older.load_session_dict(old)
+    check("scopes: a record without the key (an older build) loads OFF",
+          older.workspaces[0].lanes is False)
+    odd = json.loads(json.dumps(data))
+    odd["workspaces"][0]["lanes"] = "yes"
+    oddm = WorkspaceManager()
+    oddm.load_session_dict(odd)
+    check("scopes: only a real true turns it on",
+          oddm.workspaces[0].lanes is False)
+
+    # --- awareness follows the agent's own lane ---------------------------
+    def skims(agent):
+        p = agent.spec.system_prompt
+        return ws.board.roster_path in p and "lane notice" in p
+
+    def reads_board(agent):
+        p = agent.spec.system_prompt
+        return "BEFORE starting substantial work" in p and "roster.md" not in p
+
+    plain = mgr.add_terminal(ws.id, build_spec(
+        AgentKind.CLAUDE, "Plain", cwd=str(work), pty=True), autostart=False)
+    check("scopes: an agent without a lane reads the board",
+          reads_board(plain))
+    lane = _lane_for(work, "Plain", plain.spec.uid)
+    mgr.set_agent_lane(ws.id, plain.id, lane, lane["root"])
+    check("scopes: set_agent_lane makes it skim the roster, with no switch "
+          "anywhere", skims(plain))
+    mgr.set_integrator(ws.id, plain.id)
+    check("scopes: set_integrator gives it the integrator prompt, still "
+          "skimming", "INTEGRATOR" in plain.spec.system_prompt
+          and skims(plain))
+    mgr.set_integrator(ws.id, "")
+    check("scopes: ...and stepping down takes that back",
+          "INTEGRATOR" not in plain.spec.system_prompt and skims(plain))
+    saved = json.loads(json.dumps(mgr.to_session_dict()))
+    mgr.clear_agent_lane(ws.id, plain.id)
+    check("scopes: clear_agent_lane sends it back to the board",
+          reads_board(plain))
+    laned_load = WorkspaceManager()
+    laned_load.load_session_dict(saved)
+    back = laned_load.workspaces[0].agents[0]
+    check("scopes: a load with a laned agent skims the roster",
+          bool(back.spec.lane) and skims(back))
+    plain_load = WorkspaceManager()
+    plain_load.load_session_dict(json.loads(json.dumps(
+        mgr.to_session_dict())))
+    unlaned = plain_load.workspaces[0].agents[0]
+    check("scopes: a load without one reads the board",
+          not unlaned.spec.lane and reads_board(unlaned))
+
+    # --- the live-map guard -----------------------------------------------
+    map_path = str(tmp / "live_sessions.jsonl")
+    mgr.session_map_path = map_path
+    session_hook.reset_map(map_path)
+    live = mgr.add_terminal(ws.id, build_spec(
+        AgentKind.CLAUDE, "Live", cwd=str(work), pty=True), autostart=False)
+    real_worker = live.worker
+    live.worker = type("W", (), {"is_running": lambda s: True,
+                                 "dispose": lambda s: None})()
+    first = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+    second = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+    third = "cccccccc-3333-4333-8333-cccccccccccc"
+    fourth = "dddddddd-4444-4444-8444-dddddddddddd"
+    try:
+        live.spec.session_id = first
+        live._session_started = 1000.0
+        _hook_line(map_path, live.id, first, str(work), 1001.0)
+        # a plain restart: a new id and a new start, the old record remains
+        live.spec.session_id = second
+        live._session_started = 2000.0
+        changed = mgr.sync_live_sessions()
+        check("scopes: a record written before this run started never "
+              "re-pins its id (a plain restart had this gap)",
+              live.spec.session_id == second
+              and not [c for c in changed if c[0] == live.id], changed)
+        _hook_line(map_path, live.id, first, str(tmp / "elsewhere"), 3000.0)
+        changed = mgr.sync_live_sessions()
+        check("scopes: a record from another folder never re-pins either",
+              live.spec.session_id == second, changed)
+        _hook_line(map_path, live.id, third, str(work), 3001.0)
+        mgr.sync_live_sessions()
+        check("scopes: this run's record in this folder still pins (an "
+              "in-TUI /resume)", live.spec.session_id == third)
+        _hook_line(map_path, live.id, fourth,
+                   str(work).replace("\\", "/").upper(), 3002.0)
+        mgr.sync_live_sessions()
+        check("scopes: ...the folder match ignores case and slash style",
+              live.spec.session_id == fourth)
+    finally:
+        live.worker = real_worker
+    for m in (mgr, again, older, oddm, laned_load, plain_load):
+        for w in list(m.workspaces):
+            m.remove_workspace(w.id)
+    app.processEvents()
+    _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lane_scopes_window():
+    """Lane scopes through the real window, stubbed workers: the header
+    toggle (hidden outside git, persisted, forced on and locked by the
+    Options switch), the dialog's starting tick from it, one agent opting in
+    alone in an OFF workspace and getting the whole lane machinery, and the
+    lane service's lifetime following the lanes, with no git at all for a
+    workspace that has none. Phase B: the "What are lanes?" explainer from
+    the header and the dialog, and the one-time two-lanes hint."""
+    from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+    from app import lanes, session_hook
+    from app import lane_service as svc_mod
+    from app.session_store import SessionStore
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-scopes-win-"))
+    work = _make_repo(tmp)
+    other = _make_repo(tmp, "other")
+    plain_dir = tmp / "plain"
+    plain_dir.mkdir()
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    check("scopes window: no lane service at startup without a lane",
+          not win.lane_service.is_running())
+    ws_a = win.manager.create_workspace("A", str(work))
+    ws_b = win.manager.create_workspace("B", str(other))
+    ws_p = win.manager.create_workspace("Plain", str(plain_dir))
+    ws_n = win.manager.create_workspace("Nested", str(work / "sub"))
+    page_a, page_b, page_p = (win._pages[w.id] for w in (ws_a, ws_b, ws_p))
+    seen = []
+
+    def run_dialog(ws, setup=None, accept=True):
+        orig = AddTerminalDialog.exec
+
+        def fake_exec(dlg):
+            seen.append(dlg)
+            if setup is not None:
+                setup(dlg)
+            return (QDialog.DialogCode.Accepted if accept
+                    else QDialog.DialogCode.Rejected)
+        AddTerminalDialog.exec = fake_exec
+        try:
+            before = list(ws.agents)
+            win._on_add_terminal_clicked(ws.id)
+        finally:
+            AddTerminalDialog.exec = orig
+        app.processEvents()
+        return [a for a in ws.agents if a not in before]
+
+    # --- the header toggle -------------------------------------------------
+    check("scopes window: a folder outside git shows no lanes toggle",
+          page_p.lanes_box.isHidden())
+    check("scopes window: a git workspace shows it, OFF and enabled",
+          not page_a.lanes_box.isHidden()
+          and not page_a.lanes_switch.isChecked()
+          and page_a.lanes_switch.isEnabled())
+    page_a.lanes_switch.click()
+    check("scopes window: clicking it turns the workspace's lanes on",
+          ws_a.lanes is True and win.lane_default(ws_a)
+          and not win.lane_default(ws_b))
+    saved = {w["id"]: w for w in win.manager.to_session_dict()["workspaces"]}
+    check("scopes window: ...persisted on that workspace only",
+          saved[ws_a.id]["lanes"] is True and saved[ws_b.id]["lanes"] is False)
+    check("scopes window: ...and it starts nothing",
+          not win.lane_service.is_running() and not ws_a.agents)
+    win.top_bar.agent_lanes_btn.click()
+    check("scopes window: Options ON turns every workspace's default on",
+          all(win.lane_default(w) for w in (ws_a, ws_b, ws_p, ws_n)))
+    check("scopes window: ...and shows every header toggle on and locked",
+          all(p.lanes_switch.isChecked() and not p.lanes_switch.isEnabled()
+              for p in (page_a, page_b)))
+    page_b.lanes_switch.click()           # a click that slips through
+    check("scopes window: a locked toggle changes nothing",
+          ws_b.lanes is False and page_b.lanes_switch.isChecked())
+    win.top_bar.agent_lanes_btn.click()
+    check("scopes window: Options OFF gives each workspace its own value "
+          "back", page_a.lanes_switch.isChecked()
+          and not page_b.lanes_switch.isChecked()
+          and page_b.lanes_switch.isEnabled()
+          and win.lane_default(ws_a) and not win.lane_default(ws_b))
+    win.manager.set_workspace_path(ws_p.id, str(other / "sub"))
+    check("scopes window: moving a workspace into git shows its toggle",
+          not page_p.lanes_box.isHidden())
+
+    # --- "What are lanes?" -------------------------------------------------
+    def explainers(owner):
+        return [b for b in owner.findChildren(QMessageBox, "LanesExplainer")
+                if b.isVisible()]
+    page_a.lanes_help_btn.click()
+    shown = explainers(win)
+    check("scopes window: the header's ? opens the lanes explainer",
+          len(shown) == 1 and shown[0].windowTitle() == "What are lanes?"
+          and "branch per person" in shown[0].text()
+          and "Integrator" in shown[0].text(),
+          [b.windowTitle() for b in shown])
+    for b in shown:
+        b.close()
+    app.processEvents()
+
+    # --- the dialog's starting tick ------------------------------------------
+    run_dialog(ws_b, accept=False)
+    check("scopes window: an OFF workspace offers the box, unticked",
+          seen[-1].lane_check is not None
+          and not seen[-1].lane_check.isChecked())
+    dlg = seen[-1]
+    dlg.lanes_help.linkActivated.emit("lanes")
+    shown = explainers(dlg)
+    check("scopes window: the dialog's What are lanes? opens it too",
+          dlg.lanes_help is not None and len(shown) == 1)
+    for b in shown:
+        b.close()
+    app.processEvents()
+    run_dialog(ws_a, accept=False)
+    check("scopes window: an ON workspace starts it ticked",
+          seen[-1].lane_check.isChecked() and seen[-1].wants_lane())
+    win.manager.set_workspace_lanes(ws_n.id, True)
+    run_dialog(ws_n, accept=False)
+    check("scopes window: a workspace nested in a bigger repo stays "
+          "unticked even when ON", not seen[-1].lane_check.isChecked())
+
+    with _stub_starts():
+        with _record_git() as g:
+            plain_b = run_dialog(ws_b)[0]
+        check("scopes window: an unticked agent gets no lane and no git runs",
+              not plain_b.spec.lane and g.calls == []
+              and not win.lane_service.is_running(), g.calls)
+
+        # --- ws_a ON: its new agent gets a lane, the service starts ---------
+        laned_a = run_dialog(ws_a)[0]
+        win.lane_ops.drain(60)
+        app.processEvents()
+        check("scopes window: the ON workspace's new agent gets a lane",
+              bool(laned_a.spec.lane))
+        check("scopes window: the first lane starts the lane service",
+              win.lane_service.is_running())
+
+        # --- ws_b OFF: one agent opts in alone ---------------------------------
+        def tick(d):
+            d.lane_check.setChecked(True)
+        solo = run_dialog(ws_b, tick)[0]
+        win.lane_ops.drain(60)
+        app.processEvents()
+        check("scopes window: one agent opts in alone in an OFF workspace",
+              bool(solo.spec.lane) and not ws_b.lanes)
+        check("scopes window: ...its lane hooks are armed",
+              solo.spec.env.get(session_hook.LANE_UID_ENV) == solo.spec.uid
+              and solo.spec.settings_path == win._lane_settings_path)
+        check("scopes window: ...it skims the roster",
+              "roster.md" in solo.spec.system_prompt)
+        win.lane_service.poll()
+        win.lane_service.drain(30)
+        card = page_b.card_for(solo.id)
+        check("scopes window: ...its card shows the lane chip",
+              card.lane_mark.isVisibleTo(card)
+              and solo.spec.lane["branch"] in card.lane_mark.toolTip())
+        info = win._integration_info(solo)
+        check("scopes window: ...and offers Make integrator and Submit",
+              info.get("role", ("",))[0] == "Make integrator"
+              and info["role"][1] and "submit" in info, info)
+        check("scopes window: ...lanes.json is live for its workspace",
+              json.loads(Path(svc_mod.index_path(ws_b)).read_text(
+                  encoding="utf-8")).get("enabled") is True)
+        info_p = win._integration_info(plain_b)
+        check("scopes window: an unlaned agent next to it is offered a "
+              "disabled Make integrator", bool(info_p.get("role"))
+              and not info_p["role"][1], info_p)
+
+        # --- a second lane without an integrator: one hint, once -------------
+        from app.terminal_agent import TerminalAgent
+        told = []
+        real_notice = TerminalAgent.notice
+
+        def recording_notice(agent, text):
+            told.append((agent.spec.name, text))
+            real_notice(agent, text)
+        TerminalAgent.notice = recording_notice
+        try:
+            duo = run_dialog(ws_b, lambda d: (tick(d), d.count_plus.click()))
+            win.lane_ops.drain(60)
+            app.processEvents()
+        finally:
+            TerminalAgent.notice = real_notice
+        hints = [n for n, t in told if "Two lanes in this workspace" in t]
+        check("scopes window: a workspace's second lane with no integrator "
+              "gets a one-line hint, once", len(duo) == 2
+              and all(a.spec.lane for a in duo) and len(hints) == 1, told)
+        for a in duo:
+            win._close_agent(ws_b.id, a.id)
+        win.lane_ops.drain(60)
+        app.processEvents()
+
+        # --- A's last lane closes, B keeps one: the service runs on --------
+        win._close_agent(ws_a.id, laned_a.id)
+        win.lane_ops.drain(60)
+        app.processEvents()
+        check("scopes window: the service keeps running while another "
+              "workspace has a lane", win.lane_service.is_running())
+        calls = []
+        orig_runner = lanes.RUNNER
+
+        def runner(args, cwd, timeout):
+            calls.append(str(cwd))
+            return orig_runner(args, cwd, timeout)
+        lanes.RUNNER = runner
+        try:
+            win.lane_service.poll()
+            win.lane_service.drain(30)
+            win.lane_service.fetch()
+            win.lane_ops.drain(60)
+        finally:
+            lanes.RUNNER = orig_runner
+        mine = os.path.normcase(str(work))
+        check("scopes window: a workspace with no laned agent runs no lane "
+              "git", bool(calls) and not [c for c in calls
+                                          if os.path.normcase(c)
+                                          .startswith(mine)], calls)
+
+        # --- the last laned card closes: the service stops ---------------------
+        win._close_agent(ws_b.id, solo.id)
+        win.lane_ops.drain(60)
+        app.processEvents()
+        check("scopes window: the last laned card's close stops the service",
+              not win.lane_service.is_running())
+        check("scopes window: ...and lanes.json says disabled",
+              json.loads(Path(svc_mod.index_path(ws_b)).read_text(
+                  encoding="utf-8")).get("enabled") is False)
+        for w in (ws_a, ws_b, ws_p, ws_n):
+            for agent in list(w.agents):
+                win._close_agent(w.id, agent.id)
+        win.lane_ops.drain(60)
+    for box in list(win._lane_boxes):
+        box.close()
+    win._save_timer.stop()
+    win.close()
+    win.deleteLater()
+    app.processEvents()
+    check("scopes window: the real .venv survived",
+          (work / ".venv" / "marker.txt").read_text() == "real venv"
+          and (other / ".venv" / "marker.txt").read_text() == "real venv")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_restart_in_own_lane():
+    """Restart in own lane, through the real window with a stubbed worker:
+    offered only where the lane default is on, refused while the agent
+    works, waits for the user or is already moving; holds the start before
+    it stops the agent; changes nothing until the worker has ended; the
+    save written once the lane is recorded has no session id and the
+    lane's folder; the agent keeps its name, uid and card and starts a
+    fresh conversation in its new lane; New Agent offers the old
+    conversation again; a failed create leaves it in the workspace
+    folder."""
+    from PySide6.QtWidgets import QApplication, QDialog, QMenu
+    from app import event_log as el
+    from app import lanes
+    from app.process_worker import WorkerState
+    from app.session_store import SessionStore
+    from app.terminal_agent import AgentStatus
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-adopt-"))
+    work = _make_repo(tmp)
+    lanes_dir = tmp / "proj.lanes"
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    win.manager.set_active(ws.id)
+    page = win._pages[ws.id]
+
+    def run_dialog(setup=None, accept=True):
+        orig = AddTerminalDialog.exec
+
+        def fake_exec(dlg):
+            if setup is not None:
+                setup(dlg)
+            return (QDialog.DialogCode.Accepted if accept
+                    else QDialog.DialogCode.Rejected)
+        AddTerminalDialog.exec = fake_exec
+        try:
+            before = list(ws.agents)
+            win._on_add_terminal_clicked(ws.id)
+        finally:
+            AddTerminalDialog.exec = orig
+        app.processEvents()
+        return [a for a in ws.agents if a not in before]
+
+    def menu_labels(card):
+        shown = []
+
+        class RecordingMenu(QMenu):
+            def exec(self, *a, **k):
+                shown.append([(act.text(), act.isEnabled())
+                              for act in self.actions()])
+        from app.widgets import terminal_card as tc_mod
+        orig_menu = tc_mod.QMenu
+        tc_mod.QMenu = RecordingMenu
+        try:
+            card.show_actions_menu(card.mapToGlobal(card.rect().center()))
+        finally:
+            tc_mod.QMenu = orig_menu
+        return shown[0] if shown else []
+
+    win._confirm_adopt = lambda _agent: True
+    with _stub_starts() as starts:
+        agent = run_dialog()[0]
+        name, uid = agent.spec.name, agent.spec.uid
+        card = page.card_for(agent.id)
+        check("adopt: an unlaned agent", not agent.spec.lane)
+        check("adopt: not offered while the workspace's lane default is off",
+              "adopt" not in win._integration_info(agent)
+              and not [t for t, _ in menu_labels(card)
+                       if t.startswith("Restart in own lane")])
+        win.manager.set_workspace_lanes(ws.id, True)
+        offered = [(t, e) for t, e in menu_labels(card)
+                   if t.startswith("Restart in own lane")]
+        check("adopt: the workspace toggle ON offers it in the card menu",
+              offered == [("Restart in own lane (new conversation)", True)],
+              offered)
+        tip = win._integration_info(agent)["adopt"][2]
+        check("adopt: its tooltip says the old conversation stays and names "
+              "the main-folder blind spot",
+              "New Agent can resume it" in tip and "invisible" in tip, tip)
+        for what, attr in (("works", "is_busy"),
+                           ("waits for the user", "is_waiting")):
+            setattr(agent, attr, lambda: True)
+            state = win._integration_info(agent)["adopt"]
+            boxes = len(win._lane_boxes)
+            win._on_lane_action(ws.id, agent.id, "adopt")
+            check(f"adopt: refused while the agent {what}",
+                  state[1] is False and not agent.spec.lane
+                  and not agent.start_hold()
+                  and len(win._lane_boxes) == boxes + 1, state)
+            delattr(agent, attr)
+        win._lane_pending.add(uid)
+        state = win._integration_info(agent)["adopt"]
+        check("adopt: refused while a lane operation is pending",
+              state[1] is False and "already" in state[2], state)
+        win._lane_pending.discard(uid)
+        for box in list(win._lane_boxes):
+            box.close()
+
+        # --- a running agent on a main-folder conversation ---------------------
+        old_sid = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"
+        agent.spec.session_id = old_sid
+        _write_transcript(str(work), old_sid, "main", "the main-folder chat")
+        worker = agent.worker
+        worker._set_state(WorkerState.RUNNING)
+        check("adopt: the agent runs", agent.is_running()
+              and agent.status is AgentStatus.RUNNING)
+        pick = {}
+        run_dialog(lambda d: pick.update(before=d.resume_combo.findData(
+            old_sid)), accept=False)
+        check("adopt: while it runs, New Agent does not offer its "
+              "conversation", pick.get("before") == -1, pick)
+
+        stops = []
+
+        def fake_stop(grace_ms=1200):
+            stops.append(agent.start_hold())
+            worker._set_state(WorkerState.STOPPING)
+        worker.stop = fake_stop
+        snaps = []
+        orig_set = win.manager.set_agent_lane
+
+        def spy(ws_id, agent_id, lane, cwd=""):
+            ok = orig_set(ws_id, agent_id, lane, cwd)
+            for w in win.manager.to_session_dict()["workspaces"]:
+                snaps.extend(t for t in w["terminals"] if t.get("uid") == uid)
+            return ok
+        win.manager.set_agent_lane = spy
+        starts.calls.clear()
+        try:
+            win._on_lane_action(ws.id, agent.id, "adopt")
+            check("adopt: the start is held before the agent is stopped",
+                  len(stops) == 1 and bool(stops[0]), stops)
+            app.processEvents()
+            win.lane_ops.drain(5)
+            check("adopt: nothing changes while the worker is still "
+                  "stopping", not agent.spec.lane
+                  and agent.spec.session_id == old_sid and not snaps
+                  and "LANE-ADOPT" not in _log(store)
+                  and not lanes_dir.exists() and starts.calls == [])
+            state = win._integration_info(agent)["adopt"]
+            check("adopt: ...and it can't be asked for twice meanwhile",
+                  state[1] is False, state)
+            # the worker ends
+            worker._set_state(WorkerState.DEAD)
+            worker.finished.emit(0, False)
+        finally:
+            win.manager.set_agent_lane = orig_set
+        check("adopt: once the worker has ended the lane is recorded",
+              bool(agent.spec.lane) and len(snaps) == 1, snaps)
+        rec = snaps[0] if snaps else {}
+        check("adopt: the save written as the lane is recorded has no "
+              "session id and the lane's folder",
+              rec.get("session_id") == ""
+              and lanes_same(rec.get("cwd", ""), agent.spec.lane["root"])
+              and rec.get("lane", {}).get("root") == agent.spec.lane["root"],
+              rec)
+        check("adopt: LANE-ADOPT is audited with the conversation it left",
+              f"LANE-ADOPT agent={name!r}" in _log(store)
+              and old_sid in _log(store))
+        check("adopt: nothing starts before the lane exists",
+              starts.calls == [] and bool(agent.start_hold()))
+        win.lane_ops.drain(60)
+        app.processEvents()
+        root = agent.spec.lane["root"]
+        args = starts.calls[0][2] if starts.calls else []
+        check("adopt: the lane exists and the agent starts once, in it",
+              os.path.isdir(root) and starts.cwds(name) == [root],
+              starts.calls)
+        check("adopt: ...as a fresh conversation, never a resume",
+              "--resume" not in args and "--continue" not in args
+              and agent.spec.session_id not in ("", old_sid), args)
+        check("adopt: it keeps its name, uid and card",
+              agent.spec.name == name and agent.spec.uid == uid
+              and page.card_for(agent.id) is card and agent in ws.agents)
+        check("adopt: the lane create is audited as an adopt",
+              "LANE-CREATE" in _log(store) and "adopt=1" in _log(store))
+        rows = [r for r in win.event_hub.records if r["kind"] == el.LANE]
+        check("adopt: the event log says it restarted in its own lane",
+              any("restarted in its own lane" in r["text"] for r in rows),
+              rows)
+        check("adopt: the lane machinery runs for it",
+              win.lane_service.is_running()
+              and agent.spec.settings_path == win._lane_settings_path)
+        check("adopt: the menu no longer offers it",
+              "adopt" not in win._integration_info(agent))
+        worker._set_state(WorkerState.RUNNING)     # the new child runs
+        pick = {}
+        run_dialog(lambda d: pick.update(after=d.resume_combo.findData(
+            old_sid)), accept=False)
+        check("adopt: New Agent now offers the old conversation, to resume "
+              "in the workspace folder", pick.get("after", -1) >= 0, pick)
+        worker._set_state(WorkerState.DEAD)
+
+        # --- a failed create leaves it in the workspace folder ----------------
+        other = run_dialog(lambda d: d.lane_check.setChecked(False))[0]
+        check("adopt: a second, unlaned agent", not other.spec.lane)
+        plan = lanes.plan_lane(str(work), str(work), other.spec.name,
+                               other.spec.uid)
+        Path(plan.root).mkdir(parents=True)
+        (Path(plan.root) / "mine.txt").write_text("not yours")
+        told = []
+        real_notice = other.notice
+        other.notice = lambda text: (told.append(text), real_notice(text))
+        starts.calls.clear()
+        win._on_lane_action(ws.id, other.id, "adopt")
+        win.lane_ops.drain(30)
+        app.processEvents()
+        check("adopt: a failed create leaves the agent in the workspace "
+              "folder", not other.spec.lane
+              and lanes_same(other.spec.cwd, str(work)))
+        o_args = starts.calls[0][2] if starts.calls else []
+        check("adopt: ...and starts it there, fresh",
+              starts.cwds(other.spec.name) == [str(work)]
+              and "--resume" not in o_args, starts.calls)
+        check("adopt: ...with a notice saying why",
+              any("no lane" in t for t in told), told)
+        check("adopt: ...audited as a failed adopt",
+              "LANE-FAIL exists adopt" in _log(store), _log(store)[-400:])
+        check("adopt: ...leaving the folder in the way untouched",
+              (Path(plan.root) / "mine.txt").read_text() == "not yours")
+        for a in list(ws.agents):
+            win._close_agent(ws.id, a.id)
+        win.lane_ops.drain(60)
+    for box in list(win._lane_boxes):
+        box.close()
+    win._save_timer.stop()
+    win.close()
+    win.deleteLater()
+    app.processEvents()
+    check("adopt: the real .venv survived",
+          (work / ".venv" / "marker.txt").read_text() == "real venv")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_restored_laned_agent_without_pin_starts_fresh():
+    """A laned agent saved with no session id (moved into its lane and
+    closed before its first start there) comes back as a fresh start, not
+    `--continue`. A laned agent with a pin still resumes it by id."""
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.workspace_manager import WorkspaceManager
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-adopt-restore-"))
+    work = _make_repo(tmp)
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Repo", str(work))
+    made = []
+    for name, uid, sid in (
+            ("Moved", "7a" * 16, ""),
+            ("Pinned", "7b" * 16, "ffffffff-6666-4666-8666-ffffffffffff")):
+        lane = _lane_for(work, name, uid)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"], pty=True)
+        spec.uid, spec.lane, spec.session_id = uid, lane, sid
+        mgr.add_terminal(ws.id, spec, autostart=False)
+        made.append(lane)
+    data = mgr.to_session_dict()
+    for w in list(mgr.workspaces):
+        mgr.remove_workspace(w.id)
+    path = tmp / "session.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with _stub_starts():
+        win = create_main_window(SessionStore(path=path))
+        win._save_timer.stop()
+        got = {a.spec.name: a for a in win.manager.all_agents()}
+        moved, pinned = got.get("Moved"), got.get("Pinned")
+        check("adopt-restore: a laned agent without a pin does not resume",
+              moved is not None and not moved.spec.resume
+              and "--continue" not in moved.spec.effective_args(),
+              moved.spec.effective_args() if moved else None)
+        check("adopt-restore: a laned agent with a pin still resumes it by id",
+              pinned is not None and pinned.spec.resume
+              and "--resume" in pinned.spec.effective_args())
+        # the restored lanes started the lane service: let its git finish
+        # before the folders go
+        win.lane_service.drain(30)
+        win.lane_ops.drain(30)
+        win.close()
+        win.deleteLater()
+        app.processEvents()
+    for lane in made:
+        _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_queue_approve_after_cards_close():
+    """No switch pauses the queue, and an item awaiting approval stays
+    approvable after every laned card in its workspace has closed (the
+    lane service has stopped by then) and the Options switch is off."""
+    from app import integration as integ
+    with _QueueRig("ai-hive-queue-scopes-") as q:
+        _commit(q.a.spec.lane["root"], "a.txt", "A1\n", "A: first")
+        q.poll()
+        item = q.submit(q.a)
+        q.deliver()
+        q.integrate(item)
+        q.turn_end()
+        check("queue-scopes: the item awaits approval",
+              item.state == integ.AWAITING, item)
+        q.win.top_bar.agent_lanes_btn.click()
+        del q.i.is_running
+        for x in list(q.ws.agents):
+            q.win._close_agent(q.ws.id, x.id)
+        q.settle()
+        check("queue-scopes: every laned card is closed and the lane "
+              "service stopped", not q.ws.agents
+              and not q.win.lane_service.is_running()
+              and not q.win.lane_default(q.ws))
+        q.win._on_queue_action(item.id, "approve")
+        q.settle()
+        check("queue-scopes: Approve merge still merges the tested head",
+              item.state == integ.MERGED and bool(q.gh.merges())
+              and q.gh.merges()[-1][-1] == item.tested_sha, item)

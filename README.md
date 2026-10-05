@@ -402,19 +402,26 @@ workspaces keep executing — switching never pauses anything.
   The board keeps the newest 40 notes (older ones move to
   `.aihive/board-archive.md`), so reading it stays cheap. Scoped per
   workspace; workspaces stay isolated.
-- **Agent lanes** (⚙ Options > Agents, off by default): with the switch on, a
-  new Claude agent in a git workspace gets its own git worktree and branch
-  beside the repository (`<repo>.lanes\<name>-<id>`, branch `hive/<name>-<id>`),
-  so agents can no longer reset, restage or commit each other's work. The New
-  Agent dialog's **Own lane** checkbox opts one out; with Count 3 you get three
+- **Agent lanes** (off by default): a lane is a Claude agent's own git
+  worktree and branch beside the repository (`<repo>.lanes\<name>-<id>`,
+  branch `hive/<name>-<id>`), so agents can no longer reset, restage or commit
+  each other's work. Each git workspace's header has a **⎇ Lanes** toggle: on,
+  the New Agent dialog ticks **Own lane** for its new Claude agents.
+  ⚙ Options > Agents > **Lanes in every workspace** forces every workspace's
+  toggle on. The toggles only set where that tick starts: in any git
+  workspace one agent can opt in alone, or out, and an existing agent can
+  move into a lane with **Restart in own lane** from its card's right-click
+  menu (a new conversation; the old one stays resumable from the workspace
+  folder). Turning a toggle off never touches an existing lane. The **?**
+  beside the toggle, and **What are lanes?** in the New Agent dialog, map
+  each part onto how a team worked before AI. With Count 3 you get three
   lanes. The ignored `.venv` / `venv` / `node_modules` are linked in, so the
   usual test command works in a lane. Closing a card removes its lane only when
   it holds nothing (clean, and its commits are already in the base branch);
   otherwise the lane is kept and AI Hive says what is in it. A lane a program
   still runs in is not touched; the removal is retried for a minute. A kept
   lane's conversation stays in the New Agent dialog's Conversation list, and
-  picking it brings the lane back at the same path. Turning the switch off
-  stops new lanes; agents that already have one keep it. Lane branches have
+  picking it brings the lane back at the same path. Lane branches have
   no upstream, so git never suggests pushing a lane to the base branch. A
   workspace inside a larger repository starts with the box unticked. Git
   operations on one repo run one at a time (none on the GUI thread), every
@@ -422,7 +429,9 @@ workspaces keep executing — switching never pauses anything.
   ignored files it took), and lane removal never uses `--force` or `-D`.
   A `.worktreeinclude` file at the repo root (gitignore syntax) names
   ignored local files, like a `.env`, to copy into each new lane.
-- **Lane awareness** (while Agent lanes is on): AI Hive reads every lane about
+- **Lane awareness** (for every lane, whatever the toggles say; with no lane
+  anywhere AI Hive starts no lane git process at all): AI Hive reads every
+  lane about
   every 15 seconds and right after an agent's turn ends, and fetches the base
   branch every 5 minutes. Each laned card gets a chip (`⎇ ↑2 ±3`: commits
   ahead, uncommitted files) that turns amber when another lane or the base
@@ -439,17 +448,19 @@ workspaces keep executing — switching never pauses anything.
   and Touching columns. The Activity panel gets a Lanes section and lists
   changed files per lane, the Agent/File Map shows one tree for the repo
   however many lanes touched a file, and first overlaps and conflicts land in
-  the event log. Turning the switch off silences all of it at once, retried
-  until it sticks, and the hooks also go quiet on their own once AI Hive
+  the event log. Closing a laned card is what quiets its lane: the last one
+  closed silences all of it at once, retried until it sticks, and the hooks
+  also go quiet on their own once AI Hive
   stops refreshing `lanes.json`. A lane whose `.worktreeinclude` copy (a
   `.env`) was edited or deleted is kept when its card closes, and so is one
   whose local files could not be checked.
   A lane with no work of its own whose agent is idle is fast-forwarded to the
   base by itself when the base moves, and the agent is told on its next
   prompt.
-- **Integration queue** (while Agent lanes is on; needs a GitHub remote and a
-  logged-in `gh`): right-click a laned Claude agent's header and pick **Make
-  integrator** (one per workspace). **Submit to integrator** on another lane's
+- **Integration queue** (needs lanes, a GitHub remote and a logged-in `gh`):
+  right-click a laned Claude agent's header and pick **Make
+  integrator** (one per workspace). The second lane in a workspace without an
+  integrator says so on its card, once. **Submit to integrator** on another lane's
   chip pins that lane's newest commit and queues it. One lane at a time, once
   the integrator is idle, AI Hive types it a short brief (the pinned commit,
   its log and files, a merge check against the base and the other queued
@@ -873,7 +884,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2676 checks drive the real app headlessly (offscreen Qt platform) with real
+2772 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1013,7 +1024,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2676 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2772 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

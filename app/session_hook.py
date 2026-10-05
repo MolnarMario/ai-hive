@@ -12,8 +12,8 @@ question the agent ended its turn on. These prompt events are EDGES appended to
 a separate events file and read incrementally by the manager; SessionStart
 records stay in the mapping file. See write_settings_file / read_prompt_events.
 
-A third family, the agent-lanes hooks, goes ONLY to laned agents while the
-Agent lanes switch is on (its own settings file, `lanes=True`): PostToolUse on
+A third family, the agent-lanes hooks, goes ONLY to laned agents, whatever
+the lanes toggles say (its own settings file, `lanes=True`): PostToolUse on
 the edit tools warns when another lane changed the same file, and
 UserPromptSubmit injects unread lane notices. Both print
 hookSpecificOutput.additionalContext, the only output this script ever
@@ -72,7 +72,7 @@ _WAITING_TOOL_SET = set(WAITING_TOOLS.split("|"))
 # Agent lanes (app/lanes.py, app/lane_service.py). The edit tools whose
 # PostToolUse runs the overlap check, and the per-run env vars that arm the
 # lane hooks. MainWindow._arm_agent_mcp sets them ONLY for a laned Claude
-# agent while the Agent lanes switch is on, never persisted; every path is
+# agent, never persisted; every path is
 # absolute and lives in the workspace's own .aihive folder (never a lane's).
 EDIT_TOOLS = "Edit|Write|MultiEdit|NotebookEdit"
 _EDIT_TOOL_SET = set(EDIT_TOOLS.split("|"))
@@ -144,7 +144,7 @@ def write_settings_file(settings_path: str, mapping_path: str,
         matcher famously broke.
 
     `lanes` adds the agent-lanes family (a SEPARATE settings file, given only
-    to laned agents while the Agent lanes switch is on, so no other agent
+    to laned agents, so no other agent
     pays a Python start-up per edit): PostToolUse on the edit tools warns
     about a real overlap with another lane, and UserPromptSubmit injects
     unread lane notices. Both print `additionalContext` and stay silent
@@ -425,7 +425,7 @@ def _save_seen(path: str, seen: dict) -> None:
 
 def _lane_env(env) -> dict | None:
     """The lane env vars, or None when this agent's lane hooks are not
-    armed (no lane, or the Agent lanes switch was off at launch)."""
+    armed (the agent had no lane at launch)."""
     vals = {k: env.get(k, "") for k in LANE_ENV_KEYS}
     return vals if all(vals.values()) else None
 

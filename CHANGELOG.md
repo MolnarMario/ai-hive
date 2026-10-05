@@ -8,6 +8,27 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.28.0
+
+- Lanes can now be turned on per workspace. Each git workspace's header has
+  a ⎇ Lanes toggle (off for new workspaces): on, the New Agent dialog ticks
+  Own lane for that workspace's new Claude agents.
+- The Options switch is now "Lanes in every workspace". On, it turns every
+  workspace's toggle on and locks it. Off, each workspace decides.
+- The New Agent dialog offers Own lane in every git workspace, so one agent
+  can have a lane while the rest of the workspace shares the folder.
+- An existing agent can move into a lane with Restart in own lane in its
+  card's right-click menu. It starts a new conversation in its own worktree,
+  and the old conversation stays in the New Agent picker.
+- Turning lanes off no longer pauses anything. A lane keeps its warnings,
+  its chip and its way to the integrator until you close its card, and a
+  pull request awaiting approval can be merged even after its lane is gone.
+- New "What are lanes?" explainer, from the ? beside the header toggle and
+  from the New Agent dialog, and a one-time hint when a workspace gets two
+  lanes without an integrator.
+- Fixed: right after a restart, an agent could briefly be pinned back to its
+  previous conversation.
+
 ## 0.27.1
 
 - Closing a laned agent now keeps its lane when the agent deleted one of the

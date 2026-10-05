@@ -21,9 +21,16 @@ reading the whole board:
 * every FETCH_MS it fetches each repo's base through LaneOps (a fetch writes
   refs), so "the base moved under you" is seen without anyone pulling.
 
-It runs only while the Agent lanes switch is on (MainWindow starts and
-stops it). Stopping writes `"enabled": false` into every lanes.json it
-wrote, which silences already-running agents' hooks at once. On Windows
+It runs while any agent anywhere has a lane, whatever the lanes toggles say
+(.scratch/agent-lanes/spec-v4-lane-scopes.md): MainWindow._sync_lane_service
+starts it with the first lane and stops it when the last one goes, so with
+no lane AI Hive starts no lane git process at all. Stopping writes
+`"enabled": false` into every lanes.json it wrote, which silences
+already-running agents' hooks at once. A workspace that loses its last lane
+while another workspace keeps one gets no such write: the service keeps
+running, stops rewriting that workspace's lanes.json, and its hooks treat
+the file as off once it is LANES_STALE_S old (no agent there has a lane to
+arm a hook with anyway). On Windows
 that write fails while a hook has the file open, so a failed one is retried
 every STOP_RETRY_MS. As a backstop, every poll rewrites lanes.json with a
 fresh `ts` even when nothing changed, and the hooks treat a lanes.json older
@@ -153,9 +160,9 @@ class LaneService(QObject):
         self.poll()
 
     def stop(self) -> None:
-        """Switch off: no more polls or fetches, every lanes.json this run
-        wrote says disabled (running agents' hooks go quiet at once), and the
-        chips go back to plain."""
+        """The last lane went: no more polls or fetches, every lanes.json
+        this run wrote says disabled (running agents' hooks go quiet at
+        once), and the chips go back to plain."""
         if not self._running:
             return
         self._running = False
