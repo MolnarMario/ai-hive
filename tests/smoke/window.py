@@ -1293,6 +1293,22 @@ def test_providers_grid_and_workspace():
     pump(250)  # let the conceal animation finish
     check("v2 activity: panel closes", not win.activity_panel.is_open())
 
+    # a narrow window: the panel floats over the terminals instead of raising
+    # the window's minimum width (which pushed the window off a 1080p screen)
+    win.resize(1250, 900)
+    pump(100)
+    min_before = win.minimumSizeHint().width()
+    win._toggle_activity(wa.id)
+    pump(300)
+    check("v2 activity: narrow window floats the panel",
+          win._activity_floating and win.activity_panel.width() == 320,
+          (win._activity_floating, win.activity_panel.width()))
+    check("v2 activity: open panel leaves the window's minimum width alone",
+          win.minimumSizeHint().width() <= min_before,
+          (min_before, win.minimumSizeHint().width()))
+    win._toggle_activity(wa.id)
+    pump(250)
+
     win.close()
     pump(200)
     ui_theme.CONSOLE_FONT_PX = ui_theme.DEFAULT_CONSOLE_PX

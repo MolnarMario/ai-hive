@@ -52,7 +52,7 @@ from ..lane_ops import LaneOps
 from .. import lane_service as lane_svc
 from ..lane_service import LaneService
 from ..orchestrator_bridge import OrchestratorBridge
-from .activity_panel import ActivityPanel
+from .activity_panel import PANEL_WIDTH as ACTIVITY_PANEL_WIDTH, ActivityPanel
 from .agent_file_map import AgentFileMapWindow
 from .event_log_window import EventLogWindow
 from .lanes_help import show_lanes_explainer
@@ -2524,6 +2524,13 @@ class MainWindow(QMainWindow):
         self.activity_panel.taskEdited.connect(self._on_task_edited)
         center_lay.addWidget(self.stack, 1)
         center_lay.addWidget(self.activity_panel)
+        # Beside the terminals when they keep their minimum width, floating
+        # over them otherwise (see _place_activity).
+        self._center_body = center
+        self._center_lay = center_lay
+        self._activity_floating = False
+        center.installEventFilter(self)
+        self.activity_panel.widthAnimated.connect(self._place_activity)
 
         self.body_split.addWidget(self.sidebar)
         self.body_split.addWidget(center)
@@ -5536,6 +5543,38 @@ class MainWindow(QMainWindow):
         for wid, page in self._pages.items():
             page.activity_btn.setChecked(wid == open_id)
 
+    def eventFilter(self, obj, event):
+        if (obj is getattr(self, "_center_body", None)
+                and event.type() == QEvent.Type.Resize):
+            self._place_activity()
+        return super().eventFilter(obj, event)
+
+    def _place_activity(self) -> None:
+        """Put the Activity panel beside the terminals, or over them.
+
+        Inside the layout the panel adds its width to the window's minimum
+        width. On a scaled 1080p screen that minimum passes the screen, so Qt
+        grew the window off-screen and kept it that size after the panel
+        closed. When the terminals would drop below their own minimum, the
+        panel leaves the layout and floats over the right edge instead, which
+        costs the window nothing."""
+        panel = self.activity_panel
+        if not panel.isVisible():
+            return
+        center = self._center_body
+        fits = (center.width() - ACTIVITY_PANEL_WIDTH
+                >= self.stack.minimumSizeHint().width())
+        if self._activity_floating and fits:
+            self._activity_floating = False
+            self._center_lay.addWidget(panel)
+        elif not self._activity_floating and not fits:
+            self._activity_floating = True
+            self._center_lay.removeWidget(panel)
+        if self._activity_floating:
+            w = panel.maximumWidth()
+            panel.setGeometry(center.width() - w, 0, w, center.height())
+            panel.raise_()
+
     def _toggle_activity(self, ws_id: str) -> None:
         ws = self.manager.workspace(ws_id)
         if ws is None:
@@ -5547,6 +5586,7 @@ class MainWindow(QMainWindow):
             self.activity_panel.set_lanes(self.lane_service.views(ws.id))
             self.activity_panel.set_workspace(ws)
             self.activity_panel.reveal()
+            self._place_activity()
             self._push_queue_panel()
             self._activity_timer.start()
         self._sync_activity_buttons()

@@ -168,6 +168,7 @@ class ActivityPanel(QFrame):
     # a queue row's button: item id, action (approve | recheck | resend |
     # open | skip). MainWindow acts on the panel's workspace.
     queueAction = Signal(str, str)
+    widthAnimated = Signal()  # each step of the reveal/conceal slide
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -185,6 +186,7 @@ class ActivityPanel(QFrame):
         self._anim.setDuration(160)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._anim.finished.connect(self._on_anim_done)
+        self._anim.valueChanged.connect(lambda _v: self.widthAnimated.emit())
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
