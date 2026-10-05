@@ -54,7 +54,7 @@ class Provider:
 RESUME_PROVIDERS = ("claude", "gemini", "grok")
 
 
-# Values are the CLI's own aliases (verified in claude 2.1.283), which resolve
+# Values are the CLI's own aliases (verified in claude 2.1.289), which resolve
 # client-side to the newest model the installed CLI knows. The version in each
 # label is what that alias meant when this list was last refreshed; update the
 # labels when a new model ships. "[1m]" is the 1M-context variant, "opusplan"
@@ -63,7 +63,7 @@ CLAUDE_MODELS = (
     ("Default", ""),
     ("Fable 5.1", "fable"), ("Fable 5.1 (1M context)", "fable[1m]"),
     ("Opus 5.5", "opus"), ("Opus 5.5 (1M context)", "opus[1m]"),
-    ("Sonnet 5", "sonnet"), ("Sonnet 5 (1M context)", "sonnet[1m]"),
+    ("Sonnet 5.5", "sonnet"), ("Sonnet 5.5 (1M context)", "sonnet[1m]"),
     ("Haiku 4.5", "haiku"),
     ("Opus Plan (Opus plans, Sonnet executes)", "opusplan"),
 )

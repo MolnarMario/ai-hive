@@ -975,7 +975,7 @@ QScrollArea {{ background: transparent; border: none; }}
 }}
 #HeaderFolderIcon {{ color: {p.TEXT_DIM}; font-size: 13px; }}
 #HeaderPath {{ color: {p.TEXT_DIM}; font-size: 12px; }}
-#HeaderLanesLabel {{ color: {p.TEXT}; font-size: 12px; }}
+#HeaderLanesLabel {{ color: {p.TEXT}; padding-left: 20px; }}
 #HeaderLanesLabel[forced="true"] {{ color: {p.TEXT_DIM}; }}
 #HeaderLanesHelp {{
     background: transparent; border: 1px solid {p.BORDER};
@@ -1000,11 +1000,17 @@ QScrollArea {{ background: transparent; border: none; }}
 /* Open repo hovered: its right edge is the ▾'s left border (WorkspacePage
    sets seamLit), so light that too or the hover box has no right side */
 #RepoActivityMenuButton[seamLit="true"] {{ border-left-color: {p.ACCENT_BLUE}; }}
-#GridButton, #ActivityToggle {{
+/* padding-left leaves room for the line icon header_icons paints */
+#GridButton, #MapToggle, #ActivityToggle {{
+    background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
+    border-radius: 3px; padding: 3px 8px 3px 28px; color: {p.TEXT};
+}}
+#HeaderOpenFolder, #HeaderChangeFolder {{
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
     border-radius: 3px; padding: 3px 8px; color: {p.TEXT};
 }}
-#GridButton:hover, #ActivityToggle:hover {{ border-color: {p.ACCENT_BLUE}; }}
+#GridButton:hover, #MapToggle:hover, #ActivityToggle:hover,
+#HeaderOpenFolder:hover, #HeaderChangeFolder:hover {{ border-color: {p.ACCENT_BLUE}; }}
 #ActivityToggle:checked {{
     border-color: {p.ACCENT_BLUE}; color: {p.ACCENT_BLUE};
 }}

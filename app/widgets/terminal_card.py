@@ -14,8 +14,8 @@ from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (QAction, QColor, QCursor, QDrag, QPainter, QPixmap,
                            QTextCharFormat, QTextCursor)
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
-                               QPlainTextEdit, QToolButton, QVBoxLayout,
-                               QWidget)
+                               QPlainTextEdit, QSizePolicy, QToolButton,
+                               QVBoxLayout, QWidget)
 
 from .. import scheduled_send, transcripts, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
@@ -334,12 +334,18 @@ class _HeaderTools(QWidget):
         self.setFixedWidth(self._HINT_W)
         self.tray = _ToolsTray(self, parent)
         tl = QHBoxLayout(self.tray)
-        tl.setContentsMargins(5, 1, 5, 1)
-        tl.setSpacing(4)
+        # no margins or gaps: every pixel of the tray is a button, so there is
+        # no dead strip between them or at the edge the pointer arrives from
+        tl.setContentsMargins(1, 1, 1, 1)   # the tray's own 1px border
+        tl.setSpacing(0)
         self.tray.hide()
 
     def add(self, btn) -> None:
         btn.setParent(self.tray)
+        # fill the tray's full height, so the hover area is the whole header
+        # strip and leaving it up or down closes the tray
+        btn.setSizePolicy(QSizePolicy.Policy.Preferred,
+                          QSizePolicy.Policy.Expanding)
         btn.hide()
         self._buttons.append(btn)
         self.tray.layout().addWidget(btn)
@@ -358,8 +364,9 @@ class _HeaderTools(QWidget):
         size = self.tray.sizeHint()
         mine = self.geometry()
         x = max(0, mine.right() + 1 - size.width())
-        y = mine.center().y() - size.height() // 2
-        self.tray.setGeometry(x, max(0, y), size.width(), size.height())
+        h = max(size.height(), mine.height())
+        y = mine.center().y() - h // 2
+        self.tray.setGeometry(x, max(0, y), size.width(), h)
 
     def _set_open(self, on: bool) -> None:
         if on == self._open:
@@ -396,10 +403,12 @@ class _HeaderTools(QWidget):
     def _recheck(self) -> None:
         try:
             pos = QCursor.pos()
-            inside = (self.rect().contains(self.mapFromGlobal(pos))
-                      or (self.tray.isVisible()
-                          and self.tray.rect().contains(
-                              self.tray.mapFromGlobal(pos))))
+            # while the tray is up it covers the strip, so only the tray
+            # counts: a pointer above or below it must close it
+            if self.tray.isVisible():
+                inside = self.tray.rect().contains(self.tray.mapFromGlobal(pos))
+            else:
+                inside = self.rect().contains(self.mapFromGlobal(pos))
         except RuntimeError:      # widget went away under the timer
             return
         if not inside:
