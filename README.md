@@ -408,7 +408,7 @@ workspaces keep executing — switching never pauses anything.
 - **Agent lanes** (off by default): a lane is a Claude agent's own git
   worktree and branch beside the repository (`<repo>.lanes\<name>-<id>`,
   branch `hive/<name>-<id>`), so agents can no longer reset, restage or commit
-  each other's work. Each git workspace's header has a **⎇ Lanes** toggle: on,
+  each other's work. Each git workspace's header has a **Lanes** toggle: on,
   the New Agent dialog ticks **Own lane** for its new Claude agents.
   ⚙ Options > Agents > **Lanes in every workspace** forces every workspace's
   toggle on. The toggles only set where that tick starts: in any git
@@ -490,7 +490,7 @@ workspaces keep executing — switching never pauses anything.
   auto-memory.
 - **Per-workspace agent numbering** — each workspace counts Agent 1, 2, 3…
   independently.
-- **Agent/File Map** — a **◆ Map** button in the workspace header opens a
+- **Agent/File Map** — a **Map** button in the workspace header opens a
   separate, resizable window that draws a **Tree** view of the workspace: a
   VSCode-style file hierarchy (folders/subfolders) on the left, the agents as
   round bubbles on the right **vertically centered** against the tree, and
@@ -744,7 +744,7 @@ system prompt, gives each a race-safe `log_activity` tool, and keeps the roster
 reflecting live state. File-modification attribution is self-reported by agents in the log
 plus the repo-wide git view — the app does not attribute individual OS file
 writes to a specific terminal. For a precise per-agent view, the **Agent/File
-Map** (the ◆ Map button) parses each Claude agent's own transcript to show
+Map** (the Map button) parses each Claude agent's own transcript to show
 exactly which files that agent read and edited; this is transcript-derived, not
 OS-level, so it covers Claude agents (not Gemini/OpenAI/shells) and cannot see
 inside a Claude Task sub-agent (those files roll up to the parent).
@@ -887,7 +887,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2797 checks drive the real app headlessly (offscreen Qt platform) with real
+2799 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1028,7 +1028,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2797 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2799 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

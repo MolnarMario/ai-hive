@@ -15,6 +15,14 @@ em dashes: this text is shown in the app.
   the full header height.
 - Moving the pointer above or below those buttons now hides them, instead of
   leaving them open until you leave sideways.
+- Layout, Map, Activity and Lanes in the workspace header have line icons
+  instead of font symbols, which some systems drew as colour emoji.
+- Open folder and Change... look like the other header buttons, and the
+  Lanes toggle sits before them.
+- On a window too narrow for the terminals plus the Activity panel, the panel
+  now slides over the terminals instead of pushing the window wider than the
+  screen.
+- The model dropdown labels Sonnet as 5.5.
 
 ## 0.28.1
 
