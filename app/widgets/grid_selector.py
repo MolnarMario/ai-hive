@@ -13,6 +13,7 @@ from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QGridLayout, QToolButton, QWidget
 
 from ..ui_theme import Palette
+from .header_icons import IconToolButton
 from .ornaments import anchored_popup_pos
 
 # (label "W×H", layout string, rows, cols). "auto" draws a special glyph.
@@ -90,16 +91,16 @@ class GridSelectorPopup(QWidget):
         self.close()
 
 
-class GridButton(QToolButton):
+class GridButton(IconToolButton):
     """Header button that opens the layout palette and reports the choice."""
 
     layoutChosen = Signal(str)
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        super().__init__("layout", parent)
         self.setObjectName("GridButton")
         self._current = "auto"
-        self.setText("▦ Layout")
+        self.setText("Layout")
         self.setToolTip("Choose the agent grid layout")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clicked.connect(self._open)

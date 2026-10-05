@@ -38,6 +38,7 @@ from ..tiling import compute_grid, explicit_grid, parse_layout
 from ..ui_theme import Palette, repolish
 from ..workspace_manager import Workspace
 from .grid_selector import GridButton
+from .header_icons import IconLabel, IconToolButton
 from .lanes_help import show_lanes_explainer
 from .ornaments import ToggleSwitch, anchored_popup_pos
 from .terminal_card import CARD_REORDER_MIME, TerminalCard
@@ -205,8 +206,8 @@ class WorkspacePage(QWidget):
         self.path_label.setObjectName("HeaderPath")
         self.path_label.setToolTip(self.workspace.project_path)
 
-        def tool(text, tip, obj=""):
-            b = QToolButton(header)
+        def tool(text, tip, obj="", icon=""):
+            b = IconToolButton(icon, header) if icon else QToolButton(header)
             b.setText(text)
             b.setToolTip(tip)
             if obj:
@@ -245,11 +246,10 @@ class WorkspacePage(QWidget):
         self.open_btn = tool("Open folder", "Open this workspace's folder")
         self.change_btn = tool("Change…", "Change the workspace folder")
         self.grid_button = GridButton(header)
-        self.map_btn = tool("◆ Map", "Show the agent / file map (who is "
-                                     "working on which files)")
-        self.map_btn.setObjectName("MapToggle")
-        self.activity_btn = tool("❦ Activity", "Show the workspace activity board")
-        self.activity_btn.setObjectName("ActivityToggle")
+        self.map_btn = tool("Map", "Show the agent / file map (who is "
+                                   "working on which files)", "MapToggle", "map")
+        self.activity_btn = tool("Activity", "Show the workspace activity board",
+                                 "ActivityToggle", "activity")
         self.activity_btn.setCheckable(True)
         # the workspace's lanes toggle (spec-v4-lane-scopes.md): the default
         # "Own lane" tick for its new agents. Hidden outside a git
@@ -258,7 +258,7 @@ class WorkspacePage(QWidget):
         lanes_lay = QHBoxLayout(self.lanes_box)
         lanes_lay.setContentsMargins(0, 0, 0, 0)
         lanes_lay.setSpacing(5)
-        self.lanes_label = QLabel("⎇ Lanes", self.lanes_box)
+        self.lanes_label = IconLabel("lanes", "Lanes", self.lanes_box)
         self.lanes_label.setObjectName("HeaderLanesLabel")
         self.lanes_switch = ToggleSwitch(self.lanes_box)
         self.lanes_switch.setObjectName("HeaderLanesSwitch")
