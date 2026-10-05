@@ -557,6 +557,64 @@ def test_workspace_header():
     page.deleteLater()
 
 
+def test_workspace_header_trash_and_repo_seam():
+    """The delete button is the trash glyph in a font that takes QSS color
+    (Qt's stock pixmap ignored it and never turned red), and hovering Open
+    repo lights the shared edge on the dropdown half, or its hover box had
+    no right side."""
+    from PySide6.QtCore import QCoreApplication, QEvent, Qt
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.workspace_page import WorkspacePage
+    from app.workspace_manager import Workspace
+    from main import setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    page = WorkspacePage(Workspace(id="w1", name="WS",
+                                   project_path="C:/proj/ai-hive"))
+    page.resize(1300, 200)
+    page.show()
+    app.processEvents()
+
+    trash = page.delete_btn
+    check("header trash: the delete button is the trash glyph, no icon",
+          trash.text() == "🗑" and trash.icon().isNull(),
+          (trash.text(), trash.icon().isNull()))
+    check("header trash: drawn in Segoe UI Symbol so QSS colors it",
+          trash.font().family() == "Segoe UI Symbol", trash.font().family())
+    check("header trash: no taller than the Open repo button beside it",
+          trash.height() <= page.repo_btn.height() + 1,
+          (trash.height(), page.repo_btn.height()))
+
+    repo, drop = page.repo_btn, page.repo_activity_btn
+    seam = drop.mapTo(page, drop.rect().topLeft())
+    top = repo.mapTo(page, repo.rect().topLeft())
+
+    def pixel(x, y):
+        return page.grab().toImage().pixelColor(x, y).name()
+
+    mid_y = seam.y() + drop.height() // 2
+    rest = pixel(seam.x(), mid_y)
+    repo.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, True)
+    QCoreApplication.sendEvent(repo, QEvent(QEvent.Type.Enter))
+    app.processEvents()
+    lit = pixel(seam.x(), mid_y)
+    edge = pixel(top.x() + repo.width() // 2, top.y())
+    check("repo seam: hovering Open repo lights the dropdown's left edge",
+          drop.property("seamLit") is True and lit != rest,
+          (drop.property("seamLit"), rest, lit))
+    check("repo seam: the lit edge matches Open repo's hover border",
+          lit == edge, (lit, edge))
+    repo.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, False)
+    QCoreApplication.sendEvent(repo, QEvent(QEvent.Type.Leave))
+    app.processEvents()
+    check("repo seam: leaving Open repo puts the edge back",
+          drop.property("seamLit") is False
+          and pixel(seam.x(), mid_y) == rest,
+          (drop.property("seamLit"), pixel(seam.x(), mid_y), rest))
+    page.deleteLater()
+
+
 def test_sidebar_categories():
     """Categories: create one, drag workspaces into/out of it, collapse it, and
     delete it (its workspaces spill back out in place)."""

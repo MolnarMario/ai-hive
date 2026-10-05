@@ -437,6 +437,140 @@ def test_live_model_effort():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_repo_activity_cache():
+    """The Open repo dropdown shows a cached list at once. The fetch runs
+    in the background (prefetch, or a click on a stale copy), a failed
+    refresh keeps the last good list, and a folder change drops it."""
+    import inspect
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    import main as main_mod
+    from app import repo_activity
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def wait_idle(win):
+        for _ in range(100):
+            if not win._repo_activity_busy:
+                return
+            pump(20)
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-repoact-"))
+    pa, pb = tmp / "a", tmp / "b"
+    pa.mkdir(); pb.mkdir()
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    calls = []
+    answer = {"error": ""}
+
+    def fake_fetch(path):
+        calls.append(path)
+        if answer["error"]:
+            return {"pull_requests": [], "commits": [], "repo_url": "",
+                    "error": answer["error"]}
+        return {"pull_requests": [{"number": 7, "title": "Seven",
+                                   "state": "open", "merged": False,
+                                   "url": "https://github.com/o/r/pull/7"}],
+                "commits": [{"sha": "abcdef1234", "message": "first line",
+                             "url": "https://github.com/o/r/commit/abc"}],
+                "error": "", "repo_url": "https://github.com/o/r"}
+
+    win._repo_activity_fetch = fake_fetch
+    mgr = win.manager
+    wa = mgr.workspaces[0]
+    mgr.set_workspace_path(wa.id, str(pa))
+    wb = mgr.create_workspace("B", str(pb))
+    mgr.set_active(wb.id)
+    page = win._pages[wa.id]
+
+    def labels():
+        return [a.text() for a in page.repo_activity_menu.actions()
+                if a.text()]
+
+    check("repo activity: the menu opens on a loading line before any fetch",
+          labels() == ["Loading recent GitHub activity…"], labels())
+
+    win._prefetch_repo_activity()
+    wait_idle(win)
+    check("repo activity: prefetch fetches every workspace, the visible "
+          "one first", calls == [str(pb), str(pa)], calls)
+    check("repo activity: the prefetched list is in the menu",
+          "#7  Seven" in labels(), labels())
+
+    menu_actions = page.repo_activity_menu.actions()
+    page.repoActivityRequested.emit(wa.id)
+    pump(30)
+    check("repo activity: a click on a fresh copy fetches nothing",
+          len(calls) == 2, calls)
+
+    win._repo_activity[wa.id]["at"] -= repo_activity.STALE_AFTER_S + 1
+    page.repoActivityRequested.emit(wa.id)
+    wait_idle(win)
+    check("repo activity: a click on a stale copy refreshes it",
+          calls[2:] == [str(pa)], calls)
+    check("repo activity: an unchanged refresh leaves the menu untouched",
+          page.repo_activity_menu.actions() == menu_actions)
+
+    answer["error"] = "Could not load GitHub activity: HTTP Error 403"
+    win._repo_activity[wa.id]["at"] -= repo_activity.STALE_AFTER_S + 1
+    page.repoActivityRequested.emit(wa.id)
+    wait_idle(win)
+    check("repo activity: a failed refresh keeps the last good list",
+          "#7  Seven" in labels(), labels())
+    page.repoActivityRequested.emit(wa.id)
+    wait_idle(win)
+    check("repo activity: after a failed refresh the next click retries",
+          len(calls) == 5, calls)
+
+    mgr.set_workspace_path(wa.id, str(pb))
+    check("repo activity: a new folder drops the old list",
+          wa.id not in win._repo_activity
+          and labels() == ["Loading recent GitHub activity…"], labels())
+    page.repoActivityRequested.emit(wa.id)
+    wait_idle(win)
+    check("repo activity: an error with nothing cached shows the error",
+          labels() == [answer["error"]], labels())
+    page.repoActivityRequested.emit(wa.id)
+    wait_idle(win)
+    check("repo activity: an error is never treated as fresh",
+          len(calls) == 7, calls)
+
+    check("repo activity: create_main_window never starts the prefetch",
+          "start_repo_activity_prefetch"
+          not in inspect.getsource(main_mod.create_main_window))
+    src = inspect.getsource(main_mod.main)
+    check("repo activity: main() starts it last, after the startup recovery",
+          src.find("start_repo_activity_prefetch")
+          > src.find("recover_blocked_at_startup") > 0)
+
+    win.close()
+    pump(100)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_repo_activity_browser_url():
+    """The origin remote forms git prints map to the github.com page."""
+    from app import repo_activity
+
+    cases = {
+        "git@github.com:o/r.git": "https://github.com/o/r",
+        "https://github.com/o/r.git/": "https://github.com/o/r",
+        "ssh://git@github.com/o/r.git": "https://github.com/o/r",
+        "https://gitlab.com/o/r.git": "",
+        "": "",
+    }
+    got = {k: repo_activity.browser_url(k) for k in cases}
+    check("repo url: origin forms map to the github.com browser URL",
+          got == cases, got)
+
+
 def test_no_em_dashes_in_visible_text():
     """No em dash reaches the reader. The app's visible strings (labels,
     tooltips, dialog copy, terminal notices, the board markdown) are checked by

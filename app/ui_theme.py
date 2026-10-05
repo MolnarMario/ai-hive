@@ -651,10 +651,13 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 /* live "last reply finished at" stamp, same treatment as #CardTokens */
 #CardLimitMark {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
 /* clickable (opens a menu of what to kill) -- transparent by default, like
-   #CardSchedule, so it doesn't inherit the platform's default button chrome */
+   #CardSchedule, so it doesn't inherit the platform's default button chrome.
+   Pinned to the glyph's width: QToolButton pads text with two spaces on top
+   of the generic 8px padding, which made a 47px pill for one gear. */
 #CardBgShell {{
     background: transparent; color: {p.ACCENT_ORANGE};
     border: 1px solid transparent; border-radius: 8px; font-size: 13px;
+    padding: 0; min-width: 20px; max-width: 20px;
 }}
 #CardBgShell:hover {{
     background: rgba(232,152,58,0.20); border-color: {p.ACCENT_ORANGE};
@@ -766,6 +769,13 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     border-radius: 4px;
 }}
 #WsDelete {{ color: {p.TEXT}; font-size: 17px; font-weight: 900; }}
+/* the workspace header's trash glyph. Segoe UI Symbol draws U+1F5D1 as a
+   one-color outline that takes `color`; left to fallback, Windows can pick
+   the color emoji, which ignores it and never turns red on hover. */
+#WsTrash {{
+    padding: 1px 6px; color: {p.TEXT}; font-size: 17px;
+    font-family: "Segoe UI Symbol";
+}}
 #GlobalFontBtn {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 2px 7px; color: {p.TEXT_DIM}; font-weight: 700;
@@ -874,7 +884,9 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 1px 6px; font-size: 11px;
 }}
-#CardClose:hover, #WsDelete:hover {{ color: {p.RED}; border-color: {p.RED}; }}
+#CardClose:hover, #WsDelete:hover, #WsTrash:hover {{
+    color: {p.RED}; border-color: {p.RED};
+}}
 QPushButton {{
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
     border-radius: 3px; padding: 5px 14px;
@@ -985,6 +997,9 @@ QScrollArea {{ background: transparent; border: none; }}
 #RepoOpenButton:hover, #RepoActivityMenuButton:hover {{
     background: {p.BG_ACTIVE}; border-color: {p.ACCENT_BLUE};
 }}
+/* Open repo hovered: its right edge is the ▾'s left border (WorkspacePage
+   sets seamLit), so light that too or the hover box has no right side */
+#RepoActivityMenuButton[seamLit="true"] {{ border-left-color: {p.ACCENT_BLUE}; }}
 #GridButton, #ActivityToggle {{
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
     border-radius: 3px; padding: 3px 8px; color: {p.TEXT};

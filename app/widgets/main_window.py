@@ -11,9 +11,8 @@ import shutil
 import subprocess
 import threading
 import time
-import urllib.request
 from dataclasses import replace as dc_replace
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 
 from PySide6.QtCore import QEvent, QPoint, QProcess, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
@@ -33,6 +32,7 @@ from .. import integration
 from .. import lanes
 from .. import limit_ledger
 from .. import providers
+from .. import repo_activity
 from ..limit_banner import LIMIT_PROVIDERS, SEVEN_DAY_WINDOWS
 from .. import scheduled_send
 from .. import session_hook
@@ -2109,7 +2109,7 @@ class MainWindow(QMainWindow):
     # `plan_usage()` exposes the latest full reading for polling-style callers.
     planLimitReached = Signal(object)   # claude_usage.Limit
     planLimitCleared = Signal()
-    repoActivityLoaded = Signal(str, object, object, str, str)
+    repoActivityLoaded = Signal(str, str, object)  # ws_id, path, result
     workspaceCloneFinished = Signal(str, str, str, str)
 
     def __init__(self, manager: WorkspaceManager, store: SessionStore,
@@ -2121,6 +2121,12 @@ class MainWindow(QMainWindow):
         self.resize(1440, 900)
 
         self._pages: dict[str, WorkspacePage] = {}
+        # the Open repo dropdown's GitHub activity (app/repo_activity.py):
+        # ws_id -> {"path", "at" (monotonic), "result"}, plus the workspaces
+        # with a fetch in flight. The fetcher is an attribute for tests.
+        self._repo_activity: dict[str, dict] = {}
+        self._repo_activity_busy: set[str] = set()
+        self._repo_activity_fetch = repo_activity.fetch
         self.repoActivityLoaded.connect(self._on_repo_activity_loaded)
         self.workspaceCloneFinished.connect(self._on_workspace_clone_finished)
         self._clone_progress: QProgressDialog | None = None
@@ -5484,6 +5490,7 @@ class MainWindow(QMainWindow):
         if (self._map_window is not None
                 and getattr(self._map_window._workspace, "id", None) == ws_id):
             self._map_window.close()   # don't keep mapping a deleted workspace
+        self._repo_activity.pop(ws_id, None)
         page = self._pages.pop(ws_id, None)
         if page is not None:
             for card in list(page.cards):
@@ -5709,6 +5716,9 @@ class MainWindow(QMainWindow):
         page = self._pages.get(ws_id)
         if page is not None:
             page.set_path_text(path)
+            # the old folder's GitHub activity is not this one's
+            self._repo_activity.pop(ws_id, None)
+            page.reset_repo_activity()
         # the new folder may or may not be in a git repository
         self._refresh_workspace_lane_toggles(ws_id)
         self.sidebar.set_row_folder(ws_id, os.path.basename(path) or path)
@@ -5742,15 +5752,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "AI Hive",
                                 f"Folder not found:\n{ws.project_path}")
             return
-        try:
-            result = subprocess.run(
-                ["git", "-C", ws.project_path, "remote", "get-url", "origin"],
-                capture_output=True, text=True, timeout=3,
-                creationflags=0x08000000)  # CREATE_NO_WINDOW
-        except (OSError, subprocess.SubprocessError):
-            result = None
-        remote = result.stdout.strip() if result and result.returncode == 0 else ""
-        url = self._repo_remote_url(remote)
+        url = repo_activity.origin_url(ws.project_path)
         if url:
             if not fsopen.open_url(url):
                 QMessageBox.warning(self, "AI Hive",
@@ -5761,91 +5763,96 @@ class MainWindow(QMainWindow):
                 f"No GitHub origin remote found for:\n{ws.project_path}")
 
     def _load_repo_activity(self, ws_id: str) -> None:
-        """Fetch recent public GitHub activity without blocking the UI."""
+        """The dropdown opened. It already shows the cached list (or the
+        loading line); fetch only when there is no good copy for this folder
+        or it is older than repo_activity.STALE_AFTER_S. A fresh result
+        rebuilds the menu in place, even while it is open."""
         ws = self.manager.workspace(ws_id)
         if ws is None:
             return
-        project_path = ws.project_path
+        entry = self._repo_activity.get(ws_id)
+        if (entry is not None and entry["path"] == ws.project_path
+                and not entry["result"]["error"]
+                and time.monotonic() - entry["at"]
+                < repo_activity.STALE_AFTER_S):
+            return
+        self._fetch_repo_activity([ws_id])
 
-        def fetch() -> None:
-            pull_requests, commits, error = [], [], ""
-            try:
-                result = subprocess.run(
-                    ["git", "-C", project_path, "remote", "get-url", "origin"],
-                    capture_output=True, text=True, timeout=3,
-                    creationflags=0x08000000)
-                remote_url = self._repo_remote_url(
-                    result.stdout.strip() if result.returncode == 0 else "")
-                if not remote_url:
-                    error = "No GitHub origin remote found"
-                else:
-                    parts = [part for part in urlparse(remote_url).path.split("/")
-                             if part]
-                    if len(parts) != 2:
-                        error = "Could not identify this GitHub repository"
-                    else:
-                        api_base = f"https://api.github.com/repos/{parts[0]}/{parts[1]}"
+    def start_repo_activity_prefetch(self) -> None:
+        """Fill every workspace's Open repo dropdown once, in the background,
+        after the restored agents have had the machine for a few seconds.
+        OPT-IN, called by main.py only, like start_usage_polling: the smoke
+        suite must never touch the network."""
+        QTimer.singleShot(repo_activity.PREFETCH_DELAY_MS, self,
+                          self._prefetch_repo_activity)
 
-                        def get_json(endpoint: str):
-                            request = urllib.request.Request(
-                                endpoint,
-                                headers={"Accept": "application/vnd.github+json",
-                                         "User-Agent": "AI-Hive"})
-                            with urllib.request.urlopen(request, timeout=8) as response:
-                                return json.loads(response.read().decode("utf-8"))
+    def _prefetch_repo_activity(self) -> None:
+        if self._closing:
+            return
+        active = self.manager.active_id
+        # the workspace on screen first: it's the dropdown most likely opened
+        ids = sorted((w.id for w in self.manager.workspaces),
+                     key=lambda ws_id: ws_id != active)
+        self._fetch_repo_activity(
+            [ws_id for ws_id in ids if ws_id not in self._repo_activity])
 
-                        prs = get_json(api_base + "/pulls?state=all&sort=updated&direction=desc&per_page=10")
-                        recent_commits = get_json(api_base + "/commits?per_page=10")
-                        pull_requests = [{
-                            "number": item["number"],
-                            "title": item["title"],
-                            "state": item["state"],
-                            "merged": bool(item.get("merged_at")),
-                            "url": item["html_url"],
-                        } for item in prs]
-                        commits = [{
-                            "sha": item["sha"],
-                            "message": item["commit"]["message"],
-                            "url": item["html_url"],
-                        } for item in recent_commits]
-            except (OSError, subprocess.SubprocessError, ValueError,
-                    KeyError, TypeError) as exc:
-                error = f"Could not load GitHub activity: {exc}"
-            self.repoActivityLoaded.emit(ws_id, pull_requests, commits, error,
-                                         remote_url if not error else "")
+    def _fetch_repo_activity(self, ws_ids: list[str]) -> None:
+        """Fetch each workspace's activity in turn on ONE worker thread, so a
+        prefetch of many workspaces never opens many connections at once."""
+        jobs = []
+        for ws_id in ws_ids:
+            ws = self.manager.workspace(ws_id)
+            if ws is None or ws_id in self._repo_activity_busy:
+                continue
+            self._repo_activity_busy.add(ws_id)
+            jobs.append((ws_id, ws.project_path))
+        if not jobs:
+            return
+        fetch = self._repo_activity_fetch
 
-        threading.Thread(target=fetch, name="github-repo-activity",
+        def run() -> None:
+            for ws_id, path in jobs:
+                try:
+                    result = fetch(path)
+                except Exception as exc:  # never leave a workspace "busy"
+                    result = {"pull_requests": [], "commits": [],
+                              "repo_url": "",
+                              "error": f"Could not load GitHub activity: {exc}"}
+                try:
+                    self.repoActivityLoaded.emit(ws_id, path, result)
+                except RuntimeError:   # the window is gone
+                    return
+
+        threading.Thread(target=run, name="github-repo-activity",
                          daemon=True).start()
 
-    def _on_repo_activity_loaded(self, ws_id: str, pull_requests: list,
-                                 commits: list, error: str,
-                                 repo_url: str) -> None:
+    def _on_repo_activity_loaded(self, ws_id: str, path: str,
+                                 result: dict) -> None:
+        self._repo_activity_busy.discard(ws_id)
+        ws = self.manager.workspace(ws_id)
+        if ws is None:
+            return
+        if ws.project_path != path:
+            # the folder changed while this was in flight: fetch the new one
+            self._fetch_repo_activity([ws_id])
+            return
+        old = self._repo_activity.get(ws_id)
+        if (result["error"] and old is not None and old["path"] == path
+                and not old["result"]["error"]):
+            # a failed refresh (offline, rate limited) keeps the last good
+            # list, still stale, so the next click tries again
+            return
+        self._repo_activity[ws_id] = {"path": path, "at": time.monotonic(),
+                                      "result": result}
         page = self._pages.get(ws_id)
         if page is not None:
-            page.show_repo_activity(pull_requests, commits, error, repo_url)
+            page.show_repo_activity(result["pull_requests"], result["commits"],
+                                    result["error"], result["repo_url"])
 
     @staticmethod
     def _repo_remote_url(remote: str) -> str:
         """Convert a GitHub origin URL (HTTPS or SSH) to its browser URL."""
-        remote = (remote or "").strip()
-        if not remote:
-            return ""
-        # Git's SCP-like SSH syntax is not accepted by urlparse as a URL.
-        if remote.startswith("git@github.com:"):
-            path = remote.partition(":")[2]
-            parsed = urlparse(f"https://github.com/{path}")
-        else:
-            parsed = urlparse(remote)
-            if parsed.scheme in ("ssh", "git") and parsed.hostname == "github.com":
-                parsed = parsed._replace(scheme="https", netloc="github.com")
-        if parsed.scheme not in ("http", "https") or parsed.hostname != "github.com":
-            return ""
-        path = parsed.path.rstrip("/")
-        if path.endswith(".git"):
-            path = path[:-4]
-        if not path.strip("/"):
-            return ""
-        return urlunparse(("https", "github.com", path, "", "", ""))
+        return repo_activity.browser_url(remote)
 
     def _change_workspace_folder(self, ws_id: str) -> None:
         ws = self.manager.workspace(ws_id)

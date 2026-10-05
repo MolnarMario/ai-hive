@@ -469,6 +469,31 @@ def test_bg_shell_live_ui():
     a.deleteLater()
 
 
+def test_card_bg_mark_compact():
+    """The header gear is one glyph wide. It used to inherit QToolButton's
+    8px side padding plus the two spaces QToolButton adds around text, a
+    47px pill that pushed the task summary away."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard
+    from main import setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Geared", cwd=SCRATCH_CWD))
+    card = TerminalCard(a)
+    card.resize(900, 300); card.show()
+    a._bg_shell = True
+    a.bg_shell_changed.emit(True)
+    loop = QEventLoop(); QTimer.singleShot(60, loop.quit); loop.exec()
+    w = card.bg_mark.width()
+    check("bg shell UI: the card gear is at most 24px wide", 0 < w <= 24, w)
+    card.detach(); card.close()
+    a.deleteLater()
+
+
 def test_bg_shell_extra_pids_and_kill_pid():
     """bg_shell_extra_pids() is what the kill menu lists, and
     kill_bg_shell_pid() is its per-item action -- letting the user kill one
