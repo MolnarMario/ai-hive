@@ -35,10 +35,11 @@ from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel,
 
 from ..terminal_agent import TerminalAgent
 from ..tiling import compute_grid, explicit_grid, parse_layout
-from ..ui_theme import Palette
+from ..ui_theme import Palette, repolish
 from ..workspace_manager import Workspace
 from .grid_selector import GridButton
-from .ornaments import anchored_popup_pos
+from .lanes_help import show_lanes_explainer
+from .ornaments import ToggleSwitch, anchored_popup_pos
 from .terminal_card import CARD_REORDER_MIME, TerminalCard
 
 
@@ -127,6 +128,7 @@ class WorkspacePage(QWidget):
     fileActivated = Signal(str, str)    # ws_id, abs path (Ctrl+clicked in a card)
     reorderCommitted = Signal(str, list)  # ws_id, new ordered agent ids
     laneActionRequested = Signal(str, str, str)  # ws_id, agent id, action
+    lanesToggled = Signal(str, bool)    # ws_id, the header's ⎇ Lanes toggle
 
     def __init__(self, workspace: Workspace, parent=None):
         super().__init__(parent)
@@ -244,6 +246,28 @@ class WorkspacePage(QWidget):
         self.activity_btn = tool("❦ Activity", "Show the workspace activity board")
         self.activity_btn.setObjectName("ActivityToggle")
         self.activity_btn.setCheckable(True)
+        # the workspace's lanes toggle (spec-v4-lane-scopes.md): the default
+        # "Own lane" tick for its new agents. Hidden outside a git
+        # repository; MainWindow sets its state (set_lanes_state).
+        self.lanes_box = QWidget(header)
+        lanes_lay = QHBoxLayout(self.lanes_box)
+        lanes_lay.setContentsMargins(0, 0, 0, 0)
+        lanes_lay.setSpacing(5)
+        self.lanes_label = QLabel("⎇ Lanes", self.lanes_box)
+        self.lanes_label.setObjectName("HeaderLanesLabel")
+        self.lanes_switch = ToggleSwitch(self.lanes_box)
+        self.lanes_switch.setObjectName("HeaderLanesSwitch")
+        # a tooltip can't hold a link, so the explainer has its own button
+        self.lanes_help_btn = QToolButton(self.lanes_box)
+        self.lanes_help_btn.setText("?")
+        self.lanes_help_btn.setObjectName("HeaderLanesHelp")
+        self.lanes_help_btn.setToolTip("What are lanes?")
+        self.lanes_help_btn.setAccessibleName("What are lanes?")
+        self.lanes_help_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        lanes_lay.addWidget(self.lanes_label)
+        lanes_lay.addWidget(self.lanes_switch)
+        lanes_lay.addWidget(self.lanes_help_btn)
+        self.lanes_box.hide()
 
         hl.addWidget(folder_icon)
         hl.addWidget(self.path_label, 1)
@@ -252,6 +276,7 @@ class WorkspacePage(QWidget):
         hl.addWidget(self.open_btn)
         hl.addWidget(self.change_btn)
         hl.addSpacing(8)
+        hl.addWidget(self.lanes_box)
         hl.addWidget(self.grid_button)
         hl.addWidget(self.map_btn)
         hl.addWidget(self.activity_btn)
@@ -274,7 +299,47 @@ class WorkspacePage(QWidget):
         # clicked (not toggled) so programmatic setChecked never re-fires
         self.activity_btn.clicked.connect(
             lambda: self.activityToggled.emit(self.workspace.id))
+        self.lanes_switch.clicked.connect(self._on_lanes_clicked)
+        self.lanes_help_btn.clicked.connect(
+            lambda: show_lanes_explainer(self.window()))
         return header
+
+    def _on_lanes_clicked(self) -> None:
+        # emitted even while forced: MainWindow then puts the switch back
+        self.lanesToggled.emit(self.workspace.id, self.lanes_switch.isChecked())
+
+    def set_lanes_state(self, on: bool, forced: bool = False,
+                        available: bool = True) -> None:
+        """Reflect the workspace's lane default (no signal). `forced`: the
+        Options switch "Lanes in every workspace" is on, so the toggle shows
+        on and can't be changed here. `available`: the folder is in a git
+        repository; outside one there is nothing to make a lane from."""
+        self.lanes_switch.setChecked(bool(on))
+        self.lanes_switch.setEnabled(not forced)
+        if self.lanes_label.property("forced") is not bool(forced):
+            self.lanes_label.setProperty("forced", bool(forced))
+            repolish(self.lanes_label)
+        if forced:
+            tip = ("Lanes: ON for every workspace (the Options switch "
+                   "\"Lanes in every workspace\" is on). Turn that off to "
+                   "choose per workspace.")
+        elif on:
+            tip = ("Lanes: ON. A new Claude agent in this workspace gets its "
+                   "own git worktree and branch (the New Agent dialog ticks "
+                   "Own lane). Agents that are already here stay where they "
+                   "are; each card offers Restart in own lane.\nClick to turn "
+                   "off. Existing lanes are never touched.")
+        else:
+            tip = ("Lanes: OFF. New agents in this workspace share the "
+                   "workspace folder. The New Agent dialog can still give one "
+                   "agent its own lane.\nClick to turn on. Nothing runs and "
+                   "no agent moves: it only changes the default for new "
+                   "agents.")
+        self.lanes_switch.setToolTip(tip)
+        self.lanes_label.setToolTip(tip)
+        if self.lanes_box.isHidden() == bool(available):
+            self.lanes_box.setVisible(bool(available))
+            self._elide_path()
 
     def _show_repo_activity_menu(self) -> None:
         menu = self.repo_activity_menu
@@ -355,7 +420,8 @@ class WorkspacePage(QWidget):
             used += hl.spacing() * max(0, hl.count() - 1)
             for i in range(hl.count()):
                 item = hl.itemAt(i)
-                if item.widget() is self.path_label:
+                if item.widget() is self.path_label or (
+                        item.widget() is not None and item.widget().isHidden()):
                     continue
                 if item.widget() is not None:
                     used += item.widget().sizeHint().width()

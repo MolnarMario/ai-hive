@@ -69,6 +69,10 @@ class Workspace:
     integrator_uid: str = ""
     integration_queue: list = field(default_factory=list)
     base_branch: str = ""
+    # the workspace's lanes toggle (.scratch/agent-lanes/spec-v4-lane-
+    # scopes.md): ON ticks "Own lane" for its new Claude agents. It only
+    # sets that default; it never touches an agent that exists.
+    lanes: bool = False
 
 
 class WorkspaceManager(QObject):
@@ -81,6 +85,7 @@ class WorkspaceManager(QObject):
     terminalCountChanged = Signal(str, int)  # ws_id, count
     workspaceStatsChanged = Signal(str, dict)  # ws_id, {total,active,idle,error}
     workspacePathChanged = Signal(str, str)  # ws_id, new project_path
+    workspaceLanesChanged = Signal(str, bool)  # ws_id, lanes toggle
     layoutChanged = Signal(str, str)         # ws_id, layout
     sidebarLayoutChanged = Signal()          # workspace order / categories
     # rising edge of an agent's waiting-for-user state (standby -> waiting):
@@ -124,11 +129,6 @@ class WorkspaceManager(QObject):
         # Their cwd is NOT moved to the workspace folder; MainWindow repairs
         # the lane at the same path (take_lane_repairs) and they wait for it.
         self._lane_repairs: list[tuple[str, str]] = []
-        # is the lane machinery running (MainWindow's Agent lanes switch)? A
-        # laned agent's system prompt then says "skim the roster" instead of
-        # "read the board", because its overlap hooks tell it what matters.
-        # Set by MainWindow, transient, followed by reapply_coordination().
-        self.lane_awareness = False
 
     # ------------------------------------------------------------- reads ---
 
@@ -250,6 +250,20 @@ class WorkspaceManager(QObject):
         self._recompute(ws_id)  # scaffold + roster the new board immediately
         self.dirty.emit()
 
+    def set_workspace_lanes(self, ws_id: str, on: bool) -> bool:
+        """The workspace's lanes toggle. Persisted, so it goes through
+        _touch. Starts no git and changes no agent: it only decides whether
+        the New Agent dialog ticks "Own lane" for this workspace."""
+        ws = self.workspace(ws_id)
+        if ws is None:
+            return False
+        on = bool(on)
+        if ws.lanes != on:
+            ws.lanes = on
+            self.workspaceLanesChanged.emit(ws_id, on)
+            self._touch(ws_id)
+        return True
+
     def set_layout(self, ws_id: str, layout: str) -> None:
         ws = self.workspace(ws_id)
         if ws is None or ws.layout == layout:
@@ -318,7 +332,8 @@ class WorkspaceManager(QObject):
     # ------------------------------------------------------- agent lanes ---
     # A lane is the agent's private git worktree (app/lanes.py). The record is
     # persisted, so both mutations mark the session dirty, and both re-apply
-    # coordination: the system prompt carries the lane's branch and base.
+    # coordination: the system prompt carries the lane's branch and base, and
+    # whether the agent skims the roster (laned) or reads the board.
 
     def set_agent_lane(self, ws_id: str, agent_id: str, lane: dict,
                        cwd: str = "") -> bool:
@@ -365,14 +380,6 @@ class WorkspaceManager(QObject):
         # the lane hooks' env vars and settings file follow the lane record
         if self.arm_agent is not None:
             self.arm_agent(ws, agent)
-
-    def reapply_coordination(self) -> None:
-        """Rebuild every agent's coordination config (system prompt, board
-        dir) after `lane_awareness` changed. Takes effect at each agent's
-        next launch, like every other launch flag."""
-        for ws in self._workspaces:
-            for agent in ws.agents:
-                self._apply_coordination(ws, agent)
 
     # ------------------------------------------------- integration queue ---
     # Agent lanes Phase 3 (app/integration.py). Every mutation here is
@@ -920,7 +927,7 @@ class WorkspaceManager(QObject):
                     if self.session_map_path else {})
         for a in running:
             rec = live_map.get(a.id)
-            if not rec:
+            if not rec or not self._live_record_current(a, rec):
                 continue
             covered.add(a.id)  # the child spoke for itself; trust it, not mtime
             new = rec.get("session_id")
@@ -961,6 +968,26 @@ class WorkspaceManager(QObject):
             self.dirty.emit()
         return changed
 
+    @staticmethod
+    def _live_record_current(agent: TerminalAgent, rec: dict) -> bool:
+        """Does this SessionStart record describe the agent's CURRENT child?
+        The map keeps an agent's last record until its new child writes one,
+        so after a restart, a fresh start or a move into a lane the old
+        record (old id, maybe the old folder) is still there. Pinning it back
+        would put the old conversation onto the new run, and after a move
+        into a lane `--resume` would continue the main-folder conversation
+        inside the lane. A record written before this run started, or in
+        another folder, is ignored; the mtime fallback below covers the gap."""
+        ts = rec.get("ts")
+        started = getattr(agent, "_session_started", 0.0) or 0.0
+        if isinstance(ts, (int, float)) and 0 < ts < started:
+            return False
+        cwd = rec.get("cwd")
+        if (isinstance(cwd, str) and cwd and agent.spec.cwd
+                and not lanes.same_path(cwd, agent.spec.cwd)):
+            return False
+        return True
+
     def _apply_coordination(self, ws: Workspace, agent: TerminalAgent) -> None:
         """Give AI agents access to the shared workspace board (peer
         awareness) via --add-dir; Claude additionally gets the board etiquette
@@ -973,10 +1000,13 @@ class WorkspaceManager(QObject):
         agent.spec.extra_dirs = [ws.board.dir]
         if agent.spec.provider == "claude":
             # every Claude agent gets the peer-etiquette prompt: read the board
-            # before starting work, and log_activity as it goes
+            # before starting work, and log_activity as it goes. A laned
+            # agent skims the roster instead: the lane machinery runs for
+            # every lane (MainWindow._sync_lane_service), so its hooks tell
+            # it about real overlaps
             agent.spec.system_prompt = coordination.system_prompt_text(
                 ws.name, agent.spec.name, ws.board.path,
-                lane=agent.spec.lane, aware=self.lane_awareness,
+                lane=agent.spec.lane, aware=bool(agent.spec.lane),
                 integrator=bool(ws.integrator_uid
                                 and ws.integrator_uid == agent.spec.uid))
 
@@ -1153,6 +1183,10 @@ class WorkspaceManager(QObject):
                     "integrator": w.integrator_uid,
                     "integration_queue": self._queue_safe(w),
                     "base_branch": w.base_branch,
+                    # additive and read with a default, so no version bump.
+                    # An older build drops it on its next save, which only
+                    # resets the toggle to OFF; lanes themselves are kept.
+                    "lanes": w.lanes,
                 }
                 for w in self._workspaces
             ],
@@ -1180,7 +1214,8 @@ class WorkspaceManager(QObject):
                            name=wd.get("name", "Workspace"),
                            project_path=path,
                            layout=wd.get("layout", DEFAULT_LAYOUT),
-                           board=coordination.WorkspaceBoard(path))
+                           board=coordination.WorkspaceBoard(path),
+                           lanes=wd.get("lanes") is True)
             self._workspaces.append(ws)
             self.workspaceAdded.emit(ws)
             for td in wd.get("terminals", [])[:MAX_AGENTS_PER_WORKSPACE]:

@@ -123,8 +123,7 @@ class QueueRow(QFrame):
         lay.addLayout(self.buttons_row)
         self.buttons: dict[str, QPushButton] = {}
 
-    def show_item(self, item, position: int, since: int,
-                  enabled: bool) -> None:
+    def show_item(self, item, position: int, since: int) -> None:
         self.item_id = item.id
         if self.property("state") != item.state:
             self.setProperty("state", item.state)
@@ -162,10 +161,6 @@ class QueueRow(QFrame):
                         self.item_id, a))
                 self.buttons_row.addWidget(btn)
                 self.buttons[action] = btn
-        for action, btn in self.buttons.items():
-            # opening the PR is read-only; everything else waits for the
-            # Agent lanes switch, like the rest of the queue
-            btn.setEnabled(enabled or action == "open")
 
 
 class ActivityPanel(QFrame):
@@ -304,13 +299,13 @@ class ActivityPanel(QFrame):
 
     def set_lanes(self, views: dict) -> None:
         """The lane poller's latest {agent uid: lanes.LaneView} for the shown
-        workspace ({} while Agent lanes is off). Cheap: no git."""
+        workspace ({} while it has no lane). Cheap: no git."""
         self._lane_views = dict(views or {})
         if self._workspace is not None:
             self._render_lanes(self._workspace)
 
     def set_integration(self, state: dict | None) -> None:
-        """The workspace's queue, from MainWindow: {"paused", "integrator"
+        """The workspace's queue, from MainWindow: {"integrator"
         (a name or ""), "laned" (the workspace has a lane), "items"
         [QueueItem], "since" {item id: commits on the lane since submit},
         "reason" (why a lane can't be submitted now, or "")}. None hides the
@@ -332,27 +327,21 @@ class ActivityPanel(QFrame):
             self.queue_rows.append(row)
         if not visible:
             return
-        paused = bool(state.get("paused"))
         waiting = sum(1 for i in items if i.is_open)
         self.queue_header.setText(
-            "Integration: paused" if paused else
             f"Integration: {waiting} in line" if waiting else "Integration")
         who = state.get("integrator") or ""
         info = [f"Integrator: {who}" if who else
                 "No integrator yet. Right-click a laned Claude agent's "
                 "header and pick Make integrator."]
-        if paused:
-            info.append("Paused while Agent lanes is off. Nothing is sent "
-                        "and nothing is merged; the queue is kept.")
-        elif state.get("reason"):
+        if state.get("reason"):
             info.append(state["reason"])
         self.queue_info.setText("\n".join(info))
         since = state.get("since") or {}
         position = 0
         for row, item in zip(self.queue_rows, items):
             position = position + 1 if item.is_open else 0
-            row.show_item(item, position, int(since.get(item.id, 0)),
-                          not paused)
+            row.show_item(item, position, int(since.get(item.id, 0)))
 
     def _laned(self, workspace) -> list:
         return [a for a in workspace.agents
@@ -373,7 +362,7 @@ class ActivityPanel(QFrame):
         view = self._lane_views.get(agent.spec.uid)
         head = f"{agent.spec.name}  ⎇ {lane['branch']}"
         if view is None:
-            return head + "\n  (details while Agent lanes is on)"
+            return head + "\n  (reading the lane...)"
         if not view.exists:
             return head + "\n  (lane folder missing)"
         counts = [f"↑{view.ahead}", f"↓{view.behind}",
@@ -405,7 +394,7 @@ class ActivityPanel(QFrame):
             parts.append("")
             parts.append(f"{agent.spec.name}'s lane:")
             if view is None:
-                parts.append("(details while Agent lanes is on)")
+                parts.append("(reading the lane...)")
             elif view.dirty:
                 shown = view.dirty[:30]
                 parts.extend(shown)

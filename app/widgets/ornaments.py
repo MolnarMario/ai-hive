@@ -1708,6 +1708,8 @@ class ToggleSwitch(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if not self.isEnabled():
+            p.setOpacity(0.5)   # locked by another setting
         off = QColor(Palette.BORDER)
         on = QColor(Palette.GREEN)
         t = self._pos

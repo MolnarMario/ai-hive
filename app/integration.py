@@ -29,8 +29,9 @@ queue". A laned agent's work reaches the base branch one lane at a time:
 
 An item becomes MERGED only through Approve merge or the user's Mark merged
 (a PR merged on github.com), and only when GitHub says MERGED. The queue never
-skips a failed item by itself, and it is paused while the Agent lanes switch
-is off.
+skips a failed item by itself. No toggle pauses it: without lanes it has
+nothing to do, and an item awaiting approval stays approvable after its
+lane's card is closed.
 
 What AI Hive can't prove: that the suite really ran on the Tested-commit. That
 line is the integrator's claim; the RESULT line next to it is for the user,
