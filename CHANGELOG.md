@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.28.2
+
+- The A- / A+ / maximize buttons that appear when you hover the ⋯ in a card
+  header now touch each other and the tray edge, with no dead gaps, and fill
+  the full header height.
+- Moving the pointer above or below those buttons now hides them, instead of
+  leaving them open until you leave sideways.
+
 ## 0.28.1
 
 - The ⚙ badge in a card header (a background command is still running) is
