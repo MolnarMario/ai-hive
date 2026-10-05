@@ -2041,3 +2041,42 @@ def test_terminal_scrollbar():
     card.deleteLater()
     c1.deleteLater()
     c2.deleteLater()
+
+
+def test_header_tools_tray_has_no_dead_space():
+    """The hover tray (A- / A+ / maximize) must be solid buttons edge to edge,
+    as tall as its header strip, and must close when the pointer is above or
+    below it, not only when it leaves the strip sideways."""
+    from PySide6.QtCore import QEventLoop, QPoint, QTimer
+    from PySide6.QtGui import QCursor
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Tray", cwd=SCRATCH_CWD))
+    card = TerminalCard(a)
+    card.resize(900, 300); card.show(); pump(60)
+    ht = card.header_tools
+    ht._set_open(True); pump(30)
+    tray = ht.tray
+    check("tray: no spacing between the buttons", tray.layout().spacing() == 0)
+    check("tray: only the 1px border around the buttons",
+          tuple(tray.layout().contentsMargins().__getattribute__(n)()
+                for n in ("left", "top", "right", "bottom")) == (1, 1, 1, 1))
+    check("tray: as tall as the strip it opens from",
+          tray.height() >= ht.height(), (tray.height(), ht.height()))
+    # pointer just above the tray, still over the strip's column
+    above = tray.mapToGlobal(QPoint(tray.width() // 2, -3))
+    QCursor.setPos(above); pump(30)
+    ht._recheck()
+    check("tray: closes when the pointer is above it",
+          not tray.isVisible())
+
+    card.detach(); card.close()
+    a.deleteLater()
