@@ -318,6 +318,10 @@ def main() -> int:
     # transcripts and types into real agents, so like the usage poll it is
     # opted into here rather than in the factory the smoke suite shares.
     window.recover_blocked_at_startup()
+    # last: fill the Open repo dropdowns from GitHub in the background, a few
+    # seconds from now, so a click shows the list at once. Network, so it is
+    # opted into here like the usage poll.
+    window.start_repo_activity_prefetch()
     return app.exec()
 
 

@@ -25,12 +25,12 @@ reorderCommitted → WorkspaceManager.reorder_agents, which re-sequences
 ws.agents (persisted by list position) and marks the session dirty.
 """
 
-from PySide6.QtCore import (QAbstractAnimation, QEasingCurve,
+from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent,
                             QParallelAnimationGroup, QPropertyAnimation, QRect,
-                            QSize, Qt, Signal)
+                            Qt, Signal)
 from PySide6.QtGui import QColor, QFontMetrics, QPainter
 from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel,
-                               QMenu, QScrollArea, QStyle, QToolButton, QVBoxLayout,
+                               QMenu, QScrollArea, QToolButton, QVBoxLayout,
                                QWidget)
 
 from ..terminal_agent import TerminalAgent
@@ -217,11 +217,10 @@ class WorkspacePage(QWidget):
         # delete sits LEFT of open/change — the sidebar used to duplicate both
         # open-folder and delete as hover buttons on the workspace row; both
         # actions now live here, once, next to the folder they act on.
-        self.delete_btn = tool("", "Delete workspace", "WsDelete")
+        # a text glyph, not Qt's stock trash pixmap: text takes the QSS color,
+        # so it matches the header and turns red on hover like every delete
+        self.delete_btn = tool("🗑", "Delete workspace", "WsTrash")
         self.delete_btn.setAccessibleName("Delete workspace")
-        self.delete_btn.setIcon(self.delete_btn.style().standardIcon(
-            QStyle.StandardPixmap.SP_TrashIcon))
-        self.delete_btn.setIconSize(QSize(15, 15))
         self.repo_btn = tool("Open repo", "Open this workspace's GitHub repository in a browser",
                              "RepoOpenButton")
         self.repo_activity_btn = tool("▾", "Show recent GitHub pull requests and commits",
@@ -235,8 +234,14 @@ class WorkspacePage(QWidget):
         repo_actions_lay.setSpacing(0)
         repo_actions_lay.addWidget(self.repo_btn)
         repo_actions_lay.addWidget(self.repo_activity_btn)
+        # Open repo has no right border (the ▾ draws the shared edge), so its
+        # hover lights that edge on the ▾ or the hover box reads open
+        self.repo_btn.installEventFilter(self)
         self.repo_activity_menu = QMenu(self.repo_activity_btn)
-        self.repo_activity_menu.addAction("Recent GitHub activity loads when opened…")
+        # MainWindow fills it in the background (app/repo_activity.py); a
+        # click shows whatever is here at once
+        self._repo_activity_shown = None
+        self.reset_repo_activity()
         self.open_btn = tool("Open folder", "Open this workspace's folder")
         self.change_btn = tool("Change…", "Change the workspace folder")
         self.grid_button = GridButton(header)
@@ -341,6 +346,16 @@ class WorkspacePage(QWidget):
             self.lanes_box.setVisible(bool(available))
             self._elide_path()
 
+    def eventFilter(self, obj, event):
+        if obj is self.repo_btn and event.type() in (QEvent.Type.Enter,
+                                                     QEvent.Type.Leave):
+            lit = event.type() == QEvent.Type.Enter
+            seam = self.repo_activity_btn
+            if seam.property("seamLit") is not lit:
+                seam.setProperty("seamLit", lit)
+                repolish(seam)
+        return super().eventFilter(obj, event)
+
     def _show_repo_activity_menu(self) -> None:
         menu = self.repo_activity_menu
         # Measure it before showing so Qt never paints it at the raw anchor
@@ -351,11 +366,33 @@ class WorkspacePage(QWidget):
                                       align_right=True))
         self.repoActivityRequested.emit(self.workspace.id)
 
+    def reset_repo_activity(self) -> None:
+        """Back to the loading line: nothing fetched yet for this folder."""
+        self._repo_activity_shown = None
+        self.repo_activity_menu.clear()
+        self.repo_activity_menu.addAction(
+            "Loading recent GitHub activity…").setEnabled(False)
+
     def show_repo_activity(self, pull_requests: list, commits: list,
                            error: str = "", repo_url: str = "") -> None:
-        """Replace the loading menu with GitHub activity for this workspace."""
+        """Replace the menu with GitHub activity for this workspace. The same
+        data again is a no-op, so a refresh that found nothing new never
+        rebuilds a menu the user has open."""
+        shown = (pull_requests, commits, error, repo_url)
+        if shown == self._repo_activity_shown:
+            return
+        self._repo_activity_shown = shown
         menu = self.repo_activity_menu
         menu.clear()
+        self._fill_repo_activity(menu, pull_requests, commits, error, repo_url)
+        if menu.isVisible():
+            # rebuilt while open: re-measure and re-anchor, as on popup
+            menu.adjustSize()
+            menu.move(anchored_popup_pos(self.repo_activity_btn,
+                                         menu.sizeHint(), align_right=True))
+
+    def _fill_repo_activity(self, menu, pull_requests: list, commits: list,
+                            error: str, repo_url: str) -> None:
         if error:
             menu.addAction(error).setEnabled(False)
             return

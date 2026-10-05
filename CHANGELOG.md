@@ -8,6 +8,19 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.28.1
+
+- The ⚙ badge in a card header (a background command is still running) is
+  now as narrow as the gear itself, instead of a wide pill that pushed the
+  task summary aside.
+- The workspace header's delete button is now a 🗑 trash can, and it turns
+  red on hover like the other delete buttons.
+- Hovering Open repo now outlines the whole button, right edge included.
+- The Open repo ▾ list of recent pull requests and commits loads in the
+  background a few seconds after AI Hive starts, so it opens with the list
+  already there. Opening it refreshes the list in place when it is more than
+  3 minutes old, and a refresh that fails keeps the list you had.
+
 ## 0.28.0
 
 - Lanes can now be turned on per workspace. Each git workspace's header has

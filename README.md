@@ -392,7 +392,10 @@ workspaces keep executing — switching never pauses anything.
   again) closes it and restores what was expanded before.
 - **First-class folders** — every workspace header shows its full path
   (eliding only what its own buttons don't leave room for) with **Delete**,
-  **Open folder** and **Change…** buttons; agents launch rooted there.
+  **Open repo**, **Open folder** and **Change…** buttons; agents launch rooted
+  there. The ▾ beside Open repo lists the GitHub repository's recent pull
+  requests and commits. AI Hive loads that list in the background a few
+  seconds after startup and keeps it, so the menu opens already filled.
 - **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ under
   **⚙ Options**; sizes persist.
 - **Shared agent awareness** — agents in a workspace coordinate through a
@@ -884,7 +887,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2772 checks drive the real app headlessly (offscreen Qt platform) with real
+2793 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1007,6 +1010,7 @@ app/
   cli_install.py           how Claude Code is installed + the switch onto the self-updating build (Qt-free)
   self_update.py           update AI Hive from GitHub main: version check, changelog, ff-only merge (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
+  repo_activity.py         Open repo dropdown: GitHub PRs + commits, origin URL (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
   widgets/                 main_window, sidebar (drag-reorder + categories +
@@ -1024,7 +1028,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2772 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2793 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
