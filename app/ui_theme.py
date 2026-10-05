@@ -1005,7 +1005,12 @@ QScrollArea {{ background: transparent; border: none; }}
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
     border-radius: 3px; padding: 3px 8px 3px 28px; color: {p.TEXT};
 }}
-#GridButton:hover, #MapToggle:hover, #ActivityToggle:hover {{ border-color: {p.ACCENT_BLUE}; }}
+#HeaderOpenFolder, #HeaderChangeFolder {{
+    background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
+    border-radius: 3px; padding: 3px 8px; color: {p.TEXT};
+}}
+#GridButton:hover, #MapToggle:hover, #ActivityToggle:hover,
+#HeaderOpenFolder:hover, #HeaderChangeFolder:hover {{ border-color: {p.ACCENT_BLUE}; }}
 #ActivityToggle:checked {{
     border-color: {p.ACCENT_BLUE}; color: {p.ACCENT_BLUE};
 }}

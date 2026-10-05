@@ -64,7 +64,7 @@ class IconToolButton(QToolButton):
     def paintEvent(self, event):
         super().paintEvent(event)
         ink = (Palette.ACCENT_BLUE if self.isChecked() else Palette.TEXT)
-        # 8px = the stylesheet's horizontal padding plus the 1px border
+        # 9px = the stylesheet's 8px horizontal padding plus the 1px border
         _paint(self, self._icon_name, ink, 9)
 
 

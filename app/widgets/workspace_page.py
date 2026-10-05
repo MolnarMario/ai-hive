@@ -243,8 +243,10 @@ class WorkspacePage(QWidget):
         # click shows whatever is here at once
         self._repo_activity_shown = None
         self.reset_repo_activity()
-        self.open_btn = tool("Open folder", "Open this workspace's folder")
-        self.change_btn = tool("Change…", "Change the workspace folder")
+        self.open_btn = tool("Open folder", "Open this workspace's folder",
+                             "HeaderOpenFolder")
+        self.change_btn = tool("Change…", "Change the workspace folder",
+                               "HeaderChangeFolder")
         self.grid_button = GridButton(header)
         self.map_btn = tool("Map", "Show the agent / file map (who is "
                                    "working on which files)", "MapToggle", "map")
@@ -278,10 +280,10 @@ class WorkspacePage(QWidget):
         hl.addWidget(self.path_label, 1)
         hl.addWidget(self.delete_btn)
         hl.addWidget(repo_actions)
+        hl.addWidget(self.lanes_box)
         hl.addWidget(self.open_btn)
         hl.addWidget(self.change_btn)
         hl.addSpacing(8)
-        hl.addWidget(self.lanes_box)
         hl.addWidget(self.grid_button)
         hl.addWidget(self.map_btn)
         hl.addWidget(self.activity_btn)
