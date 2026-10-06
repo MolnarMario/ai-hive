@@ -21,20 +21,24 @@ Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
 3. Bump `__version__` in `app/__init__.py` and add the matching `## x.y.z`
    section at the top of `CHANGELOG.md` (written for users, no em dash).
 4. Run `/code-review` on the branch and fix what it finds.
-5. Commit.
-6. Run the FULL suite, including the real-claude e2e test, on that commit:
+5. Commit, then get a second review from GPT-6-Luna through the Codex CLI:
+   `codex review --base {base_ref} -c model=gpt-6-luna -c model_reasoning_effort=high -c sandbox_mode=read-only`.
+   Fix each finding that holds up and commit. The PR body lists every finding with
+   what you did about it. If Codex is missing or fails, the PR body says so.
+6. Commit anything left uncommitted.
+7. Run the FULL suite, including the real-claude e2e test, on that commit:
    `{test_command}`. Don't shorten its timeouts.
-7. Set the README check count from the suite's RESULT line and commit it.
-   That is the only change allowed after step 6: if anything else changes,
-   commit it and run step 6 again.
-8. Push with `git push -u origin {integrate}` and open the pull request with
+8. Set the README check count from the suite's RESULT line and commit it.
+   That is the only change allowed after step 7: if anything else changes,
+   commit it and run step 7 again.
+9. Push with `git push -u origin {integrate}` and open the pull request with
    `gh pr create --base {base} --head {integrate}`. The PR body has the line
-   `Tested-commit: <full sha of the commit step 6 ran on>` and the suite's
+   `Tested-commit: <full sha of the commit step 7 ran on>` and the suite's
    `RESULT` line. List every failing check, and run it on {base_ref} to say
    whether it fails there too. Never decide yourself that a failure is
    acceptable.
-9. Never run `gh pr merge`. Stop and report: the user approves the merge in
-   AI Hive, and AI Hive merges only the commit you tested.
+10. Never run `gh pr merge`. Stop and report: the user approves the merge in
+    AI Hive, and AI Hive merges only the commit you tested.
 
 ## What AI Hive checks, and what it can't
 

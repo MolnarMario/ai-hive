@@ -14,6 +14,9 @@ em dashes: this text is shown in the app.
   always runs the latest approved changes. Before, nothing moved your folder
   after a merge, and a folder left on an old branch never updated at all.
   It still never touches local changes or commits that are not on GitHub.
+- The integrator now gets a second code review from GPT-6-Luna (through
+  your Codex CLI) before it opens a pull request, and lists each finding
+  and what it did about it in the PR.
 
 ## 0.28.3
 
