@@ -40,7 +40,8 @@ from ..workspace_manager import Workspace
 from .grid_selector import GridButton
 from .header_icons import IconLabel, IconToolButton
 from .lanes_help import show_lanes_explainer
-from .ornaments import ToggleSwitch, anchored_popup_pos
+from .ornaments import (ToggleSwitch, anchored_popup_pos,
+                        close_on_anchor_press)
 from .terminal_card import CARD_REORDER_MIME, TerminalCard
 
 
@@ -239,6 +240,7 @@ class WorkspacePage(QWidget):
         # hover lights that edge on the ▾ or the hover box reads open
         self.repo_btn.installEventFilter(self)
         self.repo_activity_menu = QMenu(self.repo_activity_btn)
+        close_on_anchor_press(self.repo_activity_menu, self.repo_activity_btn)
         # MainWindow fills it in the background (app/repo_activity.py); a
         # click shows whatever is here at once
         self._repo_activity_shown = None

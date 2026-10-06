@@ -615,6 +615,58 @@ def test_workspace_header_trash_and_repo_seam():
     page.deleteLater()
 
 
+def test_repo_dropdown_second_click_closes():
+    """A second click on the dropdown arrow beside Open repo closes the
+    activity menu. The popup grab hands that press to the menu, which closes
+    as for any outside click, and Qt then replayed the press to the arrow,
+    whose click opened the menu again. QTest clicks bypass the grab, so the
+    check feeds the menu the press it would get."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.workspace_page import WorkspacePage
+    from app.workspace_manager import Workspace
+    from main import setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    page = WorkspacePage(Workspace(id="w1", name="WS",
+                                   project_path="C:/proj/ai-hive"))
+    page.resize(1300, 200)
+    page.show()
+    app.processEvents()
+    drop, menu = page.repo_activity_btn, page.repo_activity_menu
+    no_replay = Qt.WidgetAttribute.WA_NoMouseReplay
+
+    def press_at(widget):
+        g = widget.mapToGlobal(widget.rect().center())
+        ev = QMouseEvent(QEvent.Type.MouseButtonPress,
+                         QPointF(menu.mapFromGlobal(g)), QPointF(g),
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(menu, ev)
+        app.processEvents()
+
+    drop.click()
+    app.processEvents()
+    check("repo dropdown: clicking the arrow opens the menu",
+          menu.isVisible())
+    press_at(drop)
+    check("repo dropdown: a press on the arrow closes the open menu",
+          not menu.isVisible())
+    check("repo dropdown: ...and is not replayed to the arrow to reopen it",
+          menu.testAttribute(no_replay))
+    drop.click()
+    app.processEvents()
+    check("repo dropdown: opening again re-arms the replay for other clicks",
+          menu.isVisible() and not menu.testAttribute(no_replay))
+    press_at(page.repo_btn)
+    check("repo dropdown: a press elsewhere closes it and still replays there",
+          not menu.isVisible() and not menu.testAttribute(no_replay))
+    menu.hide()
+    page.deleteLater()
+
+
 def test_sidebar_categories():
     """Categories: create one, drag workspaces into/out of it, collapse it, and
     delete it (its workspaces spill back out in place)."""

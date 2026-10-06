@@ -52,7 +52,8 @@ from ..terminal_agent import AgentStatus
 from ..ui_theme import Palette, repolish
 from .activity_panel import _ICON
 from .ornaments import (AgentCountBadge, ElidingLabel, FadingLabel,
-                        OrnamentDivider, WorkspaceSpinner)
+                        OrnamentDivider, WorkspaceSpinner,
+                        close_on_anchor_press)
 
 SIDEBAR_WIDTH = 230
 ROW_HEIGHT = 44
@@ -830,6 +831,7 @@ class AgentRow(QFrame):
             act_all = QAction(f"Kill all {len(pids)}", menu)
             act_all.triggered.connect(self.agent.kill_bg_shell_extras)
             menu.addAction(act_all)
+        close_on_anchor_press(menu, self.bg_mark)
         menu.exec(self.bg_mark.mapToGlobal(self.bg_mark.rect().bottomLeft()))
 
     def set_search_hit(self, hit: bool) -> None:
