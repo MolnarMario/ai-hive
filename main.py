@@ -36,21 +36,52 @@ except ImportError:
         "To (re)install dependencies:\n"
         "    .venv\\Scripts\\python.exe -m pip install -r requirements.txt")
 
+
+def _single_instance_guard(
+        name: str = "Local\\ai-hive-single-instance") -> "object | None":
+    """Return a held handle if we're the only instance, else None.
+
+    A second instance would race the session file (last writer wins) and
+    silently clobber agents the running instance hasn't saved yet — this is
+    how workspace agents have been lost. A kernel named mutex is atomic:
+    no probe timeout to race, no listen() result to forget to check, and the
+    OS destroys it automatically when the owning process dies (no stale-lock
+    state after a crash). Fails CLOSED: if exclusivity can't be proven, we
+    refuse to run rather than risk the user's session."""
+    if sys.platform != "win32":
+        return object()  # non-Windows dev run; no mutex namespace
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.CreateMutexW(None, False, name)
+    already = kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    if not handle:
+        return None  # can't verify exclusivity -> fail closed
+    if already:
+        kernel32.CloseHandle(handle)
+        return None  # another instance holds it
+    return handle  # held (never closed) for the life of this process
+
+
 # ---- pull what merged on GitHub, before the app's code is imported ---------
 # Only when launched, never on import: the smoke suite imports this module
 # and runs FROM this clone. The pull may change app/ itself, so the few app
 # modules this needed are dropped and everything below imports fresh files.
-# The audit line waits for the session store in main().
+# The audit line waits for the session store in main(). The instance lock
+# comes first: a second launch, refused in main(), must not pull new files
+# under the instance that is running.
+_LAUNCH_GUARD = None
 _STARTUP_UPDATE_AUDIT = ""
 if __name__ == "__main__":
-    from app import self_update as _self_update
-    _result = _self_update.startup_update(_self_update.subprocess_runner)
-    if _result is not None:
-        _STARTUP_UPDATE_AUDIT = _self_update.audit_line(_result)
-    for _name in [m for m in sys.modules
-                  if m == "app" or m.startswith("app.")]:
-        del sys.modules[_name]
-    del _self_update, _result
+    _LAUNCH_GUARD = _single_instance_guard()
+    if _LAUNCH_GUARD is not None:
+        from app import self_update as _self_update
+        _result = _self_update.startup_update(_self_update.subprocess_runner)
+        if _result is not None:
+            _STARTUP_UPDATE_AUDIT = _self_update.audit_line(_result)
+        for _name in [m for m in sys.modules
+                      if m == "app" or m.startswith("app.")]:
+            del sys.modules[_name]
+        del _self_update, _result
 
 from app.process_worker import AgentKind, build_spec
 from app.pty_worker import HAS_CONPTY
@@ -189,31 +220,6 @@ def create_main_window(store: SessionStore | None = None) -> MainWindow:
     return window
 
 
-def _single_instance_guard(
-        name: str = "Local\\ai-hive-single-instance") -> "object | None":
-    """Return a held handle if we're the only instance, else None.
-
-    A second instance would race the session file (last writer wins) and
-    silently clobber agents the running instance hasn't saved yet — this is
-    how workspace agents have been lost. A kernel named mutex is atomic:
-    no probe timeout to race, no listen() result to forget to check, and the
-    OS destroys it automatically when the owning process dies (no stale-lock
-    state after a crash). Fails CLOSED: if exclusivity can't be proven, we
-    refuse to run rather than risk the user's session."""
-    if sys.platform != "win32":
-        return object()  # non-Windows dev run; no mutex namespace
-    import ctypes
-    kernel32 = ctypes.windll.kernel32
-    handle = kernel32.CreateMutexW(None, False, name)
-    already = kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
-    if not handle:
-        return None  # can't verify exclusivity -> fail closed
-    if already:
-        kernel32.CloseHandle(handle)
-        return None  # another instance holds it
-    return handle  # held (never closed) for the life of this process
-
-
 def _set_app_user_model_id() -> None:
     """Give the process its own AppUserModelID (AUMID) instead of inheriting
     the shared 'python'/'pythonw' one. Windows taskbar pinning/grouping keys
@@ -288,7 +294,8 @@ def main() -> int:
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
-    guard = _single_instance_guard()  # noqa: F841 — held until process exit
+    # held until process exit; taken at launch, above the imports
+    guard = _LAUNCH_GUARD or _single_instance_guard()
     if guard is None:
         _fatal("AI Hive is already running.\n\nOnly one instance can run at a "
                "time (a second would overwrite the first's saved session). "

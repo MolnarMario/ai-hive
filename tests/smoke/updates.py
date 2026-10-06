@@ -1817,10 +1817,18 @@ def test_startup_update():
           and version(user) == "0.1.0", res)
 
     src = (ROOT / "main.py").read_text(encoding="utf-8")
-    guard = src.find('if __name__ == "__main__":\n    from app import '
-                     'self_update')
+    launched = src.find('if __name__ == "__main__":\n    _LAUNCH_GUARD = '
+                        '_single_instance_guard()\n    if _LAUNCH_GUARD is '
+                        'not None:\n')
+    pull = src.find("startup_update(", max(launched, 0))
     check("launch-update: main.py pulls only when launched, and before it "
           "imports the app",
-          0 < guard < src.find("from app.process_worker import")
-          and "startup_update(" in src[guard:guard + 200], guard)
+          0 < launched < pull < src.find("from app.process_worker import"),
+          (launched, pull))
+    # a second launch exits at the instance check; pulling first would
+    # change files under the instance that is running (GPT-6-Luna review)
+    check("launch-update: only the launch that holds the instance lock pulls, "
+          "and main() reuses that lock",
+          launched > 0 and "guard = _LAUNCH_GUARD or _single_instance_guard()"
+          in src, launched)
     shutil.rmtree(root, ignore_errors=True)
