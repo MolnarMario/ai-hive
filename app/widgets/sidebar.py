@@ -35,14 +35,15 @@ transient too: it saves/restores the pre-search expansion and never persists.
 import os
 import uuid
 
-from PySide6.QtCore import (QEasingCurve, QEvent, QFileSystemWatcher, QMimeData,
-                            QPoint, QPropertyAnimation, QRect, QSize, Qt, QTimer,
-                            Signal)
+from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent,
+                            QFileSystemWatcher, QMimeData, QPoint,
+                            QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer,
+                            QVariantAnimation, Signal)
 from PySide6.QtGui import (QAction, QColor, QDrag, QFont, QFontMetrics,
                            QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
                                QHBoxLayout, QLabel, QLineEdit, QMenu,
-                               QSizePolicy, QToolButton, QTreeWidget,
+                               QSizePolicy, QToolButton, QToolTip, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import scheduled_send
@@ -76,6 +77,19 @@ def _agent_haystack(agent) -> str:
 
 # drag payload: b"workspace:<id>" or b"category:<id>"
 NODE_MIME = "application/x-aihive-sidebar-node"
+
+
+def ws_state(stats: dict) -> str:
+    """A workspace's status light, the key into `AgentCountBadge._STATE_COLOR`.
+    Shared by the row's count badge and the collapsed rail, so the two never
+    disagree. Amber pulses ONLY when an agent is actually working; a
+    running-but-quiet agent (standby, no errors) reads green. Working wins over
+    a stale error, so an active row is amber even if a sibling errored."""
+    if not stats.get("total", 0):
+        return "empty"
+    if stats.get("busy", 0) > 0:
+        return "working"
+    return "error" if stats.get("error", 0) > 0 else "idle"
 
 
 class WorkspaceRow(QFrame):
@@ -305,14 +319,7 @@ class WorkspaceRow(QFrame):
         running = stats.get("active", 0)  # process alive (may be idle at prompt)
         e = stats.get("error", 0)
         total = stats.get("total", 0)
-        # amber pulses ONLY when an agent is actually working; a running-but-
-        # quiet agent (standby, no errors) reads green. Working wins over a
-        # stale error, so an active row is amber even if a sibling errored.
-        state = ("empty" if total == 0
-                 else "working" if busy > 0
-                 else "error" if e > 0
-                 else "idle")
-        self.count_badge.set_state(total, state)
+        self.count_badge.set_state(total, ws_state(stats))
         # the right-edge spinner mirrors just the working count (hidden at 0)
         self.work_spinner.set_count(busy)
         # the "?" shows when any agent is waiting for the user (hidden at 0)
@@ -957,6 +964,162 @@ class TreeEntryRow(QFrame):
         super().mousePressEvent(event)
 
 
+class WorkspaceRail(QWidget):
+    """What stays of the sidebar while it is collapsed: one thin strip per
+    workspace, in sidebar order, coloured like that row's count badge. A click
+    opens the workspace and leaves the sidebar closed.
+
+    The rail exists for small screens. Workspace order rarely changes, so the
+    user learns which strip is which by position and gets the 230px back.
+    `Sidebar` feeds it (`set_rail`) from the same model and stats as its rows,
+    and MainWindow shows it only while the splitter has the sidebar at width
+    0. Colours come from the live `Palette` at paint time, so it follows every
+    skin. The pulse animation runs only while the rail is shown and some
+    workspace is working, like the badge's own."""
+
+    workspaceSelected = Signal(str)
+
+    WIDTH = 10
+    _STRIP_H = 28      # strip height when there is room for all of them
+    _GAP = 6
+    _TOP = 8
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(self.WIDTH)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._entries: list[tuple[str, str, dict]] = []  # (ws_id, name, stats)
+        self._active_id = ""
+        self._pulse = 0.0
+        self._anim = QVariantAnimation(self)
+        self._anim.setStartValue(0.0)
+        self._anim.setKeyValueAt(0.5, 1.0)
+        self._anim.setEndValue(0.0)
+        self._anim.setDuration(1100)
+        self._anim.setLoopCount(-1)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+        self._anim.valueChanged.connect(self._on_pulse)
+
+    def set_entries(self, entries: list, active_id: str) -> None:
+        entries = [(wid, name, dict(stats or {})) for wid, name, stats in entries]
+        if entries == self._entries and active_id == self._active_id:
+            return
+        self._entries, self._active_id = entries, active_id
+        self._sync_anim()
+        self.update()
+
+    def _sync_anim(self) -> None:
+        want = self.isVisible() and any(
+            ws_state(st) == "working" for _, _, st in self._entries)
+        running = self._anim.state() == QAbstractAnimation.State.Running
+        if want and not running:
+            self._anim.start()
+        elif not want and running:
+            self._anim.stop()
+            self._pulse = 0.0
+
+    def _on_pulse(self, value) -> None:
+        self._pulse = float(value or 0.0)
+        self.update()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_anim()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._sync_anim()
+
+    # ----------------------------------------------------------- geometry ---
+
+    def _metrics(self) -> tuple[int, int]:
+        """(strip height, gap): full size when everything fits, otherwise
+        squeezed so every workspace keeps a strip, down to 3px each."""
+        n = len(self._entries)
+        avail = self.height() - 2 * self._TOP
+        if n == 0 or n * self._STRIP_H + (n - 1) * self._GAP <= avail:
+            return self._STRIP_H, self._GAP
+        gap = self._GAP if avail / n >= 12 else 2
+        return max(3, (avail - (n - 1) * gap) // n), gap
+
+    def strip_rect(self, i: int) -> QRect:
+        """The painted strip for entry `i`. The active workspace's strip is
+        the wide one."""
+        h, gap = self._metrics()
+        y = self._TOP + i * (h + gap)
+        if self._entries[i][0] == self._active_id:
+            return QRect(1, y, self.WIDTH - 3, h)
+        return QRect(3, y, 3, h)
+
+    def index_at(self, y: int) -> int:
+        """The entry whose slot (its strip plus half the gap on each side)
+        holds `y`, or -1. Clicks count across the full rail width."""
+        h, gap = self._metrics()
+        rel = y - self._TOP + gap // 2
+        if rel < 0:
+            return -1
+        i = rel // (h + gap)
+        return i if i < len(self._entries) else -1
+
+    # -------------------------------------------------------------- paint ---
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(Palette.BG_PANEL))
+        p.setPen(QColor(Palette.BORDER))
+        p.drawLine(self.width() - 1, 0, self.width() - 1, self.height())
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        for i, (_wid, _name, stats) in enumerate(self._entries):
+            state = ws_state(stats)
+            color = QColor(AgentCountBadge._STATE_COLOR[state]())
+            if state == "working":
+                color.setAlpha(150 + int(105 * self._pulse))
+            elif state == "empty":
+                color.setAlpha(140)
+            p.setBrush(color)
+            p.drawRoundedRect(QRectF(self.strip_rect(i)), 1.5, 1.5)
+        p.end()
+
+    # -------------------------------------------------------------- mouse ---
+
+    def mouseMoveEvent(self, event) -> None:
+        over = self.index_at(int(event.position().y())) >= 0
+        self.setCursor(Qt.CursorShape.PointingHandCursor if over
+                       else Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        i = self.index_at(int(event.position().y()))
+        if event.button() == Qt.MouseButton.LeftButton and i >= 0:
+            self.workspaceSelected.emit(self._entries[i][0])
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.Type.ToolTip:
+            i = self.index_at(event.pos().y())
+            if i < 0:
+                QToolTip.hideText()
+                event.ignore()
+                return True
+            QToolTip.showText(event.globalPos(), self.tooltip_for(i), self)
+            return True
+        return super().event(event)
+
+    def tooltip_for(self, i: int) -> str:
+        _wid, name, st = self._entries[i]
+        tip = f"{name}\n{st.get('total', 0)} agent(s), " \
+              f"{st.get('busy', 0)} working"
+        if st.get("waiting", 0):
+            tip += f", {st['waiting']} waiting for you"
+        if st.get("error", 0):
+            tip += f", {st['error']} error"
+        return tip
+
+
 class Sidebar(QFrame):
     addRequested = Signal()
     addCategoryRequested = Signal()          # M2
@@ -984,6 +1147,7 @@ class Sidebar(QFrame):
         self._nodes: list[dict] = []
         self._ws_data: dict[str, dict] = {}   # ws_id -> {name, folder, stats}
         self._active_id = ""
+        self._rail: WorkspaceRail | None = None   # see set_rail
         # rebuilt each rebuild(): ws_id -> row widget / tree item
         self._ws_widgets: dict[str, WorkspaceRow] = {}
         self._ws_items: dict[str, QTreeWidgetItem] = {}
@@ -1224,6 +1388,7 @@ class Sidebar(QFrame):
         w = self._ws_widgets.get(ws_id)
         if w is not None:
             w.set_name(name)
+        self._sync_rail()
 
     def set_row_folder(self, ws_id: str, folder: str) -> None:
         if ws_id in self._ws_data:
@@ -1238,6 +1403,7 @@ class Sidebar(QFrame):
         w = self._ws_widgets.get(ws_id)
         if w is not None:
             w.set_stats(stats)
+        self._sync_rail()
         # if this workspace is expanded, keep its inline agent list in sync the
         # instant an agent is added/removed (stats fire on terminal add/remove)
         if (ws_id in self._expanded_ws
@@ -1248,6 +1414,22 @@ class Sidebar(QFrame):
         self._active_id = ws_id
         for wid, w in self._ws_widgets.items():
             w.set_active(wid == ws_id)
+        self._sync_rail()
+
+    def set_rail(self, rail: WorkspaceRail) -> None:
+        """Attach the collapsed-sidebar rail. The sidebar keeps it in step
+        with its own rows: order, names, stats and the active workspace."""
+        self._rail = rail
+        rail.workspaceSelected.connect(self.workspaceSelected)
+        self._sync_rail()
+
+    def _sync_rail(self) -> None:
+        if self._rail is None:
+            return
+        self._rail.set_entries(
+            [(wid, self._ws_data[wid]["name"], self._ws_data[wid]["stats"])
+             for wid in self._ws_node_ids() if wid in self._ws_data],
+            self._active_id)
 
     def begin_rename(self, ws_id: str) -> None:
         w = self._ws_widgets.get(ws_id)
@@ -1283,6 +1465,7 @@ class Sidebar(QFrame):
         self._update_count()
         self._rewatch()
         self._reapply_reveal()
+        self._sync_rail()
 
     def _add_cat_item(self, node: dict) -> None:
         cid = node["id"]
