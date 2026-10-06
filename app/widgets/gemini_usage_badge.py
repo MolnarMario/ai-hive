@@ -49,7 +49,8 @@ class GeminiUsageBadge(UsagePillBadge):
 
     def _format_limit(self) -> str:
         return gemini_usage.format_limit(self._limit, with_label=self._label,
-                                         days_only=self.window == "weekly")
+                                         days_only=self.window == "weekly",
+                                         left=self._show_left)
 
     def _unreadable_text(self) -> str:
         return "Gemini limit unreadable, click to refresh"
@@ -66,7 +67,8 @@ class GeminiUsageBadge(UsagePillBadge):
         lines = [f"Gemini ({self._usage.plan})"]
         for lim in self._usage.limits:
             lines.append(f"{lim.label}: " + gemini_usage.format_limit(
-                lim, days_only=lim.key.startswith("seven_day")))
+                lim, days_only=lim.key.startswith("seven_day"),
+                left=self._show_left))
         if self._usage.fetched_at:
             age = gemini_usage.format_countdown(
                 time.time() - self._usage.fetched_at)
