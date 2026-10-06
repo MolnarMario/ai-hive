@@ -318,9 +318,18 @@ class _HeaderTools(QWidget):
     a naive leaveEvent would hide the buttons the instant the user reached for
     one. The close is therefore deferred by one turn of the event loop and
     checked against the real cursor position, which is inside this widget's
-    rect -- or the tray's -- for as long as the pointer is over any of them."""
+    rect -- or the tray's -- for as long as the pointer is over any of them.
+
+    That one check is not enough on its own. A slow exit fires Leave on the
+    first pixel past the edge, and under fractional DPI scaling (main.py sets
+    PassThrough) QCursor.pos() can round that pixel back inside the tray. The
+    check says "inside", the pointer is already gone, and no event ever comes
+    to close it: the tray stuck open on every slow exit up or down. So while
+    the tray is open a timer repeats the check, and a missed Leave costs at
+    most one tick."""
 
     _HINT_W = 14
+    _WATCH_MS = 150
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -345,6 +354,9 @@ class _HeaderTools(QWidget):
         tl.setContentsMargins(1, 1, 1, 1)   # the tray's own 1px border
         tl.setSpacing(0)
         self.tray.hide()
+        self._watch = QTimer(self)
+        self._watch.setInterval(self._WATCH_MS)
+        self._watch.timeout.connect(self._recheck)
 
     def add(self, btn) -> None:
         btn.setParent(self.tray)
@@ -402,7 +414,9 @@ class _HeaderTools(QWidget):
             self._place_tray()          # before show(), or it flashes at 0,0
             self.tray.show()
             self.tray.raise_()
+            self._watch.start()
         else:
+            self._watch.stop()
             self.tray.hide()
 
     def enterEvent(self, event):
