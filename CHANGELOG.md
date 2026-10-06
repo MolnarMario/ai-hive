@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.28.5
+
+- Closing an agent no longer says "Lane kept" with an unmerged commit when
+  that work is already on main as a different commit. This happened when the
+  integrator cherry-picked a lane into a batch, and after a squash or rebase
+  merge. AI Hive now removes the lane once every change in it is on main. A
+  lane with even one change main lacks is still kept.
+
 ## 0.28.4
 
 - AI Hive pulls what merged on GitHub every time it starts, so a restart
