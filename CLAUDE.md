@@ -69,17 +69,15 @@ This file holds only the rules that protect user data or fail silently.
   hold `lane_ops.lock_for(repo)` around each lane: Windows won't delete a
   folder that is some process's cwd, so a poll inside a lane being removed
   leaves a half-deleted worktree.
-- The integration queue (`app/integration.py`): only a user click picks the
-  integrator, submits a lane or approves a merge. No bridge op may do any of
-  it, and agents never run `gh pr merge`. AI Hive runs the merge itself, and
-  only for the PR head the integrator tested, with `--match-head-commit`,
-  after checking the base has not moved since. An item becomes merged only
-  through Approve merge or the user's Mark merged, and only when GitHub says
-  MERGED (a squash leaves the tested commit out of the base). The queue never
-  skips an item by itself, and only a "no pull request yet" item is rechecked
-  without a user click. Lane-authored text (commit subjects, file names)
-  reaches the integrator only inside the brief's fenced blocks, with control
-  characters stripped.
+- Shipping lanes (`docs/agents/integration.md`): a laned agent flags
+  finished work with a commit line of just `Task done` (`lanes.DONE_GREP`).
+  AI Hive's only part is typing the idle integrator a note that names the
+  flagged lanes (`MainWindow._nudge_integrator`), with agent names, branches
+  and shas only, never commit text. Only the user picks the integrator, and
+  no bridge op may pick one, merge or nudge. The integrator, and no other
+  agent, merges, and only its own PR after a clean GPT-6-Luna review and a
+  passing full suite on the PR head, with `--merge --match-head-commit`
+  (never a squash: lanes clear their flag and fast-forward by ancestry).
 - Nothing renames an agent except the user.
 - No em dash in any string the user sees. `test_no_em_dashes_in_visible_text`
   enforces it for non-docstring literals.
@@ -129,5 +127,5 @@ pollute resume ordering. Use a scratch cwd.
 Issues live as markdown under `.scratch/<feature-slug>/`, see
 `docs/agents/issue-tracker.md`. Triage labels are in
 `docs/agents/triage-labels.md`, domain docs in `docs/agents/domain.md`. The
-integrator's checklist is `docs/agents/integration.md`; AI Hive embeds it in
-every integration brief, read from the base branch.
+integrator's checklist is `docs/agents/integration.md`; the integrator reads
+it from the base branch every time AI Hive nudges it.

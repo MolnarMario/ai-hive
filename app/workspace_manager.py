@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from PySide6.QtCore import QObject, Signal
 
 from . import coordination
-from . import integration
 from . import lanes
 from . import providers
 from . import session_hook
@@ -27,13 +26,14 @@ from .pty_worker import HAS_CONPTY
 from .terminal_agent import AgentStatus, AssignmentState, TerminalAgent
 
 MAX_AGENTS_PER_WORKSPACE = 12
-# v6: the integration queue (Workspace.integrator_uid, integration_queue,
-# base_branch); v5: agent lanes (AgentSpec.lane); v4: sidebar layout
-SESSION_VERSION = 6
+# v7: the integration queue is gone, a workspace keeps only its integrator
+# (a v6 file's integration_queue and base_branch are dropped on load);
+# v6: the integration queue; v5: agent lanes (AgentSpec.lane); v4: sidebar
+SESSION_VERSION = 7
 # the first version whose agents may carry a lane record
 LANES_SESSION_VERSION = 5
-# the first version whose workspaces may carry an integrator and a queue
-INTEGRATION_SESSION_VERSION = 6
+# the first version whose workspaces may carry an integrator
+INTEGRATOR_SESSION_VERSION = 6
 DEFAULT_LAYOUT = "auto"
 
 # Shell kinds whose pre-v2 (line-mode-default) instances are upgraded to
@@ -62,13 +62,10 @@ class Workspace:
     agents: list = field(default_factory=list)  # list[TerminalAgent]
     layout: str = DEFAULT_LAYOUT   # "auto" or "RxC" (e.g. "2x2")
     board: object = None           # coordination.WorkspaceBoard
-    # the integration queue (app/integration.py, agent lanes Phase 3): the
-    # integrator agent's spec.uid (one per workspace, "" for none), the
-    # submitted lanes in order [integration.QueueItem], and the base branch
-    # the queue merges into (taken from the first submitted lane)
+    # the integrator agent's spec.uid (one per workspace, "" for none).
+    # AI Hive nudges it when a lane's commit says "Task done"
+    # (MainWindow._nudge_integrators, docs/agents/integration.md).
     integrator_uid: str = ""
-    integration_queue: list = field(default_factory=list)
-    base_branch: str = ""
     # the workspace's lanes toggle (.scratch/agent-lanes/spec-v4-lane-
     # scopes.md): ON ticks "Own lane" for its new Claude agents. It only
     # sets that default; it never touches an agent that exists.
@@ -364,7 +361,6 @@ class WorkspaceManager(QObject):
             # made integrator while its lane was being created, and the
             # creation failed: an integrator without a lane can't branch
             ws.integrator_uid = ""
-            self._orphan_integrating(ws, "The integrator lost its lane.")
         self._apply_coordination(ws, agent)
         self._rearm(ws, agent)
         self._touch(ws_id)
@@ -381,13 +377,9 @@ class WorkspaceManager(QObject):
         if self.arm_agent is not None:
             self.arm_agent(ws, agent)
 
-    # ------------------------------------------------- integration queue ---
-    # Agent lanes Phase 3 (app/integration.py). Every mutation here is
-    # persisted, so each one goes through _touch. Only the USER reaches
-    # these: the card menus, the lane chip and the Activity panel's queue
-    # rows. No bridge op (and so no agent) can enqueue, approve or pick an
-    # integrator; MainWindow advances an item only on what it read from git
-    # and gh after one of those clicks.
+    # ------------------------------------------------------ integrator ---
+    # One laned Claude agent per workspace, picked only by the USER (the
+    # card's Make integrator). No bridge op (and so no agent) can set it.
 
     def integrator(self, ws_id: str) -> TerminalAgent | None:
         """The workspace's integrator: always a laned agent, or None."""
@@ -405,8 +397,7 @@ class WorkspaceManager(QObject):
     def can_integrate(self, agent: TerminalAgent) -> str:
         """"" when `agent` may be a workspace's integrator, else why not. It
         needs its own lane (it branches and commits) and to be Claude (the
-        brief is typed into a Claude prompt and its turn end is a Stop
-        hook)."""
+        nudge is typed into a Claude prompt)."""
         if agent.spec.provider != "claude" or not agent.is_pty:
             return "The integrator must be an interactive Claude agent."
         if not agent.spec.lane:
@@ -428,88 +419,9 @@ class WorkspaceManager(QObject):
             uid = agent.spec.uid
         if uid == ws.integrator_uid:
             return True
-        if ws.integrator_uid:
-            self._orphan_integrating(ws, "The integrator changed while this "
-                                         "was being integrated.")
         ws.integrator_uid = uid
         for agent in ws.agents:
             self._apply_coordination(ws, agent)
-        self._touch(ws_id)
-        return True
-
-    @staticmethod
-    def _orphan_integrating(ws: Workspace, why: str) -> None:
-        """The item an integrator was working on lost that integrator. It is
-        never handed to another one silently (the old one may already have
-        pushed a branch or opened a PR): it waits for the user, who can
-        Recheck the PR or Resend the brief."""
-        for item in ws.integration_queue:
-            if item.state == integration.INTEGRATING:
-                item.state = integration.NEEDS_YOU
-                item.note = why + " Recheck its pull request or resend the brief."
-                item.updated = time.time()
-
-    def queue(self, ws_id: str) -> list:
-        ws = self.workspace(ws_id)
-        return list(ws.integration_queue) if ws is not None else []
-
-    def queue_item(self, ws_id: str, item_id: str):
-        return next((i for i in self.queue(ws_id) if i.id == item_id), None)
-
-    def queue_head(self, ws_id: str):
-        return integration.head(self.queue(ws_id))
-
-    def open_item_for(self, ws_id: str, lane_uid: str):
-        return next((i for i in self.queue(ws_id)
-                     if i.lane_uid == lane_uid and i.is_open), None)
-
-    def submit_to_integrator(self, ws_id: str, agent_id: str, sha: str,
-                             ahead: int = 0):
-        """Queue `agent_id`'s lane at commit `sha` (pinned now; later commits
-        stay on the lane). One open item per lane: a lane whose item is still
-        queued or needs the user is re-pinned and queued again in its place,
-        one that is being integrated or merged is refused. Returns the item
-        or None."""
-        ws = self.workspace(ws_id)
-        agent = self.agent(ws_id, agent_id)
-        if (ws is None or agent is None or not agent.spec.lane or not sha
-                or agent.spec.uid == ws.integrator_uid):
-            return None
-        lane = agent.spec.lane
-        item = self.open_item_for(ws_id, agent.spec.uid)
-        if item is not None:
-            if item.state not in (integration.QUEUED, integration.NEEDS_YOU):
-                return None
-            item.sha, item.submit_ahead = sha, int(ahead or 0)
-            item.state, item.note, item.rebrief = integration.QUEUED, "", False
-            item.pr, item.pr_url, item.tested_sha = 0, "", ""
-            item.updated = time.time()
-        else:
-            item = integration.new_item(agent.spec.uid, agent.spec.name,
-                                        lane["branch"], sha,
-                                        lane.get("base") or ws.base_branch,
-                                        ahead)
-            ws.integration_queue.append(item)
-        if not ws.base_branch and item.base:
-            ws.base_branch = item.base
-        ws.integration_queue = integration.prune(ws.integration_queue)
-        self._touch(ws_id)
-        return item
-
-    def update_queue_item(self, ws_id: str, item_id: str, **changes) -> bool:
-        """Move an item along (state, pr, pr_url, tested_sha, note, rebrief).
-        Its identity and pinned commit never change here."""
-        ws = self.workspace(ws_id)
-        item = self.queue_item(ws_id, item_id)
-        if ws is None or item is None:
-            return False
-        for key, value in changes.items():
-            if hasattr(item, key) and key not in ("id", "lane_uid", "sha"):
-                setattr(item, key, value)
-        if item.state not in integration.STATES:
-            item.state = integration.NEEDS_YOU
-        item.updated = time.time()
-        ws.integration_queue = integration.prune(ws.integration_queue)
         self._touch(ws_id)
         return True
 
@@ -618,8 +530,6 @@ class WorkspaceManager(QObject):
         ws.agents.remove(agent)
         if ws.integrator_uid and ws.integrator_uid == agent.spec.uid:
             ws.integrator_uid = ""      # the role goes with the card
-            self._orphan_integrating(ws, "The integrator's card was closed "
-                                         "while it was integrating.")
         self.terminalRemoved.emit(ws_id, agent_id)
         self.terminalCountChanged.emit(ws_id, len(ws.agents))
         self._recompute(ws_id)
@@ -1108,18 +1018,6 @@ class WorkspaceManager(QObject):
                             f"{type(exc2).__name__}: {exc2}")
                 return None
 
-    def _queue_safe(self, w) -> list:
-        """The queue for the session file. One bad item is dropped and
-        audited; it must never take the workspace's agents down with it."""
-        out = []
-        for item in list(w.integration_queue):
-            try:
-                out.append(item.to_dict())
-            except Exception as exc:
-                self._audit(f"SAVE-DEGRADE queue item ws={w.name!r} "
-                            f"{type(exc).__name__}: {exc}")
-        return out
-
     @staticmethod
     def _lane_safe(spec) -> dict:
         """The lane record for the DEGRADED record, read without anything
@@ -1139,10 +1037,9 @@ class WorkspaceManager(QObject):
         except Exception:
             return []
 
-    def _restore_queue(self, ws: Workspace, wd: dict) -> None:
-        """The integrator and the queue from a v6 record. An integrator
-        whose card did not come back loses the role; a merge that was in
-        flight needs the user (integration.restored)."""
+    def _restore_integrator(self, ws: Workspace, wd: dict) -> None:
+        """The integrator from a v6+ record. An integrator whose card did
+        not come back loses the role. A v6 file's queue is not read."""
         uid = wd.get("integrator")
         if isinstance(uid, str) and uid and any(
                 a.spec.uid == uid and a.spec.lane for a in ws.agents):
@@ -1150,11 +1047,6 @@ class WorkspaceManager(QObject):
             for agent in ws.agents:
                 if agent.spec.uid == uid:
                     self._apply_coordination(ws, agent)
-        ws.integration_queue = [integration.restored(i) for i in
-                                integration.clean_queue(
-                                    wd.get("integration_queue"))]
-        base = wd.get("base_branch")
-        ws.base_branch = base if isinstance(base, str) else ""
 
     def _audit(self, message: str) -> None:
         """Best-effort line into session.log; forensics must never break the
@@ -1179,10 +1071,7 @@ class WorkspaceManager(QObject):
                     "terminals": [d for d in (self._agent_dict_safe(a)
                                               for a in w.agents)
                                   if d is not None],
-                    # the integration queue (v6, app/integration.py)
                     "integrator": w.integrator_uid,
-                    "integration_queue": self._queue_safe(w),
-                    "base_branch": w.base_branch,
                     # additive and read with a default, so no version bump.
                     # An older build drops it on its next save, which only
                     # resets the toggle to OFF; lanes themselves are kept.
@@ -1204,8 +1093,8 @@ class WorkspaceManager(QObject):
         migrate_shells = data.get("version", 1) < 3 and HAS_CONPTY
         # lanes arrived in v5: an older file has none, whatever it holds
         with_lanes = data.get("version", 1) >= LANES_SESSION_VERSION
-        # ...and the integration queue in v6
-        with_queue = data.get("version", 1) >= INTEGRATION_SESSION_VERSION
+        # ...and the integrator in v6
+        with_integrator = data.get("version", 1) >= INTEGRATOR_SESSION_VERSION
         for wd in data.get("workspaces", []):
             path = wd.get("project_path", "")
             if not path or not os.path.isdir(path):
@@ -1267,8 +1156,8 @@ class WorkspaceManager(QObject):
                 self._wire_agent(ws, agent)
                 self._apply_coordination(ws, agent)
                 self.terminalAdded.emit(ws.id, agent)
-            if with_queue:
-                self._restore_queue(ws, wd)
+            if with_integrator:
+                self._restore_integrator(ws, wd)
             self.terminalCountChanged.emit(ws.id, len(ws.agents))
             self._recompute(ws.id)
         # restore the sidebar layout (order + categories); absent on <v4 -> all

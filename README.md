@@ -468,35 +468,24 @@ workspaces keep executing — switching never pauses anything.
   A lane with no work of its own whose agent is idle is fast-forwarded to the
   base by itself when the base moves, and the agent is told on its next
   prompt.
-- **Integration queue** (needs lanes, a GitHub remote and a logged-in `gh`):
-  hover the `⋯` on a laned Claude agent's header and click `⚑` **Make
-  integrator** (one per workspace). The second lane in a workspace without an
-  integrator says so on its card, once. **Submit to integrator** on another lane's
-  chip pins that lane's newest commit and queues it. One lane at a time, once
-  the integrator is idle, AI Hive types it a short brief (the pinned commit,
-  its log and files, a merge check against the base and the other queued
-  lanes, the test command and the checklist from the base branch's
-  `docs/agents/integration.md`). The integrator merges the base into
-  `integrate/<lane>-<item>` (one branch per submitted item), bumps the
-  version, commits, runs the suite on that commit and opens a pull request
-  whose body names it (`Tested-commit:`), and never merges it. When its turn
-  ends AI Hive reads the PR: it waits for your approval only when the PR comes
-  from that branch into the base, holds the submitted commit, and its head is
-  the tested commit (plus README.md at most). The Activity panel's
-  **Integration** section then shows **Approve merge**. Only that click
-  merges, and AI Hive runs the merge itself: it refuses when the PR changed
-  since it was tested or the base can't be confirmed with GitHub, sends it
-  back to the integrator when the base moved since then, and merges with
-  `gh pr merge --match-head-commit`. Then the next lane goes. A PR merged on
-  github.com instead waits for your **Mark merged**, which checks with GitHub
-  first. Anything unexpected waits for you (Recheck, Resend brief, Skip) with
-  the "?" chime and the reason; nothing is skipped or re-approved by itself.
-  A lane whose squash merge your folder can't see yet gets **Remove lane
-  (merged as #N)**.
-  Every step is a `QUEUE-*` line in `session.log`, and the queue survives a
-  restart. The integrator needs `Bash(git:*)` and `PowerShell(git:*)` allowed,
-  and every lane of a repository shares the main checkout's Claude
-  auto-memory.
+- **Shipping finished lanes** (needs lanes, a GitHub remote and a logged-in
+  `gh`): hover the `⋯` on a laned Claude agent's header and click `⚑`
+  **Make integrator** (one per workspace). The second lane in a workspace
+  without an integrator says so on its card, once. Every other laned agent is
+  told to end its finished work with a commit whose last line is just
+  `Task done`. AI Hive spots that commit on its next lane read (the chip gets
+  a `✓`), logs it, and types a short note into the integrator once it is
+  idle: which lanes, which branches, which commits. The integrator then
+  follows the base branch's `docs/agents/integration.md`. It gathers every
+  lane with an unmerged `Task done` commit into one `integrate/` branch,
+  bumps the version and CHANGELOG, runs the full suite, opens the pull
+  request and has GPT-6-Luna review it at high effort, fixing and reviewing
+  again until the review comes back clean. Only then does it merge (a merge
+  commit, never a squash) and fast-forward the main checkout, so the next
+  launch runs what merged. Each flag is a `LANE-DONE` line and each note a
+  `NUDGE` line in `session.log`. The integrator needs `Bash(git:*)` and
+  `PowerShell(git:*)` allowed, and every lane of a repository shares the main
+  checkout's Claude auto-memory.
 - **Per-workspace agent numbering** — each workspace counts Agent 1, 2, 3…
   independently.
 - **Agent/File Map** — a **Map** button in the workspace header opens a
@@ -996,7 +985,6 @@ app/
   lanes.py                 agent lanes: a git worktree per agent, create/repair/retire (Qt-free)
   lane_ops.py              runs lane git operations one at a time per repo, off the GUI thread
   lane_service.py          lane awareness: polls every lane, overlaps, lanes.json, lane notices
-  integration.py           the approved integration queue: briefs, PR reads, the guarded merge (Qt-free)
   process_worker.py        QProcess engine, HybridDecoder, WinJob (line mode)
   pty_worker.py            ConPTY engine via pywinpty (full-terminal mode)
   terminal_agent.py        per-terminal model (worker + log/buffer + lifecycle)
