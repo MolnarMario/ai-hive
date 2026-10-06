@@ -598,6 +598,22 @@ class LaneStatus:
             parts.append("local files that could not be checked")
         return " and ".join(parts)
 
+    def dirty_paths(self) -> list:
+        """The file names in `dirty`, which holds `status --porcelain` lines.
+        The runner strips its output, so the first line may have lost the
+        space in front of its status: split on whitespace instead of
+        slicing. A rename gives its new name."""
+        out = []
+        for line in self.dirty:
+            parts = line.strip().split(None, 1)
+            if len(parts) < 2:
+                continue
+            path = parts[1].split(" -> ")[-1]
+            if len(path) > 1 and path[0] == path[-1] == '"':
+                path = path[1:-1]
+            out.append(path)
+        return out
+
 
 def lane_status(lane: dict) -> LaneStatus:
     """Head, ahead/behind the base, dirty files and whether the head's work

@@ -637,9 +637,9 @@ def _lane_dirty_files(root: str):
 
 def lane_stop_decision(payload: dict, env=None, now: float = 0.0) -> str:
     """Stop: the reason to keep a laned agent going once, when it ends a
-    turn with uncommitted changes in its lane, or "" to let it stop.
-    (.scratch/batch-integration/spec.md, A2.) The lane prompt already says
-    to commit finished work; this backs it for the agent that forgot.
+    turn with uncommitted changes in its lane, or "" to let it stop. The
+    lane prompt already says to commit finished work with a "Task done"
+    line (lanes.DONE_MARK); this backs it for the agent that forgot.
 
     Blocks only a laned agent (lane env set) while the lane machinery runs
     (lanes.json live), that is not the integrator (it commits as part of its
@@ -671,7 +671,8 @@ def lane_stop_decision(payload: dict, env=None, now: float = 0.0) -> str:
         names += f", +{n - STOP_FILES_SHOWN} more"
     return (f"AI Hive: your lane has {n} uncommitted "
             f"file{'' if n == 1 else 's'} ({names}). If the task you just did "
-            f"is finished, commit them on your lane branch now. If it is not "
+            f"is finished, commit them on your lane branch now, ending the "
+            f"commit message with a line of just \"Task done\". If it is not "
             f"finished, or the user asked you not to commit, end your turn "
             f"without committing.")
 

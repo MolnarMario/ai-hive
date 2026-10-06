@@ -4609,6 +4609,15 @@ class MainWindow(QMainWindow):
                 pass
         self.lane_service.poke()
 
+    @staticmethod
+    def _file_names(paths: list, shown: int = 3) -> str:
+        """"a.py, b.py, c.py (+2 more)" for a notice. Control characters
+        are dropped: a file name is not AI Hive's text."""
+        names = [_printable(p) for p in paths]
+        more = len(names) - shown
+        return ", ".join(names[:shown]) + (f" (+{more} more)" if more > 0
+                                            else "")
+
     def _show_lane_kept(self, name: str, lane: dict, status,
                         reason: str) -> None:
         """Non-blocking notice that a closed agent's lane was kept, because
@@ -4617,12 +4626,23 @@ class MainWindow(QMainWindow):
         held = status.describe() if status is not None else ""
         kept = ("The lane folder is kept." if os.path.isdir(lane["root"])
                 else "Its branch is kept.")
-        if held:
+        if (status is not None and status.merged and status.dirty
+                and not status.local):
+            # kept only for uncommitted files: name them, so the user can
+            # judge whether they matter now that the commits are in
+            n = len(status.dirty)
+            base = lane.get("base") or status.base_ref or "the base branch"
+            text = (f"{name}'s lane has {n} uncommitted "
+                    f"file{'' if n == 1 else 's'} "
+                    f"({self._file_names(status.dirty_paths())}). Its "
+                    f"commits are all on {base}. {kept}")
+        elif held:
             text = f"{name}'s lane has {held}. {kept}"
         else:
             text = f"{name}'s lane could not be removed ({reason}). {kept}"
         box = QMessageBox(QMessageBox.Icon.Information, "Lane kept", text,
                           parent=self)
+        box.setTextFormat(Qt.TextFormat.PlainText)    # it holds file names
         box.setInformativeText(
             f"Folder: {lane['root']}\nBranch: {lane['branch']}\n\nTo keep "
             f"working on it, pick its conversation under Conversation in "

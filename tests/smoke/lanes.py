@@ -2109,7 +2109,7 @@ def _service_rig(tmp: Path, names=("Agent A", "Agent B")):
 
 
 def test_lane_stop_nudge():
-    """Part A2 of the batch plan: a laned agent that ends a turn with
+    """A laned agent that ends a turn with
     uncommitted lane changes is kept going once (the Stop hook's
     `decision: block`) and told to commit finished work. Never when the
     lane is clean, on the turn's second stop, on a question, for the
@@ -2446,7 +2446,7 @@ def test_lane_roster_file():
 
 
 def test_lane_prompt_commit_rule():
-    """Part A1 of the batch plan: a laned agent finished tasks and left them
+    """A laned agent finished tasks and left them
     uncommitted, because Claude Code commits only when asked. Its prompt
     says to commit finished work without asking and to run only the tests
     for what it changed. The integrator's prompt is not touched."""
@@ -3912,4 +3912,87 @@ def test_session_v7_drops_the_queue():
     for m in (mgr, back):
         for x in m.all_agents():
             x.dispose()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lane_uncommitted_notices():
+    """A lane kept on close only for uncommitted files names them (up to
+    three) and says its commits are in the base, with no delete button.
+    The same holds once the lane's own commits have reached the base."""
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lane-dirty-"))
+    work = _make_repo(tmp)
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    made = []
+
+    def laned(name, uid):
+        lane = _lane_for(work, name, uid)
+        made.append(lane)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"], pty=True)
+        spec.uid = uid
+        spec.lane = lane
+        return win.manager.add_terminal(ws.id, spec, autostart=False)
+
+    def settle():
+        for _ in range(3):
+            win.lane_ops.drain(60)
+            app.processEvents()
+
+    def close_and_read(agent):
+        before = len(win._lane_boxes)
+        win._close_agent(ws.id, agent.id)
+        settle()
+        return win._lane_boxes[-1] if len(win._lane_boxes) > before else None
+
+    with _stub_starts():
+        a = laned("Agent A", "d2a1a1" + "0" * 26)
+        b = laned("Agent B", "d2b2b2" + "0" * 26)
+        settle()
+        # B never committed anything: its uncommitted files are all it has
+        rb = b.spec.lane["root"]
+        (Path(rb) / "a.txt").write_text("B's edit\n")
+        (Path(rb) / "sub" / "new.txt").write_text("new\n")
+        box = close_and_read(b)
+        check("lane-dirty: a lane kept only for uncommitted files names them "
+              "and says its commits are in the base",
+              box is not None and os.path.isdir(rb)
+              and "2 uncommitted files (a.txt, sub/new.txt)" in box.text()
+              and "Its commits are all on" in box.text()
+              and "—" not in box.text(),
+              box.text() if box else None)
+        check("lane-dirty: ...and offers no delete button",
+              box is not None
+              and [x.text() for x in box.buttons()] == ["Keep",
+                                                        "Open folder"],
+              [x.text() for x in box.buttons()] if box else None)
+        if box is not None:
+            box.close()
+
+        # A's commit reaches the base; a leftover edit keeps the lane
+        ra = a.spec.lane["root"]
+        _commit(ra, "a2.txt", "a2\n", "A's work\n\nTask done")
+        (Path(ra) / "draft.txt").write_text("draft\n")
+        _git(ra, "push", "-q", "origin", "HEAD:main")
+        _git(work, "fetch", "-q", "origin")
+        box = close_and_read(a)
+        check("lane-dirty: ...the same once the lane's commits are merged",
+              box is not None
+              and "1 uncommitted file (draft.txt)" in box.text()
+              and "Its commits are all on" in box.text()
+              and "unmerged" not in box.text(),
+              box.text() if box else None)
+        if box is not None:
+            box.close()
+    win.close()
+    app.processEvents()
+    for lane in made:
+        if os.path.isdir(lane["root"]):
+            _drop_lane_folder(lane["root"])
     shutil.rmtree(tmp, ignore_errors=True)

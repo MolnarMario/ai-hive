@@ -429,7 +429,12 @@ workspaces keep executing — switching never pauses anything.
   usual test command works in a lane. Closing a card removes its lane only when
   it holds nothing (clean, and its commits, or the same changes as other
   commits after a cherry-pick, rebase or squash, are already in the base);
-  otherwise the lane is kept and AI Hive says what is in it. A lane a program
+  otherwise the lane is kept and AI Hive says what is in it, naming up to
+  three files when uncommitted files are all that keeps it. A laned agent
+  is told to commit each finished task on its lane branch without asking,
+  and one that ends a turn with uncommitted lane changes anyway is asked
+  once, by a Stop hook, to commit them if the task is done (never the
+  integrator, and never when the turn ends on a question). A lane a program
   still runs in is not touched; the removal is retried for a minute. A kept
   lane's conversation stays in the New Agent dialog's Conversation list, and
   picking it brings the lane back at the same path. Lane branches have

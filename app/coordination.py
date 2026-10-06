@@ -120,14 +120,19 @@ def system_prompt_text(workspace_name: str, agent_name: str,
         base = lane.get("base") or "the base branch"
         # The commit rule is explicit because Claude Code commits only when
         # asked: lane agents finished tasks and left them uncommitted, and
-        # uncommitted work can't be submitted or proven merged when the card
-        # closes (.scratch/batch-integration/spec.md, Part A)
+        # uncommitted work can't ship or be proven merged when the card
+        # closes. The "Task done" line is what gets a lane shipped
+        # (MainWindow._nudge_integrator); session_hook.lane_stop_decision
+        # backs the rule for an agent that forgets.
         text += (
             f" You work in your own git worktree (your lane) at {lane['root']}, "
             f"on the branch {lane['branch']}, which starts from {base}. Commit "
             f"each finished task on your lane branch yourself, without asking "
-            f"first. The lane is private: nothing in it reaches {base} until "
-            f"the user submits it. Don't finish a task with uncommitted "
+            f"first, and end that commit's message with a line of just "
+            f"\"{lanes.DONE_MARK}\". That line tells the integrator your work "
+            f"is ready to ship, so never put it on unfinished work. The lane "
+            f"is private: nothing in it reaches {base} until the integrator "
+            f"ships it. Don't finish a task with uncommitted "
             f"changes, unless the user asked you not to commit. Run the tests "
             f"that cover what you changed; the full test suite runs once, "
             f"when your work is integrated. Never edit files in other "
@@ -139,11 +144,7 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"checkout's copy, so installing packages there changes them for "
             f"every lane. Do not bump the version or edit the CHANGELOG or "
             f"the README check count: that is done once per pull request, "
-            f"when your work is integrated. When your task is finished, "
-            f"commit all of it with a commit message whose last line is "
-            f"just \"{lanes.DONE_MARK}\". That line tells the integrator "
-            f"your work is ready to ship, so never put it on a commit of "
-            f"unfinished work.")
+            f"when your work is integrated.")
     return text
 
 

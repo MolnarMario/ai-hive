@@ -10,6 +10,17 @@ its own lane, by the checklist below.
 Lanes never bump the version or touch the CHANGELOG or the README check
 count. The integrator does, once per pull request.
 
+## Testing policy
+
+- A lane agent commits each finished task on its lane branch and runs the
+  tests for the area it changed (`-k <area>` or `--quick` here). It never
+  needs the full suite.
+- The integrator runs the full suite, e2e included, once per pull request,
+  on the commit it pushes.
+- After that run only the README count may change, with no rerun. Any
+  other change means a new commit, a new full run and a new GPT-6-Luna
+  review.
+
 Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
 
 ## Checklist
