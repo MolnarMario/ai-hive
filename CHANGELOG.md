@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.34.1
+
+- Removes the old task hand-off code that 0.34.0 left without a button.
+  Nothing you can see changes: scheduled sends and the auto-continue
+  after a plan limit still type into agents the same way.
+- The collapsed sidebar rail and the workspace count badges now share
+  one "working" pulse, so they breathe in step.
+
 ## 0.34.0
 
 - Restart now gives you a fresh agent, as if you closed the card and

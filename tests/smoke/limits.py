@@ -445,8 +445,7 @@ def _auto_continue_on_limit_reset_body():
     # Prompt readiness must accept the WHOLE rotating footer-hint family, not
     # just "? for shortcuts". Keying on that one member left a restored agent
     # permanently "not ready" -- the watchdog logged WAIT every minute and
-    # never nudged it (verified live), and a delivered task would have hung in
-    # _pending_task just as long.
+    # never nudged it (verified live).
     for hint in ("? for shortcuts",
                  "auto mode on(shift+tab to cycle) \xb7 ctrl+t to show tasks "
                  "\xb7 ← for agents"):

@@ -7,6 +7,7 @@ the design handoff's inline data-URIs.
 """
 
 import os
+import math
 import time
 from functools import lru_cache
 
@@ -250,6 +251,32 @@ class DropCap(QWidget):
         p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._letter)
 
 
+PULSE_PERIOD_S = 1.1
+
+
+def pulse_phase(now: float | None = None) -> float:
+    """The amber "working" breath at `now`: 0 to 1 to 0 every PULSE_PERIOD_S,
+    eased like a sine. It reads the monotonic clock, not an animation's own
+    start time, so every pulse in the app is at the same point of the breath
+    whenever it started."""
+    t = time.monotonic() if now is None else now
+    return 0.5 - 0.5 * math.cos(2 * math.pi * (t % PULSE_PERIOD_S)
+                                / PULSE_PERIOD_S)
+
+
+def working_pulse(owner: QObject, on_value) -> QVariantAnimation:
+    """A looping frame clock that hands `on_value` the shared `pulse_phase`.
+    The count badge and the collapsed sidebar rail both use it, so they
+    breathe in step. Not started: the owner starts and stops it."""
+    anim = QVariantAnimation(owner)
+    anim.setStartValue(0.0)
+    anim.setEndValue(1.0)
+    anim.setDuration(int(PULSE_PERIOD_S * 1000))
+    anim.setLoopCount(-1)
+    anim.valueChanged.connect(lambda _v: on_value(pulse_phase()))
+    return anim
+
+
 class AgentCountBadge(QWidget):
     """A workspace's agent tally: a rounded badge showing how many agents are
     open, colour-coded by state — pulsing amber while any agent is working,
@@ -278,14 +305,7 @@ class AgentCountBadge(QWidget):
         self._count = 0
         self._state = "empty"
         self._pulse = 0.0  # 0..1 breathing factor while working
-        self._anim = QVariantAnimation(self)
-        self._anim.setStartValue(0.0)
-        self._anim.setKeyValueAt(0.5, 1.0)
-        self._anim.setEndValue(0.0)
-        self._anim.setDuration(1100)
-        self._anim.setLoopCount(-1)
-        self._anim.setEasingCurve(QEasingCurve.Type.InOutSine)
-        self._anim.valueChanged.connect(self._on_pulse)
+        self._anim = working_pulse(self, self._on_pulse)
 
     def set_state(self, count: int, state: str) -> None:
         if state not in self._STATE_COLOR:

@@ -1744,8 +1744,7 @@ def test_terminal_scrollbar():
     # AI Hive's own writes must never look like the user typing
     agent.write("\r")
     agent.nudge("Continue")
-    agent.deliver_task("go and do the thing")
-    check("scrollbar: write/nudge/deliver_task record no milestones",
+    check("scrollbar: write/nudge record no milestones",
           len(agent.prompt_marks()) == 1, agent.prompt_marks())
 
     # ---- uid is never an id() ------------------------------------------

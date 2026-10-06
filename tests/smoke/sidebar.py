@@ -322,6 +322,43 @@ def test_row_name_fades_under_badges():
     row.deleteLater()
 
 
+def test_working_pulses_share_one_phase():
+    """The count badges and the collapsed rail each run their own frame clock,
+    but the breath they paint comes from one shared clock. Two pulses started
+    0.4 s apart (one workspace starts working later than another) must still
+    be at the same point of the breath."""
+    from PySide6.QtCore import QEventLoop, QObject, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets import ornaments
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    period = ornaments.PULSE_PERIOD_S
+    check("pulse: the breath runs 0 -> 1 -> 0 over one period",
+          abs(ornaments.pulse_phase(0.0)) < 1e-9
+          and abs(ornaments.pulse_phase(period / 2) - 1.0) < 1e-9
+          and abs(ornaments.pulse_phase(period)) < 1e-9)
+    owner = QObject()
+    got = {"a": [], "b": []}
+    a = ornaments.working_pulse(owner, lambda v: got["a"].append(v))
+    a.start()
+    pump(400)
+    b = ornaments.working_pulse(owner, lambda v: got["b"].append(v))
+    b.start()
+    pump(150)
+    a.stop(); b.stop()
+    now = ornaments.pulse_phase()
+    check("pulse: a pulse started later is in step with an earlier one",
+          got["a"] and got["b"] and abs(got["a"][-1] - got["b"][-1]) < 0.15
+          and abs(got["b"][-1] - now) < 0.25,
+          (got["a"][-1:], got["b"][-1:], now))
+    owner.deleteLater()
+
+
 def test_collapsed_sidebar_rail():
     """A collapsed sidebar leaves a thin rail of per-workspace strips in
     sidebar order, coloured like each row's count badge. A click opens that

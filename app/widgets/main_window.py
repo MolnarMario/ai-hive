@@ -2491,7 +2491,7 @@ class MainWindow(QMainWindow):
         Only affects agents started from here on -- a running agent keeps the
         renderer it launched with, and restarting someone's working agent to
         change a display preference is exactly the kind of surprise the
-        nudge-vs-deliver_task rules exist to avoid. An ordinary UI preference:
+        nudge rules exist to avoid. An ordinary UI preference:
         _schedule_save, never _touch."""
         on = bool(on)
         if on == self._terminal_scrollback:
@@ -3661,9 +3661,9 @@ class MainWindow(QMainWindow):
     def _deliver_scheduled(self, agent, msg, now: float) -> None:
         """Type one due message into its agent, or decide it can't be.
 
-        Delivery is `nudge`, NEVER `deliver_task`: the user pressed a deferred
-        Enter, they did not assign a task, so `current_task`, the assignment
-        state and the role must all be left exactly as they are. `nudge` also
+        Delivery is `nudge`: the user pressed a deferred Enter, they did not
+        assign a task, so `current_task` must be left exactly as it is.
+        `nudge` also
         does not stamp `_last_input_ts`, so the work it kicks off still pulses
         the sidebar rather than reading as the user's own typing.
 
