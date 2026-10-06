@@ -727,6 +727,7 @@ class UsagePillBadge(QWidget):
         self._stale_after = usage_poll.STALE_FLOOR_S
         self._painted_stale = False  # so a tick repaints only on a change
         self._label = False         # prefix the window name (multi-limit plans)
+        self._show_left = False     # "79% left" instead of "21% used"
         self._unreadable = ""       # last error, when we have NO reading at all
         self._loading = False       # a fetch is in flight and we have nothing yet
         self._hovering = False      # paint the X's scrim over the text tail
@@ -848,6 +849,19 @@ class UsagePillBadge(QWidget):
         self._limit = None
         self._usage = None
         self._refresh_text()
+
+    def set_show_left(self, on: bool) -> None:
+        """Word the number as what remains ("79% left") or what is spent
+        ("21% used"), the Options switch "Show usage left". The ring follows
+        the number on the text, so a full ring means a full allowance when
+        this is on. The red warning still keys on USED percent: 85% used is
+        15% left, and the colour means the same thing either way."""
+        on = bool(on)
+        if on == self._show_left:
+            return
+        self._show_left = on
+        self._refresh_text()
+        self.update()     # the ring sweep changes even if the text width doesn't
 
     def tick(self) -> None:
         """Re-render the countdown from the clock alone (no network). Repaints
@@ -1060,8 +1074,7 @@ class UsagePillBadge(QWidget):
             p.setPen(color)
             p.drawText(ring, int(Qt.AlignmentFlag.AlignCenter), "!")
         else:
-            span = int(max(0.0, min(100.0, self._limit.percent))
-                       / 100.0 * 360 * 16)
+            span = int(self._ring_percent() / 100.0 * 360 * 16)
         if span:
             ap = QPen(color)
             ap.setWidthF(2.2)
@@ -1087,6 +1100,12 @@ class UsagePillBadge(QWidget):
         if self._hovering:
             self._paint_close_scrim(p, color, dim)
         p.end()
+
+    def _ring_percent(self) -> float:
+        """How much of the ring the sweep fills: the same number the text
+        states, used or left (see `set_show_left`)."""
+        used = max(0.0, min(100.0, self._limit.percent))
+        return 100.0 - used if self._show_left else used
 
     def _heal_width(self, advance: int) -> None:
         """Painting found the pill narrower than its own text: widen it,
@@ -1231,7 +1250,8 @@ class PlanUsageBadge(UsagePillBadge):
         from .. import claude_usage
 
         return claude_usage.format_limit(self._limit, with_label=self._label,
-                                         days_only=self.window == "weekly")
+                                         days_only=self.window == "weekly",
+                                         left=self._show_left)
 
     def _unreadable_text(self) -> str:
         return ("Claude 7d usage unreadable, click to refresh"
@@ -1257,7 +1277,8 @@ class PlanUsageBadge(UsagePillBadge):
         for lim in self._usage.limits:
             lines.append(f"{lim.label}: "
                          + claude_usage.format_limit(
-                             lim, days_only=lim.key.startswith("seven_day")))
+                             lim, days_only=lim.key.startswith("seven_day"),
+                             left=self._show_left))
         if self._usage.fetched_at:
             age = claude_usage.format_since(_time.time() - self._usage.fetched_at)
             src = " (cached by Claude)" if self._usage.source == "cache" else ""

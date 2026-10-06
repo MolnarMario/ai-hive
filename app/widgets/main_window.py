@@ -444,6 +444,7 @@ class TopBar(QFrame):
     # therefore the terminal scrollbar and its prompt milestones) is ours?
     terminalScrollbackToggled = Signal(bool)
     taskbarBadgeToggled = Signal(bool)     # show/hide the taskbar count overlay
+    usageLeftToggled = Signal(bool)        # usage pills say "% left", not "% used"
     # install newer Claude Code / agy CLIs at the NEXT startup, before any
     # agent launches (the only moment those binaries are not locked)
     autoUpdateToggled = Signal(bool)
@@ -642,6 +643,13 @@ class TopBar(QFrame):
             "codex_five_hour": self.codex_badge,
         }
         self._trackers = dict(DEFAULT_USAGE_TRACKERS)
+        # "Show usage left": every pill states what remains instead of what
+        # is spent. Default OFF, the wording the pills always had.
+        self._usage_left = False
+        self.usage_left_label = toggle_label("")
+        self.usage_left_btn = ToggleSwitch(self)
+        self.usage_left_btn.clicked.connect(self._on_usage_left_clicked)
+        self._refresh_usage_left_btn()
         for key, pill in self._usage_pills.items():
             pill.setVisible(False)
             pill.refreshRequested.connect(self.usageRefreshRequested)
@@ -714,6 +722,8 @@ class TopBar(QFrame):
         self.options_panel.add_row("Theme", self.theme_select)
         self.options_panel.add_row("Font size", self.font_dec_btn,
                                    self.font_inc_btn)
+        self.options_panel.add_switch_row(self.usage_left_label,
+                                          self.usage_left_btn)
 
         self.options_btn = QToolButton(self)
         self.options_btn.setObjectName("OptionsBtn")
@@ -883,6 +893,32 @@ class TopBar(QFrame):
             "Click to turn on.")
         self.taskbar_btn.setToolTip(tip)
         self.taskbar_label.setToolTip(tip)
+
+    def _on_usage_left_clicked(self) -> None:
+        self.set_usage_left(not self._usage_left)
+        self.usageLeftToggled.emit(self._usage_left)
+
+    def set_usage_left(self, on: bool) -> None:
+        """Reflect the "Show usage left" switch onto itself and every usage
+        pill (no signal emitted)."""
+        self._usage_left = bool(on)
+        self._refresh_usage_left_btn()
+        for pill in self._usage_pills.values():
+            pill.set_show_left(self._usage_left)
+
+    def _refresh_usage_left_btn(self) -> None:
+        self.usage_left_btn.setChecked(self._usage_left)
+        self.usage_left_label.setText("◔  Show usage left")
+        tip = (
+            "Show usage left: ON. Each usage pill counts down what remains of "
+            "its window, \"Claude 79% left\", and its ring empties as you "
+            "use it.\nClick to show the share used instead."
+            if self._usage_left else
+            "Show usage left: OFF. Each usage pill counts up what you have "
+            "used of its window, \"Claude 21% used\".\n"
+            "Click to show what is left instead.")
+        self.usage_left_btn.setToolTip(tip)
+        self.usage_left_label.setToolTip(tip)
 
     def _on_agent_lanes_clicked(self) -> None:
         self.set_agent_lanes(not self._agent_lanes)
@@ -2191,6 +2227,9 @@ class MainWindow(QMainWindow):
         # _restore_ui_state, or the restored preference is clobbered back to on.
         self._taskbar_badge = True    # user preference (persisted)
         self._taskbar_key = None      # last key actually pushed to the shell
+        # "Show usage left". Default OFF, assigned above _restore_ui_state
+        # for the same reason as the taskbar badge.
+        self._usage_left = False      # user preference (persisted)
         # startup CLI auto-update. Default OFF (it changes installed software),
         # and like every other preference here the default MUST be assigned
         # above _restore_ui_state or the restored value is clobbered.
@@ -2573,6 +2612,7 @@ class MainWindow(QMainWindow):
         self.top_bar.terminalScrollbackToggled.connect(
             self._on_terminal_scrollback)
         self.top_bar.taskbarBadgeToggled.connect(self._on_taskbar_badge_toggled)
+        self.top_bar.usageLeftToggled.connect(self._on_usage_left_toggled)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.agentLanesToggled.connect(self._on_agent_lanes_toggled)
         self.top_bar.updatesPanelRequested.connect(self.open_updates_panel)
@@ -3868,6 +3908,13 @@ class MainWindow(QMainWindow):
         self._schedule_save()
         self._push_taskbar_badge()   # apply now, don't wait for an agent event
 
+    def _on_usage_left_toggled(self, enabled: bool) -> None:
+        """User flipped "Show usage left". The top bar has already reworded
+        its pills; this only persists the choice, as an additive optional
+        key under "ui" like `taskbar_badge` (no SESSION_VERSION bump)."""
+        self._usage_left = bool(enabled)
+        self._schedule_save()
+
     def _on_auto_update_toggled(self, enabled: bool) -> None:
         """User flipped the startup CLI auto-update switch. An ordinary UI
         preference: additive optional key under "ui", saved on the debounced
@@ -4928,6 +4975,9 @@ class MainWindow(QMainWindow):
         # idle hive shows no badge at all, so it never nags)
         self._taskbar_badge = bool(ui.get("taskbar_badge", True))
         self.top_bar.set_taskbar_badge(self._taskbar_badge)
+        # usage pills say "% left" instead of "% used" (default OFF)
+        self._usage_left = bool(ui.get("usage_left", False))
+        self.top_bar.set_usage_left(self._usage_left)
         # startup CLI auto-update (default OFF: it installs software, so it is
         # armed deliberately, once, exactly like the recovery switches were)
         self._auto_update = bool(ui.get("auto_update", False))
@@ -5788,6 +5838,7 @@ class MainWindow(QMainWindow):
             # can never fight on the way back in.
             "usage_visible": any(self._usage_trackers.values()),
             "taskbar_badge": self._taskbar_badge,
+            "usage_left": self._usage_left,
             "auto_update": self._auto_update,
             "agent_lanes": self._agent_lanes,
             "auto_continue": self._auto_continue,

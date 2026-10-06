@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .claude_usage import pct_text
+
 # what a terminal-shaped run of the CLI wraps its output in (see `_read_usage`)
 _ESC = chr(27)
 _ESCAPES = re.compile(_ESC + r"\[[0-9;?<>=]*[ -/]*[@-~]|" + _ESC + r"\][^\x07]*\x07|"
@@ -306,15 +308,19 @@ def format_countdown_dh(seconds: float) -> str:
 
 
 def format_limit(limit: GeminiLimit, now: float | None = None,
-                 with_label: bool = False, days_only: bool = False) -> str:
+                 with_label: bool = False, days_only: bool = False,
+                 left: bool = False) -> str:
     """Format badge text for Gemini usage limit.
+
+    `left` states what remains instead of what is used, as
+    `claude_usage.format_limit` does.
 
     `days_only` drops the countdown to day+hour granularity (no minutes) —
     set it for the 7-day window pill.
     """
     now = time.time() if now is None else now
     head = ("limit reached" if limit.percent >= EXHAUSTED_PCT
-            else f"Gemini {limit.percent:.0f}% used")
+            else f"Gemini {pct_text(limit.percent, left)}")
     if with_label:
         head = f"{limit.short} {head}"
     if limit.resets_at is None:

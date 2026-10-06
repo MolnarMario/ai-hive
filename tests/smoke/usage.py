@@ -1478,3 +1478,98 @@ def test_codex_summary_reads_first_real_prompt():
     check("codex summary: live usage still comes from the tail",
           used == 1234 and window == 200000 and effort == "high",
           (used, window, effort))
+
+
+def test_usage_pills_show_left():
+    """The Options switch "Show usage left" flips every usage pill from
+    "21% used" to "79% left", and the ring with it. The red warning still
+    keys on the share USED, so 85% used is red in both wordings. The switch
+    is a persisted UI preference, default off."""
+    import pathlib
+    import tempfile
+    import time as _time
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QColor
+    from app import claude_usage as cu, gemini_usage as gu
+    from app import codex_usage as xu
+    from app.session_store import SessionStore
+    from app.widgets.ornaments import Palette, PlanUsageBadge
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    reset = _time.time() + 4800
+
+    check("usage-left: pct_text words used and left so they add up to 100",
+          (cu.pct_text(21.4), cu.pct_text(21.4, left=True),
+           cu.pct_text(120.0, left=True))
+          == ("21% used", "79% left", "0% left"))
+    climit = cu.Limit("five_hour", "Session (5h)", "5h", 21.0, reset)
+    glimit = gu.GeminiLimit("five_hour", "5-hour", "5h", 18.0, reset)
+    xlimit = xu.CodexLimit(30.0, reset)
+    check("usage-left: every provider's formatter takes the flag",
+          cu.format_limit(climit, left=True).startswith("Claude 79% left, ")
+          and gu.format_limit(glimit, left=True).startswith("Gemini 82% left, ")
+          and xu.format_limit(xlimit, left=True).startswith("GPT 70% left, "),
+          (cu.format_limit(climit, left=True),
+           gu.format_limit(glimit, left=True),
+           xu.format_limit(xlimit, left=True)))
+    check("usage-left: the default wording is unchanged",
+          cu.format_limit(climit).startswith("Claude 21% used, "))
+    spent = cu.Limit("five_hour", "Session (5h)", "5h", 100.0, reset)
+    check("usage-left: a spent window still says limit reached",
+          cu.format_limit(spent, left=True).startswith("limit reached"))
+
+    b = PlanUsageBadge(window="five_hour")
+    b.set_usage(cu.Usage(limits=(climit,)))
+    used_ring = b._ring_percent()
+    b.set_show_left(True)
+    check("usage-left: the pill rewords itself and its ring shows what is left",
+          b._text.startswith("5h Claude 79% left, ")
+          and used_ring == 21.0 and b._ring_percent() == 79.0,
+          (b._text, used_ring, b._ring_percent()))
+    check("usage-left: the tooltip uses the same wording",
+          "79% left" in b.toolTip() and "% used" not in b.toolTip(),
+          b.toolTip())
+    hot = PlanUsageBadge(window="five_hour")
+    hot.set_show_left(True)
+    hot.set_usage(cu.Usage(limits=(cu.Limit("five_hour", "Session (5h)",
+                                             "5h", 85.0, reset),)))
+    check("usage-left: 85% used (15% left) is still red",
+          hot._text.startswith("5h Claude 15% left")
+          and hot._color().name() == QColor(Palette.RED).name(),
+          (hot._text, hot._color().name()))
+    for w in (b, hot):
+        w.deleteLater()
+
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="ai-hive-usage-left-"))
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    bar = win.top_bar
+    check("usage-left: the switch defaults to off",
+          not win._usage_left and not bar.usage_left_btn.isChecked())
+    bar.usage_badge.set_usage(cu.Usage(limits=(climit,)))
+    emitted = []
+    bar.usageLeftToggled.connect(emitted.append)
+    win._save_timer.stop()
+    bar.usage_left_btn.click()
+    check("usage-left: a click emits True, rewords every pill and saves",
+          emitted == [True] and win._usage_left
+          and all(p._show_left for p in bar._usage_pills.values())
+          and "79% left" in bar.usage_badge._text
+          and win._save_timer.isActive(),
+          (emitted, bar.usage_badge._text))
+    check("usage-left: the preference is persisted under ui",
+          win._session_payload()["ui"].get("usage_left") is True)
+    win._save_session()
+    win.close()
+    app.processEvents()
+    win2 = create_main_window(store)
+    check("usage-left: a reopened window restores the switch and the pills",
+          win2._usage_left and win2.top_bar.usage_left_btn.isChecked()
+          and all(p._show_left for p in win2.top_bar._usage_pills.values()))
+    win2._restore_ui_state({"ui": {}})
+    check("usage-left: a session that predates the feature defaults it off",
+          not win2._usage_left
+          and not win2.top_bar.usage_badge._show_left)
+    win2.close()
+    app.processEvents()
