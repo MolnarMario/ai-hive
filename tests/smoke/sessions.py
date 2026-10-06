@@ -97,6 +97,10 @@ def test_persistence_resume():
     ag = win2.manager.workspaces[0].agents[0]
     check("persist: a running LEGACY unpinned Claude agent resumes (--continue)",
           ag.spec.resume and "--continue" in ag.spec.effective_args())
+    from app.terminal_agent import AssignmentState
+    check("persist: a saved 'working' assignment restores as idle (nothing "
+          "would ever move it on)", ag.assignment is AssignmentState.IDLE,
+          ag.assignment)
     win2.close(); pump(120)
 
     # a UTF-8 BOM must NOT make a valid session look corrupt (the bug that

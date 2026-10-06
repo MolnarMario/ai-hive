@@ -3662,8 +3662,8 @@ class MainWindow(QMainWindow):
         """Type one due message into its agent, or decide it can't be.
 
         Delivery is `nudge`: the user pressed a deferred Enter, they did not
-        assign a task, so `current_task`, the assignment
-        state and the role must all be left exactly as they are. `nudge` also
+        assign a task, so `current_task` must be left exactly as it is.
+        `nudge` also
         does not stamp `_last_input_ts`, so the work it kicks off still pulses
         the sidebar rather than reading as the user's own typing.
 

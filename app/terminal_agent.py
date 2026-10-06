@@ -1796,8 +1796,7 @@ class TerminalAgent(QObject):
         # then falls quiet (a resumed conversation parked at its prompt) nothing
         # ever looks again. The agent stays "not ready" forever: `nudge` refuses
         # it, so a plan-limit resume is declined every minute. Observed live
-        # 2026-08-07:
-        # nine consecutive "WAIT (TUI not ready)" ticks on an agent whose child
+        # 2026-08-07: nine consecutive "WAIT (TUI not ready)" ticks on an agent whose child
         # had been up for ten minutes, ending only when the user happened to
         # click that workspace.
         #

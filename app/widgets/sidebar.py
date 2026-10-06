@@ -52,9 +52,9 @@ from ..process_worker import describe_pid
 from ..terminal_agent import AgentStatus
 from ..ui_theme import Palette, repolish
 from .activity_panel import _ICON
-from .ornaments import (AgentCountBadge, working_pulse, ElidingLabel, FadingLabel,
+from .ornaments import (AgentCountBadge, ElidingLabel, FadingLabel,
                         OrnamentDivider, WorkspaceSpinner,
-                        close_on_anchor_press)
+                        close_on_anchor_press, working_pulse)
 
 SIDEBAR_WIDTH = 230
 ROW_HEIGHT = 44

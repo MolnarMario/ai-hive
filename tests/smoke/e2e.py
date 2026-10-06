@@ -251,8 +251,6 @@ def _lifecycle_e2e_body(tmp, windows, pump, marker):
     # a brand-new folder shows the trust dialog first, and nothing may be
     # typed into it: nudge refuses until the real prompt is up
     ask = f"Reply with exactly the word {marker} and nothing else."
-    check("e2e: a nudge before the prompt is up is refused",
-          not agent.nudge(ask))
     dialog = wait_until(lambda: _e2e_trust_options_drawn(agent), 45000)
     check("e2e: trust dialog appeared for the fresh folder", dialog,
           screen_text(agent)[-300:])
@@ -260,6 +258,8 @@ def _lifecycle_e2e_body(tmp, windows, pump, marker):
         return
     check("e2e: prompt not ready while the trust dialog is up",
           not agent._prompt_ready)
+    check("e2e: a nudge into the trust dialog is refused",
+          not agent.nudge(ask), screen_text(agent)[-300:])
     accepted = _e2e_accept_trust(agent, pump)
     check("e2e: the trust dialog's highlight reached Yes", accepted,
           "\n".join(r.rstrip() for r in _e2e_screen_rows(agent) if r.strip()))
@@ -270,14 +270,17 @@ def _lifecycle_e2e_body(tmp, windows, pump, marker):
           screen_text(agent)[-300:])
     if not ready:
         return
-    check("e2e: the task is typed once the prompt is up", agent.nudge(ask))
+    typed = agent.nudge(ask)
+    check("e2e: the task is typed once the prompt is up", typed)
+    if not typed:
+        return
     tpath = Path(transcripts.transcript_path(str(tmp), sid))
     # the transcript flush lags the on-screen answer (file first, content
     # later): wait until the REPLY is in the file before closing, or the
     # close-time backup snapshots a partial conversation
     answered = wait_until(lambda: _e2e_assistant_said(tpath, marker), 120000)
-    check("e2e: the queued task was delivered and claude's reply is in the "
-          "pinned transcript", answered, screen_text(agent)[-300:])
+    check("e2e: the typed task got claude's reply into the pinned "
+          "transcript", answered, screen_text(agent)[-300:])
     if not answered:
         return
     first_worker = agent.worker

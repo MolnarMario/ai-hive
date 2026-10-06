@@ -1466,13 +1466,12 @@ def test_render_perm_mode_bridge():
           and AgentSpec.from_dict(pm_spec.to_dict()).permission_mode
           == "acceptEdits", pm_spec.to_dict())
 
-    mgr = WorkspaceManager()
-    ws = mgr.create_workspace("W", str(tmp))
-
     # --- #3/#8 board bridge over the real named pipe: log_activity round-trips
     from app.orchestrator_bridge import OrchestratorBridge, HAS_QTNETWORK
     if HAS_QTNETWORK:
         from app import mcp_server
+        mgr = WorkspaceManager()
+        ws = mgr.create_workspace("W", str(tmp))
         bridge = OrchestratorBridge(mgr, active_ws=lambda: ws.id)
         check("v3 bridge: named pipe listening", bridge.start())
         os.environ["AIHIVE_PIPE"] = bridge.pipe_name
