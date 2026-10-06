@@ -1477,7 +1477,7 @@ class TerminalAgent(QObject):
         self._hint_if_tty_only(text.strip())
         if not self.worker.send_line(text):
             self._emit(STREAM_SYSTEM,
-                       "[not running; right-click the card header to start]\n")
+                       "[not running; hover the ⋯ on the card header and click ▶ to start]\n")
 
     def _hint_if_tty_only(self, command: str) -> None:
         parts = command.split()

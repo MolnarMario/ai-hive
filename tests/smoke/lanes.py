@@ -4284,7 +4284,7 @@ def test_restart_in_own_lane():
     fresh conversation in its new lane; New Agent offers the old
     conversation again; a failed create leaves it in the workspace
     folder."""
-    from PySide6.QtWidgets import QApplication, QDialog, QMenu
+    from PySide6.QtWidgets import QApplication, QDialog
     from app import event_log as el
     from app import lanes
     from app.process_worker import WorkerState
@@ -4322,20 +4322,15 @@ def test_restart_in_own_lane():
         return [a for a in ws.agents if a not in before]
 
     def menu_labels(card):
-        shown = []
-
-        class RecordingMenu(QMenu):
-            def exec(self, *a, **k):
-                shown.append([(act.text(), act.isEnabled())
-                              for act in self.actions()])
-        from app.widgets import terminal_card as tc_mod
-        orig_menu = tc_mod.QMenu
-        tc_mod.QMenu = RecordingMenu
+        # the card's actions live in the header's hover tray: open it the way
+        # a hover does and read what it offers, by each glyph's tooltip
+        tools = card.header_tools
+        tools._set_open(True)
         try:
-            card.show_actions_menu(card.mapToGlobal(card.rect().center()))
+            return [(b.toolTip().split("\n")[0], b.isEnabled())
+                    for b in tools._buttons if not b.isHidden()]
         finally:
-            tc_mod.QMenu = orig_menu
-        return shown[0] if shown else []
+            tools._set_open(False)
 
     win._confirm_adopt = lambda _agent: True
     with _stub_starts() as starts:
@@ -4350,7 +4345,7 @@ def test_restart_in_own_lane():
         win.manager.set_workspace_lanes(ws.id, True)
         offered = [(t, e) for t, e in menu_labels(card)
                    if t.startswith("Restart in own lane")]
-        check("adopt: the workspace toggle ON offers it in the card menu",
+        check("adopt: the workspace toggle ON offers it in the card tray",
               offered == [("Restart in own lane (new conversation)", True)],
               offered)
         tip = win._integration_info(agent)["adopt"][2]

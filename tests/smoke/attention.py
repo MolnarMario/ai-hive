@@ -1316,3 +1316,48 @@ def test_event_log():
           "lifecycle" in ui["event_log"]["filter"]["groups"])
     mw._event_log_window.close()
     mw.close()
+
+
+def test_chime_sound_menu_second_click_closes():
+    """A second click on a chime row's note button closes its menu. The
+    popup closes as for any outside press, and Qt then replayed that press
+    to the button, whose click opened the menu again (the bug
+    `ornaments.close_on_anchor_press` fixes for the other dropdowns). The
+    menu runs a real exec(); a timer inside its loop does the checking and
+    then closes it."""
+    from PySide6.QtCore import QEvent, QPointF, Qt, QTimer
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+    from app import chime
+    from app.widgets.main_window import TopBar
+
+    QApplication.instance() or QApplication([])
+    bar = TopBar()
+    btn = bar.chime_sound_btns[chime.QUESTION]
+    # the button lives in the Options panel; the filter only counts a
+    # press on an anchor that is on screen
+    btn.window().show(); QApplication.processEvents()
+    seen = {}
+
+    def inside_exec():
+        menu = QApplication.activePopupWidget()
+        seen["menu"] = menu is not None
+        if menu is None:
+            return
+        g = btn.mapToGlobal(btn.rect().center())
+        QApplication.sendEvent(menu, QMouseEvent(
+            QEvent.Type.MouseButtonPress, QPointF(menu.mapFromGlobal(g)),
+            QPointF(g), Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier))
+        seen["no_replay"] = menu.testAttribute(
+            Qt.WidgetAttribute.WA_NoMouseReplay)
+        menu.close()
+
+    check("chime menu: test button is on screen", btn.isVisible())
+    QTimer.singleShot(150, inside_exec)
+    btn.click()                   # returns once inside_exec closed the menu
+    check("chime menu: the note button opens a menu", seen.get("menu"), seen)
+    check("chime menu: a press on its button is not replayed to reopen it",
+          seen.get("no_replay"), seen)
+    btn.window().hide()
+    bar.deleteLater()

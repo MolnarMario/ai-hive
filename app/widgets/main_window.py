@@ -59,7 +59,7 @@ from .lanes_help import show_lanes_explainer
 from . import ornaments
 from .ornaments import (DropDownComboBox, LogoRoundel,
                         PageBorder, PlanUsageBadge, RefreshGlyphButton,
-                        ToggleSwitch)
+                        ToggleSwitch, close_on_anchor_press)
 from .options_panel import OptionsPanel
 from .sidebar import SIDEBAR_WIDTH, Sidebar
 
@@ -1072,8 +1072,9 @@ class TopBar(QFrame):
 
     def _open_chime_sound_menu(self, kind: str) -> None:
         btn = self.chime_sound_btns[kind]
-        self.build_chime_sound_menu(kind).exec(
-            btn.mapToGlobal(QPoint(0, btn.height())))
+        menu = self.build_chime_sound_menu(kind)
+        close_on_anchor_press(menu, btn)
+        menu.exec(btn.mapToGlobal(QPoint(0, btn.height())))
 
     def _on_recover_clicked(self) -> None:
         self.set_startup_recovery(not self._startup_recovery)
@@ -1144,6 +1145,7 @@ class TopBar(QFrame):
 
     def _open_tracker_menu(self) -> None:
         menu = self.build_tracker_menu()
+        close_on_anchor_press(menu, self.usage_add_btn)
         menu.exec(self.usage_add_btn.mapToGlobal(
             QPoint(0, self.usage_add_btn.height())))
 
@@ -1746,7 +1748,7 @@ class ScheduleMessageDialog(QDialog):
     """Compose a message now, choose when it is typed in.
 
     Opened by Ctrl+Shift+Enter in an agent's terminal (prefilled with whatever
-    was typed) or from the card's right-click menu (empty). It doubles as the
+    was typed) or from the card's ⏱ tray button (empty). It doubles as the
     manage view: everything already queued for this agent is listed with a
     cancel button, and a MISSED entry can be sent immediately or dismissed.
 
@@ -4395,7 +4397,7 @@ class MainWindow(QMainWindow):
                                    f"The lane folder is missing:\n"
                                    f"{lane['root']}")
         elif action == "refresh":
-            # the menu may have been opened before the agent started a turn
+            # the chip's menu may have opened before the agent started a turn
             if agent.is_busy() or agent.is_waiting():
                 agent.notice("[lane not updated: this agent is working. "
                              "Update it once its turn is over.]")
@@ -4457,8 +4459,8 @@ class MainWindow(QMainWindow):
     # stays approvable after its lane's card is closed.
 
     def _integration_info(self, agent) -> dict:
-        """What a card's menus show for the queue and for Restart in own
-        lane (see TerminalCard.integration_info). Never runs git or gh on
+        """What a card's action tray and lane chip menu show for the queue
+        and for Restart in own lane (see TerminalCard.integration_info). Never runs git or gh on
         this thread: a stale gh answer only starts a background check."""
         ws = self.manager.workspace_of(agent.id)
         if ws is None:
@@ -4474,12 +4476,12 @@ class MainWindow(QMainWindow):
                             "briefs. The queue keeps its items.")
         elif (agent.spec.provider == "claude" and agent.is_pty
               and (agent.spec.lane or any(a.spec.lane for a in ws.agents))):
-            # offered where lanes are: in a workspace without any, the menu
+            # offered where lanes are: in a workspace without any, the tray
             # is exactly what it was before lanes
             why = self.manager.can_integrate(agent)
             if why and not agent.spec.lane and adopt is not None:
                 why = ("This agent has no lane. Restart it in its own lane "
-                       "from this menu first.")
+                       "first (the ⎇ button in this tray).")
             current = self.manager.integrator(ws.id)
             tip = why or (
                 (f"Replaces {current.spec.name} as this workspace's "
@@ -4509,8 +4511,9 @@ class MainWindow(QMainWindow):
     def _submit_state(self, ws, agent) -> tuple:
         """(enabled, tooltip) for a lane's Submit to integrator."""
         if self.manager.integrator(ws.id) is None:
-            return False, ("Pick an integrator first: right-click a laned "
-                           "Claude agent's header and choose Make integrator.")
+            return False, ("Pick an integrator first: hover the ⋯ on a "
+                           "laned Claude agent's header and click ⚑ "
+                           "(Make integrator).")
         ok, reason = self._gh_state(agent.spec.lane["repo"])
         if not ok:
             return False, reason

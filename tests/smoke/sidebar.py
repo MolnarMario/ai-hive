@@ -615,6 +615,58 @@ def test_workspace_header_trash_and_repo_seam():
     page.deleteLater()
 
 
+def test_repo_dropdown_second_click_closes():
+    """A second click on the dropdown arrow beside Open repo closes the
+    activity menu. The popup grab hands that press to the menu, which closes
+    as for any outside click, and Qt then replayed the press to the arrow,
+    whose click opened the menu again. QTest clicks bypass the grab, so the
+    check feeds the menu the press it would get."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.workspace_page import WorkspacePage
+    from app.workspace_manager import Workspace
+    from main import setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    page = WorkspacePage(Workspace(id="w1", name="WS",
+                                   project_path="C:/proj/ai-hive"))
+    page.resize(1300, 200)
+    page.show()
+    app.processEvents()
+    drop, menu = page.repo_activity_btn, page.repo_activity_menu
+    no_replay = Qt.WidgetAttribute.WA_NoMouseReplay
+
+    def press_at(widget):
+        g = widget.mapToGlobal(widget.rect().center())
+        ev = QMouseEvent(QEvent.Type.MouseButtonPress,
+                         QPointF(menu.mapFromGlobal(g)), QPointF(g),
+                         Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(menu, ev)
+        app.processEvents()
+
+    drop.click()
+    app.processEvents()
+    check("repo dropdown: clicking the arrow opens the menu",
+          menu.isVisible())
+    press_at(drop)
+    check("repo dropdown: a press on the arrow closes the open menu",
+          not menu.isVisible())
+    check("repo dropdown: ...and is not replayed to the arrow to reopen it",
+          menu.testAttribute(no_replay))
+    drop.click()
+    app.processEvents()
+    check("repo dropdown: opening again re-arms the replay for other clicks",
+          menu.isVisible() and not menu.testAttribute(no_replay))
+    press_at(page.repo_btn)
+    check("repo dropdown: a press elsewhere closes it and still replays there",
+          not menu.isVisible() and not menu.testAttribute(no_replay))
+    menu.hide()
+    page.deleteLater()
+
+
 def test_sidebar_categories():
     """Categories: create one, drag workspaces into/out of it, collapse it, and
     delete it (its workspaces spill back out in place)."""
@@ -736,6 +788,86 @@ def test_category_container():
     QApplication.processEvents()
     pm = QPixmap(sb.size())
     sb.render(pm)   # drawRow container painting must not raise
+    sb.deleteLater()
+
+
+def test_category_row_click_toggles():
+    """A click anywhere on a category row toggles it, not only the caret. A
+    click on the name text toggles after the double-click interval, and a
+    double-click there renames without toggling. A drag never toggles."""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.sidebar import Sidebar
+
+    QApplication.instance() or QApplication([])
+    sb = Sidebar()
+    sb.resize(240, 220)
+    sb.add_row("w", "Web", "p")
+    cid = sb._add_category("Work")
+    row = sb._cat_widgets[cid]
+    row._end_rename()
+    sb.show()
+    QApplication.processEvents()
+    collapsed = lambda: sb._cat_node(cid)["collapsed"]  # noqa: E731
+    left = Qt.MouseButton.LeftButton
+
+    # the empty stretch between the name text and the count chip
+    blank = QPoint(row.count_label.geometry().left() - 4, row.height() // 2)
+    check("cat click: test point is off the name text",
+          not row._on_name_text(blank))
+    QTest.mouseClick(row, left, pos=blank)
+    check("cat click: a click on the row body collapses it", collapsed())
+    QTest.mouseClick(row, left, pos=blank)
+    check("cat click: a second click expands it again", not collapsed())
+
+    name_pt = row.name_label.geometry().topLeft() + QPoint(3, 6)
+    check("cat click: test point is on the name text",
+          row._on_name_text(name_pt))
+    QTest.mouseClick(row, left, pos=name_pt)
+    check("cat click: a name click waits for a possible double-click",
+          not collapsed() and row._name_click.isActive())
+    QTest.qWait(QApplication.doubleClickInterval() + 150)
+    check("cat click: the name click toggles once the interval passes",
+          collapsed())
+    sb._on_cat_toggled(cid)  # back to expanded
+    row = sb._cat_widgets[cid]
+
+    QTest.mouseClick(row, left, pos=name_pt)
+    QTest.mouseDClick(row, left, pos=name_pt)
+    check("cat click: a double-click on the name renames",
+          row._renaming and not row._name_click.isActive())
+    QTest.qWait(QApplication.doubleClickInterval() + 150)
+    check("cat click: the rename double-click never toggles", not collapsed())
+    row._end_rename()
+
+    QTest.mousePress(row, left, pos=blank)
+    row._press_pos = None  # what mouseMoveEvent does when a drag starts
+    QTest.mouseRelease(row, left, pos=blank)
+    check("cat click: a press that became a drag does not toggle",
+          not collapsed())
+
+    # a fast pair whose first click is on the name and second is off it:
+    # Qt delivers press, release, double-click, release. The release toggles
+    # once; the name click's pending toggle must not fire on top of it
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+
+    def send(kind, pos, buttons):
+        QApplication.sendEvent(row, QMouseEvent(
+            kind, QPointF(pos), QPointF(row.mapToGlobal(pos)), left,
+            buttons, Qt.KeyboardModifier.NoModifier))
+
+    flips = []
+    row.toggled.connect(flips.append)
+    none = Qt.MouseButton.NoButton
+    send(QEvent.Type.MouseButtonPress, name_pt, left)
+    send(QEvent.Type.MouseButtonRelease, name_pt, none)
+    send(QEvent.Type.MouseButtonDblClick, blank, left)
+    send(QEvent.Type.MouseButtonRelease, blank, none)
+    QTest.qWait(QApplication.doubleClickInterval() + 150)
+    check("cat click: name then off-name double-click toggles exactly once",
+          len(flips) == 1 and collapsed(), flips)
     sb.deleteLater()
 
 

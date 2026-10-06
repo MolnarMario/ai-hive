@@ -8,6 +8,25 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.29.0
+
+- The card actions that lived in the header's right-click menu (start, stop,
+  restart, assign a task, scheduled send, Restart in own lane, Make
+  integrator) are now buttons in the tray that opens when you hover the ⋯ in
+  a card header, next to A- / A+ / maximize. Each has a tooltip naming it.
+  The right-click menu is gone. A lane action AI Hive can't do right now
+  shows disabled, and its tooltip says why.
+- The hover tray closes when you move the pointer slowly off it, up or down.
+  Before, it could stay stuck open on a display with fractional scaling.
+- A second click on a dropdown's button now closes the dropdown. Before, it
+  closed and opened again at once. This affects the repo activity arrow, the
+  usage "+" picker, the chime rows' note button in Options, and the
+  background-shell and lane chips.
+- A click anywhere on a sidebar category row expands or collapses it, not
+  only on the arrow. A double-click on the name still renames it.
+- The Activity panel's "No integrator yet" hint points at the ⚑ button in
+  the card's hover tray instead of the right-click menu that is gone.
+
 ## 0.28.5
 
 - Closing an agent no longer says "Lane kept" with an unmerged commit when

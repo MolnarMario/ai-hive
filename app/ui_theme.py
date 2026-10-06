@@ -747,20 +747,33 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 /* compact single-glyph buttons live in the ultramarine running-head, so they
    take the head's subtitle color, not the body text color */
 #CardClose, #WsDelete,
+#CardStart, #CardStop, #CardRestart, #CardAssign, #CardAdopt,
+#CardIntegrator, #CardScheduleSend,
 #CardFontDec, #CardFontInc, #CardMaximize {{
     padding: 3px 6px; font-size: 14px; color: {p.CARDHEAD_SUB};
 }}
+#CardStart:hover, #CardStop:hover, #CardRestart:hover, #CardAssign:hover,
+#CardAdopt:hover, #CardIntegrator:hover, #CardScheduleSend:hover,
 #CardFontDec:hover,
 #CardFontInc:hover, #CardMaximize:hover {{ color: {p.CARDHEAD_FG}; }}
+/* the id rules above outrank QToolButton:disabled, so a tray action the
+   agent can't take right now needs its own faded rule */
+#CardStart:disabled, #CardStop:disabled, #CardAdopt:disabled,
+#CardIntegrator:disabled {{ color: {p.TEXT_FAINT}; }}
+/* the action glyphs have color-emoji forms (U+25B6, U+23F1). Segoe UI Symbol
+   draws all of them as one-color outlines that take `color`; left to
+   fallback, Windows can pick the emoji, which ignores it. */
+#CardStart, #CardStop, #CardRestart, #CardAssign, #CardAdopt,
+#CardIntegrator, #CardScheduleSend {{ font-family: "Segoe UI Symbol"; }}
 /* the A-/A+ font steppers read better a hair smaller than the glyph icons;
    the maximize/restore glyph a hair larger (later rules win on equal id
    specificity) */
 #CardFontDec, #CardFontInc {{ font-size: 12px; font-weight: 700; }}
 #CardMaximize {{ font-size: 16px; }}
-/* the collapsed stand-in for A-/A+/maximize: faint enough to read as chrome,
-   visible enough to say "there is something here to hover" */
+/* the collapsed stand-in for the action tray: faint enough to read as
+   chrome, visible enough to say "there is something here to hover" */
 #CardToolsHint {{ color: {p.CARDHEAD_SUB}; font-size: 13px; }}
-/* the hover tray those three buttons expand into. It FLOATS over the header
+/* the hover tray the card's actions expand into. It FLOATS over the header
    rather than taking layout width (see _HeaderTools), so it has to be opaque
    or the summary underneath reads straight through it. */
 #CardToolsTray {{

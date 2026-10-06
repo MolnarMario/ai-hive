@@ -11,8 +11,8 @@ import time
 from functools import lru_cache
 
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
-                            QEvent, QRectF, Qt, QTimer, QVariantAnimation,
-                            Signal)
+                            QEvent, QObject, QPoint, QRect, QRectF, Qt, QTimer,
+                            QVariantAnimation, Signal)
 from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage,
                            QLinearGradient, QPainter, QPainterPath, QPen,
                            QPixmap, QRadialGradient)
@@ -1797,6 +1797,45 @@ def anchored_popup_pos(anchor, size, align_right=False):
         y = tl.y() - h                        # flip above the button
     y = max(top, min(y, bottom - h))
     return QPoint(x, y)
+
+
+class _AnchorPressCloses(QObject):
+    """Event filter behind `close_on_anchor_press`."""
+
+    def __init__(self, popup, anchor):
+        super().__init__(popup)
+        self._anchor = anchor
+
+    def eventFilter(self, obj, event):
+        no_replay = Qt.WidgetAttribute.WA_NoMouseReplay
+        if event.type() == QEvent.Type.Show:
+            # a close by an anchor press left this set; any other outside
+            # press must still reach whatever it landed on
+            obj.setAttribute(no_replay, False)
+        elif event.type() == QEvent.Type.MouseButtonPress:
+            try:
+                anchor = self._anchor
+                hit = anchor.isVisible() and QRect(
+                    anchor.mapToGlobal(QPoint(0, 0)), anchor.size()).contains(
+                        event.globalPosition().toPoint())
+            except RuntimeError:  # the anchor's C++ side is gone
+                hit = False
+            if hit:
+                obj.setAttribute(no_replay, True)
+        return False
+
+
+def close_on_anchor_press(popup, anchor) -> None:
+    """Make a press on `anchor` close `popup` and stop there.
+
+    A button whose `clicked` opens a menu could never close it. The popup
+    grab hands the second press to the menu, the menu closes as for any
+    outside click, and then Qt REPLAYS the press to the button, whose click
+    opened the menu again. `WA_NoMouseReplay` drops the replay, set only for
+    presses on the anchor. QToolButton.setMenu does the same internally, and
+    `OptionsPanel.mousePressEvent` does it for the Options panel.
+    """
+    popup.installEventFilter(_AnchorPressCloses(popup, anchor))
 
 
 class DropDownComboBox(QComboBox):

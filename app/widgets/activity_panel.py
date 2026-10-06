@@ -334,8 +334,8 @@ class ActivityPanel(QFrame):
             f"Integration: {waiting} in line" if waiting else "Integration")
         who = state.get("integrator") or ""
         info = [f"Integrator: {who}" if who else
-                "No integrator yet. Right-click a laned Claude agent's "
-                "header and pick Make integrator."]
+                "No integrator yet. Hover the ⋯ on a laned Claude agent's "
+                "header and click ⚑ (Make integrator)."]
         if state.get("reason"):
             info.append(state["reason"])
         self.queue_info.setText("\n".join(info))

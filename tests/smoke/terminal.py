@@ -2080,3 +2080,138 @@ def test_header_tools_tray_has_no_dead_space():
 
     card.detach(); card.close()
     a.deleteLater()
+
+
+def test_header_tray_carries_the_card_actions():
+    """The actions that used to hide behind a right-click on the header
+    (start, stop, restart, assign, scheduled send, the lane actions) are
+    icon buttons in the hover tray, each with a tooltip naming it. The user
+    had forgotten the right-click menu existed."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard, _CardHeader
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Acts", cwd=SCRATCH_CWD))
+    card = TerminalCard(a)
+    card.resize(900, 300); card.show(); pump(60)
+    ht = card.header_tools
+
+    def shown():
+        return [b for b in ht._buttons if not b.isHidden()]
+
+    check("actions: the header has no right-click menu any more",
+          "contextMenuEvent" not in _CardHeader.__dict__
+          and not hasattr(card, "show_actions_menu"))
+    ht._set_open(True); pump(20)
+    lifecycle = [card.btn_start, card.btn_stop, card.btn_restart,
+                 card.btn_assign, card.btn_sched]
+    check("actions: start/stop/restart/assign/schedule are in the tray",
+          all(b in shown() for b in lifecycle))
+    check("actions: every tray button has a tooltip",
+          all(b.toolTip().strip() for b in shown()),
+          [(b.text(), b.toolTip()) for b in shown()])
+    check("actions: lane buttons stay out with nothing to offer",
+          card.btn_adopt not in shown()
+          and card.btn_integrator not in shown())
+    check("actions: an idle agent can start but not stop",
+          card.btn_start.isEnabled() and not card.btn_stop.isEnabled())
+    # a status change while the tray is open updates what is clickable
+    a.status = AgentStatus.RUNNING
+    card._on_status(AgentStatus.RUNNING)
+    check("actions: a running agent can stop but not start",
+          card.btn_stop.isEnabled() and not card.btn_start.isEnabled())
+    a.status = AgentStatus.IDLE
+    card._on_status(AgentStatus.IDLE)
+    ht._set_open(False)
+
+    # what the integration queue offers decides the lane buttons, and its
+    # label and reason land in their tooltips
+    card.integration_info = lambda _agent: {
+        "adopt": ("Restart in own lane (new conversation)", False,
+                  "This agent is working."),
+        "role": ("Make integrator", True, "Types each lane into it.")}
+    ht._set_open(True); pump(20)
+    check("actions: offered lane buttons appear",
+          card.btn_adopt in shown() and card.btn_integrator in shown())
+    check("actions: a refused lane action is disabled, with its reason",
+          not card.btn_adopt.isEnabled()
+          and card.btn_adopt.toolTip().startswith("Restart in own lane")
+          and "This agent is working." in card.btn_adopt.toolTip(),
+          card.btn_adopt.toolTip())
+    got = []
+    card.laneActionRequested.connect(lambda aid, act: got.append(act))
+    card.btn_integrator.click()
+    check("actions: the integrator button asks for the integrator action",
+          got == ["integrator"], got)
+    ht._set_open(False)
+
+    # the Activity panel's no-integrator hint points at the tray, not at the
+    # right-click menu that is gone
+    from app.widgets.activity_panel import ActivityPanel
+    panel = ActivityPanel()
+    panel.set_integration({"integrator": "", "laned": True, "items": []})
+    hint = panel.queue_info.text()
+    check("actions: the no-integrator hint names the tray, not a right-click",
+          "right-click" not in hint.lower() and "⋯" in hint
+          and "Make integrator" in hint, hint)
+    panel.deleteLater()
+
+    card.detach(); card.close()
+    a.deleteLater()
+
+
+def test_header_tools_tray_closes_without_a_leave_event():
+    """A slow exit up or down can fire Leave while QCursor.pos() still rounds
+    inside the tray (fractional DPI), and then no further event reaches it.
+    The tray must notice the pointer is gone by itself, with no Leave and no
+    explicit _recheck call."""
+    from PySide6.QtCore import QEvent, QEventLoop, QObject, QPoint, QTimer
+    from PySide6.QtGui import QCursor
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Tray", cwd=SCRATCH_CWD))
+    card = TerminalCard(a)
+    card.resize(900, 300); card.show(); pump(60)
+    ht = card.header_tools
+    tray = ht.tray
+    ht._set_open(True); pump(30)
+    QCursor.setPos(tray.mapToGlobal(QPoint(tray.width() // 2,
+                                           tray.height() // 2)))
+    pump(ht._WATCH_MS * 2)
+    check("tray: stays open while the pointer is on it", tray.isVisible())
+    # just below the tray, over the terminal, with every Enter/Leave eaten:
+    # offscreen Qt turns setPos into real crossing events, which would hide
+    # the very case this guards
+    class _NoCrossing(QObject):
+        def eventFilter(self, obj, ev):
+            return ev.type() in (QEvent.Type.Enter, QEvent.Type.Leave)
+    eat = _NoCrossing()
+    QApplication.instance().installEventFilter(eat)
+    try:
+        QCursor.setPos(tray.mapToGlobal(QPoint(tray.width() // 2,
+                                               tray.height() + 2)))
+        pump(ht._WATCH_MS * 3)
+    finally:
+        QApplication.instance().removeEventFilter(eat)
+    check("tray: closes on its own once the pointer is below it",
+          not tray.isVisible())
+    check("tray: the watch timer stops when the tray closes",
+          not ht._watch.isActive())
+
+    card.detach(); card.close()
+    a.deleteLater()
