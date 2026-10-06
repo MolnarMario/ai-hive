@@ -1134,7 +1134,8 @@ def test_lane_awareness_core():
           lanes.status_paths(e["root"]) == [], lanes.status_paths(e["root"]))
 
 
-def _run_hook(payload, env_extra: dict, stdin_raw: str | None = None):
+def _run_hook(payload, env_extra: dict, stdin_raw: str | None = None,
+              events: str = ""):
     """app/session_hook.py exactly as Claude runs it: a subprocess, JSON on
     stdin. Returns (exit code, stdout)."""
     import sys
@@ -1143,7 +1144,7 @@ def _run_hook(payload, env_extra: dict, stdin_raw: str | None = None):
            if k not in session_hook.LANE_ENV_KEYS}
     env.update(env_extra)
     raw = stdin_raw if stdin_raw is not None else json.dumps(payload)
-    r = subprocess.run([sys.executable, session_hook.__file__, "", ""],
+    r = subprocess.run([sys.executable, session_hook.__file__, "", events],
                        input=raw, capture_output=True, text=True, env=env,
                        timeout=30, creationflags=_NO_WINDOW)
     return r.returncode, r.stdout.strip()
@@ -2107,6 +2108,131 @@ def _service_rig(tmp: Path, names=("Agent A", "Agent B")):
     return work, mgr, ws, ops, svc, agents
 
 
+def test_lane_stop_nudge():
+    """Part A2 of the batch plan: a laned agent that ends a turn with
+    uncommitted lane changes is kept going once (the Stop hook's
+    `decision: block`) and told to commit finished work. Never when the
+    lane is clean, on the turn's second stop, on a question, for the
+    integrator, without the lane env or a live lanes.json, or when git
+    can't answer. A real temp repo and lane, never a project folder."""
+    from app import session_hook
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-stop-"))
+    work = _make_repo(tmp)
+    lane = _lane_for(work, "Agent S", "5709" + "0" * 28)
+    root = Path(lane["root"])
+    try:
+        index = work / ".aihive" / "lanes.json"
+        env = {session_hook.LANE_UID_ENV: "s",
+               session_hook.LANE_ROOT_ENV: str(root),
+               session_hook.LANE_REPO_ENV: str(work),
+               session_hook.LANES_INDEX_ENV: str(index),
+               session_hook.LANE_NOTICES_ENV: str(work / ".aihive" / "n.jsonl"),
+               session_hook.LANE_SEEN_ENV: str(work / ".aihive" / "seen.json")}
+
+        def write_index(role="", enabled=True, age=0.0, lanes_part=None):
+            session_hook.write_lanes_index(str(index), {
+                "version": 1, "enabled": enabled, "ts": time.time() - age,
+                "lanes": ({"s": {"role": role}} if lanes_part is None
+                          else lanes_part), "files": {}})
+
+        stop = {"hook_event_name": "Stop", "stop_hook_active": False,
+                "last_assistant_message": "Done, the parser is fixed."}
+
+        def decide(payload=None, e=None):
+            return session_hook.lane_stop_decision(
+                stop if payload is None else payload, env if e is None else e)
+
+        write_index()
+        check("lane-stop: a clean lane is let stop", decide() == "")
+        (root / "a.txt").write_text("changed\n")
+        (root / "new.py").write_text("x = 1\n")
+        reason = decide()
+        check("lane-stop: a dirty lane is kept going, with the count and the "
+              "names", "2 uncommitted files" in reason and "a.txt" in reason
+              and "new.py" in reason, reason)
+        check("lane-stop: ...told to commit finished work, or to stop "
+              "without committing when it isn't finished or the user said "
+              "not to", "commit them on your lane branch now" in reason
+              and "end your turn without committing" in reason, reason)
+        check("lane-stop: the reason has no em dash", "—" not in reason)
+        check("lane-stop: the turn's second stop is let through",
+              decide({**stop, "stop_hook_active": True}) == "")
+        check("lane-stop: ...and so is a stop without the field (a Claude "
+              "that can't say it already blocked once)",
+              decide({k: v for k, v in stop.items()
+                      if k != "stop_hook_active"}) == "")
+        check("lane-stop: a turn that ends on a question is left waiting",
+              decide({**stop, "last_assistant_message":
+                       "Should I commit these?"}) == "")
+        check("lane-stop: no lane env, no nudge", decide(e={}) == "")
+        write_index(role="integrator")
+        check("lane-stop: the integrator is never held up", decide() == "")
+        write_index(lanes_part={})
+        check("lane-stop: ...nor a lane the index doesn't list", decide() == "")
+        write_index(lanes_part={"s": {}})
+        check("lane-stop: ...nor one without a role (can't rule out the "
+              "integrator)", decide() == "")
+        write_index(enabled=False)
+        check("lane-stop: lanes switched off, no nudge", decide() == "")
+        write_index(age=session_hook.LANES_STALE_S + 30)
+        check("lane-stop: a stale lanes.json (AI Hive gone), no nudge",
+              decide() == "")
+        write_index()
+        nogit = tmp / "not-a-repo"
+        nogit.mkdir()
+        check("lane-stop: git failing in the lane folder means no nudge",
+              decide(e={**env, session_hook.LANE_ROOT_ENV: str(nogit)}) == "")
+        check("lane-stop: ...and so does a missing lane folder",
+              decide(e={**env, session_hook.LANE_ROOT_ENV:
+                        str(tmp / "gone")}) == "")
+
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "S: work")
+        _git(root, "mv", "sub/b.txt", "sub/c.txt")
+        reason = decide()
+        check("lane-stop: a rename counts once, by its new name",
+              "1 uncommitted file (sub/c.txt)" in reason, reason)
+        _git(root, "commit", "-q", "-m", "S: rename")
+        for n in range(5):
+            (root / f"f{n}.txt").write_text(f"{n}\n")
+        reason = decide()
+        check("lane-stop: past three names the rest are counted",
+              "5 uncommitted files" in reason and "+2 more" in reason, reason)
+        check("lane-stop: control characters are stripped from names",
+              session_hook._printable("a\x1b[31m\nb\x9b") == "a[31mb")
+
+        events = tmp / "events.jsonl"
+        events.write_text("")
+        rc, out = _run_hook(stop, env, events=str(events))
+        try:
+            shape = json.loads(out)
+        except ValueError:
+            shape = {}
+        check("lane-stop: the hook prints the Stop hook's decision shape",
+              rc == 0 and shape.get("decision") == "block"
+              and "5 uncommitted files" in shape.get("reason", "")
+              and "hookSpecificOutput" not in shape, (rc, out))
+        kinds = [json.loads(ln)["kind"] for ln in
+                 events.read_text().splitlines() if ln.strip()]
+        check("lane-stop: ...after writing the stop's prompt events as "
+              "before", kinds == [session_hook.EV_TOOL_CLEAR,
+                                  session_hook.EV_TURN_CLEAR], kinds)
+        rc, out = _run_hook({**stop, "stop_hook_active": True}, env,
+                            events=str(events))
+        check("lane-stop: an unblocked stop prints nothing", rc == 0
+              and out == "", (rc, out))
+        rc, out = _run_hook(None, env, stdin_raw="{not json")
+        check("lane-stop: malformed input still exits 0, silently",
+              rc == 0 and out == "", (rc, out))
+        rc, out = _run_hook(None, env, stdin_raw='["Stop"]')
+        check("lane-stop: ...and so does a payload that isn't an object",
+              rc == 0 and out == "", (rc, out))
+    finally:
+        _drop_lane_folder(lane["root"])
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _lane_hook_env(ws, agent) -> dict:
     from app import lane_service as svc_mod
     from app import session_hook
@@ -2797,8 +2923,24 @@ def test_integrator_lane_not_a_peer():
               "owner", all(o.get("uid") != i.spec.uid
                            for owners in idx.get("files", {}).values()
                            for o in owners), idx.get("files"))
+        check("integ-peer: lanes.json gives each lane its role, for the "
+              "Stop hook's nudge to commit",
+              idx["lanes"][i.spec.uid].get("role") == "integrator"
+              and idx["lanes"][a.spec.uid].get("role") == "",
+              idx.get("lanes"))
         (Path(b.spec.lane["root"]) / "a.txt").write_text("B's draft\n")
+        (Path(ri) / "NOTES").write_text("integrator's scratch\n")
         poll()
+        from app import session_hook
+        stop = {"hook_event_name": "Stop", "stop_hook_active": False,
+                "last_assistant_message": "Done."}
+        check("integ-peer: a dirty ordinary lane is nudged to commit at its "
+              "turn end, off the index LaneService wrote",
+              "1 uncommitted file (a.txt)" in session_hook.lane_stop_decision(
+                  stop, _lane_hook_env(ws, b)))
+        check("integ-peer: ...but a dirty integrator lane never is",
+              session_hook.lane_stop_decision(stop, _lane_hook_env(ws, i))
+              == "")
         check("integ-peer: two ordinary lanes on one file are still "
               "reported", [k for k in _notice_keys(notices_a)
                            if f"|{b.spec.uid}|" in k]

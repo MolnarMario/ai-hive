@@ -374,7 +374,10 @@ class LaneService(QObject):
                 "agent": s.agent, "branch": s.branch, "root": s.root,
                 "base_ref": s.base_ref, "ahead": s.ahead, "behind": s.behind,
                 "dirty": len(s.dirty), "exists": s.exists,
-                "fork": s.fork, "base_changed": s.base_changed[:500]}
+                "fork": s.fork, "base_changed": s.base_changed[:500],
+                # the Stop hook's nudge to commit skips the integrator
+                # (session_hook.lane_stop_decision)
+                "role": s.role}
         data = {"version": session_hook.LANES_INDEX_VERSION, "enabled": True,
                 "repo": snap.repo, "merge_tree": snap.merge_tree,
                 "lanes": lanes_part, "files": snap.index()}
