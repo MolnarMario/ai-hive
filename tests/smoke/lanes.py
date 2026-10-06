@@ -2319,6 +2319,41 @@ def test_lane_roster_file():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_lane_prompt_commit_rule():
+    """Part A1 of the batch plan: a laned agent finished tasks and left them
+    uncommitted, because Claude Code commits only when asked. Its prompt
+    says to commit finished work without asking and to run only the tests
+    for what it changed. The integrator's prompt is not touched."""
+    from app import coordination
+
+    lane = {"root": "C:/p.lanes/a-1", "branch": "hive/a-1", "base": "main",
+            "repo": "C:/p"}
+    board = "C:/p/.aihive/board.md"
+    prompt = coordination.system_prompt_text("WS", "Agent 1", board,
+                                             lane=lane, aware=True)
+    check("lane-prompt: a laned agent commits each finished task without "
+          "asking", "Commit each finished task on your lane branch yourself, "
+          "without asking first" in prompt, prompt)
+    check("lane-prompt: ...never ends a task with uncommitted changes unless "
+          "told not to commit",
+          "Don't finish a task with uncommitted changes, unless the user "
+          "asked you not to commit" in prompt, prompt)
+    check("lane-prompt: ...runs the tests for what it changed, not the full "
+          "suite", "Run the tests that cover what you changed" in prompt
+          and "the full test suite runs once" in prompt, prompt)
+    check("lane-prompt: ...and still never commits to the base",
+          "never commit to main" in prompt and "Do not bump the version"
+          in prompt, prompt)
+    check("lane-prompt: the prompt names no test command (it goes to every "
+          "project)", "smoke_test" not in prompt and "pytest" not in prompt)
+    integrator = coordination.system_prompt_text(
+        "WS", "Agent 2", board, lane=lane, aware=True, integrator=True)
+    check("lane-prompt: the integrator's prompt does not get the lane commit "
+          "rule", "INTEGRATOR" in integrator
+          and "without asking first" not in integrator
+          and "Run the tests that cover" not in integrator, integrator)
+
+
 def test_lane_include_local_changes():
     """A50's repro: a lane's ignored `.env` (copied in by .worktreeinclude)
     was deleted with the lane, edits and all, because `git status` hides

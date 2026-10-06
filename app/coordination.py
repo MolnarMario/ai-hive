@@ -118,10 +118,19 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"tell the user.")
     elif laned:
         base = lane.get("base") or "the base branch"
+        # The commit rule is explicit because Claude Code commits only when
+        # asked: lane agents finished tasks and left them uncommitted, and
+        # uncommitted work can't be submitted or proven merged when the card
+        # closes (.scratch/batch-integration/spec.md, Part A)
         text += (
             f" You work in your own git worktree (your lane) at {lane['root']}, "
             f"on the branch {lane['branch']}, which starts from {base}. Commit "
-            f"your work there, on that branch. Never edit files in other "
+            f"each finished task on your lane branch yourself, without asking "
+            f"first. The lane is private: nothing in it reaches {base} until "
+            f"the user submits it. Don't finish a task with uncommitted "
+            f"changes, unless the user asked you not to commit. Run the tests "
+            f"that cover what you changed; the full test suite runs once, "
+            f"when your work is integrated. Never edit files in other "
             f"worktrees or in the main checkout at {lane.get('repo', '')} "
             f"(reading its board is fine), and never commit to {base}. Never "
             f"push your lane branch to {base}, even when git suggests it: "
