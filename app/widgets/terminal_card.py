@@ -216,7 +216,7 @@ class _CardHeader(QFrame):
     from EMPTY header space past a small threshold starts a reorder drag; the
     buttons consume their own presses, so they never drag, while the labels
     (name/model/summary/usage) don't consume presses, so the whole strip
-    except the buttons is grabbable — exactly the area the user asked to drag
+    except the buttons is grabbable, exactly the area the user asked to drag
     from. A plain click (no movement) is left alone, so double-click-to-rename
     on the title still works.
 

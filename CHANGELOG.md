@@ -20,9 +20,12 @@ em dashes: this text is shown in the app.
   Before, it could stay stuck open on a display with fractional scaling.
 - A second click on a dropdown's button now closes the dropdown. Before, it
   closed and opened again at once. This affects the repo activity arrow, the
-  usage "+" picker, and the background-shell and lane chips.
+  usage "+" picker, the chime rows' note button in Options, and the
+  background-shell and lane chips.
 - A click anywhere on a sidebar category row expands or collapses it, not
   only on the arrow. A double-click on the name still renames it.
+- The Activity panel's "No integrator yet" hint points at the ⚑ button in
+  the card's hover tray instead of the right-click menu that is gone.
 
 ## 0.28.5
 

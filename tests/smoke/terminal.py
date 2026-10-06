@@ -2152,6 +2152,17 @@ def test_header_tray_carries_the_card_actions():
           got == ["integrator"], got)
     ht._set_open(False)
 
+    # the Activity panel's no-integrator hint points at the tray, not at the
+    # right-click menu that is gone
+    from app.widgets.activity_panel import ActivityPanel
+    panel = ActivityPanel()
+    panel.set_integration({"integrator": "", "laned": True, "items": []})
+    hint = panel.queue_info.text()
+    check("actions: the no-integrator hint names the tray, not a right-click",
+          "right-click" not in hint.lower() and "⋯" in hint
+          and "Make integrator" in hint, hint)
+    panel.deleteLater()
+
     card.detach(); card.close()
     a.deleteLater()
 

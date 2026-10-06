@@ -433,7 +433,7 @@ class WorkspaceRow(QFrame):
 class CategoryRow(QFrame):
     """A collapsible category header: disclosure caret + editable name + a
     child-count chip + hover delete. Draggable (categories reorder at the top
-    level only — they never nest). A click on the caret or anywhere on the
+    level only, they never nest). A click on the caret or anywhere on the
     row expands/collapses its workspaces, and a double-click on the name text
     renames. A click on the name text waits out the double-click interval
     before it toggles (`_name_click`), so a rename never collapses the group
@@ -588,7 +588,10 @@ class CategoryRow(QFrame):
                 self.start_rename()
             else:
                 # the second click of a fast pair off the name counts as a
-                # click of its own and toggles on release
+                # click of its own and toggles on release. If the first one
+                # landed on the name, its pending toggle is dropped, or the
+                # pair toggles twice and the group flickers back
+                self._name_click.stop()
                 self._press_pos = event.position().toPoint()
         super().mouseDoubleClickEvent(event)
 

@@ -846,6 +846,28 @@ def test_category_row_click_toggles():
     QTest.mouseRelease(row, left, pos=blank)
     check("cat click: a press that became a drag does not toggle",
           not collapsed())
+
+    # a fast pair whose first click is on the name and second is off it:
+    # Qt delivers press, release, double-click, release. The release toggles
+    # once; the name click's pending toggle must not fire on top of it
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QMouseEvent
+
+    def send(kind, pos, buttons):
+        QApplication.sendEvent(row, QMouseEvent(
+            kind, QPointF(pos), QPointF(row.mapToGlobal(pos)), left,
+            buttons, Qt.KeyboardModifier.NoModifier))
+
+    flips = []
+    row.toggled.connect(flips.append)
+    none = Qt.MouseButton.NoButton
+    send(QEvent.Type.MouseButtonPress, name_pt, left)
+    send(QEvent.Type.MouseButtonRelease, name_pt, none)
+    send(QEvent.Type.MouseButtonDblClick, blank, left)
+    send(QEvent.Type.MouseButtonRelease, blank, none)
+    QTest.qWait(QApplication.doubleClickInterval() + 150)
+    check("cat click: name then off-name double-click toggles exactly once",
+          len(flips) == 1 and collapsed(), flips)
     sb.deleteLater()
 
 

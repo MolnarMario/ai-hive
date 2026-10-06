@@ -1072,8 +1072,9 @@ class TopBar(QFrame):
 
     def _open_chime_sound_menu(self, kind: str) -> None:
         btn = self.chime_sound_btns[kind]
-        self.build_chime_sound_menu(kind).exec(
-            btn.mapToGlobal(QPoint(0, btn.height())))
+        menu = self.build_chime_sound_menu(kind)
+        close_on_anchor_press(menu, btn)
+        menu.exec(btn.mapToGlobal(QPoint(0, btn.height())))
 
     def _on_recover_clicked(self) -> None:
         self.set_startup_recovery(not self._startup_recovery)
