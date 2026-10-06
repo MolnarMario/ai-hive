@@ -791,6 +791,64 @@ def test_category_container():
     sb.deleteLater()
 
 
+def test_category_row_click_toggles():
+    """A click anywhere on a category row toggles it, not only the caret. A
+    click on the name text toggles after the double-click interval, and a
+    double-click there renames without toggling. A drag never toggles."""
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.sidebar import Sidebar
+
+    QApplication.instance() or QApplication([])
+    sb = Sidebar()
+    sb.resize(240, 220)
+    sb.add_row("w", "Web", "p")
+    cid = sb._add_category("Work")
+    row = sb._cat_widgets[cid]
+    row._end_rename()
+    sb.show()
+    QApplication.processEvents()
+    collapsed = lambda: sb._cat_node(cid)["collapsed"]  # noqa: E731
+    left = Qt.MouseButton.LeftButton
+
+    # the empty stretch between the name text and the count chip
+    blank = QPoint(row.count_label.geometry().left() - 4, row.height() // 2)
+    check("cat click: test point is off the name text",
+          not row._on_name_text(blank))
+    QTest.mouseClick(row, left, pos=blank)
+    check("cat click: a click on the row body collapses it", collapsed())
+    QTest.mouseClick(row, left, pos=blank)
+    check("cat click: a second click expands it again", not collapsed())
+
+    name_pt = row.name_label.geometry().topLeft() + QPoint(3, 6)
+    check("cat click: test point is on the name text",
+          row._on_name_text(name_pt))
+    QTest.mouseClick(row, left, pos=name_pt)
+    check("cat click: a name click waits for a possible double-click",
+          not collapsed() and row._name_click.isActive())
+    QTest.qWait(QApplication.doubleClickInterval() + 150)
+    check("cat click: the name click toggles once the interval passes",
+          collapsed())
+    sb._on_cat_toggled(cid)  # back to expanded
+    row = sb._cat_widgets[cid]
+
+    QTest.mouseClick(row, left, pos=name_pt)
+    QTest.mouseDClick(row, left, pos=name_pt)
+    check("cat click: a double-click on the name renames",
+          row._renaming and not row._name_click.isActive())
+    QTest.qWait(QApplication.doubleClickInterval() + 150)
+    check("cat click: the rename double-click never toggles", not collapsed())
+    row._end_rename()
+
+    QTest.mousePress(row, left, pos=blank)
+    row._press_pos = None  # what mouseMoveEvent does when a drag starts
+    QTest.mouseRelease(row, left, pos=blank)
+    check("cat click: a press that became a drag does not toggle",
+          not collapsed())
+    sb.deleteLater()
+
+
 def test_agent_inline_expansion():
     """Clicking a workspace's count badge expands its agents INLINE in the
     sidebar (folder-tree style, not a popup): each agent shows its name on the
