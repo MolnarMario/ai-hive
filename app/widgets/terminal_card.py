@@ -1124,6 +1124,8 @@ class TerminalCard(QFrame):
             if view.done:
                 text += " ✓"
         state = view.state if view is not None else "clean"
+        if state == "clean" and view is not None and view.done:
+            state = "done"      # an overlap or conflict still outranks it
         self.lane_mark.setText(text)
         tip = self._lane_tooltip(lane, view)
         if integrator:
