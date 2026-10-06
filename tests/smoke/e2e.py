@@ -94,15 +94,131 @@ def _e2e_trust_options_drawn(agent) -> bool:
     return "itrustthisfolder" in flat and "no,exit" in flat
 
 
-def _e2e_accept_trust(agent, pump) -> None:
-    """Choose "Yes, I trust this folder". CLI 2.1.283 puts the cursor on
-    "No, exit", so a bare Enter quits: move down when the cursor is on "No",
-    then confirm as a separate write."""
+_TRUST_LABELS = (("yes", "yes, i trust this folder"), ("no", "no, exit"))
+
+
+def _e2e_screen_rows(agent) -> list:
+    """The agent's screen as rows of text: its raw stream replayed through
+    pyte (the emulator the cards use) at the PTY's size. Claude redraws a
+    dialog with relative cursor moves, so only a rendered screen says which
+    row a cursor glyph landed on."""
+    import pyte
+    screen = pyte.Screen(agent.worker.cols, agent.worker.rows)
+    pyte.Stream(screen).feed(agent.pty_replay())
+    return screen.display
+
+
+def _e2e_trust_rows(rows) -> dict:
+    """{"yes"|"no": (row index, highlighted)} for the trust options drawn.
+    The highlighted option has a marker in the gutter left of its label. The
+    marker was "❯" in CLI 2.1.283 and is ">" in 2.1.290, so any mark there
+    counts (box borders and an option number like "1." don't)."""
     import re as _re
-    pump(300)   # let the frame finish before reading the cursor
-    if _re.search("❯\\s*(\\d\\.\\s*)?no", _e2e_screen_text(agent)):
-        agent.write("\x1b[B"); pump(300)
-    agent.write("\r")
+    found = {}
+    for i, row in enumerate(rows):
+        low = row.lower()
+        for key, label in _TRUST_LABELS:
+            at = low.find(label)
+            if at >= 0:
+                gutter = _re.sub(r"[\s│┃|]|\d+\.", "", low[:at])
+                found[key] = (i, bool(gutter))
+    return found
+
+
+def _e2e_accept_trust(agent, pump) -> bool:
+    """Choose "Yes, I trust this folder". Returns False, without pressing
+    Enter, when the highlight can't be put on Yes.
+
+    Enter on "No, exit" quits claude, and the cursor glyph and the option
+    order have both changed between CLI versions. So nothing is assumed: the
+    rendered screen says where the highlight is, an arrow key moves it toward
+    Yes, and Enter goes only once the screen shows it on Yes."""
+    for _ in range(4):
+        pump(300)   # let the frame finish before reading it
+        found = _e2e_trust_rows(_e2e_screen_rows(agent))
+        marked = [k for k, (_i, on) in found.items() if on]
+        if len(found) < 2 or len(marked) != 1:
+            continue    # half drawn, or mid-redraw
+        if marked == ["yes"]:
+            agent.write("\r")
+            return True
+        up = found["yes"][0] < found["no"][0]
+        agent.write("\x1b[A" if up else "\x1b[B")
+    return False
+
+
+# CLI 2.1.290's trust dialog as it reaches the PTY (120 columns), and the
+# bytes it sends after one Down arrow, captured from a real claude
+_TRUST_DIALOG_2_1_290 = (
+    "\r\n" + "─" * 120 + "\r\n"
+    "\x1b[2GAccessing\x1b[12Gworkspace:\r\n\r\n"
+    "\x1b[2GC:\\scratch\\e2e\r\n\r\n"
+    "\x1b[2GQuick\x1b[8Gsafety\x1b[15Gcheck:\x1b[22GIs\x1b[25Gthis\x1b[30Ga"
+    "\x1b[32Gproject\x1b[40Gyou\x1b[44Gcreated\x1b[52Gor\x1b[55Gone"
+    "\x1b[59Gyou\x1b[63Gtrust?\r\n\r\n"
+    "\x1b[2GSecurity\x1b[11Gguide\r\n\r\n"
+    "\x1b[2G>\x1b[4GNo,\x1b[8Gexit\r\n"
+    "\x1b[4GYes,\x1b[9GI\x1b[11Gtrust\x1b[17Gthis\x1b[22Gfolder\r\n\r\n"
+    "\x1b[2GEnter\x1b[8Gto\x1b[11Gconfirm\x1b[19G·\x1b[21GEsc\x1b[25Gto"
+    "\x1b[28Gcancel\r\n"
+    "\x1b[1C\x1b[4A\x1b[>0q\x1b[?u\x1b[c")
+_TRUST_DOWN_2_1_290 = ("\x1b[1D\x1b[4B\r\x1b[1C\x1b[4A \r\x1b[1C\x1b[1B>"
+                       "\r\n\n\n\x1b[1C\x1b[3A")
+# the 2.1.283 shape: numbered options, "❯", Yes first
+_TRUST_DIALOG_2_1_283 = (
+    "\x1b[2GDo you trust the files in this folder?\r\n\r\n"
+    "\x1b[2G❯ 1. Yes, I trust this folder\r\n"
+    "\x1b[4G2. No, exit\r\n")
+
+
+def test_e2e_trust_dialog_accept():
+    """The e2e's trust-dialog helper, offline against captured CLI output.
+    CLI 2.1.290 drew its cursor as ">" instead of "❯", the old helper didn't
+    see it, sent Enter onto "No, exit" and claude quit, failing the e2e."""
+    from types import SimpleNamespace
+
+    class FakeAgent:
+        """Echoes what claude draws for each key: `moves` maps a key to the
+        bytes claude answers with; any other key changes nothing."""
+        def __init__(self, stream, moves=None):
+            self.stream, self.moves, self.writes = stream, moves or {}, []
+            self.worker = SimpleNamespace(rows=40, cols=120)
+
+        def pty_replay(self):
+            return self.stream
+
+        def write(self, data):
+            self.writes.append(data)
+            self.stream += self.moves.get(data, "")
+
+    def pump(_ms):
+        pass
+
+    new = FakeAgent(_TRUST_DIALOG_2_1_290)
+    found = _e2e_trust_rows(_e2e_screen_rows(new))
+    check("e2e trust: 2.1.290 dialog, both options found, cursor on No",
+          set(found) == {"yes", "no"} and found["no"][1]
+          and not found["yes"][1], found)
+
+    new = FakeAgent(_TRUST_DIALOG_2_1_290, {"\x1b[B": _TRUST_DOWN_2_1_290})
+    ok = _e2e_accept_trust(new, pump)
+    check("e2e trust: 2.1.290, one Down moves to Yes, then Enter",
+          ok and new.writes == ["\x1b[B", "\r"], new.writes)
+
+    old = FakeAgent(_TRUST_DIALOG_2_1_283)
+    ok = _e2e_accept_trust(old, pump)
+    check("e2e trust: 2.1.283 numbered dialog with Yes selected, Enter only",
+          ok and old.writes == ["\r"], old.writes)
+
+    stuck = FakeAgent(_TRUST_DIALOG_2_1_290)
+    ok = _e2e_accept_trust(stuck, pump)
+    check("e2e trust: a highlight that won't reach Yes never gets Enter",
+          not ok and "\r" not in stuck.writes, stuck.writes)
+
+    half = FakeAgent(_TRUST_DIALOG_2_1_290.split("\x1b[4GYes")[0])
+    ok = _e2e_accept_trust(half, pump)
+    check("e2e trust: a half-drawn dialog gets no keys at all",
+          not ok and half.writes == [], half.writes)
 
 
 def _lifecycle_e2e_body(tmp, windows, pump, marker):
@@ -143,7 +259,11 @@ def _lifecycle_e2e_body(tmp, windows, pump, marker):
         return
     check("e2e: prompt not ready while the trust dialog is up",
           not agent._prompt_ready)
-    _e2e_accept_trust(agent, pump)
+    accepted = _e2e_accept_trust(agent, pump)
+    check("e2e: the trust dialog's highlight reached Yes", accepted,
+          "\n".join(r.rstrip() for r in _e2e_screen_rows(agent) if r.strip()))
+    if not accepted:
+        return
     ready = wait_until(lambda: agent._prompt_ready, 45000)
     check("e2e: accepting trust reaches the real prompt", ready,
           screen_text(agent)[-300:])

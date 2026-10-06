@@ -8,6 +8,12 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.28.3
+
+- No change to the app itself. The release test that drives a real Claude
+  Code agent works again with Claude Code 2.1.290, which changed how its
+  "do you trust this folder" question marks the selected answer.
+
 ## 0.28.2
 
 - The A- / A+ / maximize buttons that appear when you hover the ⋯ in a card
