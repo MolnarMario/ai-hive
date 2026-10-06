@@ -427,7 +427,8 @@ workspaces keep executing — switching never pauses anything.
   each part onto how a team worked before AI. With Count 3 you get three
   lanes. The ignored `.venv` / `venv` / `node_modules` are linked in, so the
   usual test command works in a lane. Closing a card removes its lane only when
-  it holds nothing (clean, and its commits are already in the base branch);
+  it holds nothing (clean, and its commits, or the same changes as other
+  commits after a cherry-pick, rebase or squash, are already in the base);
   otherwise the lane is kept and AI Hive says what is in it. A lane a program
   still runs in is not touched; the removal is retried for a minute. A kept
   lane's conversation stays in the New Agent dialog's Conversation list, and
@@ -490,7 +491,8 @@ workspaces keep executing — switching never pauses anything.
   github.com instead waits for your **Mark merged**, which checks with GitHub
   first. Anything unexpected waits for you (Recheck, Resend brief, Skip) with
   the "?" chime and the reason; nothing is skipped or re-approved by itself.
-  A lane whose work was squash-merged gets **Remove lane (merged as #N)**.
+  A lane whose squash merge your folder can't see yet gets **Remove lane
+  (merged as #N)**.
   Every step is a `QUEUE-*` line in `session.log`, and the queue survives a
   restart. The integrator needs `Bash(git:*)` and `PowerShell(git:*)` allowed,
   and every lane of a repository shares the main checkout's Claude
@@ -894,7 +896,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2819 checks drive the real app headlessly (offscreen Qt platform) with real
+2825 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1035,7 +1037,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2819 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2825 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

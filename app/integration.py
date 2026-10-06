@@ -807,10 +807,11 @@ def mark_merged(repo: str, item: QueueItem) -> Outcome:
 
 def remove_merged_lane(repo: str, lane: dict, item: QueueItem,
                        pids=(), wait_s: float | None = None):
-    """The user's "Remove lane (merged as #N)". A lane whose work reached
-    the base by a squash or rebase merge is never "merged" by ancestry, so
-    every close keeps it. This removes it, only when GitHub confirms the
-    item's PR is MERGED (its own branch and base, not a fork, containing the
+    """The user's "Remove lane (merged as #N)". A close removes a lane
+    whose squash or rebase merge the local base already shows
+    (lanes._landed), and keeps one it can't see yet: not fetched, or the
+    base edited those lines again. This removes that one, only when GitHub
+    confirms the item's PR is MERGED (its own branch and base, not a fork, containing the
     pinned commit) and the lane is clean with its head still at that commit.
     Then the usual removal rules: links first, no --force, the branch by
     compare-and-delete. Raises lanes.LaneError. Runs on LaneOps."""

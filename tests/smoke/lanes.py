@@ -4593,3 +4593,82 @@ def test_queue_approve_after_cards_close():
         check("queue-scopes: Approve merge still merges the tested head",
               item.state == integ.MERGED and bool(q.gh.merges())
               and q.gh.merges()[-1][-1] == item.tested_sha, item)
+
+
+def test_lanes_landed_as_other_commits():
+    """A lane whose work reached the base as OTHER commits (the integrator
+    cherry-picked it into a batch, or a rebase or squash merge) is removed
+    on close. Ancestry alone kept such a lane with "1 unmerged commit"
+    forever. A lane holding any change the base lacks is still kept, a
+    merge commit's own content included."""
+    from app import lanes
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-lanes-landed-"))
+    work = _make_repo(tmp)
+    other = tmp / "integrator"
+    _git(tmp, "clone", "-q", str(tmp / "proj-origin.git"), str(other))
+
+    def land(lane, *args):
+        """The integrator's clone takes the lane's work as new commits. Main
+        moves first: a pick onto the lane's own parent in the same second
+        would rebuild the lane's exact commit, sha and all."""
+        _git(other, "pull", "-q")
+        _commit(other, f"main-{lane['branch'][-6:]}.txt", "x\n", "unrelated")
+        _git(other, "fetch", "-q", str(work), lane["branch"])
+        _git(other, *args)
+        if args[0] == "merge":
+            _git(other, "commit", "-q", "-m", "squashed")
+        _git(other, "push", "-q", "origin", "main")
+        _git(work, "fetch", "-q")
+
+    def gone(lane, res):
+        return (res.removed and not os.path.exists(lane["root"])
+                and lane["branch"] not in _git(work, "branch", "--list"))
+
+    picked = _lane_for(work, "Picked", "1a0001" + "0" * 26)
+    _commit(picked["root"], "a.txt", "picked\n", "fix a")
+    res = lanes.retire_lane(picked, wait_s=0)
+    check("lanes-landed: a lane whose commit is not in the base is kept",
+          not res.removed and os.path.isdir(picked["root"]), res)
+    land(picked, "cherry-pick", "FETCH_HEAD")
+    _commit(other, "a.txt", "edited again\n", "main edits those lines")
+    _git(other, "push", "-q", "origin", "main")
+    _git(work, "fetch", "-q")
+    res = lanes.retire_lane(picked, wait_s=0)
+    check("lanes-landed: a cherry-picked lane is removed, even after the "
+          "base edited the same lines again", gone(picked, res), res)
+
+    squashed = _lane_for(work, "Squashed", "1a0002" + "0" * 26)
+    _commit(squashed["root"], "sub/b.txt", "s1\n", "first")
+    _commit(squashed["root"], "new.txt", "s2\n", "second")
+    land(squashed, "merge", "--squash", "FETCH_HEAD")
+    res = lanes.retire_lane(squashed, wait_s=0)
+    check("lanes-landed: a squash-merged lane is removed",
+          gone(squashed, res), res)
+
+    partial = _lane_for(work, "Partial", "1a0003" + "0" * 26)
+    _commit(partial["root"], "p1.txt", "1\n", "landed")
+    _commit(partial["root"], "p2.txt", "2\n", "not landed")
+    land(partial, "cherry-pick", "FETCH_HEAD~1")
+    res = lanes.retire_lane(partial, wait_s=0)
+    check("lanes-landed: a lane with one commit the base lacks is kept",
+          not res.removed and os.path.isdir(partial["root"])
+          and res.status is not None
+          and "unmerged" in res.status.describe(), res)
+
+    merged = _lane_for(work, "Merged", "1a0004" + "0" * 26)
+    _commit(merged["root"], "m.txt", "m\n", "landed")
+    land(merged, "cherry-pick", "FETCH_HEAD")
+    _git(merged["root"], "merge", "-q", "--no-ff", "--no-commit",
+         "origin/main")
+    (Path(merged["root"]) / "only-in-merge.txt").write_text("x\n")
+    _git(merged["root"], "add", "-A")
+    _git(merged["root"], "commit", "-q", "-m", "merge main")
+    res = lanes.retire_lane(merged, wait_s=0)
+    check("lanes-landed: a merge commit with a change of its own keeps "
+          "the lane", not res.removed and os.path.isdir(merged["root"]),
+          res)
+    _git(merged["root"], "rm", "-q", "only-in-merge.txt")
+    _git(merged["root"], "commit", "-q", "-m", "drop it")
+    res = lanes.retire_lane(merged, wait_s=0)
+    check("lanes-landed: ...and once that change is gone too, it is removed",
+          gone(merged, res), res)

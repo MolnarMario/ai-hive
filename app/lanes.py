@@ -561,7 +561,9 @@ class LaneStatus:
     ahead: int = 0
     behind: int = 0
     dirty: list = field(default_factory=list)
-    merged: bool = False        # head is in the base: removing loses nothing
+    # head is in the base, or its changes landed there as other commits
+    # (_landed): removing loses nothing
+    merged: bool = False
     base_ref: str = ""
     # ignored `.worktreeinclude` files changed or deleted in the lane, plus
     # LOCAL_UNCHECKED when they could not all be checked (local_changes)
@@ -589,8 +591,8 @@ class LaneStatus:
 
 
 def lane_status(lane: dict) -> LaneStatus:
-    """Head, ahead/behind the base, dirty files and whether the head is
-    already in the base. Read-only: `status` runs with --no-optional-locks so
+    """Head, ahead/behind the base, dirty files and whether the head's work
+    is already in the base (_in_base). Read-only: `status` runs with --no-optional-locks so
     it never writes the index."""
     root, branch, repo = lane["root"], lane["branch"], lane["repo"]
     base = lane.get("base") or default_base(repo)
@@ -625,10 +627,47 @@ def lane_status(lane: dict) -> LaneStatus:
 
 
 def _in_base(cwd: str, head: str, base: str, base_ref: str) -> bool:
-    for ref in dict.fromkeys(r for r in (base_ref, base) if r):
+    """True when removing a lane at `head` loses no change the base lacks:
+    `head` is in the base, or its work landed there as other commits."""
+    refs = list(dict.fromkeys(r for r in (base_ref, base) if r))
+    for ref in refs:
         if git(["merge-base", "--is-ancestor", head, ref], cwd).ok:
             return True
-    return False
+    return any(_landed(cwd, head, ref) for ref in refs)
+
+
+def _landed(cwd: str, head: str, ref: str) -> bool:
+    """`head`'s changes are already in `ref` under other commits. An
+    integrator that cherry-picks a lane into a batch, a rebase merge and a
+    squash merge all leave the lane's own commits out of the base, and an
+    ancestry check alone then kept every such lane on close, forever.
+
+    Either test is enough. Every lane commit has a patch-equivalent commit
+    in `ref` (cherry-pick, rebase; survives later edits to those lines).
+    Or merging `head` into `ref` leaves `ref`'s tree as it is (a squash).
+    A lane holding a merge commit skips the first test, because a merge
+    has no patch of its own and its conflict resolution could be the only
+    copy of some change. The merge test still covers it.
+
+    Like the ancestry check, the patch test reads the base's history, not
+    its current tree: a landed commit the base later reverted still counts,
+    and the base's history still holds it. Testing the tree instead would
+    keep every landed lane again once the base edits the same lines."""
+    r = git(["rev-list", "--merges", "--count", f"{ref}..{head}"], cwd)
+    if not r.ok:
+        return False
+    if r.out == "0":
+        r = git(["rev-list", "--right-only", "--cherry-pick",
+                 f"{ref}...{head}"], cwd)
+        if r.ok and not r.out:
+            return True
+    if not merge_tree_supported():
+        return False
+    merged = git(["merge-tree", "--write-tree", "--no-messages", ref, head],
+                 cwd, MERGE_TIMEOUT)
+    tree = git(["rev-parse", "--verify", "--quiet", f"{ref}^{{tree}}"], cwd)
+    return (merged.rc == 0 and tree.ok and bool(tree.out)
+            and merged.out.splitlines()[:1] == [tree.out])
 
 
 @dataclass
@@ -653,7 +692,7 @@ def remove_lane(lane: dict, merged_as: str = "") -> RemoveResult:
     """Remove a lane that holds nothing: worktree and branch.
 
     Refuses unless the lane is clean AND both its head and its branch are in
-    the base. Unlinks its junctions first and refuses while any directory
+    the base, by ancestry or because their changes landed there (_landed). Unlinks its junctions first and refuses while any directory
     link remains (see the module docstring: git follows them). Never
     `--force`, never `-D`: git's own refusal is the last line of defense,
     and it stays armed.
@@ -670,7 +709,8 @@ def remove_lane(lane: dict, merged_as: str = "") -> RemoveResult:
     `merged_as` is a commit a squash or rebase merge took into the base
     (integration.remove_merged_lane checked that with GitHub): the lane
     then counts as merged only while its head AND its branch are exactly
-    that commit. Ancestry can't say so: a squash leaves the commit out."""
+    that commit. That path is for a squash the local base can't show yet
+    (not fetched, or the base edited those lines again since)."""
     st = lane_status(lane)
     if st.dirty or st.local:
         raise LaneError("dirty", st.describe())

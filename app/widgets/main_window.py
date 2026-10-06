@@ -5087,8 +5087,9 @@ class MainWindow(QMainWindow):
         keep = box.addButton("Keep", QMessageBox.ButtonRole.AcceptRole)
         open_btn = box.addButton("Open folder",
                                  QMessageBox.ButtonRole.ActionRole)
-        # squash- or rebase-merged through the queue: ancestry says unmerged,
-        # GitHub says merged. Removing it is the user's call, never automatic.
+        # squash- or rebase-merged through the queue, but the local base
+        # doesn't show it yet (lanes._landed): GitHub says merged. Removing
+        # it on GitHub's word alone is the user's call, never automatic.
         merged = self._merged_item_for(
             lane, status.head if status is not None else "")
         if merged is not None and not status.dirty and not status.local:
