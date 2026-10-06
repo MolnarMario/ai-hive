@@ -1128,10 +1128,14 @@ class LaneView:
 
     @property
     def state(self) -> str:
-        """"conflict", "overlap" or "clean", for the chip's colour."""
+        """"conflict", "overlap", "done" or "clean", for the chip's colour.
+        A "Task done" commit turns the chip green, but a file another lane
+        also changed outranks it."""
         if any(o.level == CONFLICTS for o in self.overlaps):
             return "conflict"
-        return "overlap" if self.overlaps else "clean"
+        if self.overlaps:
+            return "overlap"
+        return "done" if self.done else "clean"
 
     def touching(self) -> list:
         """Every file this lane changed, committed or not, sorted."""

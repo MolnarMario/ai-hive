@@ -505,6 +505,7 @@ def test_workspace_header():
     matching the sidebar's old left-to-right order — and the path shows the
     FULL text whenever it fits, eliding only the overflow the header's own
     buttons would otherwise be squeezed by."""
+    from PySide6.QtGui import QFontMetrics
     from PySide6.QtWidgets import QApplication
     from app.widgets.workspace_page import WorkspacePage
     from app.workspace_manager import Workspace
@@ -570,6 +571,11 @@ def test_workspace_header():
     check("workspace header: a narrow window elides the path instead of "
           "overlapping the buttons",
           page.path_label.text() != long_path, page.path_label.text())
+    shown = QFontMetrics(page.path_label.font()).horizontalAdvance(
+        page.path_label.text())
+    check("workspace header: the elided path fits the label it sits in",
+          shown <= page.path_label.width(),
+          (shown, page.path_label.width()))
 
     # growing back out restores the full path (not stuck at the smaller
     # elision like the old self-referential width computation)

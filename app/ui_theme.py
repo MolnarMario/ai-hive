@@ -689,7 +689,6 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     border: 1px solid transparent; border-radius: 8px;
     font-size: 11px; font-weight: 700; padding: 0 5px;
 }}
-#CardLane:hover {{ border-color: {p.ACCENT_GOLD_DIM}; }}
 #CardLane[lane="overlap"] {{
     background: rgba(232,152,58,0.28); color: {p.TEXT};
     border-color: {p.ACCENT_ORANGE};
@@ -699,11 +698,14 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     border-color: {p.RED};
 }}
 /* a "Task done" commit with no overlap: green, so finished work stands out.
-   Overlap and conflict take priority (terminal_card.refresh_lane). */
+   Overlap and conflict take priority (lanes.LaneView.state). */
 #CardLane[lane="done"] {{
     background: rgba(70,170,90,0.30); color: {p.TEXT};
     border-color: {p.GREEN};
 }}
+/* after the state rules: equal specificity, so the later rule wins and a
+   coloured chip still shows it is clickable */
+#CardLane:hover {{ border-color: {p.ACCENT_GOLD_DIM}; }}
 /* the "send later" composer: preset delay buttons + the resolved fire time */
 #SchedulePreset {{
     background: {p.BG_INPUT}; color: {p.TEXT};

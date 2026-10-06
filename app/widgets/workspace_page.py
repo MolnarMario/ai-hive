@@ -44,6 +44,9 @@ from .ornaments import (ToggleSwitch, anchored_popup_pos,
                         close_on_anchor_press)
 from .terminal_card import CARD_REORDER_MIME, TerminalCard
 
+# the header path label's smallest width, and the floor of its elide budget
+PATH_MIN_W = 60
+
 
 class EmptySlot(QFrame):
     """A clickable placeholder occupying an unused grid cell."""
@@ -208,8 +211,8 @@ class WorkspacePage(QWidget):
         self.path_label.setToolTip(self.workspace.project_path)
         # a QLabel's minimum size is its whole text, which would hold the
         # window at least as wide as the full path plus every button and
-        # leave _elide_path nothing to elide. 60 is _path_budget's floor.
-        self.path_label.setMinimumWidth(60)
+        # leave _elide_path nothing to elide
+        self.path_label.setMinimumWidth(PATH_MIN_W)
 
         def tool(text, tip, obj="", icon=""):
             b = IconToolButton(icon, header) if icon else QToolButton(header)
@@ -466,7 +469,7 @@ class WorkspacePage(QWidget):
         lanes box its 6px slot elided the path that much too early."""
         hl = getattr(self, "_header_lay", None)
         if hl is None:
-            return max(60, self.path_label.width())
+            return max(PATH_MIN_W, self.path_label.width())
         others = [hl.itemAt(i).widget() for i in range(hl.count())]
         others = [w for w in others if w is not None
                   and w is not self.path_label and not w.isHidden()]
@@ -474,7 +477,7 @@ class WorkspacePage(QWidget):
         used = (margins.left() + margins.right()
                 + hl.spacing() * len(others)
                 + sum(w.sizeHint().width() for w in others))
-        return max(60, self.width() - used)
+        return max(PATH_MIN_W, self.width() - used)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
