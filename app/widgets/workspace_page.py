@@ -251,7 +251,7 @@ class WorkspacePage(QWidget):
         self.reset_repo_activity()
         self.open_btn = tool("Open folder", "Open this workspace's folder",
                              "HeaderOpenFolder")
-        self.change_btn = tool("Change…", "Change the workspace folder",
+        self.change_btn = tool("Change folder", "Change the workspace folder",
                                "HeaderChangeFolder")
         self.grid_button = GridButton(header)
         self.map_btn = tool("Map", "Show the agent / file map (who is "

@@ -500,7 +500,7 @@ def test_agent_card_reorder():
 
 
 def test_workspace_header():
-    """The workspace header bar owns Open folder / Change… / Delete (not
+    """The workspace header bar owns Open folder / Change folder / Delete (not
     duplicated as sidebar hover buttons any more) — delete sits LEFT of open,
     matching the sidebar's old left-to-right order — and the path shows the
     FULL text whenever it fits, eliding only the overflow the header's own
