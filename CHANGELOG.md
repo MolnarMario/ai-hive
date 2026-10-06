@@ -8,6 +8,16 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.28.4
+
+- AI Hive pulls what merged on GitHub every time it starts, so a restart
+  always runs the latest approved changes. Before, nothing moved your folder
+  after a merge, and a folder left on an old branch never updated at all.
+  It still never touches local changes or commits that are not on GitHub.
+- The integrator now gets a second code review from GPT-6-Luna (through
+  your Codex CLI) before it opens a pull request, and lists each finding
+  and what it did about it in the PR.
+
 ## 0.28.3
 
 - No change to the app itself. The release test that drives a real Claude

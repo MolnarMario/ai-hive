@@ -37,9 +37,20 @@ This folder is also where the app is developed, often by several agents at
 once, so an update is only attempted on a clean `main` that is an ancestor of
 `origin/main`. Anything else (another branch, modified tracked files, local
 commits not on GitHub) is reported as `blocked` with the reason, and no git
-command that writes is run. There is no `reset`, no `stash`, no `checkout`:
-fast-forward or nothing. Untracked files are left alone; if the update would
-overwrite one, git itself refuses the merge and that refusal is reported.
+command that writes is run. There is no `reset`, no `stash`: fast-forward or
+nothing. Untracked files are left alone; if the update would overwrite one,
+git itself refuses the merge and that refusal is reported.
+
+EVERY LAUNCH PULLS WHAT MERGED
+------------------------------
+Agents work in lanes and the integrator merges from its own lane, so nothing
+else moves this folder after a PR merges. `main.py` calls `startup_update`
+before it imports the app, so the next launch runs what merged. A session
+that worked here on a branch leaves the folder on it, which blocked every
+update until someone switched by hand (0.28.2 sat there for hours). So the
+launch, and only the launch, switches a clean folder back to main when
+`git cherry` finds nothing on its branch that main lacks. It never switches
+away from unmerged commits or local changes.
 
 THE USER RESTARTS, NEVER US
 ---------------------------
@@ -72,6 +83,8 @@ BRANCH = "main"
 UPSTREAM = f"{REMOTE}/{BRANCH}"
 
 FETCH_TIMEOUT_S = 30.0
+# the launch waits on this with no window up yet, so it gives up sooner
+STARTUP_FETCH_TIMEOUT_S = 10.0
 GIT_TIMEOUT_S = 15.0
 MERGE_TIMEOUT_S = 60.0
 PIP_TIMEOUT_S = 600.0
@@ -313,6 +326,68 @@ def apply(runner, repo: str = REPO_DIR, python: str = "") -> Applied:
         result.deps_ok = rc == 0
     result.detail = applied_text(result)
     return result
+
+
+# --------------------------------------------------------------- launch ---
+
+def _leave_merged_branch(runner, repo: str) -> None:
+    """Switch a clean folder back to main when its branch holds nothing that
+    main lacks. A session that worked here on a branch leaves the folder on
+    it after its PR merges, and every update after that is blocked. `git
+    cherry` compares patches, so commits that reached main under new hashes
+    (a cherry-pick, an integration branch) count as merged. It skips merge
+    commits, though, and a merge can carry conflict resolutions, so a branch
+    with a merge commit main lacks is never left."""
+    rc, out = runner(_git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
+                     GIT_TIMEOUT_S)
+    branch = _first_line(out) if rc == 0 else ""
+    if branch in ("", "HEAD", BRANCH):
+        return
+    rc, out = runner(_git(repo, "status", "--porcelain",
+                          "--untracked-files=no"), GIT_TIMEOUT_S)
+    if rc != 0 or out.strip():
+        return
+    rc, out = runner(_git(repo, "rev-list", "--merges", f"{UPSTREAM}..HEAD"),
+                     GIT_TIMEOUT_S)
+    if rc != 0 or out.strip():
+        return
+    rc, out = runner(_git(repo, "cherry", UPSTREAM, "HEAD"), GIT_TIMEOUT_S)
+    if rc != 0 or any(ln.startswith("+") for ln in out.splitlines()):
+        return
+    runner(_git(repo, "switch", "--quiet", BRANCH), GIT_TIMEOUT_S)
+
+
+def startup_update(runner, repo: str = REPO_DIR, python: str = ""):
+    """Bring this clone to GitHub's main at launch, before `main.py` imports
+    the app, so whatever merged since the last run is what runs now.
+
+    None when the folder already has everything on main. Otherwise the
+    `Applied`, which is a refusal (`ok=False`) whenever `apply` would refuse:
+    local changes and unmerged commits are never touched."""
+    rc, out = runner(_git(repo, "fetch", "--quiet", REMOTE, BRANCH),
+                     STARTUP_FETCH_TIMEOUT_S)
+    if rc != 0:
+        return Applied(False, detail=_git_error("Checking GitHub", rc, out))
+    rc, _ = runner(_git(repo, "merge-base", "--is-ancestor", UPSTREAM,
+                        "HEAD"), GIT_TIMEOUT_S)
+    if rc == 0:
+        return None
+    _leave_merged_branch(runner, repo)
+    return apply(runner, repo, python)
+
+
+def startup_failure(result) -> str:
+    """What stops the launch after `startup_update`, or "". The pulled code
+    may need packages that failed to install; importing it then dies before
+    any window could say why, so the launch stops with the fix instead."""
+    if (not isinstance(result, Applied) or not result.ok
+            or not result.deps_changed or result.deps_ok):
+        return ""
+    version = f" v{result.version}" if result.version else ""
+    return (f"AI Hive pulled{version} from GitHub, but installing the Python "
+            "packages it needs failed.\n\nIn the AI Hive folder, run:\n"
+            "    .venv\\Scripts\\python.exe -m pip install -r requirements.txt"
+            "\n\nThen start AI Hive again.")
 
 
 def applied_text(result: Applied) -> str:

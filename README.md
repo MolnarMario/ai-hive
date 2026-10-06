@@ -258,6 +258,13 @@ workspaces keep executing — switching never pauses anything.
   close and reopen AI Hive yourself, so your agents keep working until you
   choose to restart. That state is read from the files on disk, so it also
   covers a `git pull` you ran by hand.
+- **Every launch pulls what merged.** Before it loads its own code, AI Hive
+  fetches `main` and fast-forwards this folder, so a PR merged since the last
+  run is what you see after a restart. If the folder sits on a branch whose
+  commits are all on `main` already (a session worked here and its PR merged),
+  it switches back to `main` first. Local changes or unmerged commits stop
+  both, and the launch goes ahead on what is there. Offline, it gives up
+  after 10 seconds.
 - **Let Claude Code update itself** — the **⬇ button** beside the taskbar toggle
   opens a small **Updates** panel, and what it offers depends on how Claude Code
   is actually installed on your machine (it re-reads that every time, so it is
@@ -887,7 +894,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2805 checks drive the real app headlessly (offscreen Qt platform) with real
+2819 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1028,7 +1035,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2805 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2819 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
