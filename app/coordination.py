@@ -74,9 +74,10 @@ def system_prompt_text(workspace_name: str, agent_name: str,
     base branch's docs/agents/integration.md when the project has one. AI
     Hive's own does all three; another project's main checkout is the
     user's working copy, which a pull could change under their editor or
-    dev server, so without the doc the integrator leaves it alone. It merges
-    its own pull request, and only after a clean GPT-6-Luna review, doc or
-    no doc. Every other laned agent flags finished work with a "Task
+    dev server, so without the doc the integrator leaves it alone. Doc or
+    no doc, it merges only its own pull request, only after a clean
+    GPT-6-Luna review and passing tests on the head it merges, and only by
+    `--match-head-commit` with a merge commit. Every other laned agent flags finished work with a "Task
     done" commit line (lanes.DONE_MARK). The flag only marks the work
     ready: the integrator starts when the user asks it to, never because a
     lane was flagged."""
@@ -113,22 +114,28 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"never because a lane was flagged. Then gather the lanes the "
             f"user names, or every lane with an unmerged "
             f"\"{lanes.DONE_MARK}\" commit if they name none, into one "
-            f"integrate/ branch. If {base} has docs/agents/integration.md, "
-            f"read it from {base} and follow it: it says how this project "
-            f"tests, versions and finishes a release. Without it, run the "
+            f"integrate/ branch that starts from origin/{base}, and open "
+            f"its pull request against {base}. If {base} has a checklist "
+            f"for shipping lanes at docs/agents/integration.md, read it "
+            f"from {base} and follow it: it says how this project tests, "
+            f"versions and finishes a release. Without it, run the "
             f"project's tests, open the pull request, have GPT-6-Luna "
             f"review it at high effort, fix every valid finding and review "
-            f"again until Luna finds nothing, then merge it yourself with a "
-            f"merge commit. Bump a version or edit a CHANGELOG only when "
-            f"that doc asks for it, and update the main checkout at "
-            f"{lane.get('repo', '')} only when it says to (fast-forward "
-            f"only, never when it has uncommitted changes). Otherwise leave "
-            f"it alone and tell the user {base} moved, so they pull when "
-            f"they are ready. Whatever the doc says, merge only your own "
-            f"pull request and only after a clean GPT-6-Luna review. Never "
-            f"rebase or force-push, never squash, never edit other "
-            f"worktrees, never edit files in the main checkout, and never "
-            f"commit to {base} directly. If something fails that you can't "
+            f"again until Luna finds nothing, then merge it yourself. Bump "
+            f"a version or edit a CHANGELOG only when that doc asks for "
+            f"it, and update the main checkout at {lane.get('repo', '')} "
+            f"only when it says to (fast-forward only, never when it has "
+            f"uncommitted changes). Otherwise leave it alone and tell the "
+            f"user {base} moved, so they pull when they are ready. Whatever "
+            f"the doc says, merge only your own pull request, only after a "
+            f"clean GPT-6-Luna review and passing tests on the head you "
+            f"merge, and only with a merge commit through "
+            f"`gh pr merge --merge --match-head-commit <that head>`. If "
+            f"{base} moved since you tested, merge it in and test again. "
+            f"Never rebase or force-push, never squash, never edit other "
+            f"worktrees, never edit files in the main checkout beyond the "
+            f"fast-forward a checklist asks for, and never commit to {base} "
+            f"directly. If something fails that you can't "
             f"fix, stop and tell the user.")
     elif laned:
         base = lane.get("base") or "the base branch"
@@ -157,8 +164,8 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"venv or node_modules folder in your lane is a link to the main "
             f"checkout's copy, so installing packages there changes them for "
             f"every lane. Do not bump the version or edit the CHANGELOG or "
-            f"the README check count: that is done once per pull request, "
-            f"when your work is integrated.")
+            f"a test count in the README: the integrator does that once per "
+            f"pull request, in projects that keep them.")
     return text
 
 

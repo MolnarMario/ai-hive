@@ -2496,8 +2496,11 @@ def test_integrator_prompt_project_neutral():
         "WS", "Agent 3", "C:/p/.aihive/board.md", lane=lane, aware=True,
         integrator=True)
     check("integ-neutral: the project's integration doc on the base leads",
-          "If dev has docs/agents/integration.md, read it from dev and "
-          "follow it" in prompt, prompt)
+          "checklist for shipping lanes at docs/agents/integration.md, "
+          "read it from dev and follow it" in prompt, prompt)
+    check("integ-neutral: the branch starts from the base and the PR "
+          "targets it", "starts from origin/dev" in prompt
+          and "pull request against dev" in prompt, prompt)
     check("integ-neutral: no unconditional version or CHANGELOG bump",
           "bump the version and the CHANGELOG once" not in prompt
           and "Bump a version or edit a CHANGELOG only when that doc asks"
@@ -2507,13 +2510,25 @@ def test_integrator_prompt_project_neutral():
           and "Otherwise leave it alone and tell the user dev moved"
           in prompt
           and "bring the main checkout" not in prompt, prompt)
-    check("integ-neutral: a clean GPT-6-Luna review gates the merge, doc "
-          "or no doc", "Whatever the doc says, merge only your own pull "
-          "request and only after a clean GPT-6-Luna review" in prompt,
+    check("integ-neutral: a clean review, passing tests on the merged head "
+          "and --match-head-commit gate every merge, doc or no doc",
+          "Whatever the doc says, merge only your own pull request, only "
+          "after a clean GPT-6-Luna review and passing tests on the head "
+          "you merge" in prompt and "--match-head-commit" in prompt
+          and "If dev moved since you tested" in prompt, prompt)
+    check("integ-neutral: the main checkout rule allows only the "
+          "checklist's fast-forward", "never edit files in the main "
+          "checkout beyond the fast-forward a checklist asks for" in prompt,
           prompt)
     check("integ-neutral: no AI Hive test command or file in the prompt",
           "smoke_test" not in prompt and "app/__init__" not in prompt,
           prompt)
+    lane_prompt = coordination.system_prompt_text(
+        "WS", "Agent 4", "C:/p/.aihive/board.md", lane=lane, aware=True)
+    check("integ-neutral: a lane leaves release bookkeeping to the "
+          "integrator, only where the project keeps it",
+          "in projects that keep them" in lane_prompt
+          and "README check count" not in lane_prompt, lane_prompt)
 
 
 def test_lane_include_local_changes():
