@@ -2080,3 +2080,53 @@ def test_header_tools_tray_has_no_dead_space():
 
     card.detach(); card.close()
     a.deleteLater()
+
+
+def test_header_tools_tray_closes_without_a_leave_event():
+    """A slow exit up or down can fire Leave while QCursor.pos() still rounds
+    inside the tray (fractional DPI), and then no further event reaches it.
+    The tray must notice the pointer is gone by itself, with no Leave and no
+    explicit _recheck call."""
+    from PySide6.QtCore import QEvent, QEventLoop, QObject, QPoint, QTimer
+    from PySide6.QtGui import QCursor
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Tray", cwd=SCRATCH_CWD))
+    card = TerminalCard(a)
+    card.resize(900, 300); card.show(); pump(60)
+    ht = card.header_tools
+    tray = ht.tray
+    ht._set_open(True); pump(30)
+    QCursor.setPos(tray.mapToGlobal(QPoint(tray.width() // 2,
+                                           tray.height() // 2)))
+    pump(ht._WATCH_MS * 2)
+    check("tray: stays open while the pointer is on it", tray.isVisible())
+    # just below the tray, over the terminal, with every Enter/Leave eaten:
+    # offscreen Qt turns setPos into real crossing events, which would hide
+    # the very case this guards
+    class _NoCrossing(QObject):
+        def eventFilter(self, obj, ev):
+            return ev.type() in (QEvent.Type.Enter, QEvent.Type.Leave)
+    eat = _NoCrossing()
+    QApplication.instance().installEventFilter(eat)
+    try:
+        QCursor.setPos(tray.mapToGlobal(QPoint(tray.width() // 2,
+                                               tray.height() + 2)))
+        pump(ht._WATCH_MS * 3)
+    finally:
+        QApplication.instance().removeEventFilter(eat)
+    check("tray: closes on its own once the pointer is below it",
+          not tray.isVisible())
+    check("tray: the watch timer stops when the tray closes",
+          not ht._watch.isActive())
+
+    card.detach(); card.close()
+    a.deleteLater()
