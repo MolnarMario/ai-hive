@@ -322,6 +322,121 @@ def test_row_name_fades_under_badges():
     row.deleteLater()
 
 
+def test_collapsed_sidebar_rail():
+    """A collapsed sidebar leaves a thin rail of per-workspace strips in
+    sidebar order, coloured like each row's count badge. A click opens that
+    workspace, and the rail shows exactly while the sidebar is at width 0,
+    including after a restart with the sidebar saved collapsed."""
+    from PySide6.QtCore import QAbstractAnimation, QEventLoop, QPoint, Qt, QTimer
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from app.session_store import SessionStore
+    from app.widgets.sidebar import Sidebar, WorkspaceRail, ws_state
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    sb = Sidebar()
+    rail = WorkspaceRail()
+    rail.resize(WorkspaceRail.WIDTH, 400)
+    sb.add_row("a", "Alpha", "")
+    sb.add_row("b", "Bravo", "")
+    sb.add_row("c", "Charlie", "")
+    sb.set_rail(rail)
+    sb.set_active_row("b")
+    sb.set_stats("a", {"total": 2, "active": 2, "busy": 1, "error": 0})
+    sb.set_stats("b", {"total": 1, "active": 1, "busy": 0, "error": 0,
+                       "waiting": 1})
+    sb.set_stats("c", {"total": 1, "active": 0, "busy": 0, "error": 1})
+
+    check("rail: one entry per workspace, in sidebar order",
+          [e[0] for e in rail._entries] == ["a", "b", "c"], rail._entries)
+    check("rail: strips share the count badge's states",
+          [ws_state(e[2]) for e in rail._entries]
+          == ["working", "idle", "error"],
+          [ws_state(e[2]) for e in rail._entries])
+    check("rail: the active workspace's strip is the wide one",
+          rail.strip_rect(1).width() > rail.strip_rect(0).width()
+          and rail.strip_rect(0).width() == rail.strip_rect(2).width(),
+          [rail.strip_rect(i).width() for i in range(3)])
+    check("rail: tooltip names the workspace and who is waiting",
+          rail.tooltip_for(1).startswith("Bravo\n")
+          and "1 waiting for you" in rail.tooltip_for(1), rail.tooltip_for(1))
+    check("rail: no pulse while the rail is hidden",
+          rail._anim.state() != QAbstractAnimation.State.Running)
+
+    picked = []
+    rail.workspaceSelected.connect(picked.append)
+    mid = rail.strip_rect(2).center()
+    QTest.mouseClick(rail, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                     QPoint(mid.x(), mid.y()))
+    QTest.mouseClick(rail, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                     QPoint(5, 395))
+    check("rail: a strip click selects its workspace, empty rail does not",
+          picked == ["c"], picked)
+
+    sb.apply_layout([{"type": "category", "id": "k", "name": "K",
+                      "collapsed": True, "children": ["c"]},
+                     {"type": "workspace", "id": "a"},
+                     {"type": "workspace", "id": "b"}])
+    sb.set_row_name("a", "Alpha 2")
+    check("rail: follows reorders (collapsed categories included) and renames",
+          [(e[0], e[1]) for e in rail._entries]
+          == [("c", "Charlie"), ("a", "Alpha 2"), ("b", "Bravo")],
+          rail._entries)
+    rail.resize(WorkspaceRail.WIDTH, 40)
+    check("rail: a short rail squeezes strips so every workspace keeps one",
+          rail.strip_rect(2).bottom() < 40 and rail.strip_rect(2).height() >= 3,
+          rail.strip_rect(2))
+    sb.remove_row("c")
+    check("rail: a removed workspace loses its strip",
+          [e[0] for e in rail._entries] == ["a", "b"], rail._entries)
+
+    # --- in the window: visibility follows the collapse, clicks switch ---
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-rail-"))
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    win.resize(1200, 700)
+    win.show()
+    pump(100)
+    mgr = win.manager
+    wa = mgr.workspaces[0]
+    wb = mgr.create_workspace("Bravo")
+    mgr.set_active(wa.id)
+    check("rail: hidden while the sidebar is open", win.ws_rail.isHidden())
+    win._toggle_sidebar()
+    pump(50)
+    check("rail: shown once the sidebar collapses",
+          win.body_split.sizes()[0] == 0 and win.ws_rail.isVisible(),
+          win.body_split.sizes())
+    i = [e[0] for e in win.ws_rail._entries].index(wb.id)
+    mid = win.ws_rail.strip_rect(i).center()
+    QTest.mouseClick(win.ws_rail, Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier, QPoint(mid.x(), mid.y()))
+    check("rail: clicking a strip opens that workspace, sidebar stays shut",
+          mgr.active_id == wb.id and win.body_split.sizes()[0] == 0,
+          (mgr.active_id, win.body_split.sizes()))
+    win._save_now()
+    win.close()
+    pump(100)
+
+    win2 = create_main_window(store)
+    check("rail: a sidebar saved collapsed restores with the rail showing",
+          not win2.ws_rail.isHidden() and win2.body_split.sizes()[0] == 0,
+          win2.body_split.sizes())
+    win2._toggle_sidebar()
+    check("rail: reopening the sidebar hides the rail",
+          win2.ws_rail.isHidden(), win2.body_split.sizes())
+    win2.close()
+    pump(100)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_sidebar_reorder():
     """Drag-reorder: the sidebar's drop handler re-sequences its node model and
     emits the new top-to-bottom ws-id order; a rebuild keeps every row."""

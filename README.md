@@ -130,6 +130,9 @@ workspaces keep executing — switching never pauses anything.
   (Claude terracotta, Gemini blue, GPT in the card header's light title ink)
   and turns red at 85%, so you see a wall coming instead of hitting it
   mid-task, and the red pill tells you which agent is about to hit it.
+  Switch on **Show usage left** in ⚙ Options and every pill counts down
+  instead (`5h Claude 79% left`), with its ring emptying as you use the
+  window; red still means 85% used.
   **Click either to refresh**; hover for every limit window, your
   plan, and how old the reading is. The numbers come from the same place the
   CLI's `/usage` gets them, read in the background. Nothing is logged or
@@ -535,8 +538,8 @@ workspaces keep executing — switching never pauses anything.
   show without file edges; see below.)
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
-  reset**, **Question chime**, **Reply finished chime**, **Taskbar count** and **Check for CLI
-  updates at start-up** as labelled switches (each with a green/dark LED, so
+  reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Check for CLI
+  updates at start-up** and **Show usage left** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
   the theme and global font size below. Click outside or press `Esc` to close.
@@ -595,7 +598,10 @@ error dialog instead of silently closing. Packaging to a distributable
   clones the repo's default branch (`main`, `master` or whatever it is
   called) into a new folder and opens the workspace there.
   Double-click a row to rename, `✕` deletes (confirmation appears only when
-  terminals are running). `☰` / `Ctrl+Shift+B` collapses the sidebar.
+  terminals are running). `☰` / `Ctrl+Shift+B` collapses the sidebar to a
+  10px rail with one strip per workspace, in sidebar order and colored like
+  its count badge. The active workspace has the wide strip, hover shows the
+  name, and a click opens that workspace without reopening the sidebar.
 - **Agents** — `+ Terminal` (or `Ctrl+Shift+T`), or click any empty grid slot.
   The dialog groups **AI agents** (Claude with model + effort + mode dropdowns —
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;
@@ -628,8 +634,10 @@ error dialog instead of silently closing. Packaging to a distributable
   selected; otherwise it copies), `Ctrl+R` reverse-searches, arrows/`Tab`
   complete, exactly as in a real terminal.
 - **Card controls** — hover the `⋯` at the right of a card's header for its
-  actions: `▶` start, `■` stop, `↻` restart (fresh session), `✎` assign /
-  reassign, `⏱` send on a countdown, `A−`/`A+` font and `⤢` maximize, plus
+  actions: `■` stop, `↻` restart (replaces the agent with a fresh one: new
+  conversation, the permission mode, model and effort it was created with,
+  no old title or task; name and folder stay), `⏱` send on a countdown,
+  `A−`/`A+` font and `⤢` maximize, plus
   `⎇` restart in own lane and `⚑` make integrator where lanes apply. Each
   icon has a tooltip. `✕` close stays visible. Collapsed, the actions take
   no header width, so the summary gets it. Type into the bottom input line to send a command to that terminal;
@@ -705,9 +713,6 @@ awareness* below).
 - **Persistent agents** — agents **never** auto-close. A completed agent stays
   in the grid so you can review its work, continue the conversation, or retask
   it. Only you close an agent.
-- **Reassign anywhere** — click `✎` in any card's `⋯` tray to hand it
-  fresh work without losing the session. Its name,
-  model and effort are left exactly as you set them.
 
 ## Shared agent awareness
 
@@ -894,7 +899,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2804 checks drive the real app headlessly (offscreen Qt platform) with real
+2838 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -996,7 +1001,7 @@ app/
   process_worker.py        QProcess engine, HybridDecoder, WinJob (line mode)
   pty_worker.py            ConPTY engine via pywinpty (full-terminal mode)
   terminal_agent.py        per-terminal model (worker + log/buffer + lifecycle)
-  workspace_manager.py     model layer: workspaces, agents, spawn/assign/reassign
+  workspace_manager.py     model layer: workspaces, agents, spawn/retire
   orchestrator_bridge.py   named-pipe RPC server (GUI side) for board log_activity
   mcp_server.py            stdlib MCP stdio server (log_activity) the Claude CLI spawns
   session_store.py         atomic JSON persistence (AppData) + save-audit log
@@ -1034,7 +1039,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2804 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2838 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

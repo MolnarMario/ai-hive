@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from .claude_usage import pct_text
+
 USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 _USER_AGENT = "ai-hive (codex-usage readout)"
 
@@ -144,13 +146,15 @@ def format_countdown(seconds: float) -> str:
     return f"{total}s"
 
 
-def format_limit(limit: CodexLimit, now: float | None = None) -> str:
+def format_limit(limit: CodexLimit, now: float | None = None,
+                 left: bool = False) -> str:
     now = time.time() if now is None else now
-    head = "limit reached" if limit.percent >= 100.0 else f"GPT {limit.percent:.0f}% used"
+    head = ("limit reached" if limit.percent >= 100.0
+            else f"GPT {pct_text(limit.percent, left)}")
     if limit.resets_at is None:
         return head
-    left = limit.resets_at - now
-    if left <= 0:
+    until_reset = limit.resets_at - now
+    if until_reset <= 0:
         return f"{head}, resets now"
     when = datetime.fromtimestamp(limit.resets_at).strftime("%H:%M")
-    return f"{head}, resets in {format_countdown(left)} at {when}"
+    return f"{head}, resets in {format_countdown(until_reset)} at {when}"

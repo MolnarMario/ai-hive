@@ -21,7 +21,7 @@ class CodexUsageBadge(UsagePillBadge):
         return "GPT 5h usage, reading..."
 
     def _format_limit(self) -> str:
-        return codex_usage.format_limit(self._limit)
+        return codex_usage.format_limit(self._limit, left=self._show_left)
 
     def _unreadable_text(self) -> str:
         return "GPT usage unreadable, click to refresh"
@@ -35,7 +35,7 @@ class CodexUsageBadge(UsagePillBadge):
         if self._usage is None or self._limit is None:
             return "GPT 5-hour usage"
         lines = ["GPT" + (f" ({self._usage.plan})" if self._usage.plan else ""),
-                 codex_usage.format_limit(self._limit)]
+                 codex_usage.format_limit(self._limit, left=self._show_left)]
         if self._usage.fetched_at:
             lines.append(f"Updated {codex_usage.format_countdown(time.time() - self._usage.fetched_at)} ago")
         lines.extend(self._failure_lines())

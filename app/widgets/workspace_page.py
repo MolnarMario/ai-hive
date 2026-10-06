@@ -119,7 +119,6 @@ class _ReorderGrid(QWidget):
 class WorkspacePage(QWidget):
     closeRequested = Signal(str)        # agent id
     focusGained = Signal(object)        # TerminalCard
-    reassignRequested = Signal(str)     # agent id
     scheduleRequested = Signal(str, str)  # agent id, text to prefill
     addRequested = Signal(str)          # ws_id (empty slot clicked)
     layoutChosen = Signal(str, str)     # ws_id, layout
@@ -501,7 +500,6 @@ class WorkspacePage(QWidget):
         card = TerminalCard(agent, parent=self.grid_host)
         card.closeRequested.connect(self.closeRequested)
         card.focusGained.connect(self.focusGained)
-        card.reassignRequested.connect(self.reassignRequested)
         card.scheduleRequested.connect(self.scheduleRequested)
         card.maximizeRequested.connect(self.toggle_solo)
         card.fileActivated.connect(

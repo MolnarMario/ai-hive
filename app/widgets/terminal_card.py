@@ -220,10 +220,10 @@ class _CardHeader(QFrame):
     from. A plain click (no movement) is left alone, so double-click-to-rename
     on the title still works.
 
-    There is no right-click menu any more. Start / Stop / Restart / Assign and
-    the lane actions it carried live in the hover tray (see _HeaderTools),
-    where the user can find them: the user forgot a right-click menu on a
-    title bar was there at all."""
+    There is no right-click menu any more. Stop / Restart and the lane
+    actions it carried live in the hover tray (see _HeaderTools), where the
+    user can find them: the user forgot a right-click menu on a title bar was
+    there at all."""
 
     _SLOP = 8
 
@@ -285,8 +285,8 @@ class _ToolsTray(QFrame):
 
 
 class _HeaderTools(QWidget):
-    """The card's action buttons (start, stop, restart, assign, the lane
-    actions, scheduled send, A- / A+ / maximize), collapsed to a narrow "⋯"
+    """The card's action buttons (stop, restart, the lane actions,
+    scheduled send, A- / A+ / maximize), collapsed to a narrow "⋯"
     strip until the pointer is over them.
 
     Laid out permanently they would cost ~300px of every header, and that
@@ -455,7 +455,6 @@ class _HeaderTools(QWidget):
 class TerminalCard(QFrame):
     closeRequested = Signal(str)     # agent id
     focusGained = Signal(object)     # self
-    reassignRequested = Signal(str)  # agent id (retask a completed/idle agent)
     maximizeRequested = Signal(object)  # self (toggle solo view of this card)
     fileActivated = Signal(str)      # abs path Ctrl+clicked in the conversation
     scheduleRequested = Signal(str, str)  # agent id, text to prefill (may be "")
@@ -726,16 +725,17 @@ class TerminalCard(QFrame):
         # _refresh_actions sets their enablement each time the tray opens.
         self.header_tools = _HeaderTools(header)
         self.header_tools.before_open = self._refresh_actions
-        self.btn_start = tool("▶", "CardStart", "Start", self.header_tools)
         self.btn_stop = tool("■", "CardStop",
-                             "Stop (Ctrl+C, then terminate)" if self.is_pty
+                             "Stop (Ctrl+C, then kill)" if self.is_pty
                              else "Stop (graceful, stdin EOF)",
                              self.header_tools)
+        # Restart is "close this card, open a new agent like it": see
+        # TerminalAgent.restart for what it resets. It also starts a stopped
+        # agent, and so does any keystroke in the terminal, so there is no
+        # separate Start button.
         self.btn_restart = tool("↻", "CardRestart",
-                                "Restart (kill + fresh session)",
+                                "Restart (replace with a fresh agent)",
                                 self.header_tools)
-        self.btn_assign = tool("✎", "CardAssign", "Assign or reassign a task",
-                               self.header_tools)
         # lane scopes: an existing agent moves into its own worktree. Label
         # and tooltip come from integration_info each time the tray opens.
         self.btn_adopt = tool("⎇", "CardAdopt", "Restart in own lane",
@@ -756,9 +756,8 @@ class TerminalCard(QFrame):
         # never touches sibling processes (see WorkspacePage.toggle_solo)
         self.btn_max = tool("⤢", "CardMaximize", "Maximize (focus this agent)",
                             self.header_tools)
-        for _b in (self.btn_start, self.btn_stop, self.btn_restart,
-                   self.btn_assign, self.btn_adopt, self.btn_integrator,
-                   self.btn_sched, self.btn_font_dec, self.btn_font_inc,
+        for _b in (self.btn_stop, self.btn_restart, self.btn_adopt,
+                   self.btn_integrator, self.btn_sched, self.btn_font_dec, self.btn_font_inc,
                    self.btn_max):
             self.header_tools.add(_b)
         self.header_tools.withhold(self.btn_adopt, True)
@@ -840,11 +839,8 @@ class TerminalCard(QFrame):
         self.title.installEventFilter(self)        # double-click to rename
         self.title_edit.installEventFilter(self)   # Esc cancels, focus-out commits
         self.title_edit.returnPressed.connect(self._commit_rename)
-        self.btn_start.clicked.connect(self.agent.start)
         self.btn_stop.clicked.connect(self.agent.stop)
         self.btn_restart.clicked.connect(self.agent.restart)
-        self.btn_assign.clicked.connect(
-            lambda: self.reassignRequested.emit(self.agent.id))
         self.btn_adopt.clicked.connect(
             lambda: self.laneActionRequested.emit(self.agent.id, "adopt"))
         self.btn_integrator.clicked.connect(
@@ -907,10 +903,8 @@ class TerminalCard(QFrame):
         """Set the action tray's buttons from the agent's state right now.
         Runs as the tray opens, and on a status change while it is open, so
         a button the user can see is never enabled for an action its agent
-        can't take. Enablement follows the rules the right-click menu used."""
+        can't take."""
         status = self.agent.status
-        self.btn_start.setEnabled(status is AgentStatus.IDLE
-                                  or status in _ENDED)
         self.btn_stop.setEnabled(status in (AgentStatus.STARTING,
                                             AgentStatus.RUNNING))
         info = self._integration()

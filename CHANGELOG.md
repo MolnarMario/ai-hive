@@ -8,6 +8,23 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.34.0
+
+- Restart now gives you a fresh agent, as if you closed the card and
+  opened a new one of the same kind. It drops a permission mode you
+  switched into, a /model or /effort override, the AI title, the
+  context badge and the assigned task. Name, folder, lane, font and
+  the model, effort and permission mode you created it with stay.
+- The Start and Assign buttons are gone from the card's hover tray.
+  Restart or any keystroke starts a stopped agent.
+- A collapsed sidebar now leaves a thin rail with one strip per
+  workspace, colored like its count badge: amber while an agent
+  works, green when idle, red on an error. Hover a strip for the name
+  and counts, click it to open that workspace.
+- New "Show usage left" switch under Options, Appearance. Usage pills
+  then read "Claude 79% left" instead of "Claude 21% used", and the
+  ring empties as you use up the window. Red still means 85% used.
+
 ## 0.33.0
 
 - The integrator no longer pulls main into your project's own folder
