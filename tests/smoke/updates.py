@@ -1832,6 +1832,20 @@ def test_startup_update():
           res is not None and not res.ok and "Checking GitHub" in res.detail
           and version(user) == "0.1.0", res)
 
+    # pulled code whose new packages failed to install would die on import
+    # with no window to say why (GPT-6-Luna review, round 3)
+    A = self_update.Applied
+    broken = self_update.startup_failure(
+        A(True, version="0.1.1", deps_changed=True, deps_ok=False))
+    check("launch-update: a failed package install stops the launch with "
+          "the command that fixes it",
+          "v0.1.1" in broken and "pip install -r requirements.txt" in broken
+          and "—" not in broken, broken)
+    check("launch-update: nothing else stops the launch",
+          not any(self_update.startup_failure(r) for r in (
+              None, A(False, detail="blocked"), A(True, version="0.1.1"),
+              A(True, version="0.1.1", deps_changed=True, deps_ok=True))))
+
     src = (ROOT / "main.py").read_text(encoding="utf-8")
     launched = src.find('if __name__ == "__main__":\n    _LAUNCH_GUARD = '
                         '_single_instance_guard()\n    if _LAUNCH_GUARD is '
@@ -1847,4 +1861,8 @@ def test_startup_update():
           "and main() reuses that lock",
           launched > 0 and "guard = _LAUNCH_GUARD or _single_instance_guard()"
           in src, launched)
+    check("launch-update: main.py stops before importing the pulled app "
+          "when its packages failed",
+          pull < src.find("_fatal(_self_update.startup_failure(_result))")
+          < src.find("from app.process_worker import"))
     shutil.rmtree(root, ignore_errors=True)

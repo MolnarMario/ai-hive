@@ -376,6 +376,20 @@ def startup_update(runner, repo: str = REPO_DIR, python: str = ""):
     return apply(runner, repo, python)
 
 
+def startup_failure(result) -> str:
+    """What stops the launch after `startup_update`, or "". The pulled code
+    may need packages that failed to install; importing it then dies before
+    any window could say why, so the launch stops with the fix instead."""
+    if (not isinstance(result, Applied) or not result.ok
+            or not result.deps_changed or result.deps_ok):
+        return ""
+    version = f" v{result.version}" if result.version else ""
+    return (f"AI Hive pulled{version} from GitHub, but installing the Python "
+            "packages it needs failed.\n\nIn the AI Hive folder, run:\n"
+            "    .venv\\Scripts\\python.exe -m pip install -r requirements.txt"
+            "\n\nThen start AI Hive again.")
+
+
 def applied_text(result: Applied) -> str:
     if not result.ok:
         return result.detail

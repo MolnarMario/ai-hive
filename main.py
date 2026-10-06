@@ -78,6 +78,8 @@ if __name__ == "__main__":
         _result = _self_update.startup_update(_self_update.subprocess_runner)
         if _result is not None:
             _STARTUP_UPDATE_AUDIT = _self_update.audit_line(_result)
+        if _self_update.startup_failure(_result):
+            _fatal(_self_update.startup_failure(_result))
         for _name in [m for m in sys.modules
                       if m == "app" or m.startswith("app.")]:
             del sys.modules[_name]
