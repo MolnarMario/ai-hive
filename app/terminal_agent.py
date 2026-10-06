@@ -1221,22 +1221,18 @@ class TerminalAgent(QObject):
                                    if len(files) > 3 else shown)
         return row
 
-    def deliver_task(self, text: str, title: str = "") -> None:
+    def deliver_task(self, text: str) -> None:
         """Give this agent a task to work on (the reassign path).
 
         For a pty agent (Claude Code) the task is delivered only once the TUI
         is prompt-ready (we watch its output stream for bracketed-paste-enable,
         ESC[?2004h — a fixed delay is unreliable on a cold start). Multi-line
         text is wrapped in bracketed paste so it isn't submitted at the first
-        newline, then a separate Enter submits it.
-
-        `title` is what the sidebar, the roster and the card show as its task
-        instead of the text itself, for a long generated text like the
-        integrator's note about finished lanes."""
+        newline, then a separate Enter submits it."""
         text = sanitize_text(text or "").strip()
         if not text:
             return
-        self.set_task(sanitize_text(title or "").strip() or text)
+        self.set_task(text)
         self.set_assignment(AssignmentState.WORKING)
         self.task_delivered.emit(text)
         if not self.is_pty:

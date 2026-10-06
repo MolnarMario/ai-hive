@@ -13,7 +13,7 @@ changed-files list is per checkout: the workspace folder's own `git status`,
 then each lane's uncommitted files. Lane data comes from MainWindow
 (`set_lanes`, fed by app/lane_service.py), so the panel runs no git for it.
 A lane whose agent committed "Task done" (`LaneView.done`) shows a check
-mark: the integrator has been, or will be, told to ship it.
+mark: it is ready to ship when the user asks the integrator.
 """
 
 from PySide6.QtCore import (QEasingCurve, QPropertyAnimation, Qt, Signal)

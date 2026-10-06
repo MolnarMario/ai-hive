@@ -8,6 +8,15 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.32.0
+
+- You decide when finished work ships. AI Hive no longer types a note
+  into the integrator each time a lane's agent commits "Task done".
+  The lane chip still gets its ✓ and turns green. When you think
+  there is enough for a pull request, ask the integrator to ship it,
+  naming the lanes you want or none for everything marked done.
+- The integrator starts only when you ask it to, never on its own.
+
 ## 0.31.0
 
 - A lane's chip on its card turns green once its agent commits "Task

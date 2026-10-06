@@ -71,13 +71,15 @@ This file holds only the rules that protect user data or fail silently.
   leaves a half-deleted worktree.
 - Shipping lanes (`docs/agents/integration.md`): a laned agent flags
   finished work with a commit line of just `Task done` (`lanes.DONE_GREP`).
-  AI Hive's only part is typing the idle integrator a note that names the
-  flagged lanes (`MainWindow._nudge_integrator`), with agent names, branches
-  and shas only, never commit text. Only the user picks the integrator, and
-  no bridge op may pick one, merge or nudge. The integrator, and no other
-  agent, merges, and only its own PR after a clean GPT-6-Luna review and a
-  passing full suite on the PR head, with `--merge --match-head-commit`
-  (never a squash: lanes clear their flag and fast-forward by ancestry).
+  AI Hive only shows the flag on the lane chip and logs it
+  (`MainWindow._log_done_lanes`). It never types into the integrator. The
+  user decides when there is enough to ship and asks the integrator. A note
+  on every flag had the integrator shipping work the moment it landed. Only
+  the user picks the integrator, and no bridge op may pick one, merge or
+  start an integration. The integrator, and no other agent, merges, and
+  only its own PR after a clean GPT-6-Luna review and a passing full suite
+  on the PR head, with `--merge --match-head-commit` (never a squash: lanes
+  clear their flag and fast-forward by ancestry).
 - Nothing renames an agent except the user.
 - No em dash in any string the user sees. `test_no_em_dashes_in_visible_text`
   enforces it for non-docstring literals.
@@ -128,4 +130,4 @@ Issues live as markdown under `.scratch/<feature-slug>/`, see
 `docs/agents/issue-tracker.md`. Triage labels are in
 `docs/agents/triage-labels.md`, domain docs in `docs/agents/domain.md`. The
 integrator's checklist is `docs/agents/integration.md`; the integrator reads
-it from the base branch every time AI Hive nudges it.
+it from the base branch every time the user asks it to ship.

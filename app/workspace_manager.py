@@ -63,8 +63,8 @@ class Workspace:
     layout: str = DEFAULT_LAYOUT   # "auto" or "RxC" (e.g. "2x2")
     board: object = None           # coordination.WorkspaceBoard
     # the integrator agent's spec.uid (one per workspace, "" for none).
-    # AI Hive nudges it when a lane's commit says "Task done"
-    # (MainWindow._nudge_integrators, docs/agents/integration.md).
+    # It ships "Task done" lanes when the user asks; AI Hive never tells
+    # it (docs/agents/integration.md).
     integrator_uid: str = ""
     # the workspace's lanes toggle (.scratch/agent-lanes/spec-v4-lane-
     # scopes.md): ON ticks "Own lane" for its new Claude agents. It only
