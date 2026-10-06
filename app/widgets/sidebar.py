@@ -432,10 +432,13 @@ class WorkspaceRow(QFrame):
 class CategoryRow(QFrame):
     """A collapsible category header: disclosure caret + editable name + a
     child-count chip + hover delete. Draggable (categories reorder at the top
-    level only — they never nest). Toggling the caret expands/collapses its
-    workspaces."""
+    level only — they never nest). A click on the caret or anywhere on the
+    row expands/collapses its workspaces, and a double-click on the name text
+    renames. A click on the name text waits out the double-click interval
+    before it toggles (`_name_click`), so a rename never collapses the group
+    first. A click anywhere else toggles on release, with no delay."""
 
-    toggled = Signal(str)               # cat_id (caret clicked)
+    toggled = Signal(str)               # cat_id (caret or row clicked)
     renameCommitted = Signal(str, str)  # cat_id, new name
     deleteRequested = Signal(str)       # cat_id
 
@@ -446,6 +449,11 @@ class CategoryRow(QFrame):
         self._renaming = False
         self._collapsed = collapsed
         self._press_pos: QPoint | None = None
+        # a click on the name text toggles only once no second click follows
+        self._name_click = QTimer(self)
+        self._name_click.setSingleShot(True)
+        self._name_click.timeout.connect(
+            lambda: self.toggled.emit(self.cat_id))
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setObjectName("WsCategory")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -530,6 +538,16 @@ class CategoryRow(QFrame):
 
     # ------------------------------------------------------------ events ---
 
+    def _on_name_text(self, pos: QPoint) -> bool:
+        """True when `pos` (row coords) lands on the drawn name text, not on
+        the empty stretch the label fills to its right."""
+        lab = self.name_label
+        if not lab.isVisible():
+            return False
+        text_w = lab.fontMetrics().horizontalAdvance(lab.text())
+        text_rect = QRect(lab.geometry().topLeft(), QSize(text_w, lab.height()))
+        return text_rect.adjusted(-2, 0, 2, 0).contains(pos)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._press_pos = event.position().toPoint()
@@ -547,11 +565,30 @@ class CategoryRow(QFrame):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        # a press that never turned into a drag is a click: toggle the group
+        pos = event.position().toPoint()
+        clicked = (self._press_pos is not None
+                   and event.button() == Qt.MouseButton.LeftButton
+                   and not self._renaming and self.rect().contains(pos))
         self._press_pos = None
+        if clicked:
+            if self._on_name_text(pos):
+                self._name_click.start(QApplication.doubleClickInterval())
+            else:
+                self.toggled.emit(self.cat_id)
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
-        self.start_rename()
+        if (event.button() == Qt.MouseButton.LeftButton
+                and not self._renaming):
+            if (self._name_click.isActive()
+                    and self._on_name_text(event.position().toPoint())):
+                self._name_click.stop()
+                self.start_rename()
+            else:
+                # the second click of a fast pair off the name counts as a
+                # click of its own and toggles on release
+                self._press_pos = event.position().toPoint()
         super().mouseDoubleClickEvent(event)
 
     def enterEvent(self, event):
