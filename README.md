@@ -595,7 +595,10 @@ error dialog instead of silently closing. Packaging to a distributable
   clones the repo's default branch (`main`, `master` or whatever it is
   called) into a new folder and opens the workspace there.
   Double-click a row to rename, `✕` deletes (confirmation appears only when
-  terminals are running). `☰` / `Ctrl+Shift+B` collapses the sidebar.
+  terminals are running). `☰` / `Ctrl+Shift+B` collapses the sidebar to a
+  10px rail with one strip per workspace, in sidebar order and colored like
+  its count badge. The active workspace has the wide strip, hover shows the
+  name, and a click opens that workspace without reopening the sidebar.
 - **Agents** — `+ Terminal` (or `Ctrl+Shift+T`), or click any empty grid slot.
   The dialog groups **AI agents** (Claude with model + effort + mode dropdowns —
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;

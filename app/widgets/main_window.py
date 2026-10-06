@@ -59,7 +59,7 @@ from .ornaments import (DropDownComboBox, LogoRoundel,
                         PageBorder, PlanUsageBadge, RefreshGlyphButton,
                         ToggleSwitch, close_on_anchor_press)
 from .options_panel import OptionsPanel
-from .sidebar import SIDEBAR_WIDTH, Sidebar
+from .sidebar import SIDEBAR_WIDTH, Sidebar, WorkspaceRail
 
 SIDEBAR_MIN, SIDEBAR_MAX = 170, 700  # drag bounds (ultrawide-friendly)
 from .terminal_card import TerminalCard, _snippet
@@ -2522,8 +2522,20 @@ class MainWindow(QMainWindow):
         self.body_split.setSizes([SIDEBAR_WIDTH, 1000])
         self.body_split.splitterMoved.connect(self._on_sidebar_resized)
 
+        # the collapsed sidebar leaves a rail of workspace strips behind,
+        # left of the splitter so the splitter handle still drags it open
+        body = QWidget(central)
+        body_lay = QHBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(0)
+        self.ws_rail = WorkspaceRail(body)
+        self.ws_rail.hide()
+        self.sidebar.set_rail(self.ws_rail)
+        body_lay.addWidget(self.ws_rail)
+        body_lay.addWidget(self.body_split, 1)
+
         root.addWidget(self.top_bar)
-        root.addWidget(self.body_split, 1)
+        root.addWidget(body, 1)
         self.setCentralWidget(central)
 
         # illuminated-manuscript page border: a mouse-transparent overlay over
@@ -2612,13 +2624,20 @@ class MainWindow(QMainWindow):
         else:  # restore
             w = self._sidebar_saved_width or SIDEBAR_WIDTH
             self.body_split.setSizes([w, total - w])
+        self._sync_ws_rail()
         self._schedule_save()
 
     def _on_sidebar_resized(self, _pos: int, _index: int) -> None:
         w = self.body_split.sizes()[0]
         if w > 0:
             self._sidebar_saved_width = w
+        self._sync_ws_rail()
         self._schedule_save()
+
+    def _sync_ws_rail(self) -> None:
+        """Show the workspace rail exactly while the sidebar is collapsed,
+        whether the toggle, Ctrl+Shift+B, a drag or a restore closed it."""
+        self.ws_rail.setVisible(self.body_split.sizes()[0] == 0)
 
     def _adopt_existing_model(self) -> None:
         """Build pages/rows for workspaces created before this window existed
@@ -4943,6 +4962,7 @@ class MainWindow(QMainWindow):
             self.body_split.setSizes([0, 1000])
         else:
             self.body_split.setSizes([self._sidebar_saved_width, 1000])
+        self._sync_ws_rail()
         # restore the global console font (pages already built → refresh them)
         px = int(ui.get("console_font_px", 0) or 0)
         if 7 <= px <= 40 and px != ui_theme.CONSOLE_FONT_PX:
