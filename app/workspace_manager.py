@@ -540,25 +540,6 @@ class WorkspaceManager(QObject):
     # The card's "Assign / reassign a task..." action drives this. Assigning a
     # task to an agent changes nothing about that agent except its task.
 
-    def reassign_agent(self, agent_id: str, task: str) -> bool:
-        """Retask an idle/completed agent, preserving its session (no restart —
-        the task is typed into the existing pty).
-
-        Assigning a task NEVER renames the agent. It used to: the task was run
-        through a keyword-matched role heuristic and the result became both the
-        role sublabel and (unless the user had renamed it by hand) the display
-        name, so one dialog silently relabelled the card twice over with a
-        guess."""
-        agent = self.resolve_agent(agent_id)
-        if agent is None:
-            return False
-        if self.workspace_of(agent.id) is None:
-            return False
-        if not agent.is_running():
-            agent.start()
-        agent.deliver_task(task)  # queued if (re)starting, else typed now
-        return True
-
     # ------------------------------------------------ stats + coordination ---
 
     def _wire_agent(self, ws: Workspace, agent: TerminalAgent) -> None:

@@ -1467,7 +1467,7 @@ def test_render_perm_mode_reassign_bridge():
           and AgentSpec.from_dict(pm_spec.to_dict()).permission_mode
           == "acceptEdits", pm_spec.to_dict())
 
-    # --- task reassignment via a fast line-mode echo agent ---
+    # --- delivering a task via a fast line-mode echo agent ---
     mgr = WorkspaceManager()
     ws = mgr.create_workspace("W", str(tmp))
     echo = mgr.add_terminal(ws.id, build_spec(
@@ -1478,7 +1478,7 @@ def test_render_perm_mode_reassign_bridge():
     echo.output_segment.connect(lambda s, t: seen.append(t))
     wait_until(lambda: echo.is_running(), 8000)
     name_before, role_before = echo.spec.name, echo.spec.role
-    mgr.reassign_agent(echo.id, "now write the tests")
+    echo.deliver_task("now write the tests")
     check("v3 reassign: WORKING + delivered to the existing session",
           echo.assignment is AssignmentState.WORKING
           and wait_until(lambda: any("did:now write the tests" in t for t in seen),
