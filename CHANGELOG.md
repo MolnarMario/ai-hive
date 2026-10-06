@@ -8,6 +8,25 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.30.0
+
+- Finished work now ships without any clicks. When a laned agent finishes
+  its task, it commits with a last line of just "Task done". AI Hive sees
+  that commit, puts a ✓ on the lane's chip and tells the integrator. The
+  integrator combines every finished lane into one pull request, runs the
+  tests, gets a GPT-6-Luna code review, fixes what it finds and reviews
+  again until the review is clean. Then it merges and updates your main
+  folder, so the next launch runs the new version.
+- The integration queue is gone: no more Submit to integrator, Approve
+  merge, Mark merged or the Activity panel's Integration section. Your
+  integrator stays the integrator. Queue items saved by an older version
+  are dropped when the session loads.
+- A laned agent now commits each finished task on its own, without asking.
+  If it ends a turn with uncommitted changes anyway, it gets one reminder to
+  commit them.
+- When a closed card's lane is kept only because of uncommitted files, the
+  notice names up to three of them.
+
 ## 0.29.0
 
 - The card actions that lived in the header's right-click menu (start, stop,
