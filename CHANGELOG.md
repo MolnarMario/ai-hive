@@ -13,6 +13,7 @@ em dashes: this text is shown in the app.
 - The workspace header's buttons are evenly spaced again. Change and
   Layout had a 20px gap between them while every other pair sat 6px
   apart.
+- The header's Change… button is now called Change folder.
 
 ## 0.30.0
 
