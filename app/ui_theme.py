@@ -698,6 +698,12 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     background: rgba(190,60,60,0.30); color: {p.TEXT};
     border-color: {p.RED};
 }}
+/* a "Task done" commit with no overlap: green, so finished work stands out.
+   Overlap and conflict take priority (terminal_card.refresh_lane). */
+#CardLane[lane="done"] {{
+    background: rgba(70,170,90,0.30); color: {p.TEXT};
+    border-color: {p.GREEN};
+}}
 /* the "send later" composer: preset delay buttons + the resolved fire time */
 #SchedulePreset {{
     background: {p.BG_INPUT}; color: {p.TEXT};
