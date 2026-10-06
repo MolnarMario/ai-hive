@@ -10,10 +10,9 @@ agent twenty minutes from now, once the first is likely done". A scheduled
 message is that Enter, deferred.
 
 WHAT IT IS NOT. It is not an assignment. When one of these fires it goes through
-`TerminalAgent.nudge`, never `deliver_task` - the same distinction the plan-limit
-auto-continue makes. It is a message inside work the agent already has, so it
-must not overwrite the persisted `current_task`, flip the assignment to WORKING,
-or re-infer the role.
+`TerminalAgent.nudge`, as the plan-limit auto-continue does. It is a message
+inside work the agent already has, so it must not overwrite the persisted
+`current_task`.
 
 STATES. A message is PENDING until it is either typed (SENT) or given up on
 (MISSED). MISSED is the important one and exists for a single case: the app was

@@ -1109,10 +1109,10 @@ class WorkspaceManager(QObject):
                 agent.current_task = td.get("task", "")
                 agent.restore_scheduled(td.get("scheduled") or [])
                 agent.auto_created = bool(td.get("auto_created", False))
-                try:
-                    agent.assignment = AssignmentState(td.get("assignment", "idle"))
-                except ValueError:
-                    agent.assignment = AssignmentState.IDLE
+                # nothing moves an assignment off WORKING or COMPLETED any
+                # more (the hand-off that did is gone), so a saved one would
+                # sit on the card for good: every agent restores IDLE
+                agent.assignment = AssignmentState.IDLE
                 agent.autostart_on_restore = bool(td.get("running", False))
                 # Codex owns its transcript and thread id. Restore the saved
                 # thread for both running agents (which autostart) and stopped

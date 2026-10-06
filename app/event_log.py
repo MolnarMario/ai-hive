@@ -38,7 +38,7 @@ TEXT_CAP = 2000
 
 # ---------------------------------------------------------------- kinds ---
 PROMPT = "prompt"                # the user pressed Enter on their own prompt
-TASK = "task"                    # AI Hive handed the agent a task
+TASK = "task"                    # a task AI Hive typed (older logs only)
 QUESTION = "question"            # the agent raised "?" and is waiting on you
 ANSWERED = "answered"            # ...and stopped waiting (ref -> the question)
 REPLY = "reply"                  # a turn the user asked for finished
