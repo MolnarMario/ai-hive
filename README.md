@@ -481,13 +481,16 @@ workspaces keep executing — switching never pauses anything.
   `Task done`. AI Hive spots that commit on its next lane read (the chip gets
   a `✓` and turns green) and logs it. Nothing ships until you say so: when
   you think there is enough for a pull request, ask the integrator to ship.
-  It then follows the base branch's `docs/agents/integration.md`. It gathers
-  the lanes you name, or every lane with an unmerged `Task done` commit,
-  into one `integrate/` branch, bumps the version and CHANGELOG, runs the
-  full suite, opens the pull request and has GPT-6-Luna review it at high
-  effort, fixing and reviewing again until the review comes back clean. Only
-  then does it merge (a merge commit, never a squash) and fast-forward the
-  main checkout, so the next launch runs what merged. Each flag is a
+  It gathers the lanes you name, or every lane with an unmerged `Task done`
+  commit, into one `integrate/` branch. If the base branch has
+  `docs/agents/integration.md`, the integrator follows it. AI Hive's own
+  has it bump the version and CHANGELOG, run the full suite and
+  fast-forward the main checkout after the merge, so the next launch runs
+  what merged. A project without that file gets the default: run the
+  project's tests, open the pull request, have GPT-6-Luna review it at high
+  effort until the review comes back clean, then merge (a merge commit,
+  never a squash). The default never touches your main checkout, it tells
+  you the base moved so you pull when you're ready. Each flag is a
   `LANE-DONE` line in `session.log`. The integrator needs `Bash(git:*)` and
   `PowerShell(git:*)` allowed, and every lane of a repository shares the main
   checkout's Claude auto-memory.

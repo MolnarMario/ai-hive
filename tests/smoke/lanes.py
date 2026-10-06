@@ -2481,6 +2481,41 @@ def test_lane_prompt_commit_rule():
           and "Run the tests that cover" not in integrator, integrator)
 
 
+def test_integrator_prompt_project_neutral():
+    """Every workspace's integrator got AI Hive's own release steps: bump
+    the version and CHANGELOG, then pull main into the main checkout. In
+    another project that checkout is the user's working copy. The prompt
+    now defers those steps to the base branch's integration doc and,
+    without one, leaves the main checkout alone. The merge gate holds
+    either way."""
+    from app import coordination
+
+    lane = {"root": "C:/p.lanes/i-1", "branch": "hive/i-1", "base": "dev",
+            "repo": "C:/p"}
+    prompt = coordination.system_prompt_text(
+        "WS", "Agent 3", "C:/p/.aihive/board.md", lane=lane, aware=True,
+        integrator=True)
+    check("integ-neutral: the project's integration doc on the base leads",
+          "If dev has docs/agents/integration.md, read it from dev and "
+          "follow it" in prompt, prompt)
+    check("integ-neutral: no unconditional version or CHANGELOG bump",
+          "bump the version and the CHANGELOG once" not in prompt
+          and "Bump a version or edit a CHANGELOG only when that doc asks"
+          in prompt, prompt)
+    check("integ-neutral: without the doc the main checkout is left alone",
+          "update the main checkout at C:/p only when it says to" in prompt
+          and "Otherwise leave it alone and tell the user dev moved"
+          in prompt
+          and "bring the main checkout" not in prompt, prompt)
+    check("integ-neutral: a clean GPT-6-Luna review gates the merge, doc "
+          "or no doc", "Whatever the doc says, merge only your own pull "
+          "request and only after a clean GPT-6-Luna review" in prompt,
+          prompt)
+    check("integ-neutral: no AI Hive test command or file in the prompt",
+          "smoke_test" not in prompt and "app/__init__" not in prompt,
+          prompt)
+
+
 def test_lane_include_local_changes():
     """A50's repro: a lane's ignored `.env` (copied in by .worktreeinclude)
     was deleted with the lane, edits and all, because `git status` hides
