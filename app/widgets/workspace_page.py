@@ -285,7 +285,6 @@ class WorkspacePage(QWidget):
         hl.addWidget(self.lanes_box)
         hl.addWidget(self.open_btn)
         hl.addWidget(self.change_btn)
-        hl.addSpacing(8)
         hl.addWidget(self.grid_button)
         hl.addWidget(self.map_btn)
         hl.addWidget(self.activity_btn)
