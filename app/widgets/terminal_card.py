@@ -212,15 +212,18 @@ def _snippet(text: str, limit: int = 140) -> str:
 
 
 class _CardHeader(QFrame):
-    """The card's title bar, which doubles as its drag handle and carries the
-    card's action menu. A left-drag from EMPTY header space past a small
-    threshold starts a reorder drag; the buttons consume their own presses, so
-    they never drag, while the labels (name/model/summary/usage) don't consume
-    presses, so the whole strip except the buttons is grabbable — exactly the
-    area the user asked to drag from. A plain click (no movement) is left
-    alone, so double-click-to-rename on the title still works. A RIGHT-click
-    opens start/stop/restart/assign: those are rare, deliberate actions, and
-    the four buttons they used to occupy were worth more as summary space."""
+    """The card's title bar, which doubles as its drag handle. A left-drag
+    from EMPTY header space past a small threshold starts a reorder drag; the
+    buttons consume their own presses, so they never drag, while the labels
+    (name/model/summary/usage) don't consume presses, so the whole strip
+    except the buttons is grabbable — exactly the area the user asked to drag
+    from. A plain click (no movement) is left alone, so double-click-to-rename
+    on the title still works.
+
+    There is no right-click menu any more. Start / Stop / Restart / Assign and
+    the lane actions it carried live in the hover tray (see _HeaderTools),
+    where the user can find them: the user forgot a right-click menu on a
+    title bar was there at all."""
 
     _SLOP = 8
 
@@ -253,13 +256,9 @@ class _CardHeader(QFrame):
         self._press = None
         super().mouseReleaseEvent(event)
 
-    def contextMenuEvent(self, event):
-        self._card.show_actions_menu(event.globalPos())
-        event.accept()
-
 
 class _ToolsTray(QFrame):
-    """The floating strip that carries A- / A+ / maximize while the pointer is
+    """The floating strip that carries the card's actions while the pointer is
     on the header tools.
 
     It is a child of the HEADER, not of `_HeaderTools`, so it can hang out to
@@ -286,14 +285,19 @@ class _ToolsTray(QFrame):
 
 
 class _HeaderTools(QWidget):
-    """The header's secondary buttons (A- / A+ / maximize), collapsed to a
-    narrow strip until the pointer is over them.
+    """The card's action buttons (start, stop, restart, assign, the lane
+    actions, scheduled send, A- / A+ / maximize), collapsed to a narrow "⋯"
+    strip until the pointer is over them.
 
-    They cost ~100px of every header for actions that all have keyboard
-    equivalents, and that width comes straight out of the task summary, which
-    is the thing that tells two agents apart on a split screen. Collapsing
-    them gives it back without hiding them anywhere the user has to go
-    looking for.
+    Laid out permanently they would cost ~300px of every header, and that
+    width comes straight out of the task summary, which is the thing that
+    tells two agents apart on a split screen. Collapsing them gives it back
+    without hiding them anywhere the user has to go looking for. Each button
+    is a single glyph, so each carries a tooltip that names its action.
+
+    `before_open` runs just before the tray shows, so the card sets which
+    buttons are enabled, and which are offered at all (`withhold`), from the
+    agent's state at that moment.
 
     THE EXPANDED BUTTONS DO NOT LIVE IN THE HEADER'S LAYOUT, and that is the
     invariant here. This widget's own footprint is FIXED at the hint width for
@@ -322,6 +326,8 @@ class _HeaderTools(QWidget):
         super().__init__(parent)
         self._open = False
         self._buttons = []
+        self._withheld = set()
+        self.before_open = None
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
@@ -329,7 +335,7 @@ class _HeaderTools(QWidget):
         self.hint.setObjectName("CardToolsHint")
         self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.hint.setFixedWidth(self._HINT_W)
-        self.hint.setToolTip("Font size and maximize")
+        self.hint.setToolTip("Agent actions")
         lay.addWidget(self.hint)
         self.setFixedWidth(self._HINT_W)
         self.tray = _ToolsTray(self, parent)
@@ -349,6 +355,21 @@ class _HeaderTools(QWidget):
         btn.hide()
         self._buttons.append(btn)
         self.tray.layout().addWidget(btn)
+
+    def is_open(self) -> bool:
+        return self._open
+
+    def withhold(self, btn, on: bool) -> None:
+        """Keep `btn` out of the tray (True) or offer it again (False). A
+        withheld button takes no room. One that applies but can't run right
+        now is disabled instead, so its tooltip can say why."""
+        if on:
+            self._withheld.add(btn)
+        else:
+            self._withheld.discard(btn)
+        if self._open:
+            btn.setVisible(not on)
+            self._place_tray()
 
     def _place_tray(self) -> None:
         """Right-align the tray on this strip, inside the header.
@@ -372,9 +393,11 @@ class _HeaderTools(QWidget):
         if on == self._open:
             return
         self._open = on
+        if on and self.before_open is not None:
+            self.before_open()
         self.hint.setVisible(not on)
         for b in self._buttons:
-            b.setVisible(on)
+            b.setVisible(on and b not in self._withheld)
         if on:
             self._place_tray()          # before show(), or it flashes at 0,0
             self.tray.show()
@@ -422,7 +445,7 @@ class TerminalCard(QFrame):
     maximizeRequested = Signal(object)  # self (toggle solo view of this card)
     fileActivated = Signal(str)      # abs path Ctrl+clicked in the conversation
     scheduleRequested = Signal(str, str)  # agent id, text to prefill (may be "")
-    # the lane chip's and the header menu's lane actions: agent id, "open" |
+    # the lane chip's and the action tray's lane actions: agent id, "open" |
     # "refresh" (app/lanes.py) | "submit" | "integrator" (app/integration.py)
     # | "adopt" (Restart in own lane)
     laneActionRequested = Signal(str, str)
@@ -444,8 +467,9 @@ class TerminalCard(QFrame):
         # what the lane poller last saw in this agent's lane (lanes.LaneView),
         # or None before its first read. Transient view state.
         self._lane_view = None
-        # the integration queue's view of this agent, asked when a menu opens
-        # or the lane chip repaints: callable(agent) -> dict with "integrator"
+        # the integration queue's view of this agent, asked when the action
+        # tray or a menu opens or the lane chip repaints: callable(agent) ->
+        # dict with "integrator"
         # (bool), "role", "submit", "remove_merged" and "adopt" ((label,
         # enabled, tooltip) or absent).
         # Set by WorkspacePage; None when nothing provides it.
@@ -570,7 +594,7 @@ class TerminalCard(QFrame):
 
         header = self.header = _CardHeader(self, self)
         header.setObjectName("CardHeader")
-        header.setToolTip("Drag to reorder this agent, right-click for actions")
+        header.setToolTip("Drag to reorder this agent")
         header.setFixedHeight(38)   # room for the larger 14px glyph buttons
         hl = QHBoxLayout(header)
         hl.setContentsMargins(8, 0, 6, 0)
@@ -683,13 +707,35 @@ class TerminalCard(QFrame):
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             return b
 
-        # Only the buttons worth their width live here. Start / Stop / Restart /
-        # Assign moved to the header's right-click menu: the terminal itself is
-        # how this app is driven (any keystroke wakes a stopped card), so those
-        # four were spending ~130px of every header on actions nobody clicks.
-        # The three that remain are hover-revealed (see _HeaderTools): each has
-        # a keyboard equivalent, so their idle width belongs to the summary.
+        # Every card action is hover-revealed behind the "⋯" strip (see
+        # _HeaderTools): the terminal itself is how this app is driven (any
+        # keystroke wakes a stopped card), so their idle width belongs to the
+        # summary. Glyphs only, so every one gets a tooltip naming it.
+        # _refresh_actions sets their enablement each time the tray opens.
         self.header_tools = _HeaderTools(header)
+        self.header_tools.before_open = self._refresh_actions
+        self.btn_start = tool("▶", "CardStart", "Start", self.header_tools)
+        self.btn_stop = tool("■", "CardStop",
+                             "Stop (Ctrl+C, then terminate)" if self.is_pty
+                             else "Stop (graceful, stdin EOF)",
+                             self.header_tools)
+        self.btn_restart = tool("↻", "CardRestart",
+                                "Restart (kill + fresh session)",
+                                self.header_tools)
+        self.btn_assign = tool("✎", "CardAssign", "Assign or reassign a task",
+                               self.header_tools)
+        # lane scopes: an existing agent moves into its own worktree. Label
+        # and tooltip come from integration_info each time the tray opens.
+        self.btn_adopt = tool("⎇", "CardAdopt", "Restart in own lane",
+                              self.header_tools)
+        # agent lanes Phase 3: one integrator per workspace
+        self.btn_integrator = tool("⚑", "CardIntegrator", "Make integrator",
+                                   self.header_tools)
+        # the discoverable half of Ctrl+Shift+Enter (which needs the terminal
+        # focused and something typed); this opens the same dialog empty
+        self.btn_sched = tool("⏱", "CardScheduleSend",
+                              "Send a message on a countdown",
+                              self.header_tools)
         self.btn_font_dec = tool("A−", "CardFontDec", "Smaller font (Ctrl+-)",
                                  self.header_tools)
         self.btn_font_inc = tool("A+", "CardFontInc", "Larger font (Ctrl+=)",
@@ -698,8 +744,14 @@ class TerminalCard(QFrame):
         # never touches sibling processes (see WorkspacePage.toggle_solo)
         self.btn_max = tool("⤢", "CardMaximize", "Maximize (focus this agent)",
                             self.header_tools)
-        for _b in (self.btn_font_dec, self.btn_font_inc, self.btn_max):
+        for _b in (self.btn_start, self.btn_stop, self.btn_restart,
+                   self.btn_assign, self.btn_adopt, self.btn_integrator,
+                   self.btn_sched, self.btn_font_dec, self.btn_font_inc,
+                   self.btn_max):
             self.header_tools.add(_b)
+        self.header_tools.withhold(self.btn_adopt, True)
+        self.header_tools.withhold(self.btn_integrator, True)
+        self.header_tools.withhold(self.btn_sched, not self.is_pty)
         hl.addWidget(self.header_tools)
         # the usage chip sits between the collapsed tools and the close button,
         # so the strip that reveals them is the space to the chip's LEFT
@@ -776,6 +828,17 @@ class TerminalCard(QFrame):
         self.title.installEventFilter(self)        # double-click to rename
         self.title_edit.installEventFilter(self)   # Esc cancels, focus-out commits
         self.title_edit.returnPressed.connect(self._commit_rename)
+        self.btn_start.clicked.connect(self.agent.start)
+        self.btn_stop.clicked.connect(self.agent.stop)
+        self.btn_restart.clicked.connect(self.agent.restart)
+        self.btn_assign.clicked.connect(
+            lambda: self.reassignRequested.emit(self.agent.id))
+        self.btn_adopt.clicked.connect(
+            lambda: self.laneActionRequested.emit(self.agent.id, "adopt"))
+        self.btn_integrator.clicked.connect(
+            lambda: self.laneActionRequested.emit(self.agent.id, "integrator"))
+        self.btn_sched.clicked.connect(
+            lambda: self.scheduleRequested.emit(self.agent.id, ""))
         self.btn_max.clicked.connect(lambda: self.maximizeRequested.emit(self))
         self.btn_close.clicked.connect(self._on_close_clicked)
         self.btn_font_dec.clicked.connect(lambda: self._font_delta(-1))
@@ -828,68 +891,25 @@ class TerminalCard(QFrame):
         sb.valueChanged.connect(self._on_scroll_value)
         sb.rangeChanged.connect(self._on_scroll_range)
 
-    def show_actions_menu(self, global_pos) -> None:
-        """The card's lifecycle actions, opened by right-clicking the header.
-        These used to be four permanent header buttons; the menu keeps every one
-        of them reachable while giving the row back to the summary. Enablement
-        follows the same status rules the buttons used."""
+    def _refresh_actions(self) -> None:
+        """Set the action tray's buttons from the agent's state right now.
+        Runs as the tray opens, and on a status change while it is open, so
+        a button the user can see is never enabled for an action its agent
+        can't take. Enablement follows the rules the right-click menu used."""
         status = self.agent.status
-        running = status in (AgentStatus.STARTING, AgentStatus.RUNNING)
-        menu = QMenu(self)
-        act_start = QAction("Start", menu)
-        act_start.triggered.connect(self.agent.start)
-        act_start.setEnabled(status is AgentStatus.IDLE or status in _ENDED)
-        act_stop = QAction("Stop (Ctrl+C, then terminate)" if self.is_pty
-                           else "Stop (graceful, stdin EOF)", menu)
-        act_stop.triggered.connect(self.agent.stop)
-        act_stop.setEnabled(running)
-        act_restart = QAction("Restart (kill + fresh session)", menu)
-        act_restart.triggered.connect(self.agent.restart)
-        act_assign = QAction("Assign / reassign a task…", menu)
-        act_assign.triggered.connect(
-            lambda: self.reassignRequested.emit(self.agent.id))
-        for act in (act_start, act_stop, act_restart, act_assign):
-            menu.addAction(act)
+        self.btn_start.setEnabled(status is AgentStatus.IDLE
+                                  or status in _ENDED)
+        self.btn_stop.setEnabled(status in (AgentStatus.STARTING,
+                                            AgentStatus.RUNNING))
         info = self._integration()
-        adopt = info.get("adopt")
-        if adopt:
-            # lane scopes: an existing agent moves into its own worktree
-            menu.setToolTipsVisible(True)
-            label, enabled, tip = adopt
-            act_adopt = QAction(label, menu)
-            act_adopt.setEnabled(enabled)
-            act_adopt.setToolTip(tip)
-            act_adopt.triggered.connect(
-                lambda: self.laneActionRequested.emit(self.agent.id, "adopt"))
-            menu.addAction(act_adopt)
-        role = info.get("role")
-        if role:
-            # agent lanes Phase 3: one integrator per workspace
-            menu.setToolTipsVisible(True)
-            label, enabled, tip = role
-            act_role = QAction(label, menu)
-            act_role.setEnabled(enabled)
-            act_role.setToolTip(tip)
-            act_role.triggered.connect(
-                lambda: self.laneActionRequested.emit(self.agent.id,
-                                                      "integrator"))
-            menu.addAction(act_role)
-        menu.addSeparator()
-        # the discoverable half of Ctrl+Shift+Enter (which needs the terminal
-        # focused and something typed); this opens the same dialog empty
-        act_sched = QAction("Send a message on a countdown…", menu)
-        act_sched.triggered.connect(
-            lambda: self.scheduleRequested.emit(self.agent.id, ""))
-        act_sched.setEnabled(self.is_pty)
-        menu.addAction(act_sched)
-        menu.addSeparator()
-        act_max = QAction("Maximize (focus this agent)", menu)
-        act_max.triggered.connect(lambda: self.maximizeRequested.emit(self))
-        menu.addAction(act_max)
-        act_close = QAction("Close terminal", menu)
-        act_close.triggered.connect(self._on_close_clicked)
-        menu.addAction(act_close)
-        menu.exec(global_pos)
+        for btn, key in ((self.btn_adopt, "adopt"),
+                         (self.btn_integrator, "role")):
+            offer = info.get(key)
+            self.header_tools.withhold(btn, not offer)
+            if offer:
+                label, enabled, tip = offer
+                btn.setEnabled(bool(enabled))
+                btn.setToolTip(f"{label}\n\n{tip}" if tip else label)
 
     def _begin_reorder_drag(self) -> None:
         """Start a drag the WorkspacePage turns into a card reorder. Carries the
@@ -2003,6 +2023,8 @@ class TerminalCard(QFrame):
         if exit_info and not running:
             tip += f" (code {exit_info[0]})"
         self.glyph.setToolTip(tip)
+        if self.header_tools.is_open():
+            self._refresh_actions()
 
         # A start that RESUMES a conversation reprints that whole conversation
         # itself, so the snapshot underneath it is a duplicate — and one
