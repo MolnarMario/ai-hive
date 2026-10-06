@@ -206,6 +206,10 @@ class WorkspacePage(QWidget):
         self.path_label = QLabel(self.workspace.project_path, header)
         self.path_label.setObjectName("HeaderPath")
         self.path_label.setToolTip(self.workspace.project_path)
+        # a QLabel's minimum size is its whole text, which would hold the
+        # window at least as wide as the full path plus every button and
+        # leave _elide_path nothing to elide. 60 is _path_budget's floor.
+        self.path_label.setMinimumWidth(60)
 
         def tool(text, tip, obj="", icon=""):
             b = IconToolButton(icon, header) if icon else QToolButton(header)
@@ -451,26 +455,26 @@ class WorkspacePage(QWidget):
         live: a wide window still showed "C:/Users…/ai-hive" with a large gap
         of empty space before the buttons)."""
         path = getattr(self, "_full_path", self.workspace.project_path)
-        hl = getattr(self, "_header_lay", None)
-        if hl is None:
-            available = max(60, self.path_label.width())
-        else:
-            margins = hl.contentsMargins()
-            used = margins.left() + margins.right()
-            used += hl.spacing() * max(0, hl.count() - 1)
-            for i in range(hl.count()):
-                item = hl.itemAt(i)
-                if item.widget() is self.path_label or (
-                        item.widget() is not None and item.widget().isHidden()):
-                    continue
-                if item.widget() is not None:
-                    used += item.widget().sizeHint().width()
-                elif item.spacerItem() is not None:
-                    used += item.spacerItem().sizeHint().width()
-            available = max(60, self.width() - used)
         fm = QFontMetrics(self.path_label.font())
         self.path_label.setText(fm.elidedText(
-            path, Qt.TextElideMode.ElideMiddle, available))
+            path, Qt.TextElideMode.ElideMiddle, self._path_budget()))
+
+    def _path_budget(self) -> int:
+        """The width the header row leaves the path label. The row holds
+        widgets only, no spacer items. QBoxLayout puts no spacing beside a
+        hidden widget, so only the visible ones count: charging the hidden
+        lanes box its 6px slot elided the path that much too early."""
+        hl = getattr(self, "_header_lay", None)
+        if hl is None:
+            return max(60, self.path_label.width())
+        others = [hl.itemAt(i).widget() for i in range(hl.count())]
+        others = [w for w in others if w is not None
+                  and w is not self.path_label and not w.isHidden()]
+        margins = hl.contentsMargins()
+        used = (margins.left() + margins.right()
+                + hl.spacing() * len(others)
+                + sum(w.sizeHint().width() for w in others))
+        return max(60, self.width() - used)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

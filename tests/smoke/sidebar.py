@@ -526,17 +526,28 @@ def test_workspace_header():
           (idx_delete, idx_open, idx_change))
 
     # one gap between every header button: a spacer item between Change and
-    # Layout once made that gap 20px against the 6px everywhere else
+    # Layout once made that gap 20px against the 6px everywhere else. The
+    # lanes box is shown so its two gaps are measured too.
+    page.set_lanes_state(False, available=True)
     page.resize(1400, 600)
     page.show()
     app.processEvents()
-    row = [page.open_btn, page.change_btn, page.grid_button, page.map_btn,
-           page.activity_btn]
+    row = order[order.index(page.delete_btn):]
     gaps = [b.geometry().left() - a.geometry().right() - 1
             for a, b in zip(row, row[1:])]
+    spacing = page._header_lay.spacing()
+    check("workspace header: every button from Delete to Activity sits one "
+          "layout spacing from the next",
+          len(row) == 8 and all(w.isVisible() for w in row)
+          and gaps == [spacing] * (len(row) - 1),
+          (spacing, gaps, [w.isVisible() for w in row]))
+    page.set_lanes_state(False, available=False)
+    app.processEvents()
+    check("workspace header: the path gets exactly the width the row leaves "
+          "it when the lanes box is hidden",
+          page.path_label.width() == page._path_budget(),
+          (page.path_label.width(), page._path_budget()))
     page.hide()
-    check("workspace header: same gap between Open folder, Change, Layout, "
-          "Map and Activity", len(set(gaps)) == 1, gaps)
 
     deleted = []
     page.deleteRequested.connect(deleted.append)
