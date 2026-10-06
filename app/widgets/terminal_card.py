@@ -23,7 +23,7 @@ from ..process_worker import AI_KINDS, describe_pid
 from ..terminal_agent import (STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
                               TerminalAgent)
 from ..ui_theme import Palette, repolish
-from .ornaments import BootVeil, ElidingLabel
+from .ornaments import BootVeil, ElidingLabel, close_on_anchor_press
 from .terminal_view import is_reply_footer
 
 _LINE_BREAKS = re.compile(r"[\r\n]")
@@ -1024,6 +1024,7 @@ class TerminalCard(QFrame):
             act_all = QAction(f"Kill all {len(pids)}", menu)
             act_all.triggered.connect(self.agent.kill_bg_shell_extras)
             menu.addAction(act_all)
+        close_on_anchor_press(menu, self.bg_mark)
         menu.exec(self.bg_mark.mapToGlobal(self.bg_mark.rect().bottomLeft()))
 
     def refresh_schedule(self) -> None:
@@ -1138,6 +1139,7 @@ class TerminalCard(QFrame):
     def _show_lane_menu(self) -> None:
         menu = self._lane_menu()
         if menu is not None:
+            close_on_anchor_press(menu, self.lane_mark)
             menu.exec(self.lane_mark.mapToGlobal(
                 self.lane_mark.rect().bottomLeft()))
 

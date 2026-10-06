@@ -59,7 +59,7 @@ from .lanes_help import show_lanes_explainer
 from . import ornaments
 from .ornaments import (DropDownComboBox, LogoRoundel,
                         PageBorder, PlanUsageBadge, RefreshGlyphButton,
-                        ToggleSwitch)
+                        ToggleSwitch, close_on_anchor_press)
 from .options_panel import OptionsPanel
 from .sidebar import SIDEBAR_WIDTH, Sidebar
 
@@ -1144,6 +1144,7 @@ class TopBar(QFrame):
 
     def _open_tracker_menu(self) -> None:
         menu = self.build_tracker_menu()
+        close_on_anchor_press(menu, self.usage_add_btn)
         menu.exec(self.usage_add_btn.mapToGlobal(
             QPoint(0, self.usage_add_btn.height())))
 
