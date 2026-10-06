@@ -215,12 +215,6 @@ LIMIT_UNKNOWN_WAIT_S = 5 * 3600 + 600
 # poll, never git.
 NUDGE_TICK_MS = 5000
 
-
-def _printable(text: str) -> str:
-    """`text` without control characters, for a line typed into an agent:
-    a newline or escape in an agent's name must not split the note."""
-    return "".join(ch for ch in text if ch.isprintable())
-
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [
     ("AI agents", [
@@ -2236,10 +2230,11 @@ class MainWindow(QMainWindow):
             self.manager, self.lane_ops,
             skip=lambda uid: uid in self._lane_pending,
             audit=self._store_audit, parent=self)
-        # "Task done" lane commits, as {(lane uid, sha)}: seen (logged once)
-        # and passed on to the integrator. Transient: after a restart an
-        # unmerged flagged lane is passed on once more, and the integrator
-        # skips whatever the base already has.
+        # "Task done" lane commits: seen, as {(lane uid, sha)} (logged
+        # once), and passed on, as {(integrator uid, lane uid, sha)}, so a
+        # new integrator hears again what the old one may not have shipped.
+        # Transient: after a restart an unmerged flagged lane is passed on
+        # once more, and the integrator skips whatever the base has.
         self._done_seen: set = set()
         self._nudged: set = set()
         # lanes being fast-forwarded on their own (_refresh_idle_lanes)
@@ -4512,18 +4507,20 @@ class MainWindow(QMainWindow):
         """Tell the workspace's idle integrator about lanes whose agent
         committed "Task done" since it last heard. Reads only what the lane
         service last saw: the integrator does the git work itself. A flag
-        seen with no integrator around is logged and noted on its card once,
-        and passed on as soon as there is one."""
+        seen with no integrator around, or one that isn't running, is
+        logged and noted on its card once, and passed on as soon as there is
+        an idle one."""
         ws = self.manager.workspace(ws_id)
         if ws is None:
             return
         integrator = self.manager.integrator(ws_id)
+        who = integrator.spec.uid if integrator is not None else ""
         fresh = []
         for agent in ws.agents:
             view = (self.lane_service.view(agent.spec.uid)
                     if agent.spec.lane else None)
             if (view is None or not view.done or agent is integrator
-                    or (agent.spec.uid, view.done) in self._nudged):
+                    or (who, agent.spec.uid, view.done) in self._nudged):
                 continue
             fresh.append((agent, view))
             key = (agent.spec.uid, view.done)
@@ -4540,17 +4537,25 @@ class MainWindow(QMainWindow):
                 agent.notice("[work marked done, but this workspace has no "
                              "integrator to ship it. Make one with the flag "
                              "in a laned Claude agent's tray.]")
+            elif not integrator.is_running():
+                agent.notice(f"[work marked done, but the integrator "
+                             f"{integrator.spec.name} isn't running. Start "
+                             f"it to ship this work.]")
         if (not fresh or integrator is None
                 or not self._integrator_idle(integrator)):
             return
-        lines = [f"- {_printable(a.spec.name)}: branch {v.branch}, "
-                 f"\"Task done\" at {v.done}" for a, v in fresh]
+        lines = [f"- {session_hook.printable(a.spec.name)}: branch "
+                 f"{v.branch}, \"Task done\" at {v.done}" for a, v in fresh]
+        base = integrator.spec.lane.get("base") or "main"
         integrator.deliver_task(
             "[AI Hive] These lanes have finished work to integrate:\n"
             + "\n".join(lines)
-            + "\nFollow docs/agents/integration.md.",
+            + f"\nFollow the checklist as it is on {base}, not your lane's "
+              f"copy: git show origin/{base}:docs/agents/integration.md. If "
+              f"your own integrate/ pull request is still open, add these "
+              f"lanes to it instead of starting another.",
             title="Integrating finished lanes")
-        self._nudged.update((a.spec.uid, v.done) for a, v in fresh)
+        self._nudged.update((who, a.spec.uid, v.done) for a, v in fresh)
         self._store_audit(
             f"NUDGE integrator={integrator.spec.name!r} lanes="
             + ",".join(f"{v.branch}@{v.done[:7]}" for _a, v in fresh))
@@ -4613,7 +4618,7 @@ class MainWindow(QMainWindow):
     def _file_names(paths: list, shown: int = 3) -> str:
         """"a.py, b.py, c.py (+2 more)" for a notice. Control characters
         are dropped: a file name is not AI Hive's text."""
-        names = [_printable(p) for p in paths]
+        names = [session_hook.printable(p) for p in paths]
         more = len(names) - shown
         return ", ".join(names[:shown]) + (f" (+{more} more)" if more > 0
                                             else "")

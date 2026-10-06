@@ -600,9 +600,10 @@ def lane_notice_context(env=None, now: float = 0.0) -> str:
             "changed files you also changed):\n" + body)
 
 
-def _printable(text: str) -> str:
-    """A file name as plain text for the model: control characters (an ESC,
-    a newline in a name) dropped."""
+def printable(text: str) -> str:
+    """Text from outside AI Hive (a file name, an agent name) as plain text
+    for a model or a notice: control characters (an ESC, a newline in a
+    name) dropped. MainWindow uses it too."""
     return "".join(ch for ch in text
                    if ch >= " " and not "\x7f" <= ch <= "\x9f")
 
@@ -630,7 +631,7 @@ def _lane_dirty_files(root: str):
         if len(tok) < 4:
             continue
         files.append(tok[3:])
-        if tok[0] in "RC":
+        if tok[0] in "RC" or tok[1] in "RC":
             i += 1          # -z puts a rename's old name in the next token
     return files
 
@@ -666,7 +667,7 @@ def lane_stop_decision(payload: dict, env=None, now: float = 0.0) -> str:
     if not files:
         return ""
     n = len(files)
-    names = ", ".join(_printable(f)[:120] for f in files[:STOP_FILES_SHOWN])
+    names = ", ".join(printable(f)[:120] for f in files[:STOP_FILES_SHOWN])
     if n > STOP_FILES_SHOWN:
         names += f", +{n - STOP_FILES_SHOWN} more"
     return (f"AI Hive: your lane has {n} uncommitted "

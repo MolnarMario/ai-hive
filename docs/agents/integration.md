@@ -25,6 +25,10 @@ Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
 
 ## Checklist
 
+0. If your own `integrate/` pull request is still open, don't start a new
+   one: merge the newly flagged commits into that branch (step 2), keep its
+   one version bump, and carry on from step 4. Two open integration PRs
+   would fight over the version and the CHANGELOG.
 1. `git fetch origin`. Find every lane with finished work that main lacks,
    not only the ones the note named. Work left over from earlier counts too:
    ```

@@ -602,7 +602,8 @@ class LaneStatus:
         """The file names in `dirty`, which holds `status --porcelain` lines.
         The runner strips its output, so the first line may have lost the
         space in front of its status: split on whitespace instead of
-        slicing. A rename gives its new name."""
+        slicing. A rename gives its new name. A name git quoted (spaces at
+        the ends, non-ASCII with core.quotePath) is unquoted back to UTF-8."""
         out = []
         for line in self.dirty:
             parts = line.strip().split(None, 1)
@@ -610,9 +611,20 @@ class LaneStatus:
                 continue
             path = parts[1].split(" -> ")[-1]
             if len(path) > 1 and path[0] == path[-1] == '"':
-                path = path[1:-1]
+                path = _unquote_c(path[1:-1])
             out.append(path)
         return out
+
+
+def _unquote_c(text: str) -> str:
+    """git's C-style quoting undone: octal escapes back to the UTF-8 name,
+    and `\\t`, `\\"` and `\\\\` back to themselves. The text as it was
+    when it doesn't decode."""
+    try:
+        raw = text.encode("ascii").decode("unicode_escape")
+        return raw.encode("latin-1").decode("utf-8")
+    except (UnicodeError, ValueError):
+        return text
 
 
 def lane_status(lane: dict) -> LaneStatus:
@@ -1243,8 +1255,13 @@ def _done_commit(root: str, head: str, base_ref: str, cache) -> str:
     key = ("done", head, r.out)
     if cache is not None and key in cache:
         return cache[key]
-    m = git(["log", "-1", "--format=%H", "--right-only", "--cherry-pick",
-             "-i", "-E", f"--grep={DONE_GREP}", f"{r.out}...{head}"], root)
+    grep = ["log", "-1", "--format=%H", "-i", "-E", f"--grep={DONE_GREP}"]
+    # the cheap read first: most lanes have no flag at all, and only a
+    # flagged one is worth the patch ids --cherry-pick computes
+    m = git(grep + [f"{r.out}..{head}"], root)
+    if m.ok and m.out:
+        m = git(grep + ["--right-only", "--cherry-pick",
+                        f"{r.out}...{head}"], root)
     done = m.out if m.ok else ""
     if cache is not None:
         cache[key] = done

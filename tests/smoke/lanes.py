@@ -2200,7 +2200,7 @@ def test_lane_stop_nudge():
         check("lane-stop: past three names the rest are counted",
               "5 uncommitted files" in reason and "+2 more" in reason, reason)
         check("lane-stop: control characters are stripped from names",
-              session_hook._printable("a\x1b[31m\nb\x9b") == "a[31mb")
+              session_hook.printable("a\x1b[31m\nb\x9b") == "a[31mb")
 
         events = tmp / "events.jsonl"
         events.write_text("")
@@ -3838,6 +3838,11 @@ def test_task_done_nudges_the_integrator():
               and lanes.DONE_MARK in i.spec.system_prompt)
         check("nudge: an integrator that isn't idle is not typed into",
               not delivered, delivered)
+        flag(a, "3" * 40)
+        win._nudge_integrators()
+        check("nudge: an integrator that isn't running is named on the "
+              "flagged card", len(told) == 2 and "isn't running" in told[1]
+              and "Integrator" in told[1], told)
         for attr, value in (("is_running", True), ("prompt_ready", True),
                             ("is_busy", False), ("is_waiting", False),
                             ("is_limit_blocked", False)):
@@ -3848,8 +3853,9 @@ def test_task_done_nudges_the_integrator():
               "branch and the flagged commit", len(delivered) == 1
               and "Agent A" in delivered[0]
               and a.spec.lane["branch"] in delivered[0]
-              and sha1 in delivered[0]
-              and "docs/agents/integration.md" in delivered[0], delivered)
+              and "3" * 40 in delivered[0]
+              and "origin/main:docs/agents/integration.md" in delivered[0]
+              and "still open" in delivered[0], delivered)
         check("nudge: ...never about its own lane",
               delivered and "e" * 40 not in delivered[0], delivered)
         win._nudge_integrators()
@@ -3858,6 +3864,19 @@ def test_task_done_nudges_the_integrator():
         win._nudge_integrators()
         check("nudge: a newer Task done commit is passed on again",
               len(delivered) == 2 and sha2 in delivered[1], delivered)
+        # a new integrator hears what the old one may not have shipped
+        j = laned("Integrator 2", "d1e1ff" + "0" * 26)
+        app.processEvents()
+        got_j = []
+        j.deliver_task = lambda text, title="": got_j.append(text)
+        for attr, value in (("is_running", True), ("prompt_ready", True),
+                            ("is_busy", False), ("is_waiting", False),
+                            ("is_limit_blocked", False)):
+            setattr(j, attr, lambda v=value: v)
+        win._toggle_integrator(ws.id, j)
+        check("nudge: a replacement integrator is told about the flagged "
+              "lanes again", len(got_j) == 1 and sha2 in got_j[0]
+              and len(delivered) == 2, (got_j, delivered))
         for agent in list(ws.agents):
             win._close_agent(ws.id, agent.id)
         win.lane_ops.drain(60)
@@ -3959,11 +3978,13 @@ def test_lane_uncommitted_notices():
         rb = b.spec.lane["root"]
         (Path(rb) / "a.txt").write_text("B's edit\n")
         (Path(rb) / "sub" / "new.txt").write_text("new\n")
+        (Path(rb) / "caf\u00e9.txt").write_text("x\n")
         box = close_and_read(b)
         check("lane-dirty: a lane kept only for uncommitted files names them "
-              "and says its commits are in the base",
-              box is not None and os.path.isdir(rb)
-              and "2 uncommitted files (a.txt, sub/new.txt)" in box.text()
+              "(a non-ASCII name as itself) and says its commits are in the "
+              "base", box is not None and os.path.isdir(rb)
+              and "3 uncommitted files (a.txt, caf\u00e9.txt, sub/new.txt)"
+              in box.text()
               and "Its commits are all on" in box.text()
               and "—" not in box.text(),
               box.text() if box else None)
