@@ -335,7 +335,9 @@ def _leave_merged_branch(runner, repo: str) -> None:
     main lacks. A session that worked here on a branch leaves the folder on
     it after its PR merges, and every update after that is blocked. `git
     cherry` compares patches, so commits that reached main under new hashes
-    (a cherry-pick, an integration branch) count as merged."""
+    (a cherry-pick, an integration branch) count as merged. It skips merge
+    commits, though, and a merge can carry conflict resolutions, so a branch
+    with a merge commit main lacks is never left."""
     rc, out = runner(_git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
                      GIT_TIMEOUT_S)
     branch = _first_line(out) if rc == 0 else ""
@@ -343,6 +345,10 @@ def _leave_merged_branch(runner, repo: str) -> None:
         return
     rc, out = runner(_git(repo, "status", "--porcelain",
                           "--untracked-files=no"), GIT_TIMEOUT_S)
+    if rc != 0 or out.strip():
+        return
+    rc, out = runner(_git(repo, "rev-list", "--merges", f"{UPSTREAM}..HEAD"),
+                     GIT_TIMEOUT_S)
     if rc != 0 or out.strip():
         return
     rc, out = runner(_git(repo, "cherry", UPSTREAM, "HEAD"), GIT_TIMEOUT_S)

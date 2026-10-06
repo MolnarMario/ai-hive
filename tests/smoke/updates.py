@@ -1788,6 +1788,22 @@ def test_startup_update():
           and "wip" in (user / "notes.txt").read_text(encoding="utf-8"),
           (res, branch(user)))
 
+    # git cherry skips merges: a branch whose plain commits all reached main
+    # but that holds its own merge (a conflict resolution) must stay put
+    _, user, dev = setup("merge-commit")
+    git(user, "switch", "-q", "-c", "fix/side")
+    commit(user, "side.txt", "side\n", "fix: side")
+    git(user, "switch", "-q", "-c", "fix/resolve", "main")
+    commit(user, "notes.txt", "a\nresolve\n", "fix: resolve")
+    git(user, "merge", "-q", "--no-ff", "-m", "merge side", "fix/side")
+    commit(dev, "side.txt", "side\n", "fix: side")
+    commit(dev, "notes.txt", "a\nresolve\n", "fix: resolve")
+    merge_new_version(dev)
+    res = self_update.startup_update(run, str(user))
+    check("launch-update: a branch with its own merge commit is left alone",
+          res is not None and not res.ok and branch(user) == "fix/resolve"
+          and version(user) == "0.1.0", (res, branch(user)))
+
     _, user, dev = setup("dirty")
     git(user, "switch", "-q", "-c", "fix/done")
     commit(user, "notes.txt", "a\ndone\n", "fix: done")
