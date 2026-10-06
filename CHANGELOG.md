@@ -8,6 +8,12 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.30.1
+
+- The workspace header's buttons are evenly spaced again. Change and
+  Layout had a 20px gap between them while every other pair sat 6px
+  apart.
+
 ## 0.30.0
 
 - Finished work now ships without any clicks. When a laned agent finishes
