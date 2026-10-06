@@ -1972,8 +1972,8 @@ class TerminalView(QWidget):
             first-task-submit timing the SessionStart `startup` exclusion
             exists to protect.
         It also excludes what the user asked to exclude, by construction:
-        deliver_task, nudge (auto-continue's "Continue") and scheduled sends
-        all reach worker.write and never pass through a key event.
+        nudge (auto-continue's "Continue") and scheduled sends both reach
+        worker.write and never pass through a key event.
 
         The numbered-option reject is the other half of the menu guard (the
         card adds agent.is_waiting()): _INPUT_PROMPTS includes the selection

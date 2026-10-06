@@ -250,6 +250,21 @@ class DropCap(QWidget):
         p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._letter)
 
 
+def working_pulse(owner: QObject, on_value) -> QVariantAnimation:
+    """The amber "working" breath, 0 to 1 to 0 every 1.1 s, looping. The
+    count badge and the collapsed sidebar rail both use it so the two stay
+    in step. Not started: the owner starts and stops it."""
+    anim = QVariantAnimation(owner)
+    anim.setStartValue(0.0)
+    anim.setKeyValueAt(0.5, 1.0)
+    anim.setEndValue(0.0)
+    anim.setDuration(1100)
+    anim.setLoopCount(-1)
+    anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+    anim.valueChanged.connect(on_value)
+    return anim
+
+
 class AgentCountBadge(QWidget):
     """A workspace's agent tally: a rounded badge showing how many agents are
     open, colour-coded by state — pulsing amber while any agent is working,
@@ -278,14 +293,7 @@ class AgentCountBadge(QWidget):
         self._count = 0
         self._state = "empty"
         self._pulse = 0.0  # 0..1 breathing factor while working
-        self._anim = QVariantAnimation(self)
-        self._anim.setStartValue(0.0)
-        self._anim.setKeyValueAt(0.5, 1.0)
-        self._anim.setEndValue(0.0)
-        self._anim.setDuration(1100)
-        self._anim.setLoopCount(-1)
-        self._anim.setEasingCurve(QEasingCurve.Type.InOutSine)
-        self._anim.valueChanged.connect(self._on_pulse)
+        self._anim = working_pulse(self, self._on_pulse)
 
     def set_state(self, count: int, state: str) -> None:
         if state not in self._STATE_COLOR:

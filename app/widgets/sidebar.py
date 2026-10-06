@@ -38,7 +38,7 @@ import uuid
 from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent,
                             QFileSystemWatcher, QMimeData, QPoint,
                             QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer,
-                            QVariantAnimation, Signal)
+                            Signal)
 from PySide6.QtGui import (QAction, QColor, QDrag, QFont, QFontMetrics,
                            QPainter, QPen, QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
@@ -52,7 +52,7 @@ from ..process_worker import describe_pid
 from ..terminal_agent import AgentStatus
 from ..ui_theme import Palette, repolish
 from .activity_panel import _ICON
-from .ornaments import (AgentCountBadge, ElidingLabel, FadingLabel,
+from .ornaments import (AgentCountBadge, working_pulse, ElidingLabel, FadingLabel,
                         OrnamentDivider, WorkspaceSpinner,
                         close_on_anchor_press)
 
@@ -992,14 +992,7 @@ class WorkspaceRail(QWidget):
         self._entries: list[tuple[str, str, dict]] = []  # (ws_id, name, stats)
         self._active_id = ""
         self._pulse = 0.0
-        self._anim = QVariantAnimation(self)
-        self._anim.setStartValue(0.0)
-        self._anim.setKeyValueAt(0.5, 1.0)
-        self._anim.setEndValue(0.0)
-        self._anim.setDuration(1100)
-        self._anim.setLoopCount(-1)
-        self._anim.setEasingCurve(QEasingCurve.Type.InOutSine)
-        self._anim.valueChanged.connect(self._on_pulse)
+        self._anim = working_pulse(self, self._on_pulse)
 
     def set_entries(self, entries: list, active_id: str) -> None:
         entries = [(wid, name, dict(stats or {})) for wid, name, stats in entries]

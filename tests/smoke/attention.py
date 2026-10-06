@@ -1138,9 +1138,10 @@ def test_event_log():
     check("event log: a finished reply says how long it took",
           rec["kind"] == el.REPLY and "took" in rec["data"]
           and el.describe(rec).startswith("finished (took "), rec)
-    ag.deliver_task("write the docs")
-    check("event log: a task AI Hive hands over is its own kind",
-          hub.records[-1]["kind"] == el.TASK)
+    check("event log: a task row from an older log still reads as its text",
+          el.describe({"kind": el.TASK, "text": "write the docs"})
+          == 'AI Hive sent a task: "write the docs"',
+          el.describe({"kind": el.TASK, "text": "write the docs"}))
 
     ag.status = AgentStatus.RUNNING
     ag._tool_waiting = True

@@ -1400,9 +1400,9 @@ def test_v2_review_fixes():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_render_perm_mode_reassign_bridge():
-    """Private-CSI/underline fix, clipboard, the permission-mode flag, task
-    reassignment, and the named-pipe board bridge. (Was test_v3_features;
+def test_render_perm_mode_bridge():
+    """Private-CSI/underline fix, clipboard, the permission-mode flag and
+    the named-pipe board bridge. (Was test_v3_features;
     check names keep their "v3" prefix.)"""
     import threading
 
@@ -1411,7 +1411,6 @@ def test_render_perm_mode_reassign_bridge():
 
     from app import providers
     from app.process_worker import AgentKind, AgentSpec, build_spec
-    from app.terminal_agent import AssignmentState
     from app.widgets.terminal_view import TerminalView
     from app.workspace_manager import WorkspaceManager
     from main import setup_application
@@ -1467,27 +1466,8 @@ def test_render_perm_mode_reassign_bridge():
           and AgentSpec.from_dict(pm_spec.to_dict()).permission_mode
           == "acceptEdits", pm_spec.to_dict())
 
-    # --- delivering a task via a fast line-mode echo agent ---
     mgr = WorkspaceManager()
     ws = mgr.create_workspace("W", str(tmp))
-    echo = mgr.add_terminal(ws.id, build_spec(
-        AgentKind.CUSTOM, "Echo", cwd=str(tmp), program=sys.executable,
-        args=["-u", "-c", "import sys\nfor l in sys.stdin: print('did:'+l.strip(),flush=True)"]),
-        autostart=True)
-    seen = []
-    echo.output_segment.connect(lambda s, t: seen.append(t))
-    wait_until(lambda: echo.is_running(), 8000)
-    name_before, role_before = echo.spec.name, echo.spec.role
-    echo.deliver_task("now write the tests")
-    check("v3 reassign: WORKING + delivered to the existing session",
-          echo.assignment is AssignmentState.WORKING
-          and wait_until(lambda: any("did:now write the tests" in t for t in seen),
-                         8000))
-    # regression: assigning a task used to run it through a role heuristic and
-    # rename the agent to the result ("Testing Agent"), clobbering the name.
-    check("v3 reassign: never renames the agent or its kind sublabel",
-          echo.spec.name == name_before and echo.spec.role == role_before,
-          f"name={echo.spec.name} role={echo.spec.role}")
 
     # --- #3/#8 board bridge over the real named pipe: log_activity round-trips
     from app.orchestrator_bridge import OrchestratorBridge, HAS_QTNETWORK
@@ -1521,7 +1501,6 @@ def test_render_perm_mode_reassign_bridge():
         os.environ.pop("AIHIVE_WS", None)
         os.environ.pop("AIHIVE_PIPE", None)
 
-    echo.dispose()
     pump(200)
     shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2069,7 +2048,7 @@ def test_task_submit_waits_for_echo():
     floor = ta.TASK_SUBMIT_MS + 150   # past the floor, well short of the fallback
 
     a, writes = agent()
-    a.deliver_task(task)
+    a.nudge(task)
     check("submit-echo: the text is typed at once", writes == [task], writes)
     pump(floor)
     check("submit-echo: no Enter while Claude has not drawn the text (the "
@@ -2082,7 +2061,7 @@ def test_task_submit_waits_for_echo():
     check("submit-echo: exactly one Enter", writes.count("\r") == 1, writes)
 
     a, writes = agent()
-    a.deliver_task(task)
+    a.nudge(task)
     a._on_pty_output("", drawn)
     pump(100)
     check("submit-echo: an early echo still waits for the floor",
@@ -2093,7 +2072,7 @@ def test_task_submit_waits_for_echo():
 
     a, writes = agent()
     a._on_pty_output("", "Use the Write tool to create a file named out.txt")
-    a.deliver_task(task)
+    a.nudge(task)
     pump(floor)
     check("submit-echo: the same words on screen BEFORE the typing don't "
           "count", "\r" not in writes, writes)
@@ -2102,7 +2081,7 @@ def test_task_submit_waits_for_echo():
           "\r" not in writes, writes)
 
     a, writes = agent()
-    a.deliver_task("line one of a plan\nline two\nline three")
+    a.nudge("line one of a plan\nline two\nline three")
     check("submit-echo: a multi-line task is one bracketed paste",
           writes and writes[0].startswith(ta.PASTE_ON), writes)
     pump(floor)
@@ -2114,7 +2093,7 @@ def test_task_submit_waits_for_echo():
     ta.TASK_ECHO_TIMEOUT_MS = 600
     try:
         a, writes = agent()
-        a.deliver_task(task)
+        a.nudge(task)
         pump(800)
         check("submit-echo: with no echo at all the Enter still goes after "
               "the fallback (the old behavior, never worse)",
@@ -2125,7 +2104,7 @@ def test_task_submit_waits_for_echo():
               writes.count("\r") == 1, writes)
 
         a, writes = agent()
-        a.deliver_task(task)
+        a.nudge(task)
         a.restart()
         a._on_pty_output("", drawn)
         pump(800)
@@ -2143,7 +2122,7 @@ def test_task_submit_waits_for_echo():
           writes.count("\r") == 2, writes)
 
     a, writes = agent(AgentKind.POWERSHELL)
-    a.deliver_task("Get-ChildItem")
+    a.nudge("Get-ChildItem")
     pump(floor)
     check("submit-echo: other TUIs keep the plain fixed beat",
           writes[-1:] == ["\r"], writes)
@@ -2269,9 +2248,8 @@ def test_scheduled_send():
     a._scheduled = [m for m in a._scheduled if m.id != stale.id]
 
     # --- delivery is a NUDGE, never an assignment --------------------------
-    # deliver_task overwrites the persisted current_task, flips the assignment
-    # to WORKING and re-infers the role. The user pressed a deferred Enter; they
-    # did not assign anything, so none of that may move.
+    # The user pressed a deferred Enter; they did not assign anything, so the
+    # persisted current_task, the assignment and the role may not move.
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-sched-"))
     store = SessionStore(path=tmp / "s.json")
     win = create_main_window(store)
@@ -2290,7 +2268,7 @@ def test_scheduled_send():
     check("schedule: a due message is typed into the agent",
           "please continue" in sent(d))
     check("schedule: delivery leaves task/assignment/role untouched "
-          "(nudge, not deliver_task)",
+          "(it is a nudge)",
           (d.current_task, d.assignment, d.spec.role) == before,
           (d.current_task, d.assignment, d.spec.role))
     check("schedule: a sent message is dropped from the queue",

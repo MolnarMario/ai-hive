@@ -375,11 +375,9 @@ class TerminalAgent(QObject):
     # comes from its Stop hook (note_turn_ended), the others' from
     # REPLY_QUIET_MS of silence after a settle (_on_reply_quiet).
     reply_finished = Signal()
-    # the user pressed Enter on a prompt of their own (note_prompt_submitted),
-    # and AI Hive handed the agent a task (deliver_task). Transient, for the
-    # event log only; neither is ever wired to a save.
+    # the user pressed Enter on a prompt of their own (note_prompt_submitted).
+    # Transient, for the event log only; never wired to a save.
     user_prompted = Signal(str)
-    task_delivered = Signal(str)
     # the agent's live conversation was REPLACED (/clear, or a /resume onto a
     # different session), so the scrollback behind the current screen belongs
     # to a conversation that is no longer on display. Transient view signal.
@@ -421,7 +419,6 @@ class TerminalAgent(QObject):
         self._pty_seed = ""    # restored screen, until a child draws over it
         self._prompt_ready = False    # the TUI's input prompt is interactive
         self._ready_tail = ""         # rolling stripped tail (pre-ready only)
-        self._pending_task = None     # task queued until the TUI is ready
         # typed tasks still waiting for their Enter (see TASK_SUBMIT_MS)
         self._pending_submits: list[_PendingSubmit] = []
         self._resume_attempt = False  # last start() launched with --continue
@@ -790,7 +787,7 @@ class TerminalAgent(QObject):
 
         Called from TerminalCard, off TerminalView.promptSubmitted -- which
         fires ONLY on a bare Enter in the terminal, so AI Hive's own writes
-        (deliver_task, nudge, scheduled sends) can never land here."""
+        (nudge, scheduled sends) can never land here."""
         self.user_prompted.emit(text)
         if not self.is_pty:
             return None
@@ -1248,42 +1245,17 @@ class TerminalAgent(QObject):
                                    if len(files) > 3 else shown)
         return row
 
-    def deliver_task(self, text: str) -> None:
-        """Give this agent a task to work on and mark it WORKING.
-
-        For a pty agent (Claude Code) the task is delivered only once the TUI
-        is prompt-ready (we watch its output stream for bracketed-paste-enable,
-        ESC[?2004h — a fixed delay is unreliable on a cold start). Multi-line
-        text is wrapped in bracketed paste so it isn't submitted at the first
-        newline, then a separate Enter submits it."""
-        text = sanitize_text(text or "").strip()
-        if not text:
-            return
-        self.set_task(text)
-        self.set_assignment(AssignmentState.WORKING)
-        self.task_delivered.emit(text)
-        if not self.is_pty:
-            self.send_command(text)
-            return
-        if self._prompt_ready and self.worker.is_running():
-            self._write_task_to_pty(text)
-        else:
-            self._pending_task = text  # flushed when the prompt is ready
-
     def nudge(self, text: str) -> bool:
         """Type `text` at the agent's prompt and submit it, WITHOUT touching any
         persisted metadata. Returns False when the agent can't take it.
 
-        The difference from `deliver_task` is the whole point: that path is for
-        ASSIGNING work, so it overwrites `current_task` and flips the assignment
-        to WORKING. A nudge is a message
-        inside work the agent already has (the auto-continue after a plan-limit
-        reset), so none of that may change — `current_task` in particular is
-        persisted and shown in the sidebar and on the board.
+        A nudge is a message inside work the agent already has (the
+        auto-continue after a plan-limit reset, a scheduled send), so it never
+        overwrites `current_task` or the assignment: both are persisted and
+        shown in the sidebar and on the board.
 
-        Unlike `write`, this does NOT stamp `_last_input_ts`: the resumed work's
-        output must still light the sidebar's "working" pulse, exactly as a
-        delivered task's does.
+        Unlike `write`, this does NOT stamp `_last_input_ts`: the work it
+        kicks off must still light the sidebar's "working" pulse.
         """
         text = sanitize_text(text or "").strip()
         if not text or not self.is_pty:
@@ -1823,8 +1795,8 @@ class TerminalAgent(QObject):
         # by more than that in the same burst is never seen — and if the child
         # then falls quiet (a resumed conversation parked at its prompt) nothing
         # ever looks again. The agent stays "not ready" forever: `nudge` refuses
-        # it, so a plan-limit resume is declined every minute, and a delivered
-        # task waits in _pending_task indefinitely. Observed live 2026-08-07:
+        # it, so a plan-limit resume is declined every minute. Observed live
+        # 2026-08-07:
         # nine consecutive "WAIT (TUI not ready)" ticks on an agent whose child
         # had been up for ten minutes, ending only when the user happened to
         # click that workspace.
@@ -2456,9 +2428,8 @@ class TerminalAgent(QObject):
         # <- for agents" — so keying on it alone leaves an agent permanently
         # "not ready" whenever the rotation sits elsewhere. Verified live: a
         # restored agent parked on a spent plan limit sat un-nudged through
-        # repeated watchdog ticks for exactly this reason, and a task
-        # delivered to it would have hung in _pending_task forever too. If a
-        # future CLI renames these, this tuple is the one place to fix.
+        # repeated watchdog ticks for exactly this reason. If a future CLI
+        # renames these, this tuple is the one place to fix.
         if not self._prompt_ready:
             if self.spec.provider == "claude":
                 self._ready_tail = (self._ready_tail + stripped)[-600:]
@@ -2483,20 +2454,16 @@ class TerminalAgent(QObject):
         never fires. Measured on a live classic-renderer session: the hint was
         present and correctly spaced on the rendered pyte screen from the first
         frame, and matched the escape-stripped stream NEVER. Since readiness
-        gates task delivery, that silently parks every first task in
-        `_pending_task` forever and leaves the BootVeil up until its timeout.
+        gates `nudge`, that silently refuses every nudge and leaves the
+        BootVeil up until its timeout.
         Despacing both sides is a superset of the old comparison, so the
         alt-screen renderer keeps matching exactly as before."""
         low = _despace(text)
         return any(h in low for h in _READY_HINTS_DESPACED)
 
     def _became_prompt_ready(self) -> None:
-        """The TUI's prompt just went live: announce it and release any task
-        that was waiting for exactly this."""
+        """The TUI's prompt just went live: announce it."""
         self._set_prompt_ready(True)
-        if self._pending_task is not None and self.worker.is_running():
-            task, self._pending_task = self._pending_task, None
-            self._write_task_to_pty(task)
 
     def _set_status(self, status: AgentStatus) -> None:
         if status is not self.status:

@@ -248,10 +248,11 @@ def _lifecycle_e2e_body(tmp, windows, pump, marker):
     agent = win.manager.add_terminal(ws.id, spec, autostart=True)
     sid = agent.spec.session_id
     check("e2e: launch minted a pinned session id", bool(sid))
-    # a brand-new folder shows the trust dialog first; the task is queued and
-    # must NOT be typed into the dialog
-    agent.deliver_task(
-        f"Reply with exactly the word {marker} and nothing else.")
+    # a brand-new folder shows the trust dialog first, and nothing may be
+    # typed into it: nudge refuses until the real prompt is up
+    ask = f"Reply with exactly the word {marker} and nothing else."
+    check("e2e: a nudge before the prompt is up is refused",
+          not agent.nudge(ask))
     dialog = wait_until(lambda: _e2e_trust_options_drawn(agent), 45000)
     check("e2e: trust dialog appeared for the fresh folder", dialog,
           screen_text(agent)[-300:])
@@ -269,6 +270,7 @@ def _lifecycle_e2e_body(tmp, windows, pump, marker):
           screen_text(agent)[-300:])
     if not ready:
         return
+    check("e2e: the task is typed once the prompt is up", agent.nudge(ask))
     tpath = Path(transcripts.transcript_path(str(tmp), sid))
     # the transcript flush lags the on-screen answer (file first, content
     # later): wait until the REPLY is in the file before closing, or the

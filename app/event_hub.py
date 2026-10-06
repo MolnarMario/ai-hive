@@ -7,7 +7,7 @@ in memory for the window, which listens to `appended`.
 
 Most events are already announced somewhere; the hub only collects them:
 
-    prompt / task      TerminalAgent.user_prompted / task_delivered
+    prompt             TerminalAgent.user_prompted
     question/answered  TerminalAgent.waiting_changed (both edges)
     reply              TerminalAgent.reply_finished (turns the user asked for)
     limit              TerminalAgent.limit_blocked_changed (rising edge)
@@ -160,8 +160,6 @@ class EventHub(QObject):
         self._prev_status[agent.id] = agent.status
         agent.user_prompted.connect(
             lambda text, a=agent: self._on_prompt(a, el.PROMPT, text))
-        agent.task_delivered.connect(
-            lambda text, a=agent: self._on_prompt(a, el.TASK, text))
         agent.waiting_changed.connect(
             lambda waiting, a=agent: self._on_waiting(a, waiting))
         agent.reply_finished.connect(lambda a=agent: self._on_reply(a))

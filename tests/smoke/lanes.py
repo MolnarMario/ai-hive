@@ -3864,7 +3864,7 @@ def test_task_done_waits_for_the_user():
         views = {}
         told, delivered, audit = [], [], []
         a.notice = lambda text: told.append(text)
-        i.deliver_task = lambda text: delivered.append(text)
+        i.nudge = lambda text: (delivered.append(text), True)[1]
         win._store_audit = audit.append
 
         def flag(agent, sha):
