@@ -399,7 +399,7 @@ workspaces keep executing — switching never pauses anything.
   again) closes it and restores what was expanded before.
 - **First-class folders** — every workspace header shows its full path
   (eliding only what its own buttons don't leave room for) with **Delete**,
-  **Open repo**, **Open folder** and **Change…** buttons; agents launch rooted
+  **Open repo**, **Open folder** and **Change folder** buttons; agents launch rooted
   there. The ▾ beside Open repo lists the GitHub repository's recent pull
   requests and commits. AI Hive loads that list in the background a few
   seconds after startup and keeps it, so the menu opens already filled.
@@ -613,7 +613,7 @@ error dialog instead of silently closing. Packaging to a distributable
   (1 full, 2 side-by-side, 3 = 3×1, 4 = 2×2, 5–6 = 3×2, …). Line and full-terminal
   cards share the same grid.
 - **Folder & activity** — the workspace header shows the full project path
-  with **Delete** / **Open folder** / **Change…**; **Activity** opens a panel
+  with **Delete** / **Open folder** / **Change folder**; **Activity** opens a panel
   with the live agent roster, the shared coordination log, and git-changed
   files.
 - **Font size** — per-agent `A−`/`A+` in each card header (or `Ctrl+±` while
