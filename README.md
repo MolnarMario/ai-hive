@@ -258,6 +258,13 @@ workspaces keep executing — switching never pauses anything.
   close and reopen AI Hive yourself, so your agents keep working until you
   choose to restart. That state is read from the files on disk, so it also
   covers a `git pull` you ran by hand.
+- **Every launch pulls what merged.** Before it loads its own code, AI Hive
+  fetches `main` and fast-forwards this folder, so a PR merged since the last
+  run is what you see after a restart. If the folder sits on a branch whose
+  commits are all on `main` already (a session worked here and its PR merged),
+  it switches back to `main` first. Local changes or unmerged commits stop
+  both, and the launch goes ahead on what is there. Offline, it gives up
+  after 10 seconds.
 - **Let Claude Code update itself** — the **⬇ button** beside the taskbar toggle
   opens a small **Updates** panel, and what it offers depends on how Claude Code
   is actually installed on your machine (it re-reads that every time, so it is

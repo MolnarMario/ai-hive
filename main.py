@@ -36,6 +36,22 @@ except ImportError:
         "To (re)install dependencies:\n"
         "    .venv\\Scripts\\python.exe -m pip install -r requirements.txt")
 
+# ---- pull what merged on GitHub, before the app's code is imported ---------
+# Only when launched, never on import: the smoke suite imports this module
+# and runs FROM this clone. The pull may change app/ itself, so the few app
+# modules this needed are dropped and everything below imports fresh files.
+# The audit line waits for the session store in main().
+_STARTUP_UPDATE_AUDIT = ""
+if __name__ == "__main__":
+    from app import self_update as _self_update
+    _result = _self_update.startup_update(_self_update.subprocess_runner)
+    if _result is not None:
+        _STARTUP_UPDATE_AUDIT = _self_update.audit_line(_result)
+    for _name in [m for m in sys.modules
+                  if m == "app" or m.startswith("app.")]:
+        del sys.modules[_name]
+    del _self_update, _result
+
 from app.process_worker import AgentKind, build_spec
 from app.pty_worker import HAS_CONPTY
 from app.session_store import SessionStore
@@ -287,6 +303,11 @@ def main() -> int:
     # offscreen suite shares the factory and must never shell out.
     store = SessionStore()
     session = store.load()
+    if _STARTUP_UPDATE_AUDIT:
+        try:
+            store.audit(_STARTUP_UPDATE_AUDIT)
+        except Exception:  # noqa: BLE001 - forensics, never fatal
+            pass
     gate = None
     if session.get("ui", {}).get("auto_update", False):
         from app.widgets.update_splash import run_update_gate

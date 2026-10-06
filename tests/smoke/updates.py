@@ -1697,3 +1697,130 @@ def _dialog_strings(widget) -> list:
                 except TypeError:
                     pass
     return out
+
+
+def test_startup_update():
+    """The launch pulls whatever merged on GitHub (self_update.startup_update,
+    called by main.py before it imports the app). Real git against a temp
+    origin and clone, never this clone: 0.28.2 sat unseen for hours because
+    the user's folder was left on a merged branch and nothing pulled."""
+    import subprocess
+    from app import self_update
+
+    root = Path(tempfile.mkdtemp(prefix="ai-hive-launchupd-"))
+
+    def git(cwd, *args):
+        res = subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t",
+             "-c", "init.defaultBranch=main", "-c", "advice.detachedHead=0",
+             *args], cwd=cwd, capture_output=True, text=True)
+        return res.stdout.strip()
+
+    def write(cwd, rel, text):
+        p = Path(cwd) / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+
+    def commit(cwd, rel, text, msg):
+        write(cwd, rel, text)
+        git(cwd, "add", "-A")
+        git(cwd, "commit", "-q", "-m", msg)
+
+    def version(cwd):
+        return self_update.read_installed_version(str(cwd))
+
+    def branch(cwd):
+        return git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+
+    def setup(name):
+        """origin with 0.1.0, the user's clone of it, and a dev clone that
+        then merges 0.1.1 to origin's main."""
+        base = root / name
+        origin, user, dev = base / "origin.git", base / "user", base / "dev"
+        base.mkdir()
+        git(base, "init", "-q", "--bare", "-b", "main", str(origin))
+        git(base, "clone", "-q", str(origin), str(dev))
+        commit(dev, "app/__init__.py", '__version__ = "0.1.0"\n', "0.1.0")
+        commit(dev, "notes.txt", "a\n", "notes")
+        git(dev, "push", "-q", "origin", "main")
+        git(base, "clone", "-q", str(origin), str(user))
+        return origin, user, dev
+
+    def merge_new_version(dev):
+        commit(dev, "app/__init__.py", '__version__ = "0.1.1"\n', "0.1.1")
+        git(dev, "push", "-q", "origin", "main")
+
+    run = self_update.subprocess_runner
+
+    _, user, dev = setup("plain")
+    merge_new_version(dev)
+    res = self_update.startup_update(run, str(user))
+    check("launch-update: a clean main fast-forwards to what merged",
+          res is not None and res.ok and version(user) == "0.1.1"
+          and branch(user) == "main", (res, version(user)))
+    check("launch-update: a folder already current does nothing",
+          self_update.startup_update(run, str(user)) is None)
+
+    # the 0.28.2 case: a session committed on a branch in the user's folder,
+    # the same change reached main under another hash, and main moved on
+    _, user, dev = setup("merged-branch")
+    git(user, "switch", "-q", "-c", "fix/tray")
+    commit(user, "notes.txt", "a\nfix\n", "fix: tray")
+    write(user, "untracked.md", "keep me\n")
+    commit(dev, "notes.txt", "a\nfix\n", "fix: tray")
+    merge_new_version(dev)
+    res = self_update.startup_update(run, str(user))
+    check("launch-update: a clean branch whose commits are all on main "
+          "switches back to main and updates",
+          res is not None and res.ok and branch(user) == "main"
+          and version(user) == "0.1.1", (res, branch(user), version(user)))
+    check("launch-update: untracked files survive the switch",
+          (user / "untracked.md").read_text(encoding="utf-8") == "keep me\n")
+
+    _, user, dev = setup("unmerged-branch")
+    git(user, "switch", "-q", "-c", "feat/wip")
+    commit(user, "notes.txt", "a\nwip\n", "feat: wip")
+    merge_new_version(dev)
+    res = self_update.startup_update(run, str(user))
+    check("launch-update: a branch with unmerged commits is left alone",
+          res is not None and not res.ok and branch(user) == "feat/wip"
+          and version(user) == "0.1.0"
+          and "wip" in (user / "notes.txt").read_text(encoding="utf-8"),
+          (res, branch(user)))
+
+    _, user, dev = setup("dirty")
+    git(user, "switch", "-q", "-c", "fix/done")
+    commit(user, "notes.txt", "a\ndone\n", "fix: done")
+    commit(dev, "notes.txt", "a\ndone\n", "fix: done")
+    merge_new_version(dev)
+    write(user, "notes.txt", "a\ndone\nunsaved\n")
+    res = self_update.startup_update(run, str(user))
+    check("launch-update: local changes block the switch and the update",
+          res is not None and not res.ok and branch(user) == "fix/done"
+          and "unsaved" in (user / "notes.txt").read_text(encoding="utf-8"),
+          (res, branch(user)))
+
+    _, user, dev = setup("dirty-main")
+    merge_new_version(dev)
+    write(user, "notes.txt", "a\nunsaved\n")
+    res = self_update.startup_update(run, str(user))
+    check("launch-update: local changes on main block the update",
+          res is not None and not res.ok and version(user) == "0.1.0"
+          and "unsaved" in (user / "notes.txt").read_text(encoding="utf-8"),
+          res)
+
+    origin, user, dev = setup("offline")
+    git(user, "remote", "set-url", "origin", str(origin) + "-gone")
+    res = self_update.startup_update(run, str(user))
+    check("launch-update: a failed fetch is reported and changes nothing",
+          res is not None and not res.ok and "Checking GitHub" in res.detail
+          and version(user) == "0.1.0", res)
+
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    guard = src.find('if __name__ == "__main__":\n    from app import '
+                     'self_update')
+    check("launch-update: main.py pulls only when launched, and before it "
+          "imports the app",
+          0 < guard < src.find("from app.process_worker import")
+          and "startup_update(" in src[guard:guard + 200], guard)
+    shutil.rmtree(root, ignore_errors=True)
