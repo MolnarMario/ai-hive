@@ -76,8 +76,10 @@ def system_prompt_text(workspace_name: str, agent_name: str,
     user's working copy, which a pull could change under their editor or
     dev server, so without the doc the integrator leaves it alone. Doc or
     no doc, it merges only its own pull request, only after a clean
-    GPT-6-Luna review and passing tests on the head it merges, and only by
-    `--match-head-commit` with a merge commit. Every other laned agent flags finished work with a "Task
+    GPT-6-Luna review and passing tests on the head it merges (or the
+    commit a checklist counts as tested, as AI Hive's does for a README-only
+    count commit), and only by `--match-head-commit` with a merge commit.
+    Every other laned agent flags finished work with a "Task
     done" commit line (lanes.DONE_MARK). The flag only marks the work
     ready: the integrator starts when the user asks it to, never because a
     lane was flagged."""
@@ -129,7 +131,8 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"user {base} moved, so they pull when they are ready. Whatever "
             f"the doc says, merge only your own pull request, only after a "
             f"clean GPT-6-Luna review and passing tests on the head you "
-            f"merge, and only with a merge commit through "
+            f"merge or the commit your checklist counts as tested for it, "
+            f"and only with a merge commit through "
             f"`gh pr merge --merge --match-head-commit <that head>`. If "
             f"{base} moved since you tested, merge it in and test again. "
             f"Never rebase or force-push, never squash, never edit other "

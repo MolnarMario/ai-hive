@@ -2515,7 +2515,8 @@ def test_integrator_prompt_project_neutral():
           "and --match-head-commit gate every merge, doc or no doc",
           "Whatever the doc says, merge only your own pull request, only "
           "after a clean GPT-6-Luna review and passing tests on the head "
-          "you merge" in prompt and "--match-head-commit" in prompt
+          "you merge or the commit your checklist counts as tested" in prompt
+          and "--match-head-commit" in prompt
           and "If dev moved since you tested" in prompt, prompt)
     check("integ-neutral: the main checkout rule allows only the "
           "checklist's fast-forward", "never edit files in the main "
