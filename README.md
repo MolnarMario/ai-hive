@@ -344,7 +344,7 @@ workspaces keep executing — switching never pauses anything.
   long as something is queued (click it to change or cancel, or to send a
   queued message right away), with an **⏱N** badge on the workspace row and a
   marker beside the agent in the sidebar's expanded list. Same dialog from the
-  header's right-click menu if you'd rather not learn the chord.
+  `⏱` button in the header's `⋯` tray if you'd rather not learn the chord.
   A scheduled message is a *message*, not an assignment: it never overwrites
   what the card says the agent is working on. Queued messages survive a
   restart, but one whose moment passed while the app was closed comes back
@@ -420,8 +420,8 @@ workspaces keep executing — switching never pauses anything.
   ⚙ Options > Agents > **Lanes in every workspace** forces every workspace's
   toggle on. The toggles only set where that tick starts: in any git
   workspace one agent can opt in alone, or out, and an existing agent can
-  move into a lane with **Restart in own lane** from its card's right-click
-  menu (a new conversation; the old one stays resumable from the workspace
+  move into a lane with **Restart in own lane** (`⎇` in its card's `⋯`
+  tray; a new conversation, and the old one stays resumable from the workspace
   folder). Turning a toggle off never touches an existing lane. The **?**
   beside the toggle, and **What are lanes?** in the New Agent dialog, map
   each part onto how a team worked before AI. With Count 3 you get three
@@ -469,7 +469,7 @@ workspaces keep executing — switching never pauses anything.
   base by itself when the base moves, and the agent is told on its next
   prompt.
 - **Integration queue** (needs lanes, a GitHub remote and a logged-in `gh`):
-  right-click a laned Claude agent's header and pick **Make
+  hover the `⋯` on a laned Claude agent's header and click `⚑` **Make
   integrator** (one per workspace). The second lane in a workspace without an
   integrator says so on its card, once. **Submit to integrator** on another lane's
   chip pins that lane's newest commit and queues it. One lane at a time, once
@@ -630,11 +630,12 @@ error dialog instead of silently closing. Packaging to a distributable
   `Shift+Tab` cycles Claude Code's modes, `Ctrl+C` interrupts (when nothing is
   selected; otherwise it copies), `Ctrl+R` reverse-searches, arrows/`Tab`
   complete, exactly as in a real terminal.
-- **Card controls** — the header keeps only what you reach for: `A−`/`A+`
-  font, `⤢` maximize, `✕` close. **Right-click the header** for Start,
-  Stop (stdin EOF), Restart (fresh session) and Assign / reassign; those four
-  are rare and deliberate, and the width they used to hold now goes to the
-  summary. Type into the bottom input line to send a command to that terminal;
+- **Card controls** — hover the `⋯` at the right of a card's header for its
+  actions: `▶` start, `■` stop, `↻` restart (fresh session), `✎` assign /
+  reassign, `⏱` send on a countdown, `A−`/`A+` font and `⤢` maximize, plus
+  `⎇` restart in own lane and `⚑` make integrator where lanes apply. Each
+  icon has a tooltip. `✕` close stays visible. Collapsed, the actions take
+  no header width, so the summary gets it. Type into the bottom input line to send a command to that terminal;
   `↑`/`↓` recall history; `cls`/`clear` clears the console locally.
 - **PowerShell quirks to know** — there is no prompt line by design, and
   bare `cd` prints nothing in PowerShell (use `pwd` to see where you are).
@@ -707,8 +708,8 @@ awareness* below).
 - **Persistent agents** — agents **never** auto-close. A completed agent stays
   in the grid so you can review its work, continue the conversation, or retask
   it. Only you close an agent.
-- **Reassign anywhere** — right-click any card header and pick **Assign /
-  reassign a task** to hand it fresh work without losing the session. Its name,
+- **Reassign anywhere** — click `✎` in any card's `⋯` tray to hand it
+  fresh work without losing the session. Its name,
   model and effort are left exactly as you set them.
 
 ## Shared agent awareness
@@ -877,8 +878,8 @@ Hard-won rules, each with a regression test:
   (e.g. xterm modifyOtherKeys) are filtered so text renders clean, not
   underlined.
 - **Line-console cards** stay line-oriented: full-screen TUIs won't render in
-  them, and there's no per-command Ctrl+C (right-click the header for Stop or
-  Restart, or
+  them, and there's no per-command Ctrl+C (`■` stop or `↻` restart in the
+  header's `⋯` tray, or
   switch that agent to full-terminal mode). Bare `cd` prints nothing in
   PowerShell — that's PowerShell, not the app.
 - Windows-first: developed and tested on Windows 11. On non-Windows,
