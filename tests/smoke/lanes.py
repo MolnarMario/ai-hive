@@ -3772,14 +3772,14 @@ def test_task_done_flag_core():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_task_done_nudges_the_integrator():
+def test_task_done_waits_for_the_user():
     """Through the real window, stubbed workers: a lane agent is told to end
-    finished work with "Task done" and the integrator gets the merge-after-
-    review prompt. A flag seen with no integrator is noted on its card once
-    and waits. Once there is an idle integrator, AI Hive types one note
-    naming the lane, its branch and the flagged commit, never twice for the
-    same commit, again for a newer one, and never about the integrator's
-    own lane. The lane chip shows a check mark."""
+    finished work with "Task done", and the integrator's prompt has it start
+    only when the user asks. A flag shows on the lane chip (a check mark,
+    green, outranked by an overlap) and is logged once per commit. AI Hive
+    never types into the integrator about it, idle or not, newly made or
+    not, and puts no notice on the flagged card: the user decides when
+    there is enough to ship."""
     from PySide6.QtWidgets import QApplication
     from app import lanes
     from app.process_worker import AgentKind, build_spec
@@ -3791,7 +3791,6 @@ def test_task_done_nudges_the_integrator():
     work = _make_repo(tmp)
     win = create_main_window(SessionStore(path=tmp / "session.json"))
     win._save_timer.stop()
-    win._nudge_timer.stop()
     ws = win.manager.create_workspace("Repo", str(work))
     made = []
 
@@ -3807,85 +3806,70 @@ def test_task_done_nudges_the_integrator():
         a = laned("Agent A", "d1e1a1" + "0" * 26)
         i = laned("Integrator", "d1e1ee" + "0" * 26)
         app.processEvents()
-        check("nudge: a lane agent is told to end finished work with "
+        check("task done: a lane agent is told to end finished work with "
               "Task done", lanes.DONE_MARK in a.spec.system_prompt
               and "INTEGRATOR" not in a.spec.system_prompt)
         views = {}
         win.lane_service.view = lambda uid: views.get(uid)
-        told, delivered = [], []
+        told, delivered, audit = [], [], []
         a.notice = lambda text: told.append(text)
         i.deliver_task = lambda text, title="": delivered.append(text)
+        win._store_audit = audit.append
 
         def flag(agent, sha):
             views[agent.spec.uid] = lanes.LaneView(
                 uid=agent.spec.uid, branch=agent.spec.lane["branch"],
                 root=agent.spec.lane["root"], ahead=1, done=sha)
 
+        def done_lines():
+            return [ln for ln in audit if ln.startswith("LANE-DONE")]
+
         sha1, sha2 = "1" * 40, "2" * 40
         flag(a, sha1)
         card = win._pages[ws.id].card_for(a.id)
         card.set_lane_view(views[a.spec.uid])
-        check("nudge: the lane chip shows a check mark",
-              "✓" in card.lane_mark.text(), card.lane_mark.text())
-        check("nudge: a done lane's chip turns green",
+        check("task done: the lane chip shows a check mark",
+              "\u2713" in card.lane_mark.text(), card.lane_mark.text())
+        check("task done: a done lane's chip turns green",
               card.lane_mark.property("lane") == "done",
               card.lane_mark.property("lane"))
         clash = lanes.Overlap(path="a.txt", peer_uid="", peer="main",
                               peer_branch="main", state="committed")
-        check("nudge: a file another lane changed outranks done",
+        check("task done: a file another lane changed outranks done",
               dataclasses.replace(views[a.spec.uid],
                                   overlaps=[clash]).state == "overlap")
-        win._nudge_integrators()
-        win._nudge_integrators()
-        check("nudge: with no integrator the card hears it once",
-              len(told) == 1 and "no integrator" in told[0], told)
+        win._on_lanes_changed(ws.id, dict(views))
+        win._on_lanes_changed(ws.id, dict(views))
+        check("task done: a lane read logs the flag once",
+              len(done_lines()) == 1 and "Agent A" in done_lines()[0]
+              and sha1[:7] in done_lines()[0], audit)
+        check("task done: the flagged card gets no notice", told == [], told)
 
         win._toggle_integrator(ws.id, i)
-        check("nudge: the integrator's prompt has it merge only after a "
-              "clean review", "GPT-6-Luna" in i.spec.system_prompt
-              and "NEVER run gh pr merge" not in i.spec.system_prompt
-              and lanes.DONE_MARK in i.spec.system_prompt)
-        check("nudge: an integrator that isn't idle is not typed into",
-              not delivered, delivered)
-        flag(a, "3" * 40)
-        win._nudge_integrators()
-        check("nudge: an integrator that isn't running is named on the "
-              "flagged card", len(told) == 2 and "isn't running" in told[1]
-              and "Integrator" in told[1], told)
+        prompt = i.spec.system_prompt
+        check("task done: the integrator's prompt has it merge only after a "
+              "clean review", "GPT-6-Luna" in prompt
+              and "NEVER run gh pr merge" not in prompt
+              and lanes.DONE_MARK in prompt)
+        check("task done: the integrator's prompt has it start only when the "
+              "user asks", "Start only when the user asks you to" in prompt
+              and "never because a lane was flagged" in prompt
+              and "When AI Hive tells you" not in prompt)
         for attr, value in (("is_running", True), ("prompt_ready", True),
                             ("is_busy", False), ("is_waiting", False),
                             ("is_limit_blocked", False)):
             setattr(i, attr, lambda v=value: v)
-        flag(i, "e" * 40)
-        win._nudge_integrators()
-        check("nudge: an idle integrator gets one note naming the lane, its "
-              "branch and the flagged commit", len(delivered) == 1
-              and "Agent A" in delivered[0]
-              and a.spec.lane["branch"] in delivered[0]
-              and "3" * 40 in delivered[0]
-              and "origin/main:docs/agents/integration.md" in delivered[0]
-              and "still open" in delivered[0], delivered)
-        check("nudge: ...never about its own lane",
-              delivered and "e" * 40 not in delivered[0], delivered)
-        win._nudge_integrators()
-        check("nudge: the same commit is passed on once", len(delivered) == 1)
         flag(a, sha2)
-        win._nudge_integrators()
-        check("nudge: a newer Task done commit is passed on again",
-              len(delivered) == 2 and sha2 in delivered[1], delivered)
-        # a new integrator hears what the old one may not have shipped
-        j = laned("Integrator 2", "d1e1ff" + "0" * 26)
-        app.processEvents()
-        got_j = []
-        j.deliver_task = lambda text, title="": got_j.append(text)
-        for attr, value in (("is_running", True), ("prompt_ready", True),
-                            ("is_busy", False), ("is_waiting", False),
-                            ("is_limit_blocked", False)):
-            setattr(j, attr, lambda v=value: v)
-        win._toggle_integrator(ws.id, j)
-        check("nudge: a replacement integrator is told about the flagged "
-              "lanes again", len(got_j) == 1 and sha2 in got_j[0]
-              and len(delivered) == 2, (got_j, delivered))
+        win._on_lanes_changed(ws.id, dict(views))
+        check("task done: a newer Task done commit is logged again",
+              len(done_lines()) == 2 and sha2[:7] in done_lines()[1], audit)
+        win._toggle_integrator(ws.id, i)
+        win._toggle_integrator(ws.id, i)
+        win._on_lanes_changed(ws.id, dict(views))
+        check("task done: AI Hive never types into the integrator, idle or "
+              "newly made", delivered == [], delivered)
+        check("task done: no NUDGE line is written",
+              not any(ln.startswith("NUDGE") for ln in audit), audit)
         for agent in list(ws.agents):
             win._close_agent(ws.id, agent.id)
         win.lane_ops.drain(60)

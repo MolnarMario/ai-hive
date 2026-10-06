@@ -29,13 +29,14 @@ _ROWS = (
      "so the agent hears about a conflict before anyone merges."),
     ("Task done",
      "A developer saying \"ready for review\". When an agent finishes its "
-     "task it commits with a last line of just Task done, and AI Hive "
-     "tells the integrator."),
+     "task it commits with a last line of just Task done. Nothing ships "
+     "until you ask the integrator."),
     ("Integrator",
      "The teammate who owns the merge: an agent you pick with Make "
-     "integrator. It combines every finished lane into one pull request, "
-     "fixes conflicts, bumps the version, runs the full test suite, gets "
-     "a code review and fixes what it finds, then merges."),
+     "integrator. When you ask it to, it combines the finished lanes into "
+     "one pull request, fixes conflicts, bumps the version, runs the full "
+     "test suite, gets a code review and fixes what it finds, then "
+     "merges."),
 )
 
 

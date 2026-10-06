@@ -2,10 +2,13 @@
 
 Every laned agent ends its finished work with a commit whose message has a
 last line of just `Task done`. AI Hive reads every lane, sees that commit
-(`lanes.DONE_GREP`, a check mark on the lane chip) and types a short note
-into the workspace's integrator once it is idle. The note names each lane,
-its branch and the flagged commit. The integrator does everything else, in
-its own lane, by the checklist below.
+(`lanes.DONE_GREP`), puts a check mark on the lane chip, turns it green and
+logs it. That is all it does. It never tells the integrator.
+
+The user decides when there is enough finished work for a pull request and
+asks the integrator to ship it. The integrator starts only then, never on
+its own and never because a lane got flagged, and does everything else in
+its own lane by the checklist below.
 
 Lanes never bump the version or touch the CHANGELOG or the README check
 count. The integrator does, once per pull request.
@@ -25,12 +28,14 @@ Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
 
 ## Checklist
 
-0. If your own `integrate/` pull request is still open, don't start a new
-   one: merge the newly flagged commits into that branch (step 2), keep its
-   one version bump, and carry on from step 4. Two open integration PRs
-   would fight over the version and the CHANGELOG.
-1. `git fetch origin`. Find every lane with finished work that main lacks,
-   not only the ones the note named. Work left over from earlier counts too:
+0. If your own `integrate/` pull request is still open when the user asks
+   for more, don't start a new one: merge the lanes they asked for into
+   that branch (step 2), keep its one version bump, and carry on from
+   step 4. Two open integration PRs would fight over the version and the
+   CHANGELOG. A lane flagged while your PR is open waits for the user too.
+1. `git fetch origin`. Ship the lanes the user named. If they named none,
+   take every lane with finished work that main lacks, including work left
+   over from earlier:
    ```
    git for-each-ref --format="%(refname:short)" refs/heads/hive/
    git log -1 --format=%H -i -E --grep="^[[:space:]]*task done[.!]?[[:space:]]*$" origin/main..<branch>

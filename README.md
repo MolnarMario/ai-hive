@@ -479,16 +479,16 @@ workspaces keep executing — switching never pauses anything.
   without an integrator says so on its card, once. Every other laned agent is
   told to end its finished work with a commit whose last line is just
   `Task done`. AI Hive spots that commit on its next lane read (the chip gets
-  a `✓`), logs it, and types a short note into the integrator once it is
-  idle: which lanes, which branches, which commits. The integrator then
-  follows the base branch's `docs/agents/integration.md`. It gathers every
-  lane with an unmerged `Task done` commit into one `integrate/` branch,
-  bumps the version and CHANGELOG, runs the full suite, opens the pull
-  request and has GPT-6-Luna review it at high effort, fixing and reviewing
-  again until the review comes back clean. Only then does it merge (a merge
-  commit, never a squash) and fast-forward the main checkout, so the next
-  launch runs what merged. Each flag is a `LANE-DONE` line and each note a
-  `NUDGE` line in `session.log`. The integrator needs `Bash(git:*)` and
+  a `✓` and turns green) and logs it. Nothing ships until you say so: when
+  you think there is enough for a pull request, ask the integrator to ship.
+  It then follows the base branch's `docs/agents/integration.md`. It gathers
+  the lanes you name, or every lane with an unmerged `Task done` commit,
+  into one `integrate/` branch, bumps the version and CHANGELOG, runs the
+  full suite, opens the pull request and has GPT-6-Luna review it at high
+  effort, fixing and reviewing again until the review comes back clean. Only
+  then does it merge (a merge commit, never a squash) and fast-forward the
+  main checkout, so the next launch runs what merged. Each flag is a
+  `LANE-DONE` line in `session.log`. The integrator needs `Bash(git:*)` and
   `PowerShell(git:*)` allowed, and every lane of a repository shares the main
   checkout's Claude auto-memory.
 - **Per-workspace agent numbering** — each workspace counts Agent 1, 2, 3…

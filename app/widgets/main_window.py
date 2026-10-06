@@ -210,11 +210,6 @@ LIMIT_UNKNOWN_WAIT_S = 5 * 3600 + 600
 # that instead, and a fixed bound had already begun silently skipping real
 # cut-offs.)
 
-# how often idle integrators hear about lanes whose agent committed "Task
-# done" (MainWindow._nudge_integrators). It reads the lane service's last
-# poll, never git.
-NUDGE_TICK_MS = 5000
-
 # Grouped agent types for the creation dialog.
 KIND_GROUPS = [
     ("AI agents", [
@@ -2230,18 +2225,11 @@ class MainWindow(QMainWindow):
             self.manager, self.lane_ops,
             skip=lambda uid: uid in self._lane_pending,
             audit=self._store_audit, parent=self)
-        # "Task done" lane commits: seen, as {(lane uid, sha)} (logged
-        # once), and passed on, as {(integrator uid, lane uid, sha)}, so a
-        # new integrator hears again what the old one may not have shipped.
-        # Transient: after a restart an unmerged flagged lane is passed on
-        # once more, and the integrator skips whatever the base has.
+        # "Task done" lane commits already logged, as {(lane uid, sha)}.
+        # Transient: after a restart an unmerged flag is logged once more.
         self._done_seen: set = set()
-        self._nudged: set = set()
         # lanes being fast-forwarded on their own (_refresh_idle_lanes)
         self._auto_refreshing: set[str] = set()
-        self._nudge_timer = QTimer(self)
-        self._nudge_timer.setInterval(NUDGE_TICK_MS)
-        self._nudge_timer.timeout.connect(self._nudge_integrators)
         # providers whose CLI was STILL INSTALLING when the user skipped the
         # update splash. Their agents are held out of the autostart, because
         # launching one now could execute a half written binary. Transient by
@@ -2369,7 +2357,6 @@ class MainWindow(QMainWindow):
         self._wire_model()
         self.lane_service.lanesChanged.connect(self._on_lanes_changed)
         self.lane_service.overlapFound.connect(self._on_lane_overlap)
-        self._nudge_timer.start()
         # restored laned agents whose folder is missing: repaired in place
         # before they may start (they are holding their start until then)
         self._start_lane_repairs()
@@ -4335,6 +4322,7 @@ class MainWindow(QMainWindow):
         if self.activity_panel.is_open() and ws_id == self.manager.active_id:
             self.activity_panel.set_lanes(views)
         self._refresh_idle_lanes(ws_id, views)
+        self._log_done_lanes(ws_id, views)
 
     def _push_lane_view(self, ws_id: str, agent) -> None:
         """One agent's lane record changed (created, failed, revived): repaint
@@ -4468,14 +4456,6 @@ class MainWindow(QMainWindow):
             info["role"] = ("Make integrator", not why, tip)
         return info
 
-    @staticmethod
-    def _integrator_idle(agent) -> bool:
-        """Ready for a note: running, at its prompt, not working, not asking
-        anything, not parked on a usage limit."""
-        return (agent.is_running() and agent.prompt_ready()
-                and not agent.is_busy() and not agent.is_waiting()
-                and not agent.is_limit_blocked())
-
     def _toggle_integrator(self, ws_id: str, agent) -> None:
         """The card header's Make integrator / Stop being the integrator."""
         if self.manager.is_integrator(agent):
@@ -4497,32 +4477,18 @@ class MainWindow(QMainWindow):
         page = self._pages.get(ws_id)
         for card in (page.cards if page is not None else []):
             card.refresh_lane()
-        self._nudge_integrator(ws_id)
 
-    def _nudge_integrators(self) -> None:
-        for ws in self.manager.workspaces:
-            self._nudge_integrator(ws.id)
-
-    def _nudge_integrator(self, ws_id: str) -> None:
-        """Tell the workspace's idle integrator about lanes whose agent
-        committed "Task done" since it last heard. Reads only what the lane
-        service last saw: the integrator does the git work itself. A flag
-        seen with no integrator around, or one that isn't running, is
-        logged and noted on its card once, and passed on as soon as there is
-        an idle one."""
+    def _log_done_lanes(self, ws_id: str, views: dict) -> None:
+        """Log each lane commit that says "Task done", once per commit. Past
+        the chip's check mark, that is all AI Hive does with the flag. The
+        user decides when there is enough to ship and asks the integrator.
+        AI Hive never types into the integrator: told about every flag as
+        it landed, the integrator shipped work before the user asked."""
         ws = self.manager.workspace(ws_id)
-        if ws is None:
-            return
-        integrator = self.manager.integrator(ws_id)
-        who = integrator.spec.uid if integrator is not None else ""
-        fresh = []
-        for agent in ws.agents:
-            view = (self.lane_service.view(agent.spec.uid)
-                    if agent.spec.lane else None)
-            if (view is None or not view.done or agent is integrator
-                    or (who, agent.spec.uid, view.done) in self._nudged):
+        for agent in (ws.agents if ws is not None else []):
+            view = views.get(agent.spec.uid) if agent.spec.lane else None
+            if view is None or not view.done:
                 continue
-            fresh.append((agent, view))
             key = (agent.spec.uid, view.done)
             if key in self._done_seen:
                 continue
@@ -4533,37 +4499,6 @@ class MainWindow(QMainWindow):
                 self.event_hub.lane_event(
                     agent, f"marked its work done at {view.done[:7]}",
                     {"branch": view.branch, "sha": view.done})
-            if integrator is None:
-                agent.notice("[work marked done, but this workspace has no "
-                             "integrator to ship it. Make one with the flag "
-                             "in a laned Claude agent's tray.]")
-            elif not integrator.is_running():
-                agent.notice(f"[work marked done, but the integrator "
-                             f"{integrator.spec.name} isn't running. Start "
-                             f"it to ship this work.]")
-        if (not fresh or integrator is None
-                or not self._integrator_idle(integrator)):
-            return
-        lines = [f"- {session_hook.printable(a.spec.name)}: branch "
-                 f"{v.branch}, \"Task done\" at {v.done}" for a, v in fresh]
-        base = integrator.spec.lane.get("base") or "main"
-        integrator.deliver_task(
-            "[AI Hive] These lanes have finished work to integrate:\n"
-            + "\n".join(lines)
-            + f"\nFollow the checklist as it is on {base}, not your lane's "
-              f"copy: git show origin/{base}:docs/agents/integration.md. If "
-              f"your own integrate/ pull request is still open, add these "
-              f"lanes to it instead of starting another.",
-            title="Integrating finished lanes")
-        self._nudged.update((who, a.spec.uid, v.done) for a, v in fresh)
-        self._store_audit(
-            f"NUDGE integrator={integrator.spec.name!r} lanes="
-            + ",".join(f"{v.branch}@{v.done[:7]}" for _a, v in fresh))
-        if self.event_hub is not None:
-            self.event_hub.lane_event(
-                integrator, "was asked to integrate "
-                + ", ".join(a.spec.name for a, _v in fresh),
-                {"lanes": [v.branch for _a, v in fresh]})
 
     def _refresh_idle_lanes(self, ws_id: str, views: dict) -> None:
         """Keep idle lanes fresh (spec Phase 3): a lane with nothing of its

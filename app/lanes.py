@@ -60,8 +60,8 @@ sides committed, a real in-memory merge (`git merge-tree --write-tree`, git
 2.38+) says whether they CONFLICT. All of it is read-only and lock-free, so
 app/lane_service.py polls it off the LaneOps queue. The same read finds the
 lane's newest commit whose message has a line saying just "Task done"
-(`DONE_GREP`): the agent's flag that its slice of work is finished, which
-MainWindow passes on to the workspace's integrator.
+(`DONE_GREP`): the agent's flag that its slice of work is finished. The
+lane chip shows it, and the integrator ships it when the user asks.
 """
 
 from __future__ import annotations

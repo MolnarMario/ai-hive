@@ -1127,12 +1127,13 @@ class TerminalCard(QFrame):
         self.lane_mark.setText(text)
         tip = self._lane_tooltip(lane, view)
         if integrator:
-            tip = ("This agent is the workspace's integrator: AI Hive tells "
-                   "it when a lane's agent commits \"Task done\", and it "
-                   "ships that work.\n\n" + tip)
+            tip = ("This agent is the workspace's integrator: when you ask "
+                   "it to, it ships the lanes whose agent committed \"Task "
+                   "done\".\n\n" + tip)
         elif view is not None and view.done:
             tip = (f"✓ Work marked done at {view.done[:7]} (a \"Task "
-                   f"done\" commit). The integrator picks it up.\n\n" + tip)
+                   f"done\" commit). It ships when you ask the integrator "
+                   f"to.\n\n" + tip)
         self.lane_mark.setToolTip(tip)
         if self.lane_mark.property("lane") != state:
             self.lane_mark.setProperty("lane", state)
