@@ -669,20 +669,41 @@ def test_pty():
     check("pty: the child command is running",
           wait_until(lambda: bool(ping_pids()), 15000),
           agent.worker.job_process_ids())
+    # ...and past its startup. A ping that is in the job but still loading
+    # can drop the control event: 8 of 24 runs failed with 8 copies of this
+    # test running at once. Three 127.0.0.1s on screen are the typed command,
+    # the header and a first reply, in any locale.
+    check("pty: the child command printed its first reply",
+          wait_until(lambda: card.terminal.screen_text().count("127.0.0.1")
+                     >= 3, 15000),
+          card.terminal.screen_text()[-160:])
     agent.write("\x03")
     check("pty: Ctrl+C interrupted the running child",
           wait_until(lambda: not ping_pids(), 10000), ping_pids())
     # an INTERRUPT, not a kill: the shell survives its child being stopped
     check("pty: Ctrl+C left the shell alive", agent.is_running())
 
+    def at_prompt():
+        lines = [ln.rstrip() for ln in
+                 card.terminal.screen_text().splitlines() if ln.strip()]
+        return bool(lines) and lines[-1].startswith("PS") \
+            and lines[-1].endswith(">")
+
+    # type the next command at a prompt, not into a shell still unwinding
+    # the interrupt
+    wait_until(at_prompt, 10000)
+
     # background retention while hidden
-    agent.write("1..8 | %{ $_; Start-Sleep -Milliseconds 100 }\r")
+    # a 4 s stream and a deadline, not an 800 ms stream and one fixed 1.3 s
+    # window: with the machine busy, the shell could start the stream late
+    # and the window saw no change (2 of 24 runs, 8 copies at once)
+    agent.write("1..40 | %{ $_; Start-Sleep -Milliseconds 100 }\r")
     pump(150)
     card.hide()
     before = card.terminal.screen_text()
-    pump(1300)
     check("pty: hidden terminal kept updating",
-          card.terminal.screen_text() != before and not card.isVisible())
+          wait_until(lambda: card.terminal.screen_text() != before, 6000)
+          and not card.isVisible(), before[-240:])
 
     pid = agent.worker.pid()
     card.detach()
