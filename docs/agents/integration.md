@@ -13,6 +13,16 @@ its own lane by the checklist below.
 Lanes never bump the version or touch the CHANGELOG or the README check
 count. The integrator does, once per pull request.
 
+AI Hive gives every workspace's integrator the same prompt
+(`coordination.system_prompt_text`), and that prompt defers to this file
+on the base branch. Everything AI Hive-specific lives here: the version
+and CHANGELOG bump, the smoke suite, the README count and step 10's
+update of the main checkout. A project without this file gets the
+prompt's default flow: test, pull request, a clean GPT-6-Luna review, a
+merge commit. It leaves that project's main checkout alone, because it is
+the user's working copy and a pull could change files under their editor
+or dev server.
+
 ## Testing policy
 
 - A lane agent commits each finished task on its lane branch and runs the

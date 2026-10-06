@@ -3678,8 +3678,15 @@ class MainWindow(QMainWindow):
         target = ""
         if reason is None:
             ext = os.path.splitext(source)[1].lower()
-            target = os.path.join(
-                self.sounds_dir(), f"{kind}-{int(time.time() * 1000)}{ext}")
+            # a name no file has yet: a replacement in the same millisecond
+            # copied over the current copy, then _drop_custom_chime_file
+            # deleted it, leaving the chime pointing at nothing
+            stamp = int(time.time() * 1000)
+            target = os.path.join(self.sounds_dir(), f"{kind}-{stamp}{ext}")
+            while os.path.exists(target):
+                stamp += 1
+                target = os.path.join(self.sounds_dir(),
+                                      f"{kind}-{stamp}{ext}")
             try:
                 os.makedirs(self.sounds_dir(), exist_ok=True)
                 shutil.copyfile(source, target)

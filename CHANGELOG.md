@@ -8,6 +8,16 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.33.0
+
+- The integrator no longer pulls main into your project's own folder
+  after it merges. That folder is your working copy, and a pull could
+  change files under your editor or dev server. It tells you main moved
+  instead, so you pull when you're ready.
+- The integrator no longer bumps a version or edits a CHANGELOG in
+  every project. It does both only when the project's
+  docs/agents/integration.md asks for it, the way AI Hive's own does.
+
 ## 0.32.0
 
 - You decide when finished work ships. AI Hive no longer types a note

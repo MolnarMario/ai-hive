@@ -68,11 +68,18 @@ def system_prompt_text(workspace_name: str, agent_name: str,
     tool returns a whole file. Every other agent keeps the full instruction,
     because the board is its only awareness.
 
-    `integrator`: this laned agent is the workspace's integrator
-    (docs/agents/integration.md). It owns the version, CHANGELOG and README
-    count that every other lane is told to leave alone. It merges its own
-    pull request, and only after a clean GPT-6-Luna review and a passing
-    full suite. Every other laned agent flags finished work with a "Task
+    `integrator`: this laned agent is the workspace's integrator. The
+    prompt is the same for every repository, so anything project-specific
+    (a version bump, a CHANGELOG, updating the main checkout) comes from the
+    base branch's docs/agents/integration.md when the project has one. AI
+    Hive's own does all three; another project's main checkout is the
+    user's working copy, which a pull could change under their editor or
+    dev server, so without the doc the integrator leaves it alone. Doc or
+    no doc, it merges only its own pull request, only after a clean
+    GPT-6-Luna review and passing tests on the head it merges (or the
+    commit a checklist counts as tested, as AI Hive's does for a README-only
+    count commit), and only by `--match-head-commit` with a merge commit.
+    Every other laned agent flags finished work with a "Task
     done" commit line (lanes.DONE_MARK). The flag only marks the work
     ready: the integrator starts when the user asks it to, never because a
     lane was flagged."""
@@ -106,22 +113,33 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"with a commit whose message has the line \"{lanes.DONE_MARK}\". "
             f"The user decides when there is enough finished work to ship. "
             f"Start only when the user asks you to, never on your own and "
-            f"never because a lane was flagged. Then follow "
-            f"docs/agents/integration.md from {base}: gather the lanes the "
+            f"never because a lane was flagged. Then gather the lanes the "
             f"user names, or every lane with an unmerged "
             f"\"{lanes.DONE_MARK}\" commit if they name none, into one "
-            f"integrate/ branch, bump the version and the CHANGELOG once, "
-            f"run the full test suite, open the pull request, and have "
-            f"GPT-6-Luna review it at high effort. Fix every valid finding "
-            f"and review again "
-            f"until Luna finds nothing. Only then merge it yourself with a "
-            f"merge commit, and bring the main checkout at "
-            f"{lane.get('repo', '')} up to date with {base} (fast-forward "
-            f"only, never when it has uncommitted changes). Never rebase or "
-            f"force-push, never squash, never edit other worktrees, never "
-            f"edit files in the main checkout, and never commit to {base} "
-            f"directly. If something fails that you can't fix, stop and "
-            f"tell the user.")
+            f"integrate/ branch that starts from origin/{base}; its pull "
+            f"request targets {base}. If {base} has a checklist "
+            f"for shipping lanes at docs/agents/integration.md, read it "
+            f"from {base} and follow it: it says how this project tests, "
+            f"versions and finishes a release. Without it, run the "
+            f"project's tests, open the pull request, have GPT-6-Luna "
+            f"review it at high effort, fix every valid finding and review "
+            f"again until Luna finds nothing, then merge it yourself. Bump "
+            f"a version or edit a CHANGELOG only when that doc asks for "
+            f"it, and update the main checkout at {lane.get('repo', '')} "
+            f"only when it says to (fast-forward only, never when it has "
+            f"uncommitted changes). Otherwise leave it alone and tell the "
+            f"user {base} moved, so they pull when they are ready. Whatever "
+            f"the doc says, merge only your own pull request, only after a "
+            f"clean GPT-6-Luna review and passing tests on the head you "
+            f"merge or the commit your checklist counts as tested for it, "
+            f"and only with a merge commit through "
+            f"`gh pr merge --merge --match-head-commit <that head>`. If "
+            f"{base} moved since you tested, merge it in and test again. "
+            f"Never rebase or force-push, never squash, never edit other "
+            f"worktrees, never edit files in the main checkout beyond the "
+            f"fast-forward a checklist asks for, and never commit to {base} "
+            f"directly. If something fails that you can't "
+            f"fix, stop and tell the user.")
     elif laned:
         base = lane.get("base") or "the base branch"
         # The commit rule is explicit because Claude Code commits only when
@@ -149,8 +167,8 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"venv or node_modules folder in your lane is a link to the main "
             f"checkout's copy, so installing packages there changes them for "
             f"every lane. Do not bump the version or edit the CHANGELOG or "
-            f"the README check count: that is done once per pull request, "
-            f"when your work is integrated.")
+            f"a test count in the README: the integrator does that once per "
+            f"pull request, in projects that keep them.")
     return text
 
 

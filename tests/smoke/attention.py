@@ -324,6 +324,26 @@ def test_custom_chime_sounds():
               second != copied and not os.path.exists(copied)
               and os.path.isfile(second), (copied, second))
 
+        # a replacement in the same millisecond once copied over the
+        # current copy and then deleted it
+        import app.widgets.main_window as mw
+        real_time = mw.time
+        frozen = real_time.time()
+        mw.time = types.SimpleNamespace(time=lambda: frozen)
+        try:
+            first_src = write_wav("tick.wav", 0.3)
+            win.set_custom_chime(chime.QUESTION, first_src)
+            first_ms = win._custom_sounds[chime.QUESTION]
+            second_src = write_wav("dong.wav", 0.3)
+            win.set_custom_chime(chime.QUESTION, second_src)
+            second = win._custom_sounds[chime.QUESTION]
+        finally:
+            mw.time = real_time
+        check("custom chime: a replacement in the same millisecond keeps "
+              "the new copy", second != first_ms
+              and not os.path.exists(first_ms) and os.path.isfile(second),
+              (first_ms, second))
+
         win._save_session()
         win._save_timer.stop()
         win.close()
