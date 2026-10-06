@@ -7,6 +7,7 @@ real-AI-launch guard: a laned Claude agent is started by the lane callback,
 and that start must record, not launch.
 """
 
+import dataclasses
 import json
 import os
 import shutil
@@ -3826,6 +3827,14 @@ def test_task_done_nudges_the_integrator():
         card.set_lane_view(views[a.spec.uid])
         check("nudge: the lane chip shows a check mark",
               "✓" in card.lane_mark.text(), card.lane_mark.text())
+        check("nudge: a done lane's chip turns green",
+              card.lane_mark.property("lane") == "done",
+              card.lane_mark.property("lane"))
+        clash = lanes.Overlap(path="a.txt", peer_uid="", peer="main",
+                              peer_branch="main", state="committed")
+        check("nudge: a file another lane changed outranks done",
+              dataclasses.replace(views[a.spec.uid],
+                                  overlaps=[clash]).state == "overlap")
         win._nudge_integrators()
         win._nudge_integrators()
         check("nudge: with no integrator the card hears it once",

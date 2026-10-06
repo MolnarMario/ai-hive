@@ -500,11 +500,12 @@ def test_agent_card_reorder():
 
 
 def test_workspace_header():
-    """The workspace header bar owns Open folder / Change… / Delete (not
+    """The workspace header bar owns Open folder / Change folder / Delete (not
     duplicated as sidebar hover buttons any more) — delete sits LEFT of open,
     matching the sidebar's old left-to-right order — and the path shows the
     FULL text whenever it fits, eliding only the overflow the header's own
     buttons would otherwise be squeezed by."""
+    from PySide6.QtGui import QFontMetrics
     from PySide6.QtWidgets import QApplication
     from app.widgets.workspace_page import WorkspacePage
     from app.workspace_manager import Workspace
@@ -524,6 +525,30 @@ def test_workspace_header():
           "change",
           idx_delete < idx_open < idx_change,
           (idx_delete, idx_open, idx_change))
+
+    # one gap between every header button: a spacer item between Change and
+    # Layout once made that gap 20px against the 6px everywhere else. The
+    # lanes box is shown so its two gaps are measured too.
+    page.set_lanes_state(False, available=True)
+    page.resize(1400, 600)
+    page.show()
+    app.processEvents()
+    row = order[order.index(page.delete_btn):]
+    gaps = [b.geometry().left() - a.geometry().right() - 1
+            for a, b in zip(row, row[1:])]
+    spacing = page._header_lay.spacing()
+    check("workspace header: every button from Delete to Activity sits one "
+          "layout spacing from the next",
+          len(row) == 8 and all(w.isVisible() for w in row)
+          and gaps == [spacing] * (len(row) - 1),
+          (spacing, gaps, [w.isVisible() for w in row]))
+    page.set_lanes_state(False, available=False)
+    app.processEvents()
+    check("workspace header: the path gets exactly the width the row leaves "
+          "it when the lanes box is hidden",
+          page.path_label.width() == page._path_budget(),
+          (page.path_label.width(), page._path_budget()))
+    page.hide()
 
     deleted = []
     page.deleteRequested.connect(deleted.append)
@@ -546,6 +571,11 @@ def test_workspace_header():
     check("workspace header: a narrow window elides the path instead of "
           "overlapping the buttons",
           page.path_label.text() != long_path, page.path_label.text())
+    shown = QFontMetrics(page.path_label.font()).horizontalAdvance(
+        page.path_label.text())
+    check("workspace header: the elided path fits the label it sits in",
+          shown <= page.path_label.width(),
+          (shown, page.path_label.width()))
 
     # growing back out restores the full path (not stuck at the smaller
     # elision like the old self-referential width computation)

@@ -399,7 +399,7 @@ workspaces keep executing — switching never pauses anything.
   again) closes it and restores what was expanded before.
 - **First-class folders** — every workspace header shows its full path
   (eliding only what its own buttons don't leave room for) with **Delete**,
-  **Open repo**, **Open folder** and **Change…** buttons; agents launch rooted
+  **Open repo**, **Open folder** and **Change folder** buttons; agents launch rooted
   there. The ▾ beside Open repo lists the GitHub repository's recent pull
   requests and commits. AI Hive loads that list in the background a few
   seconds after startup and keeps it, so the menu opens already filled.
@@ -613,7 +613,7 @@ error dialog instead of silently closing. Packaging to a distributable
   (1 full, 2 side-by-side, 3 = 3×1, 4 = 2×2, 5–6 = 3×2, …). Line and full-terminal
   cards share the same grid.
 - **Folder & activity** — the workspace header shows the full project path
-  with **Delete** / **Open folder** / **Change…**; **Activity** opens a panel
+  with **Delete** / **Open folder** / **Change folder**; **Activity** opens a panel
   with the live agent roster, the shared coordination log, and git-changed
   files.
 - **Font size** — per-agent `A−`/`A+` in each card header (or `Ctrl+±` while
@@ -891,7 +891,7 @@ Hard-won rules, each with a regression test:
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2791 checks drive the real app headlessly (offscreen Qt platform) with real
+2796 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1031,7 +1031,7 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2791 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME (2796 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
