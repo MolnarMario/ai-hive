@@ -2499,8 +2499,9 @@ def test_integrator_prompt_project_neutral():
           "checklist for shipping lanes at docs/agents/integration.md, "
           "read it from dev and follow it" in prompt, prompt)
     check("integ-neutral: the branch starts from the base and the PR "
-          "targets it", "starts from origin/dev" in prompt
-          and "pull request against dev" in prompt, prompt)
+          "targets it, without fixing when the PR opens",
+          "starts from origin/dev; its pull request targets dev" in prompt
+          and "and open its pull request" not in prompt, prompt)
     check("integ-neutral: no unconditional version or CHANGELOG bump",
           "bump the version and the CHANGELOG once" not in prompt
           and "Bump a version or edit a CHANGELOG only when that doc asks"
