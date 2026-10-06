@@ -130,6 +130,9 @@ workspaces keep executing — switching never pauses anything.
   (Claude terracotta, Gemini blue, GPT in the card header's light title ink)
   and turns red at 85%, so you see a wall coming instead of hitting it
   mid-task, and the red pill tells you which agent is about to hit it.
+  Switch on **Show usage left** in ⚙ Options and every pill counts down
+  instead (`5h Claude 79% left`), with its ring emptying as you use the
+  window; red still means 85% used.
   **Click either to refresh**; hover for every limit window, your
   plan, and how old the reading is. The numbers come from the same place the
   CLI's `/usage` gets them, read in the background. Nothing is logged or
@@ -535,8 +538,8 @@ workspaces keep executing — switching never pauses anything.
   show without file edges; see below.)
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
-  reset**, **Question chime**, **Reply finished chime**, **Taskbar count** and **Check for CLI
-  updates at start-up** as labelled switches (each with a green/dark LED, so
+  reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Check for CLI
+  updates at start-up** and **Show usage left** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
   the theme and global font size below. Click outside or press `Esc` to close.
@@ -632,7 +635,7 @@ error dialog instead of silently closing. Packaging to a distributable
   complete, exactly as in a real terminal.
 - **Card controls** — hover the `⋯` at the right of a card's header for its
   actions: `■` stop, `↻` restart (replaces the agent with a fresh one: new
-  conversation, the CLI's default permission mode, launch model and effort,
+  conversation, the permission mode, model and effort it was created with,
   no old title or task; name and folder stay), `⏱` send on a countdown,
   `A−`/`A+` font and `⤢` maximize, plus
   `⎇` restart in own lane and `⚑` make integrator where lanes apply. Each

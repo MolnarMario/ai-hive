@@ -536,10 +536,6 @@ class WorkspaceManager(QObject):
         self.dirty.emit()
         agent.deleteLater()
 
-    # -------------------------------------------------- task assignment ---
-    # The card's "Assign / reassign a task..." action drives this. Assigning a
-    # task to an agent changes nothing about that agent except its task.
-
     # ------------------------------------------------ stats + coordination ---
 
     def _wire_agent(self, ws: Workspace, agent: TerminalAgent) -> None:
@@ -985,6 +981,8 @@ class WorkspaceManager(QObject):
                         "model": getattr(spec, "model", ""),
                         "effort": getattr(spec, "effort", ""),
                         "permission_mode": getattr(spec, "permission_mode", ""),
+                        "launch_permission_mode": getattr(
+                            spec, "launch_permission_mode", ""),
                         "role": getattr(spec, "role", ""),
                         "font_px": getattr(spec, "font_px", 0),
                         # a laned agent that lost this would come back in its

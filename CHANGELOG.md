@@ -13,8 +13,8 @@ em dashes: this text is shown in the app.
 - Restart now gives you a fresh agent, as if you closed the card and
   opened a new one of the same kind. It drops a permission mode you
   switched into, a /model or /effort override, the AI title, the
-  context badge and the assigned task. Name, folder, lane, model,
-  effort and font stay.
+  context badge and the assigned task. Name, folder, lane, font and
+  the model, effort and permission mode you created it with stay.
 - The Start and Assign buttons are gone from the card's hover tray.
   Restart or any keystroke starts a stopped agent.
 - A collapsed sidebar now leaves a thin rail with one strip per

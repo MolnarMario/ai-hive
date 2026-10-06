@@ -105,6 +105,11 @@ class AgentSpec:
     # the CLI's own default (today's behavior). Baked into `args` by build_spec
     # via providers.build_invocation, like model/effort.
     permission_mode: str = ""
+    # the mode the agent was CREATED with (the New Agent dialog's pick).
+    # `permission_mode` above also takes the live mode the manager reads back
+    # from the transcript (Shift+Tab), so Restart needs this to get back to
+    # the launch choice instead of guessing "".
+    launch_permission_mode: str = ""
     custom_command: str = ""  # user override for template providers
     font_px: int = 0         # 0 = follow the global/default size
     # extra system-prompt text injected for coordination (Claude)
@@ -219,6 +224,7 @@ class AgentSpec:
             "user_args": list(self.user_args), "pty": self.pty,
             "provider": self.provider, "model": self.model,
             "effort": self.effort, "permission_mode": self.permission_mode,
+            "launch_permission_mode": self.launch_permission_mode,
             "custom_command": self.custom_command,
             "font_px": self.font_px,
             "session_id": self.session_id,
@@ -246,6 +252,11 @@ class AgentSpec:
         # a pre-uid session keeps the fresh one the dataclass minted, and saves it
         spec.uid = str(d.get("uid", "") or "") or spec.uid
         spec.lane = clean_lane(d.get("lane"))
+        # a file from before this key has only the live mode; keeping that
+        # (build_spec's default) is what Restart did before it existed
+        if "launch_permission_mode" in d:
+            spec.launch_permission_mode = str(
+                d.get("launch_permission_mode") or "")
         return spec
 
 
@@ -285,6 +296,7 @@ def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
         pty = True
     spec = AgentSpec(kind=kind, name=name, role=role, cwd=cwd, pty=pty,
                      model=model, effort=effort, permission_mode=permission_mode,
+                     launch_permission_mode=permission_mode,
                      custom_command=custom_command,
                      font_px=font_px,
                      user_program=program, user_args=args)

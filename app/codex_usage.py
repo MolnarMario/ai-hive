@@ -153,8 +153,8 @@ def format_limit(limit: CodexLimit, now: float | None = None,
             else f"GPT {pct_text(limit.percent, left)}")
     if limit.resets_at is None:
         return head
-    left = limit.resets_at - now
-    if left <= 0:
+    until_reset = limit.resets_at - now
+    if until_reset <= 0:
         return f"{head}, resets now"
     when = datetime.fromtimestamp(limit.resets_at).strftime("%H:%M")
-    return f"{head}, resets in {format_countdown(left)} at {when}"
+    return f"{head}, resets in {format_countdown(until_reset)} at {when}"

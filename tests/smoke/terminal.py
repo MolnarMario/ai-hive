@@ -2205,6 +2205,43 @@ def test_restart_resets_the_agent_to_its_launch_defaults():
     a.dispose()
 
 
+def test_restart_keeps_the_permission_mode_the_agent_was_created_with():
+    """Restart drops a mode the user shifted into, but not the one they
+    picked in the New Agent dialog. The manager writes the live mode back to
+    spec.permission_mode, so the launch pick lives in its own field and has
+    to survive a save and load. A file written before that field existed
+    keeps its stored mode, which is what Restart did before."""
+    from app.process_worker import AgentKind, AgentSpec, build_spec
+    from app.terminal_agent import TerminalAgent
+
+    spec = build_spec(AgentKind.CLAUDE, "Edits", cwd=SCRATCH_CWD,
+                      permission_mode="acceptEdits")
+    spec.set_permission_mode("plan")          # the user shifted into plan
+    spec = AgentSpec.from_dict(spec.to_dict())  # and AI Hive restarted
+    check("launch-mode: a save and load keep the launch pick apart",
+          spec.permission_mode == "plan"
+          and spec.launch_permission_mode == "acceptEdits",
+          (spec.permission_mode, spec.launch_permission_mode))
+    a = TerminalAgent(spec)
+    # a stub: from IDLE, PtyWorker.restart() STARTS a real claude
+    a.worker.restart = lambda: None
+    a.restart()
+    args = a.spec.effective_args()
+    check("launch-mode: restart comes back in the mode it was created with",
+          a.spec.permission_mode == "acceptEdits"
+          and "plan" not in args
+          and args[args.index("--permission-mode") + 1] == "acceptEdits",
+          args)
+    a.dispose()
+
+    legacy = build_spec(AgentKind.CLAUDE, "Old", cwd=SCRATCH_CWD,
+                        permission_mode="plan").to_dict()
+    del legacy["launch_permission_mode"]
+    old = AgentSpec.from_dict(legacy)
+    check("launch-mode: an older session file keeps its stored mode",
+          old.launch_permission_mode == "plan", old.launch_permission_mode)
+
+
 def test_header_tools_tray_closes_without_a_leave_event():
     """A slow exit up or down can fire Leave while QCursor.pos() still rounds
     inside the tray (fractional DPI), and then no further event reaches it.

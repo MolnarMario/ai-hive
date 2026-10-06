@@ -2562,19 +2562,21 @@ class MainWindow(QMainWindow):
         self.body_split.splitterMoved.connect(self._on_sidebar_resized)
 
         # the collapsed sidebar leaves a rail of workspace strips behind,
-        # left of the splitter so the splitter handle still drags it open
-        body = QWidget(central)
-        body_lay = QHBoxLayout(body)
+        # left of the splitter so the splitter handle still drags it open.
+        # A sub-layout, not a wrapper widget: one more widget between the
+        # splitter and the window delays the window's growth to its minimum
+        # width past settle_layout, and every pty child spawns too narrow.
+        body_lay = QHBoxLayout()
         body_lay.setContentsMargins(0, 0, 0, 0)
         body_lay.setSpacing(0)
-        self.ws_rail = WorkspaceRail(body)
+        self.ws_rail = WorkspaceRail(central)
         self.ws_rail.hide()
         self.sidebar.set_rail(self.ws_rail)
         body_lay.addWidget(self.ws_rail)
         body_lay.addWidget(self.body_split, 1)
 
         root.addWidget(self.top_bar)
-        root.addWidget(body, 1)
+        root.addLayout(body_lay, 1)
         self.setCentralWidget(central)
 
         # illuminated-manuscript page border: a mouse-transparent overlay over

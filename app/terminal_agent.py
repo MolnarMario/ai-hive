@@ -39,7 +39,7 @@ class AssignmentState(Enum):
     """Orchestration lifecycle, distinct from process status: an interactive
     Claude process stays RUNNING even after finishing a task, so this is what
     says 'done / free for a new task'. Auto-created agents NEVER auto-close —
-    they sit in COMPLETED/IDLE until the user closes or reassigns them."""
+    they sit in COMPLETED/IDLE until the user closes or restarts them."""
     IDLE = "idle"                    # running, no assigned task
     AWAITING = "awaiting"            # spawned, waiting for its first task
     WORKING = "working"             # actively on an assigned task
@@ -1098,13 +1098,13 @@ class TerminalAgent(QObject):
         """Drop what the old conversation left on this agent, so a restart
         reads like closing the card and opening a new agent of the same kind.
 
-        What stays is what the user set up: name, folder, lane, model and
-        effort as launched, font size. What goes is state that belonged to the
-        conversation: the permission mode the user had shifted into (the
-        manager writes it back to the spec, so without this a restart would
-        come up in plan or auto mode), a /model or /effort override, the AI
-        title, the context badge and the assigned task."""
-        self.spec.set_permission_mode("")
+        What stays is what the user set up: name, folder, lane, model,
+        effort and permission mode as launched, font size. What goes is state
+        that belonged to the conversation: a permission mode the user shifted
+        into (the manager writes it back to the spec, so without this a
+        restart would come up in plan or auto mode), a /model or /effort
+        override, the AI title, the context badge and the assigned task."""
+        self.spec.set_permission_mode(self.spec.launch_permission_mode)
         before = self.model_badge()
         self._seed_live_state()
         if self.model_badge() != before:
@@ -1249,7 +1249,7 @@ class TerminalAgent(QObject):
         return row
 
     def deliver_task(self, text: str) -> None:
-        """Give this agent a task to work on (the reassign path).
+        """Give this agent a task to work on and mark it WORKING.
 
         For a pty agent (Claude Code) the task is delivered only once the TUI
         is prompt-ready (we watch its output stream for bracketed-paste-enable,
@@ -1500,7 +1500,7 @@ class TerminalAgent(QObject):
         self._hint_if_tty_only(text.strip())
         if not self.worker.send_line(text):
             self._emit(STREAM_SYSTEM,
-                       "[not running; hover the ⋯ on the card header and click ▶ to start]\n")
+                       "[not running; hover the ⋯ on the card header and click ↻ to restart]\n")
 
     def _hint_if_tty_only(self, command: str) -> None:
         parts = command.split()
