@@ -22,6 +22,8 @@ import datetime
 import os
 import subprocess
 
+from . import lanes
+
 BOARD_DIRNAME = ".aihive"
 BOARD_FILENAME = "board.md"
 ARCHIVE_FILENAME = "board-archive.md"
@@ -67,8 +69,11 @@ def system_prompt_text(workspace_name: str, agent_name: str,
     because the board is its only awareness.
 
     `integrator`: this laned agent is the workspace's integrator
-    (app/integration.py). It owns the version, CHANGELOG and README count
-    that every other lane is told to leave alone, and it never merges."""
+    (docs/agents/integration.md). It owns the version, CHANGELOG and README
+    count that every other lane is told to leave alone. It merges its own
+    pull request, and only after a clean GPT-6-Luna review and a passing
+    full suite. Every other laned agent flags finished work with a "Task
+    done" commit line (lanes.DONE_MARK), which is what gets it integrated."""
     laned = bool(lane and lane.get("root") and lane.get("branch"))
     if laned and aware:
         roster = os.path.join(os.path.dirname(board_path), ROSTER_FILENAME)
@@ -95,25 +100,42 @@ def system_prompt_text(workspace_name: str, agent_name: str,
         base = lane.get("base") or "the base branch"
         text += (
             f" You are this workspace's INTEGRATOR, working in your own git "
-            f"worktree at {lane['root']}. When the user submits another "
-            f"agent's lane, AI Hive types an integration brief into your "
-            f"prompt. For each brief: create the integrate/ branch it names "
-            f"from the pinned commit, merge {base} into it, resolve "
-            f"conflicts, bump the version and the CHANGELOG once for that "
-            f"pull request, review, commit, run the full test suite on that "
-            f"commit, set the README count, push, and open the pull request "
-            f"with gh pr create and a Tested-commit line naming the commit "
-            f"the suite ran on, then end your turn. Never rebase or "
-            f"force-push, never edit other worktrees or "
-            f"the main checkout at {lane.get('repo', '')}, never commit to "
-            f"{base} directly, and NEVER run gh pr merge: the user approves "
-            f"every merge in AI Hive.")
+            f"worktree at {lane['root']}. Other agents mark finished work "
+            f"with a commit whose message has the line \"{lanes.DONE_MARK}\". "
+            f"When AI Hive tells you such work is waiting, follow "
+            f"docs/agents/integration.md from {base}: gather every lane with "
+            f"an unmerged \"{lanes.DONE_MARK}\" commit into one integrate/ "
+            f"branch, bump the version and the CHANGELOG once, run the full "
+            f"test suite, open the pull request, and have GPT-6-Luna review "
+            f"it at high effort. Fix every valid finding and review again "
+            f"until Luna finds nothing. Only then merge it yourself with a "
+            f"merge commit, and bring the main checkout at "
+            f"{lane.get('repo', '')} up to date with {base} (fast-forward "
+            f"only, never when it has uncommitted changes). Never rebase or "
+            f"force-push, never squash, never edit other worktrees, never "
+            f"edit files in the main checkout, and never commit to {base} "
+            f"directly. If something fails that you can't fix, stop and "
+            f"tell the user.")
     elif laned:
         base = lane.get("base") or "the base branch"
+        # The commit rule is explicit because Claude Code commits only when
+        # asked: lane agents finished tasks and left them uncommitted, and
+        # uncommitted work can't ship or be proven merged when the card
+        # closes. The "Task done" line is what gets a lane shipped
+        # (MainWindow._nudge_integrator); session_hook.lane_stop_decision
+        # backs the rule for an agent that forgets.
         text += (
             f" You work in your own git worktree (your lane) at {lane['root']}, "
             f"on the branch {lane['branch']}, which starts from {base}. Commit "
-            f"your work there, on that branch. Never edit files in other "
+            f"each finished task on your lane branch yourself, without asking "
+            f"first, and end that commit's message with a line of just "
+            f"\"{lanes.DONE_MARK}\". That line tells the integrator your work "
+            f"is ready to ship, so never put it on unfinished work. The lane "
+            f"is private: nothing in it reaches {base} until the integrator "
+            f"ships it. Don't finish a task with uncommitted "
+            f"changes, unless the user asked you not to commit. Run the tests "
+            f"that cover what you changed; the full test suite runs once, "
+            f"when your work is integrated. Never edit files in other "
             f"worktrees or in the main checkout at {lane.get('repo', '')} "
             f"(reading its board is fine), and never commit to {base}. Never "
             f"push your lane branch to {base}, even when git suggests it: "

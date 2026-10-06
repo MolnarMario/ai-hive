@@ -16,10 +16,12 @@ A third family, the agent-lanes hooks, goes ONLY to laned agents, whatever
 the lanes toggles say (its own settings file, `lanes=True`): PostToolUse on
 the edit tools warns when another lane changed the same file, and
 UserPromptSubmit injects unread lane notices. Both print
-hookSpecificOutput.additionalContext, the only output this script ever
-prints. Their data files (lanes.json, notices, seen) are written by
-app/lane_service.py; the formats live here, next to their reader. See the
-"agent lanes" section below.
+hookSpecificOutput.additionalContext. The Stop hook above also keeps a
+laned agent going once when it ends a turn with uncommitted lane changes
+(lane_stop_decision), printed as the Stop hook's {"decision": "block"}.
+Nothing else is ever printed. Their data files (lanes.json, notices, seen)
+are written by app/lane_service.py; the formats live here, next to their
+reader. See the "agent lanes" section below.
 
 
 AI Hive pins each Claude agent to a conversation with `--session-id`/`--resume`,
@@ -94,6 +96,12 @@ SEEN_KEYS_CAP = 2000
 # "enabled": false that lost a race with a hook reading the file, or an AI
 # Hive that is gone, still silences the hooks within this long.
 LANES_STALE_S = 45.0
+# the turn-end nudge (lane_stop_decision) runs `git status` inside the
+# agent's Stop: a slow disk or a locked index must not hold its turn end
+# for long, so git gets this long and a timeout means no nudge
+STOP_GIT_TIMEOUT_S = 5.0
+STOP_FILES_SHOWN = 3
+_CREATE_NO_WINDOW = 0x08000000
 
 
 def _hook_command(mapping_path: str, events_path: str | None = None,
@@ -592,10 +600,88 @@ def lane_notice_context(env=None, now: float = 0.0) -> str:
             "changed files you also changed):\n" + body)
 
 
+def printable(text: str) -> str:
+    """Text from outside AI Hive (a file name, an agent name) as plain text
+    for a model or a notice: control characters (an ESC, a newline in a
+    name) dropped. MainWindow uses it too."""
+    return "".join(ch for ch in text
+                   if ch >= " " and not "\x7f" <= ch <= "\x9f")
+
+
+def _lane_dirty_files(root: str):
+    """Paths with uncommitted changes in the lane, or None when git fails,
+    times out or is missing: then the caller can't tell, and stays quiet."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git", "--no-optional-locks", "status", "--porcelain", "-z"],
+            cwd=root, capture_output=True, timeout=STOP_GIT_TIMEOUT_S,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                 "GCM_INTERACTIVE": "never"},
+            creationflags=_CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    toks = r.stdout.decode("utf-8", "replace").split("\0")
+    files, i = [], 0
+    while i < len(toks):
+        tok = toks[i]
+        i += 1
+        if len(tok) < 4:
+            continue
+        files.append(tok[3:])
+        if tok[0] in "RC" or tok[1] in "RC":
+            i += 1          # -z puts a rename's old name in the next token
+    return files
+
+
+def lane_stop_decision(payload: dict, env=None, now: float = 0.0) -> str:
+    """Stop: the reason to keep a laned agent going once, when it ends a
+    turn with uncommitted changes in its lane, or "" to let it stop. The
+    lane prompt already says to commit finished work with a "Task done"
+    line (lanes.DONE_MARK); this backs it for the agent that forgot.
+
+    Blocks only a laned agent (lane env set) while the lane machinery runs
+    (lanes.json live), that is not the integrator (it commits as part of its
+    checklist and is never held up), on its first stop of the turn
+    (`stop_hook_active` is exactly False, so a Claude that never sends the
+    field is never blocked at all), whose last message is not a question (an
+    agent waiting for the user stays waiting), and only when `git status`
+    in the lane works and lists something. Anything unreadable means no
+    block: a missed nudge costs nothing, a wrong one costs a turn."""
+    lane = _lane_env(os.environ if env is None else env)
+    if lane is None or payload.get("stop_hook_active") is not False:
+        return ""
+    if _ends_with_question(payload.get("last_assistant_message")):
+        return ""
+    index = read_lanes_index(lane[LANES_INDEX_ENV])
+    if not lanes_index_live(index, now):
+        return ""
+    entry = (index.get("lanes") or {}).get(lane[LANE_UID_ENV])
+    # "" is an ordinary lane; a missing role means an index this AI Hive
+    # didn't write, and the integrator must never be the one held up
+    if not isinstance(entry, dict) or entry.get("role") != "":
+        return ""
+    files = _lane_dirty_files(lane[LANE_ROOT_ENV])
+    if not files:
+        return ""
+    n = len(files)
+    names = ", ".join(printable(f)[:120] for f in files[:STOP_FILES_SHOWN])
+    if n > STOP_FILES_SHOWN:
+        names += f", +{n - STOP_FILES_SHOWN} more"
+    return (f"AI Hive: your lane has {n} uncommitted "
+            f"file{'' if n == 1 else 's'} ({names}). If the task you just did "
+            f"is finished, commit them on your lane branch now, ending the "
+            f"commit message with a line of just \"Task done\". If it is not "
+            f"finished, or the user asked you not to commit, end your turn "
+            f"without committing.")
+
+
 def _dispatch(mapping_path, events_path, payload: dict) -> str:
     """Route one hook payload to the right file/record by its event name.
-    Returns context for the model ("" for none): only the lane hooks add
-    any."""
+    Returns text for the model ("" for none): the context the lane hooks
+    add, or for a Stop the reason it is blocked (lane_stop_decision)."""
     event = payload.get("hook_event_name")
     if event == "SessionStart":
         if mapping_path:
@@ -605,6 +691,22 @@ def _dispatch(mapping_path, events_path, payload: dict) -> str:
         return lane_notice_context()
     if event == "PostToolUse" and payload.get("tool_name") in _EDIT_TOOL_SET:
         return lane_overlap_context(payload)
+    if event == "Stop":
+        # a turn ended: any in-flight tool prompt is resolved (covers the user
+        # cancelling an AskUserQuestion, where no PostToolUse fires), and the
+        # agent is now waiting iff its last message was a plain question.
+        # Written even when the stop is blocked below: the manager moves the
+        # reply's stamp to a later Stop of the same turn (note_reply_stopped)
+        if events_path:
+            try:
+                _append_event(events_path, EV_TOOL_CLEAR, {"tool": "stop"})
+                if _ends_with_question(payload.get("last_assistant_message")):
+                    _append_event(events_path, EV_TURN_SET)
+                else:
+                    _append_event(events_path, EV_TURN_CLEAR)
+            except OSError:
+                pass
+        return lane_stop_decision(payload)
     if not events_path:
         return ""
     if event == "PreToolUse":
@@ -615,15 +717,6 @@ def _dispatch(mapping_path, events_path, payload: dict) -> str:
         if payload.get("tool_name") in _WAITING_TOOL_SET:
             _append_event(events_path, EV_TOOL_CLEAR,
                           {"tool": payload.get("tool_name")})
-    elif event == "Stop":
-        # a turn ended: any in-flight tool prompt is resolved (covers the user
-        # cancelling an AskUserQuestion, where no PostToolUse fires), and the
-        # agent is now waiting iff its last message was a plain question.
-        _append_event(events_path, EV_TOOL_CLEAR, {"tool": "stop"})
-        if _ends_with_question(payload.get("last_assistant_message")):
-            _append_event(events_path, EV_TURN_SET)
-        else:
-            _append_event(events_path, EV_TURN_CLEAR)
     return ""
 
 
@@ -632,8 +725,11 @@ def main(argv) -> int:
     per-agent env id, append the matching record(s). argv[1] is the SessionStart
     mapping file; argv[2] (optional) is the prompt-events file. Silent + best-
     effort: a hook must NEVER break the Claude session it is attached to, so
-    it always exits 0, and prints only the lane hooks' context (as
-    hookSpecificOutput.additionalContext, which the CLI hands the model)."""
+    it always exits 0. It prints only the lane hooks' text: context as
+    hookSpecificOutput.additionalContext, which the CLI hands the model, and
+    a blocked Stop as {"decision": "block", "reason"}, the Stop hook's own
+    shape (verified on Claude Code 2.1.291: the agent continues with the
+    reason, and its next Stop carries stop_hook_active true)."""
     mapping_path = argv[1] if len(argv) > 1 else None
     events_path = argv[2] if len(argv) > 2 else None
     try:
@@ -649,9 +745,13 @@ def main(argv) -> int:
     except Exception:
         context = ""
     if context and event:
+        if event == "Stop":
+            out = {"decision": "block", "reason": context}
+        else:
+            out = {"hookSpecificOutput": {"hookEventName": event,
+                                          "additionalContext": context}}
         try:
-            sys.stdout.write(json.dumps({"hookSpecificOutput": {
-                "hookEventName": event, "additionalContext": context}}))
+            sys.stdout.write(json.dumps(out))
             sys.stdout.flush()
         except Exception:
             pass

@@ -1231,8 +1231,8 @@ class TerminalAgent(QObject):
         newline, then a separate Enter submits it.
 
         `title` is what the sidebar, the roster and the card show as its task
-        instead of the text itself, for a long generated text like an
-        integration brief."""
+        instead of the text itself, for a long generated text like the
+        integrator's note about finished lanes."""
         text = sanitize_text(text or "").strip()
         if not text:
             return

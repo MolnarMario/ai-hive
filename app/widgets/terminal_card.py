@@ -460,8 +460,7 @@ class TerminalCard(QFrame):
     fileActivated = Signal(str)      # abs path Ctrl+clicked in the conversation
     scheduleRequested = Signal(str, str)  # agent id, text to prefill (may be "")
     # the lane chip's and the action tray's lane actions: agent id, "open" |
-    # "refresh" (app/lanes.py) | "submit" | "integrator" (app/integration.py)
-    # | "adopt" (Restart in own lane)
+    # "refresh" (app/lanes.py) | "integrator" | "adopt" (Restart in own lane)
     laneActionRequested = Signal(str, str)
 
     def __init__(self, agent: TerminalAgent, parent=None):
@@ -481,10 +480,9 @@ class TerminalCard(QFrame):
         # what the lane poller last saw in this agent's lane (lanes.LaneView),
         # or None before its first read. Transient view state.
         self._lane_view = None
-        # the integration queue's view of this agent, asked when the action
+        # MainWindow's view of this agent's lane roles, asked when the action
         # tray or a menu opens or the lane chip repaints: callable(agent) ->
-        # dict with "integrator"
-        # (bool), "role", "submit", "remove_merged" and "adopt" ((label,
+        # dict with "integrator" (bool), "role" and "adopt" ((label,
         # enabled, tooltip) or absent).
         # Set by WorkspacePage; None when nothing provides it.
         self.integration_info = None
@@ -1123,12 +1121,18 @@ class TerminalCard(QFrame):
                 text += f" ↑{view.ahead}"
             if view.dirty:
                 text += f" ±{len(view.dirty)}"
+            if view.done:
+                text += " ✓"
         state = view.state if view is not None else "clean"
         self.lane_mark.setText(text)
         tip = self._lane_tooltip(lane, view)
         if integrator:
-            tip = ("This agent is the workspace's integrator: AI Hive sends "
-                   "it each submitted lane to merge and test.\n\n" + tip)
+            tip = ("This agent is the workspace's integrator: AI Hive tells "
+                   "it when a lane's agent commits \"Task done\", and it "
+                   "ships that work.\n\n" + tip)
+        elif view is not None and view.done:
+            tip = (f"✓ Work marked done at {view.done[:7]} (a \"Task "
+                   f"done\" commit). The integrator picks it up.\n\n" + tip)
         self.lane_mark.setToolTip(tip)
         if self.lane_mark.property("lane") != state:
             self.lane_mark.setProperty("lane", state)
@@ -1212,25 +1216,6 @@ class TerminalCard(QFrame):
                    f"commit. Nothing of its own can be lost.")
         act_refresh.setToolTip(why)
         menu.addAction(act_refresh)
-        submit = self._integration().get("submit")
-        if submit:
-            label, enabled, tip = submit
-            act_submit = QAction(label, menu)
-            act_submit.setEnabled(enabled)
-            act_submit.setToolTip(tip)
-            act_submit.triggered.connect(
-                lambda: self.laneActionRequested.emit(self.agent.id, "submit"))
-            menu.addAction(act_submit)
-        remove = self._integration().get("remove_merged")
-        if remove:
-            label, enabled, tip = remove
-            act_remove = QAction(label, menu)
-            act_remove.setEnabled(enabled)
-            act_remove.setToolTip(tip)
-            act_remove.triggered.connect(
-                lambda: self.laneActionRequested.emit(self.agent.id,
-                                                      "remove-merged"))
-            menu.addAction(act_remove)
         return menu
 
     def _set_sched_missed(self, missed: bool) -> None:

@@ -2131,8 +2131,8 @@ def test_header_tray_carries_the_card_actions():
     card._on_status(AgentStatus.IDLE)
     ht._set_open(False)
 
-    # what the integration queue offers decides the lane buttons, and its
-    # label and reason land in their tooltips
+    # what MainWindow offers decides the lane buttons, and its label and
+    # reason land in their tooltips
     card.integration_info = lambda _agent: {
         "adopt": ("Restart in own lane (new conversation)", False,
                   "This agent is working."),
@@ -2151,17 +2151,6 @@ def test_header_tray_carries_the_card_actions():
     check("actions: the integrator button asks for the integrator action",
           got == ["integrator"], got)
     ht._set_open(False)
-
-    # the Activity panel's no-integrator hint points at the tray, not at the
-    # right-click menu that is gone
-    from app.widgets.activity_panel import ActivityPanel
-    panel = ActivityPanel()
-    panel.set_integration({"integrator": "", "laned": True, "items": []})
-    hint = panel.queue_info.text()
-    check("actions: the no-integrator hint names the tray, not a right-click",
-          "right-click" not in hint.lower() and "⋯" in hint
-          and "Make integrator" in hint, hint)
-    panel.deleteLater()
 
     card.detach(); card.close()
     a.deleteLater()

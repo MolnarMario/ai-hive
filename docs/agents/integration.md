@@ -1,64 +1,80 @@
-# Integrating a lane
+# Shipping finished lanes
 
-AI Hive's integration queue (`app/integration.py`, agent lanes Phase 3) sends
-the workspace's integrator agent one brief per lane the user submits. The
-brief embeds the **Checklist** section below and the **Test command** line,
-read from the base branch, with these placeholders filled in: `{integrate}`
-(the branch to create, one per submitted item), `{sha}` (the pinned commit),
-`{base_ref}` (`origin/main`), `{base}` (`main`) and `{test_command}`.
+Every laned agent ends its finished work with a commit whose message has a
+last line of just `Task done`. AI Hive reads every lane, sees that commit
+(`lanes.DONE_GREP`, a check mark on the lane chip) and types a short note
+into the workspace's integrator once it is idle. The note names each lane,
+its branch and the flagged commit. The integrator does everything else, in
+its own lane, by the checklist below.
 
 Lanes never bump the version or touch the CHANGELOG or the README check
 count. The integrator does, once per pull request.
+
+## Testing policy
+
+- A lane agent commits each finished task on its lane branch and runs the
+  tests for the area it changed (`-k <area>` or `--quick` here). It never
+  needs the full suite.
+- The integrator runs the full suite, e2e included, once per pull request,
+  on the commit it pushes.
+- After that run only the README count may change, with no rerun. Any
+  other change means a new commit, a new full run and a new GPT-6-Luna
+  review.
 
 Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
 
 ## Checklist
 
-1. In your own lane, create the branch from the pinned commit:
-   `git switch -c {integrate} {sha}`. Work only on that branch.
-2. `git fetch origin`, then merge {base_ref} into it and resolve every
-   conflict. Never rebase and never force-push.
+0. If your own `integrate/` pull request is still open, don't start a new
+   one: merge the newly flagged commits into that branch (step 2), keep its
+   one version bump, and carry on from step 4. Two open integration PRs
+   would fight over the version and the CHANGELOG.
+1. `git fetch origin`. Find every lane with finished work that main lacks,
+   not only the ones the note named. Work left over from earlier counts too:
+   ```
+   git for-each-ref --format="%(refname:short)" refs/heads/hive/
+   git log -1 --format=%H -i -E --grep="^[[:space:]]*task done[.!]?[[:space:]]*$" origin/main..<branch>
+   ```
+   Take each lane's newest flagged commit, not its head: commits after it
+   are unfinished work.
+2. In your own lane, branch from main: `git switch -c integrate/<yyyy-mm-dd>-<short-name> origin/main`.
+   Merge each flagged commit with `git merge --no-ff <sha>` and resolve every
+   conflict. Never rebase, never squash, never force-push.
 3. Bump `__version__` in `app/__init__.py` and add the matching `## x.y.z`
-   section at the top of `CHANGELOG.md` (written for users, no em dash).
-4. Run `/code-review` on the branch and fix what it finds.
-5. Commit, then get a second review from GPT-6-Luna through the Codex CLI:
-   `codex review --base {base_ref} -c model=gpt-6-luna -c model_reasoning_effort=high -c sandbox_mode=read-only`.
-   Fix each finding that holds up and commit. The PR body lists every finding with
-   what you did about it. If Codex is missing or fails, the PR body says so.
-6. Commit anything left uncommitted.
-7. Run the FULL suite, including the real-claude e2e test, on that commit:
-   `{test_command}`. Don't shorten its timeouts.
-8. Set the README check count from the suite's RESULT line and commit it.
-   That is the only change allowed after step 7: if anything else changes,
-   commit it and run step 7 again.
-9. Push with `git push -u origin {integrate}` and open the pull request with
-   `gh pr create --base {base} --head {integrate}`. The PR body has the line
-   `Tested-commit: <full sha of the commit step 7 ran on>` and the suite's
-   `RESULT` line. List every failing check, and run it on {base_ref} to say
-   whether it fails there too. Never decide yourself that a failure is
-   acceptable.
-10. Never run `gh pr merge`. Stop and report: the user approves the merge in
-    AI Hive, and AI Hive merges only the commit you tested.
-
-## What AI Hive checks, and what it can't
-
-- When the integrator's turn ends, AI Hive reads the pull request from the
-  item's own integrate branch. It waits for approval only when the PR comes
-  from that branch (not a fork), targets the item's base, contains the
-  pinned commit, and its head is the `Tested-commit` or differs from it only
-  in `README.md`. Anything else needs the user, with the reason shown.
-- `Tested-commit` is the integrator's claim. AI Hive can't prove that the
-  suite ran on that commit. The `RESULT` line next to it is there for the
-  user, who approves.
-- Approve merge fetches the base and asks GitHub where it is
-  (`gh api repos/{owner}/{repo}/branches/<base>`). If either fails, or the
-  two disagree, nothing is merged. A short window remains between that check
-  and the merge, in which someone can still push to the base. GitHub's branch
-  protection setting "Require branches to be up to date before merging"
-  closes it. `gh pr merge --match-head-commit` already pins the PR head.
-- A pull request merged on github.com, not with Approve merge, is never
-  counted as merged by itself. The item waits for the user's **Mark merged**,
-  which checks with GitHub first.
+   section at the top of `CHANGELOG.md`, written for users, no em dash.
+4. Run `/code-review` on the branch and fix what it finds. Commit.
+5. Run the FULL suite, including the real-claude e2e test, on that commit.
+   Don't shorten its timeouts. A failing check is never acceptable on your
+   say-so: fix it, or run it on `origin/main` and, if it fails there too,
+   say so in the PR body.
+6. Set the README check count from the suite's RESULT line and commit it.
+7. Push with `git push -u origin <branch>` and open the pull request with
+   `gh pr create --base main --head <branch>`. The body lists the lanes and
+   commits it ships, `Tested-commit: <full sha the suite ran on>` and the
+   suite's `RESULT` line.
+8. Get the review from GPT-6-Luna at high effort:
+   `codex review --base origin/main -c model=gpt-6-luna -c model_reasoning_effort=high -c sandbox_mode=read-only`.
+   Fix every finding that holds up, rerun the suite, push, update the PR
+   body (each finding and what you did about it) and run the review again.
+   Repeat until Luna has nothing left that you accept as a real problem.
+   If Codex is missing or fails, stop and tell the user. Never merge
+   without a clean review.
+9. Merge only when all of these hold: the last Luna review is clean, the
+   suite passed on the PR head (or the head adds only README.md on top of
+   the tested commit), `gh pr view` says MERGEABLE, and `origin/main` has
+   not moved since you tested. If main moved, merge it in and go back to
+   step 5. Then:
+   `gh pr merge <number> --merge --match-head-commit <head sha>`.
+   If a permission check refuses the merge, stop and tell the user. Never
+   retry it in another form to get past the check.
+10. Bring the main checkout up to date so the user's AI Hive runs what
+    merged: `git -C <main checkout> switch main` (only if it sits on a
+    branch whose commits are all on main) and
+    `git -C <main checkout> pull --ff-only`. Skip it and tell the user if
+    the main checkout has uncommitted changes or commits main lacks. Never
+    edit files there.
+11. Report in a few plain sentences: which lanes shipped, the version, the
+    PR link, and anything you skipped or couldn't fix.
 
 ## Setting up the integrator
 

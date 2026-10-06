@@ -149,7 +149,7 @@ class WorkspacePage(QWidget):
         # in-flight reflow animation so it isn't garbage-collected mid-flight.
         self._drag_card: "TerminalCard | None" = None
         self._reflow_anim = None
-        # MainWindow's integration-queue view of an agent, for the cards'
+        # MainWindow's view of an agent's lane roles, for the cards'
         # menus: callable(agent) -> dict (see TerminalCard.integration_info)
         self.integration_info = None
 

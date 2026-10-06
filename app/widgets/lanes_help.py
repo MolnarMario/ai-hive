@@ -1,10 +1,10 @@
 """The "What are lanes?" explainer (.scratch/agent-lanes/spec-v4-lane-
 scopes.md, Phase B).
 
-Lanes, the integrator and the queue map one to one onto how a developer
-worked before AI agents: a branch per person, merge main in, run the
-tests, open a pull request, someone approves the merge. The explainer says
-that in one table, because nothing else in the app does. Opened from the
+Lanes and the integrator map one to one onto how a developer worked
+before AI agents: a branch per person, say when it's done, someone merges
+main in, runs the tests, opens a pull request and gets it reviewed. The
+explainer says that in one table, because nothing else in the app does. Opened from the
 workspace header's ⎇ Lanes toggle and from the New Agent dialog.
 """
 
@@ -18,24 +18,23 @@ _ROWS = (
      "A feature branch in its own folder (git worktree), beside the repo "
      "in <i>repo</i>.lanes. Its agent can't overwrite or reset anyone "
      "else's work."),
-    ("Lane chip ⎇ ↑2 ±3",
-     "A glance at git status: 2 commits of its own, 3 uncommitted files. "
-     "Amber or red means another lane, or main, changed the same files."),
+    ("Lane chip ⎇ ↑2 ±3 ✓",
+     "A glance at git status: 2 commits of its own, 3 uncommitted files, "
+     "and ✓ once its agent marked the work done. Amber or red means "
+     "another lane, or main, changed the same files."),
     ("Lane notices",
      "A colleague saying \"I changed that file an hour ago\". AI Hive "
      "reads every lane every 15 seconds and runs a real merge in memory, "
      "so the agent hears about a conflict before anyone merges."),
+    ("Task done",
+     "A developer saying \"ready for review\". When an agent finishes its "
+     "task it commits with a last line of just Task done, and AI Hive "
+     "tells the integrator."),
     ("Integrator",
      "The teammate who owns the merge: an agent you pick with Make "
-     "integrator. It merges current main into a finished lane, fixes "
-     "conflicts, bumps the version, runs the full test suite and opens "
-     "the pull request."),
-    ("Integration queue",
-     "The order pull requests land in, one at a time, so each one is "
-     "tested on top of the main it will land on."),
-    ("Approve merge",
-     "Pressing Merge on GitHub. AI Hive merges only the exact commit the "
-     "integrator tested."),
+     "integrator. It combines every finished lane into one pull request, "
+     "fixes conflicts, bumps the version, runs the full test suite, gets "
+     "a code review and fixes what it finds, then merges."),
 )
 
 
@@ -46,8 +45,9 @@ def explainer_html() -> str:
         for term, what in _ROWS)
     return (
         "<p>A lane is how a developer worked before AI: a branch per "
-        "person, merge main in, run the tests, open a pull request, "
-        "someone approves the merge. AI Hive does the same for agents.</p>"
+        "person, say when it's done, merge main in, run the tests, open a "
+        "pull request, get it reviewed. AI Hive does the same for "
+        "agents.</p>"
         f"<table>{rows}</table>"
         "<p>Working with one agent at a time, or agents in different "
         "repositories? A lane is then just a branch, and you can open the "
