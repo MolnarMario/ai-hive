@@ -8,8 +8,11 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
-## 0.30.1
+## 0.31.0
 
+- A lane's chip on its card turns green once its agent commits "Task
+  done". Amber or red for files another lane also changed still wins
+  over green.
 - The workspace header's buttons are evenly spaced again. Change and
   Layout had a 20px gap between them while every other pair sat 6px
   apart.
