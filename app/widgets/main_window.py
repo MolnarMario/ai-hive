@@ -3994,8 +3994,9 @@ class MainWindow(QMainWindow):
         agent.release_start(run=True)
 
     TWO_LANES_HINT = ("[Two lanes in this workspace. Pick an integrator (the "
-                      "flag in a laned Claude agent's tray) to ship each "
-                      "lane once its agent commits \"Task done\".]")
+                      "flag in a laned Claude agent's tray). When you ask "
+                      "it to, it ships the lanes whose agent committed "
+                      "\"Task done\".]")
 
     def _hint_integrator(self, ws_id: str, agent) -> None:
         """The first time this run a workspace has two lanes and no
@@ -4418,10 +4419,12 @@ class MainWindow(QMainWindow):
 
     # The integrator (docs/agents/integration.md). The USER picks it. A lane
     # agent flags finished work with a "Task done" commit line, the lane
-    # service sees it (LaneView.done), and AI Hive types a short note into
-    # the idle integrator. Everything after that (combining the lanes, the
-    # pull request, the review loop, the merge) is the integrator's own
-    # work in its own lane. AI Hive never merges anything.
+    # service sees it (LaneView.done), and AI Hive shows it on the chip and
+    # logs it, nothing more. The user decides when to ship and asks the
+    # integrator. Everything after that (combining the lanes, the pull
+    # request, the review loop, the merge) is the integrator's own work in
+    # its own lane. AI Hive never merges anything and never tells the
+    # integrator to start.
 
     def _integration_info(self, agent) -> dict:
         """What a card's action tray shows for the integrator role and for
@@ -4436,8 +4439,8 @@ class MainWindow(QMainWindow):
             info["adopt"] = ("Restart in own lane (new conversation)",) + adopt
         if is_integrator:
             info["role"] = ("Stop being the integrator", True,
-                            "AI Hive stops telling this agent about "
-                            "finished lanes.")
+                            "This agent stops being the one that ships "
+                            "finished lanes when you ask.")
         elif (agent.spec.provider == "claude" and agent.is_pty
               and (agent.spec.lane or any(a.spec.lane for a in ws.agents))):
             # offered where lanes are: in a workspace without any, the tray
@@ -4450,9 +4453,9 @@ class MainWindow(QMainWindow):
             tip = why or (
                 (f"Replaces {current.spec.name} as this workspace's "
                  f"integrator. " if current is not None else "")
-                + "When a lane's agent commits \"Task done\", AI Hive tells "
-                  "this agent. It combines the finished lanes into one pull "
-                  "request, gets it reviewed and tested, and merges it.")
+                + "When you ask it to, it combines the lanes whose agent "
+                  "committed \"Task done\" into one pull request, gets it "
+                  "reviewed and tested, and merges it.")
             info["role"] = ("Make integrator", not why, tip)
         return info
 
@@ -4485,9 +4488,11 @@ class MainWindow(QMainWindow):
         AI Hive never types into the integrator: told about every flag as
         it landed, the integrator shipped work before the user asked."""
         ws = self.manager.workspace(ws_id)
+        integrator = self.manager.integrator(ws_id)
         for agent in (ws.agents if ws is not None else []):
             view = views.get(agent.spec.uid) if agent.spec.lane else None
-            if view is None or not view.done:
+            # the integrator's branch carries the flags it merged in
+            if view is None or not view.done or agent is integrator:
                 continue
             key = (agent.spec.uid, view.done)
             if key in self._done_seen:

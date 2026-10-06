@@ -3810,10 +3810,9 @@ def test_task_done_waits_for_the_user():
               "Task done", lanes.DONE_MARK in a.spec.system_prompt
               and "INTEGRATOR" not in a.spec.system_prompt)
         views = {}
-        win.lane_service.view = lambda uid: views.get(uid)
         told, delivered, audit = [], [], []
         a.notice = lambda text: told.append(text)
-        i.deliver_task = lambda text, title="": delivered.append(text)
+        i.deliver_task = lambda text: delivered.append(text)
         win._store_audit = audit.append
 
         def flag(agent, sha):
@@ -3860,9 +3859,12 @@ def test_task_done_waits_for_the_user():
                             ("is_limit_blocked", False)):
             setattr(i, attr, lambda v=value: v)
         flag(a, sha2)
+        flag(i, "e" * 40)
         win._on_lanes_changed(ws.id, dict(views))
         check("task done: a newer Task done commit is logged again",
               len(done_lines()) == 2 and sha2[:7] in done_lines()[1], audit)
+        check("task done: the integrator's own merged flags are not logged",
+              not any("Integrator" in ln for ln in done_lines()), audit)
         win._toggle_integrator(ws.id, i)
         win._toggle_integrator(ws.id, i)
         win._on_lanes_changed(ws.id, dict(views))
