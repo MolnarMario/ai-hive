@@ -647,7 +647,12 @@ def _landed(cwd: str, head: str, ref: str) -> bool:
     Or merging `head` into `ref` leaves `ref`'s tree as it is (a squash).
     A lane holding a merge commit skips the first test, because a merge
     has no patch of its own and its conflict resolution could be the only
-    copy of some change. The merge test still covers it."""
+    copy of some change. The merge test still covers it.
+
+    Like the ancestry check, the patch test reads the base's history, not
+    its current tree: a landed commit the base later reverted still counts,
+    and the base's history still holds it. Testing the tree instead would
+    keep every landed lane again once the base edits the same lines."""
     r = git(["rev-list", "--merges", "--count", f"{ref}..{head}"], cwd)
     if not r.ok:
         return False
