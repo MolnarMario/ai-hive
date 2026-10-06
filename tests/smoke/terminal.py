@@ -2084,7 +2084,7 @@ def test_header_tools_tray_has_no_dead_space():
 
 def test_header_tray_carries_the_card_actions():
     """The actions that used to hide behind a right-click on the header
-    (start, stop, restart, assign, scheduled send, the lane actions) are
+    (stop, restart, scheduled send, the lane actions) are
     icon buttons in the hover tray, each with a tooltip naming it. The user
     had forgotten the right-click menu existed."""
     from PySide6.QtCore import QEventLoop, QTimer
@@ -2110,23 +2110,26 @@ def test_header_tray_carries_the_card_actions():
           "contextMenuEvent" not in _CardHeader.__dict__
           and not hasattr(card, "show_actions_menu"))
     ht._set_open(True); pump(20)
-    lifecycle = [card.btn_start, card.btn_stop, card.btn_restart,
-                 card.btn_assign, card.btn_sched]
-    check("actions: start/stop/restart/assign/schedule are in the tray",
+    lifecycle = [card.btn_stop, card.btn_restart, card.btn_sched]
+    check("actions: stop/restart/schedule are in the tray",
           all(b in shown() for b in lifecycle))
+    check("actions: no Start or Assign button (restart and any keystroke "
+          "start an agent)",
+          not hasattr(card, "btn_start") and not hasattr(card, "btn_assign")
+          and not hasattr(card, "reassignRequested"))
     check("actions: every tray button has a tooltip",
           all(b.toolTip().strip() for b in shown()),
           [(b.text(), b.toolTip()) for b in shown()])
     check("actions: lane buttons stay out with nothing to offer",
           card.btn_adopt not in shown()
           and card.btn_integrator not in shown())
-    check("actions: an idle agent can start but not stop",
-          card.btn_start.isEnabled() and not card.btn_stop.isEnabled())
+    check("actions: an idle agent cannot stop",
+          not card.btn_stop.isEnabled())
     # a status change while the tray is open updates what is clickable
     a.status = AgentStatus.RUNNING
     card._on_status(AgentStatus.RUNNING)
-    check("actions: a running agent can stop but not start",
-          card.btn_stop.isEnabled() and not card.btn_start.isEnabled())
+    check("actions: a running agent can stop",
+          card.btn_stop.isEnabled())
     a.status = AgentStatus.IDLE
     card._on_status(AgentStatus.IDLE)
     ht._set_open(False)
@@ -2154,6 +2157,52 @@ def test_header_tray_carries_the_card_actions():
 
     card.detach(); card.close()
     a.deleteLater()
+
+
+def test_restart_resets_the_agent_to_its_launch_defaults():
+    """Restart reads like closing the card and opening a new agent of the same
+    kind. The permission mode the user shifted into (which the manager writes
+    back to the spec), a /model override, the AI title, the context badge and
+    the task all belonged to the old conversation and must not carry over.
+    The name, folder and launch model/effort stay."""
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AssignmentState, TerminalAgent
+
+    def make():
+        return TerminalAgent(build_spec(AgentKind.CLAUDE, "Keep me",
+                                        cwd=SCRATCH_CWD, effort="high"))
+
+    fresh = make()
+    a = make()
+    a.set_live_model("Sonnet 5", "low", "plan")
+    a.spec.set_permission_mode("plan")
+    a.set_ai_title("Old conversation")
+    a.set_token_usage(200_000, 1_000_000)
+    a.set_task("old task")
+    a.set_assignment(AssignmentState.WORKING)
+    badges = []
+    a.model_changed.connect(badges.append)
+    # a stub: from IDLE, PtyWorker.restart() STARTS a real claude
+    a.worker.restart = lambda: None
+    a.restart()
+
+    check("restart-reset: the permission mode is back to the CLI default",
+          a.spec.permission_mode == ""
+          and "--permission-mode" not in a.spec.effective_args()
+          and a.permission_mode() == "", a.spec.effective_args())
+    check("restart-reset: the header chip reads like a new agent's",
+          a.model_badge() == fresh.model_badge()
+          and badges == [fresh.model_badge()],
+          (a.model_badge(), fresh.model_badge(), badges))
+    check("restart-reset: no old title, context badge or task",
+          a.summary() == "" and a.token_badge() == ""
+          and a.current_task == ""
+          and a.assignment is AssignmentState.IDLE,
+          (a.summary(), a.token_badge(), a.current_task))
+    check("restart-reset: the name and launch effort stay",
+          a.spec.name == "Keep me" and a.spec.effort == "high")
+    fresh.dispose()
+    a.dispose()
 
 
 def test_header_tools_tray_closes_without_a_leave_event():

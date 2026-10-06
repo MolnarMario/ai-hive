@@ -400,12 +400,7 @@ class TerminalAgent(QObject):
         # the card is never blank, then kept true by the manager's transcript
         # poll. Transient: never written back to spec (that is the persisted
         # command line) and never marks the session dirty.
-        self._live_effort = (spec.effort or "").strip()
-        self._live_mode = (getattr(spec, "permission_mode", "") or "").strip()
-        self._live_model = self._seed_model()
-        if spec.provider == "openai" and not self._live_effort:
-            _, configured_effort = transcripts.codex_user_defaults()
-            self._live_effort = configured_effort.strip()
+        self._seed_live_state()
         self.assignment = AssignmentState.IDLE  # task-assignment lifecycle
         self.auto_created = False  # only ever restored from older sessions
         self.autostart_on_restore = False  # set from persisted run state
@@ -682,6 +677,7 @@ class TerminalAgent(QObject):
         self._forget_limit_echo()      # a new screen: nothing is an echo yet
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._pending_submits.clear()
+        self._reset_to_launch_defaults()
         if self.spec.provider in ("claude", "gemini"):  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
         elif self.spec.provider == "openai":
@@ -1086,6 +1082,37 @@ class TerminalAgent(QObject):
         else:
             win = f"{self._token_window // 1000}K"
         return f"{pct}% of {win}"
+
+    def _seed_live_state(self) -> None:
+        """Set the live model, effort and permission mode from the launch spec,
+        which is what a brand-new agent of this kind shows."""
+        spec = self.spec
+        self._live_effort = (spec.effort or "").strip()
+        self._live_mode = (getattr(spec, "permission_mode", "") or "").strip()
+        self._live_model = self._seed_model()
+        if spec.provider == "openai" and not self._live_effort:
+            _, configured_effort = transcripts.codex_user_defaults()
+            self._live_effort = configured_effort.strip()
+
+    def _reset_to_launch_defaults(self) -> None:
+        """Drop what the old conversation left on this agent, so a restart
+        reads like closing the card and opening a new agent of the same kind.
+
+        What stays is what the user set up: name, folder, lane, model and
+        effort as launched, font size. What goes is state that belonged to the
+        conversation: the permission mode the user had shifted into (the
+        manager writes it back to the spec, so without this a restart would
+        come up in plan or auto mode), a /model or /effort override, the AI
+        title, the context badge and the assigned task."""
+        self.spec.set_permission_mode("")
+        before = self.model_badge()
+        self._seed_live_state()
+        if self.model_badge() != before:
+            self.model_changed.emit(self.model_badge())
+        self.set_ai_title("")
+        self.set_token_usage(0, 0)
+        self.set_task("")
+        self.set_assignment(AssignmentState.IDLE)
 
     def _seed_model(self) -> str:
         """The model label to show before the transcript has said anything.

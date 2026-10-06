@@ -628,8 +628,10 @@ error dialog instead of silently closing. Packaging to a distributable
   selected; otherwise it copies), `Ctrl+R` reverse-searches, arrows/`Tab`
   complete, exactly as in a real terminal.
 - **Card controls** — hover the `⋯` at the right of a card's header for its
-  actions: `▶` start, `■` stop, `↻` restart (fresh session), `✎` assign /
-  reassign, `⏱` send on a countdown, `A−`/`A+` font and `⤢` maximize, plus
+  actions: `■` stop, `↻` restart (replaces the agent with a fresh one: new
+  conversation, the CLI's default permission mode, launch model and effort,
+  no old title or task; name and folder stay), `⏱` send on a countdown,
+  `A−`/`A+` font and `⤢` maximize, plus
   `⎇` restart in own lane and `⚑` make integrator where lanes apply. Each
   icon has a tooltip. `✕` close stays visible. Collapsed, the actions take
   no header width, so the summary gets it. Type into the bottom input line to send a command to that terminal;
@@ -705,9 +707,6 @@ awareness* below).
 - **Persistent agents** — agents **never** auto-close. A completed agent stays
   in the grid so you can review its work, continue the conversation, or retask
   it. Only you close an agent.
-- **Reassign anywhere** — click `✎` in any card's `⋯` tray to hand it
-  fresh work without losing the session. Its name,
-  model and effort are left exactly as you set them.
 
 ## Shared agent awareness
 
@@ -996,7 +995,7 @@ app/
   process_worker.py        QProcess engine, HybridDecoder, WinJob (line mode)
   pty_worker.py            ConPTY engine via pywinpty (full-terminal mode)
   terminal_agent.py        per-terminal model (worker + log/buffer + lifecycle)
-  workspace_manager.py     model layer: workspaces, agents, spawn/assign/reassign
+  workspace_manager.py     model layer: workspaces, agents, spawn/retire
   orchestrator_bridge.py   named-pipe RPC server (GUI side) for board log_activity
   mcp_server.py            stdlib MCP stdio server (log_activity) the Claude CLI spawns
   session_store.py         atomic JSON persistence (AppData) + save-audit log

@@ -4980,7 +4980,6 @@ class MainWindow(QMainWindow):
         page.changePathRequested.connect(self._change_workspace_folder)
         page.activityToggled.connect(self._toggle_activity)
         page.mapRequested.connect(self._open_agent_map)
-        page.reassignRequested.connect(self._on_reassign_agent)
         page.scheduleRequested.connect(self._on_schedule_message)
         page.fileActivated.connect(self._reveal_file_in_tree)
         page.reorderCommitted.connect(self.manager.reorder_agents)
@@ -5211,18 +5210,6 @@ class MainWindow(QMainWindow):
         agent = self.manager.agent(ws.id, agent_id)
         if agent is not None:
             agent.set_task(task)
-
-    def _on_reassign_agent(self, agent_id: str) -> None:
-        from PySide6.QtWidgets import QInputDialog
-        agent = self.manager.resolve_agent(agent_id)
-        if agent is None:
-            return
-        task, ok = QInputDialog.getMultiLineText(
-            self, "Assign task",
-            f"Task for “{agent.spec.name}” (its role/model adapt to the task):",
-            agent.current_task)
-        if ok and task.strip():
-            self.manager.reassign_agent(agent_id, task.strip())
 
     def _on_terminal_added(self, ws_id: str, agent) -> None:
         page = self._pages.get(ws_id)
