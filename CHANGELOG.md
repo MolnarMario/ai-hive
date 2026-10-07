@@ -8,6 +8,26 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.36.0
+
+- Close merged agents on the integrator's lane chip closes, after you
+  confirm, every agent whose lane work is now on main and that holds
+  nothing else: no commit ahead, no uncommitted file, not mid-turn. Their
+  lanes go too. The integrator and every other agent stay open.
+- The Ship finished lanes confirmation has a Don't ask again box. Options
+  > Agents > Confirm Ship finished lanes turns the question back on.
+- Stop is gone from a terminal card's hover tray. Ctrl+C in the terminal
+  does the same. Line-console cards, which have no Ctrl+C, keep it. Restart on a running agent now shows a restarting veil until
+  the new prompt is live, instead of a frozen old frame.
+- A finished lane that shares a file with another lane keeps its green
+  chip and gets a yellow border, instead of turning amber. Lane chips
+  have squarer corners.
+- The model badge no longer shows backticks or a cut-off name like
+  "Sonnet 5" after a /model pick.
+- The agent map's hub colors match the sidebar: green when idle, yellow
+  while working.
+- Show usage moved to the left column in Options, under the chime rows.
+
 ## 0.35.0
 
 - Click the integrator's lane chip and pick Ship finished lanes to ask it

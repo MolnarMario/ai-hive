@@ -148,6 +148,12 @@ def test_sidebar_count_badge():
           and AgentCountBadge._STATE_COLOR["working"]() == Palette.YELLOW,
           (AgentCountBadge._STATE_COLOR["idle"](),
            AgentCountBadge._STATE_COLOR["working"]()))
+    # the Agent / File Map hubs use the sidebar's colours (they were swapped)
+    from app.widgets import agent_file_map as afm
+    check("map: hub idle/working colours match the sidebar badge",
+          all(afm._STATE_COLOR[s]() == AgentCountBadge._STATE_COLOR[s]()
+              for s in ("idle", "working")),
+          {s: afm._STATE_COLOR[s]() for s in ("idle", "working")})
 
     # right-edge spinner: hidden + stopped at 0 working, shown + spinning + count
     # when working (isHidden() reflects explicit show/hide intent, ancestor-free)

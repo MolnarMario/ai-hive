@@ -3823,6 +3823,251 @@ def test_task_done_flag_core():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_landed_commit_core():
+    """lanes.lane_snap reports a lane's newest own commit once the base has
+    it (LaneSnap.landed), read from the branch's reflog. A fresh lane, a
+    lane fast-forwarded to the base without a commit of its own, a lane
+    still ahead and the integrator's lane report none. A merged lane keeps
+    reporting it after its idle fast-forward. A lane picked into the base
+    as other commits is still ahead by ancestry and reports none (the
+    integrator merges, it never squashes or picks). A newer commit the
+    agent dropped again makes the lane report none."""
+    from app import lanes
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-landed-"))
+    work = _make_repo(tmp)
+    a = _lane_for(work, "Agent A", "1a0de1" + "0" * 26)
+    b = _lane_for(work, "Agent B", "1a0de2" + "0" * 26)
+    c = _lane_for(work, "Agent C", "1a0de3" + "0" * 26)
+    d = _lane_for(work, "Agent D", "1a0de4" + "0" * 26)
+    ea, eb = _entry("A", "Agent A", a), _entry("B", "Agent B", b)
+    ec, ed = _entry("C", "Agent C", c), _entry("D", "Agent D", d)
+
+    def landed(entry):
+        return lanes.lane_snap(entry, {}).landed
+
+    check("landed: a fresh lane reports none", landed(ea) == "")
+    _commit(a["root"], "a.txt", "a2\n", "a's work\n\nTask done")
+    a_sha = _git(a["root"], "rev-parse", "HEAD")
+    check("landed: a lane still ahead reports none", landed(ea) == "")
+    _commit(c["root"], "c.txt", "c\n", "c's work")
+    c_sha = _git(c["root"], "rev-parse", "HEAD")
+    _commit(d["root"], "d.txt", "d\n", "d's work")
+    d_sha = _git(d["root"], "rev-parse", "HEAD")
+
+    # the integrator merges A (a merge commit), picks C as a new commit
+    # and merges D
+    _git(work, "merge", "-q", "--no-ff", "-m", "integrate A", a_sha)
+    _git(work, "cherry-pick", c_sha)
+    _git(work, "merge", "-q", "--no-ff", "-m", "integrate D", d_sha)
+    _git(work, "push", "-q", "origin", "main")
+    _git(work, "fetch", "-q")
+    check("landed: merged into the base, the lane reports its commit",
+          landed(ea) == a_sha, landed(ea))
+    check("landed: the lane view carries it",
+          lanes.RepoSnapshot(repo=str(work), lanes=[
+              lanes.lane_snap(ea, {})]).view("A").landed == a_sha)
+    t0 = time.time()
+    read_at = lanes.RepoSnapshot(repo=str(work), lanes=[
+        lanes.lane_snap(ea, {})]).view("A").read_at
+    check("landed: the view says when the lane read began",
+          t0 <= read_at <= time.time(), (t0, read_at))
+    check("landed: the integrator's lane never reports one",
+          landed({**ea, "role": lanes.INTEGRATOR_ROLE}) == "")
+    snap_c = lanes.lane_snap(ec, {})
+    check("landed: a lane picked into the base is still ahead, none",
+          snap_c.ahead == 1 and snap_c.landed == "",
+          (snap_c.ahead, snap_c.landed))
+    lanes.refresh_lane(a)
+    check("landed: the idle fast-forward keeps it",
+          landed(ea) == a_sha and _git(a["root"], "rev-parse", "HEAD")
+          != a_sha, landed(ea))
+    lanes.refresh_lane(b)
+    check("landed: a lane fast-forwarded without a commit reports none",
+          landed(eb) == "" and _git(b["root"], "rev-parse", "HEAD")
+          == _git(work, "rev-parse", "origin/main"))
+    check("landed: D's merged commit counts", landed(ed) == d_sha)
+    _commit(d["root"], "d2.txt", "d2\n", "more of d's work")
+    _git(d["root"], "reset", "-q", "--hard", d_sha)
+    check("landed: a newer commit dropped again makes it none",
+          landed(ed) == "", landed(ed))
+    for lane in (a, b, c, d):
+        _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_close_merged_agents_from_integrator_chip():
+    """The integrator's lane chip offers Close merged agents. It closes,
+    after the user confirms, each laned agent whose lane committed work the
+    base now has and holds nothing else, through the card's close path.
+    Never the integrator, an agent with uncommitted files, commits ahead or
+    a flag waiting to ship, a busy agent, one that never committed, or an
+    agent without a lane."""
+    from PySide6.QtWidgets import QApplication
+    from app import lanes
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-close-merged-"))
+    work = _make_repo(tmp)
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    made = []
+
+    def laned(name, uid):
+        lane = _lane_for(work, name, uid)
+        made.append(lane)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"], pty=True)
+        spec.uid = uid
+        spec.lane = lane
+        return win.manager.add_terminal(ws.id, spec, autostart=False)
+
+    def close_action(agent):
+        menu = win._pages[ws.id].card_for(agent.id)._lane_menu()
+        return next((act for act in menu.actions()
+                     if act.text().startswith("Close merged agents")), None)
+
+    def view(agent, **kw):
+        return lanes.LaneView(uid=agent.spec.uid,
+                              branch=agent.spec.lane["branch"],
+                              root=agent.spec.lane["root"], **kw)
+
+    with _stub_starts():
+        a = laned("Agent A", "c105e1" + "0" * 26)
+        b = laned("Agent B", "c105e2" + "0" * 26)
+        c = laned("Agent C", "c105e3" + "0" * 26)
+        d = laned("Agent D", "c105e4" + "0" * 26)
+        e = laned("Agent E", "c105e5" + "0" * 26)
+        f = laned("Agent F", "c105e6" + "0" * 26)
+        i = laned("Integrator", "c105ee" + "0" * 26)
+        win.manager.add_terminal(
+            ws.id, build_spec(AgentKind.CLAUDE, "Plain", cwd=str(work),
+                              pty=True), autostart=False)
+        app.processEvents()
+        audit, asked, told = [], [], []
+        win._store_audit = audit.append
+        win._lane_message = lambda title, text: told.append(text)
+        answer = [False]
+        win._confirm_close_merged = lambda merged: (
+            asked.append([x.spec.name for x, _v in merged]), answer[0])[1]
+        c.is_busy = lambda: True
+        views = {a.spec.uid: view(a, landed="a" * 40, behind=2),
+                 b.spec.uid: view(b, landed="b" * 40, dirty=["x.txt"]),
+                 c.spec.uid: view(c, landed="c" * 40),
+                 d.spec.uid: view(d, landed="d" * 40, ahead=1,
+                                  done="e" * 40),
+                 e.spec.uid: view(e),
+                 f.spec.uid: view(f, landed="f" * 40),
+                 i.spec.uid: view(i, landed="9" * 40)}
+
+        check("close-merged: no integrator, no item",
+              close_action(a) is None and close_action(i) is None)
+        win._toggle_integrator(ws.id, i)
+        check("close-merged: a lane agent's chip has no item",
+              close_action(a) is None)
+        act = close_action(i)
+        check("close-merged: nothing merged, the item is disabled",
+              act is not None and not act.isEnabled(), act and act.toolTip())
+        win._on_lanes_changed(ws.id, dict(views))
+        act = close_action(i)
+        check("close-merged: merged lanes enable it and count them",
+              act.isEnabled() and act.text() == "Close merged agents (2)"
+              and "Agent A" in act.toolTip() and "Agent F" in act.toolTip()
+              and "Agent B" not in act.toolTip(), (act.text(), act.toolTip()))
+
+        # F was sent a line after its lane was read: the view can't show
+        # what that turn wrote, so F waits for the next poll
+        f._last_submit_ts = 2000.0
+        win._on_lanes_changed(ws.id, {
+            k: dataclasses.replace(v, read_at=1000.0)
+            for k, v in views.items()})
+        act = close_action(i)
+        check("close-merged: an agent sent a line after the lane read waits",
+              act.text() == "Close merged agents (1)"
+              and "Agent F" not in act.toolTip(), (act.text(), act.toolTip()))
+        f._last_submit_ts = 0.0
+        win._on_lanes_changed(ws.id, dict(views))
+
+        got = []
+        card = win._pages[ws.id].card_for(i.id)
+        card.laneActionRequested.connect(lambda aid, what: got.append(what))
+        close_action(i).trigger()
+        check("close-merged: the item asks for its action",
+              got == ["close_merged"], got)
+        check("close-merged: Cancel closes nothing",
+              asked == [["Agent A", "Agent F"]] and len(ws.agents) == 8,
+              (asked, len(ws.agents)))
+
+        # after the OK each lane is read again; `fresh` is what that read
+        # finds beyond the poll's view
+        fresh = {}
+
+        def fake_snap(entry):
+            v = views[entry["uid"]]
+            snap = lanes.LaneSnap(uid=v.uid, agent=entry["agent"],
+                                  ws_id=entry["ws_id"], branch=v.branch,
+                                  root=v.root, ahead=v.ahead,
+                                  dirty=list(v.dirty), landed=v.landed,
+                                  read_at=time.time())
+            return dataclasses.replace(snap, **fresh.get(v.uid, {}))
+        win._lane_snap_for_close = fake_snap
+
+        # the user edited a file in A's lane and F's lane after the poll:
+        # the fresh read sees it, so neither closes
+        fresh = {a.spec.uid: {"dirty": ["new.txt"]},
+                 f.spec.uid: {"ahead": 1}}
+        answer[0] = True
+        told.clear()
+        close_action(i).trigger()
+        win.lane_ops.drain(60)
+        check("close-merged: a lane changed since the poll is read again "
+              "and stays open",
+              len(ws.agents) == 8 and told and "Agent A" in told[-1]
+              and "Agent F" in told[-1], (len(ws.agents), told))
+        check("close-merged: the kept agents are audited",
+              sum(ln.startswith("CLOSE-MERGED-KEEP") for ln in audit) == 2,
+              audit)
+        fresh = {}
+        # the drain pumped events, so a real lane poll may have replaced
+        # the views this test made up
+        win._on_lanes_changed(ws.id, dict(views))
+
+        # F starts a turn while the dialog is open: it stays open
+        def f_busy_meanwhile(merged):
+            f.is_busy = lambda: True
+            return True
+        win._confirm_close_merged = f_busy_meanwhile
+        close_action(i).trigger()
+        win.lane_ops.drain(60)
+        left = {x.spec.name for x in ws.agents}
+        check("close-merged: OK closes only the merged agents",
+              left == {"Agent B", "Agent C", "Agent D", "Agent E",
+                       "Agent F", "Integrator", "Plain"}, left)
+        check("close-merged: an agent busy behind the dialog stays, and "
+              "the user hears why", told and "Agent F" in told[-1], told)
+        check("close-merged: the close is audited",
+              any(ln.startswith("CLOSE-MERGED") and "Agent A" in ln
+                  and "aaaaaaa" in ln for ln in audit), audit)
+        win.lane_ops.drain(60)
+        check("close-merged: the closed agent's lane is retired",
+              not os.path.isdir(made[0]["root"]))
+        n = len(ws.agents)
+        win._close_merged_agents(ws.id, b)
+        check("close-merged: a non-integrator closes nothing",
+              len(ws.agents) == n)
+        for agent in list(ws.agents):
+            win._close_agent(ws.id, agent.id)
+        win.lane_ops.drain(60)
+    win.close()
+    app.processEvents()
+    for lane in made:
+        if os.path.isdir(lane["root"]):
+            _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_task_done_waits_for_the_user():
     """Through the real window, stubbed workers: a lane agent is told to end
     finished work with "Task done", and the integrator's prompt has it start
@@ -3885,9 +4130,26 @@ def test_task_done_waits_for_the_user():
               card.lane_mark.property("lane"))
         clash = lanes.Overlap(path="a.txt", peer_uid="", peer="main",
                               peer_branch="main", state="committed")
-        check("task done: a file another lane changed outranks done",
+        check("task done: a file another lane changed keeps done, with a "
+              "border", dataclasses.replace(
+                  views[a.spec.uid], overlaps=[clash]).state == "done-overlap")
+        fight = dataclasses.replace(clash, state="conflicts")
+        check("task done: a real conflict outranks done",
               dataclasses.replace(views[a.spec.uid],
-                                  overlaps=[clash]).state == "overlap")
+                                  overlaps=[clash, fight]).state == "conflict")
+        card.set_lane_view(dataclasses.replace(views[a.spec.uid],
+                                               overlaps=[clash]))
+        check("task done: a done lane sharing a file shows green with a "
+              "yellow border", card.lane_mark.property("lane") == "done-overlap"
+              and "✓" in card.lane_mark.text(),
+              card.lane_mark.property("lane"))
+        from app import ui_theme
+        qss = ui_theme.build_qss()
+        rule = qss.split('#CardLane[lane="done-overlap"]', 1)[-1].split("}", 1)[0]
+        check("task done: the done-overlap chip is green with a yellow border",
+              "rgba(70,170,90" in rule
+              and f"border-color: {ui_theme.Palette.YELLOW}" in rule, rule)
+        card.set_lane_view(views[a.spec.uid])
         win._on_lanes_changed(ws.id, dict(views))
         win._on_lanes_changed(ws.id, dict(views))
         check("task done: a lane read logs the flag once",
@@ -4074,6 +4336,127 @@ def test_ship_lanes_from_integrator_chip():
         if os.path.isdir(lane["root"]):
             _drop_lane_folder(lane["root"])
     shutil.rmtree(tmp, ignore_errors=True)
+
+def test_ship_confirm_dont_ask_again():
+    """Ticking "Don't ask again" on the Ship finished lanes dialog and
+    pressing OK skips that dialog from then on, and the choice survives a
+    restart. Cancel with the box ticked changes nothing."""
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from app import lanes
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-ship-skip-"))
+    work = _make_repo(tmp)
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    made = []
+
+    def laned(name, uid):
+        lane = _lane_for(work, name, uid)
+        made.append(lane)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"], pty=True)
+        spec.uid = uid
+        spec.lane = lane
+        return win.manager.add_terminal(ws.id, spec, autostart=False)
+
+    real_exec = QMessageBox.exec
+    with _stub_starts():
+        a = laned("Agent A", "5b1e01" + "0" * 26)
+        i = laned("Integrator", "5b1eee" + "0" * 26)
+        app.processEvents()
+        delivered = []
+        i.nudge = lambda text: (delivered.append(text), True)[1]
+        win._store_audit = lambda line: None
+        state = {"is_running": True, "prompt_ready": True,
+                 "is_busy": False, "is_waiting": False}
+        for attr in state:
+            setattr(i, attr, lambda k=attr: state[k])
+        win._toggle_integrator(ws.id, i)
+        win._on_lanes_changed(ws.id, {a.spec.uid: lanes.LaneView(
+            uid=a.spec.uid, branch=a.spec.lane["branch"],
+            root=a.spec.lane["root"], ahead=1, done="a" * 40)})
+
+        outcome = {"button": QMessageBox.StandardButton.Cancel,
+                   "tick": True, "shown": 0, "has_box": False}
+
+        def fake_exec(box):
+            outcome["shown"] += 1
+            from PySide6.QtWidgets import QCheckBox
+            check_box = box.findChild(QCheckBox)
+            outcome["has_box"] = (check_box is not None
+                                  and "ask again" in check_box.text())
+            if check_box is not None:
+                check_box.setChecked(outcome["tick"])
+            return outcome["button"]
+        QMessageBox.exec = fake_exec
+        try:
+            check("ship skip: off by default",
+                  win._ship_skip_confirm is False
+                  and win._session_payload()["ui"]["ship_skip_confirm"]
+                  is False)
+            win._ship_lanes(ws.id, i)
+            check("ship skip: the dialog carries a Don't ask again box",
+                  outcome["shown"] == 1 and outcome["has_box"], outcome)
+            check("ship skip: Cancel with the box ticked changes nothing",
+                  not win._ship_skip_confirm and delivered == [])
+            outcome["button"] = QMessageBox.StandardButton.Ok
+            outcome["tick"] = False
+            win._ship_lanes(ws.id, i)
+            check("ship skip: OK without the box still asks next time",
+                  not win._ship_skip_confirm and len(delivered) == 1)
+            delivered.clear()
+            outcome["tick"] = True
+            win._ship_lanes(ws.id, i)
+            check("ship skip: OK with the box ticked ships and remembers",
+                  win._ship_skip_confirm and len(delivered) == 1
+                  and win._session_payload()["ui"]["ship_skip_confirm"]
+                  is True)
+            delivered.clear()
+            shown = outcome["shown"]
+            win._ship_lanes(ws.id, i)
+            check("ship skip: once remembered, no dialog and it ships",
+                  outcome["shown"] == shown and len(delivered) == 1,
+                  (outcome, delivered))
+            # the Options switch is the way back from "Don't ask again"
+            tb = win.top_bar
+            check("ship skip: the Options switch shows the dialog is off",
+                  not tb.ship_confirm_btn.isChecked())
+            tb.ship_confirm_btn.click()
+            check("ship skip: the switch turns asking back on and saves it",
+                  tb.ship_confirm_btn.isChecked()
+                  and win._ship_skip_confirm is False
+                  and win._session_payload()["ui"]["ship_skip_confirm"]
+                  is False)
+            delivered.clear()
+            outcome["button"] = QMessageBox.StandardButton.Cancel
+            win._ship_lanes(ws.id, i)
+            check("ship skip: switched back on, the dialog asks again",
+                  outcome["shown"] == shown + 1 and delivered == [],
+                  (outcome, delivered))
+        finally:
+            QMessageBox.exec = real_exec
+
+        win._restore_ui_state({"ui": {}})
+        check("ship skip: a session without the key loads it off",
+              win._ship_skip_confirm is False)
+        win._restore_ui_state({"ui": {"ship_skip_confirm": True}})
+        check("ship skip: restore reads the saved choice",
+              win._ship_skip_confirm is True
+              and not win.top_bar.ship_confirm_btn.isChecked())
+        for agent in list(ws.agents):
+            win._close_agent(ws.id, agent.id)
+        win.lane_ops.drain(60)
+    win.close()
+    app.processEvents()
+    for lane in made:
+        if os.path.isdir(lane["root"]):
+            _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
 
 def test_session_v7_drops_the_queue():
     """v7 keeps a workspace's integrator and nothing of the old integration

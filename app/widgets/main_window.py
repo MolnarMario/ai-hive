@@ -450,6 +450,8 @@ class TopBar(QFrame):
     autoUpdateToggled = Signal(bool)
     # "Lanes in every workspace": does every new agent start with Own lane
     agentLanesToggled = Signal(bool)
+    # "Confirm Ship finished lanes": ask before typing the request (True)
+    shipConfirmToggled = Signal(bool)
     # the down-arrow button: open the Updates panel (the install-method control
     # and the startup-check checkbox live there, so the bar gains no button)
     updatesPanelRequested = Signal()
@@ -588,6 +590,14 @@ class TopBar(QFrame):
         self.agent_lanes_btn.clicked.connect(self._on_agent_lanes_clicked)
         self._refresh_agent_lanes_btn()
 
+        # "Confirm Ship finished lanes". Default ON. The dialog's "Don't ask
+        # again" turns it off, and this switch is the way back.
+        self._ship_confirm = True
+        self.ship_confirm_label = toggle_label("")
+        self.ship_confirm_btn = ToggleSwitch(self)
+        self.ship_confirm_btn.clicked.connect(self._on_ship_confirm_clicked)
+        self._refresh_ship_confirm_btn()
+
         # The detected Claude Code install method, under the switch it explains.
         # It used to be reachable only by hovering the down-arrow; the panel has
         # room to state it.
@@ -706,6 +716,8 @@ class TopBar(QFrame):
         self.options_panel.add_switch_row(
             self.reply_sound_label, self.reply_sound_btn,
             self.chime_sound_btns[chime.REPLY])
+        self.options_panel.add_switch_row(self.usage_left_label,
+                                          self.usage_left_btn)
         self.options_panel.add_switch_row(self.taskbar_label, self.taskbar_btn)
         self.options_panel.add_switch_row(self.auto_update_label,
                                           self.auto_update_btn)
@@ -716,13 +728,13 @@ class TopBar(QFrame):
         self.options_panel.add_section("Agents")
         self.options_panel.add_switch_row(self.agent_lanes_label,
                                           self.agent_lanes_btn)
+        self.options_panel.add_switch_row(self.ship_confirm_label,
+                                          self.ship_confirm_btn)
         self.options_panel.add_separator()
         self.options_panel.add_section("Appearance")
         self.options_panel.add_row("Theme", self.theme_select)
         self.options_panel.add_row("Font size", self.font_dec_btn,
                                    self.font_inc_btn)
-        self.options_panel.add_switch_row(self.usage_left_label,
-                                          self.usage_left_btn)
 
         self.options_btn = QToolButton(self)
         self.options_btn.setObjectName("OptionsBtn")
@@ -948,6 +960,29 @@ class TopBar(QFrame):
             "Existing lanes are never touched.\nClick to turn on.")
         self.agent_lanes_btn.setToolTip(tip)
         self.agent_lanes_label.setToolTip(tip)
+
+    def _on_ship_confirm_clicked(self) -> None:
+        self.set_ship_confirm(not self._ship_confirm)
+        self.shipConfirmToggled.emit(self._ship_confirm)
+
+    def set_ship_confirm(self, on: bool) -> None:
+        """Reflect the "Confirm Ship finished lanes" switch (no signal)."""
+        self._ship_confirm = bool(on)
+        self._refresh_ship_confirm_btn()
+
+    def _refresh_ship_confirm_btn(self) -> None:
+        self.ship_confirm_btn.setChecked(self._ship_confirm)
+        self.ship_confirm_label.setText("⚑  Confirm Ship finished lanes")
+        tip = (
+            "Confirm Ship finished lanes: ON. Ship finished lanes on the "
+            "integrator's chip lists the lanes and waits for your OK before "
+            "it types the request.\nClick to ship on the click alone."
+            if self._ship_confirm else
+            "Confirm Ship finished lanes: OFF. Ship finished lanes types the "
+            "request into the integrator as soon as you click it.\n"
+            "Click to be asked first again.")
+        self.ship_confirm_btn.setToolTip(tip)
+        self.ship_confirm_label.setToolTip(tip)
 
     def _on_auto_update_clicked(self) -> None:
         """Arm or disarm the startup update gate, like every other row here.
@@ -2236,6 +2271,11 @@ class MainWindow(QMainWindow):
         # "Lanes in every workspace". Default OFF, assigned here for the same
         # reason. Read it only through lane_default(ws).
         self._agent_lanes = False     # user preference (persisted)
+        # Ship finished lanes asks first until the user ticks "Don't ask
+        # again" in that dialog. Assigned here for the same reason.
+        self._ship_skip_confirm = False   # user preference (persisted)
+        # uids whose lane Close merged agents is reading again right now
+        self._close_merged_reading: set[str] = set()
         # every mutating lane git operation runs here, one at a time per repo
         # (app/lane_ops.py). Created whatever the toggles say: repairing,
         # retiring and reviving an existing lane never ask them.
@@ -2616,6 +2656,7 @@ class MainWindow(QMainWindow):
         self.top_bar.usageLeftToggled.connect(self._on_usage_left_toggled)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.agentLanesToggled.connect(self._on_agent_lanes_toggled)
+        self.top_bar.shipConfirmToggled.connect(self._on_ship_confirm_toggled)
         self.top_bar.updatesPanelRequested.connect(self.open_updates_panel)
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
         self.top_bar.startupRecoveryToggled.connect(self._on_startup_recovery)
@@ -3951,6 +3992,12 @@ class MainWindow(QMainWindow):
         self._schedule_save()
         self._refresh_workspace_lane_toggles()
 
+    def _on_ship_confirm_toggled(self, enabled: bool) -> None:
+        """User flipped "Confirm Ship finished lanes", the way back from the
+        dialog's "Don't ask again". A UI preference like the one above."""
+        self._ship_skip_confirm = not enabled
+        self._schedule_save()
+
     def lane_default(self, ws) -> bool:
         """Should a new Claude agent in `ws` start with "Own lane" ticked?
         The Options switch forces it on everywhere; otherwise the
@@ -4469,6 +4516,8 @@ class MainWindow(QMainWindow):
             self._toggle_integrator(ws_id, agent)
         elif action == "ship":
             self._ship_lanes(ws_id, agent)
+        elif action == "close_merged":
+            self._close_merged_agents(ws_id, agent)
 
     def _on_lane_refreshed(self, ws_id, agent_id, uid, name, lane, result,
                            error) -> None:
@@ -4524,6 +4573,7 @@ class MainWindow(QMainWindow):
                             "This agent stops being the one that ships "
                             "finished lanes when you ask.")
             info["ship"] = self._ship_offer(ws, agent)
+            info["close_merged"] = self._close_merged_offer(ws, agent)
         elif (agent.spec.provider == "claude" and agent.is_pty
               and (agent.spec.lane or any(a.spec.lane for a in ws.agents))):
             # offered where lanes are: in a workspace without any, the tray
@@ -4598,7 +4648,7 @@ class MainWindow(QMainWindow):
         if why:
             self._lane_message("Nothing shipped", why)
             return
-        if not self._confirm_ship(agent, done):
+        if not self._ship_skip_confirm and not self._confirm_ship(agent, done):
             return
         # the dialog ran its own event loop: a scheduled send may have
         # started a turn, or a lane poll moved a flag, meanwhile
@@ -4626,16 +4676,32 @@ class MainWindow(QMainWindow):
                           f"lanes={lanes_at}")
 
     def _confirm_ship(self, agent, done: list) -> bool:
-        """The user's go-ahead for Ship finished lanes (tests replace it)."""
+        """The user's go-ahead for Ship finished lanes (tests replace it).
+        Ticking "Don't ask again" and pressing OK stops this dialog
+        (`ui.ship_skip_confirm`) until the Options switch "Confirm Ship
+        finished lanes" turns it back on; Cancel keeps asking."""
         lines = "\n".join(f"  {a.spec.name}: {view.branch} at "
                           f"{view.done[:7]}" for a, view in done)
-        answer = QMessageBox.question(
-            self, "Ship finished lanes",
+        box = QMessageBox(
+            QMessageBox.Icon.Question, "Ship finished lanes",
             f"{agent.spec.name} combines these lanes into one pull request, "
             f"gets it reviewed and tested, and merges it:\n\n{lines}",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        return answer == QMessageBox.StandardButton.Ok
+            self)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        # keep the Python reference: box.checkBox() alone hands back a bare
+        # QObject without isChecked()
+        again = QCheckBox("Don't ask again")
+        box.setCheckBox(again)
+        ok = box.exec() == QMessageBox.StandardButton.Ok
+        skip = ok and again.isChecked()
+        # parented to the window, so it would live until exit otherwise
+        box.deleteLater()
+        if skip:
+            self._ship_skip_confirm = True
+            self.top_bar.set_ship_confirm(False)
+            self._schedule_save()
+        return ok
 
     def _toggle_integrator(self, ws_id: str, agent) -> None:
         """The card header's Make integrator / Stop being the integrator."""
@@ -4658,6 +4724,140 @@ class MainWindow(QMainWindow):
         page = self._pages.get(ws_id)
         for card in (page.cards if page is not None else []):
             card.refresh_lane()
+
+    def _merged_agents(self, ws, integrator) -> list:
+        """The agents the integrator chip's Close merged agents closes, as
+        the lane service last read them: (agent, LaneView) pairs. A laned
+        agent other than the integrator whose lane made a commit the base
+        now has (LaneView.landed), and holds nothing the base lacks: no
+        commit ahead, no "Task done" waiting to ship, no uncommitted file.
+        An agent in a turn is left open, it may be starting new work. So is
+        one sent a line after its lane was read: the view can't show what
+        that turn wrote or committed, and the next poll will."""
+        found = []
+        for agent in ws.agents:
+            view = getattr(agent, "lane_view", None)
+            if (agent is integrator or not agent.spec.lane or view is None
+                    or not view.landed or view.ahead or view.done
+                    or view.dirty or view.error
+                    or agent.spec.uid in self._lane_pending
+                    or agent.is_busy() or agent.is_waiting()
+                    or agent.last_submit_at() > view.read_at):
+                continue
+            found.append((agent, view))
+        return found
+
+    def _close_merged_offer(self, ws, agent) -> tuple:
+        """(label, enabled, tooltip) for the integrator chip's Close merged
+        agents."""
+        merged = self._merged_agents(ws, agent)
+        if not merged:
+            return ("Close merged agents", False,
+                    "No agent's committed work is in the base branch with "
+                    "nothing left to ship.")
+        names = ", ".join(a.spec.name for a, _ in merged)
+        return (f"Close merged agents ({len(merged)})", True,
+                f"Closes {names}. Everything they committed is in the base "
+                f"branch. The integrator and the other agents stay open.")
+
+    def _close_merged_agents(self, ws_id: str, agent) -> None:
+        """The integrator chip's Close merged agents: closes, after the
+        user confirms, each agent whose committed work the base branch has
+        (_merged_agents), the same way its card's close button does, so
+        each lane is retired too. Never the integrator, never another
+        agent.
+
+        The offer comes from the last poll, up to 15 s old, and the user
+        may have edited or committed in a lane since. So each lane is read
+        again on the lane queue after the OK, and only an agent that still
+        qualifies on that read closes (_close_merged_checked)."""
+        ws = self.manager.workspace(ws_id)
+        if ws is None or agent is None or not self.manager.is_integrator(agent):
+            return
+        merged = self._merged_agents(ws, agent)
+        if not merged:
+            self._lane_message("Nothing closed",
+                               "No agent's committed work is in the base "
+                               "branch with nothing left to ship.")
+            return
+        if not self._confirm_close_merged(merged):
+            return
+        # the dialog ran its own event loop: an agent may have started a
+        # turn, or a lane poll seen new work, meanwhile
+        still = {a.spec.uid for a, _v in self._merged_agents(
+            ws, self.manager.integrator(ws_id))}
+        batch = {"left": 0,
+                 "kept": [a.spec.name for a, _v in merged
+                          if a.spec.uid not in still]}
+        for other, _view in merged:
+            uid = other.spec.uid
+            if uid not in still or uid in self._close_merged_reading:
+                continue
+            self._close_merged_reading.add(uid)
+            batch["left"] += 1
+            entry = {"uid": uid, "agent": other.spec.name, "ws_id": ws_id,
+                     "lane": dict(other.spec.lane)}
+            self.lane_ops.submit(
+                other.spec.lane["repo"], self._lane_snap_for_close, entry,
+                label="close-merged",
+                callback=lambda snap, err, u=uid: self._close_merged_checked(
+                    ws_id, u, snap, err, batch))
+        if not batch["left"]:
+            self._report_close_merged_kept(batch)
+
+    def _lane_snap_for_close(self, entry: dict):
+        """Close merged agents' fresh read of one lane, on the lane queue
+        (tests replace it)."""
+        return lanes.lane_snap(entry)
+
+    def _close_merged_checked(self, ws_id: str, uid: str, snap, error,
+                              batch: dict) -> None:
+        """A lane re-read for Close merged agents is back: close its agent
+        if the read still says merged with nothing left, and it is still
+        idle and not the integrator. An agent the user closed meanwhile was
+        retired by its own close."""
+        self._close_merged_reading.discard(uid)
+        batch["left"] -= 1
+        ws = self.manager.workspace(ws_id)
+        other = next((a for a in (ws.agents if ws is not None else [])
+                      if a.spec.uid == uid), None)
+        if other is not None:
+            if (error is not None or snap is None or snap.error
+                    or not snap.exists or snap.ahead or snap.dirty
+                    or not snap.landed
+                    or other is self.manager.integrator(ws_id)
+                    or uid in self._lane_pending
+                    or other.is_busy() or other.is_waiting()
+                    or other.last_submit_at() > snap.read_at):
+                self._store_audit(f"CLOSE-MERGED-KEEP "
+                                  f"agent={other.spec.name!r}")
+                batch["kept"].append(other.spec.name)
+            else:
+                self._store_audit(f"CLOSE-MERGED agent={other.spec.name!r} "
+                                  f"branch={snap.branch} "
+                                  f"landed={snap.landed[:7]}")
+                self._close_agent(ws_id, other.id)
+        if not batch["left"]:
+            self._report_close_merged_kept(batch)
+
+    def _report_close_merged_kept(self, batch: dict) -> None:
+        if batch["kept"]:
+            self._lane_message(
+                "Some agents kept",
+                f"These agents changed since the lanes were read, so they "
+                f"stay open: {', '.join(batch['kept'])}.")
+
+    def _confirm_close_merged(self, merged: list) -> bool:
+        """The user's go-ahead for Close merged agents (tests replace it)."""
+        lines = "\n".join(f"  {a.spec.name}: {view.branch}"
+                          for a, view in merged)
+        answer = QMessageBox.question(
+            self, "Close merged agents",
+            f"Everything these agents committed is in the base branch. "
+            f"Close them and remove their lanes?\n\n{lines}",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        return answer == QMessageBox.StandardButton.Ok
 
     def _log_done_lanes(self, ws_id: str, views: dict) -> None:
         """Log each lane commit that says "Task done", once per commit. Past
@@ -5095,6 +5295,8 @@ class MainWindow(QMainWindow):
         self._agent_lanes = bool(ui.get("agent_lanes", False))
         self.top_bar.set_agent_lanes(self._agent_lanes)
         self._refresh_workspace_lane_toggles()
+        self._ship_skip_confirm = bool(ui.get("ship_skip_confirm", False))
+        self.top_bar.set_ship_confirm(not self._ship_skip_confirm)
         self._auto_continue = bool(ui.get("auto_continue", True))
         self.top_bar.set_auto_continue(self._auto_continue)
         self._startup_recovery = bool(ui.get("startup_recovery", True))
@@ -5947,6 +6149,7 @@ class MainWindow(QMainWindow):
             "usage_left": self._usage_left,
             "auto_update": self._auto_update,
             "agent_lanes": self._agent_lanes,
+            "ship_skip_confirm": self._ship_skip_confirm,
             "auto_continue": self._auto_continue,
             "startup_recovery": self._startup_recovery,
             "terminal_scrollback": self._terminal_scrollback,

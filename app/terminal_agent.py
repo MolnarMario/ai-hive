@@ -458,6 +458,9 @@ class TerminalAgent(QObject):
         # the usage poll's cadence follows it (see usage_poll.provider_active)
         self._last_work_ts = 0.0
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
+        # walltime a line last went in (typed, a task, a nudge): a lane read
+        # older than it may predate work that line started (_note_submit)
+        self._last_submit_ts = 0.0
         # "a line has been submitted to this child since it launched", and the
         # mark that turn owns. See _note_submit / _on_idle_timeout: a settle is
         # only a REPLY when something was asked, and nothing else may stamp a
@@ -736,6 +739,7 @@ class TerminalAgent(QObject):
         MOVING that turn's one mark to where the reply really ended, rather
         than either falling silent or littering the turn with stamps. For
         Claude that movement ends at the Stop hook: see note_reply_stopped."""
+        self._last_submit_ts = time.time()
         self._turn_open = True
         self._turn_mark_uid = None    # the next settle starts this turn's mark
         self._turn_end_ts = None
@@ -1506,6 +1510,11 @@ class TerminalAgent(QObject):
         """Wall time this agent last produced output that counted as work
         (keystroke echo excluded), or 0.0 if it never has."""
         return self._last_work_ts
+
+    def last_submit_at(self) -> float:
+        """Wall time a line was last submitted to this agent's child (typed,
+        a task or a nudge), or 0.0 if none was this run."""
+        return self._last_submit_ts
 
     def _has_stop_hook(self) -> bool:
         """Claude reports each turn's end through its Stop hook, which is

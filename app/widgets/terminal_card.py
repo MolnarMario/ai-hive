@@ -220,7 +220,7 @@ class _CardHeader(QFrame):
     from. A plain click (no movement) is left alone, so double-click-to-rename
     on the title still works.
 
-    There is no right-click menu any more. Stop / Restart and the lane
+    There is no right-click menu any more. Restart and the lane
     actions it carried live in the hover tray (see _HeaderTools), where the
     user can find them: the user forgot a right-click menu on a title bar was
     there at all."""
@@ -285,7 +285,7 @@ class _ToolsTray(QFrame):
 
 
 class _HeaderTools(QWidget):
-    """The card's action buttons (stop, restart, the lane actions,
+    """The card's action buttons (restart, the lane actions,
     scheduled send, A- / A+ / maximize), collapsed to a narrow "⋯"
     strip until the pointer is over them.
 
@@ -460,7 +460,8 @@ class TerminalCard(QFrame):
     scheduleRequested = Signal(str, str)  # agent id, text to prefill (may be "")
     # the lane chip's and the action tray's lane actions: agent id, "open" |
     # "refresh" (app/lanes.py) | "integrator" | "adopt" (Restart in own lane)
-    # | "ship" (the integrator's Ship finished lanes)
+    # | "ship" (the integrator's Ship finished lanes) | "close_merged" (its
+    # Close merged agents)
     laneActionRequested = Signal(str, str)
 
     def __init__(self, agent: TerminalAgent, parent=None):
@@ -482,8 +483,8 @@ class TerminalCard(QFrame):
         self._lane_view = None
         # MainWindow's view of this agent's lane roles, asked when the action
         # tray or a menu opens or the lane chip repaints: callable(agent) ->
-        # dict with "integrator" (bool), "role", "adopt" and "ship" ((label,
-        # enabled, tooltip) or absent).
+        # dict with "integrator" (bool), "role", "adopt", "ship" and
+        # "close_merged" ((label, enabled, tooltip) or absent).
         # Set by WorkspacePage; None when nothing provides it.
         self.integration_info = None
         self._task_full = ""    # untruncated current-task (the label elides it)
@@ -494,6 +495,9 @@ class TerminalCard(QFrame):
         # it (see __init__, _on_status, _rerender_restored).
         self._boot_seed = False
         self._restored_hooked = False  # is _rerender_restored still armed?
+        # did the user click Restart and the new child is not up yet? Holds
+        # the veil over the old child's dying frame (see _on_restart_clicked)
+        self._restarting = False
         # prompt milestone uid -> absolute line IN THIS VIEW. Per-card because
         # a rebuilt view has a different `pushed` origin; keyed on uid because
         # id() is reused after a FIFO eviction (see PromptMark).
@@ -726,10 +730,13 @@ class TerminalCard(QFrame):
         # _refresh_actions sets their enablement each time the tray opens.
         self.header_tools = _HeaderTools(header)
         self.header_tools.before_open = self._refresh_actions
-        self.btn_stop = tool("■", "CardStop",
-                             "Stop (Ctrl+C, then kill)" if self.is_pty
-                             else "Stop (graceful, stdin EOF)",
-                             self.header_tools)
+        # Stop only on a line-console card: a terminal card's Ctrl+C stops
+        # its child, and a stopped card only waits for the next keystroke to
+        # start again. A line console has no per-command Ctrl+C, so its Stop
+        # (graceful, stdin EOF) is the only way to end a child but Restart.
+        self.btn_stop = (None if self.is_pty else
+                         tool("■", "CardStop", "Stop (graceful, stdin EOF)",
+                              self.header_tools))
         # Restart is "close this card, open a new agent like it": see
         # TerminalAgent.restart for what it resets. It also starts a stopped
         # agent, and so does any keystroke in the terminal, so there is no
@@ -760,7 +767,8 @@ class TerminalCard(QFrame):
         for _b in (self.btn_stop, self.btn_restart, self.btn_adopt,
                    self.btn_integrator, self.btn_sched, self.btn_font_dec, self.btn_font_inc,
                    self.btn_max):
-            self.header_tools.add(_b)
+            if _b is not None:
+                self.header_tools.add(_b)
         self.header_tools.withhold(self.btn_adopt, True)
         self.header_tools.withhold(self.btn_integrator, True)
         self.header_tools.withhold(self.btn_sched, not self.is_pty)
@@ -840,8 +848,9 @@ class TerminalCard(QFrame):
         self.title.installEventFilter(self)        # double-click to rename
         self.title_edit.installEventFilter(self)   # Esc cancels, focus-out commits
         self.title_edit.returnPressed.connect(self._commit_rename)
-        self.btn_stop.clicked.connect(self.agent.stop)
-        self.btn_restart.clicked.connect(self.agent.restart)
+        if self.btn_stop is not None:
+            self.btn_stop.clicked.connect(self.agent.stop)
+        self.btn_restart.clicked.connect(self._on_restart_clicked)
         self.btn_adopt.clicked.connect(
             lambda: self.laneActionRequested.emit(self.agent.id, "adopt"))
         self.btn_integrator.clicked.connect(
@@ -905,9 +914,9 @@ class TerminalCard(QFrame):
         Runs as the tray opens, and on a status change while it is open, so
         a button the user can see is never enabled for an action its agent
         can't take."""
-        status = self.agent.status
-        self.btn_stop.setEnabled(status in (AgentStatus.STARTING,
-                                            AgentStatus.RUNNING))
+        if self.btn_stop is not None:
+            self.btn_stop.setEnabled(self.agent.status in (
+                AgentStatus.STARTING, AgentStatus.RUNNING))
         info = self._integration()
         for btn, key in ((self.btn_adopt, "adopt"),
                          (self.btn_integrator, "role")):
@@ -1185,16 +1194,20 @@ class TerminalCard(QFrame):
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
         # the integrator's chip: the user's own "ship it now", typed into
-        # this agent only on that click (MainWindow._ship_lanes)
-        ship = self._integration().get("ship")
-        if ship:
-            label, enabled, tip = ship
-            act_ship = QAction(label, menu)
-            act_ship.setEnabled(bool(enabled))
-            act_ship.setToolTip(tip)
-            act_ship.triggered.connect(
-                lambda: self.laneActionRequested.emit(self.agent.id, "ship"))
-            menu.addAction(act_ship)
+        # this agent only on that click (MainWindow._ship_lanes), and
+        # closing the agents whose work is merged (_close_merged_agents)
+        info = self._integration()
+        offers = [(info[key], key) for key in ("ship", "close_merged")
+                  if info.get(key)]
+        for (label, enabled, tip), key in offers:
+            act = QAction(label, menu)
+            act.setEnabled(bool(enabled))
+            act.setToolTip(tip)
+            act.triggered.connect(
+                lambda _c=False, k=key: self.laneActionRequested.emit(
+                    self.agent.id, k))
+            menu.addAction(act)
+        if offers:
             menu.addSeparator()
         act_open = QAction("Open lane folder", menu)
         act_open.triggered.connect(
@@ -1530,22 +1543,60 @@ class TerminalCard(QFrame):
         # `spec.resume` is cleared by `start()` right after the worker is
         # launched, so at STARTING it still says whether this launch is
         # reopening a conversation or beginning one.
-        self.boot.begin("restoring conversation…" if self.agent.spec.resume
-                        else "starting…")
+        if self._restarting:
+            caption = "restarting…"
+        elif self.agent.spec.resume:
+            caption = "restoring conversation…"
+        else:
+            caption = "starting…"
+        self.boot.begin(caption)
         self._place_overlay()
         self._boot_timer.start(BOOT_VEIL_MAX_MS)
 
     def _end_boot_veil(self) -> None:
         """Ready: dissolve, so the conversation appears rather than snaps in."""
         self._boot_timer.stop()
+        self._restarting = False
         if self.is_pty:
             self.boot.finish()
 
     def _dismiss_boot_veil(self) -> None:
         """Drop it immediately (stopped, typed into, or timed out)."""
         self._boot_timer.stop()
+        self._restarting = False
         if self.is_pty:
             self.boot.dismiss()
+
+    def _on_restart_clicked(self) -> None:
+        """Restart, with the veil up from the click rather than from STARTING.
+
+        A running child is killed first, and until it is gone (a second or
+        more on a busy Claude) the worker sits in STOPPING with the old
+        frame frozen on screen. Nothing said the click had landed. The veil
+        goes up now and `_restarting` keeps `_on_status` from lowering it
+        through STOPPING, the exit and IDLE, until the new child's prompt
+        lifts it like any other boot."""
+        if not self.is_pty:
+            self.agent.restart()
+            return
+        self._restarting = True
+        self.agent.restart()
+        if self.agent.status is AgentStatus.STOPPING:
+            self._begin_boot_veil()
+        elif not self.boot.is_active():
+            self._restarting = False   # held, or the start failed at once
+
+    def _settle_restart(self) -> None:
+        """Queued by `_on_status` when a restarting card leaves the live
+        states. The new child normally starts in the same call stack as the
+        old one's exit (`PtyWorker._on_exit`), so by now it is STARTING. If it
+        is not, the restart failed: drop the veil and show the stopped card."""
+        if not self._restarting or self.agent.status in (
+                AgentStatus.STARTING, AgentStatus.RUNNING,
+                AgentStatus.STOPPING):
+            return
+        self._dismiss_boot_veil()
+        self._on_status(self.agent.status)
 
     def _on_prompt_ready(self, ready: bool) -> None:
         if ready:
@@ -2050,15 +2101,20 @@ class TerminalCard(QFrame):
             self.drop_restored_screen()
 
         if self.is_pty:  # stopped terminal shows the wake banner, never black
-            self.overlay.setVisible(not running
+            # a Restart passes through STOPPING, the exit and IDLE on its way
+            # to the new child; the veil owns all of them (_on_restart_clicked)
+            restarting = self._restarting and not running
+            self.overlay.setVisible(not running and not restarting
                                     and status is not AgentStatus.STOPPING)
-            if not running:
+            if not running and not restarting:
                 self._refresh_overlay()
                 self.overlay.raise_()
             # a booting child and a stopped one are mutually exclusive states,
             # and the wake banner owns the stopped one
             if running and not self.agent.prompt_ready():
                 self._begin_boot_veil()
+            elif restarting:
+                QTimer.singleShot(0, self, self._settle_restart)
             elif not running and not self._boot_seed:
                 # a RESTORED card that stays stopped keeps the veil until its
                 # settled-width projection lands (_rerender_restored); the

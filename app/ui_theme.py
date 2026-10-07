@@ -682,11 +682,11 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 }}
 /* agent lanes: the agent's own git worktree ("(branch glyph) +2 3~"),
    clickable for lane actions. Quiet by default; an OVERLAP with another lane
-   or the base turns it into an amber pill and a CONFLICT into a red one, both
+   or the base turns it into an amber chip and a CONFLICT into a red one, both
    in primary text for the same readability reason as the missed schedule. */
 #CardLane {{
     background: transparent; color: {p.CARDHEAD_SUB};
-    border: 1px solid transparent; border-radius: 8px;
+    border: 1px solid transparent; border-radius: 3px;
     font-size: 11px; font-weight: 700; padding: 0 5px;
 }}
 #CardLane[lane="overlap"] {{
@@ -697,11 +697,17 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     background: rgba(190,60,60,0.30); color: {p.TEXT};
     border-color: {p.RED};
 }}
-/* a "Task done" commit with no overlap: green, so finished work stands out.
-   Overlap and conflict take priority (lanes.LaneView.state). */
+/* a "Task done" commit: green, so finished work stands out. A done lane that
+   shares a file with another lane keeps the green and gets a yellow border,
+   "be aware" rather than amber's "something is wrong". Only a conflict
+   outranks done (lanes.LaneView.state). */
 #CardLane[lane="done"] {{
     background: rgba(70,170,90,0.30); color: {p.TEXT};
     border-color: {p.GREEN};
+}}
+#CardLane[lane="done-overlap"] {{
+    background: rgba(70,170,90,0.30); color: {p.TEXT};
+    border-color: {p.YELLOW};
 }}
 /* after the state rules: equal specificity, so the later rule wins and a
    coloured chip still shows it is clickable */

@@ -20,8 +20,9 @@ _ROWS = (
     ("Lane chip ⎇ ↑2 ±3 ✓",
      "A glance at git status: 2 commits of its own, 3 uncommitted files, "
      "and ✓ once its agent marked the work done, which turns the chip "
-     "green. Amber or red means another lane, or main, changed the same "
-     "files, and wins over green."),
+     "green. Amber means another lane, or main, changed the same files; "
+     "on a done lane that shows as a yellow border on the green chip. "
+     "Red means a real merge conflict, and wins over green."),
     ("Lane notices",
      "A colleague saying \"I changed that file an hour ago\". AI Hive "
      "reads every lane every 15 seconds and runs a real merge in memory, "
