@@ -1,6 +1,7 @@
 """Agent lanes: a private git worktree ("lane") per agent.
 
-Design and rationale: `.scratch/agent-lanes/spec-v2.md`. Every agent in a
+The original specs are in git history (`.scratch/agent-lanes/`, removed in
+0.35.0); this docstring and the code are current. Every agent in a
 workspace used to share one checkout, one index and one branch, so agents
 reset, restaged and committed each other's work. A laned agent works in its
 own worktree on its own branch instead:

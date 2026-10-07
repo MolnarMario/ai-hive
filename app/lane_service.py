@@ -1,7 +1,7 @@
 """LaneService: what every agent lane holds, and where lanes overlap.
 
-Phase 2 of agent lanes (.scratch/agent-lanes/spec-v2.md, "Awareness without
-the token cost"). Lanes keep agents from sharing one index and one working
+Phase 2 of agent lanes ("Awareness without the token cost"; the lane specs
+are in git history under .scratch/agent-lanes/, removed in 0.35.0). Lanes keep agents from sharing one index and one working
 tree; this service keeps them aware of each other without every agent
 reading the whole board:
 
@@ -21,8 +21,8 @@ reading the whole board:
 * every FETCH_MS it fetches each repo's base through LaneOps (a fetch writes
   refs), so "the base moved under you" is seen without anyone pulling.
 
-It runs while any agent anywhere has a lane, whatever the lanes toggles say
-(.scratch/agent-lanes/spec-v4-lane-scopes.md): MainWindow._sync_lane_service
+It runs while any agent anywhere has a lane, whatever the lanes toggles say:
+MainWindow._sync_lane_service
 starts it with the first lane and stops it when the last one goes, so with
 no lane AI Hive starts no lane git process at all. Stopping writes
 `"enabled": false` into every lanes.json it wrote, which silences

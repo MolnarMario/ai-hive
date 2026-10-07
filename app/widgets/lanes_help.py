@@ -1,5 +1,4 @@
-"""The "What are lanes?" explainer (.scratch/agent-lanes/spec-v4-lane-
-scopes.md, Phase B).
+"""The "What are lanes?" explainer (lane scopes, Phase B).
 
 Lanes and the integrator map one to one onto how a developer worked
 before AI agents: a branch per person, say when it's done, someone merges
@@ -30,7 +29,8 @@ _ROWS = (
     ("Task done",
      "A developer saying \"ready for review\". When an agent finishes its "
      "task it commits with a last line of just Task done. Nothing ships "
-     "until you ask the integrator."),
+     "until you ask the integrator, or pick Ship finished lanes on its "
+     "lane chip."),
     ("Integrator",
      "The teammate who owns the merge: an agent you pick with Make "
      "integrator. When you ask it to, it combines the finished lanes into "
