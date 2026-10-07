@@ -2236,6 +2236,9 @@ class MainWindow(QMainWindow):
         # "Lanes in every workspace". Default OFF, assigned here for the same
         # reason. Read it only through lane_default(ws).
         self._agent_lanes = False     # user preference (persisted)
+        # Ship finished lanes asks first until the user ticks "Don't ask
+        # again" in that dialog. Assigned here for the same reason.
+        self._ship_skip_confirm = False   # user preference (persisted)
         # every mutating lane git operation runs here, one at a time per repo
         # (app/lane_ops.py). Created whatever the toggles say: repairing,
         # retiring and reviving an existing lane never ask them.
@@ -4598,7 +4601,7 @@ class MainWindow(QMainWindow):
         if why:
             self._lane_message("Nothing shipped", why)
             return
-        if not self._confirm_ship(agent, done):
+        if not self._ship_skip_confirm and not self._confirm_ship(agent, done):
             return
         # the dialog ran its own event loop: a scheduled send may have
         # started a turn, or a lane poll moved a flag, meanwhile
@@ -4626,16 +4629,28 @@ class MainWindow(QMainWindow):
                           f"lanes={lanes_at}")
 
     def _confirm_ship(self, agent, done: list) -> bool:
-        """The user's go-ahead for Ship finished lanes (tests replace it)."""
+        """The user's go-ahead for Ship finished lanes (tests replace it).
+        Ticking "Don't ask again" and pressing OK stops this dialog for
+        good (`ui.ship_skip_confirm`); Cancel keeps asking."""
         lines = "\n".join(f"  {a.spec.name}: {view.branch} at "
                           f"{view.done[:7]}" for a, view in done)
-        answer = QMessageBox.question(
-            self, "Ship finished lanes",
+        box = QMessageBox(
+            QMessageBox.Icon.Question, "Ship finished lanes",
             f"{agent.spec.name} combines these lanes into one pull request, "
             f"gets it reviewed and tested, and merges it:\n\n{lines}",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        return answer == QMessageBox.StandardButton.Ok
+            self)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        # keep the Python reference: box.checkBox() alone hands back a bare
+        # QObject without isChecked()
+        again = QCheckBox("Don't ask again")
+        box.setCheckBox(again)
+        if box.exec() != QMessageBox.StandardButton.Ok:
+            return False
+        if again.isChecked():
+            self._ship_skip_confirm = True
+            self._schedule_save()
+        return True
 
     def _toggle_integrator(self, ws_id: str, agent) -> None:
         """The card header's Make integrator / Stop being the integrator."""
@@ -5095,6 +5110,7 @@ class MainWindow(QMainWindow):
         self._agent_lanes = bool(ui.get("agent_lanes", False))
         self.top_bar.set_agent_lanes(self._agent_lanes)
         self._refresh_workspace_lane_toggles()
+        self._ship_skip_confirm = bool(ui.get("ship_skip_confirm", False))
         self._auto_continue = bool(ui.get("auto_continue", True))
         self.top_bar.set_auto_continue(self._auto_continue)
         self._startup_recovery = bool(ui.get("startup_recovery", True))
@@ -5947,6 +5963,7 @@ class MainWindow(QMainWindow):
             "usage_left": self._usage_left,
             "auto_update": self._auto_update,
             "agent_lanes": self._agent_lanes,
+            "ship_skip_confirm": self._ship_skip_confirm,
             "auto_continue": self._auto_continue,
             "startup_recovery": self._startup_recovery,
             "terminal_scrollback": self._terminal_scrollback,

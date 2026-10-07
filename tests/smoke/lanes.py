@@ -4075,6 +4075,110 @@ def test_ship_lanes_from_integrator_chip():
             _drop_lane_folder(lane["root"])
     shutil.rmtree(tmp, ignore_errors=True)
 
+def test_ship_confirm_dont_ask_again():
+    """Ticking "Don't ask again" on the Ship finished lanes dialog and
+    pressing OK skips that dialog from then on, and the choice survives a
+    restart. Cancel with the box ticked changes nothing."""
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    from app import lanes
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-ship-skip-"))
+    work = _make_repo(tmp)
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    made = []
+
+    def laned(name, uid):
+        lane = _lane_for(work, name, uid)
+        made.append(lane)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"], pty=True)
+        spec.uid = uid
+        spec.lane = lane
+        return win.manager.add_terminal(ws.id, spec, autostart=False)
+
+    real_exec = QMessageBox.exec
+    with _stub_starts():
+        a = laned("Agent A", "5b1e01" + "0" * 26)
+        i = laned("Integrator", "5b1eee" + "0" * 26)
+        app.processEvents()
+        delivered = []
+        i.nudge = lambda text: (delivered.append(text), True)[1]
+        win._store_audit = lambda line: None
+        state = {"is_running": True, "prompt_ready": True,
+                 "is_busy": False, "is_waiting": False}
+        for attr in state:
+            setattr(i, attr, lambda k=attr: state[k])
+        win._toggle_integrator(ws.id, i)
+        win._on_lanes_changed(ws.id, {a.spec.uid: lanes.LaneView(
+            uid=a.spec.uid, branch=a.spec.lane["branch"],
+            root=a.spec.lane["root"], ahead=1, done="a" * 40)})
+
+        outcome = {"button": QMessageBox.StandardButton.Cancel,
+                   "tick": True, "shown": 0, "has_box": False}
+
+        def fake_exec(box):
+            outcome["shown"] += 1
+            from PySide6.QtWidgets import QCheckBox
+            check_box = box.findChild(QCheckBox)
+            outcome["has_box"] = (check_box is not None
+                                  and "ask again" in check_box.text())
+            if check_box is not None:
+                check_box.setChecked(outcome["tick"])
+            return outcome["button"]
+        QMessageBox.exec = fake_exec
+        try:
+            check("ship skip: off by default",
+                  win._ship_skip_confirm is False
+                  and win._session_payload()["ui"]["ship_skip_confirm"]
+                  is False)
+            win._ship_lanes(ws.id, i)
+            check("ship skip: the dialog carries a Don't ask again box",
+                  outcome["shown"] == 1 and outcome["has_box"], outcome)
+            check("ship skip: Cancel with the box ticked changes nothing",
+                  not win._ship_skip_confirm and delivered == [])
+            outcome["button"] = QMessageBox.StandardButton.Ok
+            outcome["tick"] = False
+            win._ship_lanes(ws.id, i)
+            check("ship skip: OK without the box still asks next time",
+                  not win._ship_skip_confirm and len(delivered) == 1)
+            delivered.clear()
+            outcome["tick"] = True
+            win._ship_lanes(ws.id, i)
+            check("ship skip: OK with the box ticked ships and remembers",
+                  win._ship_skip_confirm and len(delivered) == 1
+                  and win._session_payload()["ui"]["ship_skip_confirm"]
+                  is True)
+            delivered.clear()
+            shown = outcome["shown"]
+            win._ship_lanes(ws.id, i)
+            check("ship skip: once remembered, no dialog and it ships",
+                  outcome["shown"] == shown and len(delivered) == 1,
+                  (outcome, delivered))
+        finally:
+            QMessageBox.exec = real_exec
+
+        win._restore_ui_state({"ui": {}})
+        check("ship skip: a session without the key loads it off",
+              win._ship_skip_confirm is False)
+        win._restore_ui_state({"ui": {"ship_skip_confirm": True}})
+        check("ship skip: restore reads the saved choice",
+              win._ship_skip_confirm is True)
+        for agent in list(ws.agents):
+            win._close_agent(ws.id, agent.id)
+        win.lane_ops.drain(60)
+    win.close()
+    app.processEvents()
+    for lane in made:
+        if os.path.isdir(lane["root"]):
+            _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_session_v7_drops_the_queue():
     """v7 keeps a workspace's integrator and nothing of the old integration
     queue: a v6 file with queue items loads with its integrator, and the
