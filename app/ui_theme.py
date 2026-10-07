@@ -779,11 +779,13 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
    fallback, Windows can pick the emoji, which ignores it. */
 #CardStart, #CardStop, #CardRestart, #CardAssign, #CardAdopt,
 #CardIntegrator, #CardScheduleSend {{ font-family: "Segoe UI Symbol"; }}
-/* the A-/A+ font steppers read better a hair smaller than the glyph icons;
-   the maximize/restore glyph a hair larger (later rules win on equal id
-   specificity) */
+/* the A-/A+ font steppers read better a hair smaller than the glyph icons
+   (later rules win on equal id specificity). The maximize/restore squares
+   are Segoe MDL2 Assets private-use glyphs (see terminal_card.MAXIMIZE_GLYPH),
+   pinned here so Qt's fallback doesn't choose their size and shape; at 13px
+   the square matches the height of the stop and close glyphs beside it. */
 #CardFontDec, #CardFontInc {{ font-size: 12px; font-weight: 700; }}
-#CardMaximize {{ font-size: 16px; }}
+#CardMaximize {{ font-family: "Segoe MDL2 Assets"; font-size: 13px; }}
 /* the collapsed stand-in for the action tray: faint enough to read as
    chrome, visible enough to say "there is something here to hover" */
 #CardToolsHint {{ color: {p.CARDHEAD_SUB}; font-size: 13px; }}

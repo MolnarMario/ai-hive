@@ -648,7 +648,8 @@ error dialog instead of silently closing. Packaging to a distributable
   actions: `↻` restart (replaces the agent with a fresh one: new
   conversation, the permission mode, model and effort it was created with,
   no old title or task; name and folder stay), `⏱` send on a countdown,
-  `A−`/`A+` font and `⤢` maximize, plus
+  `A−`/`A+` font and a Windows-style
+  maximize / restore square, plus
   `⎇` restart in own lane and `⚑` make integrator where lanes apply. A
   terminal card has no stop button, `Ctrl+C` does that; a line-console
   card keeps `■` stop. Restart on a running agent puts up a "restarting"
