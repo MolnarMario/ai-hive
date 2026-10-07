@@ -63,6 +63,9 @@ app/lane_service.py polls it off the LaneOps queue. The same read finds the
 lane's newest commit whose message has a line saying just "Task done"
 (`DONE_GREP`): the agent's flag that its slice of work is finished. The
 lane chip shows it, and the integrator ships it when the user asks.
+A lane with nothing the base lacks also reports its agent's newest own
+commit (from the branch's reflog) once the base has it (`_landed_commit`):
+the integrator chip's Close merged agents closes those agents.
 """
 
 from __future__ import annotations
@@ -94,6 +97,11 @@ CREATE_NO_WINDOW = 0x08000000
 # matches it per line, so a subject that mentions it in passing doesn't count.
 DONE_MARK = "Task done"
 DONE_GREP = r"^[[:space:]]*task done[.!]?[[:space:]]*$"
+
+# reflog actions that record a commit made in the lane. The branch's
+# creation ("branch: Created from") and a fast-forward to the base ("merge
+# origin/main: Fast-forward") point it at base commits nobody made there.
+OWN_COMMIT_ACTIONS = ("commit", "cherry-pick", "revert")
 
 
 class LaneError(Exception):
@@ -1064,6 +1072,9 @@ class LaneSnap:
     # the newest of the lane's own commits flagged "Task done" (DONE_GREP)
     # that the base doesn't have yet, by ancestry or as a patch-equal commit
     done: str = ""
+    # with nothing ahead of the base: the newest commit made in the lane,
+    # once the base has it (_landed_commit). Its agent's work is merged.
+    landed: str = ""
     error: str = ""
 
     def files(self) -> dict:
@@ -1126,6 +1137,7 @@ class LaneView:
     error: str = ""
     head: str = ""
     done: str = ""
+    landed: str = ""
 
     @property
     def state(self) -> str:
@@ -1169,7 +1181,8 @@ class RepoSnapshot:
                         behind=s.behind, dirty=list(s.dirty),
                         committed=list(s.committed),
                         overlaps=list(self.overlaps.get(uid, [])),
-                        error=s.error, head=s.head, done=s.done)
+                        error=s.error, head=s.head, done=s.done,
+                        landed=s.landed)
 
     def index(self) -> dict:
         """repo path -> [{uid, agent, branch, state}] over every lane, for
@@ -1228,6 +1241,9 @@ def lane_snap(entry: dict, cache: dict | None = None) -> LaneSnap:
             if snap.ahead and snap.role != INTEGRATOR_ROLE:
                 snap.done = _done_commit(root, snap.head, snap.base_ref,
                                          cache)
+            elif snap.role != INTEGRATOR_ROLE:
+                snap.landed = _landed_commit(root, snap.branch, snap.base,
+                                             snap.base_ref, cache)
     except LaneError as exc:
         snap.error = str(exc)
     return snap
@@ -1271,6 +1287,39 @@ def _done_commit(root: str, head: str, base_ref: str, cache) -> str:
     if cache is not None:
         cache[key] = done
     return done
+
+
+def _landed_commit(root: str, branch: str, base: str, base_ref: str,
+                   cache) -> str:
+    """The newest commit made in the lane, when the base has it (by ancestry
+    or as other commits, _in_base), or "". The branch's reflog says which
+    commits were made there: after the integrator merges a lane, the idle
+    lane is fast-forwarded to the base, and its head alone can no longer
+    tell its agent's work from a lane that never committed anything. A
+    newer commit the agent dropped again (a reset) counts as its newest,
+    so the lane doesn't qualify. Cached by (commit, base sha)."""
+    r = git(["log", "-g", "--max-count=200", "--format=%H%x09%gs",
+             f"refs/heads/{branch}"], root)
+    if not r.ok:
+        return ""
+    own = ""
+    for line in r.out.splitlines():
+        sha, _tab, action = line.partition("\t")
+        if action.startswith(OWN_COMMIT_ACTIONS):
+            own = sha
+            break
+    if not own:
+        return ""
+    b = git(["rev-parse", base_ref], root)
+    if not b.ok:
+        return ""
+    key = ("landed", own, b.out)
+    if cache is not None and key in cache:
+        return cache[key]
+    landed = own if _in_base(root, own, base, base_ref) else ""
+    if cache is not None:
+        cache[key] = landed
+    return landed
 
 
 def _related(cache, cwd: str, a: str, b: str) -> bool:

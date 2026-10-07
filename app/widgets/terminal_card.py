@@ -460,7 +460,8 @@ class TerminalCard(QFrame):
     scheduleRequested = Signal(str, str)  # agent id, text to prefill (may be "")
     # the lane chip's and the action tray's lane actions: agent id, "open" |
     # "refresh" (app/lanes.py) | "integrator" | "adopt" (Restart in own lane)
-    # | "ship" (the integrator's Ship finished lanes)
+    # | "ship" (the integrator's Ship finished lanes) | "close_merged" (its
+    # Close merged agents)
     laneActionRequested = Signal(str, str)
 
     def __init__(self, agent: TerminalAgent, parent=None):
@@ -482,8 +483,8 @@ class TerminalCard(QFrame):
         self._lane_view = None
         # MainWindow's view of this agent's lane roles, asked when the action
         # tray or a menu opens or the lane chip repaints: callable(agent) ->
-        # dict with "integrator" (bool), "role", "adopt" and "ship" ((label,
-        # enabled, tooltip) or absent).
+        # dict with "integrator" (bool), "role", "adopt", "ship" and
+        # "close_merged" ((label, enabled, tooltip) or absent).
         # Set by WorkspacePage; None when nothing provides it.
         self.integration_info = None
         self._task_full = ""    # untruncated current-task (the label elides it)
@@ -1185,16 +1186,20 @@ class TerminalCard(QFrame):
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
         # the integrator's chip: the user's own "ship it now", typed into
-        # this agent only on that click (MainWindow._ship_lanes)
-        ship = self._integration().get("ship")
-        if ship:
-            label, enabled, tip = ship
-            act_ship = QAction(label, menu)
-            act_ship.setEnabled(bool(enabled))
-            act_ship.setToolTip(tip)
-            act_ship.triggered.connect(
-                lambda: self.laneActionRequested.emit(self.agent.id, "ship"))
-            menu.addAction(act_ship)
+        # this agent only on that click (MainWindow._ship_lanes), and
+        # closing the agents whose work is merged (_close_merged_agents)
+        info = self._integration()
+        offers = [(info[key], key) for key in ("ship", "close_merged")
+                  if info.get(key)]
+        for (label, enabled, tip), key in offers:
+            act = QAction(label, menu)
+            act.setEnabled(bool(enabled))
+            act.setToolTip(tip)
+            act.triggered.connect(
+                lambda _c=False, k=key: self.laneActionRequested.emit(
+                    self.agent.id, k))
+            menu.addAction(act)
+        if offers:
             menu.addSeparator()
         act_open = QAction("Open lane folder", menu)
         act_open.triggered.connect(
