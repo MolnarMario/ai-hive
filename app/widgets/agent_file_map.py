@@ -135,8 +135,8 @@ def _agent_state(agent) -> str:
 
 
 _STATE_COLOR = {
-    "working": lambda: Palette.GREEN,
-    "idle": lambda: Palette.YELLOW,
+    "working": lambda: Palette.YELLOW,   # same as the sidebar dots
+    "idle": lambda: Palette.GREEN,
     "error": lambda: Palette.RED,
     "empty": lambda: Palette.TEXT_DIM,
 }
