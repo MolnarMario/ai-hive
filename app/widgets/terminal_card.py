@@ -60,6 +60,13 @@ REPLAY_SEED_CAP = 8 * 1024
 # own 120ms resize debounce, so a real resize wins the race and this stays a
 # backstop rather than a second projection.
 REPLAY_SETTLE_MS = 300
+# The card's maximize/restore button wears the Windows caption-button pair
+# (ChromeMaximize, ChromeRestore): one square, then two stacked squares. They
+# are private-use codepoints of "Segoe MDL2 Assets" (Windows 10 and 11). The
+# #CardMaximize QSS rule names that font; without it the glyph's size and
+# shape depend on whichever icon font Qt's fallback happens to pick.
+MAXIMIZE_GLYPH = ""
+RESTORE_GLYPH = ""
 # how much of a transcript prompt must be found on a scrollback line to call it
 # that prompt's echo (see TerminalCard._recover_marks)
 _MARK_MATCH_CHARS = 28
@@ -762,8 +769,8 @@ class TerminalCard(QFrame):
                                  self.header_tools)
         # solo/restore this card in the workspace grid — a pure view toggle;
         # never touches sibling processes (see WorkspacePage.toggle_solo)
-        self.btn_max = tool("⤢", "CardMaximize", "Maximize (focus this agent)",
-                            self.header_tools)
+        self.btn_max = tool(MAXIMIZE_GLYPH, "CardMaximize",
+                            "Maximize (focus this agent)", self.header_tools)
         for _b in (self.btn_stop, self.btn_restart, self.btn_adopt,
                    self.btn_integrator, self.btn_sched, self.btn_font_dec, self.btn_font_inc,
                    self.btn_max):
@@ -1997,7 +2004,7 @@ class TerminalCard(QFrame):
     def set_maximized(self, on: bool) -> None:
         # the SAME button toggles between Maximize and Restore down — the page
         # owns the actual solo state; this only reflects it in the glyph/tooltip
-        self.btn_max.setText("⤡" if on else "⤢")
+        self.btn_max.setText(RESTORE_GLYPH if on else MAXIMIZE_GLYPH)
         self.btn_max.setToolTip("Restore down" if on
                                 else "Maximize (focus this agent)")
 
