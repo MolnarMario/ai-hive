@@ -1,5 +1,4 @@
-"""Agent lanes: a private git worktree per agent
-(.scratch/agent-lanes/spec-v2.md).
+"""Agent lanes: a private git worktree per agent (app/lanes.py).
 
 Lane tests build real temp git repos in the sandbox profile and never touch
 the real repo. Every agent is a stubbed worker (`_stub_starts`), per the
@@ -3009,7 +3008,7 @@ def test_integrator_lane_not_a_peer():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-# ---------------------------------------- lane scopes (spec-v4) ---
+# ------------------------------------------------- lane scopes ---
 
 def _hook_line(map_path: str, agent_id: str, sid: str, cwd: str,
                ts: float) -> None:
@@ -3934,6 +3933,147 @@ def test_task_done_waits_for_the_user():
             _drop_lane_folder(lane["root"])
     shutil.rmtree(tmp, ignore_errors=True)
 
+
+def test_ship_lanes_from_integrator_chip():
+    """The integrator's lane chip offers Ship finished lanes. It is the
+    user's own ask: offered only on the integrator's chip, enabled only
+    with a flagged lane and an idle integrator, confirmed by the user, and
+    typed in once naming the flagged lanes. Cancel types nothing."""
+    from PySide6.QtWidgets import QApplication
+    from app import lanes
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-ship-win-"))
+    work = _make_repo(tmp)
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    made = []
+
+    def laned(name, uid):
+        lane = _lane_for(work, name, uid)
+        made.append(lane)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"], pty=True)
+        spec.uid = uid
+        spec.lane = lane
+        return win.manager.add_terminal(ws.id, spec, autostart=False)
+
+    def ship_action(agent):
+        menu = win._pages[ws.id].card_for(agent.id)._lane_menu()
+        return next((act for act in menu.actions()
+                     if act.text().startswith("Ship finished lanes")), None)
+
+    with _stub_starts():
+        a = laned("Agent A", "5a1e01" + "0" * 26)
+        b = laned("Agent B", "5a1e02" + "0" * 26)
+        i = laned("Integrator", "5a1eee" + "0" * 26)
+        app.processEvents()
+        delivered, audit, asked = [], [], []
+        i.nudge = lambda text: (delivered.append(text), True)[1]
+        win._store_audit = audit.append
+        answer = [False]
+        win._confirm_ship = lambda agent, done: (
+            asked.append([v.branch for _a, v in done]), answer[0])[1]
+        state = {"is_running": True, "prompt_ready": True,
+                 "is_busy": False, "is_waiting": False}
+        for attr in state:
+            setattr(i, attr, lambda k=attr: state[k])
+        views = {a.spec.uid: lanes.LaneView(
+            uid=a.spec.uid, branch=a.spec.lane["branch"],
+            root=a.spec.lane["root"], ahead=1, done="a" * 40),
+            b.spec.uid: lanes.LaneView(
+            uid=b.spec.uid, branch=b.spec.lane["branch"],
+            root=b.spec.lane["root"], ahead=1)}
+
+        check("ship: no integrator, no Ship item",
+              ship_action(a) is None and ship_action(i) is None)
+        win._toggle_integrator(ws.id, i)
+        check("ship: a lane agent's chip has no Ship item",
+              ship_action(a) is None)
+        act = ship_action(i)
+        check("ship: no flagged lane, the item is disabled",
+              act is not None and not act.isEnabled(),
+              act and act.toolTip())
+        win._on_lanes_changed(ws.id, dict(views))
+        act = ship_action(i)
+        check("ship: a flagged lane enables it and counts it",
+              act.isEnabled() and act.text() == "Ship finished lanes (1)"
+              and "Agent A" in act.toolTip() and "Agent B" not in
+              act.toolTip(), (act.text(), act.toolTip()))
+        state["is_busy"] = True
+        act = ship_action(i)
+        check("ship: a busy integrator disables it, with the reason",
+              not act.isEnabled() and "finished its turn" in act.toolTip(),
+              act.toolTip())
+        state["is_busy"] = False
+        state["is_running"] = False
+        check("ship: a stopped integrator disables it",
+              not ship_action(i).isEnabled())
+        state["is_running"] = True
+
+        got = []
+        card = win._pages[ws.id].card_for(i.id)
+        card.laneActionRequested.connect(lambda aid, what: got.append(what))
+        ship_action(i).trigger()
+        check("ship: the item asks for the ship action", got == ["ship"], got)
+        check("ship: Cancel types nothing",
+              asked == [[a.spec.lane["branch"]]] and delivered == [],
+              (asked, delivered))
+        answer[0] = True
+        ship_action(i).trigger()
+        check("ship: OK types one request naming the flagged lane",
+              len(delivered) == 1
+              and a.spec.lane["branch"] in delivered[0]
+              and b.spec.lane["branch"] not in delivered[0]
+              and lanes.DONE_MARK in delivered[0]
+              and "\n" not in delivered[0], delivered)
+        check("ship: the request pins the confirmed Task done commit",
+              ("a" * 12) in delivered[0], delivered)
+        check("ship: the request is audited",
+              any(ln.startswith("LANE-SHIP") and a.spec.lane["branch"] in ln
+                  for ln in audit), audit)
+        delivered.clear()
+
+        # the confirm dialog runs its own event loop: what changed while it
+        # was open decides, not what the menu saw
+        told = []
+        win._lane_message = lambda title, text: told.append(text)
+
+        def busy_meanwhile(agent, done):
+            state["is_busy"] = True
+            return True
+        win._confirm_ship = busy_meanwhile
+        win._ship_lanes(ws.id, i)
+        state["is_busy"] = False
+        check("ship: an integrator that got busy behind the dialog gets "
+              "nothing", delivered == [] and told
+              and "finished its turn" in told[-1], (delivered, told))
+
+        def flagged_meanwhile(agent, done):
+            views[b.spec.uid] = dataclasses.replace(
+                views[b.spec.uid], done="b" * 40)
+            win._on_lanes_changed(ws.id, dict(views))
+            return True
+        win._confirm_ship = flagged_meanwhile
+        win._ship_lanes(ws.id, i)
+        check("ship: a lane flagged behind the dialog stops the send",
+              delivered == [] and "changed while the dialog" in told[-1],
+              (delivered, told))
+        delivered.clear()
+        win._ship_lanes(ws.id, a)
+        check("ship: a non-integrator cannot ship", delivered == [])
+        for agent in list(ws.agents):
+            win._close_agent(ws.id, agent.id)
+        win.lane_ops.drain(60)
+    win.close()
+    app.processEvents()
+    for lane in made:
+        if os.path.isdir(lane["root"]):
+            _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
 
 def test_session_v7_drops_the_queue():
     """v7 keeps a workspace's integrator and nothing of the old integration

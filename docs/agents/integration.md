@@ -3,12 +3,14 @@
 Every laned agent ends its finished work with a commit whose message has a
 last line of just `Task done`. AI Hive reads every lane, sees that commit
 (`lanes.DONE_GREP`), puts a check mark on the lane chip, turns it green and
-logs it. That is all it does. It never tells the integrator.
+logs it. That is all it does. A flag never tells the integrator.
 
 The user decides when there is enough finished work for a pull request and
-asks the integrator to ship it. The integrator starts only then, never on
-its own and never because a lane got flagged, and does everything else in
-its own lane by the checklist below.
+asks the integrator to ship it, in their own words or with Ship finished
+lanes in the integrator's lane chip menu. That item types one request into
+the integrator naming the flagged lanes, and only on the user's click. The
+integrator starts only then, never on its own and never because a lane got
+flagged, and does everything else in its own lane by the checklist below.
 
 Lanes never bump the version or touch the CHANGELOG or the README check
 count. The integrator does, once per pull request.
@@ -26,7 +28,8 @@ or dev server.
 ## Testing policy
 
 - A lane agent commits each finished task on its lane branch and runs the
-  tests for the area it changed (`-k <area>` or `--quick` here). It never
+  tests for the area it changed (`-m <area>` here, the module in
+  `tests/smoke/`, or `--quick`). It never
   needs the full suite.
 - The integrator runs the full suite, e2e included, once per pull request,
   on the commit it pushes.

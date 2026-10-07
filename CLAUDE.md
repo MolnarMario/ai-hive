@@ -72,9 +72,12 @@ This file holds only the rules that protect user data or fail silently.
 - Shipping lanes (`docs/agents/integration.md`): a laned agent flags
   finished work with a commit line of just `Task done` (`lanes.DONE_GREP`).
   AI Hive only shows the flag on the lane chip and logs it
-  (`MainWindow._log_done_lanes`). It never types into the integrator. The
-  user decides when there is enough to ship and asks the integrator. A note
-  on every flag had the integrator shipping work the moment it landed. Only
+  (`MainWindow._log_done_lanes`). A flag never types into the integrator.
+  The user decides when there is enough to ship and asks the integrator,
+  by hand or with the integrator chip's Ship finished lanes
+  (`MainWindow._ship_lanes`), the only path that types into it, and only
+  on the user's click. A note on every flag had the integrator shipping
+  work the moment it landed. Only
   the user picks the integrator, and no bridge op may pick one, merge or
   start an integration. The integrator, and no other agent, merges, and
   only its own PR after a clean GPT-6-Luna review and a passing full suite
@@ -89,8 +92,14 @@ This file holds only the rules that protect user data or fail silently.
 ```powershell
 .venv\Scripts\python.exe tests\smoke_test.py             # full, before a merge
 .venv\Scripts\python.exe tests\smoke_test.py --quick     # skips the real-claude e2e
+.venv\Scripts\python.exe tests\smoke_test.py -m lanes      # one area: tests/smoke/lanes.py
 .venv\Scripts\python.exe tests\smoke_test.py -k scrollbar  # tests whose name matches
+.venv\Scripts\python.exe tests\smoke_test.py -k NAME -j 1  # one process, to chase a
+                                                           # parallel-only failure
 ```
+
+The runner uses up to 6 worker processes, each with its own sandbox. A test
+must not depend on another test having run first in the same process.
 
 Every bug fix gets a regression check in `tests/smoke/<area>.py`. Any
 `test_*` function there runs; `tests/smoke_test.py` is only the runner. Import

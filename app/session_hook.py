@@ -337,8 +337,7 @@ def _append_record(mapping_path: str, payload: dict) -> None:
 
 
 # ------------------------------------------------------------ agent lanes ---
-# The overlap hook and lane notices (.scratch/agent-lanes/spec-v2.md, Phase
-# 2). AI Hive's LaneService WRITES lanes.json and the notices; the hooks
+# The overlap hook and lane notices (agent lanes Phase 2). AI Hive's LaneService WRITES lanes.json and the notices; the hooks
 # below READ them, so the file formats live here, in one place, next to
 # their reader. Everything is best-effort: a hook problem prints nothing.
 

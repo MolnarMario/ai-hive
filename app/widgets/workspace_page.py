@@ -261,7 +261,7 @@ class WorkspacePage(QWidget):
         self.activity_btn = tool("Activity", "Show the workspace activity board",
                                  "ActivityToggle", "activity")
         self.activity_btn.setCheckable(True)
-        # the workspace's lanes toggle (spec-v4-lane-scopes.md): the default
+        # the workspace's lanes toggle: the default
         # "Own lane" tick for its new agents. Hidden outside a git
         # repository; MainWindow sets its state (set_lanes_state).
         self.lanes_box = QWidget(header)

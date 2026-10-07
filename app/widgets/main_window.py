@@ -579,8 +579,7 @@ class TopBar(QFrame):
         self.auto_update_btn.clicked.connect(self._on_auto_update_clicked)
         self._refresh_auto_update_btn()
 
-        # "Lanes in every workspace" (.scratch/agent-lanes/spec-v4-lane-
-        # scopes.md). Default OFF: armed, it ticks "Own lane" for every new
+        # "Lanes in every workspace". Default OFF: armed, it ticks "Own lane" for every new
         # Claude agent in every git workspace, so it is the user's decision,
         # made once and persisted. Each workspace has its own toggle too.
         self._agent_lanes = False
@@ -1312,7 +1311,7 @@ class AddTerminalDialog(QDialog):
     past conversation is picked: two agents resuming one transcript race for
     it and one of them destroys it.
 
-    Agent lanes (app/lanes.py, spec-v4-lane-scopes.md): the "Own lane (git
+    Agent lanes (app/lanes.py): the "Own lane (git
     worktree)" checkbox exists in any git workspace (`repo_root`), whatever
     the lanes toggles say, so one agent can opt in alone. It starts ticked
     for Claude when `lane_default` (the Options switch or the workspace's
@@ -2712,13 +2711,13 @@ class MainWindow(QMainWindow):
         # Stats are recomputed on every `scheduled_changed`, so this is the
         # one edge that always covers it; _sync_schedule_timer is written to
         # be safe under this signal's high firing rate.
-        mgr.workspaceStatsChanged.connect(
-            lambda *_: self._sync_schedule_timer())
         # ...and the same edge drives the taskbar badge: busy and waiting both
         # recompute stats, which is exactly the pair the overlay encodes. It is
         # coalesced rather than pushed here, since this fires per workspace.
-        mgr.workspaceStatsChanged.connect(
-            lambda *_: self._schedule_taskbar_badge())
+        # A bound method, not a lambda: the manager outlives a deleted window
+        # (the smoke runner deletes each test's windows), and only a slot on
+        # this object is disconnected when it goes.
+        mgr.workspaceStatsChanged.connect(self._on_stats_for_timers)
         mgr.workspacePathChanged.connect(self._on_workspace_path_changed)
         mgr.workspaceLanesChanged.connect(
             lambda ws_id, _on: self._refresh_workspace_lane_toggles(ws_id))
@@ -3621,6 +3620,10 @@ class MainWindow(QMainWindow):
     def _schedule_pending(self) -> bool:
         return any(a.pending_scheduled() for a in self.manager.all_agents())
 
+    def _on_stats_for_timers(self, *_) -> None:
+        self._sync_schedule_timer()
+        self._schedule_taskbar_badge()
+
     def _sync_schedule_timer(self) -> None:
         """Run the countdown tick only while something is actually queued.
 
@@ -3927,7 +3930,7 @@ class MainWindow(QMainWindow):
         self._schedule_save()
 
     # ------------------------------------------------------- agent lanes ---
-    # Lane scopes (.scratch/agent-lanes/spec-v4-lane-scopes.md). Two
+    # Lane scopes. Two
     # toggles, the Options switch "Lanes in every workspace" and each
     # workspace's own, decide ONE thing: whether "Own lane" starts ticked
     # for a new agent (lane_default). A lane is created only by the user's
@@ -4186,7 +4189,7 @@ class MainWindow(QMainWindow):
                     pass
         agent.release_start(run=revive)
 
-    # Restart in own lane (spec-v4-lane-scopes.md): an existing agent without
+    # Restart in own lane: an existing agent without
     # a lane starts a NEW conversation in a new worktree, keeping its name,
     # uid and card. The order is the point; each step closes a race:
     #   1. hold its start, so nothing (a keystroke, a scheduled send, the
@@ -4464,6 +4467,8 @@ class MainWindow(QMainWindow):
                     ws_id, agent_id, uid, name, lane, res, err))
         elif action == "integrator":
             self._toggle_integrator(ws_id, agent)
+        elif action == "ship":
+            self._ship_lanes(ws_id, agent)
 
     def _on_lane_refreshed(self, ws_id, agent_id, uid, name, lane, result,
                            error) -> None:
@@ -4499,7 +4504,9 @@ class MainWindow(QMainWindow):
     # integrator. Everything after that (combining the lanes, the pull
     # request, the review loop, the merge) is the integrator's own work in
     # its own lane. AI Hive never merges anything and never tells the
-    # integrator to start.
+    # integrator to start on its own. The one way AI Hive types into it is
+    # the integrator chip's Ship finished lanes, a click by the user
+    # (_ship_lanes).
 
     def _integration_info(self, agent) -> dict:
         """What a card's action tray shows for the integrator role and for
@@ -4516,6 +4523,7 @@ class MainWindow(QMainWindow):
             info["role"] = ("Stop being the integrator", True,
                             "This agent stops being the one that ships "
                             "finished lanes when you ask.")
+            info["ship"] = self._ship_offer(ws, agent)
         elif (agent.spec.provider == "claude" and agent.is_pty
               and (agent.spec.lane or any(a.spec.lane for a in ws.agents))):
             # offered where lanes are: in a workspace without any, the tray
@@ -4533,6 +4541,101 @@ class MainWindow(QMainWindow):
                   "reviewed and tested, and merges it.")
             info["role"] = ("Make integrator", not why, tip)
         return info
+
+    @staticmethod
+    def _finished_lanes(ws, integrator) -> list:
+        """The lanes with a "Task done" commit the base lacks, as the lane
+        service last read them: (agent, LaneView) pairs, integrator left
+        out (its branch carries the flags it merged in)."""
+        found = []
+        for agent in ws.agents:
+            view = getattr(agent, "lane_view", None)
+            if (agent is not integrator and agent.spec.lane
+                    and view is not None and view.done):
+                found.append((agent, view))
+        return found
+
+    def _ship_state(self, ws, agent) -> tuple:
+        """(finished lanes, why the integrator can't take a ship request
+        now or "")."""
+        done = self._finished_lanes(ws, agent)
+        if not done:
+            why = "No lane has a \"Task done\" commit that the base lacks."
+        elif not agent.is_running():
+            why = "The integrator is stopped. Restart it first."
+        elif agent.is_busy() or agent.is_waiting():
+            why = "Wait until the integrator has finished its turn."
+        elif not agent.prompt_ready():
+            why = "The integrator is still starting."
+        else:
+            why = ""
+        return done, why
+
+    def _ship_offer(self, ws, agent) -> tuple:
+        """(label, enabled, tooltip) for the integrator chip's Ship finished
+        lanes."""
+        done, why = self._ship_state(ws, agent)
+        label = (f"Ship finished lanes ({len(done)})" if done
+                 else "Ship finished lanes")
+        if why:
+            return (label, False, why)
+        names = ", ".join(a.spec.name for a, _ in done)
+        return (label, True,
+                f"Asks the integrator to ship {names}: one pull request, "
+                f"reviewed and tested, then merged.")
+
+    def _ship_lanes(self, ws_id: str, agent) -> None:
+        """The integrator chip's Ship finished lanes: the user asking the
+        integrator to ship, typed in for them. It names each lane with the
+        "Task done" commit the user confirmed, so a lane flagged (or
+        flagged again) after the click waits for the next ask. Only this
+        click types into the integrator; a flag never does
+        (_log_done_lanes)."""
+        ws = self.manager.workspace(ws_id)
+        if ws is None or agent is None or not self.manager.is_integrator(agent):
+            return
+        done, why = self._ship_state(ws, agent)
+        if why:
+            self._lane_message("Nothing shipped", why)
+            return
+        if not self._confirm_ship(agent, done):
+            return
+        # the dialog ran its own event loop: a scheduled send may have
+        # started a turn, or a lane poll moved a flag, meanwhile
+        again, why = self._ship_state(ws, agent)
+        if not why and ([(a.spec.uid, v.done) for a, v in again]
+                        != [(a.spec.uid, v.done) for a, v in done]):
+            why = ("The finished lanes changed while the dialog was open. "
+                   "Open the menu again to see the new list.")
+        if why or not self.manager.is_integrator(agent):
+            self._lane_message("Nothing shipped",
+                               why or f"{agent.spec.name} is no longer the "
+                                      f"integrator.")
+            return
+        lanes_at = ", ".join(f"{view.branch} at {view.done[:12]}"
+                             for _a, view in done)
+        text = (f"Ship the finished lanes now: {lanes_at}. Merge each of "
+                f"those \"Task done\" commits into one integrate/ branch and "
+                f"follow your integrator instructions through to the merge.")
+        if not agent.nudge(text):
+            self._lane_message("Nothing shipped",
+                               f"{agent.spec.name} could not take the "
+                               f"request. Try again once it is at its prompt.")
+            return
+        self._store_audit(f"LANE-SHIP agent={agent.spec.name!r} "
+                          f"lanes={lanes_at}")
+
+    def _confirm_ship(self, agent, done: list) -> bool:
+        """The user's go-ahead for Ship finished lanes (tests replace it)."""
+        lines = "\n".join(f"  {a.spec.name}: {view.branch} at "
+                          f"{view.done[:7]}" for a, view in done)
+        answer = QMessageBox.question(
+            self, "Ship finished lanes",
+            f"{agent.spec.name} combines these lanes into one pull request, "
+            f"gets it reviewed and tested, and merges it:\n\n{lines}",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        return answer == QMessageBox.StandardButton.Ok
 
     def _toggle_integrator(self, ws_id: str, agent) -> None:
         """The card header's Make integrator / Stop being the integrator."""
@@ -4559,9 +4662,10 @@ class MainWindow(QMainWindow):
     def _log_done_lanes(self, ws_id: str, views: dict) -> None:
         """Log each lane commit that says "Task done", once per commit. Past
         the chip's check mark, that is all AI Hive does with the flag. The
-        user decides when there is enough to ship and asks the integrator.
-        AI Hive never types into the integrator: told about every flag as
-        it landed, the integrator shipped work before the user asked."""
+        user decides when there is enough to ship and asks the integrator,
+        in their own words or with the chip's Ship finished lanes. A flag
+        never types into the integrator: told about every flag as it
+        landed, the integrator shipped work before the user asked."""
         ws = self.manager.workspace(ws_id)
         integrator = self.manager.integrator(ws_id)
         for agent in (ws.agents if ws is not None else []):

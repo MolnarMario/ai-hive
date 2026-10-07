@@ -59,8 +59,8 @@ def system_prompt_text(workspace_name: str, agent_name: str,
 
     `aware`: the lane machinery runs for this agent, so its overlap hooks
     are armed. The manager passes it for every laned agent, because the
-    machinery follows the lanes, whatever the lanes toggles say
-    (spec-v4-lane-scopes.md). Only then does a laned agent
+    machinery follows the lanes, whatever the lanes toggles say.
+    Only then does a laned agent
     swap "read the board first" for "read roster.md": AI Hive tells it
     about a real overlap when one exists, and reading every note is the
     token cost the feature exists to remove. roster.md (written next to

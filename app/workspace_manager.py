@@ -66,8 +66,7 @@ class Workspace:
     # It ships "Task done" lanes when the user asks; AI Hive never tells
     # it (docs/agents/integration.md).
     integrator_uid: str = ""
-    # the workspace's lanes toggle (.scratch/agent-lanes/spec-v4-lane-
-    # scopes.md): ON ticks "Own lane" for its new Claude agents. It only
+    # the workspace's lanes toggle: ON ticks "Own lane" for its new Claude agents. It only
     # sets that default; it never touches an agent that exists.
     lanes: bool = False
 

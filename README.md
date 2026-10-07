@@ -483,8 +483,10 @@ workspaces keep executing — switching never pauses anything.
   told to end its finished work with a commit whose last line is just
   `Task done`. AI Hive spots that commit on its next lane read (the chip gets
   a `✓` and turns green) and logs it. Nothing ships until you say so: when
-  you think there is enough for a pull request, ask the integrator to ship.
-  It gathers the lanes you name, or every lane with an unmerged `Task done`
+  you think there is enough for a pull request, ask the integrator to ship,
+  or click the integrator's `⎇ integrator` chip and pick **Ship finished
+  lanes**. That asks you to confirm the list, then types the request into
+  the integrator. It gathers the lanes you name, or every lane with an unmerged `Task done`
   commit, into one `integrate/` branch. If the base branch has
   `docs/agents/integration.md`, the integrator follows it. AI Hive's own
   has it bump the version and CHANGELOG, run the full suite and
@@ -894,12 +896,22 @@ Hard-won rules, each with a regression test:
 .venv\Scripts\python.exe tests\smoke_test.py            # everything
 .venv\Scripts\python.exe tests\smoke_test.py --quick    # skip the real-claude e2e
 .venv\Scripts\python.exe tests\smoke_test.py -k NAME    # only tests matching NAME
+.venv\Scripts\python.exe tests\smoke_test.py -m lanes   # only tests/smoke/lanes.py
+.venv\Scripts\python.exe tests\smoke_test.py -j 1      # one process, file order
 ```
 
 The suite runs under a throwaway profile and a scratch project folder, and
 fails if any test other than the e2e one starts a real AI CLI.
 
-2841 checks drive the real app headlessly (offscreen Qt platform) with real
+Tests run in up to 6 worker processes by default, slowest first, using the
+durations the last run saved in `tests/.smoke-times.json`. On an 8-core
+machine `--quick` and the full run (e2e included) each take a little over a
+minute; `--quick -j 1` takes about four. A failure that only shows in
+parallel points at an order or load dependence: rerun it with
+`-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
+the suite's temp files and git processes takes about a third of the CPU.
+
+2873 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1039,7 +1051,8 @@ app/
                            its worker thread)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
-tests/smoke_test.py        suite runner: --quick, -k NAME (2841 checks)
+tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
+                           (2873 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
