@@ -4472,6 +4472,8 @@ class MainWindow(QMainWindow):
             self._toggle_integrator(ws_id, agent)
         elif action == "ship":
             self._ship_lanes(ws_id, agent)
+        elif action == "close_merged":
+            self._close_merged_agents(ws_id, agent)
 
     def _on_lane_refreshed(self, ws_id, agent_id, uid, name, lane, result,
                            error) -> None:
@@ -4527,6 +4529,7 @@ class MainWindow(QMainWindow):
                             "This agent stops being the one that ships "
                             "finished lanes when you ask.")
             info["ship"] = self._ship_offer(ws, agent)
+            info["close_merged"] = self._close_merged_offer(ws, agent)
         elif (agent.spec.provider == "claude" and agent.is_pty
               and (agent.spec.lane or any(a.spec.lane for a in ws.agents))):
             # offered where lanes are: in a workspace without any, the tray
@@ -4673,6 +4676,85 @@ class MainWindow(QMainWindow):
         page = self._pages.get(ws_id)
         for card in (page.cards if page is not None else []):
             card.refresh_lane()
+
+    def _merged_agents(self, ws, integrator) -> list:
+        """The agents the integrator chip's Close merged agents closes, as
+        the lane service last read them: (agent, LaneView) pairs. A laned
+        agent other than the integrator whose lane made a commit the base
+        now has (LaneView.landed), and holds nothing the base lacks: no
+        commit ahead, no "Task done" waiting to ship, no uncommitted file.
+        An agent in a turn is left open, it may be starting new work."""
+        found = []
+        for agent in ws.agents:
+            view = getattr(agent, "lane_view", None)
+            if (agent is integrator or not agent.spec.lane or view is None
+                    or not view.landed or view.ahead or view.done
+                    or view.dirty or view.error
+                    or agent.spec.uid in self._lane_pending
+                    or agent.is_busy() or agent.is_waiting()):
+                continue
+            found.append((agent, view))
+        return found
+
+    def _close_merged_offer(self, ws, agent) -> tuple:
+        """(label, enabled, tooltip) for the integrator chip's Close merged
+        agents."""
+        merged = self._merged_agents(ws, agent)
+        if not merged:
+            return ("Close merged agents", False,
+                    "No agent's committed work is in the base branch with "
+                    "nothing left to ship.")
+        names = ", ".join(a.spec.name for a, _ in merged)
+        return (f"Close merged agents ({len(merged)})", True,
+                f"Closes {names}. Everything they committed is in the base "
+                f"branch. The integrator and the other agents stay open.")
+
+    def _close_merged_agents(self, ws_id: str, agent) -> None:
+        """The integrator chip's Close merged agents: closes, after the
+        user confirms, each agent whose committed work the base branch has
+        (_merged_agents), the same way its card's close button does, so
+        each lane is retired too. Never the integrator, never another
+        agent."""
+        ws = self.manager.workspace(ws_id)
+        if ws is None or agent is None or not self.manager.is_integrator(agent):
+            return
+        merged = self._merged_agents(ws, agent)
+        if not merged:
+            self._lane_message("Nothing closed",
+                               "No agent's committed work is in the base "
+                               "branch with nothing left to ship.")
+            return
+        if not self._confirm_close_merged(merged):
+            return
+        # the dialog ran its own event loop: an agent may have started a
+        # turn, or a lane poll seen new work, meanwhile
+        still = {a.spec.uid for a, _v in self._merged_agents(
+            ws, self.manager.integrator(ws_id))}
+        kept = [a.spec.name for a, _v in merged if a.spec.uid not in still]
+        for other, view in merged:
+            if other.spec.uid not in still:
+                continue
+            self._store_audit(f"CLOSE-MERGED agent={other.spec.name!r} "
+                              f"branch={view.branch} "
+                              f"landed={view.landed[:7]}")
+            self._close_agent(ws_id, other.id)
+        if kept:
+            self._lane_message(
+                "Some agents kept",
+                f"These agents changed while the dialog was open, so they "
+                f"stay open: {', '.join(kept)}.")
+
+    def _confirm_close_merged(self, merged: list) -> bool:
+        """The user's go-ahead for Close merged agents (tests replace it)."""
+        lines = "\n".join(f"  {a.spec.name}: {view.branch}"
+                          for a, view in merged)
+        answer = QMessageBox.question(
+            self, "Close merged agents",
+            f"Everything these agents committed is in the base branch. "
+            f"Close them and remove their lanes?\n\n{lines}",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        return answer == QMessageBox.StandardButton.Ok
 
     def _log_done_lanes(self, ws_id: str, views: dict) -> None:
         """Log each lane commit that says "Task done", once per commit. Past

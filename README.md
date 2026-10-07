@@ -496,7 +496,12 @@ workspaces keep executing — switching never pauses anything.
   effort until the review comes back clean, then merge (a merge commit,
   never a squash). The default never touches your main checkout, it tells
   you the base moved so you pull when you're ready. Each flag is a
-  `LANE-DONE` line in `session.log`. The integrator needs `Bash(git:*)` and
+  `LANE-DONE` line in `session.log`. Once the merge lands, **Close merged
+  agents** on the same chip closes, after you confirm, every agent whose
+  lane committed work the base branch now has and holds nothing else (no
+  commit ahead, no uncommitted file, not mid-turn), and removes their
+  lanes. The integrator and every other agent stay open. Each close is a
+  `CLOSE-MERGED` line in `session.log`. The integrator needs `Bash(git:*)` and
   `PowerShell(git:*)` allowed, and every lane of a repository shares the main
   checkout's Claude auto-memory.
 - **Per-workspace agent numbering** — each workspace counts Agent 1, 2, 3…
