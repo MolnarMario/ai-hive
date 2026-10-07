@@ -9,8 +9,10 @@ app imports inside the test functions.
 
 import os
 import shutil
+import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"  # must precede any Qt import
@@ -142,13 +144,94 @@ def check(name, cond, detail=""):
 
 
 
-def _remove_sandbox_home():
-    """Delete this run's throwaway profile. Refuses anything that is not a
-    direct child of the temp dir named like one, so a bad SANDBOX_HOME can
+def drop_windows():
+    """Delete every top-level widget a test left behind. Tests show windows
+    and cards and never delete them, and every app-wide restyle (a theme or
+    font change, setup_application) sends events to each live widget. By
+    the window tests a serial run held thousands, and test_themes took 22 s
+    against 0.2 s in a fresh process. Hidden and deleted, never close()d: a
+    closeEvent could open a dialog that nobody answers."""
+    if "PySide6.QtWidgets" not in sys.modules:
+        return
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app is None:
+        return
+    for widget in app.topLevelWidgets():
+        widget.hide()
+        widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+
+
+def _rmtree(path):
+    """shutil.rmtree that also deletes read-only files. Git writes its
+    objects read-only, and rmtree(ignore_errors=True) silently left every
+    sandbox that held a repo: that is how 4150 test folders piled up in
+    %TEMP%."""
+    def clear_and_retry(func, failed, _exc):
+        try:
+            os.chmod(failed, stat.S_IWRITE)
+            func(failed)
+        except OSError:
+            pass   # still in use: the next sweep_stale_temp gets it
+    shutil.rmtree(path, onerror=clear_and_retry)
+
+
+def remove_sandbox(home, wait_s=0.0):
+    """Delete a throwaway profile, retrying for up to wait_s while the
+    processes that had it as their cwd finish dying. Refuses anything that
+    is not a direct child of the temp dir named like one, so a bad path can
     never aim this at a real folder."""
-    home = SANDBOX_HOME.resolve()
-    if home.parent == REAL_TMP and home.name.startswith("ai-hive-home-"):
-        shutil.rmtree(home, ignore_errors=True)
+    home = Path(home).resolve()
+    if home.parent != REAL_TMP or not home.name.startswith("ai-hive-home-"):
+        return False
+    deadline = time.monotonic() + wait_s
+    while True:
+        _rmtree(home)
+        if not home.exists() or time.monotonic() >= deadline:
+            return not home.exists()
+        time.sleep(0.25)
+
+
+def _remove_sandbox_home():
+    """Delete this run's throwaway profile. Whatever this process's own
+    agents still hold stays until the next run's sweep_stale_temp."""
+    remove_sandbox(SANDBOX_HOME)
+
+
+# Every folder the suite makes in the real temp dir starts with this: the
+# sandboxes, and the mkdtemp folders from before the sandbox existed. The app
+# names its own temp folders "aihive-...", so this never matches them.
+_TEST_TEMP_PREFIX = "ai-hive-"
+# No run lasts this long, so an older folder belongs to a killed or
+# crashed run, never to one in progress in another lane.
+STALE_TEMP_AGE_S = 6 * 3600
+
+
+def sweep_stale_temp(root=None):
+    """Delete test folders that runs left in the real temp dir: a killed
+    run never reaches its cleanup, and a serial run can't remove a sandbox
+    its own agents still use as their cwd. 4150 had piled up by
+    2026-10-07. Returns how many it removed."""
+    root = Path(root).resolve() if root else REAL_TMP
+    cutoff = time.time() - STALE_TEMP_AGE_S
+    removed = 0
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if (entry.name.startswith(_TEST_TEMP_PREFIX)
+                    and entry.is_dir(follow_symlinks=False)
+                    and entry.stat(follow_symlinks=False).st_mtime < cutoff
+                    and Path(entry.path).resolve().parent == root):
+                _rmtree(entry.path)
+                removed += not os.path.exists(entry.path)
+        except OSError:
+            continue
+    return removed
 
 
 def _remove_fixture_transcripts():

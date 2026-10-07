@@ -92,8 +92,14 @@ This file holds only the rules that protect user data or fail silently.
 ```powershell
 .venv\Scripts\python.exe tests\smoke_test.py             # full, before a merge
 .venv\Scripts\python.exe tests\smoke_test.py --quick     # skips the real-claude e2e
+.venv\Scripts\python.exe tests\smoke_test.py -m lanes      # one area: tests/smoke/lanes.py
 .venv\Scripts\python.exe tests\smoke_test.py -k scrollbar  # tests whose name matches
+.venv\Scripts\python.exe tests\smoke_test.py -k NAME -j 1  # one process, to chase a
+                                                           # parallel-only failure
 ```
+
+The runner uses up to 6 worker processes, each with its own sandbox. A test
+must not depend on another test having run first in the same process.
 
 Every bug fix gets a regression check in `tests/smoke/<area>.py`. Any
 `test_*` function there runs; `tests/smoke_test.py` is only the runner. Import

@@ -17,6 +17,7 @@ venv/
 
 # Test artifacts
 tests/screenshots/
+tests/.smoke-times.json
 
 # Design-handoff sources and dev scratch shots (not needed to build/run)
 *.zip
