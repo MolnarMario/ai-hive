@@ -3885,9 +3885,26 @@ def test_task_done_waits_for_the_user():
               card.lane_mark.property("lane"))
         clash = lanes.Overlap(path="a.txt", peer_uid="", peer="main",
                               peer_branch="main", state="committed")
-        check("task done: a file another lane changed outranks done",
+        check("task done: a file another lane changed keeps done, with a "
+              "border", dataclasses.replace(
+                  views[a.spec.uid], overlaps=[clash]).state == "done-overlap")
+        fight = dataclasses.replace(clash, state="conflicts")
+        check("task done: a real conflict outranks done",
               dataclasses.replace(views[a.spec.uid],
-                                  overlaps=[clash]).state == "overlap")
+                                  overlaps=[clash, fight]).state == "conflict")
+        card.set_lane_view(dataclasses.replace(views[a.spec.uid],
+                                               overlaps=[clash]))
+        check("task done: a done lane sharing a file shows green with a "
+              "yellow border", card.lane_mark.property("lane") == "done-overlap"
+              and "✓" in card.lane_mark.text(),
+              card.lane_mark.property("lane"))
+        from app import ui_theme
+        qss = ui_theme.build_qss()
+        rule = qss.split('#CardLane[lane="done-overlap"]', 1)[-1].split("}", 1)[0]
+        check("task done: the done-overlap chip is green with a yellow border",
+              "rgba(70,170,90" in rule
+              and f"border-color: {ui_theme.Palette.YELLOW}" in rule, rule)
+        card.set_lane_view(views[a.spec.uid])
         win._on_lanes_changed(ws.id, dict(views))
         win._on_lanes_changed(ws.id, dict(views))
         check("task done: a lane read logs the flag once",
