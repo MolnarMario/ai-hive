@@ -706,6 +706,8 @@ class TopBar(QFrame):
         self.options_panel.add_switch_row(
             self.reply_sound_label, self.reply_sound_btn,
             self.chime_sound_btns[chime.REPLY])
+        self.options_panel.add_switch_row(self.usage_left_label,
+                                          self.usage_left_btn)
         self.options_panel.add_switch_row(self.taskbar_label, self.taskbar_btn)
         self.options_panel.add_switch_row(self.auto_update_label,
                                           self.auto_update_btn)
@@ -721,8 +723,6 @@ class TopBar(QFrame):
         self.options_panel.add_row("Theme", self.theme_select)
         self.options_panel.add_row("Font size", self.font_dec_btn,
                                    self.font_inc_btn)
-        self.options_panel.add_switch_row(self.usage_left_label,
-                                          self.usage_left_btn)
 
         self.options_btn = QToolButton(self)
         self.options_btn.setObjectName("OptionsBtn")
