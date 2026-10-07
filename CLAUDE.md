@@ -89,6 +89,7 @@ This file holds only the rules that protect user data or fail silently.
 ```powershell
 .venv\Scripts\python.exe tests\smoke_test.py             # full, before a merge
 .venv\Scripts\python.exe tests\smoke_test.py --quick     # skips the real-claude e2e
+.venv\Scripts\python.exe tests\smoke_test.py -m lanes      # one area: tests/smoke/lanes.py
 .venv\Scripts\python.exe tests\smoke_test.py -k scrollbar  # tests whose name matches
 .venv\Scripts\python.exe tests\smoke_test.py -k NAME -j 1  # one process, to chase a
                                                            # parallel-only failure

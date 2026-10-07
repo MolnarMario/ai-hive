@@ -2712,13 +2712,13 @@ class MainWindow(QMainWindow):
         # Stats are recomputed on every `scheduled_changed`, so this is the
         # one edge that always covers it; _sync_schedule_timer is written to
         # be safe under this signal's high firing rate.
-        mgr.workspaceStatsChanged.connect(
-            lambda *_: self._sync_schedule_timer())
         # ...and the same edge drives the taskbar badge: busy and waiting both
         # recompute stats, which is exactly the pair the overlay encodes. It is
         # coalesced rather than pushed here, since this fires per workspace.
-        mgr.workspaceStatsChanged.connect(
-            lambda *_: self._schedule_taskbar_badge())
+        # A bound method, not a lambda: the manager outlives a deleted window
+        # (the smoke runner deletes each test's windows), and only a slot on
+        # this object is disconnected when it goes.
+        mgr.workspaceStatsChanged.connect(self._on_stats_for_timers)
         mgr.workspacePathChanged.connect(self._on_workspace_path_changed)
         mgr.workspaceLanesChanged.connect(
             lambda ws_id, _on: self._refresh_workspace_lane_toggles(ws_id))
@@ -3620,6 +3620,10 @@ class MainWindow(QMainWindow):
 
     def _schedule_pending(self) -> bool:
         return any(a.pending_scheduled() for a in self.manager.all_agents())
+
+    def _on_stats_for_timers(self, *_) -> None:
+        self._sync_schedule_timer()
+        self._schedule_taskbar_badge()
 
     def _sync_schedule_timer(self) -> None:
         """Run the countdown tick only while something is actually queued.

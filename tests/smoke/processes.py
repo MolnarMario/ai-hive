@@ -691,7 +691,8 @@ def test_pty():
 
     # type the next command at a prompt, not into a shell still unwinding
     # the interrupt
-    wait_until(at_prompt, 10000)
+    check("pty: the prompt came back after Ctrl+C",
+          wait_until(at_prompt, 10000), card.terminal.screen_text()[-160:])
 
     # background retention while hidden
     # a 4 s stream and a deadline, not an 800 ms stream and one fixed 1.3 s

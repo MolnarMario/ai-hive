@@ -26,7 +26,8 @@ or dev server.
 ## Testing policy
 
 - A lane agent commits each finished task on its lane branch and runs the
-  tests for the area it changed (`-k <area>` or `--quick` here). It never
+  tests for the area it changed (`-m <area>` here, the module in
+  `tests/smoke/`, or `--quick`). It never
   needs the full suite.
 - The integrator runs the full suite, e2e included, once per pull request,
   on the commit it pushes.

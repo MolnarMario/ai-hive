@@ -4,6 +4,7 @@ Run with the project venv, no display needed:
     .venv\\Scripts\\python.exe tests\\smoke_test.py            (full)
     .venv\\Scripts\\python.exe tests\\smoke_test.py --quick    (no real claude)
     .venv\\Scripts\\python.exe tests\\smoke_test.py -k NAME    (matching tests)
+    .venv\\Scripts\\python.exe tests\\smoke_test.py -m lanes   (one module)
     .venv\\Scripts\\python.exe tests\\smoke_test.py -j 1       (one process)
 
 Drives the REAL application (create_main_window) on the offscreen Qt
@@ -18,13 +19,20 @@ listed in MODULES runs, so a new test needs no registration.
 
 By default the tests run in parallel worker processes (-j, default up to 6).
 Most of the suite's time is spent waiting on child processes and timers, so
-6 workers cut the quick run from about 6 minutes to about 1.5. Each worker
+6 workers cut the quick run from about 6 minutes to about 1. Each worker
 imports smoke.harness itself and so gets its own throwaway profile; the
 parent hands out one test at a time, slowest first by the durations the last
 run saved in tests/.smoke-times.json, and prints each test's output as one
 block when it ends. Output order is completion order. A failure that only
 shows in parallel is an order or load dependence: rerun the test alone with
 -k NAME -j 1.
+
+The parent owns cleanup. It removes each worker's sandbox after the worker
+exits (a worker can't: its agents' children keep the sandbox as their cwd
+until the worker's Job Objects close at exit, and Windows won't delete a
+cwd), kills a worker whose test runs past TEST_TIMEOUT, and shuts every
+worker down on Ctrl+C. At start it sweeps test folders that killed runs
+left in %TEMP% (see harness.sweep_stale_temp).
 """
 
 import json
@@ -51,9 +59,9 @@ MODULES = [sidebar, attention, processes, terminal, reply_marks, sessions,
 # merge; --quick is for the edit-run loop.
 SLOW_TESTS = {"test_lifecycle_e2e"}
 
-# More than 6 workers on an 8-core machine bought nothing measurable and
-# pushes the timing-sensitive tests (task delivery waits for Claude's echo)
-# closer to their limits.
+# 8 workers on an 8-core machine saved about 7 s of 62 over 6 and push the
+# timing-sensitive tests (task delivery waits for Claude's echo) closer to
+# their limits.
 DEFAULT_JOBS = max(1, min(6, os.cpu_count() or 1))
 TIMES_FILE = Path(__file__).resolve().parent / ".smoke-times.json"
 # A worker prints this, then JSON, after each test. Nothing else in the suite
@@ -63,6 +71,13 @@ SENTINEL = "@@smoke-worker@@ "
 # of the real ~/.claude/projects to the parent: in a worker it could delete
 # the folder of an e2e test still running in another worker.
 WORKER_ENV = "AIHIVE_SMOKE_WORKER"
+# A parallel test running longer than this is killed with its worker and
+# counts as a FAIL. Every wait in a test has its own timeout, so this only
+# catches a real hang; the slowest test, the e2e, needs about 2 minutes.
+TEST_TIMEOUT = int(os.environ.get("AIHIVE_SMOKE_TEST_TIMEOUT", "600"))
+# For test_parallel_runner only: "crash:NAME" or "hang:NAME" makes a worker
+# print one FAIL and then die or hang when it reaches test NAME.
+FAULT_ENV = "AIHIVE_SMOKE_FAULT"
 
 
 def collect():
@@ -85,29 +100,30 @@ def collect():
 
 def _parse_args(argv):
     """--quick skips SLOW_TESTS. -k PATTERN (repeatable) runs only the tests
-    whose name contains one of the patterns. -j N runs N worker processes,
-    -j 1 runs everything in this process."""
-    quick, patterns, jobs, worker, it = False, [], DEFAULT_JOBS, False, \
-        iter(argv)
+    whose name contains one of the patterns. -m MODULE (repeatable) runs only
+    the tests in tests/smoke/MODULE.py; with -k too, a test must match both.
+    -j N runs N worker processes, -j 1 runs everything in this process."""
+    quick, worker, jobs = False, False, DEFAULT_JOBS
+    patterns, modules, it = [], [], iter(argv)
     for arg in it:
+        flag, value = arg[:2], arg[2:]
         if arg == "--quick":
             quick = True
         elif arg == "--worker":
             worker = True
-        elif arg in ("-k", "-j"):
-            value = next(it, "")
-            if arg == "-k":
+        elif flag in ("-k", "-m", "-j"):
+            if not value:
+                value = next(it, "")
+            if flag == "-k":
                 patterns.append(value)
+            elif flag == "-m":
+                modules.append(value)
             else:
                 jobs = _jobs(value)
-        elif arg.startswith("-k"):
-            patterns.append(arg[2:])
-        elif arg.startswith("-j"):
-            jobs = _jobs(arg[2:])
         else:
             raise SystemExit(f"unknown argument: {arg} "
-                             f"(use --quick, -k NAME, -j N)")
-    return quick, patterns, jobs, worker
+                             f"(use --quick, -k NAME, -m MODULE, -j N)")
+    return quick, patterns, modules, jobs, worker
 
 
 def _jobs(value):
@@ -155,7 +171,9 @@ def _run_one(test):
     except Exception:
         traceback.print_exc()
         check(f"{test.__name__}: crashed", False)
+    harness.drop_windows()
     return time.perf_counter() - started
+
 
 
 def _finish(selected, total, wall):
@@ -177,12 +195,20 @@ def _run_serial(selected, total):
 
 
 def _worker_loop(by_name):
-    """--worker: run the test named on each stdin line, then print the
-    sentinel with this test's counts. Exits at EOF."""
+    """--worker: announce this worker's sandbox, then run the test named on
+    each stdin line and print the sentinel with its counts. Exits at EOF."""
+    print(SENTINEL + json.dumps({"sandbox": str(harness.SANDBOX_HOME)}),
+          flush=True)
+    fault, _, fault_test = os.environ.get(FAULT_ENV, "").partition(":")
     for line in sys.stdin:
         name = line.strip()
         if not name:
             continue
+        if name == fault_test:
+            check(f"{name}: injected fault ({fault})", False)
+            if fault == "crash":
+                os._exit(3)
+            time.sleep(3600)
         before = (harness.PASS, harness.FAIL, harness.SKIP,
                   len(harness.REAL_AI_LAUNCHES))
         seconds = _run_one(by_name[name])
@@ -199,8 +225,9 @@ def _worker_loop(by_name):
 
 class _Worker:
     """One `smoke_test.py --worker` child. A reader thread turns its output
-    into (worker, test name, lines, result) items on the shared queue;
-    result is None when the child died mid-test."""
+    into (worker, test name, lines, result) items on the shared queue.
+    result is None once the child has exited, after the reader removed its
+    sandbox; `current` then names the test it died in, if any."""
 
     def __init__(self, argv, results):
         env = dict(os.environ, **{WORKER_ENV: "1",
@@ -223,13 +250,23 @@ class _Worker:
             errors="replace", bufsize=1,
             cwd=str(Path(__file__).resolve().parents[1]))
         self.current = None
+        self.started = 0.0
+        self.timed_out = False
+        self.sandbox = None
         self._results = results
-        threading.Thread(target=self._read, daemon=True).start()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
 
     def send(self, name):
-        self.current = name
-        self.proc.stdin.write(name + "\n")
-        self.proc.stdin.flush()
+        """Hand the worker its next test. False when its stdin is gone: the
+        worker died after its last result, and its reader reports that."""
+        try:
+            self.proc.stdin.write(name + "\n")
+            self.proc.stdin.flush()
+        except OSError:
+            return False
+        self.current, self.started = name, time.monotonic()
+        return True
 
     def close(self):
         try:
@@ -237,17 +274,37 @@ class _Worker:
         except OSError:
             pass
 
+    def kill(self):
+        # the worker's agents sit in Job Objects with KILL_ON_JOB_CLOSE, so
+        # killing the worker takes its whole process tree down with it
+        try:
+            self.proc.kill()
+        except OSError:
+            pass
+
     def _read(self):
         lines = []
         for line in self.proc.stdout:
             if line.startswith(SENTINEL):
-                result = json.loads(line[len(SENTINEL):])
-                self._results.put((self, result["name"], lines, result))
+                msg = json.loads(line[len(SENTINEL):])
+                if "sandbox" in msg:
+                    self.sandbox = msg["sandbox"]
+                    continue
+                self._results.put((self, msg["name"], lines, msg))
                 lines = []
             else:
                 lines.append(line)
         self.proc.wait()
+        if self.sandbox:
+            harness.remove_sandbox(self.sandbox, wait_s=10)
         self._results.put((self, self.current, lines, None))
+
+
+def _count_checks(lines):
+    """PASS/FAIL/SKIP lines a dead worker printed before it died, so a crash
+    mid-test never hides the failures that came before it."""
+    return [sum(ln.startswith(tag) for ln in lines)
+            for tag in ("[PASS] ", "[FAIL] ", "[SKIP] ")]
 
 
 def _run_parallel(selected, total, jobs, argv):
@@ -258,36 +315,77 @@ def _run_parallel(selected, total, jobs, argv):
     pending = sorted((t.__name__ for t in selected),
                      key=lambda n: -times.get(n, 60.0))
     results = queue.Queue()
-    # pass --quick and -k through so the worker's collect() agrees on names
-    workers = [_Worker(argv, results) for _ in range(min(jobs, len(pending)))]
-    for w in workers:
-        w.send(pending.pop(0))
-    measured, busy = {}, len(workers)
-    while busy:
-        worker, name, lines, result = results.get()
-        sys.stdout.write("".join(lines))
-        if result is None:
-            # the child died (a crash in Qt or a native module). Its test is
-            # one FAIL; a fresh worker takes the rest of the queue.
+    measured, everyone, live = {}, [], set()
+
+    def spawn():
+        # pass --quick, -k and -m through so the worker selects the same
+        # tests and agrees on names
+        w = _Worker(argv, results)
+        everyone.append(w)
+        live.add(w)
+        dispatch(w)
+
+    def dispatch(w):
+        w.current = None
+        if not pending:
+            w.close()   # EOF: the worker exits, its reader posts None
+            return
+        if w.send(pending[0]):
+            pending.pop(0)
+        # else the pipe is dead: the reader's None spawns a replacement,
+        # which takes this test
+
+    try:
+        for _ in range(min(jobs, len(pending))):
+            spawn()
+        while live:
+            try:
+                worker, name, lines, result = results.get(timeout=1.0)
+            except queue.Empty:
+                now = time.monotonic()
+                for w in live:
+                    if (w.current and not w.timed_out
+                            and now - w.started > TEST_TIMEOUT):
+                        w.timed_out = True
+                        w.kill()
+                continue
+            sys.stdout.write("".join(lines))
+            if result is not None:
+                harness.PASS += result["pass"]
+                harness.FAIL += result["fail"]
+                harness.SKIP += result["skip"]
+                harness.REAL_AI_LAUNCHES.extend(result["launches"])
+                measured[name] = result["seconds"]
+                dispatch(worker)
+                continue
+            # the child exited: normally at EOF, otherwise mid-test (a hang
+            # past TEST_TIMEOUT, or a crash in Qt or a native module). That
+            # test is one FAIL; a fresh worker takes the rest of the queue.
+            live.discard(worker)
             if worker.current is not None:
-                check(f"{worker.current}: worker process died "
-                      f"(exit {worker.proc.returncode})", False)
-            busy -= 1
+                passed, failed, skipped = _count_checks(lines)
+                harness.PASS += passed
+                harness.FAIL += failed
+                harness.SKIP += skipped
+                why = (f"ran past {TEST_TIMEOUT}s, worker killed"
+                       if worker.timed_out else
+                       f"worker process died (exit {worker.proc.returncode})")
+                check(f"{worker.current}: {why}", False)
             if pending:
-                worker = _Worker(argv, results)
-                worker.send(pending.pop(0))
-                busy += 1
-            continue
-        harness.PASS += result["pass"]
-        harness.FAIL += result["fail"]
-        harness.SKIP += result["skip"]
-        harness.REAL_AI_LAUNCHES.extend(result["launches"])
-        measured[name] = result["seconds"]
-        if pending:
-            worker.send(pending.pop(0))
-        else:
-            worker.current = None
-            worker.close()   # EOF: the worker exits, its reader posts None
+                spawn()
+    finally:
+        # Ctrl+C or a crash here: no worker may outlive the run, or its
+        # sandbox and its agents' processes stay behind
+        for w in everyone:
+            w.close()
+        deadline = time.monotonic() + 5
+        for w in everyone:
+            try:
+                w.proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                w.kill()
+        for w in everyone:
+            w.reader.join(timeout=15)
     sys.stdout.flush()
     _save_times(measured)
     return _finish(len(selected), total, time.perf_counter() - started)
@@ -295,15 +393,28 @@ def _run_parallel(selected, total, jobs, argv):
 
 def main(argv=()):
     argv = list(argv)
-    quick, patterns, jobs, worker = _parse_args(argv)
+    quick, patterns, modules, jobs, worker = _parse_args(argv)
     harness._guard_real_ai_launches()
     tests = collect()
+    known = [m.__name__.rsplit(".", 1)[-1] for m in MODULES]
+    unknown = [m for m in modules if m not in known]
+    if unknown:
+        raise SystemExit(f"no test module {', '.join(unknown)} "
+                         f"(have: {', '.join(known)})")
     selected = [t for t in tests
                 if not (quick and t.__name__ in SLOW_TESTS)
                 and (not patterns
-                     or any(p in t.__name__ for p in patterns))]
+                     or any(p in t.__name__ for p in patterns))
+                and (not modules
+                     or t.__module__.rsplit(".", 1)[-1] in modules)]
     if worker:
         return _worker_loop({t.__name__: t for t in selected})
+    if not selected:
+        # a typo in -k used to run nothing and report a clean pass
+        raise SystemExit("no test matches the -k/-m filters")
+    # in the background: the first sweep after a long gap has thousands of
+    # folders to delete, and the tests need not wait for it
+    threading.Thread(target=harness.sweep_stale_temp, daemon=True).start()
     if jobs > 1 and len(selected) > 1:
         passthrough = [a for a in argv if a != "--worker"]
         return _run_parallel(selected, len(tests), jobs, passthrough)
