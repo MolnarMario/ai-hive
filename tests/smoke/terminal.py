@@ -2277,6 +2277,112 @@ def test_restart_blanks_the_card_screen():
     agent.dispose()
 
 
+def test_restart_drops_the_dying_childs_frames():
+    """What a Restart's old child draws while it dies never reaches the new
+    conversation: its footer must not make the new child read as ready, and
+    a plan-limit banner on it must not park the new one. The view drops a
+    selection made on the old frame, a restored screen's pending projection
+    is cancelled, a restart whose new child never starts stops dropping
+    output, and Restart in own lane gets the same blank screen."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY, WorkerState
+    from app.terminal_agent import TerminalAgent
+    QApplication.instance() or QApplication([])
+    if not HAS_CONPTY:
+        return skip("restart-tail", "no ConPTY")
+    from app.widgets.terminal_card import TerminalCard
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    agent = TerminalAgent(build_spec(
+        AgentKind.CLAUDE, "Restart tail", cwd=SCRATCH_CWD, pty=True))
+    card = TerminalCard(agent)
+    term = card.terminal
+    worker = agent.worker
+    worker.restart = lambda: worker._set_state(WorkerState.STOPPING)
+    worker._set_state(WorkerState.RUNNING)
+    agent._on_pty_output("pty", "old line\r\n" * 60)
+    pushed = term.screen.history.top.pushed
+    term._sel_anchor, term._sel_end = (0, 0), (0, 3)
+
+    agent.restart()
+    # the dying child's last frames: the footer, then a limit banner
+    agent._on_pty_output("pty", "? for shortcuts\r\n")
+    agent._on_pty_output("pty", "You've hit your session limit \xb7 resets "
+                                "4:40am (Europe/Budapest)\r\n")
+    check("restart-tail: the old child's footer does not make the new one "
+          "ready", not agent.prompt_ready())
+    check("restart-tail: a limit banner on the old frame parks nothing",
+          not agent._limit_blocked)
+    worker._set_state(WorkerState.DEAD)
+    worker._set_state(WorkerState.IDLE)
+    worker._set_state(WorkerState.STARTING)
+    check("restart-tail: the old frame's selection is gone",
+          term._sel_anchor is None and term._sel_end is None)
+    check("restart-tail: absolute line ids keep counting up",
+          pushed > 0 and term.screen.history.top.pushed == pushed,
+          (pushed, term.screen.history.top.pushed))
+    agent._on_pty_output("pty", "new banner")
+    check("restart-tail: the new child's output is kept",
+          "new banner" in agent.pty_replay()
+          and "old line" not in agent.pty_replay())
+    card.detach()
+    worker._set_state(WorkerState.IDLE)
+    agent.dispose()
+
+    # a restored screen waiting for its settled-size projection
+    seeded = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Seeded", cwd=SCRATCH_CWD, pty=True))
+    seeded.seed_pty_replay("PREVIOUS-RUN-SCREEN\r\n")
+    scard = TerminalCard(seeded)
+    check("restart-tail: the restored screen's projection is pending",
+          scard._settle_timer.isActive() and scard._boot_seed)
+    seeded.worker.restart = lambda: seeded.worker._set_state(
+        WorkerState.STARTING)
+    seeded.restart()
+    check("restart-tail: Restart cancels the restored screen's projection",
+          not scard._settle_timer.isActive() and not scard._restored_hooked
+          and not scard._boot_seed)
+    pump(400)
+    check("restart-tail: ...so it never replays over the new child",
+          "PREVIOUS-RUN-SCREEN" not in scard.terminal.screen_text())
+    scard.detach()
+    seeded.worker._set_state(WorkerState.IDLE)
+    seeded.dispose()
+
+    # a restart whose new child never starts
+    failed = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Failed", cwd=SCRATCH_CWD, pty=True))
+    failed.worker.restart = lambda: failed.worker._set_state(
+        WorkerState.STOPPING)
+    failed.worker._set_state(WorkerState.RUNNING)
+    failed.restart()
+    failed.worker._set_state(WorkerState.DEAD)
+    pump(30)
+    failed._on_pty_output("pty", "after the failed start")
+    check("restart-tail: a restart that never started stops dropping output",
+          "after the failed start" in failed.pty_replay())
+    failed.dispose()
+
+    # Restart in own lane: the worker already stopped, the lane's first
+    # child starts on a blank screen
+    adopt = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Adopt", cwd=SCRATCH_CWD, pty=True))
+    resets = []
+    adopt.screen_reset.connect(lambda: resets.append(1))
+    adopt._on_pty_output("pty", "main folder frame")
+    adopt.begin_fresh_screen()
+    adopt.worker._set_state(WorkerState.STARTING)
+    check("restart-tail: Restart in own lane starts on a blank screen",
+          resets == [1] and adopt.pty_replay() == "")
+    adopt.worker._set_state(WorkerState.IDLE)
+    adopt.dispose()
+
+
 def test_restart_keeps_the_permission_mode_the_agent_was_created_with():
     """Restart drops a mode the user shifted into, but not the one they
     picked in the New Agent dialog. The manager writes the live mode back to

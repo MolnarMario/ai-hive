@@ -990,8 +990,11 @@ class TerminalCard(QFrame):
 
     def _on_screen_reset(self) -> None:
         """A Restart's new child is starting: blank the view and its modes
-        (alt screen, bracketed paste, mouse) the way a fresh terminal would."""
-        self._pending_replay = ""
+        (alt screen, bracketed paste, mouse) the way a fresh terminal would.
+        A restored screen still waiting for its settled-size projection goes
+        with it, timer and resize hook included, or that projection would
+        replay over the new child's boot."""
+        self.drop_restored_screen()
         self.terminal.reset()
         self._proj_cols = self.terminal.screen.columns
 

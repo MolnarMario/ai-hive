@@ -4116,6 +4116,11 @@ class MainWindow(QMainWindow):
                        + (", in a new conversation" if adopt else ""),
                 {"root": result["root"], "branch": result["branch"]})
         self._push_lane_view(ws_id, agent)
+        if adopt:
+            # Restart in own lane is a new conversation too: the lane's
+            # first child starts on a blank screen, not over the main
+            # folder's last frame
+            agent.begin_fresh_screen()
         agent.release_start(run=True)
 
     TWO_LANES_HINT = ("[Two lanes in this workspace. Pick an integrator (the "
