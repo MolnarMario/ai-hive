@@ -2220,6 +2220,63 @@ def test_restart_resets_the_agent_to_its_launch_defaults():
     a.dispose()
 
 
+def test_restart_blanks_the_card_screen():
+    """Restart gives the new child a blank screen, as a fresh terminal would.
+
+    The regression: restart() dropped the agent's raw buffer but the card's
+    view kept the old frame and its cursor, so the new Claude painted its
+    banner and input box over the old one from wherever the old cursor sat.
+    The dying child's last output also arrives after restart() (its EOF
+    comes later), and none of that may survive into the new screen."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY, WorkerState
+    from app.terminal_agent import TerminalAgent
+    QApplication.instance() or QApplication([])
+    if not HAS_CONPTY:
+        return skip("restart-blank", "no ConPTY")
+    from app.widgets.terminal_card import TerminalCard
+
+    agent = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Restart blank", cwd=SCRATCH_CWD, pty=True))
+    card = TerminalCard(agent)
+    worker = agent.worker
+    # stub the worker side: a real restart kills a child and starts another
+    worker.restart = lambda: worker._set_state(WorkerState.STOPPING)
+    worker._set_state(WorkerState.RUNNING)
+    agent._on_pty_output("pty", "old banner\r\nold prompt\r\n\x1b[?2004h> ")
+    agent._set_prompt_ready(True)
+    check("restart-blank: the old frame is on screen first",
+          "old banner" in card.terminal.screen_text()
+          and card.terminal.screen.cursor.y > 0)
+
+    agent.restart()
+    agent._on_pty_output("pty", "old tail")   # the dying child's last frame
+    worker._set_state(WorkerState.DEAD)      # PtyWorker._on_eof
+    worker._set_state(WorkerState.IDLE)
+    worker._set_state(WorkerState.STARTING)  # ...and the new child
+    term = card.terminal
+    check("restart-blank: the new child gets an empty screen at the top left",
+          not term.screen_text().strip()
+          and (term.screen.cursor.x, term.screen.cursor.y) == (0, 0)
+          and not term._bracketed_paste, repr(term.screen_text()))
+    check("restart-blank: nothing of the old child is kept for replay",
+          agent.pty_replay() == "" and not agent.prompt_ready())
+    agent._on_pty_output("pty", "new banner")
+    check("restart-blank: the new banner draws on the first row",
+          term.screen_text().splitlines()[0].startswith("new banner"))
+
+    # a plain start is not a restart: what is on screen stays
+    worker._set_state(WorkerState.IDLE)
+    worker._set_state(WorkerState.STARTING)
+    check("restart-blank: a later start keeps the screen",
+          "new banner" in term.screen_text())
+    card.detach()
+    worker._set_state(WorkerState.IDLE)
+    agent.dispose()
+
+
 def test_restart_keeps_the_permission_mode_the_agent_was_created_with():
     """Restart drops a mode the user shifted into, but not the one they
     picked in the New Agent dialog. The manager writes the live mode back to

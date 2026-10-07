@@ -896,6 +896,7 @@ class TerminalCard(QFrame):
             self.agent.reply_marks_changed.connect(self._on_reply_mark_added)
             self.agent.conversation_replaced.connect(
                 self.terminal.clear_history)
+            self.agent.screen_reset.connect(self._on_screen_reset)
             self.scroll_bar.markActivated.connect(self.terminal.scroll_to_abs)
             self.terminal.installEventFilter(self)
             return
@@ -965,6 +966,7 @@ class TerminalCard(QFrame):
             pairs.append((self.agent.pty_output, self._on_pty_output))
             pairs.append((self.agent.prompt_ready_changed,
                           self._on_prompt_ready))
+            pairs.append((self.agent.screen_reset, self._on_screen_reset))
             # a card on its way out must not leave a throbber animating
             self._dismiss_boot_veil()
         else:
@@ -978,6 +980,13 @@ class TerminalCard(QFrame):
 
     def _on_pty_output(self, text: str) -> None:
         self.terminal.feed(text)
+
+    def _on_screen_reset(self) -> None:
+        """A Restart's new child is starting: blank the view and its modes
+        (alt screen, bracketed paste, mouse) the way a fresh terminal would."""
+        self._pending_replay = ""
+        self.terminal.reset()
+        self._proj_cols = self.terminal.screen.columns
 
     def _on_key_input(self, seq: str) -> None:
         """Keystrokes reach the process — and a stopped terminal is never a
