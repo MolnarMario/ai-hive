@@ -4030,6 +4030,9 @@ def test_close_merged_agents_from_integrator_chip():
               sum(ln.startswith("CLOSE-MERGED-KEEP") for ln in audit) == 2,
               audit)
         fresh = {}
+        # the drain pumped events, so a real lane poll may have replaced
+        # the views this test made up
+        win._on_lanes_changed(ws.id, dict(views))
 
         # F starts a turn while the dialog is open: it stays open
         def f_busy_meanwhile(merged):
