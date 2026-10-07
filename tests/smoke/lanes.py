@@ -4000,12 +4000,44 @@ def test_close_merged_agents_from_integrator_chip():
               asked == [["Agent A", "Agent F"]] and len(ws.agents) == 8,
               (asked, len(ws.agents)))
 
+        # after the OK each lane is read again; `fresh` is what that read
+        # finds beyond the poll's view
+        fresh = {}
+
+        def fake_snap(entry):
+            v = views[entry["uid"]]
+            snap = lanes.LaneSnap(uid=v.uid, agent=entry["agent"],
+                                  ws_id=entry["ws_id"], branch=v.branch,
+                                  root=v.root, ahead=v.ahead,
+                                  dirty=list(v.dirty), landed=v.landed,
+                                  read_at=time.time())
+            return dataclasses.replace(snap, **fresh.get(v.uid, {}))
+        win._lane_snap_for_close = fake_snap
+
+        # the user edited a file in A's lane and F's lane after the poll:
+        # the fresh read sees it, so neither closes
+        fresh = {a.spec.uid: {"dirty": ["new.txt"]},
+                 f.spec.uid: {"ahead": 1}}
+        answer[0] = True
+        told.clear()
+        close_action(i).trigger()
+        win.lane_ops.drain(60)
+        check("close-merged: a lane changed since the poll is read again "
+              "and stays open",
+              len(ws.agents) == 8 and told and "Agent A" in told[-1]
+              and "Agent F" in told[-1], (len(ws.agents), told))
+        check("close-merged: the kept agents are audited",
+              sum(ln.startswith("CLOSE-MERGED-KEEP") for ln in audit) == 2,
+              audit)
+        fresh = {}
+
         # F starts a turn while the dialog is open: it stays open
         def f_busy_meanwhile(merged):
             f.is_busy = lambda: True
             return True
         win._confirm_close_merged = f_busy_meanwhile
         close_action(i).trigger()
+        win.lane_ops.drain(60)
         left = {x.spec.name for x in ws.agents}
         check("close-merged: OK closes only the merged agents",
               left == {"Agent B", "Agent C", "Agent D", "Agent E",
