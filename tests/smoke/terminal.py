@@ -2085,8 +2085,9 @@ def test_header_tray_carries_the_card_actions():
     """The actions that used to hide behind a right-click on the header
     (restart, scheduled send, the lane actions) are
     icon buttons in the hover tray, each with a tooltip naming it. The user
-    had forgotten the right-click menu existed. Stop is gone: Ctrl+C in the
-    terminal does it, and the user found the button useless."""
+    had forgotten the right-click menu existed. A terminal card has no Stop:
+    Ctrl+C in the terminal does it, and the user found the button useless.
+    A line-console card keeps it, having no Ctrl+C."""
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
     from app.terminal_agent import AgentStatus, TerminalAgent
@@ -2118,7 +2119,7 @@ def test_header_tray_carries_the_card_actions():
           not hasattr(card, "btn_start") and not hasattr(card, "btn_assign")
           and not hasattr(card, "reassignRequested"))
     check("actions: no Stop button (Ctrl+C in the terminal stops it)",
-          not hasattr(card, "btn_stop")
+          card.btn_stop is None
           and not any("Stop" in b.toolTip() for b in ht._buttons))
     check("actions: every tray button has a tooltip",
           all(b.toolTip().strip() for b in shown()),
@@ -2127,6 +2128,26 @@ def test_header_tray_carries_the_card_actions():
           card.btn_adopt not in shown()
           and card.btn_integrator not in shown())
     ht._set_open(False)
+
+    # a line console has no per-command Ctrl+C, so it keeps its Stop
+    # (graceful, stdin EOF): without it only Restart could end its child
+    lc = TerminalAgent(build_spec(AgentKind.POWERSHELL, "Line",
+                                  cwd=SCRATCH_CWD, pty=False))
+    stops = []
+    lc.stop = lambda: stops.append(1)
+    lc_card = TerminalCard(lc)
+    lc_card.resize(900, 300); lc_card.show(); pump(60)
+    check("actions: a line-console card keeps its Stop in the tray",
+          not lc_card.is_pty and lc_card.btn_stop is not None
+          and lc_card.btn_stop in lc_card.header_tools._buttons)
+    lc_card.header_tools._set_open(True); pump(20)
+    check("actions: a line console's Stop is off while the child is idle",
+          not lc_card.btn_stop.isEnabled())
+    lc_card.btn_stop.setEnabled(True)
+    lc_card.btn_stop.click(); pump(10)
+    check("actions: a line console's Stop calls agent.stop", stops == [1])
+    lc_card.header_tools._set_open(False)
+    lc_card.detach(); lc_card.deleteLater(); pump(10)
 
     # what MainWindow offers decides the lane buttons, and its label and
     # reason land in their tooltips

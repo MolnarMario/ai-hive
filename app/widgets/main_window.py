@@ -450,6 +450,8 @@ class TopBar(QFrame):
     autoUpdateToggled = Signal(bool)
     # "Lanes in every workspace": does every new agent start with Own lane
     agentLanesToggled = Signal(bool)
+    # "Confirm Ship finished lanes": ask before typing the request (True)
+    shipConfirmToggled = Signal(bool)
     # the down-arrow button: open the Updates panel (the install-method control
     # and the startup-check checkbox live there, so the bar gains no button)
     updatesPanelRequested = Signal()
@@ -588,6 +590,14 @@ class TopBar(QFrame):
         self.agent_lanes_btn.clicked.connect(self._on_agent_lanes_clicked)
         self._refresh_agent_lanes_btn()
 
+        # "Confirm Ship finished lanes". Default ON. The dialog's "Don't ask
+        # again" turns it off, and this switch is the way back.
+        self._ship_confirm = True
+        self.ship_confirm_label = toggle_label("")
+        self.ship_confirm_btn = ToggleSwitch(self)
+        self.ship_confirm_btn.clicked.connect(self._on_ship_confirm_clicked)
+        self._refresh_ship_confirm_btn()
+
         # The detected Claude Code install method, under the switch it explains.
         # It used to be reachable only by hovering the down-arrow; the panel has
         # room to state it.
@@ -718,6 +728,8 @@ class TopBar(QFrame):
         self.options_panel.add_section("Agents")
         self.options_panel.add_switch_row(self.agent_lanes_label,
                                           self.agent_lanes_btn)
+        self.options_panel.add_switch_row(self.ship_confirm_label,
+                                          self.ship_confirm_btn)
         self.options_panel.add_separator()
         self.options_panel.add_section("Appearance")
         self.options_panel.add_row("Theme", self.theme_select)
@@ -948,6 +960,29 @@ class TopBar(QFrame):
             "Existing lanes are never touched.\nClick to turn on.")
         self.agent_lanes_btn.setToolTip(tip)
         self.agent_lanes_label.setToolTip(tip)
+
+    def _on_ship_confirm_clicked(self) -> None:
+        self.set_ship_confirm(not self._ship_confirm)
+        self.shipConfirmToggled.emit(self._ship_confirm)
+
+    def set_ship_confirm(self, on: bool) -> None:
+        """Reflect the "Confirm Ship finished lanes" switch (no signal)."""
+        self._ship_confirm = bool(on)
+        self._refresh_ship_confirm_btn()
+
+    def _refresh_ship_confirm_btn(self) -> None:
+        self.ship_confirm_btn.setChecked(self._ship_confirm)
+        self.ship_confirm_label.setText("⚑  Confirm Ship finished lanes")
+        tip = (
+            "Confirm Ship finished lanes: ON. Ship finished lanes on the "
+            "integrator's chip lists the lanes and waits for your OK before "
+            "it types the request.\nClick to ship on the click alone."
+            if self._ship_confirm else
+            "Confirm Ship finished lanes: OFF. Ship finished lanes types the "
+            "request into the integrator as soon as you click it.\n"
+            "Click to be asked first again.")
+        self.ship_confirm_btn.setToolTip(tip)
+        self.ship_confirm_label.setToolTip(tip)
 
     def _on_auto_update_clicked(self) -> None:
         """Arm or disarm the startup update gate, like every other row here.
@@ -2619,6 +2654,7 @@ class MainWindow(QMainWindow):
         self.top_bar.usageLeftToggled.connect(self._on_usage_left_toggled)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.agentLanesToggled.connect(self._on_agent_lanes_toggled)
+        self.top_bar.shipConfirmToggled.connect(self._on_ship_confirm_toggled)
         self.top_bar.updatesPanelRequested.connect(self.open_updates_panel)
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
         self.top_bar.startupRecoveryToggled.connect(self._on_startup_recovery)
@@ -3954,6 +3990,12 @@ class MainWindow(QMainWindow):
         self._schedule_save()
         self._refresh_workspace_lane_toggles()
 
+    def _on_ship_confirm_toggled(self, enabled: bool) -> None:
+        """User flipped "Confirm Ship finished lanes", the way back from the
+        dialog's "Don't ask again". A UI preference like the one above."""
+        self._ship_skip_confirm = not enabled
+        self._schedule_save()
+
     def lane_default(self, ws) -> bool:
         """Should a new Claude agent in `ws` start with "Own lane" ticked?
         The Options switch forces it on everywhere; otherwise the
@@ -4633,8 +4675,9 @@ class MainWindow(QMainWindow):
 
     def _confirm_ship(self, agent, done: list) -> bool:
         """The user's go-ahead for Ship finished lanes (tests replace it).
-        Ticking "Don't ask again" and pressing OK stops this dialog for
-        good (`ui.ship_skip_confirm`); Cancel keeps asking."""
+        Ticking "Don't ask again" and pressing OK stops this dialog
+        (`ui.ship_skip_confirm`) until the Options switch "Confirm Ship
+        finished lanes" turns it back on; Cancel keeps asking."""
         lines = "\n".join(f"  {a.spec.name}: {view.branch} at "
                           f"{view.done[:7]}" for a, view in done)
         box = QMessageBox(
@@ -4648,12 +4691,15 @@ class MainWindow(QMainWindow):
         # QObject without isChecked()
         again = QCheckBox("Don't ask again")
         box.setCheckBox(again)
-        if box.exec() != QMessageBox.StandardButton.Ok:
-            return False
-        if again.isChecked():
+        ok = box.exec() == QMessageBox.StandardButton.Ok
+        skip = ok and again.isChecked()
+        # parented to the window, so it would live until exit otherwise
+        box.deleteLater()
+        if skip:
             self._ship_skip_confirm = True
+            self.top_bar.set_ship_confirm(False)
             self._schedule_save()
-        return True
+        return ok
 
     def _toggle_integrator(self, ws_id: str, agent) -> None:
         """The card header's Make integrator / Stop being the integrator."""
@@ -4683,7 +4729,9 @@ class MainWindow(QMainWindow):
         agent other than the integrator whose lane made a commit the base
         now has (LaneView.landed), and holds nothing the base lacks: no
         commit ahead, no "Task done" waiting to ship, no uncommitted file.
-        An agent in a turn is left open, it may be starting new work."""
+        An agent in a turn is left open, it may be starting new work. So is
+        one sent a line after its lane was read: the view can't show what
+        that turn wrote or committed, and the next poll will."""
         found = []
         for agent in ws.agents:
             view = getattr(agent, "lane_view", None)
@@ -4691,7 +4739,8 @@ class MainWindow(QMainWindow):
                     or not view.landed or view.ahead or view.done
                     or view.dirty or view.error
                     or agent.spec.uid in self._lane_pending
-                    or agent.is_busy() or agent.is_waiting()):
+                    or agent.is_busy() or agent.is_waiting()
+                    or agent.last_submit_at() > view.read_at):
                 continue
             found.append((agent, view))
         return found
@@ -5193,6 +5242,7 @@ class MainWindow(QMainWindow):
         self.top_bar.set_agent_lanes(self._agent_lanes)
         self._refresh_workspace_lane_toggles()
         self._ship_skip_confirm = bool(ui.get("ship_skip_confirm", False))
+        self.top_bar.set_ship_confirm(not self._ship_skip_confirm)
         self._auto_continue = bool(ui.get("auto_continue", True))
         self.top_bar.set_auto_continue(self._auto_continue)
         self._startup_recovery = bool(ui.get("startup_recovery", True))

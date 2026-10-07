@@ -730,8 +730,13 @@ class TerminalCard(QFrame):
         # _refresh_actions sets their enablement each time the tray opens.
         self.header_tools = _HeaderTools(header)
         self.header_tools.before_open = self._refresh_actions
-        # No Stop button: Ctrl+C in the terminal stops the child, and a
-        # stopped card only waited for the next keystroke to start again.
+        # Stop only on a line-console card: a terminal card's Ctrl+C stops
+        # its child, and a stopped card only waits for the next keystroke to
+        # start again. A line console has no per-command Ctrl+C, so its Stop
+        # (graceful, stdin EOF) is the only way to end a child but Restart.
+        self.btn_stop = (None if self.is_pty else
+                         tool("■", "CardStop", "Stop (graceful, stdin EOF)",
+                              self.header_tools))
         # Restart is "close this card, open a new agent like it": see
         # TerminalAgent.restart for what it resets. It also starts a stopped
         # agent, and so does any keystroke in the terminal, so there is no
@@ -759,10 +764,11 @@ class TerminalCard(QFrame):
         # never touches sibling processes (see WorkspacePage.toggle_solo)
         self.btn_max = tool("⤢", "CardMaximize", "Maximize (focus this agent)",
                             self.header_tools)
-        for _b in (self.btn_restart, self.btn_adopt,
+        for _b in (self.btn_stop, self.btn_restart, self.btn_adopt,
                    self.btn_integrator, self.btn_sched, self.btn_font_dec, self.btn_font_inc,
                    self.btn_max):
-            self.header_tools.add(_b)
+            if _b is not None:
+                self.header_tools.add(_b)
         self.header_tools.withhold(self.btn_adopt, True)
         self.header_tools.withhold(self.btn_integrator, True)
         self.header_tools.withhold(self.btn_sched, not self.is_pty)
@@ -842,6 +848,8 @@ class TerminalCard(QFrame):
         self.title.installEventFilter(self)        # double-click to rename
         self.title_edit.installEventFilter(self)   # Esc cancels, focus-out commits
         self.title_edit.returnPressed.connect(self._commit_rename)
+        if self.btn_stop is not None:
+            self.btn_stop.clicked.connect(self.agent.stop)
         self.btn_restart.clicked.connect(self._on_restart_clicked)
         self.btn_adopt.clicked.connect(
             lambda: self.laneActionRequested.emit(self.agent.id, "adopt"))
@@ -906,6 +914,9 @@ class TerminalCard(QFrame):
         Runs as the tray opens, and on a status change while it is open, so
         a button the user can see is never enabled for an action its agent
         can't take."""
+        if self.btn_stop is not None:
+            self.btn_stop.setEnabled(self.agent.status in (
+                AgentStatus.STARTING, AgentStatus.RUNNING))
         info = self._integration()
         for btn, key in ((self.btn_adopt, "adopt"),
                          (self.btn_integrator, "role")):

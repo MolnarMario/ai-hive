@@ -455,7 +455,9 @@ workspaces keep executing — switching never pauses anything.
   branch every 5 minutes. Each laned card gets a chip (`⎇ ↑2 ±3`: commits
   ahead, uncommitted files) that turns amber when another lane or the base
   branch changed one of its files, and red when a real merge of the two would
-  conflict (`git merge-tree`, git 2.38+). Its menu opens the lane folder and
+  conflict (`git merge-tree`, git 2.38+). A lane with a `Task done` commit
+  stays green when it shares a file and gets a yellow border instead; only
+  a conflict outranks it. Its menu opens the lane folder and
   fast-forwards an empty lane to the newest base (not while the agent is
   working). The agents hear about it only when it matters: a hook warns an
   agent the moment it edits a file another lane changed (or edits outside its
@@ -486,7 +488,9 @@ workspaces keep executing — switching never pauses anything.
   you think there is enough for a pull request, ask the integrator to ship,
   or click the integrator's `⎇ integrator` chip and pick **Ship finished
   lanes**. That asks you to confirm the list, then types the request into
-  the integrator. It gathers the lanes you name, or every lane with an unmerged `Task done`
+  the integrator. The dialog's "Don't ask again" skips the question from
+  then on; ⚙ Options > Agents > **Confirm Ship finished lanes** brings it
+  back. It gathers the lanes you name, or every lane with an unmerged `Task done`
   commit, into one `integrate/` branch. If the base branch has
   `docs/agents/integration.md`, the integrator follows it. AI Hive's own
   has it bump the version and CHANGELOG, run the full suite and
@@ -641,12 +645,14 @@ error dialog instead of silently closing. Packaging to a distributable
   selected; otherwise it copies), `Ctrl+R` reverse-searches, arrows/`Tab`
   complete, exactly as in a real terminal.
 - **Card controls** — hover the `⋯` at the right of a card's header for its
-  actions: `■` stop, `↻` restart (replaces the agent with a fresh one: new
+  actions: `↻` restart (replaces the agent with a fresh one: new
   conversation, the permission mode, model and effort it was created with,
   no old title or task; name and folder stay), `⏱` send on a countdown,
   `A−`/`A+` font and `⤢` maximize, plus
-  `⎇` restart in own lane and `⚑` make integrator where lanes apply. Each
-  icon has a tooltip. `✕` close stays visible. Collapsed, the actions take
+  `⎇` restart in own lane and `⚑` make integrator where lanes apply. A
+  terminal card has no stop button, `Ctrl+C` does that; a line-console
+  card keeps `■` stop. Restart on a running agent puts up a "restarting"
+  veil until the new prompt is live. Each icon has a tooltip. `✕` close stays visible. Collapsed, the actions take
   no header width, so the summary gets it. Type into the bottom input line to send a command to that terminal;
   `↑`/`↓` recall history; `cls`/`clear` clears the console locally.
 - **PowerShell quirks to know** — there is no prompt line by design, and

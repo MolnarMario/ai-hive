@@ -3866,6 +3866,11 @@ def test_landed_commit_core():
     check("landed: the lane view carries it",
           lanes.RepoSnapshot(repo=str(work), lanes=[
               lanes.lane_snap(ea, {})]).view("A").landed == a_sha)
+    t0 = time.time()
+    read_at = lanes.RepoSnapshot(repo=str(work), lanes=[
+        lanes.lane_snap(ea, {})]).view("A").read_at
+    check("landed: the view says when the lane read began",
+          t0 <= read_at <= time.time(), (t0, read_at))
     check("landed: the integrator's lane never reports one",
           landed({**ea, "role": lanes.INTEGRATOR_ROLE}) == "")
     snap_c = lanes.lane_snap(ec, {})
@@ -3971,6 +3976,19 @@ def test_close_merged_agents_from_integrator_chip():
               act.isEnabled() and act.text() == "Close merged agents (2)"
               and "Agent A" in act.toolTip() and "Agent F" in act.toolTip()
               and "Agent B" not in act.toolTip(), (act.text(), act.toolTip()))
+
+        # F was sent a line after its lane was read: the view can't show
+        # what that turn wrote, so F waits for the next poll
+        f._last_submit_ts = 2000.0
+        win._on_lanes_changed(ws.id, {
+            k: dataclasses.replace(v, read_at=1000.0)
+            for k, v in views.items()})
+        act = close_action(i)
+        check("close-merged: an agent sent a line after the lane read waits",
+              act.text() == "Close merged agents (1)"
+              and "Agent F" not in act.toolTip(), (act.text(), act.toolTip()))
+        f._last_submit_ts = 0.0
+        win._on_lanes_changed(ws.id, dict(views))
 
         got = []
         card = win._pages[ws.id].card_for(i.id)
@@ -4368,6 +4386,22 @@ def test_ship_confirm_dont_ask_again():
             check("ship skip: once remembered, no dialog and it ships",
                   outcome["shown"] == shown and len(delivered) == 1,
                   (outcome, delivered))
+            # the Options switch is the way back from "Don't ask again"
+            tb = win.top_bar
+            check("ship skip: the Options switch shows the dialog is off",
+                  not tb.ship_confirm_btn.isChecked())
+            tb.ship_confirm_btn.click()
+            check("ship skip: the switch turns asking back on and saves it",
+                  tb.ship_confirm_btn.isChecked()
+                  and win._ship_skip_confirm is False
+                  and win._session_payload()["ui"]["ship_skip_confirm"]
+                  is False)
+            delivered.clear()
+            outcome["button"] = QMessageBox.StandardButton.Cancel
+            win._ship_lanes(ws.id, i)
+            check("ship skip: switched back on, the dialog asks again",
+                  outcome["shown"] == shown + 1 and delivered == [],
+                  (outcome, delivered))
         finally:
             QMessageBox.exec = real_exec
 
@@ -4376,7 +4410,8 @@ def test_ship_confirm_dont_ask_again():
               win._ship_skip_confirm is False)
         win._restore_ui_state({"ui": {"ship_skip_confirm": True}})
         check("ship skip: restore reads the saved choice",
-              win._ship_skip_confirm is True)
+              win._ship_skip_confirm is True
+              and not win.top_bar.ship_confirm_btn.isChecked())
         for agent in list(ws.agents):
             win._close_agent(ws.id, agent.id)
         win.lane_ops.drain(60)

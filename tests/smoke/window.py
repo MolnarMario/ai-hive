@@ -184,6 +184,16 @@ def test_live_model_effort():
           transcripts._read_model_effort(str(tpath)) == ("Opus 5.5", "high", ""),
           transcripts._read_model_effort(str(tpath)))
 
+    # a session-only pick has no "and saved" tail to stop the name at
+    write([_turn(), _pick("Set model to `Sonnet 5.5` with `low` effort")])
+    check("model: a backtick pick with no tail stops at the closing tick",
+          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5.5", "low", ""),
+          transcripts._read_model_effort(str(tpath)))
+    write([_turn(), _pick("Set model to Sonnet 5.5 with high effort")])
+    check("model: a plain pick's name stops before 'with ... effort'",
+          transcripts._read_model_effort(str(tpath)) == ("Sonnet 5.5", "high", ""),
+          transcripts._read_model_effort(str(tpath)))
+
     # a turn AFTER a pick wins again (ordering is file order, not kind)
     write([_pick("Set model to \x1b[1mSonnet 5\x1b[22m and saved as your "
                  "default for new sessions"),

@@ -91,9 +91,13 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 #   Set model to <b>Opus 5</b> and saved as your default for new sessions
 #   Set model to <b>Opus 4.8 (1M context)</b> and saved ... with <b>high</b> effort
 #   Set effort level to max (this session only): Maximum capability with ...
+# Newer builds quote the name (and the effort) in markdown backticks instead:
+#   Set model to `Sonnet 5.5` and saved as your default ... with `high` effort
 _SET_MODEL_BOLD_RE = re.compile(r"Set model to\s+\x1b\[1m(.+?)\x1b\[")
+_SET_MODEL_TICK_RE = re.compile(r"Set model to\s+`([^`\n]+)`")
 _SET_MODEL_RE = re.compile(
-    r"Set model to\s+(.+?)(?:\s+and saved\b|\s+for this session\b|\.(?:\s|$)|\n|$)")
+    r"Set model to\s+(.+?)(?:\s+and saved\b|\s+for this session\b"
+    r"|\s+with\s+\S+\s+effort\b|\.(?:\s|$)|\n|$)")
 _SET_MODEL_EFFORT_RE = re.compile(r"with\s+(\w+)\s+effort")
 _SET_EFFORT_RE = re.compile(r"Set effort level to\s+([A-Za-z]+)")
 # a concrete model id as Claude writes it on an assistant record, e.g.
@@ -1421,6 +1425,10 @@ def _parse_set_model(content: str) -> tuple[str, str]:
     if "Set model to" not in content:
         return ("", "")
     m = _SET_MODEL_BOLD_RE.search(content)
+    if not m:
+        # the backticks delimit the name, so match them before dropping
+        # them: the plain match has only the words after it to stop at
+        m = _SET_MODEL_TICK_RE.search(_ANSI_RE.sub("", content))
     # newer builds wrap the name (and the effort) in markdown backticks
     # instead of SGR bold, and the badge would show them
     plain = _ANSI_RE.sub("", content).replace("`", "")

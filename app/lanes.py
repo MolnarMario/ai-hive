@@ -1076,6 +1076,9 @@ class LaneSnap:
     # once the base has it (_landed_commit). Its agent's work is merged.
     landed: str = ""
     error: str = ""
+    # wall time this read began: anything the agent was asked after it may
+    # have changed the lane since (Close merged agents waits a poll)
+    read_at: float = 0.0
 
     def files(self) -> dict:
         """path -> "committed" | "dirty" (uncommitted wins: it is newest)."""
@@ -1138,6 +1141,7 @@ class LaneView:
     head: str = ""
     done: str = ""
     landed: str = ""
+    read_at: float = 0.0
 
     @property
     def state(self) -> str:
@@ -1185,7 +1189,7 @@ class RepoSnapshot:
                         committed=list(s.committed),
                         overlaps=list(self.overlaps.get(uid, [])),
                         error=s.error, head=s.head, done=s.done,
-                        landed=s.landed)
+                        landed=s.landed, read_at=s.read_at)
 
     def index(self) -> dict:
         """repo path -> [{uid, agent, branch, state}] over every lane, for
@@ -1211,12 +1215,13 @@ def lane_snap(entry: dict, cache: dict | None = None) -> LaneSnap:
     """Read one lane for a poll. Never raises: a lane that can't be read
     comes back with `exists` False or an `error`. `cache` (the poller's, per
     repo) keeps each lane's fork by (head, base sha)."""
+    import time
     lane = entry["lane"]
     root, repo = lane["root"], lane["repo"]
     snap = LaneSnap(uid=entry["uid"], agent=entry.get("agent", ""),
                     ws_id=entry.get("ws_id", ""), branch=lane["branch"],
                     root=root, base=lane.get("base") or "",
-                    role=entry.get("role", ""))
+                    role=entry.get("role", ""), read_at=time.time())
     try:
         if not _is_worktree(root):
             snap.exists = False
