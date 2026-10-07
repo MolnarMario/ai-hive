@@ -1664,6 +1664,80 @@ def test_boot_veil():
     lcard.detach(); live.dispose(); pump(50)
 
 
+def test_restart_veil():
+    """Restart covers the card from the click, not from STARTING.
+
+    The regression: Restart on a running agent left the old frame frozen on
+    screen for seconds while the worker killed the child (STOPPING), so
+    nothing said the click had landed. The veil now goes up on the click,
+    says "restarting", and stays through STOPPING, the exit and IDLE until
+    the new child's prompt is live. A restart that never gets a new child
+    hands the card back to the wake banner instead of covering it."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    QApplication.instance() or QApplication([])
+    if not HAS_CONPTY:
+        return
+    from app.widgets.terminal_card import TerminalCard
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    agent = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Restart", cwd=SCRATCH_CWD, pty=True))
+    card = TerminalCard(agent)
+    card.resize(640, 400); card.show(); pump(100)
+
+    def to(status):
+        agent.status = status
+        card._on_status(status)
+
+    # stub the worker side: a running child is killed first (STOPPING)
+    agent.status = AgentStatus.RUNNING
+    agent.restart = lambda: to(AgentStatus.STOPPING)
+    card.btn_restart.click()
+    check("restart-veil: the click covers the card while the old child dies",
+          card.boot.is_active() and card._restarting
+          and card.boot._caption == "restarting…")
+    to(AgentStatus.EXITED_OK)   # PtyWorker._on_exit: DEAD, IDLE, start()
+    to(AgentStatus.IDLE)
+    to(AgentStatus.STARTING)
+    pump(30)                    # past the queued _settle_restart
+    check("restart-veil: the exit and IDLE on the way do not drop it, "
+          "and no wake banner flashes",
+          card.boot.is_active() and not card.overlay.isVisible())
+    check("restart-veil: ...and it still says restarting once the new child "
+          "boots", card.boot._caption == "restarting…")
+    agent._set_prompt_ready(True)
+    pump(500)                   # the fade is 260ms
+    check("restart-veil: the new prompt lifts it and clears the flag",
+          not card.boot.is_active() and not card._restarting)
+
+    # a restart whose new child never comes: the stopped card gets its
+    # wake banner back rather than a loader that spins for 25 seconds
+    agent._set_prompt_ready(False)
+    to(AgentStatus.RUNNING)
+    agent.restart = lambda: to(AgentStatus.STOPPING)
+    card.btn_restart.click()
+    to(AgentStatus.EXITED_ERR)
+    pump(30)
+    check("restart-veil: a restart that ends stopped drops the veil and "
+          "shows the wake banner",
+          not card.boot.is_active() and not card._restarting
+          and card.overlay.isVisible())
+
+    # a held restart (the start is on hold) changes nothing: no veil
+    agent.restart = lambda: None
+    card.btn_restart.click()
+    check("restart-veil: a restart that does nothing raises no veil",
+          not card.boot.is_active() and not card._restarting)
+    card.detach(); agent.dispose(); pump(50)
+
+
 def test_resume_fallback():
     """A resume (--continue) launch that dies before the interactive prompt ever
     comes up (Claude prints 'No conversation found to continue' and exits) must

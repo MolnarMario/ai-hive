@@ -2083,9 +2083,10 @@ def test_header_tools_tray_has_no_dead_space():
 
 def test_header_tray_carries_the_card_actions():
     """The actions that used to hide behind a right-click on the header
-    (stop, restart, scheduled send, the lane actions) are
+    (restart, scheduled send, the lane actions) are
     icon buttons in the hover tray, each with a tooltip naming it. The user
-    had forgotten the right-click menu existed."""
+    had forgotten the right-click menu existed. Stop is gone: Ctrl+C in the
+    terminal does it, and the user found the button useless."""
     from PySide6.QtCore import QEventLoop, QTimer
     from PySide6.QtWidgets import QApplication
     from app.terminal_agent import AgentStatus, TerminalAgent
@@ -2109,28 +2110,22 @@ def test_header_tray_carries_the_card_actions():
           "contextMenuEvent" not in _CardHeader.__dict__
           and not hasattr(card, "show_actions_menu"))
     ht._set_open(True); pump(20)
-    lifecycle = [card.btn_stop, card.btn_restart, card.btn_sched]
-    check("actions: stop/restart/schedule are in the tray",
+    lifecycle = [card.btn_restart, card.btn_sched]
+    check("actions: restart/schedule are in the tray",
           all(b in shown() for b in lifecycle))
     check("actions: no Start or Assign button (restart and any keystroke "
           "start an agent)",
           not hasattr(card, "btn_start") and not hasattr(card, "btn_assign")
           and not hasattr(card, "reassignRequested"))
+    check("actions: no Stop button (Ctrl+C in the terminal stops it)",
+          not hasattr(card, "btn_stop")
+          and not any("Stop" in b.toolTip() for b in ht._buttons))
     check("actions: every tray button has a tooltip",
           all(b.toolTip().strip() for b in shown()),
           [(b.text(), b.toolTip()) for b in shown()])
     check("actions: lane buttons stay out with nothing to offer",
           card.btn_adopt not in shown()
           and card.btn_integrator not in shown())
-    check("actions: an idle agent cannot stop",
-          not card.btn_stop.isEnabled())
-    # a status change while the tray is open updates what is clickable
-    a.status = AgentStatus.RUNNING
-    card._on_status(AgentStatus.RUNNING)
-    check("actions: a running agent can stop",
-          card.btn_stop.isEnabled())
-    a.status = AgentStatus.IDLE
-    card._on_status(AgentStatus.IDLE)
     ht._set_open(False)
 
     # what MainWindow offers decides the lane buttons, and its label and
