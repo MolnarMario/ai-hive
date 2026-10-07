@@ -8,6 +8,17 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.35.0
+
+- Click the integrator's lane chip and pick Ship finished lanes to ask it
+  to ship. The item counts the lanes with a Task done commit, shows you
+  the list to confirm, then types the request into the integrator. It
+  stays greyed out while the integrator works or no lane is finished.
+- The test suite runs in parallel worker processes and finishes in about
+  a minute and a half instead of six. It also stops leaving test folders
+  behind in your Temp folder.
+- Old plan and review documents are gone from the project folder.
+
 ## 0.34.1
 
 - Removes the old task hand-off code that 0.34.0 left without a button.
