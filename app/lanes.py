@@ -1129,13 +1129,16 @@ class LaneView:
 
     @property
     def state(self) -> str:
-        """"conflict", "overlap", "done" or "clean", for the chip's colour.
-        A "Task done" commit turns the chip green, but a file another lane
-        also changed outranks it."""
+        """"conflict", "overlap", "done-overlap", "done" or "clean", for the
+        chip's colour. A "Task done" commit turns the chip green. A file
+        another lane also changed keeps it green with a yellow border
+        ("done-overlap"): the work is still ready, and a shared file that
+        merges clean is something to know, not a blocker. A real conflict
+        outranks done."""
         if any(o.level == CONFLICTS for o in self.overlaps):
             return "conflict"
         if self.overlaps:
-            return "overlap"
+            return "done-overlap" if self.done else "overlap"
         return "done" if self.done else "clean"
 
     def touching(self) -> list:
