@@ -101,6 +101,26 @@ def test_parallel_runner():
     check("runner: no worker sandbox outlives a crashed or killed worker",
           _sandboxes() == before, (before, _sandboxes()))
 
+    # output glued to the front of the sentinel still reports the test
+    glue, glue_counts = _run("-j", "2", env_extra={
+        "AIHIVE_SMOKE_FAULT": "glue:test_ansi"}, timeout=120)
+    check("runner: a sentinel glued after a partial line still counts",
+          glue.returncode == 0 and glue_counts == serial_counts
+          and "a partial line with no newline" in glue.stdout,
+          (glue_counts, glue.stdout[-400:]))
+    # workers that die at startup end the run instead of respawning: each
+    # death costs the test it was handed, or after three in a row that
+    # never took one, the rest of the queue
+    started = time.monotonic()
+    boot, boot_counts = _run("-j", "2", env_extra={
+        "AIHIVE_SMOKE_FAULT": "boot"}, timeout=120)
+    check("runner: workers dying at startup fail the run instead of "
+          "respawning forever",
+          boot.returncode == 1 and boot_counts and boot_counts[1] >= 1
+          and boot.stdout.count("[PASS] ") == 1
+          and time.monotonic() - started < 60,
+          (boot_counts, boot.stdout[-400:]))
+
 
 def test_drop_windows():
     """The runner deletes each test's leftover windows. A main window can

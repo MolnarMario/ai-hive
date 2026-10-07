@@ -4555,12 +4555,10 @@ class MainWindow(QMainWindow):
                 found.append((agent, view))
         return found
 
-    def _ship_offer(self, ws, agent) -> tuple:
-        """(label, enabled, tooltip) for the integrator chip's Ship finished
-        lanes."""
+    def _ship_state(self, ws, agent) -> tuple:
+        """(finished lanes, why the integrator can't take a ship request
+        now or "")."""
         done = self._finished_lanes(ws, agent)
-        label = (f"Ship finished lanes ({len(done)})" if done
-                 else "Ship finished lanes")
         if not done:
             why = "No lane has a \"Task done\" commit that the base lacks."
         elif not agent.is_running():
@@ -4570,31 +4568,54 @@ class MainWindow(QMainWindow):
         elif not agent.prompt_ready():
             why = "The integrator is still starting."
         else:
-            names = ", ".join(a.spec.name for a, _ in done)
-            return (label, True,
-                    f"Asks the integrator to ship {names}: one pull request, "
-                    f"reviewed and tested, then merged.")
-        return (label, False, why)
+            why = ""
+        return done, why
+
+    def _ship_offer(self, ws, agent) -> tuple:
+        """(label, enabled, tooltip) for the integrator chip's Ship finished
+        lanes."""
+        done, why = self._ship_state(ws, agent)
+        label = (f"Ship finished lanes ({len(done)})" if done
+                 else "Ship finished lanes")
+        if why:
+            return (label, False, why)
+        names = ", ".join(a.spec.name for a, _ in done)
+        return (label, True,
+                f"Asks the integrator to ship {names}: one pull request, "
+                f"reviewed and tested, then merged.")
 
     def _ship_lanes(self, ws_id: str, agent) -> None:
         """The integrator chip's Ship finished lanes: the user asking the
-        integrator to ship, typed in for them. It names the lanes the user
-        saw flagged, so a lane flagged after the click waits for the next
-        ask. Only this click types into the integrator; a flag never does
+        integrator to ship, typed in for them. It names each lane with the
+        "Task done" commit the user confirmed, so a lane flagged (or
+        flagged again) after the click waits for the next ask. Only this
+        click types into the integrator; a flag never does
         (_log_done_lanes)."""
         ws = self.manager.workspace(ws_id)
         if ws is None or agent is None or not self.manager.is_integrator(agent):
             return
-        _label, ok, why = self._ship_offer(ws, agent)
-        if not ok:
+        done, why = self._ship_state(ws, agent)
+        if why:
             self._lane_message("Nothing shipped", why)
             return
-        done = self._finished_lanes(ws, agent)
         if not self._confirm_ship(agent, done):
             return
-        branches = ", ".join(view.branch for _a, view in done)
-        text = (f"Ship the finished lanes now: {branches}. Merge each lane's "
-                f"newest \"Task done\" commit into one integrate/ branch and "
+        # the dialog ran its own event loop: a scheduled send may have
+        # started a turn, or a lane poll moved a flag, meanwhile
+        again, why = self._ship_state(ws, agent)
+        if not why and ([(a.spec.uid, v.done) for a, v in again]
+                        != [(a.spec.uid, v.done) for a, v in done]):
+            why = ("The finished lanes changed while the dialog was open. "
+                   "Open the menu again to see the new list.")
+        if why or not self.manager.is_integrator(agent):
+            self._lane_message("Nothing shipped",
+                               why or f"{agent.spec.name} is no longer the "
+                                      f"integrator.")
+            return
+        lanes_at = ", ".join(f"{view.branch} at {view.done[:12]}"
+                             for _a, view in done)
+        text = (f"Ship the finished lanes now: {lanes_at}. Merge each of "
+                f"those \"Task done\" commits into one integrate/ branch and "
                 f"follow your integrator instructions through to the merge.")
         if not agent.nudge(text):
             self._lane_message("Nothing shipped",
@@ -4602,7 +4623,7 @@ class MainWindow(QMainWindow):
                                f"request. Try again once it is at its prompt.")
             return
         self._store_audit(f"LANE-SHIP agent={agent.spec.name!r} "
-                          f"lanes={branches}")
+                          f"lanes={lanes_at}")
 
     def _confirm_ship(self, agent, done: list) -> bool:
         """The user's go-ahead for Ship finished lanes (tests replace it)."""

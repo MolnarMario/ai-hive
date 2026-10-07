@@ -4030,9 +4030,38 @@ def test_ship_lanes_from_integrator_chip():
               and b.spec.lane["branch"] not in delivered[0]
               and lanes.DONE_MARK in delivered[0]
               and "\n" not in delivered[0], delivered)
+        check("ship: the request pins the confirmed Task done commit",
+              ("a" * 12) in delivered[0], delivered)
         check("ship: the request is audited",
               any(ln.startswith("LANE-SHIP") and a.spec.lane["branch"] in ln
                   for ln in audit), audit)
+        delivered.clear()
+
+        # the confirm dialog runs its own event loop: what changed while it
+        # was open decides, not what the menu saw
+        told = []
+        win._lane_message = lambda title, text: told.append(text)
+
+        def busy_meanwhile(agent, done):
+            state["is_busy"] = True
+            return True
+        win._confirm_ship = busy_meanwhile
+        win._ship_lanes(ws.id, i)
+        state["is_busy"] = False
+        check("ship: an integrator that got busy behind the dialog gets "
+              "nothing", delivered == [] and told
+              and "finished its turn" in told[-1], (delivered, told))
+
+        def flagged_meanwhile(agent, done):
+            views[b.spec.uid] = dataclasses.replace(
+                views[b.spec.uid], done="b" * 40)
+            win._on_lanes_changed(ws.id, dict(views))
+            return True
+        win._confirm_ship = flagged_meanwhile
+        win._ship_lanes(ws.id, i)
+        check("ship: a lane flagged behind the dialog stops the send",
+              delivered == [] and "changed while the dialog" in told[-1],
+              (delivered, told))
         delivered.clear()
         win._ship_lanes(ws.id, a)
         check("ship: a non-integrator cannot ship", delivered == [])

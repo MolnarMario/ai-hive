@@ -197,14 +197,16 @@ def _run_serial(selected, total):
 def _worker_loop(by_name):
     """--worker: announce this worker's sandbox, then run the test named on
     each stdin line and print the sentinel with its counts. Exits at EOF."""
+    fault, _, fault_test = os.environ.get(FAULT_ENV, "").partition(":")
+    if fault == "boot":
+        os._exit(4)
     print(SENTINEL + json.dumps({"sandbox": str(harness.SANDBOX_HOME)}),
           flush=True)
-    fault, _, fault_test = os.environ.get(FAULT_ENV, "").partition(":")
     for line in sys.stdin:
         name = line.strip()
         if not name:
             continue
-        if name == fault_test:
+        if name == fault_test and fault in ("crash", "hang"):
             check(f"{name}: injected fault ({fault})", False)
             if fault == "crash":
                 os._exit(3)
@@ -212,6 +214,8 @@ def _worker_loop(by_name):
         before = (harness.PASS, harness.FAIL, harness.SKIP,
                   len(harness.REAL_AI_LAUNCHES))
         seconds = _run_one(by_name[name])
+        if name == fault_test and fault == "glue":
+            sys.stdout.write("a partial line with no newline")
         sys.stderr.flush()
         print(SENTINEL + json.dumps({
             "name": name, "seconds": seconds,
@@ -253,6 +257,7 @@ class _Worker:
         self.started = 0.0
         self.timed_out = False
         self.sandbox = None
+        self.ran = 0        # results this worker posted
         self._results = results
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -283,21 +288,37 @@ class _Worker:
             pass
 
     def _read(self):
+        # The exit item is posted whatever happens in here: without it the
+        # parent waits on this worker forever.
         lines = []
-        for line in self.proc.stdout:
-            if line.startswith(SENTINEL):
-                msg = json.loads(line[len(SENTINEL):])
+        try:
+            for line in self.proc.stdout:
+                # stderr shares the pipe, so a partial line written just
+                # before the sentinel puts it mid-line
+                at = line.find(SENTINEL)
+                try:
+                    msg = (json.loads(line[at + len(SENTINEL):])
+                           if at >= 0 else None)
+                except ValueError:
+                    msg = None
+                if not isinstance(msg, dict):
+                    lines.append(line)
+                    continue
+                if at > 0:
+                    lines.append(line[:at] + "\n")
                 if "sandbox" in msg:
                     self.sandbox = msg["sandbox"]
                     continue
-                self._results.put((self, msg["name"], lines, msg))
+                self.ran += 1
+                self._results.put((self, msg.get("name"), lines, msg))
                 lines = []
-            else:
-                lines.append(line)
-        self.proc.wait()
-        if self.sandbox:
-            harness.remove_sandbox(self.sandbox, wait_s=10)
-        self._results.put((self, self.current, lines, None))
+            self.proc.wait()
+        finally:
+            self._results.put((self, self.current, lines, None))
+            # after the post: a replacement worker need not wait for this
+            # deletion, and the parent joins this thread before it exits
+            if self.sandbox:
+                harness.remove_sandbox(self.sandbox, wait_s=10)
 
 
 def _count_checks(lines):
@@ -316,6 +337,9 @@ def _run_parallel(selected, total, jobs, argv):
                      key=lambda n: -times.get(n, 60.0))
     results = queue.Queue()
     measured, everyone, live = {}, [], set()
+    # workers that died in a row without finishing a test: a broken import
+    # or a sandbox that can't be built would otherwise respawn forever
+    stillborn = [0]
 
     def spawn():
         # pass --quick, -k and -m through so the worker selects the same
@@ -339,15 +363,17 @@ def _run_parallel(selected, total, jobs, argv):
         for _ in range(min(jobs, len(pending))):
             spawn()
         while live:
+            # every pass, not only on a quiet second: other workers' results
+            # can keep the queue busy while one test hangs
+            now = time.monotonic()
+            for w in live:
+                if (w.current and not w.timed_out
+                        and now - w.started > TEST_TIMEOUT):
+                    w.timed_out = True
+                    w.kill()
             try:
                 worker, name, lines, result = results.get(timeout=1.0)
             except queue.Empty:
-                now = time.monotonic()
-                for w in live:
-                    if (w.current and not w.timed_out
-                            and now - w.started > TEST_TIMEOUT):
-                        w.timed_out = True
-                        w.kill()
                 continue
             sys.stdout.write("".join(lines))
             if result is not None:
@@ -356,6 +382,7 @@ def _run_parallel(selected, total, jobs, argv):
                 harness.SKIP += result["skip"]
                 harness.REAL_AI_LAUNCHES.extend(result["launches"])
                 measured[name] = result["seconds"]
+                stillborn[0] = 0
                 dispatch(worker)
                 continue
             # the child exited: normally at EOF, otherwise mid-test (a hang
@@ -371,6 +398,13 @@ def _run_parallel(selected, total, jobs, argv):
                        if worker.timed_out else
                        f"worker process died (exit {worker.proc.returncode})")
                 check(f"{worker.current}: {why}", False)
+            elif worker.ran == 0 and pending:
+                stillborn[0] += 1
+                if stillborn[0] >= 3:
+                    check(f"suite: 3 workers in a row died before running a "
+                          f"test (last exit {worker.proc.returncode}); "
+                          f"{len(pending)} tests not run", False)
+                    pending.clear()
             if pending:
                 spawn()
     finally:
