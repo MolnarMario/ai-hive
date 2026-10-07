@@ -673,9 +673,25 @@ class TerminalView(QWidget):
         self._gap_timer.start()
 
     def reset(self) -> None:
+        """A fresh terminal: blank screen, no scrollback, default modes. For
+        a Restart's new child. Nothing of the old screen survives, a
+        selection or a hovered link included, but `pushed` carries over so
+        absolute line ids stay monotonic (see the coordinate block below)."""
         rows, cols = self.screen.lines, self.screen.columns
+        pushed = getattr(self.screen.history.top, "pushed", 0)
         self.screen = _new_history_screen(cols, rows)
+        try:
+            self.screen.history.top.pushed = pushed
+        except Exception:
+            pass
         self.stream = pyte.Stream(self.screen)
+        self._esc_carry = ""
+        self._input_gap_row = None
+        self._sel_anchor = self._sel_end = None
+        self._input_selected = False
+        self._pending_fwd = None
+        self._hover_link = None
+        self._hover_cell = None
         self._scroll_offset = 0
         self._bracketed_paste = False
         self._alt_screen = False

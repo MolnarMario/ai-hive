@@ -761,8 +761,18 @@ def test_app():
           page.cards[0].isVisible() and max_pos == (0, 0, 1, 1), max_pos)
     check("maximize: sibling cards hidden (processes untouched)",
           not page.cards[1].isVisible() and not page.cards[2].isVisible())
+    from PySide6.QtGui import QRawFont
+    from app.widgets.terminal_card import MAXIMIZE_GLYPH, RESTORE_GLYPH
     check("maximize: button shows Restore glyph",
-          page.cards[0].btn_max.text() == "⤡")
+          page.cards[0].btn_max.text() == RESTORE_GLYPH)
+    # the two squares are private-use codepoints, so the QSS rule must give
+    # the button a font that holds them itself. QRawFont looks at that one
+    # font only; QFontMetrics.inFontUcs4 counts fallback and says yes for any.
+    _max_raw = QRawFont.fromFont(page.cards[0].btn_max.font())
+    check("maximize: button font holds the maximize and restore glyphs",
+          _max_raw.supportsCharacter(ord(MAXIMIZE_GLYPH))
+          and _max_raw.supportsCharacter(ord(RESTORE_GLYPH)),
+          _max_raw.familyName())
     check("maximize: no stale row/col stretch while soloed",
           page.grid.columnStretch(1) == 0 and page.grid.rowStretch(1) == 0)
     snap(win, "04b_maximized")
@@ -773,7 +783,7 @@ def test_app():
     check("restore: all cards visible again",
           all(c.isVisible() for c in page.cards))
     check("restore: button shows Maximize glyph",
-          page.cards[0].btn_max.text() == "⤢")
+          page.cards[0].btn_max.text() == MAXIMIZE_GLYPH)
     check("maximize: solo toggling never marks the session dirty",
           solo_dirty["n"] == 0, solo_dirty["n"])
     mgr.dirty.disconnect(_solo_conn)

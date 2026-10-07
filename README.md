@@ -648,7 +648,8 @@ error dialog instead of silently closing. Packaging to a distributable
   actions: `↻` restart (replaces the agent with a fresh one: new
   conversation, the permission mode, model and effort it was created with,
   no old title or task; name and folder stay), `⏱` send on a countdown,
-  `A−`/`A+` font and `⤢` maximize, plus
+  `A−`/`A+` font and a Windows-style
+  maximize / restore square, plus
   `⎇` restart in own lane and `⚑` make integrator where lanes apply. A
   terminal card has no stop button, `Ctrl+C` does that; a line-console
   card keeps `■` stop. Restart on a running agent puts up a "restarting"
@@ -922,7 +923,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-2925 checks drive the real app headlessly (offscreen Qt platform) with real
+2941 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1063,7 +1064,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (2925 checks)
+                           (2941 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

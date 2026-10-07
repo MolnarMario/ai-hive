@@ -382,6 +382,10 @@ class TerminalAgent(QObject):
     # different session), so the scrollback behind the current screen belongs
     # to a conversation that is no longer on display. Transient view signal.
     conversation_replaced = Signal()
+    # a Restart's new child is starting on a blank screen: the card must wipe
+    # its view too, or the new TUI paints over the old frame from the old
+    # cursor (see _on_worker_state). Transient view signal.
+    screen_reset = Signal()
 
     def __init__(self, spec: AgentSpec, parent: QObject | None = None):
         super().__init__(parent)
@@ -417,6 +421,7 @@ class TerminalAgent(QObject):
         self._reply_marks: list[ReplyMark] = []
         self._reply_mark_seq = 0   # monotonic; source of ReplyMark.uid
         self._pty_seed = ""    # restored screen, until a child draws over it
+        self._fresh_screen = False    # a Restart's child has not started yet
         self._prompt_ready = False    # the TUI's input prompt is interactive
         self._ready_tail = ""         # rolling stripped tail (pre-ready only)
         # typed tasks still waiting for their Enter (see TASK_SUBMIT_MS)
@@ -690,18 +695,32 @@ class TerminalAgent(QObject):
         self._turn_end_ts = None
         self._turn_mark_final = False
         if self.is_pty:
-            self._pty_buffer = []
-            self._pty_bytes = 0
-            # a restart is a deliberately fresh conversation, so the stream
-            # coordinates and every milestone anchored into them go with it
-            self._pty_total = 0
-            self._pty_dropped = 0
-            self.clear_prompt_marks()
-            self.clear_reply_marks()
-            self._pty_seed = ""
+            self.begin_fresh_screen()
         else:
             self._emit(STREAM_SYSTEM, "--- restarted ---\n")
         self.worker.restart()
+
+    def begin_fresh_screen(self) -> None:
+        """The next child begins a new conversation on a blank screen
+        (Restart, Restart in own lane). The buffer goes now, a running old
+        child's last frames are dropped as it dies (_on_pty_output), and
+        the card's view is reset when the next child is STARTING
+        (screen_reset)."""
+        if not self.is_pty:
+            return
+        self._forget_pty_screen()
+        self._fresh_screen = True
+
+    def _forget_pty_screen(self) -> None:
+        """A restart is a deliberately fresh conversation, so the raw stream,
+        its coordinates and every milestone anchored into them go."""
+        self._pty_buffer = []
+        self._pty_bytes = 0
+        self._pty_total = 0
+        self._pty_dropped = 0
+        self.clear_prompt_marks()
+        self.clear_reply_marks()
+        self._pty_seed = ""
 
     # ---- pty-mode I/O (keystrokes / resize come straight from the view) ---
 
@@ -2402,6 +2421,12 @@ class TerminalAgent(QObject):
         self._emit(stream, text)
 
     def _on_pty_output(self, _stream: str, text: str) -> None:
+        if self._fresh_screen:
+            # a Restart's old child drawing its last frames while it dies.
+            # They belong to the conversation restart() wiped: buffered they
+            # would paint under the new child, and scraped they could read
+            # as its prompt or latch a plan limit it never hit.
+            return
         self._mark_busy()  # streaming VT output => the agent is working
         # keep a bounded raw tail so a freshly created card can rebuild the
         # screen; the live TerminalView is fed directly via the signal
@@ -2490,6 +2515,15 @@ class TerminalAgent(QObject):
 
     def _on_worker_state(self, state: WorkerState) -> None:
         if state is WorkerState.STARTING:
+            if self._fresh_screen:
+                # Restart's new child. _on_pty_output dropped the old one's
+                # last frames while it died, so the buffer is still the
+                # blank one restart() left. The card resets its view on
+                # screen_reset; without that the new Claude paints its
+                # banner over the old frame, starting wherever the old
+                # cursor was.
+                self._fresh_screen = False
+                self.screen_reset.emit()
             self._set_status(AgentStatus.STARTING)
         elif state is WorkerState.RUNNING:
             self._set_status(AgentStatus.RUNNING)
@@ -2498,6 +2532,18 @@ class TerminalAgent(QObject):
         elif state is WorkerState.IDLE:
             self._set_status(AgentStatus.IDLE)
         # DEAD is refined by _on_finished/_on_failed
+        if self._fresh_screen and state in (WorkerState.IDLE,
+                                            WorkerState.DEAD):
+            # the old child is gone; its successor starts in this same call
+            # stack (PtyWorker._on_exit) unless the start failed
+            QTimer.singleShot(0, self, self._settle_fresh_screen)
+
+    def _settle_fresh_screen(self) -> None:
+        """A Restart whose new child never reached STARTING (a failed
+        start, a dispose) stops dropping output, so a later start shows
+        what it prints."""
+        if self._fresh_screen and not self.worker.is_running():
+            self._fresh_screen = False
 
     def _on_finished(self, code: int, crashed: bool) -> None:
         # A resume (--continue) launch that dies before the interactive prompt

@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.36.1
+
+- Restart now gives the new agent a blank screen. The new Claude used to
+  draw its banner and input box over the old one's last frame.
+- The card's maximize button uses the Windows caption icons: one square
+  to maximize, two stacked squares to restore. They are larger than the
+  old arrows, which looked alike.
+
 ## 0.36.0
 
 - Close merged agents on the integrator's lane chip closes, after you
