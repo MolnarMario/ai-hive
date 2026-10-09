@@ -1017,6 +1017,45 @@ def test_input_echo_not_busy():
     check("echo: the pulse drops when output settles", not a.is_busy())
 
 
+def test_resize_redraw_not_busy():
+    """Opening or closing the sidebar resizes every card, and the full-screen
+    TUI redraws its frame in answer. That redraw is not work: it must not light
+    the working pulse on an idle agent (it turned every idle workspace amber).
+    Real output after the window, and a pulse already running, still count."""
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, RESIZE_REDRAW_S, TerminalAgent
+
+    QApplication.instance() or QApplication([])
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Redraw", cwd=SCRATCH_CWD))
+    a.status = AgentStatus.RUNNING
+    acts = []
+    a.activity_changed.connect(acts.append)
+
+    rows, cols = a.worker.rows, a.worker.cols
+    a.resize(rows, cols)    # same size: the child draws nothing
+    a._on_pty_output("pty", "Thinking... running the task\r\n")
+    check("redraw: a same-size resize does not suppress real output",
+          a.is_busy() and acts == [True], acts)
+    a._on_idle_timeout()
+    acts.clear()
+
+    a.resize(rows, cols + 20)    # the sidebar closed: the card got wider
+    a._on_pty_output("pty", "\x1b[2J\x1b[Hframe redrawn\r\n")
+    check("redraw: the redraw after a real resize does NOT flag busy",
+          not a.is_busy() and acts == [], acts)
+
+    a._last_resize_ts -= RESIZE_REDRAW_S + 0.1
+    a._on_pty_output("pty", "Thinking... running the task\r\n")
+    check("redraw: output after the window flags busy as usual",
+          a.is_busy() and acts == [True], acts)
+
+    a.resize(rows, cols)
+    a._on_pty_output("pty", "more output\r\n")
+    check("redraw: a resize leaves a running pulse alone",
+          a.is_busy() and acts == [True], acts)
+
+
 def test_agent_busy_activity():
     """is_busy() tracks OUTPUT ACTIVITY, not process-alive: an interactive
     agent idling at its prompt is running but NOT busy, so the sidebar badge
