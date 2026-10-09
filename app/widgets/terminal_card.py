@@ -1221,9 +1221,16 @@ class TerminalCard(QFrame):
                    "it to, it ships the lanes whose agent committed \"Task "
                    "done\".\n\n" + tip)
         elif view is not None and view.done:
+            # red outranks the green of done, but a conflict is the
+            # integrator's to resolve (docs/agents/integration.md), not the
+            # user's: say so, or a red chip reads as "fix me first"
+            clash = ("\nIt conflicts with another lane or the base. The "
+                     "integrator resolves that when it merges, and tells you "
+                     "only if the two changes can't both hold."
+                     if view.state == "conflict" else "")
             tip = (f"✓ Work marked done at {view.done[:7]} (a \"Task "
                    f"done\" commit). It ships when you ask the integrator "
-                   f"to.\n\n" + tip)
+                   f"to.{clash}\n\n" + tip)
         self.lane_mark.setToolTip(tip)
         if self.lane_mark.property("lane") != state:
             self.lane_mark.setProperty("lane", state)

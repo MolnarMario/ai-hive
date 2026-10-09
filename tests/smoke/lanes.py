@@ -2501,6 +2501,13 @@ def test_integrator_prompt_project_neutral():
           "targets it, without fixing when the PR opens",
           "starts from origin/dev; its pull request targets dev" in prompt
           and "and open its pull request" not in prompt, prompt)
+    check("integ-neutral: lanes merge oldest flag first and a conflict is "
+          "resolved keeping both lanes' intent, never one side whole",
+          "Merge the flagged commits oldest first" in prompt
+          and "keep what each lane meant to do, never one side whole"
+          in prompt
+          and "leave that lane out of the pull request and tell the user"
+          in prompt, prompt)
     check("integ-neutral: no unconditional version or CHANGELOG bump",
           "bump the version and the CHANGELOG once" not in prompt
           and "Bump a version or edit a CHANGELOG only when that doc asks"
@@ -4168,6 +4175,20 @@ def test_task_done_waits_for_the_user():
         check("task done: the done-overlap chip is green with a yellow border",
               "rgba(70,170,90" in rule
               and f"border-color: {ui_theme.Palette.YELLOW}" in rule, rule)
+        tip = card.lane_mark.toolTip()
+        check("task done: a done lane that merges clean says nothing about "
+              "conflicts", "conflicts with another lane" not in tip, tip)
+        # a red done lane read as "fix me first": the conflict is the
+        # integrator's to resolve when it ships the lane
+        card.set_lane_view(dataclasses.replace(views[a.spec.uid],
+                                               overlaps=[fight]))
+        tip = card.lane_mark.toolTip()
+        check("task done: a red done lane still ships and the integrator "
+              "resolves its conflict",
+              card.lane_mark.property("lane") == "conflict"
+              and "It ships when you ask the integrator" in tip
+              and "The integrator resolves that when it merges" in tip
+              and "—" not in tip, tip)
         card.set_lane_view(views[a.spec.uid])
         win._on_lanes_changed(ws.id, dict(views))
         win._on_lanes_changed(ws.id, dict(views))
