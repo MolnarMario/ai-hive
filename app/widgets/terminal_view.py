@@ -1043,6 +1043,10 @@ class TerminalView(QWidget):
             # text-selection gesture; Ctrl+Shift+Z is redo -- claim them so an
             # app-level QShortcut can't swallow them before keyPressEvent.
             nav = key in _NAV_KEYS
+            # Ctrl+N is MainWindow's new-terminal shortcut, the user's
+            # pick over readline's next-history (Down does the same)
+            if ctrl and not shift and not alt and key == Qt.Key.Key_N:
+                return super().event(e)
             if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab) \
                     or (ctrl and not shift) or (alt and not shift) \
                     or (shift and nav) \
