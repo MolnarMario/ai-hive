@@ -1541,6 +1541,136 @@ def test_projection_happens_once():
     card4.detach(); dropped.dispose(); pump(30)
 
 
+def test_replay_reads_each_part_at_its_drawn_size():
+    """A card rebuild or a width change must not double a Claude reply.
+
+    Live-reported: a reply's text showed up several times over, each copy a
+    little longer. Claude's classic renderer erases its streaming frame by
+    moving up one row per line it drew, at the width it was told. The card
+    replayed the raw stream at its CURRENT width on every width change and
+    rebuild, so the erase missed rows and every older frame stayed stacked
+    above the next. The agent now records the view's size at its stream
+    offset and the replay feeds each part at the size it was drawn at."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.terminal_card import TerminalCard
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+
+    def ink_reply(word, width):
+        # the classic renderer's stream: erase the frame's rows, redraw longer
+        out, prev = "", 0
+        for n in range(4, 40, 6):
+            text = word + ": " + " ".join(f"w{i}" for i in range(n))
+            if prev:
+                out += "\x1b[2K\x1b[1A" * (prev - 1) + "\x1b[2K\r"
+            rows = [text[i:i + width] for i in range(0, len(text), width)]
+            out += "\r\n".join(rows)
+            prev = len(rows)
+        return out + "\r\n> \r\n"
+
+    def size(card, rows, cols):        # what TerminalView._apply_resize does
+        card.terminal.screen.resize(rows, cols)
+        card.terminal.sizeChanged.emit(rows, cols)
+
+    def starts(view, word):
+        scr = view.screen
+        lines = list(scr.history.top) + [scr.buffer[r] for r in range(scr.lines)]
+        return sum(1 for ln in lines
+                   if "".join(ln[c].data for c in range(80)).startswith(word))
+
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Geometry",
+                                     cwd=SCRATCH_CWD, pty=True))
+    card = TerminalCard(agent)
+    card._proj_cols = card.terminal.screen.columns
+    size(card, 20, 60)
+    agent._on_pty_output("pty", "header\r\n" + ink_reply("Alpha", 60))
+    check("geometry: the live view shows the reply once",
+          starts(card.terminal, "Alpha:") == 1, starts(card.terminal, "Alpha:"))
+    flat = TerminalView(rows=20, cols=40)
+    flat.feed(agent.pty_replay())
+    check("geometry: (fixture) fed flat at 40 cols the reply doubles",
+          starts(flat, "Alpha:") > 1, starts(flat, "Alpha:"))
+
+    fed = []
+    real_feed = card.terminal.feed
+    card.terminal.feed = lambda d: (fed.append(d), real_feed(d))[1]
+    size(card, 20, 40)                 # the card narrows
+    check("geometry: a width change does not re-feed a live stream",
+          fed == [] and starts(card.terminal, "Alpha:") == 1,
+          (len(fed), starts(card.terminal, "Alpha:")))
+    del card.terminal.feed
+    off40 = agent._pty_total
+    agent._on_pty_output("pty", ink_reply("Beta", 40))
+    check("geometry: the sizes are recorded at their stream offsets",
+          [(off, g.cols) for off, g in agent.replay_geometry()][-2:]
+          == [(0, 60), (off40, 40)],
+          [(off, g.rows, g.cols) for off, g in agent.replay_geometry()])
+
+    card2 = TerminalCard(agent)        # a retile / workspace switch
+    size(card2, 20, 40)
+    check("geometry: a rebuilt card shows each reply once",
+          starts(card2.terminal, "Alpha:") == 1
+          and starts(card2.terminal, "Beta:") == 1,
+          (starts(card2.terminal, "Alpha:"), starts(card2.terminal, "Beta:")))
+    check("geometry: ...and is back at its own size afterwards",
+          (card2.terminal.screen.lines, card2.terminal.screen.columns)
+          == (20, 40))
+
+    # a capped replay that starts after a recorded size starts AT that size
+    sizes = []
+    real_ps = card2.terminal.project_size
+    card2.terminal.project_size = lambda r, c: (sizes.append((r, c)),
+                                                real_ps(r, c))[1]
+    replay = agent.pty_replay()
+    card2._clear_for_projection()
+    card2._replay_with_marks(replay, cap=len(replay) - off40 - 5,
+                             recover=False)
+    check("geometry: a capped replay starts at the size in force there",
+          sizes[:1] == [(20, 40)] and sizes[-1] == (20, 40), sizes)
+    del card2.terminal.project_size
+
+    # a size and a prompt mark at one offset replay in the order they came
+    log = []
+    agent.note_prompt_submitted("first")
+    agent.resize(20, 50)
+    agent.note_prompt_submitted("second")
+    card2.terminal.project_size = lambda r, c: (log.append(("size", c)),
+                                                real_ps(r, c))[1]
+    real_anchor = card2.terminal.anchor_line
+    card2.terminal.anchor_line = lambda: (log.append(("mark",)),
+                                          real_anchor())[1]
+    card2._clear_for_projection()
+    card2._replay_with_marks(agent.pty_replay(), recover=False)
+    tail = [e for e in log if e == ("mark",) or e == ("size", 50)]
+    check("geometry: a mark and a resize at one offset keep their order",
+          tail == [("mark",), ("size", 50), ("mark",)], log)
+    del card2.terminal.project_size, card2.terminal.anchor_line
+
+    # a restart starts a new stream at the view's current size
+    agent.begin_fresh_screen()
+    check("geometry: a restart keeps the view's size for the new stream",
+          [(off, g.cols) for off, g in agent.replay_geometry()] == [(0, 50)],
+          [(off, g.cols) for off, g in agent.replay_geometry()])
+    card.detach(); card2.detach(); agent.dispose()
+
+    # dropping a restored seed must not leave buffer offsets counting it
+    seeded = TerminalAgent(build_spec(AgentKind.CLAUDE, "Seeded",
+                                      cwd=SCRATCH_CWD, pty=True))
+    seeded.seed_pty_replay("PREVIOUS-RUN " * 50)
+    seeded.drop_seeded_screen()
+    seeded._on_pty_output("pty", "hello\r\n")
+    seeded.note_prompt_submitted("typed")
+    check("geometry: offsets after a dropped seed point into the buffer",
+          [off for off, _ in seeded.replay_marks()]
+          == [len(seeded.pty_replay())],
+          ([off for off, _ in seeded.replay_marks()], len(seeded.pty_replay())))
+    seeded.dispose()
+
+
 def test_history_screen_wrapper_removed():
     """_FastHistoryScreen drops pyte's per-event wrapper without changing what
     is rendered.
@@ -1888,15 +2018,19 @@ def test_terminal_scrollbar():
     check("scrollbar: ...and is actually painted, not waiting to scroll off",
           found)
 
-    # ---- width change re-projects the scrollback -------------------------
+    # ---- width change re-projects a restored snapshot's scrollback ---------
+    # (a stream drawn this run is replayed at its recorded sizes instead, see
+    # test_replay_reads_each_part_at_its_drawn_size)
     wide = TerminalAgent(build_spec(AgentKind.CLAUDE, "Reflow", cwd=SCRATCH_CWD,
                                     pty=True))
     wcard = TerminalCard(wide)
     wt = wcard.terminal
     wt.screen.resize(20, 30)                   # a pre-layout narrow card
     wcard._proj_cols = 30
-    wide._on_pty_output("pty", ("A very long line of conversation text that "
-                                "must wrap at thirty columns\r\n") * 20)
+    snap = ("A very long line of conversation text that "
+            "must wrap at thirty columns\r\n") * 20
+    wide.seed_pty_replay(snap)
+    wt.feed(snap)                              # the seed projection's paint
     narrow_lines = len(wt.screen.history.top)
     wt.screen.resize(20, 100)                  # the tiling grid widens it
     wcard._reproject_on_size(20, 100)

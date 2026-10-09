@@ -820,7 +820,11 @@ def test_reply_stamps_survive_a_reprojection():
           mark is not None and len(card.terminal.reply_marks()) == 1,
           card.terminal.reply_marks())
 
-    card._reproject_on_size(30, card.terminal.screen.columns - 20)
+    # a replay onto a narrower screen, what a width change used to run and a
+    # rebuild of a card without recorded sizes still does
+    card.terminal.screen.resize(30, card.terminal.screen.columns - 20)
+    card._clear_for_projection()
+    card._replay_with_marks(agent.pty_replay())
     check("reproject: a width change keeps the agent's reply mark",
           agent.reply_marks() == [mark], agent.reply_marks())
     check("reproject: ...and the view carries the stamp again",
@@ -883,7 +887,8 @@ def test_reply_stamps_survive_replaying_an_old_wipe():
           first is not None and second is not None
           and agent.reply_marks() == [first, second], agent.reply_marks())
     term.screen.resize(30, 50)
-    card._reproject_on_size(30, 50)
+    card._clear_for_projection()
+    card._replay_with_marks(agent.pty_replay())
     check("old-wipe: a narrower replay of the old ED 3 keeps the marks",
           agent.reply_marks() == [first, second], agent.reply_marks())
     card.deleteLater()

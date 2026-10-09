@@ -1043,6 +1043,15 @@ class TerminalView(QWidget):
         self._notify_view(immediate=True)   # page size changed
         self.update()
 
+    def project_size(self, rows: int, cols: int) -> None:
+        """Resize the emulated screen only, for a replay that has to read the
+        stream at the size each part was drawn for (see
+        TerminalAgent.replay_geometry). No sizeChanged: the child and the
+        agent's size record must not hear about it, and the replay puts the
+        widget's own size back when it ends."""
+        if (rows, cols) != (self.screen.lines, self.screen.columns):
+            self.screen.resize(rows, cols)
+
     # ------------------------------------------------------------- input ---
 
     def focusNextPrevChild(self, _next):

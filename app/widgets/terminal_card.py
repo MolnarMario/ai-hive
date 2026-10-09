@@ -37,7 +37,7 @@ _LINE_BREAKS = re.compile(r"[\r\n]")
 # never leave the user looking at a cover instead of their terminal.
 BOOT_VEIL_MAX_MS = 25_000
 # How much of an agent's raw pty tail is replayed when a card is (re)built or
-# the terminal changes width. This is a COMPROMISE, not a free bound: re-measured
+# a restored snapshot changes width. This is a COMPROMISE, not a free bound: re-measured
 # on real classic-renderer captures at ~100 cols, 128 KiB projects only 844-1519
 # of HISTORY_LINES' 2000 lines, so the cap is already what truncates reachable
 # scrollback, and LOWERING it costs milestones (an earlier note here claimed
@@ -1552,8 +1552,8 @@ class TerminalCard(QFrame):
 
         It projects the agent's CURRENT buffer, not the snapshot the constructor
         took. For an ordinary rebuild (a retile, a workspace switch) the buffer
-        IS the live conversation, and projecting it is exactly what
-        _reproject_on_size does on every width change; comparing against the
+        IS the live conversation, replayed at the sizes it was drawn at
+        (TerminalAgent.replay_geometry); comparing against the
         constructor snapshot and bailing on any difference -- as an earlier
         version did -- would leave a busy agent's card showing nothing but the
         8 KiB seed, because a live child's buffer is different by the time the
@@ -1709,27 +1709,28 @@ class TerminalCard(QFrame):
             self._reprojecting = False
 
     def _reproject_on_size(self, _rows: int, cols: int) -> None:
-        """Re-render the scrollback whenever the terminal's WIDTH changes.
+        """Re-render a restored snapshot's scrollback when the terminal's
+        WIDTH changes, and nothing else.
 
         pyte does not reflow: a history line keeps the column count it had when
-        it was pushed. That never mattered while Claude owned its own
-        scrollback (history was always empty), but now that AI Hive keeps it,
-        every width change leaves the old lines wrapped for a screen that no
-        longer exists -- rendering as a short fragment with the wrapped
-        remainder stranded out at the old right edge. The launch case is the
-        one that bites: a card is built at its pre-layout width, the child
-        paints into that, those lines scroll into history, and only then does
-        the tiling grid give the card its real size.
+        it was pushed. A restored snapshot (`seed_pty_replay`) never recorded
+        the size it was drawn at, so the only way to fit it to a new width is
+        to project it again at that width, as before.
 
-        The raw pty stream is the truth and the screen is only a projection of
-        it at one width, so the honest repair is to project again. Bounded by
-        _replay_with_marks' cap, and skipped entirely when there is no
-        scrollback to mangle."""
+        A stream drawn this run is left alone. It was drawn at the sizes the
+        agent recorded (`replay_geometry`), and the live view already shows it
+        exactly as it was fed. Projecting it at the new width is what doubled
+        Claude's replies: the classic renderer erases a streaming frame by
+        moving up one row per line it drew at the OLD width, so at another
+        width the erase stops short and every older frame stays stacked above
+        the next. The child redraws at the new width on its own."""
         if not self.is_pty or self._pending_replay:
             return          # the restored-screen path owns the first render
         if cols == self._proj_cols:
             return          # height-only change: wrapping is unaffected
         self._proj_cols = cols
+        if not self.agent.has_pristine_seed():
+            return          # drawn this run: the live view is already right
         if not len(self.terminal.screen.history.top):
             return          # nothing captured at the old width yet
         replay = self.agent.pty_replay()
@@ -1760,6 +1761,11 @@ class TerminalCard(QFrame):
         Splitting mid-escape is safe -- feed() carries a trailing partial
         escape across calls.
 
+        The stream is split at the agent's recorded view sizes too
+        (`replay_geometry`), and each part is fed at the size it was drawn
+        at. Fed at one size instead, Claude's erase-and-redraw of a streaming
+        reply misses its rows and the reply shows up several times over.
+
         Only the TAIL is replayed, bounded by `cap`. Feeding a full 512 KiB
         buffer through pyte measures ~1.25s, unaffordable per resize across a
         hive of cards; the default REPLAY_PROJECT_CAP is the compromise
@@ -1788,8 +1794,17 @@ class TerminalCard(QFrame):
         # rebuild, exactly what _rerender_restored's single-projection rule
         # exists to avoid.
         tagged = ([(off, "prompt", mark) for off, mark in self.agent.replay_marks()] +
-                  [(off, "reply", mark) for off, mark in self.agent.reply_replay_marks()])
-        tagged.sort(key=lambda t: t[0])
+                  [(off, "reply", mark) for off, mark in self.agent.reply_replay_marks()] +
+                  [(off, "size", g) for off, g in self.agent.replay_geometry()])
+        # a size and a mark at one offset go in the order they happened
+        tagged.sort(key=lambda t: (t[0], t[2].seq))
+        # Each byte is read at the size the view had when it arrived (see
+        # TerminalAgent.ScreenSize), then the view's own size comes back.
+        # Without a recorded size (a restored snapshot) the view's size stands.
+        own_size = (self.terminal.screen.lines, self.terminal.screen.columns)
+        start = [g for off, kind, g in tagged if kind == "size" and off < skip]
+        if start:
+            self.terminal.project_size(start[-1].rows, start[-1].cols)
         pos = skip
         # an ED 3 or a reset inside the replayed stream wipes the view's
         # history again, and its historyCleared must not reach the agent's
@@ -1804,7 +1819,9 @@ class TerminalCard(QFrame):
                 if off > pos:
                     self.terminal.feed(replay[pos:off])
                     pos = off
-                if kind == "prompt":
+                if kind == "size":
+                    self.terminal.project_size(mark.rows, mark.cols)
+                elif kind == "prompt":
                     self._mark_lines[mark.uid] = self.terminal.anchor_line()
                 else:
                     line = self.terminal.reply_anchor_line()
@@ -1813,6 +1830,7 @@ class TerminalCard(QFrame):
             if pos < len(replay):
                 self.terminal.feed(replay[pos:])
         finally:
+            self.terminal.project_size(*own_size)
             self._reprojecting = held
         if recover:
             rows = self._scrollback_rows()
@@ -1843,9 +1861,9 @@ class TerminalCard(QFrame):
         The prompt TEXTS are cached per conversation, and that is a correctness
         no-op as well as the difference between a smooth retile and a visible
         freeze. This runs on EVERY projection (card build, and every width
-        change via _reproject_on_size), and the read is O(whole transcript):
-        transcripts keeps an (mtime,size) cache, but a LIVE agent rewrites its
-        transcript continuously, so that cache misses precisely for the agents
+        change of a restored snapshot via _reproject_on_size), and the read
+        is O(whole transcript): transcripts keeps an (mtime,size) cache, but
+        a LIVE agent rewrites its transcript continuously, so that cache misses precisely for the agents
         being used -- MEASURED at 90-165ms on the user's real 50MB transcripts,
         on the GUI thread, per card. Re-reading inside one conversation can only
         turn up prompts typed since the card was built, and the card WATCHED
@@ -2151,9 +2169,9 @@ class TerminalCard(QFrame):
         the card was built, once the screen has settled.
 
         Milestone recovery normally rides a PROJECTION (_rerender_restored on a
-        card build, _reproject_on_size on a width change), which is the right
-        place for it: the scan has to run against the screen the marks will be
-        drawn on. The launch autostart has neither. `drop_restored_screen`
+        card build, _reproject_on_size when a snapshot changes width), which
+        is the right place for it: the scan has to run against the screen the
+        marks will be drawn on. The launch autostart has neither. `drop_restored_screen`
         cancels the settled-size projection for every agent it is about to
         start (that snapshot is the previous run's screen, hard-wrapped for a
         width nothing can reflow), and `_reproject_on_size` bails while the
