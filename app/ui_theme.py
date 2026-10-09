@@ -780,12 +780,10 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 #CardStart, #CardStop, #CardRestart, #CardAssign, #CardAdopt,
 #CardIntegrator, #CardScheduleSend {{ font-family: "Segoe UI Symbol"; }}
 /* the A-/A+ font steppers read better a hair smaller than the glyph icons
-   (later rules win on equal id specificity). The maximize/restore squares
-   are Segoe MDL2 Assets private-use glyphs (see terminal_card.MAXIMIZE_GLYPH),
-   pinned here so Qt's fallback doesn't choose their size and shape; at 13px
-   the square matches the height of the stop and close glyphs beside it. */
+   (later rules win on equal id specificity). The maximize/restore button
+   paints its own icon (terminal_card._MaximizeButton), so it takes only the
+   padding and hover plate from the rules above. */
 #CardFontDec, #CardFontInc {{ font-size: 12px; font-weight: 700; }}
-#CardMaximize {{ font-family: "Segoe MDL2 Assets"; font-size: 13px; }}
 /* the collapsed stand-in for the action tray: faint enough to read as
    chrome, visible enough to say "there is something here to hover" */
 #CardToolsHint {{ color: {p.CARDHEAD_SUB}; font-size: 13px; }}
