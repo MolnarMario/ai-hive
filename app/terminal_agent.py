@@ -89,6 +89,23 @@ BUSY_IDLE_MS = 2000
 # pulses a beat later. Seconds, compared against time.time().
 INPUT_ECHO_S = 0.8
 
+# A resize makes a full-screen TUI redraw its whole frame, and that redraw is
+# not work either. Opening or closing the sidebar resizes every visible card,
+# which used to light every idle workspace amber for the 2 s idle window.
+# Output within this long of the last size change to the child does not start
+# the "working" pulse. A pulse already running is untouched, and real work that
+# outlasts the window still lights it, at most this much late. Seconds.
+RESIZE_REDRAW_S = 1.0
+
+# While a submitted turn is open (`_awaiting_reply`: from the submit until
+# Claude's Stop hook or the finished-reply chime), output in a redraw window
+# counts as work, so a short reply, or a reply resuming after a tool's quiet
+# spell, still lights the pulse and settles its turn. A turn that never ends
+# that way (a submit whose only output was its echo) stops holding the check
+# once it has been quiet this long, so it can't disable it for good. Seconds,
+# from the later of the submit and the turn's last work.
+TURN_QUIET_S = 120.0
+
 # Extra quiet, on top of BUSY_IDLE_MS, before a submitted turn of a provider
 # WITHOUT a Stop hook (Codex, Gemini, Grok) counts as a finished reply and
 # rings the reply chime. A settle alone is 2 s of silence, which every tool
@@ -501,6 +518,8 @@ class TerminalAgent(QObject):
         # the usage poll's cadence follows it (see usage_poll.provider_active)
         self._last_work_ts = 0.0
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
+        self._last_resize_ts = 0.0    # walltime the child was last resized
+        self._awaiting_reply = False  # a submitted turn is open (TURN_QUIET_S)
         # walltime a line last went in (typed, a task, a nudge): a lane read
         # older than it may predate work that line started (_note_submit)
         self._last_submit_ts = 0.0
@@ -644,6 +663,7 @@ class TerminalAgent(QObject):
         self._pending_submits.clear()
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         self._turn_open = False        # nothing asked yet, so nothing to stamp
+        self._awaiting_reply = False
         self._turn_mark_uid = None
         self._turn_end_ts = None
         self._turn_mark_final = False
@@ -729,6 +749,7 @@ class TerminalAgent(QObject):
         # a restart is a fresh conversation: the next reply worth stamping is
         # the next one somebody asks for (see _note_submit)
         self._turn_open = False
+        self._awaiting_reply = False
         self._turn_mark_uid = None
         self._turn_end_ts = None
         self._turn_mark_final = False
@@ -772,9 +793,14 @@ class TerminalAgent(QObject):
         # echo of that typing apart from genuine agent output — echo must not
         # light the "working" pulse (see _mark_busy / INPUT_ECHO_S).
         self._last_input_ts = time.time()
-        if submits_a_line(data):
+        submit = submits_a_line(data)
+        if submit:
             self._note_submit()
-        return self.worker.write(data)
+        ok = self.worker.write(data)
+        if submit and not ok:
+            # nothing reached a child, so no reply will come to settle it
+            self._awaiting_reply = False
+        return ok
 
     def _note_submit(self) -> None:
         """A line was just submitted to the child, so the reply to it is
@@ -802,6 +828,7 @@ class TerminalAgent(QObject):
         than either falling silent or littering the turn with stamps. For
         Claude that movement ends at the Stop hook: see note_reply_stopped."""
         self._last_submit_ts = time.time()
+        self._awaiting_reply = True
         self._turn_open = True
         self._turn_mark_uid = None    # the next settle starts this turn's mark
         self._turn_end_ts = None
@@ -811,7 +838,15 @@ class TerminalAgent(QObject):
     def resize(self, rows: int, cols: int) -> None:
         if self.is_pty:
             self._note_view_size(rows, cols)
-            self.worker.resize(rows, cols)
+            self._resize_child(rows, cols)
+
+    def _resize_child(self, rows: int, cols: int) -> None:
+        """Resize the child and remember when, so the redraw it answers with
+        is not mistaken for work (see RESIZE_REDRAW_S). Only a size a running
+        child took counts: a same-size call, a child not started yet or a
+        failed setwinsize draws nothing."""
+        if self.worker.resize(rows, cols):
+            self._last_resize_ts = time.time()
 
     def _next_seq(self) -> int:
         self._order_seq += 1
@@ -899,9 +934,9 @@ class TerminalAgent(QObject):
         rows, cols = self.worker.rows, self.worker.cols
         if cols <= 10:      # already at PtyWorker's floor; nothing to give back
             return False
-        self.worker.resize(rows, cols - 1)
+        self._resize_child(rows, cols - 1)
         QTimer.singleShot(REPAINT_RESTORE_MS,
-                          lambda: self.worker.resize(rows, cols))
+                          lambda: self._resize_child(rows, cols))
         return True
 
     def pty_replay(self) -> str:
@@ -1038,6 +1073,7 @@ class TerminalAgent(QObject):
         A later Stop with no submit in between is Claude replying on its own
         (a background task finished), which is a new ending for the same
         turn, so it reopens the mark to follow that one instead."""
+        self._awaiting_reply = False    # the turn ended (TURN_QUIET_S)
         if not self.is_pty or not self._turn_open:
             return
         self._turn_end_ts = ts
@@ -1678,6 +1714,7 @@ class TerminalAgent(QObject):
         # a background command still running means the agent kicked off work
         # and is waiting on it, which is not a finished reply
         if not self._busy and not self._bg_shell:
+            self._awaiting_reply = False    # the turn ended (TURN_QUIET_S)
             self._announce_reply()
 
     def is_bg_shell_busy(self) -> bool:
@@ -1886,6 +1923,21 @@ class TerminalAgent(QObject):
             return
         now = time.time()
         self._last_output_ts = now
+        # A redraw answering a resize (RESIZE_REDRAW_S) is not work, and it
+        # answers no question either, so it lights nothing and keeps the
+        # waiting flags. It still arms the settle: `_on_idle_timeout`
+        # re-scrapes the redrawn screen for a menu, a limit banner and prompt
+        # readiness, the very things `request_repaint` asks a redraw for. Only
+        # when it would START the pulse (once busy, output keeps it alive),
+        # and never while a submitted turn is open (TURN_QUIET_S), whose
+        # output inside the window would otherwise be lost.
+        awaiting = (self._awaiting_reply
+                    and now - max(self._last_submit_ts, self._last_work_ts)
+                    < TURN_QUIET_S)
+        if (not self._busy and not awaiting
+                and now - self._last_resize_ts < RESIZE_REDRAW_S):
+            self._idle_timer.start()
+            return
         # producing output => not waiting on a scrape menu, and any free-text
         # turn-question is resolved (the user engaged / the agent resumed). A
         # tool prompt (AskUserQuestion) renders its OWN output, so _tool_waiting

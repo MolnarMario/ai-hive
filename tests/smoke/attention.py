@@ -1017,6 +1017,114 @@ def test_input_echo_not_busy():
     check("echo: the pulse drops when output settles", not a.is_busy())
 
 
+def test_resize_redraw_not_busy():
+    """Opening or closing the sidebar resizes every card, and the full-screen
+    TUI redraws its frame in answer. That redraw is not work: it must not light
+    the working pulse on an idle agent (it turned every idle workspace amber).
+    Real output after the window, and a pulse already running, still count."""
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, RESIZE_REDRAW_S, TerminalAgent
+
+    QApplication.instance() or QApplication([])
+    from app.process_worker import WorkerState
+
+    class _Child:               # a running child that takes every size
+        def setwinsize(self, rows, cols):
+            pass
+
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Redraw", cwd=SCRATCH_CWD))
+    a.status = AgentStatus.RUNNING
+    a.worker._proc = _Child()
+    a.worker.state = WorkerState.RUNNING
+    acts = []
+    a.activity_changed.connect(acts.append)
+
+    rows, cols = a.worker.rows, a.worker.cols
+    a.resize(rows, cols)    # same size: the child draws nothing
+    a._on_pty_output("pty", "Thinking... running the task\r\n")
+    check("redraw: a same-size resize does not suppress real output",
+          a.is_busy() and acts == [True], acts)
+    a._on_idle_timeout()
+    acts.clear()
+
+    a.resize(rows, cols + 20)    # the sidebar closed: the card got wider
+    a._on_pty_output("pty", "\x1b[2J\x1b[Hframe redrawn\r\n")
+    check("redraw: the redraw after a real resize does NOT flag busy",
+          not a.is_busy() and acts == [], acts)
+
+    a._last_resize_ts -= RESIZE_REDRAW_S + 0.1
+    a._on_pty_output("pty", "Thinking... running the task\r\n")
+    check("redraw: output after the window flags busy as usual",
+          a.is_busy() and acts == [True], acts)
+
+    a.resize(rows, cols)
+    a._on_pty_output("pty", "more output\r\n")
+    check("redraw: a resize leaves a running pulse alone",
+          a.is_busy() and acts == [True], acts)
+    a._on_idle_timeout()
+    acts.clear()
+
+    # code review: the redraw keeps a waiting agent waiting and still arms
+    # the settle scrape, the one that re-reads menus, limits and readiness
+    a.set_turn_waiting(True)
+    a.resize(rows, cols + 20)
+    a._on_pty_output("pty", "\x1b[2J\x1b[Hframe redrawn\r\n")
+    check("redraw: a question the agent asked stays pending",
+          a.is_waiting() and not a.is_busy(), (a.is_waiting(), a.is_busy()))
+    check("redraw: ...and the settle scrape is still armed",
+          a._idle_timer.isActive())
+    a._idle_timer.stop()
+
+    # a short reply to a submitted line, landing inside the window, is work
+    a._note_submit()
+    a.resize(rows, cols)
+    a._on_pty_output("pty", "Done.\r\n")
+    check("redraw: output while a submit awaits its reply flags busy",
+          a.is_busy() and acts == [True], acts)
+    a._on_idle_timeout()
+
+    # Luna: a turn that goes quiet mid-reply (a long tool) is still open, and
+    # its next output after a resize is work too
+    acts.clear()
+    a.resize(rows, cols + 20)
+    a._on_pty_output("pty", "tool finished, continuing\r\n")
+    check("redraw: a turn resuming after a settle still flags busy",
+          a.is_busy() and acts == [True], acts)
+    a._on_idle_timeout()
+    a.note_reply_stopped(0.0)
+    check("redraw: the Stop hook ends the turn's hold on the check",
+          not a._awaiting_reply)
+
+    # a child that is not running draws nothing, so nothing is suppressed
+    a.worker.state = WorkerState.STARTING
+    stamp = a._last_resize_ts
+    a.resize(rows, cols + 20)
+    check("redraw: a resize no running child took stamps nothing",
+          a._last_resize_ts == stamp)
+
+    # Luna: a line no child received awaits no reply, so it must not latch
+    a.write("hello\r")
+    check("redraw: a submit that failed to write awaits no reply",
+          not a._awaiting_reply)
+
+    # Luna: a submit whose only output was its echo never settles, and must
+    # not keep the redraw check off for good
+    from app.terminal_agent import TURN_QUIET_S
+    a.worker.state = WorkerState.RUNNING
+    a._note_submit()
+    a._last_submit_ts -= TURN_QUIET_S + 0.1
+    a._last_work_ts = a._last_submit_ts
+    acts.clear()
+    a.resize(rows, cols)
+    a._on_pty_output("pty", "\x1b[2J\x1b[Hframe redrawn\r\n")
+    check("redraw: an old unsettled submit no longer counts the redraw",
+          not a.is_busy() and acts == [], acts)
+    a._idle_timer.stop()
+    a.worker._proc = None
+    a.dispose()
+
+
 def test_agent_busy_activity():
     """is_busy() tracks OUTPUT ACTIVITY, not process-alive: an interactive
     agent idling at its prompt is running but NOT busy, so the sidebar badge

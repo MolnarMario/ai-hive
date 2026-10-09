@@ -453,9 +453,11 @@ workspaces keep executing — switching never pauses anything.
   lane about
   every 15 seconds and right after an agent's turn ends, and fetches the base
   branch every 5 minutes. Each laned card gets a chip (a branch icon, then `↑2 ±3`:
-  commits ahead, uncommitted files) that turns amber when another lane or the base
-  branch changed one of its files, and red when a real merge of the two would
-  conflict (`git merge-tree`, git 2.38+). A lane with a `Task done` commit
+  commits ahead of the base, uncommitted files, untracked ones included) that turns
+  amber when another lane or the base branch changed one of its files, and red when
+  a real merge of the two would conflict (`git merge-tree`, git 2.38+). Hovering the
+  chip also shows how many commits the lane is behind the base and which files
+  overlap. A lane with a `Task done` commit
   stays green when it shares a file and gets a yellow border instead; only
   a conflict outranks it. Its menu opens the lane folder and
   fast-forwards an empty lane to the newest base (not while the agent is
@@ -936,7 +938,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3074 checks drive the real app headlessly (offscreen Qt platform) with real
+3086 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1078,7 +1080,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3074 checks)
+                           (3086 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
