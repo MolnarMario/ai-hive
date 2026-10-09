@@ -619,7 +619,8 @@ error dialog instead of silently closing. Packaging to a distributable
   cursor on the top edge for 1.5 s and the top bar and workspace header float
   over the agents; rest it on the left edge and the sidebar floats in at its
   usual width, or as the thin rail if it was collapsed. Neither resizes a
-  terminal. `F11` again brings the window back as it was.
+  terminal. `F11` again brings the window back as it was. The Fullscreen
+  switch under Options > Appearance does the same.
 - **Agents** — `+ Terminal` (or `Ctrl+T` / `Ctrl+Shift+T`), or click any empty grid slot.
   The dialog groups **AI agents** (Claude with model + effort + mode dropdowns —
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;

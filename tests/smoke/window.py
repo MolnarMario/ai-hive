@@ -3038,8 +3038,9 @@ def test_fullscreen_f11():
     floats the top bar and the active workspace header over the grid,
     resting it on the left edge floats the sidebar at its pre-F11 width (or
     the rail, when the sidebar was collapsed), and neither reveal resizes
-    the terminals. F11 again puts everything back where it was. Ctrl+T adds
-    a terminal even while a terminal has focus."""
+    the terminals. F11 again puts everything back where it was, and the
+    Options panel's Fullscreen switch does the same as F11 and follows it.
+    Ctrl+T adds a terminal even while a terminal has focus."""
     from PySide6.QtCore import QEvent, QEventLoop, QPoint, Qt, QTimer
     from PySide6.QtGui import QKeyEvent, QShortcut
     from PySide6.QtTest import QTest
@@ -3205,6 +3206,32 @@ def test_fullscreen_f11():
         win._toggle_sidebar()
         check("fullscreen: the sidebar still reopens at its width",
               win.body_split.sizes()[0] == width, win.body_split.sizes())
+
+        bar = win.top_bar
+        check("fullscreen: the Options panel has a Fullscreen switch, off",
+              bar.options_panel.isAncestorOf(bar.fullscreen_btn)
+              and not bar.fullscreen_btn.isChecked())
+        bar._open_options()
+        bar.fullscreen_btn.click()
+        pump(50)
+        check("fullscreen: the Options switch enters fullscreen and closes "
+              "the panel", fs.active and win.isFullScreen()
+              and not bar.options_panel.isVisible()
+              and bar.fullscreen_btn.isChecked(), win.windowState())
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen: F11 leaving turns the switch off",
+              not fs.active and not bar.fullscreen_btn.isChecked())
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen: F11 entering turns the switch on",
+              fs.active and bar.fullscreen_btn.isChecked())
+        bar.fullscreen_btn.click()
+        pump(50)
+        check("fullscreen: the switch leaves fullscreen too",
+              not fs.active and not win.isFullScreen()
+              and win.top_bar.isVisible()
+              and not bar.fullscreen_btn.isChecked(), win.windowState())
 
         tv = TerminalView(rows=6, cols=80)
         ctrl = Qt.KeyboardModifier.ControlModifier

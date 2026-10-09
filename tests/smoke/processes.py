@@ -2,6 +2,7 @@
 stats, the pty worker and its launch width."""
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -874,3 +875,65 @@ def test_pty_width_at_launch():
         pty_worker.PtyWorker.resize = orig_resize
         pty_worker.PtyWorker.start = orig_start
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+_CONSOLE_PROBE = r'''
+import ctypes, sys
+from ctypes import wintypes
+sys.path.insert(0, sys.argv[1])
+from app.pty_worker import ensure_windowless_console
+k32 = ctypes.windll.kernel32
+k32.GetConsoleWindow.restype = wintypes.HWND
+had = k32.GetConsoleWindow()
+done = ensure_windowless_console()
+hwnd = k32.GetConsoleWindow()
+shown = bool(hwnd) and bool(ctypes.windll.user32.IsWindowVisible(hwnd))
+from winpty import PtyProcess
+p = PtyProcess.spawn("cmd.exe /c exit 0")
+after = k32.GetConsoleWindow()
+again = ensure_windowless_console()
+with open(sys.argv[2], "w") as fh:
+    print(had is None, done, shown, after == hwnd, again, sep="|", file=fh)
+'''
+
+
+def test_windowless_console():
+    """A pythonw AI Hive gets a console with no window (or a hidden one on
+    older Windows) before its window shows, so pywinpty's first spawn never
+    allocates one. That console used to take the foreground from AI Hive,
+    and F11 then went to conhost and opened a black window over the app."""
+    if sys.platform != "win32":
+        skip('windowless console', 'non-Windows: no consoles to allocate')
+        return
+    root = str(Path(__file__).resolve().parents[2])
+    # pythonw, the production launch: a GUI-subsystem process with no
+    # console. A venv python.exe is a redirector that starts the real one
+    # as a child, which gets a console of its own whatever flags we pass.
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    if not pythonw.is_file():
+        skip('windowless console', f'no pythonw.exe beside {sys.executable}')
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-console-"))
+    try:
+        result = tmp / "out.txt"
+        res = subprocess.run(
+            [str(pythonw), "-c", _CONSOLE_PROBE, root, str(result)],
+            capture_output=True, text=True, timeout=60, cwd=SCRATCH_CWD)
+        out = (result.read_text().strip().split("|") if result.is_file()
+               else [])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    check("console: the probe ran", res.returncode == 0 and len(out) == 5,
+          (res.returncode, out, res.stderr[-800:]))
+    if len(out) != 5:
+        return
+    had_none, done, shown, same, again = out
+    check("console: a pythonw launch starts with no console",
+          had_none == "True", out)
+    check("console: it gets a windowless or hidden one",
+          done in ("windowless", "hidden"), out)
+    check("console: nothing on screen", shown == "False", out)
+    check("console: the first pty spawn allocates no console of its own",
+          same == "True", out)
+    check("console: a second call leaves the console alone",
+          again == "existing", out)

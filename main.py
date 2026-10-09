@@ -86,7 +86,7 @@ if __name__ == "__main__":
         del _self_update, _result
 
 from app.process_worker import AgentKind, build_spec
-from app.pty_worker import HAS_CONPTY
+from app.pty_worker import HAS_CONPTY, ensure_windowless_console
 from app.session_store import SessionStore
 from app.ui_theme import build_qss
 from app.widgets.main_window import MainWindow
@@ -302,6 +302,9 @@ def main() -> int:
         _fatal("AI Hive is already running.\n\nOnly one instance can run at a "
                "time (a second would overwrite the first's saved session). "
                "Use the window that's already open.")
+    # before the update splash or the main window: the first agent spawn
+    # would otherwise allocate a console that takes the keyboard from AI Hive
+    ensure_windowless_console()
     setup_application(app)
     # ---- CLI auto-update gate (opt-in, before anything else exists) --------
     # Windows cannot overwrite a running .exe, and every agent IS a claude.exe

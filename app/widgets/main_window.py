@@ -462,6 +462,7 @@ class TopBar(QFrame):
     startupRecoveryToggled = Signal(bool)  # recover cut-off agents on startup
     usageRefreshRequested = Signal()       # user clicked the readout
     eventLogClicked = Signal()             # open the event log window
+    fullscreenToggled = Signal()           # the Options switch twin of F11
     appUpdateClicked = Signal()            # check for / show an AI Hive update
 
     def __init__(self, parent=None):
@@ -669,6 +670,13 @@ class TopBar(QFrame):
         self.reply_stamps_btn = ToggleSwitch(self)
         self.reply_stamps_btn.clicked.connect(self._on_reply_stamps_clicked)
         self._refresh_reply_stamps_btn()
+        # "Fullscreen": the same toggle as F11, for whoever looks for it in
+        # the menu. MainWindow's FullscreenController reflects its state.
+        self._fullscreen = False
+        self.fullscreen_label = toggle_label("")
+        self.fullscreen_btn = ToggleSwitch(self)
+        self.fullscreen_btn.clicked.connect(self._on_fullscreen_clicked)
+        self._refresh_fullscreen_btn()
         for key, pill in self._usage_pills.items():
             pill.setVisible(False)
             pill.refreshRequested.connect(self.usageRefreshRequested)
@@ -742,6 +750,8 @@ class TopBar(QFrame):
                                           self.ship_confirm_btn)
         self.options_panel.add_separator()
         self.options_panel.add_section("Appearance")
+        self.options_panel.add_switch_row(self.fullscreen_label,
+                                          self.fullscreen_btn)
         self.options_panel.add_switch_row(self.reply_stamps_label,
                                           self.reply_stamps_btn)
         self.options_panel.add_row("Theme", self.theme_select)
@@ -965,6 +975,30 @@ class TopBar(QFrame):
             "back.\nClick to show them.")
         self.reply_stamps_btn.setToolTip(tip)
         self.reply_stamps_label.setToolTip(tip)
+
+    def _on_fullscreen_clicked(self) -> None:
+        # the panel would float over a window that is changing size under
+        # it, and entering moves this bar into the fullscreen overlay
+        self.options_panel.hide()
+        self.fullscreenToggled.emit()
+
+    def set_fullscreen(self, on: bool) -> None:
+        """Reflect the "Fullscreen" switch (no signal emitted)."""
+        self._fullscreen = bool(on)
+        self._refresh_fullscreen_btn()
+
+    def _refresh_fullscreen_btn(self) -> None:
+        self.fullscreen_btn.setChecked(self._fullscreen)
+        self.fullscreen_label.setText("⛶  Fullscreen (F11)")
+        tip = (
+            "Fullscreen: ON. Only the agent grid shows. Rest the cursor on "
+            "the top or left edge to bring the bars back.\n"
+            "Click or press F11 to leave."
+            if self._fullscreen else
+            "Fullscreen: OFF.\nClick or press F11 to show only the agent "
+            "grid.")
+        self.fullscreen_btn.setToolTip(tip)
+        self.fullscreen_label.setToolTip(tip)
 
     def _on_agent_lanes_clicked(self) -> None:
         self.set_agent_lanes(not self._agent_lanes)
@@ -2739,6 +2773,10 @@ class MainWindow(QMainWindow):
         # focused terminal; F11 carries no modifier, so no terminal claims it.
         QShortcut(QKeySequence("Ctrl+T"), self, self._on_add_terminal_clicked)
         QShortcut(QKeySequence("F11"), self, self._fullscreen.toggle)
+        # the Options switch: after the panel's click has finished, since
+        # entering reparents the bar the click came from
+        self.top_bar.fullscreenToggled.connect(
+            lambda: QTimer.singleShot(0, self._fullscreen.toggle))
         self.top_bar.eventLogClicked.connect(self.open_event_log)
         self.top_bar.appUpdateClicked.connect(self.check_for_app_update)
 

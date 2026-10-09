@@ -1,5 +1,6 @@
 """F11 fullscreen: the screen holds only the agent grid, and the chrome
-floats back over it on demand.
+floats back over it on demand. The Options panel's "Fullscreen" switch is
+the same toggle, and both enter() and exit() set that switch.
 
 Entering moves the top bar, every workspace header and the sidebar out of
 the window's layouts. The top bar and the sidebar go into two floating
@@ -109,6 +110,7 @@ class FullscreenController(QObject):
         self._top_dwell = self._left_dwell = 0
         w.showFullScreen()
         self._timer.start()
+        w.top_bar.set_fullscreen(True)
 
     def exit(self) -> None:
         if not self.active:
@@ -152,6 +154,7 @@ class FullscreenController(QObject):
             handle.setEnabled(True)
             handle.setCursor(Qt.CursorShape.SplitHCursor)
         w._sync_ws_rail()
+        w.top_bar.set_fullscreen(False)
 
     def saved_ui(self) -> tuple[bool, bool]:
         """(sidebar collapsed, window maximized) as they were before F11."""
