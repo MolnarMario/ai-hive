@@ -230,16 +230,19 @@ class PtyWorker(QObject):
     def send_line(self, text: str) -> bool:
         return self.write(text + "\r")
 
-    def resize(self, rows: int, cols: int) -> None:
+    def resize(self, rows: int, cols: int) -> bool:
+        """True when a running child took a new size, so it will redraw."""
         rows, cols = max(2, rows), max(10, cols)
         if (rows, cols) == (self.rows, self.cols):
-            return
+            return False
         self.rows, self.cols = rows, cols
         if self._proc is not None and self.state is WorkerState.RUNNING:
             try:
                 self._proc.setwinsize(rows, cols)
+                return True
             except (OSError, RuntimeError):
                 pass
+        return False
 
     def stop(self, grace_ms: int = 1200) -> None:
         """Ctrl+C first (a real interrupt now), tree kill after the grace."""

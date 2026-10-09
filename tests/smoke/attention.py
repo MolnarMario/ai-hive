@@ -1027,8 +1027,16 @@ def test_resize_redraw_not_busy():
     from app.terminal_agent import AgentStatus, RESIZE_REDRAW_S, TerminalAgent
 
     QApplication.instance() or QApplication([])
+    from app.process_worker import WorkerState
+
+    class _Child:               # a running child that takes every size
+        def setwinsize(self, rows, cols):
+            pass
+
     a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Redraw", cwd=SCRATCH_CWD))
     a.status = AgentStatus.RUNNING
+    a.worker._proc = _Child()
+    a.worker.state = WorkerState.RUNNING
     acts = []
     a.activity_changed.connect(acts.append)
 
@@ -1054,6 +1062,36 @@ def test_resize_redraw_not_busy():
     a._on_pty_output("pty", "more output\r\n")
     check("redraw: a resize leaves a running pulse alone",
           a.is_busy() and acts == [True], acts)
+    a._on_idle_timeout()
+    acts.clear()
+
+    # code review: the redraw keeps a waiting agent waiting and still arms
+    # the settle scrape, the one that re-reads menus, limits and readiness
+    a.set_turn_waiting(True)
+    a.resize(rows, cols + 20)
+    a._on_pty_output("pty", "\x1b[2J\x1b[Hframe redrawn\r\n")
+    check("redraw: a question the agent asked stays pending",
+          a.is_waiting() and not a.is_busy(), (a.is_waiting(), a.is_busy()))
+    check("redraw: ...and the settle scrape is still armed",
+          a._idle_timer.isActive())
+    a._idle_timer.stop()
+
+    # a short reply to a submitted line, landing inside the window, is work
+    a._note_submit()
+    a.resize(rows, cols)
+    a._on_pty_output("pty", "Done.\r\n")
+    check("redraw: output while a submit awaits its reply flags busy",
+          a.is_busy() and acts == [True], acts)
+    a._on_idle_timeout()
+
+    # a child that is not running draws nothing, so nothing is suppressed
+    a.worker.state = WorkerState.STARTING
+    stamp = a._last_resize_ts
+    a.resize(rows, cols + 20)
+    check("redraw: a resize no running child took stamps nothing",
+          a._last_resize_ts == stamp)
+    a.worker._proc = None
+    a.dispose()
 
 
 def test_agent_busy_activity():

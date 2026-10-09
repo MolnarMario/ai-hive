@@ -510,6 +510,7 @@ class TerminalAgent(QObject):
         self._last_work_ts = 0.0
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
         self._last_resize_ts = 0.0    # walltime the child was last resized
+        self._awaiting_reply = False  # a line went in and no settle came since
         # walltime a line last went in (typed, a task, a nudge): a lane read
         # older than it may predate work that line started (_note_submit)
         self._last_submit_ts = 0.0
@@ -811,6 +812,7 @@ class TerminalAgent(QObject):
         than either falling silent or littering the turn with stamps. For
         Claude that movement ends at the Stop hook: see note_reply_stopped."""
         self._last_submit_ts = time.time()
+        self._awaiting_reply = True
         self._turn_open = True
         self._turn_mark_uid = None    # the next settle starts this turn's mark
         self._turn_end_ts = None
@@ -824,15 +826,10 @@ class TerminalAgent(QObject):
 
     def _resize_child(self, rows: int, cols: int) -> None:
         """Resize the child and remember when, so the redraw it answers with
-        is not mistaken for work (see RESIZE_REDRAW_S). A same-size call is a
-        no-op in the worker and makes the child draw nothing, so it stamps
-        nothing."""
-        def size():
-            return (getattr(self.worker, "rows", None),
-                    getattr(self.worker, "cols", None))
-        before = size()
-        self.worker.resize(rows, cols)
-        if size() != before:
+        is not mistaken for work (see RESIZE_REDRAW_S). Only a size a running
+        child took counts: a same-size call, a child not started yet or a
+        failed setwinsize draws nothing."""
+        if self.worker.resize(rows, cols):
             self._last_resize_ts = time.time()
 
     def _next_seq(self) -> int:
@@ -1908,6 +1905,18 @@ class TerminalAgent(QObject):
             return
         now = time.time()
         self._last_output_ts = now
+        # A redraw answering a resize (RESIZE_REDRAW_S) is not work, and it
+        # answers no question either, so it lights nothing and keeps the
+        # waiting flags. It still arms the settle: `_on_idle_timeout`
+        # re-scrapes the redrawn screen for a menu, a limit banner and prompt
+        # readiness, the very things `request_repaint` asks a redraw for. Only
+        # when it would START the pulse (once busy, output keeps it alive),
+        # and never while a submitted line still awaits its reply, which a
+        # short reply landing inside the window would otherwise lose.
+        if (not self._busy and not self._awaiting_reply
+                and now - self._last_resize_ts < RESIZE_REDRAW_S):
+            self._idle_timer.start()
+            return
         # producing output => not waiting on a scrape menu, and any free-text
         # turn-question is resolved (the user engaged / the agent resumed). A
         # tool prompt (AskUserQuestion) renders its OWN output, so _tool_waiting
@@ -1921,11 +1930,7 @@ class TerminalAgent(QObject):
         # light the "working" pulse for it (and don't re-arm the idle timer, so
         # a pulse left over from real work still drops on schedule instead of
         # being held alive by the typing). Genuine work outlasts the window.
-        # A redraw answering a resize is skipped the same way, but only when it
-        # would START the pulse: once busy, output keeps the pulse alive as usual.
-        redraw = (not self._busy
-                  and now - self._last_resize_ts < RESIZE_REDRAW_S)
-        if now - self._last_input_ts >= INPUT_ECHO_S and not redraw:
+        if now - self._last_input_ts >= INPUT_ECHO_S:
             self._last_work_ts = now
             if not self._busy:
                 self._busy = True
@@ -1936,6 +1941,7 @@ class TerminalAgent(QObject):
     def _on_idle_timeout(self) -> None:
         if self._busy:
             self._busy = False
+            self._awaiting_reply = False
             # A settle is only 2 s of quiet, which is not the same thing as a
             # reply ending: a --resume launch reprints the WHOLE past
             # conversation as real terminal output, pausing on the way, and
