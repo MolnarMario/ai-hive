@@ -8,6 +8,21 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.37.0
+
+- F11 goes fullscreen with only the agent grid on screen. Rest the
+  pointer on the top edge for a moment to float the top bar and the
+  workspace header over the grid, or on the left edge for the sidebar.
+  Terminals never resize when they appear. F11 again puts the window
+  back as it was.
+- Ctrl+N opens a new terminal, also while a terminal has focus.
+- Reply time stamps no longer vanish when a card is resized, retiled or
+  rebuilt. They now work for Codex and Gemini agents, and a reopened
+  Codex conversation gets its stamps back. Options > Reply times hides
+  them.
+- The card's maximize button draws corner arrows, pointing out to
+  maximize and in to restore, in the theme's header colors.
+
 ## 0.36.1
 
 - Restart now gives the new agent a blank screen. The new Claude used to
