@@ -8,6 +8,17 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.37.2
+
+- The icons in a card's hover tray are now one size, the maximize
+  button included, and the "⋯" that opens the tray is bigger.
+- Make integrator is no longer offered while the workspace already has
+  an integrator. Stop the current one first to hand the role on.
+- The lane chip on a card shows a drawn branch icon instead of the small
+  "⎇" glyph. The integrator's chip shows two lanes merging into one.
+- The folder and trash beside the workspace path are line icons that
+  match Lanes, Layout, Map and Activity, and the path is easier to read.
+
 ## 0.37.1
 
 - The new terminal shortcut is now Ctrl+T instead of Ctrl+N, so Ctrl+N
