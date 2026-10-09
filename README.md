@@ -616,8 +616,8 @@ error dialog instead of silently closing. Packaging to a distributable
   its count badge. The active workspace has the wide strip, hover shows the
   name, and a click opens that workspace without reopening the sidebar.
 - **Fullscreen.** `F11` hides everything but the agent grid. Rest the
-  cursor on the top edge for 1.5 s and the top bar and workspace header float
-  over the agents; rest it on the left edge and the sidebar floats in at its
+  cursor on the top edge for 0.75 s and the top bar (minus the logo, version
+  and update button) and workspace header float over the agents; rest it on the left edge and the sidebar floats in at its
   usual width, or as the thin rail if it was collapsed. Neither resizes a
   terminal. `F11` again brings the window back as it was.
 - **Agents** — `+ Terminal` (or `Ctrl+T` / `Ctrl+Shift+T`), or click any empty grid slot.

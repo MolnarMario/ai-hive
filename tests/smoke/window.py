@@ -3119,6 +3119,16 @@ def test_fullscreen_f11():
               and page_a.header.parent() is fs.top
               and page_a.header.isVisible(),
               (fs.top.isVisible(), page_a.header.parent()))
+        bar = win.top_bar
+        identity = (bar.toggle_btn, bar._logo, bar._name, bar._version,
+                    bar.app_update_btn)
+        check("fullscreen: the floating top bar leaves out the menu, logo, "
+              "name, version and update button",
+              not any(x.isVisible() for x in identity)
+              and bar.add_terminal_btn.isVisible(),
+              [x.isVisible() for x in identity])
+        check("fullscreen: the top edge reveals in 750 ms",
+              fullscreen.REVEAL_MS == 750, fullscreen.REVEAL_MS)
         check("fullscreen: the overlay covers the grid, never resizes it",
               win.stack.geometry() == grid
               and fs.top.geometry().top() == 0
@@ -3171,6 +3181,9 @@ def test_fullscreen_f11():
               and page_b.header.parent() is page_b
               and page_b.layout().indexOf(page_b.header) == 0
               and page_b.header.isVisible() and not page_a.header.isHidden())
+        check("fullscreen: leaving it shows the top bar's identity block again",
+              all(x.isVisible() for x in identity),
+              [x.isVisible() for x in identity])
         check("fullscreen: the sidebar is back at its width",
               win.body_split.count() == 2
               and win.body_split.widget(0) is win.sidebar

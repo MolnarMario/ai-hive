@@ -839,6 +839,13 @@ class TopBar(QFrame):
     def _open_options(self) -> None:
         self.options_panel.toggle_under(self.options_btn)
 
+    def set_identity_visible(self, visible: bool) -> None:
+        """Show or hide the left block: ☰, logo, name, version and the
+        update button. F11 hides it while the bar floats in fullscreen."""
+        for w in (self.toggle_btn, self._logo, self._name, self._version,
+                  self.app_update_btn):
+            w.setVisible(visible)
+
     APP_UPDATE_BTN_SIDE = 34
     APP_UPDATE_IDLE_TIP = "Check GitHub for a newer AI Hive"
 
