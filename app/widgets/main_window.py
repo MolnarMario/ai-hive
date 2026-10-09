@@ -63,6 +63,7 @@ from .sidebar import SIDEBAR_WIDTH, Sidebar, WorkspaceRail
 
 SIDEBAR_MIN, SIDEBAR_MAX = 170, 700  # drag bounds (ultrawide-friendly)
 from .terminal_card import TerminalCard, _snippet
+from .terminal_view import TerminalView
 from .workspace_page import WorkspacePage
 
 SAVE_DEBOUNCE_MS = 800
@@ -445,6 +446,7 @@ class TopBar(QFrame):
     terminalScrollbackToggled = Signal(bool)
     taskbarBadgeToggled = Signal(bool)     # show/hide the taskbar count overlay
     usageLeftToggled = Signal(bool)        # usage pills say "% left", not "% used"
+    replyStampsToggled = Signal(bool)      # date/time under each finished reply
     # install newer Claude Code / agy CLIs at the NEXT startup, before any
     # agent launches (the only moment those binaries are not locked)
     autoUpdateToggled = Signal(bool)
@@ -659,6 +661,13 @@ class TopBar(QFrame):
         self.usage_left_btn = ToggleSwitch(self)
         self.usage_left_btn.clicked.connect(self._on_usage_left_clicked)
         self._refresh_usage_left_btn()
+        # "Reply times": the date and time each finished reply is stamped with,
+        # drawn inside every terminal. Default ON, the way it has always been.
+        self._reply_stamps = True
+        self.reply_stamps_label = toggle_label("")
+        self.reply_stamps_btn = ToggleSwitch(self)
+        self.reply_stamps_btn.clicked.connect(self._on_reply_stamps_clicked)
+        self._refresh_reply_stamps_btn()
         for key, pill in self._usage_pills.items():
             pill.setVisible(False)
             pill.refreshRequested.connect(self.usageRefreshRequested)
@@ -732,6 +741,8 @@ class TopBar(QFrame):
                                           self.ship_confirm_btn)
         self.options_panel.add_separator()
         self.options_panel.add_section("Appearance")
+        self.options_panel.add_switch_row(self.reply_stamps_label,
+                                          self.reply_stamps_btn)
         self.options_panel.add_row("Theme", self.theme_select)
         self.options_panel.add_row("Font size", self.font_dec_btn,
                                    self.font_inc_btn)
@@ -930,6 +941,29 @@ class TopBar(QFrame):
             "Click to show what is left instead.")
         self.usage_left_btn.setToolTip(tip)
         self.usage_left_label.setToolTip(tip)
+
+    def _on_reply_stamps_clicked(self) -> None:
+        self.set_reply_stamps(not self._reply_stamps)
+        self.replyStampsToggled.emit(self._reply_stamps)
+
+    def set_reply_stamps(self, on: bool) -> None:
+        """Reflect the "Reply times" switch (no signal emitted)."""
+        self._reply_stamps = bool(on)
+        self._refresh_reply_stamps_btn()
+
+    def _refresh_reply_stamps_btn(self) -> None:
+        self.reply_stamps_btn.setChecked(self._reply_stamps)
+        self.reply_stamps_label.setText("🕒  Reply times")
+        tip = (
+            "Reply times: ON. Each finished reply in a Claude, Codex or "
+            "Gemini terminal carries the date and time it ended, on the row "
+            "under the reply.\nClick to hide them."
+            if self._reply_stamps else
+            "Reply times: OFF. Terminals show no date or time under finished "
+            "replies. They are still tracked, so turning this on brings them "
+            "back.\nClick to show them.")
+        self.reply_stamps_btn.setToolTip(tip)
+        self.reply_stamps_label.setToolTip(tip)
 
     def _on_agent_lanes_clicked(self) -> None:
         self.set_agent_lanes(not self._agent_lanes)
@@ -2264,6 +2298,9 @@ class MainWindow(QMainWindow):
         # "Show usage left". Default OFF, assigned above _restore_ui_state
         # for the same reason as the taskbar badge.
         self._usage_left = False      # user preference (persisted)
+        # "Reply times". Default ON, assigned above _restore_ui_state like the
+        # other preferences or the restored value is clobbered.
+        self._reply_stamps = True     # user preference (persisted)
         # startup CLI auto-update. Default OFF (it changes installed software),
         # and like every other preference here the default MUST be assigned
         # above _restore_ui_state or the restored value is clobbered.
@@ -2654,6 +2691,7 @@ class MainWindow(QMainWindow):
             self._on_terminal_scrollback)
         self.top_bar.taskbarBadgeToggled.connect(self._on_taskbar_badge_toggled)
         self.top_bar.usageLeftToggled.connect(self._on_usage_left_toggled)
+        self.top_bar.replyStampsToggled.connect(self._on_reply_stamps_toggled)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.agentLanesToggled.connect(self._on_agent_lanes_toggled)
         self.top_bar.shipConfirmToggled.connect(self._on_ship_confirm_toggled)
@@ -3959,6 +3997,15 @@ class MainWindow(QMainWindow):
         its pills; this only persists the choice, as an additive optional
         key under "ui" like `taskbar_badge` (no SESSION_VERSION bump)."""
         self._usage_left = bool(enabled)
+        self._schedule_save()
+
+    def _on_reply_stamps_toggled(self, enabled: bool) -> None:
+        """User flipped "Reply times". Every terminal repaints at once; the
+        marks themselves are kept either way, so switching back on shows the
+        full history again. An additive optional key under "ui" (no
+        SESSION_VERSION bump), saved on the debounced timer."""
+        self._reply_stamps = bool(enabled)
+        TerminalView.set_reply_stamps_enabled(self._reply_stamps)
         self._schedule_save()
 
     def _on_auto_update_toggled(self, enabled: bool) -> None:
@@ -5289,6 +5336,10 @@ class MainWindow(QMainWindow):
         # usage pills say "% left" instead of "% used" (default OFF)
         self._usage_left = bool(ui.get("usage_left", False))
         self.top_bar.set_usage_left(self._usage_left)
+        # date/time stamp under each finished reply (default ON)
+        self._reply_stamps = bool(ui.get("reply_stamps", True))
+        self.top_bar.set_reply_stamps(self._reply_stamps)
+        TerminalView.set_reply_stamps_enabled(self._reply_stamps)
         # startup CLI auto-update (default OFF: it installs software, so it is
         # armed deliberately, once, exactly like the recovery switches were)
         self._auto_update = bool(ui.get("auto_update", False))
@@ -6152,6 +6203,7 @@ class MainWindow(QMainWindow):
             "usage_visible": any(self._usage_trackers.values()),
             "taskbar_badge": self._taskbar_badge,
             "usage_left": self._usage_left,
+            "reply_stamps": self._reply_stamps,
             "auto_update": self._auto_update,
             "agent_lanes": self._agent_lanes,
             "ship_skip_confirm": self._ship_skip_confirm,

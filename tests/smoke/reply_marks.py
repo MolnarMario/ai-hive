@@ -785,3 +785,267 @@ def test_reply_stamp_time_comes_from_stop_hook():
     a.dispose()
     b.dispose()
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_reply_stamps_survive_a_reprojection():
+    """A width change, a retile or a rebuilt card must not erase reply stamps.
+
+    Live-reported: reply times did not show in any terminal. Cause: both
+    projection paths (_reproject_on_size on a width change, _rerender_restored
+    when a card is built) blank the screen through note_history_cleared, and
+    that signal is also what a REAL wipe (a /clear, an ED 3) uses to drop the
+    agent's marks. So every resize, sidebar toggle, retile and workspace
+    switch deleted every live prompt and reply mark, and the replay that
+    followed had nothing to re-anchor. A real wipe must still clear them."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.widgets.terminal_card import TerminalCard
+
+    QApplication.instance() or QApplication([])
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Reproject",
+                                     cwd=SCRATCH_CWD, pty=True))
+    agent.status = AgentStatus.RUNNING
+    card = TerminalCard(agent)
+    card.resize(900, 500)
+    card._proj_cols = card.terminal.screen.columns
+    body = "".join(f"line {i}\r\n" for i in range(60))
+    agent._note_submit()
+    agent._on_pty_output("pty", "> hello\r\n\r\n● " + body
+                         + "\r\n✳ Crunched for 58s\r\n\r\n" + "─" * 40
+                         + "\r\n> ")
+    mark = agent.note_reply_settled()
+    check("reproject: the fixture minted a stamp",
+          mark is not None and len(card.terminal.reply_marks()) == 1,
+          card.terminal.reply_marks())
+
+    card._reproject_on_size(30, card.terminal.screen.columns - 20)
+    check("reproject: a width change keeps the agent's reply mark",
+          agent.reply_marks() == [mark], agent.reply_marks())
+    check("reproject: ...and the view carries the stamp again",
+          len(card.terminal.reply_marks()) == 1, card.terminal.reply_marks())
+
+    card2 = TerminalCard(agent)
+    card2.resize(900, 500)
+    card2._rerender_restored()
+    check("reproject: a rebuilt card's settled projection keeps the mark",
+          agent.reply_marks() == [mark]
+          and len(card2.terminal.reply_marks()) == 1,
+          (agent.reply_marks(), card2.terminal.reply_marks()))
+    card2.deleteLater()
+
+    # a REAL wipe still drops everything
+    card.terminal.feed("\x1b[3J")
+    check("reproject: a real ED 3 wipe still clears the marks",
+          agent.reply_marks() == [] and card.terminal.reply_marks() == [],
+          (agent.reply_marks(), card.terminal.reply_marks()))
+    card.deleteLater()
+    agent.dispose()
+
+
+def test_reply_anchor_for_codex_and_gemini_screens():
+    """The stamp anchor works on the screens Codex and Gemini draw, not just
+    Claude's.
+
+    Codex pins its composer to the bottom of the window, so until the
+    conversation fills the screen a reply sits 20+ rows ABOVE the box with
+    blank rows between. The anchor scan used a fixed row bound that ended in
+    that gap, so Codex never got a stamp. Its footer also reads
+    "Worked for 1s • 3:42 PM", and Claude's now carries "· done 3:18 PM". A
+    verb with an accent ("Sautéed") has to count as a footer too."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import TerminalView, is_reply_footer
+
+    QApplication.instance() or QApplication([])
+
+    # Codex: reply at the top, blank gap, composer on row 46
+    v = TerminalView(rows=50, cols=82)
+    v.feed("\r\n  >_ OpenAI Codex (v0.162.0)\r\n\r\n"
+           "› Reply with exactly the word PINEAPPLE\r\n\r\n"
+           "• PINEAPPLE\r\n\r\n  Worked for 1s • 3:42 PM\r\n")
+    v.feed("\x1b[47;1H› Ask Codex to do anything"
+           "\x1b[49;3H← for agents · ? for shortcuts\x1b[47;3H")
+    row = v.screen.cursor.y
+    check("codex anchor: the composer is far below the reply",
+          row == 46 and v._input_block_span() == (46, 46),
+          (row, v._input_block_span()))
+    footer_row = next(r for r in range(50) if "Worked for" in "".join(
+        c.data for c in v.screen.buffer[r].values()))
+    check("codex anchor: the stamp row is the blank row under the footer",
+          v.reply_anchor_line() == v.history_pushed() + footer_row + 1,
+          (v.reply_anchor_line(), footer_row))
+
+    # nothing but chrome above the box still anchors nothing
+    bare = TerminalView(rows=50, cols=82)
+    bare.feed("\x1b[20;1H" + "─" * 40 + "\x1b[21;1H> ")
+    check("codex anchor: a rule above the box with no reply is not a reply",
+          bare.reply_anchor_line() is None, bare.reply_anchor_line())
+
+    # Gemini: no footer, the reply text is directly above the blank row
+    g = TerminalView(rows=30, cols=82)
+    g.feed("> hi\r\n\r\n  PINEAPPLE\r\n\r\n" + "─" * 40 + "\r\n> \r\n"
+           + "─" * 40 + "\r\n? for shortcuts")
+    g.feed("\x1b[6;3H")
+    check("gemini anchor: the blank row under the reply",
+          g.reply_anchor_line() == g.history_pushed() + 3,
+          g.reply_anchor_line())
+
+    for text in ("  Sautéed for 9m 25s · done 3:18 PM",
+                 "✻ Worked for 2s • 3:40 PM",
+                 "✻ Cooked for 8m 2s · 1 shell still running"):
+        check(f"footer regex: {text.strip()[:24]!r} is a turn footer",
+              is_reply_footer(text), text)
+    for text in ("? for shortcuts", "← for agents", "3 files for review"):
+        check(f"footer regex: {text!r} is not a turn footer",
+              not is_reply_footer(text), text)
+
+
+def test_codex_reply_times_from_rollout():
+    """A reopened Codex conversation gets its stamps from the rollout file:
+    each turn ends with an event_msg/task_complete record that carries the
+    last message and when the turn completed."""
+    import json
+
+    from app import transcripts
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-codexreply-"))
+    old = os.environ.get("CODEX_HOME")
+    os.environ["CODEX_HOME"] = str(tmp)
+    try:
+        sid = "01a120b0-9ada-7e03-8763-9026d54c0c0a"
+        day = tmp / "sessions" / "2026" / "10" / "09"
+        day.mkdir(parents=True)
+        rollout = day / f"rollout-2026-10-09T15-43-27-{sid}.jsonl"
+        recs = [
+            {"timestamp": "2026-10-09T12:43:27.000Z", "type": "session_meta",
+             "payload": {"id": sid, "cwd": SCRATCH_CWD}},
+            {"timestamp": "2026-10-09T12:43:37.222Z", "type": "event_msg",
+             "payload": {"type": "task_complete", "turn_id": "a",
+                         "last_agent_message": "PINEAPPLE",
+                         "completed_at": 1791549817}},
+            # no completed_at: the record's own timestamp is used
+            {"timestamp": "2026-10-09T12:50:00.000Z", "type": "event_msg",
+             "payload": {"type": "task_complete", "turn_id": "b",
+                         "last_agent_message": "Second reply."}},
+            # an interrupted turn has no message and nothing to anchor to
+            {"timestamp": "2026-10-09T12:55:00.000Z", "type": "event_msg",
+             "payload": {"type": "task_complete", "turn_id": "c",
+                         "last_agent_message": None}},
+            {"timestamp": "2026-10-09T12:56:00.000Z", "type": "event_msg",
+             "payload": {"type": "token_count"}},
+        ]
+        rollout.write_text("\n".join(json.dumps(r) for r in recs) + "\n",
+                           encoding="utf-8")
+        got = transcripts.codex_reply_times(sid)
+        check("codex replies: one entry per turn that ended on a message",
+              [t for _w, t in got] == ["PINEAPPLE", "Second reply."], got)
+        check("codex replies: completed_at wins, else the record timestamp",
+              got[0][0] == 1791549817.0 and got[1][0] > 1791549817.0, got)
+        check("codex replies: an unknown conversation reads as empty",
+              transcripts.codex_reply_times("nope") == []
+              and transcripts.codex_reply_times("") == [])
+    finally:
+        if old is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = old
+        transcripts._CODEX_PATHS.clear()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_reply_times_option_toggle():
+    """The "Reply times" switch in the Options panel hides or shows every
+    stamp, defaults ON, persists under ui, and never discards a mark: the
+    stamps return when it goes back on."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.widgets.main_window import TopBar
+    from app.widgets.terminal_card import TerminalCard
+    from app.widgets.terminal_view import TerminalView
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-stamptoggle-"))
+    try:
+        bar = TopBar()
+        check("reply toggle: defaults to ON",
+              bar._reply_stamps and bar.reply_stamps_btn.isChecked())
+        emitted = []
+        bar.replyStampsToggled.connect(emitted.append)
+        bar.reply_stamps_btn.click()
+        check("reply toggle: a click turns it off and emits False",
+              emitted == [False] and not bar._reply_stamps, emitted)
+        bar.set_reply_stamps(True)
+        check("reply toggle: set_reply_stamps does not re-emit",
+              bar._reply_stamps and emitted == [False])
+        check("reply toggle: the switch has a row in the Options panel",
+              bar.options_panel.isAncestorOf(bar.reply_stamps_btn))
+        bar.deleteLater()
+
+        win = create_main_window(SessionStore(path=tmp / "session.json"))
+        check("reply toggle: a fresh window has the stamps on",
+              win._reply_stamps and TerminalView.reply_stamps_enabled())
+
+        # a card with one stamp: pixels differ between ON and OFF
+        agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Stamp",
+                                         cwd=SCRATCH_CWD, pty=True))
+        agent.status = AgentStatus.RUNNING
+        card = TerminalCard(agent)
+        card.resize(700, 400)
+        agent._note_submit()
+        agent._on_pty_output("pty", "> hi\r\n\r\n● Done.\r\n\r\n"
+                             "✳ Crunched for 5s\r\n\r\n" + "─" * 40 + "\r\n> ")
+        agent.note_reply_settled()
+        card.boot.hide()    # the starting veil would cover the screen
+        t = card.terminal   # the card is never shown, so size it to its grid
+        t.resize(int(t._cell_w * t.screen.columns) + 40,
+                 int(t._cell_h * t.screen.lines) + 20)
+        on_img = card.terminal.grab().toImage()
+        win._save_timer.stop()
+        win._on_reply_stamps_toggled(False)
+        off_img = card.terminal.grab().toImage()
+        check("reply toggle: OFF paints the terminal without the stamp",
+              on_img != off_img and not TerminalView.reply_stamps_enabled())
+        check("reply toggle: ...but the marks are still there",
+              len(card.terminal.reply_marks()) == 1
+              and len(agent.reply_marks()) == 1)
+        check("reply toggle: flipping it marks the session for saving",
+              win._save_timer.isActive())
+        payload = win._session_payload()
+        check("reply toggle: the preference is persisted under ui",
+              payload["ui"]["reply_stamps"] is False, payload["ui"])
+        win._on_reply_stamps_toggled(True)
+        check("reply toggle: ON paints the stamp back, same pixels as before",
+              card.terminal.grab().toImage() == on_img)
+
+        win._restore_ui_state({"ui": {"reply_stamps": False}})
+        check("reply toggle: restored onto the window, bar and terminals",
+              not win._reply_stamps and not win.top_bar._reply_stamps
+              and not TerminalView.reply_stamps_enabled())
+        win._restore_ui_state({"ui": {}})
+        check("reply toggle: a session that predates it defaults ON",
+              win._reply_stamps and TerminalView.reply_stamps_enabled())
+
+        win._reply_stamps = False
+        win.top_bar.set_reply_stamps(False)
+        win._save_session()
+        win.close()
+        app.processEvents()
+        again = create_main_window(SessionStore(path=tmp / "session.json"))
+        check("reply toggle: OFF survives a close and reopen",
+              not again._reply_stamps and not again.top_bar._reply_stamps
+              and not TerminalView.reply_stamps_enabled())
+        again._save_timer.stop()
+        again.close()
+        app.processEvents()
+        card.deleteLater()
+        agent.dispose()
+    finally:
+        TerminalView.set_reply_stamps_enabled(True)   # the flag is global
+        shutil.rmtree(tmp, ignore_errors=True)

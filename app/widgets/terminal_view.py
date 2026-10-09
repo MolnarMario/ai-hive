@@ -166,11 +166,12 @@ _REPLY_ANCHOR_SCAN = 6
 # turn took -- "✻ Worked for 16m 36s", "✻ Cooked for 8m 2s · 1 shell still
 # running". The reply stamp is drawn on the blank row BELOW this rather than
 # beside the reply text above it (see reply_anchor_line). The leading-glyph
-# slot must be followed by a WORD and then " for <duration>", which is what
-# keeps the input box's own footer hints ("? for shortcuts", "← for agents")
-# out: neither has a second "for" after its first word.
+# slot must be followed by a WORD (any letters, "Sautéed" is one) and then
+# " for <duration>", which is what keeps the input box's own footer hints
+# ("? for shortcuts", "← for agents") out: neither has a second "for" after
+# its first word.
 _REPLY_FOOTER_RE = re.compile(
-    r"^\s*[^\w\s]?\s*[A-Za-z][A-Za-z'\-]*\s+for\s+"
+    r"^\s*[^\w\s]?\s*[^\W\d_](?:[^\W\d_]|['\-])*\s+for\s+"
     r"(?:\d+h\s*)?(?:\d+m\s*)?\d+(?:\.\d+)?s\b", re.I)
 
 
@@ -760,37 +761,49 @@ class TerminalView(QWidget):
         (_replay_with_marks), exactly like anchor_line() -- one function over
         identical screen state on both sides is what keeps them agreeing.
 
-        Found by scanning up from the input box Claude redraws at settle
+        Found by scanning up from the input box the child redraws at settle
         (`_input_block_span`'s top row), skipping the chrome between the two --
-        blank separators AND the box's own top border, which is what sits
-        directly above the prompt row -- to the nearest real content row -- bounded by _REPLY_ANCHOR_SCAN so a
-        missing footer (an unusual screen shape, or the settle firing before
-        the redraw) can never walk into unrelated older history and mislabel
-        it. None when there is no live input box to scan from at all (e.g. the
-        agent settled parked on a menu) or nothing is found within the bound;
-        the mark is then simply skipped, exactly like an un-anchored
+        blank rows (any number: Codex leaves a gap above its bottom-pinned
+        composer) AND rules and hint rows, such as the box's own top border,
+        which sits directly above the prompt row -- to the nearest real
+        content row. At most _REPLY_ANCHOR_SCAN rule/hint rows are skipped, so
+        a screen that is nothing but chrome can never walk into unrelated older
+        history and mislabel it. None when there is no live input box to scan
+        from at all (e.g. the agent settled parked on a menu) or no content is
+        found; the mark is then simply skipped, exactly like an un-anchored
         PromptMark."""
         span = self._input_block_span()
         if span is None:
             return None
-        bound = span[0] - _REPLY_ANCHOR_SCAN
+        chrome = 0
         r = span[0] - 1
-        while r >= 0 and r > bound:
+        while r >= 0:
             first, _ = self._row_content(r)
-            # Blanks, rules and the box's hint line are all chrome between
-            # the box and the reply. The box's own top BORDER sits directly
-            # above the prompt row, so a scan that stopped at the first rule
-            # stopped before it had looked at anything -- that bail-out is why
-            # the live stamp silently never appeared on the real screen shape,
-            # while a fixture without that border passed.
-            if (first >= 0 and not self._row_is_rule(r)
-                    and not self._row_is_input_footer(r)):
-                below = r + 1
-                if (below < self.screen.lines
-                        and self._row_content(below) == (-1, -1)):
-                    return self.history_pushed() + below  # UNDER the footer
-                return self.history_pushed() + r    # nothing below to use
-            r -= 1
+            if first < 0:
+                # A blank row costs nothing. Codex pins its composer to the
+                # bottom of the window and leaves the whole gap above it
+                # blank until the conversation fills the screen, so a reply
+                # sits 20+ rows above the box. The old fixed row bound ended
+                # that scan in the gap and Codex never got a stamp.
+                r -= 1
+                continue
+            # Rules and the box's hint line are chrome between the box and the
+            # reply. The box's own top BORDER sits directly above the prompt
+            # row, so a scan that stopped at the first rule stopped before it
+            # had looked at anything -- that bail-out is why the live stamp
+            # silently never appeared on the real screen shape, while a
+            # fixture without that border passed.
+            if self._row_is_rule(r) or self._row_is_input_footer(r):
+                chrome += 1
+                if chrome > _REPLY_ANCHOR_SCAN:
+                    return None     # a stack of chrome, not a settled reply
+                r -= 1
+                continue
+            below = r + 1
+            if (below < self.screen.lines
+                    and self._row_content(below) == (-1, -1)):
+                return self.history_pushed() + below  # UNDER the footer
+            return self.history_pushed() + r    # nothing below to use
         return None
 
     def scroll_to_abs(self, abs_line: int, lead: int = 2) -> None:
@@ -833,6 +846,26 @@ class TerminalView(QWidget):
 
     def reply_marks(self) -> list[tuple[int, str]]:
         return list(self._reply_marks)
+
+    # The "Reply times" switch in Options. One flag for every terminal, read
+    # at paint time: the marks are always collected, so flipping it back on
+    # shows the whole history again instead of only the replies finished
+    # since.
+    _reply_stamps_enabled = True
+
+    @classmethod
+    def set_reply_stamps_enabled(cls, on: bool) -> None:
+        on = bool(on)
+        if on == cls._reply_stamps_enabled:
+            return
+        cls._reply_stamps_enabled = on
+        for w in QApplication.allWidgets():
+            if isinstance(w, TerminalView):
+                w.update()
+
+    @classmethod
+    def reply_stamps_enabled(cls) -> bool:
+        return cls._reply_stamps_enabled
 
     def clear_history(self) -> None:
         """Drop the scrollback but leave the LIVE screen alone.
@@ -2478,7 +2511,7 @@ class TerminalView(QWidget):
         # close to the edge, so a long footer or a narrow terminal never
         # collides with it (better to miss a stamp than draw over real
         # output).
-        if self._reply_marks:
+        if self._reply_marks and TerminalView._reply_stamps_enabled:
             stamp_map = {ln: txt for ln, txt in self._reply_marks}
             pushed = self.history_pushed()
             stamp_font = QFont(self._font)
