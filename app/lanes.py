@@ -63,6 +63,9 @@ app/lane_service.py polls it off the LaneOps queue. The same read finds the
 lane's newest commit whose message has a line saying just "Task done"
 (`DONE_GREP`): the agent's flag that its slice of work is finished. The
 lane chip shows it, and the integrator ships it when the user asks.
+The integrator merges that commit, not the head, so a flagged lane's chip
+takes its conflicts from the flagged commit (`_ship_overlaps`), while the
+agent's own notices keep following its head, where it works.
 A lane with nothing the base lacks also reports its agent's newest own
 commit (from the branch's reflog) once the base has it (`_landed_commit`):
 the integrator chip's Close merged agents closes those agents.
@@ -75,7 +78,7 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 LANES_SUFFIX = ".lanes"
 BRANCH_PREFIX = "hive/"
@@ -1072,6 +1075,8 @@ class LaneSnap:
     # the newest of the lane's own commits flagged "Task done" (DONE_GREP)
     # that the base doesn't have yet, by ancestry or as a patch-equal commit
     done: str = ""
+    # with `done`: the paths that commit changed since its fork from the base
+    done_paths: list = field(default_factory=list)
     # with nothing ahead of the base: the newest commit made in the lane,
     # once the base has it (_landed_commit). Its agent's work is merged.
     landed: str = ""
@@ -1150,7 +1155,9 @@ class LaneView:
         another lane also changed keeps it green with a yellow border
         ("done-overlap"): the work is still ready, and a shared file that
         merges clean is something to know, not a blocker. A real conflict
-        outranks done."""
+        outranks done. On a done lane the overlaps' conflict levels come
+        from the flagged commit, the one the integrator merges
+        (RepoSnapshot.ship_overlaps)."""
         if any(o.level == CONFLICTS for o in self.overlaps):
             return "conflict"
         if self.overlaps:
@@ -1173,6 +1180,10 @@ class RepoSnapshot:
     repo: str
     lanes: list = field(default_factory=list)       # [LaneSnap]
     overlaps: dict = field(default_factory=dict)    # uid -> [Overlap]
+    # uid -> [Overlap] for done lanes: `overlaps` with the conflict levels
+    # of the flagged commit, the one that ships (_ship_overlaps). Views use
+    # it; notices and lanes.json keep the head's, where the agent works.
+    ship_overlaps: dict = field(default_factory=dict)
     merge_tree: bool = False
     ts: float = 0.0
 
@@ -1183,11 +1194,13 @@ class RepoSnapshot:
         s = self.lane(uid)
         if s is None:
             return None
+        ovs = (self.ship_overlaps[uid] if uid in self.ship_overlaps
+               else self.overlaps.get(uid, []))
         return LaneView(uid=s.uid, branch=s.branch, root=s.root, base=s.base,
                         base_ref=s.base_ref, exists=s.exists, ahead=s.ahead,
                         behind=s.behind, dirty=list(s.dirty),
                         committed=list(s.committed),
-                        overlaps=list(self.overlaps.get(uid, [])),
+                        overlaps=list(ovs),
                         error=s.error, head=s.head, done=s.done,
                         landed=s.landed, read_at=s.read_at)
 
@@ -1249,6 +1262,9 @@ def lane_snap(entry: dict, cache: dict | None = None) -> LaneSnap:
             if snap.ahead and snap.role != INTEGRATOR_ROLE:
                 snap.done = _done_commit(root, snap.head, snap.base_ref,
                                          cache)
+                if snap.done:
+                    snap.done_paths = _done_paths(root, snap.done,
+                                                  snap.base_ref, cache)
             elif snap.role != INTEGRATOR_ROLE:
                 snap.landed = _landed_commit(root, snap.branch, snap.base,
                                              snap.base_ref, cache)
@@ -1295,6 +1311,23 @@ def _done_commit(root: str, head: str, base_ref: str, cache) -> str:
     if cache is not None:
         cache[key] = done
     return done
+
+
+def _done_paths(root: str, done: str, base_ref: str, cache) -> list:
+    """Paths the flagged commit changed since its fork from the base, what
+    shipping it brings in. Cached by (commit, base sha) like `_fork`."""
+    r = git(["rev-parse", base_ref], root)
+    if not r.ok:
+        return []
+    key = ("done_paths", done, r.out)
+    if cache is not None and key in cache:
+        return cache[key]
+    d = git(["--no-optional-locks", "diff", "--name-only", "-z",
+             f"{r.out}...{done}"], root)
+    paths = _z_list(d.out) if d.ok else []
+    if cache is not None:
+        cache[key] = paths
+    return paths
 
 
 def _landed_commit(root: str, branch: str, base: str, base_ref: str,
@@ -1365,7 +1398,9 @@ def snapshot_repo(repo: str, entries: list, cache: dict | None = None,
     Two lanes overlap on a file both changed (committed or not). When both
     committed changes to it, a real merge of the two heads decides whether it
     CONFLICTS. A lane overlaps its base on a file it changed that the base
-    also changed since the fork. `cache` maps a head pair to its merge result
+    also changed since the fork. A done lane also gets `ship_overlaps`, the
+    same overlaps judged by its flagged commit. `cache` maps a head pair to
+    its merge result
     (commits are immutable, so a result never goes stale); the poller keeps
     one per repo. The base is compared by its ref name, which moves, so that
     pair is cached under the base's resolved sha. `lock` (LaneOps.lock_for)
@@ -1431,7 +1466,71 @@ def snapshot_repo(repo: str, entries: list, cache: dict | None = None,
                                CONFLICTS if path in conflicts else "committed",
                                s.fork))
     snap.overlaps = ovs
+    if snap.merge_tree:
+        snap.ship_overlaps = _ship_overlaps(repo, live, files, ovs, cache)
     return snap
+
+
+def _ship_overlaps(repo: str, live: list, files: dict, ovs: dict,
+                   cache) -> dict:
+    """uid -> [Overlap] for every done lane, with conflict levels from its
+    flagged commit instead of its head. The integrator merges that commit
+    (docs/agents/integration.md), so work after the flag must not turn the
+    chip red, and a flagged commit that conflicts must, even after the lane
+    merged the fix in later. A peer counts with what it would ship: its own
+    flagged commit, or its head. File-level overlaps stay the head's: work
+    after the flag is still worth knowing about. Where git can't say (a
+    merge-tree error), the head's level stands."""
+    out: dict = {}
+    base_shas: dict = {}
+    by_uid = {s.uid: s for s in live}
+    for a in live:
+        if not a.done:
+            continue
+        mine = set(a.done_paths)
+        hot: dict = {}              # peer uid ("" = base) -> paths or None
+        for b in live:
+            if b is a:
+                continue
+            ship, paths = ((b.done, b.done_paths) if b.done
+                           else (b.head, b.committed))
+            if mine & set(paths) and ship != a.done:
+                found = _cached_conflicts(cache, repo, a.done, ship)
+                hot[b.uid] = None if found is None else set(found)
+        if mine and a.base_ref:
+            if a.base_ref not in base_shas:
+                r = git(["rev-parse", a.base_ref], repo)
+                base_shas[a.base_ref] = r.out if r.ok else ""
+            if base_shas[a.base_ref]:
+                found = _cached_conflicts(cache, repo, a.done,
+                                          base_shas[a.base_ref])
+                hot[""] = None if found is None else set(found)
+        result, seen = [], set()
+        for o in ovs.get(a.uid, []):
+            seen.add((o.peer_uid, o.path))
+            paths = hot.get(o.peer_uid, set())
+            if paths is None:
+                result.append(o)                    # unknown: the head's
+            elif o.path in paths:
+                result.append(replace(o, state=CONFLICTS))
+            elif o.level == CONFLICTS:              # only the head clashes
+                peer = files.get(o.peer_uid, {}).get(o.path, "committed")
+                result.append(replace(o, state=peer))
+            else:
+                result.append(o)
+        for peer_uid, paths in hot.items():
+            for path in sorted(paths or ()):
+                if (peer_uid, path) in seen:
+                    continue
+                if peer_uid:
+                    b = by_uid[peer_uid]
+                    result.append(Overlap(path, b.uid, b.agent, b.branch,
+                                          CONFLICTS, a.fork, b.fork))
+                else:
+                    result.append(Overlap(path, "", a.base_ref, a.base_ref,
+                                          CONFLICTS, a.fork))
+        out[a.uid] = result
+    return out
 
 
 def describe_overlap(o: Overlap) -> str:
