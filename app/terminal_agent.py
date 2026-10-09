@@ -97,13 +97,14 @@ INPUT_ECHO_S = 0.8
 # outlasts the window still lights it, at most this much late. Seconds.
 RESIZE_REDRAW_S = 1.0
 
-# How long a submitted line is "awaiting its reply" for that check: output in
-# a redraw window counts as work while a submit this recent has not settled,
-# so a short reply landing right after a resize still settles its turn. A
-# reply starts within seconds (Claude's spinner, Codex's "Working"), and the
-# bound keeps a submit whose only output was its echo, which never settles,
-# from disabling the redraw check for good. Seconds.
-REPLY_START_S = 10.0
+# While a submitted turn is open (`_awaiting_reply`: from the submit until
+# Claude's Stop hook or the finished-reply chime), output in a redraw window
+# counts as work, so a short reply, or a reply resuming after a tool's quiet
+# spell, still lights the pulse and settles its turn. A turn that never ends
+# that way (a submit whose only output was its echo) stops holding the check
+# once it has been quiet this long, so it can't disable it for good. Seconds,
+# from the later of the submit and the turn's last work.
+TURN_QUIET_S = 120.0
 
 # Extra quiet, on top of BUSY_IDLE_MS, before a submitted turn of a provider
 # WITHOUT a Stop hook (Codex, Gemini, Grok) counts as a finished reply and
@@ -518,7 +519,7 @@ class TerminalAgent(QObject):
         self._last_work_ts = 0.0
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
         self._last_resize_ts = 0.0    # walltime the child was last resized
-        self._awaiting_reply = False  # a line went in and no settle came since
+        self._awaiting_reply = False  # a submitted turn is open (TURN_QUIET_S)
         # walltime a line last went in (typed, a task, a nudge): a lane read
         # older than it may predate work that line started (_note_submit)
         self._last_submit_ts = 0.0
@@ -1072,6 +1073,7 @@ class TerminalAgent(QObject):
         A later Stop with no submit in between is Claude replying on its own
         (a background task finished), which is a new ending for the same
         turn, so it reopens the mark to follow that one instead."""
+        self._awaiting_reply = False    # the turn ended (TURN_QUIET_S)
         if not self.is_pty or not self._turn_open:
             return
         self._turn_end_ts = ts
@@ -1712,6 +1714,7 @@ class TerminalAgent(QObject):
         # a background command still running means the agent kicked off work
         # and is waiting on it, which is not a finished reply
         if not self._busy and not self._bg_shell:
+            self._awaiting_reply = False    # the turn ended (TURN_QUIET_S)
             self._announce_reply()
 
     def is_bg_shell_busy(self) -> bool:
@@ -1926,10 +1929,11 @@ class TerminalAgent(QObject):
         # re-scrapes the redrawn screen for a menu, a limit banner and prompt
         # readiness, the very things `request_repaint` asks a redraw for. Only
         # when it would START the pulse (once busy, output keeps it alive),
-        # and never while a submitted line still awaits its reply, which a
-        # short reply landing inside the window would otherwise lose.
+        # and never while a submitted turn is open (TURN_QUIET_S), whose
+        # output inside the window would otherwise be lost.
         awaiting = (self._awaiting_reply
-                    and now - self._last_submit_ts < REPLY_START_S)
+                    and now - max(self._last_submit_ts, self._last_work_ts)
+                    < TURN_QUIET_S)
         if (not self._busy and not awaiting
                 and now - self._last_resize_ts < RESIZE_REDRAW_S):
             self._idle_timer.start()
@@ -1958,7 +1962,6 @@ class TerminalAgent(QObject):
     def _on_idle_timeout(self) -> None:
         if self._busy:
             self._busy = False
-            self._awaiting_reply = False
             # A settle is only 2 s of quiet, which is not the same thing as a
             # reply ending: a --resume launch reprints the WHOLE past
             # conversation as real terminal output, pausing on the way, and

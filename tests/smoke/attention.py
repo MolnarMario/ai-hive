@@ -1084,6 +1084,18 @@ def test_resize_redraw_not_busy():
           a.is_busy() and acts == [True], acts)
     a._on_idle_timeout()
 
+    # Luna: a turn that goes quiet mid-reply (a long tool) is still open, and
+    # its next output after a resize is work too
+    acts.clear()
+    a.resize(rows, cols + 20)
+    a._on_pty_output("pty", "tool finished, continuing\r\n")
+    check("redraw: a turn resuming after a settle still flags busy",
+          a.is_busy() and acts == [True], acts)
+    a._on_idle_timeout()
+    a.note_reply_stopped(0.0)
+    check("redraw: the Stop hook ends the turn's hold on the check",
+          not a._awaiting_reply)
+
     # a child that is not running draws nothing, so nothing is suppressed
     a.worker.state = WorkerState.STARTING
     stamp = a._last_resize_ts
@@ -1098,10 +1110,11 @@ def test_resize_redraw_not_busy():
 
     # Luna: a submit whose only output was its echo never settles, and must
     # not keep the redraw check off for good
-    from app.terminal_agent import REPLY_START_S
+    from app.terminal_agent import TURN_QUIET_S
     a.worker.state = WorkerState.RUNNING
     a._note_submit()
-    a._last_submit_ts -= REPLY_START_S + 0.1
+    a._last_submit_ts -= TURN_QUIET_S + 0.1
+    a._last_work_ts = a._last_submit_ts
     acts.clear()
     a.resize(rows, cols)
     a._on_pty_output("pty", "\x1b[2J\x1b[Hframe redrawn\r\n")
