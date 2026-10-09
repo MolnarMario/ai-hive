@@ -4170,6 +4170,21 @@ def test_task_done_waits_for_the_user():
         check("task done: the flagged card gets no notice", told == [], told)
 
         win._toggle_integrator(ws.id, i)
+        icard = win._pages[ws.id].card_for(i.id)
+        icard.refresh_lane()
+        check("lane chip: the integrator's chip paints the merge icon and "
+              "an implementer's the lanes icon",
+              icard.lane_mark._icon_name == "merge"
+              and card.lane_mark._icon_name == "lanes",
+              (icard.lane_mark._icon_name, card.lane_mark._icon_name))
+        check("lane chip: the integrator's text is its role, with no glyph "
+              "in front", icard.lane_mark.text() == "integrator",
+              icard.lane_mark.text())
+        from app import ui_theme
+        bare = card.lane_mark.__class__()
+        check("lane chip: a chip with no text is the icon plus its padding",
+              bare.sizeHint().width() == 2 * (1 + ui_theme.LANE_PAD_PX)
+              + ui_theme.LANE_ICON_PX, bare.sizeHint().width())
         prompt = i.spec.system_prompt
         check("task done: the integrator's prompt has it merge only after a "
               "clean review", "GPT-6-Luna" in prompt
