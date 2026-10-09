@@ -56,8 +56,13 @@ Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
    Take each lane's newest flagged commit, not its head: commits after it
    are unfinished work.
 2. In your own lane, branch from main: `git switch -c integrate/<yyyy-mm-dd>-<short-name> origin/main`.
-   Merge each flagged commit with `git merge --no-ff <sha>` and resolve every
-   conflict. Never rebase, never squash, never force-push.
+   Merge the flagged commits oldest first, by commit time
+   (`git log -1 --format=%ct <sha>`), each with
+   `git -c merge.conflictStyle=zdiff3 merge --no-ff <sha>`. Oldest first
+   lands the lane that finished first, as its own pull request would have,
+   so the result doesn't depend on when the user asked. Resolve a conflict
+   by "Resolving conflicts" below. Never rebase, never squash, never
+   force-push.
 3. Bump `__version__` in `app/__init__.py` and add the matching `## x.y.z`
    section at the top of `CHANGELOG.md`, written for users, no em dash.
 4. Run `/code-review` on the branch and fix what it finds. Commit.
@@ -68,8 +73,9 @@ Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
 6. Set the README check count from the suite's RESULT line and commit it.
 7. Push with `git push -u origin <branch>` and open the pull request with
    `gh pr create --base main --head <branch>`. The body lists the lanes and
-   commits it ships, `Tested-commit: <full sha the suite ran on>` and the
-   suite's `RESULT` line.
+   commits it ships, every conflict you resolved and what the resolution
+   kept from each side, `Tested-commit: <full sha the suite ran on>` and
+   the suite's `RESULT` line.
 8. Get the review from GPT-6-Luna at high effort:
    `codex review --base origin/main -c model=gpt-6-luna -c model_reasoning_effort=high -c sandbox_mode=read-only`.
    Fix every finding that holds up, rerun the suite, push, update the PR
@@ -80,8 +86,8 @@ Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
 9. Merge only when all of these hold: the last Luna review is clean, the
    suite passed on the PR head (or the head adds only README.md on top of
    the tested commit), `gh pr view` says MERGEABLE, and `origin/main` has
-   not moved since you tested. If main moved, merge it in and go back to
-   step 5. Then:
+   not moved since you tested. If main moved, merge it in (a conflict
+   follows "Resolving conflicts") and go back to step 5. Then:
    `gh pr merge <number> --merge --match-head-commit <head sha>`.
    If a permission check refuses the merge, stop and tell the user. Never
    retry it in another form to get past the check.
@@ -93,6 +99,36 @@ Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
     edit files there.
 11. Report in a few plain sentences: which lanes shipped, the version, the
     PR link, and anything you skipped or couldn't fix.
+
+## Resolving conflicts
+
+A red lane chip means a real merge of that lane's commits with another
+lane, or with main, conflicts. The user does nothing special about it.
+You resolve it while merging, the way a merge queue would: the lane that
+merges later adapts to what landed before it.
+
+1. Learn what each side meant before you touch a marker. zdiff3 puts the
+   base version between the two sides. Take `<fork>` from
+   `git merge-base HEAD <sha>` and read each side's commits on every
+   conflicted path, `git log --format=%h%n%B <fork>..HEAD -- <path>` and
+   the same for `<sha>`, and the lane's own change,
+   `git diff <fork> <sha> -- <path>`.
+2. Keep both behaviors. Never take one side whole (`-X ours`, `-X theirs`,
+   `checkout --ours` or `--theirs`) unless the other side's change is
+   already inside it.
+3. Commit the merge with a `Conflicts:` section in its message: each path,
+   the two lanes, and what the resolution keeps from each.
+4. Test the resolution before the next merge. Run each smoke area whose
+   `tests/smoke/<area>.py` either side changed, and the areas covering the
+   conflicted files (`-m <area>`, or `--quick` when unsure). Both lanes'
+   regression checks passing on the merged tree is what shows neither
+   side's behavior got lost. Fix a failure in a new commit before the next
+   merge.
+5. Some conflicts are product decisions, not merges: the two lanes change
+   the same behavior in opposite directions, or no resolution passes both
+   lanes' checks. Then `git merge --abort`, leave that lane out of the pull
+   request (it stays flagged), ship the rest, and say in your report which
+   lane, which file and what each side wants. Don't pick a winner.
 
 ## Setting up the integrator
 

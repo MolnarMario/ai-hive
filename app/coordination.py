@@ -79,6 +79,10 @@ def system_prompt_text(workspace_name: str, agent_name: str,
     GPT-6-Luna review and passing tests on the head it merges (or the
     commit a checklist counts as tested, as AI Hive's does for a README-only
     count commit), and only by `--match-head-commit` with a merge commit.
+    A lane conflict (the red lane chip) is the integrator's to resolve,
+    oldest flag first, keeping both lanes' intent; only two changes that
+    can't both hold go back to the user, so a red lane needs no special
+    handling from them.
     Every other laned agent flags finished work with a "Task
     done" commit line (lanes.DONE_MARK). The flag only marks the work
     ready: the integrator starts when the user asks it to, never because a
@@ -117,7 +121,11 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"user names, or every lane with an unmerged "
             f"\"{lanes.DONE_MARK}\" commit if they name none, into one "
             f"integrate/ branch that starts from origin/{base}; its pull "
-            f"request targets {base}. If {base} has a checklist "
+            f"request targets {base}. Merge the flagged commits oldest "
+            f"first. When one conflicts, read both sides' commits on that "
+            f"file and keep what each lane meant to do, never one side "
+            f"whole; if the two can't both hold, leave that lane out of the "
+            f"pull request and tell the user. If {base} has a checklist "
             f"for shipping lanes at docs/agents/integration.md, read it "
             f"from {base} and follow it: it says how this project tests, "
             f"versions and finishes a release. Without it, run the "

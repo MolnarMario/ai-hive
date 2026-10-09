@@ -22,7 +22,8 @@ _ROWS = (
      "and ✓ once its agent marked the work done, which turns the chip "
      "green. Amber means another lane, or main, changed the same files; "
      "on a done lane that shows as a yellow border on the green chip. "
-     "Red means a real merge conflict, and wins over green."),
+     "Red means a real merge conflict, and wins over green. A red lane "
+     "still ships: the integrator resolves the conflict when it merges."),
     ("Lane notices",
      "A colleague saying \"I changed that file an hour ago\". AI Hive "
      "reads every lane every 15 seconds and runs a real merge in memory, "
@@ -35,7 +36,8 @@ _ROWS = (
     ("Integrator",
      "The teammate who owns the merge: an agent you pick with Make "
      "integrator. When you ask it to, it combines the finished lanes into "
-     "one pull request, fixes conflicts, bumps the version, runs the full "
+     "one pull request, oldest first, resolves conflicts by keeping what "
+     "each lane meant to do, bumps the version, runs the full "
      "test suite, gets a code review and fixes what it finds, then "
      "merges."),
 )

@@ -2501,6 +2501,13 @@ def test_integrator_prompt_project_neutral():
           "targets it, without fixing when the PR opens",
           "starts from origin/dev; its pull request targets dev" in prompt
           and "and open its pull request" not in prompt, prompt)
+    check("integ-neutral: lanes merge oldest flag first and a conflict is "
+          "resolved keeping both lanes' intent, never one side whole",
+          "Merge the flagged commits oldest first" in prompt
+          and "keep what each lane meant to do, never one side whole"
+          in prompt
+          and "leave that lane out of the pull request and tell the user"
+          in prompt, prompt)
     check("integ-neutral: no unconditional version or CHANGELOG bump",
           "bump the version and the CHANGELOG once" not in prompt
           and "Bump a version or edit a CHANGELOG only when that doc asks"
@@ -3835,6 +3842,64 @@ def test_task_done_flag_core():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_done_chip_follows_the_flagged_commit():
+    """The integrator merges a lane's "Task done" commit, not its head, so a
+    done lane's chip takes its conflicts from that commit: work after the
+    flag that clashes leaves it green with a border, and a flagged commit
+    that clashes with the base stays red even after the lane merged the base
+    in a later commit. The agent's own overlaps (notices, lanes.json) keep
+    following its head, where it works."""
+    from app import lanes
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-done-ship-"))
+    work = _make_repo(tmp)
+    a = _lane_for(work, "Agent A", "5d1a00" + "0" * 26)
+    b = _lane_for(work, "Agent B", "5d1b00" + "0" * 26)
+    c = _lane_for(work, "Agent C", "5d1c00" + "0" * 26)
+    ea, eb, ec = (_entry("A", "Agent A", a), _entry("B", "Agent B", b),
+                  _entry("C", "Agent C", c))
+
+    # A flags work on x.txt, then starts on a.txt, which B changes too
+    _commit(a["root"], "x.txt", "x\n", "x feature\n\nTask done")
+    _commit(a["root"], "a.txt", "A's next thing\n", "wip")
+    _commit(b["root"], "a.txt", "B's version\n", "b")
+    snap = lanes.snapshot_repo(str(work), [ea, eb])
+    check("done ship: the head still conflicts, so A's agent hears of it",
+          [o.level for o in snap.overlaps["A"]] == ["conflicts"],
+          snap.overlaps)
+    check("done ship: what ships merges clean, so A's chip is green with "
+          "a border", snap.view("A").state == "done-overlap",
+          snap.view("A").overlaps)
+    check("done ship: B, not done, stays red against A's head",
+          snap.view("B").state == "conflict")
+
+    # C flags a.txt, main changes it too, then C merges main to fix it
+    _commit(c["root"], "a.txt", "C's version\n", "c feature\n\nTask done")
+    _push_to_base(tmp, work, "a.txt", "main's version\n")
+    _git(work, "fetch", "-q")
+    snap = lanes.snapshot_repo(str(work), [ec])
+    check("done ship: a flagged commit that clashes with the base is red",
+          snap.view("C").state == "conflict", snap.view("C").overlaps)
+    try:
+        _git(c["root"], "merge", "-q", "origin/main")
+    except RuntimeError:
+        pass                                # the conflict, resolved below
+    (Path(c["root"]) / "a.txt").write_text("C and main\n")
+    _git(c["root"], "add", "a.txt")
+    _git(c["root"], "commit", "-q", "-m", "merge main")
+    snap = lanes.snapshot_repo(str(work), [ec])
+    view = snap.view("C")
+    check("done ship: the head merged main, so the agent hears nothing",
+          not any(o.level == "conflicts"
+                  for o in snap.overlaps.get("C", [])), snap.overlaps)
+    check("done ship: the flagged commit still clashes, so the chip stays red",
+          view.state == "conflict" and view.done
+          and [(o.path, o.peer_uid) for o in view.overlaps]
+          == [("a.txt", "")], view.overlaps)
+    for lane in (a, b, c):
+        _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_landed_commit_core():
     """lanes.lane_snap reports a lane's newest own commit once the base has
     it (LaneSnap.landed), read from the branch's reflog. A fresh lane, a
@@ -4251,6 +4316,20 @@ def test_task_done_waits_for_the_user():
         check("task done: the done-overlap chip is green with a yellow border",
               "rgba(70,170,90" in rule
               and f"border-color: {ui_theme.Palette.YELLOW}" in rule, rule)
+        tip = card.lane_mark.toolTip()
+        check("task done: a done lane that merges clean says nothing about "
+              "conflicts", "conflicts with another lane" not in tip, tip)
+        # a red done lane read as "fix me first": the conflict is the
+        # integrator's to resolve when it ships the lane
+        card.set_lane_view(dataclasses.replace(views[a.spec.uid],
+                                               overlaps=[fight]))
+        tip = card.lane_mark.toolTip()
+        check("task done: a red done lane still ships and the integrator "
+              "resolves its conflict",
+              card.lane_mark.property("lane") == "conflict"
+              and "It ships when you ask the integrator" in tip
+              and "The integrator resolves that when it merges" in tip
+              and "—" not in tip, tip)
         card.set_lane_view(views[a.spec.uid])
         win._on_lanes_changed(ws.id, dict(views))
         win._on_lanes_changed(ws.id, dict(views))
