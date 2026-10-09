@@ -263,20 +263,19 @@ class _CardHeader(QFrame):
 
 
 class _MaximizeButton(QToolButton):
-    """The maximize / restore button, drawn as four corner brackets with an
-    arrow in each. Maximize points the arrows out at the corners, restore
-    points them in at the middle.
+    """The maximize / restore button: four diagonal arrows. Maximize points
+    them out at the corners, restore points them in at the middle.
 
     It paints the icon itself, in the header's own inks (CARDHEAD_SUB, then
     CARDHEAD_FG while hovered), read from Palette at paint time. A font glyph
     took its color from QSS and had no form for this pair, and a pixmap would
     need rebuilding on every theme change."""
 
-    _BOX = 16   # icon edge in px; the 24-unit drawing below is scaled to it
-    # per quadrant, top-left, on a 24 grid; the other three mirror about 12.
-    # (bracket arm length, arrow tail, arrow tip, arrow head arm end points)
-    _OUT = (6.0, (8.6, 8.6), (4.0, 4.0), ((7.2, 4.0), (4.0, 7.2)))
-    _IN = (8.0, (4.2, 4.2), (9.6, 9.6), ((6.8, 9.6), (9.6, 6.8)))
+    _BOX = 20   # icon edge in px; the 24-unit drawing below is scaled to it
+    # the top-left arrow on a 24 grid, the other three mirror about 12:
+    # (tail, tip, the two head ends). Restore is the same arrow reversed.
+    _OUT = ((10.0, 10.0), (3.0, 3.0), ((3.0, 8.5), (8.5, 3.0)))
+    _IN = ((3.0, 3.0), (9.0, 9.0), ((3.5, 9.0), (9.0, 3.5)))
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -288,13 +287,13 @@ class _MaximizeButton(QToolButton):
             self.update()
 
     def sizeHint(self):
-        # an iconless, textless QToolButton collapses to its padding; keep it
-        # as wide as the glyph buttons beside it
-        return QSize(self._BOX + 14, self._BOX + 10)
+        # an iconless, textless QToolButton collapses to its padding; match
+        # the height of the glyph buttons beside it (about 24px)
+        return QSize(self._BOX + 12, self._BOX + 4)
 
     def paintEvent(self, event):
         super().paintEvent(event)   # the QSS hover plate
-        arm, tail, tip, head = self._IN if self.restored else self._OUT
+        tail, tip, head = self._IN if self.restored else self._OUT
         ink = Palette.CARDHEAD_FG if self.underMouse() else Palette.CARDHEAD_SUB
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -302,7 +301,7 @@ class _MaximizeButton(QToolButton):
         p.translate((self.width() - self._BOX) / 2.0,
                     (self.height() - self._BOX) / 2.0)
         p.scale(k, k)
-        pen = QPen(QColor(ink), 2.2)
+        pen = QPen(QColor(ink), 2.4)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
@@ -312,9 +311,6 @@ class _MaximizeButton(QToolButton):
                 def pt(x, y, sx=sx, sy=sy):
                     return QPointF(x if sx > 0 else 24 - x,
                                    y if sy > 0 else 24 - y)
-                path.moveTo(pt(1.0, 1.0 + arm))
-                path.lineTo(pt(1.0, 1.0))
-                path.lineTo(pt(1.0 + arm, 1.0))
                 path.moveTo(pt(*tail))
                 path.lineTo(pt(*tip))
                 path.moveTo(pt(*head[0]))
