@@ -746,8 +746,10 @@ def test_workspace_header():
 
 
 def test_workspace_header_trash_and_repo_seam():
-    """The delete button is the trash glyph in a font that takes QSS color
-    (Qt's stock pixmap ignored it and never turned red), and hovering Open
+    """The folder and delete button left of Open repo are painted line icons
+    at the same weight as Layout/Map (the 🗀/🗑 font glyphs drew too thin),
+    the trash still turns red on hover, the path matches the buttons' text,
+    and hovering Open
     repo lights the shared edge on the dropdown half, or its hover box had
     no right side."""
     from PySide6.QtCore import QCoreApplication, QEvent, Qt
@@ -764,12 +766,43 @@ def test_workspace_header_trash_and_repo_seam():
     page.show()
     app.processEvents()
 
+    from app.widgets.header_icons import IconLabel, IconToolButton
     trash = page.delete_btn
-    check("header trash: the delete button is the trash glyph, no icon",
-          trash.text() == "🗑" and trash.icon().isNull(),
-          (trash.text(), trash.icon().isNull()))
-    check("header trash: drawn in Segoe UI Symbol so QSS colors it",
-          trash.font().family() == "Segoe UI Symbol", trash.font().family())
+    check("header trash: a painted line icon like Layout/Map, no glyph text",
+          isinstance(trash, IconToolButton)
+          and trash._icon_name == "trash" and trash.text() == "",
+          (type(trash).__name__, trash.text()))
+
+    def reddish(widget):
+        img = widget.grab().toImage()
+        return sum(1 for x in range(img.width()) for y in range(img.height())
+                   if (c := img.pixelColor(x, y)).red() > c.green() + 60
+                   and c.red() > c.blue() + 60)
+
+    rest_red = reddish(trash)
+    trash.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, True)
+    QCoreApplication.sendEvent(trash, QEvent(QEvent.Type.Enter))
+    app.processEvents()
+    hover_red = reddish(trash)
+    trash.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, False)
+    QCoreApplication.sendEvent(trash, QEvent(QEvent.Type.Leave))
+    app.processEvents()
+    check("header trash: hovering turns the painted icon red",
+          rest_red == 0 and hover_red > 10, (rest_red, hover_red))
+
+    folder = page.header.findChildren(IconLabel)
+    check("header path: the folder is the painted line icon",
+          any(w._icon_name == "folder" for w in folder),
+          [w._icon_name for w in folder])
+    path, repo = page.path_label, page.repo_btn
+    check("header path: same font size and ink as the buttons",
+          path.font().pointSizeF() == repo.font().pointSizeF()
+          and path.font().pixelSize() == repo.font().pixelSize()
+          and path.palette().windowText().color()
+          == repo.palette().buttonText().color(),
+          (path.font().pixelSize(), repo.font().pixelSize(),
+           path.palette().windowText().color().name(),
+           repo.palette().buttonText().color().name()))
     check("header trash: no taller than the Open repo button beside it",
           trash.height() <= page.repo_btn.height() + 1,
           (trash.height(), page.repo_btn.height()))

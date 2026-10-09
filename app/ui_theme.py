@@ -200,6 +200,12 @@ class Palette:
 ANSI_16: list = list(_ANSI_DARK)   # mutated in place (kept as the same object)
 DISPLAY_FONT = THEMES[DEFAULT_THEME_ID].display_font
 BODY_FONT = THEMES[DEFAULT_THEME_ID].body_font
+
+# the card header's lane chip paints its own icon (header_icons.LaneChip); the
+# stylesheet reserves the room for it with these, so both read the same numbers
+LANE_ICON_PX = 16
+LANE_ICON_GAP_PX = 4
+LANE_PAD_PX = 5
 CONSOLE_FONT = THEMES[DEFAULT_THEME_ID].console_font
 ACTIVE_THEME: Theme = THEMES[DEFAULT_THEME_ID]
 
@@ -687,8 +693,11 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 #CardLane {{
     background: transparent; color: {p.CARDHEAD_SUB};
     border: 1px solid transparent; border-radius: 3px;
-    font-size: 11px; font-weight: 700; padding: 0 5px;
+    font-size: 11px; font-weight: 700;
+    padding: 0 {LANE_PAD_PX}px 0 {LANE_PAD_PX + LANE_ICON_PX + LANE_ICON_GAP_PX}px;
 }}
+/* no text beside the icon (a quiet lane): the icon alone fills the chip */
+#CardLane[bare="true"] {{ padding: 0 {LANE_PAD_PX}px; }}
 #CardLane[lane="overlap"] {{
     background: rgba(232,152,58,0.28); color: {p.TEXT};
     border-color: {p.ACCENT_ORANGE};
@@ -783,10 +792,14 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
    (later rules win on equal id specificity). The maximize/restore button
    paints its own icon (terminal_card._MaximizeButton), so it takes only the
    padding and hover plate from the rules above. */
-#CardFontDec, #CardFontInc {{ font-size: 12px; font-weight: 700; }}
+#CardFontDec, #CardFontInc {{ font-size: 14px; font-weight: 700; }}
+/* the tray icons are meant to look one size: 16px glyphs here, a 16px drawn
+   maximize icon, 14px bold A-/A+. (The close button keeps the 14px above.) */
+#CardStop, #CardRestart, #CardAdopt, #CardIntegrator,
+#CardScheduleSend {{ font-size: 16px; }}
 /* the collapsed stand-in for the action tray: faint enough to read as
    chrome, visible enough to say "there is something here to hover" */
-#CardToolsHint {{ color: {p.CARDHEAD_SUB}; font-size: 13px; }}
+#CardToolsHint {{ color: {p.CARDHEAD_SUB}; font-size: 18px; }}
 /* the hover tray the card's actions expand into. It FLOATS over the header
    rather than taking layout width (see _HeaderTools), so it has to be opaque
    or the summary underneath reads straight through it. */
@@ -796,13 +809,10 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     border-radius: 4px;
 }}
 #WsDelete {{ color: {p.TEXT}; font-size: 17px; font-weight: 900; }}
-/* the workspace header's trash glyph. Segoe UI Symbol draws U+1F5D1 as a
-   one-color outline that takes `color`; left to fallback, Windows can pick
-   the color emoji, which ignores it and never turns red on hover. */
-#WsTrash {{
-    padding: 1px 6px; color: {p.TEXT}; font-size: 17px;
-    font-family: "Segoe UI Symbol";
-}}
+/* the workspace header's trash: header_icons paints the icon centred, so
+   this only reserves its 14px box. The hover red reaches the icon through
+   IconToolButton's hover_ink, not through `color`. */
+#WsTrash {{ padding: 3px 6px; min-width: 14px; min-height: 14px; }}
 #GlobalFontBtn {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 2px 7px; color: {p.TEXT_DIM}; font-weight: 700;
@@ -1000,7 +1010,9 @@ QScrollArea {{ background: transparent; border: none; }}
 #WorkspaceHeader {{
     background: {p.BG_PANEL}; border-bottom: 1px solid {p.BORDER};
 }}
-#HeaderFolderIcon {{ color: {p.TEXT_DIM}; font-size: 13px; }}
+/* the path takes the buttons' ink and size so the row reads as one weight
+   (#HeaderPath stays the dim caption the map and event log use) */
+#WsHeaderPath {{ color: {p.TEXT}; }}
 #HeaderPath {{ color: {p.TEXT_DIM}; font-size: 12px; }}
 #HeaderLanesLabel {{ color: {p.TEXT}; padding-left: 20px; }}
 #HeaderLanesLabel[forced="true"] {{ color: {p.TEXT_DIM}; }}

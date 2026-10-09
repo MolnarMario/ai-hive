@@ -25,6 +25,7 @@ from ..process_worker import AI_KINDS, describe_pid
 from ..terminal_agent import (STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
                               TerminalAgent)
 from ..ui_theme import Palette, repolish
+from .header_icons import LaneChip
 from .ornaments import BootVeil, ElidingLabel, close_on_anchor_press
 from .terminal_view import is_reply_footer
 
@@ -271,7 +272,7 @@ class _MaximizeButton(QToolButton):
     took its color from QSS and had no form for this pair, and a pixmap would
     need rebuilding on every theme change."""
 
-    _BOX = 20   # icon edge in px; the 24-unit drawing below is scaled to it
+    _BOX = 16   # icon edge in px; the 24-unit drawing below is scaled to it
     # the top-left arrow on a 24 grid, the other three mirror about 12:
     # (tail, tip, the two head ends). Restore points the arrow back in.
     _OUT = ((10.0, 10.0), (3.0, 3.0), ((3.0, 8.5), (8.5, 3.0)))
@@ -288,8 +289,8 @@ class _MaximizeButton(QToolButton):
 
     def sizeHint(self):
         # an iconless, textless QToolButton collapses to its padding; match
-        # the height of the glyph buttons beside it (about 24px)
-        return QSize(self._BOX + 12, self._BOX + 4)
+        # the height of the glyph buttons beside it (about 26px)
+        return QSize(self._BOX + 12, self._BOX + 10)
 
     def paintEvent(self, event):
         super().paintEvent(event)   # the QSS hover plate
@@ -391,7 +392,7 @@ class _HeaderTools(QWidget):
     the tray is open a timer repeats the check, and a missed Leave costs at
     most one tick."""
 
-    _HINT_W = 14
+    _HINT_W = 20   # wide enough for the "⋯" at its 18px (#CardToolsHint)
     _WATCH_MS = 150
 
     def __init__(self, parent=None):
@@ -747,11 +748,11 @@ class TerminalCard(QFrame):
         self.sched_mark.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sched_mark.hide()
         # "this agent works in its own git worktree" (agent lanes): branch
-        # glyph, commits ahead, uncommitted files. Neutral when the lane is
+        # icon, commits ahead, uncommitted files. Neutral when the lane is
         # quiet, amber when another lane or the base changed one of its files,
         # red when a real merge of the two would conflict. Clickable for the
         # lane's actions; hidden for an agent without a lane.
-        self.lane_mark = QToolButton(header)
+        self.lane_mark = LaneChip(header)
         self.lane_mark.setObjectName("CardLane")
         self.lane_mark.setCursor(Qt.CursorShape.PointingHandCursor)
         self.lane_mark.setProperty("lane", "clean")
@@ -1199,16 +1200,21 @@ class TerminalCard(QFrame):
             return
         view = self._lane_view
         integrator = bool(self._integration().get("integrator"))
-        text = "⎇ integrator" if integrator else "⎇"
+        parts = ["integrator"] if integrator else []
         if view is not None:
             if view.ahead:
-                text += f" ↑{view.ahead}"
+                parts.append(f"↑{view.ahead}")
             if view.dirty:
-                text += f" ±{len(view.dirty)}"
+                parts.append(f"±{len(view.dirty)}")
             if view.done:
-                text += " ✓"
+                parts.append("✓")
         state = view.state if view is not None else "clean"
-        self.lane_mark.setText(text)
+        self.lane_mark.setText(" ".join(parts))
+        self.lane_mark.set_icon_name("merge" if integrator else "lanes")
+        bare = "" if parts else "true"
+        if (self.lane_mark.property("bare") or "") != bare:
+            self.lane_mark.setProperty("bare", bare)
+            repolish(self.lane_mark)
         tip = self._lane_tooltip(lane, view)
         if integrator:
             tip = ("This agent is the workspace's integrator: when you ask "

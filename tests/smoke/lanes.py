@@ -3327,6 +3327,18 @@ def test_lane_scopes_window():
         check("scopes window: an unlaned agent next to it is offered a "
               "disabled Make integrator", bool(info_p.get("role"))
               and not info_p["role"][1], info_p)
+        # once the workspace has an integrator, no other agent is offered
+        # the role (the user stops the current one first)
+        win.manager.set_integrator(ws_b.id, solo.id)
+        app.processEvents()
+        check("scopes window: the integrator is offered Stop being it",
+              win._integration_info(solo).get("role", ("",))[0]
+              == "Stop being the integrator")
+        check("scopes window: ...and no other agent is offered Make "
+              "integrator", "role" not in win._integration_info(plain_b),
+              win._integration_info(plain_b))
+        win.manager.set_integrator(ws_b.id, "")
+        app.processEvents()
 
         # --- a second lane without an integrator: one hint, once -------------
         from app.terminal_agent import TerminalAgent
@@ -3965,6 +3977,13 @@ def test_close_merged_agents_from_integrator_chip():
         check("close-merged: no integrator, no item",
               close_action(a) is None and close_action(i) is None)
         win._toggle_integrator(ws.id, i)
+        before = len(told)
+        win._toggle_integrator(ws.id, a)
+        check("integrator: Make integrator from a stale tray while another "
+              "agent has the role changes nothing and says why",
+              win.manager.integrator(ws.id) is i and len(told) == before + 1
+              and "already this workspace's integrator" in told[-1],
+              told[before:])
         check("close-merged: a lane agent's chip has no item",
               close_action(a) is None)
         act = close_action(i)
@@ -4158,6 +4177,28 @@ def test_task_done_waits_for_the_user():
         check("task done: the flagged card gets no notice", told == [], told)
 
         win._toggle_integrator(ws.id, i)
+        icard = win._pages[ws.id].card_for(i.id)
+        icard.refresh_lane()
+        check("lane chip: the integrator's chip paints the merge icon and "
+              "an implementer's the lanes icon",
+              icard.lane_mark._icon_name == "merge"
+              and card.lane_mark._icon_name == "lanes",
+              (icard.lane_mark._icon_name, card.lane_mark._icon_name))
+        check("lane chip: the integrator's text is its role, with no glyph "
+              "in front", icard.lane_mark.text() == "integrator",
+              icard.lane_mark.text())
+        from app import ui_theme
+        from app.widgets.header_icons import LaneChip
+        bare = LaneChip(card)
+        check("lane chip: a chip with no text is the icon plus its padding",
+              bare.sizeHint().width() == 2 * (1 + ui_theme.LANE_PAD_PX)
+              + ui_theme.LANE_ICON_PX, bare.sizeHint().width())
+        bare_h = bare.sizeHint().height()
+        bare.setText("↑1")
+        check("lane chip: gaining text keeps the chip's height",
+              bare.sizeHint().height() == bare_h,
+              (bare_h, bare.sizeHint().height()))
+        bare.deleteLater()
         prompt = i.spec.system_prompt
         check("task done: the integrator's prompt has it merge only after a "
               "clean review", "GPT-6-Luna" in prompt

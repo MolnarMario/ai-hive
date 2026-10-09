@@ -452,8 +452,8 @@ workspaces keep executing — switching never pauses anything.
   anywhere AI Hive starts no lane git process at all): AI Hive reads every
   lane about
   every 15 seconds and right after an agent's turn ends, and fetches the base
-  branch every 5 minutes. Each laned card gets a chip (`⎇ ↑2 ±3`: commits
-  ahead, uncommitted files) that turns amber when another lane or the base
+  branch every 5 minutes. Each laned card gets a chip (a branch icon, then `↑2 ±3`:
+  commits ahead, uncommitted files) that turns amber when another lane or the base
   branch changed one of its files, and red when a real merge of the two would
   conflict (`git merge-tree`, git 2.38+). A lane with a `Task done` commit
   stays green when it shares a file and gets a yellow border instead; only
@@ -480,13 +480,15 @@ workspaces keep executing — switching never pauses anything.
   prompt.
 - **Shipping finished lanes** (needs lanes, a GitHub remote and a logged-in
   `gh`): hover the `⋯` on a laned Claude agent's header and click `⚑`
-  **Make integrator** (one per workspace). The second lane in a workspace
+  **Make integrator** (one per workspace, so it is not offered while the
+  workspace has one). The second lane in a workspace
   without an integrator says so on its card, once. Every other laned agent is
   told to end its finished work with a commit whose last line is just
   `Task done`. AI Hive spots that commit on its next lane read (the chip gets
   a `✓` and turns green) and logs it. Nothing ships until you say so: when
   you think there is enough for a pull request, ask the integrator to ship,
-  or click the integrator's `⎇ integrator` chip and pick **Ship finished
+  or click the integrator's `integrator` chip (its icon shows two lanes
+  merging) and pick **Ship finished
   lanes**. That asks you to confirm the list, then types the request into
   the integrator. The dialog's "Don't ask again" skips the question from
   then on; ⚙ Options > Agents > **Confirm Ship finished lanes** brings it
@@ -930,7 +932,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-2999 checks drive the real app headlessly (offscreen Qt platform) with real
+3008 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1072,7 +1074,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (2999 checks)
+                           (3008 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
