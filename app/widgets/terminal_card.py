@@ -91,6 +91,9 @@ _HOOK_ROWS = 4
 # text, the live path to the footer row itself. Three rows spans that gap and
 # nothing else; a reply is never two turns away from itself.
 _STAMP_MERGE_SLACK = 3
+# providers whose transcript records say when each reply finished (see
+# TerminalCard._recover_marks)
+_RECOVERABLE = ("claude", "gemini", "openai")
 
 
 def _norm_line(text: str) -> str:
@@ -582,6 +585,9 @@ class TerminalCard(QFrame):
         # the agents that matter. See _recover_marks for why re-reading within
         # one conversation cannot find anything the card doesn't already know.
         self._recover_key: tuple = ()
+        # True while this card clears its own screen only to project the SAME
+        # conversation again (see _clear_for_projection)
+        self._reprojecting = False
         # settles left to look for a conversation reprinted after this card was
         # built (see _rescan_recovery)
         self._recover_tries = _RECOVER_RESCAN_TRIES
@@ -1567,8 +1573,7 @@ class TerminalCard(QFrame):
         # screen.reset() wipes history WITHOUT going through feed(), so the
         # shrink check there never sees it -- tell the view explicitly, then
         # re-derive the milestones from the same replay.
-        self.terminal.note_history_cleared()
-        self.terminal.screen.reset()
+        self._clear_for_projection()
         self._replay_with_marks(replay)
         self._proj_cols = self.terminal.screen.columns
         self._refresh_overlay()
@@ -1680,6 +1685,27 @@ class TerminalCard(QFrame):
         if ready:
             self._end_boot_veil()
 
+    def _clear_for_projection(self) -> None:
+        """Blank the screen so the agent's pty stream can be projected onto it
+        again, at a new width or on a rebuilt card.
+
+        That is a view-only reset: the conversation has not changed, so the
+        agent's prompt and reply marks have to survive it. They are exactly
+        what _replay_with_marks re-anchors from (each mark's `pos` is an offset
+        into this same stream). Going through note_history_cleared alone
+        wiped them, because its historyCleared signal is also what a REAL wipe
+        (a /clear, an ED 3) uses to drop the agent's marks. So every width
+        change, sidebar toggle, retile and card rebuild erased every reply
+        stamp of every live agent, and the replay that followed had nothing
+        left to place. Only the transcript could bring a stamp back, and only
+        for the replies it could match on screen."""
+        self._reprojecting = True
+        try:
+            self.terminal.note_history_cleared()
+            self.terminal.screen.reset()
+        finally:
+            self._reprojecting = False
+
     def _reproject_on_size(self, _rows: int, cols: int) -> None:
         """Re-render the scrollback whenever the terminal's WIDTH changes.
 
@@ -1707,8 +1733,7 @@ class TerminalCard(QFrame):
         replay = self.agent.pty_replay()
         if not replay:
             return
-        self.terminal.note_history_cleared()
-        self.terminal.screen.reset()
+        self._clear_for_projection()
         self._replay_with_marks(replay)
 
     def _replay_with_marks(self, replay: str, cap: int | None = None,
@@ -1819,7 +1844,7 @@ class TerminalCard(QFrame):
         (a pin change or /clear), which changes the key and re-reads."""
         self._recovered = []
         spec = self.agent.spec
-        if not self.is_pty or spec.provider not in ("claude", "gemini"):
+        if not self.is_pty or spec.provider not in _RECOVERABLE:
             return
         key = (spec.provider, spec.cwd, spec.session_id)
         if key != self._recover_key:
@@ -1834,9 +1859,10 @@ class TerminalCard(QFrame):
                     spec.session_id)
                 self._recover_replies = transcripts.gemini_reply_times(
                     spec.session_id)
-            else:
+            else:   # openai: reply times only, there is no prompt reader
                 self._recover_prompts = []
-                self._recover_replies = []
+                self._recover_replies = transcripts.codex_reply_times(
+                    spec.session_id)
         prompts = self._recover_prompts
         if not prompts:
             return
@@ -1903,7 +1929,7 @@ class TerminalCard(QFrame):
         inventing a time for one."""
         self._recovered_replies = []
         spec = self.agent.spec
-        if not self.is_pty or spec.provider not in ("claude", "gemini"):
+        if not self.is_pty or spec.provider not in _RECOVERABLE:
             return
         if not self._recover_replies:
             return
@@ -1959,9 +1985,11 @@ class TerminalCard(QFrame):
         milestone anchored into it is meaningless."""
         self._mark_lines = {}
         self._recovered = []
-        self.agent.clear_prompt_marks()
         self._reply_mark_lines = {}
         self._recovered_replies = []
+        if self._reprojecting:
+            return      # same conversation: the agent keeps its marks
+        self.agent.clear_prompt_marks()
         self.agent.clear_reply_marks()
 
     def _refresh_reply_marks(self) -> None:

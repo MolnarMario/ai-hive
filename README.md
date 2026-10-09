@@ -550,7 +550,7 @@ workspaces keep executing — switching never pauses anything.
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
   reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Check for CLI
-  updates at start-up** and **Show usage left** as labelled switches (each with a green/dark LED, so
+  updates at start-up**, **Show usage left** and **Reply times** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
   the theme and global font size below. Click outside or press `Esc` to close.
@@ -942,8 +942,9 @@ a per-agent task summary beside the name, the per-card maximize/restore toggle
 (solo one agent full-area without touching any sibling's process, then restore
 the exact prior tiling), the context-window usage badge beside the summary
 ("N% of 1M/200K", read from the transcript's last usage record — transient,
-never persisted), and a date-and-time stamp under every finished reply,
-drawn inline in the terminal directly beneath Claude's own "✻ Worked for
+never persisted), and a date-and-time stamp under every finished reply
+(Claude, Codex and Gemini alike, hidden by the **Reply times** switch in
+Options without discarding any), drawn inline in the terminal directly beneath the agent's own "✻ Worked for
 16m 36s" footer (a second FIFO-capped milestone type mirroring the
 scrollbar's prompt marks, captured live on the busy-to-idle settle and
 otherwise READ FROM THE CONVERSATION ON DISK by matching each transcript

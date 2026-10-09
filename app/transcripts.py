@@ -52,6 +52,7 @@ _GEMINI_PROMPT_CACHE: dict[str, tuple[float, int, list]] = {}
 
 # cache for gemini_reply_times: path -> (mtime, size, [(epoch, final text), ...]).
 _GEMINI_REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
+_CODEX_REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
 
 # cache for limit_cut_off: path -> (mtime, size, verdict dict).
 _LIMIT_CACHE: dict[str, tuple[float, int, dict]] = {}
@@ -1311,6 +1312,70 @@ def latest_codex_session(cwd: str, started_at: float,
     return (sid, path)
 
 
+def _codex_rollout_path(session_id: str) -> str:
+    """The rollout file of one Codex thread, or "" when it is not on disk.
+    _CODEX_PATHS only lasts for this AI Hive process. Codex names rollout
+    files with the thread id, so a restored pin can be resolved directly even
+    when its conversation started days ago."""
+    if not session_id:
+        return ""
+    path = _CODEX_PATHS.get(session_id, "")
+    if path and os.path.isfile(path):
+        return path
+    root = os.path.join(codex_home(), "sessions")
+    matches = glob.glob(os.path.join(
+        root, "**", f"rollout-*-{glob.escape(session_id)}.jsonl"),
+        recursive=True)
+    if not matches:
+        return path
+    path = max(matches, key=os.path.getmtime)
+    _CODEX_PATHS[session_id] = path
+    return path
+
+
+def codex_reply_times(session_id: str) -> list[tuple[float, str]]:
+    """Every finished reply in this Codex conversation as (epoch, final text),
+    oldest first. Codex closes each turn with an event_msg/task_complete record
+    that carries the turn's last message and when it completed, which is the
+    same fact claude's transcript gives reply_times(). A turn that ended with
+    no message (an interrupt) has nothing on screen to anchor to and is
+    skipped. Cached by (mtime, size). Never raises."""
+    path = _codex_rollout_path(session_id)
+    if not path:
+        return []
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    cached = _CODEX_REPLY_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return list(cached[2])
+    out: list[tuple[float, str]] = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"task_complete"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                payload = rec.get("payload") or {}
+                if rec.get("type") != "event_msg" or                         payload.get("type") != "task_complete":
+                    continue
+                text = str(payload.get("last_agent_message") or "").strip()
+                when = _record_epoch(rec)
+                done = payload.get("completed_at")
+                if isinstance(done, (int, float)) and done > 0:
+                    when = float(done)
+                if text and when:
+                    out.append((when, text))
+    except OSError:
+        return list(cached[2]) if cached else []
+    _CODEX_REPLY_CACHE[path] = (st.st_mtime, st.st_size, list(out))
+    return out
+
+
 def latest_codex_state(cwd: str, session_id: str, started_at: float,
                        excluded: set[str] | None = None) -> tuple[str, str, str, str, int, int, str]:
     """Return (session id, model, effort, mode, used, window, summary).
@@ -1319,18 +1384,7 @@ def latest_codex_state(cwd: str, session_id: str, started_at: float,
     `event_msg/token_count` supplies context occupancy. User messages provide
     the summary, matching the conversation's entry in Codex's resume list.
     """
-    sid, path = session_id, _CODEX_PATHS.get(session_id, "") if session_id else ""
-    if sid and (not path or not os.path.isfile(path)):
-        # _CODEX_PATHS only lasts for this AI Hive process. Codex names rollout
-        # files with the thread id, so a restored pin can be resolved directly
-        # even when its conversation started days ago.
-        root = os.path.join(codex_home(), "sessions")
-        matches = glob.glob(os.path.join(
-            root, "**", f"rollout-*-{glob.escape(sid)}.jsonl"),
-            recursive=True)
-        if matches:
-            path = max(matches, key=os.path.getmtime)
-            _CODEX_PATHS[sid] = path
+    sid, path = session_id, _codex_rollout_path(session_id)
     if not path or not os.path.isfile(path):
         if sid:
             path = _CODEX_PATHS.get(sid, "")
