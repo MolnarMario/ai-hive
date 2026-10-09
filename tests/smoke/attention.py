@@ -1095,6 +1095,19 @@ def test_resize_redraw_not_busy():
     a.write("hello\r")
     check("redraw: a submit that failed to write awaits no reply",
           not a._awaiting_reply)
+
+    # Luna: a submit whose only output was its echo never settles, and must
+    # not keep the redraw check off for good
+    from app.terminal_agent import REPLY_START_S
+    a.worker.state = WorkerState.RUNNING
+    a._note_submit()
+    a._last_submit_ts -= REPLY_START_S + 0.1
+    acts.clear()
+    a.resize(rows, cols)
+    a._on_pty_output("pty", "\x1b[2J\x1b[Hframe redrawn\r\n")
+    check("redraw: an old unsettled submit no longer counts the redraw",
+          not a.is_busy() and acts == [], acts)
+    a._idle_timer.stop()
     a.worker._proc = None
     a.dispose()
 

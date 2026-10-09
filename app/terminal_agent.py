@@ -97,6 +97,14 @@ INPUT_ECHO_S = 0.8
 # outlasts the window still lights it, at most this much late. Seconds.
 RESIZE_REDRAW_S = 1.0
 
+# How long a submitted line is "awaiting its reply" for that check: output in
+# a redraw window counts as work while a submit this recent has not settled,
+# so a short reply landing right after a resize still settles its turn. A
+# reply starts within seconds (Claude's spinner, Codex's "Working"), and the
+# bound keeps a submit whose only output was its echo, which never settles,
+# from disabling the redraw check for good. Seconds.
+REPLY_START_S = 10.0
+
 # Extra quiet, on top of BUSY_IDLE_MS, before a submitted turn of a provider
 # WITHOUT a Stop hook (Codex, Gemini, Grok) counts as a finished reply and
 # rings the reply chime. A settle alone is 2 s of silence, which every tool
@@ -1920,7 +1928,9 @@ class TerminalAgent(QObject):
         # when it would START the pulse (once busy, output keeps it alive),
         # and never while a submitted line still awaits its reply, which a
         # short reply landing inside the window would otherwise lose.
-        if (not self._busy and not self._awaiting_reply
+        awaiting = (self._awaiting_reply
+                    and now - self._last_submit_ts < REPLY_START_S)
+        if (not self._busy and not awaiting
                 and now - self._last_resize_ts < RESIZE_REDRAW_S):
             self._idle_timer.start()
             return
