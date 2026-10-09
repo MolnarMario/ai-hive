@@ -1090,6 +1090,11 @@ def test_resize_redraw_not_busy():
     a.resize(rows, cols + 20)
     check("redraw: a resize no running child took stamps nothing",
           a._last_resize_ts == stamp)
+
+    # Luna: a line no child received awaits no reply, so it must not latch
+    a.write("hello\r")
+    check("redraw: a submit that failed to write awaits no reply",
+          not a._awaiting_reply)
     a.worker._proc = None
     a.dispose()
 

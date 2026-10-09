@@ -654,6 +654,7 @@ class TerminalAgent(QObject):
         self._pending_submits.clear()
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         self._turn_open = False        # nothing asked yet, so nothing to stamp
+        self._awaiting_reply = False
         self._turn_mark_uid = None
         self._turn_end_ts = None
         self._turn_mark_final = False
@@ -739,6 +740,7 @@ class TerminalAgent(QObject):
         # a restart is a fresh conversation: the next reply worth stamping is
         # the next one somebody asks for (see _note_submit)
         self._turn_open = False
+        self._awaiting_reply = False
         self._turn_mark_uid = None
         self._turn_end_ts = None
         self._turn_mark_final = False
@@ -782,9 +784,14 @@ class TerminalAgent(QObject):
         # echo of that typing apart from genuine agent output — echo must not
         # light the "working" pulse (see _mark_busy / INPUT_ECHO_S).
         self._last_input_ts = time.time()
-        if submits_a_line(data):
+        submit = submits_a_line(data)
+        if submit:
             self._note_submit()
-        return self.worker.write(data)
+        ok = self.worker.write(data)
+        if submit and not ok:
+            # nothing reached a child, so no reply will come to settle it
+            self._awaiting_reply = False
+        return ok
 
     def _note_submit(self) -> None:
         """A line was just submitted to the child, so the reply to it is
