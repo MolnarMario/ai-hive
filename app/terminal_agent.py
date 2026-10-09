@@ -89,6 +89,14 @@ BUSY_IDLE_MS = 2000
 # pulses a beat later. Seconds, compared against time.time().
 INPUT_ECHO_S = 0.8
 
+# A resize makes a full-screen TUI redraw its whole frame, and that redraw is
+# not work either. Opening or closing the sidebar resizes every visible card,
+# which used to light every idle workspace amber for the 2 s idle window.
+# Output within this long of the last size change to the child does not start
+# the "working" pulse. A pulse already running is untouched, and real work that
+# outlasts the window still lights it, at most this much late. Seconds.
+RESIZE_REDRAW_S = 1.0
+
 # Extra quiet, on top of BUSY_IDLE_MS, before a submitted turn of a provider
 # WITHOUT a Stop hook (Codex, Gemini, Grok) counts as a finished reply and
 # rings the reply chime. A settle alone is 2 s of silence, which every tool
@@ -501,6 +509,7 @@ class TerminalAgent(QObject):
         # the usage poll's cadence follows it (see usage_poll.provider_active)
         self._last_work_ts = 0.0
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
+        self._last_resize_ts = 0.0    # walltime the child was last resized
         # walltime a line last went in (typed, a task, a nudge): a lane read
         # older than it may predate work that line started (_note_submit)
         self._last_submit_ts = 0.0
@@ -811,7 +820,20 @@ class TerminalAgent(QObject):
     def resize(self, rows: int, cols: int) -> None:
         if self.is_pty:
             self._note_view_size(rows, cols)
-            self.worker.resize(rows, cols)
+            self._resize_child(rows, cols)
+
+    def _resize_child(self, rows: int, cols: int) -> None:
+        """Resize the child and remember when, so the redraw it answers with
+        is not mistaken for work (see RESIZE_REDRAW_S). A same-size call is a
+        no-op in the worker and makes the child draw nothing, so it stamps
+        nothing."""
+        def size():
+            return (getattr(self.worker, "rows", None),
+                    getattr(self.worker, "cols", None))
+        before = size()
+        self.worker.resize(rows, cols)
+        if size() != before:
+            self._last_resize_ts = time.time()
 
     def _next_seq(self) -> int:
         self._order_seq += 1
@@ -899,9 +921,9 @@ class TerminalAgent(QObject):
         rows, cols = self.worker.rows, self.worker.cols
         if cols <= 10:      # already at PtyWorker's floor; nothing to give back
             return False
-        self.worker.resize(rows, cols - 1)
+        self._resize_child(rows, cols - 1)
         QTimer.singleShot(REPAINT_RESTORE_MS,
-                          lambda: self.worker.resize(rows, cols))
+                          lambda: self._resize_child(rows, cols))
         return True
 
     def pty_replay(self) -> str:
@@ -1899,7 +1921,11 @@ class TerminalAgent(QObject):
         # light the "working" pulse for it (and don't re-arm the idle timer, so
         # a pulse left over from real work still drops on schedule instead of
         # being held alive by the typing). Genuine work outlasts the window.
-        if now - self._last_input_ts >= INPUT_ECHO_S:
+        # A redraw answering a resize is skipped the same way, but only when it
+        # would START the pulse: once busy, output keeps the pulse alive as usual.
+        redraw = (not self._busy
+                  and now - self._last_resize_ts < RESIZE_REDRAW_S)
+        if now - self._last_input_ts >= INPUT_ECHO_S and not redraw:
             self._last_work_ts = now
             if not self._busy:
                 self._busy = True
