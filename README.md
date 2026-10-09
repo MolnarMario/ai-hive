@@ -645,7 +645,9 @@ error dialog instead of silently closing. Packaging to a distributable
   focused), and global `A−`/`A+` under **⚙ Options**; both persist.
 - **App shortcuts use `Ctrl+Shift+…`** (T = new terminal, N = new workspace,
   B = toggle sidebar) so every plain `Ctrl`/`Alt` key, `Tab`, and `Shift+Tab`
-  goes straight to the focused terminal — click a full-terminal card and
+  goes straight to the focused terminal. The two exceptions are `F11` and
+  `Ctrl+T` (new terminal), which a focused terminal never receives. Click
+  a full-terminal card and
   `Shift+Tab` cycles Claude Code's modes, `Ctrl+C` interrupts (when nothing is
   selected; otherwise it copies), `Ctrl+R` reverse-searches, arrows/`Tab`
   complete, exactly as in a real terminal.
@@ -653,8 +655,8 @@ error dialog instead of silently closing. Packaging to a distributable
   actions: `↻` restart (replaces the agent with a fresh one: new
   conversation, the permission mode, model and effort it was created with,
   no old title or task; name and folder stay), `⏱` send on a countdown,
-  `A−`/`A+` font and a Windows-style
-  maximize / restore square, plus
+  `A−`/`A+` font and a maximize / restore
+  button of four arrows, plus
   `⎇` restart in own lane and `⚑` make integrator where lanes apply. A
   terminal card has no stop button, `Ctrl+C` does that; a line-console
   card keeps `■` stop. Restart on a running agent puts up a "restarting"

@@ -273,7 +273,7 @@ class _MaximizeButton(QToolButton):
 
     _BOX = 20   # icon edge in px; the 24-unit drawing below is scaled to it
     # the top-left arrow on a 24 grid, the other three mirror about 12:
-    # (tail, tip, the two head ends). Restore is the same arrow reversed.
+    # (tail, tip, the two head ends). Restore points the arrow back in.
     _OUT = ((10.0, 10.0), (3.0, 3.0), ((3.0, 8.5), (8.5, 3.0)))
     _IN = ((3.0, 3.0), (9.0, 9.0), ((3.5, 9.0), (9.0, 3.5)))
 
