@@ -618,7 +618,7 @@ error dialog instead of silently closing. Packaging to a distributable
   over the agents; rest it on the left edge and the sidebar floats in at its
   usual width, or as the thin rail if it was collapsed. Neither resizes a
   terminal. `F11` again brings the window back as it was.
-- **Agents** — `+ Terminal` (or `Ctrl+N` / `Ctrl+Shift+T`), or click any empty grid slot.
+- **Agents** — `+ Terminal` (or `Ctrl+T` / `Ctrl+Shift+T`), or click any empty grid slot.
   The dialog groups **AI agents** (Claude with model + effort + mode dropdowns —
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;
   Gemini/Antigravity with its model list; Grok via the xAI CLI; OpenAI as an

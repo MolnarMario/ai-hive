@@ -2735,9 +2735,9 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Shift+B"), self, self._toggle_sidebar)
         QShortcut(QKeySequence("Ctrl+Shift+L"), self, self.open_event_log)
         # The two exceptions to the Ctrl+Shift rule, at the user's request.
-        # TerminalView leaves Ctrl+N unclaimed so this one wins over a
+        # TerminalView leaves Ctrl+T unclaimed so this one wins over a
         # focused terminal; F11 carries no modifier, so no terminal claims it.
-        QShortcut(QKeySequence("Ctrl+N"), self, self._on_add_terminal_clicked)
+        QShortcut(QKeySequence("Ctrl+T"), self, self._on_add_terminal_clicked)
         QShortcut(QKeySequence("F11"), self, self._fullscreen.toggle)
         self.top_bar.eventLogClicked.connect(self.open_event_log)
         self.top_bar.appUpdateClicked.connect(self.check_for_app_update)

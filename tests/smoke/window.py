@@ -3038,7 +3038,7 @@ def test_fullscreen_f11():
     floats the top bar and the active workspace header over the grid,
     resting it on the left edge floats the sidebar at its pre-F11 width (or
     the rail, when the sidebar was collapsed), and neither reveal resizes
-    the terminals. F11 again puts everything back where it was. Ctrl+N adds
+    the terminals. F11 again puts everything back where it was. Ctrl+T adds
     a terminal even while a terminal has focus."""
     from PySide6.QtCore import QEvent, QEventLoop, QPoint, Qt, QTimer
     from PySide6.QtGui import QKeyEvent, QShortcut
@@ -3084,8 +3084,8 @@ def test_fullscreen_f11():
         width = win.body_split.sizes()[0]
 
         keys = {s.key().toString() for s in win.findChildren(QShortcut)}
-        check("fullscreen: F11 and Ctrl+N are window shortcuts",
-              {"F11", "Ctrl+N"} <= keys, keys)
+        check("fullscreen: F11 and Ctrl+T are window shortcuts",
+              {"F11", "Ctrl+T"} <= keys, keys)
 
         def rest(x, y, ms):
             Cursor.at = win._central.mapToGlobal(QPoint(x, y))
@@ -3208,14 +3208,14 @@ def test_fullscreen_f11():
 
         tv = TerminalView(rows=6, cols=80)
         ctrl = Qt.KeyboardModifier.ControlModifier
+        ev_t = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_T, ctrl)
         ev_n = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_N, ctrl)
-        ev_p = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_P, ctrl)
+        ev_t.ignore()
         ev_n.ignore()
-        ev_p.ignore()
+        tv.event(ev_t)
         tv.event(ev_n)
-        tv.event(ev_p)
-        check("ctrl+n: a focused terminal leaves Ctrl+N to the window, "
-              "keeps Ctrl+P", not ev_n.isAccepted() and ev_p.isAccepted())
+        check("ctrl+t: a focused terminal leaves Ctrl+T to the window, "
+              "keeps Ctrl+N", not ev_t.isAccepted() and ev_n.isAccepted())
         tv.deleteLater()
         win.close()
         pump(100)
