@@ -8,6 +8,25 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.38.0
+
+- Tooltips wrap at one readable width instead of stretching into a thin
+  strip across the window. A new Tooltips switch in Options turns them
+  all off.
+- Options has a Fullscreen switch that does the same as F11.
+- F11 no longer opens a black console window when pressed right after
+  AI Hive starts.
+- In fullscreen, resting the cursor on the top or left edge brings the
+  bars back in 0.75 s instead of 1.5 s, and the floating top bar leaves
+  out the logo, name and version.
+- A Claude reply no longer shows up several times over in a card after
+  the card changes width.
+- Close merged agents closes every merged agent in one click, not one
+  per click.
+- A finished lane's chip judges conflicts by the commit it flagged as
+  done, so later unfinished work no longer turns a shippable lane red.
+- The Claude model list says Haiku 5.5 instead of Haiku 4.5.
+
 ## 0.37.2
 
 - The icons in a card's hover tray are now one size, the maximize

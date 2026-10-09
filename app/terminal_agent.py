@@ -287,12 +287,17 @@ class PromptMark:
     FIFO-capped, and CPython reuses an address once the object is collected, so
     a dropped mark can hand its id to a new one, which would then silently
     inherit the dropped marker's line. `pos` is not unique either (two submits
-    with no output between them share an offset)."""
+    with no output between them share an offset).
+
+    `seq` orders it against a ScreenSize at the same `pos`: a resize changes
+    the rows a mark anchors to, so a replay has to apply the two in the order
+    they happened (see TerminalAgent._order_seq)."""
 
     uid: int
     pos: int
     text: str
     ts: float
+    seq: int = 0
 
 
 @dataclass
@@ -302,11 +307,38 @@ class ReplyMark:
     on the scrollbar. Mirrors PromptMark's shape and the same `pos`/`uid`
     reasoning -- a character offset into the pty stream survives a card
     rebuild where a screen line does not, and `uid` (never `id()`) is the only
-    safe FIFO-capped key."""
+    safe FIFO-capped key. `seq` is PromptMark's tie-breaker."""
 
     uid: int
     pos: int
     ts: float
+    seq: int = 0
+
+
+@dataclass
+class ScreenSize:
+    """The card's terminal took this size at stream offset `pos`.
+
+    The raw pty stream only means what it meant at the size it was drawn
+    for. Claude's classic renderer erases its live frame by moving the cursor
+    up one row per line it drew, counted at the width it was told. Replayed
+    at another width, every frame wraps onto more or fewer rows than that
+    count, the erase stops short, and each older frame of a streaming reply
+    stays stacked above the next one. That is how a card rebuild or a width
+    change used to show a reply's text doubled. Measured on a real capture
+    (claude 2.1.296, a 40-line reply at 120 cols, then 60): replayed flat at
+    60 cols it painted 210 rows, garbled; replayed with this resize at its
+    offset, 93 rows, the same as the live screen.
+
+    Recorded from `TerminalAgent.resize`, the view's own size request, so a
+    replay repeats the live VIEW's feeds and resizes, not the child's internal
+    screen. Bytes that were in flight when the size changed are counted on
+    the new side, which is what the live view did with them too."""
+
+    pos: int
+    seq: int
+    rows: int
+    cols: int
 
 
 def submits_a_line(data: str) -> bool:
@@ -420,6 +452,12 @@ class TerminalAgent(QObject):
         self._mark_seq = 0     # monotonic; source of PromptMark.uid
         self._reply_marks: list[ReplyMark] = []
         self._reply_mark_seq = 0   # monotonic; source of ReplyMark.uid
+        # the sizes the card's terminal took, in stream order (see ScreenSize)
+        self._geometry: list[ScreenSize] = []
+        self._view_size: tuple[int, int] | None = None
+        # one counter across marks AND sizes: their `seq` breaks ties at one
+        # stream offset
+        self._order_seq = 0
         self._pty_seed = ""    # restored screen, until a child draws over it
         self._fresh_screen = False    # a Restart's child has not started yet
         self._prompt_ready = False    # the TUI's input prompt is interactive
@@ -721,6 +759,11 @@ class TerminalAgent(QObject):
         self.clear_prompt_marks()
         self.clear_reply_marks()
         self._pty_seed = ""
+        # the view keeps its size across a restart, and the new stream starts
+        # at it
+        self._geometry = []
+        if self._view_size is not None:
+            self._note_view_size(*self._view_size)
 
     # ---- pty-mode I/O (keystrokes / resize come straight from the view) ---
 
@@ -767,7 +810,69 @@ class TerminalAgent(QObject):
 
     def resize(self, rows: int, cols: int) -> None:
         if self.is_pty:
+            self._note_view_size(rows, cols)
             self.worker.resize(rows, cols)
+
+    def _next_seq(self) -> int:
+        self._order_seq += 1
+        return self._order_seq
+
+    def _note_view_size(self, rows: int, cols: int) -> None:
+        """Remember the view's size at this point of the stream, running child
+        or not: the live view resized either way, so a replay has to as well.
+        `request_repaint` bypasses this on purpose, since its one-column
+        wiggle never resized the view.
+
+        A resize storm with no output in between is kept whole, not collapsed
+        to its last size: pyte drops rows off the top on every shrink, so the
+        live view's screen depends on each step.
+
+        Nothing is recorded over a pristine restored seed. It never recorded
+        the size it was drawn at, and the card projects it again at every new
+        width (`_reproject_on_size`). A size noted now would sit at the seed's
+        END, and replaying a narrow-then-wide pair there cuts every seed line
+        to the narrow width. The first bytes after the seed record the size
+        they were drawn at (`_note_first_size`)."""
+        self._view_size = (rows, cols)
+        if self.has_pristine_seed():
+            return
+        self._record_size(rows, cols)
+
+    def _note_first_size(self) -> None:
+        """Before the first bytes of a stream with no recorded size: they are
+        drawn at the size the view last asked for, or at the size the child
+        was spawned at when no view has asked yet (a card in a workspace not
+        shown since launch never resizes)."""
+        if self._geometry:
+            return
+        size = self._view_size or (getattr(self.worker, "rows", 0),
+                                   getattr(self.worker, "cols", 0))
+        if size[0] and size[1]:
+            self._record_size(*size)
+
+    def _record_size(self, rows: int, cols: int) -> None:
+        last = self._geometry[-1] if self._geometry else None
+        if last is not None and (last.rows, last.cols) == (rows, cols):
+            return
+        self._geometry.append(ScreenSize(pos=self._pty_total,
+                                         seq=self._next_seq(),
+                                         rows=rows, cols=cols))
+
+    def _trim_geometry(self) -> None:
+        """Drop the sizes whose bytes aged out of the replay buffer, except the
+        newest of them: the buffer still starts at that size."""
+        old = 0
+        while (old + 1 < len(self._geometry)
+               and self._geometry[old + 1].pos <= self._pty_dropped):
+            old += 1
+        if old:
+            del self._geometry[:old]
+
+    def replay_geometry(self) -> list:
+        """[(offset within pty_replay(), ScreenSize)]. Unlike a mark, a size
+        from before the buffer start is clamped to 0, not discarded: the
+        bytes after it were still drawn at that size."""
+        return [(max(0, g.pos - self._pty_dropped), g) for g in self._geometry]
 
     def request_repaint(self) -> bool:
         """Ask the child TUI to redraw its whole frame. False if it can't.
@@ -816,7 +921,7 @@ class TerminalAgent(QObject):
             return None
         self._mark_seq += 1
         mark = PromptMark(uid=self._mark_seq, pos=self._pty_total,
-                          text=text, ts=time.time())
+                          text=text, ts=time.time(), seq=self._next_seq())
         self._prompt_marks.append(mark)
         while len(self._prompt_marks) > PROMPT_MARK_CAP:
             self._prompt_marks.pop(0)
@@ -892,11 +997,13 @@ class TerminalAgent(QObject):
         mark = self._turn_mark()
         if mark is not None:
             mark.pos = self._pty_total
+            mark.seq = self._next_seq()
             mark.ts = ts
             self.reply_marks_changed.emit()
             return mark
         self._reply_mark_seq += 1
-        mark = ReplyMark(uid=self._reply_mark_seq, pos=self._pty_total, ts=ts)
+        mark = ReplyMark(uid=self._reply_mark_seq, pos=self._pty_total, ts=ts,
+                         seq=self._next_seq())
         self._turn_mark_uid = mark.uid
         self._reply_marks.append(mark)
         while len(self._reply_marks) > REPLY_MARK_CAP:
@@ -984,6 +1091,8 @@ class TerminalAgent(QObject):
         self._pty_total = len(text)
         self._pty_dropped = 0
         self._pty_seed = text
+        # the previous run never recorded the size it drew this at
+        self._geometry = []
         return True
 
     def seed_written_over(self) -> bool:
@@ -1036,6 +1145,10 @@ class TerminalAgent(QObject):
             return False
         self._pty_buffer = []
         self._pty_bytes = 0
+        # those bytes left the front of the buffer like any aged-out tail, so
+        # offsets into pty_replay() (marks, sizes) must stop counting them
+        self._pty_dropped = self._pty_total
+        self._trim_geometry()
         return True
 
     def dispose(self) -> None:
@@ -2430,6 +2543,7 @@ class TerminalAgent(QObject):
         self._mark_busy()  # streaming VT output => the agent is working
         # keep a bounded raw tail so a freshly created card can rebuild the
         # screen; the live TerminalView is fed directly via the signal
+        self._note_first_size()
         self._pty_buffer.append(text)
         self._pty_bytes += len(text)
         self._pty_total += len(text)
@@ -2437,6 +2551,7 @@ class TerminalAgent(QObject):
             dropped = self._pty_buffer.pop(0)
             self._pty_bytes -= len(dropped)
             self._pty_dropped += len(dropped)
+        self._trim_geometry()
         # rolling escape-stripped tail for waiting-for-input detection (the idle
         # timer scans it once output settles — see _screen_waiting)
         stripped = _CSI_RE.sub("", text)

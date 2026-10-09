@@ -19,6 +19,7 @@ pipes are independent, so this split is safe.
 """
 
 import os
+import sys
 import threading
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -42,6 +43,63 @@ def agent_environment() -> dict:
         if up.startswith(("CLAUDECODE", "CLAUDE_CODE", "CLAUDE_EFFORT")):
             env.pop(key)
     return env
+
+
+def ensure_windowless_console() -> str:
+    """Give a console-less AI Hive, the pythonw launch, a console with no
+    window before any window of ours is shown. Returns what it did:
+    "windowless", "hidden", "existing", or "" off Windows or on failure.
+
+    pywinpty needs a console to build a pty from. Without one, its first
+    spawn calls AllocConsole and then hides the new window, and that window
+    keeps the FOREGROUND even while hidden. Measured: GetForegroundWindow is
+    the console from the spawn on, and AI Hive's window is no longer
+    active. So the agents restoring at startup took the keyboard away from
+    AI Hive, and until the user clicked the window, keys went to conhost.
+    F11 there is conhost's own fullscreen, which put a black window titled
+    "AIHive.DesktopApp" over the app instead of AI Hive's fullscreen. That
+    title is the AUMID a pinned taskbar launch hands the console.
+
+    Windows 11 24H2 has AllocConsoleWithOptions(NO_WINDOW): a console with
+    no window at all, so nothing can take focus or appear later. Older
+    builds fall back to AllocConsole plus SW_HIDE, which steals the
+    foreground too, but here that happens before the main window shows, and
+    showing the window takes the foreground back, also measured. Either way pywinpty's
+    own AllocConsole then fails because a console exists, and it never
+    hides or focuses anything. A console that is already attached, as with
+    python.exe from a terminal or the smoke suite, is left alone and never
+    hidden."""
+    if sys.platform != "win32":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        alloc_opts = getattr(k32, "AllocConsoleWithOptions", None)
+        if alloc_opts is not None:
+            class _Options(ctypes.Structure):
+                _fields_ = [("mode", ctypes.c_int),
+                            ("useShowWindow", wintypes.BOOL),
+                            ("showWindow", wintypes.WORD)]
+            alloc_opts.argtypes = [ctypes.POINTER(_Options),
+                                   ctypes.POINTER(ctypes.c_int)]
+            alloc_opts.restype = ctypes.c_long
+            no_window = _Options(2, False, 0)   # ALLOC_CONSOLE_MODE_NO_WINDOW
+            result = ctypes.c_int(0)
+            if alloc_opts(ctypes.byref(no_window), ctypes.byref(result)) == 0:
+                # ALLOC_CONSOLE_RESULT_NEW_CONSOLE = 1, EXISTING_CONSOLE = 2
+                return {1: "windowless", 2: "existing"}.get(result.value, "")
+        if not k32.AllocConsole():
+            return "existing"       # already attached to one: leave it be
+        k32.GetConsoleWindow.restype = wintypes.HWND
+        hwnd = k32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)   # SW_HIDE
+        return "hidden"
+    except Exception:
+        return ""
+
 
 try:
     from winpty import PtyProcess

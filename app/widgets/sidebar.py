@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
                                QSizePolicy, QToolButton, QToolTip, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .. import scheduled_send
+from .. import scheduled_send, tooltips
 from ..filetypes import EMOJI_FONT, FOLDER_ICON, FOLDER_OPEN_ICON, file_icon
 from ..process_worker import describe_pid
 from ..terminal_agent import AgentStatus
@@ -1098,7 +1098,7 @@ class WorkspaceRail(QWidget):
                 QToolTip.hideText()
                 event.ignore()
                 return True
-            QToolTip.showText(event.globalPos(), self.tooltip_for(i), self)
+            tooltips.show_text(event.globalPos(), self.tooltip_for(i), self)
             return True
         return super().event(event)
 

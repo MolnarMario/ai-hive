@@ -34,6 +34,7 @@ from .. import repo_activity
 from ..limit_banner import LIMIT_PROVIDERS, SEVEN_DAY_WINDOWS
 from .. import scheduled_send
 from .. import session_hook
+from .. import tooltips
 from .. import transcripts
 from .. import ui_theme
 from .. import usage_poll
@@ -448,6 +449,7 @@ class TopBar(QFrame):
     taskbarBadgeToggled = Signal(bool)     # show/hide the taskbar count overlay
     usageLeftToggled = Signal(bool)        # usage pills say "% left", not "% used"
     replyStampsToggled = Signal(bool)      # date/time under each finished reply
+    tooltipsToggled = Signal(bool)         # hover tooltips, app-wide
     # install newer Claude Code / agy CLIs at the NEXT startup, before any
     # agent launches (the only moment those binaries are not locked)
     autoUpdateToggled = Signal(bool)
@@ -462,6 +464,7 @@ class TopBar(QFrame):
     startupRecoveryToggled = Signal(bool)  # recover cut-off agents on startup
     usageRefreshRequested = Signal()       # user clicked the readout
     eventLogClicked = Signal()             # open the event log window
+    fullscreenToggled = Signal()           # the Options switch twin of F11
     appUpdateClicked = Signal()            # check for / show an AI Hive update
 
     def __init__(self, parent=None):
@@ -669,6 +672,21 @@ class TopBar(QFrame):
         self.reply_stamps_btn = ToggleSwitch(self)
         self.reply_stamps_btn.clicked.connect(self._on_reply_stamps_clicked)
         self._refresh_reply_stamps_btn()
+        # "Fullscreen": the same toggle as F11, for whoever looks for it in
+        # the menu. MainWindow's FullscreenController reflects its state.
+        self._fullscreen = False
+        self.fullscreen_label = toggle_label("")
+        self.fullscreen_btn = ToggleSwitch(self)
+        self.fullscreen_btn.clicked.connect(self._on_fullscreen_clicked)
+        self._refresh_fullscreen_btn()
+        # "Tooltips": the hover explanations on nearly every control. Default
+        # ON. The switch is read by `app.tooltips`, which every tooltip goes
+        # through, so one flag silences all of them.
+        self._tooltips = True
+        self.tooltips_label = toggle_label("")
+        self.tooltips_btn = ToggleSwitch(self)
+        self.tooltips_btn.clicked.connect(self._on_tooltips_clicked)
+        self._refresh_tooltips_btn()
         for key, pill in self._usage_pills.items():
             pill.setVisible(False)
             pill.refreshRequested.connect(self.usageRefreshRequested)
@@ -742,8 +760,12 @@ class TopBar(QFrame):
                                           self.ship_confirm_btn)
         self.options_panel.add_separator()
         self.options_panel.add_section("Appearance")
+        self.options_panel.add_switch_row(self.fullscreen_label,
+                                          self.fullscreen_btn)
         self.options_panel.add_switch_row(self.reply_stamps_label,
                                           self.reply_stamps_btn)
+        self.options_panel.add_switch_row(self.tooltips_label,
+                                          self.tooltips_btn)
         self.options_panel.add_row("Theme", self.theme_select)
         self.options_panel.add_row("Font size", self.font_dec_btn,
                                    self.font_inc_btn)
@@ -838,6 +860,13 @@ class TopBar(QFrame):
 
     def _open_options(self) -> None:
         self.options_panel.toggle_under(self.options_btn)
+
+    def set_identity_visible(self, visible: bool) -> None:
+        """Show or hide the left block: ☰, logo, name, version and the
+        update button. F11 hides it while the bar floats in fullscreen."""
+        for w in (self.toggle_btn, self._logo, self._name, self._version,
+                  self.app_update_btn):
+            w.setVisible(visible)
 
     APP_UPDATE_BTN_SIDE = 34
     APP_UPDATE_IDLE_TIP = "Check GitHub for a newer AI Hive"
@@ -965,6 +994,51 @@ class TopBar(QFrame):
             "back.\nClick to show them.")
         self.reply_stamps_btn.setToolTip(tip)
         self.reply_stamps_label.setToolTip(tip)
+
+    def _on_fullscreen_clicked(self) -> None:
+        # the panel would float over a window that is changing size under
+        # it, and entering moves this bar into the fullscreen overlay
+        self.options_panel.hide()
+        self.fullscreenToggled.emit()
+
+    def set_fullscreen(self, on: bool) -> None:
+        """Reflect the "Fullscreen" switch (no signal emitted)."""
+        self._fullscreen = bool(on)
+        self._refresh_fullscreen_btn()
+
+    def _refresh_fullscreen_btn(self) -> None:
+        self.fullscreen_btn.setChecked(self._fullscreen)
+        self.fullscreen_label.setText("⛶  Fullscreen (F11)")
+        tip = (
+            "Fullscreen: ON. Only the agent grid shows. Rest the cursor on "
+            "the top or left edge to bring the bars back.\n"
+            "Click or press F11 to leave."
+            if self._fullscreen else
+            "Fullscreen: OFF.\nClick or press F11 to show only the agent "
+            "grid.")
+        self.fullscreen_btn.setToolTip(tip)
+        self.fullscreen_label.setToolTip(tip)
+
+    def _on_tooltips_clicked(self) -> None:
+        self.set_tooltips(not self._tooltips)
+        self.tooltipsToggled.emit(self._tooltips)
+
+    def set_tooltips(self, on: bool) -> None:
+        """Reflect the "Tooltips" switch (no signal emitted)."""
+        self._tooltips = bool(on)
+        self._refresh_tooltips_btn()
+
+    def _refresh_tooltips_btn(self) -> None:
+        self.tooltips_btn.setChecked(self._tooltips)
+        self.tooltips_label.setText("💬  Tooltips")
+        tip = (
+            "Tooltips: ON. Hovering a control explains what it does.\n"
+            "Click to turn every tooltip off."
+            if self._tooltips else
+            "Tooltips: OFF. Hovering shows nothing.\n"
+            "Click to turn the explanations back on.")
+        self.tooltips_btn.setToolTip(tip)
+        self.tooltips_label.setToolTip(tip)
 
     def _on_agent_lanes_clicked(self) -> None:
         self.set_agent_lanes(not self._agent_lanes)
@@ -2302,6 +2376,8 @@ class MainWindow(QMainWindow):
         # "Reply times". Default ON, assigned above _restore_ui_state like the
         # other preferences or the restored value is clobbered.
         self._reply_stamps = True     # user preference (persisted)
+        self._tooltips = True         # user preference (persisted)
+        tooltips.install()            # width cap + switch, app-wide
         # startup CLI auto-update. Default OFF (it changes installed software),
         # and like every other preference here the default MUST be assigned
         # above _restore_ui_state or the restored value is clobbered.
@@ -2696,6 +2772,7 @@ class MainWindow(QMainWindow):
         self.top_bar.taskbarBadgeToggled.connect(self._on_taskbar_badge_toggled)
         self.top_bar.usageLeftToggled.connect(self._on_usage_left_toggled)
         self.top_bar.replyStampsToggled.connect(self._on_reply_stamps_toggled)
+        self.top_bar.tooltipsToggled.connect(self._on_tooltips_toggled)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.agentLanesToggled.connect(self._on_agent_lanes_toggled)
         self.top_bar.shipConfirmToggled.connect(self._on_ship_confirm_toggled)
@@ -2739,6 +2816,10 @@ class MainWindow(QMainWindow):
         # focused terminal; F11 carries no modifier, so no terminal claims it.
         QShortcut(QKeySequence("Ctrl+T"), self, self._on_add_terminal_clicked)
         QShortcut(QKeySequence("F11"), self, self._fullscreen.toggle)
+        # the Options switch: after the panel's click has finished, since
+        # entering reparents the bar the click came from
+        self.top_bar.fullscreenToggled.connect(
+            lambda: QTimer.singleShot(0, self._fullscreen.toggle))
         self.top_bar.eventLogClicked.connect(self.open_event_log)
         self.top_bar.appUpdateClicked.connect(self.check_for_app_update)
 
@@ -4024,6 +4105,14 @@ class MainWindow(QMainWindow):
         TerminalView.set_reply_stamps_enabled(self._reply_stamps)
         self._schedule_save()
 
+    def _on_tooltips_toggled(self, enabled: bool) -> None:
+        """User flipped "Tooltips". `app.tooltips` holds the flag every
+        tooltip checks. An additive optional key under "ui" (no
+        SESSION_VERSION bump), saved on the debounced timer."""
+        self._tooltips = bool(enabled)
+        tooltips.set_enabled(self._tooltips)
+        self._schedule_save()
+
     def _on_auto_update_toggled(self, enabled: bool) -> None:
         """User flipped the startup CLI auto-update switch. An ordinary UI
         preference: additive optional key under "ui", saved on the debounced
@@ -4848,7 +4937,11 @@ class MainWindow(QMainWindow):
         The offer comes from the last poll, up to 15 s old, and the user
         may have edited or committed in a lane since. So each lane is read
         again on the lane queue after the OK, and only an agent that still
-        qualifies on that read closes (_close_merged_checked)."""
+        qualifies on that read closes (_close_merged_checked). Every agent
+        is judged once all the reads are back, before any of them closes:
+        a close reflows the grid, the other cards' TUIs redraw at their new
+        size, and that redraw reads as busy for a couple of seconds. Judged
+        one by one, only the first agent of each batch ever closed."""
         ws = self.manager.workspace(ws_id)
         if ws is None or agent is None or not self.manager.is_integrator(agent):
             return
@@ -4864,7 +4957,7 @@ class MainWindow(QMainWindow):
         # turn, or a lane poll seen new work, meanwhile
         still = {a.spec.uid for a, _v in self._merged_agents(
             ws, self.manager.integrator(ws_id))}
-        batch = {"left": 0,
+        batch = {"left": 0, "reads": [],
                  "kept": [a.spec.name for a, _v in merged
                           if a.spec.uid not in still]}
         for other, _view in merged:
@@ -4890,33 +4983,47 @@ class MainWindow(QMainWindow):
 
     def _close_merged_checked(self, ws_id: str, uid: str, snap, error,
                               batch: dict) -> None:
-        """A lane re-read for Close merged agents is back: close its agent
-        if the read still says merged with nothing left, and it is still
-        idle and not the integrator. An agent the user closed meanwhile was
-        retired by its own close."""
-        self._close_merged_reading.discard(uid)
+        """A lane re-read for Close merged agents is back. Once the last
+        one is, judge every agent of the batch, then close the ones that
+        still qualify (see _close_merged_agents for why not sooner)."""
+        batch["reads"].append((uid, snap, error))
         batch["left"] -= 1
+        if batch["left"]:
+            return
         ws = self.manager.workspace(ws_id)
-        other = next((a for a in (ws.agents if ws is not None else [])
-                      if a.spec.uid == uid), None)
-        if other is not None:
-            if (error is not None or snap is None or snap.error
-                    or not snap.exists or snap.ahead or snap.dirty
-                    or not snap.landed
-                    or other is self.manager.integrator(ws_id)
-                    or uid in self._lane_pending
-                    or other.is_busy() or other.is_waiting()
-                    or other.last_submit_at() > snap.read_at):
+        agents = {a.spec.uid: a for a in (ws.agents if ws is not None
+                                          else [])}
+        closing = []
+        for uid, snap, error in batch["reads"]:
+            self._close_merged_reading.discard(uid)
+            other = agents.get(uid)
+            # an agent the user closed meanwhile was retired by its own close
+            if other is None:
+                continue
+            if self._close_merged_qualifies(ws_id, other, snap, error):
+                closing.append((other, snap))
+            else:
                 self._store_audit(f"CLOSE-MERGED-KEEP "
                                   f"agent={other.spec.name!r}")
                 batch["kept"].append(other.spec.name)
-            else:
-                self._store_audit(f"CLOSE-MERGED agent={other.spec.name!r} "
-                                  f"branch={snap.branch} "
-                                  f"landed={snap.landed[:7]}")
-                self._close_agent(ws_id, other.id)
-        if not batch["left"]:
-            self._report_close_merged_kept(batch)
+        for other, snap in closing:
+            self._store_audit(f"CLOSE-MERGED agent={other.spec.name!r} "
+                              f"branch={snap.branch} "
+                              f"landed={snap.landed[:7]}")
+            self._close_agent(ws_id, other.id)
+        self._report_close_merged_kept(batch)
+
+    def _close_merged_qualifies(self, ws_id: str, other, snap,
+                                error) -> bool:
+        """The fresh read still says merged with nothing left, and the
+        agent is still idle and not the integrator."""
+        return not (error is not None or snap is None or snap.error
+                    or not snap.exists or snap.ahead or snap.dirty
+                    or not snap.landed
+                    or other is self.manager.integrator(ws_id)
+                    or other.spec.uid in self._lane_pending
+                    or other.is_busy() or other.is_waiting()
+                    or other.last_submit_at() > snap.read_at)
 
     def _report_close_merged_kept(self, batch: dict) -> None:
         if batch["kept"]:
@@ -5366,6 +5473,10 @@ class MainWindow(QMainWindow):
         self._reply_stamps = bool(ui.get("reply_stamps", True))
         self.top_bar.set_reply_stamps(self._reply_stamps)
         TerminalView.set_reply_stamps_enabled(self._reply_stamps)
+        # hover tooltips (default ON)
+        self._tooltips = bool(ui.get("tooltips", True))
+        self.top_bar.set_tooltips(self._tooltips)
+        tooltips.set_enabled(self._tooltips)
         # startup CLI auto-update (default OFF: it installs software, so it is
         # armed deliberately, once, exactly like the recovery switches were)
         self._auto_update = bool(ui.get("auto_update", False))
@@ -6249,6 +6360,7 @@ class MainWindow(QMainWindow):
             "taskbar_badge": self._taskbar_badge,
             "usage_left": self._usage_left,
             "reply_stamps": self._reply_stamps,
+            "tooltips": self._tooltips,
             "auto_update": self._auto_update,
             "agent_lanes": self._agent_lanes,
             "ship_skip_confirm": self._ship_skip_confirm,

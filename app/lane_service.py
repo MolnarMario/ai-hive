@@ -323,6 +323,9 @@ class LaneService(QObject):
                 result.overlaps = {
                     u: [o for o in ovs if not o.peer_uid or o.peer_uid in uids]
                     for u, ovs in result.overlaps.items() if u in uids}
+                result.ship_overlaps = {
+                    u: [o for o in ovs if not o.peer_uid or o.peer_uid in uids]
+                    for u, ovs in result.ship_overlaps.items() if u in uids}
                 self._snaps[key] = result
                 try:
                     self._after_snapshot(key, result)

@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QMenu,
                                QPushButton, QScrollArea, QToolTip, QVBoxLayout,
                                QWidget)
 
-from .. import file_activity, fsopen, lanes
+from .. import file_activity, fsopen, lanes, tooltips
 from ..filetypes import DEFAULT_ICON as _DEFAULT_ICON
 from ..filetypes import EMOJI_FONT as _EMOJI_FONT
 from ..filetypes import file_icon as _file_icon
@@ -472,14 +472,14 @@ class AgentFileMapCanvas(QWidget):
             return
         hit = self._hit(self._scene(pos))
         if hit and hit[0] == "file":
-            QToolTip.showText(event.globalPosition().toPoint(), hit[1].path, self)
+            tooltips.show_text(event.globalPosition().toPoint(), hit[1].path, self)
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         elif hit and hit[0] == "agent":
             self.setCursor(Qt.CursorShape.PointingHandCursor)
         elif hit and hit[0] == "sub":
             stype, desc = hit[1].subs[hit[2]]
-            QToolTip.showText(event.globalPosition().toPoint(),
-                              f"sub-agent: {stype}\n{desc}".strip(), self)
+            tooltips.show_text(event.globalPosition().toPoint(),
+                               f"sub-agent: {stype}\n{desc}".strip(), self)
             self.setCursor(Qt.CursorShape.ArrowCursor)
         else:
             QToolTip.hideText()

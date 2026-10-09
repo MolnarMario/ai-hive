@@ -552,13 +552,16 @@ workspaces keep executing — switching never pauses anything.
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
   reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Check for CLI
-  updates at start-up**, **Show usage left** and **Reply times** as labelled switches (each with a green/dark LED, so
+  updates at start-up**, **Show usage left**, **Reply times** and **Tooltips** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
   the theme and global font size below. Click outside or press `Esc` to close.
   The bar itself keeps only what you actually glance at: the usage pills and
   their `+`, and `+ Terminal`, so it fits on a laptop instead of hiding
   controls behind a scrollbar.
+  Every tooltip in the app is held to one width (360 px, never over 28% of the
+  screen) so long explanations wrap into a block instead of one wide strip, and
+  the **Tooltips** switch turns all of them off.
 - **Themes (Winamp-style skins)** — a dropdown under **⚙ Options** swaps the whole
   chrome palette live: **Scriptorium (Dark)** (the shipped warm-parchment/gold
   look), **Illuminated Manuscript** (light vellum, ultramarine running-heads,
@@ -616,10 +619,11 @@ error dialog instead of silently closing. Packaging to a distributable
   its count badge. The active workspace has the wide strip, hover shows the
   name, and a click opens that workspace without reopening the sidebar.
 - **Fullscreen.** `F11` hides everything but the agent grid. Rest the
-  cursor on the top edge for 1.5 s and the top bar and workspace header float
-  over the agents; rest it on the left edge and the sidebar floats in at its
+  cursor on the top edge for 0.75 s and the top bar (minus the logo, version
+  and update button) and workspace header float over the agents; rest it on the left edge and the sidebar floats in at its
   usual width, or as the thin rail if it was collapsed. Neither resizes a
-  terminal. `F11` again brings the window back as it was.
+  terminal. `F11` again brings the window back as it was. The Fullscreen
+  switch under Options > Appearance does the same.
 - **Agents** — `+ Terminal` (or `Ctrl+T` / `Ctrl+Shift+T`), or click any empty grid slot.
   The dialog groups **AI agents** (Claude with model + effort + mode dropdowns —
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;
@@ -932,7 +936,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3008 checks drive the real app headlessly (offscreen Qt platform) with real
+3074 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1074,7 +1078,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3008 checks)
+                           (3074 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
