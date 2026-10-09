@@ -8,6 +8,13 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.38.1
+
+- Opening or closing the sidebar no longer lights every idle agent as
+  working for two seconds.
+- The README explains the lane chip's counts, untracked files and its
+  hover tooltip.
+
 ## 0.38.0
 
 - Tooltips wrap at one readable width instead of stretching into a thin
