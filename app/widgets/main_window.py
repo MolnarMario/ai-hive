@@ -53,6 +53,7 @@ from ..orchestrator_bridge import OrchestratorBridge
 from .activity_panel import PANEL_WIDTH as ACTIVITY_PANEL_WIDTH, ActivityPanel
 from .agent_file_map import AgentFileMapWindow
 from .event_log_window import EventLogWindow
+from .fullscreen import FullscreenController
 from .lanes_help import show_lanes_explainer
 from . import ornaments
 from .ornaments import (DropDownComboBox, LogoRoundel,
@@ -2613,6 +2614,7 @@ class MainWindow(QMainWindow):
         self.sidebar.set_rail(self.ws_rail)
         body_lay.addWidget(self.ws_rail)
         body_lay.addWidget(self.body_split, 1)
+        self._body_lay = body_lay
 
         root.addWidget(self.top_bar)
         root.addLayout(body_lay, 1)
@@ -2625,6 +2627,8 @@ class MainWindow(QMainWindow):
         self._root_layout = root
         self._page_border = PageBorder(central)
         self._apply_page_border()   # geometry + margins + visibility for theme
+        # F11: only the agent grid, chrome floating back in on edge hover
+        self._fullscreen = FullscreenController(self)
 
         # refresh the activity panel's board log + git changes while visible
         self._activity_timer = QTimer(self)
@@ -2692,12 +2696,21 @@ class MainWindow(QMainWindow):
                   self._on_add_workspace_clicked)
         QShortcut(QKeySequence("Ctrl+Shift+B"), self, self._toggle_sidebar)
         QShortcut(QKeySequence("Ctrl+Shift+L"), self, self.open_event_log)
+        # The two exceptions to the Ctrl+Shift rule, at the user's request.
+        # TerminalView leaves Ctrl+N unclaimed so this one wins over a
+        # focused terminal; F11 carries no modifier, so no terminal claims it.
+        QShortcut(QKeySequence("Ctrl+N"), self, self._on_add_terminal_clicked)
+        QShortcut(QKeySequence("F11"), self, self._fullscreen.toggle)
         self.top_bar.eventLogClicked.connect(self.open_event_log)
         self.top_bar.appUpdateClicked.connect(self.check_for_app_update)
 
     # ------------------------------------------------------------- sidebar ---
 
     def _toggle_sidebar(self) -> None:
+        if self._fullscreen.active:
+            # the sidebar lives in an overlay until F11 again
+            self._fullscreen.toggle_left()
+            return
         sizes = self.body_split.sizes()
         total = sizes[0] + sizes[1]
         if sizes[0] > 0:  # collapse, remembering the current width
@@ -2718,7 +2731,10 @@ class MainWindow(QMainWindow):
 
     def _sync_ws_rail(self) -> None:
         """Show the workspace rail exactly while the sidebar is collapsed,
-        whether the toggle, Ctrl+Shift+B, a drag or a restore closed it."""
+        whether the toggle, Ctrl+Shift+B, a drag or a restore closed it.
+        Fullscreen owns the rail until it exits."""
+        if self._fullscreen.active:
+            return
         self.ws_rail.setVisible(self.body_split.sizes()[0] == 0)
 
     def _adopt_existing_model(self) -> None:
@@ -5351,6 +5367,7 @@ class MainWindow(QMainWindow):
         if ws.id in self._pages:
             return
         page = WorkspacePage(ws)
+        self._fullscreen.adopt_page(page)
         page.closeRequested.connect(
             lambda agent_id, ws_id=ws.id: self._close_agent(ws_id, agent_id))
         page.focusGained.connect(self._set_focused_card)
@@ -5387,6 +5404,7 @@ class MainWindow(QMainWindow):
         self._repo_activity.pop(ws_id, None)
         page = self._pages.pop(ws_id, None)
         if page is not None:
+            self._fullscreen.release_page(page)
             for card in list(page.cards):
                 if card is self._focused_card:
                     self._focused_card = None
@@ -5409,6 +5427,7 @@ class MainWindow(QMainWindow):
         if page is not None:
             self.stack.setCurrentWidget(page)
         self.sidebar.set_active_row(ws_id)
+        self._fullscreen.page_changed()
         ws = self.manager.workspace(ws_id)
         # keep the activity panel following the active workspace
         if self.activity_panel.is_open() and ws is not None:
@@ -5993,6 +6012,15 @@ class MainWindow(QMainWindow):
         self._page_border.raise_()
         self._page_border.update()
 
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        # left fullscreen some other way than F11 (a Windows shortcut):
+        # put the chrome back
+        if (event.type() == QEvent.Type.WindowStateChange
+                and hasattr(self, "_fullscreen") and self._fullscreen.active
+                and not self.isFullScreen()):
+            self._fullscreen.exit()
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if hasattr(self, "_page_border") and self._page_border.isVisible():
@@ -6122,14 +6150,21 @@ class MainWindow(QMainWindow):
 
     def _session_payload(self) -> dict:
         data = self.manager.to_session_dict()
-        if self.isMaximized():  # remember the restore-down size, not the
-            g = self.normalGeometry()  # screen-sized maximized geometry
+        if self._fullscreen.active:
+            # save the window as it was before F11; the splitter has no
+            # sidebar in it while the sidebar sits in its overlay
+            collapsed, maximized = self._fullscreen.saved_ui()
+        else:
+            collapsed = self.body_split.sizes()[0] == 0
+            maximized = self.isMaximized()
+        if self.isMaximized() or self.isFullScreen():
+            # remember the restore-down size, not the screen-sized geometry
+            g = self.normalGeometry()
             w, h = g.width(), g.height()
         else:
             w, h = self.width(), self.height()
-        sizes = self.body_split.sizes()
         data["ui"] = {
-            "sidebar_collapsed": sizes[0] == 0,
+            "sidebar_collapsed": collapsed,
             "sidebar_width": self._sidebar_saved_width,
             "console_font_px": ui_theme.CONSOLE_FONT_PX,
             "theme": self._theme_id,
@@ -6158,7 +6193,7 @@ class MainWindow(QMainWindow):
             "auto_continue": self._auto_continue,
             "startup_recovery": self._startup_recovery,
             "terminal_scrollback": self._terminal_scrollback,
-            "window": {"w": w, "h": h, "maximized": self.isMaximized()},
+            "window": {"w": w, "h": h, "maximized": maximized},
             # which workspaces have their inline file tree open (per-folder
             # expansion + highlight are transient, not persisted)
             "file_trees_open": self.sidebar.open_file_trees(),

@@ -159,7 +159,9 @@ class WorkspacePage(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(self._build_header())
+        # MainWindow's F11 fullscreen hides it and lends it to an overlay
+        self.header = self._build_header()
+        root.addWidget(self.header)
 
         self.body = QWidget(self)
         body_lay = QVBoxLayout(self.body)
