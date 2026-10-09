@@ -35,6 +35,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import QScrollBar, QToolTip
 
+from .. import tooltips
 from ..ui_theme import Palette
 
 WIDTH = 10          # matches the QScrollBar:vertical width in ui_theme's QSS
@@ -145,7 +146,7 @@ class TerminalScrollBar(QScrollBar):
         if ev.type() == ev.Type.ToolTip:
             hit = self._mark_at(ev.pos().y())
             if hit is not None:
-                QToolTip.showText(ev.globalPos(), _snippet(hit[1]), self)
+                tooltips.show_text(ev.globalPos(), _snippet(hit[1]), self)
             else:
                 QToolTip.hideText()
             ev.accept()

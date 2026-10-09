@@ -34,6 +34,7 @@ from .. import repo_activity
 from ..limit_banner import LIMIT_PROVIDERS, SEVEN_DAY_WINDOWS
 from .. import scheduled_send
 from .. import session_hook
+from .. import tooltips
 from .. import transcripts
 from .. import ui_theme
 from .. import usage_poll
@@ -448,6 +449,7 @@ class TopBar(QFrame):
     taskbarBadgeToggled = Signal(bool)     # show/hide the taskbar count overlay
     usageLeftToggled = Signal(bool)        # usage pills say "% left", not "% used"
     replyStampsToggled = Signal(bool)      # date/time under each finished reply
+    tooltipsToggled = Signal(bool)         # hover tooltips, app-wide
     # install newer Claude Code / agy CLIs at the NEXT startup, before any
     # agent launches (the only moment those binaries are not locked)
     autoUpdateToggled = Signal(bool)
@@ -677,6 +679,14 @@ class TopBar(QFrame):
         self.fullscreen_btn = ToggleSwitch(self)
         self.fullscreen_btn.clicked.connect(self._on_fullscreen_clicked)
         self._refresh_fullscreen_btn()
+        # "Tooltips": the hover explanations on nearly every control. Default
+        # ON. The switch is read by `app.tooltips`, which every tooltip goes
+        # through, so one flag silences all of them.
+        self._tooltips = True
+        self.tooltips_label = toggle_label("")
+        self.tooltips_btn = ToggleSwitch(self)
+        self.tooltips_btn.clicked.connect(self._on_tooltips_clicked)
+        self._refresh_tooltips_btn()
         for key, pill in self._usage_pills.items():
             pill.setVisible(False)
             pill.refreshRequested.connect(self.usageRefreshRequested)
@@ -754,6 +764,8 @@ class TopBar(QFrame):
                                           self.fullscreen_btn)
         self.options_panel.add_switch_row(self.reply_stamps_label,
                                           self.reply_stamps_btn)
+        self.options_panel.add_switch_row(self.tooltips_label,
+                                          self.tooltips_btn)
         self.options_panel.add_row("Theme", self.theme_select)
         self.options_panel.add_row("Font size", self.font_dec_btn,
                                    self.font_inc_btn)
@@ -1006,6 +1018,27 @@ class TopBar(QFrame):
             "grid.")
         self.fullscreen_btn.setToolTip(tip)
         self.fullscreen_label.setToolTip(tip)
+
+    def _on_tooltips_clicked(self) -> None:
+        self.set_tooltips(not self._tooltips)
+        self.tooltipsToggled.emit(self._tooltips)
+
+    def set_tooltips(self, on: bool) -> None:
+        """Reflect the "Tooltips" switch (no signal emitted)."""
+        self._tooltips = bool(on)
+        self._refresh_tooltips_btn()
+
+    def _refresh_tooltips_btn(self) -> None:
+        self.tooltips_btn.setChecked(self._tooltips)
+        self.tooltips_label.setText("💬  Tooltips")
+        tip = (
+            "Tooltips: ON. Hovering a control explains what it does.\n"
+            "Click to turn every tooltip off."
+            if self._tooltips else
+            "Tooltips: OFF. Hovering shows nothing.\n"
+            "Click to turn the explanations back on.")
+        self.tooltips_btn.setToolTip(tip)
+        self.tooltips_label.setToolTip(tip)
 
     def _on_agent_lanes_clicked(self) -> None:
         self.set_agent_lanes(not self._agent_lanes)
@@ -2343,6 +2376,8 @@ class MainWindow(QMainWindow):
         # "Reply times". Default ON, assigned above _restore_ui_state like the
         # other preferences or the restored value is clobbered.
         self._reply_stamps = True     # user preference (persisted)
+        self._tooltips = True         # user preference (persisted)
+        tooltips.install()            # width cap + switch, app-wide
         # startup CLI auto-update. Default OFF (it changes installed software),
         # and like every other preference here the default MUST be assigned
         # above _restore_ui_state or the restored value is clobbered.
@@ -2737,6 +2772,7 @@ class MainWindow(QMainWindow):
         self.top_bar.taskbarBadgeToggled.connect(self._on_taskbar_badge_toggled)
         self.top_bar.usageLeftToggled.connect(self._on_usage_left_toggled)
         self.top_bar.replyStampsToggled.connect(self._on_reply_stamps_toggled)
+        self.top_bar.tooltipsToggled.connect(self._on_tooltips_toggled)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.agentLanesToggled.connect(self._on_agent_lanes_toggled)
         self.top_bar.shipConfirmToggled.connect(self._on_ship_confirm_toggled)
@@ -4067,6 +4103,14 @@ class MainWindow(QMainWindow):
         SESSION_VERSION bump), saved on the debounced timer."""
         self._reply_stamps = bool(enabled)
         TerminalView.set_reply_stamps_enabled(self._reply_stamps)
+        self._schedule_save()
+
+    def _on_tooltips_toggled(self, enabled: bool) -> None:
+        """User flipped "Tooltips". `app.tooltips` holds the flag every
+        tooltip checks. An additive optional key under "ui" (no
+        SESSION_VERSION bump), saved on the debounced timer."""
+        self._tooltips = bool(enabled)
+        tooltips.set_enabled(self._tooltips)
         self._schedule_save()
 
     def _on_auto_update_toggled(self, enabled: bool) -> None:
@@ -5429,6 +5473,10 @@ class MainWindow(QMainWindow):
         self._reply_stamps = bool(ui.get("reply_stamps", True))
         self.top_bar.set_reply_stamps(self._reply_stamps)
         TerminalView.set_reply_stamps_enabled(self._reply_stamps)
+        # hover tooltips (default ON)
+        self._tooltips = bool(ui.get("tooltips", True))
+        self.top_bar.set_tooltips(self._tooltips)
+        tooltips.set_enabled(self._tooltips)
         # startup CLI auto-update (default OFF: it installs software, so it is
         # armed deliberately, once, exactly like the recovery switches were)
         self._auto_update = bool(ui.get("auto_update", False))
@@ -6312,6 +6360,7 @@ class MainWindow(QMainWindow):
             "taskbar_badge": self._taskbar_badge,
             "usage_left": self._usage_left,
             "reply_stamps": self._reply_stamps,
+            "tooltips": self._tooltips,
             "auto_update": self._auto_update,
             "agent_lanes": self._agent_lanes,
             "ship_skip_confirm": self._ship_skip_confirm,
