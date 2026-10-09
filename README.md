@@ -552,13 +552,16 @@ workspaces keep executing — switching never pauses anything.
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
   reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Check for CLI
-  updates at start-up**, **Show usage left** and **Reply times** as labelled switches (each with a green/dark LED, so
+  updates at start-up**, **Show usage left**, **Reply times** and **Tooltips** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
   the theme and global font size below. Click outside or press `Esc` to close.
   The bar itself keeps only what you actually glance at: the usage pills and
   their `+`, and `+ Terminal`, so it fits on a laptop instead of hiding
   controls behind a scrollbar.
+  Every tooltip in the app is held to one width (360 px, never over 28% of the
+  screen) so long explanations wrap into a block instead of one wide strip, and
+  the **Tooltips** switch turns all of them off.
 - **Themes (Winamp-style skins)** — a dropdown under **⚙ Options** swaps the whole
   chrome palette live: **Scriptorium (Dark)** (the shipped warm-parchment/gold
   look), **Illuminated Manuscript** (light vellum, ultramarine running-heads,
