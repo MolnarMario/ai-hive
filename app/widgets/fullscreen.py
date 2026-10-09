@@ -6,7 +6,8 @@ Entering moves the top bar, every workspace header and the sidebar out of
 the window's layouts. The top bar and the sidebar go into two floating
 overlays (children of the central widget, above the grid). Resting the
 cursor on the top edge for REVEAL_MS shows the top overlay: the top bar
-plus the active page's header, lent to the overlay while it shows. Resting
+without its identity block (☰, logo, name, version, update button) plus the
+active page's header, lent to the overlay while it shows. Resting
 it on the left edge shows the left overlay: the sidebar at the width it
 had before F11, or the thin workspace rail when the sidebar was collapsed.
 Moving the cursor off an overlay hides it again.
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QVBoxLayout
 
 from .sidebar import WorkspaceRail
 
-REVEAL_MS = 1500        # cursor rest on an edge before the chrome shows
+REVEAL_MS = 750         # cursor rest on an edge before the chrome shows
 EDGE_PX = 2             # how close to the edge counts as "on" it
 POLL_MS = 100
 CONCEAL_GRACE_MS = 400  # cursor away from an overlay before it hides
@@ -88,6 +89,7 @@ class FullscreenController(QObject):
             w._sidebar_saved_width = sizes[0]
         w._root_layout.removeWidget(w.top_bar)
         self.top.layout().addWidget(w.top_bar)
+        w.top_bar.set_identity_visible(False)
         for page in w._pages.values():
             page.header.hide()
         if self._sidebar_open:
@@ -133,6 +135,7 @@ class FullscreenController(QObject):
                     w.setGeometry(geo)
         self.top.layout().removeWidget(w.top_bar)
         w._root_layout.insertWidget(0, w.top_bar)
+        w.top_bar.set_identity_visible(True)
         w.top_bar.show()
         for page in w._pages.values():
             page.header.show()
