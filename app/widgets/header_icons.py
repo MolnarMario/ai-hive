@@ -1,19 +1,21 @@
 """Line icons for the workspace header: the folder and trash beside the path,
-and Layout, Map, Activity and Lanes.
+and Layout, Map, Activity and Lanes, plus the card header's lane chip.
 
 Font glyphs (the old "▦", "◆", "❦", "⎇") render as colour emoji on some
 systems and never match the text weight. These are stroked SVG paths (the
 Lucide set, 24px grid) painted in the same ink the stylesheet gives the
 button's text, so a hover, checked or dimmed state recolours both together.
-The stylesheet reserves the room with `padding-left`; the icon is drawn there.
+Beside text, the icon goes in the room the stylesheet reserves with
+`padding-left`. A button or label with no text gets it centred.
 """
 
 from functools import lru_cache
 
-from PySide6.QtCore import QByteArray, QRectF, QSize
+from PySide6.QtCore import QByteArray, QRectF, QSize, Qt
 from PySide6.QtGui import QPainter
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import QLabel, QToolButton
+from PySide6.QtWidgets import (QLabel, QStyle, QStyleOptionToolButton,
+                               QToolButton)
 
 from .. import ui_theme
 from ..ui_theme import Palette
@@ -120,7 +122,16 @@ class LaneChip(QToolButton):
         if self.text():
             w += (ui_theme.LANE_ICON_GAP_PX
                   + self.fontMetrics().horizontalAdvance(self.text()))
-        return QSize(w, super().sizeHint().height())
+        # the height of one line of text, with or without text: a bare chip
+        # is icon-only to QToolButton and came out 1px taller, so the chip
+        # shifted when a quiet lane made its first commit
+        opt = QStyleOptionToolButton()
+        self.initStyleOption(opt)
+        opt.toolButtonStyle = Qt.ToolButtonStyle.ToolButtonTextOnly
+        h = self.style().sizeFromContents(
+            QStyle.ContentsType.CT_ToolButton, opt,
+            QSize(0, self.fontMetrics().height()), self).height()
+        return QSize(w, h)
 
     def paintEvent(self, event):
         super().paintEvent(event)

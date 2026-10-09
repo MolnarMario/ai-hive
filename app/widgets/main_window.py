@@ -4778,6 +4778,16 @@ class MainWindow(QMainWindow):
             self._store_audit(f"INTEGRATOR ws={ws_id} none "
                               f"(was {agent.spec.name!r})")
         else:
+            # the tray stops offering the role once there is an integrator,
+            # but a tray opened before that still shows it: the role never
+            # moves by a stray click
+            current = self.manager.integrator(ws_id)
+            if current is not None:
+                self._lane_message(
+                    "Not the integrator",
+                    f"{current.spec.name} is already this workspace's "
+                    f"integrator. Stop it being the integrator first.")
+                return
             why = self.manager.can_integrate(agent)
             if why:
                 self._lane_message("Not the integrator", why)

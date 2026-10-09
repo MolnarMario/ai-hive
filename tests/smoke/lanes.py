@@ -3977,6 +3977,13 @@ def test_close_merged_agents_from_integrator_chip():
         check("close-merged: no integrator, no item",
               close_action(a) is None and close_action(i) is None)
         win._toggle_integrator(ws.id, i)
+        before = len(told)
+        win._toggle_integrator(ws.id, a)
+        check("integrator: Make integrator from a stale tray while another "
+              "agent has the role changes nothing and says why",
+              win.manager.integrator(ws.id) is i and len(told) == before + 1
+              and "already this workspace's integrator" in told[-1],
+              told[before:])
         check("close-merged: a lane agent's chip has no item",
               close_action(a) is None)
         act = close_action(i)
@@ -4181,10 +4188,17 @@ def test_task_done_waits_for_the_user():
               "in front", icard.lane_mark.text() == "integrator",
               icard.lane_mark.text())
         from app import ui_theme
-        bare = card.lane_mark.__class__()
+        from app.widgets.header_icons import LaneChip
+        bare = LaneChip(card)
         check("lane chip: a chip with no text is the icon plus its padding",
               bare.sizeHint().width() == 2 * (1 + ui_theme.LANE_PAD_PX)
               + ui_theme.LANE_ICON_PX, bare.sizeHint().width())
+        bare_h = bare.sizeHint().height()
+        bare.setText("↑1")
+        check("lane chip: gaining text keeps the chip's height",
+              bare.sizeHint().height() == bare_h,
+              (bare_h, bare.sizeHint().height()))
+        bare.deleteLater()
         prompt = i.spec.system_prompt
         check("task done: the integrator's prompt has it merge only after a "
               "clean review", "GPT-6-Luna" in prompt
