@@ -550,7 +550,7 @@ workspaces keep executing — switching never pauses anything.
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
   reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Check for CLI
-  updates at start-up** and **Show usage left** as labelled switches (each with a green/dark LED, so
+  updates at start-up**, **Show usage left** and **Reply times** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
   the theme and global font size below. Click outside or press `Esc` to close.
@@ -613,7 +613,12 @@ error dialog instead of silently closing. Packaging to a distributable
   10px rail with one strip per workspace, in sidebar order and colored like
   its count badge. The active workspace has the wide strip, hover shows the
   name, and a click opens that workspace without reopening the sidebar.
-- **Agents** — `+ Terminal` (or `Ctrl+Shift+T`), or click any empty grid slot.
+- **Fullscreen.** `F11` hides everything but the agent grid. Rest the
+  cursor on the top edge for 1.5 s and the top bar and workspace header float
+  over the agents; rest it on the left edge and the sidebar floats in at its
+  usual width, or as the thin rail if it was collapsed. Neither resizes a
+  terminal. `F11` again brings the window back as it was.
+- **Agents** — `+ Terminal` (or `Ctrl+N` / `Ctrl+Shift+T`), or click any empty grid slot.
   The dialog groups **AI agents** (Claude with model + effort + mode dropdowns —
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;
   Gemini/Antigravity with its model list; Grok via the xAI CLI; OpenAI as an
@@ -923,7 +928,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-2941 checks drive the real app headlessly (offscreen Qt platform) with real
+2999 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -937,8 +942,9 @@ a per-agent task summary beside the name, the per-card maximize/restore toggle
 (solo one agent full-area without touching any sibling's process, then restore
 the exact prior tiling), the context-window usage badge beside the summary
 ("N% of 1M/200K", read from the transcript's last usage record — transient,
-never persisted), and a date-and-time stamp under every finished reply,
-drawn inline in the terminal directly beneath Claude's own "✻ Worked for
+never persisted), and a date-and-time stamp under every finished reply
+(Claude, Codex and Gemini alike, hidden by the **Reply times** switch in
+Options without discarding any), drawn inline in the terminal directly beneath the agent's own "✻ Worked for
 16m 36s" footer (a second FIFO-capped milestone type mirroring the
 scrollbar's prompt marks, captured live on the busy-to-idle settle and
 otherwise READ FROM THE CONVERSATION ON DISK by matching each transcript
@@ -1064,7 +1070,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (2941 checks)
+                           (2999 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

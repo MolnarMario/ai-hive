@@ -10,9 +10,11 @@ agent signals can't fire into a dead widget.
 import datetime
 import re
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, Qt, QTimer, Signal
-from PySide6.QtGui import (QAction, QColor, QCursor, QDrag, QPainter, QPixmap,
-                           QTextCharFormat, QTextCursor)
+from PySide6.QtCore import (QEvent, QMimeData, QPoint, QPointF, QSize, Qt,
+                            QTimer, Signal)
+from PySide6.QtGui import (QAction, QColor, QCursor, QDrag, QPainter,
+                           QPainterPath, QPen, QPixmap, QTextCharFormat,
+                           QTextCursor)
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QPlainTextEdit, QSizePolicy, QToolButton,
                                QVBoxLayout, QWidget)
@@ -60,13 +62,6 @@ REPLAY_SEED_CAP = 8 * 1024
 # own 120ms resize debounce, so a real resize wins the race and this stays a
 # backstop rather than a second projection.
 REPLAY_SETTLE_MS = 300
-# The card's maximize/restore button wears the Windows caption-button pair
-# (ChromeMaximize, ChromeRestore): one square, then two stacked squares. They
-# are private-use codepoints of "Segoe MDL2 Assets" (Windows 10 and 11). The
-# #CardMaximize QSS rule names that font; without it the glyph's size and
-# shape depend on whichever icon font Qt's fallback happens to pick.
-MAXIMIZE_GLYPH = ""
-RESTORE_GLYPH = ""
 # how much of a transcript prompt must be found on a scrollback line to call it
 # that prompt's echo (see TerminalCard._recover_marks)
 _MARK_MATCH_CHARS = 28
@@ -96,6 +91,9 @@ _HOOK_ROWS = 4
 # text, the live path to the footer row itself. Three rows spans that gap and
 # nothing else; a reply is never two turns away from itself.
 _STAMP_MERGE_SLACK = 3
+# providers whose transcript records say when each reply finished (see
+# TerminalCard._recover_marks)
+_RECOVERABLE = ("claude", "gemini", "openai")
 
 
 def _norm_line(text: str) -> str:
@@ -262,6 +260,68 @@ class _CardHeader(QFrame):
     def mouseReleaseEvent(self, event):
         self._press = None
         super().mouseReleaseEvent(event)
+
+
+class _MaximizeButton(QToolButton):
+    """The maximize / restore button, drawn as four corner brackets with an
+    arrow in each. Maximize points the arrows out at the corners, restore
+    points them in at the middle.
+
+    It paints the icon itself, in the header's own inks (CARDHEAD_SUB, then
+    CARDHEAD_FG while hovered), read from Palette at paint time. A font glyph
+    took its color from QSS and had no form for this pair, and a pixmap would
+    need rebuilding on every theme change."""
+
+    _BOX = 16   # icon edge in px; the 24-unit drawing below is scaled to it
+    # per quadrant, top-left, on a 24 grid; the other three mirror about 12.
+    # (bracket arm length, arrow tail, arrow tip, arrow head arm end points)
+    _OUT = (6.0, (8.6, 8.6), (4.0, 4.0), ((7.2, 4.0), (4.0, 7.2)))
+    _IN = (8.0, (4.2, 4.2), (9.6, 9.6), ((6.8, 9.6), (9.6, 6.8)))
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.restored = False
+
+    def set_restored(self, on: bool) -> None:
+        if on != self.restored:
+            self.restored = on
+            self.update()
+
+    def sizeHint(self):
+        # an iconless, textless QToolButton collapses to its padding; keep it
+        # as wide as the glyph buttons beside it
+        return QSize(self._BOX + 14, self._BOX + 10)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)   # the QSS hover plate
+        arm, tail, tip, head = self._IN if self.restored else self._OUT
+        ink = Palette.CARDHEAD_FG if self.underMouse() else Palette.CARDHEAD_SUB
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        k = self._BOX / 24.0
+        p.translate((self.width() - self._BOX) / 2.0,
+                    (self.height() - self._BOX) / 2.0)
+        p.scale(k, k)
+        pen = QPen(QColor(ink), 2.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        path = QPainterPath()
+        for sx in (1, -1):
+            for sy in (1, -1):
+                def pt(x, y, sx=sx, sy=sy):
+                    return QPointF(x if sx > 0 else 24 - x,
+                                   y if sy > 0 else 24 - y)
+                path.moveTo(pt(1.0, 1.0 + arm))
+                path.lineTo(pt(1.0, 1.0))
+                path.lineTo(pt(1.0 + arm, 1.0))
+                path.moveTo(pt(*tail))
+                path.lineTo(pt(*tip))
+                path.moveTo(pt(*head[0]))
+                path.lineTo(pt(*tip))
+                path.lineTo(pt(*head[1]))
+        p.drawPath(path)
+        p.end()
 
 
 class _ToolsTray(QFrame):
@@ -525,6 +585,9 @@ class TerminalCard(QFrame):
         # the agents that matter. See _recover_marks for why re-reading within
         # one conversation cannot find anything the card doesn't already know.
         self._recover_key: tuple = ()
+        # True while this card clears its own screen only to project the SAME
+        # conversation again (see _clear_for_projection)
+        self._reprojecting = False
         # settles left to look for a conversation reprinted after this card was
         # built (see _rescan_recovery)
         self._recover_tries = _RECOVER_RESCAN_TRIES
@@ -769,8 +832,10 @@ class TerminalCard(QFrame):
                                  self.header_tools)
         # solo/restore this card in the workspace grid — a pure view toggle;
         # never touches sibling processes (see WorkspacePage.toggle_solo)
-        self.btn_max = tool(MAXIMIZE_GLYPH, "CardMaximize",
-                            "Maximize (focus this agent)", self.header_tools)
+        self.btn_max = _MaximizeButton(self.header_tools)
+        self.btn_max.setObjectName("CardMaximize")
+        self.btn_max.setToolTip("Maximize (focus this agent)")
+        self.btn_max.setCursor(Qt.CursorShape.PointingHandCursor)
         for _b in (self.btn_stop, self.btn_restart, self.btn_adopt,
                    self.btn_integrator, self.btn_sched, self.btn_font_dec, self.btn_font_inc,
                    self.btn_max):
@@ -1508,8 +1573,7 @@ class TerminalCard(QFrame):
         # screen.reset() wipes history WITHOUT going through feed(), so the
         # shrink check there never sees it -- tell the view explicitly, then
         # re-derive the milestones from the same replay.
-        self.terminal.note_history_cleared()
-        self.terminal.screen.reset()
+        self._clear_for_projection()
         self._replay_with_marks(replay)
         self._proj_cols = self.terminal.screen.columns
         self._refresh_overlay()
@@ -1621,6 +1685,27 @@ class TerminalCard(QFrame):
         if ready:
             self._end_boot_veil()
 
+    def _clear_for_projection(self) -> None:
+        """Blank the screen so the agent's pty stream can be projected onto it
+        again, at a new width or on a rebuilt card.
+
+        That is a view-only reset: the conversation has not changed, so the
+        agent's prompt and reply marks have to survive it. They are exactly
+        what _replay_with_marks re-anchors from (each mark's `pos` is an offset
+        into this same stream). Going through note_history_cleared alone
+        wiped them, because its historyCleared signal is also what a REAL wipe
+        (a /clear, an ED 3) uses to drop the agent's marks. So every width
+        change, sidebar toggle, retile and card rebuild erased every reply
+        stamp of every live agent, and the replay that followed had nothing
+        left to place. Only the transcript could bring a stamp back, and only
+        for the replies it could match on screen."""
+        self._reprojecting = True
+        try:
+            self.terminal.note_history_cleared()
+            self.terminal.screen.reset()
+        finally:
+            self._reprojecting = False
+
     def _reproject_on_size(self, _rows: int, cols: int) -> None:
         """Re-render the scrollback whenever the terminal's WIDTH changes.
 
@@ -1648,8 +1733,7 @@ class TerminalCard(QFrame):
         replay = self.agent.pty_replay()
         if not replay:
             return
-        self.terminal.note_history_cleared()
-        self.terminal.screen.reset()
+        self._clear_for_projection()
         self._replay_with_marks(replay)
 
     def _replay_with_marks(self, replay: str, cap: int | None = None,
@@ -1705,21 +1789,29 @@ class TerminalCard(QFrame):
                   [(off, "reply", mark) for off, mark in self.agent.reply_replay_marks()])
         tagged.sort(key=lambda t: t[0])
         pos = skip
-        for off, kind, mark in tagged:
-            off = max(0, min(len(replay), off))
-            if off < skip:
-                continue        # its bytes are outside the projected window
-            if off > pos:
-                self.terminal.feed(replay[pos:off])
-                pos = off
-            if kind == "prompt":
-                self._mark_lines[mark.uid] = self.terminal.anchor_line()
-            else:
-                line = self.terminal.reply_anchor_line()
-                if line is not None:
-                    self._reply_mark_lines[mark.uid] = line
-        if pos < len(replay):
-            self.terminal.feed(replay[pos:])
+        # an ED 3 or a reset inside the replayed stream wipes the view's
+        # history again, and its historyCleared must not reach the agent's
+        # marks: the live wipe already dropped the ones before it, and every
+        # mark left is one this replay is placing (_on_history_cleared)
+        held, self._reprojecting = self._reprojecting, True
+        try:
+            for off, kind, mark in tagged:
+                off = max(0, min(len(replay), off))
+                if off < skip:
+                    continue    # its bytes are outside the projected window
+                if off > pos:
+                    self.terminal.feed(replay[pos:off])
+                    pos = off
+                if kind == "prompt":
+                    self._mark_lines[mark.uid] = self.terminal.anchor_line()
+                else:
+                    line = self.terminal.reply_anchor_line()
+                    if line is not None:
+                        self._reply_mark_lines[mark.uid] = line
+            if pos < len(replay):
+                self.terminal.feed(replay[pos:])
+        finally:
+            self._reprojecting = held
         if recover:
             rows = self._scrollback_rows()
             self._recover_marks(rows)
@@ -1760,7 +1852,7 @@ class TerminalCard(QFrame):
         (a pin change or /clear), which changes the key and re-reads."""
         self._recovered = []
         spec = self.agent.spec
-        if not self.is_pty or spec.provider not in ("claude", "gemini"):
+        if not self.is_pty or spec.provider not in _RECOVERABLE:
             return
         key = (spec.provider, spec.cwd, spec.session_id)
         if key != self._recover_key:
@@ -1775,9 +1867,10 @@ class TerminalCard(QFrame):
                     spec.session_id)
                 self._recover_replies = transcripts.gemini_reply_times(
                     spec.session_id)
-            else:
+            else:   # openai: reply times only, there is no prompt reader
                 self._recover_prompts = []
-                self._recover_replies = []
+                self._recover_replies = transcripts.codex_reply_times(
+                    spec.session_id)
         prompts = self._recover_prompts
         if not prompts:
             return
@@ -1844,7 +1937,7 @@ class TerminalCard(QFrame):
         inventing a time for one."""
         self._recovered_replies = []
         spec = self.agent.spec
-        if not self.is_pty or spec.provider not in ("claude", "gemini"):
+        if not self.is_pty or spec.provider not in _RECOVERABLE:
             return
         if not self._recover_replies:
             return
@@ -1900,9 +1993,11 @@ class TerminalCard(QFrame):
         milestone anchored into it is meaningless."""
         self._mark_lines = {}
         self._recovered = []
-        self.agent.clear_prompt_marks()
         self._reply_mark_lines = {}
         self._recovered_replies = []
+        if self._reprojecting:
+            return      # same conversation: the agent keeps its marks
+        self.agent.clear_prompt_marks()
         self.agent.clear_reply_marks()
 
     def _refresh_reply_marks(self) -> None:
@@ -2015,8 +2110,8 @@ class TerminalCard(QFrame):
 
     def set_maximized(self, on: bool) -> None:
         # the SAME button toggles between Maximize and Restore down — the page
-        # owns the actual solo state; this only reflects it in the glyph/tooltip
-        self.btn_max.setText(RESTORE_GLYPH if on else MAXIMIZE_GLYPH)
+        # owns the actual solo state; this only reflects it in the icon/tooltip
+        self.btn_max.set_restored(on)
         self.btn_max.setToolTip("Restore down" if on
                                 else "Maximize (focus this agent)")
 

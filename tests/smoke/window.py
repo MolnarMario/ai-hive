@@ -761,18 +761,10 @@ def test_app():
           page.cards[0].isVisible() and max_pos == (0, 0, 1, 1), max_pos)
     check("maximize: sibling cards hidden (processes untouched)",
           not page.cards[1].isVisible() and not page.cards[2].isVisible())
-    from PySide6.QtGui import QRawFont
-    from app.widgets.terminal_card import MAXIMIZE_GLYPH, RESTORE_GLYPH
-    check("maximize: button shows Restore glyph",
-          page.cards[0].btn_max.text() == RESTORE_GLYPH)
-    # the two squares are private-use codepoints, so the QSS rule must give
-    # the button a font that holds them itself. QRawFont looks at that one
-    # font only; QFontMetrics.inFontUcs4 counts fallback and says yes for any.
-    _max_raw = QRawFont.fromFont(page.cards[0].btn_max.font())
-    check("maximize: button font holds the maximize and restore glyphs",
-          _max_raw.supportsCharacter(ord(MAXIMIZE_GLYPH))
-          and _max_raw.supportsCharacter(ord(RESTORE_GLYPH)),
-          _max_raw.familyName())
+    check("maximize: button shows the restore icon",
+          page.cards[0].btn_max.restored)
+    check("maximize: tooltip says Restore down",
+          page.cards[0].btn_max.toolTip() == "Restore down")
     check("maximize: no stale row/col stretch while soloed",
           page.grid.columnStretch(1) == 0 and page.grid.rowStretch(1) == 0)
     snap(win, "04b_maximized")
@@ -782,8 +774,8 @@ def test_app():
     assert_layout(page, 3)            # exact prior arrangement reproduced
     check("restore: all cards visible again",
           all(c.isVisible() for c in page.cards))
-    check("restore: button shows Maximize glyph",
-          page.cards[0].btn_max.text() == MAXIMIZE_GLYPH)
+    check("restore: button shows the maximize icon",
+          not page.cards[0].btn_max.restored)
     check("maximize: solo toggling never marks the session dirty",
           solo_dirty["n"] == 0, solo_dirty["n"])
     mgr.dirty.disconnect(_solo_conn)
@@ -3039,3 +3031,194 @@ def test_topbar_extras_grow_with_window():
           bar.minimumSizeHint().width() < 1000,
           bar.minimumSizeHint().width())
     host.deleteLater()
+
+
+def test_fullscreen_f11():
+    """F11 leaves only the agent grid. Resting the cursor on the top edge
+    floats the top bar and the active workspace header over the grid,
+    resting it on the left edge floats the sidebar at its pre-F11 width (or
+    the rail, when the sidebar was collapsed), and neither reveal resizes
+    the terminals. F11 again puts everything back where it was. Ctrl+N adds
+    a terminal even while a terminal has focus."""
+    from PySide6.QtCore import QEvent, QEventLoop, QPoint, Qt, QTimer
+    from PySide6.QtGui import QKeyEvent, QShortcut
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from app.session_store import SessionStore
+    from app.widgets import fullscreen
+    from app.widgets.sidebar import WorkspaceRail
+    from app.widgets.terminal_view import TerminalView
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    class Cursor:          # the offscreen platform has no real pointer
+        at = QPoint(0, 0)
+
+        @staticmethod
+        def pos():
+            return Cursor.at
+
+    real_cursor = fullscreen.QCursor
+    fullscreen.QCursor = Cursor
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-fullscreen-"))
+    try:
+        store = SessionStore(path=tmp / "s.json")
+        win = create_main_window(store)
+        win.resize(1200, 700)
+        win.show()
+        pump(100)
+        win.isActiveWindow = lambda: True
+        fs = win._fullscreen
+        mgr = win.manager
+        wa = mgr.workspaces[0]
+        wb = mgr.create_workspace("Bravo")
+        mgr.set_active(wa.id)
+        win.body_split.setSizes([260, 940])
+        pump(50)
+        width = win.body_split.sizes()[0]
+
+        keys = {s.key().toString() for s in win.findChildren(QShortcut)}
+        check("fullscreen: F11 and Ctrl+N are window shortcuts",
+              {"F11", "Ctrl+N"} <= keys, keys)
+
+        def rest(x, y, ms):
+            Cursor.at = win._central.mapToGlobal(QPoint(x, y))
+            for _ in range(ms // fullscreen.POLL_MS + 1):
+                fs._poll()
+
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        page_a, page_b = win._pages[wa.id], win._pages[wb.id]
+        check("fullscreen: F11 enters fullscreen",
+              fs.active and win.isFullScreen(), win.windowState())
+        check("fullscreen: top bar, headers and sidebar are gone",
+              not win.top_bar.isVisible() and page_a.header.isHidden()
+              and page_b.header.isHidden() and not win.sidebar.isVisible()
+              and win.body_split.count() == 1,
+              (win.top_bar.isVisible(), win.body_split.count()))
+        payload = win._session_payload()["ui"]
+        check("fullscreen: a save records the pre-F11 sidebar and window",
+              payload["sidebar_collapsed"] is False
+              and payload["window"]["maximized"] is False
+              and payload["sidebar_width"] == width, payload)
+
+        grid = win.stack.geometry()
+        rest(500, 0, fullscreen.REVEAL_MS - 2 * fullscreen.POLL_MS)
+        check("fullscreen: a short rest on the top edge shows nothing",
+              not fs.top.isVisible())
+        rest(500, 0, 2 * fullscreen.POLL_MS)
+        check("fullscreen: resting on the top edge floats the top bar and "
+              "the active header in",
+              fs.top.isVisible() and win.top_bar.isVisible()
+              and page_a.header.parent() is fs.top
+              and page_a.header.isVisible(),
+              (fs.top.isVisible(), page_a.header.parent()))
+        check("fullscreen: the overlay covers the grid, never resizes it",
+              win.stack.geometry() == grid
+              and fs.top.geometry().top() == 0
+              and fs.top.height() == win.top_bar.height()
+              + page_a.header.height(),
+              (win.stack.geometry(), grid, fs.top.geometry()))
+
+        mgr.set_active(wb.id)
+        check("fullscreen: switching workspace lends the new header",
+              page_b.header.parent() is fs.top
+              and page_a.header.parent() is page_a
+              and page_a.header.isHidden(),
+              (page_a.header.parent(), page_b.header.parent()))
+
+        rest(500, 400, fullscreen.CONCEAL_GRACE_MS)
+        check("fullscreen: moving off the top overlay hides it again",
+              not fs.top.isVisible() and page_b.header.parent() is page_b
+              and page_b.layout().indexOf(page_b.header) == 0
+              and page_b.header.isHidden())
+
+        rest(0, 300, fullscreen.REVEAL_MS)
+        check("fullscreen: resting on the left edge floats the sidebar "
+              "at its pre-F11 width",
+              fs.left.isVisible() and win.sidebar.parent() is fs.left
+              and fs.left.width() == width and win.stack.geometry() == grid,
+              (fs.left.isVisible(), fs.left.width(), width))
+        rest(800, 300, fullscreen.CONCEAL_GRACE_MS)
+        check("fullscreen: moving off the sidebar hides it",
+              not fs.left.isVisible())
+
+        win._toggle_sidebar()
+        rest(800, 300, 2 * fullscreen.CONCEAL_GRACE_MS)
+        check("fullscreen: Ctrl+Shift+B shows the sidebar until the cursor "
+              "has been over it",
+              fs.left.isVisible())
+        rest(5, 300, fullscreen.POLL_MS)
+        rest(800, 300, fullscreen.CONCEAL_GRACE_MS)
+        check("fullscreen: ... and leaving it then hides it",
+              not fs.left.isVisible())
+
+        rest(500, 0, fullscreen.REVEAL_MS)
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen: F11 again restores the window",
+              not fs.active and not win.isFullScreen()
+              and not fs.top.isVisible(), win.windowState())
+        check("fullscreen: top bar and headers are back in their layouts",
+              win._root_layout.indexOf(win.top_bar) == 0
+              and win.top_bar.isVisible()
+              and page_b.header.parent() is page_b
+              and page_b.layout().indexOf(page_b.header) == 0
+              and page_b.header.isVisible() and not page_a.header.isHidden())
+        check("fullscreen: the sidebar is back at its width",
+              win.body_split.count() == 2
+              and win.body_split.widget(0) is win.sidebar
+              and win.body_split.sizes()[0] == width
+              and win.body_split.isCollapsible(0)
+              and not win.body_split.isCollapsible(1)
+              and win.ws_rail.isHidden(),
+              (win.body_split.sizes(), win.size(), width))
+
+        win._toggle_sidebar()
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen: a collapsed sidebar leaves the rail for the "
+              "left edge", win.ws_rail.parent() is fs.left
+              and fs.left.width() == WorkspaceRail.WIDTH
+              and win.body_split.sizes()[0] == 0)
+        check("fullscreen: the splitter handle on the left edge cannot be dragged",
+              not win.body_split.handle(1).isEnabled())
+        check("fullscreen: a save keeps the sidebar collapsed",
+              win._session_payload()["ui"]["sidebar_collapsed"] is True)
+        rest(0, 300, fullscreen.REVEAL_MS)
+        check("fullscreen: the left edge shows the thin rail",
+              fs.left.isVisible() and win.ws_rail.isVisible())
+        win.showNormal()
+        pump(50)
+        check("fullscreen: leaving fullscreen another way puts the chrome "
+              "back", not fs.active and win.top_bar.isVisible()
+              and win._body_lay.indexOf(win.ws_rail) == 0
+              and win.ws_rail.isVisible()
+              and win.body_split.sizes()[0] == 0
+              and win.body_split.handle(1).isEnabled())
+        win._toggle_sidebar()
+        check("fullscreen: the sidebar still reopens at its width",
+              win.body_split.sizes()[0] == width, win.body_split.sizes())
+
+        tv = TerminalView(rows=6, cols=80)
+        ctrl = Qt.KeyboardModifier.ControlModifier
+        ev_n = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_N, ctrl)
+        ev_p = QKeyEvent(QEvent.Type.ShortcutOverride, Qt.Key.Key_P, ctrl)
+        ev_n.ignore()
+        ev_p.ignore()
+        tv.event(ev_n)
+        tv.event(ev_p)
+        check("ctrl+n: a focused terminal leaves Ctrl+N to the window, "
+              "keeps Ctrl+P", not ev_n.isAccepted() and ev_p.isAccepted())
+        tv.deleteLater()
+        win.close()
+        pump(100)
+    finally:
+        fullscreen.QCursor = real_cursor
+        shutil.rmtree(tmp, ignore_errors=True)
