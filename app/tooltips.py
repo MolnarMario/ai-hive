@@ -21,6 +21,7 @@ event and makes `show_text` a no-op, so one flag covers both paths.
 from __future__ import annotations
 
 import html
+import re
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt
 from PySide6.QtGui import QFontMetrics, QGuiApplication, QTextDocument
@@ -63,7 +64,10 @@ def max_width(widget: QWidget | None = None) -> int:
 
 
 def _natural_width(text: str, rich: bool, widget: QWidget | None) -> float:
-    font = widget.font() if widget is not None else QToolTip.font()
+    # The tip is drawn in the app stylesheet's chrome font (the `*` rule in
+    # ui_theme), which the top-level window carries too. The hovered
+    # widget's own font can be far off (a terminal's monospace).
+    font = widget.window().font() if widget is not None else QToolTip.font()
     if rich:
         doc = QTextDocument()
         doc.setDefaultFont(font)
@@ -72,6 +76,22 @@ def _natural_width(text: str, rich: bool, widget: QWidget | None) -> float:
     metrics = QFontMetrics(font)
     return max((metrics.horizontalAdvance(line)
                 for line in text.split("\n")), default=0)
+
+
+def _keep_indent(line: str) -> str:
+    """Rich text collapses spaces, so a plain tip's indented lines (the lane
+    chip lists its overlaps that way) keep their indent as &nbsp;."""
+    stripped = line.lstrip(" ")
+    return "&nbsp;" * (len(line) - len(stripped)) + stripped
+
+
+def _menu_tip(action) -> str:
+    """The tooltip an action SET, which is all QMenu shows. QAction.toolTip()
+    falls back to the action's text with its "&" mnemonics and any "..."
+    removed (Qt's qt_strippedText), and a menu shows nothing for that."""
+    label = re.sub(r"&(.)", r"\1", action.text().replace("...", "")).strip()
+    tip = action.toolTip()
+    return "" if tip == label else tip
 
 
 def wrap(text: str, widget: QWidget | None = None) -> str:
@@ -83,7 +103,8 @@ def wrap(text: str, widget: QWidget | None = None) -> str:
     rich = _GuiQt.mightBeRichText(text)
     if _natural_width(text, rich, widget) <= limit:
         return text
-    body = text if rich else html.escape(text).replace("\n", "<br>")
+    body = text if rich else "<br>".join(
+        _keep_indent(line) for line in html.escape(text).split("\n"))
     return (f'<table width="{limit}" cellspacing="0" cellpadding="0">'
             f"<tr><td>{body}</td></tr></table>")
 
@@ -122,7 +143,7 @@ class TooltipFilter(QObject):
             if not obj.toolTipsVisible():
                 return "", obj
             action = obj.actionAt(event.pos())
-            return (action.toolTip() if action is not None else ""), obj
+            return (_menu_tip(action) if action is not None else ""), obj
         view = obj.parentWidget()
         if isinstance(view, QAbstractItemView) and obj is view.viewport():
             index = view.indexAt(event.pos())

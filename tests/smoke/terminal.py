@@ -1670,6 +1670,34 @@ def test_replay_reads_each_part_at_its_drawn_size():
           ([off for off, _ in seeded.replay_marks()], len(seeded.pty_replay())))
     seeded.dispose()
 
+    # a pristine restored seed records no sizes: the card projects it again
+    # at every width, and sizes at its end cut its lines to the narrowest
+    restored = TerminalAgent(build_spec(AgentKind.CLAUDE, "Restored",
+                                        cwd=SCRATCH_CWD, pty=True))
+    seed = "PREVIOUS-RUN " * 50
+    restored.seed_pty_replay(seed)
+    restored.resize(30, 60)
+    restored.resize(30, 120)
+    check("geometry: resizes over a pristine seed record no size",
+          restored.replay_geometry() == [], restored.replay_geometry())
+    restored._on_pty_output("pty", "drawn over\r\n")
+    check("geometry: the first bytes after a seed record the view's size",
+          [(off, g.cols) for off, g in restored.replay_geometry()]
+          == [(len(seed), 120)],
+          [(off, g.cols) for off, g in restored.replay_geometry()])
+    restored.dispose()
+
+    # a card that never resized (a workspace not shown yet): the first bytes
+    # are read at the size the child was spawned at
+    unseen = TerminalAgent(build_spec(AgentKind.CLAUDE, "Unseen",
+                                      cwd=SCRATCH_CWD, pty=True))
+    unseen._on_pty_output("pty", "hello\r\n")
+    check("geometry: with no view size the spawn size is recorded",
+          [(off, g.rows, g.cols) for off, g in unseen.replay_geometry()]
+          == [(0, unseen.worker.rows, unseen.worker.cols)],
+          [(off, g.rows, g.cols) for off, g in unseen.replay_geometry()])
+    unseen.dispose()
+
 
 def test_history_screen_wrapper_removed():
     """_FastHistoryScreen drops pyte's per-event wrapper without changing what

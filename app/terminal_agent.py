@@ -825,8 +825,32 @@ class TerminalAgent(QObject):
 
         A resize storm with no output in between is kept whole, not collapsed
         to its last size: pyte drops rows off the top on every shrink, so the
-        live view's screen depends on each step."""
+        live view's screen depends on each step.
+
+        Nothing is recorded over a pristine restored seed. It never recorded
+        the size it was drawn at, and the card projects it again at every new
+        width (`_reproject_on_size`). A size noted now would sit at the seed's
+        END, and replaying a narrow-then-wide pair there cuts every seed line
+        to the narrow width. The first bytes after the seed record the size
+        they were drawn at (`_note_first_size`)."""
         self._view_size = (rows, cols)
+        if self.has_pristine_seed():
+            return
+        self._record_size(rows, cols)
+
+    def _note_first_size(self) -> None:
+        """Before the first bytes of a stream with no recorded size: they are
+        drawn at the size the view last asked for, or at the size the child
+        was spawned at when no view has asked yet (a card in a workspace not
+        shown since launch never resizes)."""
+        if self._geometry:
+            return
+        size = self._view_size or (getattr(self.worker, "rows", 0),
+                                   getattr(self.worker, "cols", 0))
+        if size[0] and size[1]:
+            self._record_size(*size)
+
+    def _record_size(self, rows: int, cols: int) -> None:
         last = self._geometry[-1] if self._geometry else None
         if last is not None and (last.rows, last.cols) == (rows, cols):
             return
@@ -2519,6 +2543,7 @@ class TerminalAgent(QObject):
         self._mark_busy()  # streaming VT output => the agent is working
         # keep a bounded raw tail so a freshly created card can rebuild the
         # screen; the live TerminalView is fed directly via the signal
+        self._note_first_size()
         self._pty_buffer.append(text)
         self._pty_bytes += len(text)
         self._pty_total += len(text)

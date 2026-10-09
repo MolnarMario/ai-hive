@@ -105,6 +105,39 @@ def test_tooltip_wrap_caps_the_width():
         host.deleteLater()
 
 
+def test_tooltip_menu_and_wrap_details():
+    """Review fixes: a menu item with no tooltip of its own shows none, a
+    wrapped plain tip keeps its indents, and the width is judged in the
+    window's font, not the hovered widget's."""
+    from PySide6.QtGui import QAction, QFont
+    from PySide6.QtWidgets import QApplication, QLabel, QWidget
+
+    from app import tooltips
+
+    QApplication.instance() or QApplication([])
+    plain = QAction("&Open lane folder...")
+    check("tooltip: a menu item without a tip of its own shows none",
+          tooltips._menu_tip(plain) == "", plain.toolTip())
+    tipped = QAction("Update lane")
+    tipped.setToolTip("Merge the base into this lane")
+    check("tooltip: a menu item's own tip still shows",
+          tooltips._menu_tip(tipped) == "Merge the base into this lane")
+
+    wrapped = tooltips.wrap("Overlaps:\n    app/lanes.py with Agent 2\n"
+                            + "word " * 80)
+    check("tooltip: a wrapped plain tip keeps a line's indent",
+          "<br>&nbsp;&nbsp;&nbsp;&nbsp;app/lanes.py" in wrapped, wrapped[:160])
+
+    win = QWidget()
+    win.setFont(QFont("Segoe UI", 8))
+    child = QLabel("x", win)
+    child.setFont(QFont("Consolas", 40))
+    text = "word " * 5       # narrow in the window's font, wide at 40pt
+    check("tooltip: the width is measured in the window's font",
+          tooltips.wrap(text, child) == text, tooltips.wrap(text, child)[:60])
+    win.deleteLater()
+
+
 def test_tooltips_option_toggle():
     """The "Tooltips" switch in the Options panel defaults ON, flips the
     app-wide flag, and persists under ui."""

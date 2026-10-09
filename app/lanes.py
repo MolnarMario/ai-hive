@@ -1262,7 +1262,9 @@ def lane_snap(entry: dict, cache: dict | None = None) -> LaneSnap:
             if snap.ahead and snap.role != INTEGRATOR_ROLE:
                 snap.done = _done_commit(root, snap.head, snap.base_ref,
                                          cache)
-                if snap.done:
+                if snap.done == snap.head:      # the usual case
+                    snap.done_paths = list(snap.committed)
+                elif snap.done:
                     snap.done_paths = _done_paths(root, snap.done,
                                                   snap.base_ref, cache)
             elif snap.role != INTEGRATOR_ROLE:

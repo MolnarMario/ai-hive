@@ -59,7 +59,7 @@ class FullscreenController(QObject):
         self._sidebar_open = True
         self._left_widget = None    # the sidebar or the rail, while active
         self._lent = None           # (page, header) shown in the top overlay
-        self._left_held = False     # shown by ☰ / Ctrl+Shift+B, not the edge
+        self._left_held = False     # pinned by Ctrl+Shift+B, not the edge
         self._top_dwell = self._left_dwell = 0
         self._top_away = self._left_away = 0
         self.top = _Overlay(win._central, vertical=True)
@@ -201,8 +201,9 @@ class FullscreenController(QObject):
         self._left_held = False
 
     def toggle_left(self) -> None:
-        """☰ and Ctrl+Shift+B while fullscreen: show or hide the sidebar
-        overlay, and keep it up until the cursor has been over it."""
+        """Ctrl+Shift+B while fullscreen (the ☰ button hides with the top
+        bar's identity block): show or hide the sidebar overlay, and keep it
+        up until the cursor has been over it."""
         if self.left.isVisible():
             self.conceal_left()
         else:
