@@ -1,4 +1,5 @@
-"""Line icons for the workspace header's Layout, Map, Activity and Lanes.
+"""Line icons for the workspace header: the folder and trash beside the path,
+and Layout, Map, Activity and Lanes.
 
 Font glyphs (the old "▦", "◆", "❦", "⎇") render as colour emoji on some
 systems and never match the text weight. These are stroked SVG paths (the
@@ -35,6 +36,14 @@ _BODIES = {
     "lanes": ("<line x1='6' x2='6' y1='3' y2='15'/>"
               "<circle cx='18' cy='6' r='3'/><circle cx='6' cy='18' r='3'/>"
               "<path d='M18 9a9 9 0 0 1-9 9'/>"),
+    "folder": ("<path d='M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 "
+               "1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 "
+               "0 0 2 2Z'/>"),
+    "trash": ("<path d='M3 6h18'/>"
+              "<path d='M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6'/>"
+              "<path d='M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2'/>"
+              "<line x1='10' x2='10' y1='11' y2='17'/>"
+              "<line x1='14' x2='14' y1='11' y2='17'/>"),
 }
 
 
@@ -54,23 +63,33 @@ def _paint(widget, name: str, ink: str, left: int) -> None:
 
 
 class IconToolButton(QToolButton):
-    """A header text button with a line icon left of its text. The icon is
-    blue while the button is checked, like the text, else the normal ink."""
+    """A header button with a line icon left of its text, or centred when it
+    has no text. The icon is blue while the button is checked, like the text,
+    else the normal ink. `hover_ink` names the Palette colour the stylesheet's
+    :hover rule gives the button (the trash turns RED): a painted icon can't
+    read a pseudo-state's colour."""
 
-    def __init__(self, icon_name: str, parent=None):
+    def __init__(self, icon_name: str, parent=None, hover_ink: str = ""):
         super().__init__(parent)
         self._icon_name = icon_name
+        self._hover_ink = hover_ink
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        ink = (Palette.ACCENT_BLUE if self.isChecked() else Palette.TEXT)
+        if self.isChecked():
+            ink = Palette.ACCENT_BLUE
+        elif self._hover_ink and self.underMouse():
+            ink = getattr(Palette, self._hover_ink)
+        else:
+            ink = Palette.TEXT
         # 9px = the stylesheet's 8px horizontal padding plus the 1px border
-        _paint(self, self._icon_name, ink, 9)
+        left = 9 if self.text() else (self.width() - ICON_SIZE) / 2
+        _paint(self, self._icon_name, ink, left)
 
 
 class IconLabel(QLabel):
-    """The Lanes label. Its `forced` property dims the text, so the icon dims
-    with it."""
+    """The Lanes label, and the textless folder icon before the path. Its
+    `forced` property dims the text, so the icon dims with it."""
 
     def __init__(self, icon_name: str, text: str, parent=None):
         super().__init__(text, parent)

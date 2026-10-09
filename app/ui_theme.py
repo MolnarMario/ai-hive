@@ -796,13 +796,10 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     border-radius: 4px;
 }}
 #WsDelete {{ color: {p.TEXT}; font-size: 17px; font-weight: 900; }}
-/* the workspace header's trash glyph. Segoe UI Symbol draws U+1F5D1 as a
-   one-color outline that takes `color`; left to fallback, Windows can pick
-   the color emoji, which ignores it and never turns red on hover. */
-#WsTrash {{
-    padding: 1px 6px; color: {p.TEXT}; font-size: 17px;
-    font-family: "Segoe UI Symbol";
-}}
+/* the workspace header's trash: header_icons paints the icon centred, so
+   this only reserves its 14px box. The hover red reaches the icon through
+   IconToolButton's hover_ink, not through `color`. */
+#WsTrash {{ padding: 3px 6px; min-width: 14px; min-height: 14px; }}
 #GlobalFontBtn {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 2px 7px; color: {p.TEXT_DIM}; font-weight: 700;
@@ -1000,7 +997,9 @@ QScrollArea {{ background: transparent; border: none; }}
 #WorkspaceHeader {{
     background: {p.BG_PANEL}; border-bottom: 1px solid {p.BORDER};
 }}
-#HeaderFolderIcon {{ color: {p.TEXT_DIM}; font-size: 13px; }}
+/* the path takes the buttons' ink and size so the row reads as one weight
+   (#HeaderPath stays the dim caption the map and event log use) */
+#WsHeaderPath {{ color: {p.TEXT}; }}
 #HeaderPath {{ color: {p.TEXT_DIM}; font-size: 12px; }}
 #HeaderLanesLabel {{ color: {p.TEXT}; padding-left: 20px; }}
 #HeaderLanesLabel[forced="true"] {{ color: {p.TEXT_DIM}; }}

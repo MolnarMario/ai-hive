@@ -38,7 +38,7 @@ from ..tiling import compute_grid, explicit_grid, parse_layout
 from ..ui_theme import Palette, repolish
 from ..workspace_manager import Workspace
 from .grid_selector import GridButton
-from .header_icons import IconLabel, IconToolButton
+from .header_icons import ICON_SIZE, IconLabel, IconToolButton
 from .lanes_help import show_lanes_explainer
 from .ornaments import (ToggleSwitch, anchored_popup_pos,
                         close_on_anchor_press)
@@ -205,18 +205,21 @@ class WorkspacePage(QWidget):
         hl.setContentsMargins(10, 0, 8, 0)
         hl.setSpacing(6)
 
-        folder_icon = QLabel("🗀", header)
-        folder_icon.setObjectName("HeaderFolderIcon")
+        # line icons, not the 🗀/🗑 font glyphs: those drew thinner than the
+        # Lanes/Layout/Map icons on the same row (header_icons)
+        folder_icon = IconLabel("folder", "", header)
+        folder_icon.setFixedWidth(ICON_SIZE)
         self.path_label = QLabel(self.workspace.project_path, header)
-        self.path_label.setObjectName("HeaderPath")
+        self.path_label.setObjectName("WsHeaderPath")
         self.path_label.setToolTip(self.workspace.project_path)
         # a QLabel's minimum size is its whole text, which would hold the
         # window at least as wide as the full path plus every button and
         # leave _elide_path nothing to elide
         self.path_label.setMinimumWidth(PATH_MIN_W)
 
-        def tool(text, tip, obj="", icon=""):
-            b = IconToolButton(icon, header) if icon else QToolButton(header)
+        def tool(text, tip, obj="", icon="", hover_ink=""):
+            b = (IconToolButton(icon, header, hover_ink) if icon
+                 else QToolButton(header))
             b.setText(text)
             b.setToolTip(tip)
             if obj:
@@ -227,9 +230,9 @@ class WorkspacePage(QWidget):
         # delete sits LEFT of open/change — the sidebar used to duplicate both
         # open-folder and delete as hover buttons on the workspace row; both
         # actions now live here, once, next to the folder they act on.
-        # a text glyph, not Qt's stock trash pixmap: text takes the QSS color,
-        # so it matches the header and turns red on hover like every delete
-        self.delete_btn = tool("🗑", "Delete workspace", "WsTrash")
+        # it turns red on hover like every delete
+        self.delete_btn = tool("", "Delete workspace", "WsTrash", "trash",
+                               hover_ink="RED")
         self.delete_btn.setAccessibleName("Delete workspace")
         self.repo_btn = tool("Open repo", "Open this workspace's GitHub repository in a browser",
                              "RepoOpenButton")
