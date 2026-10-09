@@ -3187,6 +3187,8 @@ def test_fullscreen_f11():
               "left edge", win.ws_rail.parent() is fs.left
               and fs.left.width() == WorkspaceRail.WIDTH
               and win.body_split.sizes()[0] == 0)
+        check("fullscreen: the splitter handle on the left edge cannot be dragged",
+              not win.body_split.handle(1).isEnabled())
         check("fullscreen: a save keeps the sidebar collapsed",
               win._session_payload()["ui"]["sidebar_collapsed"] is True)
         rest(0, 300, fullscreen.REVEAL_MS)
@@ -3198,7 +3200,8 @@ def test_fullscreen_f11():
               "back", not fs.active and win.top_bar.isVisible()
               and win._body_lay.indexOf(win.ws_rail) == 0
               and win.ws_rail.isVisible()
-              and win.body_split.sizes()[0] == 0)
+              and win.body_split.sizes()[0] == 0
+              and win.body_split.handle(1).isEnabled())
         win._toggle_sidebar()
         check("fullscreen: the sidebar still reopens at its width",
               win.body_split.sizes()[0] == width, win.body_split.sizes())

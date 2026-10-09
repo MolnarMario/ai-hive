@@ -1789,21 +1789,29 @@ class TerminalCard(QFrame):
                   [(off, "reply", mark) for off, mark in self.agent.reply_replay_marks()])
         tagged.sort(key=lambda t: t[0])
         pos = skip
-        for off, kind, mark in tagged:
-            off = max(0, min(len(replay), off))
-            if off < skip:
-                continue        # its bytes are outside the projected window
-            if off > pos:
-                self.terminal.feed(replay[pos:off])
-                pos = off
-            if kind == "prompt":
-                self._mark_lines[mark.uid] = self.terminal.anchor_line()
-            else:
-                line = self.terminal.reply_anchor_line()
-                if line is not None:
-                    self._reply_mark_lines[mark.uid] = line
-        if pos < len(replay):
-            self.terminal.feed(replay[pos:])
+        # an ED 3 or a reset inside the replayed stream wipes the view's
+        # history again, and its historyCleared must not reach the agent's
+        # marks: the live wipe already dropped the ones before it, and every
+        # mark left is one this replay is placing (_on_history_cleared)
+        held, self._reprojecting = self._reprojecting, True
+        try:
+            for off, kind, mark in tagged:
+                off = max(0, min(len(replay), off))
+                if off < skip:
+                    continue    # its bytes are outside the projected window
+                if off > pos:
+                    self.terminal.feed(replay[pos:off])
+                    pos = off
+                if kind == "prompt":
+                    self._mark_lines[mark.uid] = self.terminal.anchor_line()
+                else:
+                    line = self.terminal.reply_anchor_line()
+                    if line is not None:
+                        self._reply_mark_lines[mark.uid] = line
+            if pos < len(replay):
+                self.terminal.feed(replay[pos:])
+        finally:
+            self._reprojecting = held
         if recover:
             rows = self._scrollback_rows()
             self._recover_marks(rows)

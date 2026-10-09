@@ -67,6 +67,11 @@ _MODEL_CACHE: dict[str, tuple[float, int, str, str, str]] = {}
 # owns these files; cache them by path metadata just like Claude's transcript.
 _CODEX_CACHE: dict[str, tuple] = {}
 _CODEX_PATHS: dict[str, str] = {}
+# thread id -> monotonic time a recursive search of ~/.codex/sessions last
+# found no rollout for it. That search runs on the GUI thread and grows with
+# every day of Codex history, so a miss is not repeated for _CODEX_MISS_S.
+_CODEX_MISSES: dict[str, float] = {}
+_CODEX_MISS_S = 30.0
 
 # cache for reply_times: path -> (mtime, size, [(epoch, final text), ...]).
 _REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
@@ -1322,15 +1327,27 @@ def _codex_rollout_path(session_id: str) -> str:
     path = _CODEX_PATHS.get(session_id, "")
     if path and os.path.isfile(path):
         return path
+    import time
+    missed = _CODEX_MISSES.get(session_id)
+    if missed is not None and time.monotonic() - missed < _CODEX_MISS_S:
+        return path
     root = os.path.join(codex_home(), "sessions")
     matches = glob.glob(os.path.join(
         root, "**", f"rollout-*-{glob.escape(session_id)}.jsonl"),
         recursive=True)
-    if not matches:
+
+    def mtime(p: str) -> float:
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return -1.0     # deleted between the glob and here
+    newest = max(matches, key=mtime, default="")
+    if not newest or mtime(newest) < 0:
+        _CODEX_MISSES[session_id] = time.monotonic()
         return path
-    path = max(matches, key=os.path.getmtime)
-    _CODEX_PATHS[session_id] = path
-    return path
+    _CODEX_MISSES.pop(session_id, None)
+    _CODEX_PATHS[session_id] = newest
+    return newest
 
 
 def codex_reply_times(session_id: str) -> list[tuple[float, str]]:
@@ -1361,7 +1378,8 @@ def codex_reply_times(session_id: str) -> list[tuple[float, str]]:
                 except ValueError:
                     continue
                 payload = rec.get("payload") or {}
-                if rec.get("type") != "event_msg" or                         payload.get("type") != "task_complete":
+                if (rec.get("type") != "event_msg"
+                        or payload.get("type") != "task_complete"):
                     continue
                 text = str(payload.get("last_agent_message") or "").strip()
                 when = _record_epoch(rec)
@@ -1386,10 +1404,7 @@ def latest_codex_state(cwd: str, session_id: str, started_at: float,
     """
     sid, path = session_id, _codex_rollout_path(session_id)
     if not path or not os.path.isfile(path):
-        if sid:
-            path = _CODEX_PATHS.get(sid, "")
-        if not path or not os.path.isfile(path):
-            sid, path = latest_codex_session(cwd, started_at, excluded)
+        sid, path = latest_codex_session(cwd, started_at, excluded)
     if not path:
         return (sid, "", "", "", 0, 0, "")
     try:

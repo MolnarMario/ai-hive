@@ -95,6 +95,13 @@ class FullscreenController(QObject):
         else:
             w._body_lay.removeWidget(w.ws_rail)
             lw, width = w.ws_rail, WorkspaceRail.WIDTH
+            # the collapsed sidebar stays in the splitter at width 0, so its
+            # handle sits on the very edge the poll watches, and a drag there
+            # would open the sidebar inside the layout and resize every card.
+            # Disabled, not hidden: QSplitter shows its handles again itself
+            handle = w.body_split.handle(1)
+            handle.setEnabled(False)
+            handle.setCursor(Qt.CursorShape.ArrowCursor)
         self.left.layout().addWidget(lw)
         lw.show()
         self.left.setFixedWidth(width)
@@ -141,6 +148,9 @@ class FullscreenController(QObject):
             split.setSizes([width, max(1, split.width() - width)])
         else:
             w._body_lay.insertWidget(0, w.ws_rail)
+            handle = w.body_split.handle(1)
+            handle.setEnabled(True)
+            handle.setCursor(Qt.CursorShape.SplitHCursor)
         w._sync_ws_rail()
 
     def saved_ui(self) -> tuple[bool, bool]:

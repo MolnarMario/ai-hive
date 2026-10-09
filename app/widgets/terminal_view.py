@@ -155,11 +155,12 @@ _NAMED = {
 # transcript). Claude Code draws '>'; '❯' covers common shell/other prompts.
 _INPUT_PROMPTS = (">", "❯")
 
-# How far above the freshly-redrawn input box reply_anchor_line() will look
-# for the finished reply's own footer row ("Crunched for Ns" and its many
-# spinner-verb siblings). One blank separator line is the normal case; a few
-# extra rows of slack cover a wrapped/multi-line footer without risking a
-# runaway scan that lands on unrelated, much older content.
+# How many rule and hint rows reply_anchor_line() skips above the freshly
+# redrawn input box on its way to the finished reply's own footer row
+# ("Crunched for Ns" and its many spinner-verb siblings). Blank rows don't
+# count: Codex leaves the whole gap above its bottom-pinned composer blank.
+# The scan never leaves the live screen, and a screen that is nothing but
+# chrome gets no stamp rather than one on older content.
 _REPLY_ANCHOR_SCAN = 6
 
 # Claude Code's settled-turn footer: a spinner glyph, a verb, and how long the

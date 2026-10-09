@@ -844,6 +844,52 @@ def test_reply_stamps_survive_a_reprojection():
     agent.dispose()
 
 
+def test_reply_stamps_survive_replaying_an_old_wipe():
+    """A stream that holds an ED 3 (a `cls`, a CLI clearing its scrollback)
+    replays that wipe on every projection, and a replay must never drop the
+    agent's marks. The view only sees a wipe as history shrinking within one
+    feed, so an ED 3 that arrived with plenty of output behind it went
+    unseen live and its marks stayed. A narrower reprojection wraps the long
+    lines before it into more history, the replayed ED 3 then shrinks it,
+    and without the guard every mark of the agent went."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.widgets.terminal_card import TerminalCard
+
+    QApplication.instance() or QApplication([])
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Old wipe",
+                                     cwd=SCRATCH_CWD, pty=True))
+    agent.status = AgentStatus.RUNNING
+    card = TerminalCard(agent)
+    card.resize(900, 500)
+    term = card.terminal
+    term.screen.resize(30, 120)
+    card._proj_cols = 120
+
+    def turn(text):
+        agent._note_submit()
+        agent._on_pty_output("pty", text + "\r\n✳ Crunched for 5s\r\n\r\n"
+                             + "─" * 40 + "\r\n> ")
+        return agent.note_reply_settled()
+
+    first = turn("● " + "".join("x" * 300 + "\r\n" for _ in range(40)))
+    hist = len(term.screen.history.top)
+    # one chunk: the wipe, then more lines than history held before it
+    second = turn("\x1b[3J" + "".join(f"line {i}\r\n"
+                                      for i in range(hist + 40)))
+    check("old-wipe: the live ED 3 went unseen and kept the first mark",
+          first is not None and second is not None
+          and agent.reply_marks() == [first, second], agent.reply_marks())
+    term.screen.resize(30, 50)
+    card._reproject_on_size(30, 50)
+    check("old-wipe: a narrower replay of the old ED 3 keeps the marks",
+          agent.reply_marks() == [first, second], agent.reply_marks())
+    card.deleteLater()
+    agent.dispose()
+
+
 def test_reply_anchor_for_codex_and_gemini_screens():
     """The stamp anchor works on the screens Codex and Gemini draw, not just
     Claude's.
@@ -946,12 +992,42 @@ def test_codex_reply_times_from_rollout():
         check("codex replies: an unknown conversation reads as empty",
               transcripts.codex_reply_times("nope") == []
               and transcripts.codex_reply_times("") == [])
+
+        # the search behind a miss walks every day of Codex history on the
+        # GUI thread, so a miss is remembered for a while
+        real_glob, globs = transcripts.glob.glob, []
+        transcripts.glob.glob = lambda *a, **k: (globs.append(1),
+                                                 real_glob(*a, **k))[1]
+        try:
+            transcripts.codex_reply_times("nope")
+            transcripts.codex_reply_times("nope")
+        finally:
+            transcripts.glob.glob = real_glob
+        check("codex replies: a missing rollout is not searched for again "
+              "at once", globs == [], globs)
+
+        # a rollout that disappears between the search and the stat
+        transcripts._CODEX_PATHS.clear()
+        real_mtime = transcripts.os.path.getmtime
+
+        def gone(_p):
+            raise FileNotFoundError(_p)
+        transcripts.os.path.getmtime = gone
+        try:
+            raced = transcripts.codex_reply_times(sid)
+        except OSError as exc:
+            raced = exc
+        finally:
+            transcripts.os.path.getmtime = real_mtime
+        check("codex replies: a rollout gone mid-search reads as empty, "
+              "never raises", raced == [], raced)
     finally:
         if old is None:
             os.environ.pop("CODEX_HOME", None)
         else:
             os.environ["CODEX_HOME"] = old
         transcripts._CODEX_PATHS.clear()
+        transcripts._CODEX_MISSES.clear()
         shutil.rmtree(tmp, ignore_errors=True)
 
 
