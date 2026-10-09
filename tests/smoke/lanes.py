@@ -4087,6 +4087,89 @@ def test_close_merged_agents_from_integrator_chip():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_close_merged_agents_closes_the_whole_batch():
+    """Close merged agents with several merged lanes closes all of them in
+    one click. A close reflows the grid and the other cards' TUIs redraw,
+    which reads as busy for a couple of seconds; judged one read at a time,
+    every agent after the first was kept as "changed since the lanes were
+    read" (live: Agent 14 closed, 15 and 16 kept, one per click)."""
+    from PySide6.QtWidgets import QApplication
+    from app import lanes
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-close-batch-"))
+    work = _make_repo(tmp)
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    made = []
+
+    def laned(name, uid):
+        lane = _lane_for(work, name, uid)
+        made.append(lane)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"], pty=True)
+        spec.uid = uid
+        spec.lane = lane
+        return win.manager.add_terminal(ws.id, spec, autostart=False)
+
+    with _stub_starts():
+        a = laned("Agent A", "ba7c01" + "0" * 26)
+        b = laned("Agent B", "ba7c02" + "0" * 26)
+        c = laned("Agent C", "ba7c03" + "0" * 26)
+        i = laned("Integrator", "ba7cee" + "0" * 26)
+        app.processEvents()
+        win._toggle_integrator(ws.id, i)
+        audit, told = [], []
+        win._store_audit = audit.append
+        win._lane_message = lambda title, text: told.append(text)
+        win._confirm_close_merged = lambda merged: True
+        views = {x.spec.uid: lanes.LaneView(
+                     uid=x.spec.uid, branch=x.spec.lane["branch"],
+                     root=x.spec.lane["root"], landed=x.spec.uid[:6] * 6)
+                 for x in (a, b, c)}
+
+        def fake_snap(entry):
+            v = views[entry["uid"]]
+            return lanes.LaneSnap(uid=v.uid, agent=entry["agent"],
+                                  ws_id=entry["ws_id"], branch=v.branch,
+                                  root=v.root, landed=v.landed,
+                                  read_at=time.time())
+        win._lane_snap_for_close = fake_snap
+
+        # a close resizes the cards left, and their redraw reads as busy
+        real_close = win._close_agent
+
+        def close_and_redraw(ws_id, agent_id):
+            real_close(ws_id, agent_id)
+            for x in ws.agents:
+                x.is_busy = lambda: True
+        win._close_agent = close_and_redraw
+
+        win._on_lanes_changed(ws.id, dict(views))
+        win._close_merged_agents(ws.id, i)
+        win.lane_ops.drain(60)
+        left = {x.spec.name for x in ws.agents}
+        check("close-merged batch: one click closes every merged agent",
+              left == {"Integrator"}, (left, told))
+        check("close-merged batch: nobody is reported kept", not told, told)
+        check("close-merged batch: each close is audited",
+              sum(ln.startswith("CLOSE-MERGED agent=") for ln in audit) == 3
+              and not any("KEEP" in ln for ln in audit), audit)
+        win._close_agent = real_close
+        for agent in list(ws.agents):
+            win._close_agent(ws.id, agent.id)
+        win.lane_ops.drain(60)
+    win.close()
+    app.processEvents()
+    for lane in made:
+        if os.path.isdir(lane["root"]):
+            _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_task_done_waits_for_the_user():
     """Through the real window, stubbed workers: a lane agent is told to end
     finished work with "Task done", and the integrator's prompt has it start

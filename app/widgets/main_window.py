@@ -4848,7 +4848,11 @@ class MainWindow(QMainWindow):
         The offer comes from the last poll, up to 15 s old, and the user
         may have edited or committed in a lane since. So each lane is read
         again on the lane queue after the OK, and only an agent that still
-        qualifies on that read closes (_close_merged_checked)."""
+        qualifies on that read closes (_close_merged_checked). Every agent
+        is judged once all the reads are back, before any of them closes:
+        a close reflows the grid, the other cards' TUIs redraw at their new
+        size, and that redraw reads as busy for a couple of seconds. Judged
+        one by one, only the first agent of each batch ever closed."""
         ws = self.manager.workspace(ws_id)
         if ws is None or agent is None or not self.manager.is_integrator(agent):
             return
@@ -4864,7 +4868,7 @@ class MainWindow(QMainWindow):
         # turn, or a lane poll seen new work, meanwhile
         still = {a.spec.uid for a, _v in self._merged_agents(
             ws, self.manager.integrator(ws_id))}
-        batch = {"left": 0,
+        batch = {"left": 0, "reads": [],
                  "kept": [a.spec.name for a, _v in merged
                           if a.spec.uid not in still]}
         for other, _view in merged:
@@ -4890,33 +4894,47 @@ class MainWindow(QMainWindow):
 
     def _close_merged_checked(self, ws_id: str, uid: str, snap, error,
                               batch: dict) -> None:
-        """A lane re-read for Close merged agents is back: close its agent
-        if the read still says merged with nothing left, and it is still
-        idle and not the integrator. An agent the user closed meanwhile was
-        retired by its own close."""
-        self._close_merged_reading.discard(uid)
+        """A lane re-read for Close merged agents is back. Once the last
+        one is, judge every agent of the batch, then close the ones that
+        still qualify (see _close_merged_agents for why not sooner)."""
+        batch["reads"].append((uid, snap, error))
         batch["left"] -= 1
+        if batch["left"]:
+            return
         ws = self.manager.workspace(ws_id)
-        other = next((a for a in (ws.agents if ws is not None else [])
-                      if a.spec.uid == uid), None)
-        if other is not None:
-            if (error is not None or snap is None or snap.error
-                    or not snap.exists or snap.ahead or snap.dirty
-                    or not snap.landed
-                    or other is self.manager.integrator(ws_id)
-                    or uid in self._lane_pending
-                    or other.is_busy() or other.is_waiting()
-                    or other.last_submit_at() > snap.read_at):
+        agents = {a.spec.uid: a for a in (ws.agents if ws is not None
+                                          else [])}
+        closing = []
+        for uid, snap, error in batch["reads"]:
+            self._close_merged_reading.discard(uid)
+            other = agents.get(uid)
+            # an agent the user closed meanwhile was retired by its own close
+            if other is None:
+                continue
+            if self._close_merged_qualifies(ws_id, other, snap, error):
+                closing.append((other, snap))
+            else:
                 self._store_audit(f"CLOSE-MERGED-KEEP "
                                   f"agent={other.spec.name!r}")
                 batch["kept"].append(other.spec.name)
-            else:
-                self._store_audit(f"CLOSE-MERGED agent={other.spec.name!r} "
-                                  f"branch={snap.branch} "
-                                  f"landed={snap.landed[:7]}")
-                self._close_agent(ws_id, other.id)
-        if not batch["left"]:
-            self._report_close_merged_kept(batch)
+        for other, snap in closing:
+            self._store_audit(f"CLOSE-MERGED agent={other.spec.name!r} "
+                              f"branch={snap.branch} "
+                              f"landed={snap.landed[:7]}")
+            self._close_agent(ws_id, other.id)
+        self._report_close_merged_kept(batch)
+
+    def _close_merged_qualifies(self, ws_id: str, other, snap,
+                                error) -> bool:
+        """The fresh read still says merged with nothing left, and the
+        agent is still idle and not the integrator."""
+        return not (error is not None or snap is None or snap.error
+                    or not snap.exists or snap.ahead or snap.dirty
+                    or not snap.landed
+                    or other is self.manager.integrator(ws_id)
+                    or other.spec.uid in self._lane_pending
+                    or other.is_busy() or other.is_waiting()
+                    or other.last_submit_at() > snap.read_at)
 
     def _report_close_merged_kept(self, batch: dict) -> None:
         if batch["kept"]:
