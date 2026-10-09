@@ -17,7 +17,7 @@ _ROWS = (
      "A feature branch in its own folder (git worktree), beside the repo "
      "in <i>repo</i>.lanes. Its agent can't overwrite or reset anyone "
      "else's work."),
-    ("Lane chip ⎇ ↑2 ±3 ✓",
+    ("Lane chip ↑2 ±3 ✓",
      "A glance at git status: 2 commits of its own, 3 uncommitted files, "
      "and ✓ once its agent marked the work done, which turns the chip "
      "green. Amber means another lane, or main, changed the same files; "
