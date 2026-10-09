@@ -783,7 +783,11 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
    (later rules win on equal id specificity). The maximize/restore button
    paints its own icon (terminal_card._MaximizeButton), so it takes only the
    padding and hover plate from the rules above. */
-#CardFontDec, #CardFontInc {{ font-size: 12px; font-weight: 700; }}
+#CardFontDec, #CardFontInc {{ font-size: 14px; font-weight: 700; }}
+/* the tray icons are meant to look one size: 16px glyphs here, a 16px drawn
+   maximize icon, 14px bold A-/A+. (The close button keeps the 14px above.) */
+#CardStop, #CardRestart, #CardAdopt, #CardIntegrator,
+#CardScheduleSend {{ font-size: 16px; }}
 /* the collapsed stand-in for the action tray: faint enough to read as
    chrome, visible enough to say "there is something here to hover" */
 #CardToolsHint {{ color: {p.CARDHEAD_SUB}; font-size: 13px; }}

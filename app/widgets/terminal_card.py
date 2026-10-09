@@ -271,7 +271,7 @@ class _MaximizeButton(QToolButton):
     took its color from QSS and had no form for this pair, and a pixmap would
     need rebuilding on every theme change."""
 
-    _BOX = 20   # icon edge in px; the 24-unit drawing below is scaled to it
+    _BOX = 16   # icon edge in px; the 24-unit drawing below is scaled to it
     # the top-left arrow on a 24 grid, the other three mirror about 12:
     # (tail, tip, the two head ends). Restore points the arrow back in.
     _OUT = ((10.0, 10.0), (3.0, 3.0), ((3.0, 8.5), (8.5, 3.0)))
@@ -288,8 +288,8 @@ class _MaximizeButton(QToolButton):
 
     def sizeHint(self):
         # an iconless, textless QToolButton collapses to its padding; match
-        # the height of the glyph buttons beside it (about 24px)
-        return QSize(self._BOX + 12, self._BOX + 4)
+        # the height of the glyph buttons beside it (about 26px)
+        return QSize(self._BOX + 12, self._BOX + 10)
 
     def paintEvent(self, event):
         super().paintEvent(event)   # the QSS hover plate

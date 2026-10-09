@@ -3327,6 +3327,18 @@ def test_lane_scopes_window():
         check("scopes window: an unlaned agent next to it is offered a "
               "disabled Make integrator", bool(info_p.get("role"))
               and not info_p["role"][1], info_p)
+        # once the workspace has an integrator, no other agent is offered
+        # the role (the user stops the current one first)
+        win.manager.set_integrator(ws_b.id, solo.id)
+        app.processEvents()
+        check("scopes window: the integrator is offered Stop being it",
+              win._integration_info(solo).get("role", ("",))[0]
+              == "Stop being the integrator")
+        check("scopes window: ...and no other agent is offered Make "
+              "integrator", "role" not in win._integration_info(plain_b),
+              win._integration_info(plain_b))
+        win.manager.set_integrator(ws_b.id, "")
+        app.processEvents()
 
         # --- a second lane without an integrator: one hint, once -------------
         from app.terminal_agent import TerminalAgent
