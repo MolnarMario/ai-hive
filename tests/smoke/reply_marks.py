@@ -192,6 +192,222 @@ def test_reply_marks_recovered_after_reprint():
     agent.dispose()
 
 
+def test_reply_stamp_survives_a_reopen():
+    """The newest reply of a reopened conversation gets its stamp, however
+    the reprint happened to arrive.
+
+    Live-reported on 0.38.1: a reply finished at 02:58, AI Hive restarted at
+    03:01 and resumed the agent, and the reprinted reply sat there with no
+    stamp. Replayed offline against the same transcript, recovery placed it
+    fine. What failed was WHEN recovery ran: only on the agent's busy -> idle
+    edge (a redraw inside RESIZE_REDRAW_S of a resize never makes one), only
+    until the first scan that found anything (a reprint that pauses partway
+    closed it before the newest reply was drawn), and never again after a
+    wipe. The last part is the live half: a turn whose live mark found no
+    anchor gets its stamp from the transcript once the turn has ended, and
+    never while it is still open."""
+    import datetime as _dt
+    import json
+
+    from PySide6.QtWidgets import QApplication
+
+    from app import transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.widgets.terminal_card import (_RECOVER_RESCAN_TRIES, TerminalCard,
+                                           _format_reply_stamp)
+
+    QApplication.instance() or QApplication([])
+    stamp = "2026-10-09T23:%02d:00.000Z"
+
+    def at(minute):
+        return _dt.datetime.fromisoformat(
+            (stamp % minute).replace("Z", "+00:00")).timestamp()
+
+    def prompt(minute, text):
+        return json.dumps({"type": "user", "timestamp": stamp % minute,
+                           "promptSource": "typed",
+                           "origin": {"kind": "human"},
+                           "message": {"role": "user", "content": text}})
+
+    def reply(minute, text):
+        return json.dumps({"type": "assistant", "timestamp": stamp % minute,
+                           "message": {"content": [{"type": "text",
+                                                    "text": text}]}})
+
+    first = [prompt(40, "check the first thing please"),
+             reply(41, "The first thing checks out fine.")]
+    newest = [prompt(50, "now ship the second thing"),
+              reply(58, "Shipped, and the full suite passed.")]
+    FIRST = ("> check the first thing please\r\n\r\n"
+             "● The first thing checks out fine.\r\n\r\n")
+    NEWEST = ("> now ship the second thing\r\n\r\n"
+              "● Shipped, and the full suite passed.\r\n\r\n"
+              "✻ Cogitated for 7m 15s · done 2:58 AM\r\n\r\n")
+    BOX = "─" * 40 + "\r\n> "
+
+    made = []
+
+    def reopened(name, records):
+        """A restored Claude agent whose transcript holds `records`, with the
+        launch autostart's empty card and a running child."""
+        tmp = Path(tempfile.mkdtemp(prefix="ai-hive-stamps-"))
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=str(tmp), pty=True)
+        spec.session_id = "aaaaaaaa-1111-2222-3333-%012d" % len(made)
+        path = Path(transcripts.transcript_path(str(tmp), spec.session_id))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(records) + "\n", encoding="utf-8")
+        agent = TerminalAgent(spec)
+        card = TerminalCard(agent)
+        card.resize(900, 500)
+        card.drop_restored_screen()
+        agent.status = AgentStatus.RUNNING
+        made.append((agent, card, tmp))
+        return agent, card, path
+
+    def unhook(agent, card):
+        # detach() leaves the two mark signals _wire() connects (see
+        # test_reply_stamp_repaint_and_merge), so they go by hand
+        for sig, slot in ((agent.prompt_marks_changed, card._refresh_marks),
+                          (agent.reply_marks_changed,
+                           card._on_reply_mark_added)):
+            try:
+                sig.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        card.detach()
+        card.deleteLater()
+
+    def times(card):
+        return [t for _, t in card.terminal.reply_marks()]
+
+    def row_below(card, needle):
+        oldest, raw = card._scrollback_rows()
+        hits = [i for i, t in enumerate(raw) if needle in t]
+        return oldest + hits[-1] + 1 if hits else -1
+
+    # ---- a reprint that never lights the pulse ----------------------------
+    agent, card, _ = reopened("NoEdge", first + newest)
+    agent._last_resize_ts = time.time()     # the card was just resized
+    agent._on_pty_output("pty", FIRST + NEWEST + BOX)
+    check("reopen: a reprint inside the resize window does not go busy",
+          not agent.is_busy())
+    agent._on_idle_timeout()
+    check("reopen: ...so its settle is no busy edge, and no stamp came of it",
+          card.terminal.reply_marks() == [], card.terminal.reply_marks())
+    check("reopen: the card's own quiet check is armed by the output anyway",
+          card._stamp_timer.isActive())
+    card._rescan_recovery()                 # what that timer runs
+    check("reopen: ...and it stamps both replies with the transcript's times",
+          times(card) == [_format_reply_stamp(at(41)),
+                          _format_reply_stamp(at(58))], times(card))
+    check("reopen: the newest stamp sits under its turn footer",
+          card.terminal.reply_marks()[-1][0] == row_below(card, "Cogitated"),
+          (card.terminal.reply_marks(), row_below(card, "Cogitated")))
+    check("reopen: a placed newest reply closes the check",
+          card._recover_tries == 0, card._recover_tries)
+
+    # ---- a reprint that pauses partway ------------------------------------
+    agent, card, _ = reopened("Partial", first + newest)
+    agent._on_pty_output("pty", "x\r\n" * 40 + FIRST)
+    agent._on_idle_timeout()                # the pause is a real settle
+    check("reopen: the pause's scan finds the older turn",
+          times(card) == [_format_reply_stamp(at(41))] and card._recovered,
+          (times(card), card._recovered))
+    check("reopen: ...and keeps the check open for the newest reply",
+          card._recover_tries > 0, card._recover_tries)
+    agent._on_pty_output("pty", NEWEST + BOX)
+    agent._on_idle_timeout()
+    check("reopen: the newest reply, drawn after that scan, gets its stamp",
+          times(card) == [_format_reply_stamp(at(41)),
+                          _format_reply_stamp(at(58))], times(card))
+
+    # ---- a wipe re-arms it ------------------------------------------------
+    agent._on_pty_output("pty", "\x1b[2J\x1b[3J\x1b[H")
+    check("reopen: a wipe drops the stamps with the rows they marked",
+          card.terminal.reply_marks() == [], card.terminal.reply_marks())
+    agent._on_pty_output("pty", FIRST + NEWEST + BOX)
+    agent._on_idle_timeout()
+    check("reopen: ...and the reprint after it is stamped again",
+          times(card) == [_format_reply_stamp(at(41)),
+                          _format_reply_stamp(at(58))], times(card))
+
+    # ---- a live turn whose mark found no anchor ---------------------------
+    agent, card, path = reopened("LiveGap", first)
+    agent._on_pty_output("pty", FIRST + BOX)
+    agent._on_idle_timeout()
+    check("reopen: the restored reply is stamped before the new turn",
+          times(card) == [_format_reply_stamp(at(41))], times(card))
+    agent._note_submit()                     # the user asks for more
+    agent._last_input_ts = 0.0
+    card.terminal.reply_anchor_line = lambda: None   # whatever made it fail
+    agent._on_pty_output("pty", "\r\n● Now let me run the suite.\r\n\r\n")
+    path.write_text("\n".join(first + [newest[0],
+                                       reply(52, "Now let me run the suite.")])
+                    + "\n", encoding="utf-8")
+    agent._on_idle_timeout()                 # a tool runs: mid-turn settle
+    card._rescan_recovery()
+    check("reopen: a turn still open is never stamped at its pause",
+          times(card) == [_format_reply_stamp(at(41))], times(card))
+    agent._on_pty_output("pty", "● Shipped, and the full suite passed.\r\n\r\n")
+    path.write_text("\n".join(first + [newest[0],
+                                       reply(52, "Now let me run the suite."),
+                                       newest[1]]) + "\n", encoding="utf-8")
+    agent._on_idle_timeout()
+    mark = agent.reply_marks()[-1]
+    check("reopen: the live mark has no row on the card",
+          mark.uid not in card._reply_mark_lines, card._reply_mark_lines)
+    agent.note_reply_stopped(time.time())    # the Stop hook, polled in
+    check("reopen: the turn's end arms the quiet check",
+          card._stamp_timer.isActive())
+    card._rescan_recovery()
+    del card.terminal.reply_anchor_line
+    check("reopen: ...which stamps the reply from the transcript",
+          times(card) == [_format_reply_stamp(at(41)),
+                          _format_reply_stamp(at(58))], times(card))
+    check("reopen: ...under the reply's last line, not the narration",
+          card.terminal.reply_marks()[-1][0]
+          == row_below(card, "suite passed."), card.terminal.reply_marks())
+
+    # ---- a reply the scan cannot find leaves one line in session.log ------
+    agent, card, _ = reopened("Missing", first + [
+        newest[0], reply(58, "A reply that scrolled away long ago.")])
+    logged = []
+    agent.audit = logged.append
+    agent._on_pty_output("pty", FIRST + BOX)
+    for _ in range(_RECOVER_RESCAN_TRIES + 3):
+        card._rescan_recovery()
+    misses = [ln for ln in logged if ln.startswith("STAMP-MISS")]
+    check("reopen: an unplaceable reply spends a bounded budget",
+          card._recover_tries == 0, card._recover_tries)
+    check("reopen: ...and logs ONE STAMP-MISS saying what the scan saw",
+          len(misses) == 1 and "hits=0" in misses[0]
+          and "agent='Missing'" in misses[0], logged)
+    rebuilt = TerminalCard(agent)           # a workspace switch rebuilds it
+    rebuilt.resize(900, 500)
+    for _ in range(_RECOVER_RESCAN_TRIES + 1):
+        rebuilt._rescan_recovery()
+    check("reopen: a rebuilt card does not log the same reply again",
+          len([ln for ln in logged if ln.startswith("STAMP-MISS")]) == 1,
+          logged)
+    unhook(agent, rebuilt)
+
+    # ---- a fresh read only replaces what it covers ------------------------
+    from app.widgets.terminal_card import _merge_replies
+    old = [(1.0, "a"), (2.0, "b"), (3.0, "narration")]
+    check("reopen: a fresh tail read keeps the replies older than its window",
+          _merge_replies(old, [(2.0, "b"), (3.5, "c")])
+          == [(1.0, "a"), (2.0, "b"), (3.5, "c")],
+          _merge_replies(old, [(2.0, "b"), (3.5, "c")]))
+    check("reopen: ...and an empty read changes nothing",
+          _merge_replies(old, []) == old)
+
+    for agent, card, tmp in made:
+        unhook(agent, card)
+        agent.dispose()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_reply_stamp_repaint_and_merge():
     """Two ways a stamp that was recorded correctly still reads wrong.
 
