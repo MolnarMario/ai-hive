@@ -202,7 +202,9 @@ _OPTION_CARET_RE = re.compile(r"(?m)^[\s│┃|]*[>❯❱]\s*\d+\.\s+\S")
 # escape-stripped tail has no lines to match, and the blink is output every
 # second, so the 2 s settle the scrape waits for never comes while it waits.
 _OSC_TITLE_RE = re.compile(r"\x1b\][02];([^\x07\x1b]*)(?:\x07|\x1b\\)")
-_CODEX_ATTENTION = "Action Required"
+# Anchored on the marker Codex puts in front, because the thread name and
+# the folder that follow it are free text and can say "Action Required" too.
+_CODEX_ATTENTION_RE = re.compile(r"\s*\[ [!.] \] Action Required\b")
 # Longest unterminated title kept for the next chunk, in case a read split it.
 _TITLE_CARRY_MAX = 512
 
@@ -1792,7 +1794,7 @@ class TerminalAgent(QObject):
 
     def _scan_codex_title(self, text: str) -> None:
         """Follow the "Action Required" marker in the titles Codex sets (see
-        _CODEX_ATTENTION). The newest title in the chunk decides. Sticky
+        _CODEX_ATTENTION_RE). The newest title in the chunk decides. Sticky
         against other output, like _tool_waiting: the approval menu redraws
         while the user moves through it, and only a title without the marker
         (Codex went back to work, or the user cancelled) clears it."""
@@ -1806,7 +1808,7 @@ class TerminalAgent(QObject):
                     and len(rest) <= _TITLE_CARRY_MAX):
                 self._title_carry = rest
         if titles:
-            waiting = _CODEX_ATTENTION in titles[-1]
+            waiting = bool(_CODEX_ATTENTION_RE.match(titles[-1]))
             if waiting != self._title_waiting:
                 self._title_waiting = waiting
                 self._emit_waiting()

@@ -113,6 +113,9 @@ def test_codex_title_waiting():
 
     a._on_pty_output("pty", _CODEX_WORKING)
     check("codex waiting: a working title is not waiting", not a.is_waiting())
+    a._on_pty_output("pty", "\x1b]0;⠸ Action Required | proj\x07")
+    check("codex waiting: the words in a thread name are not the marker",
+          not a.is_waiting())
     a._on_pty_output("pty", _CODEX_ASKING)
     check("codex waiting: 'Action Required' title -> waiting + signal",
           a.is_waiting() and events == [True], events)
