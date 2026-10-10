@@ -80,9 +80,6 @@ _RECOVER_RESCAN_TRIES = 6
 # than the agent's own settle (BUSY_IDLE_MS), so the live mark that settle
 # places is already on the card when the check looks.
 STAMP_CHECK_MS = BUSY_IDLE_MS + 500
-# (session id, reply time) of every STAMP-MISS already written, so a reply that
-# cannot be placed is logged once, not again on every card rebuild
-_STAMP_MISSES: set = set()
 # how much of the END of a reply's last line must be found on a scrollback row
 # to call it that reply's last row (see _reply_end_row). Shorter than the
 # prompt window: a wrapped line's final row holds only what spilled onto it,
@@ -611,9 +608,15 @@ class TerminalCard(QFrame):
         # the agents that matter. See _recover_marks for why re-reading within
         # one conversation cannot find anything the card doesn't already know.
         self._recover_key: tuple = ()
-        # a real wipe dropped this run's live marks: read the transcript
-        # again, keeping the replies its tail no longer holds
+        # a real wipe dropped this run's live marks: read the replies again,
+        # keeping the ones the transcript's tail no longer holds
         self._recover_stale = False
+        # the last reply read ran while a turn was open, so it may hold the
+        # turn's narration as its newest reply: read them again after it
+        self._replies_mid_turn = False
+        # (live mark uid, fresh reads spent on it): a newest live mark with
+        # no row on the card gets a bounded number of transcript reads
+        self._fresh_reads: tuple = (None, 0)
         # True while this card clears its own screen only to project the SAME
         # conversation again (see _clear_for_projection)
         self._reprojecting = False
@@ -629,6 +632,11 @@ class TerminalCard(QFrame):
         self._stamp_timer.setSingleShot(True)
         self._stamp_timer.setInterval(STAMP_CHECK_MS)
         self._stamp_timer.timeout.connect(self._rescan_recovery)
+        # runs it again when an open turn's TURN_QUIET_S runs out, the one
+        # turn ending that emits no turn_closed
+        self._turn_wait_timer = QTimer(self)
+        self._turn_wait_timer.setSingleShot(True)
+        self._turn_wait_timer.timeout.connect(self._rescan_recovery)
         self.scroll_bar = None
         # the column count the scrollback was last projected at; a change means
         # every history line is wrapped for a screen that no longer exists
@@ -1078,6 +1086,7 @@ class TerminalCard(QFrame):
             pairs.append((self.agent.screen_reset, self._on_screen_reset))
             pairs.append((self.agent.turn_closed, self._on_turn_closed))
             self._stamp_timer.stop()
+            self._turn_wait_timer.stop()
             # a card on its way out must not leave a throbber animating
             self._dismiss_boot_veil()
         else:
@@ -1956,15 +1965,26 @@ class TerminalCard(QFrame):
 
     def _load_recovery(self, fresh_replies: bool = False) -> None:
         """Read this conversation's typed prompts and finished replies once
-        per conversation (see _recover_marks for why once). `fresh_replies`
-        reads the replies again, for the one case where the cached list can
-        be missing one that matters (see _rescan_recovery). After a real
-        wipe everything is read again, and within the same conversation the
-        replies are merged rather than replaced (see _merge_replies)."""
+        per conversation (see _recover_marks for why once).
+
+        The replies alone are read again, merged rather than replaced (see
+        _merge_replies), when the cached list can lack one that matters: a
+        real wipe dropped this run's live marks (_on_history_cleared), the
+        last read ran while a turn was open and may hold its narration as a
+        reply, or the caller asks (`fresh_replies`, see _rescan_recovery).
+        Their reader is tail-bounded. The prompts are never read again
+        within a conversation: that read covers the whole transcript, and a
+        retile can wipe every card at once."""
         spec = self.agent.spec
         key = (spec.provider, spec.cwd, spec.session_id)
-        if key != self._recover_key or self._recover_stale:
-            same = key == self._recover_key
+        if key == self._recover_key:
+            if not (self._recover_stale or self._replies_mid_turn
+                    or fresh_replies):
+                return
+            self._recover_stale = False
+            self._recover_replies = _merge_replies(self._recover_replies,
+                                                   self._read_replies())
+        else:
             self._recover_key = key
             self._recover_stale = False
             self._recover_target = None
@@ -1977,12 +1997,9 @@ class TerminalCard(QFrame):
                     spec.session_id)
             else:   # openai: reply times only, there is no prompt reader
                 self._recover_prompts = []
-            fresh = self._read_replies()
-            self._recover_replies = (_merge_replies(self._recover_replies, fresh)
-                                     if same else fresh)
-        elif fresh_replies:
-            self._recover_replies = _merge_replies(self._recover_replies,
-                                                   self._read_replies())
+            self._recover_replies = self._read_replies()
+        pending = getattr(self.agent, "turn_pending", None)
+        self._replies_mid_turn = bool(pending and pending())
 
     def _read_replies(self) -> list[tuple[float, str]]:
         """Each provider's (epoch, final text) reader. All three are cached
@@ -2296,13 +2313,21 @@ class TerminalCard(QFrame):
         * A wipe dropped every stamp and nothing looked again. It re-arms
           the check now (_on_history_cleared).
 
-        The transcript is read again only when this run's newest live mark
-        has no row on this card (its settle found no anchor) or after a
-        wipe. Every other reply the card shows already came from it, and a
-        turn whose live mark anchored needs nothing more. Nothing is read or
-        scanned while a submitted turn is open, since a reply that has not
-        ended would be stamped at its last pause. The turn's end restarts
-        the timer (TerminalAgent.turn_closed).
+        The replies are read again only when this run's newest live mark
+        has no row on this card (its settle found no anchor), at most
+        _RECOVER_RESCAN_TRIES times for that mark once its reply is placed,
+        after a wipe, or when the last read ran mid-turn. Every other reply
+        the card shows already came from the transcript, and a turn whose
+        live mark anchored needs nothing more. Nothing is read or scanned
+        while a submitted turn is open, since a reply that has not ended
+        would be stamped at its last pause. The turn's end restarts the
+        timer (TerminalAgent.turn_closed), and a turn that ends only by
+        TURN_QUIET_S of quiet, which emits nothing, by _turn_wait_timer.
+
+        The target is the newest reply whose last line is long enough to
+        find on screen (_reply_tail). A reply ending on "Done." can never
+        be placed, and aiming at it spent the whole budget on the first
+        quiet spell, before a --resume reprint had even arrived.
 
         Bounded, because the scan is MEASURED at ~35 ms over a full 2000-row
         history: each newest reply gets _RECOVER_RESCAN_TRIES quiet spells.
@@ -2310,14 +2335,24 @@ class TerminalCard(QFrame):
         session.log saying what the scan saw, so a missing stamp has a cause
         on record instead of a guess."""
         self._stamp_timer.stop()
+        self._turn_wait_timer.stop()
         if not self.is_pty or self.agent.spec.provider not in _RECOVERABLE:
             return
-        if self.agent.turn_pending():
+        left = self.agent.turn_pending_left()
+        if left > 0:
+            self._turn_wait_timer.start(int(left * 1000) + STAMP_CHECK_MS)
             return
         marks = self.agent.reply_marks()
-        unanchored = bool(marks) and marks[-1].uid not in self._reply_mark_lines
-        self._load_recovery(fresh_replies=unanchored)
-        replies = self._recover_replies
+        uid = marks[-1].uid if marks else None
+        fresh = uid is not None and uid not in self._reply_mark_lines
+        if fresh:
+            spent = self._fresh_reads[1] if self._fresh_reads[0] == uid else 0
+            fresh = (self._recover_tries > 0
+                     or spent < _RECOVER_RESCAN_TRIES)
+            if fresh:
+                self._fresh_reads = (uid, spent + 1)
+        self._load_recovery(fresh_replies=fresh)
+        replies = [r for r in self._recover_replies if _reply_tail(r[1])]
         if not replies and not self._recover_prompts:
             return
         target = replies[-1][0] if replies else None
@@ -2337,9 +2372,7 @@ class TerminalCard(QFrame):
         self._refresh_reply_marks()
         if self._recovery_done(target):
             self._recover_tries = 0
-        elif target is not None and (self._recover_tries == 0
-                                     or not _reply_tail(replies[-1][1])):
-            self._recover_tries = 0
+        elif target is not None and self._recover_tries == 0:
             self._audit_stamp_miss(replies[-1], rows)
 
     def _recovery_done(self, target: float | None) -> bool:
@@ -2355,13 +2388,12 @@ class TerminalCard(QFrame):
         is not on screen in that form, some means the rows around it are
         not the shape _reply_end_row accepts."""
         audit = getattr(self.agent, "audit", None)
+        misses = getattr(self.agent, "stamp_misses", None)
         when, text = reply
         key = (self.agent.spec.session_id, when)
-        if audit is None or key in _STAMP_MISSES:
+        if audit is None or misses is None or key in misses:
             return
-        if len(_STAMP_MISSES) > 1000:
-            _STAMP_MISSES.clear()
-        _STAMP_MISSES.add(key)
+        misses.add(key)
         tail = _reply_tail(text)
         _oldest, raw = rows
         hits = sum(1 for t in raw if tail and tail in _norm_reply_line(t))

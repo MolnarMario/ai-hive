@@ -526,6 +526,10 @@ class TerminalAgent(QObject):
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
         self._last_resize_ts = 0.0    # walltime the child was last resized
         self._awaiting_reply = False  # a submitted turn is open (TURN_QUIET_S)
+        # (session id, reply time) of each STAMP-MISS a card of this agent
+        # wrote, kept here so a card rebuild doesn't log the same reply again.
+        # Transient, never saved.
+        self.stamp_misses: set = set()
         # walltime a line last went in (typed, a task, a nudge): a lane read
         # older than it may predate work that line started (_note_submit)
         self._last_submit_ts = 0.0
@@ -811,9 +815,17 @@ class TerminalAgent(QObject):
     def turn_pending(self) -> bool:
         """A submitted turn is still open: its end has not been seen and it
         has not been quiet for TURN_QUIET_S either."""
-        return (self._awaiting_reply
-                and time.time() - max(self._last_submit_ts, self._last_work_ts)
-                < TURN_QUIET_S)
+        return self.turn_pending_left() > 0
+
+    def turn_pending_left(self) -> float:
+        """Seconds until an open submitted turn counts as ended by
+        TURN_QUIET_S of quiet, 0.0 when none is open. That ending emits no
+        turn_closed (nothing runs at that moment), so a card waiting on the
+        turn uses this to look again then."""
+        if not self._awaiting_reply:
+            return 0.0
+        quiet = time.time() - max(self._last_submit_ts, self._last_work_ts)
+        return max(0.0, TURN_QUIET_S - quiet)
 
     def _close_awaited_turn(self) -> None:
         if self._awaiting_reply:

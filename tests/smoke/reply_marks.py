@@ -392,6 +392,91 @@ def test_reply_stamp_survives_a_reopen():
           logged)
     unhook(agent, rebuilt)
 
+    # ---- a newest reply too short to find never burns the budget ----------
+    agent, card, _ = reopened("Short", first + [newest[0],
+                                                reply(58, "Done.")])
+    logged = []
+    agent.audit = logged.append
+    agent._on_pty_output("pty", "booting\r\n")
+    card._rescan_recovery()                 # a quiet spell before the reprint
+    check("reopen: a short newest reply leaves the check open until the "
+          "reprint arrives", card._recover_tries > 0
+          and not [ln for ln in logged if ln.startswith("STAMP-MISS")],
+          (card._recover_tries, logged))
+    agent._on_pty_output("pty", FIRST + "> now ship the second thing\r\n\r\n"
+                         "● Done.\r\n\r\n" + BOX)
+    card._rescan_recovery()
+    check("reopen: ...and the reprint's findable reply gets its stamp",
+          times(card) == [_format_reply_stamp(at(41))], times(card))
+
+    # ---- a turn that ends only by going quiet looks again then -------------
+    from app.terminal_agent import TURN_QUIET_S
+    from app.widgets.terminal_card import STAMP_CHECK_MS
+    agent, card, _ = reopened("QuietEnd", first)
+    agent._on_pty_output("pty", FIRST + BOX)
+    agent._note_submit()                    # a /status: no Stop hook comes
+    card._rescan_recovery()
+    check("reopen: an open turn arms a check for when TURN_QUIET_S runs out",
+          card._turn_wait_timer.isActive()
+          and card._turn_wait_timer.interval() > TURN_QUIET_S * 1000 - 5000
+          and card._turn_wait_timer.interval()
+          <= TURN_QUIET_S * 1000 + STAMP_CHECK_MS,
+          card._turn_wait_timer.interval())
+    agent._last_submit_ts -= TURN_QUIET_S + 1
+    agent._last_work_ts = 0.0
+    card._rescan_recovery()                 # what that timer runs
+    check("reopen: ...and once it has, the check runs", not
+          card._turn_wait_timer.isActive() and times(card)
+          == [_format_reply_stamp(at(41))], times(card))
+
+    # ---- a wipe reads the replies again, never the whole prompt list ------
+    reads = []
+    real_prompts = transcripts.typed_prompts
+    transcripts.typed_prompts = lambda *a: (reads.append(a), real_prompts(*a))[1]
+    try:
+        agent._on_pty_output("pty", "\x1b[2J\x1b[3J\x1b[H")
+        agent._on_pty_output("pty", FIRST + BOX)
+        card._rescan_recovery()
+    finally:
+        transcripts.typed_prompts = real_prompts
+    check("reopen: a wipe in the same conversation does not re-read the "
+          "prompts", reads == [], reads)
+    check("reopen: ...and the reprint after it is stamped from the replies",
+          times(card) == [_format_reply_stamp(at(41))], times(card))
+
+    # ---- replies read mid-turn are read again once it ends ----------------
+    agent, card, path = reopened("MidTurn", first)
+    agent._note_submit()
+    card._load_recovery()
+    check("reopen: a read while a turn is open is marked as mid-turn",
+          card._replies_mid_turn)
+    path.write_text("\n".join(first + newest) + "\n", encoding="utf-8")
+    agent._close_awaited_turn()
+    card._load_recovery()
+    check("reopen: ...and the next read after the turn picks up its reply",
+          not card._replies_mid_turn
+          and card._recover_replies[-1][0] == at(58),
+          card._recover_replies)
+
+    # ---- an unanchored live mark gets a bounded number of reads -----------
+    agent, card, path = reopened("Bounded", first + newest)
+    agent._on_pty_output("pty", FIRST + NEWEST + BOX)
+    card.terminal.reply_anchor_line = lambda: None
+    agent._note_submit()
+    agent._last_input_ts = 0.0
+    agent._on_pty_output("pty", "● Another reply that never anchors.\r\n")
+    agent._on_idle_timeout()
+    agent.note_reply_stopped(time.time())
+    del card.terminal.reply_anchor_line
+    calls = []
+    real_read = card._read_replies
+    card._read_replies = lambda: (calls.append(1), real_read())[1]
+    for _ in range(3 * _RECOVER_RESCAN_TRIES):
+        card._rescan_recovery()
+    check("reopen: an unanchored live mark stops re-reading the transcript "
+          "once its budget is spent", 0 < len(calls) <= 2 * _RECOVER_RESCAN_TRIES,
+          len(calls))
+
     # ---- a fresh read only replaces what it covers ------------------------
     from app.widgets.terminal_card import _merge_replies
     old = [(1.0, "a"), (2.0, "b"), (3.0, "narration")]
