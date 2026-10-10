@@ -16,6 +16,7 @@ from enum import Enum
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from . import providers, scheduled_send, transcripts
+from .ansi_parser import _PARTIAL_RE as _ESC_PARTIAL_RE
 from .coordination import sanitize_text
 from .scheduled_send import MISSED, PENDING, SENT, ScheduledMessage
 from .process_worker import AgentSpec, ProcessWorker, WorkerState
@@ -176,7 +177,8 @@ LIMIT_ECHO_WINDOW_S = 12 * 3600
 # strips escape sequences so on-screen TEXT can be matched: the raw stream
 # positions words individually ("trust\x1b[20Gthis\x1b[25Gfolder"), so a
 # phrase can never be matched against raw bytes
-_CSI_RE = re.compile(r"\x1b\[[0-9;?<>=]*[@-~]|\x1b[()][AB0]|\x1b\][^\x07\x1b]*\x07?")
+_CSI_RE = re.compile(r"\x1b\[[0-9;?<>=]*[@-~]|\x1b[()][AB0]"
+                     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
 
 # --- "waiting for the user" detection (Claude prompts/questions) ---
 # Claude emits no machine-readable "I'm waiting" event, so we scrape the settled
@@ -205,8 +207,9 @@ _OSC_TITLE_RE = re.compile(r"\x1b\][02];([^\x07\x1b]*)(?:\x07|\x1b\\)")
 # Anchored on the marker Codex puts in front, because the thread name and
 # the folder that follow it are free text and can say "Action Required" too.
 _CODEX_ATTENTION_RE = re.compile(r"\s*\[ [!.] \] Action Required\b")
-# Longest unterminated title kept for the next chunk, in case a read split it.
-_TITLE_CARRY_MAX = 512
+# Longest partial escape held for the next chunk, in case a read split it
+# (see _on_pty_output). A title is far shorter; anything longer is not one.
+_ESC_CARRY_MAX = 512
 
 # Claude's input-box footer rotates through several hints; ANY of them means
 # the prompt is live and will accept typing. Only "? for shortcuts" was matched
@@ -604,7 +607,7 @@ class TerminalAgent(QObject):
         self._tool_waiting = False
         self._turn_waiting = False
         self._title_waiting = False
-        self._title_carry = ""        # a title escape split across reads
+        self._esc_carry = ""          # a Codex escape split across reads
         self._waiting = False
         self._screen_tail = ""        # rolling escape-stripped output tail
         # "idle, but a background command it started is still running" (see
@@ -682,7 +685,7 @@ class TerminalAgent(QObject):
         self._set_prompt_ready(False)  # re-armed for the fresh TUI
         self._ready_tail = ""
         self._screen_tail = ""
-        self._title_carry = ""
+        self._esc_carry = ""
         self._reset_waiting()
         self._reset_bg_shell()
         self.clear_limit_block()
@@ -762,7 +765,7 @@ class TerminalAgent(QObject):
         self._set_prompt_ready(False)
         self._ready_tail = ""
         self._screen_tail = ""
-        self._title_carry = ""
+        self._esc_carry = ""
         self._reset_waiting()
         self._reset_bg_shell()
         self.clear_limit_block()
@@ -1761,8 +1764,10 @@ class TerminalAgent(QObject):
 
     def _on_reply_quiet(self) -> None:
         # a background command still running means the agent kicked off work
-        # and is waiting on it, which is not a finished reply
-        if not self._busy and not self._bg_shell:
+        # and is waiting on it, which is not a finished reply. Neither is an
+        # open Codex approval: its title blink is not work (_on_pty_output),
+        # so the quiet would otherwise close the turn while Codex waits.
+        if not self._busy and not self._bg_shell and not self._title_waiting:
             self._close_awaited_turn()      # the turn ended (TURN_QUIET_S)
             self._announce_reply()
 
@@ -1776,7 +1781,7 @@ class TerminalAgent(QObject):
         """True when the agent needs the user: it has settled on a numbered
         prompt, an interactive AskUserQuestion/ExitPlanMode prompt is open,
         it ended a turn on a free-text question, or Codex's title says
-        "Action Required". The OR of four sources — see _emit_waiting."""
+        "Action Required". The OR of four sources, see _emit_waiting."""
         return self._waiting
 
     def _emit_waiting(self) -> None:
@@ -1792,21 +1797,15 @@ class TerminalAgent(QObject):
             self._waiting = eff
             self.waiting_changed.emit(eff)
 
-    def _scan_codex_title(self, text: str) -> None:
+    def _scan_codex_title(self, data: str) -> None:
         """Follow the "Action Required" marker in the titles Codex sets (see
-        _CODEX_ATTENTION_RE). The newest title in the chunk decides. Sticky
+        _CODEX_ATTENTION_RE). The newest title in `data` decides. Sticky
         against other output, like _tool_waiting: the approval menu redraws
         while the user moves through it, and only a title without the marker
-        (Codex went back to work, or the user cancelled) clears it."""
-        data = self._title_carry + text
-        self._title_carry = ""
+        (Codex went back to work, or the user cancelled) clears it. `data`
+        holds whole escapes only: _on_pty_output keeps a partial one back
+        for the next read (_esc_carry)."""
         titles = _OSC_TITLE_RE.findall(data)
-        start = data.rfind("\x1b]")
-        if start >= 0:
-            rest = data[start:]
-            if ("\x07" not in rest and "\x1b\\" not in rest
-                    and len(rest) <= _TITLE_CARRY_MAX):
-                self._title_carry = rest
         if titles:
             waiting = bool(_CODEX_ATTENTION_RE.match(titles[-1]))
             if waiting != self._title_waiting:
@@ -2664,9 +2663,21 @@ class TerminalAgent(QObject):
             # would paint under the new child, and scraped they could read
             # as its prompt or latch a plan limit it never hit.
             return
-        stripped = _CSI_RE.sub("", text)
+        data = text
         if self.spec.provider == "openai":
-            self._scan_codex_title(text)
+            # Codex's title is its waiting signal, so an escape a read cut in
+            # two (down to a lone trailing ESC) must neither be lost nor leak
+            # its tail into `stripped` as text, where it would count as work.
+            # Only the scans wait for the rest: the buffer and the view still
+            # get the raw chunk.
+            data = self._esc_carry + text
+            self._esc_carry = ""
+            m = _ESC_PARTIAL_RE.search(data)
+            if m and len(data) - m.start() <= _ESC_CARRY_MAX:
+                self._esc_carry = data[m.start():]
+                data = data[:m.start()]
+            self._scan_codex_title(data)
+        stripped = _CSI_RE.sub("", data)
         # streaming VT output => the agent is working. Except Codex's
         # once-a-second title blink while it waits on the user: a chunk that
         # draws nothing would hold the pulse lit and the settle off for as

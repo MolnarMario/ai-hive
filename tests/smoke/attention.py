@@ -154,6 +154,44 @@ def test_codex_title_waiting():
     check("codex waiting: a title split across reads still counts",
           c.is_waiting())
 
+    # the half of a split blink that arrives second is not visible text
+    e = TerminalAgent(build_spec(AgentKind.OPENAI, "Tail", cwd=SCRATCH_CWD))
+    e.status = AgentStatus.RUNNING
+    e._on_pty_output("pty", _CODEX_ASKING)
+    e._idle_timer.stop()
+    e._on_idle_timeout()
+    e._on_pty_output("pty", _CODEX_BLINK[:20])
+    e._on_pty_output("pty", _CODEX_BLINK[20:])
+    check("codex waiting: a blink split across reads is not work",
+          e.is_waiting() and not e.is_busy()
+          and "Required" not in e._screen_tail, e._screen_tail[-80:])
+    e._on_pty_output("pty", _CODEX_BLINK.replace("\x07", "\x1b\\"))
+    check("codex waiting: a blink ended by ST instead of BEL is not work",
+          e.is_waiting() and not e.is_busy())
+    e._on_pty_output("pty", "x\x1b")
+    e._on_pty_output("pty", _CODEX_RESUMED[1:])
+    check("codex waiting: a title cut right after its ESC still clears it",
+          not e.is_waiting())
+
+    # an open approval is not the end of the turn
+    f = TerminalAgent(build_spec(AgentKind.OPENAI, "Turn", cwd=SCRATCH_CWD))
+    f.status = AgentStatus.RUNNING
+    replies = []
+    f.reply_finished.connect(lambda: replies.append(1))
+    f._note_submit()
+    f._on_pty_output("pty", _CODEX_ASKING + _CODEX_MENU)
+    f._idle_timer.stop()
+    f._on_idle_timeout()
+    f._on_reply_quiet()
+    check("codex waiting: the quiet under an open approval keeps the turn "
+          "open", f.turn_pending() and replies == [], replies)
+    f._on_pty_output("pty", _CODEX_RESUMED + _CODEX_REDRAW)
+    f._idle_timer.stop()
+    f._on_idle_timeout()
+    f._on_reply_quiet()
+    check("codex waiting: ...and once answered, the quiet ends it",
+          not f.turn_pending(), f.turn_pending())
+
     # the marker is Codex's: other providers set their own titles
     d = TerminalAgent(build_spec(AgentKind.CLAUDE, "Claude", cwd=SCRATCH_CWD))
     d.status = AgentStatus.RUNNING
