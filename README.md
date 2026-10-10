@@ -485,9 +485,9 @@ workspaces keep executing — switching never pauses anything.
   **Make integrator** (one per workspace, so it is not offered while the
   workspace has one). The second lane in a workspace
   without an integrator says so on its card, once. Every other laned agent is
-  told to have GPT-6-Luna review its finished work (`codex review`, high
-  effort), fix what Luna finds, and then commit with a last line of just
-  `Task done`. AI Hive spots that commit on its next lane read (the chip gets
+  told to merge the newest main into its lane, have GPT-6-Luna review the
+  lane (`codex review`, high effort), fix what Luna finds, and then commit
+  with a last line of just `Task done`. AI Hive spots that commit on its next lane read (the chip gets
   a `✓` and turns green) and logs it. Nothing ships until you say so: when
   you think there is enough for a pull request, ask the integrator to ship,
   or click the integrator's `integrator` chip (its icon shows two lanes

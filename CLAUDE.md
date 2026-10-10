@@ -71,7 +71,8 @@ This file holds only the rules that protect user data or fail silently.
   leaves a half-deleted worktree.
 - Shipping lanes (`docs/agents/integration.md`): a laned agent flags
   finished work with a commit line of just `Task done` (`lanes.DONE_GREP`),
-  after its own GPT-6-Luna review comes back clean.
+  after it merges the newest base and its own GPT-6-Luna review comes
+  back clean.
   AI Hive only shows the flag on the lane chip and logs it
   (`MainWindow._log_done_lanes`). A flag never types into the integrator.
   The user decides when there is enough to ship and asks the integrator,
