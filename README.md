@@ -959,9 +959,13 @@ Options without discarding any), drawn inline in the terminal directly beneath t
 scrollbar's prompt marks, captured live on the busy-to-idle settle and
 otherwise READ FROM THE CONVERSATION ON DISK by matching each transcript
 reply's closing line into the scrollback — so reopening the app shows when
-an answer was really generated rather than nothing at all; re-anchored
-across a card rebuild from the pty replay, skipped rather than guessed when
-a reply has scrolled away or a row runs out of room),
+an answer was really generated rather than nothing at all; checked again
+each time the terminal goes quiet until the newest reply has its stamp,
+however the resumed conversation's reprint arrived, and after a wipe, with
+one `STAMP-MISS` line in `session.log` for a reply that still can't be
+placed; re-anchored across a card rebuild from the pty replay, skipped
+rather than guessed when a reply has scrolled away or a row runs out of
+room),
 deferred "send later" messages (delay/clock parsing, the
 Ctrl+Shift+Enter gesture sending nothing to the child, delivery by nudge so an
 assignment is never overwritten, a refusal retried then given up on as missed,

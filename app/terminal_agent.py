@@ -424,6 +424,12 @@ class TerminalAgent(QObject):
     # comes from its Stop hook (note_turn_ended), the others' from
     # REPLY_QUIET_MS of silence after a settle (_on_reply_quiet).
     reply_finished = Signal()
+    # the open submitted turn ended (Claude's Stop hook, REPLY_QUIET_MS of
+    # quiet for the others, or a submit no child received). Unlike
+    # reply_finished it fires for a question too, and it is what tells a card
+    # the turn's reply is final enough to look up in the transcript (see
+    # TerminalCard._rescan_recovery). Transient view signal, never saved.
+    turn_closed = Signal()
     # the user pressed Enter on a prompt of their own (note_prompt_submitted).
     # Transient, for the event log only; never wired to a save.
     user_prompted = Signal(str)
@@ -799,8 +805,20 @@ class TerminalAgent(QObject):
         ok = self.worker.write(data)
         if submit and not ok:
             # nothing reached a child, so no reply will come to settle it
-            self._awaiting_reply = False
+            self._close_awaited_turn()
         return ok
+
+    def turn_pending(self) -> bool:
+        """A submitted turn is still open: its end has not been seen and it
+        has not been quiet for TURN_QUIET_S either."""
+        return (self._awaiting_reply
+                and time.time() - max(self._last_submit_ts, self._last_work_ts)
+                < TURN_QUIET_S)
+
+    def _close_awaited_turn(self) -> None:
+        if self._awaiting_reply:
+            self._awaiting_reply = False
+            self.turn_closed.emit()
 
     def _note_submit(self) -> None:
         """A line was just submitted to the child, so the reply to it is
@@ -1073,7 +1091,7 @@ class TerminalAgent(QObject):
         A later Stop with no submit in between is Claude replying on its own
         (a background task finished), which is a new ending for the same
         turn, so it reopens the mark to follow that one instead."""
-        self._awaiting_reply = False    # the turn ended (TURN_QUIET_S)
+        self._close_awaited_turn()      # the turn ended (TURN_QUIET_S)
         if not self.is_pty or not self._turn_open:
             return
         self._turn_end_ts = ts
@@ -1714,7 +1732,7 @@ class TerminalAgent(QObject):
         # a background command still running means the agent kicked off work
         # and is waiting on it, which is not a finished reply
         if not self._busy and not self._bg_shell:
-            self._awaiting_reply = False    # the turn ended (TURN_QUIET_S)
+            self._close_awaited_turn()      # the turn ended (TURN_QUIET_S)
             self._announce_reply()
 
     def is_bg_shell_busy(self) -> bool:
@@ -1931,10 +1949,7 @@ class TerminalAgent(QObject):
         # when it would START the pulse (once busy, output keeps it alive),
         # and never while a submitted turn is open (TURN_QUIET_S), whose
         # output inside the window would otherwise be lost.
-        awaiting = (self._awaiting_reply
-                    and now - max(self._last_submit_ts, self._last_work_ts)
-                    < TURN_QUIET_S)
-        if (not self._busy and not awaiting
+        if (not self._busy and not self.turn_pending()
                 and now - self._last_resize_ts < RESIZE_REDRAW_S):
             self._idle_timer.start()
             return
