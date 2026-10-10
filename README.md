@@ -82,7 +82,9 @@ workspaces keep executing — switching never pauses anything.
   question — a "?" lights up on the row (next to the working count) and beside
   that agent in the expanded list, so you can spot and answer it without hunting
   through terminals. Suppressed for agents launched in bypass-permissions mode
-  (which never prompt). A **question chime**, a short droid-style "doo-dee-bweep?"
+  (which never prompt). Codex cards light it from the "Action Required" Codex
+  puts in its window title while an approval or question is open, and the
+  card stops pulsing as busy while Codex waits. A **question chime**, a short droid-style "doo-dee-bweep?"
   whose last note is still sliding up when it stops, plays the moment that "?"
   appears (the standby→waiting rising edge), so you notice an agent needs you
   even while you're heads-down in another workspace — handy when agents you sent
@@ -985,7 +987,8 @@ drag workspaces in/out, single-level membership persisted across a v4 session
 round-trip with v3 migration), the count-badge inline agent list +
 click-to-reveal, and the waiting-for-input "?" detection (settled-screen
 prompt/question scrape, gated on the idle timer, suppressed under
-bypassPermissions) plus the question chime it triggers (WAV synthesis,
+bypassPermissions, and Codex's "Action Required" title, whose once-a-second
+blink is not counted as work) plus the question chime it triggers (WAV synthesis,
 the manager's waiting rising-edge `agentWaiting` signal, and the top-bar
 mute toggle persisted in the ui state), the reply finished chime (Claude's
 Stop-hook edge, the hookless providers' quiet timer, once per submitted turn,
