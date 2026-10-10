@@ -155,14 +155,29 @@ def system_prompt_text(workspace_name: str, agent_name: str,
         # uncommitted work can't ship or be proven merged when the card
         # closes. The "Task done" line marks a lane ready to ship (the
         # chip's check mark); session_hook.lane_stop_decision backs the
-        # rule for an agent that forgets.
+        # rule for an agent that forgets. The Luna review comes before the
+        # flag so a lane's own findings are fixed by the agent that wrote
+        # it: on the integrator's PR each fix costs a full suite run and a
+        # new review, and holds up every other lane in the batch.
         text += (
             f" You work in your own git worktree (your lane) at {lane['root']}, "
             f"on the branch {lane['branch']}, which starts from {base}. Commit "
             f"each finished task on your lane branch yourself, without asking "
             f"first, and end that commit's message with a line of just "
             f"\"{lanes.DONE_MARK}\". That line marks your work ready to "
-            f"ship, so never put it on unfinished work. The lane is private: "
+            f"ship, so never put it on unfinished work. Before that commit, "
+            f"with the task's changes still uncommitted, have GPT-6-Luna "
+            f"review them at high effort: `codex review --uncommitted -c "
+            f"model=gpt-6-luna -c model_reasoning_effort=high -c "
+            f"sandbox_mode=read-only`, and the same options with `--commit "
+            f"<sha>` in place of `--uncommitted` for each commit of this "
+            f"task you made without that line. Fix every finding that holds "
+            f"up and review again, until Luna finds nothing you accept as a "
+            f"real problem. If {base} has docs/agents/integration.md, read "
+            f"its section for lane agents first, as it can change that "
+            f"command. If Codex is missing or keeps failing, commit without "
+            f"the \"{lanes.DONE_MARK}\" line and tell the user the work is "
+            f"not reviewed. The lane is private: "
             f"nothing in it reaches {base} until the user has the integrator "
             f"ship it. Don't finish a task with uncommitted "
             f"changes, unless the user asked you not to commit. Run the tests "

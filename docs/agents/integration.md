@@ -1,7 +1,8 @@
 # Shipping finished lanes
 
-Every laned agent ends its finished work with a commit whose message has a
-last line of just `Task done`. AI Hive reads every lane, sees that commit
+Every laned agent ends its finished work, once GPT-6-Luna has reviewed it
+("Lane agents" below), with a commit whose message has a last line of just
+`Task done`. AI Hive reads every lane, sees that commit
 (`lanes.DONE_GREP`), puts a check mark on the lane chip, turns it green and
 logs it. That is all it does. A flag never tells the integrator.
 
@@ -38,6 +39,44 @@ or dev server.
   review.
 
 Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
+
+## Lane agents
+
+A lane agent gets its own GPT-6-Luna review before it writes `Task done`.
+The lane prompt says so, and this section is what it reads for this
+project. Most of what Luna finds is about one lane's own logic, and the
+agent that wrote the lane fixes it best. Found on the integrator's pull
+request instead, each fix costs a full suite run and another review, and
+every other lane in the batch waits.
+
+1. Run the area tests (Testing policy above).
+2. With the task's changes still uncommitted, run
+   `codex review --uncommitted -c model=gpt-6-luna -c model_reasoning_effort=high -c sandbox_mode=read-only`.
+   A commit of this task made earlier without the flag gets the same
+   options with `--commit <sha>` in place of `--uncommitted`.
+3. If every command Luna runs fails with `setup refresh had errors`, the
+   npm Codex CLI's sandbox setup hit a file an open Codex app session
+   holds. Run the same review with the Codex app's own binary,
+   `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe`. A reply where Luna
+   says it couldn't read the diff is not a clean review.
+4. Fix every finding that holds up, rerun the area tests and review
+   again, until Luna has nothing left that you accept as a real problem.
+5. Commit with a last line of just `Task done`. Name in the message body
+   each finding you rejected and why, so the integrator can carry it into
+   the pull request.
+
+If Codex is missing or keeps failing, commit without `Task done` and tell
+the user the work isn't reviewed.
+
+Lanes don't open pull requests of their own. Two lanes that each pass on
+their own can still break each other, and with one pull request per lane,
+the second would need main merged in, a new full run and a new review after
+the first one lands. The integrator's branch already does that merge, in
+the order a queue of lane pull requests would have landed (oldest first),
+and the lane that merges later adapts to the one before it ("Resolving
+conflicts" below). One full run and one review then cover the result. The
+integrator's review is still required: it is the only one that sees
+conflict resolutions, lanes that break each other and the version bump.
 
 ## Checklist
 

@@ -2155,6 +2155,9 @@ def test_lane_stop_nudge():
               "without committing when it isn't finished or the user said "
               "not to", "commit them on your lane branch now" in reason
               and "end your turn without committing" in reason, reason)
+        check("lane-stop: ...after a GPT-6-Luna review of finished work",
+              reason.find("GPT-6-Luna") >= 0 and reason.find("GPT-6-Luna")
+              < reason.find("commit them"), reason)
         check("lane-stop: the reason has no em dash", "—" not in reason)
         check("lane-stop: the turn's second stop is let through",
               decide({**stop, "stop_hook_active": True}) == "")
@@ -4272,6 +4275,21 @@ def test_task_done_waits_for_the_user():
         check("task done: a lane agent is told to end finished work with "
               "Task done", lanes.DONE_MARK in a.spec.system_prompt
               and "INTEGRATOR" not in a.spec.system_prompt)
+        prompt = a.spec.system_prompt
+        review = prompt.find("codex review --uncommitted")
+        check("task done: a lane agent gets a GPT-6-Luna review at high "
+              "effort before its Task done commit, and reviews again until "
+              "nothing holds up",
+              review > prompt.find(f'"{lanes.DONE_MARK}"') > 0
+              and "model=gpt-6-luna" in prompt
+              and "model_reasoning_effort=high" in prompt
+              and "sandbox_mode=read-only" in prompt
+              and "review again" in prompt
+              and "docs/agents/integration.md" in prompt, prompt)
+        check("task done: a lane agent whose Codex fails commits without "
+              "the flag and tells the user",
+              f"commit without the \"{lanes.DONE_MARK}\" line" in prompt
+              and "not reviewed" in prompt, prompt)
         views = {}
         told, delivered, audit = [], [], []
         a.notice = lambda text: told.append(text)
@@ -4366,6 +4384,8 @@ def test_task_done_waits_for_the_user():
               "clean review", "GPT-6-Luna" in prompt
               and "NEVER run gh pr merge" not in prompt
               and lanes.DONE_MARK in prompt)
+        check("task done: the integrator's prompt has no lane review step",
+              "--uncommitted" not in prompt, prompt)
         check("task done: the integrator's prompt has it start only when the "
               "user asks", "Start only when the user asks you to" in prompt
               and "never because a lane was flagged" in prompt

@@ -29,8 +29,10 @@ _ROWS = (
      "reads every lane every 15 seconds and runs a real merge in memory, "
      "so the agent hears about a conflict before anyone merges."),
     ("Task done",
-     "A developer saying \"ready for review\". When an agent finishes its "
-     "task it commits with a last line of just Task done. Nothing ships "
+     "A developer saying \"ready to merge\". When an agent finishes its "
+     "task, GPT-6-Luna reviews the change, the agent fixes what Luna "
+     "finds, and then it commits with a last line of just Task done. "
+     "Nothing ships "
      "until you ask the integrator, or pick Ship finished lanes on its "
      "lane chip."),
     ("Integrator",
