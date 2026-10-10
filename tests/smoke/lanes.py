@@ -2155,6 +2155,11 @@ def test_lane_stop_nudge():
               "without committing when it isn't finished or the user said "
               "not to", "commit them on your lane branch now" in reason
               and "end your turn without committing" in reason, reason)
+        check("lane-stop: ...and to merge the base and get a clean "
+              "GPT-6-Luna review before the Task done line",
+              "merge the newest base" in reason and "GPT-6-Luna" in reason
+              and reason.find("commit them") < reason.find("GPT-6-Luna"),
+              reason)
         check("lane-stop: the reason has no em dash", "—" not in reason)
         check("lane-stop: the turn's second stop is let through",
               decide({**stop, "stop_hook_active": True}) == "")
@@ -3837,6 +3842,22 @@ def test_task_done_flag_core():
     _git(work, "fetch", "-q")
     check("task-done: picked into the base as another commit, it clears too",
           done(eb) == "" and _git(work, "rev-parse", "HEAD") != b_sha)
+
+    # the lane prompt's flow: commit, merge the newest base in, then flag on
+    # an empty commit once the review is clean
+    _commit(a["root"], "a4.txt", "4\n", "the next feature")
+    _git(a["root"], "fetch", "-q", "origin")
+    _git(a["root"], "merge", "-q", "--no-edit", "origin/main")
+    _git(a["root"], "commit", "-q", "--allow-empty", "-m",
+         "review clean\n\nTask done")
+    empty = _git(a["root"], "rev-parse", "HEAD")
+    check("task-done: an empty commit after merging the base in flags the "
+          "lane", done(ea) == empty)
+    _git(work, "merge", "-q", "--no-ff", "-m", "integrate A again", empty)
+    _git(work, "push", "-q", "origin", "main")
+    _git(work, "fetch", "-q")
+    check("task-done: ...and clears once the base has merged it",
+          done(ea) == "")
     for lane in (a, b):
         _drop_lane_folder(lane["root"])
     shutil.rmtree(tmp, ignore_errors=True)
@@ -4272,6 +4293,26 @@ def test_task_done_waits_for_the_user():
         check("task done: a lane agent is told to end finished work with "
               "Task done", lanes.DONE_MARK in a.spec.system_prompt
               and "INTEGRATOR" not in a.spec.system_prompt)
+        prompt = a.spec.system_prompt
+        merge = prompt.find("merge origin/main into your lane")
+        review = prompt.find("codex review --base origin/main")
+        flag = prompt.find(f'line of just "{lanes.DONE_MARK}"')
+        check("task done: a lane agent merges the newest base, then gets a "
+              "GPT-6-Luna review of its whole lane at high effort, then "
+              "flags Task done", 0 < merge < review < flag
+              and "git fetch origin" in prompt
+              and "never one side whole" in prompt
+              and "Never rebase" in prompt
+              and "model=gpt-6-luna" in prompt
+              and "model_reasoning_effort=high" in prompt
+              and "sandbox_mode=read-only" in prompt
+              and "review again" in prompt
+              and "--allow-empty" in prompt
+              and "docs/agents/integration.md" in prompt, prompt)
+        check("task done: a lane agent whose Codex fails leaves the flag "
+              "off and tells the user",
+              "leave the line off" in prompt
+              and "not reviewed" in prompt, prompt)
         views = {}
         told, delivered, audit = [], [], []
         a.notice = lambda text: told.append(text)
@@ -4366,6 +4407,8 @@ def test_task_done_waits_for_the_user():
               "clean review", "GPT-6-Luna" in prompt
               and "NEVER run gh pr merge" not in prompt
               and lanes.DONE_MARK in prompt)
+        check("task done: the integrator's prompt has no lane review step",
+              "--uncommitted" not in prompt, prompt)
         check("task done: the integrator's prompt has it start only when the "
               "user asks", "Start only when the user asks you to" in prompt
               and "never because a lane was flagged" in prompt

@@ -671,8 +671,10 @@ def lane_stop_decision(payload: dict, env=None, now: float = 0.0) -> str:
         names += f", +{n - STOP_FILES_SHOWN} more"
     return (f"AI Hive: your lane has {n} uncommitted "
             f"file{'' if n == 1 else 's'} ({names}). If the task you just did "
-            f"is finished, commit them on your lane branch now, ending the "
-            f"commit message with a line of just \"Task done\". If it is not "
+            f"is finished, commit them on your lane branch now, then do what "
+            f"your lane instructions ask before the \"Task done\" line: "
+            f"merge the newest base and get a clean GPT-6-Luna review. If "
+            f"it is not "
             f"finished, or the user asked you not to commit, end your turn "
             f"without committing.")
 

@@ -8,6 +8,16 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.39.0
+
+- Before a laned agent marks its work Task done, it merges the newest main
+  into its lane and gets a GPT-6-Luna code review, fixing what the review
+  finds. Lanes reach the integrator already up to date and reviewed.
+- Agents already running keep the old instructions until they restart.
+- After a restart, the newest reply of a reopened conversation gets its
+  time stamp again, even when the reply was reprinted slowly or the card
+  was cleared.
+
 ## 0.38.1
 
 - Opening or closing the sidebar no longer lights every idle agent as

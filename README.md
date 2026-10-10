@@ -485,8 +485,9 @@ workspaces keep executing — switching never pauses anything.
   **Make integrator** (one per workspace, so it is not offered while the
   workspace has one). The second lane in a workspace
   without an integrator says so on its card, once. Every other laned agent is
-  told to end its finished work with a commit whose last line is just
-  `Task done`. AI Hive spots that commit on its next lane read (the chip gets
+  told to merge the newest main into its lane, have GPT-6-Luna review the
+  lane (`codex review`, high effort), fix what Luna finds, and then commit
+  with a last line of just `Task done`. AI Hive spots that commit on its next lane read (the chip gets
   a `✓` and turns green) and logs it. Nothing ships until you say so: when
   you think there is enough for a pull request, ask the integrator to ship,
   or click the integrator's `integrator` chip (its icon shows two lanes
@@ -938,7 +939,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3086 checks drive the real app headlessly (offscreen Qt platform) with real
+3123 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -959,9 +960,13 @@ Options without discarding any), drawn inline in the terminal directly beneath t
 scrollbar's prompt marks, captured live on the busy-to-idle settle and
 otherwise READ FROM THE CONVERSATION ON DISK by matching each transcript
 reply's closing line into the scrollback — so reopening the app shows when
-an answer was really generated rather than nothing at all; re-anchored
-across a card rebuild from the pty replay, skipped rather than guessed when
-a reply has scrolled away or a row runs out of room),
+an answer was really generated rather than nothing at all; checked again
+each time the terminal goes quiet until the newest reply has its stamp,
+however the resumed conversation's reprint arrived, and after a wipe, with
+one `STAMP-MISS` line in `session.log` for a reply that still can't be
+placed; re-anchored across a card rebuild from the pty replay, skipped
+rather than guessed when a reply has scrolled away or a row runs out of
+room),
 deferred "send later" messages (delay/clock parsing, the
 Ctrl+Shift+Enter gesture sending nothing to the child, delivery by nudge so an
 assignment is never overwritten, a refusal retried then given up on as missed,
@@ -1080,7 +1085,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3086 checks)
+                           (3123 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

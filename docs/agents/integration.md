@@ -1,7 +1,8 @@
 # Shipping finished lanes
 
-Every laned agent ends its finished work with a commit whose message has a
-last line of just `Task done`. AI Hive reads every lane, sees that commit
+Every laned agent ends its finished work, once it has merged the newest
+main and GPT-6-Luna has reviewed it ("Lane agents" below), with a commit whose message has a last line of just
+`Task done`. AI Hive reads every lane, sees that commit
 (`lanes.DONE_GREP`), puts a check mark on the lane chip, turns it green and
 logs it. That is all it does. A flag never tells the integrator.
 
@@ -39,6 +40,70 @@ or dev server.
 
 Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
 
+## Lane agents
+
+Before it writes `Task done`, a lane agent brings in the newest main and
+gets its own GPT-6-Luna review. The lane prompt says so, and this section
+is what it reads for this project. The agent that wrote the lane fits it
+to what shipped and fixes its own findings best. Left to the integrator's
+pull request, each fix costs a full suite run and another review, and
+every other lane in the batch waits.
+
+1. Commit the finished task on the lane branch, without the flag.
+2. `git fetch origin` and `git merge origin/main`. A conflict keeps what
+   both sides meant, never one side whole ("Resolving conflicts" below
+   applies here too). If they can't both hold, stop and tell the user.
+   Never rebase.
+3. Run the area tests (Testing policy above).
+4. Review everything the lane adds:
+   `codex review --base origin/main -c model=gpt-6-luna -c model_reasoning_effort=high -c sandbox_mode=read-only`.
+   If every command Luna runs fails with `setup refresh had errors`, the
+   npm Codex CLI's sandbox setup hit a file an open Codex app session
+   holds. Run the same review with the Codex app's own binary,
+   `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe`. A reply where Luna
+   says it couldn't read the diff is not a clean review.
+5. Commit a fix for every finding that holds up, rerun the area tests and
+   review again, until Luna has nothing left that you accept as a real
+   problem. If main moved meanwhile, merge it in again first.
+6. Flag the work with a commit whose last line is just `Task done`,
+   `git commit --allow-empty` when nothing is left to commit. Name in its
+   body each finding you rejected and why, so the integrator can carry it
+   into the pull request.
+
+If Codex is missing or keeps failing, leave the flag off and tell the user
+the work isn't reviewed.
+
+Lanes don't open pull requests of their own. Two lanes that each pass on
+their own can still break each other, and with one pull request per lane,
+the second would need main merged in, a new full run and a new review after
+the first one lands. The integrator's branch does those merges in one
+place and one full run and one review cover the result. That review is
+still required: it is the only one that sees lanes that break each other,
+the conflict resolutions between them and the version bump.
+
+## Choosing a batch
+
+The user picks what ships, and the lane chip colors say what each lane
+will cost. Since every done lane merged main before its flag, a conflict
+on a done lane is almost always with another lane. When the user asks
+which lanes to ship, or names none and asks for advice, use this:
+
+- Green, done and sharing no files with anything: cheap. Any number of
+  them can go in one batch.
+- Done with a yellow border, sharing files with another lane: if that
+  lane is done too, ship both in the same batch, so the overlap is
+  resolved once. If it is still in progress, ship the done one now. The
+  other lane adapts when its agent merges main before its own flag, which
+  is cheaper than the integrator fitting the two together.
+- Red and done, a real conflict: ship it with the lane it conflicts with
+  when that one is done too, in a batch of two or three, so a hard
+  resolution doesn't hold up unrelated lanes. If the other lane isn't
+  done, ship this one alone and let the other adapt.
+- Amber, or anything without the flag: not ready, leave it out.
+
+Three to five lanes is a good batch when some of them share files. A
+batch of green lanes in separate areas can be larger.
+
 ## Checklist
 
 0. If your own `integrate/` pull request is still open when the user asks
@@ -60,9 +125,14 @@ Test command: `.venv\Scripts\python.exe tests\smoke_test.py`
    (`git log -1 --format=%ct <sha>`), each with
    `git -c merge.conflictStyle=zdiff3 merge --no-ff <sha>`. Oldest first
    lands the lane that finished first, as its own pull request would have,
-   so the result doesn't depend on when the user asked. Resolve a conflict
-   by "Resolving conflicts" below. Never rebase, never squash, never
-   force-push.
+   so the result doesn't depend on when the user asked. Order only matters
+   among lanes that change the same files, and there is one exception:
+   when one of them rewrites a shared file and another makes a small
+   change to it, merge the rewrite first and fit the small change to it.
+   Redoing a refactor around a small fix is where mistakes come from. Say
+   in the pull request body whenever you change the order. Resolve a
+   conflict by "Resolving conflicts" below. Never rebase, never squash,
+   never force-push.
 3. Bump `__version__` in `app/__init__.py` and add the matching `## x.y.z`
    section at the top of `CHANGELOG.md`, written for users, no em dash.
 4. Run `/code-review` on the branch and fix what it finds. Commit.

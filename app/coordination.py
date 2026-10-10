@@ -155,19 +155,44 @@ def system_prompt_text(workspace_name: str, agent_name: str,
         # uncommitted work can't ship or be proven merged when the card
         # closes. The "Task done" line marks a lane ready to ship (the
         # chip's check mark); session_hook.lane_stop_decision backs the
-        # rule for an agent that forgets.
+        # rule for an agent that forgets. Before the flag the lane merges
+        # the newest base and gets its own GPT-6-Luna review, so the agent
+        # that wrote the lane fits it to what shipped and fixes its own
+        # findings: on the integrator's PR each fix costs a full suite run
+        # and a new review, and holds up every other lane in the batch. The
+        # flag may sit on an empty commit (lanes._done_commit finds it), so
+        # the reviewed content is exactly what gets flagged.
         text += (
             f" You work in your own git worktree (your lane) at {lane['root']}, "
             f"on the branch {lane['branch']}, which starts from {base}. Commit "
             f"each finished task on your lane branch yourself, without asking "
-            f"first, and end that commit's message with a line of just "
-            f"\"{lanes.DONE_MARK}\". That line marks your work ready to "
-            f"ship, so never put it on unfinished work. The lane is private: "
+            f"first. Then get it ready to ship, in this order. Run `git fetch "
+            f"origin` (run it again if it fails on a locked ref: another "
+            f"lane was fetching) and merge origin/{base} into your lane, so "
+            f"your work fits what shipped since your lane started. In a "
+            f"repo with no origin, use plain {base} here and in the review "
+            f"below. Resolve a conflict by keeping what "
+            f"both sides meant, never one side whole, and if they can't both "
+            f"hold, stop and tell the user. Never rebase. Run the tests that "
+            f"cover what you changed. Then have GPT-6-Luna review everything "
+            f"your lane adds, at high effort: `codex review --base "
+            f"origin/{base} -c model=gpt-6-luna -c "
+            f"model_reasoning_effort=high -c sandbox_mode=read-only`. Commit "
+            f"a fix for every finding that holds up and review again, until "
+            f"Luna finds nothing you accept as a real problem. Only then "
+            f"make a commit whose message ends with a line of just "
+            f"\"{lanes.DONE_MARK}\" (`git commit --allow-empty` when nothing "
+            f"is left to commit). That line marks your work ready to ship, "
+            f"so never put it on unfinished or unreviewed work. If {base} "
+            f"has docs/agents/integration.md, read its section for lane "
+            f"agents first, as it can change these commands. If Codex is "
+            f"missing or keeps failing, leave the line off and tell the user "
+            f"the work is not reviewed. The lane is private: "
             f"nothing in it reaches {base} until the user has the integrator "
             f"ship it. Don't finish a task with uncommitted "
-            f"changes, unless the user asked you not to commit. Run the tests "
-            f"that cover what you changed; the full test suite runs once, "
-            f"when your work is integrated. Never edit files in other "
+            f"changes, unless the user asked you not to commit; the full "
+            f"test suite runs once, when your work is integrated. Never "
+            f"edit files in other "
             f"worktrees or in the main checkout at {lane.get('repo', '')} "
             f"(reading its board is fine), and never commit to {base}. Never "
             f"push your lane branch to {base}, even when git suggests it: "
