@@ -72,6 +72,92 @@ def test_agent_waiting():
           not b.is_waiting())
 
 
+# Chunks as codex-cli 0.162.0 wrote them around a command approval, captured
+# from a real pty. Codex draws with absolute cursor moves and no newlines, and
+# names the open prompt only in its window title.
+_CODEX_WORKING = "\x1b]0;⠸ Create hello2.txt file | codexcwd\x07"
+_CODEX_ASKING = ("\x1b]0;[ ! ] Action Required | Create hello2.txt file"
+                 " | codexcwd\x07")
+_CODEX_MENU = (
+    "\x1b[?2026h\x1b[?25l\x1b[27;3H\x1b[1m\x1b[39;49mWould you like to run"
+    " the following command?\x1b[29;3H\x1b[22mEnvironment:\x1b[29;16H\x1b[1m"
+    "local\x1b[36;1H\x1b[7m\x1b[1m› 1. Yes, proceed (y)\x1b[37;1H\x1b[27m"
+    "\x1b[22m \x1b[37;3H2. Yes, and don't ask again\x1b[38;3H3.\x1b[38;6HNo,"
+    "\x1b[38;10Hand\x1b[38;14Htell\x1b[38;19HCodex\x1b[38;25Hwhat\x1b[38;30Hto"
+    "\x1b[38;33Hdo\x1b[38;36Hdifferently\x1b[40;3H\x1b[2mPress \x1b[22m\x1b[1m"
+    "enter\x1b[22m\x1b[2m\x1b[2m to confirm or \x1b[22m\x1b[1mesc\x1b[22m"
+    "\x1b[2m\x1b[2m to cancel\x1b[39m\x1b[49m\x1b[0m\x1b[?2026l")
+_CODEX_BLINK = ("\x1b]0;[ . ] Action Required | Create hello2.txt file"
+                " | codexcwd\x07")
+_CODEX_RESUMED = "\x1b]0;⠴ Create hello2.txt file | codexcwd\x07"
+_CODEX_REDRAW = ("\x1b[?2026h\x1b[20;1H\x1b[38;5;2;49m✔ \x1b[39;49mYou "
+                 "\x1b[1mapproved\x1b[22m codex to run\x1b[34;3H\x1b[2mWorking"
+                 "\x1b[?2026l")
+
+
+def test_codex_title_waiting():
+    """A Codex approval raises the "?". Codex marks it in its terminal title
+    ("[ ! ] Action Required", blinking to "[ . ]" once a second), not in a
+    screen the scrape can read. Regression: the blink is output every second,
+    so it held the working pulse lit and the settle never came, and the
+    scrape returned False for every provider but Claude anyway."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import TerminalAgent, AgentStatus
+    from app.process_worker import AgentKind, build_spec
+
+    QApplication.instance() or QApplication([])
+    a = TerminalAgent(build_spec(AgentKind.OPENAI, "Codex", cwd=SCRATCH_CWD))
+    a.status = AgentStatus.RUNNING
+    events = []
+    a.waiting_changed.connect(events.append)
+
+    a._on_pty_output("pty", _CODEX_WORKING)
+    check("codex waiting: a working title is not waiting", not a.is_waiting())
+    a._on_pty_output("pty", _CODEX_ASKING)
+    check("codex waiting: 'Action Required' title -> waiting + signal",
+          a.is_waiting() and events == [True], events)
+    a._on_pty_output("pty", _CODEX_MENU)
+    check("codex waiting: the menu drawing under it keeps it waiting",
+          a.is_waiting() and a.is_busy())
+    a._idle_timer.stop()                 # the 2 s settle after the menu
+    a._on_idle_timeout()
+    check("codex waiting: survives the settle", a.is_waiting()
+          and not a.is_busy())
+
+    a._on_pty_output("pty", _CODEX_BLINK)
+    check("codex waiting: the title blink is not work",
+          a.is_waiting() and not a.is_busy()
+          and not a._idle_timer.isActive())
+    a._on_pty_output("pty", "\x1b[?2026h\x1b[39m\x1b[49m\x1b[0m\x1b[?2026l")
+    check("codex waiting: an empty frame while asking is not work either",
+          not a.is_busy() and not a._idle_timer.isActive())
+
+    a._on_pty_output("pty", _CODEX_RESUMED)
+    a._on_pty_output("pty", _CODEX_REDRAW)
+    check("codex waiting: answering clears it and work resumes",
+          not a.is_waiting() and events == [True, False] and a.is_busy(),
+          (events, a.is_busy()))
+
+    a._on_pty_output("pty", _CODEX_ASKING)
+    a._set_status(AgentStatus.EXITED_OK)
+    check("codex waiting: exit clears it", not a.is_waiting())
+
+    # a read can cut the title escape in two
+    c = TerminalAgent(build_spec(AgentKind.OPENAI, "Split", cwd=SCRATCH_CWD))
+    c.status = AgentStatus.RUNNING
+    c._on_pty_output("pty", _CODEX_ASKING[:25])
+    check("codex waiting: half a title decides nothing", not c.is_waiting())
+    c._on_pty_output("pty", _CODEX_ASKING[25:])
+    check("codex waiting: a title split across reads still counts",
+          c.is_waiting())
+
+    # the marker is Codex's: other providers set their own titles
+    d = TerminalAgent(build_spec(AgentKind.CLAUDE, "Claude", cwd=SCRATCH_CWD))
+    d.status = AgentStatus.RUNNING
+    d._on_pty_output("pty", _CODEX_ASKING)
+    check("codex waiting: a Claude agent ignores the title", not d.is_waiting())
+
+
 def test_notification_chime():
     """The notification chime: the synthesiser writes a valid WAV, and the
     manager announces the RISING edge of an agent's waiting state via
