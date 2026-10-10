@@ -82,7 +82,9 @@ workspaces keep executing — switching never pauses anything.
   question — a "?" lights up on the row (next to the working count) and beside
   that agent in the expanded list, so you can spot and answer it without hunting
   through terminals. Suppressed for agents launched in bypass-permissions mode
-  (which never prompt). A **question chime**, a short droid-style "doo-dee-bweep?"
+  (which never prompt). Codex cards light it from the "Action Required" Codex
+  puts in its window title while an approval or question is open, and the
+  card stops pulsing as busy while Codex waits. A **question chime**, a short droid-style "doo-dee-bweep?"
   whose last note is still sliding up when it stops, plays the moment that "?"
   appears (the standby→waiting rising edge), so you notice an agent needs you
   even while you're heads-down in another workspace — handy when agents you sent
@@ -939,7 +941,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3123 checks drive the real app headlessly (offscreen Qt platform) with real
+3140 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -985,7 +987,8 @@ drag workspaces in/out, single-level membership persisted across a v4 session
 round-trip with v3 migration), the count-badge inline agent list +
 click-to-reveal, and the waiting-for-input "?" detection (settled-screen
 prompt/question scrape, gated on the idle timer, suppressed under
-bypassPermissions) plus the question chime it triggers (WAV synthesis,
+bypassPermissions, and Codex's "Action Required" title, whose once-a-second
+blink is not counted as work) plus the question chime it triggers (WAV synthesis,
 the manager's waiting rising-edge `agentWaiting` signal, and the top-bar
 mute toggle persisted in the ui state), the reply finished chime (Claude's
 Stop-hook edge, the hookless providers' quiet timer, once per submitted turn,
@@ -1085,7 +1088,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3123 checks)
+                           (3140 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

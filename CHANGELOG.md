@@ -8,6 +8,11 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.39.1
+
+- A Codex card now shows the "?" when Codex asks for approval or asks a
+  question, and stops pulsing as busy while it waits for your answer.
+
 ## 0.39.0
 
 - Before a laned agent marks its work Task done, it merges the newest main

@@ -16,6 +16,7 @@ from enum import Enum
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from . import providers, scheduled_send, transcripts
+from .ansi_parser import _PARTIAL_RE as _ESC_PARTIAL_RE
 from .coordination import sanitize_text
 from .scheduled_send import MISSED, PENDING, SENT, ScheduledMessage
 from .process_worker import AgentSpec, ProcessWorker, WorkerState
@@ -176,7 +177,8 @@ LIMIT_ECHO_WINDOW_S = 12 * 3600
 # strips escape sequences so on-screen TEXT can be matched: the raw stream
 # positions words individually ("trust\x1b[20Gthis\x1b[25Gfolder"), so a
 # phrase can never be matched against raw bytes
-_CSI_RE = re.compile(r"\x1b\[[0-9;?<>=]*[@-~]|\x1b[()][AB0]|\x1b\][^\x07\x1b]*\x07?")
+_CSI_RE = re.compile(r"\x1b\[[0-9;?<>=]*[@-~]|\x1b[()][AB0]"
+                     r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
 
 # --- "waiting for the user" detection (Claude prompts/questions) ---
 # Claude emits no machine-readable "I'm waiting" event, so we scrape the settled
@@ -193,6 +195,21 @@ _NUM_OPTION_RE = re.compile(r"(?m)^\s*[>❯❱│┃|]*\s*\d+\.\s+\S")
 # a numbered option with a selection caret in front (optionally past box
 # borders) — the highlighted row of a live menu, absent from plain prose lists
 _OPTION_CARET_RE = re.compile(r"(?m)^[\s│┃|]*[>❯❱]\s*\d+\.\s+\S")
+
+# Codex does say when it waits: the terminal title it sets (OSC 0) reads
+# "[ ! ] Action Required | <thread> | <folder>" while an approval or question
+# is open, and blinks to "[ . ] Action Required" once a second until the user
+# answers (measured on codex-cli 0.162.0). The scrape above can't serve Codex.
+# It draws with absolute cursor moves and never writes a newline, so the
+# escape-stripped tail has no lines to match, and the blink is output every
+# second, so the 2 s settle the scrape waits for never comes while it waits.
+_OSC_TITLE_RE = re.compile(r"\x1b\][02];([^\x07\x1b]*)(?:\x07|\x1b\\)")
+# Anchored on the marker Codex puts in front, because the thread name and
+# the folder that follow it are free text and can say "Action Required" too.
+_CODEX_ATTENTION_RE = re.compile(r"\s*\[ [!.] \] Action Required\b")
+# Longest partial escape held for the next chunk, in case a read split it
+# (see _on_pty_output). A title is far shorter; anything longer is not one.
+_ESC_CARRY_MAX = 512
 
 # Claude's input-box footer rotates through several hints; ANY of them means
 # the prompt is live and will accept typing. Only "? for shortcuts" was matched
@@ -577,17 +594,20 @@ class TerminalAgent(QObject):
         # last (reason, banner) reported by _note_limit_skip, so a rejection
         # that persists across hundreds of repaints is recorded ONCE
         self._limit_last_skip = None
-        # "waiting for the user" is the OR of three independent sources (see
+        # "waiting for the user" is the OR of four independent sources (see
         # _emit_waiting): _scrape_waiting (the settled screen shows a numbered
         # menu + selection caret — a permission prompt), _tool_waiting (an
         # AskUserQuestion/ExitPlanMode prompt is open, reported by a Claude
         # PreToolUse hook — the scrape CANNOT see these; confirmed no
-        # Notification fires either), and _turn_waiting (the agent ended a turn
-        # on a plain free-text question, reported by the Stop hook). _waiting is
-        # the emitted effective value.
+        # Notification fires either), _turn_waiting (the agent ended a turn
+        # on a plain free-text question, reported by the Stop hook), and
+        # _title_waiting (Codex's title says "Action Required", see
+        # _scan_codex_title). _waiting is the emitted effective value.
         self._scrape_waiting = False
         self._tool_waiting = False
         self._turn_waiting = False
+        self._title_waiting = False
+        self._esc_carry = ""          # a Codex escape split across reads
         self._waiting = False
         self._screen_tail = ""        # rolling escape-stripped output tail
         # "idle, but a background command it started is still running" (see
@@ -665,6 +685,7 @@ class TerminalAgent(QObject):
         self._set_prompt_ready(False)  # re-armed for the fresh TUI
         self._ready_tail = ""
         self._screen_tail = ""
+        self._esc_carry = ""
         self._reset_waiting()
         self._reset_bg_shell()
         self.clear_limit_block()
@@ -744,6 +765,7 @@ class TerminalAgent(QObject):
         self._set_prompt_ready(False)
         self._ready_tail = ""
         self._screen_tail = ""
+        self._esc_carry = ""
         self._reset_waiting()
         self._reset_bg_shell()
         self.clear_limit_block()
@@ -1742,8 +1764,10 @@ class TerminalAgent(QObject):
 
     def _on_reply_quiet(self) -> None:
         # a background command still running means the agent kicked off work
-        # and is waiting on it, which is not a finished reply
-        if not self._busy and not self._bg_shell:
+        # and is waiting on it, which is not a finished reply. Neither is an
+        # open Codex approval: its title blink is not work (_on_pty_output),
+        # so the quiet would otherwise close the turn while Codex waits.
+        if not self._busy and not self._bg_shell and not self._title_waiting:
             self._close_awaited_turn()      # the turn ended (TURN_QUIET_S)
             self._announce_reply()
 
@@ -1755,21 +1779,38 @@ class TerminalAgent(QObject):
 
     def is_waiting(self) -> bool:
         """True when the agent needs the user: it has settled on a numbered
-        prompt, an interactive AskUserQuestion/ExitPlanMode prompt is open, or
-        it ended a turn on a free-text question. The OR of three sources — see
-        _emit_waiting."""
+        prompt, an interactive AskUserQuestion/ExitPlanMode prompt is open,
+        it ended a turn on a free-text question, or Codex's title says
+        "Action Required". The OR of four sources, see _emit_waiting."""
         return self._waiting
 
     def _emit_waiting(self) -> None:
-        """Recompute the effective waiting state from its three sources and emit
+        """Recompute the effective waiting state from its four sources and emit
         only on a genuine change. No single source is complete: the screen
         scrape misses AskUserQuestion (no numbered+caret menu) and plain
-        questions; the hook edges miss classic permission menus. Together they
-        cover every 'needs the user' case."""
-        eff = self._scrape_waiting or self._tool_waiting or self._turn_waiting
+        questions; the hook edges miss classic permission menus; Codex has
+        neither hooks nor a screen the scrape can read, only its title.
+        Together they cover every 'needs the user' case."""
+        eff = (self._scrape_waiting or self._tool_waiting
+               or self._turn_waiting or self._title_waiting)
         if eff != self._waiting:
             self._waiting = eff
             self.waiting_changed.emit(eff)
+
+    def _scan_codex_title(self, data: str) -> None:
+        """Follow the "Action Required" marker in the titles Codex sets (see
+        _CODEX_ATTENTION_RE). The newest title in `data` decides. Sticky
+        against other output, like _tool_waiting: the approval menu redraws
+        while the user moves through it, and only a title without the marker
+        (Codex went back to work, or the user cancelled) clears it. `data`
+        holds whole escapes only: _on_pty_output keeps a partial one back
+        for the next read (_esc_carry)."""
+        titles = _OSC_TITLE_RE.findall(data)
+        if titles:
+            waiting = bool(_CODEX_ATTENTION_RE.match(titles[-1]))
+            if waiting != self._title_waiting:
+                self._title_waiting = waiting
+                self._emit_waiting()
 
     def set_tool_waiting(self, waiting: bool) -> None:
         """Authoritative Claude-hook edge: a PreToolUse for AskUserQuestion/
@@ -1795,6 +1836,7 @@ class TerminalAgent(QObject):
         self._scrape_waiting = False
         self._tool_waiting = False
         self._turn_waiting = False
+        self._title_waiting = False
         self._emit_waiting()
 
     def _reset_bg_shell(self) -> None:
@@ -2063,6 +2105,8 @@ class TerminalAgent(QObject):
         # ground-truth on the drawn box; suppress for a mode that shows no
         # prompts. bypassPermissions skips ALL prompts; other modes (incl.
         # acceptEdits) still surface questions, so only bypass is suppressed.
+        # Codex reports its prompts through its title instead
+        # (_scan_codex_title).
         if self.spec.provider != "claude":
             return False
         if getattr(self.spec, "permission_mode", "") == "bypassPermissions":
@@ -2619,7 +2663,27 @@ class TerminalAgent(QObject):
             # would paint under the new child, and scraped they could read
             # as its prompt or latch a plan limit it never hit.
             return
-        self._mark_busy()  # streaming VT output => the agent is working
+        data = text
+        if self.spec.provider == "openai":
+            # Codex's title is its waiting signal, so an escape a read cut in
+            # two (down to a lone trailing ESC) must neither be lost nor leak
+            # its tail into `stripped` as text, where it would count as work.
+            # Only the scans wait for the rest: the buffer and the view still
+            # get the raw chunk.
+            data = self._esc_carry + text
+            self._esc_carry = ""
+            m = _ESC_PARTIAL_RE.search(data)
+            if m and len(data) - m.start() <= _ESC_CARRY_MAX:
+                self._esc_carry = data[m.start():]
+                data = data[:m.start()]
+            self._scan_codex_title(data)
+        stripped = _CSI_RE.sub("", data)
+        # streaming VT output => the agent is working. Except Codex's
+        # once-a-second title blink while it waits on the user: a chunk that
+        # draws nothing would hold the pulse lit and the settle off for as
+        # long as the question stays open.
+        if not (self._title_waiting and not stripped.strip()):
+            self._mark_busy()
         # keep a bounded raw tail so a freshly created card can rebuild the
         # screen; the live TerminalView is fed directly via the signal
         self._note_first_size()
@@ -2633,7 +2697,6 @@ class TerminalAgent(QObject):
         self._trim_geometry()
         # rolling escape-stripped tail for waiting-for-input detection (the idle
         # timer scans it once output settles — see _screen_waiting)
-        stripped = _CSI_RE.sub("", text)
         self._screen_tail = (self._screen_tail + stripped)[-4000:]
         if self._pending_submits:
             self._watch_task_echo(stripped)
