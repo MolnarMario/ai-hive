@@ -170,6 +170,12 @@ LIMIT_SWEEP_SLACK_S = 30
 # card has never been on screen no longer waits for the user to click it.
 LIMIT_REPAINT_AFTER_WAITS = 3
 
+# How long a live Claude latch may stand with the conversation on disk NOT
+# ending on a cut-off before `_clear_carried_on_latches` drops it as a repaint
+# of history. The record behind a real banner lands within seconds, so ten
+# minutes leaves wide margin while the hourglass still goes soon after.
+LIMIT_UNCORROBORATED_S = 600
+
 # --- taskbar working-count overlay ---
 # `workspaceStatsChanged` fires every couple of seconds PER BUSY AGENT, and each
 # push costs a COM round trip plus a fresh HICON, so the recompute is coalesced
@@ -3476,8 +3482,19 @@ class MainWindow(QMainWindow):
         drawn but not flushed yet reads that way too (see
         `transcripts.limit_cut_off`). An agent with a nudge in flight or
         already sent is left to its verify, which owns that outcome.
+
+        The one exception is time. Claude writes a cut-off's record within a
+        second or two of drawing its banner, so an idle agent whose latch is
+        LIMIT_UNCORROBORATED_S old and whose conversation still does not end
+        on a cut-off was latched on a repaint of history, and nothing after
+        it will ever be written to prove that. This is what left Agent 15's
+        hourglass up on 2026-10-11: resumed at 21:50, done at 21:50:22,
+        re-latched at 22:02 by the "while you were away" recap's redraw, then
+        silent. Without it the latch sat until its reset-time check, a day
+        out, which reads the same transcript and dismisses it anyway.
         """
         cleared = 0
+        now = time.time()
         for agent in self.manager.all_agents():
             spec = agent.spec
             if (spec.provider != "claude" or not agent.is_limit_blocked()
@@ -3485,11 +3502,21 @@ class MainWindow(QMainWindow):
                     or agent.id in self._resume_pending):
                 continue
             info = transcripts.limit_cut_off(spec.cwd, spec.session_id)
-            if (not info or info["cut_off"]
-                    or info.get("carried_on_at", 0.0)
-                    <= agent.limit_latched_at()):
+            if not info or info["cut_off"]:
                 continue
-            if info.get("self_resumed"):
+            uncorroborated = (not agent.is_busy() and
+                              now - agent.limit_latched_at()
+                              >= LIMIT_UNCORROBORATED_S)
+            if info.get("carried_on_at", 0.0) <= agent.limit_latched_at():
+                if not uncorroborated:
+                    continue
+                self._limit_audit(f"UNCORROBORATED agent={spec.name} (idle, "
+                                  f"and the conversation still does not "
+                                  f"end on a cut-off)")
+                self._ledger_outcome(
+                    agent, limit_ledger.DISMISSED,
+                    detail="the conversation never recorded this cut-off")
+            elif info.get("self_resumed"):
                 self._limit_audit(f"SELF-RESUMED agent={spec.name} (the CLI "
                                   f"continued on its own after the latch)")
                 self._ledger_outcome(agent, limit_ledger.RESUMED,
