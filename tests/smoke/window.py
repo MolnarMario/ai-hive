@@ -802,6 +802,48 @@ def test_app():
           solo_dirty["n"] == 0, solo_dirty["n"])
     mgr.dirty.disconnect(_solo_conn)
 
+    # Ctrl+Up maximizes the selected agent, Ctrl+Down shows them all again
+    from PySide6.QtCore import QEvent as _QEvent
+    from PySide6.QtGui import QKeyEvent as _QKeyEvent
+    from PySide6.QtGui import QShortcut as _QS
+    from app.widgets.terminal_view import TerminalView as _TV
+    _ctrl = Qt.KeyboardModifier.ControlModifier
+    _tv = _TV(rows=6, cols=80)
+    for _k in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+        _ev = _QKeyEvent(_QEvent.Type.ShortcutOverride, _k, _ctrl)
+        _ev.ignore()
+        _tv.event(_ev)
+        check(f"ctrl+arrow: a focused terminal leaves Ctrl+{_k.name[4:]} "
+              "to the window", not _ev.isAccepted())
+    _tv.deleteLater()
+    mgr.set_active(alpha.id)
+    win._set_focused_card(page.cards[1])
+    # the offscreen platform has no active window, so fire the shortcuts
+    # directly; the keys they are bound to are checked by name
+    _keys = {s.key().toString(): s for s in win.findChildren(_QS)}
+    check("ctrl+arrow: Ctrl+Up and Ctrl+Down are window shortcuts",
+          {"Ctrl+Up", "Ctrl+Down"} <= set(_keys), sorted(_keys))
+    _keys["Ctrl+Up"].activated.emit()
+    pump(30)
+    check("ctrl+up: maximizes the selected agent only",
+          page._solo_card is page.cards[1] and page.cards[1].isVisible()
+          and not page.cards[0].isVisible()
+          and not page.cards[2].isVisible())
+    _keys["Ctrl+Up"].activated.emit()
+    pump(30)
+    check("ctrl+up: again on the maximized agent changes nothing",
+          page._solo_card is page.cards[1])
+    _keys["Ctrl+Down"].activated.emit()
+    pump(30)
+    assert_layout(page, 3)
+    check("ctrl+down: restores every agent to its tile",
+          page._solo_card is None and all(c.isVisible() for c in page.cards)
+          and not page.cards[1].btn_max.restored)
+    _keys["Ctrl+Down"].activated.emit()
+    pump(30)
+    check("ctrl+down: with nothing maximized changes nothing",
+          page._solo_card is None and all(c.isVisible() for c in page.cards))
+
     # adding an agent while maximized exits solo so the new card is visible
     page.toggle_solo(page.cards[0])
     pump(20)

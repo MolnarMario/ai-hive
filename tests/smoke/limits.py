@@ -2402,3 +2402,148 @@ def test_limit_echo_after_self_continue():
           cleared == 2 and len(audits) == 2
           and any("CARRIED-ON" in x for x in audits), audits)
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_limit_echo_after_torn_banner():
+    """2026-10-11: Agent 15's hourglass stayed up after AI Hive resumed it.
+
+    It latched at 21:15 on a torn repaint, "Usagelimit reached \xb7 wrapping
+    up \xb7 limit reses 9:50pm", which states no clock the parser can read, so
+    the echo guard was armed with no clock and the reset came from the
+    account reading. The nudge at 21:50 worked and the turn finished at
+    21:50:22. At 22:02 Claude Code's "while you were away" recap redrew the
+    screen, the old "continuing automatically at 9:50pm" row came back into
+    view, and it latched again dated 2026-10-12 21:50. The conversation never
+    wrote anything after that, so the watchdog had nothing to clear it with.
+    """
+    import json as _json
+    import time as _time
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from app import limit_ledger, transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.widgets.main_window import LIMIT_UNCORROBORATED_S, MainWindow
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-limit-torn-"))
+    cwd = str(tmp)
+    now = int(_time.time())
+    reset = now - now % 60 - 12 * 60        # a whole minute, 12+ min ago
+
+    def clock(at):
+        return _time.strftime("%I:%M%p", _time.localtime(at)).lstrip("0").lower()
+
+    TORN = (f"Usagelimit reached \xb7 wrapping up \xb7 limit reses "
+            f"{clock(reset)}\xb7clau.d/wrap-up \xb7 /upgrade to keep using "
+            f"Claude Code")
+    STATUS = (f"Usage limit reached \xb7 continuing automatically at "
+              f"{clock(reset)} \xb7 esc to cancel")
+
+    def mk(name):
+        a = TerminalAgent(build_spec(AgentKind.CLAUDE, name, cwd=cwd))
+        a._prompt_ready = True
+        a.status = AgentStatus.RUNNING
+        a.spec.session_id = "sid-" + name.lower()
+        return a
+
+    def show(agent, text):
+        agent._screen_tail = text + "\n  ? for shortcuts\n"
+        agent._scrape_limit()
+
+    # --- the screen: the redraw after the resume must not re-latch ----------
+    a = mk("Torn")
+    show(a, TORN)
+    check("limit-torn: the torn banner latches with no clock of its own",
+          a.is_limit_blocked() and a.limit_resets_at() is None)
+    a.set_limit_reset(reset - 0.4)          # the account reading, 21:49:59.6
+    a.clear_limit_block()                   # RESUMED at 21:50
+    show(a, STATUS)
+    check("limit-torn: the redrawn 'continuing automatically' row naming "
+          "the reset it was resumed from does NOT re-latch",
+          not a.is_limit_blocked(), a.limit_banner_text())
+    show(a, f"You've hit your session limit \xb7 resets {clock(now + 3 * 3600)}")
+    check("limit-torn: a banner with a later clock still latches",
+          a.is_limit_blocked())
+
+    b = mk("TornNextDay")
+    show(b, TORN)
+    b.set_limit_reset(reset - 0.4)
+    b.clear_limit_block()
+    b._limit_last_reset -= 20 * 3600        # that reset was 20 h ago
+    show(b, STATUS)
+    check("limit-torn: the same clock a day later is a genuine new cut-off",
+          b.is_limit_blocked())
+
+    # --- the watchdog: a latch the conversation never recorded --------------
+    def iso(at):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(at))
+
+    def write(sid, records):
+        path = transcripts.transcript_path(cwd, sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(_json.dumps(_as_cli_wrote(rec)) + "\n")
+
+    def user(text, at):
+        return {"type": "user", "timestamp": iso(at),
+                "message": {"role": "user", "content": text}}
+
+    def reply(text, at):
+        return {"type": "assistant", "timestamp": iso(at),
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    hit = f"You've hit your session limit \xb7 resets {clock(reset)}"
+    done = [user("hide the checkbox", reset - 3000),
+            reply(hit, reset - 2900),
+            user("The usage limit has reset. Continue.", reset + 11),
+            reply("The checkbox is hidden now.", reset + 22),
+            {"type": "system", "subtype": "away_summary",
+             "timestamp": iso(reset + 740), "content": "Recap"}]
+    agents, audits, outcomes = [], [], []
+    stub = SimpleNamespace(
+        manager=SimpleNamespace(all_agents=lambda: agents),
+        _resume_pending=set(), _limit_audit=audits.append,
+        _ledger_outcome=lambda ag, o, detail="":
+            outcomes.append((ag.spec.name, o)))
+
+    def latched(name, records, age):
+        ag = mk(name)
+        write(ag.spec.session_id, records)
+        ag.mark_limit_blocked(reset + 86400.0, from_startup=False,
+                              banner=STATUS)
+        ag._limit_at = now - age
+        agents.append(ag)
+        return ag
+
+    old = latched("Old", done, LIMIT_UNCORROBORATED_S + 60)
+    fresh = latched("Fresh", done, 30)
+    busy = latched("Busy", done, LIMIT_UNCORROBORATED_S + 60)
+    busy._busy = True
+    stuck = latched("Stuck", done[:2], LIMIT_UNCORROBORATED_S + 60)
+    # a wrap-up turn that ran past the window has not written its cut-off
+    # yet, and the old limit menu on screen is a parked agent
+    late = latched("WorkedLate", done, LIMIT_UNCORROBORATED_S + 60)
+    late._last_work_ts = now - 30
+    menu = latched("Menu", done, LIMIT_UNCORROBORATED_S + 60)
+    menu._screen_tail = ("  1. Stop and wait for limit to reset\n"
+                         "  2. Upgrade your plan\n")
+    cleared = MainWindow._clear_carried_on_latches(stub)
+    check("limit-torn: an idle latch the conversation never recorded is "
+          "dropped once it is old enough",
+          not old.is_limit_blocked()
+          and ("Old", limit_ledger.DISMISSED) in outcomes, outcomes)
+    check("limit-torn: ...not while it is fresh (the record may not be "
+          "written yet)", fresh.is_limit_blocked())
+    check("limit-torn: ...not while the agent is busy",
+          busy.is_limit_blocked())
+    check("limit-torn: ...and never when the conversation does end on a "
+          "cut-off", stuck.is_limit_blocked())
+    check("limit-torn: ...not until the window has passed since its last "
+          "work", late.is_limit_blocked())
+    check("limit-torn: ...and never while the limit menu is on screen",
+          menu.is_limit_blocked())
+    check("limit-torn: exactly one, with its audit line",
+          cleared == 1 and any("UNCORROBORATED" in x for x in audits), audits)
+    shutil.rmtree(tmp, ignore_errors=True)

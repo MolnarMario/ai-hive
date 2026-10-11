@@ -561,6 +561,17 @@ class WorkspacePage(QWidget):
             c.set_maximized(c is self._solo_card)
         self._retile()
 
+    def maximize_card(self, card: "TerminalCard") -> None:
+        """Ctrl+Up: show only `card`. Unlike toggle_solo, asking again for the
+        card that is already maximized leaves it alone."""
+        if card in self.cards and card is not self._solo_card:
+            self.toggle_solo(card)
+
+    def restore_tiling(self) -> None:
+        """Ctrl+Down: bring every card back. A no-op when nothing is soloed."""
+        if self._solo_card is not None:
+            self.toggle_solo(self._solo_card)
+
     def _exit_solo(self) -> None:
         if self._solo_card is None:
             return

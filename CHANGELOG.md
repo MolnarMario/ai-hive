@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.41.0
+
+- Ctrl+Up maximizes the selected agent and Ctrl+Down shows every agent
+  again. A focused terminal no longer receives these two keys.
+- A Claude card's usage-limit hourglass no longer comes back after a
+  resume when Claude redraws the old limit message. A limit the
+  conversation never recorded clears after 10 idle minutes.
+
 ## 0.40.0
 
 - Resizing a Claude terminal re-wraps its whole scrollback at the new size,

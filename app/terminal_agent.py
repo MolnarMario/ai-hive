@@ -207,6 +207,10 @@ LIMIT_REPLAY_TAIL_LINES = 12
 # still counts as that cut-off redrawn rather than a new one. See
 # `_echoes_last_clock` for why 12 h is safe in both directions.
 LIMIT_ECHO_WINDOW_S = 12 * 3600
+# How far a banner's clock may sit from the latched reset epoch and still name
+# it. The banner prints a minute while the account reading carries seconds
+# (21:49:59.6 for "9:50pm"), and the next window can't reset within 5 hours.
+LIMIT_ECHO_SLACK_S = 300
 
 # strips escape sequences so on-screen TEXT can be matched: the raw stream
 # positions words individually ("trust\x1b[20Gthis\x1b[25Gfolder"), so a
@@ -2424,12 +2428,29 @@ class TerminalAgent(QObject):
         A genuine new cut-off naming the same clock resets a day after the old
         one, so it latches at least 19 h after that reset (a session window is
         at most 5 h long). LIMIT_ECHO_WINDOW_S sits between the two, and the
-        transcript sweep still catches anything this lets pass."""
+        transcript sweep still catches anything this lets pass.
+
+        The clock is also compared by the EPOCH it names, not only by its
+        text, because the latched banner may have stated no clock this can
+        read. On 2026-10-11 Agent 15 latched on "Usagelimit reached \xb7
+        wrapping up \xb7 limit reses 9:50pm" (a torn repaint), so its clock key
+        was empty and the reset came from the account reading instead. Claude
+        Code's "while you were away" recap redrew the screen 12 minutes after
+        the resume, the old "continuing automatically at 9:50pm" row came back
+        into view, and with no clock to compare it latched again, dated a day
+        out. So a banner whose clock, read from just before the latched
+        reset, lands on that reset is the same cut-off too."""
         clock = banner_clock_key(clock_text)
-        return bool(clock and clock == self._limit_last_clock
-                    and self._limit_last_reset
-                    and abs(time.time() - self._limit_last_reset)
-                    <= LIMIT_ECHO_WINDOW_S)
+        if (not clock or not self._limit_last_reset
+                or abs(time.time() - self._limit_last_reset)
+                > LIMIT_ECHO_WINDOW_S):
+            return False
+        if clock == self._limit_last_clock:
+            return True
+        at = parse_reset_clock(clock_text,
+                               now=self._limit_last_reset - LIMIT_ECHO_SLACK_S)
+        return (at is not None
+                and abs(at - self._limit_last_reset) <= LIMIT_ECHO_SLACK_S)
 
     def _in_launch_replay(self) -> bool:
         """Whether output arriving now can still be a previous session being
@@ -2695,6 +2716,10 @@ class TerminalAgent(QObject):
         if self._limit_blocked and self._limit_resets_at is None and at:
             self._limit_resets_at = at
             self._limit_reset_exact = True     # an epoch, not a wall clock
+            # The echo guard was armed at the latch with no reset, so it
+            # could not recognise this cut-off's clock when it is redrawn
+            # after the resume (see `_echoes_last_clock`).
+            self._limit_last_reset = at
 
     def prompt_ready(self) -> bool:
         """True once the TUI's input prompt is live and will accept typing."""

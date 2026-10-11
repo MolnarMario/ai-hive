@@ -664,8 +664,10 @@ error dialog instead of silently closing. Packaging to a distributable
   focused), and global `A−`/`A+` under **⚙ Options**; both persist.
 - **App shortcuts use `Ctrl+Shift+…`** (T = new terminal, N = new workspace,
   B = toggle sidebar) so every plain `Ctrl`/`Alt` key, `Tab`, and `Shift+Tab`
-  goes straight to the focused terminal. The two exceptions are `F11` and
-  `Ctrl+T` (new terminal), which a focused terminal never receives. Click
+  goes straight to the focused terminal. The exceptions are `F11`,
+  `Ctrl+T` (new terminal), `Ctrl+Up` (maximize the selected agent) and
+  `Ctrl+Down` (show all agents again), which a focused terminal never
+  receives. Click
   a full-terminal card and
   `Shift+Tab` cycles Claude Code's modes, `Ctrl+C` interrupts (when nothing is
   selected; otherwise it copies), `Ctrl+R` reverse-searches, arrows/`Tab`
@@ -954,7 +956,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3264 checks drive the real app headlessly (offscreen Qt platform) with real
+3283 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1101,7 +1103,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3264 checks)
+                           (3283 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
