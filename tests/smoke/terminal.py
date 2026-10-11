@@ -1899,6 +1899,143 @@ def test_reflow_reprints_scrollback_at_new_size():
     card.detach(); card2.detach(); agent.dispose(); codex.dispose()
 
 
+def test_redraw_from_the_wrong_row_leaves_no_copy_in_scrollback():
+    """A ConPTY frame that scrolls rows off but leaves the screen as it was
+    pushed copies, not conversation, and the view takes them back.
+
+    The bytes copy the shape of two real saved screens. After Claude's idle
+    recap, it redrew its frame starting 4 rows too low: ConPTY sent a repaint
+    from row 4 down plus newlines on the last row, so 4 rows scrolled off
+    while the screen ended identical. Those rows were a reply paragraph
+    already on screen, and the scrollback showed it twice."""
+    import pyte
+    from PySide6.QtWidgets import QApplication
+    from app.widgets import terminal_view as tvm
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    rows, cols = 10, 40
+
+    def rt(line):
+        return "".join(line[x].data for x in range(cols)).rstrip()
+
+    def hist(v):
+        return [rt(r) for r in v.screen.history.top]
+
+    def screen(v):
+        return [rt(v.screen.buffer[y]) for y in range(rows)]
+
+    def conversation(v, n=20):
+        for i in range(n):
+            v.feed(f"reply paragraph line {i:02d}\r\n")
+
+    def wrong_row_redraw(texts, k=4):
+        # cursor sits on the bottom row; go up to row k-1, erase it, then
+        # paint the same screen one row lower per newline, running k rows
+        # past the bottom (what ConPTY sent for Claude's redraw)
+        out = ["\x1b[?25h\x1b[?25l\r", f"\x1b[{rows - k}A\x1b[K"]
+        for t in texts:
+            out.append("\r\n" + t + "\x1b[K")
+        return "".join(out) + "\x1b[?25h"
+
+    v = TerminalView(rows=rows, cols=cols)
+    conversation(v)
+    hist0, screen0, pushed0 = hist(v), screen(v), v.history_pushed()
+    frame = wrong_row_redraw(screen0)
+
+    raw = tvm._new_history_screen(cols, rows)
+    st = pyte.Stream(raw)
+    for i in range(20):
+        st.feed(f"reply paragraph line {i:02d}\r\n")
+    st.feed(frame)
+    check("redraw: the bytes really push 4 copied rows (else this proves "
+          "nothing)", len(raw.history.top) == len(hist0) + 4,
+          len(raw.history.top))
+
+    v.feed(frame)
+    check("redraw: the screen is unchanged", screen(v) == screen0, screen(v))
+    check("redraw: no copied rows reach the scrollback", hist(v) == hist0,
+          hist(v)[-6:])
+    check("redraw: line ids stay where they were",
+          v.history_pushed() == pushed0, v.history_pushed())
+
+    # a frame split across two chunks is still one frame
+    v2 = TerminalView(rows=rows, cols=cols)
+    conversation(v2)
+    cut = len(frame) // 2
+    v2.feed(frame[:cut])
+    v2.feed(frame[cut:])
+    check("redraw: a frame split over two chunks drops its copies too",
+          hist(v2) == hist0 and screen(v2) == screen0, hist(v2)[-6:])
+
+    # a replay feeds the whole stream at once and must come out the same
+    v3 = TerminalView(rows=rows, cols=cols)
+    v3.feed("".join(f"reply paragraph line {i:02d}\r\n" for i in range(20))
+            + frame)
+    check("redraw: a replay in one feed drops the same rows",
+          hist(v3) == hist0 and screen(v3) == screen0, hist(v3)[-6:])
+
+    # scrolled back while it happens: the view stays on the same text
+    v4 = TerminalView(rows=rows, cols=cols)
+    conversation(v4)
+    v4.scroll_by(5)
+    seen = v4.visible_text()
+    v4.feed(frame)
+    check("redraw: a scrolled-back view stays on the same text",
+          v4.scroll_offset() == 5 and v4.visible_text() == seen,
+          (v4.scroll_offset(), v4.visible_text()))
+
+    # a full history: the pushes evicted rows, which is not a wipe
+    v5 = TerminalView(rows=rows, cols=cols)
+    conversation(v5, tvm.HISTORY_LINES + 30)
+    wiped = []
+    v5.historyCleared.connect(lambda: wiped.append(1))
+    full = hist(v5)
+    v5.feed(wrong_row_redraw(screen(v5)))
+    check("redraw: with history full it is not read as a wipe",
+          not wiped, wiped)
+    check("redraw: ...and the rows its pushes evicted come back",
+          hist(v5) == full, (len(hist(v5)), len(full), hist(v5)[:2]))
+
+    # ordinary output keeps every row it scrolls off
+    v6 = TerminalView(rows=rows, cols=cols)
+    conversation(v6)
+    v6.feed("\x1b[?25lnew line A\r\nnew line B\r\n\x1b[?25h")
+    check("redraw: ordinary output keeps its scrolled-off rows",
+          hist(v6) == hist0 + screen0[:2], hist(v6)[-3:])
+
+    # the same text in new colors changed what the screen shows
+    v10 = TerminalView(rows=rows, cols=cols)
+    conversation(v10)
+    v10.feed(wrong_row_redraw(["\x1b[31m" + t + "\x1b[0m" for t in screen0]))
+    check("redraw: a recolored screen keeps its scrolled-off rows",
+          len(hist(v10)) == len(hist0) + 4, len(hist(v10)))
+
+    # a screen that repeats every k rows can't be told apart from real
+    # output scrolling, so its rows stay
+    v7 = TerminalView(rows=rows, cols=cols)
+    for _ in range(30):
+        v7.feed("y\r\n")
+    before = len(v7.screen.history.top)
+    v7.feed("\x1b[?25ly\r\ny\r\ny\r\n\x1b[?25h")
+    check("redraw: a repeating screen keeps its scrolled-off rows",
+          len(v7.screen.history.top) == before + 3,
+          (before, len(v7.screen.history.top)))
+
+    # printing the same text twice is real output, even though the screen
+    # ends the same: it scrolled at least a full screen
+    v8 = TerminalView(rows=rows, cols=cols)
+    conversation(v8)
+    conversation(v8)
+    check("redraw: the same text printed twice keeps both copies",
+          len(hist(v8)) == len(hist0) + 20, len(hist(v8)))
+    v9 = TerminalView(rows=rows, cols=cols)
+    conversation(v9)
+    v9.feed("".join(f"reply paragraph line {i:02d}\r\n" for i in range(20)))
+    check("redraw: ...also when it arrives in one chunk",
+          len(hist(v9)) == len(hist0) + 20, len(hist(v9)))
+
+
 def test_history_screen_wrapper_removed():
     """_FastHistoryScreen drops pyte's per-event wrapper without changing what
     is rendered.
