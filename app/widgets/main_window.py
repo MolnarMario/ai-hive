@@ -1606,6 +1606,7 @@ class AddTerminalDialog(QDialog):
         self._args_label = QLabel("Args", self)
         form.addRow(self._args_label, self.args_edit)
         form.addRow("", self.pty_check)
+        self._form = form
 
         self._ai_widgets = (self._model_label, self.model_combo,
                             self._effort_label, self.effort_combo)
@@ -1724,12 +1725,15 @@ class AddTerminalDialog(QDialog):
             status = "✓ detected" if detected else "⚠ CLI not detected; install it or edit the command"
             self.provider_note.setText(f"{prov.note}\n{status}")
 
-        # AI agents are always interactive (ConPTY); shells/scripts choose
+        # AI agents are always interactive (ConPTY), so the box is hidden
+        # for them (it would only show a checked, disabled choice).
+        # Shells/scripts choose.
         if kind in PTY_ONLY_KINDS:
             self.pty_check.setChecked(True)
             self.pty_check.setEnabled(False)
         else:
             self.pty_check.setEnabled(HAS_CONPTY)
+        self._form.setRowVisible(self.pty_check, kind not in PTY_ONLY_KINDS)
         self._validate()
         self._set_count(self._count)  # the resume picker may have come or gone
         self._refresh_lane_check()
@@ -2784,7 +2788,7 @@ class MainWindow(QMainWindow):
         self.manager.agentLimitBlocked.connect(self._on_agent_limit_blocked)
         self.top_bar.usageRefreshRequested.connect(self._on_usage_refresh)
         self.sidebar.addRequested.connect(self._on_add_workspace_clicked)
-        self.sidebar.workspaceSelected.connect(self.manager.set_active)
+        self.sidebar.workspaceSelected.connect(self._on_sidebar_workspace_selected)
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
         # inline agent list: the sidebar expands agents under a workspace and
         # reveals a clicked agent's card (no overlapping popup)
@@ -5707,8 +5711,29 @@ class MainWindow(QMainWindow):
         if self.manager.workspace(ws_id) is None:
             return
         self.manager.set_active(ws_id)
+        self._focus_lead_card(ws_id)
         self.raise_()
         self.activateWindow()
+
+    def _on_sidebar_workspace_selected(self, ws_id: str) -> None:
+        """A click on a workspace (row or collapsed rail) opens it ready to
+        type in its top-left agent. Qt gives click focus before the row sees
+        the press, so nothing takes it back afterwards."""
+        self.manager.set_active(ws_id)
+        self._focus_lead_card(ws_id)
+
+    def _focus_lead_card(self, ws_id: str) -> None:
+        if self.sidebar.is_renaming(ws_id):
+            return    # a double-click opened the inline rename, keep it
+        page = self._pages.get(ws_id)
+        card = page.lead_card() if page is not None else None
+        if card is not None:
+            self._focus_card(page, card)
+
+    def _focus_card(self, page: WorkspacePage, card: TerminalCard) -> None:
+        page.scroll.ensureWidgetVisible(card)
+        target = card.terminal or card.input or card
+        target.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _reveal_agent(self, ws_id: str, agent_id: str) -> None:
         """The single 'click an agent -> reveal its card' primitive (used by the
@@ -5723,9 +5748,7 @@ class MainWindow(QMainWindow):
         card = page.card_for(agent_id)
         if card is None:
             return
-        page.scroll.ensureWidgetVisible(card)
-        target = card.terminal or card.input or card
-        target.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._focus_card(page, card)
         self.raise_()
         self.activateWindow()
 

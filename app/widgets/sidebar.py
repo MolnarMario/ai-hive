@@ -1429,6 +1429,10 @@ class Sidebar(QFrame):
         if w is not None:
             w.start_rename()
 
+    def is_renaming(self, ws_id: str) -> bool:
+        w = self._ws_widgets.get(ws_id)
+        return w is not None and w._renaming
+
     def badge_for(self, ws_id: str):
         """The workspace row's count badge widget (dropdown anchor), or None."""
         w = self._ws_widgets.get(ws_id)

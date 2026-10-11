@@ -9,15 +9,16 @@ agent signals can't fire into a dead widget.
 
 import datetime
 import re
+import time
 
-from PySide6.QtCore import (QEvent, QMimeData, QPoint, QPointF, QSize, Qt,
-                            QTimer, Signal)
+from PySide6.QtCore import (QEvent, QMimeData, QPoint, QPointF, QRectF, QSize,
+                            Qt, QTimer, Signal)
 from PySide6.QtGui import (QAction, QColor, QCursor, QDrag, QPainter,
                            QPainterPath, QPen, QPixmap, QTextCharFormat,
                            QTextCursor)
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QPlainTextEdit, QSizePolicy, QToolButton,
-                               QVBoxLayout, QWidget)
+                               QToolTip, QVBoxLayout, QWidget)
 
 from .. import scheduled_send, transcripts, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
@@ -347,6 +348,95 @@ class _MaximizeButton(QToolButton):
         p.end()
 
 
+class _TaskSummaryLabel(ElidingLabel):
+    """The header's task summary. When the header leaves it room for only an
+    ellipsis, it draws a clipboard in its place and shows the whole text the
+    moment the pointer arrives.
+
+    A lone "…" sat right beside the "⋯" actions strip and read as a second
+    copy of it. The clipboard says "a task is here" instead, and the peek is
+    shown on enter rather than after the platform's tooltip delay, matching
+    the actions tray next to it. A summary that merely loses its tail keeps
+    its text and the ordinary tooltip: it already says what it is."""
+
+    _ICON_W = 18        # also the floor under the label while it has text
+    _BOX = 16           # icon edge in px; the 24-unit drawing is scaled to it
+    _MIN_SHOWN = 6      # fewer real characters than this is not a summary
+    _PEEK_W = 380       # the peek wraps past this many px
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._icon = False
+
+    def icon_mode(self) -> bool:
+        return self._icon
+
+    def set_full_text(self, text: str) -> None:
+        super().set_full_text(text)
+        self.setMinimumWidth(self._ICON_W if self._full else 0)
+
+    def _refit(self) -> None:
+        super()._refit()
+        shown = self.text()
+        icon = bool(self._full) and shown != self._full \
+            and len(shown.rstrip("…").strip()) < self._MIN_SHOWN
+        if icon:
+            self.clear()
+        if icon != self._icon:
+            self._icon = icon
+            if not icon:
+                QToolTip.hideText()
+            self.update()
+
+    def _peek(self) -> None:
+        from html import escape
+        fm = self.fontMetrics()
+        w = min(self._PEEK_W, fm.horizontalAdvance(self._full) + 8)
+        QToolTip.showText(
+            self.mapToGlobal(QPoint(0, self.height())),
+            f'<table width="{w}"><tr><td>{escape(self._full)}</td></tr></table>',
+            self, self.rect())
+
+    def enterEvent(self, event):
+        if self._icon:
+            self._peek()
+            self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self._icon:
+            QToolTip.hideText()
+            self.update()
+        super().leaveEvent(event)
+
+    def event(self, event):
+        if self._icon and event.type() == QEvent.Type.ToolTip:
+            return True      # the peek is already up, don't re-show it late
+        return super().event(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._icon:
+            return
+        ink = Palette.CARDHEAD_FG if self.underMouse() else Palette.CARDHEAD_SUB
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        k = self._BOX / 24.0
+        p.translate(0.0, (self.height() - self._BOX) / 2.0)
+        p.scale(k, k)
+        pen = QPen(QColor(ink), 2.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawRoundedRect(QRectF(4.5, 4.5, 15.0, 17.0), 2.5, 2.5)   # board
+        p.setBrush(QColor(ink))
+        p.drawRoundedRect(QRectF(8.5, 2.0, 7.0, 5.0), 1.5, 1.5)      # clip
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(QPointF(8.5, 12.0), QPointF(15.5, 12.0))          # text rows
+        p.drawLine(QPointF(8.5, 16.0), QPointF(13.5, 16.0))
+        p.end()
+
+
 class _ToolsTray(QFrame):
     """The floating strip that carries the card's actions while the pointer is
     on the header tools.
@@ -625,6 +715,9 @@ class TerminalCard(QFrame):
         self._recover_target: float | None = None
         self._recover_tries = _RECOVER_RESCAN_TRIES
         self._recover_prompts: list[str] = []
+        # when _recover_prompts was read: a live milestone typed before then
+        # is in it (see _recover_marks)
+        self._recover_prompts_ts = 0.0
         self._recover_replies: list[tuple[float, str]] = []
         # runs _rescan_recovery once the terminal has been quiet for
         # STAMP_CHECK_MS, whatever the agent's busy flag did
@@ -727,7 +820,7 @@ class TerminalCard(QFrame):
         header.setToolTip("Drag to reorder this agent")
         header.setFixedHeight(38)   # room for the larger 14px glyph buttons
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(8, 0, 6, 0)
+        hl.setContentsMargins(8, 0, 3, 0)
         hl.setSpacing(7)
 
         self.glyph = QLabel("●", header)
@@ -809,7 +902,7 @@ class TerminalCard(QFrame):
         # without reading each terminal. It takes every pixel the fixed chrome
         # beside it leaves and elides only what genuinely doesn't fit; the full
         # text is always on hover.
-        self.task_summary = ElidingLabel(header)
+        self.task_summary = _TaskSummaryLabel(header)
         self.task_summary.setObjectName("CardTaskSummary")
         # compact context-window usage (e.g. "20% of 1M"), right after the
         # summary snippet — hidden until the transcript reports usage (Claude
@@ -890,10 +983,18 @@ class TerminalCard(QFrame):
         self.header_tools.withhold(self.btn_sched, not self.is_pty)
         hl.addWidget(self.header_tools)
         # the usage chip sits between the collapsed tools and the close button,
-        # so the strip that reveals them is the space to the chip's LEFT
-        hl.addWidget(self.token_label)
+        # so the strip that reveals them is the space to the chip's LEFT. The
+        # two share a tight sub-row so the chip hugs the (square) close button
+        # rather than sitting a full header gap from it.
+        tail = QWidget(header)
+        tl = QHBoxLayout(tail)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(2)
         self.btn_close = tool("✕", "CardClose", "Close terminal")
-        hl.addWidget(self.btn_close)
+        self.btn_close.setFixedSize(24, 24)
+        tl.addWidget(self.token_label)
+        tl.addWidget(self.btn_close)
+        hl.addWidget(tail)
 
         root.addWidget(header)
         if self.is_pty:
@@ -1003,6 +1104,8 @@ class TerminalCard(QFrame):
             self.terminal.viewChanged.connect(self.scroll_bar.refresh)
             self.terminal.promptSubmitted.connect(self._on_prompt_submitted)
             self.terminal.historyCleared.connect(self._on_history_cleared)
+            self.terminal.reflowStarted.connect(self._on_reflow_started)
+            self.terminal.reflowEnded.connect(self._on_reflow_ended)
             # self-heal: the classic renderer stranded the input box above a
             # dead gap (see TerminalView._check_input_gap) -- silently ask
             # Claude to redraw. request_repaint() is already a no-op when the
@@ -1942,7 +2045,10 @@ class TerminalCard(QFrame):
             return
         self._load_recovery()
         prompts = self._recover_prompts
-        if not prompts:
+        reflowed = getattr(self.agent, "reflowed_at", 0)
+        unplaced = [m for m in self.agent.prompt_marks()
+                    if m.uid not in self._mark_lines and m.pos < reflowed]
+        if not prompts and not unplaced:
             return
         oldest, raw = rows if rows is not None else self._scrollback_rows()
         if not raw:
@@ -1960,6 +2066,25 @@ class TerminalCard(QFrame):
                 # match on the head MINUS its first char counts too
                 if head in lines[i] or head[1:] in lines[i]:
                     self._recovered.append((oldest + i, text))
+                    at = i + 1
+                    break
+        # A live milestone from before the newest reflow lost its line to it:
+        # the reflow reprinted the scrollback it was anchored in. It is found
+        # the same way, carrying on from the last prompt found, since it was
+        # typed after everything the transcript read for this conversation.
+        # Unless it was typed before that read (a card rebuilt since): then
+        # it is one of the prompts just placed, and that line stands in for
+        # it. Searching past them would land on a later line that quotes it.
+        placed = {_norm_line(text)[:_MARK_MATCH_CHARS]
+                  for _, text in self._recovered}
+        for mark in unplaced:
+            head = _norm_line(mark.text)[:_MARK_MATCH_CHARS]
+            if len(head) < 6 or (mark.ts <= self._recover_prompts_ts
+                                 and head in placed):
+                continue
+            for i in range(at, len(lines)):
+                if head in lines[i] or head[1:] in lines[i]:
+                    self._mark_lines[mark.uid] = oldest + i
                     at = i + 1
                     break
 
@@ -1989,6 +2114,7 @@ class TerminalCard(QFrame):
             self._recover_stale = False
             self._recover_target = None
             self._recover_tries = _RECOVER_RESCAN_TRIES
+            self._recover_prompts_ts = time.time()
             if spec.provider == "claude":
                 self._recover_prompts = transcripts.typed_prompts(
                     spec.cwd, spec.session_id)
@@ -2115,17 +2241,43 @@ class TerminalCard(QFrame):
         stamps, and a check that had already finished would never look again.
         A real wipe drops this run's live marks too, so the transcript is read
         again: it is the only record of those replies left."""
+        self._forget_mark_lines()
+        if self._reprojecting:
+            return      # same conversation: the agent keeps its marks
+        self._recover_stale = True
+        self.agent.clear_prompt_marks()
+        self.agent.clear_reply_marks()
+
+    def _on_reflow_started(self) -> None:
+        """The child is reprinting this same conversation at the card's new
+        size (TerminalView.reflowStarted), so every line a milestone pointed
+        at is gone. The milestones are not: unlike a real wipe the agent keeps
+        its marks, and _on_reflow_ended finds them in the reprint. The replies
+        are read again so this run's ones are there to place too."""
+        self._forget_mark_lines()
+        self._recover_stale = True
+
+    def _forget_mark_lines(self) -> None:
+        """Drop every line this card placed a milestone on, live or recovered,
+        and re-arm the stamp check. The milestones themselves stay."""
         self._mark_lines = {}
         self._recovered = []
         self._reply_mark_lines = {}
         self._recovered_replies = []
         self._recover_target = None
         self._recover_tries = _RECOVER_RESCAN_TRIES
+
+    def _on_reflow_ended(self) -> None:
+        """The reprint is in: place the milestones on it, as a projection
+        does at its end. A replay that meets the marker places them itself
+        once it is done (_replay_with_marks)."""
         if self._reprojecting:
-            return      # same conversation: the agent keeps its marks
-        self._recover_stale = True
-        self.agent.clear_prompt_marks()
-        self.agent.clear_reply_marks()
+            return
+        rows = self._scrollback_rows()
+        self._recover_marks(rows)
+        self._recover_reply_marks(rows)
+        self._refresh_marks()
+        self._refresh_reply_marks()
 
     def _refresh_reply_marks(self) -> None:
         """Push the agent's reply-finished milestones to the view, in THIS

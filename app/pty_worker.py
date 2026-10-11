@@ -300,9 +300,6 @@ class PtyWorker(QObject):
     def process(self):
         return self._proc
 
-    def job_process_count(self) -> int:
-        return self._job.process_count() if self._job else 0
-
     def job_process_ids(self) -> list[int]:
         return self._job.process_ids() if self._job else []
 
@@ -332,6 +329,12 @@ class PtyWorker(QObject):
         self._pend.append(data)
         if not self._flush_timer.isActive():
             self._flush_timer.start()
+
+    def flush(self) -> None:
+        """Hand over the batched output now, so bytes AI Hive adds to the
+        stream next land after it (TerminalAgent._end_reflow)."""
+        if self._pend:
+            self._flush()
 
     def _flush(self) -> None:
         if self._pend:

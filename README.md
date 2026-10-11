@@ -116,10 +116,12 @@ workspaces keep executing — switching never pauses anything.
   shell's `cmd &`) is still going. A **⚙ gear badge** shows on the sidebar
   row, next to the affected agent in the expanded list, and in the terminal's
   card header once that's been true for a few seconds, so you don't close AI
-  Hive thinking nothing is happening. It shares the taskbar's one overlay
-  square too: when nothing is busy or asking but a shell is still running,
-  the disc turns **violet** with the count, instead of showing nothing at
-  all.
+  Hive thinking nothing is happening. Programs a CLI runs for itself don't
+  count: Codex's app-server daemon, its MCP servers and console hosts never
+  light the gear, and its kill menu never offers them. It shares the
+  taskbar's one overlay square too: when nothing is busy or asking but a
+  shell is still running, the disc turns **violet** with the count, instead
+  of showing nothing at all.
 - **Plan usage readout** — two top-bar badges, one
   per Claude rate-limit window, showing how much you've burned and when it
   comes back: the **5-hour** pill reads `5h Claude 21% used, resets in 1h20m
@@ -379,6 +381,12 @@ workspaces keep executing — switching never pauses anything.
   clickable (keyboard still works). Right-click the top bar and untick
   **Scrollback lives in AI Hive** if you would rather have the flicker-free
   renderer back; agents already running keep whatever they launched with.
+  **Resizing a Claude terminal re-wraps its whole scrollback** at the new
+  size. Claude reprints the conversation on every resize, but the Windows
+  pseudo-console passes only one screenful of that on, so the older rows used
+  to keep their old width. Once the agent is idle, AI Hive gives it a console
+  2000 rows taller for that one reprint, then its own size back. A reply still
+  streaming finishes first, and the prompt dots move with the text.
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
@@ -844,6 +852,11 @@ Hard-won rules, each with a regression test:
   verified). Hard kill is a Windows **Job Object** tree kill, so shells AND
   their grandchildren (`ping -t`, spawned scripts) die with the card, and
   `KILL_ON_JOB_CLOSE` reaps everything even if the app crashes. No zombies.
+  The one way out is a process that explicitly asks Windows to outlive its
+  launcher, like Codex's app-server daemon, which every Codex window on the
+  account shares: closing one card no longer kills it for the rest. Codex
+  cards launch with `--no-daemon` (Codex 0.156 and later), so their session
+  and every command it runs stay inside the card's job.
 - Output decoding is UTF-8-first with cp437 fallback per chunk (cmd/PS 5.1
   builtins emit OEM cp437 on pipes; modern tools emit UTF-8 — sometimes in
   the same session). PowerShell sessions are switched to UTF-8 end-to-end at
@@ -941,7 +954,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3140 checks drive the real app headlessly (offscreen Qt platform) with real
+3264 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1088,7 +1101,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3140 checks)
+                           (3264 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
