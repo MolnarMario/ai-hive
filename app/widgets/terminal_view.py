@@ -751,6 +751,22 @@ class TerminalView(QWidget):
             return 0
         cols = scr.columns
         buf = scr.buffer
+        blank = scr.default_char
+
+        def cells(row) -> tuple:
+            # what each cell shows. An erased cell and one never written look
+            # alike, and so do blanks in two foreground colors: ConPTY's
+            # repaint writes spaces the first paint skipped, in whatever color
+            # is current (measured on both saved screens)
+            out = []
+            for x in range(cols):
+                ch = row.get(x, blank)
+                if ch.data.strip():
+                    out.append(ch)
+                else:
+                    out.append((ch.bg, ch.reverse, ch.underscore,
+                                ch.strikethrough))
+            return tuple(out)
 
         def text(row) -> str:
             return "".join(row[x].data if x in row else " "
@@ -760,8 +776,11 @@ class TerminalView(QWidget):
         for y, old in enumerate(rows_then):
             now = buf[y] if y in buf else {}
             old_text = text(old)
-            if now != old and text(now) != old_text:
-                return 0
+            if now != old:
+                # text first, it rules out ordinary scrolling cheaply; then
+                # colors, since the same text in new colors is a change too
+                if text(now) != old_text or cells(now) != cells(old):
+                    return 0
             then.append(old_text)
         if all(then[y] == then[y + k] for y in range(cursor_then - k)):
             return 0

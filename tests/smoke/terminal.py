@@ -1803,6 +1803,13 @@ def test_redraw_from_the_wrong_row_leaves_no_copy_in_scrollback():
     check("redraw: ordinary output keeps its scrolled-off rows",
           hist(v6) == hist0 + screen0[:2], hist(v6)[-3:])
 
+    # the same text in new colors changed what the screen shows
+    v10 = TerminalView(rows=rows, cols=cols)
+    conversation(v10)
+    v10.feed(wrong_row_redraw(["\x1b[31m" + t + "\x1b[0m" for t in screen0]))
+    check("redraw: a recolored screen keeps its scrolled-off rows",
+          len(hist(v10)) == len(hist0) + 4, len(hist(v10)))
+
     # a screen that repeats every k rows can't be told apart from real
     # output scrolling, so its rows stay
     v7 = TerminalView(rows=rows, cols=cols)
