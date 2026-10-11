@@ -158,16 +158,20 @@ _WS_RE = re.compile(r"\s+")
 
 
 # The old parked-on menu: its first option, a numbered row of its own,
-# behind at most a gutter or the selector. `\s*` rather than `\s+` for the
-# despacing reason in the module docstring: this one is searched on the raw
-# escape-stripped region, where a bare CR also starts a row.
+# behind at most a gutter or a selection caret. `\s*` rather than `\s+` for
+# the despacing reason in the module docstring: this one is searched on raw
+# escape-stripped lines. A caret right before the number counts mid-line
+# too: a row repainted by a cursor move loses its line break when the
+# escapes are stripped, and lands glued to the end of the row before it.
 #
 # Anywhere in the region was not enough. On 2026-10-12 an agent's own reply
 # quoted the menu's words mid-sentence, the 40-line scrape read that as the
 # menu, latched with no banner and dated the reset from the account reading,
 # four days out. The guard that keeps an on-screen menu's latch then held it.
+_MENU_CARETS = "❯❱›"     # the carets a selected row is drawn with
 LIMIT_MENU_RE = re.compile(
-    r"(?:^|\r)[" + re.escape(_GUTTER) + r"]*\d\s*\.\s*"
+    r"(?:^[" + re.escape(_GUTTER + _MENU_CARETS) + r"]*"
+    r"|[" + _MENU_CARETS + r"]\s*)\d+\s*\.\s*"
     r"stop\s*and\s*wait\s*for\s*limit\s*to\s*reset", re.I | re.M)
 
 

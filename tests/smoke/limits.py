@@ -2574,7 +2574,10 @@ def test_limit_menu_quoted_in_prose():
              "  1. Stop and wait for limit to reset\n",
              "\u276f 1.Stopandwaitforlimittoreset\n",
              "\u2502 \u276f 1. Stop and wait for limit to reset \u2502\n",
-             "What do you want to do?\r> 1. Stop and wait for limit to reset\n")
+             "❱ 1. Stop and wait for limit to reset\n",
+             # a row repainted by a cursor move, glued to the row before it
+             # once the escapes were stripped
+             "Waiting❯ 1. Stop and wait for limit to reset\n")
 
     def mk(name):
         a = TerminalAgent(build_spec(AgentKind.CLAUDE, name,
@@ -2604,14 +2607,10 @@ def test_limit_menu_quoted_in_prose():
 
     # a latch already standing on such a screen: the 10-minute sweep must not
     # take the quoted words for a menu that keeps it
-    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-limit-prose-"))
-    stuck = TerminalAgent(build_spec(AgentKind.CLAUDE, "Quoted",
-                                     cwd=str(tmp)))
-    stuck._prompt_ready = True
-    stuck.status = AgentStatus.RUNNING
-    stuck.spec.session_id = "sid-quoted"
+    stuck = mk("Quoted")
+    stuck.spec.session_id = "sid-limit-menu-quoted"
     from app import transcripts
-    path = transcripts.transcript_path(str(tmp), "sid-quoted")
+    path = transcripts.transcript_path(SCRATCH_CWD, stuck.spec.session_id)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     import json as _json
     with open(path, "w", encoding="utf-8") as fh:
@@ -2636,4 +2635,4 @@ def test_limit_menu_quoted_in_prose():
     check("limit-menu: the sweep clears a latch whose screen only quotes "
           "the menu", not stuck.is_limit_blocked(), audits)
     stuck.dispose()
-    shutil.rmtree(tmp, ignore_errors=True)
+    os.remove(path)
