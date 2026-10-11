@@ -9,6 +9,7 @@ agent signals can't fire into a dead widget.
 
 import datetime
 import re
+import time
 
 from PySide6.QtCore import (QEvent, QMimeData, QPoint, QPointF, QRectF, QSize,
                             Qt, QTimer, Signal)
@@ -714,6 +715,9 @@ class TerminalCard(QFrame):
         self._recover_target: float | None = None
         self._recover_tries = _RECOVER_RESCAN_TRIES
         self._recover_prompts: list[str] = []
+        # when _recover_prompts was read: a live milestone typed before then
+        # is in it (see _recover_marks)
+        self._recover_prompts_ts = 0.0
         self._recover_replies: list[tuple[float, str]] = []
         # runs _rescan_recovery once the terminal has been quiet for
         # STAMP_CHECK_MS, whatever the agent's busy flag did
@@ -2068,9 +2072,15 @@ class TerminalCard(QFrame):
         # the reflow reprinted the scrollback it was anchored in. It is found
         # the same way, carrying on from the last prompt found, since it was
         # typed after everything the transcript read for this conversation.
+        # Unless it was typed before that read (a card rebuilt since): then
+        # it is one of the prompts just placed, and that line stands in for
+        # it. Searching past them would land on a later line that quotes it.
+        placed = {_norm_line(text)[:_MARK_MATCH_CHARS]
+                  for _, text in self._recovered}
         for mark in unplaced:
             head = _norm_line(mark.text)[:_MARK_MATCH_CHARS]
-            if len(head) < 6:
+            if len(head) < 6 or (mark.ts <= self._recover_prompts_ts
+                                 and head in placed):
                 continue
             for i in range(at, len(lines)):
                 if head in lines[i] or head[1:] in lines[i]:
@@ -2104,6 +2114,7 @@ class TerminalCard(QFrame):
             self._recover_stale = False
             self._recover_target = None
             self._recover_tries = _RECOVER_RESCAN_TRIES
+            self._recover_prompts_ts = time.time()
             if spec.provider == "claude":
                 self._recover_prompts = transcripts.typed_prompts(
                     spec.cwd, spec.session_id)
@@ -2230,12 +2241,7 @@ class TerminalCard(QFrame):
         stamps, and a check that had already finished would never look again.
         A real wipe drops this run's live marks too, so the transcript is read
         again: it is the only record of those replies left."""
-        self._mark_lines = {}
-        self._recovered = []
-        self._reply_mark_lines = {}
-        self._recovered_replies = []
-        self._recover_target = None
-        self._recover_tries = _RECOVER_RESCAN_TRIES
+        self._forget_mark_lines()
         if self._reprojecting:
             return      # same conversation: the agent keeps its marks
         self._recover_stale = True
@@ -2248,13 +2254,18 @@ class TerminalCard(QFrame):
         at is gone. The milestones are not: unlike a real wipe the agent keeps
         its marks, and _on_reflow_ended finds them in the reprint. The replies
         are read again so this run's ones are there to place too."""
+        self._forget_mark_lines()
+        self._recover_stale = True
+
+    def _forget_mark_lines(self) -> None:
+        """Drop every line this card placed a milestone on, live or recovered,
+        and re-arm the stamp check. The milestones themselves stay."""
         self._mark_lines = {}
         self._recovered = []
         self._reply_mark_lines = {}
         self._recovered_replies = []
         self._recover_target = None
         self._recover_tries = _RECOVER_RESCAN_TRIES
-        self._recover_stale = True
 
     def _on_reflow_ended(self) -> None:
         """The reprint is in: place the milestones on it, as a projection

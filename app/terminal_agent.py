@@ -1760,6 +1760,10 @@ class TerminalAgent(QObject):
             self.scheduled_changed.emit()
 
     def _write_task_to_pty(self, text: str) -> None:
+        # A reflow's reprint of the whole conversation can hold the same
+        # words, and the echo watch would read them as the task drawn and
+        # release the Enter early. The child gets the card's rows back first.
+        self._end_reflow()
         body = text.replace("\r\n", "\r").replace("\n", "\r")
         if "\r" in body:  # multi-line: bracketed paste, then submit
             self.worker.write("\x1b[200~" + body + "\x1b[201~")

@@ -703,9 +703,12 @@ class TerminalView(QWidget):
                 grown = pushed_after - pushed_before
             else:
                 grown = len(top_after) - hist_before
-            if grown > 0:
-                self._scroll_offset = min(self._scroll_offset + grown,
-                                          len(top_after))
+            # a drop (_feed_frames) that takes back rows an earlier feed
+            # pushed lowers the count, and the offset that grew for them
+            # shrinks back with it
+            if grown:
+                self._scroll_offset = max(0, min(self._scroll_offset + grown,
+                                                 len(top_after)))
         # A SHRINK can only be _reset_history (pyte's ED 3 or screen.reset()):
         # history otherwise just grows toward maxlen, evicting from the front
         # without changing len() once saturated. That is the cheapest reliable

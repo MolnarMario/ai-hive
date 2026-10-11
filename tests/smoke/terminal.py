@@ -1886,6 +1886,43 @@ def test_reflow_reprints_scrollback_at_new_size():
           and agent.pty_replay().count(REFLOW_BEGIN) == 2,
           agent.pty_replay().count(REFLOW_BEGIN))
 
+    # a card that read the transcript after the prompt was typed (a rebuilt
+    # one) placed that prompt already: the live milestone leaves it there
+    # and never binds to a later line that quotes it
+    import time
+    spec = agent.spec
+    card._recover_key = (spec.provider, spec.cwd, spec.session_id)
+    card._recover_prompts = [mark.text]
+    card._recover_prompts_ts = time.time()
+    quoted = _reflow_render(50)
+    quoted.insert(-5, "> " + mark.text + ", again")
+    size(card, rows_n, 50)
+    agent._reflow_tick()
+    agent._on_pty_output("pty", _conhost_paint(quoted,
+                                               rows_n + REFLOW_EXTRA_ROWS))
+    agent._end_reflow()
+    agent._on_pty_output("pty", _conhost_paint(quoted[-rows_n:], rows_n))
+    view = card.terminal
+    oldest = view.history_pushed() - len(view.screen.history.top)
+    found = [screen_rows(view)[line - oldest] for line, _ in card._recovered]
+    check("reflow: a prompt the transcript holds is placed on its echo",
+          found == [quoted[2]], found)
+    check("reflow: ...and its live milestone does not take the quoting line",
+          mark_row(card, mark.uid) is None, mark_row(card, mark.uid))
+
+    # a task typed while the child has the extra rows gives the card's back
+    # first: the whole-conversation reprint could hold the task's words and
+    # release its Enter before Claude drew it
+    size(card, rows_n, 65)
+    agent._reflow_tick()
+    agent._on_pty_output("pty", _conhost_paint(_reflow_render(65),
+                                               rows_n + REFLOW_EXTRA_ROWS))
+    agent._write_task_to_pty("Explain the sorting algorithms please")
+    check("reflow: a typed task ends the reflow before its text goes in",
+          agent._reflow_step == "" and worker.sizes[-1] == (rows_n, 65),
+          worker.sizes)
+    agent._pending_submits.clear()
+
     # other providers and stopped children are left alone
     codex = TerminalAgent(build_spec(AgentKind.OPENAI, "Codex",
                                      cwd=SCRATCH_CWD, pty=True))
@@ -1984,6 +2021,21 @@ def test_redraw_from_the_wrong_row_leaves_no_copy_in_scrollback():
     check("redraw: a scrolled-back view stays on the same text",
           v4.scroll_offset() == 5 and v4.visible_text() == seen,
           (v4.scroll_offset(), v4.visible_text()))
+    # ...also when the frame is split after some of its pushes: the first
+    # chunk grows the offset for them, the second takes them back
+    v11 = TerminalView(rows=rows, cols=cols)
+    conversation(v11)
+    v11.scroll_by(5)
+    seen = v11.visible_text()
+    cut = frame.rindex("\r\n")
+    v11.feed(frame[:cut])
+    check("redraw: the split frame's first chunk pushed rows (else this "
+          "proves nothing)", v11.scroll_offset() > 5, v11.scroll_offset())
+    v11.feed(frame[cut:])
+    check("redraw: a frame split after its pushes keeps the view in place",
+          hist(v11) == hist0 and v11.scroll_offset() == 5
+          and v11.visible_text() == seen,
+          (v11.scroll_offset(), v11.visible_text()))
 
     # a full history: the pushes evicted rows, which is not a wipe
     v5 = TerminalView(rows=rows, cols=cols)

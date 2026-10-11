@@ -12,8 +12,8 @@ this module encodes, all empirically verified on the target machine:
   UTF-8-first with cp437 fallback instead (HybridDecoder).
 - QProcess.terminate() is WM_CLOSE — console apps ignore it. Graceful stop
   is stdin EOF (closeWriteChannel); the hard stop is a Job Object tree
-  kill, which also reaps grandchildren (`ping -t` etc.) and — thanks to
-  KILL_ON_JOB_CLOSE — everything else if this GUI process dies. The one way
+  kill, which also reaps grandchildren (`ping -t` etc.). KILL_ON_JOB_CLOSE
+  reaps everything else if this GUI process dies. The one way
   out is a process that explicitly asks to break away (see WinJob).
 """
 
