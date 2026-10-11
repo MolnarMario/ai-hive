@@ -1310,6 +1310,10 @@ class TerminalView(QWidget):
             # pick over readline's transpose-chars and Claude's task list
             if ctrl and not shift and not alt and key == Qt.Key.Key_T:
                 return super().event(e)
+            # Ctrl+Up / Ctrl+Down maximize and restore the selected agent
+            if ctrl and not shift and not alt \
+                    and key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                return super().event(e)
             if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab) \
                     or (ctrl and not shift) or (alt and not shift) \
                     or (shift and nav) \

@@ -664,8 +664,10 @@ error dialog instead of silently closing. Packaging to a distributable
   focused), and global `A−`/`A+` under **⚙ Options**; both persist.
 - **App shortcuts use `Ctrl+Shift+…`** (T = new terminal, N = new workspace,
   B = toggle sidebar) so every plain `Ctrl`/`Alt` key, `Tab`, and `Shift+Tab`
-  goes straight to the focused terminal. The two exceptions are `F11` and
-  `Ctrl+T` (new terminal), which a focused terminal never receives. Click
+  goes straight to the focused terminal. The exceptions are `F11`,
+  `Ctrl+T` (new terminal), `Ctrl+Up` (maximize the selected agent) and
+  `Ctrl+Down` (show all agents again), which a focused terminal never
+  receives. Click
   a full-terminal card and
   `Shift+Tab` cycles Claude Code's modes, `Ctrl+C` interrupts (when nothing is
   selected; otherwise it copies), `Ctrl+R` reverse-searches, arrows/`Tab`
