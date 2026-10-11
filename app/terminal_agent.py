@@ -98,6 +98,39 @@ INPUT_ECHO_S = 0.8
 # outlasts the window still lights it, at most this much late. Seconds.
 RESIZE_REDRAW_S = 1.0
 
+# A resize leaves a Claude card's scrollback at the old size. Claude reprints
+# the WHOLE conversation on every resize, but ConPTY forwards only what fits
+# its own buffer, which is the card's height: it erases its rows and paints
+# the last screenful. Everything above that stays wrapped at the old width,
+# and its tail repeats at the top of the new screen. Measured on claude
+# 2.1.296: a 40-row pty widened from 80 to 170 columns sent 40 rows, a
+# 300-row pty sent the whole conversation, banner included. So once a resized
+# Claude agent is idle, `_begin_reflow` gives the child this many extra rows
+# for one reprint, and the card's own rows again once it has arrived. The
+# same as TerminalView.HISTORY_LINES: rows past it scroll out of reach.
+REFLOW_EXTRA_ROWS = 2000
+# Quiet after the last resize before a reflow starts, so dragging a window
+# edge or a retile costs one reprint and not one per step. ms.
+REFLOW_DELAY_MS = 600
+# How often a due reflow looks again while the agent is not idle (a reply
+# streaming, a turn open, the TUI still booting). ms.
+REFLOW_RETRY_MS = 1000
+# The tall reprint has arrived once the child is this quiet after its first
+# byte. Measured: the reprint lands within ~100 ms of the resize. ms.
+REFLOW_QUIET_MS = 350
+# ...and a child that never goes quiet, or never answers, gets its own rows
+# back after this long anyway. ms.
+REFLOW_MAX_MS = 5000
+# Written into the agent's own pty stream around a reflow, never by a child,
+# so the live view and every replay of the stream act at the same byte. The
+# view drops the old scrollback at BEGIN and lines its screen up with
+# conhost's at END (see TerminalView._apply_reflow_marker).
+REFLOW_BEGIN = "\x1b]7766;aihive-reflow-begin\x07"
+REFLOW_END = "\x1b]7766;aihive-reflow-end\x07"
+# the alternate screen: Claude's fullscreen renderer keeps no terminal
+# scrollback there, so it has nothing to reflow
+_ALT_SCREEN_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)([hl])")
+
 # While a submitted turn is open (`_awaiting_reply`: from the submit until
 # Claude's Stop hook or the finished-reply chime), output in a redraw window
 # counts as work, so a short reply, or a reply resuming after a tool's quiet
@@ -638,6 +671,26 @@ class TerminalAgent(QObject):
         self._reply_timer.setSingleShot(True)
         self._reply_timer.setInterval(REPLY_QUIET_MS)
         self._reply_timer.timeout.connect(self._on_reply_quiet)
+        # the scrollback reflow after a resize (see REFLOW_EXTRA_ROWS).
+        # `_reflow_step` is "" between reflows, "tall" while the child has
+        # the extra rows and has not answered yet, "reprint" once it has.
+        self._reflow_due = False
+        self._reflow_step = ""
+        self._alt_screen = False      # the stream is on the alternate screen
+        # stream offset of the newest REFLOW_BEGIN: a mark before it was
+        # reprinted, so a card finds it again by text (_recover_marks)
+        self.reflowed_at = 0
+        self._reflow_timer = QTimer(self)
+        self._reflow_timer.setSingleShot(True)
+        self._reflow_timer.timeout.connect(self._reflow_tick)
+        self._reflow_quiet = QTimer(self)
+        self._reflow_quiet.setSingleShot(True)
+        self._reflow_quiet.setInterval(REFLOW_QUIET_MS)
+        self._reflow_quiet.timeout.connect(self._end_reflow)
+        self._reflow_cap = QTimer(self)
+        self._reflow_cap.setSingleShot(True)
+        self._reflow_cap.setInterval(REFLOW_MAX_MS)
+        self._reflow_cap.timeout.connect(self._end_reflow)
         if self.is_pty:
             self.worker = PtyWorker(spec, parent=self)
             self.worker.output.connect(self._on_pty_output)
@@ -692,6 +745,7 @@ class TerminalAgent(QObject):
         self._forget_limit_echo()      # a new screen: nothing is an echo yet
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._pending_submits.clear()
+        self._cancel_reflow()
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         self._turn_open = False        # nothing asked yet, so nothing to stamp
         self._awaiting_reply = False
@@ -772,6 +826,7 @@ class TerminalAgent(QObject):
         self._forget_limit_echo()      # a new screen: nothing is an echo yet
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._pending_submits.clear()
+        self._cancel_reflow()
         self._reset_to_launch_defaults()
         if self.spec.provider in ("claude", "gemini"):  # deliberate fresh session
             self.spec.session_id = str(uuid.uuid4())
@@ -809,6 +864,7 @@ class TerminalAgent(QObject):
         self._pty_bytes = 0
         self._pty_total = 0
         self._pty_dropped = 0
+        self.reflowed_at = 0
         self.clear_prompt_marks()
         self.clear_reply_marks()
         self._pty_seed = ""
@@ -886,19 +942,96 @@ class TerminalAgent(QObject):
         self._turn_end_ts = None
         self._turn_mark_final = False
         self._turn_announced = False  # ...and this turn has not chimed yet
+        # the reply must not stream into the reflow's extra rows, which the
+        # card does not have (see _end_reflow)
+        self._end_reflow()
 
     def resize(self, rows: int, cols: int) -> None:
-        if self.is_pty:
-            self._note_view_size(rows, cols)
-            self._resize_child(rows, cols)
+        if not self.is_pty:
+            return
+        self._note_view_size(rows, cols)
+        if self._reflow_step:
+            self._reflow_due = True     # _end_reflow sends the child this size
+            return
+        if self._resize_child(rows, cols) and self.spec.provider == "claude":
+            self._reflow_due = True
+            self._reflow_timer.start(REFLOW_DELAY_MS)
 
-    def _resize_child(self, rows: int, cols: int) -> None:
+    def _reflow_tick(self) -> None:
+        """A reflow is due: start it if the agent is idle, else look again."""
+        if not self._reflow_due or self._reflow_step:
+            return
+        if not self.worker.is_running() or self._alt_screen:
+            # the next child starts at the view's size, and the alternate
+            # screen has no scrollback to reflow
+            self._reflow_due = False
+            return
+        if not self._can_reflow():
+            self._reflow_timer.start(REFLOW_RETRY_MS)
+            return
+        self._begin_reflow()
+
+    def _can_reflow(self) -> bool:
+        """Idle at its prompt. A reprint into the extra rows while a reply
+        streams would erase each frame by more rows than the card has, which
+        is how replies used to show up several times over (see ScreenSize)."""
+        return (self.status is AgentStatus.RUNNING and self._prompt_ready
+                and not self._busy and not self.turn_pending()
+                and not self._pending_submits
+                and not self._fresh_screen and not self.has_pristine_seed()
+                and self._view_size is not None)
+
+    def _begin_reflow(self) -> None:
+        """Give the child REFLOW_EXTRA_ROWS more rows so its next reprint
+        reaches the card whole. The old scrollback goes with the reprint's
+        first byte (`_on_pty_output`), so a child that never answers costs
+        nothing."""
+        rows, cols = self._view_size
+        self._reflow_due = False
+        self._reflow_step = "tall"
+        if not self._resize_child(rows + REFLOW_EXTRA_ROWS, cols):
+            self._reflow_step = ""
+            return
+        self._reflow_cap.start()
+
+    def _end_reflow(self) -> None:
+        """The reprint is in (or the child never sent one): mark where it
+        ends and give the child the card's rows back. A size that changed
+        meanwhile gets a reflow of its own."""
+        if not self._reflow_step:
+            return
+        flush = getattr(self.worker, "flush", None)
+        if flush is not None:
+            flush()     # reprint bytes still batched belong before the marker
+        self._reflow_quiet.stop()
+        self._reflow_cap.stop()
+        reprinted = self._reflow_step == "reprint"
+        self._reflow_step = ""
+        if reprinted:
+            self._append_stream(REFLOW_END)
+        if self._view_size is not None:
+            self._resize_child(*self._view_size)
+        if self._reflow_due:
+            self._reflow_timer.start(REFLOW_DELAY_MS)
+
+    def _cancel_reflow(self) -> None:
+        """A new child: whatever reflow the old one owed is moot."""
+        self._reflow_due = False
+        self._reflow_step = ""
+        self._alt_screen = False
+        self._reflow_timer.stop()
+        self._reflow_quiet.stop()
+        self._reflow_cap.stop()
+
+    def _resize_child(self, rows: int, cols: int) -> bool:
         """Resize the child and remember when, so the redraw it answers with
         is not mistaken for work (see RESIZE_REDRAW_S). Only a size a running
         child took counts: a same-size call, a child not started yet or a
-        failed setwinsize draws nothing."""
+        failed setwinsize draws nothing. True when it took one."""
         if self.worker.resize(rows, cols):
             self._last_resize_ts = time.time()
+            return True
+        return False
 
     def _next_seq(self) -> int:
         self._order_seq += 1
@@ -981,14 +1114,17 @@ class TerminalAgent(QObject):
         Deliberately a request and not a policy: the caller decides when an
         agent has waited long enough to be worth poking.
         """
-        if not self.is_pty or not self.worker.is_running():
+        if (not self.is_pty or not self.worker.is_running()
+                or self._reflow_step):
             return False
         rows, cols = self.worker.rows, self.worker.cols
         if cols <= 10:      # already at PtyWorker's floor; nothing to give back
             return False
         self._resize_child(rows, cols - 1)
+        # a reflow that started meanwhile owns the child's size until it ends
         QTimer.singleShot(REPAINT_RESTORE_MS,
-                          lambda: self._resize_child(rows, cols))
+                          lambda: self._reflow_step
+                          or self._resize_child(rows, cols))
         return True
 
     def pty_replay(self) -> str:
@@ -1242,6 +1378,7 @@ class TerminalAgent(QObject):
     def dispose(self) -> None:
         """Final teardown on card close / workspace delete / app quit."""
         self._disposing = True
+        self._cancel_reflow()
         self.worker.dispose()
 
     def notice(self, text: str) -> None:
@@ -2002,9 +2139,11 @@ class TerminalAgent(QObject):
         # readiness, the very things `request_repaint` asks a redraw for. Only
         # when it would START the pulse (once busy, output keeps it alive),
         # and never while a submitted turn is open (TURN_QUIET_S), whose
-        # output inside the window would otherwise be lost.
+        # output inside the window would otherwise be lost. A reflow's
+        # reprint is such a redraw for as long as it takes.
         if (not self._busy and not self.turn_pending()
-                and now - self._last_resize_ts < RESIZE_REDRAW_S):
+                and (self._reflow_step
+                     or now - self._last_resize_ts < RESIZE_REDRAW_S)):
             self._idle_timer.start()
             return
         # producing output => not waiting on a scrape menu, and any free-text
@@ -2656,6 +2795,26 @@ class TerminalAgent(QObject):
         self._mark_busy()  # real process output => the agent is working
         self._emit(stream, text)
 
+    def _buffer_pty(self, text: str) -> None:
+        """Keep a bounded raw tail so a freshly created card can rebuild the
+        screen; the live TerminalView is fed directly via the signal."""
+        self._note_first_size()
+        self._pty_buffer.append(text)
+        self._pty_bytes += len(text)
+        self._pty_total += len(text)
+        while self._pty_bytes > PTY_BUFFER_CAP and len(self._pty_buffer) > 1:
+            dropped = self._pty_buffer.pop(0)
+            self._pty_bytes -= len(dropped)
+            self._pty_dropped += len(dropped)
+        self._trim_geometry()
+
+    def _append_stream(self, text: str) -> None:
+        """Add bytes of AI Hive's own to the stream (a REFLOW marker): into
+        the buffer, so a replay meets them at the same offset, and to the
+        view. None of the output scans see them."""
+        self._buffer_pty(text)
+        self.pty_output.emit(text)
+
     def _on_pty_output(self, _stream: str, text: str) -> None:
         if self._fresh_screen:
             # a Restart's old child drawing its last frames while it dies.
@@ -2663,6 +2822,16 @@ class TerminalAgent(QObject):
             # would paint under the new child, and scraped they could read
             # as its prompt or latch a plan limit it never hit.
             return
+        if self._reflow_step == "tall":
+            # the reprint's first byte: the scrollback it replaces goes now
+            self._reflow_step = "reprint"
+            self.reflowed_at = self._pty_total
+            self._append_stream(REFLOW_BEGIN)
+        if self._reflow_step:
+            self._reflow_quiet.start()
+        modes = _ALT_SCREEN_RE.findall(text)
+        if modes:
+            self._alt_screen = modes[-1] == "h"
         data = text
         if self.spec.provider == "openai":
             # Codex's title is its waiting signal, so an escape a read cut in
@@ -2684,17 +2853,7 @@ class TerminalAgent(QObject):
         # long as the question stays open.
         if not (self._title_waiting and not stripped.strip()):
             self._mark_busy()
-        # keep a bounded raw tail so a freshly created card can rebuild the
-        # screen; the live TerminalView is fed directly via the signal
-        self._note_first_size()
-        self._pty_buffer.append(text)
-        self._pty_bytes += len(text)
-        self._pty_total += len(text)
-        while self._pty_bytes > PTY_BUFFER_CAP and len(self._pty_buffer) > 1:
-            dropped = self._pty_buffer.pop(0)
-            self._pty_bytes -= len(dropped)
-            self._pty_dropped += len(dropped)
-        self._trim_geometry()
+        self._buffer_pty(text)
         # rolling escape-stripped tail for waiting-for-input detection (the idle
         # timer scans it once output settles — see _screen_waiting)
         self._screen_tail = (self._screen_tail + stripped)[-4000:]
@@ -2702,7 +2861,9 @@ class TerminalAgent(QObject):
             self._watch_task_echo(stripped)
         # latch a plan-limit cut-off the INSTANT it is drawn — see _scrape_limit
         # for why this must not wait for the idle-timer settle
-        if not self._limit_blocked:
+        # (a reflow's reprint is the whole conversation again, old banners
+        # and all, so it is history exactly like a --resume replay)
+        if not self._limit_blocked and not self._reflow_step:
             self._scrape_limit()
         # readiness to receive a task. For Claude the signal is the input-box
         # footer: the folder-trust dialog also enables bracketed paste (and
@@ -2768,6 +2929,7 @@ class TerminalAgent(QObject):
                     self.activity_changed.emit(False)
                 self._reset_waiting()  # a dead/stopped agent isn't waiting
                 self._reset_bg_shell()  # ...nor waiting on a shell to finish
+                self._cancel_reflow()   # ...nor owed a reprint
             self.status_changed.emit(status)
 
     def _on_worker_state(self, state: WorkerState) -> None:

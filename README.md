@@ -379,6 +379,12 @@ workspaces keep executing — switching never pauses anything.
   clickable (keyboard still works). Right-click the top bar and untick
   **Scrollback lives in AI Hive** if you would rather have the flicker-free
   renderer back; agents already running keep whatever they launched with.
+  **Resizing a Claude terminal re-wraps its whole scrollback** at the new
+  size. Claude reprints the conversation on every resize, but the Windows
+  pseudo-console passes only one screenful of that on, so the older rows used
+  to keep their old width. Once the agent is idle, AI Hive gives it a console
+  2000 rows taller for that one reprint, then its own size back. A reply still
+  streaming finishes first, and the prompt dots move with the text.
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you

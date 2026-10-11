@@ -1003,6 +1003,8 @@ class TerminalCard(QFrame):
             self.terminal.viewChanged.connect(self.scroll_bar.refresh)
             self.terminal.promptSubmitted.connect(self._on_prompt_submitted)
             self.terminal.historyCleared.connect(self._on_history_cleared)
+            self.terminal.reflowStarted.connect(self._on_reflow_started)
+            self.terminal.reflowEnded.connect(self._on_reflow_ended)
             # self-heal: the classic renderer stranded the input box above a
             # dead gap (see TerminalView._check_input_gap) -- silently ask
             # Claude to redraw. request_repaint() is already a no-op when the
@@ -1942,7 +1944,10 @@ class TerminalCard(QFrame):
             return
         self._load_recovery()
         prompts = self._recover_prompts
-        if not prompts:
+        reflowed = getattr(self.agent, "reflowed_at", 0)
+        unplaced = [m for m in self.agent.prompt_marks()
+                    if m.uid not in self._mark_lines and m.pos < reflowed]
+        if not prompts and not unplaced:
             return
         oldest, raw = rows if rows is not None else self._scrollback_rows()
         if not raw:
@@ -1960,6 +1965,19 @@ class TerminalCard(QFrame):
                 # match on the head MINUS its first char counts too
                 if head in lines[i] or head[1:] in lines[i]:
                     self._recovered.append((oldest + i, text))
+                    at = i + 1
+                    break
+        # A live milestone from before the newest reflow lost its line to it:
+        # the reflow reprinted the scrollback it was anchored in. It is found
+        # the same way, carrying on from the last prompt found, since it was
+        # typed after everything the transcript read for this conversation.
+        for mark in unplaced:
+            head = _norm_line(mark.text)[:_MARK_MATCH_CHARS]
+            if len(head) < 6:
+                continue
+            for i in range(at, len(lines)):
+                if head in lines[i] or head[1:] in lines[i]:
+                    self._mark_lines[mark.uid] = oldest + i
                     at = i + 1
                     break
 
@@ -2126,6 +2144,32 @@ class TerminalCard(QFrame):
         self._recover_stale = True
         self.agent.clear_prompt_marks()
         self.agent.clear_reply_marks()
+
+    def _on_reflow_started(self) -> None:
+        """The child is reprinting this same conversation at the card's new
+        size (TerminalView.reflowStarted), so every line a milestone pointed
+        at is gone. The milestones are not: unlike a real wipe the agent keeps
+        its marks, and _on_reflow_ended finds them in the reprint. The replies
+        are read again so this run's ones are there to place too."""
+        self._mark_lines = {}
+        self._recovered = []
+        self._reply_mark_lines = {}
+        self._recovered_replies = []
+        self._recover_target = None
+        self._recover_tries = _RECOVER_RESCAN_TRIES
+        self._recover_stale = True
+
+    def _on_reflow_ended(self) -> None:
+        """The reprint is in: place the milestones on it, as a projection
+        does at its end. A replay that meets the marker places them itself
+        once it is done (_replay_with_marks)."""
+        if self._reprojecting:
+            return
+        rows = self._scrollback_rows()
+        self._recover_marks(rows)
+        self._recover_reply_marks(rows)
+        self._refresh_marks()
+        self._refresh_reply_marks()
 
     def _refresh_reply_marks(self) -> None:
         """Push the agent's reply-finished milestones to the view, in THIS
