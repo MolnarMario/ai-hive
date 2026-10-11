@@ -8,6 +8,11 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.41.1
+
+- An agent that writes about the usage-limit menu in its own reply no
+  longer gets the hourglass. Only the real menu counts.
+
 ## 0.41.0
 
 - Ctrl+Up maximizes the selected agent and Ctrl+Down shows every agent
