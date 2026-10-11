@@ -651,8 +651,8 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 #CardModel[provider="gemini"] {{ color: {gemini_ink}; }}
 #CardTaskSummary {{ color: {p.CARDHEAD_SUB}; font-size: 13px; font-style: italic; }}
 #CardTokens {{
-    color: {p.CARDHEAD_SUB}; font-size: 10px; font-weight: 700;
-    padding: 0px 4px;
+    color: {p.CARDHEAD_SUB}; font-size: 12px; font-weight: 700;
+    padding: 0px 2px 0px 4px;
 }}
 /* live "last reply finished at" stamp, same treatment as #CardTokens */
 #CardLimitMark {{ color: {p.ACCENT_GOLD}; font-size: 13px; }}
@@ -793,6 +793,8 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
    paints its own icon (terminal_card._MaximizeButton), so it takes only the
    padding and hover plate from the rules above. */
 #CardFontDec, #CardFontInc {{ font-size: 14px; font-weight: 700; }}
+/* the close button is square (the card pins it to 24x24), so no side padding */
+#CardClose {{ padding: 0px; }}
 /* the tray icons are meant to look one size: 16px glyphs here, a 16px drawn
    maximize icon, 14px bold A-/A+. (The close button keeps the 14px above.) */
 #CardStop, #CardRestart, #CardAdopt, #CardIntegrator,

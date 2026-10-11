@@ -10,14 +10,14 @@ agent signals can't fire into a dead widget.
 import datetime
 import re
 
-from PySide6.QtCore import (QEvent, QMimeData, QPoint, QPointF, QSize, Qt,
-                            QTimer, Signal)
+from PySide6.QtCore import (QEvent, QMimeData, QPoint, QPointF, QRectF, QSize,
+                            Qt, QTimer, Signal)
 from PySide6.QtGui import (QAction, QColor, QCursor, QDrag, QPainter,
                            QPainterPath, QPen, QPixmap, QTextCharFormat,
                            QTextCursor)
 from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QPlainTextEdit, QSizePolicy, QToolButton,
-                               QVBoxLayout, QWidget)
+                               QToolTip, QVBoxLayout, QWidget)
 
 from .. import scheduled_send, transcripts, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
@@ -344,6 +344,95 @@ class _MaximizeButton(QToolButton):
                 path.lineTo(pt(*tip))
                 path.lineTo(pt(*head[1]))
         p.drawPath(path)
+        p.end()
+
+
+class _TaskSummaryLabel(ElidingLabel):
+    """The header's task summary. When the header leaves it room for only an
+    ellipsis, it draws a clipboard in its place and shows the whole text the
+    moment the pointer arrives.
+
+    A lone "…" sat right beside the "⋯" actions strip and read as a second
+    copy of it. The clipboard says "a task is here" instead, and the peek is
+    shown on enter rather than after the platform's tooltip delay, matching
+    the actions tray next to it. A summary that merely loses its tail keeps
+    its text and the ordinary tooltip: it already says what it is."""
+
+    _ICON_W = 18        # also the floor under the label while it has text
+    _BOX = 16           # icon edge in px; the 24-unit drawing is scaled to it
+    _MIN_SHOWN = 6      # fewer real characters than this is not a summary
+    _PEEK_W = 380       # the peek wraps past this many px
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._icon = False
+
+    def icon_mode(self) -> bool:
+        return self._icon
+
+    def set_full_text(self, text: str) -> None:
+        super().set_full_text(text)
+        self.setMinimumWidth(self._ICON_W if self._full else 0)
+
+    def _refit(self) -> None:
+        super()._refit()
+        shown = self.text()
+        icon = bool(self._full) and shown != self._full \
+            and len(shown.rstrip("…").strip()) < self._MIN_SHOWN
+        if icon:
+            self.clear()
+        if icon != self._icon:
+            self._icon = icon
+            if not icon:
+                QToolTip.hideText()
+            self.update()
+
+    def _peek(self) -> None:
+        from html import escape
+        fm = self.fontMetrics()
+        w = min(self._PEEK_W, fm.horizontalAdvance(self._full) + 8)
+        QToolTip.showText(
+            self.mapToGlobal(QPoint(0, self.height())),
+            f'<table width="{w}"><tr><td>{escape(self._full)}</td></tr></table>',
+            self, self.rect())
+
+    def enterEvent(self, event):
+        if self._icon:
+            self._peek()
+            self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self._icon:
+            QToolTip.hideText()
+            self.update()
+        super().leaveEvent(event)
+
+    def event(self, event):
+        if self._icon and event.type() == QEvent.Type.ToolTip:
+            return True      # the peek is already up, don't re-show it late
+        return super().event(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._icon:
+            return
+        ink = Palette.CARDHEAD_FG if self.underMouse() else Palette.CARDHEAD_SUB
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        k = self._BOX / 24.0
+        p.translate(0.0, (self.height() - self._BOX) / 2.0)
+        p.scale(k, k)
+        pen = QPen(QColor(ink), 2.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawRoundedRect(QRectF(4.5, 4.5, 15.0, 17.0), 2.5, 2.5)   # board
+        p.setBrush(QColor(ink))
+        p.drawRoundedRect(QRectF(8.5, 2.0, 7.0, 5.0), 1.5, 1.5)      # clip
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(QPointF(8.5, 12.0), QPointF(15.5, 12.0))          # text rows
+        p.drawLine(QPointF(8.5, 16.0), QPointF(13.5, 16.0))
         p.end()
 
 
@@ -727,7 +816,7 @@ class TerminalCard(QFrame):
         header.setToolTip("Drag to reorder this agent")
         header.setFixedHeight(38)   # room for the larger 14px glyph buttons
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(8, 0, 6, 0)
+        hl.setContentsMargins(8, 0, 3, 0)
         hl.setSpacing(7)
 
         self.glyph = QLabel("●", header)
@@ -809,7 +898,7 @@ class TerminalCard(QFrame):
         # without reading each terminal. It takes every pixel the fixed chrome
         # beside it leaves and elides only what genuinely doesn't fit; the full
         # text is always on hover.
-        self.task_summary = ElidingLabel(header)
+        self.task_summary = _TaskSummaryLabel(header)
         self.task_summary.setObjectName("CardTaskSummary")
         # compact context-window usage (e.g. "20% of 1M"), right after the
         # summary snippet — hidden until the transcript reports usage (Claude
@@ -890,10 +979,18 @@ class TerminalCard(QFrame):
         self.header_tools.withhold(self.btn_sched, not self.is_pty)
         hl.addWidget(self.header_tools)
         # the usage chip sits between the collapsed tools and the close button,
-        # so the strip that reveals them is the space to the chip's LEFT
-        hl.addWidget(self.token_label)
+        # so the strip that reveals them is the space to the chip's LEFT. The
+        # two share a tight sub-row so the chip hugs the (square) close button
+        # rather than sitting a full header gap from it.
+        tail = QWidget(header)
+        tl = QHBoxLayout(tail)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(2)
         self.btn_close = tool("✕", "CardClose", "Close terminal")
-        hl.addWidget(self.btn_close)
+        self.btn_close.setFixedSize(24, 24)
+        tl.addWidget(self.token_label)
+        tl.addWidget(self.btn_close)
+        hl.addWidget(tail)
 
         root.addWidget(header)
         if self.is_pty:
