@@ -1540,6 +1540,16 @@ def test_workspace_click_focuses_lead_agent():
     click_row(ws1.id)
     check("ws focus: clicking back focuses ws1's agent", in_card(ws1, a1))
 
+    # only the clicked row's own rename box keeps focus, not any sidebar edit
+    search = win.sidebar.search_edit
+    search.show()
+    search.setFocus()
+    pump(30)
+    click_row(ws2.id)
+    check("ws focus: a click leaves the sidebar search for the agent",
+          in_card(ws2, first), win.focusWidget())
+    search.hide()
+
     page2.toggle_solo(page2.card_for(second.id))
     click_row(ws2.id)
     check("ws focus: a soloed workspace focuses its maximized agent",

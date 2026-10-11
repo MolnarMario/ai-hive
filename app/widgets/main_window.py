@@ -5719,9 +5719,7 @@ class MainWindow(QMainWindow):
         self._focus_lead_card(ws_id)
 
     def _focus_lead_card(self, ws_id: str) -> None:
-        focus = self.focusWidget()
-        if (isinstance(focus, QLineEdit) and focus.isVisible()
-                and self.sidebar.isAncestorOf(focus)):
+        if self.sidebar.is_renaming(ws_id):
             return    # a double-click opened the inline rename, keep it
         page = self._pages.get(ws_id)
         card = page.lead_card() if page is not None else None
