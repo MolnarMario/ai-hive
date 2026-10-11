@@ -2522,6 +2522,13 @@ def test_limit_echo_after_torn_banner():
     busy = latched("Busy", done, LIMIT_UNCORROBORATED_S + 60)
     busy._busy = True
     stuck = latched("Stuck", done[:2], LIMIT_UNCORROBORATED_S + 60)
+    # a wrap-up turn that ran past the window has not written its cut-off
+    # yet, and the old limit menu on screen is a parked agent
+    late = latched("WorkedLate", done, LIMIT_UNCORROBORATED_S + 60)
+    late._last_work_ts = now - 30
+    menu = latched("Menu", done, LIMIT_UNCORROBORATED_S + 60)
+    menu._screen_tail = ("  1. Stop and wait for limit to reset\n"
+                         "  2. Upgrade your plan\n")
     cleared = MainWindow._clear_carried_on_latches(stub)
     check("limit-torn: an idle latch the conversation never recorded is "
           "dropped once it is old enough",
@@ -2533,6 +2540,10 @@ def test_limit_echo_after_torn_banner():
           busy.is_limit_blocked())
     check("limit-torn: ...and never when the conversation does end on a "
           "cut-off", stuck.is_limit_blocked())
+    check("limit-torn: ...not until the window has passed since its last "
+          "work", late.is_limit_blocked())
+    check("limit-torn: ...and never while the limit menu is on screen",
+          menu.is_limit_blocked())
     check("limit-torn: exactly one, with its audit line",
           cleared == 1 and any("UNCORROBORATED" in x for x in audits), audits)
     shutil.rmtree(tmp, ignore_errors=True)

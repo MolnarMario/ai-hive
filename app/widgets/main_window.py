@@ -2827,7 +2827,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+T"), self, self._on_add_terminal_clicked)
         QShortcut(QKeySequence("F11"), self, self._fullscreen.toggle)
         # Ctrl+Up / Ctrl+Down maximize and restore the selected agent. They
-        # are the third exception: TerminalView leaves them unclaimed, so a
+        # are exceptions too: TerminalView leaves them unclaimed, so a
         # focused terminal no longer receives Ctrl+Up / Ctrl+Down.
         QShortcut(QKeySequence("Ctrl+Up"), self, self._maximize_selected_card)
         QShortcut(QKeySequence("Ctrl+Down"), self, self._restore_card_tiling)
@@ -3509,9 +3509,15 @@ class MainWindow(QMainWindow):
             info = transcripts.limit_cut_off(spec.cwd, spec.session_id)
             if not info or info["cut_off"]:
                 continue
-            uncorroborated = (not agent.is_busy() and
-                              now - agent.limit_latched_at()
-                              >= LIMIT_UNCORROBORATED_S)
+            # counted from the later of the latch and the agent's last work:
+            # a wrap-up turn that ran past the window writes its cut-off only
+            # once it ends. The old limit menu on screen is the agent parked
+            # right now, whatever the conversation recorded.
+            uncorroborated = (not agent.is_busy()
+                              and now - max(agent.limit_latched_at(),
+                                            agent.last_work_at())
+                              >= LIMIT_UNCORROBORATED_S
+                              and not agent.limit_menu_visible())
             if info.get("carried_on_at", 0.0) <= agent.limit_latched_at():
                 if not uncorroborated:
                     continue

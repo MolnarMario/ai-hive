@@ -570,8 +570,7 @@ class WorkspacePage(QWidget):
     def restore_tiling(self) -> None:
         """Ctrl+Down: bring every card back. A no-op when nothing is soloed."""
         if self._solo_card is not None:
-            self._exit_solo()
-            self._retile()
+            self.toggle_solo(self._solo_card)
 
     def _exit_solo(self) -> None:
         if self._solo_card is None:
