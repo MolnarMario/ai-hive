@@ -1606,6 +1606,7 @@ class AddTerminalDialog(QDialog):
         self._args_label = QLabel("Args", self)
         form.addRow(self._args_label, self.args_edit)
         form.addRow("", self.pty_check)
+        self._form = form
 
         self._ai_widgets = (self._model_label, self.model_combo,
                             self._effort_label, self.effort_combo)
@@ -1724,12 +1725,15 @@ class AddTerminalDialog(QDialog):
             status = "✓ detected" if detected else "⚠ CLI not detected; install it or edit the command"
             self.provider_note.setText(f"{prov.note}\n{status}")
 
-        # AI agents are always interactive (ConPTY); shells/scripts choose
+        # AI agents are always interactive (ConPTY), so the box is hidden
+        # for them (it would only show a checked, disabled choice).
+        # Shells/scripts choose.
         if kind in PTY_ONLY_KINDS:
             self.pty_check.setChecked(True)
             self.pty_check.setEnabled(False)
         else:
             self.pty_check.setEnabled(HAS_CONPTY)
+        self._form.setRowVisible(self.pty_check, kind not in PTY_ONLY_KINDS)
         self._validate()
         self._set_count(self._count)  # the resume picker may have come or gone
         self._refresh_lane_check()
