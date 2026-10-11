@@ -797,13 +797,16 @@ class TerminalView(QWidget):
             then.append(old_text)
         if all(then[y] == then[y + k] for y in range(cursor_then - k)):
             return 0
+        # a full history evicted a row per push, and those rows go back in
+        # front. Copies are better than losing rows that can't come back.
+        gone = getattr(top, "evicted", 0) - evicted_then
+        kept = getattr(top, "recent_evicted", ())
+        if gone > len(kept):
+            return 0
         for _ in range(k):
             top.pop()
         top.pushed -= k
-        # a full history evicted a row per push; put those rows back in front
-        gone = getattr(top, "evicted", 0) - evicted_then
-        kept = getattr(top, "recent_evicted", ())
-        for _ in range(min(gone, len(kept))):
+        for _ in range(gone):
             top.appendleft(kept.pop())
             top.evicted -= 1
         return k
