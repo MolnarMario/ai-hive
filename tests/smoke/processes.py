@@ -12,8 +12,13 @@ from pathlib import Path
 from .harness import SCRATCH_CWD, check, skip
 
 
-def test_winjob_process_count():
-    """WinJob.process_count() reports the live process count for a job -- the
+def _fake_job_ids(n):
+    """`n` made-up pids for a stubbed job; 0 reads as a failed query."""
+    return [100 + 4 * i for i in range(n)]
+
+
+def test_winjob_process_ids():
+    """WinJob.process_ids() lists the live processes in a job -- the
     detection primitive behind poll_bg_shell(). Windows-only; skipped
     everywhere else since job objects don't exist there."""
     if sys.platform != "win32":
@@ -24,8 +29,8 @@ def test_winjob_process_count():
     job = WinJob()
     check("winjob: a fresh job object gets a real handle on Windows",
           job._handle is not None)
-    check("winjob: process_count on an empty (unassigned) job is 0",
-          job.process_count() == 0)
+    check("winjob: process_ids on an empty (unassigned) job is []",
+          job.process_ids() == [])
 
     procs = [subprocess.Popen([sys.executable, "-c",
                                "import time; time.sleep(5)"])
@@ -34,8 +39,9 @@ def test_winjob_process_count():
         for p in procs:
             check(f"winjob: assign succeeds for a live child (pid {p.pid})",
                   job.assign(p.pid))
-        check("winjob: process_count reflects both assigned processes",
-              job.process_count() == 2, job.process_count())
+        check("winjob: process_ids lists both assigned processes",
+              sorted(job.process_ids()) == sorted(p.pid for p in procs),
+              job.process_ids())
     finally:
         job.terminate_tree()
         for p in procs:
@@ -44,8 +50,8 @@ def test_winjob_process_count():
             except Exception:
                 p.kill()
         job.close()
-    check("winjob: process_count after close is 0 (no handle)",
-          job.process_count() == 0)
+    check("winjob: process_ids after close is [] (no handle)",
+          job.process_ids() == [])
 
 
 def test_winjob_process_ids_and_kill():
@@ -151,10 +157,12 @@ def test_bg_shell_workspace_stats():
 
     fake_now = [1000.0]
     orig_time = terminal_agent_mod.time.time
-    orig_count = agent.worker.job_process_count
+    orig_ids = agent.worker.job_process_ids
+    orig_image = terminal_agent_mod.process_image_path
     count = [1]
     terminal_agent_mod.time.time = lambda: fake_now[0]
-    agent.worker.job_process_count = lambda: count[0]
+    agent.worker.job_process_ids = lambda: _fake_job_ids(count[0])
+    terminal_agent_mod.process_image_path = lambda pid: ""
     try:
         agent.poll_bg_shell()   # learns the baseline (1)
         check("bg shell: the baseline alone never flags",
@@ -162,8 +170,8 @@ def test_bg_shell_workspace_stats():
 
         count[0] = 0   # a failed/unsupported query must never flap state
         agent.poll_bg_shell()
-        check("bg shell: a count<=0 (query failed) leaves the state alone",
-              not agent.is_bg_shell_busy())
+        check("bg shell: an empty job list (query failed) leaves the "
+              "state alone", not agent.is_bg_shell_busy())
         count[0] = 1
 
         count[0] = 2   # an extra process appears
@@ -229,7 +237,8 @@ def test_bg_shell_workspace_stats():
               not agent.is_bg_shell_busy() and agent._bg_baseline is None)
     finally:
         terminal_agent_mod.time.time = orig_time
-        agent.worker.job_process_count = orig_count
+        agent.worker.job_process_ids = orig_ids
+        terminal_agent_mod.process_image_path = orig_image
 
 
 def test_bg_shell_settle_relearn():
@@ -262,10 +271,12 @@ def test_bg_shell_settle_relearn():
     fake_now = [1000.0]
     agent._session_started = fake_now[0]   # simulate a just-launched agent
     orig_time = terminal_agent_mod.time.time
-    orig_count = agent.worker.job_process_count
+    orig_ids = agent.worker.job_process_ids
+    orig_image = terminal_agent_mod.process_image_path
     count = [1]
     terminal_agent_mod.time.time = lambda: fake_now[0]
-    agent.worker.job_process_count = lambda: count[0]
+    agent.worker.job_process_ids = lambda: _fake_job_ids(count[0])
+    terminal_agent_mod.process_image_path = lambda pid: ""
     try:
         agent.poll_bg_shell()   # still within warmup: ignored entirely
         check("bg shell settle: a sample during warmup is ignored",
@@ -317,7 +328,8 @@ def test_bg_shell_settle_relearn():
               "settle still flags once sustained", agent.is_bg_shell_busy())
     finally:
         terminal_agent_mod.time.time = orig_time
-        agent.worker.job_process_count = orig_count
+        agent.worker.job_process_ids = orig_ids
+        terminal_agent_mod.process_image_path = orig_image
 
 
 def test_bg_shell_kill_extras():
@@ -349,15 +361,15 @@ def test_bg_shell_kill_extras():
     fake_now = [1000.0]
     agent._session_started = fake_now[0]
     orig_time = terminal_agent_mod.time.time
-    orig_count = agent.worker.job_process_count
     orig_ids = agent.worker.job_process_ids
+    orig_image = terminal_agent_mod.process_image_path
     orig_pid = agent.worker.pid
     orig_kill = agent.worker.kill_extra_processes
     pids = [100, 101]           # root(100) + the mcp bridge(101), the baseline
     kill_calls = []
     terminal_agent_mod.time.time = lambda: fake_now[0]
-    agent.worker.job_process_count = lambda: len(pids)
     agent.worker.job_process_ids = lambda: list(pids)
+    terminal_agent_mod.process_image_path = lambda pid: ""
     agent.worker.pid = lambda: 100
     agent.worker.kill_extra_processes = (
         lambda keep: kill_calls.append(keep) or [p for p in pids
@@ -394,8 +406,8 @@ def test_bg_shell_kill_extras():
                   for line in audit_lines), audit_lines)
     finally:
         terminal_agent_mod.time.time = orig_time
-        agent.worker.job_process_count = orig_count
         agent.worker.job_process_ids = orig_ids
+        terminal_agent_mod.process_image_path = orig_image
         agent.worker.pid = orig_pid
         agent.worker.kill_extra_processes = orig_kill
 
@@ -521,14 +533,14 @@ def test_bg_shell_extra_pids_and_kill_pid():
     fake_now = [1000.0]
     agent._session_started = fake_now[0]
     orig_time = terminal_agent_mod.time.time
-    orig_count = agent.worker.job_process_count
     orig_ids = agent.worker.job_process_ids
+    orig_image = terminal_agent_mod.process_image_path
     orig_pid = agent.worker.pid
     orig_kill_pid = agent.worker.kill_pid
     pids = [100, 101]   # root(100) + mcp bridge(101): the baseline
     terminal_agent_mod.time.time = lambda: fake_now[0]
-    agent.worker.job_process_count = lambda: len(pids)
     agent.worker.job_process_ids = lambda: list(pids)
+    terminal_agent_mod.process_image_path = lambda pid: ""
     agent.worker.pid = lambda: 100
     agent.worker.kill_pid = lambda p: (kill_calls.append(p),
                                        pids.remove(p) if p in pids else None)
@@ -569,10 +581,580 @@ def test_bg_shell_extra_pids_and_kill_pid():
               not agent.is_bg_shell_busy())
     finally:
         terminal_agent_mod.time.time = orig_time
-        agent.worker.job_process_count = orig_count
         agent.worker.job_process_ids = orig_ids
+        terminal_agent_mod.process_image_path = orig_image
         agent.worker.pid = orig_pid
         agent.worker.kill_pid = orig_kill_pid
+
+
+def test_cli_tooling_classifier():
+    """is_cli_tooling() names the programs an AI CLI runs for itself, which
+    the gear badge leaves out. The positives are the image paths of a live
+    Codex 0.162 agent whose gear stayed lit while idle; the negatives are
+    what a real background command runs as, and must keep counting."""
+    from app.process_worker import is_cli_tooling
+
+    saved = os.environ.pop("CODEX_HOME", None)
+    home = os.path.expanduser("~")
+    local = os.environ["LOCALAPPDATA"]
+    daemon = os.path.join(home, ".codex", "packages", "app-server-daemon",
+                          "releases", "0.162.1-x86_64-pc-windows-msvc", "bin",
+                          "codex.exe")
+    cua = os.path.join(local, "OpenAI", "Codex", "runtimes", "cua_node",
+                       "71e3f41277f96d73", "bin")
+    try:
+        tooling = {
+            "the app-server daemon (and its updater)": daemon,
+            "the daemon launched by a \\\\?\\ path": "\\\\?\\" + daemon,
+            "the same path in other case": daemon.upper(),
+            "the computer-use node runtime": os.path.join(cua, "node.exe"),
+            "the node_repl MCP server": os.path.join(cua, "node_repl.exe"),
+            "the desktop app's own rg": os.path.join(
+                local, "OpenAI", "Codex", "bin", "26f5cb65bac96647", "rg.exe"),
+            "a bundled plugin python": os.path.join(
+                home, ".cache", "codex-runtimes", "codex-primary-runtime",
+                "dependencies", "python", "python.exe"),
+            "the npm Codex TUI": (r"C:\Users\u\AppData\Roaming\npm"
+                                  r"\node_modules\@openai\codex"
+                                  r"\node_modules\@openai\codex-win32-x64"
+                                  r"\vendor\x86_64-pc-windows-msvc\bin"
+                                  r"\codex.exe"),
+            "npm Codex's rg under another npm prefix": (
+                r"C:\nvm\v24\node_modules\@openai\codex-win32-x64\vendor"
+                r"\x86_64-pc-windows-msvc\codex-path\rg.exe"),
+            "npm's staging copy during a Codex update": (
+                r"C:\npm\node_modules\@openai\.codex-NrqtOZ5d"
+                r"\node_modules\@openai\codex-win32-x64\bin\codex.exe"),
+            "the sandbox command runner": os.path.join(
+                home, ".codex", ".sandbox-bin",
+                "codex-command-runner-0.160.1.exe"),
+            "a console host": r"C:\Windows\System32\conhost.exe",
+            "a ConPTY console host": (r"C:\Program Files\WindowsApps\Term"
+                                      r"\OpenConsole.exe"),
+        }
+        for what, path in tooling.items():
+            check(f"cli tooling: {what} is tooling", is_cli_tooling(path),
+                  path)
+        work = {
+            "the user's node": r"C:\Users\u\AppData\Local\nvm\v24\node.exe",
+            "PowerShell": (r"C:\WINDOWS\System32\WindowsPowerShell\v1.0"
+                           r"\powershell.exe"),
+            "cmd": r"C:\WINDOWS\system32\cmd.exe",
+            "Git Bash": r"C:\Program Files\Git\usr\bin\bash.exe",
+            "a project venv python": r"C:\proj\.venv\Scripts\python.exe",
+            "a folder that only starts like .codex": os.path.join(
+                home, ".codexbackup", "node.exe"),
+            "a program only named like codex": r"C:\proj\codexify.exe",
+            "a codex.exe built from source": (r"C:\src\codex\codex-rs"
+                                              r"\target\debug\codex.exe"),
+            "another @openai npm package": (r"C:\npm\node_modules\@openai"
+                                            r"\agents\bin\tool.exe"),
+            "an unreadable path": "",
+        }
+        for what, path in work.items():
+            check(f"cli tooling: {what} is not tooling",
+                  not is_cli_tooling(path), path)
+        os.environ["CODEX_HOME"] = r"D:\codexhome"
+        check("cli tooling: CODEX_HOME moves Codex's own folder",
+              is_cli_tooling(r"D:\codexhome\packages\x\node.exe"))
+    finally:
+        if saved is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = saved
+
+
+def test_bg_shell_ignores_cli_tooling():
+    """Live report: a Codex agent showed the gear right after a cold boot
+    and kept it while idle (session.log: count=10 baseline=4). Codex 0.162
+    starts a shared app-server daemon, its updater, two node_repl MCP
+    servers and their console hosts 10 to 17 s after launch, and the last
+    of them landed after the baseline had settled. Those must never count,
+    whenever they arrive, and the gear's kill-all must keep them (a kill
+    took down the daemon Codex runs its turns on). A real background
+    command still lights the gear and is the only thing the menu lists."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import (AgentStatus, BG_SHELL_DEBOUNCE_S,
+                                     BG_SHELL_SETTLE_S, BG_SHELL_WARMUP_S)
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+    import app.terminal_agent as terminal_agent_mod
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-tooling-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("BgShellTooling", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.OPENAI, "Codexed",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+
+    home = os.path.expanduser("~")
+    cua = os.path.join(os.environ["LOCALAPPDATA"], "OpenAI", "Codex",
+                       "runtimes", "cua_node", "71e3f41277f96d73", "bin")
+    daemon = os.path.join(home, ".codex", "packages", "app-server-daemon",
+                          "releases", "0.162.1", "bin", "codex.exe")
+    conhost = r"C:\Windows\System32\conhost.exe"
+    images = {
+        200: r"C:\WINDOWS\system32\cmd.exe",       # the codex.CMD shim, root
+        204: r"C:\Users\u\AppData\Local\nvm\v24\node.exe",
+        208: (r"C:\Users\u\AppData\Roaming\npm\node_modules\@openai\codex"
+              r"\node_modules\@openai\codex-win32-x64\vendor\bin"
+              r"\codex.exe"),                     # the Codex TUI
+        212: daemon, 216: daemon,                  # daemon + its updater
+        220: os.path.join(cua, "node.exe"), 224: conhost,
+        228: os.path.join(cua, "node_repl.exe"),
+        232: os.path.join(cua, "node_repl.exe"), 236: conhost,
+        240: (r"C:\WINDOWS\System32\WindowsPowerShell\v1.0"
+              r"\powershell.exe"),
+        244: conhost,                              # its console host
+    }
+    pids = [200, 204, 208]
+    keeps = []
+
+    fake_now = [1000.0]
+    agent._session_started = fake_now[0]
+    orig_time = terminal_agent_mod.time.time
+    orig_ids = agent.worker.job_process_ids
+    orig_image = terminal_agent_mod.process_image_path
+    orig_pid = agent.worker.pid
+    orig_kill = agent.worker.kill_extra_processes
+    terminal_agent_mod.time.time = lambda: fake_now[0]
+    agent.worker.job_process_ids = lambda: list(pids)
+    terminal_agent_mod.process_image_path = lambda pid: images.get(pid, "")
+    agent.worker.pid = lambda: 200
+    agent.worker.kill_extra_processes = (
+        lambda keep: keeps.append(set(keep)) or [p for p in pids
+                                                 if p not in keep])
+    try:
+        fake_now[0] += BG_SHELL_WARMUP_S + 0.1
+        agent.poll_bg_shell()
+        pids.append(212)             # the daemon makes it into the settle
+        fake_now[0] += BG_SHELL_SETTLE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell tooling: the baseline counts the shim and node, "
+              "not the Codex binaries", agent._bg_baseline == 2,
+              agent._bg_baseline)
+
+        pids.extend([216, 220, 224, 228, 232, 236])   # after the settle
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 1
+        agent.poll_bg_shell()
+        fake_now[0] += 600
+        agent.poll_bg_shell()
+        check("bg shell tooling: Codex's daemon, updater and MCP servers "
+              "arriving after the settle never light the gear",
+              not agent.is_bg_shell_busy())
+        check("bg shell tooling: and the kill menu lists none of them",
+              agent.bg_shell_extra_pids() == [], agent.bg_shell_extra_pids())
+        check("bg shell tooling: a click on the unlit gear kills nothing",
+              agent.kill_bg_shell_extras() == [] and not keeps, keeps)
+
+        pids.extend([240, 244])      # a real background command
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell tooling: a background command still lights the "
+              "gear", agent.is_bg_shell_busy())
+        check("bg shell tooling: the menu lists the command, not its "
+              "console host or Codex's tooling",
+              agent.bg_shell_extra_pids() == [240],
+              agent.bg_shell_extra_pids())
+        check("bg shell tooling: a kill of one tooling pid is refused",
+              agent.kill_bg_shell_pid(212) is False)
+        killed = agent.kill_bg_shell_extras()
+        check("bg shell tooling: kill-all keeps the daemon, its MCP servers "
+              "and every console host",
+              keeps and {212, 216, 220, 224, 228, 232, 236, 244} <= keeps[-1]
+              and 240 not in keeps[-1], keeps)
+        check("bg shell tooling: kill-all kills only the command",
+              killed == [240], killed)
+
+        # a nested `codex` the agent ran in the background, from its own
+        # npm install: codex.exe is tooling by location, but npm's node
+        # shim waits for it and still counts
+        pids[:] = [p for p in pids if p not in (240, 244)]
+        images[248] = images[204]                  # the shim's node.exe
+        images[252] = images[208]                  # the same npm codex.exe
+        pids.extend([248, 252])
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell tooling: a nested codex run from the agent's own "
+              "npm install lights the gear through its node shim",
+              agent.is_bg_shell_busy())
+        check("bg shell tooling: the menu offers the shim, whose tree kill "
+              "takes the nested codex with it",
+              agent.bg_shell_extra_pids() == [248],
+              agent.bg_shell_extra_pids())
+    finally:
+        terminal_agent_mod.time.time = orig_time
+        agent.worker.job_process_ids = orig_ids
+        terminal_agent_mod.process_image_path = orig_image
+        agent.worker.pid = orig_pid
+        agent.worker.kill_extra_processes = orig_kill
+
+
+def test_cli_tooling_real_process():
+    """process_image_path() reads a live process's real executable path,
+    and _job_tooling_pids() tells a program under Codex's runtime folder
+    apart from an ordinary child in the same job. Measured on real
+    processes, since every other gear test stubs the image lookup."""
+    if sys.platform != "win32":
+        skip('cli tooling real', 'non-Windows: job objects are Windows-only')
+        return
+    from app.process_worker import (CREATE_NO_WINDOW, WinJob, is_cli_tooling,
+                                    process_image_path)
+    from app.terminal_agent import TerminalAgent
+
+    runtime = Path(os.environ["LOCALAPPDATA"], "OpenAI", "Codex", "runtimes",
+                   "smoke")
+    runtime.mkdir(parents=True, exist_ok=True)
+    fake = runtime / "ping.exe"
+    shutil.copyfile(Path(os.environ.get("SystemRoot", r"C:\Windows"),
+                         "System32", "PING.EXE"), fake)
+    job = WinJob()
+    procs = [subprocess.Popen([str(fake), "-n", "30", "127.0.0.1"],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL,
+                              creationflags=CREATE_NO_WINDOW),
+             subprocess.Popen([sys.executable, "-c",
+                               "import time; time.sleep(30)"],
+                              creationflags=CREATE_NO_WINDOW)]
+    try:
+        for p in procs:
+            job.assign(p.pid)
+        tool, plain = procs
+        path = process_image_path(tool.pid)
+        check("cli tooling real: the image path is the copy that runs",
+              os.path.normcase(path) == os.path.normcase(str(fake)),
+              (path, str(fake)))
+        check("cli tooling real: a program in Codex's runtime folder is "
+              "tooling", is_cli_tooling(path), path)
+        check("cli tooling real: a plain python child is not",
+              not is_cli_tooling(process_image_path(plain.pid)),
+              process_image_path(plain.pid))
+        check("cli tooling real: an exited or unknown pid reads as no path",
+              process_image_path(0) == "")
+        found = TerminalAgent._job_tooling_pids(job.process_ids())
+        check("cli tooling real: the job's tooling is exactly the copy",
+              found == {tool.pid}, (found, tool.pid, plain.pid))
+    finally:
+        job.terminate_tree()
+        for p in procs:
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+        job.close()
+
+
+# Run inside a WinJob. Spawns one plain child and one that asks to break away,
+# then joins a job of its own the way node's libuv puts every child it spawns
+# in one (breakaway allowed, silently for children that don't ask) and spawns
+# the same pair again: that is where the Codex TUI starts its daemon from.
+_BREAKAWAY_CHILD = r'''
+import ctypes, subprocess, sys
+from ctypes import wintypes
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.CreateJobObjectW.restype = wintypes.HANDLE
+k32.GetCurrentProcess.restype = wintypes.HANDLE
+k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                        ctypes.c_void_p, wintypes.DWORD]
+k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+
+class Limits(ctypes.Structure):
+    _fields_ = [("times", wintypes.LARGE_INTEGER * 2),
+                ("LimitFlags", wintypes.DWORD),
+                ("working_set", ctypes.c_size_t * 2),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("classes", wintypes.DWORD * 2),
+                ("io", ctypes.c_ulonglong * 6),
+                ("memory", ctypes.c_size_t * 4)]
+
+def spawn(flags):
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                            creationflags=0x08000000 | flags).pid
+
+BREAKAWAY = 0x01000000
+sys.stdin.readline()
+pids = [spawn(0), spawn(BREAKAWAY)]
+libuv = k32.CreateJobObjectW(None, None)
+info = Limits(LimitFlags=0x2000 | 0x0800 | 0x1000)
+assert k32.SetInformationJobObject(libuv, 9, ctypes.byref(info),
+                                   ctypes.sizeof(info))
+assert k32.AssignProcessToJobObject(libuv, k32.GetCurrentProcess())
+pids += [spawn(0), spawn(BREAKAWAY)]
+print(*pids, flush=True)
+sys.stdin.readline()
+'''
+
+
+def test_winjob_breakaway_only_on_request():
+    """A child that asks to break away leaves the agent's job, and every
+    other child stays and dies with it. Codex starts its shared app-server
+    daemon that way from a TUI that node put in a nested job. Before
+    BREAKAWAY_OK, Windows kept the daemon in the agent's job without failing
+    the launch, and closing that one agent killed the daemon every Codex
+    client was using. Real processes, since the flags only matter to the
+    kernel."""
+    if sys.platform != "win32":
+        skip('winjob breakaway', 'non-Windows: job objects are Windows-only')
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    from app.process_worker import CREATE_NO_WINDOW, WinJob
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+
+    def alive(pid):
+        h = k32.OpenProcess(0x00100000 | 0x0001, False, pid)  # SYNCHRONIZE|TERMINATE
+        if not h:
+            return False
+        try:
+            return k32.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT
+        finally:
+            k32.CloseHandle(h)
+
+    def kill(pid):
+        h = k32.OpenProcess(0x0001, False, pid)
+        if h:
+            k32.TerminateProcess(h, 1)
+            k32.CloseHandle(h)
+
+    script = Path(tempfile.mkdtemp()) / "breakaway_child.py"
+    script.write_text(_BREAKAWAY_CHILD, encoding="utf-8")
+    job = WinJob()
+    parent = subprocess.Popen([sys.executable, str(script)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              text=True, creationflags=CREATE_NO_WINDOW)
+    pids = []
+    try:
+        check("winjob breakaway: the parent joins the job",
+              job.assign(parent.pid))
+        parent.stdin.write("go\n")
+        parent.stdin.flush()
+        pids = [int(p) for p in parent.stdout.readline().split()]
+        check("winjob breakaway: the parent started its four children",
+              len(pids) == 4, pids)
+        if len(pids) != 4:
+            return
+        plain, asked, plain_nested, asked_nested = pids
+        ids = set(job.process_ids())
+        check("winjob breakaway: a plain child stays in the job",
+              plain in ids, (plain, sorted(ids)))
+        check("winjob breakaway: a child that asks to break away leaves it",
+              asked not in ids, (asked, sorted(ids)))
+        check("winjob breakaway: under a node-style nested job a plain "
+              "child still stays", plain_nested in ids,
+              (plain_nested, sorted(ids)))
+        check("winjob breakaway: and one that asks leaves, like Codex's "
+              "daemon", asked_nested not in ids, (asked_nested, sorted(ids)))
+        job.terminate_tree()
+        deadline = time.monotonic() + 5
+        while (alive(plain) or alive(plain_nested)) \
+                and time.monotonic() < deadline:
+            time.sleep(0.05)
+        check("winjob breakaway: the tree kill takes the plain children",
+              not alive(plain) and not alive(plain_nested))
+        check("winjob breakaway: and leaves the ones that broke away running",
+              alive(asked) and alive(asked_nested))
+    finally:
+        job.terminate_tree()
+        job.close()
+        for pid in pids:
+            kill(pid)
+        try:
+            parent.wait(timeout=5)
+        except Exception:
+            parent.kill()
+
+
+_NPM_CMD_SHIM = r'''@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
+'''
+
+
+def _codex_package(root, version, name="@openai/codex"):
+    pkg = Path(root, "node_modules", "@openai", "codex")
+    (pkg / "bin").mkdir(parents=True, exist_ok=True)
+    (pkg / "bin" / "codex.js").write_text("", encoding="utf-8")
+    (pkg / "package.json").write_text(
+        '{"name": "%s", "version": "%s"}' % (name, version), encoding="utf-8")
+    return pkg
+
+
+def test_codex_version_from_shims():
+    """codex_version() reads the version from the npm package a shim runs,
+    without starting the CLI, through every shim layout seen in the wild.
+    An unknown version must read as (), so AI Hive never passes
+    --no-daemon to a Codex that would refuse to start on it."""
+    from app import providers
+
+    base = Path(tempfile.mkdtemp(), "with space")
+    npm = base / "npm"
+    _codex_package(npm, "0.162.1")
+    shim = npm / "codex.cmd"
+    shim.write_text(_NPM_CMD_SHIM, encoding="utf-8")
+    check("codex version: npm's own cmd shim",
+          providers.codex_version(str(shim)) == (0, 162, 1),
+          providers.codex_version(str(shim)))
+    check("codex version: 0.162 takes --no-daemon",
+          providers.codex_has_no_daemon(str(shim)))
+
+    local_bin = base / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    hand = local_bin / "codex.CMD"
+    hand.write_text('@ECHO off\nnode "%s" %%*\n'
+                    % (npm / "node_modules/@openai/codex/bin/codex.js"),
+                    encoding="utf-8")
+    check("codex version: a hand-written shim naming the package by "
+          "absolute path", providers.codex_version(str(hand)) == (0, 162, 1),
+          providers.codex_version(str(hand)))
+
+    pnpm = base / "pnpm"
+    _codex_package(pnpm / "global" / "5", "0.158.0")
+    ps1 = pnpm / "codex.ps1"
+    ps1.write_text('#!/usr/bin/env pwsh\n$basedir=Split-Path '
+                   '$MyInvocation.MyCommand.Definition -Parent\n'
+                   '& "$basedir/node$exe"  "$basedir/global/5/node_modules/'
+                   '@openai/codex/bin/codex.js" $args\n', encoding="utf-8")
+    check("codex version: a ps1 shim relative to $basedir",
+          providers.codex_version(str(ps1)) == (0, 158, 0),
+          providers.codex_version(str(ps1)))
+
+    appdata_pkg = _codex_package(Path(os.environ["APPDATA"], "npm"), "0.160.1")
+    env_shim = base / "envshim" / "codex.cmd"
+    env_shim.parent.mkdir()
+    env_shim.write_text('@node "%APPDATA%\\npm\\node_modules\\@openai\\codex'
+                        '\\bin\\codex.js" %*\n', encoding="utf-8")
+    check("codex version: a shim that names the package through %APPDATA%",
+          providers.codex_version(str(env_shim)) == (0, 160, 1),
+          providers.codex_version(str(env_shim)))
+    shutil.rmtree(appdata_pkg.parent.parent)
+
+    vendor = (npm / "node_modules" / "@openai" / "codex" / "node_modules"
+              / "@openai" / "codex-win32-x64" / "vendor" / "bin" / "codex.exe")
+    vendor.parent.mkdir(parents=True)
+    vendor.write_bytes(b"")
+    check("codex version: the vendor codex.exe inside the package",
+          providers.codex_version(str(vendor)) == (0, 162, 1),
+          providers.codex_version(str(vendor)))
+
+    old = base / "old"
+    _codex_package(old, "0.155.2")
+    (old / "codex.cmd").write_text(_NPM_CMD_SHIM, encoding="utf-8")
+    check("codex version: 0.155 has no --no-daemon",
+          providers.codex_version(str(old / "codex.cmd")) == (0, 155, 2)
+          and not providers.codex_has_no_daemon(str(old / "codex.cmd")))
+
+    alone = base / "standalone" / "codex.exe"
+    alone.parent.mkdir()
+    alone.write_bytes(b"")
+    other = base / "other"
+    _codex_package(other, "9.9.9", name="codex-lookalike")
+    (other / "codex.cmd").write_text(_NPM_CMD_SHIM, encoding="utf-8")
+    empty = base / "empty"
+    empty.mkdir()
+    saved_path = os.environ.get("PATH", "")
+    try:
+        os.environ["PATH"] = str(npm)
+        check("codex version: a bare name resolves through PATH, as the "
+              "launch does", providers.codex_version("codex") == (0, 162, 1),
+              providers.codex_version("codex"))
+        os.environ["PATH"] = str(empty)
+        for label, program in (
+                ("a standalone codex.exe", str(alone)),
+                ("a package that isn't @openai/codex",
+                 str(other / "codex.cmd")),
+                ("a bare name not on PATH", "codex"),
+                ("a shim that no longer exists", str(base / "gone.cmd")),
+                ("nothing at all", "")):
+            check(f"codex version: {label} reads as unknown",
+                  providers.codex_version(program) == ()
+                  and not providers.codex_has_no_daemon(program),
+                  providers.codex_version(program))
+    finally:
+        os.environ["PATH"] = saved_path
+
+
+def test_codex_launches_without_daemon():
+    """A Codex agent launches with --no-daemon when its Codex knows the flag,
+    so the session's server, and every command it runs, stays inside the
+    agent's Job Object instead of in the daemon all Codex clients share."""
+    from app.process_worker import AgentKind, build_spec
+
+    base = Path(tempfile.mkdtemp())
+    new, old = base / "new", base / "old"
+    _codex_package(new, "0.162.1")
+    _codex_package(old, "0.155.2")
+    for d in (new, old):
+        (d / "codex.cmd").write_text(_NPM_CMD_SHIM, encoding="utf-8")
+
+    def spec_for(root, **kw):
+        spec = build_spec(AgentKind.OPENAI, "Codex", cwd=SCRATCH_CWD, **kw)
+        if not kw.get("custom_command"):
+            spec.program = str(root / "codex.cmd")
+        return spec
+
+    spec = spec_for(new, model="gpt-5.6")
+    check("codex launch: --no-daemon leads the arguments",
+          spec.effective_args() == ["--no-daemon", "--model", "gpt-5.6"],
+          spec.effective_args())
+    spec.resume, spec.session_id = True, "019a-thread"
+    check("codex launch: a resume keeps it before the subcommand",
+          spec.effective_args() == ["--no-daemon", "--model", "gpt-5.6",
+                                    "resume", "019a-thread"],
+          spec.effective_args())
+    check("codex launch: an older Codex gets no flag it can't parse",
+          "--no-daemon" not in spec_for(old).effective_args(),
+          spec_for(old).effective_args())
+    custom = spec_for(new, custom_command='"%s" --search' % (new / "codex.cmd"))
+    check("codex launch: a custom command stays exactly as typed",
+          custom.effective_args() == ["--search"], custom.effective_args())
+    remote = spec_for(new, args=["--remote", "ws://127.0.0.1:4500"])
+    check("codex launch: --remote, which Codex refuses with --no-daemon, "
+          "gets no flag", "--no-daemon" not in remote.effective_args(),
+          remote.effective_args())
+    twice = spec_for(new, args=["--no-daemon"])
+    check("codex launch: a user's own --no-daemon isn't doubled",
+          twice.effective_args().count("--no-daemon") == 1,
+          twice.effective_args())
+
+    # the real default path, with no program swapped in: build_spec resolves
+    # `codex` on PATH and the launch carries the flag
+    saved_path = os.environ.get("PATH", "")
+    try:
+        os.environ["PATH"] = str(new)
+        plain = build_spec(AgentKind.OPENAI, "Codex", cwd=SCRATCH_CWD)
+        check("codex launch: the built-in provider resolves codex on PATH",
+              os.path.normcase(plain.program)
+              == os.path.normcase(str(new / "codex.cmd")), plain.program)
+        check("codex launch: and launches it with --no-daemon",
+              plain.effective_args() == ["--no-daemon"],
+              plain.effective_args())
+    finally:
+        os.environ["PATH"] = saved_path
 
 
 def test_pty():

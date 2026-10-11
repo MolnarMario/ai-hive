@@ -13,7 +13,8 @@ this module encodes, all empirically verified on the target machine:
 - QProcess.terminate() is WM_CLOSE — console apps ignore it. Graceful stop
   is stdin EOF (closeWriteChannel); the hard stop is a Job Object tree
   kill, which also reaps grandchildren (`ping -t` etc.) and — thanks to
-  KILL_ON_JOB_CLOSE — everything else if this GUI process dies.
+  KILL_ON_JOB_CLOSE — everything else if this GUI process dies. The one way
+  out is a process that explicitly asks to break away (see WinJob).
 """
 
 import codecs
@@ -209,11 +210,24 @@ class AgentSpec:
             # board wiring — like Gemini it's an interactive agent only.
             if self.resume:
                 args += ["--continue"]
-        elif self.provider == "openai" and self.resume and self.session_id:
-            # Codex persists threads itself. `codex resume <id>` reopens this
-            # terminal's exact conversation instead of starting an empty one
-            # or relying on a folder-wide "most recent" choice.
-            args += ["resume", self.session_id]
+        elif self.provider == "openai":
+            # Codex 0.156+ otherwise runs the session in one app-server daemon
+            # that every Codex client of this Windows user shares. The commands
+            # Codex runs are then the daemon's children, outside this agent's
+            # Job Object: the gear can't see them and Close's tree kill can't
+            # reach them. --no-daemon keeps the server inside this codex. A
+            # custom command is the user's own invocation and stays as typed,
+            # and Codex refuses --no-daemon together with --remote.
+            if (not self.custom_command
+                    and not any(a == "--no-daemon" or a.startswith("--remote")
+                                for a in args)
+                    and providers.codex_has_no_daemon(self.program)):
+                args.insert(0, "--no-daemon")
+            if self.resume and self.session_id:
+                # Codex persists threads itself. `codex resume <id>` reopens
+                # this terminal's exact conversation instead of starting an
+                # empty one or relying on a folder-wide "most recent" choice.
+                args += ["resume", self.session_id]
         return args
 
     def to_dict(self) -> dict:
@@ -452,9 +466,9 @@ if sys.platform == "win32":
         ]
 
     # fixed-capacity stand-in for JOBOBJECT_BASIC_PROCESS_ID_LIST's flexible
-    # trailing array (ctypes has no flexible array member); we only ever
-    # read the NumberOfAssignedProcesses header field, so a generous cap is
-    # enough -- no realistic agent process tree needs more.
+    # trailing array (ctypes has no flexible array member). A job with more
+    # processes fails the query, so a generous cap is enough -- no realistic
+    # agent process tree needs more.
     _BG_JOB_PID_CAP = 64
 
     class _JOBOBJECT_BASIC_PROCESS_ID_LIST(ctypes.Structure):
@@ -467,6 +481,7 @@ if sys.platform == "win32":
     _JobObjectExtendedLimitInformation = 9
     _JobObjectBasicProcessIdList = 3
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x0800
     _PROCESS_SET_QUOTA = 0x0100
     _PROCESS_TERMINATE = 0x0001
     _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -500,7 +515,19 @@ if sys.platform == "win32":
 
 
 class WinJob:
-    """One Job Object per worker: tree kill + crash-safe reaping."""
+    """One Job Object per worker: tree kill + crash-safe reaping.
+
+    A process the agent starts with CREATE_BREAKAWAY_FROM_JOB leaves the job
+    (BREAKAWAY_OK); every other descendant stays and dies with it. Only a
+    program meant to outlive whoever launched it asks for that: Codex's
+    app-server daemon and its updater, which every Codex client on the
+    account shares. Without the flag Windows does not refuse the request when
+    the asker sits in a nested job that allows breakaway, and node puts every
+    child it spawns in one. It quietly keeps the process here instead, so
+    closing whichever agent started the daemon killed it for everyone
+    (measured: the daemon and updater stayed in this job, and a plain child
+    of the same parent still stays with the flag set). SILENT_BREAKAWAY_OK
+    stays off: it would let every child out."""
 
     def __init__(self):
         self._handle = None
@@ -511,7 +538,8 @@ class WinJob:
         if not handle:
             return
         info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        info.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK)
         ok = _k32.SetInformationJobObject(
             handle, _JobObjectExtendedLimitInformation,
             ctypes.byref(info), ctypes.sizeof(info))
@@ -542,32 +570,14 @@ class WinJob:
             return False
         return bool(_k32.TerminateJobObject(self._handle, exit_code))
 
-    def process_count(self) -> int:
-        """Best-effort count of processes currently alive in this job (the
-        agent itself plus any descendant it spawned) -- used to notice a
-        still-running background command even once the agent has gone
-        quiet. Returns 0 on any failure (no handle, unsupported, query
-        error), same as every other WinJob method never raising; callers
-        must treat 0 as "unknown," not "empty.\""""
-        if not self._handle:
-            return 0
-        info = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
-        needed = wintypes.DWORD(0)
-        ok = _k32.QueryInformationJobObject(
-            self._handle, _JobObjectBasicProcessIdList, ctypes.byref(info),
-            ctypes.sizeof(info), ctypes.byref(needed))
-        if not ok:
-            return 0
-        return int(info.NumberOfAssignedProcesses)
-
     def process_ids(self) -> list[int]:
-        """Best-effort list of process ids currently alive in this job --
-        the identity-carrying sibling of process_count(), used to tell WHICH
-        extra processes to kill (see TerminalAgent.kill_bg_shell_extras)
-        rather than just how many there are. Same contract as
-        process_count(): an empty list on any failure means "unknown," not
-        "empty." Capped at _BG_JOB_PID_CAP like the query buffer itself; no
-        realistic agent process tree needs more."""
+        """Best-effort list of process ids currently alive in this job (the
+        agent itself plus any descendant it spawned). TerminalAgent's gear
+        badge counts them to notice a background command still running once
+        the agent has gone quiet, and its kill menu tells WHICH ones are
+        extra. Never raises, like every other WinJob method: an empty list
+        on any failure (no handle, unsupported, query error, more than
+        _BG_JOB_PID_CAP processes) means "unknown," not "empty."""
         if not self._handle:
             return []
         info = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
@@ -596,27 +606,97 @@ def _taskkill_tree(pid: int) -> None:
         pass
 
 
+def process_image_path(pid: int) -> str:
+    """Full path of a live process's executable, or "" when it can't be read
+    (already exited, access denied, non-Windows)."""
+    if sys.platform != "win32" or not pid:
+        return ""
+    handle = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False,
+                              int(pid))
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(32768)
+        ok = _k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+        return buf.value if ok else ""
+    finally:
+        _k32.CloseHandle(handle)
+
+
 def describe_pid(pid: int) -> str:
     """Best-effort short label for a pid -- its executable's base name (e.g.
     "java.exe", "adb.exe") -- so a human picking one process out of the kill
     menu can tell them apart. Purely cosmetic: nothing here feeds a kill
     decision. Falls back to a bare "pid N" if the process can't be queried
     (already exited, access denied, non-Windows)."""
-    if sys.platform != "win32" or not pid:
-        return f"pid {pid}"
-    handle = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False,
-                              int(pid))
-    if not handle:
-        return f"pid {pid}"
-    try:
-        buf = ctypes.create_unicode_buffer(260)
-        size = wintypes.DWORD(260)
-        ok = _k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
-        if not ok or not buf.value:
-            return f"pid {pid}"
-        return buf.value.rsplit("\\", 1)[-1]
-    finally:
-        _k32.CloseHandle(handle)
+    path = process_image_path(pid)
+    return path.rsplit("\\", 1)[-1] if path else f"pid {pid}"
+
+
+# Console hosts. Windows starts one for every console program launched
+# without a console of its own, and it exits with its last client, so it is
+# never the work itself: the client next to it is what counts.
+_CONSOLE_HOSTS = ("conhost.exe", "openconsole.exe")
+
+
+def _codex_tooling_dirs() -> list[str]:
+    """Where Codex keeps the programs it runs for itself. Measured on Codex
+    0.162: the TUI starts a shared app-server daemon and its updater from
+    `~\\.codex\\packages`, the daemon starts the desktop app's MCP servers
+    and plugin runtimes from `%LOCALAPPDATA%\\OpenAI\\Codex\\runtimes`, and
+    the bundled plugins carry their own python under
+    `~\\.cache\\codex-runtimes`."""
+    home = os.path.expanduser("~")
+    local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData",
+                                                           "Local")
+    return [os.environ.get("CODEX_HOME") or os.path.join(home, ".codex"),
+            os.path.join(local, "OpenAI", "Codex"),
+            os.path.join(home, ".cache", "codex-runtimes")]
+
+
+def _in_npm_codex_package(parts: list[str]) -> bool:
+    """True for a path inside npm's Codex package, under any npm prefix:
+    `node_modules\\@openai\\codex` and the platform package it carries,
+    `codex-win32-x64`, which holds the TUI and its own rg, sandbox runner
+    and code-mode host. `.codex-<hash>` is npm's staging copy during an
+    update. `parts` is the normcased path split on separators."""
+    for i in range(len(parts) - 2):
+        if parts[i] == "node_modules" and parts[i + 1] == "@openai":
+            pkg = parts[i + 2].lstrip(".")
+            if pkg == "codex" or pkg.startswith("codex-"):
+                return True
+    return False
+
+
+def is_cli_tooling(image_path: str) -> bool:
+    """True when `image_path` is a program an AI CLI runs for ITSELF, never
+    a command it was asked to run: a console host, or anything installed
+    where Codex keeps its own programs (_codex_tooling_dirs and npm's Codex
+    package). Location, never the name alone: a codex.exe someone built
+    from source and started on purpose is work like any other.
+
+    The gear badge (TerminalAgent.poll_bg_shell) leaves these out of its
+    count. Codex starts them seconds after launch, later still on a cold
+    boot, and keeps them for the whole session, so a launch-time baseline
+    could not absorb them: an idle Codex agent showed the gear forever
+    (live report: count=10 baseline=4, the daemon, its updater, two
+    node_repl MCP servers and their console hosts). A real background
+    command still counts, even a nested `codex` from the agent's own npm
+    install, because it runs under a shell or npm's node shim, and neither
+    is tooling: the shim (codex.js) waits for codex.exe and exits with its
+    exit code, so it lives exactly as long as the command. An unreadable
+    path ("") is not tooling, so a failed query can only show the gear,
+    never hide one."""
+    if not image_path:
+        return False
+    path = os.path.normcase(os.path.normpath(
+        image_path.removeprefix("\\\\?\\")))
+    parts = path.split(os.sep)
+    if parts[-1] in _CONSOLE_HOSTS or _in_npm_codex_package(parts):
+        return True
+    return any(path.startswith(os.path.normcase(os.path.normpath(d)) + os.sep)
+               for d in _codex_tooling_dirs())
 
 
 _ctrl_c_handler_installed = False
@@ -864,9 +944,6 @@ class ProcessWorker(QObject):
 
     def process(self) -> QProcess | None:
         return self._proc
-
-    def job_process_count(self) -> int:
-        return self._job.process_count() if self._job else 0
 
     def job_process_ids(self) -> list[int]:
         return self._job.process_ids() if self._job else []

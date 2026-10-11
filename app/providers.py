@@ -13,6 +13,7 @@ and headless tests can use it without a GUI.
 
 import json
 import os
+import re
 import shlex
 import shutil
 from dataclasses import dataclass, field
@@ -368,6 +369,91 @@ def resolve_program(key: str) -> str:
         if os.path.isfile(path):
             return path
     return p.base_cmd or p.exe_names[0]
+
+
+# Codex 0.156 began running every interactive session inside one shared
+# app-server daemon per Windows user, and added `--no-daemon` with it.
+CODEX_NO_DAEMON_SINCE = (0, 156, 0)
+_CODEX_PKG_RE = re.compile(r"@openai[\\/]codex[\\/]", re.IGNORECASE)
+_CODEX_SHIM_MAX_BYTES = 64 * 1024
+_SHIM_DIR_VARS = ("%~dp0", "%dp0%", "${basedir}", "$basedir", "$PSScriptRoot")
+
+
+def codex_version(program: str) -> tuple:
+    """(major, minor, patch) of the Codex CLI `program` launches, or () when
+    that can't be told without running it.
+
+    Read from the npm package's package.json, never by starting the CLI: a
+    launch shouldn't wait on node, and the smoke suite must never start a real
+    AI CLI. `program` is what resolve_program found, usually a shim. npm's own
+    names the package relative to itself (`%dp0%\\node_modules\\@openai\\...`);
+    a hand-written one can name it by absolute path (measured: the reporting
+    machine's `~\\.local\\bin\\codex.cmd`). A standalone codex.exe has no
+    package.json and reads as unknown."""
+    if program and not os.path.isabs(program):
+        # a bare name (resolve_program's fallback) launches through this
+        # same PATH lookup, so read the file the launch would find
+        program = shutil.which(program) or ""
+    if not program or not os.path.isfile(program):
+        return ()
+    for pkg in _codex_package_dirs(program):
+        try:
+            with open(os.path.join(pkg, "package.json"), encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(meta, dict) or meta.get("name") != "@openai/codex":
+            continue
+        found = re.match(r"(\d+)\.(\d+)\.(\d+)", str(meta.get("version", "")))
+        if found:
+            return tuple(int(n) for n in found.groups())
+    return ()
+
+
+def codex_has_no_daemon(program: str) -> bool:
+    """Does the Codex CLI at `program` accept --no-daemon? False when unknown,
+    since an older Codex refuses to start on a flag it doesn't know."""
+    return codex_version(program) >= CODEX_NO_DAEMON_SINCE
+
+
+def _codex_package_dirs(program: str) -> list:
+    """Folders that may hold the @openai/codex package `program` runs."""
+    path = os.path.normpath(program)
+    here = os.path.dirname(path)
+    dirs = []
+    # `program` inside the package itself, e.g. its bin\codex.js or the
+    # vendor codex.exe of the platform package nested in it
+    up = here
+    while os.path.dirname(up) != up:
+        if (os.path.basename(up).lower() == "codex"
+                and os.path.basename(os.path.dirname(up)).lower() == "@openai"):
+            dirs.append(up)
+        up = os.path.dirname(up)
+    dirs.append(os.path.join(here, "node_modules", "@openai", "codex"))
+    if os.path.splitext(path)[1].lower() in ("", ".cmd", ".bat", ".ps1"):
+        try:
+            if os.path.getsize(path) <= _CODEX_SHIM_MAX_BYTES:
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            else:
+                text = ""
+        except OSError:
+            text = ""
+        # a path with spaces is quoted in any shim that works, so a quoted
+        # string or else a bare word is the whole path
+        for m in re.finditer(r'"([^"\r\n]*)"|\'([^\'\r\n]*)\'|(\S+)', text):
+            token = next(g for g in m.groups() if g is not None)
+            hit = _CODEX_PKG_RE.search(token)
+            if not hit:
+                continue
+            prefix = token[:hit.start()]
+            for var in _SHIM_DIR_VARS:
+                prefix = prefix.replace(var, here + os.sep)
+            prefix = os.path.expandvars(prefix)
+            if os.path.isabs(prefix):
+                dirs.append(os.path.normpath(
+                    os.path.join(prefix, "@openai", "codex")))
+    return dirs
 
 
 def detected(key: str) -> bool:
