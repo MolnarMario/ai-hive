@@ -2547,3 +2547,92 @@ def test_limit_echo_after_torn_banner():
     check("limit-torn: exactly one, with its audit line",
           cleared == 1 and any("UNCORROBORATED" in x for x in audits), audits)
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_limit_menu_quoted_in_prose():
+    """2026-10-12: the integrator's hourglass came up on its own reply.
+
+    Its summary said the sweep "never clears a latch while the old \"Stop and
+    wait for limit to reset\" menu is on screen". The menu pattern matched
+    those words anywhere in the 40-line scrape, so the agent latched with no
+    banner, dated four days out from the account reading, and the menu guard
+    in `_clear_carried_on_latches` then kept the latch because the "menu" was
+    still in view. The menu only counts as its own numbered option row."""
+    import time as _time
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from app import limit_banner
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.widgets.main_window import LIMIT_UNCORROBORATED_S, MainWindow
+
+    QApplication.instance() or QApplication([])
+    PROSE = ("- It never clears a latch while the old \"Stop and wait for "
+             "limit to reset\" menu is on screen.\n")
+    SOURCE = ('263:            "> 1. Stop and wait for limit to reset\n"\n')
+    MENUS = ("> 1. Stop and wait for limit to reset\n",
+             "  1. Stop and wait for limit to reset\n",
+             "\u276f 1.Stopandwaitforlimittoreset\n",
+             "\u2502 \u276f 1. Stop and wait for limit to reset \u2502\n",
+             "❱ 1. Stop and wait for limit to reset\n",
+             # a row repainted by a cursor move, glued to the row before it
+             # once the escapes were stripped
+             "Waiting❯ 1. Stop and wait for limit to reset\n")
+
+    def mk(name):
+        a = TerminalAgent(build_spec(AgentKind.CLAUDE, name,
+                                     cwd=SCRATCH_CWD))
+        a._prompt_ready = True
+        a.status = AgentStatus.RUNNING
+        return a
+
+    for text, what in ((PROSE, "prose quoting the menu"),
+                       (SOURCE, "a source listing of a menu fixture")):
+        a = mk("Prose")
+        a._screen_tail = "I shipped it.\n" + text + "\n  ? for shortcuts\n"
+        a._scrape_limit()
+        check(f"limit-menu: {what} does not latch", not a.is_limit_blocked())
+        check(f"limit-menu: ...and does not read as the menu on screen",
+              not a.limit_menu_visible())
+        a.dispose()
+    check("limit-menu: every real rendering still reads as the menu",
+          all(limit_banner.LIMIT_MENU_RE.search(m) for m in MENUS),
+          [m for m in MENUS if not limit_banner.LIMIT_MENU_RE.search(m)])
+    real = mk("Parked")
+    real._screen_tail = "What do you want to do?\n" + MENUS[0] + \
+        "  2. Upgrade your plan\n"
+    real._scrape_limit()
+    check("limit-menu: the real menu still latches", real.is_limit_blocked())
+    real.dispose()
+
+    # a latch already standing on such a screen: the 10-minute sweep must not
+    # take the quoted words for a menu that keeps it
+    stuck = mk("Quoted")
+    stuck.spec.session_id = "sid-limit-menu-quoted"
+    from app import transcripts
+    path = transcripts.transcript_path(SCRATCH_CWD, stuck.spec.session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    import json as _json
+    with open(path, "w", encoding="utf-8") as fh:
+        at = _time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
+                            _time.gmtime(_time.time() - 3600))
+        for rec in ({"type": "user", "timestamp": at,
+                     "message": {"role": "user", "content": "ship it"}},
+                    {"type": "assistant", "timestamp": at,
+                     "message": {"content": [{"type": "text",
+                                              "text": "Shipped."}]}}):
+            fh.write(_json.dumps(_as_cli_wrote(rec)) + "\n")
+    stuck.mark_limit_blocked(_time.time() + 4 * 86400, from_startup=False,
+                             banner="")
+    stuck._limit_at = _time.time() - LIMIT_UNCORROBORATED_S - 60
+    stuck._screen_tail = PROSE
+    audits = []
+    stub = SimpleNamespace(
+        manager=SimpleNamespace(all_agents=lambda: [stuck]),
+        _resume_pending=set(), _limit_audit=audits.append,
+        _ledger_outcome=lambda ag, o, detail="": None)
+    MainWindow._clear_carried_on_latches(stub)
+    check("limit-menu: the sweep clears a latch whose screen only quotes "
+          "the menu", not stuck.is_limit_blocked(), audits)
+    stuck.dispose()
+    os.remove(path)
