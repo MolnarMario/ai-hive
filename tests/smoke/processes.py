@@ -848,6 +848,288 @@ def test_cli_tooling_real_process():
         job.close()
 
 
+# Run inside a WinJob. Spawns one plain child and one that asks to break away,
+# then joins a job of its own the way node's libuv puts every child it spawns
+# in one (breakaway allowed, silently for children that don't ask) and spawns
+# the same pair again: that is where the Codex TUI starts its daemon from.
+_BREAKAWAY_CHILD = r'''
+import ctypes, subprocess, sys
+from ctypes import wintypes
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.CreateJobObjectW.restype = wintypes.HANDLE
+k32.GetCurrentProcess.restype = wintypes.HANDLE
+k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                        ctypes.c_void_p, wintypes.DWORD]
+k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+
+class Limits(ctypes.Structure):
+    _fields_ = [("times", wintypes.LARGE_INTEGER * 2),
+                ("LimitFlags", wintypes.DWORD),
+                ("working_set", ctypes.c_size_t * 2),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("classes", wintypes.DWORD * 2),
+                ("io", ctypes.c_ulonglong * 6),
+                ("memory", ctypes.c_size_t * 4)]
+
+def spawn(flags):
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                            creationflags=0x08000000 | flags).pid
+
+BREAKAWAY = 0x01000000
+sys.stdin.readline()
+pids = [spawn(0), spawn(BREAKAWAY)]
+libuv = k32.CreateJobObjectW(None, None)
+info = Limits(LimitFlags=0x2000 | 0x0800 | 0x1000)
+assert k32.SetInformationJobObject(libuv, 9, ctypes.byref(info),
+                                   ctypes.sizeof(info))
+assert k32.AssignProcessToJobObject(libuv, k32.GetCurrentProcess())
+pids += [spawn(0), spawn(BREAKAWAY)]
+print(*pids, flush=True)
+sys.stdin.readline()
+'''
+
+
+def test_winjob_breakaway_only_on_request():
+    """A child that asks to break away leaves the agent's job, and every
+    other child stays and dies with it. Codex starts its shared app-server
+    daemon that way from a TUI that node put in a nested job. Before
+    BREAKAWAY_OK, Windows kept the daemon in the agent's job without failing
+    the launch, and closing that one agent killed the daemon every Codex
+    client was using. Real processes, since the flags only matter to the
+    kernel."""
+    if sys.platform != "win32":
+        skip('winjob breakaway', 'non-Windows: job objects are Windows-only')
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    from app.process_worker import CREATE_NO_WINDOW, WinJob
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+
+    def alive(pid):
+        h = k32.OpenProcess(0x00100000 | 0x0001, False, pid)  # SYNCHRONIZE|TERMINATE
+        if not h:
+            return False
+        try:
+            return k32.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT
+        finally:
+            k32.CloseHandle(h)
+
+    def kill(pid):
+        h = k32.OpenProcess(0x0001, False, pid)
+        if h:
+            k32.TerminateProcess(h, 1)
+            k32.CloseHandle(h)
+
+    script = Path(tempfile.mkdtemp()) / "breakaway_child.py"
+    script.write_text(_BREAKAWAY_CHILD, encoding="utf-8")
+    job = WinJob()
+    parent = subprocess.Popen([sys.executable, str(script)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              text=True, creationflags=CREATE_NO_WINDOW)
+    pids = []
+    try:
+        check("winjob breakaway: the parent joins the job",
+              job.assign(parent.pid))
+        parent.stdin.write("go\n")
+        parent.stdin.flush()
+        pids = [int(p) for p in parent.stdout.readline().split()]
+        check("winjob breakaway: the parent started its four children",
+              len(pids) == 4, pids)
+        if len(pids) != 4:
+            return
+        plain, asked, plain_nested, asked_nested = pids
+        ids = set(job.process_ids())
+        check("winjob breakaway: a plain child stays in the job",
+              plain in ids, (plain, sorted(ids)))
+        check("winjob breakaway: a child that asks to break away leaves it",
+              asked not in ids, (asked, sorted(ids)))
+        check("winjob breakaway: under a node-style nested job a plain "
+              "child still stays", plain_nested in ids,
+              (plain_nested, sorted(ids)))
+        check("winjob breakaway: and one that asks leaves, like Codex's "
+              "daemon", asked_nested not in ids, (asked_nested, sorted(ids)))
+        job.terminate_tree()
+        deadline = time.monotonic() + 5
+        while (alive(plain) or alive(plain_nested)) \
+                and time.monotonic() < deadline:
+            time.sleep(0.05)
+        check("winjob breakaway: the tree kill takes the plain children",
+              not alive(plain) and not alive(plain_nested))
+        check("winjob breakaway: and leaves the ones that broke away running",
+              alive(asked) and alive(asked_nested))
+    finally:
+        job.terminate_tree()
+        job.close()
+        for pid in pids:
+            kill(pid)
+        try:
+            parent.wait(timeout=5)
+        except Exception:
+            parent.kill()
+
+
+_NPM_CMD_SHIM = r'''@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
+'''
+
+
+def _codex_package(root, version, name="@openai/codex"):
+    pkg = Path(root, "node_modules", "@openai", "codex")
+    (pkg / "bin").mkdir(parents=True, exist_ok=True)
+    (pkg / "bin" / "codex.js").write_text("", encoding="utf-8")
+    (pkg / "package.json").write_text(
+        '{"name": "%s", "version": "%s"}' % (name, version), encoding="utf-8")
+    return pkg
+
+
+def test_codex_version_from_shims():
+    """codex_version() reads the version from the npm package a shim runs,
+    without starting the CLI, through every shim layout seen in the wild.
+    An unknown version must read as (), so AI Hive never passes
+    --no-daemon to a Codex that would refuse to start on it."""
+    from app import providers
+
+    base = Path(tempfile.mkdtemp(), "with space")
+    npm = base / "npm"
+    _codex_package(npm, "0.162.1")
+    shim = npm / "codex.cmd"
+    shim.write_text(_NPM_CMD_SHIM, encoding="utf-8")
+    check("codex version: npm's own cmd shim",
+          providers.codex_version(str(shim)) == (0, 162, 1),
+          providers.codex_version(str(shim)))
+    check("codex version: 0.162 takes --no-daemon",
+          providers.codex_has_no_daemon(str(shim)))
+
+    local_bin = base / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    hand = local_bin / "codex.CMD"
+    hand.write_text('@ECHO off\nnode "%s" %%*\n'
+                    % (npm / "node_modules/@openai/codex/bin/codex.js"),
+                    encoding="utf-8")
+    check("codex version: a hand-written shim naming the package by "
+          "absolute path", providers.codex_version(str(hand)) == (0, 162, 1),
+          providers.codex_version(str(hand)))
+
+    pnpm = base / "pnpm"
+    _codex_package(pnpm / "global" / "5", "0.158.0")
+    ps1 = pnpm / "codex.ps1"
+    ps1.write_text('#!/usr/bin/env pwsh\n$basedir=Split-Path '
+                   '$MyInvocation.MyCommand.Definition -Parent\n'
+                   '& "$basedir/node$exe"  "$basedir/global/5/node_modules/'
+                   '@openai/codex/bin/codex.js" $args\n', encoding="utf-8")
+    check("codex version: a ps1 shim relative to $basedir",
+          providers.codex_version(str(ps1)) == (0, 158, 0),
+          providers.codex_version(str(ps1)))
+
+    appdata_pkg = _codex_package(Path(os.environ["APPDATA"], "npm"), "0.160.1")
+    env_shim = base / "envshim" / "codex.cmd"
+    env_shim.parent.mkdir()
+    env_shim.write_text('@node "%APPDATA%\\npm\\node_modules\\@openai\\codex'
+                        '\\bin\\codex.js" %*\n', encoding="utf-8")
+    check("codex version: a shim that names the package through %APPDATA%",
+          providers.codex_version(str(env_shim)) == (0, 160, 1),
+          providers.codex_version(str(env_shim)))
+    shutil.rmtree(appdata_pkg.parent.parent)
+
+    vendor = (npm / "node_modules" / "@openai" / "codex" / "node_modules"
+              / "@openai" / "codex-win32-x64" / "vendor" / "bin" / "codex.exe")
+    vendor.parent.mkdir(parents=True)
+    vendor.write_bytes(b"")
+    check("codex version: the vendor codex.exe inside the package",
+          providers.codex_version(str(vendor)) == (0, 162, 1),
+          providers.codex_version(str(vendor)))
+
+    old = base / "old"
+    _codex_package(old, "0.155.2")
+    (old / "codex.cmd").write_text(_NPM_CMD_SHIM, encoding="utf-8")
+    check("codex version: 0.155 has no --no-daemon",
+          providers.codex_version(str(old / "codex.cmd")) == (0, 155, 2)
+          and not providers.codex_has_no_daemon(str(old / "codex.cmd")))
+
+    alone = base / "standalone" / "codex.exe"
+    alone.parent.mkdir()
+    alone.write_bytes(b"")
+    other = base / "other"
+    _codex_package(other, "9.9.9", name="codex-lookalike")
+    (other / "codex.cmd").write_text(_NPM_CMD_SHIM, encoding="utf-8")
+    for label, program in (
+            ("a standalone codex.exe", str(alone)),
+            ("a package that isn't @openai/codex", str(other / "codex.cmd")),
+            ("a bare name the PATH lookup didn't resolve", "codex"),
+            ("a shim that no longer exists", str(base / "gone.cmd")),
+            ("nothing at all", "")):
+        check(f"codex version: {label} reads as unknown",
+              providers.codex_version(program) == ()
+              and not providers.codex_has_no_daemon(program),
+              providers.codex_version(program))
+
+
+def test_codex_launches_without_daemon():
+    """A Codex agent launches with --no-daemon when its Codex knows the flag,
+    so the session's server, and every command it runs, stays inside the
+    agent's Job Object instead of in the daemon all Codex clients share."""
+    from app.process_worker import AgentKind, build_spec
+
+    base = Path(tempfile.mkdtemp())
+    new, old = base / "new", base / "old"
+    _codex_package(new, "0.162.1")
+    _codex_package(old, "0.155.2")
+    for d in (new, old):
+        (d / "codex.cmd").write_text(_NPM_CMD_SHIM, encoding="utf-8")
+
+    def spec_for(root, **kw):
+        spec = build_spec(AgentKind.OPENAI, "Codex", cwd=SCRATCH_CWD, **kw)
+        if not kw.get("custom_command"):
+            spec.program = str(root / "codex.cmd")
+        return spec
+
+    spec = spec_for(new, model="gpt-5.6")
+    check("codex launch: --no-daemon leads the arguments",
+          spec.effective_args() == ["--no-daemon", "--model", "gpt-5.6"],
+          spec.effective_args())
+    spec.resume, spec.session_id = True, "019a-thread"
+    check("codex launch: a resume keeps it before the subcommand",
+          spec.effective_args() == ["--no-daemon", "--model", "gpt-5.6",
+                                    "resume", "019a-thread"],
+          spec.effective_args())
+    check("codex launch: an older Codex gets no flag it can't parse",
+          "--no-daemon" not in spec_for(old).effective_args(),
+          spec_for(old).effective_args())
+    custom = spec_for(new, custom_command='"%s" --search' % (new / "codex.cmd"))
+    check("codex launch: a custom command stays exactly as typed",
+          custom.effective_args() == ["--search"], custom.effective_args())
+    remote = spec_for(new, args=["--remote", "ws://127.0.0.1:4500"])
+    check("codex launch: --remote, which Codex refuses with --no-daemon, "
+          "gets no flag", "--no-daemon" not in remote.effective_args(),
+          remote.effective_args())
+    twice = spec_for(new, args=["--no-daemon"])
+    check("codex launch: a user's own --no-daemon isn't doubled",
+          twice.effective_args().count("--no-daemon") == 1,
+          twice.effective_args())
+
+
 def test_pty():
     """ConPTY backend through the real card + TerminalView widget."""
     from PySide6.QtCore import QEventLoop, QTimer

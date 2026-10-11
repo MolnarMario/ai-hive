@@ -13,7 +13,8 @@ this module encodes, all empirically verified on the target machine:
 - QProcess.terminate() is WM_CLOSE — console apps ignore it. Graceful stop
   is stdin EOF (closeWriteChannel); the hard stop is a Job Object tree
   kill, which also reaps grandchildren (`ping -t` etc.) and — thanks to
-  KILL_ON_JOB_CLOSE — everything else if this GUI process dies.
+  KILL_ON_JOB_CLOSE — everything else if this GUI process dies. The one way
+  out is a process that explicitly asks to break away (see WinJob).
 """
 
 import codecs
@@ -209,11 +210,24 @@ class AgentSpec:
             # board wiring — like Gemini it's an interactive agent only.
             if self.resume:
                 args += ["--continue"]
-        elif self.provider == "openai" and self.resume and self.session_id:
-            # Codex persists threads itself. `codex resume <id>` reopens this
-            # terminal's exact conversation instead of starting an empty one
-            # or relying on a folder-wide "most recent" choice.
-            args += ["resume", self.session_id]
+        elif self.provider == "openai":
+            # Codex 0.156+ otherwise runs the session in one app-server daemon
+            # that every Codex client of this Windows user shares. The commands
+            # Codex runs are then the daemon's children, outside this agent's
+            # Job Object: the gear can't see them and Close's tree kill can't
+            # reach them. --no-daemon keeps the server inside this codex. A
+            # custom command is the user's own invocation and stays as typed,
+            # and Codex refuses --no-daemon together with --remote.
+            if (not self.custom_command
+                    and not any(a == "--no-daemon" or a.startswith("--remote")
+                                for a in args)
+                    and providers.codex_has_no_daemon(self.program)):
+                args.insert(0, "--no-daemon")
+            if self.resume and self.session_id:
+                # Codex persists threads itself. `codex resume <id>` reopens
+                # this terminal's exact conversation instead of starting an
+                # empty one or relying on a folder-wide "most recent" choice.
+                args += ["resume", self.session_id]
         return args
 
     def to_dict(self) -> dict:
@@ -467,6 +481,7 @@ if sys.platform == "win32":
     _JobObjectExtendedLimitInformation = 9
     _JobObjectBasicProcessIdList = 3
     _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x0800
     _PROCESS_SET_QUOTA = 0x0100
     _PROCESS_TERMINATE = 0x0001
     _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -500,7 +515,19 @@ if sys.platform == "win32":
 
 
 class WinJob:
-    """One Job Object per worker: tree kill + crash-safe reaping."""
+    """One Job Object per worker: tree kill + crash-safe reaping.
+
+    A process the agent starts with CREATE_BREAKAWAY_FROM_JOB leaves the job
+    (BREAKAWAY_OK); every other descendant stays and dies with it. Only a
+    program meant to outlive whoever launched it asks for that: Codex's
+    app-server daemon and its updater, which every Codex client on the
+    account shares. Without the flag Windows does not refuse the request when
+    the asker sits in a nested job that allows breakaway, and node puts every
+    child it spawns in one. It quietly keeps the process here instead, so
+    closing whichever agent started the daemon killed it for everyone
+    (measured: the daemon and updater stayed in this job, and a plain child
+    of the same parent still stays with the flag set). SILENT_BREAKAWAY_OK
+    stays off: it would let every child out."""
 
     def __init__(self):
         self._handle = None
@@ -511,7 +538,8 @@ class WinJob:
         if not handle:
             return
         info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        info.BasicLimitInformation.LimitFlags = (
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK)
         ok = _k32.SetInformationJobObject(
             handle, _JobObjectExtendedLimitInformation,
             ctypes.byref(info), ctypes.sizeof(info))
