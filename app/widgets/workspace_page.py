@@ -543,6 +543,13 @@ class WorkspacePage(QWidget):
     def card_for(self, agent_id: str) -> TerminalCard | None:
         return next((c for c in self.cards if c.agent.id == agent_id), None)
 
+    def lead_card(self) -> TerminalCard | None:
+        """The top-left card (both tilings fill row by row from cards[0]), or
+        the maximized card while one is soloed, since it's the only one shown."""
+        if self._solo_card is not None and self._solo_card in self.cards:
+            return self._solo_card
+        return self.cards[0] if self.cards else None
+
     def running_count(self) -> int:
         return sum(1 for c in self.cards if c.agent.is_running())
 
