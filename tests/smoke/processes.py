@@ -768,6 +768,24 @@ def test_bg_shell_ignores_cli_tooling():
               and 240 not in keeps[-1], keeps)
         check("bg shell tooling: kill-all kills only the command",
               killed == [240], killed)
+
+        # a nested `codex` the agent ran in the background, from its own
+        # npm install: codex.exe is tooling by location, but npm's node
+        # shim waits for it and still counts
+        pids[:] = [p for p in pids if p not in (240, 244)]
+        images[248] = images[204]                  # the shim's node.exe
+        images[252] = images[208]                  # the same npm codex.exe
+        pids.extend([248, 252])
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell tooling: a nested codex run from the agent's own "
+              "npm install lights the gear through its node shim",
+              agent.is_bg_shell_busy())
+        check("bg shell tooling: the menu offers the shim, whose tree kill "
+              "takes the nested codex with it",
+              agent.bg_shell_extra_pids() == [248],
+              agent.bg_shell_extra_pids())
     finally:
         terminal_agent_mod.time.time = orig_time
         agent.worker.job_process_ids = orig_ids

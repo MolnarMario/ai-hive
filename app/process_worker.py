@@ -654,10 +654,12 @@ def is_cli_tooling(image_path: str) -> bool:
     could not absorb them: an idle Codex agent showed the gear forever
     (live report: count=10 baseline=4, the daemon, its updater, two
     node_repl MCP servers and their console hosts). A real background
-    command still counts, even a nested `codex`, because it runs under a
-    shell or npm's node shim, and neither is tooling. An unreadable path
-    ("") is not tooling, so a failed query can only show the gear, never
-    hide one."""
+    command still counts, even a nested `codex` from the agent's own npm
+    install, because it runs under a shell or npm's node shim, and neither
+    is tooling: the shim (codex.js) waits for codex.exe and exits with its
+    exit code, so it lives exactly as long as the command. An unreadable
+    path ("") is not tooling, so a failed query can only show the gear,
+    never hide one."""
     if not image_path:
         return False
     path = os.path.normcase(os.path.normpath(
