@@ -451,10 +451,32 @@ def test_live_model_effort():
     narrow = card.task_summary.text()
     check("summary: re-fits when the card narrows",
           len(narrow) < len(shown), (len(narrow), len(shown)))
+    check("summary: a header with room shows text, not the clipboard",
+          not card.task_summary.icon_mode())
+    # squeeze only the label: that is what an over-full header does to it
+    ts = card.task_summary
+    ts.setMinimumWidth(0)
+    ts.setFixedWidth(30)
+    pump(40)
+    check("summary: room for only an ellipsis becomes the clipboard icon",
+          ts.icon_mode() and ts.text() == "", (ts.icon_mode(), ts.text()))
+    check("summary: the icon keeps the full text for its hover",
+          ts.toolTip() == long_task)
+    ts.setMinimumWidth(0)
+    ts.setMaximumWidth(16777215)
+    ts.setFixedWidth(260)
+    pump(40)
+    check("summary: widening past a few characters brings the text back",
+          not ts.icon_mode() and len(ts.text()) > 6, (ts.icon_mode(), ts.text()))
+    ts.setMinimumWidth(0)
+    ts.setMaximumWidth(16777215)
     a.set_task("")
     pump(40)
     check("summary: empty task clears the label",
-          card.task_summary.text() == "")
+          card.task_summary.text() == "" and not card.task_summary.icon_mode())
+    check("header: the close button is square",
+          card.btn_close.width() == card.btn_close.height(),
+          (card.btn_close.width(), card.btn_close.height()))
 
     card.detach(); card2.detach()
     card.close(); card2.close()
@@ -831,9 +853,12 @@ def test_app():
           and not tok_card.btn_font_inc.isVisible()
           and not tok_card.btn_max.isVisible()
           and tools.hint.isVisibleTo(tools))
+    tail = tok_card.btn_close.parentWidget()
     check("header tools: usage chip and close sit right of the strip",
-          hlay.indexOf(tools) < hlay.indexOf(tok_card.token_label)
-          < hlay.indexOf(tok_card.btn_close))
+          tail is tok_card.token_label.parentWidget()
+          and hlay.indexOf(tools) < hlay.indexOf(tail)
+          and tail.layout().indexOf(tok_card.token_label)
+          < tail.layout().indexOf(tok_card.btn_close))
     collapsed_w = tools.width()
     pos = QPointF(2, 2)
     tools.enterEvent(QEnterEvent(pos, pos, tools.mapToGlobal(pos)))
