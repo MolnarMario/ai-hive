@@ -8,6 +8,24 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.40.0
+
+- Resizing a Claude terminal re-wraps its whole scrollback at the new size,
+  not just the bottom screenful. The reflow waits until the agent is idle.
+- A reply paragraph no longer shows up twice in a Claude card's scrollback
+  after Claude redraws its screen while idle.
+- Closing a Codex agent no longer kills the Codex daemon that your other
+  Codex windows share.
+- Codex's own daemon and MCP servers no longer light the gear badge, and
+  the gear's kill menu no longer offers them.
+- Clicking a workspace in the sidebar or in the event log puts the cursor
+  in its top-left agent (or the maximized one), so you can type right away.
+- The New Agent dialog shows the Full terminal box only for shells, scripts
+  and custom commands. It was a forced, greyed-out tick for AI agents.
+- A task summary squeezed down to a lone ellipsis in a card's header turns
+  into a clipboard icon that shows the whole task on hover. The close button
+  is square and the usage text next to it is larger.
+
 ## 0.39.1
 
 - A Codex card now shows the "?" when Codex asks for approval or asks a
