@@ -2820,6 +2820,11 @@ class MainWindow(QMainWindow):
         # focused terminal; F11 carries no modifier, so no terminal claims it.
         QShortcut(QKeySequence("Ctrl+T"), self, self._on_add_terminal_clicked)
         QShortcut(QKeySequence("F11"), self, self._fullscreen.toggle)
+        # Ctrl+Up / Ctrl+Down maximize and restore the selected agent. They
+        # are the third exception: TerminalView leaves them unclaimed, so a
+        # focused terminal no longer receives Ctrl+Up / Ctrl+Down.
+        QShortcut(QKeySequence("Ctrl+Up"), self, self._maximize_selected_card)
+        QShortcut(QKeySequence("Ctrl+Down"), self, self._restore_card_tiling)
         # the Options switch: after the panel's click has finished, since
         # entering reparents the bar the click came from
         self.top_bar.fullscreenToggled.connect(
@@ -6220,6 +6225,19 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, "_page_border") and self._page_border.isVisible():
             self._page_border.setGeometry(self._central.rect())
+
+    def _maximize_selected_card(self) -> None:
+        """Ctrl+Up: maximize the selected agent of the active workspace."""
+        page = self._pages.get(self.manager.active_id)
+        card = self._focused_card
+        if page is not None and card is not None and card in page.cards:
+            page.maximize_card(card)
+
+    def _restore_card_tiling(self) -> None:
+        """Ctrl+Down: show every agent of the active workspace again."""
+        page = self._pages.get(self.manager.active_id)
+        if page is not None:
+            page.restore_tiling()
 
     def _set_focused_card(self, card: TerminalCard) -> None:
         if card is self._focused_card:
