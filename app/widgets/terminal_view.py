@@ -404,6 +404,9 @@ _TRAILING_PARTIAL_RE = re.compile(
 # whole stream into _esc_carry forever and freeze the screen. Mirrors
 # ansi_parser.MAX_CARRY.
 _MAX_ESC_CARRY = 4096
+# ConPTY opens every frame it paints with a visible cursor by hiding it (see
+# TerminalView._feed_frames)
+_FRAME_START = "\x1b[?25l"
 # DECSET/DECRST private modes (CSI ? Pm h/l). pyte ignores these, but they
 # decide how the wheel must behave (altscreen / mouse tracking / paste mode).
 _PRIVATE_MODE_RE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
@@ -562,6 +565,8 @@ class TerminalView(QWidget):
 
         self.screen = _new_history_screen(cols, rows)
         self.stream = pyte.Stream(self.screen)
+        # the screen as the current ConPTY frame found it (see _feed_frames)
+        self._frame_ref = None
 
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -648,7 +653,7 @@ class TerminalView(QWidget):
         top_before = self.screen.history.top
         pushed_before = getattr(top_before, "pushed", None)
         hist_before = len(top_before)
-        self.stream.feed(data)
+        dropped = self._feed_frames(data)
         # while scrolled back, stay anchored to the CONTENT being read: new
         # lines entering history grow the offset so the view doesn't slide.
         # Use the true push count (not the deque length) so the anchor holds
@@ -668,11 +673,102 @@ class TerminalView(QWidget):
         # history otherwise just grows toward maxlen, evicting from the front
         # without changing len() once saturated. That is the cheapest reliable
         # "the conversation was wiped" edge available from the stream itself.
-        if len(self.screen.history.top) < hist_before:
+        # Rows _feed_frames took back are not a wipe: once history is full,
+        # their pushes evicted as many rows from the front.
+        if len(self.screen.history.top) + dropped < hist_before:
             self._on_history_wiped()
         self._notify_view()
         self.update()
         self._gap_timer.start()
+
+    def _feed_frames(self, data: str) -> int:
+        """Feed pyte, then take back any rows a frame pushed into history
+        while leaving the screen exactly as it found it. Returns how many.
+
+        Claude's classic renderer sometimes redraws its frame from the wrong
+        row. Measured on two saved screens: after the idle "recap" block (4
+        rows) printed, Claude re-sent its terminal queries and redrew 36 rows
+        up from the bottom, 4 rows short of its frame's real top. Its writes
+        ran 4 rows past the bottom, and ConPTY passed that on as a repaint
+        plus 4 newlines on the last row. The screen came out exactly as it
+        was, and the 4 rows that scrolled off were copies of the rows still
+        on screen: a reply paragraph showing up twice in the scrollback. Any
+        terminal fed those bytes shows it; nothing reaches the child to fix.
+
+        The rule that removes them only fires when it can't be wrong. Output
+        written at the cursor and scrolled k rows shifts every row above the
+        cursor up by k. If the screen still ends unchanged, each of those rows
+        equals the row k below it: they repeat every k rows (a run of "y"
+        lines, say). Rows above the cursor that don't repeat can only end
+        unchanged when the frame redrew rows it had already shown, and the k
+        pushed rows are leftovers. Repeating rows stay ambiguous and are left
+        alone, and so is k >= the screen height, where a program reprinting
+        a screen it printed before is real output.
+
+        The check runs per ConPTY frame. ConPTY starts each frame by hiding
+        the cursor, so the stream is cut before every ESC[?25l, and the
+        screen at that cut is kept across feeds for a frame split between
+        two chunks. Each feed's start is a checkpoint too. A replay of the
+        same stream cuts it the same way, so a rebuilt card drops the same
+        rows."""
+        top = self.screen.history.top
+        if not hasattr(top, "pushed"):     # plain deque: no push count to use
+            self.stream.feed(data)
+            return 0
+        dropped = 0
+        for i, part in enumerate(data.split(_FRAME_START)):
+            if i:
+                part = _FRAME_START + part
+                self._frame_ref = self._screen_ref()
+                ref = None                 # same screen as the frame's
+            else:
+                ref = self._screen_ref()
+            self.stream.feed(part)
+            for r in (ref, self._frame_ref):
+                if r is not None:
+                    dropped += self._drop_repeated_push(r)
+        return dropped
+
+    def _screen_ref(self):
+        """The visible rows (as copies), the cursor row and the push count,
+        for _drop_repeated_push to compare against."""
+        scr = self.screen
+        rows = [dict(r) if r else {}
+                for r in map(scr.buffer.get, range(scr.lines))]
+        return (rows, scr.cursor.y, scr.history.top.pushed,
+                (scr.lines, scr.columns))
+
+    def _drop_repeated_push(self, ref) -> int:
+        """Pop the rows pushed since `ref` when the screen still reads as it
+        did then and its rows above the cursor don't repeat every k rows
+        (see _feed_frames)."""
+        rows_then, cursor_then, pushed_then, size = ref
+        scr = self.screen
+        top = scr.history.top
+        k = top.pushed - pushed_then
+        if (k <= 0 or k >= scr.lines or k > len(top)
+                or size != (scr.lines, scr.columns)):
+            return 0
+        cols = scr.columns
+        buf = scr.buffer
+
+        def text(row) -> str:
+            return "".join(row[x].data if x in row else " "
+                           for x in range(cols)).rstrip()
+
+        then = []
+        for y, old in enumerate(rows_then):
+            now = buf[y] if y in buf else {}
+            old_text = text(old)
+            if now != old and text(now) != old_text:
+                return 0
+            then.append(old_text)
+        if all(then[y] == then[y + k] for y in range(cursor_then - k)):
+            return 0
+        for _ in range(k):
+            top.pop()
+        top.pushed -= k
+        return k
 
     def reset(self) -> None:
         """A fresh terminal: blank screen, no scrollback, default modes. For
@@ -687,6 +783,7 @@ class TerminalView(QWidget):
         except Exception:
             pass
         self.stream = pyte.Stream(self.screen)
+        self._frame_ref = None
         self._esc_carry = ""
         self._input_gap_row = None
         self._sel_anchor = self._sel_end = None
@@ -892,6 +989,7 @@ class TerminalView(QWidget):
         self._notify_view(immediate=True)
 
     def _on_history_wiped(self) -> None:
+        self._frame_ref = None
         self._scroll_offset = 0
         self._marks = []
         self._reply_marks = []
