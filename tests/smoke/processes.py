@@ -615,8 +615,16 @@ def test_cli_tooling_classifier():
                 home, ".cache", "codex-runtimes", "codex-primary-runtime",
                 "dependencies", "python", "python.exe"),
             "the npm Codex TUI": (r"C:\Users\u\AppData\Roaming\npm"
-                                  r"\node_modules\@openai\codex\vendor\bin"
+                                  r"\node_modules\@openai\codex"
+                                  r"\node_modules\@openai\codex-win32-x64"
+                                  r"\vendor\x86_64-pc-windows-msvc\bin"
                                   r"\codex.exe"),
+            "npm Codex's rg under another npm prefix": (
+                r"C:\nvm\v24\node_modules\@openai\codex-win32-x64\vendor"
+                r"\x86_64-pc-windows-msvc\codex-path\rg.exe"),
+            "npm's staging copy during a Codex update": (
+                r"C:\npm\node_modules\@openai\.codex-NrqtOZ5d"
+                r"\node_modules\@openai\codex-win32-x64\bin\codex.exe"),
             "the sandbox command runner": os.path.join(
                 home, ".codex", ".sandbox-bin",
                 "codex-command-runner-0.160.1.exe"),
@@ -637,6 +645,10 @@ def test_cli_tooling_classifier():
             "a folder that only starts like .codex": os.path.join(
                 home, ".codexbackup", "node.exe"),
             "a program only named like codex": r"C:\proj\codexify.exe",
+            "a codex.exe built from source": (r"C:\src\codex\codex-rs"
+                                              r"\target\debug\codex.exe"),
+            "another @openai npm package": (r"C:\npm\node_modules\@openai"
+                                            r"\agents\bin\tool.exe"),
             "an unreadable path": "",
         }
         for what, path in work.items():
@@ -685,7 +697,9 @@ def test_bg_shell_ignores_cli_tooling():
     images = {
         200: r"C:\WINDOWS\system32\cmd.exe",       # the codex.CMD shim, root
         204: r"C:\Users\u\AppData\Local\nvm\v24\node.exe",
-        208: r"C:\Users\u\AppData\Roaming\npm\node_modules\codex.exe",
+        208: (r"C:\Users\u\AppData\Roaming\npm\node_modules\@openai\codex"
+              r"\node_modules\@openai\codex-win32-x64\vendor\bin"
+              r"\codex.exe"),                     # the Codex TUI
         212: daemon, 216: daemon,                  # daemon + its updater
         220: os.path.join(cua, "node.exe"), 224: conhost,
         228: os.path.join(cua, "node_repl.exe"),

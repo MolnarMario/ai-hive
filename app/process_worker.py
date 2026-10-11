@@ -627,10 +627,26 @@ def _codex_tooling_dirs() -> list[str]:
             os.path.join(home, ".cache", "codex-runtimes")]
 
 
+def _in_npm_codex_package(parts: list[str]) -> bool:
+    """True for a path inside npm's Codex package, under any npm prefix:
+    `node_modules\\@openai\\codex` and the platform package it carries,
+    `codex-win32-x64`, which holds the TUI and its own rg, sandbox runner
+    and code-mode host. `.codex-<hash>` is npm's staging copy during an
+    update. `parts` is the normcased path split on separators."""
+    for i in range(len(parts) - 2):
+        if parts[i] == "node_modules" and parts[i + 1] == "@openai":
+            pkg = parts[i + 2].lstrip(".")
+            if pkg == "codex" or pkg.startswith("codex-"):
+                return True
+    return False
+
+
 def is_cli_tooling(image_path: str) -> bool:
     """True when `image_path` is a program an AI CLI runs for ITSELF, never
-    a command it was asked to run: a console host, any Codex binary, or
-    anything installed under Codex's own folders (_codex_tooling_dirs).
+    a command it was asked to run: a console host, or anything installed
+    where Codex keeps its own programs (_codex_tooling_dirs and npm's Codex
+    package). Location, never the name alone: a codex.exe someone built
+    from source and started on purpose is work like any other.
 
     The gear badge (TerminalAgent.poll_bg_shell) leaves these out of its
     count. Codex starts them seconds after launch, later still on a cold
@@ -638,19 +654,16 @@ def is_cli_tooling(image_path: str) -> bool:
     could not absorb them: an idle Codex agent showed the gear forever
     (live report: count=10 baseline=4, the daemon, its updater, two
     node_repl MCP servers and their console hosts). A real background
-    command still counts, because it runs as a shell or a program from the
-    user's own PATH, and that process is never tooling. An unreadable path
+    command still counts, even a nested `codex`, because it runs under a
+    shell or npm's node shim, and neither is tooling. An unreadable path
     ("") is not tooling, so a failed query can only show the gear, never
     hide one."""
     if not image_path:
         return False
     path = os.path.normcase(os.path.normpath(
         image_path.removeprefix("\\\\?\\")))
-    name = os.path.basename(path)
-    if name in _CONSOLE_HOSTS:
-        return True
-    if name == "codex.exe" or (name.startswith("codex-")
-                               and name.endswith(".exe")):
+    parts = path.split(os.sep)
+    if parts[-1] in _CONSOLE_HOSTS or _in_npm_codex_package(parts):
         return True
     return any(path.startswith(os.path.normcase(os.path.normpath(d)) + os.sep)
                for d in _codex_tooling_dirs())
