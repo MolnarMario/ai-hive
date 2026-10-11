@@ -1074,16 +1074,28 @@ def test_codex_version_from_shims():
     other = base / "other"
     _codex_package(other, "9.9.9", name="codex-lookalike")
     (other / "codex.cmd").write_text(_NPM_CMD_SHIM, encoding="utf-8")
-    for label, program in (
-            ("a standalone codex.exe", str(alone)),
-            ("a package that isn't @openai/codex", str(other / "codex.cmd")),
-            ("a bare name the PATH lookup didn't resolve", "codex"),
-            ("a shim that no longer exists", str(base / "gone.cmd")),
-            ("nothing at all", "")):
-        check(f"codex version: {label} reads as unknown",
-              providers.codex_version(program) == ()
-              and not providers.codex_has_no_daemon(program),
-              providers.codex_version(program))
+    empty = base / "empty"
+    empty.mkdir()
+    saved_path = os.environ.get("PATH", "")
+    try:
+        os.environ["PATH"] = str(npm)
+        check("codex version: a bare name resolves through PATH, as the "
+              "launch does", providers.codex_version("codex") == (0, 162, 1),
+              providers.codex_version("codex"))
+        os.environ["PATH"] = str(empty)
+        for label, program in (
+                ("a standalone codex.exe", str(alone)),
+                ("a package that isn't @openai/codex",
+                 str(other / "codex.cmd")),
+                ("a bare name not on PATH", "codex"),
+                ("a shim that no longer exists", str(base / "gone.cmd")),
+                ("nothing at all", "")):
+            check(f"codex version: {label} reads as unknown",
+                  providers.codex_version(program) == ()
+                  and not providers.codex_has_no_daemon(program),
+                  providers.codex_version(program))
+    finally:
+        os.environ["PATH"] = saved_path
 
 
 def test_codex_launches_without_daemon():
@@ -1128,6 +1140,21 @@ def test_codex_launches_without_daemon():
     check("codex launch: a user's own --no-daemon isn't doubled",
           twice.effective_args().count("--no-daemon") == 1,
           twice.effective_args())
+
+    # the real default path, with no program swapped in: build_spec resolves
+    # `codex` on PATH and the launch carries the flag
+    saved_path = os.environ.get("PATH", "")
+    try:
+        os.environ["PATH"] = str(new)
+        plain = build_spec(AgentKind.OPENAI, "Codex", cwd=SCRATCH_CWD)
+        check("codex launch: the built-in provider resolves codex on PATH",
+              os.path.normcase(plain.program)
+              == os.path.normcase(str(new / "codex.cmd")), plain.program)
+        check("codex launch: and launches it with --no-daemon",
+              plain.effective_args() == ["--no-daemon"],
+              plain.effective_args())
+    finally:
+        os.environ["PATH"] = saved_path
 
 
 def test_pty():

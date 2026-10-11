@@ -390,7 +390,11 @@ def codex_version(program: str) -> tuple:
     a hand-written one can name it by absolute path (measured: the reporting
     machine's `~\\.local\\bin\\codex.cmd`). A standalone codex.exe has no
     package.json and reads as unknown."""
-    if not program or not os.path.isabs(program) or not os.path.isfile(program):
+    if program and not os.path.isabs(program):
+        # a bare name (resolve_program's fallback) launches through this
+        # same PATH lookup, so read the file the launch would find
+        program = shutil.which(program) or ""
+    if not program or not os.path.isfile(program):
         return ()
     for pkg in _codex_package_dirs(program):
         try:
