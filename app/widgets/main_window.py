@@ -2784,7 +2784,7 @@ class MainWindow(QMainWindow):
         self.manager.agentLimitBlocked.connect(self._on_agent_limit_blocked)
         self.top_bar.usageRefreshRequested.connect(self._on_usage_refresh)
         self.sidebar.addRequested.connect(self._on_add_workspace_clicked)
-        self.sidebar.workspaceSelected.connect(self.manager.set_active)
+        self.sidebar.workspaceSelected.connect(self._on_sidebar_workspace_selected)
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
         # inline agent list: the sidebar expands agents under a workspace and
         # reveals a clicked agent's card (no overlapping popup)
@@ -5707,8 +5707,31 @@ class MainWindow(QMainWindow):
         if self.manager.workspace(ws_id) is None:
             return
         self.manager.set_active(ws_id)
+        self._focus_lead_card(ws_id)
         self.raise_()
         self.activateWindow()
+
+    def _on_sidebar_workspace_selected(self, ws_id: str) -> None:
+        """A click on a workspace (row or collapsed rail) opens it ready to
+        type in its top-left agent. Qt gives click focus before the row sees
+        the press, so nothing takes it back afterwards."""
+        self.manager.set_active(ws_id)
+        self._focus_lead_card(ws_id)
+
+    def _focus_lead_card(self, ws_id: str) -> None:
+        focus = self.focusWidget()
+        if (isinstance(focus, QLineEdit) and focus.isVisible()
+                and self.sidebar.isAncestorOf(focus)):
+            return    # a double-click opened the inline rename, keep it
+        page = self._pages.get(ws_id)
+        card = page.lead_card() if page is not None else None
+        if card is not None:
+            self._focus_card(page, card)
+
+    def _focus_card(self, page: WorkspacePage, card: TerminalCard) -> None:
+        page.scroll.ensureWidgetVisible(card)
+        target = card.terminal or card.input or card
+        target.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _reveal_agent(self, ws_id: str, agent_id: str) -> None:
         """The single 'click an agent -> reveal its card' primitive (used by the
@@ -5723,9 +5746,7 @@ class MainWindow(QMainWindow):
         card = page.card_for(agent_id)
         if card is None:
             return
-        page.scroll.ensureWidgetVisible(card)
-        target = card.terminal or card.input or card
-        target.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._focus_card(page, card)
         self.raise_()
         self.activateWindow()
 

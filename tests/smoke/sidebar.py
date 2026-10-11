@@ -1480,6 +1480,85 @@ def test_new_agent_autofocus():
     win.close()
 
 
+def test_workspace_click_focuses_lead_agent():
+    """A click on a workspace row opens it with keyboard focus in its top-left
+    agent, or in the maximized one while a card is soloed, so typing needs no
+    second click. A double-click still renames: the rename box keeps focus."""
+    from PySide6.QtCore import QEventLoop, QPoint, Qt, QTimer
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+    from app.session_store import SessionStore
+    from app.process_worker import AgentKind, build_spec
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-wsfocus-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    pump(150)
+    mgr = win.manager
+    ws1 = mgr.create_workspace("One", str(tmp))  # the default one has an agent
+    ws2 = mgr.create_workspace("Two", str(tmp))
+    spec = lambda name: build_spec(AgentKind.CMD, name,  # noqa: E731
+                                   cwd=SCRATCH_CWD, pty=True)
+    a1 = mgr.add_terminal(ws1.id, spec("One"), autostart=False)
+    first = mgr.add_terminal(ws2.id, spec("First"), autostart=False)
+    second = mgr.add_terminal(ws2.id, spec("Second"), autostart=False)
+    pump(120)
+    page2 = win._pages[ws2.id]
+
+    def in_card(ws, agent):
+        card = win._pages[ws.id].card_for(agent.id)
+        focus = win.focusWidget()
+        return (card is not None and focus is not None
+                and (focus is card or card.isAncestorOf(focus)))
+
+    def click_row(ws_id):
+        row = win.sidebar._ws_widgets[ws_id]
+        QTest.mouseClick(row, Qt.MouseButton.LeftButton,
+                         pos=row.name_label.geometry().center())
+        pump(60)
+
+    mgr.set_active(ws1.id)
+    win._reveal_agent(ws1.id, a1.id)
+    pump(60)
+    check("ws focus: precondition focus sits in ws1's agent", in_card(ws1, a1))
+
+    click_row(ws2.id)
+    check("ws focus: the click switched workspaces", mgr.active_id == ws2.id)
+    check("ws focus: focus landed in the top-left agent", in_card(ws2, first),
+          win.focusWidget())
+
+    click_row(ws1.id)
+    check("ws focus: clicking back focuses ws1's agent", in_card(ws1, a1))
+
+    page2.toggle_solo(page2.card_for(second.id))
+    click_row(ws2.id)
+    check("ws focus: a soloed workspace focuses its maximized agent",
+          in_card(ws2, second), win.focusWidget())
+    page2.toggle_solo(page2.card_for(second.id))
+
+    row = win.sidebar._ws_widgets[ws2.id]
+    name_pt = row.name_label.geometry().center()
+    QTest.mouseClick(row, Qt.MouseButton.LeftButton, pos=name_pt)
+    QTest.mouseDClick(row, Qt.MouseButton.LeftButton, pos=name_pt)
+    pump(60)
+    check("ws focus: a double-click still opens the inline rename",
+          row._renaming)
+    check("ws focus: the rename box keeps focus",
+          win.focusWidget() is row.rename_edit, win.focusWidget())
+    row._end_rename()
+    win.close()
+
+
 def test_new_agent_count():
     """The New Agent dialog's [-] n [+] stepper opens n agents at once: it
     starts at 1 with minus disabled, caps at the workspace's free slots, is
