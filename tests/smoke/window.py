@@ -3262,3 +3262,35 @@ def test_fullscreen_f11():
     finally:
         fullscreen.QCursor = real_cursor
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_new_agent_full_terminal_box_hidden_for_ai():
+    """The 'Full terminal' box is a forced, disabled tick for AI agents, so
+    the dialog hides its row for them and shows it for shells and scripts."""
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind
+    from app.widgets.main_window import AddTerminalDialog
+
+    QApplication.instance() or QApplication([])
+    dlg = AddTerminalDialog("Agent 1", cwd=str(SCRATCH_CWD))
+    row = dlg._form
+
+    def shown() -> bool:
+        return row.isRowVisible(dlg.pty_check)
+
+    dlg.kind_combo.setCurrentIndex(dlg.kind_combo.findData(AgentKind.CLAUDE))
+    check("full terminal box: hidden for Claude and still forced on",
+          not shown() and dlg.pty_check.isChecked())
+    ps = dlg.kind_combo.findData(AgentKind.POWERSHELL)
+    dlg.kind_combo.setCurrentIndex(ps)
+    check("full terminal box: shown for PowerShell", shown())
+    dlg.kind_combo.setCurrentIndex(
+        dlg.kind_combo.findData(AgentKind.PYTHON_SCRIPT))
+    check("full terminal box: shown for a Python script", shown())
+    for kind in (AgentKind.OPENAI, AgentKind.GEMINI, AgentKind.GROK):
+        idx = dlg.kind_combo.findData(kind)
+        if idx < 0:
+            continue
+        dlg.kind_combo.setCurrentIndex(idx)
+        check(f"full terminal box: hidden for {kind.name}", not shown())
+    dlg.deleteLater()
