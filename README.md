@@ -116,10 +116,12 @@ workspaces keep executing — switching never pauses anything.
   shell's `cmd &`) is still going. A **⚙ gear badge** shows on the sidebar
   row, next to the affected agent in the expanded list, and in the terminal's
   card header once that's been true for a few seconds, so you don't close AI
-  Hive thinking nothing is happening. It shares the taskbar's one overlay
-  square too: when nothing is busy or asking but a shell is still running,
-  the disc turns **violet** with the count, instead of showing nothing at
-  all.
+  Hive thinking nothing is happening. Programs a CLI runs for itself don't
+  count: Codex's app-server daemon, its MCP servers and console hosts never
+  light the gear, and its kill menu never offers them. It shares the
+  taskbar's one overlay square too: when nothing is busy or asking but a
+  shell is still running, the disc turns **violet** with the count, instead
+  of showing nothing at all.
 - **Plan usage readout** — two top-bar badges, one
   per Claude rate-limit window, showing how much you've burned and when it
   comes back: the **5-hour** pill reads `5h Claude 21% used, resets in 1h20m

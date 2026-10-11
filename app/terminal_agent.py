@@ -19,7 +19,8 @@ from . import providers, scheduled_send, transcripts
 from .ansi_parser import _PARTIAL_RE as _ESC_PARTIAL_RE
 from .coordination import sanitize_text
 from .scheduled_send import MISSED, PENDING, SENT, ScheduledMessage
-from .process_worker import AgentSpec, ProcessWorker, WorkerState
+from .process_worker import (AgentSpec, ProcessWorker, WorkerState,
+                             is_cli_tooling, process_image_path)
 from .pty_worker import PtyWorker
 
 LOG_CAP = 4000  # retained (stream, text) segments per agent
@@ -612,10 +613,11 @@ class TerminalAgent(QObject):
         self._screen_tail = ""        # rolling escape-stripped output tail
         # "idle, but a background command it started is still running" (see
         # poll_bg_shell): _bg_baseline is the quietest job-process-count ever
-        # observed for this launch (learned downward, so a wrapper process
-        # like ConPTY's conhost is never mistaken for "extra"); _bg_extra_since
-        # is when a count above baseline was first seen while not busy;
-        # _bg_shell is the debounced, emitted effective value.
+        # observed for this launch, CLI tooling left out (learned downward,
+        # so a wrapper like the codex.CMD shim's cmd.exe is never mistaken
+        # for "extra"); _bg_extra_since is when a count above baseline was
+        # first seen while not busy; _bg_shell is the debounced, emitted
+        # effective value.
         self._bg_baseline: int | None = None
         # the actual PIDs seen while learning the baseline above -- identity,
         # not just a count, so a later kill (see kill_bg_shell_extras) can
@@ -1858,7 +1860,9 @@ class TerminalAgent(QObject):
         signature of a background command (a Bash tool call with
         run_in_background, a shell's own `cmd &`) still running after the
         agent returned to its prompt. Debounced like _mark_busy/idle so a
-        process that comes and goes quickly never flickers the indicator."""
+        process that comes and goes quickly never flickers the indicator.
+        The count leaves out the CLI's own tooling (_job_tooling_pids), which
+        Codex starts at no fixed time after launch."""
         if self.status not in (AgentStatus.RUNNING, AgentStatus.STARTING):
             return
         elapsed = time.time() - self._session_started
@@ -1866,9 +1870,13 @@ class TerminalAgent(QObject):
         # resting baseline (see BG_SHELL_WARMUP_S)
         if elapsed < BG_SHELL_WARMUP_S:
             return
-        count = self.worker.job_process_count()
-        if count <= 0:
+        # one query for both the count and the identities: a process born
+        # between two queries would make the count one too low, and the
+        # baseline below only ever ratchets down
+        ids = self.worker.job_process_ids()
+        if not ids:
             return  # query unsupported/failed -- don't flap on missing data
+        count = len(ids) - len(self._job_tooling_pids(ids))
         if elapsed < BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S:
             # still settling: track the latest count outright (up or down)
             # rather than only ratcheting down, so a steady-state process
@@ -1876,7 +1884,7 @@ class TerminalAgent(QObject):
             # baseline instead of being locked in as "extra" forever. Same
             # replace-outright treatment for the PID identities behind it.
             self._bg_baseline = count
-            self._bg_baseline_pids = set(self.worker.job_process_ids())
+            self._bg_baseline_pids = set(ids)
             self._bg_extra_since = None
             if self._bg_shell:
                 self._bg_shell = False
@@ -1897,7 +1905,7 @@ class TerminalAgent(QObject):
         # settling -- so a process that shows up AFTER settling is always
         # "extra" for kill_bg_shell_extras, never silently adopted as normal.
         if self._bg_baseline_pids is not None:
-            self._bg_baseline_pids &= set(self.worker.job_process_ids())
+            self._bg_baseline_pids &= set(ids)
         extra = count > self._bg_baseline
         now = time.time()
         if self.is_busy() or not extra:
@@ -1922,17 +1930,28 @@ class TerminalAgent(QObject):
                 except Exception:
                     pass
 
-    def _bg_shell_keep_pids(self) -> set[int]:
+    @staticmethod
+    def _job_tooling_pids(ids) -> set[int]:
+        """The members of `ids` that are the CLI's own machinery (Codex's
+        app-server daemon, its MCP servers, console hosts), never a command
+        it started. See process_worker.is_cli_tooling."""
+        return {p for p in ids if is_cli_tooling(process_image_path(p))}
+
+    def _bg_shell_keep_pids(self, ids=None) -> set[int]:
         """Pids that must never be treated as 'extra': the agent's own root
-        process, plus everything seen while the baseline was learned (the
-        log_activity mcp bridge, ConPTY's own conhost/OpenConsole helper).
-        Shared by every read/kill path below so they can never disagree
-        about what's safe to touch."""
+        process, everything seen while the baseline was learned (the
+        log_activity mcp bridge), and the CLI's tooling in the job now (a
+        kill there would take down Codex's daemon). Shared by every
+        read/kill path below so they can never disagree about what's safe
+        to touch. `ids` is the job's current members when the caller has
+        them already."""
         keep = set(self._bg_baseline_pids or ())
         root = self.worker.pid()
         if root:
             keep.add(root)
-        return keep
+        if ids is None:
+            ids = self.worker.job_process_ids()
+        return keep | self._job_tooling_pids(ids)
 
     def bg_shell_extra_pids(self) -> list[int]:
         """The actual extra processes behind the gear badge right now -- a
@@ -1942,8 +1961,9 @@ class TerminalAgent(QObject):
         against (i.e. before poll_bg_shell has ever settled)."""
         if self._bg_baseline_pids is None:
             return []
-        keep = self._bg_shell_keep_pids()
-        return [p for p in self.worker.job_process_ids() if p not in keep]
+        ids = self.worker.job_process_ids()
+        keep = self._bg_shell_keep_pids(ids)
+        return [p for p in ids if p not in keep]
 
     def kill_bg_shell_pid(self, pid: int) -> bool:
         """Kill exactly one process bg_shell_extra_pids() listed -- the

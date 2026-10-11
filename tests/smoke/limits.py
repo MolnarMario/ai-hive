@@ -2103,7 +2103,7 @@ def test_limit_detection_hardening():
         a.worker = type("W", (), {
             "is_running": lambda s: True,
             "write": lambda s, d: buf.append(d) or True,
-            "job_process_count": lambda s: 0,
+            "job_process_ids": lambda s: [],
             "start": lambda s: None, "dispose": lambda s: None})()
         a._prompt_ready = True
         a.status = AgentStatus.RUNNING
