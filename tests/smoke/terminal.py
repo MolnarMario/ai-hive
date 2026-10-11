@@ -1790,11 +1790,12 @@ def test_redraw_from_the_wrong_row_leaves_no_copy_in_scrollback():
     conversation(v5, tvm.HISTORY_LINES + 30)
     wiped = []
     v5.historyCleared.connect(lambda: wiped.append(1))
-    full = len(v5.screen.history.top)
+    full = hist(v5)
     v5.feed(wrong_row_redraw(screen(v5)))
     check("redraw: with history full it is not read as a wipe",
-          not wiped and len(v5.screen.history.top) == full - 4,
-          (wiped, len(v5.screen.history.top), full))
+          not wiped, wiped)
+    check("redraw: ...and the rows its pushes evicted come back",
+          hist(v5) == full, (len(hist(v5)), len(full), hist(v5)[:2]))
 
     # ordinary output keeps every row it scrolls off
     v6 = TerminalView(rows=rows, cols=cols)

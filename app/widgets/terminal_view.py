@@ -251,6 +251,9 @@ _NAV_KEYS = (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up,
 # `pushed - offset + row`, which holds only while EVERY line leaving the screen
 # is counted, so a suppressed append drifts every live-anchored mark by one.
 HISTORY_LINES = 2000
+# rows a full history keeps after evicting them, enough to undo any push
+# _drop_repeated_push takes back (fewer rows than the screen)
+EVICTED_KEEP = 512
 CELL_PAD_X = 6   # left/right inner padding (real terminals aren't flush)
 CELL_PAD_Y = 4   # top/bottom inner padding
 VIEW_NOTIFY_MS = 50   # coalescing window for viewChanged
@@ -271,14 +274,23 @@ class _CountingDeque(collections.deque):
     drift because feed() can't see that lines still scrolled by. `pushed` keeps
     counting past saturation, giving feed() the true growth to anchor against.
     (AI Hive never triggers pyte paging — scrollback is a view offset — so only
-    `append` matters; appendleft/pop from prev_page never occur.)"""
+    `append` counts.)
+
+    It also keeps the last rows a full deque evicted, so a push that
+    TerminalView._drop_repeated_push takes back can return the row it pushed
+    out of the front (`evicted` counts them all, like `pushed`)."""
 
     def __init__(self, iterable=(), maxlen=None):
         super().__init__(iterable, maxlen=maxlen)
         self.pushed = 0
+        self.evicted = 0
+        self.recent_evicted = collections.deque(maxlen=EVICTED_KEEP)
 
     def append(self, x):
         self.pushed += 1
+        if self.maxlen is not None and len(self) == self.maxlen:
+            self.evicted += 1
+            self.recent_evicted.append(self[0])
         super().append(x)
 
 
@@ -735,14 +747,15 @@ class TerminalView(QWidget):
         scr = self.screen
         rows = [dict(r) if r else {}
                 for r in map(scr.buffer.get, range(scr.lines))]
-        return (rows, scr.cursor.y, scr.history.top.pushed,
+        top = scr.history.top
+        return (rows, scr.cursor.y, top.pushed, getattr(top, "evicted", 0),
                 (scr.lines, scr.columns))
 
     def _drop_repeated_push(self, ref) -> int:
         """Pop the rows pushed since `ref` when the screen still reads as it
         did then and its rows above the cursor don't repeat every k rows
         (see _feed_frames)."""
-        rows_then, cursor_then, pushed_then, size = ref
+        rows_then, cursor_then, pushed_then, evicted_then, size = ref
         scr = self.screen
         top = scr.history.top
         k = top.pushed - pushed_then
@@ -787,6 +800,12 @@ class TerminalView(QWidget):
         for _ in range(k):
             top.pop()
         top.pushed -= k
+        # a full history evicted a row per push; put those rows back in front
+        gone = getattr(top, "evicted", 0) - evicted_then
+        kept = getattr(top, "recent_evicted", ())
+        for _ in range(min(gone, len(kept))):
+            top.appendleft(kept.pop())
+            top.evicted -= 1
         return k
 
     def reset(self) -> None:
