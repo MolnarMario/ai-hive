@@ -333,6 +333,12 @@ class PtyWorker(QObject):
         if not self._flush_timer.isActive():
             self._flush_timer.start()
 
+    def flush(self) -> None:
+        """Hand over the batched output now, so bytes AI Hive adds to the
+        stream next land after it (TerminalAgent._end_reflow)."""
+        if self._pend:
+            self._flush()
+
     def _flush(self) -> None:
         if self._pend:
             text = "".join(self._pend)

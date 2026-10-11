@@ -1699,6 +1699,206 @@ def test_replay_reads_each_part_at_its_drawn_size():
     unseen.dispose()
 
 
+def _reflow_render(width):
+    """The rows Claude's classic renderer paints for one conversation at
+    `width`: banner, the prompt's echo, a reply whose items wrap with a
+    hanging indent, the input box. Every word is unique, so a row that shows
+    up twice, or at another width, is the bug and not a coincidence."""
+    import textwrap
+    rows = ["Claude Code v9", "", "> Explain the sorting algorithms please",
+            ""]
+    for n in range(1, 9):
+        words = " ".join(f"w{n}x{i}" for i in range(30))
+        rows += textwrap.wrap(f"{n}. Item {n} {words}", width,
+                              subsequent_indent="   ")
+    return rows + ["", "-" * width, "> ", "-" * width, "  ? for shortcuts"]
+
+
+def _conhost_paint(rows, viewport):
+    """What conhost sends after a resize, as captured from claude 2.1.296:
+    erase each of its rows, home, then the frame row by row, ending on the
+    blank row the renderer's cursor sits on, and the caret back up in the
+    input box."""
+    return ("\x1b[?25l\x1b[H" + "\x1b[2K\x1b[1B" * viewport + "\x1b[H"
+            + "\r\n".join(rows) + "\r\n\x1b[2C\x1b[3A\x1b[?25h")
+
+
+def test_reflow_reprints_scrollback_at_new_size():
+    """A resized Claude card shows its whole scrollback at the new width.
+
+    Live-reported: widen an agent's card and only the bottom screenful of a
+    reply re-wrapped; everything above kept the old width, and the old
+    screen's last rows repeated at the top of the new one. Claude reprints
+    the whole conversation on a resize, but ConPTY forwards only one
+    screenful of it. The agent now gives the child REFLOW_EXTRA_ROWS more
+    rows once it is idle, so the reprint arrives whole, and marks the stream
+    so the view drops the old scrollback and lines its screen up with
+    conhost's before the child gets its own rows back."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import (REFLOW_BEGIN, REFLOW_END,
+                                    REFLOW_EXTRA_ROWS, AgentStatus,
+                                    TerminalAgent)
+    from app.widgets.terminal_card import TerminalCard
+
+    QApplication.instance() or QApplication([])
+    rows_n = 10
+
+    class Worker:
+        """A running child: records each size it is given."""
+        def __init__(self):
+            self.rows, self.cols, self.sizes = rows_n, 40, []
+            self.exit_info = None
+
+        def is_running(self):
+            return True
+
+        def resize(self, rows, cols):
+            if (rows, cols) == (self.rows, self.cols):
+                return False
+            self.rows, self.cols = rows, cols
+            self.sizes.append((rows, cols))
+            return True
+
+        def write(self, data):
+            return True
+
+        def flush(self):
+            pass
+
+        def dispose(self):
+            pass
+
+    def size(card, rows, cols):        # what TerminalView._apply_resize does
+        card.terminal.screen.resize(rows, cols)
+        card.terminal.sizeChanged.emit(rows, cols)
+
+    def screen_rows(view):
+        scr = view.screen
+        lines = list(scr.history.top) + [scr.buffer[r]
+                                         for r in range(scr.lines)]
+        return ["".join(ln[c].data for c in range(scr.columns)).rstrip()
+                for ln in lines]
+
+    def mark_row(card, uid):
+        view = card.terminal
+        line = card._mark_lines.get(uid)
+        if line is None:
+            return None
+        oldest = view.history_pushed() - len(view.screen.history.top)
+        return screen_rows(view)[line - oldest]
+
+    narrow, wide = _reflow_render(40), _reflow_render(80)
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Reflow",
+                                     cwd=SCRATCH_CWD, pty=True))
+    card = TerminalCard(agent)
+    card._proj_cols = card.terminal.screen.columns
+    agent.worker = worker = Worker()
+    size(card, rows_n, 40)
+    agent._set_status(AgentStatus.RUNNING)
+    agent._prompt_ready = True
+    # the conversation streams in at 40 columns, the prompt's Enter on its echo
+    agent._on_pty_output("pty", "\r\n".join(narrow[:3]))
+    card._on_prompt_submitted("Explain the sorting algorithms please",
+                              card.terminal.anchor_line())
+    mark = agent.prompt_marks()[-1]
+    agent._on_pty_output("pty", "\r\n" + "\r\n".join(narrow[3:])
+                         + "\r\n\x1b[2C\x1b[3A")
+    check("reflow: (fixture) the prompt's milestone sits on its echo",
+          mark_row(card, mark.uid) == narrow[2], mark_row(card, mark.uid))
+
+    size(card, rows_n, 80)             # the card widens
+    agent._on_pty_output("pty", _conhost_paint(wide[-rows_n:], rows_n))
+    check("reflow: (fixture) one screenful re-wraps, the rows above do not",
+          any(len(t) <= 40 and t.startswith("   w1x")
+              for t in screen_rows(card.terminal)))
+    check("reflow: a resized Claude agent owes a reflow",
+          agent._reflow_due and agent._reflow_timer.isActive())
+
+    # still busy: the extra rows wait, or a streaming reply would erase each
+    # frame by more rows than the card has
+    agent._busy = True
+    agent._reflow_tick()
+    check("reflow: nothing starts while the agent is busy",
+          worker.sizes[-1] == (rows_n, 80) and agent._reflow_due
+          and agent._reflow_timer.isActive(), worker.sizes)
+    agent._busy = False
+
+    agent._reflow_tick()
+    tall = rows_n + REFLOW_EXTRA_ROWS
+    check("reflow: idle, the child gets the extra rows",
+          worker.sizes[-1] == (tall, 80) and agent._reflow_step == "tall",
+          worker.sizes)
+    check("reflow: a repaint wiggle keeps out of it",
+          agent.request_repaint() is False)
+    agent._on_pty_output("pty", _conhost_paint(wide, tall))
+    check("reflow: the reprint's first byte marks where the old scrollback "
+          "ends", agent.pty_replay().count(REFLOW_BEGIN) == 1
+          and agent.reflowed_at > mark.pos)
+    agent._end_reflow()
+    check("reflow: then the child gets the card's own rows back",
+          worker.sizes[-1] == (rows_n, 80)
+          and agent.pty_replay().endswith(REFLOW_END), worker.sizes)
+    agent._on_pty_output("pty", _conhost_paint(wide[-rows_n:], rows_n))
+
+    got = screen_rows(card.terminal)
+    want = [t.rstrip() for t in wide] + [""]
+    check("reflow: the whole scrollback is at the new width, each row once",
+          got == want,
+          [t for t in got if t not in want][:3] or (len(got), len(want)))
+    check("reflow: the milestone kept by the agent, found on the reprint",
+          mark in agent.prompt_marks() and mark_row(card, mark.uid) == wide[2],
+          mark_row(card, mark.uid))
+
+    # a card rebuild replays the stream, markers included, to the same screen
+    # (the full projection _rerender_restored runs once the card is sized)
+    card2 = TerminalCard(agent)
+    size(card2, rows_n, 80)
+    card2._clear_for_projection()
+    card2._replay_with_marks(agent.pty_replay())
+    check("reflow: a rebuilt card replays to the same scrollback",
+          screen_rows(card2.terminal) == got,
+          (len(screen_rows(card2.terminal)), len(got)))
+    check("reflow: ...with the milestone on its echo",
+          mark_row(card2, mark.uid) == wide[2], mark_row(card2, mark.uid))
+    check("reflow: a same-size rebuild owes no reflow",
+          not agent._reflow_due, worker.sizes)
+
+    # a submit while the child has the extra rows gives the card's back first
+    size(card, rows_n, 60)
+    agent._reflow_tick()
+    agent._on_pty_output("pty", _conhost_paint(_reflow_render(60),
+                                               rows_n + REFLOW_EXTRA_ROWS))
+    agent.write("next question\r")
+    check("reflow: a submit ends the reflow before its reply streams",
+          agent._reflow_step == "" and worker.sizes[-1] == (rows_n, 60),
+          worker.sizes)
+
+    # a child that never answers costs no scrollback
+    size(card, rows_n, 70)
+    agent._awaiting_reply = False
+    before = screen_rows(card.terminal)
+    agent._reflow_tick()
+    agent._end_reflow()
+    check("reflow: no reprint, no wipe",
+          screen_rows(card.terminal) == before
+          and agent.pty_replay().count(REFLOW_BEGIN) == 2,
+          agent.pty_replay().count(REFLOW_BEGIN))
+
+    # other providers and stopped children are left alone
+    codex = TerminalAgent(build_spec(AgentKind.OPENAI, "Codex",
+                                     cwd=SCRATCH_CWD, pty=True))
+    codex.worker = Worker()
+    codex.resize(rows_n, 90)
+    check("reflow: only Claude reprints on a resize, so only Claude reflows",
+          not codex._reflow_due)
+    agent._set_status(AgentStatus.EXITED_OK)
+    check("reflow: a child that stops owes nothing",
+          not agent._reflow_due and agent._reflow_step == "")
+    card.detach(); card2.detach(); agent.dispose(); codex.dispose()
+
+
 def test_history_screen_wrapper_removed():
     """_FastHistoryScreen drops pyte's per-event wrapper without changing what
     is rendered.

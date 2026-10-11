@@ -136,7 +136,8 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import ui_theme
-from ..terminal_agent import _CLAUDE_READY_HINTS, _NUM_OPTION_RE
+from ..terminal_agent import (REFLOW_BEGIN, REFLOW_END, _CLAUDE_READY_HINTS,
+                              _NUM_OPTION_RE)
 from ..ui_theme import ANSI_16, Palette
 
 _NAMED = {
@@ -404,6 +405,11 @@ _TRAILING_PARTIAL_RE = re.compile(
 # whole stream into _esc_carry forever and freeze the screen. Mirrors
 # ansi_parser.MAX_CARRY.
 _MAX_ESC_CARRY = 4096
+# TerminalAgent's reflow markers, split out of a chunk so each part of it
+# is fed on its own side of the marker (see _apply_reflow_marker)
+_REFLOW_RE = re.compile("(" + re.escape(REFLOW_BEGIN) + "|"
+                        + re.escape(REFLOW_END) + ")")
+_REFLOW_TAG = REFLOW_BEGIN[:7]
 # DECSET/DECRST private modes (CSI ? Pm h/l). pyte ignores these, but they
 # decide how the wheel must behave (altscreen / mouse tracking / paste mode).
 _PRIVATE_MODE_RE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
@@ -480,6 +486,12 @@ class TerminalView(QWidget):
     # history.top was wiped (ED 3 / RIS / screen.reset()), so every marker
     # anchored into it is meaningless and the bar has nothing left to show.
     historyCleared = Signal()
+    # TerminalAgent's REFLOW_BEGIN marker dropped the scrollback because the
+    # child is reprinting the same conversation at the new size, and
+    # REFLOW_END says the reprint is in. Not historyCleared: the conversation
+    # is unchanged, so the agent's milestones stay and only move.
+    reflowStarted = Signal()
+    reflowEnded = Signal()
     # the user submitted a TYPED prompt: (inferred text, absolute line).
     # Emitted from the bare-Enter branch of keyPressEvent and nowhere else --
     # see _note_prompt_submit for why every other candidate source is wrong.
@@ -645,6 +657,19 @@ class TerminalView(QWidget):
                     self._app_cursor_keys = on
                 elif tok == "1004":
                     self._focus_reporting = on
+        if _REFLOW_TAG in data:
+            for i, part in enumerate(_REFLOW_RE.split(data)):
+                if i % 2:
+                    self._apply_reflow_marker(part)
+                elif part:
+                    self._feed_screen(part)
+        else:
+            self._feed_screen(data)
+        self._notify_view()
+        self.update()
+        self._gap_timer.start()
+
+    def _feed_screen(self, data: str) -> None:
         top_before = self.screen.history.top
         pushed_before = getattr(top_before, "pushed", None)
         hist_before = len(top_before)
@@ -670,9 +695,56 @@ class TerminalView(QWidget):
         # "the conversation was wiped" edge available from the stream itself.
         if len(self.screen.history.top) < hist_before:
             self._on_history_wiped()
-        self._notify_view()
-        self.update()
-        self._gap_timer.start()
+
+    def _apply_reflow_marker(self, marker: str) -> None:
+        """Act on a marker TerminalAgent wrote around a reflow (see
+        REFLOW_EXTRA_ROWS). Both are in the stream, so a replay of it does
+        exactly what the live view did.
+
+        BEGIN: the child is about to reprint the whole conversation at the new
+        size, so the scrollback drawn at the old one goes. The screen stays:
+        the reprint paints over it a moment later, and a blank card in between
+        would flash.
+
+        END: the reprint is in, and the child is about to get the card's rows
+        back. Shrinking its buffer, conhost keeps the rows that end at the
+        later of its cursor row and its last row with text, then repaints
+        them from the top. This screen is the bottom of what conhost painted
+        into the taller pty, which ends on the blank row the renderer's cursor
+        sits on, so it can sit lower than conhost's rows. Measured: one row
+        lower, and conhost's repaint scrolled once more. Pulling the missing
+        rows back out of history puts this screen on conhost's rows, so the
+        repaint lands on the same content and no row reaches history twice."""
+        if marker == REFLOW_BEGIN:
+            self.screen._reset_history()
+            self._forget_view_history()
+            self.reflowStarted.emit()
+            return
+        scr = self.screen
+        top = scr.history.top
+        bottom = scr.cursor.y
+        for y in range(scr.lines - 1, bottom, -1):
+            row = scr.buffer.get(y)
+            if row and any(ch.data.strip() for ch in row.values()):
+                bottom = y
+                break
+        n = min(scr.lines - 1 - bottom, len(top))
+        if n > 0:
+            buf = scr.buffer
+            for y in range(scr.lines - 1, n - 1, -1):
+                buf[y] = buf[y - n]
+            for y in range(n - 1, -1, -1):
+                buf[y] = top.pop()
+            # those rows are screen rows again and keep their ids (see the
+            # coordinate block below: a screen row's id is pushed + row)
+            if hasattr(top, "pushed"):
+                top.pushed -= n
+            scr.cursor.y += n
+            scr.dirty.update(range(scr.lines))
+            self._scroll_offset = max(0, self._scroll_offset - n)
+            self._vs_cache = None
+            self._vs_sig = None
+        self.reflowEnded.emit()
 
     def reset(self) -> None:
         """A fresh terminal: blank screen, no scrollback, default modes. For
@@ -892,12 +964,15 @@ class TerminalView(QWidget):
         self._notify_view(immediate=True)
 
     def _on_history_wiped(self) -> None:
+        self._forget_view_history()
+        self.historyCleared.emit()
+
+    def _forget_view_history(self) -> None:
         self._scroll_offset = 0
         self._marks = []
         self._reply_marks = []
         self._vs_cache = None
         self._vs_sig = None
-        self.historyCleared.emit()
 
     def _notify_view(self, immediate: bool = False) -> None:
         """Announce a scroll/extent change, coalesced to one emit per 50ms.
