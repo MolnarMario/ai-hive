@@ -1082,6 +1082,7 @@ class TerminalCard(QFrame):
         if self.is_pty:
             self.agent.pty_output.connect(self._on_pty_output)
             self.agent.prompt_ready_changed.connect(self._on_prompt_ready)
+            self.agent.start_coming_changed.connect(self._on_start_coming)
             self.terminal.keyInput.connect(self._on_key_input)
             self.terminal.sizeChanged.connect(self.agent.resize)
             self.terminal.sizeChanged.connect(self._reproject_on_size)
@@ -1186,6 +1187,8 @@ class TerminalCard(QFrame):
             pairs.append((self.agent.pty_output, self._on_pty_output))
             pairs.append((self.agent.prompt_ready_changed,
                           self._on_prompt_ready))
+            pairs.append((self.agent.start_coming_changed,
+                          self._on_start_coming))
             pairs.append((self.agent.screen_reset, self._on_screen_reset))
             pairs.append((self.agent.turn_closed, self._on_turn_closed))
             self._stamp_timer.stop()
@@ -1749,7 +1752,7 @@ class TerminalCard(QFrame):
         self._replay_with_marks(replay)
         self._proj_cols = self.terminal.screen.columns
         self._refresh_overlay()
-        if seeded and not self.agent.is_running():
+        if seeded and not self.agent.is_running()                 and not self._awaiting_start():
             # this projection IS the stopped card's final picture, so it is
             # the moment to dissolve. A card about to autostart passes through
             # here too (settle_layout flushes every resize before any child is
@@ -1792,8 +1795,16 @@ class TerminalCard(QFrame):
         prompt (`prompt_ready_changed`, which for Claude is the input-box
         footer, i.e. after any trust dialog AND after a `--resume` replay has
         finished drawing), the user typing, the agent stopping, or
-        `BOOT_VEIL_MAX_MS`. A terminal is never covered for good."""
-        if not self.is_pty or self.agent.prompt_ready():
+        `BOOT_VEIL_MAX_MS`. A terminal is never covered for good.
+
+        A start held for the agent's new lane (`_awaiting_start`) keeps the
+        veil until the release, with no timeout: dismissing it there would
+        leave a card with neither loader nor banner, and the release either
+        starts a child or hands the card its banner back. `prompt_ready` only
+        counts for a live child, because a stopped one keeps its last value
+        (Restart in own lane stops a ready agent, then waits for the lane)."""
+        if not self.is_pty or (self.agent.prompt_ready()
+                               and self.agent.is_running()):
             return
         # `spec.resume` is cleared by `start()` right after the worker is
         # launched, so at STARTING it still says whether this launch is
@@ -1806,7 +1817,15 @@ class TerminalCard(QFrame):
             caption = "starting…"
         self.boot.begin(caption)
         self._place_overlay()
-        self._boot_timer.start(BOOT_VEIL_MAX_MS)
+        if self._awaiting_start():
+            self._boot_timer.stop()
+        else:
+            self._boot_timer.start(BOOT_VEIL_MAX_MS)
+
+    def _awaiting_start(self) -> bool:
+        """A start held for the agent's new lane folder: a boot that has not
+        reached the child yet."""
+        return self.agent.start_coming() and not self.agent.is_running()
 
     def _end_boot_veil(self) -> None:
         """Ready: dissolve, so the conversation appears rather than snaps in."""
@@ -1838,7 +1857,7 @@ class TerminalCard(QFrame):
         self.agent.restart()
         if self.agent.status is AgentStatus.STOPPING:
             self._begin_boot_veil()
-        elif not self.boot.is_active():
+        elif not self.boot.is_active() or self.agent.start_hold():
             self._restarting = False   # held, or the start failed at once
 
     def _settle_restart(self) -> None:
@@ -1856,6 +1875,14 @@ class TerminalCard(QFrame):
     def _on_prompt_ready(self, ready: bool) -> None:
         if ready:
             self._end_boot_veil()
+
+    def _on_start_coming(self, _coming: bool) -> None:
+        """The agent's held start became a wait (loader up) or ended without a
+        child (banner back). A release that did start a child already went
+        through `_on_status(STARTING)`, and by now `spec.resume` is cleared,
+        so repeating it would only reword the loader's caption."""
+        if not self.agent.is_running():
+            self._on_status(self.agent.status)
 
     def _clear_for_projection(self) -> None:
         """Blank the screen so the agent's pty stream can be projected onto it
@@ -2589,14 +2616,20 @@ class TerminalCard(QFrame):
             # a Restart passes through STOPPING, the exit and IDLE on its way
             # to the new child; the veil owns all of them (_on_restart_clicked)
             restarting = self._restarting and not running
+            # a start held for the agent's new lane folder is a boot that has
+            # not reached the child yet: same loader, never the banner
+            awaiting = self._awaiting_start()
             self.overlay.setVisible(not running and not restarting
+                                    and not awaiting
                                     and status is not AgentStatus.STOPPING)
-            if not running and not restarting:
+            if not running and not restarting and not awaiting:
                 self._refresh_overlay()
                 self.overlay.raise_()
             # a booting child and a stopped one are mutually exclusive states,
             # and the wake banner owns the stopped one
             if running and not self.agent.prompt_ready():
+                self._begin_boot_veil()
+            elif awaiting:
                 self._begin_boot_veil()
             elif restarting:
                 QTimer.singleShot(0, self, self._settle_restart)

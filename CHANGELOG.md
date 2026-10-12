@@ -8,6 +8,15 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.41.2
+
+- The usage pills keep loading at startup when the first read fails and
+  say "retrying..." while they try again within seconds. They only show
+  that usage could not be read after 3 minutes of failures, or right away
+  for an expired login.
+- A new agent in its own lane shows the loading animation while AI Hive
+  creates its git worktree, instead of "terminal not running".
+
 ## 0.41.1
 
 - An agent that writes about the usage-limit menu in its own reply no

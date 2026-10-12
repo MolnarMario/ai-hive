@@ -460,6 +460,10 @@ class TerminalAgent(QObject):
     # (re)start). Purely a VIEW signal — the card uses it to lift its boot
     # veil — and, like activity/waiting, it must never mark the session dirty.
     prompt_ready_changed = Signal(bool)
+    # `start_coming()` flipped: a held agent that is about to start (its card
+    # shows the loader) or one held for good (its card shows the stopped
+    # banner). VIEW only, never persisted.
+    start_coming_changed = Signal(bool)
     # the deferred-message queue changed (added/cancelled/sent/missed). NOT a
     # countdown tick: this list IS persisted, so the manager wires this to a
     # save, and a per-second tick on that would rewrite session.json all day.
@@ -561,6 +565,10 @@ class TerminalAgent(QObject):
         # Transient, never persisted. See hold_start.
         self._start_hold = ""
         self._start_deferred = False  # a start was asked for while held
+        # the hold is a short wait for a start that WILL happen (a new lane's
+        # worktree being made), not a stop: the card shows its loader, never
+        # the "terminal not running" banner, for the whole wait
+        self._start_coming = False
         # what AI Hive's lane poller last saw in this agent's lane
         # (lanes.LaneView: ahead, dirty, overlaps), for the board roster.
         # Transient: set by WorkspaceManager.set_lane_views, never persisted.
@@ -709,14 +717,18 @@ class TerminalAgent(QObject):
 
     # ------------------------------------------------------------ control ---
 
-    def hold_start(self, reason: str) -> None:
+    def hold_start(self, reason: str, coming: bool = False) -> None:
         """Keep every start (the dialog's, the launch autostart, a waking
         keystroke, a restart) from launching the child until `release_start`.
         Used while the agent's lane folder is being created or repaired: a
         child started before its cwd exists fails, and one started anywhere
         else would work in the wrong checkout. `reason` is shown as a notice
-        when something tries to start it meanwhile."""
+        when something tries to start it meanwhile. `coming` says the caller
+        WILL release with a start, so the card covers the wait with its loader
+        instead of the stopped banner. A hold that may stay (a lane that could
+        not be restored) leaves it False."""
         self._start_hold = reason or "[waiting for this agent's folder]"
+        self._set_start_coming(coming)
 
     def release_start(self, run: bool = False) -> None:
         """Lift the hold. Starts the agent when `run`, or when a start was
@@ -724,11 +736,25 @@ class TerminalAgent(QObject):
         deferred = self._start_deferred
         self._start_hold = ""
         self._start_deferred = False
-        if (run or deferred) and not self._disposing and not self.is_running():
-            self.start()
+        try:
+            if (run or deferred) and not self._disposing                     and not self.is_running():
+                self.start()
+        finally:
+            # after the start, so the card goes from the wait straight to the
+            # child's own loader with no stopped frame between. A start that
+            # raises still ends the wait, or the card keeps its loader for good
+            self._set_start_coming(False)
 
     def start_hold(self) -> str:
         return self._start_hold
+
+    def start_coming(self) -> bool:
+        return self._start_coming
+
+    def _set_start_coming(self, coming: bool) -> None:
+        if coming != self._start_coming:
+            self._start_coming = coming
+            self.start_coming_changed.emit(coming)
 
     def _held(self) -> bool:
         if not self._start_hold:

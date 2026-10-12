@@ -28,7 +28,7 @@ class CodexUsageBadge(UsagePillBadge):
 
     def _build_tooltip(self) -> str:
         if self._loading:
-            return "Reading GPT 5-hour usage..."
+            return self._loading_tip("Reading GPT 5-hour usage...")
         if self._limit is None and self._unreadable:
             return ("GPT usage could not be read.\n"
                     f"Last attempt failed: {self._unreadable}\nClick to refresh.")
