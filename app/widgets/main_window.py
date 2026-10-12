@@ -218,11 +218,12 @@ ACCOUNT_WIDE_LIMITS = ("five_hour", "seven_day")
 MODEL_LIMIT_OF_WINDOW = {"opus": "seven_day_opus", "sonnet": "seven_day_sonnet"}
 # How long past the reset a Claude agent whose OWN auto-continue is armed is
 # left to it (`_leave_to_claude`). Claude fires 30 to 90 s after the server's
-# reset; the clock AI Hive reads is that reset printed to the minute, so up
-# to 60 s more, then 30 s of slack. Typing first is what this prevents: the
+# reset, and the clock AI Hive reads is that reset printed to the minute, so
+# Claude's continuation is due by 150 s past it. AI Hive gives it 5 minutes
+# beyond that before sending its own. Typing first is what this prevents: the
 # account's cleared edge used to nudge 8 s after the reset, which Claude
 # counts as a manual submit, so its own hidden continuation never ran.
-CLAUDE_OWN_CONTINUE_S = 180
+CLAUDE_OWN_CONTINUE_S = 150 + 300
 # An Esc AI Hive itself sent cancels Claude's timer with the same notice a
 # person's Esc does. A cancel notice this soon after one of ours is ours.
 APP_ESC_WINDOW_S = 15

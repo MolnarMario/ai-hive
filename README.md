@@ -208,8 +208,8 @@ workspaces keep executing — switching never pauses anything.
   don't all pile into a fresh window, then **verifies** against the
   conversation on disk, and retries if the resume didn't take. Claude Code
   goes first: while its own "continuing automatically" timer is armed, AI
-  Hive types nothing until 3 minutes past the reset, and steps in only if
-  Claude hasn't continued by then. If you cancel Claude's timer with Esc, AI
+  Hive types nothing, and sends its own continue only if Claude still hasn't
+  continued 5 minutes after it was due (7.5 minutes past the printed reset). If you cancel Claude's timer with Esc, AI
   Hive takes that as a no and leaves the agent parked. If Claude gives up on
   its own (it exited during the wait, hit its re-arm cap, or the reset is more
   than 24 hours out), AI Hive resumes the agent as usual. All of this is read
