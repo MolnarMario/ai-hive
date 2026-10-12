@@ -1792,6 +1792,32 @@ def test_held_start_veil():
     agent.hold_start("[lane could not be restored]")
     check("held-start: a hold that stays gives the card its banner back",
           not card.boot.is_active() and card.overlay.isVisible())
+    agent.release_start()
+
+    # Restart in own lane: the stopped child left prompt_ready set
+    agent._prompt_ready = True
+    agent.hold_start("[creating this agent's lane...]", coming=True)
+    check("held-start: a stale prompt_ready from the stopped child does not "
+          "keep the loader down",
+          card.boot.is_active() and not card.overlay.isVisible())
+    check("held-start: the wait has no veil timeout (a slow worktree never "
+          "leaves a blank card)", not card._boot_timer.isActive())
+    restarts = []
+    agent.restart = lambda: restarts.append(1)
+    card._on_restart_clicked()
+    check("held-start: a Restart click during the wait is not a restart",
+          restarts and not card._restarting)
+
+    def broken_start():
+        raise RuntimeError("spawn failed")
+    agent.start = broken_start
+    try:
+        agent.release_start(run=True)
+    except RuntimeError:
+        pass
+    check("held-start: a start that raises still ends the wait",
+          not agent.start_coming() and card.overlay.isVisible()
+          and not card.boot.is_active())
     card.detach(); agent.dispose(); pump(50)
 
 

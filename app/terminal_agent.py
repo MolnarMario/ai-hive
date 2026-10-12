@@ -736,11 +736,14 @@ class TerminalAgent(QObject):
         deferred = self._start_deferred
         self._start_hold = ""
         self._start_deferred = False
-        if (run or deferred) and not self._disposing and not self.is_running():
-            self.start()
-        # after the start, so the card goes from the wait straight to the
-        # child's own loader with no stopped frame between
-        self._set_start_coming(False)
+        try:
+            if (run or deferred) and not self._disposing                     and not self.is_running():
+                self.start()
+        finally:
+            # after the start, so the card goes from the wait straight to the
+            # child's own loader with no stopped frame between. A start that
+            # raises still ends the wait, or the card keeps its loader for good
+            self._set_start_coming(False)
 
     def start_hold(self) -> str:
         return self._start_hold
