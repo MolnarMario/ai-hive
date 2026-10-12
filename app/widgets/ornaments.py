@@ -750,6 +750,9 @@ class UsagePillBadge(QWidget):
         self._show_left = False     # "79% left" instead of "21% used"
         self._unreadable = ""       # last error, when we have NO reading at all
         self._loading = False       # a fetch is in flight and we have nothing yet
+        # the error of the last failed try, while the poller is still retrying
+        # at startup: the pill stays in the loading state and says "retrying"
+        self._load_error = ""
         self._hovering = False      # paint the X's scrim over the text tail
         # (text, width) a repair has already been tried for, so a pill that
         # cannot be helped asks exactly once, plus the advance the painter
@@ -791,6 +794,19 @@ class UsagePillBadge(QWidget):
         the bar at startup, where there is deliberately no cached figure to
         paint (a stored reading goes stale exactly where it matters most)."""
         self._loading = True
+        self._load_error = ""
+        self._unreadable = ""
+        self._fail_error = ""
+        self._refresh_text()
+
+    def mark_retrying(self, error: str = "") -> None:
+        """The first reads of this run failed and the poller is trying again
+        on its fast startup schedule: stay in the loading state, but say it is
+        retrying and keep the error for the tooltip. The can't-read pill is for
+        a source that kept failing past the startup window, not for the first
+        hiccup of a launch."""
+        self._loading = True
+        self._load_error = str(error) or "unknown"
         self._unreadable = ""
         self._fail_error = ""
         self._refresh_text()
@@ -807,6 +823,7 @@ class UsagePillBadge(QWidget):
         self._limit = self._pick_limit(usage) if usage is not None else None
         self._unreadable = ""       # a real number supersedes the error pill
         self._loading = False
+        self._load_error = ""
         self._fail_error = ""
         self._retry_at = 0.0
         self._refresh_text()
@@ -815,6 +832,7 @@ class UsagePillBadge(QWidget):
         """No reading at all and the last poll failed: say so, in place, rather
         than leave a gap in the bar."""
         self._loading = False
+        self._load_error = ""
         self._unreadable = str(error) or "unavailable"
         self._refresh_text()
 
@@ -864,6 +882,7 @@ class UsagePillBadge(QWidget):
         """This readout has nothing to show and never will this run (no login).
         Clears every kind of content, so no later re-sync can resurrect it."""
         self._loading = False
+        self._load_error = ""
         self._unreadable = ""
         self._fail_error = ""
         self._limit = None
@@ -906,6 +925,8 @@ class UsagePillBadge(QWidget):
     def _refresh_text(self) -> None:
         if self._loading:
             text = self._loading_text()
+            if self._load_error:
+                text = text.removesuffix("reading...") + "retrying..."
         elif self._limit is not None:
             text = self._format_limit()
         elif self._unreadable:
@@ -913,6 +934,15 @@ class UsagePillBadge(QWidget):
         else:
             text = ""
         self._set_text(text)
+
+    def _loading_tip(self, reading: str) -> str:
+        """The loading tooltip, plus the failure a startup retry is working
+        through."""
+        if not self._load_error:
+            return reading
+        return "\n".join((reading,
+                          f"The last try failed: {self._load_error}.",
+                          "Trying again shortly, no need to click."))
 
     def _set_text(self, text: str) -> None:
         tip = self._build_tooltip()
@@ -1232,9 +1262,11 @@ class PlanUsageBadge(UsagePillBadge):
     that hit an `http 429` with no seed on disk to fall back on. There is now
     NO on-disk seed at all, by design (see `start_usage_polling`): a stored
     number goes stale exactly where it matters most, so the pill opens in the
-    LOADING state instead and only ever shows a figure fetched this run. The
-    error pill keeps the click-to-refresh affordance, which is the one useful
-    thing a user can do about it.
+    LOADING state instead and only ever shows a figure fetched this run. A
+    failed first read keeps it loading ("retrying...", `mark_retrying`) while
+    the poller retries fast; the error pill is for a read that kept failing
+    past the startup window, and keeps the click-to-refresh affordance, which
+    is the one useful thing a user can do about it.
     """
 
     _PROVIDER = "claude"
@@ -1283,7 +1315,7 @@ class PlanUsageBadge(UsagePillBadge):
         import time as _time
 
         if self._loading:
-            return "Reading the Claude plan usage..."
+            return self._loading_tip("Reading the Claude plan usage...")
         if self._limit is None and self._unreadable:
             return ("Claude plan usage could not be read.\n"
                     f"Last attempt failed: {self._unreadable}\n"

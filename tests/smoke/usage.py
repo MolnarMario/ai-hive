@@ -416,7 +416,7 @@ def test_plan_usage():
     p4 = win4.usage_poller("claude")
     p4._running = True                  # as start() leaves it, minus the fetch
     b4 = win4.top_bar.usage_badge
-    win4._on_usage_ready(cu.Usage(error="http 429"))
+    win4._on_usage_ready(cu.Usage(error="expired"))
     app.processEvents()
     check("plan-usage: a failure with no reading shows the can't-read pill",
           b4.isVisible() and "unreadable" in b4._text
@@ -425,7 +425,7 @@ def test_plan_usage():
           not b4.has_reading() and b4.has_content()
           and win4.plan_usage() is None)
     check("plan-usage: its tooltip names the failure and the way out",
-          "http 429" in b4.toolTip() and "Click to try again" in b4.toolTip())
+          "expired" in b4.toolTip() and "Click to try again" in b4.toolTip())
     check("plan-usage: polling continues (only no-auth is terminal)",
           p4.is_running() and p4.next_poll_at() > 0)
     # and a real number supersedes the error pill entirely
@@ -437,7 +437,7 @@ def test_plan_usage():
     # an error is not a reason to force the readout back onto a bar the user
     # deliberately cleared
     win4._on_usage_tracker_toggled("claude_five_hour", False)
-    win4._on_usage_ready(cu.Usage(error="http 429"))
+    win4._on_usage_ready(cu.Usage(error="expired"))
     app.processEvents()
     check("plan-usage: a closed readout stays closed when a poll fails",
           not b4.isVisible())
@@ -969,11 +969,56 @@ def test_usage_poll_policy():
     check("usage-poll: no-auth with no reading clears the pill and stops",
           not fresh.is_running() and not fresh_pill.has_content() and gone == [1])
     other, other_pill = make()
-    other.deliver(xu.CodexUsage(error="urlerror"))
-    check("usage-poll: a failure with no reading shows the can't-read pill",
+    other.deliver(xu.CodexUsage(error="expired"))
+    check("usage-poll: an expired login with no reading shows the can't-read pill",
           other_pill.has_content() and not other_pill.has_reading()
-          and other.is_running())
+          and other.is_running() and "unreadable" in other_pill._text)
     other.stop()
+
+    # --- startup: keep trying, and say so, until the first number lands ---
+    start, start_pill = make()
+    start_pill.mark_loading()
+    start.deliver(xu.CodexUsage(error="urlerror"))
+    sgap = lambda: round(start.next_poll_at() - clock[0])
+    check("usage-poll: a first failure keeps the pill loading, as retrying",
+          start_pill._loading and "retrying" in start_pill._text
+          and "unreadable" not in start_pill._text
+          and not start_pill._unreadable, start_pill._text)
+    check("usage-poll: the tooltip names the error and says it retries itself",
+          "urlerror" in start_pill.toolTip()
+          and "Trying again" in start_pill.toolTip(), start_pill.toolTip())
+    check("usage-poll: startup retries in 3 s, not 10 s or 6 minutes",
+          sgap() == up.STARTUP_RETRY_MS[0] // 1000, sgap())
+    seen = []
+    for _ in range(6):
+        clock[0] += 3
+        start.deliver(xu.CodexUsage(error="timeouterror"))
+        seen.append(sgap())
+    check("usage-poll: startup retries lengthen to 30 s and stay there",
+          seen == [5, 10, 15, 30, 30, 30], seen)
+    start.tick()
+    check("usage-poll: the retune leaves a startup retry alone",
+          sgap() == 30, sgap())
+    start.deliver(xu.CodexUsage(error="http 429"))
+    check("usage-poll: a startup 429 waits 30 s then doubles",
+          sgap() == 30 and start.backoff() >= 1, sgap())
+    for _ in range(5):
+        start.deliver(xu.CodexUsage(error="http 429"))
+    check("usage-poll: a startup 429 wait is capped at 4 minutes",
+          sgap() == up.STARTUP_429_CAP_MS // 1000, sgap())
+    clock[0] += up.STARTUP_PATIENCE_S
+    start.deliver(xu.CodexUsage(error="urlerror"))
+    check("usage-poll: past the patience window the pill says unreadable",
+          "unreadable" in start_pill._text and not start_pill._loading
+          and start.is_running(), start_pill._text)
+    start.deliver(good())
+    check("usage-poll: the first real reading replaces it and resets the streak",
+          start_pill.has_reading() and not start_pill._loading
+          and start._fail.attempts == 0 and "retrying" not in start_pill._text)
+    start.deliver(xu.CodexUsage(error="urlerror"))
+    check("usage-poll: after a reading, failures use the ordinary retry",
+          sgap() == up.RETRY_MS // 1000 and start_pill.has_reading(), sgap())
+    start.stop()
 
     # --- every pill on the bar is on this policy ---
     covered = sorted(k for src in usage_sources() for k in src.tracker_keys)
