@@ -216,6 +216,16 @@ LIMIT_ACCOUNT_WAIT_S = 600
 # week must not hold a Sonnet agent whose session just reopened.
 ACCOUNT_WIDE_LIMITS = ("five_hour", "seven_day")
 MODEL_LIMIT_OF_WINDOW = {"opus": "seven_day_opus", "sonnet": "seven_day_sonnet"}
+# How long past the reset a Claude agent whose OWN auto-continue is armed is
+# left to it (`_leave_to_claude`). Claude fires 30 to 90 s after the server's
+# reset; the clock AI Hive reads is that reset printed to the minute, so up
+# to 60 s more, then 30 s of slack. Typing first is what this prevents: the
+# account's cleared edge used to nudge 8 s after the reset, which Claude
+# counts as a manual submit, so its own hidden continuation never ran.
+CLAUDE_OWN_CONTINUE_S = 180
+# An Esc AI Hive itself sent cancels Claude's timer with the same notice a
+# person's Esc does. A cancel notice this soon after one of ours is ours.
+APP_ESC_WINDOW_S = 15
 # Backstop for a cut-off whose reset time nothing could supply — neither the
 # screen nor the usage API. A 5-hour window cannot outlast this, so waiting it
 # out is always eventually right, and it guarantees a latch can never become
@@ -2513,6 +2523,12 @@ class MainWindow(QMainWindow):
         # audit line and the poll kick happen once per hold, not every minute
         # (see `_account_verdict`)
         self._limit_hold: dict[str, str] = {}
+        # the last thing Claude's own auto-continue said that was audited, per
+        # agent id, so each DEFER / CLAUDE-STOPPED line is written once
+        # (see `_leave_to_claude`)
+        self._claude_auto_said: dict[str, tuple] = {}
+        # when AI Hive itself last sent an agent Esc (see APP_ESC_WINDOW_S)
+        self._app_esc_at: dict[str, float] = {}
         # ledger keys already filed this run, so one cut-off is written once
         # however many times its latch is (re)raised
         self._ledger_seen: set[tuple] = set()
@@ -3357,6 +3373,7 @@ class MainWindow(QMainWindow):
         # account check
         self._limit_wait_ticks.pop(agent_id, None)
         self._limit_hold.pop(agent_id, None)
+        self._claude_auto_said.pop(agent_id, None)
         # File it durably. Skipped when this cut-off is already on record: the
         # startup scan files before it arms, and a failed verify re-latches the
         # same cut-off, so this signal fires more than once per episode.
@@ -3565,6 +3582,82 @@ class MainWindow(QMainWindow):
         if held and held != "clock":
             self._limit_audit(f"ACCOUNT-CLEAR agent={agent.spec.name}")
 
+    def _leave_to_claude(self, agent, now: float) -> bool:
+        """Whether this pass leaves a cut-off Claude agent to Claude Code's
+        own auto-continue, judged by the notices Claude writes into the
+        conversation (`limit_banner.auto_continue_state`).
+
+        Armed: Claude sends its own hidden continuation 30 to 90 s after the
+        reset. Typing before it counts as a manual submit, which cancels
+        Claude's timer and puts a visible prompt where Claude's hidden one
+        would have gone. Every nudge on record did that, because the
+        account's cleared edge fires 8 s after the reset. So an armed agent
+        is left alone until CLAUDE_OWN_CONTINUE_S past its reset. If Claude
+        continued by then, `_clear_carried_on_latches` files it as
+        SELF-RESUMED; if not, AI Hive steps in as before. Only a notice
+        written since this claude process started counts: the timer lives
+        in memory and dies with the process, and a hard kill writes nothing
+        to say so.
+
+        Cancelled by a person (Esc or Ctrl+C on the timer): the cut-off is
+        dismissed and the agent left parked, unless the Esc was AI Hive's.
+
+        Given up, or waiting for Enter after a sleep: AI Hive resumes it on
+        its usual schedule, and the log says why, once."""
+        if agent.spec.provider != "claude":
+            return False
+        info = transcripts.limit_cut_off(agent.spec.cwd, agent.spec.session_id)
+        if not info or not info["cut_off"] or not info.get("auto"):
+            return False
+        state, said_at = info["auto"], info["auto_at"]
+        name, note = agent.spec.name, info.get("auto_note", "")[:100]
+        current = said_at >= agent.session_started_at()
+
+        def once(tag: str, message: str) -> None:
+            if self._claude_auto_said.get(agent.id) != (tag, said_at):
+                self._claude_auto_said[agent.id] = (tag, said_at)
+                self._limit_audit(message)
+
+        if state == "armed":
+            if not current:
+                return False    # that timer died with an earlier process
+            at = info["resets_at"] or agent.limit_resets_at()
+            if not at:
+                return False
+            until = at + CLAUDE_OWN_CONTINUE_S
+            if now < until:
+                once("defer", f"DEFER agent={name} (Claude Code continues it "
+                              f"itself after the "
+                              f"{time.strftime('%H:%M', time.localtime(at))} "
+                              f"reset; AI Hive steps in at "
+                              f"{time.strftime('%H:%M:%S', time.localtime(until))}"
+                              f" if it has not)")
+                return True
+            once("late", f"CLAUDE-LATE agent={name} (Claude Code's own "
+                         f"continue has not run, stepping in)")
+            return False
+        if state == "cancelled":
+            esc_at = self._app_esc_at.get(agent.id, 0.0)
+            if esc_at and esc_at - 1 <= said_at <= esc_at + APP_ESC_WINDOW_S:
+                once("ours", f"CLAUDE-STOPPED agent={name} (AI Hive's own Esc "
+                             f"cancelled Claude Code's continue)")
+                return False
+            self._limit_audit(f"USER-CANCELLED agent={name} (Esc on Claude "
+                              f"Code's automatic continue, leaving it parked)")
+            self._ledger_outcome(
+                agent, limit_ledger.DISMISSED,
+                detail="the user cancelled Claude Code's automatic continue")
+            agent.clear_limit_block()
+            agent.notice("[automatic continue cancelled; AI Hive will not "
+                         "resume this cut-off]")
+            return True
+        if state == "off":
+            once("off", f"CLAUDE-STOPPED agent={name} note={note!r}")
+        elif current:
+            once("stale", f"CLAUDE-STALE agent={name} (Claude Code is waiting "
+                          f"for Enter after the reset)")
+        return False
+
     def _sweep_transcript_cut_offs(self) -> int:
         """The SECOND detector: latch any idle Claude agent whose conversation
         on disk ends on a cut-off the live screen never latched. Returns how
@@ -3710,7 +3803,8 @@ class MainWindow(QMainWindow):
 
         Only agents LATCHED as cut off are touched (`is_limit_blocked`) — the
         account-wide reading cannot say who was mid-turn. An agent that is busy
-        again, or was never cut off, is left alone.
+        again, or was never cut off, is left alone. So is one whose own Claude
+        Code will continue it, under both triggers (`_leave_to_claude`).
 
         Each latch is gated by the toggle that OWNS it: one recovered from disk
         at startup answers to `startup_recovery`, one seen live answers to
@@ -3727,6 +3821,7 @@ class MainWindow(QMainWindow):
         """
         if self._closing or not self._ready:
             return
+        now = time.time()
         blocked = [a for a in self.manager.all_agents()
                    if a.spec.provider in LIMIT_PROVIDERS and a.is_pty
                    and (due is not None or a.spec.provider == "claude")
@@ -3736,6 +3831,7 @@ class MainWindow(QMainWindow):
                         else self._auto_continue)
                    and a.limit_retry_ready(LIMIT_RETRY_S, LIMIT_MAX_TRIES)
                    and a.id not in self._resume_pending
+                   and not self._leave_to_claude(a, now)
                    and (due is None or due(a))]
         for i, agent in enumerate(blocked):
             # claimed BEFORE the stagger, because the attempt itself is only
@@ -3831,6 +3927,7 @@ class MainWindow(QMainWindow):
             # never has a menu. The beat before the text goes out is kept
             # regardless: it costs nothing and staggers the send.
             if agent.limit_menu_visible():
+                self._app_esc_at[agent.id] = time.time()
                 agent.write("\x1b")
 
         def send():
@@ -3981,6 +4078,9 @@ class MainWindow(QMainWindow):
             # TerminalView uses for Backspace over a Ctrl+A highlight), and
             # `write` is right for it: it stamps _last_input_ts, so the pty's
             # echo of the Escapes is not mistaken for the agent working.
+            # Under Claude's own limit timer they also cancel it, which is a
+            # side effect, not the user saying no (see `_leave_to_claude`).
+            self._app_esc_at[agent.id] = time.time()
             agent.write("\x1b\x1b")
         self._schedule_audit(
             f"QUEUED agent={agent.spec.name} "

@@ -930,6 +930,63 @@ def _auto_continue_on_limit_reset_body():
     # (a USER-typed slash command is classified in test_startup_limit_recovery;
     # the window only acts on that classification, as the two cases above show)
 
+    # --- Claude Code's own auto-continue goes first --------------------------
+    # 2026-10-11: Agents 13, 15 and 16 sat under Claude's "continuing
+    # automatically at 9:50pm", and the account's cleared edge typed into all
+    # three at 21:50:08, before Claude's own timer (30 to 90 s after the
+    # reset) could fire. Claude counts that as a manual submit and drops its
+    # own continuation.
+    from app.widgets.main_window import CLAUDE_OWN_CONTINUE_S
+
+    def armed_notice(reset, at):
+        clock = _time.strftime("%I:%M%p", _time.localtime(reset))
+        return {"type": "system", "subtype": "informational", "level": "notice",
+                "timestamp": ts(at),
+                "content": f"Usage limit reached \xb7 continuing automatically "
+                           f"at {clock.lstrip('0').lower()} \xb7 esc to cancel"}
+
+    def own_agent(name, reset):
+        cwd_ = str(tmp / name.lower())
+        ag = mk(name)
+        ag.spec.cwd, ag.spec.session_id = cwd_, "sid-" + name.lower()
+        ag._session_started = now - 7200
+        write_raw(cwd_, ag.spec.session_id, [
+            {"type": "user", "timestamp": ts(now - 3600),
+             "message": {"content": "port the parser to rust"}},
+            armed_notice(reset, now - 3500)])
+        settle(ag, BANNER)
+        ws.agents.append(ag)
+        return ag
+
+    writes.clear()
+    own = own_agent("OwnResume", now - 30)
+    win._resume_blocked_agents()           # the account's cleared edge
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: an agent whose own Claude Code is armed is not typed "
+          "into when the account clears", sent(own) == ""
+          and own.is_limit_blocked() and own.limit_attempts() == 0)
+    with open(_tr.transcript_path(own.spec.cwd, own.spec.session_id), "a",
+              encoding="utf-8") as fh:
+        fh.write(_json.dumps(_as_cli_wrote({
+            "type": "system", "subtype": "informational", "level": "notice",
+            "timestamp": ts(_time.time() + 5),
+            "content": "Usage limit reset \xb7 continuing automatically"}))
+            + "\n")
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: ...and once Claude continued it, the latch is filed "
+          "as its own resume", not own.is_limit_blocked() and sent(own) == ""
+          and any(r.get("event") == limit_ledger.RESUMED
+                  and "on its own" in r.get("detail", "")
+                  for r in limit_ledger.read_all(str(tmp))))
+
+    writes.clear()
+    late_own = own_agent("OwnLate", now - CLAUDE_OWN_CONTINUE_S - 120)
+    win._resume_blocked_agents()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: an armed agent Claude did not continue in time is "
+          "resumed by AI Hive", AUTO_CONTINUE_TEXT in sent(late_own))
+
     # --- the cut-off is visible on the card ---------------------------------
     marked = mk("Marked")
     settle(marked, BANNER)
@@ -2754,3 +2811,205 @@ def test_account_check_before_resume():
           and len(audits) == n, audits[n:])
     check("account-check: a Gemini agent is never held on Claude's account",
           verdict(agent("Gem", provider="gemini"), spent) is True)
+
+
+def test_claude_own_auto_continue_first():
+    """Claude Code (2.1.296) continues a cut-off agent by itself 30 to 90 s
+    after the reset and writes notices about it into the conversation. AI
+    Hive used to type "Continue" 8 s after the reset, which Claude counts as a
+    manual submit, so its own continuation never ran. Now AI Hive reads those
+    notices: it waits while Claude's timer is armed, leaves alone a cut-off a
+    person cancelled with Esc, and steps in when Claude gives up."""
+    import json as _json
+    import time as _time
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QApplication
+    from app import limit_banner as lb
+    from app import limit_ledger, transcripts
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    from app.widgets.main_window import (APP_ESC_WINDOW_S,
+                                         CLAUDE_OWN_CONTINUE_S, MainWindow)
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-own-continue-"))
+    cwd = str(tmp)
+    now = int(_time.time())
+
+    ARMED = ("Usage limit reached \xb7 continuing automatically at 9:50pm "
+             "\xb7 esc to cancel")
+    AGAIN = ("Usage limit reached again \xb7 continuing automatically at "
+             "9:50pm \xb7 esc to cancel")
+    WAITING = "Continuing automatically at 9:50pm \xb7 esc to cancel"
+    CANCEL = "Automatic continue cancelled \xb7 /rate-limit-options to re-arm"
+    EXITED = ("Automatic continue cancelled \xb7 Claude Code exited during the "
+              "wait, so the task will not resume on its own when the usage "
+              "limit resets (send a prompt after the reset to continue)")
+    CAPPED = ("Automatic continue stopped after repeated usage-limit hits \xb7 "
+              "this task will not resume on its own (/rate-limit-options to "
+              "try again)")
+    DROPPED = ("Automatic continue did not run \xb7 the continuation was "
+               "blocked before it reached the model, so this task did not "
+               "resume on its own \xb7 send a prompt to continue")
+    OFF = ("Automatic continue was turned off \xb7 this task will not resume "
+           "on its own")
+    STALE = "Usage limit has reset \xb7 press enter to continue"
+
+    # --- the notices --------------------------------------------------------
+    st = lb.auto_continue_state
+    check("own-continue: Claude's armed notice, its re-arm and its countdown "
+          "all read as armed", st(ARMED) == st(AGAIN) == st(WAITING) == "armed")
+    check("own-continue: ...painted without spaces too",
+          st(ARMED.replace(" ", "")) == "armed")
+    check("own-continue: Esc's cancel notice is a person saying no",
+          st(CANCEL) == "cancelled")
+    check("own-continue: every way Claude gives up reads as off",
+          st(EXITED) == st(CAPPED) == st(DROPPED) == st(OFF) == "off",
+          [st(x) for x in (EXITED, CAPPED, DROPPED, OFF)])
+    check("own-continue: the wait-for-Enter notice reads as stale",
+          st(STALE) == "stale")
+    reset_line = "Usage limit reset \xb7 continuing automatically"
+    check("own-continue: the reset notice is not a timer state, it ends the "
+          "cut-off", st(reset_line) == "" and lb.is_reset_notice(reset_line))
+    check("own-continue: so is the early fire after an API check",
+          lb.is_reset_notice("Usage limit available again \xb7 continuing now"))
+    check("own-continue: prose about the feature is nothing",
+          st("I think the automatic continue cancelled my run") == ""
+          and st("") == "")
+
+    # --- the conversation on disk -------------------------------------------
+    def iso(at):
+        return _time.strftime("%Y-%m-%dT%H:%M:%S.000Z", _time.gmtime(at))
+
+    def write(sid, records):
+        path = transcripts.transcript_path(cwd, sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(_json.dumps(_as_cli_wrote(rec)) + "\n")
+
+    def user(text, at):
+        return {"type": "user", "timestamp": iso(at),
+                "message": {"role": "user", "content": text}}
+
+    def reply(text, at):
+        return {"type": "assistant", "timestamp": iso(at),
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    def system(text, at):
+        return {"type": "system", "subtype": "informational",
+                "level": "notice", "timestamp": iso(at), "content": text}
+
+    def quota(at, reset):
+        return dict(reply("You've hit your session limit \xb7 resets 9:50pm",
+                          at), quotaLimits={"status": "rejected",
+                                            "resetsAt": int(reset),
+                                            "rateLimitType": "five_hour"})
+
+    ask = user("port the parser", now - 4000)
+    write("sid-armed", [ask, system(ARMED, now - 3900)])
+    info = transcripts.limit_cut_off(cwd, "sid-armed")
+    check("own-continue: the armed notice alone opens a cut-off Claude will "
+          "continue", info["cut_off"] and info["auto"] == "armed"
+          and info["auto_at"] == now - 3900, info)
+    write("sid-again", [ask, quota(now - 3900, now + 600),
+                        system(AGAIN, now - 3899)])
+    info = transcripts.limit_cut_off(cwd, "sid-again")
+    check("own-continue: a re-arm marks the open cut-off and keeps its exact "
+          "reset", info["cut_off"] and info["auto"] == "armed"
+          and info["resets_at"] == now + 600 and info["at"] == now - 3900, info)
+    write("sid-cancel", [ask, system(ARMED, now - 3900),
+                         system(CANCEL, now - 3000)])
+    info = transcripts.limit_cut_off(cwd, "sid-cancel")
+    check("own-continue: a cancel after the arm is the last word",
+          info["cut_off"] and info["auto"] == "cancelled", info)
+    write("sid-exit", [ask, system(ARMED, now - 3900),
+                       system(EXITED, now - 3000)])
+    info = transcripts.limit_cut_off(cwd, "sid-exit")
+    check("own-continue: Claude exiting during the wait leaves the cut-off "
+          "open and AI Hive's", info["cut_off"] and info["auto"] == "off"
+          and "exited" in info["auto_note"], info)
+    write("sid-fresh", [ask, system(ARMED, now - 3900),
+                        system(CANCEL, now - 3000), quota(now - 100, now + 600)])
+    info = transcripts.limit_cut_off(cwd, "sid-fresh")
+    check("own-continue: a new cut-off starts with no timer state",
+          info["cut_off"] and info["auto"] == "", info)
+    write("sid-closed", [ask, reply("Done.", now - 3900),
+                         system(CANCEL, now - 3000)])
+    info = transcripts.limit_cut_off(cwd, "sid-closed")
+    check("own-continue: a notice with no cut-off open is nothing",
+          not info["cut_off"] and info["auto"] == "", info)
+
+    # --- the verdict --------------------------------------------------------
+    audits, outcomes = [], []
+    stub = SimpleNamespace(_claude_auto_said={}, _app_esc_at={},
+                           _limit_audit=audits.append,
+                           _ledger_outcome=lambda ag, o, detail="":
+                               outcomes.append((ag.spec.name, o)))
+    made = []
+
+    def agent(name, records, started=now - 7200, kind=AgentKind.CLAUDE):
+        a = TerminalAgent(build_spec(kind, name, cwd=cwd))
+        a.status = AgentStatus.RUNNING
+        a.spec.session_id = "sid-v-" + name.lower()
+        a._session_started = started
+        write(a.spec.session_id, records)
+        a.mark_limit_blocked(None, banner="Usage limit reached")
+        made.append(a)
+        return a
+
+    def leave(a, when=now):
+        return MainWindow._leave_to_claude(stub, a, when)
+
+    reset = transcripts.limit_cut_off(cwd, "sid-armed")["resets_at"]
+    armed = [ask, system(ARMED, now - 3900)]
+    waits = agent("Waits", armed)
+    first = leave(waits, reset - 600)
+    leave(waits, reset - 540)
+    check("own-continue: an armed agent is left to Claude before its reset",
+          first is True and leave(waits, reset + 60) is True)
+    check("own-continue: ...audited once", sum(
+        "DEFER agent=Waits" in x for x in audits) == 1, audits)
+    check("own-continue: ...until Claude's window has passed",
+          leave(waits, reset + CLAUDE_OWN_CONTINUE_S + 1) is False
+          and any("CLAUDE-LATE agent=Waits" in x for x in audits), audits)
+    check("own-continue: a timer armed by an earlier claude process died with "
+          "it", leave(agent("Restarted", armed, started=now - 60),
+                      reset - 600) is False)
+
+    person = agent("Person", [ask, system(ARMED, now - 3900),
+                              system(CANCEL, now - 3000)])
+    check("own-continue: a person's Esc dismisses the cut-off",
+          leave(person) is True and not person.is_limit_blocked()
+          and ("Person", limit_ledger.DISMISSED) in outcomes
+          and any("USER-CANCELLED agent=Person" in x for x in audits),
+          (outcomes, audits))
+    ours = agent("Ours", [ask, system(ARMED, now - 3900),
+                          system(CANCEL, now - 3000)])
+    stub._app_esc_at[ours.id] = now - 3000 - APP_ESC_WINDOW_S + 2
+    check("own-continue: a cancel AI Hive's own Esc caused is not the user's",
+          leave(ours) is False and ours.is_limit_blocked()
+          and ("Ours", limit_ledger.DISMISSED) not in outcomes)
+
+    gaveup = agent("GaveUp", [ask, system(ARMED, now - 3900),
+                              system(CAPPED, now - 3000)])
+    leave(gaveup)
+    check("own-continue: when Claude gives up, AI Hive resumes it and says why "
+          "once", leave(gaveup) is False and sum(
+              "CLAUDE-STOPPED agent=GaveUp" in x and "repeated" in x
+              for x in audits) == 1, audits)
+    stale = agent("Stale", [ask, system(ARMED, now - 3900),
+                            system(STALE, now - 60)], started=now - 600)
+    check("own-continue: Claude waiting for Enter is AI Hive's to resume",
+          leave(stale) is False
+          and any("CLAUDE-STALE agent=Stale" in x for x in audits), audits)
+    n = len(audits)
+    plain = agent("Plain", [ask, quota(now - 3900, now + 600)])
+    check("own-continue: a cut-off Claude said nothing about is AI Hive's, "
+          "silently", leave(plain) is False and len(audits) == n)
+    gem = agent("Gem", armed, kind=AgentKind.GEMINI)
+    check("own-continue: a Gemini agent is never left to Claude",
+          leave(gem) is False)
+    for a in made:
+        a.dispose()
+    shutil.rmtree(tmp, ignore_errors=True)

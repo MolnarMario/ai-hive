@@ -206,9 +206,15 @@ workspaces keep executing — switching never pauses anything.
   CLI's options menu is actually on screen, since on current versions Esc
   cancels Claude's own "continuing automatically" timer), staggered so agents
   don't all pile into a fresh window, then **verifies** against the
-  conversation on disk, and retries if the resume didn't take. When Claude Code
-  already continued by itself, the transcript says so and AI Hive stays out of
-  the way. Cut-offs are caught two independent ways: off the live screen (every
+  conversation on disk, and retries if the resume didn't take. Claude Code
+  goes first: while its own "continuing automatically" timer is armed, AI
+  Hive types nothing until 3 minutes past the reset, and steps in only if
+  Claude hasn't continued by then. If you cancel Claude's timer with Esc, AI
+  Hive takes that as a no and leaves the agent parked. If Claude gives up on
+  its own (it exited during the wait, hit its re-arm cap, or the reset is more
+  than 24 hours out), AI Hive resumes the agent as usual. All of this is read
+  from the notices Claude writes into the conversation. Cut-offs are caught
+  two independent ways: off the live screen (every
   wording claude.exe 2.1.281 prints, including rows it paints with cursor jumps
   instead of spaces), and by a once-a-minute sweep of each idle agent's
   conversation file, which catches anything the screen missed. A weekly, Opus,
@@ -225,7 +231,8 @@ workspaces keep executing — switching never pauses anything.
   usage API being reachable — it fires from the agent's own stated reset even
   when the account readout is rate-limited. Every step is logged to
   `session.log` (`BLOCKED` / `LATE-LATCH` / `NUDGE` / `RESUMED` /
-  `SELF-RESUMED` / `CARRIED-ON` / `STILL-BLOCKED`), each resumed
+  `SELF-RESUMED` / `CARRIED-ON` / `STILL-BLOCKED` / `DEFER` /
+  `USER-CANCELLED` / `CLAUDE-STOPPED`), each resumed
   card shows a `— plan limit reset; auto-continued —` line, and the workspace
   board gets a note. A stopped agent is also visible at a glance, everywhere,
   live: an **⏳ hourglass** sits in the card header and next to the agent in
