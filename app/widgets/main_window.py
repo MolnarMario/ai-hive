@@ -204,6 +204,18 @@ SCHEDULE_GIVE_UP_S = 900
 # one of the few retries above. The account READING needs no such slack: when
 # it reports headroom the window is provably open already.
 LIMIT_RESET_GRACE_S = 120
+# Once a Claude agent's own clock says its window reopened, the account reading
+# gets the last word before anything is typed (`_account_verdict`): a reading
+# taken after the reset that still shows a limit out holds the agent, at no
+# cost to its retries. But the endpoint 429s and can go quiet for long
+# stretches, so waiting for a fresh reading is bounded: this long past the due
+# time, the clock alone decides again, exactly as it did before the check.
+LIMIT_ACCOUNT_WAIT_S = 600
+# The account limits that stop a Claude agent whatever model it runs. A model's
+# own weekly limit stops only an agent cut off on that window, so a spent Opus
+# week must not hold a Sonnet agent whose session just reopened.
+ACCOUNT_WIDE_LIMITS = ("five_hour", "seven_day")
+MODEL_LIMIT_OF_WINDOW = {"opus": "seven_day_opus", "sonnet": "seven_day_sonnet"}
 # Backstop for a cut-off whose reset time nothing could supply — neither the
 # screen nor the usage API. A 5-hour window cannot outlast this, so waiting it
 # out is always eventually right, and it guarantees a latch can never become
@@ -2497,6 +2509,10 @@ class MainWindow(QMainWindow):
         # agent that never gets a frame is eventually asked for one rather than
         # waited on forever (see LIMIT_REPAINT_AFTER_WAITS)
         self._limit_wait_ticks: dict[str, int] = {}
+        # why the account check is holding a due agent, per agent id, so the
+        # audit line and the poll kick happen once per hold, not every minute
+        # (see `_account_verdict`)
+        self._limit_hold: dict[str, str] = {}
         # ledger keys already filed this run, so one cut-off is written once
         # however many times its latch is (re)raised
         self._ledger_seen: set[tuple] = set()
@@ -3337,8 +3353,10 @@ class MainWindow(QMainWindow):
         self._limit_audit(f"BLOCKED agent={agent.spec.name} resets={when}"
                           f"{exact if at else ''} "
                           f"window={agent.limit_window() or '-'}")
-        # a fresh cut-off gets the full patience budget again
+        # a fresh cut-off gets the full patience budget again, and a fresh
+        # account check
         self._limit_wait_ticks.pop(agent_id, None)
+        self._limit_hold.pop(agent_id, None)
         # File it durably. Skipped when this cut-off is already on record: the
         # startup scan files before it arms, and a failed verify re-latches the
         # same cut-off, so this signal fires more than once per episode.
@@ -3406,6 +3424,12 @@ class MainWindow(QMainWindow):
         restart, a bad poll, or a missed edge silently costs a whole night. The
         banner states its reset time in local clock time, latched when it was
         drawn, so this needs neither the network nor process continuity.
+
+        It does not ignore the network when the network has an answer,
+        though: a Claude agent whose clock has passed still waits while a
+        reading taken after that reset shows its limit spent
+        (`_account_verdict`). The wait for such a reading is bounded, so the
+        clock still decides when the endpoint is down.
         """
         if self._closing or not self._ready:
             return
@@ -3444,7 +3468,10 @@ class MainWindow(QMainWindow):
                 # ...and even a session clock gets slack: the banner names a
                 # minute, not an instant, and a nudge into a window that is
                 # still shut spends one of very few retries.
-                return at + LIMIT_RESET_GRACE_S <= now
+                if at + LIMIT_RESET_GRACE_S > now:
+                    return False
+                # The clock says the window reopened. Ask the account too.
+                return self._account_verdict(a, at, usage, now)
             # Still no clock from anywhere — screen silent, API unreachable.
             # A latch must never become permanent for want of a timestamp
             # (observed live: `resets=unknown` at 05:10 sat untouched for five
@@ -3453,6 +3480,87 @@ class MainWindow(QMainWindow):
                     and now - a.limit_latched_at() >= LIMIT_UNKNOWN_WAIT_S)
 
         self._resume_blocked_agents(due=due)
+
+    def _account_verdict(self, agent, at: float, usage, now: float) -> bool:
+        """Whether a Claude agent whose own reset time `at` has passed may be
+        nudged, judged by the account reading. A nudge into a window that is
+        still shut spends a retry and types into an agent that cannot answer,
+        so the clock alone is not trusted when the account can say more.
+
+        Only a reading taken AFTER `at` counts: one from before the reset
+        describes the window that cut the agent off. In it, only the limits
+        that stop this agent matter (`ACCOUNT_WIDE_LIMITS`, plus the model's
+        own week for an agent cut off on it). One of those still spent, with
+        its reset ahead, holds the agent; the account's cleared edge or a
+        later tick resumes it. None spent lets it go.
+
+        With no such reading yet, the agent waits for one, and a poll is
+        asked for once per hold. That wait ends `LIMIT_ACCOUNT_WAIT_S` past
+        the due time, and so does the wait behind a spent limit whose own
+        reset has since passed: the endpoint can be down for hours, and a
+        latch must not outlive it. Without polling at all (no Claude login,
+        or the smoke suite) the clock decides alone, as it always did.
+        Holding never counts as an attempt."""
+        if agent.spec.provider != "claude":
+            return True     # the reading is Claude's; Gemini has its countdown
+        stops = ACCOUNT_WIDE_LIMITS + tuple(
+            k for k in (MODEL_LIMIT_OF_WINDOW.get(agent.limit_window()),) if k)
+        ref = at
+        if usage is not None and usage.fetched_at >= at:
+            spent = [l for l in usage.limits if l.key in stops
+                     and l.percent >= claude_usage.EXHAUSTED_PCT]
+            ahead = [l for l in spent
+                     if l.resets_at is not None and l.resets_at > now]
+            if ahead:
+                out = ahead[0]
+                when = time.strftime("%Y-%m-%d %H:%M",
+                                     time.localtime(out.resets_at))
+                self._hold_limit_resume(
+                    agent, f"spent:{out.key}",
+                    f"the account reading after the reset still has "
+                    f"{out.label} spent, until {when}")
+                return False
+            if not spent:
+                self._release_limit_hold(agent, clock_only=False)
+                return True
+            # spent, but its own reset has passed (or it named none): the
+            # reading is history now, so wait for one taken after that
+            ref = max([at] + [l.resets_at for l in spent
+                              if l.resets_at is not None])
+        if self._polling and now < ref + LIMIT_RESET_GRACE_S + LIMIT_ACCOUNT_WAIT_S:
+            if self._hold_limit_resume(
+                    agent, f"stale:{int(ref)}",
+                    "waiting for a usage reading taken after the reset"):
+                self._usage_pollers["claude"].poll()
+            return False
+        self._release_limit_hold(agent, clock_only=self._polling)
+        return True
+
+    def _hold_limit_resume(self, agent, reason: str, detail: str) -> bool:
+        """Record that the account check is holding `agent`. True when this
+        is a new hold (or a new reason), which is when it is audited."""
+        if self._limit_hold.get(agent.id) == reason:
+            return False
+        self._limit_hold[agent.id] = reason
+        self._limit_audit(f"HOLD agent={agent.spec.name} ({detail})")
+        return True
+
+    def _release_limit_hold(self, agent, clock_only: bool) -> None:
+        """The account check let `agent` go. `clock_only` when polling is on
+        but no reading after the reset ever came, which is audited once per
+        cut-off (a WAIT or a retry spacing calls this again every tick); a
+        hold the account itself cleared is audited as such."""
+        held = self._limit_hold.get(agent.id)
+        if clock_only:
+            if held != "clock":
+                self._limit_hold[agent.id] = "clock"
+                self._limit_audit(f"CLOCK-ONLY agent={agent.spec.name} (no "
+                                  f"usage reading after the reset, going on "
+                                  f"the clock)")
+            return
+        self._limit_hold.pop(agent.id, None)
+        if held and held != "clock":
+            self._limit_audit(f"ACCOUNT-CLEAR agent={agent.spec.name}")
 
     def _sweep_transcript_cut_offs(self) -> int:
         """The SECOND detector: latch any idle Claude agent whose conversation

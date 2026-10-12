@@ -628,6 +628,31 @@ def _auto_continue_on_limit_reset_body():
     check("auto-continue: the watchdog resumes it with NO usage reading at all",
           AUTO_CONTINUE_TEXT in sent(late))
 
+    # ...but when the account has a say, it has the last word: a reading taken
+    # after the reset that still shows the session spent holds the agent, and
+    # the hold spends none of its retries
+    writes.clear()
+    acct = mk("AccountHeld")
+    settle(acct, BANNER)
+    ws.agents.append(acct)
+    acct._limit_resets_at = now - LIMIT_RESET_GRACE_S - 60
+    saved_usage, win._usage = win._usage, cu.Usage(
+        limits=(cu.Limit(key="five_hour", label=cu._LABELS["five_hour"],
+                         short=cu._SHORT["five_hour"], percent=100.0,
+                         resets_at=now + 3600),),
+        fetched_at=now, plan="pro")
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: a due agent is held while the account reading "
+          "after its reset is still spent",
+          sent(acct) == "" and acct.is_limit_blocked()
+          and acct.limit_attempts() == 0)
+    win._usage = saved_usage                     # taken at `now`, headroom
+    win._check_limit_resets()
+    pump(AUTO_CONTINUE_SETTLE_MS)
+    check("auto-continue: ...and resumed once the account has headroom",
+          AUTO_CONTINUE_TEXT in sent(acct))
+
     # a WEEKLY window is not readable off the screen: its banner prints a bare
     # wall clock for a reset that can be days out, so acting on that clock
     # would nudge days early. It waits for the account reading instead.
@@ -2636,3 +2661,91 @@ def test_limit_menu_quoted_in_prose():
           "the menu", not stuck.is_limit_blocked(), audits)
     stuck.dispose()
     os.remove(path)
+
+
+def test_account_check_before_resume():
+    """Once a Claude agent's own reset time has passed, the account reading
+    gets the last word before "Continue" is typed. Before this the clock alone
+    decided, so a window that was still shut cost a retry and a message the
+    agent could not answer. The check must not strand anyone either: no
+    reading after the reset means a bounded wait, then the clock again."""
+    import time as _time
+    from types import SimpleNamespace
+    from app import claude_usage as cu
+    from app.widgets.main_window import (LIMIT_ACCOUNT_WAIT_S,
+                                         LIMIT_RESET_GRACE_S, MainWindow)
+
+    now = _time.time()
+    at = now - LIMIT_RESET_GRACE_S - 30          # the clock says due
+    audits, polls = [], []
+    stub = SimpleNamespace(_polling=True, _limit_hold={},
+                           _limit_audit=audits.append,
+                           _usage_pollers={"claude": SimpleNamespace(
+                               poll=lambda: polls.append(1))})
+    stub._hold_limit_resume = (
+        lambda *a: MainWindow._hold_limit_resume(stub, *a))
+    stub._release_limit_hold = (
+        lambda *a, **k: MainWindow._release_limit_hold(stub, *a, **k))
+
+    def agent(name, window="session", provider="claude"):
+        return SimpleNamespace(id=name, limit_window=lambda: window,
+                               spec=SimpleNamespace(name=name,
+                                                    provider=provider))
+
+    def reading(fetched, **pct_reset):
+        return cu.Usage(limits=tuple(
+            cu.Limit(key=k, label=cu._LABELS[k], short=cu._SHORT[k],
+                     percent=p, resets_at=r)
+            for k, (p, r) in pct_reset.items()), fetched_at=fetched)
+
+    def verdict(ag, usage, when=now, reset=at):
+        return MainWindow._account_verdict(stub, ag, reset, usage, when)
+
+    spent = reading(now, five_hour=(100.0, now + 3600))
+    held = agent("Held")
+    check("account-check: a reading after the reset with the session still "
+          "spent holds the agent", verdict(held, spent) is False)
+    verdict(held, spent)
+    check("account-check: ...and audits that hold once, not every tick",
+          sum("HOLD agent=Held" in x for x in audits) == 1, audits)
+    clear = reading(now, five_hour=(3.0, now + 18000))
+    check("account-check: a reading after the reset with headroom lets it go",
+          verdict(held, clear) is True
+          and any("ACCOUNT-CLEAR agent=Held" in x for x in audits), audits)
+
+    opus_out = reading(now, five_hour=(3.0, now + 18000),
+                       seven_day_opus=(100.0, now + 86400))
+    check("account-check: a spent Opus week does not hold an agent cut off "
+          "on its session", verdict(agent("Sess"), opus_out) is True)
+    check("account-check: ...but does hold one cut off on the Opus week",
+          verdict(agent("Opus", window="opus"), opus_out) is False)
+    check("account-check: the account-wide week holds everyone",
+          verdict(agent("Week"), reading(
+              now, seven_day=(100.0, now + 86400))) is False)
+
+    early = reading(at - 600, five_hour=(100.0, at))
+    waiting = agent("Waiting")
+    first = verdict(waiting, early)
+    verdict(waiting, early)
+    check("account-check: a reading from before the reset is no answer, so "
+          "the agent waits for a fresh one",
+          first is False and len(polls) == 1, polls)
+    late = at + LIMIT_RESET_GRACE_S + LIMIT_ACCOUNT_WAIT_S + 1
+    go = verdict(waiting, early, when=late)
+    verdict(waiting, early, when=late)
+    check("account-check: past the bounded wait the clock decides again, "
+          "audited once", go is True
+          and sum("CLOCK-ONLY agent=Waiting" in x for x in audits) == 1,
+          audits)
+    check("account-check: a spent limit whose own reset has passed is "
+          "history, not a hold", verdict(agent("Passed"), reading(
+              now, five_hour=(100.0, now - 60))) is False
+          and any("HOLD agent=Passed (waiting" in x for x in audits), audits)
+
+    stub._polling = False
+    n = len(audits)
+    check("account-check: without polling, no reading means the clock alone, "
+          "silently", verdict(agent("NoPoll"), None) is True
+          and len(audits) == n, audits[n:])
+    check("account-check: a Gemini agent is never held on Claude's account",
+          verdict(agent("Gem", provider="gemini"), spent) is True)
