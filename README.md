@@ -519,7 +519,10 @@ workspaces keep executing — switching never pauses anything.
   agents** on the same chip closes, after you confirm, every agent whose
   lane committed work the base branch now has and holds nothing else (no
   commit ahead, no uncommitted file, not mid-turn), and removes their
-  lanes. The integrator and every other agent stay open. Each close is a
+  lanes. The integrator and every other agent stay open. The closing cards
+  fade out one after another, then all go in a single reflow. The dialog's
+  "Don't ask again" skips the question from then on; ⚙ Options > Agents >
+  **Confirm Close merged agents** brings it back. Each close is a
   `CLOSE-MERGED` line in `session.log`. The integrator needs `Bash(git:*)` and
   `PowerShell(git:*)` allowed, and every lane of a repository shares the main
   checkout's Claude auto-memory.

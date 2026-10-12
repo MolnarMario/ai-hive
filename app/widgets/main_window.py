@@ -4,6 +4,7 @@ This is the only module that imports both the model and the view layers.
 Every dialog lives here so the model API stays headless-testable.
 """
 
+import contextlib
 import os
 import json
 import re
@@ -463,6 +464,8 @@ class TopBar(QFrame):
     agentLanesToggled = Signal(bool)
     # "Confirm Ship finished lanes": ask before typing the request (True)
     shipConfirmToggled = Signal(bool)
+    # "Confirm Close merged agents": ask before closing them (True)
+    closeMergedConfirmToggled = Signal(bool)
     # the down-arrow button: open the Updates panel (the install-method control
     # and the startup-check checkbox live there, so the bar gains no button)
     updatesPanelRequested = Signal()
@@ -609,6 +612,15 @@ class TopBar(QFrame):
         self.ship_confirm_btn = ToggleSwitch(self)
         self.ship_confirm_btn.clicked.connect(self._on_ship_confirm_clicked)
         self._refresh_ship_confirm_btn()
+
+        # "Confirm Close merged agents": the same shape, its own switch, so
+        # trusting one chip item never switches the other's dialog off.
+        self._close_merged_confirm = True
+        self.close_merged_confirm_label = toggle_label("")
+        self.close_merged_confirm_btn = ToggleSwitch(self)
+        self.close_merged_confirm_btn.clicked.connect(
+            self._on_close_merged_confirm_clicked)
+        self._refresh_close_merged_confirm_btn()
 
         # The detected Claude Code install method, under the switch it explains.
         # It used to be reachable only by hovering the down-arrow; the panel has
@@ -764,6 +776,8 @@ class TopBar(QFrame):
                                           self.agent_lanes_btn)
         self.options_panel.add_switch_row(self.ship_confirm_label,
                                           self.ship_confirm_btn)
+        self.options_panel.add_switch_row(self.close_merged_confirm_label,
+                                          self.close_merged_confirm_btn)
         self.options_panel.add_separator()
         self.options_panel.add_section("Appearance")
         self.options_panel.add_switch_row(self.fullscreen_label,
@@ -1098,6 +1112,30 @@ class TopBar(QFrame):
             "Click to be asked first again.")
         self.ship_confirm_btn.setToolTip(tip)
         self.ship_confirm_label.setToolTip(tip)
+
+    def _on_close_merged_confirm_clicked(self) -> None:
+        self.set_close_merged_confirm(not self._close_merged_confirm)
+        self.closeMergedConfirmToggled.emit(self._close_merged_confirm)
+
+    def set_close_merged_confirm(self, on: bool) -> None:
+        """Reflect the "Confirm Close merged agents" switch (no signal)."""
+        self._close_merged_confirm = bool(on)
+        self._refresh_close_merged_confirm_btn()
+
+    def _refresh_close_merged_confirm_btn(self) -> None:
+        self.close_merged_confirm_btn.setChecked(self._close_merged_confirm)
+        self.close_merged_confirm_label.setText(
+            "⚑  Confirm Close merged agents")
+        tip = (
+            "Confirm Close merged agents: ON. Close merged agents on the "
+            "integrator's chip lists the agents and waits for your OK before "
+            "it closes them.\nClick to close on the click alone."
+            if self._close_merged_confirm else
+            "Confirm Close merged agents: OFF. Close merged agents closes the "
+            "merged agents and removes their lanes as soon as you click it.\n"
+            "Click to be asked first again.")
+        self.close_merged_confirm_btn.setToolTip(tip)
+        self.close_merged_confirm_label.setToolTip(tip)
 
     def _on_auto_update_clicked(self) -> None:
         """Arm or disarm the startup update gate, like every other row here.
@@ -2398,6 +2436,8 @@ class MainWindow(QMainWindow):
         # Ship finished lanes asks first until the user ticks "Don't ask
         # again" in that dialog. Assigned here for the same reason.
         self._ship_skip_confirm = False   # user preference (persisted)
+        # Close merged agents likewise, with its own switch and key.
+        self._close_merged_skip_confirm = False   # user preference (persisted)
         # uids whose lane Close merged agents is reading again right now
         self._close_merged_reading: set[str] = set()
         # every mutating lane git operation runs here, one at a time per repo
@@ -2786,6 +2826,8 @@ class MainWindow(QMainWindow):
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.agentLanesToggled.connect(self._on_agent_lanes_toggled)
         self.top_bar.shipConfirmToggled.connect(self._on_ship_confirm_toggled)
+        self.top_bar.closeMergedConfirmToggled.connect(
+            self._on_close_merged_confirm_toggled)
         self.top_bar.updatesPanelRequested.connect(self.open_updates_panel)
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
         self.top_bar.startupRecoveryToggled.connect(self._on_startup_recovery)
@@ -4192,6 +4234,12 @@ class MainWindow(QMainWindow):
         self._ship_skip_confirm = not enabled
         self._schedule_save()
 
+    def _on_close_merged_confirm_toggled(self, enabled: bool) -> None:
+        """User flipped "Confirm Close merged agents", the way back from that
+        dialog's "Don't ask again". A UI preference like the one above."""
+        self._close_merged_skip_confirm = not enabled
+        self._schedule_save()
+
     def lane_default(self, ws) -> bool:
         """Should a new Claude agent in `ws` start with "Own lane" ticked?
         The Options switch forces it on everywhere; otherwise the
@@ -4995,7 +5043,8 @@ class MainWindow(QMainWindow):
                                "No agent's committed work is in the base "
                                "branch with nothing left to ship.")
             return
-        if not self._confirm_close_merged(merged):
+        if (not self._close_merged_skip_confirm
+                and not self._confirm_close_merged(merged)):
             return
         # the dialog ran its own event loop: an agent may have started a
         # turn, or a lane poll seen new work, meanwhile
@@ -5050,11 +5099,42 @@ class MainWindow(QMainWindow):
                 self._store_audit(f"CLOSE-MERGED-KEEP "
                                   f"agent={other.spec.name!r}")
                 batch["kept"].append(other.spec.name)
+        page = self._pages.get(ws_id)
+        if page is None or not closing:
+            self._finish_close_merged(ws_id, closing, batch)
+            return
+        # the cards dissolve one after another first, so the user watches
+        # what is closing, then they all go in one reflow
+        page.fade_out_cards({a.id for a, _s in closing},
+                            lambda: self._finish_close_merged(
+                                ws_id, closing, batch))
+
+    def _finish_close_merged(self, ws_id: str, closing: list,
+                             batch: dict) -> None:
+        """Close the judged agents together: one reflow for the whole batch,
+        not one per agent (each reflow resizes every TUI left, ten of them
+        in a row read as a flicker). The fade took a few hundred ms, so an
+        agent that was closed, or got work, meanwhile stays. Everything is
+        judged before the first close, for the reason in
+        _close_merged_agents."""
+        page = self._pages.get(ws_id)
+        final = []
         for other, snap in closing:
-            self._store_audit(f"CLOSE-MERGED agent={other.spec.name!r} "
-                              f"branch={snap.branch} "
-                              f"landed={snap.landed[:7]}")
-            self._close_agent(ws_id, other.id)
+            if self.manager.agent(ws_id, other.id) is None:
+                continue
+            if self._close_merged_qualifies(ws_id, other, snap, None):
+                final.append((other, snap))
+            else:
+                self._store_audit(f"CLOSE-MERGED-KEEP "
+                                  f"agent={other.spec.name!r}")
+                batch["kept"].append(other.spec.name)
+        with (page.removals_batched() if page is not None
+              else contextlib.nullcontext()):
+            for other, snap in final:
+                self._store_audit(f"CLOSE-MERGED agent={other.spec.name!r} "
+                                  f"branch={snap.branch} "
+                                  f"landed={snap.landed[:7]}")
+                self._close_agent(ws_id, other.id)
         self._report_close_merged_kept(batch)
 
     def _close_merged_qualifies(self, ws_id: str, other, snap,
@@ -5077,16 +5157,30 @@ class MainWindow(QMainWindow):
                 f"stay open: {', '.join(batch['kept'])}.")
 
     def _confirm_close_merged(self, merged: list) -> bool:
-        """The user's go-ahead for Close merged agents (tests replace it)."""
+        """The user's go-ahead for Close merged agents (tests replace it).
+        Ticking "Don't ask again" and pressing OK stops this dialog
+        (`ui.close_merged_skip_confirm`) until the Options switch "Confirm
+        Close merged agents" turns it back on; Cancel keeps asking."""
         lines = "\n".join(f"  {a.spec.name}: {view.branch}"
                           for a, view in merged)
-        answer = QMessageBox.question(
-            self, "Close merged agents",
+        box = QMessageBox(
+            QMessageBox.Icon.Question, "Close merged agents",
             f"Everything these agents committed is in the base branch. "
             f"Close them and remove their lanes?\n\n{lines}",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        return answer == QMessageBox.StandardButton.Ok
+            self)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        # keep the Python reference, as in _confirm_ship
+        again = QCheckBox("Don't ask again")
+        box.setCheckBox(again)
+        ok = box.exec() == QMessageBox.StandardButton.Ok
+        skip = ok and again.isChecked()
+        box.deleteLater()
+        if skip:
+            self._close_merged_skip_confirm = True
+            self.top_bar.set_close_merged_confirm(False)
+            self._schedule_save()
+        return ok
 
     def _log_done_lanes(self, ws_id: str, views: dict) -> None:
         """Log each lane commit that says "Task done", once per commit. Past
@@ -5534,6 +5628,10 @@ class MainWindow(QMainWindow):
         self._refresh_workspace_lane_toggles()
         self._ship_skip_confirm = bool(ui.get("ship_skip_confirm", False))
         self.top_bar.set_ship_confirm(not self._ship_skip_confirm)
+        self._close_merged_skip_confirm = bool(
+            ui.get("close_merged_skip_confirm", False))
+        self.top_bar.set_close_merged_confirm(
+            not self._close_merged_skip_confirm)
         self._auto_continue = bool(ui.get("auto_continue", True))
         self.top_bar.set_auto_continue(self._auto_continue)
         self._startup_recovery = bool(ui.get("startup_recovery", True))
@@ -6440,6 +6538,7 @@ class MainWindow(QMainWindow):
             "auto_update": self._auto_update,
             "agent_lanes": self._agent_lanes,
             "ship_skip_confirm": self._ship_skip_confirm,
+            "close_merged_skip_confirm": self._close_merged_skip_confirm,
             "auto_continue": self._auto_continue,
             "startup_recovery": self._startup_recovery,
             "terminal_scrollback": self._terminal_scrollback,
