@@ -40,6 +40,15 @@ WHAT KEEPS IT FROM GETTING THERE:
 * a poll is armed for just after the earliest reset, so a reopened window
   shows its new number within seconds.
 
+STARTUP. Until a poller has read one number this run, a failed poll is not a
+broken readout, it is a launch that has not finished. The pills stay in their
+loading state, reworded "retrying...", and the poller retries on
+`STARTUP_RETRY_MS` (3 s, 5 s, 10 s, 15 s, then every 30 s; a 429 waits 30 s and
+doubles up to 4 minutes). Only a login that `expired` goes straight to the
+can't-read pill, because no retry fixes it. After `STARTUP_PATIENCE_S` (3
+minutes) of failures the pills say they cannot read and the ordinary policy
+above takes over.
+
 The fetch runs on a daemon thread and hands its reading back through a queued
 signal. Nothing here touches the network on construction: `start()` is opt-in,
 called from `MainWindow.start_usage_polling`, which main.py alone calls (the
@@ -67,6 +76,19 @@ EXHAUSTED_PCT = 100.0
 ACTIVE_GRACE_S = 180.0
 
 RETRY_MS = 10_000
+
+# Until a poller has read a number once this run, it retries fast and its pills
+# stay in the loading state ("retrying...") instead of turning into the
+# can't-read pill: a launch that hits one timeout or 429 is not a broken
+# readout. Delays by attempt (the last one repeats), 429 backing off from 30 s
+# up to 4 minutes instead (hammering a rate limiter keeps it limited). After
+# `STARTUP_PATIENCE_S` of failures the pill says it cannot read, and the poller
+# falls back to the ordinary policy, so a source that is simply broken (no
+# agy, no login) doesn't spawn a process every 30 s forever.
+STARTUP_RETRY_MS = (3_000, 5_000, 10_000, 15_000, 30_000)
+STARTUP_429_MS = 30_000
+STARTUP_429_CAP_MS = 4 * 60_000
+STARTUP_PATIENCE_S = 180.0
 MAX_BACKOFF = 4                  # 2**4 = 16x the cadence at most...
 BACKOFF_CAP_MS = 16 * 60_000     # ...and never longer than 16 minutes
 
@@ -144,6 +166,7 @@ class _FailState:
     error: str = ""
     at: float = 0.0
     retried: bool = False        # the one quick retry of this streak is spent
+    attempts: int = 0            # failed polls in this streak
 
 
 class UsagePoller(QObject):
@@ -307,7 +330,12 @@ class UsagePoller(QObject):
         if not self._fail.error:
             self._fail = _FailState(error=error, at=now)
         self._fail.error = error
-        if error not in NO_RETRY_ERRORS and not self._fail.retried:
+        self._fail.attempts += 1
+        startup = self._in_startup(error, now)
+        if startup:
+            delay = self._startup_delay_ms(error)
+            self._schedule(delay, special=True)
+        elif error not in NO_RETRY_ERRORS and not self._fail.retried:
             self._fail.retried = True
             delay = RETRY_MS
             self._schedule(delay, special=True)
@@ -319,9 +347,24 @@ class UsagePoller(QObject):
             if pill.has_reading():
                 pill.note_poll_failed(error, now, retry_at,
                                       stale_after_s(self.cadence_ms()))
+            elif startup:
+                pill.mark_retrying(error)
             else:
                 pill.mark_unreadable(error)
         self.failed.emit(reading)
+
+    def _in_startup(self, error: str, now: float) -> bool:
+        """True while nothing has been read this run and the failures are
+        young enough to keep retrying fast. An expired login is not a hiccup:
+        only the CLI can fix it, so it goes straight to the can't-read pill."""
+        return (self._reading is None and error != "expired"
+                and now - self._fail.at < STARTUP_PATIENCE_S)
+
+    def _startup_delay_ms(self, error: str) -> int:
+        if error == "http 429":
+            return min(STARTUP_429_MS * 2 ** max(self._backoff - 1, 0),
+                       STARTUP_429_CAP_MS)
+        return STARTUP_RETRY_MS[min(self._fail.attempts, len(STARTUP_RETRY_MS)) - 1]
 
     def tick(self) -> None:
         """The 20 s countdown tick. No network, unless the situation changed
