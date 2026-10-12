@@ -3331,6 +3331,71 @@ def test_fullscreen_f11():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_fullscreen_from_maximized_skips_restore_size():
+    """F11 out of fullscreen to a maximized window used to shrink it to
+    its restore-down size for a frame, then maximize it: Qt's Windows
+    plugin restores before it maximizes. F11 from maximized lends the
+    window its maximized rect as the restore rect, and leaving fullscreen
+    by any path hands the real one back. A normal window lends nothing.
+    The placement calls themselves only act on the Windows platform."""
+    from PySide6.QtCore import QEventLoop, Qt, QTimer
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from app.session_store import SessionStore
+    from app.widgets import fullscreen
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    calls = []
+    real = fullscreen._hold_restore_rect, fullscreen._put_restore_rect
+    fullscreen._hold_restore_rect = lambda w: calls.append("hold") or "rect"
+    fullscreen._put_restore_rect = lambda w, r: calls.append(("put", r))
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-fullscreen-max-"))
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        win.showMaximized()
+        pump(100)
+        fs = win._fullscreen
+        check("fullscreen-max: no window placement off the Windows platform",
+              fullscreen._hwnd(win) == 0, app.platformName())
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen-max: F11 from maximized lends the maximized rect",
+              fs.active and calls == ["hold"], calls)
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen-max: F11 again maximizes and hands the real "
+              "restore rect back",
+              not fs.active and win.isMaximized()
+              and calls == ["hold", ("put", "rect")]
+              and fs._restore_rect is None, (calls, win.windowState()))
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        win.showNormal()
+        pump(50)
+        check("fullscreen-max: leaving another way hands it back too",
+              not fs.active and calls[-1] == ("put", "rect")
+              and len(calls) == 4, calls)
+        del calls[:]
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen-max: a normal window lends nothing",
+              not fs.active and calls == [], calls)
+        win.close()
+        pump(100)
+    finally:
+        fullscreen._hold_restore_rect, fullscreen._put_restore_rect = real
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_new_agent_full_terminal_box_hidden_for_ai():
     """The 'Full terminal' box is a forced, disabled tick for AI agents, so
     the dialog hides its row for them and shows it for shells and scripts."""
