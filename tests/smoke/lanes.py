@@ -4704,6 +4704,316 @@ def test_ship_confirm_dont_ask_again():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_close_merged_dont_ask_again():
+    """Ticking "Don't ask again" on the Close merged agents dialog and
+    pressing OK skips that dialog from then on, survives a restart, and has
+    its own Options switch apart from Ship finished lanes' one."""
+    from PySide6.QtWidgets import QApplication, QCheckBox, QMessageBox
+    from app import lanes
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-close-skip-"))
+    work = _make_repo(tmp)
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    made = []
+
+    def laned(name, uid):
+        lane = _lane_for(work, name, uid)
+        made.append(lane)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"], pty=True)
+        spec.uid = uid
+        spec.lane = lane
+        return win.manager.add_terminal(ws.id, spec, autostart=False)
+
+    real_exec = QMessageBox.exec
+    with _stub_starts():
+        a = laned("Agent A", "c10a01" + "0" * 26)
+        b = laned("Agent B", "c10a02" + "0" * 26)
+        i = laned("Integrator", "c10aee" + "0" * 26)
+        app.processEvents()
+        win._store_audit = lambda line: None
+        win._lane_message = lambda title, text: None
+        win._toggle_integrator(ws.id, i)
+        views = {x.spec.uid: lanes.LaneView(
+                     uid=x.spec.uid, branch=x.spec.lane["branch"],
+                     root=x.spec.lane["root"], landed=x.spec.uid[:6] * 6)
+                 for x in (a, b)}
+
+        def fake_snap(entry):
+            v = views[entry["uid"]]
+            return lanes.LaneSnap(uid=v.uid, agent=entry["agent"],
+                                  ws_id=entry["ws_id"], branch=v.branch,
+                                  root=v.root, landed=v.landed,
+                                  read_at=time.time())
+        win._lane_snap_for_close = fake_snap
+        win._on_lanes_changed(ws.id, dict(views))
+
+        outcome = {"button": QMessageBox.StandardButton.Cancel,
+                   "tick": True, "shown": 0, "has_box": False}
+
+        def fake_exec(box):
+            outcome["shown"] += 1
+            check_box = box.findChild(QCheckBox)
+            outcome["has_box"] = (check_box is not None
+                                  and "ask again" in check_box.text())
+            if check_box is not None:
+                check_box.setChecked(outcome["tick"])
+            return outcome["button"]
+        QMessageBox.exec = fake_exec
+        try:
+            check("close skip: off by default",
+                  win._close_merged_skip_confirm is False
+                  and win._session_payload()["ui"]["close_merged_skip_confirm"]
+                  is False)
+            win._close_merged_agents(ws.id, i)
+            win.lane_ops.drain(60)
+            check("close skip: the dialog carries a Don't ask again box",
+                  outcome["shown"] == 1 and outcome["has_box"], outcome)
+            check("close skip: Cancel with the box ticked closes nothing "
+                  "and remembers nothing",
+                  not win._close_merged_skip_confirm
+                  and {x.spec.name for x in ws.agents}
+                  == {"Agent A", "Agent B", "Integrator"})
+            outcome["button"] = QMessageBox.StandardButton.Ok
+            outcome["tick"] = True
+            win._close_merged_agents(ws.id, i)
+            win.lane_ops.drain(60)
+            check("close skip: OK with the box ticked closes and remembers",
+                  win._close_merged_skip_confirm
+                  and {x.spec.name for x in ws.agents} == {"Integrator"}
+                  and win._session_payload()["ui"]["close_merged_skip_confirm"]
+                  is True)
+            check("close skip: the ship dialog is a separate choice",
+                  win._ship_skip_confirm is False
+                  and win.top_bar.ship_confirm_btn.isChecked())
+            # once remembered, a merged agent closes with no dialog
+            c = laned("Agent C", "c10a03" + "0" * 26)
+            views[c.spec.uid] = lanes.LaneView(
+                uid=c.spec.uid, branch=c.spec.lane["branch"],
+                root=c.spec.lane["root"], landed="c" * 40)
+            win._on_lanes_changed(ws.id, dict(views))
+            shown = outcome["shown"]
+            win._close_merged_agents(ws.id, i)
+            win.lane_ops.drain(60)
+            check("close skip: once remembered, no dialog and it closes",
+                  outcome["shown"] == shown
+                  and {x.spec.name for x in ws.agents} == {"Integrator"},
+                  outcome)
+            tb = win.top_bar
+            check("close skip: the Options switch shows the dialog is off",
+                  not tb.close_merged_confirm_btn.isChecked())
+            tb.close_merged_confirm_btn.click()
+            check("close skip: the switch turns asking back on and saves it",
+                  tb.close_merged_confirm_btn.isChecked()
+                  and win._close_merged_skip_confirm is False
+                  and win._session_payload()["ui"]["close_merged_skip_confirm"]
+                  is False)
+        finally:
+            QMessageBox.exec = real_exec
+        win._restore_ui_state({"ui": {}})
+        check("close skip: a session without the key loads it off",
+              win._close_merged_skip_confirm is False)
+        win._restore_ui_state({"ui": {"close_merged_skip_confirm": True}})
+        check("close skip: restore reads the saved choice",
+              win._close_merged_skip_confirm is True
+              and not win.top_bar.close_merged_confirm_btn.isChecked())
+        for agent in list(ws.agents):
+            win._close_agent(ws.id, agent.id)
+        win.lane_ops.drain(60)
+    win.close()
+    app.processEvents()
+    for lane in made:
+        if os.path.isdir(lane["root"]):
+            _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_closing_many_cards_is_one_reflow():
+    """Closing several cards together retiles once, not once per card (each
+    retile resizes every TUI left, and ten in a row flickered), and a
+    visible page dissolves the closing cards first, then closes them."""
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-close-reflow-"))
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Plain", str(tmp))
+    with _stub_starts():
+        agents = [win.manager.add_terminal(
+            ws.id, build_spec(AgentKind.CLAUDE, f"Agent {n}", cwd=str(tmp),
+                              pty=True), autostart=False)
+            for n in range(6)]
+        app.processEvents()
+        page = win._pages[ws.id]
+        tiles = []
+        real_retile = page._retile
+        page._retile = lambda: (tiles.append(1), real_retile())[1]
+
+        # a page nobody sees closes at once
+        fired = []
+        page.fade_out_cards({agents[0].id}, lambda: fired.append(1))
+        check("close reflow: a hidden page skips the fade", fired == [1])
+
+        with page.removals_batched():
+            for x in agents[:4]:
+                win._close_agent(ws.id, x.id)
+        check("close reflow: four closes, one retile", len(tiles) == 1, tiles)
+        check("close reflow: the cards left are the two not closed",
+              [c.agent.id for c in page.cards]
+              == [agents[4].id, agents[5].id])
+        tiles.clear()
+        win._close_agent(ws.id, agents[4].id)
+        check("close reflow: a lone close still retiles at once",
+              len(tiles) == 1, tiles)
+
+        # a shown window fades first, and the close waits for the fade
+        win.manager.set_active(ws.id)
+        win.resize(1200, 800)
+        win.show()
+        for _ in range(10):
+            app.processEvents()
+        fired.clear()
+        survivor = page.cards[0]
+        check("close reflow: the shown card is visible", survivor.isVisible())
+        page.fade_out_cards({survivor.agent.id}, lambda: fired.append(1))
+        check("close reflow: a shown page fades before it calls back",
+              fired == [] and survivor.graphicsEffect() is not None)
+        deadline = time.time() + 3
+        while not fired and time.time() < deadline:
+            app.processEvents()
+        check("close reflow: the fade ends and calls back", fired == [1])
+        with page.removals_batched():
+            pass
+        deadline = time.time() + 3
+        while survivor.graphicsEffect() is not None \
+                and time.time() < deadline:
+            app.processEvents()
+        check("close reflow: the card is back to full opacity, no effect "
+              "left behind", survivor.graphicsEffect() is None)
+        for agent in list(ws.agents):
+            win._close_agent(ws.id, agent.id)
+    win.close()
+    app.processEvents()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_close_merged_fades_then_closes_in_one_reflow():
+    """On a visible workspace Close merged agents dissolves the merged
+    cards first, then closes them all with one retile (ten closes with ten
+    reflows read as a flicker, and nothing said what was going on)."""
+    from PySide6.QtWidgets import QApplication
+    from app import lanes
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-close-fade-"))
+    work = _make_repo(tmp)
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    made = []
+
+    def laned(name, uid):
+        lane = _lane_for(work, name, uid)
+        made.append(lane)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"], pty=True)
+        spec.uid = uid
+        spec.lane = lane
+        return win.manager.add_terminal(ws.id, spec, autostart=False)
+
+    with _stub_starts():
+        merged = [laned(f"Agent {n}", f"fade{n:02d}" + "0" * 26)
+                  for n in range(4)]
+        i = laned("Integrator", "fadeee" + "0" * 26)
+        win.manager.set_active(ws.id)
+        win.resize(1300, 800)
+        win.show()
+        for _ in range(10):
+            app.processEvents()
+        win._toggle_integrator(ws.id, i)
+        win._store_audit = lambda line: None
+        told = []
+        win._lane_message = lambda title, text: told.append(text)
+        win._close_merged_skip_confirm = True
+        views = {x.spec.uid: lanes.LaneView(
+                     uid=x.spec.uid, branch=x.spec.lane["branch"],
+                     root=x.spec.lane["root"], landed=x.spec.uid[:6] * 6)
+                 for x in merged}
+
+        reads = []
+
+        def fake_snap(entry):
+            reads.append(entry["uid"])
+            v = views[entry["uid"]]
+            return lanes.LaneSnap(uid=v.uid, agent=entry["agent"],
+                                  ws_id=entry["ws_id"], branch=v.branch,
+                                  root=v.root, landed=v.landed,
+                                  read_at=time.time())
+        win._lane_snap_for_close = fake_snap
+        win._on_lanes_changed(ws.id, dict(views))
+        page = win._pages[ws.id]
+        tiles = []
+        real_retile = page._retile
+        page._retile = lambda: (tiles.append(1), real_retile())[1]
+        # a long fade, so a slow drain under parallel workers can't outrun
+        # it before the mid-fade checks
+        import app.widgets.workspace_page as workspace_page
+        fade_ms, workspace_page.FADE_OUT_MS = workspace_page.FADE_OUT_MS, 3000
+        try:
+            win._close_merged_agents(ws.id, i)
+            win.lane_ops.drain(60)
+            seen = len(ws.agents)
+            check("close fade: the cards are still there while they dissolve",
+                  seen == 5 and any(c.graphicsEffect() is not None
+                                    for c in page.cards), (seen, tiles))
+            # a second click mid-fade (no dialog with Don't ask again); the
+            # lane poller re-read the real repo meanwhile, so the views that
+            # offer the agents again go back first
+            win._on_lanes_changed(ws.id, dict(views))
+            win._close_merged_agents(ws.id, i)
+            win.lane_ops.drain(60)
+            check("close fade: a second click during the fade reads no lane "
+                  "again", len(reads) == 4, reads)
+            deadline = time.time() + 10
+            while len(ws.agents) > 1 and time.time() < deadline:
+                app.processEvents()
+        finally:
+            workspace_page.FADE_OUT_MS = fade_ms
+        check("close fade: every merged agent closed after the fade",
+              {x.spec.name for x in ws.agents} == {"Integrator"}
+              and not told, ([x.spec.name for x in ws.agents], told))
+        check("close fade: the four closes shared one retile",
+              len(tiles) == 1, tiles)
+        deadline = time.time() + 3
+        while (any(c.graphicsEffect() is not None for c in page.cards)
+               and time.time() < deadline):
+            app.processEvents()
+        with page.removals_batched():
+            pass
+        check("close fade: a batch that removed nothing dims no card",
+              all(c.graphicsEffect() is None for c in page.cards))
+        for agent in list(ws.agents):
+            win._close_agent(ws.id, agent.id)
+        win.lane_ops.drain(60)
+    win.close()
+    app.processEvents()
+    for lane in made:
+        if os.path.isdir(lane["root"]):
+            _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_session_v7_drops_the_queue():
     """v7 keeps a workspace's integrator and nothing of the old integration
     queue: a v6 file with queue items loads with its integrator, and the

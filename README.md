@@ -519,7 +519,10 @@ workspaces keep executing — switching never pauses anything.
   agents** on the same chip closes, after you confirm, every agent whose
   lane committed work the base branch now has and holds nothing else (no
   commit ahead, no uncommitted file, not mid-turn), and removes their
-  lanes. The integrator and every other agent stay open. Each close is a
+  lanes. The integrator and every other agent stay open. The closing cards
+  fade out one after another, then all go in a single reflow. The dialog's
+  "Don't ask again" skips the question from then on; ⚙ Options > Agents >
+  **Confirm Close merged agents** brings it back. Each close is a
   `CLOSE-MERGED` line in `session.log`. The integrator needs `Bash(git:*)` and
   `PowerShell(git:*)` allowed, and every lane of a repository shares the main
   checkout's Claude auto-memory.
@@ -956,7 +959,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3309 checks drive the real app headlessly (offscreen Qt platform) with real
+3337 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1103,7 +1106,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3309 checks)
+                           (3337 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

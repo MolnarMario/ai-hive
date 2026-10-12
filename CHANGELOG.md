@@ -8,6 +8,16 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.42.0
+
+- The Close merged agents dialog has a "Don't ask again" box, with a
+  switch under Options > Agents (Confirm Close merged agents) that brings
+  the dialog back.
+- Closing several merged agents at once fades their cards out in turn and
+  rearranges the grid once, instead of once per agent.
+- Pressing F11 to leave fullscreen goes straight back to a maximized
+  window, without flashing at half size first.
+
 ## 0.41.2
 
 - The usage pills keep loading at startup when the first read fails and
