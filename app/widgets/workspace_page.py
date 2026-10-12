@@ -23,15 +23,22 @@ its old cell to its new one for a snap-into-place feel — cosmetic only, the
 final positions come from the layout. The new order is emitted via
 reorderCommitted → WorkspaceManager.reorder_agents, which re-sequences
 ws.agents (persisted by list position) and marks the session dirty.
+
+Closing several cards at once (Close merged agents) goes through
+fade_out_cards, then removals_batched: one retile for the batch, because each
+retile resizes every card left and the TUIs redraw. The cards left settle in
+with a short fade (_soften_reflow); nothing resizes during the fades.
 """
+
+import contextlib
 
 from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent,
                             QParallelAnimationGroup, QPropertyAnimation, QRect,
-                            Qt, Signal)
+                            QSequentialAnimationGroup, Qt, Signal)
 from PySide6.QtGui import QColor, QFontMetrics, QPainter
-from PySide6.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QLabel,
-                               QMenu, QScrollArea, QToolButton, QVBoxLayout,
-                               QWidget)
+from PySide6.QtWidgets import (QFrame, QGraphicsOpacityEffect, QGridLayout,
+                               QHBoxLayout, QLabel, QMenu, QScrollArea,
+                               QToolButton, QVBoxLayout, QWidget)
 
 from ..terminal_agent import TerminalAgent
 from ..tiling import compute_grid, explicit_grid, parse_layout
@@ -46,6 +53,16 @@ from .terminal_card import CARD_REORDER_MIME, TerminalCard
 
 # the header path label's smallest width, and the floor of its elide budget
 PATH_MIN_W = 60
+
+# Closing several cards at once (Close merged agents): each card fades over
+# FADE_OUT_MS, starting FADE_STEP_MAX_MS after the one before it, or less so
+# the last one starts within FADE_BUDGET_MS. The cards left then settle from
+# SETTLE_FROM opacity over SETTLE_MS.
+FADE_OUT_MS = 200
+FADE_STEP_MAX_MS = 45
+FADE_BUDGET_MS = 270
+SETTLE_FROM = 0.5
+SETTLE_MS = 240
 
 
 class EmptySlot(QFrame):
@@ -151,6 +168,9 @@ class WorkspacePage(QWidget):
         # in-flight reflow animation so it isn't garbage-collected mid-flight.
         self._drag_card: "TerminalCard | None" = None
         self._reflow_anim = None
+        self._fade_anim = None
+        self._batching = False        # removals_batched is open
+        self._retile_owed = False     # a removal inside it asked for a retile
         # MainWindow's view of an agent's lane roles, for the cards'
         # menus: callable(agent) -> dict (see TerminalCard.integration_info)
         self.integration_info = None
@@ -537,8 +557,92 @@ class WorkspacePage(QWidget):
             self._exit_solo()
         card.setParent(None)
         card.deleteLater()
+        if self._batching:
+            self._retile_owed = True
+            return
         self._retile()
         self._update_empty_state()
+
+    @contextlib.contextmanager
+    def removals_batched(self):
+        """Cards removed inside the block share one retile, run when it
+        ends. Every retile resizes every card left, and each resize makes
+        the TUI inside redraw: closing ten cards one retile at a time was a
+        visible flicker. The cards that stay then fade back in over the
+        snap (_soften_reflow)."""
+        self._batching = True
+        self._retile_owed = False
+        try:
+            yield
+        finally:
+            self._batching = False
+            if self._retile_owed:
+                self._retile_owed = False
+                self._retile()
+                self._update_empty_state()
+            self._soften_reflow()
+
+    def fade_out_cards(self, agent_ids, on_done) -> None:
+        """Dissolve the cards of `agent_ids` one after another, then call
+        `on_done` (at once when none of them is on screen: a hidden page, a
+        card behind a maximized one). Cosmetic: nothing moves or resizes, so
+        no TUI redraws, and the cards stay until the caller removes them."""
+        cards = [c for c in self.cards
+                 if c.agent.id in agent_ids and c.isVisible()]
+        if not cards:
+            on_done()
+            return
+        step = min(FADE_STEP_MAX_MS, FADE_BUDGET_MS // len(cards))
+        group = QParallelAnimationGroup(self)
+        for n, card in enumerate(cards):
+            effect = QGraphicsOpacityEffect(card)
+            effect.setOpacity(1.0)
+            card.setGraphicsEffect(effect)
+            seq = QSequentialAnimationGroup(group)
+            seq.addPause(n * step)
+            fade = QPropertyAnimation(effect, b"opacity", seq)
+            fade.setDuration(FADE_OUT_MS)
+            fade.setStartValue(1.0)
+            fade.setEndValue(0.0)
+            fade.setEasingCurve(QEasingCurve.Type.InOutSine)
+            seq.addAnimation(fade)
+            group.addAnimation(seq)
+        group.finished.connect(on_done)
+        self._fade_anim = group       # hold a ref (else GC'd mid-flight)
+        group.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def _soften_reflow(self) -> None:
+        """After a batch of removals: the cards left (any that fade_out_cards
+        dimmed too) ease up from half opacity, so the one snap into the new
+        grid reads as a settle and not a jump."""
+        if not self.isVisible():
+            for c in self.cards:
+                c.setGraphicsEffect(None)
+            return
+        group = QParallelAnimationGroup(self)
+        for card in self.cards:
+            if not card.isVisible():
+                continue
+            effect = QGraphicsOpacityEffect(card)
+            effect.setOpacity(SETTLE_FROM)
+            card.setGraphicsEffect(effect)
+            a = QPropertyAnimation(effect, b"opacity", group)
+            a.setDuration(SETTLE_MS)
+            a.setStartValue(SETTLE_FROM)
+            a.setEndValue(1.0)
+            a.setEasingCurve(QEasingCurve.Type.OutCubic)
+        if group.animationCount() == 0:
+            group.deleteLater()
+            return
+        # a card's effect is dropped once it is back to full opacity: an
+        # offscreen render per paint is no cost to keep on a live TUI
+        group.finished.connect(self._drop_card_effects)
+        self._fade_anim = group
+        group.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def _drop_card_effects(self) -> None:
+        for card in self.cards:     # only live cards: a closed one is gone
+            card.setGraphicsEffect(None)
 
     def card_for(self, agent_id: str) -> TerminalCard | None:
         return next((c for c in self.cards if c.agent.id == agent_id), None)
