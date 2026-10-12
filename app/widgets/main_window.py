@@ -3506,7 +3506,10 @@ class MainWindow(QMainWindow):
         stops = ACCOUNT_WIDE_LIMITS + tuple(
             k for k in (MODEL_LIMIT_OF_WINDOW.get(agent.limit_window()),) if k)
         ref = at
-        if usage is not None and usage.fetched_at >= at:
+        # `ok`: a failed fetch is stamped fresh but carries no limits, which
+        # would read as headroom. Only the poller's successes reach `_usage`
+        # today, but this check must not lean on that.
+        if usage is not None and usage.ok and usage.fetched_at >= at:
             spent = [l for l in usage.limits if l.key in stops
                      and l.percent >= claude_usage.EXHAUSTED_PCT]
             ahead = [l for l in spent

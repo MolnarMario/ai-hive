@@ -2742,6 +2742,11 @@ def test_account_check_before_resume():
               now, five_hour=(100.0, now - 60))) is False
           and any("HOLD agent=Passed (waiting" in x for x in audits), audits)
 
+    failed = cu.Usage(fetched_at=now, error="http 429")
+    check("account-check: a failed fetch after the reset is no answer, not "
+          "headroom", verdict(agent("Failed"), failed) is False
+          and any("HOLD agent=Failed (waiting" in x for x in audits), audits)
+
     stub._polling = False
     n = len(audits)
     check("account-check: without polling, no reading means the clock alone, "
