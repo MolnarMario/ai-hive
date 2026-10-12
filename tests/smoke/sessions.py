@@ -1738,6 +1738,63 @@ def test_restart_veil():
     card.detach(); agent.dispose(); pump(50)
 
 
+def test_held_start_veil():
+    """A new laned agent waits for its git worktree before its child starts.
+
+    The regression: the card was built stopped and the wake banner ("terminal
+    not running, press any key to start") sat on it for the second or so the
+    worktree took, which read as an error. A start that is held but coming
+    shows the boot loader for the whole wait. A hold that stays (a lane that
+    could not be restored) still shows the banner."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.terminal_agent import AgentStatus, TerminalAgent
+    QApplication.instance() or QApplication([])
+    if not HAS_CONPTY:
+        return
+    from app.widgets.terminal_card import TerminalCard
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    agent = TerminalAgent(build_spec(
+        AgentKind.POWERSHELL, "Held", cwd=SCRATCH_CWD, pty=True))
+    card = TerminalCard(agent)
+    card.resize(640, 400); card.show(); pump(100)
+    check("held-start: a plain stopped card shows the wake banner",
+          card.overlay.isVisible() and not card.boot.is_active())
+
+    agent.hold_start("[creating this agent's lane...]", coming=True)
+    check("held-start: a start that is coming shows the loader, not the "
+          "banner", card.boot.is_active() and not card.overlay.isVisible()
+          and card.boot._caption == "starting…")
+    pump(60)
+    check("held-start: ...and a repaint does not bring the banner back",
+          card.boot.is_active() and not card.overlay.isVisible())
+
+    def fake_start():
+        agent.status = AgentStatus.STARTING
+        card._on_status(AgentStatus.STARTING)
+    agent.start = fake_start
+    agent.release_start(run=True)
+    check("held-start: the release hands the loader to the booting child "
+          "with no banner between",
+          card.boot.is_active() and not card.overlay.isVisible()
+          and not agent.start_coming())
+
+    # a hold that stays: the lane could not be restored, so no child comes
+    agent.status = AgentStatus.IDLE
+    card._on_status(AgentStatus.IDLE)
+    agent.hold_start("[lane could not be restored]", coming=True)
+    agent.hold_start("[lane could not be restored]")
+    check("held-start: a hold that stays gives the card its banner back",
+          not card.boot.is_active() and card.overlay.isVisible())
+    card.detach(); agent.dispose(); pump(50)
+
+
 def test_resume_fallback():
     """A resume (--continue) launch that dies before the interactive prompt ever
     comes up (Claude prints 'No conversation found to continue' and exits) must

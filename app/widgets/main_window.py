@@ -4260,7 +4260,8 @@ class MainWindow(QMainWindow):
         unstarted with its lane already recorded (or, `adopt`, stopped and
         moved into it by Restart in own lane); it holds its start (a waking
         keystroke included) until the worktree exists."""
-        agent.hold_start("[creating this agent's lane (git worktree)...]")
+        agent.hold_start("[creating this agent's lane (git worktree)...]",
+                         coming=True)
         agent.notice("[creating this agent's lane (git worktree)...]")
         self._lane_pending.add(agent.spec.uid)
         lane, cwd, t0 = plan.lane_dict(), plan.cwd, time.monotonic()
@@ -4346,7 +4347,8 @@ class MainWindow(QMainWindow):
     def _revive_lane(self, ws_id: str, agent) -> None:
         """A past lane conversation picked in the New Agent dialog: bring its
         lane back at the identical path, then resume it there."""
-        agent.hold_start("[restoring this conversation's lane...]")
+        agent.hold_start("[restoring this conversation's lane...]",
+                         coming=True)
         agent.notice("[restoring this conversation's lane...]")
         self._repair_lane(ws_id, agent, revive=True)
 

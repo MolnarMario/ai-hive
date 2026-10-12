@@ -1082,6 +1082,7 @@ class TerminalCard(QFrame):
         if self.is_pty:
             self.agent.pty_output.connect(self._on_pty_output)
             self.agent.prompt_ready_changed.connect(self._on_prompt_ready)
+            self.agent.start_coming_changed.connect(self._on_start_coming)
             self.terminal.keyInput.connect(self._on_key_input)
             self.terminal.sizeChanged.connect(self.agent.resize)
             self.terminal.sizeChanged.connect(self._reproject_on_size)
@@ -1186,6 +1187,8 @@ class TerminalCard(QFrame):
             pairs.append((self.agent.pty_output, self._on_pty_output))
             pairs.append((self.agent.prompt_ready_changed,
                           self._on_prompt_ready))
+            pairs.append((self.agent.start_coming_changed,
+                          self._on_start_coming))
             pairs.append((self.agent.screen_reset, self._on_screen_reset))
             pairs.append((self.agent.turn_closed, self._on_turn_closed))
             self._stamp_timer.stop()
@@ -1856,6 +1859,14 @@ class TerminalCard(QFrame):
     def _on_prompt_ready(self, ready: bool) -> None:
         if ready:
             self._end_boot_veil()
+
+    def _on_start_coming(self, _coming: bool) -> None:
+        """The agent's held start became a wait (loader up) or ended without a
+        child (banner back). A release that did start a child already went
+        through `_on_status(STARTING)`, and by now `spec.resume` is cleared,
+        so repeating it would only reword the loader's caption."""
+        if not self.agent.is_running():
+            self._on_status(self.agent.status)
 
     def _clear_for_projection(self) -> None:
         """Blank the screen so the agent's pty stream can be projected onto it
@@ -2589,14 +2600,20 @@ class TerminalCard(QFrame):
             # a Restart passes through STOPPING, the exit and IDLE on its way
             # to the new child; the veil owns all of them (_on_restart_clicked)
             restarting = self._restarting and not running
+            # a start held for the agent's new lane folder is a boot that has
+            # not reached the child yet: same loader, never the banner
+            awaiting = self.agent.start_coming() and not running
             self.overlay.setVisible(not running and not restarting
+                                    and not awaiting
                                     and status is not AgentStatus.STOPPING)
-            if not running and not restarting:
+            if not running and not restarting and not awaiting:
                 self._refresh_overlay()
                 self.overlay.raise_()
             # a booting child and a stopped one are mutually exclusive states,
             # and the wake banner owns the stopped one
             if running and not self.agent.prompt_ready():
+                self._begin_boot_veil()
+            elif awaiting:
                 self._begin_boot_veil()
             elif restarting:
                 QTimer.singleShot(0, self, self._settle_restart)
