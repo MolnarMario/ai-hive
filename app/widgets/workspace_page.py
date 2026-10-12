@@ -168,7 +168,6 @@ class WorkspacePage(QWidget):
         # in-flight reflow animation so it isn't garbage-collected mid-flight.
         self._drag_card: "TerminalCard | None" = None
         self._reflow_anim = None
-        self._fade_anim = None
         self._batching = False        # removals_batched is open
         self._retile_owed = False     # a removal inside it asked for a retile
         # MainWindow's view of an agent's lane roles, for the cards'
@@ -569,18 +568,22 @@ class WorkspacePage(QWidget):
         ends. Every retile resizes every card left, and each resize makes
         the TUI inside redraw: closing ten cards one retile at a time was a
         visible flicker. The cards that stay then fade back in over the
-        snap (_soften_reflow)."""
+        snap (_soften_reflow), but only when a card went or one is still
+        dimmed from fade_out_cards: with nothing moved, the fade would be a
+        flash over a grid that never changed."""
         self._batching = True
         self._retile_owed = False
         try:
             yield
         finally:
             self._batching = False
-            if self._retile_owed:
-                self._retile_owed = False
+            removed, self._retile_owed = self._retile_owed, False
+            if removed:
                 self._retile()
                 self._update_empty_state()
-            self._soften_reflow()
+            if removed or any(c.graphicsEffect() is not None
+                              for c in self.cards):
+                self._soften_reflow()
 
     def fade_out_cards(self, agent_ids, on_done) -> None:
         """Dissolve the cards of `agent_ids` one after another, then call
@@ -608,7 +611,6 @@ class WorkspacePage(QWidget):
             seq.addAnimation(fade)
             group.addAnimation(seq)
         group.finished.connect(on_done)
-        self._fade_anim = group       # hold a ref (else GC'd mid-flight)
         group.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
 
     def _soften_reflow(self) -> None:
@@ -637,7 +639,6 @@ class WorkspacePage(QWidget):
         # a card's effect is dropped once it is back to full opacity: an
         # offscreen render per paint is no cost to keep on a live TUI
         group.finished.connect(self._drop_card_effects)
-        self._fade_anim = group
         group.start(QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
 
     def _drop_card_effects(self) -> None:

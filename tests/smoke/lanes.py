@@ -4951,7 +4951,10 @@ def test_close_merged_fades_then_closes_in_one_reflow():
                      root=x.spec.lane["root"], landed=x.spec.uid[:6] * 6)
                  for x in merged}
 
+        reads = []
+
         def fake_snap(entry):
+            reads.append(entry["uid"])
             v = views[entry["uid"]]
             return lanes.LaneSnap(uid=v.uid, agent=entry["agent"],
                                   ws_id=entry["ws_id"], branch=v.branch,
@@ -4963,20 +4966,43 @@ def test_close_merged_fades_then_closes_in_one_reflow():
         tiles = []
         real_retile = page._retile
         page._retile = lambda: (tiles.append(1), real_retile())[1]
-        win._close_merged_agents(ws.id, i)
-        win.lane_ops.drain(60)
-        seen = len(ws.agents)
-        check("close fade: the cards are still there while they dissolve",
-              seen == 5 and any(c.graphicsEffect() is not None
-                                for c in page.cards), (seen, tiles))
-        deadline = time.time() + 5
-        while len(ws.agents) > 1 and time.time() < deadline:
-            app.processEvents()
+        # a long fade, so a slow drain under parallel workers can't outrun
+        # it before the mid-fade checks
+        import app.widgets.workspace_page as workspace_page
+        fade_ms, workspace_page.FADE_OUT_MS = workspace_page.FADE_OUT_MS, 3000
+        try:
+            win._close_merged_agents(ws.id, i)
+            win.lane_ops.drain(60)
+            seen = len(ws.agents)
+            check("close fade: the cards are still there while they dissolve",
+                  seen == 5 and any(c.graphicsEffect() is not None
+                                    for c in page.cards), (seen, tiles))
+            # a second click mid-fade (no dialog with Don't ask again); the
+            # lane poller re-read the real repo meanwhile, so the views that
+            # offer the agents again go back first
+            win._on_lanes_changed(ws.id, dict(views))
+            win._close_merged_agents(ws.id, i)
+            win.lane_ops.drain(60)
+            check("close fade: a second click during the fade reads no lane "
+                  "again", len(reads) == 4, reads)
+            deadline = time.time() + 10
+            while len(ws.agents) > 1 and time.time() < deadline:
+                app.processEvents()
+        finally:
+            workspace_page.FADE_OUT_MS = fade_ms
         check("close fade: every merged agent closed after the fade",
               {x.spec.name for x in ws.agents} == {"Integrator"}
               and not told, ([x.spec.name for x in ws.agents], told))
         check("close fade: the four closes shared one retile",
               len(tiles) == 1, tiles)
+        deadline = time.time() + 3
+        while (any(c.graphicsEffect() is not None for c in page.cards)
+               and time.time() < deadline):
+            app.processEvents()
+        with page.removals_batched():
+            pass
+        check("close fade: a batch that removed nothing dims no card",
+              all(c.graphicsEffect() is None for c in page.cards))
         for agent in list(ws.agents):
             win._close_agent(ws.id, agent.id)
         win.lane_ops.drain(60)

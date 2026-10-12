@@ -125,7 +125,9 @@ def _hold_restore_rect(win) -> wintypes.RECT | None:
 
 def _put_restore_rect(win, rect: wintypes.RECT) -> None:
     """Give the window its real restore-down rect back, in whatever state
-    it is now, without activating it."""
+    it is now. A minimized or normal window keeps its activation; a
+    maximized one has no no-activate show command, so SetWindowPlacement
+    activates it, as the showMaximized() just before it already did."""
     hwnd = _hwnd(win)
     wp = _placement(hwnd) if hwnd else None
     if wp is None:

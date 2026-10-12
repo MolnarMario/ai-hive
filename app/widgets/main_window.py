@@ -5088,14 +5088,17 @@ class MainWindow(QMainWindow):
                                           else [])}
         closing = []
         for uid, snap, error in batch["reads"]:
-            self._close_merged_reading.discard(uid)
             other = agents.get(uid)
             # an agent the user closed meanwhile was retired by its own close
             if other is None:
+                self._close_merged_reading.discard(uid)
                 continue
             if self._close_merged_qualifies(ws_id, other, snap, error):
+                # still guarded through the fade: a second click meanwhile
+                # (no dialog with Don't ask again) must not fade it again
                 closing.append((other, snap))
             else:
+                self._close_merged_reading.discard(uid)
                 self._store_audit(f"CLOSE-MERGED-KEEP "
                                   f"agent={other.spec.name!r}")
                 batch["kept"].append(other.spec.name)
@@ -5119,6 +5122,8 @@ class MainWindow(QMainWindow):
         _close_merged_agents."""
         page = self._pages.get(ws_id)
         final = []
+        for other, _snap in closing:
+            self._close_merged_reading.discard(other.spec.uid)
         for other, snap in closing:
             if self.manager.agent(ws_id, other.id) is None:
                 continue
