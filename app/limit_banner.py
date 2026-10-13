@@ -41,7 +41,9 @@ The cut-off lines, all read off claude.exe 2.1.281's own formatters:
     shortly", "... when it resets", "... again after you continued"), and the
     grace-window status `Usage limit reached \xb7 wrapping up` / bare `Usage
     limit reached`. Claude continues by itself when it can, so AI Hive only
-    steps in if the conversation shows it did not.
+    steps in if the conversation shows it did not. What Claude's timer is
+    doing (armed, cancelled by a person, given up) is read from the notices
+    it writes into the conversation, see `auto_continue_state`.
   * `Your usage limit has reset \xb7 press enter to continue`: the auto-continue
     went stale (the reset passed while nothing could fire it) and Claude is
     now WAITING FOR A KEYPRESS. Due immediately.
@@ -89,7 +91,25 @@ _REACHED_RE = re.compile(r"usagelimitreached(?=[·•]|$)")
 _STALE_RE = re.compile(r"yourusagelimithasreset(?=[·•]|$)")
 
 # The CLI logged that it continued by itself. Not a cut-off: the END of one.
-_RESET_NOTICE_RE = re.compile(r"usagelimitreset(?=[·•]|$)")
+# "Usage limit available again \xb7 continuing now" is the same thing, fired
+# early because an API check found the model usable before the reset.
+_RESET_NOTICE_RE = re.compile(r"usagelimit(?:reset|availableagain)(?=[·•]|$)")
+
+# Claude Code's own auto-continue, as the notices it writes into the
+# conversation (claude.exe 2.1.296, `quota-auto-resume`). See
+# `auto_continue_state`. Each is matched at the start of the despaced line.
+# 2.1.296 writes only "continuing automatically <when>"; the "continuing
+# shortly" and "continuing when it resets" wordings of its status row, and of
+# older versions, count too: missing an armed timer types over Claude's own
+# continuation, while a false "armed" costs at most CLAUDE_OWN_CONTINUE_S.
+_AUTO_ARMED_RE = re.compile(
+    r"(?:usagelimitreached(?:again)?[·•])?continuing"
+    r"(?:automatically(?!$)|shortly|whenitresets)")
+_AUTO_USER_CANCEL_RE = re.compile(
+    r"automaticcontinuecancelled[·•]/rate-limit-options")
+_AUTO_OFF_RE = re.compile(
+    r"automaticcontinue(?:cancelled|stopped|didnotrun|wasturnedoff)")
+_AUTO_STALE_RE = re.compile(r"usagelimithasreset[·•]pressenter")
 
 # The captured 429 label -> the window name the rest of the app uses, first
 # substring match wins. "weekly"/"opus"/"sonnet"/"fable" are all 7-day windows
@@ -359,6 +379,40 @@ def is_reset_notice(text: str) -> bool:
     line = _strip_gutter(text or "")
     return bool(line) and len(line) <= _BANNER_MAX_CHARS \
         and bool(_RESET_NOTICE_RE.match(_despace(line)))
+
+
+def auto_continue_state(text: str) -> str:
+    """What one of Claude Code's own auto-continue notices says about the
+    cut-off it follows, or "" when `text` is not one:
+
+      * "armed": "Usage limit reached \xb7 continuing automatically at 9:50pm",
+        its "... reached again ..." re-arm, the bare "Continuing
+        automatically ...", or "... continuing shortly" / "... continuing
+        when it resets". Claude's timer will send its own continuation 30
+        to 90 s after the reset.
+      * "cancelled": "Automatic continue cancelled \xb7 /rate-limit-options to
+        re-arm". Claude prints exactly this only for Esc, Ctrl+C or the
+        kill-agents chord, so it is a person saying no.
+      * "off": any other "Automatic continue cancelled / stopped / did not
+        run / was turned off" line. Claude gave up for its own reasons (the
+        process exited, the re-arm cap, a reset more than 24 h out, the
+        setting), so the cut-off is AI Hive's to resume.
+      * "stale": "Usage limit has reset \xb7 press enter to continue". The
+        reset passed while the machine slept and Claude waits for a key.
+    """
+    line = _strip_gutter(text or "")
+    if not line or len(line) > 2 * _BANNER_MAX_CHARS:
+        return ""      # the give-up notices run long, prose runs longer
+    d = _despace(line)
+    if _AUTO_ARMED_RE.match(d):
+        return "armed"
+    if _AUTO_USER_CANCEL_RE.match(d):
+        return "cancelled"
+    if _AUTO_OFF_RE.match(d):
+        return "off"
+    if _AUTO_STALE_RE.match(d):
+        return "stale"
+    return ""
 
 
 def reset_is_dated(text: str) -> bool:

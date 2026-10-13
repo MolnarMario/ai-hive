@@ -8,6 +8,19 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.42.1
+
+- After a usage limit, Claude Code's own "continuing automatically" gets
+  to go first. AI Hive used to type Continue a few seconds after the
+  reset, which cancelled Claude's own continuation. Now it waits until 7.5
+  minutes past the reset and steps in only if Claude hasn't continued.
+- Pressing Esc on Claude's automatic continue now also tells AI Hive not
+  to resume that agent.
+- Before it continues a Claude agent whose reset time has passed, AI Hive
+  checks the account's usage reading and keeps waiting while the limit is
+  still spent. With no fresh reading, it waits up to 10 minutes, then goes
+  by the clock as before.
+
 ## 0.42.0
 
 - The Close merged agents dialog has a "Don't ask again" box, with a
