@@ -1904,6 +1904,10 @@ class TerminalAgent(QObject):
         (keystroke echo excluded), or 0.0 if it never has."""
         return self._last_work_ts
 
+    def session_started_at(self) -> float:
+        """Wall time the current child process was started, or 0.0."""
+        return self._session_started
+
     def last_submit_at(self) -> float:
         """Wall time a line was last submitted to this agent's child (typed,
         a task or a nudge), or 0.0 if none was this run."""

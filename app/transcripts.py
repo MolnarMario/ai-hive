@@ -531,7 +531,11 @@ def limit_cut_off(cwd: str, session_id: str) -> dict | None:
 
     Returns None when there is no readable transcript at all, and otherwise
     `{"cut_off", "at", "resets_at", "banner", "window", "synthetic", "exact",
-    "self_resumed", "carried_on_at"}`. `exact` says `resets_at` came from the
+    "self_resumed", "carried_on_at", "auto", "auto_at", "auto_note"}`.
+    `auto` is the last thing Claude Code's own auto-continue said about the
+    OPEN cut-off (`limit_banner.auto_continue_state`, "" when it said
+    nothing), `auto_at` when it said it and `auto_note` the notice itself.
+    `exact` says `resets_at` came from the
     record's own `quotaLimits` epoch or a dated clock rather than a bare wall
     time; `self_resumed` says the conversation's last word on the limit was
     the CLI's own "Usage limit reset" notice, i.e. it continued without AI
@@ -648,7 +652,8 @@ def _is_real_prompt(rec: dict) -> bool:
 def _no_cut_off(**extra) -> dict:
     found = {"cut_off": False, "at": 0.0, "resets_at": 0.0, "banner": "",
              "window": "", "synthetic": False, "exact": False,
-             "self_resumed": False, "carried_on_at": 0.0}
+             "self_resumed": False, "carried_on_at": 0.0, "auto": "",
+             "auto_at": 0.0, "auto_note": ""}
     found.update(extra)
     return found
 
@@ -734,10 +739,18 @@ def _read_limit_cut_off(path: str) -> dict | None:
                         found = _no_cut_off(self_resumed=True)
                         grace_hold, closer = False, rec
                         continue
+                    auto = limit_banner.auto_continue_state(text)
                     banner = limit_banner.banner_line(text)
                     if not banner:
+                        # Claude's timer re-armed, gave up or was cancelled:
+                        # news about the open cut-off, never a new one
+                        if auto and found["cut_off"]:
+                            found = dict(found, auto=auto,
+                                         auto_at=_record_epoch(rec),
+                                         auto_note=text.strip())
                         continue      # away_summary, informational, ...
                 elif rtype == "assistant":
+                    auto = ""
                     text = _message_text(rec)
                     banner = (limit_banner.banner_line(text)
                               if _is_api_error_record(rec) else "")
@@ -779,13 +792,19 @@ def _read_limit_cut_off(path: str) -> dict | None:
                     # since a still-spent limit answers with the current one.
                     if not found["cut_off"]:
                         found = _no_cut_off(synthetic=True)
-                    elif resets_at > found["resets_at"]:
-                        found.update(resets_at=resets_at, exact=exact,
-                                     window=window or found["window"])
+                    else:
+                        if resets_at > found["resets_at"]:
+                            found.update(resets_at=resets_at, exact=exact,
+                                         window=window or found["window"])
+                        if auto:
+                            found.update(auto=auto, auto_at=when,
+                                         auto_note=banner)
                     continue
                 found = _no_cut_off(
                     cut_off=True, at=when, banner=banner, window=window,
-                    resets_at=resets_at, exact=exact)
+                    resets_at=resets_at, exact=exact, auto=auto,
+                    auto_at=when if auto else 0.0,
+                    auto_note=banner if auto else "")
     except OSError:
         return cached[2] if cached else None
     if closer is not None:
