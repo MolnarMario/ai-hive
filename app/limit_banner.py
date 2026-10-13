@@ -98,8 +98,13 @@ _RESET_NOTICE_RE = re.compile(r"usagelimit(?:reset|availableagain)(?=[·•]|$)"
 # Claude Code's own auto-continue, as the notices it writes into the
 # conversation (claude.exe 2.1.296, `quota-auto-resume`). See
 # `auto_continue_state`. Each is matched at the start of the despaced line.
+# 2.1.296 writes only "continuing automatically <when>"; the "continuing
+# shortly" and "continuing when it resets" wordings of its status row, and of
+# older versions, count too: missing an armed timer types over Claude's own
+# continuation, while a false "armed" costs at most CLAUDE_OWN_CONTINUE_S.
 _AUTO_ARMED_RE = re.compile(
-    r"(?:usagelimitreached(?:again)?[·•])?continuingautomatically(?!$)")
+    r"(?:usagelimitreached(?:again)?[·•])?continuing"
+    r"(?:automatically(?!$)|shortly|whenitresets)")
 _AUTO_USER_CANCEL_RE = re.compile(
     r"automaticcontinuecancelled[·•]/rate-limit-options")
 _AUTO_OFF_RE = re.compile(
@@ -381,8 +386,9 @@ def auto_continue_state(text: str) -> str:
     cut-off it follows, or "" when `text` is not one:
 
       * "armed": "Usage limit reached \xb7 continuing automatically at 9:50pm",
-        its "... reached again ..." re-arm, or the bare "Continuing
-        automatically ...". Claude's timer will send its own continuation 30
+        its "... reached again ..." re-arm, the bare "Continuing
+        automatically ...", or "... continuing shortly" / "... continuing
+        when it resets". Claude's timer will send its own continuation 30
         to 90 s after the reset.
       * "cancelled": "Automatic continue cancelled \xb7 /rate-limit-options to
         re-arm". Claude prints exactly this only for Esc, Ctrl+C or the

@@ -2861,6 +2861,14 @@ def test_claude_own_auto_continue_first():
           "all read as armed", st(ARMED) == st(AGAIN) == st(WAITING) == "armed")
     check("own-continue: ...painted without spaces too",
           st(ARMED.replace(" ", "")) == "armed")
+    check("own-continue: the 'shortly' and 'when it resets' wordings are "
+          "armed too", all(st(x) == "armed" for x in (
+              "Usage limit reached \xb7 continuing shortly \xb7 esc to cancel",
+              "Continuing shortly \xb7 esc to cancel",
+              "Usage limit reached \xb7 continuing when it resets",
+              "Continuing automatically when it resets \xb7 esc to cancel")))
+    check("own-continue: Claude's early fire is no timer state",
+          st("Usage limit available again \xb7 continuing now") == "")
     check("own-continue: Esc's cancel notice is a person saying no",
           st(CANCEL) == "cancelled")
     check("own-continue: every way Claude gives up reads as off",
