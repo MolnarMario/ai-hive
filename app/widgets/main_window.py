@@ -32,6 +32,7 @@ from .. import lanes
 from .. import limit_ledger
 from .. import providers
 from .. import repo_activity
+from .. import limit_banner
 from ..limit_banner import LIMIT_PROVIDERS, SEVEN_DAY_WINDOWS
 from .. import scheduled_send
 from .. import session_hook
@@ -3602,6 +3603,10 @@ class MainWindow(QMainWindow):
 
         Cancelled by a person (Esc or Ctrl+C on the timer): the cut-off is
         dismissed and the agent left parked, unless the Esc was AI Hive's.
+        Only a cancel from this claude process counts. One from an earlier
+        process may have been AI Hive's own Ctrl+C on a stop, or an Esc it
+        sent before a restart (`_app_esc_at` lives in memory), so AI Hive
+        resumes that cut-off as it did before it read these notices.
 
         Given up, or waiting for Enter after a sleep: AI Hive resumes it on
         its usual schedule, and the log says why, once."""
@@ -3622,7 +3627,11 @@ class MainWindow(QMainWindow):
         if state == "armed":
             if not current:
                 return False    # that timer died with an earlier process
-            at = info["resets_at"] or agent.limit_resets_at()
+            # a re-arm ("... reached again · continuing automatically at
+            # 9:50pm") names a later reset than the cut-off it follows
+            at = max(info["resets_at"] or agent.limit_resets_at() or 0.0,
+                     limit_banner.banner_reset_at(info.get("auto_note", ""),
+                                                  said_at) or 0.0)
             if not at:
                 return False
             until = at + CLAUDE_OWN_CONTINUE_S
@@ -3643,11 +3652,25 @@ class MainWindow(QMainWindow):
                 once("ours", f"CLAUDE-STOPPED agent={name} (AI Hive's own Esc "
                              f"cancelled Claude Code's continue)")
                 return False
+            if not current:
+                once("earlier", f"CLAUDE-STOPPED agent={name} (cancelled in "
+                                f"an earlier claude process, not known to be "
+                                f"the user's)")
+                return False
             self._limit_audit(f"USER-CANCELLED agent={name} (Esc on Claude "
                               f"Code's automatic continue, leaving it parked)")
-            self._ledger_outcome(
-                agent, limit_ledger.DISMISSED,
-                detail="the user cancelled Claude Code's automatic continue")
+            detail = "the user cancelled Claude Code's automatic continue"
+            self._ledger_outcome(agent, limit_ledger.DISMISSED, detail=detail)
+            # the transcript sweep looks the cut-off up by the conversation's
+            # own reset, which can differ from the latch's (an exact epoch
+            # against a clock parsed to the minute): close that key too, or
+            # the sweep re-latches it and this dismisses it every minute
+            seen = limit_ledger.key_of(agent.spec.cwd, agent.spec.session_id,
+                                       info["resets_at"] or 0.0, info["at"])
+            if seen != self._ledger_key(agent):
+                limit_ledger.record_outcome(
+                    self._ledger_dir(), seen, limit_ledger.DISMISSED,
+                    tries=agent.limit_attempts(), detail=detail)
             agent.clear_limit_block()
             agent.notice("[automatic continue cancelled; AI Hive will not "
                          "resume this cut-off]")

@@ -2945,7 +2945,9 @@ def test_claude_own_auto_continue_first():
     stub = SimpleNamespace(_claude_auto_said={}, _app_esc_at={},
                            _limit_audit=audits.append,
                            _ledger_outcome=lambda ag, o, detail="":
-                               outcomes.append((ag.spec.name, o)))
+                               outcomes.append((ag.spec.name, o)),
+                           _ledger_dir=lambda: str(tmp))
+    stub._ledger_key = lambda ag: MainWindow._ledger_key(stub, ag)
     made = []
 
     def agent(name, records, started=now - 7200, kind=AgentKind.CLAUDE):
@@ -2990,6 +2992,27 @@ def test_claude_own_auto_continue_first():
     check("own-continue: a cancel AI Hive's own Esc caused is not the user's",
           leave(ours) is False and ours.is_limit_blocked()
           and ("Ours", limit_ledger.DISMISSED) not in outcomes)
+    seen = transcripts.limit_cut_off(cwd, person.spec.session_id)
+    check("own-continue: a person's cancel also closes the key the transcript "
+          "sweep looks up, so it is not re-latched every minute",
+          tuple(limit_ledger.key_of(cwd, person.spec.session_id,
+                                    seen["resets_at"], seen["at"]))
+          in limit_ledger.closed_keys(
+              limit_ledger.read_all(str(tmp))))
+    earlier = agent("Earlier", [ask, system(ARMED, now - 3900),
+                                system(CANCEL, now - 3000)],
+                    started=now - 60)
+    check("own-continue: a cancel from an earlier claude process (a stop's "
+          "Ctrl+C, an Esc before a restart) is not taken as the user's",
+          leave(earlier) is False and earlier.is_limit_blocked()
+          and ("Earlier", limit_ledger.DISMISSED) not in outcomes
+          and any("CLAUDE-STOPPED agent=Earlier" in x for x in audits),
+          (outcomes, audits))
+    rearmed = agent("Rearmed", [ask, quota(now - 3900, reset - 3600),
+                                system(AGAIN, now - 3899)])
+    check("own-continue: a re-arm's later clock moves Claude's turn with it",
+          leave(rearmed, reset - 3600 + CLAUDE_OWN_CONTINUE_S + 1) is True
+          and leave(rearmed, reset + CLAUDE_OWN_CONTINUE_S + 1) is False)
 
     gaveup = agent("GaveUp", [ask, system(ARMED, now - 3900),
                               system(CAPPED, now - 3000)])
