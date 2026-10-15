@@ -8,6 +8,17 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.43.0
+
+- Giving an agent its own lane, from the New Agent dialog or Restart in
+  own lane, now turns the workspace's Lanes toggle on, so the header no
+  longer says Lanes is off beside a laned card.
+- Make integrator works on an agent without a lane once the workspace has
+  a lane. After you confirm, the agent restarts in its own lane in a new
+  conversation and becomes the integrator.
+- The + that brings back closed usage readouts is now a square button with
+  the same bold + as the add workspace button.
+
 ## 0.42.1
 
 - After a usage limit, Claude Code's own "continuing automatically" gets
