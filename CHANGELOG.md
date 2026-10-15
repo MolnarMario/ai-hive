@@ -12,8 +12,8 @@ em dashes: this text is shown in the app.
 
 - A crowded card header no longer shortens the integrator's lane chip to
   "int...tor". The chip drops whole words instead, the word integrator
-  first since its icon already says it, then the counts. Hover the chip
-  for the full text.
+  first since its icon already says it, then the counts. The chip's
+  tooltip still lists the role and every count.
 
 ## 0.43.0
 

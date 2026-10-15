@@ -5,8 +5,9 @@ Font glyphs (the old "▦", "◆", "❦", "⎇") render as colour emoji on some
 systems and never match the text weight. These are stroked SVG paths (the
 Lucide set, 24px grid) painted in the same ink the stylesheet gives the
 button's text, so a hover, checked or dimmed state recolours both together.
-Beside text, the icon goes in the room the stylesheet reserves with
-`padding-left`. A button or label with no text gets it centred.
+Beside text, a header button's icon goes in the room the stylesheet reserves
+with `padding-left`. A button with no text gets it centred. The lane chip
+lays out its own icon and text (`LaneChip`).
 """
 
 from functools import lru_cache
@@ -106,7 +107,8 @@ class LaneChip(QToolButton):
     text in the middle, "int...tor". Instead the chip drops whole words from
     the front until the rest fits: "integrator" goes first, since the merge
     icon already says it, then the counts, down to the icon alone. `text()`
-    stays the full text and the tooltip carries every word.
+    stays the full text, and the tooltip spells out the role and every count
+    in words (`TerminalCard._lane_tooltip`).
 
     The old chip led with the font glyph "⎇", which has wide side bearings
     (the gap left of it) and is small at 11px."""
