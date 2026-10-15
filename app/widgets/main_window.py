@@ -744,6 +744,10 @@ class TopBar(QFrame):
         self.usage_add_btn.setObjectName("UsageTrackerAdd")
         self.usage_add_btn.setText("+")
         self.usage_add_btn.setToolTip("Choose which usage readouts to show")
+        # square, at the height its old padded pill had, so the row does not
+        # shift; the QSS drops the side padding that made it wide
+        self.usage_add_btn.setFixedSize(self.USAGE_ADD_BTN_SIDE,
+                                        self.USAGE_ADD_BTN_SIDE)
         self.usage_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.usage_add_btn.clicked.connect(self._open_tracker_menu)
 
@@ -913,6 +917,7 @@ class TopBar(QFrame):
             w.setVisible(visible)
 
     APP_UPDATE_BTN_SIDE = 34
+    USAGE_ADD_BTN_SIDE = 26
     APP_UPDATE_IDLE_TIP = "Check GitHub for a newer AI Hive"
 
     def set_app_update_state(self, text: str = "", tooltip: str = "",
@@ -2475,6 +2480,10 @@ class MainWindow(QMainWindow):
         # uids of agents Restart in own lane is stopping, before their lane
         # is planned: {uid: the status slot waiting for the worker to end}
         self._lane_adopting: dict = {}
+        # uids of agents the user made integrator before they had a lane:
+        # Restart in own lane gives them one, and the role follows as soon
+        # as the lane is recorded (_continue_adopt). Transient by design.
+        self._integrator_after_adopt: set[str] = set()
         # workspaces already told, this run, that two lanes want an
         # integrator (_hint_integrator). Transient by design.
         self._integrator_hinted: set[str] = set()
@@ -4446,7 +4455,9 @@ class MainWindow(QMainWindow):
     # toggles, the Options switch "Lanes in every workspace" and each
     # workspace's own, decide ONE thing: whether "Own lane" starts ticked
     # for a new agent (lane_default). A lane is created only by the user's
-    # tick in the New Agent dialog or the card's Restart in own lane. The
+    # tick in the New Agent dialog or the card's Restart in own lane (Make
+    # integrator on an agent without a lane goes through it). Either one
+    # turns its workspace's toggle on (_lanes_now_on). The
     # lane machinery (poller, hooks, notices, Make integrator)
     # follows the lanes themselves, never the toggles: it runs for any lane
     # that exists, and with no lane anywhere no lane git process starts. An
@@ -4480,6 +4491,14 @@ class MainWindow(QMainWindow):
         The Options switch forces it on everywhere; otherwise the
         workspace's own toggle decides. The ONLY question a toggle answers."""
         return bool(self._agent_lanes or (ws is not None and ws.lanes))
+
+    def _lanes_now_on(self, ws_id: str) -> None:
+        """An agent in `ws_id` just got a lane the user asked for (its
+        worktree exists now: a failed create or revive leaves the toggle
+        alone): the workspace's toggle turns on, so the header no longer reads "Lanes" off beside a
+        laned card and the next New Agent starts ticked. Like any toggle
+        change it starts no git and touches no agent."""
+        self.manager.set_workspace_lanes(ws_id, True)
 
     def _any_lanes(self) -> bool:
         """Does any agent have a lane, or one being made? What the lane
@@ -4567,10 +4586,20 @@ class MainWindow(QMainWindow):
                 f"{error}")
             if agent is not None:
                 # a lane problem never blocks the agent itself
+                was_integrator = self.manager.is_integrator(agent)
                 self.manager.clear_agent_lane(ws_id, agent_id)
+                if was_integrator:
+                    # Make integrator gave the role before the worktree
+                    # existed (_continue_adopt); clear_agent_lane took it
+                    self._store_audit(f"INTEGRATOR ws={ws_id} none (was "
+                                      f"{name!r}, its lane failed)")
                 agent.notice(f"[no lane: {error}. This agent works in the "
-                             f"workspace folder.]")
+                             f"workspace folder"
+                             + (", and is not the integrator"
+                                if was_integrator else "") + ".]")
                 self._push_lane_view(ws_id, agent)
+                if was_integrator:
+                    self._refresh_lane_cards(ws_id)
                 agent.release_start(run=True)
             self._sync_lane_service()
             return
@@ -4584,6 +4613,7 @@ class MainWindow(QMainWindow):
             self._sync_lane_service()
             return
         self.manager.set_agent_lane(ws_id, agent_id, result, cwd)
+        self._lanes_now_on(ws_id)
         self._sync_lane_service()
         self._hint_integrator(ws_id, agent)
         if self.event_hub is not None:
@@ -4695,6 +4725,8 @@ class MainWindow(QMainWindow):
         cwd = agent.spec.cwd if os.path.isdir(agent.spec.cwd) \
             else new_lane["root"]
         self.manager.set_agent_lane(ws_id, agent_id, new_lane, cwd)
+        if revive:
+            self._lanes_now_on(ws_id)
         self._push_lane_view(ws_id, agent)
         if recreated:
             agent.notice(f"[its branch {new_lane['branch']} was merged and "
@@ -4739,9 +4771,12 @@ class MainWindow(QMainWindow):
     def _adopt_state(self, ws, agent):
         """(enabled, tooltip) for Restart in own lane, or None when the card
         does not offer it: only an interactive Claude agent with no lane, in
-        a git workspace whose lane default is on."""
+        a git workspace whose lane default is on or that already has a lane
+        (a toggle switched off later never strands the integrator role)."""
         if (agent.spec.provider != "claude" or not agent.is_pty
-                or agent.spec.lane or not self.lane_default(ws)
+                or agent.spec.lane
+                or not (self.lane_default(ws)
+                        or any(a.spec.lane for a in ws.agents))
                 or not lanes.find_repo_root(ws.project_path)):
             return None
         uid = agent.spec.uid
@@ -4764,6 +4799,19 @@ class MainWindow(QMainWindow):
             f"{agent.spec.name} starts a new conversation in its own lane. "
             f"The current conversation stays in this workspace's folder, and "
             f"New Agent can resume it.",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        return answer == QMessageBox.StandardButton.Ok
+
+    def _confirm_integrator_adopt(self, agent) -> bool:
+        """The user's go-ahead for Make integrator on an agent without a lane
+        (tests replace it): Restart in own lane, then the role."""
+        answer = QMessageBox.question(
+            self, "Make integrator",
+            f"The integrator works in its own lane. {agent.spec.name} "
+            f"starts a new conversation in its own lane and becomes this "
+            f"workspace's integrator. The current conversation stays in this "
+            f"workspace's folder, and New Agent can resume it.",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
         return answer == QMessageBox.StandardButton.Ok
@@ -4807,6 +4855,8 @@ class MainWindow(QMainWindow):
                 wait[0].status_changed.disconnect(wait[1])
             except (RuntimeError, TypeError):
                 pass
+        integrate = uid in self._integrator_after_adopt
+        self._integrator_after_adopt.discard(uid)
         ws = self.manager.workspace(ws_id)
         agent = self.manager.agent(ws_id, agent_id)
         if (ws is None or agent is None or agent.spec.lane
@@ -4826,7 +4876,9 @@ class MainWindow(QMainWindow):
             self._store_audit(f"LANE-FAIL {exc.code} adopt agent={name!r}: "
                               f"{exc}")
             agent.notice(f"[no lane: {exc}. This agent starts a new "
-                         f"conversation in the workspace folder.]")
+                         f"conversation in the workspace folder"
+                         + (", and is not the integrator" if integrate
+                            else "") + ".]")
             agent.release_start(run=True)
             return
         # 4. record the lane, then make it
@@ -4834,6 +4886,15 @@ class MainWindow(QMainWindow):
                                     plan.cwd)
         self._store_audit(f"LANE-ADOPT agent={name!r} root={plan.root} "
                           f"branch={plan.branch} left={old_sid or '-'}")
+        if integrate:
+            # the role before the lane's first start, so that start carries
+            # the integrator prompt. A failed create takes it away again
+            # (WorkspaceManager.clear_agent_lane).
+            if self.manager.integrator(ws_id) is None:
+                self._make_integrator(ws_id, agent)
+            else:
+                agent.notice("[not made the integrator: this workspace got "
+                             "another one meanwhile]")
         self._create_lane(ws_id, agent, plan, adopt=True)
         self._sync_lane_service()
         self._push_lane_view(ws_id, agent)
@@ -4975,6 +5036,12 @@ class MainWindow(QMainWindow):
             if agent is not None and self._confirm_adopt(agent):
                 self._restart_in_lane(ws_id, agent)
             return
+        if action == "integrator":
+            # before the lane check: an agent without a lane may take the
+            # role through Restart in own lane
+            if agent is not None:
+                self._toggle_integrator(ws_id, agent)
+            return
         lane = dict(agent.spec.lane) if agent is not None else {}
         if not lane:
             return
@@ -4996,8 +5063,6 @@ class MainWindow(QMainWindow):
                 lane["repo"], lanes.refresh_lane, lane, label="refresh",
                 callback=lambda res, err: self._on_lane_refreshed(
                     ws_id, agent_id, uid, name, lane, res, err))
-        elif action == "integrator":
-            self._toggle_integrator(ws_id, agent)
         elif action == "ship":
             self._ship_lanes(ws_id, agent)
         elif action == "close_merged":
@@ -5066,14 +5131,17 @@ class MainWindow(QMainWindow):
             # workspace has an integrator: the user stops that one first, so
             # the role never moves by a stray click.
             why = self.manager.can_integrate(agent)
+            tip = ("When you ask it to, it combines the lanes whose agent "
+                   "committed \"Task done\" into one pull request, gets it "
+                   "reviewed and tested, and merges it.")
             if why and not agent.spec.lane and adopt is not None:
-                why = ("This agent has no lane. Restart it in its own lane "
-                       "first (the ⎇ button in this tray).")
-            tip = why or (
-                "When you ask it to, it combines the lanes whose agent "
-                "committed \"Task done\" into one pull request, gets it "
-                "reviewed and tested, and merges it.")
-            info["role"] = ("Make integrator", not why, tip)
+                # the role takes it into its own lane first, one click
+                why = "" if adopt[0] else adopt[1]
+                tip = ("Restarts this agent in its own lane (a new "
+                       "conversation; the current one stays resumable from "
+                       "the workspace folder) and makes it the integrator. "
+                       + tip)
+            info["role"] = ("Make integrator", not why, why or tip)
         return info
 
     @staticmethod
@@ -5205,16 +5273,51 @@ class MainWindow(QMainWindow):
                     f"integrator. Stop it being the integrator first.")
                 return
             why = self.manager.can_integrate(agent)
+            ws = self.manager.workspace(ws_id)
+            adopt = (self._adopt_state(ws, agent)
+                     if why and not agent.spec.lane and ws is not None
+                     else None)
+            if adopt is not None:
+                # no lane yet: Restart in own lane, and the role follows
+                # once the lane is recorded (_continue_adopt)
+                if not adopt[0]:
+                    self._lane_message("Not the integrator", adopt[1])
+                elif not self._confirm_integrator_adopt(agent):
+                    pass
+                elif self.manager.integrator(ws_id) is not None:
+                    # another agent took the role while the box was open:
+                    # don't stop this one for a role it can't get
+                    self._lane_message(
+                        "Not the integrator",
+                        f"{self.manager.integrator(ws_id).spec.name} became "
+                        f"this workspace's integrator meanwhile.")
+                else:
+                    self._integrator_after_adopt.add(agent.spec.uid)
+                    self._restart_in_lane(ws_id, agent)
+                    if agent.spec.uid not in self._lane_adopting:
+                        self._integrator_after_adopt.discard(agent.spec.uid)
+                return
             if why:
                 self._lane_message("Not the integrator", why)
                 return
-            self.manager.set_integrator(ws_id, agent.id)
-            self._store_audit(f"INTEGRATOR ws={ws_id} "
-                              f"agent={agent.spec.name!r}")
-            if self.event_hub is not None:
-                self.event_hub.lane_event(
-                    agent, "is now this workspace's integrator",
-                    {"integrator": agent.spec.uid})
+            self._make_integrator(ws_id, agent)
+            return
+        self._refresh_lane_cards(ws_id)
+
+    def _make_integrator(self, ws_id: str, agent) -> None:
+        """Give `agent` (laned, and the workspace has no integrator) the
+        role: the user's Make integrator, directly or after its lane."""
+        if not self.manager.set_integrator(ws_id, agent.id):
+            return
+        self._store_audit(f"INTEGRATOR ws={ws_id} "
+                          f"agent={agent.spec.name!r}")
+        if self.event_hub is not None:
+            self.event_hub.lane_event(
+                agent, "is now this workspace's integrator",
+                {"integrator": agent.spec.uid})
+        self._refresh_lane_cards(ws_id)
+
+    def _refresh_lane_cards(self, ws_id: str) -> None:
         page = self._pages.get(ws_id)
         for card in (page.cards if page is not None else []):
             card.refresh_lane()

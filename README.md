@@ -443,7 +443,8 @@ workspaces keep executing — switching never pauses anything.
   workspace one agent can opt in alone, or out, and an existing agent can
   move into a lane with **Restart in own lane** (`⎇` in its card's `⋯`
   tray; a new conversation, and the old one stays resumable from the workspace
-  folder). Turning a toggle off never touches an existing lane. The **?**
+  folder). Once an agent's lane exists, made either way or brought back by
+  resuming a lane conversation, its workspace's toggle turns on. Turning a toggle off never touches an existing lane. The **?**
   beside the toggle, and **What are lanes?** in the New Agent dialog, map
   each part onto how a team worked before AI. With Count 3 you get three
   lanes. The ignored `.venv` / `venv` / `node_modules` are linked in, so the
@@ -501,7 +502,9 @@ workspaces keep executing — switching never pauses anything.
 - **Shipping finished lanes** (needs lanes, a GitHub remote and a logged-in
   `gh`): hover the `⋯` on a laned Claude agent's header and click `⚑`
   **Make integrator** (one per workspace, so it is not offered while the
-  workspace has one). The second lane in a workspace
+  workspace has one). Once a workspace has a lane, an agent without one can
+  take the role too: it restarts in its own lane, in a new conversation, and
+  becomes the integrator. The second lane in a workspace
   without an integrator says so on its card, once. Every other laned agent is
   told to merge the newest main into its lane, have GPT-6-Luna review the
   lane (`codex review`, high effort), fix what Luna finds, and then commit
@@ -967,7 +970,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3383 checks drive the real app headlessly (offscreen Qt platform) with real
+3411 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1114,7 +1117,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3383 checks)
+                           (3411 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
