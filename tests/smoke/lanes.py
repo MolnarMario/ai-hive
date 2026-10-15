@@ -4623,6 +4623,19 @@ def test_task_done_waits_for_the_user():
         check("lane chip: gaining text keeps the chip's height",
               bare.sizeHint().height() == bare_h,
               (bare_h, bare.sizeHint().height()))
+        # a crowded header squeezes the chip below its hint, and QToolButton
+        # elided "integrator" to "int...tor": whole words drop instead
+        bare.setText("integrator ↑1")
+        full_w = bare.sizeHint().width()
+        shown = []
+        for w in (full_w, full_w - 1, 2 * (1 + ui_theme.LANE_PAD_PX)
+                  + ui_theme.LANE_ICON_PX):
+            bare.resize(w, bare_h)
+            shown.append(bare.shown_text())
+        check("lane chip: a squeezed chip drops the role word, then the "
+              "counts, never eliding a word",
+              shown == ["integrator ↑1", "↑1", ""]
+              and bare.text() == "integrator ↑1", shown)
         bare.deleteLater()
         prompt = i.spec.system_prompt
         check("task done: the integrator's prompt has it merge only after a "
