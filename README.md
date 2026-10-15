@@ -443,7 +443,8 @@ workspaces keep executing — switching never pauses anything.
   workspace one agent can opt in alone, or out, and an existing agent can
   move into a lane with **Restart in own lane** (`⎇` in its card's `⋯`
   tray; a new conversation, and the old one stays resumable from the workspace
-  folder). Turning a toggle off never touches an existing lane. The **?**
+  folder). Giving an agent a lane either way turns its workspace's toggle
+  on. Turning a toggle off never touches an existing lane. The **?**
   beside the toggle, and **What are lanes?** in the New Agent dialog, map
   each part onto how a team worked before AI. With Count 3 you get three
   lanes. The ignored `.venv` / `venv` / `node_modules` are linked in, so the
@@ -501,7 +502,9 @@ workspaces keep executing — switching never pauses anything.
 - **Shipping finished lanes** (needs lanes, a GitHub remote and a logged-in
   `gh`): hover the `⋯` on a laned Claude agent's header and click `⚑`
   **Make integrator** (one per workspace, so it is not offered while the
-  workspace has one). The second lane in a workspace
+  workspace has one). Once a workspace has a lane, an agent without one can
+  take the role too: it restarts in its own lane, in a new conversation, and
+  becomes the integrator. The second lane in a workspace
   without an integrator says so on its card, once. Every other laned agent is
   told to merge the newest main into its lane, have GPT-6-Luna review the
   lane (`codex review`, high effort), fix what Luna finds, and then commit

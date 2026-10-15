@@ -57,8 +57,10 @@ This file holds only the rules that protect user data or fail silently.
   place, never swapped for the workspace folder. Every lane git mutation goes
   through `MainWindow.lane_ops` (one queue per repo). A lane is created
   only by the user's tick in the New Agent dialog or the card's Restart in
-  own lane; `lane_default(ws)` (the Options switch or the workspace toggle)
-  only sets where the tick starts. The lane machinery (service, hooks,
+  own lane (Make integrator on a laneless agent goes through Restart in own
+  lane); `lane_default(ws)` (the Options switch or the workspace toggle)
+  only sets where the tick starts. Giving an agent a lane turns its
+  workspace's toggle on (`_lanes_now_on`). The lane machinery (service, hooks,
   queue) follows the lanes, never a toggle (`_sync_lane_service`), so no
   toggle may silence or pause an existing lane. Restart in own lane holds
   the start, waits for the worker to end, and clears `session_id` BEFORE
