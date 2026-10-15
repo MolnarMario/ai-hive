@@ -1377,10 +1377,6 @@ class TerminalCard(QFrame):
         state = view.state if view is not None else "clean"
         self.lane_mark.setText(" ".join(parts))
         self.lane_mark.set_icon_name("merge" if integrator else "lanes")
-        bare = "" if parts else "true"
-        if (self.lane_mark.property("bare") or "") != bare:
-            self.lane_mark.setProperty("bare", bare)
-            repolish(self.lane_mark)
         tip = self._lane_tooltip(lane, view)
         if integrator:
             tip = ("This agent is the workspace's integrator: when you ask "

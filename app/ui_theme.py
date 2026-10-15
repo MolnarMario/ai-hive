@@ -201,8 +201,8 @@ ANSI_16: list = list(_ANSI_DARK)   # mutated in place (kept as the same object)
 DISPLAY_FONT = THEMES[DEFAULT_THEME_ID].display_font
 BODY_FONT = THEMES[DEFAULT_THEME_ID].body_font
 
-# the card header's lane chip paints its own icon (header_icons.LaneChip); the
-# stylesheet reserves the room for it with these, so both read the same numbers
+# the card header's lane chip paints its own icon and text
+# (header_icons.LaneChip) and sizes itself from these
 LANE_ICON_PX = 16
 LANE_ICON_GAP_PX = 4
 LANE_PAD_PX = 5
@@ -693,11 +693,8 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 #CardLane {{
     background: transparent; color: {p.CARDHEAD_SUB};
     border: 1px solid transparent; border-radius: 3px;
-    font-size: 11px; font-weight: 700;
-    padding: 0 {LANE_PAD_PX}px 0 {LANE_PAD_PX + LANE_ICON_PX + LANE_ICON_GAP_PX}px;
+    font-size: 11px; font-weight: 700; padding: 0;
 }}
-/* no text beside the icon (a quiet lane): the icon alone fills the chip */
-#CardLane[bare="true"] {{ padding: 0 {LANE_PAD_PX}px; }}
 #CardLane[lane="overlap"] {{
     background: rgba(232,152,58,0.28); color: {p.TEXT};
     border-color: {p.ACCENT_ORANGE};
