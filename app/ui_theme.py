@@ -834,9 +834,10 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     color: {p.TEXT_DIM}; font-size: 11px;
 }}
 #UsagePillClose:hover {{ color: {p.RED}; }}
+/* square (TopBar pins its size), with the 18px bold + of #AddWsBtn */
 #UsageTrackerAdd {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
-    padding: 1px 7px; color: {p.TEXT_DIM}; font-size: 14px; font-weight: 700;
+    padding: 0px; color: {p.TEXT_DIM}; font-size: 18px; font-weight: 800;
 }}
 #UsageTrackerAdd:hover {{
     background: {p.BG_HOVER}; border-color: {p.ACCENT_GOLD}; color: {p.TEXT};

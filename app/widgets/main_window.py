@@ -744,6 +744,10 @@ class TopBar(QFrame):
         self.usage_add_btn.setObjectName("UsageTrackerAdd")
         self.usage_add_btn.setText("+")
         self.usage_add_btn.setToolTip("Choose which usage readouts to show")
+        # square, at the height its old padded pill had, so the row does not
+        # shift; the QSS drops the side padding that made it wide
+        self.usage_add_btn.setFixedSize(self.USAGE_ADD_BTN_SIDE,
+                                        self.USAGE_ADD_BTN_SIDE)
         self.usage_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.usage_add_btn.clicked.connect(self._open_tracker_menu)
 
@@ -913,6 +917,7 @@ class TopBar(QFrame):
             w.setVisible(visible)
 
     APP_UPDATE_BTN_SIDE = 34
+    USAGE_ADD_BTN_SIDE = 26
     APP_UPDATE_IDLE_TIP = "Check GitHub for a newer AI Hive"
 
     def set_app_update_state(self, text: str = "", tooltip: str = "",
