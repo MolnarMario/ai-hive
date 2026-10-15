@@ -11,11 +11,11 @@ Beside text, the icon goes in the room the stylesheet reserves with
 
 from functools import lru_cache
 
-from PySide6.QtCore import QByteArray, QRectF, QSize, Qt
-from PySide6.QtGui import QPainter
+from PySide6.QtCore import QByteArray, QRect, QRectF, QSize, Qt
+from PySide6.QtGui import QPainter, QPalette
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QLabel, QStyle, QStyleOptionToolButton,
-                               QToolButton)
+                               QStylePainter, QToolButton)
 
 from .. import ui_theme
 from ..ui_theme import Palette
@@ -97,13 +97,19 @@ class IconToolButton(QToolButton):
 
 class LaneChip(QToolButton):
     """The agent card header's lane chip: a line icon, then the lane's status
-    text ("↑2 ±3 ✓", "integrator"). The icon is the lanes branch, or the merge
-    for the workspace's integrator.
+    text ("↑2 ±3 ✓", "integrator ↑1"). The icon is the lanes branch, or the
+    merge for the workspace's integrator.
+
+    The chip paints its own text, because a crowded header squeezes it below
+    its sizeHint (see terminal_card._HeaderTools: an over-subscribed layout
+    shrinks every item, minimums included) and QToolButton then elides the
+    text in the middle, "int...tor". Instead the chip drops whole words from
+    the front until the rest fits: "integrator" goes first, since the merge
+    icon already says it, then the counts, down to the icon alone. `text()`
+    stays the full text and the tooltip carries every word.
 
     The old chip led with the font glyph "⎇", which has wide side bearings
-    (the gap left of it) and is small at 11px. The stylesheet reserves the
-    icon's room as padding-left (`#CardLane`) and sets `bare` while there is no
-    text, so a quiet lane is just the icon, centered."""
+    (the gap left of it) and is small at 11px."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -114,14 +120,26 @@ class LaneChip(QToolButton):
             self._icon_name = name
             self.update()
 
+    def _width_for(self, text: str) -> int:
+        w = 2 * (1 + ui_theme.LANE_PAD_PX) + ui_theme.LANE_ICON_PX
+        if text:
+            w += (ui_theme.LANE_ICON_GAP_PX
+                  + self.fontMetrics().horizontalAdvance(text))
+        return w
+
+    def shown_text(self) -> str:
+        """The longest tail of the text's words that fits the chip's width."""
+        words = self.text().split()
+        for i in range(len(words)):
+            tail = " ".join(words[i:])
+            if self._width_for(tail) <= self.width():
+                return tail
+        return ""
+
     def sizeHint(self):
         # exact, because QToolButton adds ~10px of its own around the text and
         # that shows as a gap between the icon and the text
-        pad, icon = ui_theme.LANE_PAD_PX, ui_theme.LANE_ICON_PX
-        w = 2 * (1 + pad) + icon
-        if self.text():
-            w += (ui_theme.LANE_ICON_GAP_PX
-                  + self.fontMetrics().horizontalAdvance(self.text()))
+        w = self._width_for(self.text())
         # the height of one line of text, with or without text: a bare chip
         # is icon-only to QToolButton and came out 1px taller, so the chip
         # shifted when a quiet lane made its first commit
@@ -134,10 +152,26 @@ class LaneChip(QToolButton):
         return QSize(w, h)
 
     def paintEvent(self, event):
-        super().paintEvent(event)
+        # the frame from the stylesheet (#CardLane[lane=...]), then the text
+        # left-aligned after the icon, so a chip wider than its shown text
+        # keeps the slack at the right instead of between icon and text
+        shown = self.shown_text()
+        opt = QStyleOptionToolButton()
+        self.initStyleOption(opt)
+        opt.text = ""
+        p = QStylePainter(self)
+        p.drawComplexControl(QStyle.ComplexControl.CC_ToolButton, opt)
         size = ui_theme.LANE_ICON_PX
-        left = (1 + ui_theme.LANE_PAD_PX if self.text()
+        left = (1 + ui_theme.LANE_PAD_PX if shown
                 else (self.width() - size) / 2)
+        if shown:
+            x = int(left) + size + ui_theme.LANE_ICON_GAP_PX
+            p.drawItemText(QRect(x, 0, self.width() - x, self.height()),
+                           Qt.AlignmentFlag.AlignLeft
+                           | Qt.AlignmentFlag.AlignVCenter,
+                           opt.palette, self.isEnabled(), shown,
+                           QPalette.ColorRole.ButtonText)
+        p.end()
         # the stylesheet's own text ink for this state (#CardLane[lane=...])
         ink = (Palette.CARDHEAD_SUB if self.property("lane") == "clean"
                else Palette.TEXT)
