@@ -867,6 +867,8 @@ def test_lanes_window():
 
         # --- switch OFF: an existing lane still loads, repairs, retires ----
         win.top_bar.agent_lanes_btn.click()
+        # its laned agents turned the workspace's own toggle on as well
+        win.manager.set_workspace_lanes(ws.id, False)
         check("lanes window: the switch is off again", not win.lane_default(ws))
         live_lane = dict(live.spec.lane)
         win._save_session()
@@ -1691,6 +1693,7 @@ def test_lane_service_window():
 
         # --- the switch goes off: lanes that exist carry on ------------------
         win.top_bar.agent_lanes_btn.click()
+        win.manager.set_workspace_lanes(ws.id, False)
         check("lane service: switching off leaves the poller running",
               win.lane_service.is_running() and not win.lane_default(ws))
         poll()
@@ -3316,7 +3319,9 @@ def test_lane_scopes_window():
         win.lane_ops.drain(60)
         app.processEvents()
         check("scopes window: one agent opts in alone in an OFF workspace",
-              bool(solo.spec.lane) and not ws_b.lanes)
+              bool(solo.spec.lane))
+        check("scopes window: ...and that turns the workspace's toggle on",
+              ws_b.lanes and page_b.lanes_switch.isChecked())
         check("scopes window: ...its lane hooks are armed",
               solo.spec.env.get(session_hook.LANE_UID_ENV) == solo.spec.uid
               and solo.spec.settings_path == win._lane_settings_path)
@@ -3336,9 +3341,10 @@ def test_lane_scopes_window():
               json.loads(Path(svc_mod.index_path(ws_b)).read_text(
                   encoding="utf-8")).get("enabled") is True)
         info_p = win._integration_info(plain_b)
-        check("scopes window: an unlaned agent next to it is offered a "
-              "disabled Make integrator", bool(info_p.get("role"))
-              and not info_p["role"][1], info_p)
+        check("scopes window: an unlaned agent next to it is offered Make "
+              "integrator through its own lane", bool(info_p.get("role"))
+              and info_p["role"][1]
+              and "own lane" in info_p["role"][2], info_p)
         # once the workspace has an integrator, no other agent is offered
         # the role (the user stops the current one first)
         win.manager.set_integrator(ws_b.id, solo.id)
@@ -3656,6 +3662,163 @@ def test_restart_in_own_lane():
     win.deleteLater()
     app.processEvents()
     check("adopt: the real .venv survived",
+          (work / ".venv" / "marker.txt").read_text() == "real venv")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_make_integrator_without_lane():
+    """A laned agent added in a workspace whose Lanes toggle is off turns
+    the toggle on. Make integrator on an agent without a lane, once the
+    workspace has a lane (even with the toggle switched off again), asks,
+    restarts it in its own lane and gives it the role before the lane's
+    first start; Cancel, a busy agent or a role taken meanwhile leave the
+    role where it was."""
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app.process_worker import WorkerState
+    from app.session_store import SessionStore
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-adopt-int-"))
+    work = _make_repo(tmp)
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    win.manager.set_active(ws.id)
+    page = win._pages[ws.id]
+
+    def run_dialog(setup=None):
+        orig = AddTerminalDialog.exec
+
+        def fake_exec(dlg):
+            if setup is not None:
+                setup(dlg)
+            return QDialog.DialogCode.Accepted
+        AddTerminalDialog.exec = fake_exec
+        try:
+            before = list(ws.agents)
+            win._on_add_terminal_clicked(ws.id)
+        finally:
+            AddTerminalDialog.exec = orig
+        app.processEvents()
+        return [a for a in ws.agents if a not in before]
+
+    asked = []
+
+    def confirm(answer):
+        win._confirm_integrator_adopt = (
+            lambda agent: (asked.append(agent.spec.name), answer)[1])
+
+    with _stub_starts() as starts:
+        plain = run_dialog()[0]
+        check("integrator adopt: lanes off, an unlaned agent",
+              not plain.spec.lane and not ws.lanes)
+        check("integrator adopt: no lane in the workspace, no role offered",
+              "role" not in win._integration_info(plain))
+        laned = run_dialog(lambda d: d.lane_check.setChecked(True))[0]
+        win.lane_ops.drain(60)
+        app.processEvents()
+        check("integrator adopt: a laned agent added with the toggle off "
+              "turns it on", bool(laned.spec.lane) and ws.lanes
+              and page.lanes_switch.isChecked())
+        saved = {w["id"]: w for w in
+                 win.manager.to_session_dict()["workspaces"]}[ws.id]
+        check("integrator adopt: ...and the save carries it",
+              saved.get("lanes") is True, saved.get("lanes"))
+        win.manager.set_workspace_lanes(ws.id, False)
+        info = win._integration_info(plain)
+        check("integrator adopt: with a lane in the workspace (toggle off "
+              "again) the unlaned agent is offered Make integrator",
+              info.get("role", ("",))[0] == "Make integrator"
+              and info["role"][1] and "own lane" in info["role"][2], info)
+
+        # Cancel: nothing changes
+        confirm(False)
+        win._on_lane_action(ws.id, plain.id, "integrator")
+        check("integrator adopt: it asks first, and Cancel changes nothing",
+              asked == [plain.spec.name] and not plain.spec.lane
+              and win.manager.integrator(ws.id) is None
+              and not plain.start_hold()
+              and not win._integrator_after_adopt)
+
+        # busy: refused, nothing pending
+        plain.is_busy = lambda: True
+        info = win._integration_info(plain)
+        boxes = len(win._lane_boxes)
+        confirm(True)
+        win._on_lane_action(ws.id, plain.id, "integrator")
+        check("integrator adopt: refused while the agent works",
+              not info["role"][1] and not plain.spec.lane
+              and len(win._lane_boxes) == boxes + 1
+              and not win._integrator_after_adopt, info)
+        del plain.is_busy
+        for box in list(win._lane_boxes):
+            box.close()
+
+        # a running agent: the role waits for the lane, then lands before
+        # the lane's first start
+        worker = plain.worker
+        worker._set_state(WorkerState.RUNNING)
+        worker.stop = lambda grace_ms=1200: worker._set_state(
+            WorkerState.STOPPING)
+        starts.calls.clear()
+        asked.clear()
+        win._on_lane_action(ws.id, plain.id, "integrator")
+        check("integrator adopt: OK holds the start and waits for the "
+              "worker", asked == [plain.spec.name] and not plain.spec.lane
+              and bool(plain.start_hold())
+              and plain.spec.uid in win._integrator_after_adopt)
+        check("integrator adopt: ...and not the integrator yet",
+              win.manager.integrator(ws.id) is None)
+        worker._set_state(WorkerState.DEAD)
+        worker.finished.emit(0, False)
+        check("integrator adopt: once it stops, it has a lane and the role "
+              "before anything starts", bool(plain.spec.lane)
+              and win.manager.is_integrator(plain) and starts.calls == []
+              and not win._integrator_after_adopt)
+        check("integrator adopt: ...its prompt says integrator",
+              "INTEGRATOR" in plain.spec.system_prompt)
+        check("integrator adopt: ...and the toggle is on again", ws.lanes)
+        check("integrator adopt: ...audited",
+              f"INTEGRATOR ws={ws.id} agent={plain.spec.name!r}"
+              in _log(store))
+        win.lane_ops.drain(60)
+        app.processEvents()
+        root = plain.spec.lane["root"]
+        check("integrator adopt: the lane exists and the integrator starts "
+              "once, in it", os.path.isdir(root)
+              and starts.cwds(plain.spec.name) == [root], starts.calls)
+        check("integrator adopt: the tray now offers Stop being it",
+              win._integration_info(plain).get("role", ("",))[0]
+              == "Stop being the integrator")
+
+        # someone else became integrator while this one stopped
+        third = run_dialog(lambda d: d.lane_check.setChecked(False))[0]
+        win.manager.set_integrator(ws.id, "")
+        w3 = third.worker
+        w3._set_state(WorkerState.RUNNING)
+        w3.stop = lambda grace_ms=1200: w3._set_state(WorkerState.STOPPING)
+        win._on_lane_action(ws.id, third.id, "integrator")
+        win.manager.set_integrator(ws.id, laned.id)
+        w3._set_state(WorkerState.DEAD)
+        w3.finished.emit(0, False)
+        check("integrator adopt: a role taken meanwhile is not moved",
+              bool(third.spec.lane) and win.manager.is_integrator(laned)
+              and not win.manager.is_integrator(third))
+        win.lane_ops.drain(60)
+        app.processEvents()
+        for a in list(ws.agents):
+            win._close_agent(ws.id, a.id)
+        win.lane_ops.drain(60)
+    for box in list(win._lane_boxes):
+        box.close()
+    win._save_timer.stop()
+    win.close()
+    win.deleteLater()
+    app.processEvents()
+    check("integrator adopt: the real .venv survived",
           (work / ".venv" / "marker.txt").read_text() == "real venv")
     shutil.rmtree(tmp, ignore_errors=True)
 
