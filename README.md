@@ -443,8 +443,8 @@ workspaces keep executing — switching never pauses anything.
   workspace one agent can opt in alone, or out, and an existing agent can
   move into a lane with **Restart in own lane** (`⎇` in its card's `⋯`
   tray; a new conversation, and the old one stays resumable from the workspace
-  folder). Giving an agent a lane either way turns its workspace's toggle
-  on. Turning a toggle off never touches an existing lane. The **?**
+  folder). Once an agent's lane exists, made either way or brought back by
+  resuming a lane conversation, its workspace's toggle turns on. Turning a toggle off never touches an existing lane. The **?**
   beside the toggle, and **What are lanes?** in the New Agent dialog, map
   each part onto how a team worked before AI. With Count 3 you get three
   lanes. The ignored `.venv` / `venv` / `node_modules` are linked in, so the

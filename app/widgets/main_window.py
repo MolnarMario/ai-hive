@@ -4493,8 +4493,9 @@ class MainWindow(QMainWindow):
         return bool(self._agent_lanes or (ws is not None and ws.lanes))
 
     def _lanes_now_on(self, ws_id: str) -> None:
-        """The user just gave an agent in `ws_id` a lane: the workspace's
-        toggle turns on, so the header no longer reads "Lanes" off beside a
+        """An agent in `ws_id` just got a lane the user asked for (its
+        worktree exists now: a failed create or revive leaves the toggle
+        alone): the workspace's toggle turns on, so the header no longer reads "Lanes" off beside a
         laned card and the next New Agent starts ticked. Like any toggle
         change it starts no git and touches no agent."""
         self.manager.set_workspace_lanes(ws_id, True)
@@ -4585,10 +4586,20 @@ class MainWindow(QMainWindow):
                 f"{error}")
             if agent is not None:
                 # a lane problem never blocks the agent itself
+                was_integrator = self.manager.is_integrator(agent)
                 self.manager.clear_agent_lane(ws_id, agent_id)
+                if was_integrator:
+                    # Make integrator gave the role before the worktree
+                    # existed (_continue_adopt); clear_agent_lane took it
+                    self._store_audit(f"INTEGRATOR ws={ws_id} none (was "
+                                      f"{name!r}, its lane failed)")
                 agent.notice(f"[no lane: {error}. This agent works in the "
-                             f"workspace folder.]")
+                             f"workspace folder"
+                             + (", and is not the integrator"
+                                if was_integrator else "") + ".]")
                 self._push_lane_view(ws_id, agent)
+                if was_integrator:
+                    self._refresh_lane_cards(ws_id)
                 agent.release_start(run=True)
             self._sync_lane_service()
             return
@@ -4602,6 +4613,7 @@ class MainWindow(QMainWindow):
             self._sync_lane_service()
             return
         self.manager.set_agent_lane(ws_id, agent_id, result, cwd)
+        self._lanes_now_on(ws_id)
         self._sync_lane_service()
         self._hint_integrator(ws_id, agent)
         if self.event_hub is not None:
@@ -4713,6 +4725,8 @@ class MainWindow(QMainWindow):
         cwd = agent.spec.cwd if os.path.isdir(agent.spec.cwd) \
             else new_lane["root"]
         self.manager.set_agent_lane(ws_id, agent_id, new_lane, cwd)
+        if revive:
+            self._lanes_now_on(ws_id)
         self._push_lane_view(ws_id, agent)
         if recreated:
             agent.notice(f"[its branch {new_lane['branch']} was merged and "
@@ -4872,7 +4886,6 @@ class MainWindow(QMainWindow):
                                     plan.cwd)
         self._store_audit(f"LANE-ADOPT agent={name!r} root={plan.root} "
                           f"branch={plan.branch} left={old_sid or '-'}")
-        self._lanes_now_on(ws_id)
         if integrate:
             # the role before the lane's first start, so that start carries
             # the integrator prompt. A failed create takes it away again
@@ -5269,7 +5282,16 @@ class MainWindow(QMainWindow):
                 # once the lane is recorded (_continue_adopt)
                 if not adopt[0]:
                     self._lane_message("Not the integrator", adopt[1])
-                elif self._confirm_integrator_adopt(agent):
+                elif not self._confirm_integrator_adopt(agent):
+                    pass
+                elif self.manager.integrator(ws_id) is not None:
+                    # another agent took the role while the box was open:
+                    # don't stop this one for a role it can't get
+                    self._lane_message(
+                        "Not the integrator",
+                        f"{self.manager.integrator(ws_id).spec.name} became "
+                        f"this workspace's integrator meanwhile.")
+                else:
                     self._integrator_after_adopt.add(agent.spec.uid)
                     self._restart_in_lane(ws_id, agent)
                     if agent.spec.uid not in self._lane_adopting:
@@ -6575,10 +6597,8 @@ class MainWindow(QMainWindow):
                                     "This workspace is at its agent limit.")
                 break
             if plan is not None:
-                self._lanes_now_on(ws.id)
                 self._create_lane(ws.id, agent, plan)
             elif revive is not None and spec.lane:
-                self._lanes_now_on(ws.id)
                 self._revive_lane(ws.id, agent)
             elif new_lanes:
                 agent.notice("[no lane: this agent works in the workspace "

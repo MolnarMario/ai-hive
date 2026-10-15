@@ -3674,6 +3674,7 @@ def test_make_integrator_without_lane():
     first start; Cancel, a busy agent or a role taken meanwhile leave the
     role where it was."""
     from PySide6.QtWidgets import QApplication, QDialog
+    from app import lanes
     from app.process_worker import WorkerState
     from app.session_store import SessionStore
     from app.widgets.main_window import AddTerminalDialog
@@ -3780,12 +3781,15 @@ def test_make_integrator_without_lane():
               and not win._integrator_after_adopt)
         check("integrator adopt: ...its prompt says integrator",
               "INTEGRATOR" in plain.spec.system_prompt)
-        check("integrator adopt: ...and the toggle is on again", ws.lanes)
         check("integrator adopt: ...audited",
               f"INTEGRATOR ws={ws.id} agent={plain.spec.name!r}"
               in _log(store))
+        check("integrator adopt: the toggle waits for the worktree",
+              not ws.lanes)
         win.lane_ops.drain(60)
         app.processEvents()
+        check("integrator adopt: ...and is on once the lane exists",
+              ws.lanes)
         root = plain.spec.lane["root"]
         check("integrator adopt: the lane exists and the integrator starts "
               "once, in it", os.path.isdir(root)
@@ -3809,6 +3813,61 @@ def test_make_integrator_without_lane():
               and not win.manager.is_integrator(third))
         win.lane_ops.drain(60)
         app.processEvents()
+
+        # the role went to another agent while the confirm box was open:
+        # this one is not stopped or moved for a role it can't get
+        fourth = run_dialog(lambda d: d.lane_check.setChecked(False))[0]
+        win.manager.set_integrator(ws.id, "")
+        w4 = fourth.worker
+        w4._set_state(WorkerState.RUNNING)
+        stopped = []
+        w4.stop = lambda grace_ms=1200: stopped.append(1)
+        boxes = len(win._lane_boxes)
+        win._confirm_integrator_adopt = lambda agent: (
+            win.manager.set_integrator(ws.id, laned.id), True)[1]
+        win._on_lane_action(ws.id, fourth.id, "integrator")
+        check("integrator adopt: a role taken while the box was open stops "
+              "nothing", not stopped and not fourth.spec.lane
+              and not fourth.start_hold()
+              and not win._integrator_after_adopt
+              and win.manager.is_integrator(laned)
+              and len(win._lane_boxes) == boxes + 1)
+        for box in list(win._lane_boxes):
+            box.close()
+
+        # the worktree can't be made: the role and the toggle go back
+        win.manager.set_integrator(ws.id, "")
+        win.manager.set_workspace_lanes(ws.id, False)
+        w4.stop = lambda grace_ms=1200: w4._set_state(WorkerState.STOPPING)
+        told = []
+        real_notice = fourth.notice
+        fourth.notice = lambda text: (told.append(text), real_notice(text))
+        confirm(True)
+        real_create = lanes.create_lane
+
+        def failing_create(*_a, **_k):
+            raise lanes.LaneError("git", "worktree add failed")
+        lanes.create_lane = failing_create
+        try:
+            win._on_lane_action(ws.id, fourth.id, "integrator")
+            w4._set_state(WorkerState.DEAD)
+            w4.finished.emit(0, False)
+            check("integrator adopt: the role lands before the create",
+                  win.manager.is_integrator(fourth))
+            win.lane_ops.drain(60)
+            app.processEvents()
+        finally:
+            lanes.create_lane = real_create
+        check("integrator adopt: a failed create takes the role away",
+              not fourth.spec.lane and win.manager.integrator(ws.id) is None
+              and not win.manager.is_integrator(fourth))
+        check("integrator adopt: ...the card says so",
+              any("not the integrator" in t for t in told), told)
+        check("integrator adopt: ...audited",
+              f"INTEGRATOR ws={ws.id} none (was {fourth.spec.name!r}, its "
+              f"lane failed)" in _log(store))
+        check("integrator adopt: ...and the toggle stays off",
+              not ws.lanes and not page.lanes_switch.isChecked())
         for a in list(ws.agents):
             win._close_agent(ws.id, a.id)
         win.lane_ops.drain(60)
