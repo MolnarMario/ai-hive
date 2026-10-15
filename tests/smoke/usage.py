@@ -496,6 +496,12 @@ def test_usage_trackers_preference():
           and not bar.gemini_weekly_badge.isVisible())
     check("usage-trackers: the + picker is on the bar",
           bar.usage_add_btn.isVisible())
+    # it once took text padding and drew a 37x26 pill, unlike the other +
+    # buttons (the glyph size is test_usage_add_glyph_matches_sidebar)
+    add = bar.usage_add_btn
+    check("usage-trackers: the + picker is square",
+          add.width() == add.height() == bar.USAGE_ADD_BTN_SIDE,
+          (add.width(), add.height()))
 
     # the menu mirrors the preference and is rebuilt per click, so it can never
     # show a stale checkmark
@@ -615,6 +621,33 @@ def test_usage_trackers_preference():
     check("usage-trackers: the per-key preference wins over the legacy mirror",
           win5.top_bar.usage_trackers()["claude_five_hour"] is False)
     win5.close()
+
+
+def test_usage_add_glyph_matches_sidebar():
+    """The usage pill picker's + drew at 14px, smaller than the sidebar's
+    add-workspace + beside the same kind of action. Both take their glyph
+    from the theme QSS, applied here to a host widget (not the app) so no
+    later test in the process inherits it."""
+    from PySide6.QtWidgets import QApplication, QToolButton, QWidget
+    from app import ui_theme
+
+    QApplication.instance() or QApplication([])
+    host = QWidget()
+    host.setStyleSheet(ui_theme.build_qss())
+    usage_add = QToolButton(host)
+    usage_add.setObjectName("UsageTrackerAdd")
+    ws_add = QToolButton(host)
+    ws_add.setObjectName("AddWsBtn")
+    for b in (usage_add, ws_add):
+        b.setText("+")
+        b.ensurePolished()
+    check("usage-add: the + glyph is the sidebar add button's size",
+          usage_add.font().pixelSize() == ws_add.font().pixelSize() == 18,
+          (usage_add.font().pixelSize(), ws_add.font().pixelSize()))
+    check("usage-add: and as heavy",
+          usage_add.font().weight() == ws_add.font().weight(),
+          (usage_add.font().weight(), ws_add.font().weight()))
+    host.deleteLater()
 
 
 def test_gemini_usage_read_disables_agy_auto_update():
