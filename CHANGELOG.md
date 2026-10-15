@@ -8,6 +8,13 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.43.1
+
+- A crowded card header no longer shortens the integrator's lane chip to
+  "int...tor". The chip drops whole words instead, the word integrator
+  first since its icon already says it, then the counts. Hover the chip
+  for the full text.
+
 ## 0.43.0
 
 - Giving an agent its own lane, from the New Agent dialog or Restart in
