@@ -641,7 +641,7 @@ error dialog instead of silently closing. Packaging to a distributable
   clones the repo's default branch (`main`, `master` or whatever it is
   called) into a new folder and opens the workspace there.
   Double-click a row to rename, `✕` deletes (confirmation appears only when
-  terminals are running). `☰` / `Ctrl+Shift+B` collapses the sidebar to a
+  terminals are running). The top-left sidebar button (a collapse or expand icon, whichever the next click does) or `Ctrl+Shift+B` collapses the sidebar to a
   10px rail with one strip per workspace, in sidebar order and colored like
   its count badge. The active workspace has the wide strip, hover shows the
   name, and a click opens that workspace without reopening the sidebar.
@@ -679,9 +679,11 @@ error dialog instead of silently closing. Packaging to a distributable
 - **App shortcuts use `Ctrl+Shift+…`** (T = new terminal, N = new workspace,
   B = toggle sidebar) so every plain `Ctrl`/`Alt` key, `Tab`, and `Shift+Tab`
   goes straight to the focused terminal. The exceptions are `F11`,
-  `Ctrl+T` (new terminal), `Ctrl+Up` (maximize the selected agent) and
-  `Ctrl+Down` (show all agents again), which a focused terminal never
-  receives. Click
+  `Ctrl+T` (new terminal), `Ctrl+Up` (maximize the selected agent),
+  `Ctrl+Down` (show all agents again) and `Ctrl+Tab` / `Ctrl+Shift+Tab`
+  (next / previous agent, left to right along a row, then the next row
+  down), which a focused terminal never receives. **⚙ Options > Help >
+  Keyboard shortcuts** lists every shortcut in the app. Click
   a full-terminal card and
   `Shift+Tab` cycles Claude Code's modes, `Ctrl+C` interrupts (when nothing is
   selected; otherwise it copies), `Ctrl+R` reverse-searches, arrows/`Tab`
@@ -970,7 +972,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3442 checks drive the real app headlessly (offscreen Qt platform) with real
+3469 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1117,7 +1119,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3442 checks)
+                           (3469 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

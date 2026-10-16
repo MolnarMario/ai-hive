@@ -3508,6 +3508,74 @@ def test_fullscreen_from_maximized_skips_restore_size():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_fullscreen_squares_window_edges():
+    """Windows 11 drew a 1px border and rounded corners on the fullscreen
+    window, and after F11 again on the maximized one too, so the wallpaper
+    showed around it. Entering fullscreen squares the edges and leaving it
+    by any path, from maximized or normal, hands them back to Windows
+    after the window has its state again."""
+    from PySide6.QtCore import QEventLoop, Qt, QTimer
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from app.session_store import SessionStore
+    from app.widgets import fullscreen
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    calls = []
+    real = fullscreen._square_edges
+    fullscreen._square_edges = (
+        lambda w, square: calls.append((square, w.windowState())))
+    full = Qt.WindowState.WindowFullScreen
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-fullscreen-edges-"))
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        win.showMaximized()
+        pump(100)
+        fs = win._fullscreen
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen-edges: F11 squares the edges",
+              fs.active and [c[0] for c in calls] == [True], calls)
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen-edges: F11 again hands them back once maximized",
+              not fs.active and [c[0] for c in calls] == [True, False]
+              and not calls[-1][1] & full
+              and calls[-1][1] & Qt.WindowState.WindowMaximized, calls)
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        win.showNormal()
+        pump(50)
+        check("fullscreen-edges: leaving another way hands them back too",
+              not fs.active and [c[0] for c in calls[2:]] == [True, False],
+              calls)
+        del calls[:]
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen-edges: a normal window gets them back as normal",
+              [c[0] for c in calls] == [True, False]
+              and not calls[-1][1] & full, calls)
+        fullscreen._square_edges = real
+        real(win, True)
+        real(win, False)
+        check("fullscreen-edges: no DWM call off the Windows platform",
+              fullscreen._hwnd(win) == 0, app.platformName())
+        win.close()
+        pump(100)
+    finally:
+        fullscreen._square_edges = real
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_new_agent_full_terminal_box_hidden_for_ai():
     """The 'Full terminal' box is a forced, disabled tick for AI agents, so
     the dialog hides its row for them and shows it for shells and scripts."""
@@ -3538,3 +3606,156 @@ def test_new_agent_full_terminal_box_hidden_for_ai():
         dlg.kind_combo.setCurrentIndex(idx)
         check(f"full terminal box: hidden for {kind.name}", not shown())
     dlg.deleteLater()
+
+
+def test_ctrl_tab_cycles_agents():
+    """Ctrl+Tab focuses the next agent of the active workspace: left to
+    right along a row, then the next row down from its left end, and back
+    to the first after the last. Ctrl+Shift+Tab goes backwards. A focused
+    terminal lets both through, a maximized agent hands the maximize on,
+    and Options > Help lists every window shortcut."""
+    from PySide6.QtCore import QEvent, QEventLoop, Qt, QTimer
+    from PySide6.QtGui import QKeyEvent, QShortcut
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.widgets import shortcuts_help
+    from app.widgets.terminal_view import TerminalView
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    ctrl = Qt.KeyboardModifier.ControlModifier
+    shift = Qt.KeyboardModifier.ShiftModifier
+    tv = TerminalView(rows=6, cols=80)
+    for key, mods, name in ((Qt.Key.Key_Tab, ctrl, "Ctrl+Tab"),
+                            (Qt.Key.Key_Backtab, ctrl | shift,
+                             "Ctrl+Shift+Tab")):
+        ev = QKeyEvent(QEvent.Type.ShortcutOverride, key, mods)
+        ev.ignore()
+        tv.event(ev)
+        check(f"ctrl+tab: a focused terminal leaves {name} to the window",
+              not ev.isAccepted())
+    for key, mods in ((Qt.Key.Key_Tab, Qt.KeyboardModifier.NoModifier),
+                      (Qt.Key.Key_Backtab, shift)):
+        ev = QKeyEvent(QEvent.Type.ShortcutOverride, key, mods)
+        ev.ignore()
+        tv.event(ev)
+        check(f"ctrl+tab: plain {key.name} still goes to the terminal",
+              ev.isAccepted())
+    tv.deleteLater()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-ctrl-tab-"))
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        win.resize(1200, 700)
+        win.show()
+        pump(100)
+        mgr = win.manager
+        ws = mgr.workspaces[0]
+        mgr.set_active(ws.id)
+        page = win._pages[ws.id]
+        while len(page.cards) < 5:   # a fresh window may start with one
+            mgr.add_terminal(ws.id, build_spec(AgentKind.CMD, "T",
+                                               cwd=SCRATCH_CWD),
+                             autostart=False)
+        pump(50)
+        cards = list(page.cards)
+
+        keys = {s.key().toString(): s for s in win.findChildren(QShortcut)}
+        check("ctrl+tab: Ctrl+Tab and Ctrl+Shift+Tab are window shortcuts",
+              {"Ctrl+Tab", "Ctrl+Shift+Tab"} <= set(keys), sorted(keys))
+
+        win._focused_card = None
+        seen = []
+        for _ in range(6):
+            keys["Ctrl+Tab"].activated.emit()
+            pump(10)
+            seen.append(win._focused_card)
+        cells = [page.grid.getItemPosition(page.grid.indexOf(c))[:2]
+                 for c in cards]
+        check("ctrl+tab: five agents tile as 3 on top, 2 below",
+              [r for r, _ in cells] == [0, 0, 0, 1, 1], cells)
+        check("ctrl+tab: the first press lands on the top-left agent, then "
+              "left to right, the next row, and wraps to the first",
+              seen == cards + cards[:1],
+              [cards.index(c) if c in cards else c for c in seen])
+        keys["Ctrl+Shift+Tab"].activated.emit()
+        pump(10)
+        check("ctrl+shift+tab: back from the first wraps to the last",
+              win._focused_card is cards[-1])
+        check("ctrl+tab: only the stepped-to card shows as focused",
+              [c.property("focused") is True for c in cards]
+              == [False] * 4 + [True])
+
+        # real key presses, through Qt's shortcut map
+        win._set_focused_card(cards[1])
+        QTest.keyClick(win, Qt.Key.Key_Tab, ctrl)
+        pump(20)
+        check("ctrl+tab: the real key press steps to the next agent",
+              win._focused_card is cards[2])
+        QTest.keyClick(win, Qt.Key.Key_Backtab, ctrl | shift)
+        pump(20)
+        check("ctrl+shift+tab: the real key press steps back",
+              win._focused_card is cards[1])
+
+        page.maximize_card(cards[1])
+        pump(20)
+        keys["Ctrl+Tab"].activated.emit()
+        pump(20)
+        check("ctrl+tab: with an agent maximized, the next one is "
+              "maximized instead",
+              page._solo_card is cards[2] and cards[2].isVisible()
+              and not cards[1].isVisible()
+              and win._focused_card is cards[2])
+        page.restore_tiling()
+        pump(20)
+
+        # maximized from its own button, focus left on a hidden card: the
+        # step counts from the card on screen
+        win._set_focused_card(cards[0])
+        page.maximize_card(cards[2])
+        pump(20)
+        keys["Ctrl+Tab"].activated.emit()
+        pump(20)
+        check("ctrl+tab: with focus on a hidden card, the step counts from "
+              "the maximized one", page._solo_card is cards[3],
+              cards.index(page._solo_card) if page._solo_card else None)
+        page.restore_tiling()
+        pump(20)
+
+        # exact keys, not substrings: "Ctrl+T" hides inside "Ctrl+Tab"
+        documented = {part for k, _ in shortcuts_help.WINDOW_ROWS
+                      for part in k.split(" or ")}
+        missing = [k for k in keys if k not in documented]
+        check("shortcuts help: every window shortcut is listed", not missing,
+              missing)
+        win.top_bar.shortcuts_btn.click()
+        pump(50)
+        boxes = win.findChildren(QMessageBox, "ShortcutsHelp")
+        check("shortcuts help: Options > Help opens the list",
+              len(boxes) == 1 and boxes[0].isVisible()
+              and "Ctrl+Tab" in boxes[0].text())
+        win.top_bar.shortcuts_btn.click()
+        pump(50)
+        check("shortcuts help: a second click reuses the open list",
+              len(win.findChildren(QMessageBox, "ShortcutsHelp")) == 1)
+        boxes[0].done(0)     # OK: hidden now, deleted only later
+        win.top_bar.shortcuts_btn.click()
+        pump(50)
+        shown = [b for b in win.findChildren(QMessageBox, "ShortcutsHelp")
+                 if b.isVisible()]
+        check("shortcuts help: a click right after OK opens it again",
+              len(shown) == 1, len(shown))
+        for box in win.findChildren(QMessageBox, "ShortcutsHelp"):
+            box.close()
+        win.close()
+        pump(100)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
