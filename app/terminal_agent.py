@@ -653,6 +653,10 @@ class TerminalAgent(QObject):
         self._tool_waiting = False
         self._turn_waiting = False
         self._title_waiting = False
+        # bumped by _reset_waiting (start/restart/exit). The manager drops a
+        # tool prompt still waiting for its transcript line once this moves,
+        # so a prompt from the old process can't light the new one's "?"
+        self.waiting_gen = 0
         self._esc_carry = ""          # a Codex escape split across reads
         self._waiting = False
         self._screen_tail = ""        # rolling escape-stripped output tail
@@ -2010,6 +2014,7 @@ class TerminalAgent(QObject):
 
     def _reset_waiting(self) -> None:
         """Clear every waiting source (start/restart/exit) and emit if needed."""
+        self.waiting_gen += 1
         self._scrape_waiting = False
         self._tool_waiting = False
         self._turn_waiting = False

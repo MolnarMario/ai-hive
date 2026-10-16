@@ -8,7 +8,10 @@ notification chime: PreToolUse on AskUserQuestion/ExitPlanMode (the only
 reliable way to catch those — they render no numbered menu the screen scrape
 can see and fire no Notification hook, per claude-code#59908), PostToolUse to
 clear it, and Stop to close a lingering prompt and detect a plain free-text
-question the agent ended its turn on. These prompt events are EDGES appended to
+question the agent ended its turn on. A PreToolUse edge carries the call's
+tool_use_id and transcript_path, because Claude can fire that hook with no
+call in the conversation; the manager waits for the call to appear in the
+transcript before it lights the "?". These prompt events are EDGES appended to
 a separate events file and read incrementally by the manager; SessionStart
 records stay in the mapping file. See write_settings_file / read_prompt_events.
 
@@ -712,8 +715,25 @@ def _dispatch(mapping_path, events_path, payload: dict) -> str:
         return ""
     if event == "PreToolUse":
         if payload.get("tool_name") in _WAITING_TOOL_SET:
-            _append_event(events_path, EV_TOOL_SET,
-                          {"tool": payload.get("tool_name")})
+            extra = {"tool": payload.get("tool_name")}
+            # the manager lights the "?" only once this call is in the
+            # transcript (WorkspaceManager._confirm_tool_prompts). Not for a
+            # sub-agent's call (Claude sets agent_id only inside one): its
+            # transcript_path is the parent's, which never holds the
+            # sub-agent's calls, so the check would drop a real question.
+            # Without the id the "?" lights at once, as it did before
+            if not payload.get("agent_id"):
+                for key in ("tool_use_id", "transcript_path"):
+                    if isinstance(payload.get(key), str) and payload[key]:
+                        extra[key] = payload[key]
+            # where the transcript ended as the call ran: the search starts
+            # there, so records Claude appends later can't push the call out
+            try:
+                extra["transcript_size"] = os.path.getsize(
+                    extra["transcript_path"])
+            except (KeyError, OSError):
+                pass
+            _append_event(events_path, EV_TOOL_SET, extra)
     elif event == "PostToolUse":
         if payload.get("tool_name") in _WAITING_TOOL_SET:
             _append_event(events_path, EV_TOOL_CLEAR,

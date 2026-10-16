@@ -568,6 +568,10 @@ class CategoryRow(QFrame):
                      - self._press_pos).manhattanLength()
             if moved >= QApplication.startDragDistance():
                 self._press_pos = None
+                # a drag swallows this row's Leave, and a drop rebuilds the
+                # tree, so the row may be gone once the drag returns. Drop
+                # the hover look now rather than leave it stuck on
+                self._set_hover(False)
                 start_node_drag(self, "category", self.cat_id)
                 return
         super().mouseMoveEvent(event)
@@ -602,12 +606,22 @@ class CategoryRow(QFrame):
                 self._press_pos = event.position().toPoint()
         super().mouseDoubleClickEvent(event)
 
+    def _set_hover(self, on: bool) -> None:
+        """Show the delete button and flag the row for the hover QSS. The
+        tint, caret and count all restyle off this property, not :hover,
+        because Qt never repolishes children when their parent's hover state
+        flips."""
+        self.delete_btn.setVisible(on)
+        self.setProperty("hover", on)
+        for w in (self, self.caret, self.count_label):
+            repolish(w)
+
     def enterEvent(self, event):
-        self.delete_btn.setVisible(True)
+        self._set_hover(True)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self.delete_btn.setVisible(False)
+        self._set_hover(False)
         super().leaveEvent(event)
 
 

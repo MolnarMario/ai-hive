@@ -1012,6 +1012,73 @@ def test_category_container():
     sb.deleteLater()
 
 
+def test_category_row_hover():
+    """Hovering a category header tints it, shows its delete button and
+    brightens its caret and count, and leaving undoes all of it. The tint is
+    translucent: an opaque one covered the group box drawn under the
+    header. A drag clears the look up front, since it swallows the Leave."""
+    import re
+
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QEnterEvent
+    from PySide6.QtWidgets import QApplication
+    from app import ui_theme
+    from app.widgets.sidebar import Sidebar
+
+    qss = ui_theme.build_qss()
+    m = re.search(r'#WsCategory\[hover="true"\]\s*\{\s*background:'
+                  r'\s*rgba\(([^)]*)\)', qss)
+    alpha = float(m.group(1).split(",")[3]) if m else 1.0
+    check("cat hover: the header's hover fill is translucent",
+          alpha < 1.0, m.group(0) if m else "no rule")
+
+    QApplication.instance() or QApplication([])
+    sb = Sidebar()
+    sb.setStyleSheet(qss)   # on the widget, so no other test inherits it
+    sb.resize(240, 220)
+    cid = sb._add_category("Work")
+    row = sb._cat_widgets[cid]
+    row._end_rename()
+    sb.show()
+    QApplication.processEvents()
+    ink = lambda w: w.palette().color(w.foregroundRole()).name()  # noqa: E731
+    rest = (ink(row.caret), ink(row.count_label))
+    p = QPointF(5, 5)
+    QApplication.sendEvent(row, QEnterEvent(p, p, row.mapToGlobal(p)))
+    hovered = (ink(row.caret), ink(row.count_label))
+    check("cat hover: enter flags the row and shows delete",
+          row.property("hover") is True and row.delete_btn.isVisibleTo(row))
+    check("cat hover: the caret turns accent and the count brightens",
+          hovered == (ui_theme.Palette.ACCENT_GOLD.lower(),
+                      ui_theme.Palette.TEXT_DIM.lower())
+          and hovered[0] != rest[0] and hovered[1] != rest[1],
+          f"{rest} -> {hovered}")
+    QApplication.sendEvent(row, QEvent(QEvent.Type.Leave))
+    check("cat hover: leave clears the flag, delete and colours",
+          row.property("hover") is False
+          and not row.delete_btn.isVisibleTo(row)
+          and (ink(row.caret), ink(row.count_label)) == rest)
+
+    import app.widgets.sidebar as sidebar_mod
+    started = []
+    real_drag = sidebar_mod.start_node_drag
+    sidebar_mod.start_node_drag = lambda w, k, i: started.append(
+        w.property("hover"))
+    try:
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+        QApplication.sendEvent(row, QEnterEvent(p, p, row.mapToGlobal(p)))
+        left = Qt.MouseButton.LeftButton
+        QTest.mousePress(row, left, pos=QPoint(5, 5))
+        QTest.mouseMove(row, QPoint(5 + 3 * QApplication.startDragDistance(),
+                                    5))
+    finally:
+        sidebar_mod.start_node_drag = real_drag
+    check("cat hover: a drag clears the hover look before it starts",
+          started == [False], started)
+    sb.deleteLater()
+
+
 def test_category_row_click_toggles():
     """A click anywhere on a category row toggles it, not only the caret. A
     click on the name text toggles after the double-click interval, and a

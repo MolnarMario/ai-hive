@@ -302,13 +302,18 @@ def apply_theme(theme_id: str) -> Theme:
 apply_theme(DEFAULT_THEME_ID)   # populate Palette at import
 
 
-def _rel_luma(hex_color: str) -> float:
-    """WCAG relative luminance of a #rrggbb / #rgb color (0=black, 1=white).
-    Pure-python so ui_theme stays Qt-free."""
+def _hex_rgb(hex_color: str) -> tuple[int, int, int]:
+    """(r, g, b) of a #rrggbb / #rgb color, 0-255."""
     h = hex_color.lstrip("#")
     if len(h) == 3:
         h = "".join(c * 2 for c in h)
-    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _rel_luma(hex_color: str) -> float:
+    """WCAG relative luminance of a #rrggbb / #rgb color (0=black, 1=white).
+    Pure-python so ui_theme stays Qt-free."""
+    r, g, b = (c / 255 for c in _hex_rgb(hex_color))
     lin = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
     return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
 
@@ -341,6 +346,11 @@ def _check_icon_path(fill_hex: str) -> str:
         return ""
 
 
+# alpha of the category header's hover wash (build_qss); under 1 so the group
+# box drawn beneath the header shows through
+CAT_HOVER_ALPHA = 0.11
+
+
 def build_qss(chrome_family: str = "Segoe UI", console_px: int | None = None) -> str:
     p = Palette
     cpx = int(console_px if console_px else CONSOLE_FONT_PX)
@@ -351,6 +361,11 @@ def build_qss(chrome_family: str = "Segoe UI", console_px: int | None = None) ->
     # vendor inks for the model chip -- fixed, never skin-derived (PROVIDER_INK)
     claude_ink = PROVIDER_INK["claude"]
     gemini_ink = PROVIDER_INK["gemini"]
+    # category hover wash: the body ink at low alpha, so it lightens a dark
+    # skin and darkens a light one, and the group box drawn under the header
+    # (sidebar.drawRow) still shows through. An opaque BG_HOVER covered that
+    # box, so the hovered header looked flatter than the ones beside it
+    cat_hover = "rgba({},{},{},{})".format(*_hex_rgb(p.TEXT), CAT_HOVER_ALPHA)
     return f"""
 * {{
     font-family: "{chrome_family}";
@@ -537,12 +552,18 @@ WorkspaceRow[search_hit="true"] {{
     background: transparent; border: none;
     border-top: 1px solid {p.BORDER};
 }}
-#WsCategory:hover {{ background: {p.BG_HOVER}; }}
+/* hover: a translucent wash plus a brighter caret and count. The selected
+   workspace keeps the only accent bar, so hover never reads as selection.
+   All three key off the hover property CategoryRow sets on enter/leave, not
+   :hover, because a parent's :hover does not restyle its children */
+#WsCategory[hover="true"] {{ background: {cat_hover}; }}
 #CatCaret {{
     background: transparent; border: none; color: {p.TEXT_DIM};
     font-size: 11px; padding: 0 2px;
 }}
-#CatCaret:hover {{ color: {p.ACCENT_GOLD}; }}
+#CatCaret:hover, #WsCategory[hover="true"] #CatCaret {{
+    color: {p.ACCENT_GOLD};
+}}
 #CatName {{
     font-family: {DISPLAY_FONT}; font-size: 15px; letter-spacing: 1px;
     font-weight: 700; color: {p.ACCENT_GOLD};
@@ -551,6 +572,7 @@ WorkspaceRow[search_hit="true"] {{
     color: {p.TEXT_FAINT}; font-size: 10px; font-weight: 700;
     background: {p.BG_ACTIVE}; border-radius: 7px; padding: 0 5px;
 }}
+#WsCategory[hover="true"] #CatCount {{ color: {p.TEXT_DIM}; }}
 
 /* inline agent rows (a workspace expanded to list its agents, folder-tree
    style): the name sits at the left with its task summary beside it */
