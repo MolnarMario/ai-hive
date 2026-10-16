@@ -717,10 +717,15 @@ def _dispatch(mapping_path, events_path, payload: dict) -> str:
         if payload.get("tool_name") in _WAITING_TOOL_SET:
             extra = {"tool": payload.get("tool_name")}
             # the manager lights the "?" only once this call is in the
-            # transcript (WorkspaceManager._confirm_tool_prompts)
-            for key in ("tool_use_id", "transcript_path"):
-                if isinstance(payload.get(key), str) and payload[key]:
-                    extra[key] = payload[key]
+            # transcript (WorkspaceManager._confirm_tool_prompts). Not for a
+            # sub-agent's call (Claude sets agent_id only inside one): its
+            # transcript_path is the parent's, which never holds the
+            # sub-agent's calls, so the check would drop a real question.
+            # Without the id the "?" lights at once, as it did before
+            if not payload.get("agent_id"):
+                for key in ("tool_use_id", "transcript_path"):
+                    if isinstance(payload.get(key), str) and payload[key]:
+                        extra[key] = payload[key]
             # where the transcript ended as the call ran: the search starts
             # there, so records Claude appends later can't push the call out
             try:

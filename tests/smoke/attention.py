@@ -2,6 +2,7 @@
 hook events, chimes, the taskbar badge and the event log."""
 
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -1171,8 +1172,10 @@ def test_tool_prompt_needs_transcript_call():
         mgr.sync_prompt_events()
     finally:
         wm.TOOL_CONFIRM_S = real_confirm
+    pending = [t.tool_id for t in mgr._unconfirmed_tools.get(agent.id, [])]
+    # the first phantom, still inside its own window, stays pending
     check("phantom: an unconfirmed prompt is dropped and audited",
-          not mgr._unconfirmed_tools and not agent.is_waiting()
+          pending == ["toolu_phantom"] and not agent.is_waiting()
           and any("PROMPT-SKIP" in line and "toolu_phantom2" in line
                   for line in audit), audit)
 
@@ -1219,6 +1222,70 @@ def test_tool_prompt_needs_transcript_call():
     mgr.sync_prompt_events()
     check("phantom: an unreadable transcript still lights '?'",
           agent.is_waiting())
+    hook({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion"})
+    mgr.sync_prompt_events()
+
+    # a sub-agent's call never reaches the parent transcript the hook names,
+    # so its question lights at once instead of waiting to be dropped
+    hook({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
+          "tool_use_id": "toolu_sub", "agent_id": "a1b2",
+          "transcript_path": str(transcript)})
+    recs, _off = sh.read_prompt_events(events, 0)
+    mgr.sync_prompt_events()
+    check("phantom: a sub-agent's question lights '?' at once",
+          "tool_use_id" not in recs[-1] and agent.is_waiting()
+          and not mgr._unconfirmed_tools, recs[-1])
+    hook({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion"})
+    mgr.sync_prompt_events()
+
+    # a phantom on top of a real prompt that hasn't confirmed yet: the real
+    # one must still light when its line lands
+    pre_tool("toolu_real2")
+    pre_tool("toolu_phantom3")
+    mgr.sync_prompt_events()
+    write_call("toolu_real2")
+    mgr.sync_prompt_events()
+    check("phantom: a later phantom can't push out a pending real prompt",
+          agent.is_waiting())
+    hook({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion"})
+    mgr.sync_prompt_events()
+    check("phantom: PostToolUse clears every pending prompt",
+          not agent.is_waiting() and not mgr._unconfirmed_tools)
+
+    # a restart between the hook and its transcript line: the prompt
+    # belongs to the old process and must not light the new one's '?'
+    pre_tool("toolu_old")
+    mgr.sync_prompt_events()
+    agent._reset_waiting()          # what start/restart/exit do
+    write_call("toolu_old")
+    mgr.sync_prompt_events()
+    check("phantom: a restart drops a prompt still waiting to confirm",
+          not agent.is_waiting() and not mgr._unconfirmed_tools)
+
+    # later polls read only what was appended since the last one
+    found, resume = transcripts.scan_tool_use(str(transcript), "toolu_late")
+    size = transcript.stat().st_size
+    check("phantom: a scan resumes near the end of what it read",
+          found is False and size - 64 < resume <= size, (resume, size))
+    write_call("toolu_late")
+    found2, _ = transcripts.scan_tool_use(str(transcript), "toolu_late",
+                                          start=resume)
+    check("phantom: a resumed scan finds a call appended since",
+          found2 is True)
+    # a poll that lands mid-write sees half the call; the next one must
+    # still find it, so resume keeps an overlap of the needle's length
+    with open(transcript, "ab") as fh:
+        fh.write(b'{"type":"assistant","message":{"content":[{"type":'
+                 b'"tool_use","id":"toolu_spl')
+    half, resume = transcripts.scan_tool_use(str(transcript), "toolu_split",
+                                             start=resume)
+    with open(transcript, "ab") as fh:
+        fh.write(b'it","name":"AskUserQuestion"}]}}\n')
+    whole, _ = transcripts.scan_tool_use(str(transcript), "toolu_split",
+                                         start=resume)
+    check("phantom: a call cut in half by a poll is found on the next",
+          half is False and whole is True, (half, whole))
+    shutil.rmtree(tmp, ignore_errors=True)   # the 4 MiB+ padding
 
 
 def test_input_echo_not_busy():

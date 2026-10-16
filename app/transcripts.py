@@ -1203,23 +1203,39 @@ def _read_model_effort(path: str) -> tuple[str, str, str]:
 def has_tool_use(path: str, tool_use_id: str,
                  anchor: int | None = None) -> bool | None:
     """Whether the transcript at `path` holds the tool call `tool_use_id`:
-    True or False, or None when the file can't be read. A plain byte search
-    for the call block's own `"id":"<tool_use_id>"` (compact JSON, as Claude
-    writes it). Hook and result records name the id under other keys
-    (toolUseID, tool_use_id), so they never count as the call.
+    True or False, or None when the file can't be read. See scan_tool_use."""
+    return scan_tool_use(path, tool_use_id, anchor)[0]
 
-    The search runs from _TOOL_USE_TAIL_BYTES before `anchor` (the file's
-    size when the hook ran, or its current size) to the end, so whatever
-    Claude appends after the call stays in range."""
+
+def scan_tool_use(path: str, tool_use_id: str, anchor: int | None = None,
+                  start: int | None = None) -> tuple[bool | None, int]:
+    """(found, resume) for the tool call `tool_use_id` in the transcript at
+    `path`. found is True or False, or None when the file can't be read. A
+    plain byte search for the call block's own `"id":"<tool_use_id>"`
+    (compact JSON, as Claude writes it). Hook and result records name the id
+    under other keys (toolUseID, tool_use_id), so they never count as the
+    call.
+
+    The first search runs from _TOOL_USE_TAIL_BYTES before `anchor` (the
+    file's size when the hook ran, or its current size) to the end, so
+    whatever Claude appends after the call stays in range. Pass the returned
+    `resume` as `start` on the next poll to search only what was appended
+    since, with enough overlap to catch a match split across the two reads.
+    The manager polls a pending prompt every tick on the GUI thread, so a
+    full 4 MiB read each time would add up."""
+    needle = b'"id":' + json.dumps(tool_use_id).encode("utf-8")
     try:
         with open(path, "rb") as fh:
             size = fh.seek(0, os.SEEK_END)
-            end = size if anchor is None else min(anchor, size)
-            fh.seek(max(0, end - _TOOL_USE_TAIL_BYTES))
+            if start is None:
+                end = size if anchor is None else min(anchor, size)
+                start = max(0, end - _TOOL_USE_TAIL_BYTES)
+            fh.seek(min(start, size))
             data = fh.read()
     except OSError:
-        return None
-    return b'"id":' + json.dumps(tool_use_id).encode("utf-8") in data
+        return None, start or 0
+    resume = max(start, min(start, size) + len(data) - len(needle) + 1)
+    return needle in data, resume
 
 
 def _tail_lines(path: str, limit: int) -> list[str]:
