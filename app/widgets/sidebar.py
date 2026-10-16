@@ -602,12 +602,22 @@ class CategoryRow(QFrame):
                 self._press_pos = event.position().toPoint()
         super().mouseDoubleClickEvent(event)
 
+    def _set_hover(self, on: bool) -> None:
+        """Show the delete button and flag the row for the hover QSS. The
+        caret and count restyle off this property, not :hover, because Qt
+        never repolishes children when their parent's hover state flips."""
+        self.delete_btn.setVisible(on)
+        self.setProperty("hover", on)
+        for w in (self.caret, self.count_label):
+            w.style().unpolish(w)
+            w.style().polish(w)
+
     def enterEvent(self, event):
-        self.delete_btn.setVisible(True)
+        self._set_hover(True)
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        self.delete_btn.setVisible(False)
+        self._set_hover(False)
         super().leaveEvent(event)
 
 

@@ -1012,6 +1012,43 @@ def test_category_container():
     sb.deleteLater()
 
 
+def test_category_row_hover():
+    """Hovering a category header shows its delete button and flags the row
+    so the caret and count restyle with it. The hover fill is translucent:
+    an opaque one covered the group box drawn under the header."""
+    import re
+
+    from PySide6.QtCore import QEvent, QPointF
+    from PySide6.QtGui import QEnterEvent
+    from PySide6.QtWidgets import QApplication
+    from app import ui_theme
+    from app.widgets.sidebar import Sidebar
+
+    qss = ui_theme.build_qss()
+    m = re.search(r"#WsCategory:hover \{ background: ([^;]+);", qss)
+    check("cat hover: the header's hover fill is translucent",
+          m is not None and m.group(1).startswith("rgba("),
+          m.group(1) if m else "no rule")
+
+    QApplication.instance() or QApplication([])
+    sb = Sidebar()
+    sb.resize(240, 220)
+    cid = sb._add_category("Work")
+    row = sb._cat_widgets[cid]
+    row._end_rename()
+    sb.show()
+    QApplication.processEvents()
+    p = QPointF(5, 5)
+    QApplication.sendEvent(row, QEnterEvent(p, p, row.mapToGlobal(p)))
+    check("cat hover: enter flags the row and shows delete",
+          row.property("hover") is True and row.delete_btn.isVisibleTo(row))
+    QApplication.sendEvent(row, QEvent(QEvent.Type.Leave))
+    check("cat hover: leave clears the flag and hides delete",
+          row.property("hover") is False
+          and not row.delete_btn.isVisibleTo(row))
+    sb.deleteLater()
+
+
 def test_category_row_click_toggles():
     """A click anywhere on a category row toggles it, not only the caret. A
     click on the name text toggles after the double-click interval, and a

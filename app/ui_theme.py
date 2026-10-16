@@ -351,6 +351,13 @@ def build_qss(chrome_family: str = "Segoe UI", console_px: int | None = None) ->
     # vendor inks for the model chip -- fixed, never skin-derived (PROVIDER_INK)
     claude_ink = PROVIDER_INK["claude"]
     gemini_ink = PROVIDER_INK["gemini"]
+    # category hover wash: the body ink at low alpha, so it lightens a dark
+    # skin and darkens a light one, and the group box drawn under the header
+    # (sidebar.drawRow) still shows through. An opaque BG_HOVER covered that
+    # box, so the hovered header looked flatter than the ones beside it
+    _ink = p.TEXT.lstrip("#")
+    cat_hover = "rgba({},{},{},0.11)".format(
+        *(int(_ink[i:i + 2], 16) for i in (0, 2, 4)))
     return f"""
 * {{
     font-family: "{chrome_family}";
@@ -537,12 +544,18 @@ WorkspaceRow[search_hit="true"] {{
     background: transparent; border: none;
     border-top: 1px solid {p.BORDER};
 }}
-#WsCategory:hover {{ background: {p.BG_HOVER}; }}
+/* hover: a translucent wash plus a brighter caret and count. The selected
+   workspace keeps the only accent bar, so hover never reads as selection.
+   CategoryRow sets the hover property on enter/leave, because a parent's
+   :hover does not restyle its children */
+#WsCategory:hover {{ background: {cat_hover}; }}
 #CatCaret {{
     background: transparent; border: none; color: {p.TEXT_DIM};
     font-size: 11px; padding: 0 2px;
 }}
-#CatCaret:hover {{ color: {p.ACCENT_GOLD}; }}
+#CatCaret:hover, #WsCategory[hover="true"] #CatCaret {{
+    color: {p.ACCENT_GOLD};
+}}
 #CatName {{
     font-family: {DISPLAY_FONT}; font-size: 15px; letter-spacing: 1px;
     font-weight: 700; color: {p.ACCENT_GOLD};
@@ -551,6 +564,7 @@ WorkspaceRow[search_hit="true"] {{
     color: {p.TEXT_FAINT}; font-size: 10px; font-weight: 700;
     background: {p.BG_ACTIVE}; border-radius: 7px; padding: 0 5px;
 }}
+#WsCategory[hover="true"] #CatCount {{ color: {p.TEXT_DIM}; }}
 
 /* inline agent rows (a workspace expanded to list its agents, folder-tree
    style): the name sits at the left with its task summary beside it */
