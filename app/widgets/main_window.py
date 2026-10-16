@@ -830,9 +830,8 @@ class TopBar(QFrame):
 
         self.options_btn = QToolButton(self)
         self.options_btn.setObjectName("OptionsBtn")
-        # deliberately NOT the hamburger: `toggle_btn` at the far left already
-        # uses that glyph, and two identical ones meaning different things is
-        # worse than either.
+        # deliberately NOT the hamburger: it reads as "menu", and the far-left
+        # `toggle_btn` once wore it for the sidebar. A gear says settings.
         self.options_btn.setText("⚙ Options")
         self.options_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.options_btn.clicked.connect(self._open_options)
@@ -2973,7 +2972,9 @@ class MainWindow(QMainWindow):
             return
         is_open = self.body_split.sizes()[0] > 0
         self.ws_rail.setVisible(not is_open)
-        self.top_bar.toggle_btn.set_sidebar_open(is_open)
+        # a splitter drag lands here on every mouse move
+        if self.top_bar.toggle_btn.sidebar_open() != is_open:
+            self.top_bar.toggle_btn.set_sidebar_open(is_open)
 
     def _adopt_existing_model(self) -> None:
         """Build pages/rows for workspaces created before this window existed
@@ -6195,9 +6196,12 @@ class MainWindow(QMainWindow):
         box = getattr(self, "_shortcuts_help", None)
         if box is not None:
             try:
-                box.raise_()
-                box.activateWindow()
-                return
+                # OK or Escape hides the box and frees it only later, so a
+                # hidden one is as good as gone
+                if box.isVisible():
+                    box.raise_()
+                    box.activateWindow()
+                    return
             except RuntimeError:      # closed: WA_DeleteOnClose freed it
                 pass
         self._shortcuts_help = show_shortcuts_help(self)

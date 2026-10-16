@@ -3717,7 +3717,22 @@ def test_ctrl_tab_cycles_agents():
         page.restore_tiling()
         pump(20)
 
-        documented = " ".join(k for k, _ in shortcuts_help.WINDOW_ROWS)
+        # maximized from its own button, focus left on a hidden card: the
+        # step counts from the card on screen
+        win._set_focused_card(cards[0])
+        page.maximize_card(cards[2])
+        pump(20)
+        keys["Ctrl+Tab"].activated.emit()
+        pump(20)
+        check("ctrl+tab: with focus on a hidden card, the step counts from "
+              "the maximized one", page._solo_card is cards[3],
+              cards.index(page._solo_card) if page._solo_card else None)
+        page.restore_tiling()
+        pump(20)
+
+        # exact keys, not substrings: "Ctrl+T" hides inside "Ctrl+Tab"
+        documented = {part for k, _ in shortcuts_help.WINDOW_ROWS
+                      for part in k.split(" or ")}
         missing = [k for k in keys if k not in documented]
         check("shortcuts help: every window shortcut is listed", not missing,
               missing)
@@ -3731,7 +3746,14 @@ def test_ctrl_tab_cycles_agents():
         pump(50)
         check("shortcuts help: a second click reuses the open list",
               len(win.findChildren(QMessageBox, "ShortcutsHelp")) == 1)
-        for box in boxes:
+        boxes[0].done(0)     # OK: hidden now, deleted only later
+        win.top_bar.shortcuts_btn.click()
+        pump(50)
+        shown = [b for b in win.findChildren(QMessageBox, "ShortcutsHelp")
+                 if b.isVisible()]
+        check("shortcuts help: a click right after OK opens it again",
+              len(shown) == 1, len(shown))
+        for box in win.findChildren(QMessageBox, "ShortcutsHelp"):
             box.close()
         win.close()
         pump(100)

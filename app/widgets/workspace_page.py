@@ -662,9 +662,12 @@ class WorkspacePage(QWidget):
         page. Both tilings fill row by row from cards[0], so list order is
         left to right along a row, then the next row down. While a card is
         maximized the maximize moves to the returned card, which is
-        otherwise hidden."""
+        otherwise hidden, and the step counts from the maximized card, the
+        one on screen, not from a hidden one that still has focus."""
         if not self.cards:
             return None
+        if self._solo_card is not None:
+            card = self._solo_card
         if card not in self.cards:
             return self.lead_card()
         card = self.cards[(self.cards.index(card) + step) % len(self.cards)]
