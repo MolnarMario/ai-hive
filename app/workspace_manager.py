@@ -35,6 +35,10 @@ LANES_SESSION_VERSION = 5
 # the first version whose workspaces may carry an integrator
 INTEGRATOR_SESSION_VERSION = 6
 DEFAULT_LAYOUT = "auto"
+# how long a tool prompt's hook may wait for its call to reach the transcript
+# before the manager treats it as a hook with no call behind it
+# (_confirm_tool_prompts)
+TOOL_CONFIRM_S = 10.0
 
 # Shell kinds whose pre-v2 (line-mode-default) instances are upgraded to
 # interactive on load, so old sessions get the same working terminal as new
@@ -121,6 +125,11 @@ class WorkspaceManager(QObject):
         # have consumed, so a stale edge is never re-applied after a local clear.
         self.prompt_events_path = ""
         self._prompt_offset = 0
+        # tool prompts whose call the transcript has not shown yet: agent id
+        # -> (tool_use_id, transcript_path, transcript size at the hook or
+        # None, give-up time). See _confirm_tool_prompts.
+        self._unconfirmed_tools: dict[
+            str, tuple[str, str, int | None, float]] = {}
         # laned agents whose lane folder was missing at load: (ws_id, agent_id).
         # Their cwd is NOT moved to the workspace folder; MainWindow repairs
         # the lane at the same path (take_lane_repairs) and they wait for it.
@@ -643,13 +652,25 @@ class WorkspaceManager(QObject):
         records, self._prompt_offset = session_hook.read_prompt_events(
             self.prompt_events_path, self._prompt_offset)
         for rec in records:
-            agent = self.resolve_agent(rec.get("agent_id", ""))
+            ident = rec.get("agent_id", "")
+            agent = self.resolve_agent(ident)
             if agent is None:
                 continue
             kind = rec.get("kind")
             if kind == session_hook.EV_TOOL_SET:
-                agent.set_tool_waiting(True)
+                tool_id = rec.get("tool_use_id")
+                path = rec.get("transcript_path")
+                if (isinstance(tool_id, str) and tool_id
+                        and isinstance(path, str) and path):
+                    anchor = rec.get("transcript_size")
+                    if not isinstance(anchor, int) or anchor < 0:
+                        anchor = None
+                    self._unconfirmed_tools[ident] = (
+                        tool_id, path, anchor, time.time() + TOOL_CONFIRM_S)
+                else:       # a hook from before tool ids were recorded
+                    agent.set_tool_waiting(True)
             elif kind == session_hook.EV_TOOL_CLEAR:
+                self._unconfirmed_tools.pop(ident, None)
                 agent.set_tool_waiting(False)
             elif kind == session_hook.EV_TURN_SET:
                 # every Stop writes exactly one TURN_SET or TURN_CLEAR, and
@@ -663,6 +684,38 @@ class WorkspaceManager(QObject):
                 agent.note_reply_stopped(_event_ts(rec))
                 agent.set_turn_waiting(False)
                 agent.note_turn_ended()
+        self._confirm_tool_prompts()
+
+    def _confirm_tool_prompts(self) -> None:
+        """Light the "?" for a tool prompt only once its call is in the
+        agent's transcript.
+
+        Claude can fire the PreToolUse hook for AskUserQuestion with no such
+        call in the conversation. Measured live 2026-10-16: an integrator's
+        turn ended (Stop, turn_clear), and 3 s later a tool_set arrived with
+        its id. The transcript never held that call and no PostToolUse or Stop
+        followed, so the sticky tool flag kept the "?" lit on an agent that
+        had asked nothing. A real call's transcript line was stamped 150 ms
+        before its hook ran, so a real prompt confirms on the first poll.
+
+        A call the transcript has not shown after TOOL_CONFIRM_S is dropped
+        and audited. An unreadable transcript lights the "?": a missed
+        question costs the user more than a stray badge."""
+        now = time.time()
+        for ident, (tool_id, path, anchor, give_up) in list(
+                self._unconfirmed_tools.items()):
+            agent = self.resolve_agent(ident)
+            if agent is None:
+                del self._unconfirmed_tools[ident]
+                continue
+            seen = transcripts.has_tool_use(path, tool_id, anchor)
+            if seen is not False:           # True, or None = unreadable
+                del self._unconfirmed_tools[ident]
+                agent.set_tool_waiting(True)
+            elif now >= give_up:
+                del self._unconfirmed_tools[ident]
+                self._audit(f"PROMPT-SKIP {agent.spec.name}: tool prompt "
+                            f"{tool_id} never reached the transcript")
 
     def _touch(self, ws_id: str) -> None:
         """Recompute derived state AND mark the session dirty (persisted
