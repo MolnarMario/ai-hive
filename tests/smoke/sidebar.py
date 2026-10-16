@@ -452,11 +452,25 @@ def test_collapsed_sidebar_rail():
     wb = mgr.create_workspace("Bravo")
     mgr.set_active(wa.id)
     check("rail: hidden while the sidebar is open", win.ws_rail.isHidden())
+    tb = win.top_bar.toggle_btn
+    check("toggle icon: an open sidebar shows the collapse icon",
+          tb.icon_name() == "sidebar_close"
+          and tb.toolTip().startswith("Collapse sidebar"),
+          (tb.icon_name(), tb.toolTip()))
     win._toggle_sidebar()
     pump(50)
     check("rail: shown once the sidebar collapses",
           win.body_split.sizes()[0] == 0 and win.ws_rail.isVisible(),
           win.body_split.sizes())
+    check("toggle icon: a collapsed sidebar shows the expand icon",
+          tb.icon_name() == "sidebar_open"
+          and tb.toolTip().startswith("Expand sidebar"),
+          (tb.icon_name(), tb.toolTip()))
+    # the icon is painted, so make sure both states actually render ink
+    pix = tb.grab().toImage()
+    check("toggle icon: the expand icon paints ink",
+          any(pix.pixelColor(x, y) != pix.pixelColor(0, 0)
+              for x in range(pix.width()) for y in range(pix.height())))
     i = [e[0] for e in win.ws_rail._entries].index(wb.id)
     mid = win.ws_rail.strip_rect(i).center()
     QTest.mouseClick(win.ws_rail, Qt.MouseButton.LeftButton,
@@ -472,9 +486,13 @@ def test_collapsed_sidebar_rail():
     check("rail: a sidebar saved collapsed restores with the rail showing",
           not win2.ws_rail.isHidden() and win2.body_split.sizes()[0] == 0,
           win2.body_split.sizes())
+    check("toggle icon: a sidebar restored collapsed shows the expand icon",
+          win2.top_bar.toggle_btn.icon_name() == "sidebar_open")
     win2._toggle_sidebar()
     check("rail: reopening the sidebar hides the rail",
           win2.ws_rail.isHidden(), win2.body_split.sizes())
+    check("toggle icon: reopening flips it back to the collapse icon",
+          win2.top_bar.toggle_btn.icon_name() == "sidebar_close")
     win2.close()
     pump(100)
     shutil.rmtree(tmp, ignore_errors=True)

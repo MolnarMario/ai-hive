@@ -63,6 +63,7 @@ from . import ornaments
 from .ornaments import (DropDownComboBox, LogoRoundel,
                         PageBorder, PlanUsageBadge, RefreshGlyphButton,
                         ToggleSwitch, close_on_anchor_press)
+from .header_icons import SidebarToggleButton
 from .options_panel import OptionsPanel
 from .sidebar import SIDEBAR_WIDTH, Sidebar, WorkspaceRail
 
@@ -510,10 +511,8 @@ class TopBar(QFrame):
         lay.setContentsMargins(12, 0, 8, 0)
         lay.setSpacing(8)
 
-        self.toggle_btn = QToolButton(self)
+        self.toggle_btn = SidebarToggleButton(self)
         self.toggle_btn.setObjectName("SidebarToggle")
-        self.toggle_btn.setText("☰")
-        self.toggle_btn.setToolTip("Toggle sidebar")
         self.toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.toggle_btn.clicked.connect(self.sidebarToggleClicked)
 
@@ -921,7 +920,7 @@ class TopBar(QFrame):
         self.options_panel.toggle_under(self.options_btn)
 
     def set_identity_visible(self, visible: bool) -> None:
-        """Show or hide the left block: ☰, logo, name, version and the
+        """Show or hide the left block: sidebar toggle, logo, name, version and the
         update button. F11 hides it while the bar floats in fullscreen."""
         for w in (self.toggle_btn, self._logo, self._name, self._version,
                   self.app_update_btn):
@@ -2968,10 +2967,13 @@ class MainWindow(QMainWindow):
     def _sync_ws_rail(self) -> None:
         """Show the workspace rail exactly while the sidebar is collapsed,
         whether the toggle, Ctrl+Shift+B, a drag or a restore closed it.
-        Fullscreen owns the rail until it exits."""
+        Fullscreen owns the rail until it exits. The top bar's toggle icon
+        follows the same width."""
         if self._fullscreen.active:
             return
-        self.ws_rail.setVisible(self.body_split.sizes()[0] == 0)
+        is_open = self.body_split.sizes()[0] > 0
+        self.ws_rail.setVisible(not is_open)
+        self.top_bar.toggle_btn.set_sidebar_open(is_open)
 
     def _adopt_existing_model(self) -> None:
         """Build pages/rows for workspaces created before this window existed

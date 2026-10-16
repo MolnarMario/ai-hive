@@ -45,6 +45,13 @@ _BODIES = {
     "merge": ("<circle cx='6' cy='5' r='2.5'/><circle cx='18' cy='5' r='2.5'/>"
               "<circle cx='12' cy='19' r='2.5'/>"
               "<path d='M6 7.5c0 5 6 4 6 9'/><path d='M18 7.5c0 5-6 4-6 9'/>"),
+    # the sidebar toggle: a window with its left panel divided off, and a
+    # chevron inside that panel pointing where the click sends it (left to
+    # fold it away, right to bring it back)
+    "sidebar_close": ("<rect x='2.5' y='4.5' width='19' height='15' rx='3'/>"
+                      "<path d='M10 4.5v15'/><path d='M7.8 9.2 5 12l2.8 2.8'/>"),
+    "sidebar_open": ("<rect x='2.5' y='4.5' width='19' height='15' rx='3'/>"
+                     "<path d='M10 4.5v15'/><path d='M5.2 9.2 8 12l-2.8 2.8'/>"),
     "folder": ("<path d='M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 "
                "1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 "
                "0 0 2 2Z'/>"),
@@ -94,6 +101,44 @@ class IconToolButton(QToolButton):
         # 9px = the stylesheet's 8px horizontal padding plus the 1px border
         left = 9 if self.text() else (self.width() - ICON_SIZE) / 2
         _paint(self, self._icon_name, ink, left)
+
+
+class SidebarToggleButton(QToolButton):
+    """The top bar's sidebar toggle. Its icon says what a click does: a
+    collapse icon while the sidebar is open, an expand icon while it is
+    folded away. `MainWindow._sync_ws_rail` feeds it the state, so a drag, a
+    restore and Ctrl+Shift+B all move it. Dim ink, full ink on hover, like
+    the bar's other glyph buttons."""
+
+    ICON_SIZE = 18
+    SIZE = (32, 28)
+    TIP_COLLAPSE = "Collapse sidebar (Ctrl+Shift+B)"
+    TIP_EXPAND = "Expand sidebar (Ctrl+Shift+B)"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(*self.SIZE)
+        self._open = True
+        self.set_sidebar_open(True)
+
+    def sidebar_open(self) -> bool:
+        return self._open
+
+    def set_sidebar_open(self, is_open: bool) -> None:
+        self._open = is_open
+        tip = self.TIP_COLLAPSE if is_open else self.TIP_EXPAND
+        self.setToolTip(tip)
+        self.setAccessibleName(tip.split(" (")[0])
+        self.update()
+
+    def icon_name(self) -> str:
+        return "sidebar_close" if self._open else "sidebar_open"
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        ink = Palette.TEXT if self.underMouse() else Palette.TEXT_DIM
+        _paint(self, self.icon_name(), ink,
+               (self.width() - self.ICON_SIZE) / 2, self.ICON_SIZE)
 
 
 class LaneChip(QToolButton):
