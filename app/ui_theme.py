@@ -302,13 +302,18 @@ def apply_theme(theme_id: str) -> Theme:
 apply_theme(DEFAULT_THEME_ID)   # populate Palette at import
 
 
-def _rel_luma(hex_color: str) -> float:
-    """WCAG relative luminance of a #rrggbb / #rgb color (0=black, 1=white).
-    Pure-python so ui_theme stays Qt-free."""
+def _hex_rgb(hex_color: str) -> tuple[int, int, int]:
+    """(r, g, b) of a #rrggbb / #rgb color, 0-255."""
     h = hex_color.lstrip("#")
     if len(h) == 3:
         h = "".join(c * 2 for c in h)
-    r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _rel_luma(hex_color: str) -> float:
+    """WCAG relative luminance of a #rrggbb / #rgb color (0=black, 1=white).
+    Pure-python so ui_theme stays Qt-free."""
+    r, g, b = (c / 255 for c in _hex_rgb(hex_color))
     lin = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
     return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
 
@@ -341,6 +346,11 @@ def _check_icon_path(fill_hex: str) -> str:
         return ""
 
 
+# alpha of the category header's hover wash (build_qss); under 1 so the group
+# box drawn beneath the header shows through
+CAT_HOVER_ALPHA = 0.11
+
+
 def build_qss(chrome_family: str = "Segoe UI", console_px: int | None = None) -> str:
     p = Palette
     cpx = int(console_px if console_px else CONSOLE_FONT_PX)
@@ -355,9 +365,7 @@ def build_qss(chrome_family: str = "Segoe UI", console_px: int | None = None) ->
     # skin and darkens a light one, and the group box drawn under the header
     # (sidebar.drawRow) still shows through. An opaque BG_HOVER covered that
     # box, so the hovered header looked flatter than the ones beside it
-    _ink = p.TEXT.lstrip("#")
-    cat_hover = "rgba({},{},{},0.11)".format(
-        *(int(_ink[i:i + 2], 16) for i in (0, 2, 4)))
+    cat_hover = "rgba({},{},{},{})".format(*_hex_rgb(p.TEXT), CAT_HOVER_ALPHA)
     return f"""
 * {{
     font-family: "{chrome_family}";
@@ -546,9 +554,9 @@ WorkspaceRow[search_hit="true"] {{
 }}
 /* hover: a translucent wash plus a brighter caret and count. The selected
    workspace keeps the only accent bar, so hover never reads as selection.
-   CategoryRow sets the hover property on enter/leave, because a parent's
-   :hover does not restyle its children */
-#WsCategory:hover {{ background: {cat_hover}; }}
+   All three key off the hover property CategoryRow sets on enter/leave, not
+   :hover, because a parent's :hover does not restyle its children */
+#WsCategory[hover="true"] {{ background: {cat_hover}; }}
 #CatCaret {{
     background: transparent; border: none; color: {p.TEXT_DIM};
     font-size: 11px; padding: 0 2px;
