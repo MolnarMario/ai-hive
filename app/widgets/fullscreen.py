@@ -6,7 +6,7 @@ Entering moves the top bar, every workspace header and the sidebar out of
 the window's layouts. The top bar and the sidebar go into two floating
 overlays (children of the central widget, above the grid). Resting the
 cursor on the top edge for REVEAL_MS shows the top overlay: the top bar
-without its identity block (☰, logo, name, version, update button) plus the
+without its identity block (sidebar button, logo, name, version, update button) plus the
 active page's header, lent to the overlay while it shows. Resting
 it on the left edge shows the left overlay: the sidebar at the width it
 had before F11, or the thin workspace rail when the sidebar was collapsed.
@@ -309,7 +309,7 @@ class FullscreenController(QObject):
         self._left_held = False
 
     def toggle_left(self) -> None:
-        """Ctrl+Shift+B while fullscreen (the ☰ button hides with the top
+        """Ctrl+Shift+B while fullscreen (the sidebar button hides with the top
         bar's identity block): show or hide the sidebar overlay, and keep it
         up until the cursor has been over it."""
         if self.left.isVisible():
