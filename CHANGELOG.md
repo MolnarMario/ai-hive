@@ -8,6 +8,19 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.44.0
+
+- Ctrl+Tab moves to the next agent in the workspace, left to right along
+  a row and then down to the next row, wrapping back to the first.
+  Ctrl+Shift+Tab goes the other way. If an agent is maximized, the next
+  one takes its place.
+- Options > Help > Keyboard shortcuts lists every shortcut AI Hive has.
+- The button at the top left that hides the sidebar now shows which way
+  it will go: an arrow pointing left while the sidebar is open, right
+  while it is hidden. Its tooltip names the action and the shortcut.
+- Fullscreen (F11) no longer leaves a thin strip of wallpaper at the
+  window's edges, and neither does the maximized window you return to.
+
 ## 0.43.3
 
 - Hovering a category in the sidebar now shows plainly which one the
