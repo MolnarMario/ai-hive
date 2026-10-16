@@ -12,8 +12,8 @@ em dashes: this text is shown in the app.
 
 - A narrow card header no longer cuts its chips off mid-word, such as
   "Opus 5.5 · high ·" or "10% of 1". As the card narrows, the header
-  drops whole words in a fixed order: the task summary shrinks to its
-  icon, then the word integrator goes, then the model's mode and effort,
+  drops whole words in a fixed order: the task summary shrinks to a
+  clipboard icon, then the word integrator goes, then the model's mode and effort,
   then the " of 1M" of the context badge, then the lane counts.
 
 ## 0.43.1
