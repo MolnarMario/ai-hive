@@ -267,8 +267,9 @@ class _CardHeader(QFrame):
         # an open-hand over the empty strip hints it's a drag handle; the child
         # buttons/title set their own cursors, so only the grabbable area shows it
         self.setCursor(Qt.CursorShape.OpenHandCursor)
-        # a filter runs before the layout sees the event, so the labels are
-        # shortened before the layout hands out their widths
+        # Qt hands a Resize or LayoutRequest to the widget's layout BEFORE its
+        # event filters, so the layout has already placed the old forms when
+        # this runs; _fit_header redoes the layout at once when it changed one
         self.installEventFilter(self)
 
     def eventFilter(self, obj, event):
@@ -1578,7 +1579,12 @@ class TerminalCard(QFrame):
         the " of 1M" of the context badge, and the lane chip's counts down to
         its icon. Runs from the header's event filter on every layout
         request, resize and show, and only touches a chip whose form
-        changes, so the layout request it causes finds nothing to do."""
+        changes, so the layout request it causes finds nothing to do.
+
+        The filter runs after the layout has placed the old forms, and a
+        posted layout request would leave a frame where Qt paints them
+        squeezed, so a fit that changed a chip activates the layouts
+        itself."""
         header = getattr(self, "header", None)
         tail = getattr(self, "_header_tail", None)
         if header is None or tail is None or not header.isVisible():
@@ -1608,12 +1614,17 @@ class TerminalCard(QFrame):
             if bare + sum(c.width_at(levels[c]) for c in chips) <= room:
                 break
             levels[w] = k
+        changed = False
         for w in chips:
             if w.level() != levels[w]:
                 w.set_level(levels[w])
+                changed = True
                 if w is tokens:
                     # the badge sits in the tail's own row: tell the header
                     tail.updateGeometry()
+        if changed:
+            tail.layout().activate()
+            header.layout().activate()
 
     def _on_tokens(self, badge: str = "") -> None:
         # context-window usage badge beside the summary; hidden until the

@@ -560,6 +560,19 @@ def test_narrow_header_drops_words_not_letters():
           and card.token_label.full_text() == "10% of 1M",
           (card.model_label.full_text(), card.lane_mark.text(),
            card.token_label.full_text()))
+    # Qt gives the layout a resize before the header's filter: the fit must
+    # redo the layout itself, not leave a squeezed frame for a posted request
+    card.resize(900, 300)
+    pump(30)
+    card.resize(420, 300)
+    QApplication.sendPostedEvents(card, 0)   # the top level's own resize
+    squeezed = [(name, wid.width(), wid.sizeHint().width())
+                for name, wid in (("model", card.model_label),
+                                  ("lane", card.lane_mark),
+                                  ("tokens", card.token_label))
+                if wid.isVisible() and wid.width() < wid.sizeHint().width()]
+    check("narrow header: one resize leaves no chip squeezed before any "
+          "posted layout request runs", squeezed == [], squeezed)
     card.resize(900, 300)
     pump(30)
     check("narrow header: widening the card brings every word back",
