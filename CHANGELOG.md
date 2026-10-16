@@ -8,6 +8,13 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.43.3
+
+- Hovering a category in the sidebar now shows plainly which one the
+  pointer is on: the header gets a visible tint, its arrow lights up in
+  the accent colour and its count brightens. The category's outline
+  stays visible under the tint instead of disappearing.
+
 ## 0.43.2
 
 - A narrow card header no longer cuts its chips off mid-word, such as
