@@ -90,6 +90,10 @@ _REPLY_TAIL_BYTES = 256 * 1024
 # the fallback for the rare case the tail holds neither.
 _MODEL_TAIL_BYTES = 65536
 
+# How much of the tail has_tool_use searches. The call it looks for was just
+# made, but Claude writes large api-request records after it.
+_TOOL_USE_TAIL_BYTES = 2 * 1024 * 1024
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 # `/model` and `/effort` echo their result into the transcript as a
 # <local-command-stdout> user record, the instant the user picks. Observed
@@ -1194,6 +1198,22 @@ def _read_model_effort(path: str) -> tuple[str, str, str]:
         return (cached[2], cached[3], cached[4]) if cached else ("", "", "")
     _MODEL_CACHE[path] = (st.st_mtime, st.st_size, model, effort, mode)
     return (model, effort, mode)
+
+
+def has_tool_use(path: str, tool_use_id: str) -> bool | None:
+    """Whether the transcript at `path` holds the tool call `tool_use_id`:
+    True or False, or None when the file can't be read. A plain byte search
+    of the tail for the call block's own `"id":"<tool_use_id>"` (compact
+    JSON, as Claude writes it). Hook and result records name the id under
+    other keys (toolUseID, tool_use_id), so they never count as the call."""
+    try:
+        with open(path, "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - _TOOL_USE_TAIL_BYTES))
+            data = fh.read()
+    except OSError:
+        return None
+    return b'"id":' + json.dumps(tool_use_id).encode("utf-8") in data
 
 
 def _tail_lines(path: str, limit: int) -> list[str]:

@@ -1101,6 +1101,113 @@ def test_manager_prompt_events_sync():
           agent.is_waiting() and len(rings) == before)
 
 
+def test_tool_prompt_needs_transcript_call():
+    """Regression: Claude fired a PreToolUse hook for AskUserQuestion 3 s
+    after an integrator's turn ended, with no such call in its transcript and
+    no PostToolUse after it. The sticky tool flag kept the workspace '?' lit
+    on an agent that had asked nothing. A tool_set carrying a tool id now
+    lights the '?' only once that call is in the transcript."""
+    import json as _json
+    from PySide6.QtWidgets import QApplication
+    from app import session_hook as sh
+    from app import transcripts
+    from app import workspace_manager as wm
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-phantom-"))
+    events = str(tmp / "events.jsonl")
+    transcript = tmp / "t.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    sh.reset_events(events)
+    mgr = wm.WorkspaceManager()
+    mgr.prompt_events_path = events
+    audit = []
+    mgr.audit = audit.append
+    ws = mgr.create_workspace("Phantom", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Ask",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+    rings = []
+    mgr.agentWaiting.connect(lambda wid, aid: rings.append(aid))
+
+    def hook(payload):
+        os.environ[sh.AGENT_ID_ENV] = agent.id
+        try:
+            sh._dispatch("", events, payload)
+        finally:
+            os.environ.pop(sh.AGENT_ID_ENV, None)
+
+    def pre_tool(tool_id):
+        hook({"hook_event_name": "PreToolUse",
+              "tool_name": "AskUserQuestion", "tool_use_id": tool_id,
+              "transcript_path": str(transcript)})
+
+    def write_call(tool_id):
+        rec = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": tool_id, "name": "AskUserQuestion"}]}}
+        with open(transcript, "a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(rec, separators=(",", ":")) + "\n")
+
+    hook({"hook_event_name": "Stop", "last_assistant_message": "Run it."})
+    pre_tool("toolu_phantom")
+    recs, _off = sh.read_prompt_events(events, 0)
+    check("phantom: the hook records the tool id and transcript",
+          recs[-1].get("tool_use_id") == "toolu_phantom"
+          and recs[-1].get("transcript_path") == str(transcript), recs[-1])
+    mgr.sync_prompt_events()
+    check("phantom: a hook with no call in the transcript lights no '?'",
+          not agent.is_waiting() and not rings, rings)
+    # a hook record naming the id under another key is not the call
+    with open(transcript, "a", encoding="utf-8") as fh:
+        fh.write('{"type":"progress","toolUseID":"toolu_phantom"}\n')
+    check("phantom: only the call block's own id counts",
+          transcripts.has_tool_use(str(transcript), "toolu_phantom") is False)
+    real_confirm = wm.TOOL_CONFIRM_S
+    wm.TOOL_CONFIRM_S = 0.0
+    try:
+        pre_tool("toolu_phantom2")
+        mgr.sync_prompt_events()
+    finally:
+        wm.TOOL_CONFIRM_S = real_confirm
+    check("phantom: an unconfirmed prompt is dropped and audited",
+          not mgr._unconfirmed_tools and not agent.is_waiting()
+          and any("PROMPT-SKIP" in line and "toolu_phantom2" in line
+                  for line in audit), audit)
+
+    # a real call: the hook arrives before its transcript line, then confirms
+    mgr._unconfirmed_tools.clear()
+    pre_tool("toolu_real")
+    mgr.sync_prompt_events()
+    check("phantom: a real prompt waits for its transcript line",
+          not agent.is_waiting())
+    write_call("toolu_real")
+    mgr.sync_prompt_events()
+    check("phantom: the call in the transcript lights '?' and rings",
+          agent.is_waiting() and rings == [agent.id], rings)
+    hook({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion"})
+    mgr.sync_prompt_events()
+    check("phantom: PostToolUse still clears a confirmed prompt",
+          not agent.is_waiting())
+
+    # answered before the poll confirmed it: the clear cancels it
+    pre_tool("toolu_quick")
+    hook({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion"})
+    write_call("toolu_quick")
+    mgr.sync_prompt_events()
+    check("phantom: a prompt closed before confirming never lights",
+          not agent.is_waiting() and not mgr._unconfirmed_tools)
+
+    # an unreadable transcript fails open: a missed question costs more
+    hook({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
+          "tool_use_id": "toolu_x",
+          "transcript_path": str(tmp / "missing.jsonl")})
+    mgr.sync_prompt_events()
+    check("phantom: an unreadable transcript still lights '?'",
+          agent.is_waiting())
+
+
 def test_input_echo_not_busy():
     """The pty echoes the user's OWN keystrokes back as output; that echo must
     NOT light the sidebar 'working' pulse (typing at an idle prompt made the row
