@@ -14,6 +14,10 @@ em dashes: this text is shown in the app.
   pointer is on: the header gets a visible tint, its arrow lights up in
   the accent colour and its count brightens. The category's outline
   stays visible under the tint instead of disappearing.
+- An agent no longer shows a "?" when it hasn't asked anything. Claude
+  sometimes signals a question it never asks, and the "?" then stayed
+  lit on an agent that was done. AI Hive now waits until the question is
+  actually in the conversation before it shows the "?".
 
 ## 0.43.2
 
