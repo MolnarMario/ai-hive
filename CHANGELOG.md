@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.43.2
+
+- A narrow card header no longer cuts its chips off mid-word, such as
+  "Opus 5.5 · high ·" or "10% of 1". As the card narrows, the header
+  drops whole words in a fixed order: the task summary shrinks to a
+  clipboard icon, then the word integrator goes, then the model's mode and effort,
+  then the " of 1M" of the context badge, then the lane counts.
+
 ## 0.43.1
 
 - A crowded card header no longer shortens the integrator's lane chip to

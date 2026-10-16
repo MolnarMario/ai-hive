@@ -110,12 +110,18 @@ class LaneChip(QToolButton):
     stays the full text, and the tooltip spells out the role and every count
     in words (`TerminalCard._lane_tooltip`).
 
+    The card header asks the chip to give up words before any squeeze
+    (`set_level`, from `TerminalCard._fit_header`). Level n leaves the first
+    n words out of the size hint, so the layout is never asked for room it
+    doesn't have, and the chip's neighbours don't get clipped either.
+
     The old chip led with the font glyph "⎇", which has wide side bearings
     (the gap left of it) and is small at 11px."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._icon_name = "lanes"
+        self._level = 0     # words left out of the front of the size hint
 
     def set_icon_name(self, name: str) -> None:
         if name != self._icon_name:
@@ -129,6 +135,23 @@ class LaneChip(QToolButton):
                   + self.fontMetrics().horizontalAdvance(text))
         return w
 
+    def levels(self) -> int:
+        """How many forms the chip has: each tail of its words, then the icon
+        alone."""
+        return len(self.text().split()) + 1
+
+    def level(self) -> int:
+        return self._level
+
+    def width_at(self, level: int) -> int:
+        return self._width_for(" ".join(self.text().split()[level:]))
+
+    def set_level(self, level: int) -> None:
+        if level != self._level:
+            self._level = level
+            self.updateGeometry()
+            self.update()
+
     def shown_text(self) -> str:
         """The longest tail of the text's words that fits the chip's width."""
         words = self.text().split()
@@ -141,7 +164,7 @@ class LaneChip(QToolButton):
     def sizeHint(self):
         # exact, because QToolButton adds ~10px of its own around the text and
         # that shows as a gap between the icon and the text
-        w = self._width_for(self.text())
+        w = self.width_at(self._level)
         # the height of one line of text, with or without text: a bare chip
         # is icon-only to QToolButton and came out 1px taller, so the chip
         # shifted when a quiet lane made its first commit
