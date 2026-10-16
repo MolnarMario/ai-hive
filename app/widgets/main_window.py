@@ -58,6 +58,7 @@ from .agent_file_map import AgentFileMapWindow
 from .event_log_window import EventLogWindow
 from .fullscreen import FullscreenController
 from .lanes_help import show_lanes_explainer
+from .shortcuts_help import show_shortcuts_help
 from . import ornaments
 from .ornaments import (DropDownComboBox, LogoRoundel,
                         PageBorder, PlanUsageBadge, RefreshGlyphButton,
@@ -499,6 +500,7 @@ class TopBar(QFrame):
     eventLogClicked = Signal()             # open the event log window
     fullscreenToggled = Signal()           # the Options switch twin of F11
     appUpdateClicked = Signal()            # check for / show an AI Hive update
+    shortcutsHelpRequested = Signal()      # Options > Help > Keyboard shortcuts
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -817,6 +819,15 @@ class TopBar(QFrame):
         self.options_panel.add_row("Theme", self.theme_select)
         self.options_panel.add_row("Font size", self.font_dec_btn,
                                    self.font_inc_btn)
+        self.options_panel.add_separator()
+        self.options_panel.add_section("Help")
+        self.shortcuts_btn = QToolButton(self)
+        self.shortcuts_btn.setObjectName("OptionsAction")
+        self.shortcuts_btn.setText("Show...")
+        self.shortcuts_btn.setToolTip("Every keyboard shortcut AI Hive has")
+        self.shortcuts_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.shortcuts_btn.clicked.connect(self.shortcutsHelpRequested)
+        self.options_panel.add_row("Keyboard shortcuts", self.shortcuts_btn)
 
         self.options_btn = QToolButton(self)
         self.options_btn.setObjectName("OptionsBtn")
@@ -2916,12 +2927,18 @@ class MainWindow(QMainWindow):
         # focused terminal no longer receives Ctrl+Up / Ctrl+Down.
         QShortcut(QKeySequence("Ctrl+Up"), self, self._maximize_selected_card)
         QShortcut(QKeySequence("Ctrl+Down"), self, self._restore_card_tiling)
+        # Ctrl+Tab / Ctrl+Shift+Tab step through the active workspace's
+        # agents. TerminalView leaves them unclaimed as well.
+        QShortcut(QKeySequence("Ctrl+Tab"), self, lambda: self._cycle_card(1))
+        QShortcut(QKeySequence("Ctrl+Shift+Tab"), self,
+                  lambda: self._cycle_card(-1))
         # the Options switch: after the panel's click has finished, since
         # entering reparents the bar the click came from
         self.top_bar.fullscreenToggled.connect(
             lambda: QTimer.singleShot(0, self._fullscreen.toggle))
         self.top_bar.eventLogClicked.connect(self.open_event_log)
         self.top_bar.appUpdateClicked.connect(self.check_for_app_update)
+        self.top_bar.shortcutsHelpRequested.connect(self.open_shortcuts_help)
 
     # ------------------------------------------------------------- sidebar ---
 
@@ -6171,6 +6188,18 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------- event log ---
 
+    def open_shortcuts_help(self) -> None:
+        self.top_bar.options_panel.hide()
+        box = getattr(self, "_shortcuts_help", None)
+        if box is not None:
+            try:
+                box.raise_()
+                box.activateWindow()
+                return
+            except RuntimeError:      # closed: WA_DeleteOnClose freed it
+                pass
+        self._shortcuts_help = show_shortcuts_help(self)
+
     def open_event_log(self) -> None:
         """Show the event log window (created on first use, then reused).
         Its links go through `_reveal_agent`, like the map's and the
@@ -6708,6 +6737,19 @@ class MainWindow(QMainWindow):
         card = self._focused_card
         if page is not None and card is not None and card in page.cards:
             page.maximize_card(card)
+
+    def _cycle_card(self, step: int) -> None:
+        """Ctrl+Tab (+1) / Ctrl+Shift+Tab (-1): focus the next or previous
+        agent of the active workspace. With no agent of it focused yet, the
+        first press lands on the top-left one."""
+        page = self._pages.get(self.manager.active_id)
+        if page is None:
+            return
+        card = page.step_card(self._focused_card, step)
+        if card is not None:
+            self._focus_card(page, card)
+            # offscreen or inactive, setFocus delivers no FocusIn
+            self._set_focused_card(card)
 
     def _restore_card_tiling(self) -> None:
         """Ctrl+Down: show every agent of the active workspace again."""
