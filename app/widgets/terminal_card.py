@@ -267,6 +267,16 @@ class _CardHeader(QFrame):
         # an open-hand over the empty strip hints it's a drag handle; the child
         # buttons/title set their own cursors, so only the grabbable area shows it
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+        # a filter runs before the layout sees the event, so the labels are
+        # shortened before the layout hands out their widths
+        self.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if obj is self and event.type() in (QEvent.Type.LayoutRequest,
+                                            QEvent.Type.Resize,
+                                            QEvent.Type.Show):
+            self._card._fit_header()
+        return False
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -435,6 +445,57 @@ class _TaskSummaryLabel(ElidingLabel):
         p.drawLine(QPointF(8.5, 12.0), QPointF(15.5, 12.0))          # text rows
         p.drawLine(QPointF(8.5, 16.0), QPointF(13.5, 16.0))
         p.end()
+
+
+class _FitLabel(QLabel):
+    """A header label with shorter forms of its text, longest first: the model
+    chip's "Opus 5.5 · high · auto", "Opus 5.5 · high", "Opus 5.5", or the
+    context badge's "10% of 1M", "10%". `TerminalCard._fit_header` picks the
+    form (`set_level`) so the header never asks for more room than it has.
+
+    A plain QLabel can't shrink below its text, and an over-subscribed header
+    squeezes it anyway (see _HeaderTools), so the label clipped mid-word:
+    "10% of 1" read as one percent of one. `text()` is the form shown and
+    `full_text()` the longest one, which the tooltip also spells out."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._forms = [""]
+        self._level = 0
+
+    def set_forms(self, forms) -> None:
+        kept = []
+        for f in forms:
+            if f and f not in kept:
+                kept.append(f)
+        self._forms = kept or [""]
+        self.setText(self._forms[min(self._level, len(self._forms) - 1)])
+
+    def full_text(self) -> str:
+        return self._forms[0]
+
+    def levels(self) -> int:
+        return len(self._forms)
+
+    def level(self) -> int:
+        return self._level
+
+    def width_at(self, level: int) -> int:
+        # QLabel's own hint less the shown text, plus the form's text, both
+        # measured the way QLabel measures: the form's exact hint
+        self.ensurePolished()
+        fm = self.fontMetrics()
+        flags = int(Qt.AlignmentFlag.AlignLeft.value)
+
+        def text_w(t):
+            return fm.boundingRect(0, 0, 4000, 2000, flags, t).width()
+        form = self._forms[min(level, len(self._forms) - 1)]
+        return (self.minimumSizeHint().width() - text_w(self.text())
+                + text_w(form))
+
+    def set_level(self, level: int) -> None:
+        self._level = level
+        self.setText(self._forms[min(level, len(self._forms) - 1)])
 
 
 class _ToolsTray(QFrame):
@@ -850,7 +911,7 @@ class TerminalCard(QFrame):
         # inside the terminal (/model, /effort), so this follows the live
         # conversation rather than the launch flags; hidden when unknown, which
         # is every non-AI shell.
-        self.model_label = QLabel("", header)
+        self.model_label = _FitLabel(header)
         self.model_label.setObjectName("CardModel")
         # WHOSE agent this is, as a QSS property: the chip is inked in the
         # vendor's own colour (ui_theme.PROVIDER_INK) rather than the skin's,
@@ -907,7 +968,7 @@ class TerminalCard(QFrame):
         # compact context-window usage (e.g. "20% of 1M"), right after the
         # summary snippet — hidden until the transcript reports usage (Claude
         # only). Fixed content, so no stretch: the summary keeps the slack.
-        self.token_label = QLabel("", header)
+        self.token_label = _FitLabel(header)
         self.token_label.setObjectName("CardTokens")
         self.token_label.hide()
         hl.addWidget(self.glyph)
@@ -986,7 +1047,7 @@ class TerminalCard(QFrame):
         # so the strip that reveals them is the space to the chip's LEFT. The
         # two share a tight sub-row so the chip hugs the (square) close button
         # rather than sitting a full header gap from it.
-        tail = QWidget(header)
+        tail = self._header_tail = QWidget(header)
         tl = QHBoxLayout(tail)
         tl.setContentsMargins(0, 0, 0, 0)
         tl.setSpacing(2)
@@ -1503,16 +1564,70 @@ class TerminalCard(QFrame):
         self.sched_mark.setProperty("missed", missed)
         repolish(self.sched_mark)
 
+    def _fit_header(self) -> None:
+        """Shorten the header's chips, a whole word at a time, until the
+        header's minimum width fits its real width.
+
+        Qt's answer to an over-subscribed row is to shrink every item, below
+        its minimum too (see _HeaderTools), and a QLabel squeezed that way
+        clips: a narrow integrator card read "Opus 5.5 · high ·" and
+        "10% of 1". So the header gives the space up in a fixed order before
+        the layout is asked for it. The task summary goes first, down to its
+        clipboard, since it is the stretch item. Then the integrator chip's
+        role word (its merge icon says it), the model chip's mode and effort,
+        the " of 1M" of the context badge, and the lane chip's counts down to
+        its icon. Runs from the header's event filter on every layout
+        request, resize and show, and only touches a chip whose form
+        changes, so the layout request it causes finds nothing to do."""
+        header = getattr(self, "header", None)
+        tail = getattr(self, "_header_tail", None)
+        if header is None or tail is None or not header.isVisible():
+            return
+        model, lane, tokens = self.model_label, self.lane_mark, self.token_label
+        chips = [w for w in (model, lane, tokens) if not w.isHidden()]
+        if not chips:
+            return
+        steps = []
+        role = 0
+        if not lane.isHidden():
+            role = 1 if lane.text().split()[:1] == ["integrator"] else 0
+            steps += [(lane, k) for k in range(1, role + 1)]
+        if not model.isHidden():
+            steps += [(model, k) for k in range(1, model.levels())]
+        if not tokens.isHidden():
+            steps += [(tokens, k) for k in range(1, tokens.levels())]
+        if not lane.isHidden():
+            steps += [(lane, k) for k in range(role + 1, lane.levels())]
+        # the row's minimum without the chips, from the layout itself so the
+        # gaps, margins and the summary's floor are counted the way Qt does
+        bare = header.layout().minimumSize().width() - sum(
+            w.width_at(w.level()) for w in chips)
+        levels = dict.fromkeys(chips, 0)
+        room = header.width()
+        for w, k in steps:
+            if bare + sum(c.width_at(levels[c]) for c in chips) <= room:
+                break
+            levels[w] = k
+        for w in chips:
+            if w.level() != levels[w]:
+                w.set_level(levels[w])
+                if w is tokens:
+                    # the badge sits in the tail's own row: tell the header
+                    tail.updateGeometry()
+
     def _on_tokens(self, badge: str = "") -> None:
         # context-window usage badge beside the summary; hidden until the
         # provider reports an actual context size and token count.
         if badge:
-            self.token_label.setText(badge)
+            # "10% of 1M", then "10%": the percentage is the reading, the
+            # window size is the same for every turn of the conversation
+            self.token_label.set_forms([badge, badge.split()[0]])
             self.token_label.setToolTip(
                 f"Context window: {badge} used by this conversation")
         else:
-            self.token_label.clear()
+            self.token_label.set_forms([])
         self.token_label.setVisible(bool(badge))
+        self._header_tail.updateGeometry()   # its row's minimum moved
 
     def _on_model(self, badge: str = "") -> None:
         # "Opus 5 · high · plan", tracking /model, /effort and the Shift+Tab
@@ -1528,7 +1643,10 @@ class TerminalCard(QFrame):
                 tip += (f"\nPermission mode: {mode}"
                         "\nKept for the next launch, so this agent reopens"
                         " in the same mode")
-            self.model_label.setText(badge)
+            # the mode, then the effort, drop before the model name does
+            parts = badge.split(" · ")
+            self.model_label.set_forms(
+                [" · ".join(parts[:n]) for n in range(len(parts), 0, -1)])
             provider = self.agent.spec.provider
             if provider == "openai":
                 tip += "\nFollows the model and reasoning level used in Codex turns"
@@ -1536,7 +1654,7 @@ class TerminalCard(QFrame):
                 tip += "\nFollows /model, /effort and Shift+Tab in this terminal"
             self.model_label.setToolTip(tip)
         else:
-            self.model_label.clear()
+            self.model_label.set_forms([])
         self.model_label.setVisible(bool(badge))
 
     # -------------------------------------------------------- inline rename ---

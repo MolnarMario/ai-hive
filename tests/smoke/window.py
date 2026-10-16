@@ -484,6 +484,105 @@ def test_live_model_effort():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_narrow_header_drops_words_not_letters():
+    """A narrow integrator card clipped its header chips mid-word: "Opus 5.5
+    · high ·" and "10% of 1", which read as one percent of a one-token window.
+    The header now shortens its chips by whole words, in a fixed order, before
+    Qt squeezes anything: the summary to its clipboard, then the integrator's
+    role word, the model chip's mode and effort, the badge's " of 1M", and
+    the lane counts down to the icon."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import ui_theme
+    from app.terminal_agent import TerminalAgent
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.terminal_card import TerminalCard
+
+    app = QApplication.instance() or QApplication([])
+    was_qss = app.styleSheet()
+    app.setStyleSheet(ui_theme.build_qss())
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Agent 10", cwd=SCRATCH_CWD,
+                                 model="opus", effort="high"))
+    a.set_live_model("Opus 5.5", "high", "auto")
+    a.set_token_usage(100_000, 1_000_000)
+    a.set_task("Ship the finished lanes")
+    card = TerminalCard(a)
+    a.spec.lane = {"branch": "hive/agent-10-test"}
+    card.integration_info = lambda _ag: {"integrator": True}
+    card.refresh_lane()
+    card.show()
+
+    def chips():
+        return (card.model_label.text(), card.lane_mark.shown_text(),
+                card.token_label.text())
+
+    seen = []
+    clipped = []
+    for w in range(900, 299, -10):
+        card.resize(w, 300)
+        pump(15)
+        seen.append(chips())
+        for name, wid in (("model", card.model_label),
+                          ("lane", card.lane_mark),
+                          ("tokens", card.token_label),
+                          ("title", card.title)):
+            if wid.width() < wid.sizeHint().width():
+                clipped.append((w, name, wid.width(), wid.sizeHint().width()))
+    check("narrow header: no chip is ever narrower than its text",
+          clipped == [], clipped[:5])
+    check("narrow header: a wide card shows every chip whole",
+          seen[0] == ("Opus 5.5 · high · auto", "integrator", "10% of 1M"),
+          seen[0])
+    forms = {"model": ["Opus 5.5 · high · auto", "Opus 5.5 · high",
+                       "Opus 5.5"],
+             "lane": ["integrator", ""], "tokens": ["10% of 1M", "10%"]}
+    check("narrow header: every chip shows one of its whole-word forms",
+          all(m in forms["model"] and ln in forms["lane"]
+              and t in forms["tokens"] for m, ln, t in seen),
+          sorted(set(seen)))
+    order = []
+    for prev, cur in zip(seen, seen[1:]):
+        for i, name in enumerate(("model", "lane", "tokens")):
+            if prev[i] != cur[i]:
+                order.append((name, cur[i]))
+    firsts = [next((k for k, (n, _t) in enumerate(order) if n == name), -1)
+              for name in ("lane", "model", "tokens")]
+    check("narrow header: the role word goes first, then the mode, then "
+          "the window size", -1 not in firsts and firsts == sorted(firsts),
+          order)
+    check("narrow header: the chips' full text survives the squeeze",
+          card.model_label.full_text() == "Opus 5.5 · high · auto"
+          and card.lane_mark.text() == "integrator"
+          and card.token_label.full_text() == "10% of 1M",
+          (card.model_label.full_text(), card.lane_mark.text(),
+           card.token_label.full_text()))
+    card.resize(900, 300)
+    pump(30)
+    check("narrow header: widening the card brings every word back",
+          chips() == ("Opus 5.5 · high · auto", "integrator", "10% of 1M"),
+          chips())
+    # a settled header must not keep re-fitting: each fit that changed a chip
+    # posts a layout request, and only a fit that changes nothing ends that
+    fits = []
+    real_fit = card._fit_header
+    card._fit_header = lambda: (fits.append(1), real_fit())
+    card.resize(420, 300)
+    pump(30)
+    fits.clear()
+    pump(120)
+    check("narrow header: a settled header stops re-fitting", fits == [],
+          len(fits))
+
+    card.detach()
+    card.close()
+    a.deleteLater()
+    app.setStyleSheet(was_qss)
+
+
 def test_repo_activity_cache():
     """The Open repo dropdown shows a cached list at once. The fetch runs
     in the background (prefetch, or a click on a stale copy), a failed
