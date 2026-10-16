@@ -28,7 +28,16 @@ visibly shrank to that size and popped back (measured on Qt 6.11:
 1920x1080, then 1018x672, then maximized). Qt takes that rect from the
 window placement when fullscreen starts, so enter() makes the maximized
 rect the restore-down rect for the duration (`_hold_restore_rect`) and
-exit() puts the real one back once the window is maximized again."""
+exit() puts the real one back once the window is maximized again.
+
+Windows 11 gives a fullscreen window the 1px border and rounded corners
+of a normal one, so the wallpaper showed at each edge. With the held rect
+that look also stayed on the maximized window after F11 again (measured
+on a 2560x1440 monitor: the window was maximized, rect exact, outer pixel
+wallpaper-tinted, corners rounded). enter() turns both off through DWM
+(`_square_edges`) and exit() hands them back to Windows once the window
+has its state again, which squares a maximized window and rounds a
+normal one."""
 
 from __future__ import annotations
 
@@ -138,6 +147,28 @@ def _put_restore_rect(win, rect: wintypes.RECT) -> None:
     _user32.SetWindowPlacement(hwnd, ctypes.byref(wp))
 
 
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33   # Windows 11 only, like the next
+_DWMWA_BORDER_COLOR = 34
+_DWMWCP_DEFAULT, _DWMWCP_DONOTROUND = 0, 1
+_DWMWA_COLOR_DEFAULT, _DWMWA_COLOR_NONE = 0xFFFFFFFF, 0xFFFFFFFE
+
+
+def _square_edges(win, square: bool) -> None:
+    """Drop the window's DWM border and corner rounding (True), or let
+    Windows choose them again (False). Windows 10 rejects both attributes
+    and has neither to drop."""
+    hwnd = _hwnd(win)
+    if not hwnd:
+        return
+    for attr, on, off in (
+            (_DWMWA_WINDOW_CORNER_PREFERENCE, _DWMWCP_DONOTROUND,
+             _DWMWCP_DEFAULT),
+            (_DWMWA_BORDER_COLOR, _DWMWA_COLOR_NONE, _DWMWA_COLOR_DEFAULT)):
+        v = ctypes.c_uint(on if square else off)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            wintypes.HWND(hwnd), attr, ctypes.byref(v), ctypes.sizeof(v))
+
+
 class _Overlay(QFrame):
     def __init__(self, parent, vertical: bool):
         super().__init__(parent)
@@ -215,6 +246,7 @@ class FullscreenController(QObject):
         self._top_dwell = self._left_dwell = 0
         if self._was_maximized:
             self._restore_rect = _hold_restore_rect(w)
+        _square_edges(w, True)
         w.showFullScreen()
         self._timer.start()
         w.top_bar.set_fullscreen(True)
@@ -241,6 +273,8 @@ class FullscreenController(QObject):
         if self._restore_rect is not None:
             _put_restore_rect(w, self._restore_rect)
             self._restore_rect = None
+        # after the state change, so DWM picks the edges for the new state
+        _square_edges(w, False)
         self.top.layout().removeWidget(w.top_bar)
         w._root_layout.insertWidget(0, w.top_bar)
         w.top_bar.set_identity_visible(True)

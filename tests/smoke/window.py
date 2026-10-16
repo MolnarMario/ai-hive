@@ -3508,6 +3508,74 @@ def test_fullscreen_from_maximized_skips_restore_size():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_fullscreen_squares_window_edges():
+    """Windows 11 drew a 1px border and rounded corners on the fullscreen
+    window, and after F11 again on the maximized one too, so the wallpaper
+    showed around it. Entering fullscreen squares the edges and leaving it
+    by any path, from maximized or normal, hands them back to Windows
+    after the window has its state again."""
+    from PySide6.QtCore import QEventLoop, Qt, QTimer
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from app.session_store import SessionStore
+    from app.widgets import fullscreen
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    calls = []
+    real = fullscreen._square_edges
+    fullscreen._square_edges = (
+        lambda w, square: calls.append((square, w.windowState())))
+    full = Qt.WindowState.WindowFullScreen
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-fullscreen-edges-"))
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        win.showMaximized()
+        pump(100)
+        fs = win._fullscreen
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen-edges: F11 squares the edges",
+              fs.active and [c[0] for c in calls] == [True], calls)
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen-edges: F11 again hands them back once maximized",
+              not fs.active and [c[0] for c in calls] == [True, False]
+              and not calls[-1][1] & full
+              and calls[-1][1] & Qt.WindowState.WindowMaximized, calls)
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        win.showNormal()
+        pump(50)
+        check("fullscreen-edges: leaving another way hands them back too",
+              not fs.active and [c[0] for c in calls[2:]] == [True, False],
+              calls)
+        del calls[:]
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        QTest.keyClick(win, Qt.Key.Key_F11)
+        pump(50)
+        check("fullscreen-edges: a normal window gets them back as normal",
+              [c[0] for c in calls] == [True, False]
+              and not calls[-1][1] & full, calls)
+        fullscreen._square_edges = real
+        real(win, True)
+        real(win, False)
+        check("fullscreen-edges: no DWM call off the Windows platform",
+              fullscreen._hwnd(win) == 0, app.platformName())
+        win.close()
+        pump(100)
+    finally:
+        fullscreen._square_edges = real
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_new_agent_full_terminal_box_hidden_for_ai():
     """The 'Full terminal' box is a forced, disabled tick for AI agents, so
     the dialog hides its row for them and shows it for shells and scripts."""
