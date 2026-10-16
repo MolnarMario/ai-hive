@@ -1314,6 +1314,10 @@ class TerminalView(QWidget):
             if ctrl and not shift and not alt \
                     and key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
                 return super().event(e)
+            # Ctrl+Tab / Ctrl+Shift+Tab move to the next / previous agent
+            if ctrl and not alt \
+                    and key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+                return super().event(e)
             if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab) \
                     or (ctrl and not shift) or (alt and not shift) \
                     or (shift and nav) \
