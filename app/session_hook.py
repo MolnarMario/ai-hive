@@ -721,6 +721,13 @@ def _dispatch(mapping_path, events_path, payload: dict) -> str:
             for key in ("tool_use_id", "transcript_path"):
                 if isinstance(payload.get(key), str) and payload[key]:
                     extra[key] = payload[key]
+            # where the transcript ended as the call ran: the search starts
+            # there, so records Claude appends later can't push the call out
+            try:
+                extra["transcript_size"] = os.path.getsize(
+                    extra["transcript_path"])
+            except (KeyError, OSError):
+                pass
             _append_event(events_path, EV_TOOL_SET, extra)
     elif event == "PostToolUse":
         if payload.get("tool_name") in _WAITING_TOOL_SET:

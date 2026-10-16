@@ -126,9 +126,10 @@ class WorkspaceManager(QObject):
         self.prompt_events_path = ""
         self._prompt_offset = 0
         # tool prompts whose call the transcript has not shown yet: agent id
-        # -> (tool_use_id, transcript_path, give-up time). See
-        # _confirm_tool_prompts.
-        self._unconfirmed_tools: dict[str, tuple[str, str, float]] = {}
+        # -> (tool_use_id, transcript_path, transcript size at the hook or
+        # None, give-up time). See _confirm_tool_prompts.
+        self._unconfirmed_tools: dict[
+            str, tuple[str, str, int | None, float]] = {}
         # laned agents whose lane folder was missing at load: (ws_id, agent_id).
         # Their cwd is NOT moved to the workspace folder; MainWindow repairs
         # the lane at the same path (take_lane_repairs) and they wait for it.
@@ -661,8 +662,11 @@ class WorkspaceManager(QObject):
                 path = rec.get("transcript_path")
                 if (isinstance(tool_id, str) and tool_id
                         and isinstance(path, str) and path):
+                    anchor = rec.get("transcript_size")
+                    if not isinstance(anchor, int) or anchor < 0:
+                        anchor = None
                     self._unconfirmed_tools[ident] = (
-                        tool_id, path, time.time() + TOOL_CONFIRM_S)
+                        tool_id, path, anchor, time.time() + TOOL_CONFIRM_S)
                 else:       # a hook from before tool ids were recorded
                     agent.set_tool_waiting(True)
             elif kind == session_hook.EV_TOOL_CLEAR:
@@ -698,13 +702,13 @@ class WorkspaceManager(QObject):
         and audited. An unreadable transcript lights the "?": a missed
         question costs the user more than a stray badge."""
         now = time.time()
-        for ident, (tool_id, path, give_up) in list(
+        for ident, (tool_id, path, anchor, give_up) in list(
                 self._unconfirmed_tools.items()):
             agent = self.resolve_agent(ident)
             if agent is None:
                 del self._unconfirmed_tools[ident]
                 continue
-            seen = transcripts.has_tool_use(path, tool_id)
+            seen = transcripts.has_tool_use(path, tool_id, anchor)
             if seen is not False:           # True, or None = unreadable
                 del self._unconfirmed_tools[ident]
                 agent.set_tool_waiting(True)

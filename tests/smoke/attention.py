@@ -1191,6 +1191,19 @@ def test_tool_prompt_needs_transcript_call():
     check("phantom: PostToolUse still clears a confirmed prompt",
           not agent.is_waiting())
 
+    # records past the search window appended after the call (one real
+    # record measured 1.19 MB) must not push the call out of range
+    write_call("toolu_big")
+    pre_tool("toolu_big")
+    with open(transcript, "a", encoding="utf-8") as fh:
+        fh.write('{"type":"api-request","pad":"'
+                 + "x" * (transcripts._TOOL_USE_TAIL_BYTES + 1024) + '"}\n')
+    mgr.sync_prompt_events()
+    check("phantom: a call followed by a huge record still confirms",
+          agent.is_waiting())
+    hook({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion"})
+    mgr.sync_prompt_events()
+
     # answered before the poll confirmed it: the clear cancels it
     pre_tool("toolu_quick")
     hook({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion"})
