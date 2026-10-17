@@ -665,6 +665,43 @@ def test_usage_add_glyph_matches_sidebar():
     host.deleteLater()
 
 
+def test_usage_add_plus_is_centred():
+    """The picker's + drew as the font glyph, which sat right of and below
+    the middle of its square. PlusButton paints the cross itself; the ink
+    must have the same margin on all four sides."""
+    from PySide6.QtGui import QColor
+    from PySide6.QtWidgets import QApplication, QWidget
+    from app import ui_theme
+    from app.ui_theme import Palette
+    from app.widgets.header_icons import PlusButton
+    from app.widgets.main_window import TopBar
+
+    QApplication.instance() or QApplication([])
+    host = QWidget()
+    host.setStyleSheet(ui_theme.build_qss())
+    btn = PlusButton(host)
+    btn.setObjectName("UsageTrackerAdd")
+    side = TopBar.USAGE_ADD_BTN_SIDE
+    btn.setFixedSize(side, side)
+    img = btn.grab().toImage()
+    ink = QColor(Palette.TEXT_DIM).rgb()
+    xs, ys = [], []
+    # skip the 1px border, which may share the ink's colour in some themes
+    for y in range(2, side - 2):
+        for x in range(2, side - 2):
+            if img.pixel(x, y) == ink:
+                xs.append(x)
+                ys.append(y)
+    check("usage-add: the + is painted", bool(xs))
+    if xs:
+        left, right = min(xs), side - 1 - max(xs)
+        top, bottom = min(ys), side - 1 - max(ys)
+        check("usage-add: the + is centred both ways",
+              left == right and top == bottom,
+              (left, right, top, bottom))
+    host.deleteLater()
+
+
 def test_gemini_usage_read_disables_agy_auto_update():
     """The terminal window that flashed over the desktop during a Gemini poll
     was agy's OWN auto-updater, not any console AI Hive creates.

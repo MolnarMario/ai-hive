@@ -13,7 +13,7 @@ lays out its own icon and text (`LaneChip`).
 from functools import lru_cache
 
 from PySide6.QtCore import QByteArray, QRect, QRectF, QSize, Qt
-from PySide6.QtGui import QPainter, QPalette
+from PySide6.QtGui import QColor, QPainter, QPalette
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QLabel, QStyle, QStyleOptionToolButton,
                                QStylePainter, QToolButton)
@@ -110,8 +110,9 @@ class SidebarToggleButton(QToolButton):
     restore and Ctrl+Shift+B all move it. Dim ink, full ink on hover, like
     the bar's other glyph buttons."""
 
-    ICON_SIZE = 18
-    SIZE = (32, 28)
+    # 18px read as a smudge at a glance; 22px shows the panel and chevron
+    ICON_SIZE = 22
+    SIZE = (34, 32)
     TIP_COLLAPSE = "Collapse sidebar (Ctrl+Shift+B)"
     TIP_EXPAND = "Expand sidebar (Ctrl+Shift+B)"
 
@@ -139,6 +140,34 @@ class SidebarToggleButton(QToolButton):
         ink = Palette.TEXT if self.underMouse() else Palette.TEXT_DIM
         _paint(self, self.icon_name(), ink,
                (self.width() - self.ICON_SIZE) / 2, self.ICON_SIZE)
+
+
+class PlusButton(QToolButton):
+    """The usage pill picker's "+". The stylesheet draws the frame and the
+    button paints the cross itself as two filled bars: the font's "+" sits
+    off centre (its side bearings and baseline put it a pixel or two right
+    and low), and which way depends on the font. Integer bars of even
+    thickness in an even-sided button land on whole pixels, so both arms
+    are crisp and the cross is centred both ways. Dim ink, full ink on
+    hover, the colours `#UsageTrackerAdd` gives its text."""
+
+    ARM = 10    # px, the length of each bar
+    THICK = 2   # px
+
+    def paintEvent(self, event):
+        opt = QStyleOptionToolButton()
+        self.initStyleOption(opt)
+        opt.text = ""
+        p = QStylePainter(self)
+        p.drawComplexControl(QStyle.ComplexControl.CC_ToolButton, opt)
+        ink = Palette.TEXT if self.underMouse() else Palette.TEXT_DIM
+        x = (self.width() - self.ARM) // 2
+        y = (self.height() - self.ARM) // 2
+        mid_x = (self.width() - self.THICK) // 2
+        mid_y = (self.height() - self.THICK) // 2
+        p.fillRect(QRect(x, mid_y, self.ARM, self.THICK), QColor(ink))
+        p.fillRect(QRect(mid_x, y, self.THICK, self.ARM), QColor(ink))
+        p.end()
 
 
 class LaneChip(QToolButton):

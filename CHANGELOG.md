@@ -8,6 +8,13 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.44.2
+
+- The + that picks which usage pills to show sits in the middle of its
+  square. It used to sit low and to one side.
+- The sidebar collapse and expand button in the top bar is bigger, so
+  its panel and arrow are easier to make out.
+
 ## 0.44.1
 
 - The usage pills say "checking..." at launch instead of "unreadable"

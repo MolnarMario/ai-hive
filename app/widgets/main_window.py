@@ -63,7 +63,7 @@ from . import ornaments
 from .ornaments import (DropDownComboBox, LogoRoundel,
                         PageBorder, PlanUsageBadge, RefreshGlyphButton,
                         ToggleSwitch, close_on_anchor_press)
-from .header_icons import SidebarToggleButton
+from .header_icons import PlusButton, SidebarToggleButton
 from .options_panel import OptionsPanel
 from .sidebar import SIDEBAR_WIDTH, Sidebar, WorkspaceRail
 
@@ -741,7 +741,7 @@ class TopBar(QFrame):
         # not by a missing reading, not by every tracker being off, and (unlike
         # the two recovery switches) not by `set_recovery_available` either - a
         # machine with no Claude login still has Gemini pills to manage.
-        self.usage_add_btn = QToolButton(self)
+        self.usage_add_btn = PlusButton(self)
         self.usage_add_btn.setObjectName("UsageTrackerAdd")
         self.usage_add_btn.setText("+")
         self.usage_add_btn.setToolTip("Choose which usage readouts to show")
