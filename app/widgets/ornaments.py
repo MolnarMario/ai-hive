@@ -751,7 +751,8 @@ class UsagePillBadge(QWidget):
         self._unreadable = ""       # last error, when we have NO reading at all
         self._loading = False       # a fetch is in flight and we have nothing yet
         # the error of the last failed try, while the poller is still retrying
-        # at startup: the pill stays in the loading state and says "retrying"
+        # at startup: the pill keeps its "checking..." line and only the
+        # tooltip names the error
         self._load_error = ""
         self._hovering = False      # paint the X's scrim over the text tail
         # (text, width) a repair has already been tried for, so a pill that
@@ -801,10 +802,11 @@ class UsagePillBadge(QWidget):
 
     def mark_retrying(self, error: str = "") -> None:
         """The first reads of this run failed and the poller is trying again
-        on its fast startup schedule: stay in the loading state, but say it is
-        retrying and keep the error for the tooltip. The can't-read pill is for
-        a source that kept failing past the startup window, not for the first
-        hiccup of a launch."""
+        on its fast startup schedule. The line stays "checking...", the same
+        as the first fetch: a launch that has not read its number yet is not
+        an error, and saying "retrying" on the bar made it look like one. The
+        error goes in the tooltip. The can't-read pill is for a source that
+        kept failing past the startup window."""
         self._loading = True
         self._load_error = str(error) or "unknown"
         self._unreadable = ""
@@ -925,8 +927,6 @@ class UsagePillBadge(QWidget):
     def _refresh_text(self) -> None:
         if self._loading:
             text = self._loading_text()
-            if self._load_error:
-                text = text.removesuffix("reading...") + "retrying..."
         elif self._limit is not None:
             text = self._format_limit()
         elif self._unreadable:
@@ -1032,7 +1032,7 @@ class UsagePillBadge(QWidget):
 
     # -- subclass hooks --------------------------------------------------
     def _loading_text(self) -> str:
-        return "usage, reading..."
+        return "usage, checking..."
 
     def _pick_limit(self, usage):
         """Which of the reading's windows this pill shows."""
@@ -1263,7 +1263,7 @@ class PlanUsageBadge(UsagePillBadge):
     NO on-disk seed at all, by design (see `start_usage_polling`): a stored
     number goes stale exactly where it matters most, so the pill opens in the
     LOADING state instead and only ever shows a figure fetched this run. A
-    failed first read keeps it loading ("retrying...", `mark_retrying`) while
+    failed first read keeps it loading ("checking...", `mark_retrying`) while
     the poller retries fast; the error pill is for a read that kept failing
     past the startup window, and keeps the click-to-refresh affordance, which
     is the one useful thing a user can do about it.
@@ -1295,8 +1295,8 @@ class PlanUsageBadge(UsagePillBadge):
         # grows when the reading lands (a long loading string makes it snap
         # narrower, which reads as a glitch), and it names its own tracker so
         # four grey pills side by side are still tellable apart
-        return ("Claude 7d usage, reading..." if self.window == "weekly"
-                else "Claude 5h usage, reading...")
+        return ("Claude 7d usage, checking..." if self.window == "weekly"
+                else "Claude 5h usage, checking...")
 
     def _format_limit(self) -> str:
         from .. import claude_usage
@@ -1314,8 +1314,18 @@ class PlanUsageBadge(UsagePillBadge):
         from .. import claude_usage
         import time as _time
 
+        if self._loading and self._load_error == "expired":
+            return ("Reading the Claude plan usage...\n"
+                    "The Claude login has expired. The first Claude agent "
+                    "that talks to the API renews it, and the number shows "
+                    "up within seconds of that.")
         if self._loading:
             return self._loading_tip("Reading the Claude plan usage...")
+        if self._limit is None and self._unreadable == "expired":
+            return ("Claude plan usage could not be read.\n"
+                    "The Claude login has expired. Starting any Claude agent "
+                    "renews it, and this picks it up within seconds.\n"
+                    "Click to try again now.")
         if self._limit is None and self._unreadable:
             return ("Claude plan usage could not be read.\n"
                     f"Last attempt failed: {self._unreadable}\n"

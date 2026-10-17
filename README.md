@@ -118,7 +118,9 @@ workspaces keep executing — switching never pauses anything.
   card header once that's been true for a few seconds, so you don't close AI
   Hive thinking nothing is happening. Programs a CLI runs for itself don't
   count: Codex's app-server daemon, its MCP servers and console hosts never
-  light the gear, and its kill menu never offers them. It shares the
+  light the gear, and its kill menu never offers them. Neither does AI
+  Hive's own `log_activity` bridge, which Claude starts up to half a minute
+  after launch (a python running `-m app.mcp_server`). It shares the
   taskbar's one overlay square too: when nothing is busy or asking but a
   shell is still running, the disc turns **violet** with the count, instead
   of showing nothing at all.
@@ -183,7 +185,7 @@ workspaces keep executing — switching never pauses anything.
   while no Gemini agent is working; while one is, it runs every 90 seconds
   like the others, so the flash can show up more often then.
   **Nothing is remembered between runs except the choice itself.** Every pill
-  opens saying `reading...` and fills in from a fresh fetch at startup, because
+  opens saying `checking...` and fills in from a fresh fetch at startup, because
   a stored number goes stale exactly where it matters most — a 5-hour window is
   routinely spent and reopened between one launch and the next, and a restored
   figure looks identical to a live one.
@@ -893,7 +895,9 @@ Hard-won rules, each with a regression test:
   selection so the next `Ctrl+C` interrupts; `Ctrl+Shift+A` selects all painted
   text (screen + scrollback); `Ctrl+V` / `Ctrl+Shift+V` paste (bracketed-paste
   aware for multi-line); `Ctrl+Shift+C` also copies; and a right-click
-  Copy/Paste/Select-all menu. **Mouse**: a plain left-click **places the input
+  Copy/Paste/Select-all menu. The Win+V clipboard and Win+. emoji panels
+  open at the cursor and take the arrow keys, Enter and Esc while open; a
+  CJK IME composition is drawn at the cursor until you commit it. **Mouse**: a plain left-click **places the input
   caret** where you clicked (AI Hive sends the child the right run of
   arrow keys — exact on the caret's own line, and best-effort on another line of
   a multi-line prompt (Up/Down to the row, then Left/Right to the predicted
@@ -972,7 +976,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3469 checks drive the real app headlessly (offscreen Qt platform) with real
+3512 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1119,7 +1123,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3469 checks)
+                           (3512 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

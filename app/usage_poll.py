@@ -41,13 +41,20 @@ WHAT KEEPS IT FROM GETTING THERE:
   shows its new number within seconds.
 
 STARTUP. Until a poller has read one number this run, a failed poll is not a
-broken readout, it is a launch that has not finished. The pills stay in their
-loading state, reworded "retrying...", and the poller retries on
+broken readout, it is a launch that has not finished. The pills keep their
+"checking..." line, the tooltip names the error, and the poller retries on
 `STARTUP_RETRY_MS` (3 s, 5 s, 10 s, 15 s, then every 30 s; a 429 waits 30 s and
-doubles up to 4 minutes). Only a login that `expired` goes straight to the
-can't-read pill, because no retry fixes it. After `STARTUP_PATIENCE_S` (3
-minutes) of failures the pills say they cannot read and the ordinary policy
-above takes over.
+doubles up to 4 minutes). After `STARTUP_PATIENCE_S` (3 minutes) of failures
+the pills say they cannot read and the ordinary policy above takes over.
+
+AN EXPIRED LOGIN is the usual state at launch: the Claude token lasts about 8
+hours, so it has run out after any longer break, and the first Claude agent
+that talks to the API rewrites `.credentials.json` with a fresh one (measured
+45 s after a launch). Claude's fetch spots the expiry locally and sends no
+request (`LOCAL_ERRORS`), so the poller re-reads the file every
+`LOCAL_RECHECK_MS` (2 s) and the number lands seconds after the renewal. It
+used to go straight to the can't-read pill and then wait a full cadence, up to
+6 minutes, before it looked again.
 
 The fetch runs on a daemon thread and hands its reading back through a queued
 signal. Nothing here touches the network on construction: `start()` is opt-in,
@@ -78,7 +85,7 @@ ACTIVE_GRACE_S = 180.0
 RETRY_MS = 10_000
 
 # Until a poller has read a number once this run, it retries fast and its pills
-# stay in the loading state ("retrying...") instead of turning into the
+# stay in the loading state ("checking...") instead of turning into the
 # can't-read pill: a launch that hits one timeout or 429 is not a broken
 # readout. Delays by attempt (the last one repeats), 429 backing off from 30 s
 # up to 4 minutes instead (hammering a rate limiter keeps it limited). After
@@ -106,9 +113,15 @@ RESET_GRACE_MS = 8_000
 # QTimer takes a 32-bit interval; farther resets are the ordinary poll's job
 RESET_HORIZON_MS = 6 * 3600 * 1000
 
-# errors a quick retry cannot fix. A 429 has its own backoff; a missing or
-# expired login waits for the CLI to fix it, which a retry 10 s later won't see.
-NO_RETRY_ERRORS = frozenset({"http 429", "no-auth", "expired"})
+# errors a quick retry cannot fix. A 429 has its own backoff; a missing login
+# waits for the CLI to fix it, which a retry 10 s later won't see. (An expired
+# one is re-checked on LOCAL_RECHECK_MS instead, see LOCAL_ERRORS.)
+NO_RETRY_ERRORS = frozenset({"http 429", "no-auth"})
+# errors a fetch reports without sending any request, so re-checking them often
+# costs a file read and can never feed a rate limiter. Claude's "expired" is
+# the `expiresAt` in .credentials.json, which any running Claude agent renews.
+LOCAL_ERRORS = frozenset({"expired"})
+LOCAL_RECHECK_MS = 2_000
 # no login at all and nothing ever read: this readout has nothing to show this
 # run, so its pills are cleared and the poll stops
 ABSENT_ERRORS = frozenset({"no-auth"})
@@ -330,9 +343,15 @@ class UsagePoller(QObject):
         if not self._fail.error:
             self._fail = _FailState(error=error, at=now)
         self._fail.error = error
-        self._fail.attempts += 1
-        startup = self._in_startup(error, now)
-        if startup:
+        if error not in LOCAL_ERRORS:
+            # local re-checks are not network attempts, so a minute of them
+            # must not push the first real retry out to the 30 s step
+            self._fail.attempts += 1
+        startup = self._in_startup(now)
+        if error in LOCAL_ERRORS:
+            delay = LOCAL_RECHECK_MS
+            self._schedule(delay, special=True)
+        elif startup:
             delay = self._startup_delay_ms(error)
             self._schedule(delay, special=True)
         elif error not in NO_RETRY_ERRORS and not self._fail.retried:
@@ -353,11 +372,10 @@ class UsagePoller(QObject):
                 pill.mark_unreadable(error)
         self.failed.emit(reading)
 
-    def _in_startup(self, error: str, now: float) -> bool:
+    def _in_startup(self, now: float) -> bool:
         """True while nothing has been read this run and the failures are
-        young enough to keep retrying fast. An expired login is not a hiccup:
-        only the CLI can fix it, so it goes straight to the can't-read pill."""
-        return (self._reading is None and error != "expired"
+        young enough to keep the pills on "checking..."."""
+        return (self._reading is None
                 and now - self._fail.at < STARTUP_PATIENCE_S)
 
     def _startup_delay_ms(self, error: str) -> int:

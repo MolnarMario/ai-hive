@@ -44,8 +44,8 @@ class GeminiUsageBadge(UsagePillBadge):
 
     # -- wording ---------------------------------------------------------
     def _loading_text(self) -> str:
-        return ("Gemini 7d usage, reading..." if self.window == "weekly"
-                else "Gemini 5h usage, reading...")
+        return ("Gemini 7d usage, checking..." if self.window == "weekly"
+                else "Gemini 5h usage, checking...")
 
     def _format_limit(self) -> str:
         return gemini_usage.format_limit(self._limit, with_label=self._label,

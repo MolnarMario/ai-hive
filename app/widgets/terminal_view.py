@@ -42,6 +42,15 @@ anchored at Claude's '>' prompt row so it never climbs into the transcript;
 lacking the child's real buffer it's still inference from painted rows, so it
 falls back to the cursor row when no prompt glyph is found. (Home still jumps
 to line start via 0x1b[H.)
+The view keeps Qt's input method enabled even though it has no text buffer.
+Windows feeds the Win+V clipboard and Win+. emoji panels their keys through
+the input context, so without it Up/Down/Enter/Esc went to the child while a
+panel sat open. A Win+V pick then arrives as Ctrl+V; emoji and finished IME
+compositions arrive as committed text (inputMethodEvent). That also turns on
+a CJK IME in every terminal, so the view draws the composition at the cursor
+itself (the child sees nothing until it's committed), and tells Qt after a
+repaint that moved the cursor, or panels open where the cursor was at
+focus-in.
 Ctrl+Z/Ctrl+Y (and Ctrl+Shift+Z) are an APPROXIMATE local undo/redo. A terminal
 keeps no local edit buffer, so this can't be a real per-keystroke history; it is
 a coarse "restore previous input" built from snapshots of the INFERRED input
@@ -130,7 +139,7 @@ import re
 import time
 
 import pyte
-from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
                            QPainter)
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
@@ -525,6 +534,11 @@ class TerminalView(QWidget):
         self.setObjectName("TerminalView")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        # Windows routes keys to its Win+V clipboard and Win+. emoji panels
+        # through the window's input context. Without this attribute Qt
+        # detaches that context while we have focus, so Up/Down/Enter/Esc
+        # reached the child instead and the open panel couldn't be driven.
+        self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
         self.setCursor(Qt.CursorShape.IBeamCursor)
         self.setMouseTracking(True)  # hover (no button) to highlight links
 
@@ -533,6 +547,8 @@ class TerminalView(QWidget):
         self._base_dir = ""
         self._esc_carry = ""  # trailing partial escape between feed() calls
         self._scroll_offset = 0  # lines scrolled back into history (0 = live)
+        self._preedit = ""  # IME composition in progress, drawn at the cursor
+        self._im_rect = None  # cursor rectangle Qt last heard about
         # footer row _check_input_gap last asked for a repaint at, so a
         # persistent (legitimately short) gap is checked once and left alone
         # rather than re-triggering a repaint on every settle
@@ -1287,7 +1303,51 @@ class TerminalView(QWidget):
     def focusOutEvent(self, event) -> None:
         if self._focus_reporting:
             self.keyInput.emit("\x1b[O")
+        self._preedit = ""
+        self._im_rect = None
         super().focusOutEvent(event)
+
+    def inputMethodQuery(self, query):
+        # The panels and IME candidate windows open next to this rectangle.
+        # The view keeps the live screen's cursor `off` rows lower while
+        # scrolled back, clamped so the popup stays over the card.
+        if query == Qt.InputMethodQuery.ImCursorRectangle:
+            cur = self.screen.cursor
+            col = max(0, min(self.screen.columns - 1, cur.x))
+            row = max(0, min(self.screen.lines - 1,
+                             cur.y + self._scroll_offset))
+            x0, y0, x1, y1 = self.cell_bounds(col, row)
+            return QRect(x0, y0, x1 - x0, y1 - y0)
+        if query == Qt.InputMethodQuery.ImEnabled:
+            return True
+        if query == Qt.InputMethodQuery.ImHints:
+            return (Qt.InputMethodHint.ImhNoPredictiveText
+                    | Qt.InputMethodHint.ImhNoAutoUppercase)
+        return super().inputMethodQuery(query)
+
+    def inputMethodEvent(self, event) -> None:
+        # Committed text (an emoji from Win+., a finished IME composition)
+        # is typed input. A Win+V pick never comes here: the panel sends
+        # Ctrl+V, which keyPressEvent already pastes. The preedit string is
+        # only drawn (paintEvent), the child sees the text once it's
+        # committed. A commit with a line break goes as a paste, or its
+        # newline would reach Claude as Enter.
+        text = event.commitString()
+        if text:
+            if self._input_selected:
+                self._clear_input_selection(send=True)  # replace, as typing does
+            if "\r" in text or "\n" in text:
+                self._paste_text(
+                    text.replace("\r\n", "\r").replace("\n", "\r"))
+            else:
+                self._snap_to_bottom()
+                self.keyInput.emit(text)
+                self._kick_snapshot(None, text)
+        preedit = event.preeditString()
+        if preedit != self._preedit:
+            self._preedit = preedit
+            self.update()
+        event.accept()
 
     def event(self, e):
         # When this terminal is focused it must win any key an app-level
@@ -2815,8 +2875,34 @@ class TerminalView(QWidget):
                 painter.setPen(QColor(Palette.ACCENT_ORANGE))
                 painter.drawRect(int(cx), int(cy), max(1, int(cw) - 1), int(ch) - 1)
 
+        # an IME composition sits over the cursor, underlined, until it is
+        # committed; the child has seen none of it yet
+        if self._preedit and self.hasFocus():
+            prow = cursor.y + off
+            if 0 <= prow < self.screen.lines:
+                px = int(CELL_PAD_X + cursor.x * cw)
+                py = int(CELL_PAD_Y + prow * ch)
+                pfont = QFont(self._font)
+                pfont.setUnderline(True)
+                pw = int(QFontMetricsF(pfont).horizontalAdvance(self._preedit))
+                painter.fillRect(px, py, max(1, pw), int(ch),
+                                 QColor(Palette.BG_CONSOLE))
+                painter.setFont(pfont)
+                painter.setPen(legible_color(QColor(Palette.CONSOLE_FG),
+                                             QColor(Palette.BG_CONSOLE)))
+                painter.drawText(px, int(py + self._ascent), self._preedit)
+
         # (the old "up-arrow N" scrolled-back badge lived here, at
         # width() - tw - 20 -- exactly where TerminalScrollBar now sits. The
         # thumb says the same thing continuously and in the right place, so the
         # badge would only be a second, worse readout fighting it for pixels.)
         painter.end()
+
+        # Qt reads the cursor rectangle at focus-in and keeps it, so tell it
+        # whenever a repaint moved the cursor (new output, scrolling).
+        if self.hasFocus():
+            rect = self.inputMethodQuery(Qt.InputMethodQuery.ImCursorRectangle)
+            if rect != self._im_rect:
+                self._im_rect = rect
+                QGuiApplication.inputMethod().update(
+                    Qt.InputMethodQuery.ImCursorRectangle)
