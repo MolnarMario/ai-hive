@@ -526,6 +526,42 @@ def test_terminal_keys():
           sent == ["\x03"], sent)
 
 
+def test_terminal_input_method():
+    """Win+V and Win+. panels read keys through the input context, which Qt
+    detaches from a focused widget that has no input method. The terminal
+    must keep it, place the panel at its cursor and type committed text."""
+    from PySide6.QtCore import QRect, Qt
+    from PySide6.QtGui import QInputMethodEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    view = TerminalView(rows=6, cols=40)
+    sent = []
+    view.keyInput.connect(sent.append)
+
+    check("ime: terminal enables the input method",
+          view.testAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled))
+    check("ime: query reports enabled",
+          view.inputMethodQuery(Qt.InputMethodQuery.ImEnabled) is True)
+
+    view.feed("one\r\ntwo> ab")
+    x0, y0, x1, y1 = view.cell_bounds(view.screen.cursor.x,
+                                      view.screen.cursor.y)
+    got = view.inputMethodQuery(Qt.InputMethodQuery.ImCursorRectangle)
+    check("ime: popup anchors at the cursor cell",
+          got == QRect(x0, y0, x1 - x0, y1 - y0), f"got {got}")
+
+    view.inputMethodEvent(QInputMethodEvent("に", []))  # preedit only
+    check("ime: preedit sends nothing", sent == [], f"sent {sent!r}")
+    ev = QInputMethodEvent()
+    ev.setCommitString("\U0001F600")
+    view.inputMethodEvent(ev)
+    check("ime: committed text is typed", sent == ["\U0001F600"],
+          f"sent {sent!r}")
+
+
 def test_terminal_image_paste():
     """A clipboard image is spilled to a temp PNG and its path is pasted.
 
