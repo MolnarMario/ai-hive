@@ -8,6 +8,20 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.44.1
+
+- The usage pills say "checking..." at launch instead of "unreadable"
+  when the Claude login expired during a long break. AI Hive checks again
+  every 2 seconds and fills the pill in as soon as the first Claude agent
+  renews the login, instead of waiting up to 6 minutes.
+- The gear on an agent card no longer lights up from launch on for nearly
+  every agent. It counted AI Hive's own activity log helper, which Claude
+  starts a little later, as a background process.
+- With a terminal focused, the Win+V clipboard panel and the Win+. emoji
+  panel now take the arrow keys, Enter and Esc. Before, those keys went to
+  the agent and the panel couldn't be driven or closed from the keyboard.
+  An emoji picked in the panel is typed into the agent.
+
 ## 0.44.0
 
 - Ctrl+Tab moves to the next agent in the workspace, left to right along
