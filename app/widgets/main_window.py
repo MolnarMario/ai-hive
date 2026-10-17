@@ -6717,7 +6717,11 @@ class MainWindow(QMainWindow):
             return
         lit = bool(getattr(ui_theme.ACTIVE_THEME, "ornament", ""))
         m = (PageBorder.INSET + PageBorder.THICK + 6) if lit else 0
-        self._root_layout.setContentsMargins(m, m, m, m)
+        # The top bar sits flush under the top strip. With the 6px gap there
+        # too, the gap read as part of the header and its contents sat 3px
+        # below the middle of what looked like the header band.
+        top = (PageBorder.INSET + PageBorder.THICK) if lit else 0
+        self._root_layout.setContentsMargins(m, top, m, m)
         self._page_border.setGeometry(self._central.rect())
         self._page_border.setVisible(lit)
         self._page_border.raise_()

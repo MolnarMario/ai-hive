@@ -1763,6 +1763,15 @@ def test_themes():
     check("themes: manuscript shows the illuminated border",
           not win._page_border.isHidden()
           and win._root_layout.contentsMargins().top() > 0)
+    # The top bar sits flush under the border's top strip. A gap there read
+    # as part of the header band and the bar's contents looked low in it.
+    from app.widgets.ornaments import PageBorder as _PB
+    for tid in ("illuminated-manuscript", "adeptus-mechanicus"):
+        win._change_theme(tid)
+        mg = win._root_layout.contentsMargins()
+        check(f"themes: {tid} top bar flush under the top strip",
+              mg.top() == _PB.INSET + _PB.THICK and mg.left() > mg.top(),
+              f"margins top={mg.top()} left={mg.left()}")
     win._change_theme("obsidian")
     check("themes: live switch updates palette + dropdown",
           ui_theme.Palette.BG_ROOT == "#0f1117"
