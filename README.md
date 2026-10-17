@@ -183,7 +183,7 @@ workspaces keep executing — switching never pauses anything.
   while no Gemini agent is working; while one is, it runs every 90 seconds
   like the others, so the flash can show up more often then.
   **Nothing is remembered between runs except the choice itself.** Every pill
-  opens saying `reading...` and fills in from a fresh fetch at startup, because
+  opens saying `checking...` and fills in from a fresh fetch at startup, because
   a stored number goes stale exactly where it matters most — a 5-hour window is
   routinely spent and reopened between one launch and the next, and a restored
   figure looks identical to a live one.

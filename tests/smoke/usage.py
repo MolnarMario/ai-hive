@@ -416,6 +416,21 @@ def test_plan_usage():
     p4 = win4.usage_poller("claude")
     p4._running = True                  # as start() leaves it, minus the fetch
     b4 = win4.top_bar.usage_badge
+    b4.mark_loading()                   # as start_usage_polling leaves it
+    win4._on_usage_ready(cu.Usage(error="expired"))
+    app.processEvents()
+    # the usual launch after a long break: the token ran out and the first
+    # Claude agent renews it seconds later. Reported live as an error pill
+    # at startup that then sat there for minutes.
+    check("plan-usage: an expired login at launch keeps the pill checking",
+          b4.isVisible() and b4._loading and "unreadable" not in b4._text
+          and b4._text == "Claude 5h usage, checking...", b4._text)
+    check("plan-usage: ...and its tooltip says an agent renews the login",
+          "expired" in b4.toolTip() and "renews" in b4.toolTip(), b4.toolTip())
+    check("plan-usage: an expired login is re-read in 2 s, not a cadence",
+          p4.is_running() and 0 < p4.next_poll_at() - time.time()
+          <= up.LOCAL_RECHECK_MS / 1000 + 1)
+    p4._fail.at -= up.STARTUP_PATIENCE_S    # no agent renewed it for 3 minutes
     win4._on_usage_ready(cu.Usage(error="expired"))
     app.processEvents()
     check("plan-usage: a failure with no reading shows the can't-read pill",
@@ -575,7 +590,7 @@ def test_usage_trackers_preference():
     app.processEvents()
     check("usage-trackers: re-checking restores the pill, showing loading",
           bar.usage_badge.isVisible() and bar.usage_badge.has_content()
-          and "reading" in bar.usage_badge._text)
+          and "checking" in bar.usage_badge._text)
     check("usage-trackers: its sibling stays closed, closing one leaves the "
           "other alone",
           not bar.usage_weekly_badge.isVisible())
@@ -1002,10 +1017,34 @@ def test_usage_poll_policy():
     check("usage-poll: no-auth with no reading clears the pill and stops",
           not fresh.is_running() and not fresh_pill.has_content() and gone == [1])
     other, other_pill = make()
+    other_pill.mark_loading()
     other.deliver(xu.CodexUsage(error="expired"))
-    check("usage-poll: an expired login with no reading shows the can't-read pill",
+    ogap = lambda: round(other.next_poll_at() - clock[0])
+    check("usage-poll: an expired login at startup keeps the pill checking",
+          other_pill._loading and "unreadable" not in other_pill._text
+          and other.is_running(), other_pill._text)
+    check("usage-poll: an expired login is re-read every 2 s (no request)",
+          ogap() == up.LOCAL_RECHECK_MS // 1000, ogap())
+    for _ in range(10):
+        clock[0] += 2
+        other.deliver(xu.CodexUsage(error="expired"))
+    other.tick()
+    check("usage-poll: the retune leaves the 2 s re-read alone",
+          ogap() == up.LOCAL_RECHECK_MS // 1000, ogap())
+    clock[0] += 2
+    other.deliver(xu.CodexUsage(error="urlerror"))
+    check("usage-poll: re-reads are not network attempts (first retry is 3 s)",
+          ogap() == up.STARTUP_RETRY_MS[0] // 1000, ogap())
+    clock[0] += up.STARTUP_PATIENCE_S
+    other.deliver(xu.CodexUsage(error="expired"))
+    check("usage-poll: expired past the patience window shows the can't-read pill",
           other_pill.has_content() and not other_pill.has_reading()
-          and other.is_running() and "unreadable" in other_pill._text)
+          and "unreadable" in other_pill._text, other_pill._text)
+    check("usage-poll: ...and keeps re-reading every 2 s to heal itself",
+          ogap() == up.LOCAL_RECHECK_MS // 1000, ogap())
+    other.deliver(good())
+    check("usage-poll: a renewed login lands the number at once",
+          other_pill.has_reading() and not other_pill._unreadable)
     other.stop()
 
     # --- startup: keep trying, and say so, until the first number lands ---
@@ -1013,8 +1052,8 @@ def test_usage_poll_policy():
     start_pill.mark_loading()
     start.deliver(xu.CodexUsage(error="urlerror"))
     sgap = lambda: round(start.next_poll_at() - clock[0])
-    check("usage-poll: a first failure keeps the pill loading, as retrying",
-          start_pill._loading and "retrying" in start_pill._text
+    check("usage-poll: a first failure keeps the pill on its checking line",
+          start_pill._loading and start_pill._text == "GPT 5h usage, checking..."
           and "unreadable" not in start_pill._text
           and not start_pill._unreadable, start_pill._text)
     check("usage-poll: the tooltip names the error and says it retries itself",
@@ -1047,7 +1086,7 @@ def test_usage_poll_policy():
     start.deliver(good())
     check("usage-poll: the first real reading replaces it and resets the streak",
           start_pill.has_reading() and not start_pill._loading
-          and start._fail.attempts == 0 and "retrying" not in start_pill._text)
+          and start._fail.attempts == 0 and "checking" not in start_pill._text)
     start.deliver(xu.CodexUsage(error="urlerror"))
     check("usage-poll: after a reading, failures use the ordinary retry",
           sgap() == up.RETRY_MS // 1000 and start_pill.has_reading(), sgap())
@@ -1159,7 +1198,7 @@ def test_usage_pill_geometry_and_close():
     check("usage-pill: the loading state IS content, so the bar is never blank",
           (badge.mark_loading(), badge.has_content() is True)[-1])
     check("usage-pill: the loading line names its own tracker",
-          "5h" in badge._text and "reading" in badge._text
+          "5h" in badge._text and "checking" in badge._text
           and "7d" in (weekly_badge.mark_loading(), weekly_badge._text)[-1])
     check("usage-pill: the loading pill paints with no number to draw",
           not badge.grab().isNull())
