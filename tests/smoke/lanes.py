@@ -93,14 +93,22 @@ class _record_git:
     def __enter__(self):
         from app import lanes
         self.calls = []
+        self.threads = []   # the thread each call ran on, same order
         self._orig = lanes.RUNNER
-        orig, calls = self._orig, self.calls
+        orig, calls, threads = self._orig, self.calls, self.threads
 
         def runner(args, cwd, timeout):
             calls.append(list(args))
+            threads.append(threading.current_thread().name)
             return orig(args, cwd, timeout)
         lanes.RUNNER = runner
         return self
+
+    def unpolled(self):
+        """The calls minus the lane service's read-only polls, whose timer
+        can fire in any window a test records under a loaded runner."""
+        return [c for c, t in zip(self.calls, self.threads)
+                if t != "aihive-lane-poll"]
 
     def __exit__(self, *exc):
         from app import lanes
@@ -2879,8 +2887,9 @@ def test_lane_window_37_fixes():
             win._on_lane_action(ws.id, agent.id, "refresh")
             win.lane_ops.drain(30)
         check("lanes-37: ...and the action refuses a working agent itself",
-              g.calls == [] and _git(agent.spec.lane["root"], "rev-parse",
-                                     "HEAD") == head, g.calls)
+              g.unpolled() == [] and _git(agent.spec.lane["root"],
+                                          "rev-parse", "HEAD") == head,
+              g.calls)
         check("lanes-37: ...with a notice saying why",
               any("working" in t for t in told), told)
         agent.is_busy = lambda: False
