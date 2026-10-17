@@ -502,6 +502,20 @@ if sys.platform == "win32":
         wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
         ctypes.POINTER(wintypes.DWORD)]
     _k32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    # ProcessCommandLineInformation (Windows 8.1+) needs only the same
+    # limited-query right as the image path, unlike a PEB read.
+    _ProcessCommandLineInformation = 60
+    _STATUS_INFO_LENGTH_MISMATCH = -0x3FFFFFFC  # 0xC0000004 as an NTSTATUS
+    _ntdll = ctypes.WinDLL("ntdll")
+    _ntdll.NtQueryInformationProcess.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.ULONG,
+        ctypes.POINTER(wintypes.ULONG)]
+    _ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+
+    class _UNICODE_STRING(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT),
+                    ("MaximumLength", wintypes.USHORT),
+                    ("Buffer", ctypes.c_void_p)]
     # SetConsoleCtrlHandler's first parameter is a POINTER, and it is passed
     # NULL for the ignore-flag half of enable_ctrl_c_for_children() -- without
     # an explicit prototype ctypes infers an int-sized argument and the
@@ -624,6 +638,37 @@ def process_image_path(pid: int) -> str:
         _k32.CloseHandle(handle)
 
 
+def process_command_line(pid: int) -> str:
+    """A live process's full command line, or "" when it can't be read
+    (already exited, access denied, non-Windows)."""
+    if sys.platform != "win32" or not pid:
+        return ""
+    handle = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False,
+                              int(pid))
+    if not handle:
+        return ""
+    try:
+        size = 4096
+        for _ in range(2):
+            buf = ctypes.create_string_buffer(size)
+            needed = wintypes.ULONG(0)
+            status = _ntdll.NtQueryInformationProcess(
+                handle, _ProcessCommandLineInformation, buf, size,
+                ctypes.byref(needed))
+            if status == _STATUS_INFO_LENGTH_MISMATCH and needed.value > size:
+                size = needed.value
+                continue
+            if status != 0:
+                return ""
+            text = _UNICODE_STRING.from_buffer(buf)
+            if not text.Buffer:
+                return ""
+            return ctypes.wstring_at(text.Buffer, text.Length // 2)
+        return ""
+    finally:
+        _k32.CloseHandle(handle)
+
+
 def describe_pid(pid: int) -> str:
     """Best-effort short label for a pid -- its executable's base name (e.g.
     "java.exe", "adb.exe") -- so a human picking one process out of the kill
@@ -697,6 +742,47 @@ def is_cli_tooling(image_path: str) -> bool:
         return True
     return any(path.startswith(os.path.normcase(os.path.normpath(d)) + os.sep)
                for d in _codex_tooling_dirs())
+
+
+# How every agent's --mcp-config starts AI Hive's own log_activity bridge
+# (orchestrator_bridge.mcp_config_path_for builds its args from this).
+HIVE_BRIDGE_ARGS = ("-m", "app.mcp_server")
+_PYTHON_IMAGES = ("python.exe", "pythonw.exe")
+
+
+def _image_name(image_path: str) -> str:
+    return os.path.normcase(image_path).rsplit(os.sep, 1)[-1]
+
+
+def is_hive_bridge(image_path: str, command_line: str) -> bool:
+    """True for AI Hive's log_activity bridge: a python running
+    `-m app.mcp_server` and nothing after it. A venv's python.exe is a
+    launcher that starts the base interpreter with the same arguments, so
+    one bridge is two processes and both match.
+
+    The gear badge leaves the bridge out like CLI tooling. Claude starts it
+    whenever its MCP connections come up, which on a launch of 15 agents at
+    once was 25 to 39 seconds in (measured), long after the baseline had
+    settled without it. Its two processes then read as a background command
+    for the rest of the session (live: nearly every agent lit at launch,
+    count=3 baseline=1, the only extras the bridge pair)."""
+    if not command_line or not image_path:
+        return False
+    return (_image_name(image_path) in _PYTHON_IMAGES
+            and tuple(command_line.split()[-2:]) == HIVE_BRIDGE_ARGS)
+
+
+def is_job_tooling(pid: int) -> bool:
+    """True when job member `pid` is machinery rather than work: CLI tooling
+    (is_cli_tooling) or AI Hive's own bridge (is_hive_bridge). Only a python
+    image costs the extra command-line read."""
+    path = process_image_path(pid)
+    if not path:
+        return False
+    if is_cli_tooling(path):
+        return True
+    return (_image_name(path) in _PYTHON_IMAGES
+            and is_hive_bridge(path, process_command_line(pid)))
 
 
 _ctrl_c_handler_installed = False
