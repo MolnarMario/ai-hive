@@ -853,7 +853,8 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     color: {p.TEXT_DIM}; font-size: 11px;
 }}
 #UsagePillClose:hover {{ color: {p.RED}; }}
-/* square (TopBar pins its size), with the 18px bold + of #AddWsBtn */
+/* square (TopBar pins its size). PlusButton paints the + itself, centred,
+   in these colours; the font matches #AddWsBtn for any text fallback */
 #UsageTrackerAdd {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 0px; color: {p.TEXT_DIM}; font-size: 18px; font-weight: 800;
