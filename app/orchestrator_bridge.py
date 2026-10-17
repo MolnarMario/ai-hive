@@ -29,6 +29,8 @@ import secrets
 
 from PySide6.QtCore import QObject, QStandardPaths
 
+from .process_worker import HIVE_BRIDGE_ARGS
+
 try:
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
     HAS_QTNETWORK = True
@@ -120,7 +122,7 @@ class OrchestratorBridge(QObject):
             os.makedirs(self._mcp_dir, exist_ok=True)
             cfg = {"mcpServers": {"aihive": {
                 "command": sys.executable,
-                "args": ["-m", "app.mcp_server"],
+                "args": list(HIVE_BRIDGE_ARGS),
                 "env": {"AIHIVE_PIPE": self.pipe_name,
                         "AIHIVE_WS": ws_id,
                         "PYTHONPATH": str(os.path.dirname(os.path.dirname(

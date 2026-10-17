@@ -20,7 +20,7 @@ from .ansi_parser import _PARTIAL_RE as _ESC_PARTIAL_RE
 from .coordination import sanitize_text
 from .scheduled_send import MISSED, PENDING, SENT, ScheduledMessage
 from .process_worker import (AgentSpec, ProcessWorker, WorkerState,
-                             is_cli_tooling, process_image_path)
+                             is_job_tooling)
 from .pty_worker import PtyWorker
 
 LOG_CAP = 4000  # retained (stream, text) segments per agent
@@ -181,7 +181,10 @@ BG_SHELL_WARMUP_S = 6.0
 # flagged forever. Only once BOTH windows have elapsed does the baseline
 # switch to ratchet-down-only, which is what protects a genuine long-running
 # background job started later from ever being silently absorbed as "the new
-# normal".
+# normal". Even this window lost the bridge on a launch of 15 agents at once
+# (it came up 25 to 39 s in), so the bridge is now left out of the count by
+# name (process_worker.is_hive_bridge) and the window only covers other
+# late children.
 BG_SHELL_SETTLE_S = 10.0
 
 # How long `request_repaint` holds the child one column narrower before giving
@@ -2112,16 +2115,17 @@ class TerminalAgent(QObject):
 
     @staticmethod
     def _job_tooling_pids(ids) -> set[int]:
-        """The members of `ids` that are the CLI's own machinery (Codex's
-        app-server daemon, its MCP servers, console hosts), never a command
-        it started. See process_worker.is_cli_tooling."""
-        return {p for p in ids if is_cli_tooling(process_image_path(p))}
+        """The members of `ids` that are machinery (Codex's app-server
+        daemon, its MCP servers, console hosts, AI Hive's own log_activity
+        bridge), never a command the agent started. See
+        process_worker.is_job_tooling."""
+        return {p for p in ids if is_job_tooling(p)}
 
     def _bg_shell_keep_pids(self, ids=None) -> set[int]:
         """Pids that must never be treated as 'extra': the agent's own root
-        process, everything seen while the baseline was learned (the
-        log_activity mcp bridge), and the CLI's tooling in the job now (a
-        kill there would take down Codex's daemon). Shared by every
+        process, everything seen while the baseline was learned, and the
+        tooling in the job now (a kill there would take down Codex's daemon
+        or the log_activity bridge). Shared by every
         read/kill path below so they can never disagree about what's safe
         to touch. `ids` is the job's current members when the caller has
         them already."""

@@ -138,6 +138,7 @@ def test_bg_shell_workspace_stats():
     from app.workspace_manager import WorkspaceManager
     from app.process_worker import AgentKind, build_spec
     import app.terminal_agent as terminal_agent_mod
+    import app.process_worker as process_worker_mod
 
     QApplication.instance() or QApplication([])
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-"))
@@ -158,11 +159,11 @@ def test_bg_shell_workspace_stats():
     fake_now = [1000.0]
     orig_time = terminal_agent_mod.time.time
     orig_ids = agent.worker.job_process_ids
-    orig_image = terminal_agent_mod.process_image_path
+    orig_image = process_worker_mod.process_image_path
     count = [1]
     terminal_agent_mod.time.time = lambda: fake_now[0]
     agent.worker.job_process_ids = lambda: _fake_job_ids(count[0])
-    terminal_agent_mod.process_image_path = lambda pid: ""
+    process_worker_mod.process_image_path = lambda pid: ""
     try:
         agent.poll_bg_shell()   # learns the baseline (1)
         check("bg shell: the baseline alone never flags",
@@ -238,7 +239,7 @@ def test_bg_shell_workspace_stats():
     finally:
         terminal_agent_mod.time.time = orig_time
         agent.worker.job_process_ids = orig_ids
-        terminal_agent_mod.process_image_path = orig_image
+        process_worker_mod.process_image_path = orig_image
 
 
 def test_bg_shell_settle_relearn():
@@ -259,6 +260,7 @@ def test_bg_shell_settle_relearn():
     from app.workspace_manager import WorkspaceManager
     from app.process_worker import AgentKind, build_spec
     import app.terminal_agent as terminal_agent_mod
+    import app.process_worker as process_worker_mod
 
     QApplication.instance() or QApplication([])
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-settle-"))
@@ -272,11 +274,11 @@ def test_bg_shell_settle_relearn():
     agent._session_started = fake_now[0]   # simulate a just-launched agent
     orig_time = terminal_agent_mod.time.time
     orig_ids = agent.worker.job_process_ids
-    orig_image = terminal_agent_mod.process_image_path
+    orig_image = process_worker_mod.process_image_path
     count = [1]
     terminal_agent_mod.time.time = lambda: fake_now[0]
     agent.worker.job_process_ids = lambda: _fake_job_ids(count[0])
-    terminal_agent_mod.process_image_path = lambda pid: ""
+    process_worker_mod.process_image_path = lambda pid: ""
     try:
         agent.poll_bg_shell()   # still within warmup: ignored entirely
         check("bg shell settle: a sample during warmup is ignored",
@@ -329,7 +331,7 @@ def test_bg_shell_settle_relearn():
     finally:
         terminal_agent_mod.time.time = orig_time
         agent.worker.job_process_ids = orig_ids
-        terminal_agent_mod.process_image_path = orig_image
+        process_worker_mod.process_image_path = orig_image
 
 
 def test_bg_shell_kill_extras():
@@ -347,6 +349,7 @@ def test_bg_shell_kill_extras():
     from app.workspace_manager import WorkspaceManager
     from app.process_worker import AgentKind, build_spec
     import app.terminal_agent as terminal_agent_mod
+    import app.process_worker as process_worker_mod
 
     QApplication.instance() or QApplication([])
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-kill-"))
@@ -362,14 +365,14 @@ def test_bg_shell_kill_extras():
     agent._session_started = fake_now[0]
     orig_time = terminal_agent_mod.time.time
     orig_ids = agent.worker.job_process_ids
-    orig_image = terminal_agent_mod.process_image_path
+    orig_image = process_worker_mod.process_image_path
     orig_pid = agent.worker.pid
     orig_kill = agent.worker.kill_extra_processes
     pids = [100, 101]           # root(100) + the mcp bridge(101), the baseline
     kill_calls = []
     terminal_agent_mod.time.time = lambda: fake_now[0]
     agent.worker.job_process_ids = lambda: list(pids)
-    terminal_agent_mod.process_image_path = lambda pid: ""
+    process_worker_mod.process_image_path = lambda pid: ""
     agent.worker.pid = lambda: 100
     agent.worker.kill_extra_processes = (
         lambda keep: kill_calls.append(keep) or [p for p in pids
@@ -407,7 +410,7 @@ def test_bg_shell_kill_extras():
     finally:
         terminal_agent_mod.time.time = orig_time
         agent.worker.job_process_ids = orig_ids
-        terminal_agent_mod.process_image_path = orig_image
+        process_worker_mod.process_image_path = orig_image
         agent.worker.pid = orig_pid
         agent.worker.kill_extra_processes = orig_kill
 
@@ -520,6 +523,7 @@ def test_bg_shell_extra_pids_and_kill_pid():
     from app.workspace_manager import WorkspaceManager
     from app.process_worker import AgentKind, build_spec
     import app.terminal_agent as terminal_agent_mod
+    import app.process_worker as process_worker_mod
 
     QApplication.instance() or QApplication([])
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-pids-"))
@@ -534,13 +538,13 @@ def test_bg_shell_extra_pids_and_kill_pid():
     agent._session_started = fake_now[0]
     orig_time = terminal_agent_mod.time.time
     orig_ids = agent.worker.job_process_ids
-    orig_image = terminal_agent_mod.process_image_path
+    orig_image = process_worker_mod.process_image_path
     orig_pid = agent.worker.pid
     orig_kill_pid = agent.worker.kill_pid
     pids = [100, 101]   # root(100) + mcp bridge(101): the baseline
     terminal_agent_mod.time.time = lambda: fake_now[0]
     agent.worker.job_process_ids = lambda: list(pids)
-    terminal_agent_mod.process_image_path = lambda pid: ""
+    process_worker_mod.process_image_path = lambda pid: ""
     agent.worker.pid = lambda: 100
     agent.worker.kill_pid = lambda p: (kill_calls.append(p),
                                        pids.remove(p) if p in pids else None)
@@ -582,7 +586,7 @@ def test_bg_shell_extra_pids_and_kill_pid():
     finally:
         terminal_agent_mod.time.time = orig_time
         agent.worker.job_process_ids = orig_ids
-        terminal_agent_mod.process_image_path = orig_image
+        process_worker_mod.process_image_path = orig_image
         agent.worker.pid = orig_pid
         agent.worker.kill_pid = orig_kill_pid
 
@@ -679,6 +683,7 @@ def test_bg_shell_ignores_cli_tooling():
     from app.workspace_manager import WorkspaceManager
     from app.process_worker import AgentKind, build_spec
     import app.terminal_agent as terminal_agent_mod
+    import app.process_worker as process_worker_mod
 
     QApplication.instance() or QApplication([])
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-tooling-"))
@@ -715,12 +720,12 @@ def test_bg_shell_ignores_cli_tooling():
     agent._session_started = fake_now[0]
     orig_time = terminal_agent_mod.time.time
     orig_ids = agent.worker.job_process_ids
-    orig_image = terminal_agent_mod.process_image_path
+    orig_image = process_worker_mod.process_image_path
     orig_pid = agent.worker.pid
     orig_kill = agent.worker.kill_extra_processes
     terminal_agent_mod.time.time = lambda: fake_now[0]
     agent.worker.job_process_ids = lambda: list(pids)
-    terminal_agent_mod.process_image_path = lambda pid: images.get(pid, "")
+    process_worker_mod.process_image_path = lambda pid: images.get(pid, "")
     agent.worker.pid = lambda: 200
     agent.worker.kill_extra_processes = (
         lambda keep: keeps.append(set(keep)) or [p for p in pids
@@ -789,7 +794,7 @@ def test_bg_shell_ignores_cli_tooling():
     finally:
         terminal_agent_mod.time.time = orig_time
         agent.worker.job_process_ids = orig_ids
-        terminal_agent_mod.process_image_path = orig_image
+        process_worker_mod.process_image_path = orig_image
         agent.worker.pid = orig_pid
         agent.worker.kill_extra_processes = orig_kill
 
@@ -841,6 +846,206 @@ def test_cli_tooling_real_process():
     finally:
         job.terminate_tree()
         for p in procs:
+            try:
+                p.wait(timeout=5)
+            except Exception:
+                p.kill()
+        job.close()
+
+
+def test_hive_bridge_classifier():
+    """is_hive_bridge() names AI Hive's own log_activity bridge from its
+    image and command line, as the live app showed them: the venv launcher
+    and the base interpreter it starts, both `-m app.mcp_server`. Anything
+    else a python runs is work and keeps counting."""
+    from app.process_worker import HIVE_BRIDGE_ARGS, is_hive_bridge
+
+    venv = r"C:\proj\ai-hive\.venv\Scripts\pythonw.exe"
+    base = r"C:\Program Files\Python311\pythonw.exe"
+    check("hive bridge: the config starts it with these args",
+          HIVE_BRIDGE_ARGS == ("-m", "app.mcp_server"), HIVE_BRIDGE_ARGS)
+    bridges = {
+        "the venv launcher": (venv, f'"{venv}" -m app.mcp_server'),
+        "the base interpreter": (base, f'"{base}" -m app.mcp_server'),
+        "a console python": (r"C:\Py\python.exe",
+                             r"C:\Py\python.exe -m app.mcp_server"),
+        "an upper-case image": (base.upper(), f'"{base}" -m app.mcp_server'),
+    }
+    for what, (image, line) in bridges.items():
+        check(f"hive bridge: {what} is the bridge",
+              is_hive_bridge(image, line), (image, line))
+    work = {
+        "a python script": (base, f'"{base}" build.py'),
+        "the bridge module with more args": (
+            base, f'"{base}" -m app.mcp_server --selftest'),
+        "another module": (base, f'"{base}" -m pytest'),
+        "a non-python image": (r"C:\tools\node.exe",
+                               r"node.exe -m app.mcp_server"),
+        "an unreadable command line": (base, ""),
+        "an unreadable image": ("", f'"{base}" -m app.mcp_server'),
+    }
+    for what, (image, line) in work.items():
+        check(f"hive bridge: {what} is not the bridge",
+              not is_hive_bridge(image, line), (image, line))
+
+
+def test_bg_shell_ignores_late_hive_bridge():
+    """Live report: right after launch, nearly every Claude agent showed the
+    gear while idle and kept it (session.log: count=3 baseline=1). Claude
+    started AI Hive's log_activity bridge, a venv launcher plus the base
+    python it starts, 25 to 39 s after launch on a start of 15 agents, after
+    the baseline had settled on claude.exe alone. The bridge must never
+    count, whenever it arrives, and kill-all must keep it."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import (AgentStatus, BG_SHELL_DEBOUNCE_S,
+                                     BG_SHELL_SETTLE_S, BG_SHELL_WARMUP_S)
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+    import app.terminal_agent as terminal_agent_mod
+    import app.process_worker as process_worker_mod
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-bridge-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("BgShellBridge", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Bridged",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+
+    venv = r"C:\proj\ai-hive\.venv\Scripts\pythonw.exe"
+    base = r"C:\Program Files\Python311\pythonw.exe"
+    images = {300: r"C:\Users\u\.local\bin\claude.exe",
+              304: venv, 308: base, 312: base}
+    lines = {300: r"C:\Users\u\.local\bin\claude.exe --resume x",
+             304: f'"{venv}" -m app.mcp_server',
+             308: f'"{base}" -m app.mcp_server',
+             312: f'"{base}" serve.py'}
+    pids = [300]
+    keeps = []
+
+    fake_now = [1000.0]
+    agent._session_started = fake_now[0]
+    orig_time = terminal_agent_mod.time.time
+    orig_ids = agent.worker.job_process_ids
+    orig_image = process_worker_mod.process_image_path
+    orig_line = process_worker_mod.process_command_line
+    orig_pid = agent.worker.pid
+    orig_kill = agent.worker.kill_extra_processes
+    terminal_agent_mod.time.time = lambda: fake_now[0]
+    agent.worker.job_process_ids = lambda: list(pids)
+    process_worker_mod.process_image_path = lambda pid: images.get(pid, "")
+    process_worker_mod.process_command_line = lambda pid: lines.get(pid, "")
+    agent.worker.pid = lambda: 300
+    agent.worker.kill_extra_processes = (
+        lambda keep: keeps.append(set(keep)) or [p for p in pids
+                                                 if p not in keep])
+    try:
+        fake_now[0] += BG_SHELL_WARMUP_S + 0.1
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_SETTLE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell bridge: the baseline is claude alone",
+              agent._bg_baseline == 1, agent._bg_baseline)
+
+        fake_now[0] = agent._session_started + 30
+        pids.extend([304, 308])      # the bridge pair, long after the settle
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 1
+        agent.poll_bg_shell()
+        fake_now[0] += 600
+        agent.poll_bg_shell()
+        check("bg shell bridge: a bridge arriving after the settle never "
+              "lights the gear", not agent.is_bg_shell_busy())
+        check("bg shell bridge: and the kill menu does not list it",
+              agent.bg_shell_extra_pids() == [], agent.bg_shell_extra_pids())
+
+        pids.append(312)             # a real python background command
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell bridge: a python background command still lights "
+              "the gear", agent.is_bg_shell_busy())
+        check("bg shell bridge: the menu lists only that command",
+              agent.bg_shell_extra_pids() == [312],
+              agent.bg_shell_extra_pids())
+        check("bg shell bridge: a kill of a bridge pid is refused",
+              agent.kill_bg_shell_pid(304) is False)
+        killed = agent.kill_bg_shell_extras()
+        check("bg shell bridge: kill-all keeps both bridge processes",
+              keeps and {304, 308} <= keeps[-1] and 312 not in keeps[-1],
+              keeps)
+        check("bg shell bridge: kill-all kills only the command",
+              killed == [312], killed)
+    finally:
+        terminal_agent_mod.time.time = orig_time
+        agent.worker.job_process_ids = orig_ids
+        process_worker_mod.process_image_path = orig_image
+        process_worker_mod.process_command_line = orig_line
+        agent.worker.pid = orig_pid
+        agent.worker.kill_extra_processes = orig_kill
+
+
+def test_hive_bridge_real_process():
+    """process_command_line() reads a live process's real command line, and
+    _job_tooling_pids() finds a real `-m app.mcp_server` (every process of
+    it, a venv launcher included) while a plain python child in the same
+    job still counts."""
+    if sys.platform != "win32":
+        skip('hive bridge real', 'non-Windows: job objects are Windows-only')
+        return
+    from app.process_worker import (CREATE_NO_WINDOW, WinJob, is_cli_tooling,
+                                    process_command_line, process_image_path)
+    from app.terminal_agent import TerminalAgent
+
+    launcher = (os.path.normcase(sys.executable) != os.path.normcase(
+        getattr(sys, "_base_executable", sys.executable)))
+    repo = str(Path(__file__).resolve().parents[2])
+    env = dict(os.environ, PYTHONPATH=repo, AIHIVE_PIPE="aihive-smoke-none")
+    job = WinJob()
+    bridge = subprocess.Popen([sys.executable, "-m", "app.mcp_server"],
+                              stdin=subprocess.PIPE,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, cwd=SCRATCH_CWD,
+                              env=env, creationflags=CREATE_NO_WINDOW)
+    plain = subprocess.Popen([sys.executable, "-c",
+                              "import time; time.sleep(30)"],
+                             creationflags=CREATE_NO_WINDOW)
+    try:
+        job.assign(bridge.pid)
+        job.assign(plain.pid)
+        line = process_command_line(bridge.pid)
+        check("hive bridge real: the command line ends in the bridge args",
+              line.split()[-2:] == ["-m", "app.mcp_server"], line)
+        check("hive bridge real: an unknown pid reads as no command line",
+              process_command_line(0) == "")
+        # a venv python is a launcher: each Popen above is two processes,
+        # and the second shows up a moment after the assign.
+        # CREATE_NO_WINDOW also gives each a hidden conhost, tooling already.
+        per = 2 if launcher else 1
+
+        def pythons(ids):
+            return [p for p in ids
+                    if not is_cli_tooling(process_image_path(p))]
+
+        deadline = time.time() + 5
+        ids = job.process_ids()
+        while time.time() < deadline and len(pythons(ids)) < 2 * per:
+            time.sleep(0.1)
+            ids = job.process_ids()
+        found = TerminalAgent._job_tooling_pids(ids)
+        check("hive bridge real: the bridge is tooling, the plain child is "
+              "not", bridge.pid in found and plain.pid not in found,
+              (found, bridge.pid, plain.pid))
+        bridges = {p for p in pythons(ids)
+                   if process_command_line(p).split()[-2:]
+                   == ["-m", "app.mcp_server"]}
+        check("hive bridge real: every process of the bridge is tooling and "
+              "nothing else is",
+              len(bridges) == per and found & set(pythons(ids)) == bridges,
+              (ids, found, bridges, per))
+    finally:
+        job.terminate_tree()
+        for p in (bridge, plain):
             try:
                 p.wait(timeout=5)
             except Exception:
