@@ -118,7 +118,9 @@ workspaces keep executing — switching never pauses anything.
   card header once that's been true for a few seconds, so you don't close AI
   Hive thinking nothing is happening. Programs a CLI runs for itself don't
   count: Codex's app-server daemon, its MCP servers and console hosts never
-  light the gear, and its kill menu never offers them. It shares the
+  light the gear, and its kill menu never offers them. Neither does AI
+  Hive's own `log_activity` bridge, which Claude starts up to half a minute
+  after launch (a python running `-m app.mcp_server`). It shares the
   taskbar's one overlay square too: when nothing is busy or asking but a
   shell is still running, the disc turns **violet** with the count, instead
   of showing nothing at all.
@@ -893,7 +895,9 @@ Hard-won rules, each with a regression test:
   selection so the next `Ctrl+C` interrupts; `Ctrl+Shift+A` selects all painted
   text (screen + scrollback); `Ctrl+V` / `Ctrl+Shift+V` paste (bracketed-paste
   aware for multi-line); `Ctrl+Shift+C` also copies; and a right-click
-  Copy/Paste/Select-all menu. **Mouse**: a plain left-click **places the input
+  Copy/Paste/Select-all menu. The Win+V clipboard and Win+. emoji panels
+  open at the cursor and take the arrow keys, Enter and Esc while open; a
+  CJK IME composition is drawn at the cursor until you commit it. **Mouse**: a plain left-click **places the input
   caret** where you clicked (AI Hive sends the child the right run of
   arrow keys — exact on the caret's own line, and best-effort on another line of
   a multi-line prompt (Up/Down to the row, then Left/Right to the predicted

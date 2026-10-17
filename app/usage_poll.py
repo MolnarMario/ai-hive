@@ -85,7 +85,7 @@ ACTIVE_GRACE_S = 180.0
 RETRY_MS = 10_000
 
 # Until a poller has read a number once this run, it retries fast and its pills
-# stay in the loading state ("retrying...") instead of turning into the
+# stay in the loading state ("checking...") instead of turning into the
 # can't-read pill: a launch that hits one timeout or 429 is not a broken
 # readout. Delays by attempt (the last one repeats), 429 backing off from 30 s
 # up to 4 minutes instead (hammering a rate limiter keeps it limited). After
@@ -113,9 +113,10 @@ RESET_GRACE_MS = 8_000
 # QTimer takes a 32-bit interval; farther resets are the ordinary poll's job
 RESET_HORIZON_MS = 6 * 3600 * 1000
 
-# errors a quick retry cannot fix. A 429 has its own backoff; a missing or
-# expired login waits for the CLI to fix it, which a retry 10 s later won't see.
-NO_RETRY_ERRORS = frozenset({"http 429", "no-auth", "expired"})
+# errors a quick retry cannot fix. A 429 has its own backoff; a missing login
+# waits for the CLI to fix it, which a retry 10 s later won't see. (An expired
+# one is re-checked on LOCAL_RECHECK_MS instead, see LOCAL_ERRORS.)
+NO_RETRY_ERRORS = frozenset({"http 429", "no-auth"})
 # errors a fetch reports without sending any request, so re-checking them often
 # costs a file read and can never feed a rate limiter. Claude's "expired" is
 # the `expiresAt` in .credentials.json, which any running Claude agent renews.

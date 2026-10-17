@@ -997,35 +997,43 @@ def test_hive_bridge_real_process():
                                     process_command_line, process_image_path)
     from app.terminal_agent import TerminalAgent
 
-    launcher = (os.path.normcase(sys.executable) != os.path.normcase(
-        getattr(sys, "_base_executable", sys.executable)))
+    base = getattr(sys, "_base_executable", sys.executable)
+    launcher = os.path.normcase(sys.executable) != os.path.normcase(base)
     repo = str(Path(__file__).resolve().parents[2])
     env = dict(os.environ, PYTHONPATH=repo, AIHIVE_PIPE="aihive-smoke-none")
     job = WinJob()
-    bridge = subprocess.Popen([sys.executable, "-m", "app.mcp_server"],
-                              stdin=subprocess.PIPE,
-                              stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, cwd=SCRATCH_CWD,
-                              env=env, creationflags=CREATE_NO_WINDOW)
-    plain = subprocess.Popen([sys.executable, "-c",
-                              "import time; time.sleep(30)"],
-                             creationflags=CREATE_NO_WINDOW)
+    # A parent that is one process (the base interpreter, no launcher) joins
+    # the job before it starts anything, so both children and the base
+    # interpreter each venv launcher starts are born inside it. Assigning a
+    # venv child after its Popen could lose that second process to the race.
+    parent = subprocess.Popen([base, "-c", _BRIDGE_PARENT, sys.executable,
+                               SCRATCH_CWD],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              text=True, env=env,
+                              creationflags=CREATE_NO_WINDOW)
     try:
-        job.assign(bridge.pid)
-        job.assign(plain.pid)
-        line = process_command_line(bridge.pid)
+        job.assign(parent.pid)
+        parent.stdin.write("go\n")
+        parent.stdin.flush()
+        pids = [int(p) for p in parent.stdout.readline().split()]
+        check("hive bridge real: the parent started both children",
+              len(pids) == 2, pids)
+        if len(pids) != 2:
+            return
+        bridge, plain = pids
+        line = process_command_line(bridge)
         check("hive bridge real: the command line ends in the bridge args",
               line.split()[-2:] == ["-m", "app.mcp_server"], line)
         check("hive bridge real: an unknown pid reads as no command line",
               process_command_line(0) == "")
-        # a venv python is a launcher: each Popen above is two processes,
-        # and the second shows up a moment after the assign.
+        # a venv python is a launcher: each child above is two processes,
+        # and the second shows up a moment after its parent's Popen.
         # CREATE_NO_WINDOW also gives each a hidden conhost, tooling already.
         per = 2 if launcher else 1
 
         def pythons(ids):
-            return [p for p in ids
-                    if not is_cli_tooling(process_image_path(p))]
+            return [p for p in ids if p != parent.pid
+                    and not is_cli_tooling(process_image_path(p))]
 
         deadline = time.time() + 5
         ids = job.process_ids()
@@ -1034,8 +1042,8 @@ def test_hive_bridge_real_process():
             ids = job.process_ids()
         found = TerminalAgent._job_tooling_pids(ids)
         check("hive bridge real: the bridge is tooling, the plain child is "
-              "not", bridge.pid in found and plain.pid not in found,
-              (found, bridge.pid, plain.pid))
+              "not", bridge in found and plain not in found,
+              (found, bridge, plain))
         bridges = {p for p in pythons(ids)
                    if process_command_line(p).split()[-2:]
                    == ["-m", "app.mcp_server"]}
@@ -1045,12 +1053,29 @@ def test_hive_bridge_real_process():
               (ids, found, bridges, per))
     finally:
         job.terminate_tree()
-        for p in (bridge, plain):
-            try:
-                p.wait(timeout=5)
-            except Exception:
-                p.kill()
+        try:
+            parent.wait(timeout=5)
+        except Exception:
+            parent.kill()
         job.close()
+
+
+# Run as the base interpreter inside a WinJob (test_hive_bridge_real_process):
+# waits until it has joined, then starts the bridge and a plain sleeper with
+# argv[1] (the venv python) and prints their pids.
+_BRIDGE_PARENT = r'''
+import subprocess, sys
+sys.stdin.readline()
+flags = 0x08000000  # CREATE_NO_WINDOW
+bridge = subprocess.Popen([sys.argv[1], "-m", "app.mcp_server"],
+                          stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, cwd=sys.argv[2],
+                          creationflags=flags)
+plain = subprocess.Popen([sys.argv[1], "-c", "import time; time.sleep(30)"],
+                         creationflags=flags)
+print(bridge.pid, plain.pid, flush=True)
+sys.stdin.readline()
+'''
 
 
 # Run inside a WinJob. Spawns one plain child and one that asks to break away,

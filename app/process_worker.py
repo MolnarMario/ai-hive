@@ -747,7 +747,12 @@ def is_cli_tooling(image_path: str) -> bool:
 # How every agent's --mcp-config starts AI Hive's own log_activity bridge
 # (orchestrator_bridge.mcp_config_path_for builds its args from this).
 HIVE_BRIDGE_ARGS = ("-m", "app.mcp_server")
-_PYTHON_IMAGES = ("python.exe", "pythonw.exe")
+# The bridge runs as sys.executable (a venv launcher) and the base interpreter
+# behind it, which a Store or versioned install names python3.11.exe or the like.
+_PYTHON_IMAGES = frozenset({"python.exe", "pythonw.exe"} | {
+    os.path.normcase(os.path.basename(p))
+    for p in (sys.executable, getattr(sys, "_base_executable", ""))
+    if p})
 
 
 def _image_name(image_path: str) -> str:

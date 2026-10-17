@@ -20,7 +20,10 @@ em dashes: this text is shown in the app.
 - With a terminal focused, the Win+V clipboard panel and the Win+. emoji
   panel now take the arrow keys, Enter and Esc. Before, those keys went to
   the agent and the panel couldn't be driven or closed from the keyboard.
-  An emoji picked in the panel is typed into the agent.
+  An emoji picked in the panel is typed into the agent. The panels open
+  at the terminal's cursor, and a Japanese, Chinese or Korean input method
+  works in a terminal, showing what you compose at the cursor until you
+  commit it.
 
 ## 0.44.0
 

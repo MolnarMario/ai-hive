@@ -644,8 +644,10 @@ class WorkspaceManager(QObject):
 
     def poll_bg_shell_activity(self) -> None:
         """Tick every agent's background-shell check (see
-        TerminalAgent.poll_bg_shell) -- cheap, a single Job Object syscall
-        per running agent, so a plain loop on a timer is enough."""
+        TerminalAgent.poll_bg_shell) -- cheap, one Job Object query per
+        running agent plus an image-path read per job member (and a
+        command-line read per python member, see is_job_tooling), so a
+        plain loop on a timer is enough."""
         for agent in self.all_agents():
             agent.poll_bg_shell()
 

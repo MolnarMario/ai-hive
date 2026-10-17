@@ -555,11 +555,43 @@ def test_terminal_input_method():
 
     view.inputMethodEvent(QInputMethodEvent("に", []))  # preedit only
     check("ime: preedit sends nothing", sent == [], f"sent {sent!r}")
+    check("ime: the composition is kept for drawing", view._preedit == "に",
+          repr(view._preedit))
     ev = QInputMethodEvent()
     ev.setCommitString("\U0001F600")
     view.inputMethodEvent(ev)
     check("ime: committed text is typed", sent == ["\U0001F600"],
           f"sent {sent!r}")
+    check("ime: a commit ends the composition", view._preedit == "",
+          repr(view._preedit))
+
+    # a commit with a line break must not reach Claude as Enter
+    sent.clear()
+    view.feed("\x1b[?2004h")
+    ev = QInputMethodEvent()
+    ev.setCommitString("one\ntwo")
+    view.inputMethodEvent(ev)
+    check("ime: a multi-line commit goes as a bracketed paste",
+          sent == ["\x1b[200~one\rtwo\x1b[201~"], f"sent {sent!r}")
+
+    # Qt keeps the rectangle it read at focus-in; a repaint after the cursor
+    # moved must hand it the new one
+    view.hasFocus = lambda: True
+    view.grab()
+    first = view._im_rect
+    view.feed("\r\nthree")
+    view.grab()
+    check("ime: a repaint tells Qt the cursor moved",
+          first is not None and view._im_rect != first
+          and view._im_rect == view.inputMethodQuery(
+              Qt.InputMethodQuery.ImCursorRectangle),
+          f"{first} -> {view._im_rect}")
+
+    # the composition is drawn at the cursor while it is in progress
+    plain = view.grab().toImage()
+    view.inputMethodEvent(QInputMethodEvent("にほん", []))
+    drawn = view.grab().toImage()
+    check("ime: a composition in progress is drawn", drawn != plain)
 
 
 def test_terminal_image_paste():
