@@ -18,7 +18,7 @@ class CodexUsageBadge(UsagePillBadge):
         return usage.limit
 
     def _loading_text(self) -> str:
-        return "GPT 5h usage, reading..."
+        return "GPT 5h usage, checking..."
 
     def _format_limit(self) -> str:
         return codex_usage.format_limit(self._limit, left=self._show_left)
