@@ -1565,18 +1565,21 @@ class PageBorder(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(bg)
             p.drawEllipse(bolt)
-        # aquila crest plaque straddling the top edge, centered
-        pw, ph = 190, 52
+        # aquila crest plaque, centered on the top strip. It stays within the
+        # strip (2px proud each side): taller, it hung into the top bar and
+        # pushed the eye down onto the usage pills under it.
+        pw, ph = 150, t + 4
         px = (w - pw) / 2
-        plaque = QRectF(px, ins - 4, pw, ph)
+        plaque = QRectF(px, ins - 2, pw, ph)
         pg = QLinearGradient(plaque.topLeft(), plaque.bottomLeft())
         pg.setColorAt(0.0, QColor("#4a555f"))
         pg.setColorAt(1.0, QColor("#232a30"))
         p.setBrush(pg)
         p.setPen(QPen(QColor("#5a656f")))
         p.drawRoundedRect(plaque, 6, 6)
-        aq = _pixmap(_AQUILA, 150, 48)
-        p.drawPixmap(int(px + (pw - 150) / 2), int(plaque.top() + 3), aq)
+        aw, ah = 110, ph - 4
+        aq = _pixmap(_AQUILA, aw, ah)
+        p.drawPixmap(int(px + (pw - aw) / 2), int(plaque.top() + 2), aq)
         p.end()
 
 

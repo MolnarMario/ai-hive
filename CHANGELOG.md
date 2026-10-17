@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.44.3
+
+- In the Illuminated Manuscript and Adeptus Mechanicus themes, the top
+  bar's buttons and pills sit in the middle of the header. They used to
+  sit closer to its bottom edge.
+- The Adeptus Mechanicus aquila plaque is smaller and stays on the top
+  border, so it no longer hangs over the usage pills.
+
 ## 0.44.2
 
 - The + that picks which usage pills to show sits in the middle of its
