@@ -316,6 +316,22 @@ def _find_row_text(line, cols: int):
     return joined.rstrip(), [c for c, d in enumerate(datas) for _ in d]
 
 
+def _row_cells(row, cols: int, blank) -> tuple:
+    """What each cell of a row shows, for telling a copied row from new
+    output. An erased cell and one never written look alike, and so do
+    blanks in two foreground colors: ConPTY's repaint writes spaces the
+    first paint skipped, in whatever color is current (measured on saved
+    screens)."""
+    out = []
+    for x in range(cols):
+        ch = row.get(x, blank)
+        if ch.data.strip():
+            out.append(ch)
+        else:
+            out.append((ch.bg, ch.reverse, ch.underscore, ch.strikethrough))
+    return tuple(out)
+
+
 class _CountingDeque(collections.deque):
     """A deque that remembers how many items were ever appended. pyte pushes
     each scrolled-off line to history.top via append; once the deque saturates
@@ -975,8 +991,9 @@ class TerminalView(QWidget):
         paragraph showed up three times over in a card's scrollback.
 
         So the rule: of the rows pushed since a cursor-up last reached the
-        top row in this frame, the longest leading run that equals the
-        same number of rows ending the history before them goes. Pushes
+        top row in this frame, the longest leading run that equals, cell
+        for cell, the same number of rows ending the history before them
+        goes. Pushes
         after that run stay, since a frame that grew (the recap) scrolls
         its new rows off legitimately. A run must hold a row with text: a
         blank row after a blank row proves nothing. Plain output never
@@ -999,6 +1016,7 @@ class TerminalView(QWidget):
         cols = scr.columns
         blank = scr.default_char
         texts: dict = {}
+        looks: dict = {}
 
         def text(i: int) -> str:
             # history row i, cached: a long frame compares the same rows
@@ -1009,6 +1027,12 @@ class TerminalView(QWidget):
                 t = texts[i] = "".join(
                     row.get(x, blank).data for x in range(cols)).rstrip()
             return t
+
+        def look(i: int) -> tuple:
+            c = looks.get(i)
+            if c is None:
+                c = looks[i] = _row_cells(top[i], cols, blank)
+            return c
 
         # the newest jump first: rows pushed before it were not this
         # repaint's. An older one still counts when the cursor went back up
@@ -1023,11 +1047,19 @@ class TerminalView(QWidget):
             for h in range(min(n, first), 0, -1):
                 if text(first - h) != lead:
                     continue
-                if all(text(first + i) == text(first - h + i)
-                       for i in range(1, h)):
-                    if any(text(first + i) for i in range(h)):
-                        run = h
-                    break
+                pairs = range(h)
+                # text first, it rules out most runs cheaply; then colors,
+                # since the same text in new colors is new output. Every
+                # measured copy matched its original cell for cell.
+                if not all(text(first + i) == text(first - h + i)
+                           for i in pairs):
+                    continue
+                if not all(look(first + i) == look(first - h + i)
+                           for i in pairs):
+                    continue
+                if any(text(first + i) for i in pairs):
+                    run = h
+                break
             if run:
                 return self._take_back(run, n, evicted_then)
         return 0
@@ -1079,19 +1111,7 @@ class TerminalView(QWidget):
         blank = scr.default_char
 
         def cells(row) -> tuple:
-            # what each cell shows. An erased cell and one never written look
-            # alike, and so do blanks in two foreground colors: ConPTY's
-            # repaint writes spaces the first paint skipped, in whatever color
-            # is current (measured on both saved screens)
-            out = []
-            for x in range(cols):
-                ch = row.get(x, blank)
-                if ch.data.strip():
-                    out.append(ch)
-                else:
-                    out.append((ch.bg, ch.reverse, ch.underscore,
-                                ch.strikethrough))
-            return tuple(out)
+            return _row_cells(row, cols, blank)
 
         def text(row) -> str:
             return "".join(row[x].data if x in row else " "

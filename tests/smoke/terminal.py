@@ -2293,6 +2293,15 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
     check("repaint: new text after a jump keeps its scrolled-off rows",
           hist(v8) == hist0 + fresh[:3], hist(v8)[-4:])
 
+    # the same text in new colors is new output, so it stays (a new footer
+    # keeps the older rule, which reads an unchanged screen, out of it)
+    v11 = TerminalView(rows=rows, cols=cols)
+    v11.feed(printed)
+    v11.feed(repaint(["\x1b[31m" + t + "\x1b[0m" for t in lines[8:12]]
+                     + lines[12:] + ["-- footer, new hint --"]))
+    check("repaint: recolored rows after a jump stay",
+          hist(v11) == hist0 + lines[8:12], hist(v11)[-5:])
+
     # clearing the screen and printing the same text again is real output:
     # the cursor goes home with ESC[H, not up, so both prints stay
     v10 = TerminalView(rows=rows, cols=cols)
