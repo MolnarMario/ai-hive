@@ -20,6 +20,7 @@ query. Nothing here is saved: a card rebuild starts with an empty bar.
 """
 
 from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QWheelEvent
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QLineEdit
 
 from .header_icons import IconToolButton
@@ -136,9 +137,16 @@ class FindBar(QFrame):
         event.accept()      # not the terminal's menu for the cell underneath
 
     def wheelEvent(self, event) -> None:
-        # the wheel over the bar scrolls the conversation, as the scrollbar's
-        # does, rather than dying here
-        self._view.wheelEvent(event)
+        # The wheel over the bar scrolls the conversation rather than dying
+        # here. It goes on in the terminal's coordinates: with mouse tracking
+        # on, the view reports the wheel to the agent at the cell under the
+        # pointer, and the bar's own (0, 0) is not the terminal's.
+        self._view.wheelEvent(QWheelEvent(
+            self._view.mapFromGlobal(event.globalPosition()),
+            event.globalPosition(), event.pixelDelta(), event.angleDelta(),
+            event.buttons(), event.modifiers(), event.phase(),
+            event.inverted()))
+        event.accept()
 
     def _on_text(self, text: str) -> None:
         if self.isVisible():

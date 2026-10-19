@@ -3094,8 +3094,8 @@ def test_terminal_find():
     scrollback and the live screen, the active one is the nearest to the
     view, stepping wraps and scrolls, new output keeps the active match, and
     no key typed into the bar ever reaches the agent."""
-    from PySide6.QtCore import QEvent, QEventLoop, Qt, QTimer
-    from PySide6.QtGui import QColor, QKeyEvent
+    from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, Qt, QTimer
+    from PySide6.QtGui import QColor, QKeyEvent, QWheelEvent
     from PySide6.QtWidgets import QApplication
 
     from app.process_worker import AgentKind, build_spec
@@ -3312,6 +3312,21 @@ def test_terminal_find():
           typed == [], typed)
     bar.next_btn.click()
     check("find: the next arrow steps", t.find_state() == (2, 2))
+
+    # a wheel over the bar reaches a mouse-tracking agent at the cell under
+    # the pointer, not at the bar's own top left mapped onto cell (0, 0)
+    t.feed("\x1b[?1000h\x1b[?1006h")
+    local = QPointF(20, 10)
+    glob = QPointF(bar.mapToGlobal(local))
+    QApplication.sendEvent(bar, QWheelEvent(
+        local, glob, QPoint(), QPoint(0, 120), Qt.MouseButton.NoButton,
+        M.NoModifier, Qt.ScrollPhase.NoScrollPhase, False))
+    row, col = t._cell_at(QPointF(bar.mapToParent(local)))
+    check("find: a wheel over the bar is reported at the cell under it",
+          typed and typed[-1].startswith(f"\x1b[<64;{col + 1};{row + 1}M")
+          and col > 10, (typed, row, col))
+    t.feed("\x1b[?1006l\x1b[?1000l")
+    typed.clear()
     t.grab()
     card.scroll_bar.grab()     # the find ticks paint without error
     key_in_bar(K.Key_Escape)
