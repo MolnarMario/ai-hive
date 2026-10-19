@@ -2156,6 +2156,146 @@ def test_redraw_from_the_wrong_row_leaves_no_copy_in_scrollback():
           len(hist(v9)) == len(hist0) + 20, len(hist(v9)))
 
 
+def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
+    """Claude repainting a frame taller than the card from the top row pushes
+    the frame's own top into the scrollback a second time, and the view
+    takes those rows back even when the repaint changed a row on screen.
+
+    The bytes copy the shape of a live capture (claude 2.1.303 at 25x76,
+    Ctrl+O twice over a long reply) and of six agents' saved screens: ConPTY
+    moves the cursor up to the top row, writes the whole frame, and the rows
+    past the bottom scroll off. Those rows equal the ones that end the
+    scrollback. The repaint here also changes the footer, which is what let
+    a reply paragraph show up three times over in a card: the older rule
+    only takes copies back when the screen ends exactly as it was."""
+    import pyte
+    from PySide6.QtWidgets import QApplication
+    from app.widgets import terminal_view as tvm
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    rows, cols = 10, 40
+    lines = [f"reply paragraph line {i:02d}" for i in range(20)]
+    printed = "".join(t + "\r\n" for t in lines) + "-- footer --\r\n"
+
+    def rt(line):
+        return "".join(line[x].data for x in range(cols)).rstrip()
+
+    def hist(v):
+        return [rt(r) for r in v.screen.history.top]
+
+    def screen(v):
+        return [rt(v.screen.buffer[y]) for y in range(rows)]
+
+    def repaint(frame):
+        # the cursor sits on the blank bottom row; up to the top row, then
+        # the whole frame and the row the cursor parks on
+        return ("\x1b[?25l\r\x1b[%dA" % (rows - 1)
+                + "\r\n".join(frame) + "\r\n\x1b[?25h")
+
+    # the frame: the reply from line 08 down, 4 rows taller than the card
+    v = TerminalView(rows=rows, cols=cols)
+    v.feed(printed)
+    hist0, screen0, pushed0 = hist(v), screen(v), v.history_pushed()
+    check("repaint: the reply's top is in the scrollback (else this proves "
+          "nothing)", hist0[-4:] == lines[8:12], hist0[-4:])
+    frame = lines[8:] + ["-- footer, new hint --"]
+    bytes_ = repaint(frame)
+
+    raw = tvm._new_history_screen(cols, rows)
+    pyte.Stream(raw).feed(printed + bytes_)
+    check("repaint: the bytes really push 4 copied rows",
+          [rt(r) for r in raw.history.top] == hist0 + lines[8:12],
+          [rt(r) for r in raw.history.top][-6:])
+
+    v.feed(bytes_)
+    want_screen = lines[12:] + ["-- footer, new hint --", ""]
+    check("repaint: the screen shows the repainted frame",
+          screen(v) == want_screen and screen(v) != screen0, screen(v))
+    check("repaint: no copied rows reach the scrollback", hist(v) == hist0,
+          hist(v)[-6:])
+    check("repaint: line ids stay where they were",
+          v.history_pushed() == pushed0, v.history_pushed())
+
+    # a frame split anywhere is judged whole, and a replay in one feed
+    # drops the same rows
+    for cut in (5, len(bytes_) // 2, bytes_.rindex("\r\n") + 1,
+                len(bytes_) - 3):
+        v2 = TerminalView(rows=rows, cols=cols)
+        v2.feed(printed)
+        v2.feed(bytes_[:cut])
+        v2.feed(bytes_[cut:])
+        check(f"repaint: a frame cut at {cut} drops its copies too",
+              hist(v2) == hist0 and screen(v2) == want_screen, hist(v2)[-6:])
+    v3 = TerminalView(rows=rows, cols=cols)
+    v3.feed(printed + bytes_)
+    check("repaint: a replay in one feed drops the same rows",
+          hist(v3) == hist0 and screen(v3) == want_screen, hist(v3)[-6:])
+
+    # the recap grew the frame by 2 rows: the 4 copies go, and the 2 rows
+    # it scrolled off for real stay
+    v4 = TerminalView(rows=rows, cols=cols)
+    v4.feed(printed)
+    v4.feed(repaint(lines[8:] + ["recap one", "recap two", "-- footer --"]))
+    check("repaint: a grown frame keeps the rows it scrolled off",
+          hist(v4) == hist0 + lines[12:14], hist(v4)[-6:])
+    check("repaint: ...and shows its new rows",
+          screen(v4) == lines[14:] + ["recap one", "recap two",
+                                      "-- footer --", ""], screen(v4))
+
+    # scrolled back while it happens: the view stays on the same text
+    v5 = TerminalView(rows=rows, cols=cols)
+    v5.feed(printed)
+    v5.scroll_by(3)
+    seen = v5.visible_text()
+    v5.feed(bytes_)
+    check("repaint: a scrolled-back view stays on the same text",
+          v5.scroll_offset() == 3 and v5.visible_text() == seen,
+          (v5.scroll_offset(), v5.visible_text()))
+
+    # a full history: the rows the copies evicted come back
+    v6 = TerminalView(rows=rows, cols=cols)
+    many = [f"older line {i:04d}" for i in range(tvm.HISTORY_LINES)]
+    v6.feed("".join(t + "\r\n" for t in many) + printed)
+    wiped = []
+    v6.historyCleared.connect(lambda: wiped.append(1))
+    full = hist(v6)
+    check("repaint: the history is full (else this proves nothing)",
+          len(full) == tvm.HISTORY_LINES, len(full))
+    v6.feed(bytes_)
+    check("repaint: with history full it is not read as a wipe",
+          not wiped, wiped)
+    check("repaint: ...and the rows the copies evicted come back",
+          hist(v6) == full, (hist(v6)[:2], hist(v6)[-2:]))
+
+    # output that never went to the top row keeps a repeated line
+    v7 = TerminalView(rows=rows, cols=cols)
+    v7.feed("".join("same line\r\n" for _ in range(rows + 5)))
+    before = hist(v7)
+    v7.feed("\x1b[?25lsame line\r\n\x1b[?25h")
+    check("repaint: a line printed twice without a jump stays",
+          hist(v7) == before + ["same line"], len(hist(v7)) - len(before))
+
+    # a jump to the top followed by new text keeps every row it scrolls
+    v8 = TerminalView(rows=rows, cols=cols)
+    v8.feed(printed)
+    fresh = [f"fresh text {i:02d}" for i in range(rows + 2)]
+    v8.feed("\x1b[?25l\x1b[H" + "\x1b[K\r\n".join(fresh) + "\x1b[K\r\n\x1b[?25h")
+    check("repaint: new text after a jump keeps its scrolled-off rows",
+          hist(v8) == hist0 + fresh[:3], hist(v8)[-4:])
+
+    # a blank row after a blank row proves nothing, so it stays
+    v9 = TerminalView(rows=rows, cols=cols)
+    v9.feed(printed + "\r\n" * rows)
+    before = hist(v9)
+    check("repaint: the history ends on a blank row (else this proves "
+          "nothing)", before[-1] == "", before[-2:])
+    v9.feed("\x1b[?25l\x1b[%dA\r\x1b[2K" % (rows - 1)
+            + "\r\n" * rows + "\x1b[?25h")
+    check("repaint: a blank copy stays", hist(v9) == before + [""],
+          hist(v9)[-3:])
+
+
 def test_history_screen_wrapper_removed():
     """_FastHistoryScreen drops pyte's per-event wrapper without changing what
     is rendered.
