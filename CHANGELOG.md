@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.45.1
+
+- A long Claude reply no longer shows up two or three times over in a
+  card's scrollback. When Claude redraws a reply taller than the card
+  (after the idle recap, closing Ctrl+O, or coming back to the
+  terminal), the rows that scrolled off a second time are copies, and
+  AI Hive now drops them.
+
 ## 0.45.0
 
 - Ctrl+F in a terminal opens a find box in its top right corner, like

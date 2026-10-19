@@ -278,8 +278,10 @@ _NAV_KEYS = (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up,
 # `pushed - offset + row`, which holds only while EVERY line leaving the screen
 # is counted, so a suppressed append drifts every live-anchored mark by one.
 HISTORY_LINES = 2000
-# rows a full history keeps after evicting them, enough to undo any push
-# _drop_repeated_push takes back (fewer rows than the screen)
+# rows a full history keeps after evicting them, so a take-back
+# (_drop_repeated_push, _drop_repaint_copies) can put back the rows its
+# copies pushed out. On a full history, a repaint that copied more rows than
+# this keeps its copies.
 EVICTED_KEEP = 512
 CELL_PAD_X = 6   # left/right inner padding (real terminals aren't flush)
 CELL_PAD_Y = 4   # top/bottom inner padding
@@ -314,6 +316,27 @@ def _find_row_text(line, cols: int):
     if len(joined) == cols and "" not in datas:
         return joined.rstrip(), None
     return joined.rstrip(), [c for c, d in enumerate(datas) for _ in d]
+
+
+def _row_text(row, cols: int, blank) -> str:
+    """A row's text with trailing blanks dropped, for the repaint rules."""
+    return "".join(row.get(x, blank).data for x in range(cols)).rstrip()
+
+
+def _row_cells(row, cols: int, blank) -> tuple:
+    """What each cell of a row shows, for telling a copied row from new
+    output. An erased cell and one never written look alike, and so do
+    blanks in two foreground colors: ConPTY's repaint writes spaces the
+    first paint skipped, in whatever color is current (measured on saved
+    screens)."""
+    out = []
+    for x in range(cols):
+        ch = row.get(x, blank)
+        if ch.data.strip():
+            out.append(ch)
+        else:
+            out.append((ch.bg, ch.reverse, ch.underscore, ch.strikethrough))
+    return tuple(out)
 
 
 class _CountingDeque(collections.deque):
@@ -374,6 +397,39 @@ class _FastHistoryScreen(pyte.HistoryScreen):
     prev_page would leave the screen paged away with nothing to snap it back."""
 
     __getattribute__ = object.__getattribute__
+
+    # (pushed, evicted) of history.top each time a cursor-up reached the top
+    # row since TerminalView last looked, oldest first. A full-frame repaint
+    # starts there (see TerminalView._drop_repaint_copies).
+    top_jumps: list
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.top_jumps = []
+        super().__init__(*args, **kwargs)
+
+    def cursor_up(self, count=None) -> None:
+        # only a move UP counts: a renderer erasing what it drew climbs with
+        # CUU (measured: ESC[24A, ESC[36A), while clear-and-print homes the
+        # cursor with CUP, and a second print after it is real output
+        super().cursor_up(count)
+        if self.cursor.y or (self.margins and self.margins.top):
+            return
+        top = self.history.top
+        mark = (getattr(top, "pushed", 0), getattr(top, "evicted", 0))
+        jumps = self.top_jumps
+        if not jumps or jumps[-1] != mark:
+            jumps.append(mark)
+            if len(jumps) > 8:
+                del jumps[0]
+
+    def _reset_history(self) -> None:
+        super()._reset_history()
+        self.top_jumps = []
+
+    def resize(self, lines=None, columns=None) -> None:
+        # a jump from before a resize describes another layout
+        super().resize(lines, columns)
+        self.top_jumps = []
 
     def prev_page(self) -> None:
         raise NotImplementedError(
@@ -470,9 +526,13 @@ _MAX_ESC_CARRY = 4096
 _REFLOW_RE = re.compile("(" + re.escape(REFLOW_BEGIN) + "|"
                         + re.escape(REFLOW_END) + ")")
 _REFLOW_TAG = REFLOW_BEGIN[:7]
-# ConPTY opens every frame it paints with a visible cursor by hiding it (see
-# TerminalView._feed_frames)
+# ConPTY opens every frame it paints with a visible cursor by hiding it, and
+# closes it by showing the cursor again (see TerminalView._feed_frames)
 _FRAME_START = "\x1b[?25l"
+_FRAME_END = "\x1b[?25h"
+# pyte acts on none of these but keeps them in Screen.mode, in stream order,
+# each private mode shifted left by 5
+_ALT_SCREEN_MODES = frozenset(m << 5 for m in (1049, 1047, 47))
 # DECSET/DECRST private modes (CSI ? Pm h/l). pyte ignores these, but they
 # decide how the wheel must behave (altscreen / mouse tracking / paste mode).
 _PRIVATE_MODE_RE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
@@ -572,8 +632,13 @@ class TerminalView(QWidget):
     findChanged = Signal(int, int)
 
     def __init__(self, rows: int = 30, cols: int = 100, parent=None,
-                 font_px: int = 0):
+                 font_px: int = 0, claude_repaints: bool = False):
         super().__init__(parent)
+        # take back the copies a Claude repaint from the top row scrolls
+        # into history (see _drop_repaint_copies). Only Claude cards: the
+        # bytes can't tell that repaint from a program reprinting rows on
+        # purpose, and Claude's classic renderer is the one measured.
+        self._claude_repaints = claude_repaints
         self.setObjectName("TerminalView")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
@@ -650,6 +715,9 @@ class TerminalView(QWidget):
         self.stream = pyte.Stream(self.screen)
         # the screen as the current ConPTY frame found it (see _feed_frames)
         self._frame_ref = None
+        # between REFLOW_BEGIN and REFLOW_END: the tall reprint is fresh
+        # history, not a repaint over it (see _drop_repaint_copies)
+        self._reflowing = False
 
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -821,9 +889,12 @@ class TerminalView(QWidget):
         if marker == REFLOW_BEGIN:
             self.screen._reset_history()
             self._forget_view_history()
+            self._reflowing = True
             self.reflowStarted.emit()
             return
+        self._reflowing = False
         scr = self.screen
+        scr.top_jumps = []
         top = scr.history.top
         bottom = scr.cursor.y
         for y in range(scr.lines - 1, bottom, -1):
@@ -856,20 +927,23 @@ class TerminalView(QWidget):
         self.reflowEnded.emit()
 
     def _feed_frames(self, data: str) -> int:
-        """Feed pyte, then take back any rows a frame pushed into history
-        while leaving the screen exactly as it found it. Returns how many.
+        """Feed pyte, then take back the rows a frame pushed into history
+        that are copies of rows already there. Returns how many.
 
-        Claude's classic renderer sometimes redraws its frame from the wrong
-        row. Measured on two saved screens: after the idle "recap" block (4
-        rows) printed, Claude re-sent its terminal queries and redrew 36 rows
-        up from the bottom, 4 rows short of its frame's real top. Its writes
-        ran 4 rows past the bottom, and ConPTY passed that on as a repaint
-        plus 4 newlines on the last row. The screen came out exactly as it
-        was, and the 4 rows that scrolled off were copies of the rows still
-        on screen: a reply paragraph showing up twice in the scrollback. Any
-        terminal fed those bytes shows it; nothing reaches the child to fix.
+        Two rules do it. _drop_repaint_copies handles a frame that repaints
+        from the top row, which is how every copy measured so far got in.
+        _drop_repeated_push is the older rule, for a frame that pushes rows
+        and leaves the screen exactly as it found it.
 
-        The rule that removes them only fires when it can't be wrong. Output
+        The older rule came from two saved screens read as a 40-row card:
+        after the idle "recap" block printed, Claude redrew from 36 rows up
+        and its writes ran 4 rows past the bottom, leaving the screen as it
+        was and 4 copied rows in history. Replayed at 37 rows, the height
+        where that 36-row jump lands on the top row, the same bytes are a
+        repaint from the top whose 4 pushed rows equal the 4 at the end of
+        history, and at 40 rows the replay ends with screen rows repeated in
+        history. So those were the newer rule's case too. The older rule
+        stays as a second net: it fires only when it can't be wrong. Output
         written at the cursor and scrolled k rows shifts every row above the
         cursor up by k. If the screen still ends unchanged, each of those rows
         equals the row k below it: they repeat every k rows (a run of "y"
@@ -879,12 +953,14 @@ class TerminalView(QWidget):
         alone, and so is k >= the screen height, where a program reprinting
         a screen it printed before is real output.
 
-        The check runs per ConPTY frame. ConPTY starts each frame by hiding
-        the cursor, so the stream is cut before every ESC[?25l, and the
-        screen at that cut is kept across feeds for a frame split between
-        two chunks. Each feed's start is a checkpoint too. A replay of the
-        same stream cuts it the same way, so a rebuilt card drops the same
-        rows."""
+        Both run per ConPTY frame. ConPTY starts each frame by hiding the
+        cursor and ends it by showing it again. The older rule cuts the
+        stream before every ESC[?25l and keeps the screen at that cut across
+        feeds for a frame split between two chunks; each feed's start is a
+        checkpoint too. The newer rule looks after each ESC[?25h and before
+        each ESC[?25l, never at a feed's end, so a frame split between two
+        chunks is judged whole. A replay of the same stream cuts it the same
+        way, so a rebuilt card drops the same rows."""
         top = self.screen.history.top
         if not hasattr(top, "pushed"):     # plain deque: no push count to use
             self.stream.feed(data)
@@ -892,16 +968,154 @@ class TerminalView(QWidget):
         dropped = 0
         for i, part in enumerate(data.split(_FRAME_START)):
             if i:
+                dropped += self._drop_repaint_copies()   # the last frame ended
                 part = _FRAME_START + part
                 self._frame_ref = self._screen_ref()
                 ref = None                 # same screen as the frame's
             else:
                 ref = self._screen_ref()
-            self.stream.feed(part)
+            pieces = part.split(_FRAME_END)
+            for piece in pieces[:-1]:
+                self.stream.feed(piece + _FRAME_END)
+                dropped += self._drop_repaint_copies()
+            if pieces[-1]:
+                self.stream.feed(pieces[-1])
             for r in (ref, self._frame_ref):
                 if r is not None:
                     dropped += self._drop_repeated_push(r)
         return dropped
+
+    def _drop_repaint_copies(self) -> int:
+        """At the end of a ConPTY frame: take back the rows it pushed after
+        the cursor moved to the top row when they repeat the rows that end
+        the history. Returns how many.
+
+        Claude's classic renderer keeps its last reply in the frame it
+        redraws, and a long reply makes that frame taller than the card. A
+        full repaint (after the idle recap, closing the Ctrl+O transcript,
+        or taking the terminal back) moves the cursor up as far as it goes,
+        which ConPTY clamps to the top row, and writes the whole frame from
+        there. Every row past the card's height scrolls the screen, and what
+        scrolls off is the frame's own top: rows that went into history the
+        first time the frame was drawn. Measured on a live claude at 25 rows
+        (Ctrl+O twice: one copied row) and on the saved screens of six
+        agents at 37 rows (2 to 13 copied rows per repaint): the pushed rows
+        equal the rows at the end of history, in order. A repaint that also
+        changed a row on screen, a footer hint or the recap growing the
+        frame, is the case the older rule let through, and how one reply
+        paragraph showed up three times over in a card's scrollback.
+
+        So the rule: of the rows pushed since a cursor-up last reached the
+        top row in this frame, the longest leading run that equals, cell
+        for cell, the same number of rows ending the history before them
+        goes. Pushes
+        after that run stay, since a frame that grew (the recap) scrolls
+        its new rows off legitimately. A run must hold a row with text: a
+        blank row after a blank row proves nothing. Plain output never
+        moves the cursor up to the top row before scrolling, which keeps a
+        program printing the same line twice out of this. Only a move up
+        counts: a renderer erasing what it drew climbs with ESC[nA, while
+        clearing the screen to print the same text again homes the cursor
+        with ESC[H, and that second print is real output. Even so, a
+        program could climb to the top row on purpose and print rows equal
+        to the scrollback's last ones, and its bytes would read the same,
+        so the rule runs only in a Claude card (`claude_repaints`). The
+        alternate screen keeps no scrollback, and a reflow's reprint is
+        fresh history rather than a repaint over it, so both are left
+        alone."""
+        scr = self.screen
+        jumps = scr.top_jumps
+        if not jumps:
+            return 0
+        scr.top_jumps = []
+        # the alternate screen as of this frame's end, not _alt_screen:
+        # feed() sets that from every mode switch in a chunk before feeding
+        # any of it, and a replay cuts the stream into other chunks
+        if (not self._claude_repaints or self._reflowing
+                or scr.mode & _ALT_SCREEN_MODES):
+            return 0
+        top = scr.history.top
+        cols = scr.columns
+        blank = scr.default_char
+        texts: dict = {}
+        looks: dict = {}
+
+        def text(i: int) -> str:
+            # history row i, cached: a long frame compares the same rows
+            # for every candidate run
+            t = texts.get(i)
+            if t is None:
+                t = texts[i] = _row_text(top[i], cols, blank)
+            return t
+
+        def look(i: int) -> tuple:
+            c = looks.get(i)
+            if c is None:
+                c = looks[i] = _row_cells(top[i], cols, blank)
+            return c
+
+        # the newest jump first: rows pushed before it were not this
+        # repaint's. An older one still counts when the cursor went back up
+        # after the copies were in, and it gets its turn after a take-back
+        # too: two repaints in one frame push two sets of copies.
+        dropped = 0
+        for pushed_then, evicted_then in reversed(jumps):
+            n = top.pushed - pushed_then
+            size = len(top)
+            if n <= 0 or n >= size:
+                continue
+            first = size - n                 # P = top[first:], T = top[:first]
+            lead = text(first)
+            run = 0
+            for h in range(min(n, first), 0, -1):
+                if text(first - h) != lead:
+                    continue
+                pairs = range(h)
+                # text first, it rules out most runs cheaply; then colors,
+                # since the same text in new colors is new output. Every
+                # measured copy matched its original cell for cell.
+                if not all(text(first + i) == text(first - h + i)
+                           for i in pairs):
+                    continue
+                if not all(look(first + i) == look(first - h + i)
+                           for i in pairs):
+                    continue
+                if any(text(first + i) for i in pairs):
+                    run = h
+                break
+            if run:
+                taken = self._take_back(run, n, evicted_then)
+                if not taken:
+                    break
+                dropped += taken
+                texts.clear()               # the history indexes moved
+                looks.clear()
+        return dropped
+
+    def _take_back(self, run: int, n: int, evicted_then: int) -> int:
+        """Remove the leading `run` of the last `n` history rows, and give
+        back the rows those pushes evicted from a full history (see
+        _CountingDeque). Returns `run`, or 0 when the evicted rows are no
+        longer kept: copies are better than losing rows that can't come
+        back."""
+        top = self.screen.history.top
+        gone = min(run, getattr(top, "evicted", 0) - evicted_then)
+        kept = getattr(top, "recent_evicted", ())
+        if gone > len(kept):
+            return 0
+        tail = [top.pop() for _ in range(n)]
+        tail.reverse()
+        for row in tail[run:]:
+            collections.deque.append(top, row)   # not a push: no count
+        top.pushed -= run
+        for _ in range(gone):
+            top.appendleft(kept.pop())
+            top.evicted -= 1
+        # rows went from the middle, so (pushed, len) can come back to a
+        # value _view_state cached for other rows
+        self._vs_cache = None
+        self._vs_sig = None
+        return run
 
     def _screen_ref(self):
         """The visible rows (as copies), the cursor row and the push count,
@@ -927,51 +1141,23 @@ class TerminalView(QWidget):
         cols = scr.columns
         buf = scr.buffer
         blank = scr.default_char
-
-        def cells(row) -> tuple:
-            # what each cell shows. An erased cell and one never written look
-            # alike, and so do blanks in two foreground colors: ConPTY's
-            # repaint writes spaces the first paint skipped, in whatever color
-            # is current (measured on both saved screens)
-            out = []
-            for x in range(cols):
-                ch = row.get(x, blank)
-                if ch.data.strip():
-                    out.append(ch)
-                else:
-                    out.append((ch.bg, ch.reverse, ch.underscore,
-                                ch.strikethrough))
-            return tuple(out)
-
-        def text(row) -> str:
-            return "".join(row[x].data if x in row else " "
-                           for x in range(cols)).rstrip()
-
         then = []
         for y, old in enumerate(rows_then):
             now = buf[y] if y in buf else {}
-            old_text = text(old)
+            old_text = _row_text(old, cols, blank)
             if now != old:
                 # text first, it rules out ordinary scrolling cheaply; then
                 # colors, since the same text in new colors is a change too
-                if text(now) != old_text or cells(now) != cells(old):
+                if (_row_text(now, cols, blank) != old_text
+                        or _row_cells(now, cols, blank)
+                        != _row_cells(old, cols, blank)):
                     return 0
             then.append(old_text)
         if all(then[y] == then[y + k] for y in range(cursor_then - k)):
             return 0
         # a full history evicted a row per push, and those rows go back in
-        # front. Copies are better than losing rows that can't come back.
-        gone = getattr(top, "evicted", 0) - evicted_then
-        kept = getattr(top, "recent_evicted", ())
-        if gone > len(kept):
-            return 0
-        for _ in range(k):
-            top.pop()
-        top.pushed -= k
-        for _ in range(gone):
-            top.appendleft(kept.pop())
-            top.evicted -= 1
-        return k
+        # front (_take_back)
+        return self._take_back(k, k, evicted_then)
 
     def reset(self) -> None:
         """A fresh terminal: blank screen, no scrollback, default modes. For
@@ -987,6 +1173,7 @@ class TerminalView(QWidget):
             pass
         self.stream = pyte.Stream(self.screen)
         self._frame_ref = None
+        self._reflowing = False
         self._esc_carry = ""
         self._input_gap_row = None
         self._sel_anchor = self._sel_end = None
@@ -1188,6 +1375,10 @@ class TerminalView(QWidget):
     def note_history_cleared(self) -> None:
         """Public entry for the card paths that call screen.reset() DIRECTLY
         and so never pass through feed()'s shrink check."""
+        # both start the stream over, so a reprint the old stream left open
+        # ends here: a projection meets its REFLOW_BEGIN again, a dropped
+        # seed never will
+        self._reflowing = False
         self._on_history_wiped()
         self._notify_view(immediate=True)
 
