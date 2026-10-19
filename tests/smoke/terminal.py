@@ -2267,6 +2267,14 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
           not wiped, wiped)
     check("repaint: ...and the rows the copies evicted come back",
           hist(v6) == full, (hist(v6)[:2], hist(v6)[-2:]))
+    # ...also when the frame grew and keeps 2 of its 6 pushes: history is a
+    # window, so it holds the newest rows as if only those 2 were pushed
+    v6b = TerminalView(rows=rows, cols=cols)
+    v6b.feed("".join(t + "\r\n" for t in many) + printed)
+    v6b.feed(repaint(lines[8:] + ["recap one", "recap two", "-- footer --"]))
+    want = (many + lines[:14])[-tvm.HISTORY_LINES:]
+    check("repaint: a grown frame on a full history keeps the right window",
+          hist(v6b) == want, (hist(v6b)[:2], hist(v6b)[-3:]))
 
     # output that never went to the top row keeps a repeated line
     v7 = TerminalView(rows=rows, cols=cols)
