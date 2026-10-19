@@ -2194,7 +2194,7 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
                 + "\r\n".join(frame) + "\r\n\x1b[?25h")
 
     # the frame: the reply from line 08 down, 4 rows taller than the card
-    v = TerminalView(rows=rows, cols=cols)
+    v = TerminalView(rows=rows, cols=cols, claude_repaints=True)
     v.feed(printed)
     hist0, screen0, pushed0 = hist(v), screen(v), v.history_pushed()
     check("repaint: the reply's top is in the scrollback (else this proves "
@@ -2221,20 +2221,20 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
     # drops the same rows
     for cut in (5, len(bytes_) // 2, bytes_.rindex("\r\n") + 1,
                 len(bytes_) - 3):
-        v2 = TerminalView(rows=rows, cols=cols)
+        v2 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
         v2.feed(printed)
         v2.feed(bytes_[:cut])
         v2.feed(bytes_[cut:])
         check(f"repaint: a frame cut at {cut} drops its copies too",
               hist(v2) == hist0 and screen(v2) == want_screen, hist(v2)[-6:])
-    v3 = TerminalView(rows=rows, cols=cols)
+    v3 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
     v3.feed(printed + bytes_)
     check("repaint: a replay in one feed drops the same rows",
           hist(v3) == hist0 and screen(v3) == want_screen, hist(v3)[-6:])
 
     # the recap grew the frame by 2 rows: the 4 copies go, and the 2 rows
     # it scrolled off for real stay
-    v4 = TerminalView(rows=rows, cols=cols)
+    v4 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
     v4.feed(printed)
     v4.feed(repaint(lines[8:] + ["recap one", "recap two", "-- footer --"]))
     check("repaint: a grown frame keeps the rows it scrolled off",
@@ -2244,7 +2244,7 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
                                       "-- footer --", ""], screen(v4))
 
     # scrolled back while it happens: the view stays on the same text
-    v5 = TerminalView(rows=rows, cols=cols)
+    v5 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
     v5.feed(printed)
     v5.scroll_by(3)
     seen = v5.visible_text()
@@ -2254,7 +2254,7 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
           (v5.scroll_offset(), v5.visible_text()))
 
     # a full history: the rows the copies evicted come back
-    v6 = TerminalView(rows=rows, cols=cols)
+    v6 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
     many = [f"older line {i:04d}" for i in range(tvm.HISTORY_LINES)]
     v6.feed("".join(t + "\r\n" for t in many) + printed)
     wiped = []
@@ -2269,7 +2269,7 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
           hist(v6) == full, (hist(v6)[:2], hist(v6)[-2:]))
     # ...also when the frame grew and keeps 2 of its 6 pushes: history is a
     # window, so it holds the newest rows as if only those 2 were pushed
-    v6b = TerminalView(rows=rows, cols=cols)
+    v6b = TerminalView(rows=rows, cols=cols, claude_repaints=True)
     v6b.feed("".join(t + "\r\n" for t in many) + printed)
     v6b.feed(repaint(lines[8:] + ["recap one", "recap two", "-- footer --"]))
     want = (many + lines[:14])[-tvm.HISTORY_LINES:]
@@ -2277,7 +2277,7 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
           hist(v6b) == want, (hist(v6b)[:2], hist(v6b)[-3:]))
 
     # output that never went to the top row keeps a repeated line
-    v7 = TerminalView(rows=rows, cols=cols)
+    v7 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
     v7.feed("".join("same line\r\n" for _ in range(rows + 5)))
     before = hist(v7)
     v7.feed("\x1b[?25lsame line\r\n\x1b[?25h")
@@ -2285,7 +2285,7 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
           hist(v7) == before + ["same line"], len(hist(v7)) - len(before))
 
     # a jump to the top followed by new text keeps every row it scrolls
-    v8 = TerminalView(rows=rows, cols=cols)
+    v8 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
     v8.feed(printed)
     fresh = [f"fresh text {i:02d}" for i in range(rows + 2)]
     v8.feed("\x1b[?25l\x1b[%dA\r" % (rows - 1)
@@ -2295,7 +2295,7 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
 
     # the same text in new colors is new output, so it stays (a new footer
     # keeps the older rule, which reads an unchanged screen, out of it)
-    v11 = TerminalView(rows=rows, cols=cols)
+    v11 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
     v11.feed(printed)
     v11.feed(repaint(["\x1b[31m" + t + "\x1b[0m" for t in lines[8:12]]
                      + lines[12:] + ["-- footer, new hint --"]))
@@ -2304,14 +2304,14 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
 
     # clearing the screen and printing the same text again is real output:
     # the cursor goes home with ESC[H, not up, so both prints stay
-    v10 = TerminalView(rows=rows, cols=cols)
+    v10 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
     v10.feed(printed)
     v10.feed("\x1b[?25l\x1b[H\x1b[2J" + printed + "\x1b[?25h")
     check("repaint: clear and print the same text again keeps both",
           hist(v10) == hist0 + hist0, (len(hist(v10)), hist(v10)[-3:]))
 
     # a blank row after a blank row proves nothing, so it stays
-    v9 = TerminalView(rows=rows, cols=cols)
+    v9 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
     v9.feed(printed + "\r\n" * rows)
     before = hist(v9)
     check("repaint: the history ends on a blank row (else this proves "
@@ -2320,6 +2320,27 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
             + "\r\n" * rows + "\x1b[?25h")
     check("repaint: a blank copy stays", hist(v9) == before + [""],
           hist(v9)[-3:])
+
+    # only a Claude card takes copies back: another program's bytes could
+    # mean a reprint on purpose
+    v12 = TerminalView(rows=rows, cols=cols)
+    v12.feed(printed + bytes_)
+    check("repaint: a view without claude_repaints keeps the rows",
+          hist(v12) == hist0 + lines[8:12], hist(v12)[-5:])
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.terminal_card import TerminalCard
+    seen = {}
+    for kind in (AgentKind.CLAUDE, AgentKind.OPENAI):
+        agent = TerminalAgent(build_spec(kind, "Repaint", cwd=SCRATCH_CWD))
+        card = TerminalCard(agent)
+        seen[kind.value] = (card.terminal is not None
+                            and card.terminal._claude_repaints)
+        card.detach()
+        card.close()
+        agent.deleteLater()
+    check("repaint: a Claude card turns the rule on, a Codex card doesn't",
+          seen == {"claude": True, "openai": False}, seen)
 
 
 def test_history_screen_wrapper_removed():

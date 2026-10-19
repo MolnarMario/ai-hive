@@ -622,8 +622,13 @@ class TerminalView(QWidget):
     findChanged = Signal(int, int)
 
     def __init__(self, rows: int = 30, cols: int = 100, parent=None,
-                 font_px: int = 0):
+                 font_px: int = 0, claude_repaints: bool = False):
         super().__init__(parent)
+        # take back the copies a Claude repaint from the top row scrolls
+        # into history (see _drop_repaint_copies). Only Claude cards: the
+        # bytes can't tell that repaint from a program reprinting rows on
+        # purpose, and Claude's classic renderer is the one measured.
+        self._claude_repaints = claude_repaints
         self.setObjectName("TerminalView")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
@@ -1001,15 +1006,19 @@ class TerminalView(QWidget):
         program printing the same line twice out of this. Only a move up
         counts: a renderer erasing what it drew climbs with ESC[nA, while
         clearing the screen to print the same text again homes the cursor
-        with ESC[H, and that second print is real output. The alternate
-        screen keeps no scrollback, and a reflow's reprint is fresh
-        history rather than a repaint over it, so both are left alone."""
+        with ESC[H, and that second print is real output. Even so, a
+        program could climb to the top row on purpose and print rows equal
+        to the scrollback's last ones, and its bytes would read the same,
+        so the rule runs only in a Claude card (`claude_repaints`). The
+        alternate screen keeps no scrollback, and a reflow's reprint is
+        fresh history rather than a repaint over it, so both are left
+        alone."""
         scr = self.screen
         jumps = scr.top_jumps
         if not jumps:
             return 0
         scr.top_jumps = []
-        if self._alt_screen or self._reflowing:
+        if not self._claude_repaints or self._alt_screen or self._reflowing:
             return 0
         top = scr.history.top
         size = len(top)

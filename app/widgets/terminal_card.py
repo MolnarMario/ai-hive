@@ -1061,10 +1061,10 @@ class TerminalCard(QFrame):
         root.addWidget(header)
         if self.is_pty:
             from .terminal_view import TerminalView
-            self.terminal = TerminalView(rows=self.agent.worker.rows,
-                                         cols=self.agent.worker.cols,
-                                         parent=self,
-                                         font_px=self.agent.spec.font_px)
+            self.terminal = TerminalView(
+                rows=self.agent.worker.rows, cols=self.agent.worker.cols,
+                parent=self, font_px=self.agent.spec.font_px,
+                claude_repaints=self.agent.spec.provider == "claude")
             root.addWidget(self.terminal, 1)
             # Overlay children of the terminal, created in z-order (each new
             # one sits above the last): the scrollbar is chrome the veil and
