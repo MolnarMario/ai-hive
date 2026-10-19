@@ -773,6 +773,20 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     placeholder-text-color: {p.TEXT_FAINT};
 }}
 #CardInput:focus {{ border-top: 1px solid {p.ACCENT_ORANGE}; }}
+/* Ctrl+F's find box (terminal_find.py), hanging from the terminal's top edge
+   like Chrome's. The query box is borderless inside it, so the generic
+   QLineEdit frame and focus ring stay off. */
+#TerminalFind {{
+    background: {p.BG_PANEL};
+    border: 1px solid {p.BORDER}; border-top: none;
+    border-bottom-left-radius: 6px; border-bottom-right-radius: 6px;
+}}
+#TerminalFindInput {{
+    background: transparent; border: none; padding: 2px 2px;
+    color: {p.TEXT}; placeholder-text-color: {p.TEXT_FAINT};
+}}
+#TerminalFindCount {{ color: {p.TEXT_DIM}; font-size: 12px; padding: 0 2px; }}
+#TerminalFindButton {{ padding: 0; }}
 #EmptyState {{ color: {p.TEXT_FAINT}; font-size: 14px; }}
 
 /* ----------------------------------------------------------- buttons --- */

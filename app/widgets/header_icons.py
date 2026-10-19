@@ -1,5 +1,6 @@
 """Line icons for the workspace header: the folder and trash beside the path,
-and Layout, Map, Activity and Lanes, plus the card header's lane chip.
+and Layout, Map, Activity and Lanes, plus the card header's lane chip and the
+terminal find bar's arrows and close button.
 
 Font glyphs (the old "▦", "◆", "❦", "⎇") render as colour emoji on some
 systems and never match the text weight. These are stroked SVG paths (the
@@ -52,6 +53,10 @@ _BODIES = {
                       "<path d='M10 4.5v15'/><path d='M7.8 9.2 5 12l2.8 2.8'/>"),
     "sidebar_open": ("<rect x='2.5' y='4.5' width='19' height='15' rx='3'/>"
                      "<path d='M10 4.5v15'/><path d='M5.2 9.2 8 12l-2.8 2.8'/>"),
+    # the terminal find bar's previous / next / close
+    "chevron_up": "<path d='m18 15-6-6-6 6'/>",
+    "chevron_down": "<path d='m6 9 6 6 6-6'/>",
+    "close": "<path d='M18 6 6 18'/><path d='m6 6 12 12'/>",
     "folder": ("<path d='M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 "
                "1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 "
                "0 0 2 2Z'/>"),
@@ -94,6 +99,8 @@ class IconToolButton(QToolButton):
         super().paintEvent(event)
         if self.isChecked():
             ink = Palette.ACCENT_BLUE
+        elif not self.isEnabled():
+            ink = Palette.TEXT_FAINT
         elif self._hover_ink and self.underMouse():
             ink = getattr(Palette, self._hover_ink)
         else:
