@@ -3,7 +3,8 @@
 A slim bar overlaid on a TerminalView's right edge, showing how far back the
 conversation reaches and marking every point where the USER submitted a typed
 prompt, so a long session can be jumped through by milestone rather than
-scrubbed through by hand.
+scrubbed through by hand. While a Ctrl+F search is open it also carries
+Chrome's find ticks, one per row with a match.
 
 Three decisions worth keeping:
 
@@ -37,12 +38,14 @@ from PySide6.QtWidgets import QScrollBar, QToolTip
 
 from .. import tooltips
 from ..ui_theme import Palette
+from .terminal_view import FIND_ACTIVE, FIND_HIT
 
 WIDTH = 10          # matches the QScrollBar:vertical width in ui_theme's QSS
 MARK_HIT_PX = 5     # click/hover slop around a marker
 _MARK_W = 6         # marker dash, px
 _MARK_H = 3
 _INSET = 3          # keeps the first/last marker off the rounded ends
+_FIND_TICK_H = 2    # px, a find match's tick
 
 
 class TerminalScrollBar(QScrollBar):
@@ -156,11 +159,14 @@ class TerminalScrollBar(QScrollBar):
     def paintEvent(self, event) -> None:
         super().paintEvent(event)       # groove + handle, straight from the QSS
         marks = self._view.marks()
-        if not marks:
+        finds = self._view.find_matches()
+        if not marks and not finds:
             return
         oldest, span = self._span()
         newest = oldest + span
         painter = QPainter(self)
+        if finds:
+            self._paint_find_ticks(painter, finds, oldest, newest)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         # read at paint time so the marker follows a live theme switch, exactly
         # like BootVeil -- there is no QSS token for a custom-painted dash
@@ -175,6 +181,26 @@ class TerminalScrollBar(QScrollBar):
             y = self._y_for(abs_line) - _MARK_H / 2.0
             painter.drawRoundedRect(x, y, _MARK_W, _MARK_H, 1.5, 1.5)
         painter.end()
+
+    def _paint_find_ticks(self, painter, finds, oldest, newest) -> None:
+        """Chrome's find ticks: a full-width line per row holding a match,
+        the active match's in orange on top. Under the prompt milestones,
+        which stay clickable. One tick per pixel row, since a common word
+        can match thousands of times."""
+        active, _total = self._view.find_state()
+        seen = set()
+        for abs_line, _c0, _c1 in finds:
+            if oldest <= abs_line <= newest:
+                seen.add(int(self._y_for(abs_line)))
+        hit = QColor(FIND_HIT)
+        for y in seen:
+            painter.fillRect(1, y - 1, self.width() - 2, _FIND_TICK_H, hit)
+        if active:
+            abs_line = finds[active - 1][0]
+            if oldest <= abs_line <= newest:
+                painter.fillRect(1, int(self._y_for(abs_line)) - 1,
+                                 self.width() - 2, _FIND_TICK_H,
+                                 QColor(FIND_ACTIVE))
 
 
 def _snippet(text: str, limit: int = 90) -> str:

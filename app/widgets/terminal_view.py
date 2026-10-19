@@ -132,9 +132,25 @@ prompt is never counted). Fail-closed: a selection that escapes the input box
 nothing -- inference from painted rows must never corrupt what it can't be sure
 of. To empty the whole prompt at once, use Ctrl+A then Backspace (the
 clear-prompt gesture above).
+Ctrl+F finds text in the conversation the way Chrome's find bar does: the
+view emits findRequested and the card opens its FindBar (terminal_find.py),
+which feeds the query back through set_find_query. The view owns the search
+because only it can read the rows: every scrollback line plus the live
+screen, matched case-insensitively within one row at a time (a phrase the
+child wrapped onto the next row is not found). Every match is painted on a
+yellow box, the active one orange, and stepping to a match off screen
+scrolls the view to center it. Typing a query makes the match nearest the
+view active (the first at or below the view's top row, else the last one
+above it) rather than wrapping to the oldest line, since a terminal is read
+from the bottom up. New output rescans at most every FIND_RESCAN_MS and
+keeps the active match by its absolute line, so a streaming agent never
+yanks the view. Ctrl+F no longer reaches the child (readline's forward-char,
+which Right arrow also does), and F3/Shift+F3 step through matches while the
+find box holds a query and reach the child otherwise.
 """
 
 import collections
+import math
 import re
 import time
 
@@ -275,6 +291,28 @@ _INPUT_SCAN_ROWS = 6
 # the conversation means the user is not typing a prompt
 _INPUT_ZONE_ROWS = 12
 _WIDE_GAP_RE = re.compile(r"\s{8,}")
+# Ctrl+F: the longest a streaming agent waits for its matches to catch up
+# with new output. A ceiling, not a debounce (see _find_dirty).
+FIND_RESCAN_MS = 120
+# Chrome's own find colors. Fixed rather than Palette reads: a match has to
+# stand out on every skin's console background, the light one included, and
+# the text on it is redrawn in FIND_INK so it stays legible whatever color
+# the child printed it in.
+FIND_HIT = "#ffdf4a"
+FIND_ACTIVE = "#ff9632"
+FIND_INK = "#141414"
+
+
+def _find_row_text(line, cols: int):
+    """(text, colmap) of one row for find, trailing blanks dropped. colmap is
+    None when string index == column; otherwise it maps each index to its
+    column, because a wide glyph leaves an empty second cell and a combining
+    mark joins the cell before it."""
+    datas = [line[c].data for c in range(cols)]
+    joined = "".join(datas)
+    if len(joined) == cols and "" not in datas:
+        return joined.rstrip(), None
+    return joined.rstrip(), [c for c, d in enumerate(datas) for _ in d]
 
 
 class _CountingDeque(collections.deque):
@@ -527,6 +565,10 @@ class TerminalView(QWidget):
     # TerminalAgent.request_repaint() so the layout self-heals with no user
     # action.
     staleLayoutDetected = Signal()
+    # Ctrl+F: the card opens (or refocuses) its find bar
+    findRequested = Signal()
+    # the find bar's "3/17": (1-based active match, or 0 with none; total)
+    findChanged = Signal(int, int)
 
     def __init__(self, rows: int = 30, cols: int = 100, parent=None,
                  font_px: int = 0):
@@ -652,6 +694,27 @@ class TerminalView(QWidget):
         self._view_notify_timer.setInterval(VIEW_NOTIFY_MS)
         self._view_notify_timer.timeout.connect(self._emit_view_changed)
 
+        # Ctrl+F find, pure view state like the marks. Matches are
+        # (absolute line, first col, last col) in reading order; _find_rows
+        # indexes them by line for paintEvent as (first col, last col, index).
+        self._find_re = None
+        self._find_matches: list[tuple[int, int, int]] = []
+        self._find_rows: dict[int, list[tuple[int, int, int]]] = {}
+        self._find_active = -1
+        # id(history line) -> (line, cols, text, colmap). A line never changes
+        # while it sits in history, so a rescan only reads the live screen and
+        # lines new since the last one. The entry holds the line itself, so
+        # its id can't be reused by another object while cached. Cleared
+        # wherever rows leave history for the screen (_apply_reflow_marker).
+        self._find_cache: dict[int, tuple] = {}
+        # px from the top a match must sit below to count as on screen:
+        # the find bar covers the rows above it (set_find_inset)
+        self._find_inset = 0
+        self._find_timer = QTimer(self)
+        self._find_timer.setSingleShot(True)
+        self._find_timer.setInterval(FIND_RESCAN_MS)
+        self._find_timer.timeout.connect(self._find_refresh)
+
     # -------------------------------------------------------------- data ---
 
     def feed(self, data: str) -> None:
@@ -701,6 +764,7 @@ class TerminalView(QWidget):
         self._notify_view()
         self.update()
         self._gap_timer.start()
+        self._find_dirty()
 
     def _feed_screen(self, data: str) -> None:
         top_before = self.screen.history.top
@@ -782,6 +846,9 @@ class TerminalView(QWidget):
             self._scroll_offset = max(0, self._scroll_offset - n)
             self._vs_cache = None
             self._vs_sig = None
+            # the popped rows are screen rows again and will be drawn over,
+            # so their cached find text can go stale
+            self._find_cache = {}
             # the frame's screen and push count moved under it, so it no
             # longer describes this screen (see _drop_repeated_push)
             self._frame_ref = None
@@ -1134,6 +1201,8 @@ class TerminalView(QWidget):
         self._reply_marks = []
         self._vs_cache = None
         self._vs_sig = None
+        self._find_cache = {}
+        self._find_dirty()
 
     def _notify_view(self, immediate: bool = False) -> None:
         """Announce a scroll/extent change, coalesced to one emit per 50ms.
@@ -1247,6 +1316,165 @@ class TerminalView(QWidget):
         self._apply_resize()
         self.update()
 
+    # -------------------------------------------------------------- find ---
+
+    def set_find_query(self, text: str) -> None:
+        """Search the scrollback and the live screen for `text` and make the
+        match nearest the view active, scrolling to it when it is off screen.
+        A refined query keeps the active match when it still matches, as
+        Chrome does. An empty `text` is the same as clear_find."""
+        if not text:
+            self.clear_find()
+            return
+        anchor = self._find_anchor()
+        self._find_re = re.compile(re.escape(text), re.IGNORECASE)
+        self._find_timer.stop()
+        self._find_scan()
+        self._find_pick(anchor)
+        self._reveal_find()
+        self.update()
+        self._emit_find()
+
+    def find_step(self, delta: int) -> None:
+        """Make the next (delta 1) or previous (-1) match active, wrapping
+        at either end, and scroll to it."""
+        if not self._find_matches:
+            return
+        if self._find_timer.isActive():
+            # stepping on matches that are up to FIND_RESCAN_MS stale could
+            # land on a row the output has already rewritten
+            self._find_timer.stop()
+            self._find_refresh()
+        if not self._find_matches:
+            return
+        self._find_active = (self._find_active + delta) % len(self._find_matches)
+        self._reveal_find()
+        self.update()
+        self._emit_find()
+
+    def clear_find(self) -> None:
+        """Close the search: no highlights, no rescans. The view stays
+        wherever the last match put it, as Chrome's page does."""
+        self._find_re = None
+        self._find_timer.stop()
+        self._find_matches = []
+        self._find_rows = {}
+        self._find_active = -1
+        self._find_cache = {}
+        self.update()
+        self._emit_find()
+
+    def find_state(self) -> tuple[int, int]:
+        """(1-based active match or 0, match count)."""
+        if not self._find_matches:
+            return 0, 0
+        return self._find_active + 1, len(self._find_matches)
+
+    def find_matches(self) -> list[tuple[int, int, int]]:
+        """Every match as (absolute line, first col, last col), oldest
+        first. The scrollbar draws them as ticks."""
+        return list(self._find_matches)
+
+    def set_find_inset(self, px: int) -> None:
+        """Rows whose top is less than `px` down count as hidden when
+        deciding whether a match needs scrolling to (the find bar covers
+        them)."""
+        self._find_inset = max(0, int(px))
+
+    def _find_dirty(self) -> None:
+        # Armed only when idle, like _notify_view: a restart per chunk would
+        # starve the rescan for as long as the agent streams.
+        if self._find_re is not None and not self._find_timer.isActive():
+            self._find_timer.start()
+
+    def _find_refresh(self) -> None:
+        """Rescan after the content changed, keeping the active match by
+        position. Never scrolls: the user may be reading somewhere else."""
+        if self._find_re is None:
+            return
+        anchor = self._find_anchor()
+        self._find_scan()
+        self._find_pick(anchor)
+        self.update()
+        self._emit_find()
+
+    def _find_anchor(self) -> tuple[int, int]:
+        """(line, col) the next pick starts from: the active match, or with
+        none the first row the find bar leaves uncovered."""
+        if 0 <= self._find_active < len(self._find_matches):
+            line, c0, _c1 = self._find_matches[self._find_active]
+            return line, c0
+        return self.abs_line_at_row(self._find_top_row()), 0
+
+    def _find_top_row(self) -> int:
+        """First visual row the find bar leaves uncovered."""
+        if self._find_inset <= CELL_PAD_Y:
+            return 0
+        hidden = math.ceil((self._find_inset - CELL_PAD_Y)
+                           / max(1.0, self._cell_h))
+        return min(self.screen.lines - 1, hidden)
+
+    def _find_scan(self) -> None:
+        rx = self._find_re
+        cols = self.screen.columns
+        top = self.screen.history.top
+        pushed = self.history_pushed()
+        first = pushed - len(top)
+        old, cache = self._find_cache, {}
+        matches: list[tuple[int, int, int]] = []
+        rows: dict[int, list[tuple[int, int, int]]] = {}
+
+        def scan(abs_line, line, text, colmap):
+            for m in rx.finditer(text):
+                if m.end() <= m.start():
+                    continue
+                c0 = colmap[m.start()] if colmap else m.start()
+                c1 = colmap[m.end() - 1] if colmap else m.end() - 1
+                if c1 + 1 < cols and line[c1 + 1].data == "":
+                    c1 += 1         # the wide glyph's second cell
+                rows.setdefault(abs_line, []).append((c0, c1, len(matches)))
+                matches.append((abs_line, c0, c1))
+
+        for i, line in enumerate(top):
+            hit = old.get(id(line))
+            if hit is None or hit[0] is not line or hit[1] != cols:
+                hit = (line, cols) + _find_row_text(line, cols)
+            cache[id(line)] = hit
+            scan(first + i, line, hit[2], hit[3])
+        buf = self.screen.buffer
+        for r in range(self.screen.lines):
+            line = buf[r]
+            scan(pushed + r, line, *_find_row_text(line, cols))
+        self._find_cache = cache
+        self._find_matches = matches
+        self._find_rows = rows
+
+    def _find_pick(self, anchor) -> None:
+        """Active = the first match at or after `anchor` (line, col), else
+        the last one before it."""
+        matches = self._find_matches
+        if not matches:
+            self._find_active = -1
+            return
+        for i, (line, c0, _c1) in enumerate(matches):
+            if (line, c0) >= anchor:
+                self._find_active = i
+                return
+        self._find_active = len(matches) - 1
+
+    def _reveal_find(self) -> None:
+        """Center the active match when it is off screen or under the bar."""
+        if not 0 <= self._find_active < len(self._find_matches):
+            return
+        line = self._find_matches[self._find_active][0]
+        row = line - self.abs_line_at_row(0)
+        if self._find_top_row() <= row < self.screen.lines:
+            return
+        self.scroll_to_abs(line, lead=self.screen.lines // 2)
+
+    def _emit_find(self) -> None:
+        self.findChanged.emit(*self.find_state())
+
     # ------------------------------------------------------------ sizing ---
 
     def sizeHint(self) -> QSize:
@@ -1278,6 +1506,7 @@ class TerminalView(QWidget):
         self.sizeChanged.emit(rows, cols)
         self._notify_view(immediate=True)   # page size changed
         self.update()
+        self._find_dirty()
 
     def project_size(self, rows: int, cols: int) -> None:
         """Resize the emulated screen only, for a replay that has to read the
@@ -1287,6 +1516,7 @@ class TerminalView(QWidget):
         widget's own size back when it ends."""
         if (rows, cols) != (self.screen.lines, self.screen.columns):
             self.screen.resize(rows, cols)
+            self._find_dirty()
 
     # ------------------------------------------------------------- input ---
 
@@ -1401,6 +1631,19 @@ class TerminalView(QWidget):
             return
         if shift and key == Qt.Key.Key_PageDown:
             self.scroll_by(-max(1, self.screen.lines - 1))
+            event.accept()
+            return
+
+        # Ctrl+F opens the find bar, as in Chrome. F3 / Shift+F3 step through
+        # the matches, but only while a search is open: otherwise F3 is the
+        # child's key like any other F-key.
+        if ctrl and not shift and not alt and key == Qt.Key.Key_F:
+            self.findRequested.emit()
+            event.accept()
+            return
+        if key == Qt.Key.Key_F3 and not ctrl and not alt \
+                and self._find_re is not None:
+            self.find_step(-1 if shift else 1)
             event.accept()
             return
 
@@ -2804,6 +3047,36 @@ class TerminalView(QWidget):
                             "".join(line[k].data or " " for k in range(i, j)))
                         i = j
                 col = run_end
+
+        # find matches (Ctrl+F) on Chrome's yellow, the active one orange.
+        # Drawn OVER the text with the glyphs redrawn in dark ink, because
+        # a pale box under the child's own (often pale) ink is unreadable.
+        if self._find_rows:
+            top_line = self.history_pushed() - off
+            painter.setFont(self._font)
+            hit, active = QColor(FIND_HIT), QColor(FIND_ACTIVE)
+            ink = QColor(FIND_INK)
+            for row in range(self.screen.lines):
+                spans = self._find_rows.get(top_line + row)
+                if not spans:
+                    continue
+                line = lines[row]
+                y = CELL_PAD_Y + row * ch
+                for c0, c1, idx in spans:
+                    if c0 >= _cols:
+                        continue
+                    c1 = min(c1, _cols - 1)
+                    x0, y0, _, y1 = self.cell_bounds(c0, row)
+                    x1 = self.cell_bounds(c1, row)[2]
+                    painter.fillRect(x0, y0, x1 - x0, y1 - y0,
+                                     active if idx == self._find_active
+                                     else hit)
+                    painter.setPen(ink)
+                    for c in range(c0, c1 + 1):
+                        data = line[c].data
+                        if data.strip():
+                            painter.drawText(int(CELL_PAD_X + c * cw),
+                                             int(y + self._ascent), data)
 
         # reply-finished stamps: a dim date/time drawn into the RIGHT-hand
         # blank space of the row reply_anchor_line() picked out (Claude's own

@@ -40,6 +40,8 @@ TERMINAL_ROWS = (
     ("Ctrl+Z, Ctrl+Y", "Undo and redo your typing"),
     ("Shift+arrows", "Select text. Add Ctrl to select whole words"),
     ("Shift+PageUp, Shift+PageDown", "Scroll through the history"),
+    ("Ctrl+F", "Find in the conversation. Enter or F3 goes to the next "
+     "match, Shift+Enter or Shift+F3 to the previous, Esc closes"),
     ("Ctrl+Enter", "New line in the prompt"),
     ("Ctrl+Shift+Enter", "Send what you typed later, on a timer"),
     ("Shift+Tab", "Cycle Claude Code's modes"),

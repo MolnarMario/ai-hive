@@ -1071,6 +1071,9 @@ class TerminalCard(QFrame):
             # the wake banner are both entitled to cover.
             from .terminal_scrollbar import TerminalScrollBar
             self.scroll_bar = TerminalScrollBar(self.terminal, self.terminal)
+            # Ctrl+F's Chrome-style find box, hidden until asked for
+            from .terminal_find import FindBar
+            self.find_bar = FindBar(self.terminal, self.terminal)
             # a stopped terminal must NEVER read as a dead black screen: a
             # visible banner says so, and any keystroke starts the session.
             # It takes TWO shapes, because the banner is only the whole story
@@ -1181,7 +1184,12 @@ class TerminalCard(QFrame):
             self.agent.screen_reset.connect(self._on_screen_reset)
             self.agent.turn_closed.connect(self._on_turn_closed)
             self.scroll_bar.markActivated.connect(self.terminal.scroll_to_abs)
+            self.terminal.findRequested.connect(self._open_find)
+            self.terminal.findChanged.connect(
+                lambda *_: self.scroll_bar.update())     # the find ticks
             self.terminal.installEventFilter(self)
+            # typing in the find box selects this card, as the terminal does
+            self.find_bar.edit.installEventFilter(self)
             return
 
         self.agent.output_segment.connect(self._on_segment)
@@ -2514,6 +2522,7 @@ class TerminalCard(QFrame):
         sb_w = self.scroll_bar.width()      # fixed by the widget itself
         self.scroll_bar.setGeometry(max(0, self.terminal.width() - sb_w), 0,
                                     sb_w, self.terminal.height())
+        self.find_bar.place()
         if self._overlay_compact:  # a full-width strip along the bottom edge,
             h = 24                 # so the conversation above stays readable
             self.overlay.setGeometry(0, max(0, self.terminal.height() - h),
@@ -2523,6 +2532,10 @@ class TerminalCard(QFrame):
         h = 64
         self.overlay.setGeometry((self.terminal.width() - w) // 2,
                                  (self.terminal.height() - h) // 2, w, h)
+
+    def _open_find(self) -> None:
+        """Ctrl+F in the terminal. Text selected there becomes the query."""
+        self.find_bar.open(self.terminal.selected_text())
 
     def _on_scroll_value(self, value: int) -> None:
         self._follow = value >= self.console.verticalScrollBar().maximum()

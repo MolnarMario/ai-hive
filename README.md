@@ -397,6 +397,16 @@ workspaces keep executing — switching never pauses anything.
   to keep their old width. Once the agent is idle, AI Hive gives it a console
   2000 rows taller for that one reprint, then its own size back. A reply still
   streaming finishes first, and the prompt dots move with the text.
+- **Find in the conversation.** `Ctrl+F` in a terminal opens a find box in
+  its top right corner, the way Chrome's page search works. It searches the
+  whole scrollback plus the screen as you type, ignoring case, paints every
+  match yellow and the current one orange, shows `3/17`, and puts a tick on
+  the scrollbar for each match. `Enter` / `F3` go to the next match and
+  `Shift+Enter` / `Shift+F3` to the previous one, scrolling it into view;
+  `Esc` closes the box. Text you selected becomes the query, otherwise the
+  last search comes back. Matches stay current while the agent keeps
+  writing, without moving the view. A phrase the agent wrapped onto two
+  rows is not found, since each row is searched on its own.
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
