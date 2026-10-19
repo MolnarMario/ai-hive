@@ -278,8 +278,10 @@ _NAV_KEYS = (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up,
 # `pushed - offset + row`, which holds only while EVERY line leaving the screen
 # is counted, so a suppressed append drifts every live-anchored mark by one.
 HISTORY_LINES = 2000
-# rows a full history keeps after evicting them, enough to undo any push
-# _drop_repeated_push takes back (fewer rows than the screen)
+# rows a full history keeps after evicting them, so a take-back
+# (_drop_repeated_push, _drop_repaint_copies) can put back the rows its
+# copies pushed out. On a full history, a repaint that copied more rows than
+# this keeps its copies.
 EVICTED_KEEP = 512
 CELL_PAD_X = 6   # left/right inner padding (real terminals aren't flush)
 CELL_PAD_Y = 4   # top/bottom inner padding
@@ -314,6 +316,11 @@ def _find_row_text(line, cols: int):
     if len(joined) == cols and "" not in datas:
         return joined.rstrip(), None
     return joined.rstrip(), [c for c, d in enumerate(datas) for _ in d]
+
+
+def _row_text(row, cols: int, blank) -> str:
+    """A row's text with trailing blanks dropped, for the repaint rules."""
+    return "".join(row.get(x, blank).data for x in range(cols)).rstrip()
 
 
 def _row_cells(row, cols: int, blank) -> tuple:
@@ -523,6 +530,9 @@ _REFLOW_TAG = REFLOW_BEGIN[:7]
 # closes it by showing the cursor again (see TerminalView._feed_frames)
 _FRAME_START = "\x1b[?25l"
 _FRAME_END = "\x1b[?25h"
+# pyte acts on none of these but keeps them in Screen.mode, in stream order,
+# each private mode shifted left by 5
+_ALT_SCREEN_MODES = frozenset(m << 5 for m in (1049, 1047, 47))
 # DECSET/DECRST private modes (CSI ? Pm h/l). pyte ignores these, but they
 # decide how the wheel must behave (altscreen / mouse tracking / paste mode).
 _PRIVATE_MODE_RE = re.compile(r"\x1b\[\?([0-9;]+)([hl])")
@@ -1018,10 +1028,13 @@ class TerminalView(QWidget):
         if not jumps:
             return 0
         scr.top_jumps = []
-        if not self._claude_repaints or self._alt_screen or self._reflowing:
+        # the alternate screen as of this frame's end, not _alt_screen:
+        # feed() sets that from every mode switch in a chunk before feeding
+        # any of it, and a replay cuts the stream into other chunks
+        if (not self._claude_repaints or self._reflowing
+                or scr.mode & _ALT_SCREEN_MODES):
             return 0
         top = scr.history.top
-        size = len(top)
         cols = scr.columns
         blank = scr.default_char
         texts: dict = {}
@@ -1032,9 +1045,7 @@ class TerminalView(QWidget):
             # for every candidate run
             t = texts.get(i)
             if t is None:
-                row = top[i]
-                t = texts[i] = "".join(
-                    row.get(x, blank).data for x in range(cols)).rstrip()
+                t = texts[i] = _row_text(top[i], cols, blank)
             return t
 
         def look(i: int) -> tuple:
@@ -1045,9 +1056,12 @@ class TerminalView(QWidget):
 
         # the newest jump first: rows pushed before it were not this
         # repaint's. An older one still counts when the cursor went back up
-        # after the copies were in.
+        # after the copies were in, and it gets its turn after a take-back
+        # too: two repaints in one frame push two sets of copies.
+        dropped = 0
         for pushed_then, evicted_then in reversed(jumps):
             n = top.pushed - pushed_then
+            size = len(top)
             if n <= 0 or n >= size:
                 continue
             first = size - n                 # P = top[first:], T = top[:first]
@@ -1070,8 +1084,13 @@ class TerminalView(QWidget):
                     run = h
                 break
             if run:
-                return self._take_back(run, n, evicted_then)
-        return 0
+                taken = self._take_back(run, n, evicted_then)
+                if not taken:
+                    break
+                dropped += taken
+                texts.clear()               # the history indexes moved
+                looks.clear()
+        return dropped
 
     def _take_back(self, run: int, n: int, evicted_then: int) -> int:
         """Remove the leading `run` of the last `n` history rows, and give
@@ -1092,6 +1111,10 @@ class TerminalView(QWidget):
         for _ in range(gone):
             top.appendleft(kept.pop())
             top.evicted -= 1
+        # rows went from the middle, so (pushed, len) can come back to a
+        # value _view_state cached for other rows
+        self._vs_cache = None
+        self._vs_sig = None
         return run
 
     def _screen_ref(self):
@@ -1118,39 +1141,23 @@ class TerminalView(QWidget):
         cols = scr.columns
         buf = scr.buffer
         blank = scr.default_char
-
-        def cells(row) -> tuple:
-            return _row_cells(row, cols, blank)
-
-        def text(row) -> str:
-            return "".join(row[x].data if x in row else " "
-                           for x in range(cols)).rstrip()
-
         then = []
         for y, old in enumerate(rows_then):
             now = buf[y] if y in buf else {}
-            old_text = text(old)
+            old_text = _row_text(old, cols, blank)
             if now != old:
                 # text first, it rules out ordinary scrolling cheaply; then
                 # colors, since the same text in new colors is a change too
-                if text(now) != old_text or cells(now) != cells(old):
+                if (_row_text(now, cols, blank) != old_text
+                        or _row_cells(now, cols, blank)
+                        != _row_cells(old, cols, blank)):
                     return 0
             then.append(old_text)
         if all(then[y] == then[y + k] for y in range(cursor_then - k)):
             return 0
         # a full history evicted a row per push, and those rows go back in
-        # front. Copies are better than losing rows that can't come back.
-        gone = getattr(top, "evicted", 0) - evicted_then
-        kept = getattr(top, "recent_evicted", ())
-        if gone > len(kept):
-            return 0
-        for _ in range(k):
-            top.pop()
-        top.pushed -= k
-        for _ in range(gone):
-            top.appendleft(kept.pop())
-            top.evicted -= 1
-        return k
+        # front (_take_back)
+        return self._take_back(k, k, evicted_then)
 
     def reset(self) -> None:
         """A fresh terminal: blank screen, no scrollback, default modes. For
@@ -1368,6 +1375,10 @@ class TerminalView(QWidget):
     def note_history_cleared(self) -> None:
         """Public entry for the card paths that call screen.reset() DIRECTLY
         and so never pass through feed()'s shrink check."""
+        # both start the stream over, so a reprint the old stream left open
+        # ends here: a projection meets its REFLOW_BEGIN again, a dropped
+        # seed never will
+        self._reflowing = False
         self._on_history_wiped()
         self._notify_view(immediate=True)
 

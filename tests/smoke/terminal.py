@@ -2343,6 +2343,182 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
           seen == {"claude": True, "openai": False}, seen)
 
 
+def test_repaint_take_back_edges():
+    """The repaint rule (_drop_repaint_copies) where the stream gets awkward:
+    two repaints in one frame, a frame split around a paint while scrolled
+    back, a mode switch in the same chunk as the frame, and a reprint the
+    stream never closed."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import REFLOW_BEGIN
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    rows, cols = 10, 40
+    lines = [f"reply paragraph line {i:02d}" for i in range(20)]
+    printed = "".join(t + "\r\n" for t in lines) + "-- footer --\r\n"
+
+    def rt(line):
+        return "".join(line[x].data for x in range(cols)).rstrip()
+
+    def hist(v):
+        return [rt(r) for r in v.screen.history.top]
+
+    def frame(rows_):
+        return ("\r\x1b[%dA" % (rows - 1) + "\r\n".join(rows_) + "\r\n")
+
+    def view(scrolled=0):
+        v = TerminalView(rows=rows, cols=cols, claude_repaints=True)
+        v.feed(printed)
+        if scrolled:
+            v.scroll_by(scrolled)
+        return v
+
+    hist0 = hist(view())
+    once = frame(lines[8:] + ["-- footer, new hint --"])
+
+    # two repaints before the frame ends: both sets of copies go
+    v = view()
+    v.feed("\x1b[?25l" + once + once + "\x1b[?25h")
+    check("repaint-edge: two repaints in one frame leave no copy",
+          hist(v) == hist0, hist(v)[-6:])
+
+    # a frame that grew, cut after its first 2 pushes, with a paint in
+    # between: the take-back brings (pushed, len) back to the value the
+    # paint cached for other rows
+    grown = ("\x1b[?25l" + frame(lines[8:] + ["recap one", "recap two",
+                                              "-- footer --"]) + "\x1b[?25h")
+    cut = 0
+    for _ in range(rows + 1):
+        cut = grown.index("\r\n", cut) + 2
+    v = view(scrolled=3)
+    p0 = v.history_pushed()
+    v.feed(grown[:cut])
+    check("repaint-edge: (fixture) the cut lands after 2 pushes",
+          v.history_pushed() == p0 + 2, v.history_pushed() - p0)
+    v.visible_text()                       # a paint caches the history
+    v.feed(grown[cut:])
+    check("repaint-edge: (fixture) the grown frame keeps 2 of its rows",
+          hist(v) == hist0 + lines[12:14], hist(v)[-4:])
+    cached = v._view_state()[0]
+    check("repaint-edge: a scrolled-back view paints the rows history holds",
+          [rt(r) for r in cached] == hist(v), [rt(r) for r in cached][-4:])
+
+    # a mode switch after the frame, in the same chunk: the frame was on the
+    # main screen, and a feed cut anywhere agrees
+    v = view()
+    v.feed("\x1b[?25l" + once + "\x1b[?25h\x1b[?1049h")
+    check("repaint-edge: a frame before ESC[?1049h in its chunk drops copies",
+          hist(v) == hist0, hist(v)[-6:])
+    alt = "\x1b[?1049h\x1b[?25l" + once + "\x1b[?25h\x1b[?1049l"
+    v, v2 = view(), view()
+    v.feed(alt)
+    for part in alt.split("\x1b[?25h"):
+        v2.feed(part if part.startswith("\x1b[?1049l") else part + "\x1b[?25h")
+    check("repaint-edge: a frame on the alternate screen keeps its rows, "
+          "however the chunk is cut",
+          hist(v) == hist(v2) == hist0 + lines[8:12], hist(v)[-6:])
+
+    # a reprint the stream never closed (the app quit mid-reflow) ends when
+    # the card drops that screen for the next child
+    v = view()
+    v.feed(REFLOW_BEGIN + "reprinted\r\n")
+    check("repaint-edge: (fixture) an open reprint turns the rule off",
+          v._reflowing)
+    v.note_history_cleared()
+    v.screen.reset()
+    check("repaint-edge: a dropped screen ends the reprint", not v._reflowing)
+    v.feed(printed + "\x1b[?25l" + once + "\x1b[?25h")
+    check("repaint-edge: ...and the next repaint's copies go",
+          hist(v) == hist0, hist(v)[-6:])
+
+
+def test_cancelled_reflow_still_ends_in_the_stream():
+    """A child that stops in the middle of a reflow's reprint still gets its
+    REFLOW_END. Without it the view took everything after for reprint and
+    kept every Claude repaint's copies, live and in a rebuilt card."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import (REFLOW_BEGIN, REFLOW_END,
+                                    REFLOW_EXTRA_ROWS, AgentStatus,
+                                    TerminalAgent)
+    from app.widgets.terminal_card import TerminalCard
+
+    QApplication.instance() or QApplication([])
+    rows_n = 10
+
+    class Worker:
+        def __init__(self):
+            self.rows, self.cols, self.exit_info = rows_n, 40, None
+            self.flushed = 0
+
+        def is_running(self):
+            return True
+
+        def resize(self, rows, cols):
+            if (rows, cols) == (self.rows, self.cols):
+                return False
+            self.rows, self.cols = rows, cols
+            return True
+
+        def write(self, data):
+            return True
+
+        def flush(self):
+            self.flushed += 1
+
+        def dispose(self):
+            pass
+
+    def size(card, rows, cols):
+        card.terminal.screen.resize(rows, cols)
+        card.terminal.sizeChanged.emit(rows, cols)
+
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Reflow cancel",
+                                     cwd=SCRATCH_CWD, pty=True))
+    card = TerminalCard(agent)
+    card._proj_cols = card.terminal.screen.columns
+    agent.worker = worker = Worker()
+    size(card, rows_n, 40)
+    agent._set_status(AgentStatus.RUNNING)
+    agent._prompt_ready = True
+    agent._on_pty_output("pty", "\r\n".join(_reflow_render(40)))
+    size(card, rows_n, 80)
+    wide = _reflow_render(80)
+    agent._on_pty_output("pty", _conhost_paint(wide[-rows_n:], rows_n))
+    agent._busy = False                # idle at its prompt
+    agent._reflow_tick()
+    agent._on_pty_output("pty", _conhost_paint(wide,
+                                               rows_n + REFLOW_EXTRA_ROWS))
+    check("reflow-cancel: (fixture) the reprint is under way",
+          agent._reflow_step == "reprint" and card.terminal._reflowing,
+          agent._reflow_step)
+    agent._set_status(AgentStatus.EXITED_OK)
+    replay = agent.pty_replay()
+    check("reflow-cancel: the reprint ends in the stream",
+          replay.endswith(REFLOW_END) and replay.count(REFLOW_BEGIN) == 1
+          and agent._reflow_step == "", agent._reflow_step)
+    check("reflow-cancel: ...after the bytes the worker still held",
+          worker.flushed == 1, worker.flushed)
+    check("reflow-cancel: the live view is out of the reprint",
+          not card.terminal._reflowing)
+    card2 = TerminalCard(agent)        # the full projection, markers in
+    size(card2, rows_n, 80)
+    card2._clear_for_projection()
+    card2._replay_with_marks(agent.pty_replay())
+    check("reflow-cancel: so is a rebuilt card",
+          not card2.terminal._reflowing)
+    # nothing more to end: a second stop and the teardown add nothing
+    agent._set_status(AgentStatus.IDLE)
+    agent.dispose()
+    check("reflow-cancel: one REFLOW_END, however often it is cancelled",
+          agent.pty_replay().count(REFLOW_END) == 1)
+    for c in (card, card2):
+        c.detach()
+        c.close()
+    agent.deleteLater()
+
+
 def test_history_screen_wrapper_removed():
     """_FastHistoryScreen drops pyte's per-event wrapper without changing what
     is rendered.

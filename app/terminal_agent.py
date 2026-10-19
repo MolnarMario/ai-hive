@@ -1054,7 +1054,15 @@ class TerminalAgent(QObject):
             self._reflow_timer.start(REFLOW_DELAY_MS)
 
     def _cancel_reflow(self) -> None:
-        """A new child: whatever reflow the old one owed is moot."""
+        """A new child, or none: whatever reflow the old one owed is moot.
+        A reprint already under way still gets its REFLOW_END. Without it
+        the view reads everything after as reprint and never takes back a
+        repaint's copies (TerminalView._drop_repaint_copies)."""
+        if self._reflow_step == "reprint" and not self._disposing:
+            flush = getattr(self.worker, "flush", None)
+            if flush is not None:
+                flush()     # reprint bytes still batched belong before it
+            self._append_stream(REFLOW_END)
         self._reflow_due = False
         self._reflow_step = ""
         self._alt_screen = False
