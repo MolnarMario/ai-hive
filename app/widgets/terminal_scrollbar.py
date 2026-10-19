@@ -111,8 +111,8 @@ class TerminalScrollBar(QScrollBar):
         return (self._view.history_pushed() - hist,
                 hist + self._view.screen.lines)
 
-    def _y_for(self, abs_line: int) -> float:
-        oldest, span = self._span()
+    def _y_for(self, abs_line: int, span=None) -> float:
+        oldest, span = span or self._span()
         frac = (abs_line - oldest) / float(max(1, span))
         frac = max(0.0, min(1.0, frac))
         return _INSET + frac * max(1, self.height() - 2 * _INSET)
@@ -160,14 +160,14 @@ class TerminalScrollBar(QScrollBar):
     def paintEvent(self, event) -> None:
         super().paintEvent(event)       # groove + handle, straight from the QSS
         marks = self._view.marks()
-        finds = self._view.find_matches()
+        finds, active = self._view.find_lines()
         if not marks and not finds:
             return
         oldest, span = self._span()
         newest = oldest + span
         painter = QPainter(self)
         if finds:
-            self._paint_find_ticks(painter, finds, oldest, newest)
+            self._paint_find_ticks(painter, finds, active, (oldest, span))
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         # read at paint time so the marker follows a live theme switch, exactly
         # like BootVeil -- there is no QSS token for a custom-painted dash
@@ -183,25 +183,25 @@ class TerminalScrollBar(QScrollBar):
             painter.drawRoundedRect(x, y, _MARK_W, _MARK_H, 1.5, 1.5)
         painter.end()
 
-    def _paint_find_ticks(self, painter, finds, oldest, newest) -> None:
+    def _paint_find_ticks(self, painter, lines, active, span) -> None:
         """Chrome's find ticks: a full-width line per row holding a match,
         the active match's in orange on top. Under the prompt milestones,
-        which stay clickable. One tick per pixel row, since a common word
-        can match thousands of times."""
-        active, _total = self._view.find_state()
+        which stay clickable. `lines` has one entry per line however often
+        it matches, and the ticks one per pixel row; `span` is _span(),
+        read once rather than once per line."""
+        oldest, count = span
+        newest = oldest + count
         seen = set()
-        for abs_line, _c0, _c1 in finds:
+        for abs_line in lines:
             if oldest <= abs_line <= newest:
-                seen.add(int(self._y_for(abs_line)))
+                seen.add(int(self._y_for(abs_line, span)))
         hit = QColor(FIND_HIT)
         for y in seen:
             painter.fillRect(1, y - 1, self.width() - 2, _FIND_TICK_H, hit)
-        if active:
-            abs_line = finds[active - 1][0]
-            if oldest <= abs_line <= newest:
-                painter.fillRect(1, int(self._y_for(abs_line)) - 1,
-                                 self.width() - 2, _FIND_TICK_H,
-                                 QColor(FIND_ACTIVE))
+        if oldest <= active <= newest:
+            painter.fillRect(1, int(self._y_for(active, span)) - 1,
+                             self.width() - 2, _FIND_TICK_H,
+                             QColor(FIND_ACTIVE))
 
 
 def _snippet(text: str, limit: int = 90) -> str:

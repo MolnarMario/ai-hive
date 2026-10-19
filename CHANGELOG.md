@@ -16,7 +16,9 @@ em dashes: this text is shown in the app.
   orange, shows how many there are and marks each one on the scrollbar.
   Enter or F3 goes to the next match, Shift+Enter or Shift+F3 to the
   previous one, and Esc closes the box. Text you selected becomes the
-  search. A phrase the agent wrapped onto two rows is not found.
+  search. A phrase the agent wrapped onto two rows is not found. In a
+  full-screen program such as less or vim, Ctrl+F still goes to the
+  program.
 - A mouse wheel over a terminal's scrollbar reaches an agent that tracks
   the mouse at the spot under the pointer. It used to reach it at the
   terminal's left edge.

@@ -406,7 +406,9 @@ workspaces keep executing — switching never pauses anything.
   `Esc` closes the box. Text you selected becomes the query, otherwise the
   last search comes back. Matches stay current while the agent keeps
   writing, without moving the view. A phrase the agent wrapped onto two
-  rows is not found, since each row is searched on its own.
+  rows is not found, since each row is searched on its own. In a
+  full-screen program such as `less` or `vim`, `Ctrl+F` goes to the
+  program, which pages forward with it.
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you

@@ -145,8 +145,9 @@ above it) rather than wrapping to the oldest line, since a terminal is read
 from the bottom up. New output rescans at most every FIND_RESCAN_MS and
 keeps the active match by its absolute line, so a streaming agent never
 yanks the view. Ctrl+F no longer reaches the child (readline's forward-char,
-which Right arrow also does), and F3/Shift+F3 step through matches while the
-find box holds a query and reach the child otherwise.
+which Right arrow also does) except on the alternate screen, where less and
+vim page forward with it. F3/Shift+F3 step through matches while the find
+box holds a query and reach the child otherwise.
 """
 
 import collections
@@ -1202,6 +1203,10 @@ class TerminalView(QWidget):
         self._vs_cache = None
         self._vs_sig = None
         self._find_cache = {}
+        # The reprinted lines get new ids, all past the active match's, so
+        # anchoring on it would make the oldest match active. Pick from the
+        # view instead.
+        self._find_active = -1
         self._find_dirty()
 
     def _notify_view(self, immediate: bool = False) -> None:
@@ -1322,11 +1327,12 @@ class TerminalView(QWidget):
         """Search the scrollback and the live screen for `text` and make the
         match nearest the view active, scrolling to it when it is off screen.
         A refined query keeps the active match when it still matches, as
-        Chrome does. An empty `text` is the same as clear_find."""
+        Chrome does, unless the user scrolled it out of sight. An empty
+        `text` is the same as clear_find."""
         if not text:
             self.clear_find()
             return
-        anchor = self._find_anchor()
+        anchor = self._find_anchor(visible_only=True)
         self._find_re = re.compile(re.escape(text), re.IGNORECASE)
         self._find_timer.stop()
         self._find_scan()
@@ -1338,11 +1344,10 @@ class TerminalView(QWidget):
     def find_step(self, delta: int) -> None:
         """Make the next (delta 1) or previous (-1) match active, wrapping
         at either end, and scroll to it."""
-        if not self._find_matches:
-            return
         if self._find_timer.isActive():
             # stepping on matches that are up to FIND_RESCAN_MS stale could
-            # land on a row the output has already rewritten
+            # land on a row the output has already rewritten, or miss the
+            # first match the agent just printed
             self._find_timer.stop()
             self._find_refresh()
         if not self._find_matches:
@@ -1354,13 +1359,13 @@ class TerminalView(QWidget):
 
     def clear_find(self) -> None:
         """Close the search: no highlights, no rescans. The view stays
-        wherever the last match put it, as Chrome's page does."""
+        wherever the last match put it, as Chrome's page does. The row text
+        cache stays, so the next Ctrl+F doesn't read all of history again."""
         self._find_re = None
         self._find_timer.stop()
         self._find_matches = []
         self._find_rows = {}
         self._find_active = -1
-        self._find_cache = {}
         self.update()
         self._emit_find()
 
@@ -1372,8 +1377,17 @@ class TerminalView(QWidget):
 
     def find_matches(self) -> list[tuple[int, int, int]]:
         """Every match as (absolute line, first col, last col), oldest
-        first. The scrollbar draws them as ticks."""
+        first."""
         return list(self._find_matches)
+
+    def find_lines(self) -> tuple[list[int], int]:
+        """(every absolute line holding a match, oldest first; the active
+        match's line, or -1). The scrollbar's ticks: one per line, since a
+        one-letter query can match 30000 times in a full history."""
+        active = -1
+        if 0 <= self._find_active < len(self._find_matches):
+            active = self._find_matches[self._find_active][0]
+        return list(self._find_rows), active
 
     def set_find_inset(self, px: int) -> None:
         """Rows whose top is less than `px` down count as hidden when
@@ -1398,13 +1412,22 @@ class TerminalView(QWidget):
         self.update()
         self._emit_find()
 
-    def _find_anchor(self) -> tuple[int, int]:
+    def _find_anchor(self, visible_only: bool = False) -> tuple[int, int]:
         """(line, col) the next pick starts from: the active match, or with
-        none the first row the find bar leaves uncovered."""
+        none the first row the find bar leaves uncovered. With
+        `visible_only` an active match the user scrolled away from doesn't
+        count: a new query starts from what is on screen."""
         if 0 <= self._find_active < len(self._find_matches):
             line, c0, _c1 = self._find_matches[self._find_active]
-            return line, c0
+            if not visible_only or self._find_on_screen(line):
+                return line, c0
         return self.abs_line_at_row(self._find_top_row()), 0
+
+    def _find_on_screen(self, abs_line: int) -> bool:
+        """True when the line shows on screen and the find bar doesn't
+        cover it."""
+        row = abs_line - self.abs_line_at_row(0)
+        return self._find_top_row() <= row < self.screen.lines
 
     def _find_top_row(self) -> int:
         """First visual row the find bar leaves uncovered."""
@@ -1424,7 +1447,8 @@ class TerminalView(QWidget):
         matches: list[tuple[int, int, int]] = []
         rows: dict[int, list[tuple[int, int, int]]] = {}
 
-        def scan(abs_line, line, text, colmap):
+        def spans(line, text, colmap):
+            out = []
             for m in rx.finditer(text):
                 if m.end() <= m.start():
                     continue
@@ -1432,19 +1456,31 @@ class TerminalView(QWidget):
                 c1 = colmap[m.end() - 1] if colmap else m.end() - 1
                 if c1 + 1 < cols and line[c1 + 1].data == "":
                     c1 += 1         # the wide glyph's second cell
-                rows.setdefault(abs_line, []).append((c0, c1, len(matches)))
-                matches.append((abs_line, c0, c1))
+                out.append((c0, c1))
+            return out
+
+        def add(abs_line, found):
+            if found:
+                n = len(matches)
+                rows[abs_line] = [(c0, c1, n + k)
+                                  for k, (c0, c1) in enumerate(found)]
+                matches.extend((abs_line, c0, c1) for c0, c1 in found)
 
         for i, line in enumerate(top):
+            # [line, cols, text, colmap, query, spans]: a history line's
+            # spans are kept per query too, so a streaming agent's rescans
+            # only run the regex over new lines and the live screen
             hit = old.get(id(line))
             if hit is None or hit[0] is not line or hit[1] != cols:
-                hit = (line, cols) + _find_row_text(line, cols)
+                hit = [line, cols, *_find_row_text(line, cols), None, ()]
+            if hit[4] is not rx:
+                hit[4], hit[5] = rx, spans(line, hit[2], hit[3])
             cache[id(line)] = hit
-            scan(first + i, line, hit[2], hit[3])
+            add(first + i, hit[5])
         buf = self.screen.buffer
         for r in range(self.screen.lines):
             line = buf[r]
-            scan(pushed + r, line, *_find_row_text(line, cols))
+            add(pushed + r, spans(line, *_find_row_text(line, cols)))
         self._find_cache = cache
         self._find_matches = matches
         self._find_rows = rows
@@ -1467,10 +1503,8 @@ class TerminalView(QWidget):
         if not 0 <= self._find_active < len(self._find_matches):
             return
         line = self._find_matches[self._find_active][0]
-        row = line - self.abs_line_at_row(0)
-        if self._find_top_row() <= row < self.screen.lines:
-            return
-        self.scroll_to_abs(line, lead=self.screen.lines // 2)
+        if not self._find_on_screen(line):
+            self.scroll_to_abs(line, lead=self.screen.lines // 2)
 
     def _emit_find(self) -> None:
         self.findChanged.emit(*self.find_state())
@@ -1634,10 +1668,12 @@ class TerminalView(QWidget):
             event.accept()
             return
 
-        # Ctrl+F opens the find bar, as in Chrome. F3 / Shift+F3 step through
-        # the matches, but only while a search is open: otherwise F3 is the
-        # child's key like any other F-key.
-        if ctrl and not shift and not alt and key == Qt.Key.Key_F:
+        # Ctrl+F opens the find bar, as in Chrome, except on the alternate
+        # screen, where less and vim page forward with it. F3 / Shift+F3 step
+        # through the matches, but only while a search is open: otherwise F3
+        # is the child's key like any other F-key.
+        if ctrl and not shift and not alt and key == Qt.Key.Key_F \
+                and not self._alt_screen:
             self.findRequested.emit()
             event.accept()
             return
@@ -3064,11 +3100,15 @@ class TerminalView(QWidget):
         # find matches (Ctrl+F) on Chrome's yellow, the active one orange.
         # Drawn OVER the text with the glyphs redrawn in dark ink, because
         # a pale box under the child's own (often pale) ink is unreadable.
+        # A selection over a match is tinted again on top of its box, or
+        # nothing would show what Ctrl+C copies.
         if self._find_rows:
             top_line = self.history_pushed() - off
             painter.setFont(self._font)
             hit, active = QColor(FIND_HIT), QColor(FIND_ACTIVE)
             ink = QColor(FIND_INK)
+            sel = QColor(Palette.SELECTION)
+            sel.setAlpha(90)
             for row in range(self.screen.lines):
                 spans = self._find_rows.get(top_line + row)
                 if not spans:
@@ -3084,12 +3124,32 @@ class TerminalView(QWidget):
                     painter.fillRect(x0, y0, x1 - x0, y1 - y0,
                                      active if idx == self._find_active
                                      else hit)
+                    if rng is not None and rng[0][0] <= row <= rng[1][0]:
+                        s0 = max(c0, rng[0][1] if row == rng[0][0] else 0)
+                        s1 = min(c1, rng[1][1] if row == rng[1][0]
+                                 else _cols - 1)
+                        if s0 <= s1:
+                            sx0 = self.cell_bounds(s0, row)[0]
+                            sx1 = self.cell_bounds(s1, row)[2]
+                            painter.fillRect(sx0, y0, sx1 - sx0, y1 - y0, sel)
                     painter.setPen(ink)
-                    for c in range(c0, c1 + 1):
-                        data = line[c].data
-                        if data.strip():
-                            painter.drawText(int(CELL_PAD_X + c * cw),
-                                             int(y + self._ascent), data)
+                    # grid-safe pieces, one drawText each, as for the text
+                    # itself: a glyph per call made a page of one-letter
+                    # matches cost 90 ms a paint
+                    i = c0
+                    while i <= c1:
+                        j = i
+                        while j <= c1 and self._is_grid_glyph(
+                                line[j].data or " "):
+                            j += 1
+                        if j == i:  # a lone off-grid glyph, placed by hand
+                            j = i + 1
+                        text = "".join(line[k].data or " "
+                                       for k in range(i, j))
+                        if text.strip():
+                            painter.drawText(int(CELL_PAD_X + i * cw),
+                                             int(y + self._ascent), text)
+                        i = j
 
         # reply-finished stamps: a dim date/time drawn into the RIGHT-hand
         # blank space of the row reply_anchor_line() picked out (Claude's own

@@ -88,9 +88,6 @@ class FindBar(QFrame):
 
     # ------------------------------------------------------------- api ---
 
-    def is_open(self) -> bool:
-        return self.isVisible()
-
     def open(self, prefill: str = "") -> None:
         """Show the bar (or refocus it) with the query selected. A one-line
         `prefill` (the terminal's selection) replaces the query."""
@@ -108,13 +105,15 @@ class FindBar(QFrame):
 
     def close_find(self) -> None:
         """Hide the bar, drop the highlights and hand the focus back to the
-        terminal. The query stays for the next Ctrl+F."""
+        terminal if the bar had it. The query stays for the next Ctrl+F."""
         if not self.isVisible():
             return
+        had_focus = self.edit.hasFocus()
         self.hide()
         self._view.set_find_inset(0)
         self._view.clear_find()
-        self._view.setFocus(Qt.FocusReason.OtherFocusReason)
+        if had_focus:       # never pull the focus out of another card
+            self._view.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def place(self) -> None:
         """Pin the bar to the view's top right, left of the scrollbar."""

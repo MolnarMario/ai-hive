@@ -1948,6 +1948,10 @@ class TerminalCard(QFrame):
             caption = "restoring conversation…"
         else:
             caption = "starting…"
+        # The veil covers the find bar but not its keyboard focus, so typing
+        # would go into a box nobody can see. The conversation is redrawn
+        # under the veil anyway.
+        self.find_bar.close_find()
         self.boot.begin(caption)
         self._place_overlay()
         if self._awaiting_start():

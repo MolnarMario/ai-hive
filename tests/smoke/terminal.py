@@ -3231,11 +3231,19 @@ def test_terminal_find():
     check("find: another match is painted yellow",
           fill_at(p.find_matches()[1]) == QColor(FIND_HIT),
           fill_at(p.find_matches()[1]).name())
+    # a selection dragged over a match stays visible on top of its box
+    p._sel_anchor, p._sel_end = (1, 2), (1, 7)
+    img = p.grab().toImage()
+    check("find: a selection over a match still shows",
+          fill_at(p.find_matches()[1]) != QColor(FIND_HIT),
+          fill_at(p.find_matches()[1]).name())
 
     v.clear_find()
     check("find: closing drops every match",
           v.find_matches() == [] and v.find_state() == (0, 0))
     check("find: closing tells the bar", changes[-1] == (0, 0))
+    check("find: closing keeps the row text for the next search",
+          len(v._find_cache) > 0, len(v._find_cache))
     v.feed("more needle\r\n")
     check("find: a closed search does not rescan", not v._find_timer.isActive())
 
@@ -3263,6 +3271,62 @@ def test_terminal_find():
           w.find_matches() and w.find_matches()[0][1:] == (2, 3),
           w.find_matches())
 
+    # a history wipe (a reflow's reprint, ED 3) gives every reprinted line
+    # a new id past the old active match: the rescan picks from the view
+    # rather than jumping to the oldest match
+    h = TerminalView(rows=10, cols=40)
+    h.resize(400, 200)
+    body = "".join(f"line {i}" + (" needle" if i % 10 == 3 else "")
+                   + "\r\n" for i in range(60))
+    h.feed(body)
+    h.set_find_query("needle")
+    h.find_step(-1)
+    h.feed("\x1b[3J\x1b[2J\x1b[H")      # the wipe, then the reprint
+    h.feed(body)
+    h._find_timer.stop()
+    h._find_refresh()
+    check("find: after a history wipe the active match is the one by "
+          "the view, not the oldest",
+          h.find_state() == (6, 6), h.find_state())
+
+    # a new query starts from what is on screen, not from an active match
+    # the user scrolled away from
+    a = TerminalView(rows=10, cols=40)
+    a.resize(400, 200)
+    a.feed("".join(f"row {i} " + ("needle" if i % 10 == 3 else "")
+                   + (" pick" if i in (12, 55) else "") + "\r\n"
+                   for i in range(60)))
+    a.set_find_query("needle")
+    a.find_step(1)              # wraps to the oldest match, far up
+    a.scroll_by(-10 ** 6)       # the user wheels back to the bottom
+    a.set_find_query("pick")
+    check("find: a new query picks the match on screen, not one past "
+          "the old active match",
+          a.find_state() == (2, 2) and a.scroll_offset() == 0,
+          (a.find_state(), a.scroll_offset()))
+
+    # Enter right after the agent printed the first match, before the
+    # rescan ran, still finds it
+    e = TerminalView(rows=6, cols=40)
+    e.set_find_query("error")
+    e.feed("an error\r\n")
+    e.find_step(1)
+    check("find: stepping runs a pending rescan even from 0/0",
+          e.find_state() == (1, 1), e.find_state())
+
+    # the scrollbar's ticks: one entry per line, however often it matches
+    f = TerminalView(rows=6, cols=40)
+    f.feed("e e e\r\nxyz\r\ne\r\n")
+    f.set_find_query("e")
+    tick_lines, tick_active = f.find_lines()
+    check("find: the scrollbar gets one line per row, not one per match",
+          len(f.find_matches()) == 4
+          and tick_lines == sorted({m[0] for m in f.find_matches()})
+          and len(tick_lines) == 2, (f.find_matches(), tick_lines))
+    check("find: the scrollbar knows the active match's line",
+          tick_active == f.find_matches()[f.find_state()[0] - 1][0],
+          tick_active)
+
     # keys: Ctrl+F asks for the bar and types nothing; F3 is the child's
     # key until a search is open
     k = TerminalView(rows=6, cols=40)
@@ -3283,6 +3347,14 @@ def test_terminal_find():
           k.find_state() == (2, 2) and sent == [], (k.find_state(), sent))
     press(k, K.Key_F3, M.ShiftModifier)
     check("find: Shift+F3 steps back", k.find_state() == (1, 2))
+    # less and vim page forward with Ctrl+F on the alternate screen
+    sent.clear()
+    asked.clear()
+    k.feed("\x1b[?1049h")
+    press(k, K.Key_F, M.ControlModifier)
+    check("find: on the alternate screen Ctrl+F goes to the program",
+          asked == [] and sent == ["\x06"], (asked, sent))
+    k.feed("\x1b[?1049l")
 
     # the card: Ctrl+F opens the bar, the bar drives the view
     agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Find", cwd=SCRATCH_CWD,
@@ -3373,6 +3445,15 @@ def test_terminal_find():
     key_in_bar(K.Key_Escape)
     check("find: nothing typed in the bar reached the agent",
           typed == [], typed)
+
+    # a boot veil over an open bar would leave the focus in a box nobody
+    # can see: the veil closes the bar
+    press(t, K.Key_F, M.ControlModifier)
+    check("find: the bar is open before the veil", bar.isVisible())
+    card._begin_boot_veil()
+    check("find: a starting agent's veil closes the find bar",
+          not bar.isVisible())
+    card._dismiss_boot_veil()
 
     card.detach()
     card.close()
