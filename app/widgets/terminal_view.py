@@ -375,7 +375,7 @@ class _FastHistoryScreen(pyte.HistoryScreen):
 
     __getattribute__ = object.__getattribute__
 
-    # (pushed, evicted) of history.top each time the cursor moved to the top
+    # (pushed, evicted) of history.top each time a cursor-up reached the top
     # row since TerminalView last looked, oldest first. A full-frame repaint
     # starts there (see TerminalView._drop_repaint_copies).
     top_jumps: list
@@ -384,7 +384,11 @@ class _FastHistoryScreen(pyte.HistoryScreen):
         self.top_jumps = []
         super().__init__(*args, **kwargs)
 
-    def _note_top_row(self) -> None:
+    def cursor_up(self, count=None) -> None:
+        # only a move UP counts: a renderer erasing what it drew climbs with
+        # CUU (measured: ESC[24A, ESC[36A), while clear-and-print homes the
+        # cursor with CUP, and a second print after it is real output
+        super().cursor_up(count)
         if self.cursor.y or (self.margins and self.margins.top):
             return
         top = self.history.top
@@ -395,25 +399,12 @@ class _FastHistoryScreen(pyte.HistoryScreen):
             if len(jumps) > 8:
                 del jumps[0]
 
-    def cursor_up(self, count=None) -> None:
-        super().cursor_up(count)
-        self._note_top_row()
-
-    def cursor_position(self, line=None, column=None) -> None:
-        super().cursor_position(line, column)
-        self._note_top_row()
-
-    def cursor_to_line(self, line=None) -> None:
-        super().cursor_to_line(line)
-        self._note_top_row()
-
     def _reset_history(self) -> None:
         super()._reset_history()
         self.top_jumps = []
 
     def resize(self, lines=None, columns=None) -> None:
-        # pyte homes the cursor to drop rows on a shrink, which is not a
-        # repaint, and a jump from before a resize describes another layout
+        # a jump from before a resize describes another layout
         super().resize(lines, columns)
         self.top_jumps = []
 
@@ -983,17 +974,19 @@ class TerminalView(QWidget):
         frame, is the case the older rule let through, and how one reply
         paragraph showed up three times over in a card's scrollback.
 
-        So the rule: of the rows pushed since the cursor last reached the
+        So the rule: of the rows pushed since a cursor-up last reached the
         top row in this frame, the longest leading run that equals the
         same number of rows ending the history before them goes. Pushes
         after that run stay, since a frame that grew (the recap) scrolls
         its new rows off legitimately. A run must hold a row with text: a
         blank row after a blank row proves nothing. Plain output never
-        moves the cursor to the top row before scrolling, which is what
-        keeps a program printing the same line twice out of this. The
-        alternate screen keeps no scrollback, and a reflow's reprint is
-        fresh history rather than a repaint over it, so both are left
-        alone."""
+        moves the cursor up to the top row before scrolling, which keeps a
+        program printing the same line twice out of this. Only a move up
+        counts: a renderer erasing what it drew climbs with ESC[nA, while
+        clearing the screen to print the same text again homes the cursor
+        with ESC[H, and that second print is real output. The alternate
+        screen keeps no scrollback, and a reflow's reprint is fresh
+        history rather than a repaint over it, so both are left alone."""
         scr = self.screen
         jumps = scr.top_jumps
         if not jumps:

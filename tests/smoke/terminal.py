@@ -2280,9 +2280,18 @@ def test_repaint_from_the_top_leaves_no_copy_in_scrollback():
     v8 = TerminalView(rows=rows, cols=cols)
     v8.feed(printed)
     fresh = [f"fresh text {i:02d}" for i in range(rows + 2)]
-    v8.feed("\x1b[?25l\x1b[H" + "\x1b[K\r\n".join(fresh) + "\x1b[K\r\n\x1b[?25h")
+    v8.feed("\x1b[?25l\x1b[%dA\r" % (rows - 1)
+            + "\x1b[K\r\n".join(fresh) + "\x1b[K\r\n\x1b[?25h")
     check("repaint: new text after a jump keeps its scrolled-off rows",
           hist(v8) == hist0 + fresh[:3], hist(v8)[-4:])
+
+    # clearing the screen and printing the same text again is real output:
+    # the cursor goes home with ESC[H, not up, so both prints stay
+    v10 = TerminalView(rows=rows, cols=cols)
+    v10.feed(printed)
+    v10.feed("\x1b[?25l\x1b[H\x1b[2J" + printed + "\x1b[?25h")
+    check("repaint: clear and print the same text again keeps both",
+          hist(v10) == hist0 + hist0, (len(hist(v10)), hist(v10)[-3:]))
 
     # a blank row after a blank row proves nothing, so it stays
     v9 = TerminalView(rows=rows, cols=cols)
