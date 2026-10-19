@@ -132,8 +132,9 @@ class TerminalScrollBar(QScrollBar):
     def wheelEvent(self, event) -> None:
         # The wheel has three regimes (forward to the child / alternate scroll
         # / local history) and they must stay decided in ONE place, so a wheel
-        # over this 10px strip behaves exactly like one over the terminal.
-        self._view.wheelEvent(event)
+        # over this 10px strip behaves exactly like one over the terminal,
+        # down to the cell a mouse-tracking agent hears it at.
+        self._view.overlay_wheel(event)
 
     def mousePressEvent(self, event) -> None:
         hit = self._mark_at(event.position().y())

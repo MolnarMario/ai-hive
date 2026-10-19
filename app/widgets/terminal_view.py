@@ -157,7 +157,7 @@ import time
 import pyte
 from PySide6.QtCore import QEvent, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
-                           QPainter)
+                           QPainter, QWheelEvent)
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import ui_theme
@@ -1864,6 +1864,19 @@ class TerminalView(QWidget):
         else:
             # normal buffer: scroll our own history view
             self.scroll_by(steps if up else -steps)
+        event.accept()
+
+    def overlay_wheel(self, event) -> None:
+        """A wheel that landed on a child laid over the view (the scrollbar,
+        the find bar), handled as if it hit the view. Its position is moved
+        into the view's coordinates first: with mouse tracking on, the agent
+        hears the wheel at the cell under the pointer, and the child's own
+        (0, 0) is not the view's."""
+        self.wheelEvent(QWheelEvent(
+            self.mapFromGlobal(event.globalPosition()),
+            event.globalPosition(), event.pixelDelta(), event.angleDelta(),
+            event.buttons(), event.modifiers(), event.phase(),
+            event.inverted()))
         event.accept()
 
     def _wheel_report(self, up: bool, row: int, col: int) -> str:

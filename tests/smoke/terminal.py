@@ -2237,8 +2237,8 @@ def test_terminal_scrollbar():
     Covers the coordinate identity everything rests on, the capture point (a
     bare Enter and nothing else), the overlay's no-stolen-columns contract, and
     every path that has to wipe a milestone."""
-    from PySide6.QtCore import QEvent, QPoint, Qt
-    from PySide6.QtGui import QKeyEvent, QMouseEvent, QPixmap
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtGui import QKeyEvent, QMouseEvent, QPixmap, QWheelEvent
     from PySide6.QtWidgets import QApplication
 
     import json
@@ -2430,6 +2430,23 @@ def test_terminal_scrollbar():
     check("scrollbar: pinned to the right edge, full height",
           geo.right() >= t.width() - 2 and geo.height() == t.height()
           and geo.width() == WIDTH, geo)
+
+    # a wheel over the bar reaches a mouse-tracking agent at the cell under
+    # the pointer (the right edge), not at the bar's own x mapped onto col 0
+    sent = []
+    t.keyInput.connect(sent.append)
+    t.feed("\x1b[?1000h\x1b[?1006h")
+    local = QPointF(WIDTH / 2, 100)
+    QApplication.sendEvent(card.scroll_bar, QWheelEvent(
+        local, QPointF(card.scroll_bar.mapToGlobal(local)), QPoint(),
+        QPoint(0, 120), Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase, False))
+    row, col = t._cell_at(QPointF(card.scroll_bar.mapToParent(local)))
+    check("scrollbar: a wheel over it is reported at the cell under it",
+          sent and sent[-1].startswith(f"\x1b[<64;{col + 1};{row + 1}M")
+          and col > 5, (sent, row, col))
+    t.feed("\x1b[?1006l\x1b[?1000l")
+    t.keyInput.disconnect(sent.append)
 
     # ---- markers paint, and a click on one jumps -------------------------
     bare.resize(WIDTH, 200)
