@@ -2237,8 +2237,8 @@ def test_terminal_scrollbar():
     Covers the coordinate identity everything rests on, the capture point (a
     bare Enter and nothing else), the overlay's no-stolen-columns contract, and
     every path that has to wipe a milestone."""
-    from PySide6.QtCore import QEvent, QPoint, Qt
-    from PySide6.QtGui import QKeyEvent, QMouseEvent, QPixmap
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtGui import QKeyEvent, QMouseEvent, QPixmap, QWheelEvent
     from PySide6.QtWidgets import QApplication
 
     import json
@@ -2430,6 +2430,23 @@ def test_terminal_scrollbar():
     check("scrollbar: pinned to the right edge, full height",
           geo.right() >= t.width() - 2 and geo.height() == t.height()
           and geo.width() == WIDTH, geo)
+
+    # a wheel over the bar reaches a mouse-tracking agent at the cell under
+    # the pointer (the right edge), not at the bar's own x mapped onto col 0
+    sent = []
+    t.keyInput.connect(sent.append)
+    t.feed("\x1b[?1000h\x1b[?1006h")
+    local = QPointF(WIDTH / 2, 100)
+    QApplication.sendEvent(card.scroll_bar, QWheelEvent(
+        local, QPointF(card.scroll_bar.mapToGlobal(local)), QPoint(),
+        QPoint(0, 120), Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase, False))
+    row, col = t._cell_at(QPointF(card.scroll_bar.mapToParent(local)))
+    check("scrollbar: a wheel over it is reported at the cell under it",
+          sent and sent[-1].startswith(f"\x1b[<64;{col + 1};{row + 1}M")
+          and col > 5, (sent, row, col))
+    t.feed("\x1b[?1006l\x1b[?1000l")
+    t.keyInput.disconnect(sent.append)
 
     # ---- markers paint, and a click on one jumps -------------------------
     bare.resize(WIDTH, 200)
@@ -3087,3 +3104,358 @@ def test_header_tools_tray_closes_without_a_leave_event():
 
     card.detach(); card.close()
     a.deleteLater()
+
+
+def test_terminal_find():
+    """Ctrl+F: the Chrome-style find bar over a terminal. Matches cover the
+    scrollback and the live screen, the active one is the nearest to the
+    view, stepping wraps and scrolls, new output keeps the active match, and
+    no key typed into the bar ever reaches the agent."""
+    from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, Qt, QTimer
+    from PySide6.QtGui import QColor, QKeyEvent, QWheelEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.terminal_card import TerminalCard
+    from app.widgets.terminal_view import (FIND_ACTIVE, FIND_HIT,
+                                           TerminalView)
+
+    app = QApplication.instance() or QApplication([])
+    K, M = Qt.Key, Qt.KeyboardModifier
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    def abs_text(view, abs_line):
+        """The text of an absolute line, wherever the view is scrolled."""
+        top = view.screen.history.top
+        idx = abs_line - (view.history_pushed() - len(top))
+        line = top[idx] if idx < len(top) \
+            else view.screen.buffer[idx - len(top)]
+        return "".join(line[c].data
+                       for c in range(view.screen.columns)).rstrip()
+
+    def visible(view, abs_line):
+        return 0 <= abs_line - view.abs_line_at_row(0) < view.screen.lines
+
+    def press(view, key, mods=M.NoModifier):
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, mods, ""))
+
+    v = TerminalView(rows=10, cols=40)
+    v.resize(400, 200)
+    for i in range(60):
+        v.feed(f"line {i}" + (" Needle here" if i % 10 == 3 else "") + "\r\n")
+    v.feed("> prompt")
+    changes = []
+    v.findChanged.connect(lambda a, t: changes.append((a, t)))
+
+    v.set_find_query("needle")
+    lines = [m[0] for m in v.find_matches()]
+    check("find: case-insensitive, one match per row that has one",
+          len(lines) == 6, v.find_matches())
+    check("find: matches are in reading order", lines == sorted(lines))
+    check("find: a match's line is the line that says it",
+          [abs_text(v, ln) for ln in lines]
+          == [f"line {n} Needle here" for n in (3, 13, 23, 33, 43, 53)],
+          [abs_text(v, ln) for ln in lines])
+    # the view sat at the bottom, so the active match is the newest one
+    # above it, scrolled into view, not the oldest line in history
+    check("find: the active match is the one nearest the view",
+          v.find_state() == (6, 6), v.find_state())
+    check("find: findChanged carries the count",
+          changes and changes[-1] == (6, 6), changes)
+    check("find: the active match is scrolled into view",
+          visible(v, lines[-1]), v.scroll_offset())
+    m = v.find_matches()[-1]
+    check("find: the match spans the word's columns",
+          (m[1], m[2]) == (len("line 53 "), len("line 53 Needle") - 1), m)
+
+    v.find_step(1)
+    check("find: next wraps from the last match to the first",
+          v.find_state() == (1, 6), v.find_state())
+    check("find: stepping scrolls the match into view",
+          visible(v, lines[0]), v.scroll_offset())
+    v.find_step(-1)
+    check("find: previous wraps from the first match to the last",
+          v.find_state() == (6, 6), v.find_state())
+    v.find_step(-1)
+    check("find: previous steps back one", v.find_state() == (5, 6))
+
+    # refining keeps the active match while it still matches
+    active_line = v.find_matches()[4][0]
+    v.set_find_query("needle h")
+    check("find: a refined query keeps the active match",
+          v.find_state()[1] == 6
+          and v.find_matches()[v.find_state()[0] - 1][0] == active_line,
+          v.find_state())
+    v.set_find_query("needle hx")
+    check("find: no match reads 0/0", v.find_state() == (0, 0))
+    v.set_find_query("needle")
+
+    # new output: the matches catch up, the active match and the view stay
+    keep = v.find_matches()[v.find_state()[0] - 1]
+    top_before = v.abs_line_at_row(0)
+    check("find: the test starts scrolled back", v.scroll_offset() > 0)
+    v.feed("\r\nfresh needle one\r\nfresh needle two\r\n")
+    check("find: new output arms the rescan", v._find_timer.isActive())
+    v._find_timer.stop()
+    v._find_refresh()
+    check("find: the rescan counts the new matches",
+          v.find_state()[1] == 8, v.find_state())
+    check("find: the active match survives the rescan",
+          v.find_matches()[v.find_state()[0] - 1] == keep,
+          (v.find_matches(), keep))
+    check("find: the rescan does not move a scrolled-back view",
+          v.abs_line_at_row(0) == top_before,
+          (v.abs_line_at_row(0), top_before))
+
+    # paint: the active match on orange, another on yellow
+    p = TerminalView(rows=6, cols=40)
+    p.resize(400, 150)
+    p.feed("a needle\r\nb needle\r\n")
+    p.set_find_query("needle")
+    check("find: on a fresh screen the first match is active",
+          p.find_state() == (1, 2), p.find_state())
+    img = p.grab().toImage()
+
+    def fill_at(match):
+        r = match[0] - p.abs_line_at_row(0)
+        x0, _y0, _x1, y1 = p.cell_bounds(match[1], r)
+        return img.pixelColor(x0 + 1, y1 - 2)
+    check("find: the active match is painted orange",
+          fill_at(p.find_matches()[0]) == QColor(FIND_ACTIVE),
+          fill_at(p.find_matches()[0]).name())
+    check("find: another match is painted yellow",
+          fill_at(p.find_matches()[1]) == QColor(FIND_HIT),
+          fill_at(p.find_matches()[1]).name())
+    # a selection dragged over a match stays visible on top of its box
+    p._sel_anchor, p._sel_end = (1, 2), (1, 7)
+    img = p.grab().toImage()
+    check("find: a selection over a match still shows",
+          fill_at(p.find_matches()[1]) != QColor(FIND_HIT),
+          fill_at(p.find_matches()[1]).name())
+
+    v.clear_find()
+    check("find: closing drops every match",
+          v.find_matches() == [] and v.find_state() == (0, 0))
+    check("find: closing tells the bar", changes[-1] == (0, 0))
+    check("find: closing keeps the row text for the next search",
+          len(v._find_cache) > 0, len(v._find_cache))
+    v.feed("more needle\r\n")
+    check("find: a closed search does not rescan", not v._find_timer.isActive())
+
+    # a search that found nothing yet: when matches arrive, the active one
+    # is the newest above the view, as for a fresh query, not the oldest
+    z = TerminalView(rows=5, cols=40)
+    z.set_find_query("zebra")
+    check("find: nothing to find reads 0/0", z.find_state() == (0, 0))
+    z.feed("".join(f"zebra {i}\r\n" for i in range(20)) + "plain\r\n" * 6)
+    z._find_timer.stop()
+    z._find_refresh()
+    check("find: matches that arrive later start at the newest",
+          z.find_state() == (20, 20), z.find_state())
+    check("find: ...without scrolling the view", z.scroll_offset() == 0)
+
+    # wide glyphs: string index is not column
+    w = TerminalView(rows=4, cols=30)
+    w.feed("中文 needle 中\r\n")
+    w.set_find_query("needle")
+    check("find: a match after wide glyphs sits on its real columns",
+          w.find_matches() and w.find_matches()[0][1:] == (5, 10),
+          w.find_matches())
+    w.set_find_query("文")
+    check("find: a wide glyph match covers both of its cells",
+          w.find_matches() and w.find_matches()[0][1:] == (2, 3),
+          w.find_matches())
+
+    # a history wipe (a reflow's reprint, ED 3) gives every reprinted line
+    # a new id past the old active match: the rescan picks from the view
+    # rather than jumping to the oldest match
+    h = TerminalView(rows=10, cols=40)
+    h.resize(400, 200)
+    body = "".join(f"line {i}" + (" needle" if i % 10 == 3 else "")
+                   + "\r\n" for i in range(60))
+    h.feed(body)
+    h.set_find_query("needle")
+    h.find_step(-1)
+    h.feed("\x1b[3J\x1b[2J\x1b[H")      # the wipe, then the reprint
+    h.feed(body)
+    h._find_timer.stop()
+    h._find_refresh()
+    check("find: after a history wipe the active match is the one by "
+          "the view, not the oldest",
+          h.find_state() == (6, 6), h.find_state())
+
+    # a new query starts from what is on screen, not from an active match
+    # the user scrolled away from
+    a = TerminalView(rows=10, cols=40)
+    a.resize(400, 200)
+    a.feed("".join(f"row {i} " + ("needle" if i % 10 == 3 else "")
+                   + (" pick" if i in (12, 55) else "") + "\r\n"
+                   for i in range(60)))
+    a.set_find_query("needle")
+    a.find_step(1)              # wraps to the oldest match, far up
+    a.scroll_by(-10 ** 6)       # the user wheels back to the bottom
+    a.set_find_query("pick")
+    check("find: a new query picks the match on screen, not one past "
+          "the old active match",
+          a.find_state() == (2, 2) and a.scroll_offset() == 0,
+          (a.find_state(), a.scroll_offset()))
+
+    # Enter right after the agent printed the first match, before the
+    # rescan ran, still finds it
+    e = TerminalView(rows=6, cols=40)
+    e.set_find_query("error")
+    e.feed("an error\r\n")
+    e.find_step(1)
+    check("find: stepping runs a pending rescan even from 0/0",
+          e.find_state() == (1, 1), e.find_state())
+
+    # the scrollbar's ticks: one entry per line, however often it matches
+    f = TerminalView(rows=6, cols=40)
+    f.feed("e e e\r\nxyz\r\ne\r\n")
+    f.set_find_query("e")
+    tick_lines, tick_active = f.find_lines()
+    check("find: the scrollbar gets one line per row, not one per match",
+          len(f.find_matches()) == 4
+          and tick_lines == sorted({m[0] for m in f.find_matches()})
+          and len(tick_lines) == 2, (f.find_matches(), tick_lines))
+    check("find: the scrollbar knows the active match's line",
+          tick_active == f.find_matches()[f.find_state()[0] - 1][0],
+          tick_active)
+
+    # keys: Ctrl+F asks for the bar and types nothing; F3 is the child's
+    # key until a search is open
+    k = TerminalView(rows=6, cols=40)
+    sent, asked = [], []
+    k.keyInput.connect(sent.append)
+    k.findRequested.connect(lambda: asked.append(1))
+    press(k, K.Key_F, M.ControlModifier)
+    check("find: Ctrl+F asks for the find bar", asked == [1], asked)
+    check("find: Ctrl+F sends nothing to the agent", sent == [], sent)
+    press(k, K.Key_F3)
+    check("find: F3 with no search goes to the agent",
+          sent == ["\x1bOR"], sent)
+    sent.clear()
+    k.feed("alpha beta alpha\r\n")
+    k.set_find_query("alpha")
+    press(k, K.Key_F3)
+    check("find: F3 steps while a search is open",
+          k.find_state() == (2, 2) and sent == [], (k.find_state(), sent))
+    press(k, K.Key_F3, M.ShiftModifier)
+    check("find: Shift+F3 steps back", k.find_state() == (1, 2))
+    # less and vim page forward with Ctrl+F on the alternate screen
+    sent.clear()
+    asked.clear()
+    k.feed("\x1b[?1049h")
+    press(k, K.Key_F, M.ControlModifier)
+    check("find: on the alternate screen Ctrl+F goes to the program",
+          asked == [] and sent == ["\x06"], (asked, sent))
+    k.feed("\x1b[?1049l")
+
+    # the card: Ctrl+F opens the bar, the bar drives the view
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Find", cwd=SCRATCH_CWD,
+                                     pty=True))
+    agent.worker.start = lambda: None       # a keypress wakes a stopped card
+    card = TerminalCard(agent)
+    card.resize(700, 360)
+    card.show()
+    pump(60)
+    t, bar = card.terminal, card.find_bar
+    typed = []
+    t.keyInput.connect(typed.append)
+    for i in range(40):
+        t.feed(f"row {i} {'Target' if i in (5, 30) else ''}\r\n")
+    check("find: the bar starts hidden", not bar.isVisible())
+    press(t, K.Key_F, M.ControlModifier)
+    check("find: Ctrl+F in the terminal opens the bar", bar.isVisible())
+    check("find: the bar sits at the top right, left of the scrollbar",
+          bar.y() == 0 and bar.geometry().right() < card.scroll_bar.x(),
+          (bar.geometry(), card.scroll_bar.geometry()))
+    check("find: rows under the bar count as hidden for scrolling to",
+          t._find_top_row() * t._cell_h + 4 >= bar.height() > 0,
+          (t._find_top_row(), t._cell_h, bar.height()))
+    bar.edit.setText("target")
+    check("find: typing searches as you go",
+          t.find_state() == (2, 2) and bar.count.text() == "2/2",
+          (t.find_state(), bar.count.text()))
+
+    def key_in_bar(key, mods=M.NoModifier):
+        QApplication.sendEvent(bar.edit, QKeyEvent(QEvent.Type.KeyPress,
+                                                   key, mods, ""))
+    key_in_bar(K.Key_Return)
+    check("find: Enter in the bar goes to the next match",
+          t.find_state() == (1, 2) and bar.count.text() == "1/2",
+          bar.count.text())
+    key_in_bar(K.Key_Return, M.ShiftModifier)
+    check("find: Shift+Enter goes to the previous one",
+          t.find_state() == (2, 2), t.find_state())
+    key_in_bar(K.Key_G, M.ControlModifier)
+    check("find: Ctrl+G goes to the next one too", t.find_state() == (1, 2))
+    for key in (K.Key_Up, K.Key_Down, K.Key_PageUp, K.Key_F5, K.Key_Tab):
+        key_in_bar(key)
+    check("find: keys the query box ignores never reach the agent",
+          typed == [], typed)
+    bar.next_btn.click()
+    check("find: the next arrow steps", t.find_state() == (2, 2))
+
+    # a wheel over the bar reaches a mouse-tracking agent at the cell under
+    # the pointer, not at the bar's own top left mapped onto cell (0, 0)
+    t.feed("\x1b[?1000h\x1b[?1006h")
+    local = QPointF(20, 10)
+    glob = QPointF(bar.mapToGlobal(local))
+    QApplication.sendEvent(bar, QWheelEvent(
+        local, glob, QPoint(), QPoint(0, 120), Qt.MouseButton.NoButton,
+        M.NoModifier, Qt.ScrollPhase.NoScrollPhase, False))
+    row, col = t._cell_at(QPointF(bar.mapToParent(local)))
+    check("find: a wheel over the bar is reported at the cell under it",
+          typed and typed[-1].startswith(f"\x1b[<64;{col + 1};{row + 1}M")
+          and col > 10, (typed, row, col))
+    t.feed("\x1b[?1006l\x1b[?1000l")
+    typed.clear()
+    t.grab()
+    card.scroll_bar.grab()     # the find ticks paint without error
+    key_in_bar(K.Key_Escape)
+    check("find: Esc closes the bar", not bar.isVisible())
+    check("find: closing clears the highlights", t.find_matches() == [])
+    check("find: Esc in the bar is not sent to the agent", typed == [], typed)
+
+    # Ctrl+F again brings the last query back and searches it
+    press(t, K.Key_F, M.ControlModifier)
+    check("find: reopening keeps the last query",
+          bar.isVisible() and bar.edit.text() == "target"
+          and bar.edit.selectedText() == "target" and t.find_state()[1] == 2,
+          (bar.edit.text(), t.find_state()))
+    key_in_bar(K.Key_Escape)
+    # a one-line selection becomes the query
+    t.feed("pick this word\r\n")
+    r = t.screen.cursor.y - 1
+    t._sel_anchor, t._sel_end = (r, 5), (r, 8)
+    press(t, K.Key_F, M.ControlModifier)
+    check("find: the terminal's selection becomes the query",
+          bar.edit.text() == "this", bar.edit.text())
+    key_in_bar(K.Key_Escape)
+    t._sel_anchor, t._sel_end = (0, 0), (2, 3)
+    press(t, K.Key_F, M.ControlModifier)
+    check("find: a multi-line selection does not replace the query",
+          bar.edit.text() == "this", bar.edit.text())
+    key_in_bar(K.Key_Escape)
+    check("find: nothing typed in the bar reached the agent",
+          typed == [], typed)
+
+    # a boot veil over an open bar would leave the focus in a box nobody
+    # can see: the veil closes the bar
+    press(t, K.Key_F, M.ControlModifier)
+    check("find: the bar is open before the veil", bar.isVisible())
+    card._begin_boot_veil()
+    check("find: a starting agent's veil closes the find bar",
+          not bar.isVisible())
+    card._dismiss_boot_veil()
+
+    card.detach()
+    card.close()
+    agent.deleteLater()
+    app.processEvents()

@@ -3,7 +3,8 @@
 A slim bar overlaid on a TerminalView's right edge, showing how far back the
 conversation reaches and marking every point where the USER submitted a typed
 prompt, so a long session can be jumped through by milestone rather than
-scrubbed through by hand.
+scrubbed through by hand. While a Ctrl+F search is open it also carries
+Chrome's find ticks, one per row with a match.
 
 Three decisions worth keeping:
 
@@ -37,12 +38,14 @@ from PySide6.QtWidgets import QScrollBar, QToolTip
 
 from .. import tooltips
 from ..ui_theme import Palette
+from .terminal_view import FIND_ACTIVE, FIND_HIT
 
 WIDTH = 10          # matches the QScrollBar:vertical width in ui_theme's QSS
 MARK_HIT_PX = 5     # click/hover slop around a marker
 _MARK_W = 6         # marker dash, px
 _MARK_H = 3
 _INSET = 3          # keeps the first/last marker off the rounded ends
+_FIND_TICK_H = 2    # px, a find match's tick
 
 
 class TerminalScrollBar(QScrollBar):
@@ -108,8 +111,8 @@ class TerminalScrollBar(QScrollBar):
         return (self._view.history_pushed() - hist,
                 hist + self._view.screen.lines)
 
-    def _y_for(self, abs_line: int) -> float:
-        oldest, span = self._span()
+    def _y_for(self, abs_line: int, span=None) -> float:
+        oldest, span = span or self._span()
         frac = (abs_line - oldest) / float(max(1, span))
         frac = max(0.0, min(1.0, frac))
         return _INSET + frac * max(1, self.height() - 2 * _INSET)
@@ -129,8 +132,9 @@ class TerminalScrollBar(QScrollBar):
     def wheelEvent(self, event) -> None:
         # The wheel has three regimes (forward to the child / alternate scroll
         # / local history) and they must stay decided in ONE place, so a wheel
-        # over this 10px strip behaves exactly like one over the terminal.
-        self._view.wheelEvent(event)
+        # over this 10px strip behaves exactly like one over the terminal,
+        # down to the cell a mouse-tracking agent hears it at.
+        self._view.overlay_wheel(event)
 
     def mousePressEvent(self, event) -> None:
         hit = self._mark_at(event.position().y())
@@ -156,11 +160,14 @@ class TerminalScrollBar(QScrollBar):
     def paintEvent(self, event) -> None:
         super().paintEvent(event)       # groove + handle, straight from the QSS
         marks = self._view.marks()
-        if not marks:
+        finds, active = self._view.find_lines()
+        if not marks and not finds:
             return
         oldest, span = self._span()
         newest = oldest + span
         painter = QPainter(self)
+        if finds:
+            self._paint_find_ticks(painter, finds, active, (oldest, span))
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         # read at paint time so the marker follows a live theme switch, exactly
         # like BootVeil -- there is no QSS token for a custom-painted dash
@@ -175,6 +182,26 @@ class TerminalScrollBar(QScrollBar):
             y = self._y_for(abs_line) - _MARK_H / 2.0
             painter.drawRoundedRect(x, y, _MARK_W, _MARK_H, 1.5, 1.5)
         painter.end()
+
+    def _paint_find_ticks(self, painter, lines, active, span) -> None:
+        """Chrome's find ticks: a full-width line per row holding a match,
+        the active match's in orange on top. Under the prompt milestones,
+        which stay clickable. `lines` has one entry per line however often
+        it matches, and the ticks one per pixel row; `span` is _span(),
+        read once rather than once per line."""
+        oldest, count = span
+        newest = oldest + count
+        seen = set()
+        for abs_line in lines:
+            if oldest <= abs_line <= newest:
+                seen.add(int(self._y_for(abs_line, span)))
+        hit = QColor(FIND_HIT)
+        for y in seen:
+            painter.fillRect(1, y - 1, self.width() - 2, _FIND_TICK_H, hit)
+        if oldest <= active <= newest:
+            painter.fillRect(1, int(self._y_for(active, span)) - 1,
+                             self.width() - 2, _FIND_TICK_H,
+                             QColor(FIND_ACTIVE))
 
 
 def _snippet(text: str, limit: int = 90) -> str:

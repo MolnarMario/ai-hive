@@ -397,6 +397,18 @@ workspaces keep executing — switching never pauses anything.
   to keep their old width. Once the agent is idle, AI Hive gives it a console
   2000 rows taller for that one reprint, then its own size back. A reply still
   streaming finishes first, and the prompt dots move with the text.
+- **Find in the conversation.** `Ctrl+F` in a terminal opens a find box in
+  its top right corner, the way Chrome's page search works. It searches the
+  whole scrollback plus the screen as you type, ignoring case, paints every
+  match yellow and the current one orange, shows `3/17`, and puts a tick on
+  the scrollbar for each match. `Enter` / `F3` go to the next match and
+  `Shift+Enter` / `Shift+F3` to the previous one, scrolling it into view;
+  `Esc` closes the box. Text you selected becomes the query, otherwise the
+  last search comes back. Matches stay current while the agent keeps
+  writing, without moving the view. A phrase the agent wrapped onto two
+  rows is not found, since each row is searched on its own. In a
+  full-screen program such as `less` or `vim`, `Ctrl+F` goes to the
+  program, which pages forward with it.
 - **Inline file explorer** — hover a workspace row and click the **▸ files**
   toggle to expand a **VS Code-style file tree** right under it: folders and
   files of the project root, each with a **type icon**, lazily populated as you
@@ -976,7 +988,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3516 checks drive the real app headlessly (offscreen Qt platform) with real
+3579 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1123,7 +1135,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3516 checks)
+                           (3579 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

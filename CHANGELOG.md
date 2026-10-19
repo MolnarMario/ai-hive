@@ -8,6 +8,21 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.45.0
+
+- Ctrl+F in a terminal opens a find box in its top right corner, like
+  Chrome's page search. It searches the agent's whole history as you
+  type, ignoring case, paints every match yellow and the current one
+  orange, shows how many there are and marks each one on the scrollbar.
+  Enter or F3 goes to the next match, Shift+Enter or Shift+F3 to the
+  previous one, and Esc closes the box. Text you selected becomes the
+  search. A phrase the agent wrapped onto two rows is not found. In a
+  full-screen program such as less or vim, Ctrl+F still goes to the
+  program.
+- A mouse wheel over a terminal's scrollbar reaches an agent that tracks
+  the mouse at the spot under the pointer. It used to reach it at the
+  terminal's left edge.
+
 ## 0.44.3
 
 - In the Illuminated Manuscript and Adeptus Mechanicus themes, the top
