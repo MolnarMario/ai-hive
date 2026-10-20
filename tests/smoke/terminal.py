@@ -2639,12 +2639,15 @@ def test_reflow_keeps_scrollback_until_the_reprint_starts():
     agent._reflow_tick()
     at = paint.index("\x1b[H") + 2
     agent._on_pty_output("pty", paint[:at])
-    check("tall-reflow: (fixture) half a home sequence starts nothing",
-          agent._reflow_step == "tall")
+    check("tall-reflow: half a home sequence starts nothing and waits",
+          agent._reflow_step == "tall"
+          and agent.pty_replay().endswith("\x1b[?25l"), agent._reflow_step)
     agent._on_pty_output("pty", paint[at:])
-    check("tall-reflow: the rest of it does",
-          agent._reflow_step == "reprint"
-          and agent.pty_replay().count(REFLOW_BEGIN) == 2)
+    check("tall-reflow: the rest of it does, the marker before the whole "
+          "sequence", agent._reflow_step == "reprint"
+          and agent.pty_replay().count(REFLOW_BEGIN) == 2
+          and agent.pty_replay().endswith("\x1b[?25l" + REFLOW_BEGIN
+                                          + paint[paint.index("\x1b[H"):]))
     agent._end_reflow()
     agent._on_pty_output("pty", _conhost_paint(conv[-rows_n:], rows_n))
     check("tall-reflow: ...and the scrollback holds each row once",
@@ -2669,6 +2672,17 @@ def test_reflow_keeps_scrollback_until_the_reprint_starts():
           screen_rows(view) == before
           and agent.pty_replay().count(REFLOW_BEGIN) == 2,
           agent.pty_replay().count(REFLOW_BEGIN))
+
+    # an escape cut short with no home after it is not lost
+    size(card, rows_n, 72)
+    agent._busy = False
+    agent._reflow_tick()
+    agent._on_pty_output("pty", "\x1b[?25l\x1b[")
+    agent._end_reflow()
+    agent._on_pty_output("pty", "?25h")
+    check("tall-reflow: a held escape goes on when the reflow ends",
+          agent.pty_replay().endswith("\x1b[?25l\x1b[?25h")
+          and agent.pty_replay().count(REFLOW_BEGIN) == 2)
     card.detach(); card2.detach(); agent.dispose()
 
 

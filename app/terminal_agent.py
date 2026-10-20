@@ -141,6 +141,16 @@ REFLOW_END = "\x1b]7766;aihive-reflow-end\x07"
 # moves the cursor relative to where it is and never homes it.
 _REPAINT_HOME = "\x1b[H"
 _FRAME_START = "\x1b[?25l"      # conhost hides the cursor to start a frame
+
+
+def _home_prefix_len(text: str) -> int:
+    """How many chars at the end of `text` could begin _REPAINT_HOME."""
+    for n in range(len(_REPAINT_HOME) - 1, 0, -1):
+        if text.endswith(_REPAINT_HOME[:n]):
+            return n
+    return 0
+
+
 # the alternate screen: Claude's fullscreen renderer keeps no terminal
 # scrollback there, so it has nothing to reflow
 _ALT_SCREEN_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)([hl])")
@@ -708,11 +718,11 @@ class TerminalAgent(QObject):
         # the scrollback reflow after a resize (see REFLOW_EXTRA_ROWS).
         # `_reflow_step` is "" between reflows, "tall" while the child has
         # the extra rows and its reprint has not started, "reprint" once it
-        # has. `_reflow_tail` is the end of the last chunk read while tall,
-        # for a home sequence a read cut in two (_reprint_start).
+        # has. `_reflow_hold` is the start of a home sequence a read cut in
+        # two while tall, kept back for the next read (_on_pty_output).
         self._reflow_due = False
         self._reflow_step = ""
-        self._reflow_tail = ""
+        self._reflow_hold = ""
         self._alt_screen = False      # the stream is on the alternate screen
         # stream offset of the newest REFLOW_BEGIN: a mark before it was
         # reprinted, so a card finds it again by text (_recover_marks)
@@ -1047,13 +1057,13 @@ class TerminalAgent(QObject):
         if tall <= rows:
             return
         self._reflow_step = "tall"
-        self._reflow_tail = ""
         if not self._resize_child(tall, cols):
             self._reflow_step = ""
             return
         self._reflow_cap.start()
 
-    def _reprint_start(self, text: str) -> int | None:
+    @staticmethod
+    def _reprint_start(text: str) -> int | None:
         """Where the tall reprint starts in `text`, or None when it does not.
 
         The reprint is conhost's answer to the tall resize, a frame that
@@ -1061,17 +1071,15 @@ class TerminalAgent(QObject):
         meanwhile is a hint or a spinner redrawn in place. Taking the first
         byte for the reprint wiped the scrollback whenever Claude ignored the
         resize (REFLOW_MAX_ROWS) and then cleared a footer hint: the card
-        kept one screenful. The cut is the start of the home's frame, so the
-        frame goes in whole after REFLOW_BEGIN, and a home a read cut in two
-        starts at this chunk."""
-        probe = self._reflow_tail + text
-        self._reflow_tail = probe[1 - len(_REPAINT_HOME):]
-        at = probe.find(_REPAINT_HOME)
+        kept one screenful. The cut is the start of the home's frame when
+        this read holds it, else the home itself, so REFLOW_BEGIN goes in
+        between whole escape sequences (`_on_pty_output` keeps back a home
+        a read cut short). A redraw that homes the cursor would still pass
+        for the reprint. A reprint without a home would be missed, and the
+        old scrollback would stay above it."""
+        at = text.find(_REPAINT_HOME)
         if at < 0:
             return None
-        at -= len(probe) - len(text)
-        if at <= 0:
-            return 0
         start = text.rfind(_FRAME_START, 0, at)
         return start if start >= 0 else at
 
@@ -1088,6 +1096,9 @@ class TerminalAgent(QObject):
         self._reflow_cap.stop()
         reprinted = self._reflow_step == "reprint"
         self._reflow_step = ""
+        held, self._reflow_hold = self._reflow_hold, ""
+        if held:
+            self._read_pty(held)    # no home came after it
         if reprinted:
             self._append_stream(REFLOW_END)
         if self._view_size is not None:
@@ -1107,6 +1118,7 @@ class TerminalAgent(QObject):
             self._append_stream(REFLOW_END)
         self._reflow_due = False
         self._reflow_step = ""
+        self._reflow_hold = ""      # the end of an escape the old child cut
         self._alt_screen = False
         self._reflow_timer.stop()
         self._reflow_quiet.stop()
@@ -2961,12 +2973,22 @@ class TerminalAgent(QObject):
             # as its prompt or latch a plan limit it never hit.
             return
         if self._reflow_step == "tall":
+            text = self._reflow_hold + text
+            self._reflow_hold = ""
             cut = self._reprint_start(text)
-            if cut is not None:
-                self._reflow_tail = ""
+            if cut is None:
+                # a home sequence this read cut short waits for the next
+                # one, so REFLOW_BEGIN never lands inside it
+                keep = _home_prefix_len(text)
+                if keep:
+                    self._reflow_hold = text[-keep:]
+                    text = text[:-keep]
+                    if not text:
+                        return
+            else:
                 if cut:
                     # what the child drew before the reprint's frame
-                    self._on_pty_output(_stream, text[:cut])
+                    self._read_pty(text[:cut])
                     text = text[cut:]
                 # the reprint starts: the scrollback it replaces goes now
                 self._reflow_step = "reprint"
@@ -2974,6 +2996,11 @@ class TerminalAgent(QObject):
                 self._append_stream(REFLOW_BEGIN)
         if self._reflow_step == "reprint":
             self._reflow_quiet.start()
+        self._read_pty(text)
+
+    def _read_pty(self, text: str) -> None:
+        """Take in a chunk of the child's output: the scans, the buffer and
+        the view."""
         modes = _ALT_SCREEN_RE.findall(text)
         if modes:
             self._alt_screen = modes[-1] == "h"
