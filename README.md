@@ -395,7 +395,8 @@ workspaces keep executing — switching never pauses anything.
   size. Claude reprints the conversation on every resize, but the Windows
   pseudo-console passes only one screenful of that on, so the older rows used
   to keep their old width. Once the agent is idle, AI Hive gives it a console
-  2000 rows taller for that one reprint, then its own size back. A reply still
+  2000 rows taller for that one reprint, never over the 2048 rows Claude
+  answers to, then its own size back. A reply still
   streaming finishes first, and the prompt dots move with the text.
 - **Find in the conversation.** `Ctrl+F` in a terminal opens a find box in
   its top right corner, the way Chrome's page search works. It searches the
@@ -988,7 +989,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3619 checks drive the real app headlessly (offscreen Qt platform) with real
+3633 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1135,7 +1136,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3619 checks)
+                           (3633 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
