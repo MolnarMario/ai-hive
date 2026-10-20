@@ -8,6 +8,13 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.45.2
+
+- A Claude card taller than 48 rows keeps its scrollback when the card
+  changes size. It used to lose everything above the last screenful, in
+  resumed conversations and open ones alike, so the scrollbar went away
+  and the mouse wheel did nothing.
+
 ## 0.45.1
 
 - A long Claude reply no longer shows up two or three times over in a
