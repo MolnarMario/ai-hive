@@ -2519,6 +2519,173 @@ def test_cancelled_reflow_still_ends_in_the_stream():
     agent.deleteLater()
 
 
+def test_reflow_keeps_scrollback_until_the_reprint_starts():
+    """A tall Claude card keeps its scrollback through a reflow.
+
+    Live-reported: every Claude card showed its last screenful and nothing
+    to scroll back to. Claude answers a resize to at most 2048 rows with the
+    whole conversation and ignores a taller one (measured on claude 2.1.302
+    and 2.1.304), so a card over 48 rows got no reprint for its rows +
+    REFLOW_EXTRA_ROWS. The first byte read meanwhile counted as the reprint
+    and dropped the scrollback, and that byte was a footer hint Claude
+    cleared in place. The tall size now stops at REFLOW_MAX_ROWS, and only
+    a frame that homes the cursor starts the reprint."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import (REFLOW_BEGIN, REFLOW_END,
+                                    REFLOW_EXTRA_ROWS, REFLOW_MAX_ROWS,
+                                    AgentStatus, TerminalAgent)
+    from app.widgets.terminal_card import TerminalCard
+
+    QApplication.instance() or QApplication([])
+    rows_n = 60
+
+    class Worker:
+        def __init__(self):
+            self.rows, self.cols, self.sizes = rows_n, 40, []
+            self.exit_info = None
+
+        def is_running(self):
+            return True
+
+        def resize(self, rows, cols):
+            if (rows, cols) == (self.rows, self.cols):
+                return False
+            self.rows, self.cols = rows, cols
+            self.sizes.append((rows, cols))
+            return True
+
+        def write(self, data):
+            return True
+
+        def flush(self):
+            pass
+
+        def dispose(self):
+            pass
+
+    def size(card, rows, cols):        # what TerminalView._apply_resize does
+        card.terminal.screen.resize(rows, cols)
+        card.terminal.sizeChanged.emit(rows, cols)
+
+    def screen_rows(view):
+        scr = view.screen
+        lines = list(scr.history.top) + [scr.buffer[r]
+                                         for r in range(scr.lines)]
+        return ["".join(ln[c].data for c in range(scr.columns)).rstrip()
+                for ln in lines]
+
+    conv = [f"row {i}" for i in range(1, 151)]
+
+    def each_row_once(view):
+        got = [t for t in screen_rows(view) if t.startswith("row ")]
+        return got == conv
+
+    # the bytes claude 2.1.304 sent while it ignored a 2050-row resize: the
+    # footer hint after a reply, erased in place
+    hint = ("\x1b[?25l\x1b[2D\x1b[3B\r\x1b[61C\x1b[1A\x1b[K\r\n"
+            "\x1b[2C\x1b[3A\x1b[?25h")
+
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Tall reflow",
+                                     cwd=SCRATCH_CWD, pty=True))
+    card = TerminalCard(agent)
+    card._proj_cols = card.terminal.screen.columns
+    agent.worker = worker = Worker()
+    size(card, rows_n, 40)
+    agent._set_status(AgentStatus.RUNNING)
+    agent._prompt_ready = True
+    agent._on_pty_output("pty", "\r\n".join(conv) + "\r\n")
+    size(card, rows_n, 80)
+    agent._on_pty_output("pty", _conhost_paint(conv[-rows_n:], rows_n))
+    view = card.terminal
+    hist = len(view.screen.history.top)
+    check("tall-reflow: (fixture) the conversation is in the scrollback",
+          hist > 80 and each_row_once(view), hist)
+
+    agent._busy = False
+    agent._reflow_tick()
+    check("tall-reflow: the child is never made taller than Claude answers",
+          rows_n + REFLOW_EXTRA_ROWS > REFLOW_MAX_ROWS
+          and worker.sizes[-1] == (REFLOW_MAX_ROWS, 80)
+          and agent._reflow_step == "tall", worker.sizes)
+
+    agent._on_pty_output("pty", hint)
+    check("tall-reflow: a hint redrawn meanwhile is not the reprint",
+          REFLOW_BEGIN not in agent.pty_replay()
+          and agent._reflow_step == "tall"
+          and len(view.screen.history.top) == hist and each_row_once(view),
+          (agent._reflow_step, len(view.screen.history.top)))
+    check("tall-reflow: ...and does not end the wait for it",
+          not agent._reflow_quiet.isActive()
+          and agent._reflow_cap.isActive())
+
+    paint = _conhost_paint(conv, REFLOW_MAX_ROWS)
+    agent._on_pty_output("pty", hint + paint)
+    replay = agent.pty_replay()
+    check("tall-reflow: the reprint starts at its frame, after the hint",
+          replay.count(REFLOW_BEGIN) == 1
+          and replay.endswith(hint + REFLOW_BEGIN + paint)
+          and agent._reflow_step == "reprint", agent._reflow_step)
+    agent._end_reflow()
+    agent._on_pty_output("pty", _conhost_paint(conv[-rows_n:], rows_n))
+    check("tall-reflow: the reprint replaced the scrollback, each row once",
+          each_row_once(view) and agent.pty_replay().count(REFLOW_END) == 1,
+          len(view.screen.history.top))
+
+    # a read that cuts the home sequence in two still starts the reprint
+    size(card, rows_n, 70)
+    agent._busy = False
+    agent._reflow_tick()
+    at = paint.index("\x1b[H") + 2
+    agent._on_pty_output("pty", paint[:at])
+    check("tall-reflow: half a home sequence starts nothing and waits",
+          agent._reflow_step == "tall"
+          and agent.pty_replay().endswith("\x1b[?25l"), agent._reflow_step)
+    agent._on_pty_output("pty", paint[at:])
+    check("tall-reflow: the rest of it does, the marker before the whole "
+          "sequence", agent._reflow_step == "reprint"
+          and agent.pty_replay().count(REFLOW_BEGIN) == 2
+          and agent.pty_replay().endswith("\x1b[?25l" + REFLOW_BEGIN
+                                          + paint[paint.index("\x1b[H"):]))
+    agent._end_reflow()
+    agent._on_pty_output("pty", _conhost_paint(conv[-rows_n:], rows_n))
+    check("tall-reflow: ...and the scrollback holds each row once",
+          each_row_once(view), len(view.screen.history.top))
+
+    # the stream replays to the same scrollback
+    card2 = TerminalCard(agent)
+    size(card2, rows_n, 70)
+    card2._clear_for_projection()
+    card2._replay_with_marks(agent.pty_replay())
+    check("tall-reflow: a rebuilt card replays to the same scrollback",
+          screen_rows(card2.terminal) == screen_rows(view))
+
+    # a child that ignores the resize and redraws a hint keeps everything
+    size(card, rows_n, 75)
+    agent._busy = False
+    agent._reflow_tick()
+    before = screen_rows(view)
+    agent._on_pty_output("pty", hint)
+    agent._end_reflow()
+    check("tall-reflow: no reprint, no wipe, even with a hint meanwhile",
+          screen_rows(view) == before
+          and agent.pty_replay().count(REFLOW_BEGIN) == 2,
+          agent.pty_replay().count(REFLOW_BEGIN))
+
+    # an escape cut short with no home after it is not lost
+    size(card, rows_n, 72)
+    agent._busy = False
+    agent._reflow_tick()
+    agent._on_pty_output("pty", "\x1b[?25l\x1b[")
+    agent._end_reflow()
+    agent._on_pty_output("pty", "?25h")
+    check("tall-reflow: a held escape goes on when the reflow ends",
+          agent.pty_replay().endswith("\x1b[?25l\x1b[?25h")
+          and agent.pty_replay().count(REFLOW_BEGIN) == 2)
+    card.detach(); card2.detach(); agent.dispose()
+
+
 def test_history_screen_wrapper_removed():
     """_FastHistoryScreen drops pyte's per-event wrapper without changing what
     is rendered.
