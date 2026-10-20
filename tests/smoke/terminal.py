@@ -2683,6 +2683,26 @@ def test_reflow_keeps_scrollback_until_the_reprint_starts():
     check("tall-reflow: a held escape goes on when the reflow ends",
           agent.pty_replay().endswith("\x1b[?25l\x1b[?25h")
           and agent.pty_replay().count(REFLOW_BEGIN) == 2)
+
+    # a hint's frame that ended before the home is not the reprint's frame
+    lead = "\x1b[?25lhint\x1b[?25h"
+    check("tall-reflow: a frame that ended before the home stays before "
+          "the cut", TerminalAgent._reprint_start(lead + "\x1b[Hpaint")
+          == len(lead)
+          and TerminalAgent._reprint_start(lead + "\x1b[?25l\x1b[H")
+          == len(lead))
+
+    # a child that stops mid-reflow still finishes the escape it cut
+    size(card, rows_n, 74)
+    agent._busy = False
+    agent._reflow_tick()
+    agent._on_pty_output("pty", "\x1b[?25l\x1b[")
+    agent._set_status(AgentStatus.STOPPING)
+    agent._on_pty_output("pty", "?25h")
+    check("tall-reflow: a stopping child's held escape is not lost",
+          agent._reflow_step == "" and agent._reflow_hold == ""
+          and agent.pty_replay().endswith("\x1b[?25l\x1b[?25h"),
+          repr(agent.pty_replay()[-20:]))
     card.detach(); card2.detach(); agent.dispose()
 
 

@@ -141,6 +141,7 @@ REFLOW_END = "\x1b]7766;aihive-reflow-end\x07"
 # moves the cursor relative to where it is and never homes it.
 _REPAINT_HOME = "\x1b[H"
 _FRAME_START = "\x1b[?25l"      # conhost hides the cursor to start a frame
+_FRAME_END = "\x1b[?25h"        # ...and shows it again to end one
 
 
 def _home_prefix_len(text: str) -> int:
@@ -1074,14 +1075,17 @@ class TerminalAgent(QObject):
         kept one screenful. The cut is the start of the home's frame when
         this read holds it, else the home itself, so REFLOW_BEGIN goes in
         between whole escape sequences (`_on_pty_output` keeps back a home
-        a read cut short). A redraw that homes the cursor would still pass
-        for the reprint. A reprint without a home would be missed, and the
-        old scrollback would stay above it."""
+        a read cut short). A frame that ended before the home was a hint's,
+        and stays before the cut. A redraw that homes the cursor would still
+        pass for the reprint. A reprint without a home would be missed, and
+        the old scrollback would stay above it."""
         at = text.find(_REPAINT_HOME)
         if at < 0:
             return None
         start = text.rfind(_FRAME_START, 0, at)
-        return start if start >= 0 else at
+        if start < 0 or _FRAME_END in text[start:at]:
+            return at
+        return start
 
     def _end_reflow(self) -> None:
         """The reprint is in (or the child never sent one): mark where it
@@ -1106,11 +1110,13 @@ class TerminalAgent(QObject):
         if self._reflow_due:
             self._reflow_timer.start(REFLOW_DELAY_MS)
 
-    def _cancel_reflow(self) -> None:
+    def _cancel_reflow(self, child_lives: bool = False) -> None:
         """A new child, or none: whatever reflow the old one owed is moot.
         A reprint already under way still gets its REFLOW_END. Without it
         the view reads everything after as reprint and never takes back a
-        repaint's copies (TerminalView._drop_repaint_copies)."""
+        repaint's copies (TerminalView._drop_repaint_copies). A child that
+        is stopping (`child_lives`) still writes its last frames, so the
+        start of an escape it cut short goes on ahead of the rest."""
         if self._reflow_step == "reprint" and not self._disposing:
             flush = getattr(self.worker, "flush", None)
             if flush is not None:
@@ -1118,11 +1124,13 @@ class TerminalAgent(QObject):
             self._append_stream(REFLOW_END)
         self._reflow_due = False
         self._reflow_step = ""
-        self._reflow_hold = ""      # the end of an escape the old child cut
+        held, self._reflow_hold = self._reflow_hold, ""
         self._alt_screen = False
         self._reflow_timer.stop()
         self._reflow_quiet.stop()
         self._reflow_cap.stop()
+        if held and child_lives:
+            self._read_pty(held)
 
     def _resize_child(self, rows: int, cols: int) -> bool:
         """Resize the child and remember when, so the redraw it answers with
@@ -3101,7 +3109,8 @@ class TerminalAgent(QObject):
                     self.activity_changed.emit(False)
                 self._reset_waiting()  # a dead/stopped agent isn't waiting
                 self._reset_bg_shell()  # ...nor waiting on a shell to finish
-                self._cancel_reflow()   # ...nor owed a reprint
+                # ...nor owed a reprint
+                self._cancel_reflow(child_lives=status is AgentStatus.STOPPING)
             self.status_changed.emit(status)
 
     def _on_worker_state(self, state: WorkerState) -> None:

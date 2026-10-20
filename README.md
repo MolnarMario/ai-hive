@@ -395,7 +395,8 @@ workspaces keep executing — switching never pauses anything.
   size. Claude reprints the conversation on every resize, but the Windows
   pseudo-console passes only one screenful of that on, so the older rows used
   to keep their old width. Once the agent is idle, AI Hive gives it a console
-  2000 rows taller for that one reprint, then its own size back. A reply still
+  2000 rows taller for that one reprint, never over the 2048 rows Claude
+  answers to, then its own size back. A reply still
   streaming finishes first, and the prompt dots move with the text.
 - **Find in the conversation.** `Ctrl+F` in a terminal opens a find box in
   its top right corner, the way Chrome's page search works. It searches the
