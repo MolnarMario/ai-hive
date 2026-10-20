@@ -110,14 +110,21 @@ RESIZE_REDRAW_S = 1.0
 # for one reprint, and the card's own rows again once it has arrived. The
 # same as TerminalView.HISTORY_LINES: rows past it scroll out of reach.
 REFLOW_EXTRA_ROWS = 2000
+# ...but never taller than this. Claude answers a resize to at most 2048 rows
+# with the whole conversation, and one to 2049 rows or more with nothing at
+# all (measured on claude 2.1.302 and 2.1.304, at 79, 100 and 120 columns).
+# A card over 48 rows asked for its rows + REFLOW_EXTRA_ROWS, got no reprint,
+# and lost its scrollback to the next hint Claude redrew (see
+# _reprint_start).
+REFLOW_MAX_ROWS = 2048
 # Quiet after the last resize before a reflow starts, so dragging a window
 # edge or a retile costs one reprint and not one per step. ms.
 REFLOW_DELAY_MS = 600
 # How often a due reflow looks again while the agent is not idle (a reply
 # streaming, a turn open, the TUI still booting). ms.
 REFLOW_RETRY_MS = 1000
-# The tall reprint has arrived once the child is this quiet after its first
-# byte. Measured: the reprint lands within ~100 ms of the resize. ms.
+# The tall reprint has arrived once the child is this quiet after it started.
+# Measured: the reprint lands within ~100 ms of the resize. ms.
 REFLOW_QUIET_MS = 350
 # ...and a child that never goes quiet, or never answers, gets its own rows
 # back after this long anyway. ms.
@@ -128,6 +135,12 @@ REFLOW_MAX_MS = 5000
 # conhost's at END (see TerminalView._apply_reflow_marker).
 REFLOW_BEGIN = "\x1b]7766;aihive-reflow-begin\x07"
 REFLOW_END = "\x1b]7766;aihive-reflow-end\x07"
+# conhost answers the tall resize by repainting its rows from the home
+# position: ESC[H, then each row erased, then the reprint (captured from
+# claude 2.1.296 and 2.1.304). A hint or spinner Claude redraws in place
+# moves the cursor relative to where it is and never homes it.
+_REPAINT_HOME = "\x1b[H"
+_FRAME_START = "\x1b[?25l"      # conhost hides the cursor to start a frame
 # the alternate screen: Claude's fullscreen renderer keeps no terminal
 # scrollback there, so it has nothing to reflow
 _ALT_SCREEN_RE = re.compile(r"\x1b\[\?(?:1049|1047|47)([hl])")
@@ -694,9 +707,12 @@ class TerminalAgent(QObject):
         self._reply_timer.timeout.connect(self._on_reply_quiet)
         # the scrollback reflow after a resize (see REFLOW_EXTRA_ROWS).
         # `_reflow_step` is "" between reflows, "tall" while the child has
-        # the extra rows and has not answered yet, "reprint" once it has.
+        # the extra rows and its reprint has not started, "reprint" once it
+        # has. `_reflow_tail` is the end of the last chunk read while tall,
+        # for a home sequence a read cut in two (_reprint_start).
         self._reflow_due = False
         self._reflow_step = ""
+        self._reflow_tail = ""
         self._alt_screen = False      # the stream is on the alternate screen
         # stream offset of the newest REFLOW_BEGIN: a mark before it was
         # reprinted, so a card finds it again by text (_recover_marks)
@@ -1021,17 +1037,43 @@ class TerminalAgent(QObject):
                 and self._view_size is not None)
 
     def _begin_reflow(self) -> None:
-        """Give the child REFLOW_EXTRA_ROWS more rows so its next reprint
-        reaches the card whole. The old scrollback goes with the reprint's
-        first byte (`_on_pty_output`), so a child that never answers costs
-        nothing."""
+        """Give the child REFLOW_EXTRA_ROWS more rows, up to REFLOW_MAX_ROWS,
+        so its next reprint reaches the card whole. The old scrollback goes
+        when the reprint starts (`_reprint_start`), so a child that never
+        answers, or redraws only a hint in the meantime, costs nothing."""
         rows, cols = self._view_size
+        tall = min(rows + REFLOW_EXTRA_ROWS, REFLOW_MAX_ROWS)
         self._reflow_due = False
+        if tall <= rows:
+            return
         self._reflow_step = "tall"
-        if not self._resize_child(rows + REFLOW_EXTRA_ROWS, cols):
+        self._reflow_tail = ""
+        if not self._resize_child(tall, cols):
             self._reflow_step = ""
             return
         self._reflow_cap.start()
+
+    def _reprint_start(self, text: str) -> int | None:
+        """Where the tall reprint starts in `text`, or None when it does not.
+
+        The reprint is conhost's answer to the tall resize, a frame that
+        homes the cursor (_REPAINT_HOME). Anything else the child draws
+        meanwhile is a hint or a spinner redrawn in place. Taking the first
+        byte for the reprint wiped the scrollback whenever Claude ignored the
+        resize (REFLOW_MAX_ROWS) and then cleared a footer hint: the card
+        kept one screenful. The cut is the start of the home's frame, so the
+        frame goes in whole after REFLOW_BEGIN, and a home a read cut in two
+        starts at this chunk."""
+        probe = self._reflow_tail + text
+        self._reflow_tail = probe[1 - len(_REPAINT_HOME):]
+        at = probe.find(_REPAINT_HOME)
+        if at < 0:
+            return None
+        at -= len(probe) - len(text)
+        if at <= 0:
+            return 0
+        start = text.rfind(_FRAME_START, 0, at)
+        return start if start >= 0 else at
 
     def _end_reflow(self) -> None:
         """The reprint is in (or the child never sent one): mark where it
@@ -2919,11 +2961,18 @@ class TerminalAgent(QObject):
             # as its prompt or latch a plan limit it never hit.
             return
         if self._reflow_step == "tall":
-            # the reprint's first byte: the scrollback it replaces goes now
-            self._reflow_step = "reprint"
-            self.reflowed_at = self._pty_total
-            self._append_stream(REFLOW_BEGIN)
-        if self._reflow_step:
+            cut = self._reprint_start(text)
+            if cut is not None:
+                self._reflow_tail = ""
+                if cut:
+                    # what the child drew before the reprint's frame
+                    self._on_pty_output(_stream, text[:cut])
+                    text = text[cut:]
+                # the reprint starts: the scrollback it replaces goes now
+                self._reflow_step = "reprint"
+                self.reflowed_at = self._pty_total
+                self._append_stream(REFLOW_BEGIN)
+        if self._reflow_step == "reprint":
             self._reflow_quiet.start()
         modes = _ALT_SCREEN_RE.findall(text)
         if modes:
