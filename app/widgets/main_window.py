@@ -2389,6 +2389,15 @@ def clone_default_branch(remote: str, destination: str) -> str:
     return error
 
 
+def _read_cut_offs(targets) -> list[tuple]:
+    """`transcripts.limit_cut_off` for each (agent id, cwd, session id) in
+    `targets`, returned as (agent id, cwd, session id, verdict). Runs on the
+    startup scan's worker thread, so plain data in and out."""
+    return [(agent_id, cwd, session_id,
+             transcripts.limit_cut_off(cwd, session_id))
+            for agent_id, cwd, session_id in targets]
+
+
 class NewWorkspaceDialog(QDialog):
     """Choose an existing project folder or clone a GitHub repository's
     default branch (see `clone_default_branch`)."""
@@ -2687,6 +2696,10 @@ class MainWindow(QMainWindow):
         self._launched_at = time.time()
         self._auto_continue = True    # user preference (persisted)
         self._startup_recovery = True  # user preference (persisted)
+        # recover_blocked_at_startup's transcript reads in flight (a Job), and
+        # how many agents its last scan armed
+        self._startup_scan = None
+        self._startup_armed = 0
         self._usage_tick_timer = QTimer(self)
         self._usage_tick_timer.setInterval(USAGE_TICK_MS)
         self._usage_tick_timer.timeout.connect(self._tick_usage)
@@ -3360,9 +3373,9 @@ class MainWindow(QMainWindow):
         self._startup_recovery = bool(on)
         self._schedule_save()   # a UI preference, like sound_enabled
 
-    def recover_blocked_at_startup(self) -> int:
+    def recover_blocked_at_startup(self) -> bool:
         """Find agents the plan limit stopped BEFORE this run, and arm them to
-        be resumed. Returns how many were armed.
+        be resumed. Returns whether a scan started.
 
         OPT-IN and called from main.py only, exactly like `start_usage_polling`
         and `quit_on_close`: the smoke suite shares `create_main_window` and
@@ -3373,26 +3386,71 @@ class MainWindow(QMainWindow):
         ignores as history. The transcript is the durable record instead: it
         still ends exactly where the limit stopped it.
 
+        The transcript reads (0.7 s over 14 transcripts, cold) run on a worker
+        and hand plain tuples back. The GUI thread files and arms what they
+        found when they land (`_arm_startup_cut_offs`), and
+        `startup_scan_pending` says they haven't yet.
+
         This only ARMS them. Delivery stays with the one watchdog
         (`_check_limit_resets`), so there is a single resume path to get right
         — including waiting for a freshly launched TUI to become prompt-ready.
         """
+        if self._startup_scan is not None:
+            return False        # the reads in flight answer this one too
+        self._startup_armed = 0
         if not self._startup_recovery:
-            return 0
+            return False
         # 1. LOOK EVERYWHERE. Every agent in every workspace is examined,
         #    running or not, and every cut-off found is filed — the record is
         #    supposed to be complete even where the action is selective.
+        #    Read here, on the GUI thread: the worker never touches an agent.
+        targets = [(agent.id, agent.spec.cwd, agent.spec.session_id)
+                   for agent in self.manager.all_agents()
+                   if agent.spec.provider == "claude" and agent.is_pty
+                   # already latched live; nothing to reconstruct
+                   and not agent.is_limit_blocked()]
+        from .self_update_dialog import Job
+        self._startup_scan = Job(lambda: _read_cut_offs(targets), self,
+                                 name="ai-hive-limit-scan", poll_ms=15)
+        self._startup_scan.finished.connect(self._on_startup_scan)
+        self._startup_scan.start()
+        return True
+
+    def startup_scan_pending(self) -> bool:
+        return self._startup_scan is not None
+
+    def _on_startup_scan(self, results) -> None:
+        self._startup_scan = None
+        # a window closing, or a toggle turned off while the reads ran,
+        # drops them: arming would start agents nobody wants started now
+        if self._closing or not self._startup_recovery:
+            return
+        if isinstance(results, Exception):   # Job's report of a crashed read
+            self._limit_audit(f"STARTUP-SCAN failed: {results!r}")
+            return
+        self._startup_armed = self._arm_startup_cut_offs(results)
+
+    def _arm_startup_cut_offs(self, results) -> int:
+        """The GUI-thread half of `recover_blocked_at_startup`: `results` is
+        what `_read_cut_offs` read. Returns how many agents it armed."""
+        agents = {agent.id: agent for agent in self.manager.all_agents()}
         found: list[tuple] = []           # (agent, record, info)
-        for agent in self.manager.all_agents():
-            spec = agent.spec
-            if spec.provider != "claude" or not agent.is_pty:
-                continue
-            if agent.is_limit_blocked():
-                continue        # already latched live; nothing to reconstruct
-            info = transcripts.limit_cut_off(spec.cwd, spec.session_id)
+        for agent_id, cwd, session_id, info in results:
             # The gate: no stoppage message, no action.
             if not info or not info["cut_off"] or not info["at"]:
                 continue
+            agent = agents.get(agent_id)
+            if agent is None:
+                continue        # closed while the reads ran
+            spec = agent.spec
+            # the reads ran off this thread, and the agent may have moved to
+            # another conversation since. The cut-off belongs to the one read.
+            if (spec.cwd, spec.session_id) != (cwd, session_id):
+                self._limit_audit(f"STARTUP-SKIP agent={spec.name} (its "
+                                  f"conversation changed during the scan)")
+                continue
+            if agent.is_limit_blocked():
+                continue        # latched live meanwhile
             record = self._ledger_cut_off(agent, info["at"],
                                           info["resets_at"], info["window"],
                                           info["banner"], source="transcript")
@@ -6987,7 +7045,13 @@ class MainWindow(QMainWindow):
         The snapshots go BEFORE `settle_layout`. Its resize flush is what
         projects a restored screen at the settled width, a full replay
         through pyte per card (0.4 to 0.6 s for a large one), and for a card
-        about to start that projection would only be wiped a moment later."""
+        about to start that projection would only be wiped a moment later.
+
+        First it joins the launch's transcript backup, which has been
+        copying on a worker since the top of `create_main_window`. Each
+        start below would wait for it anyway (`TerminalAgent.start`); the
+        join here keeps the wait out of the middle of the starts."""
+        transcripts.wait_for_backup()
         starting = []
         for ws in self.manager.workspaces:
             page = self._pages.get(ws.id)
@@ -7255,7 +7319,9 @@ class MainWindow(QMainWindow):
         self._save_session()  # persist FIRST: teardown can never lose state
         from .. import transcripts
         agents = self.manager.all_agents()
-        transcripts.backup_for_agents(  # snapshot the day's conversations
+        # snapshot the day's conversations. A launch backup still copying is
+        # waited for in there, after the save above, never ahead of it.
+        transcripts.backup_for_agents(
             agents, str(self.store.path.parent / "transcripts"))
         # ...and the SCREENS, so a card left stopped reopens showing its
         # conversation rather than a black rectangle. Must run while the

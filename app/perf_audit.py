@@ -9,9 +9,12 @@ One line per launch (`StartupPhases`). `update` and `imports` run at module
 level in main.py, before the session store exists, so main.py carries their
 times forward the way it carries `_STARTUP_UPDATE_AUDIT`. `cli_gate` is 0
 unless the user opted into CLI auto-update. `total` runs from the moment
-Windows created the process to the end of the recovery scan, so it also
-holds what no phase names (interpreter start, the PySide6 import, loading
-the session file).
+Windows created the process to the end of `recovery`, so it also holds what
+no phase names (interpreter start, the PySide6 import, loading the session
+file). Two pieces of file work run on workers and show up in a phase only
+when the GUI thread waits for them: the transcript backup, started in
+`window` and joined at the top of `autostart`, and the limit scan's reads,
+which `recovery` only hands off.
 
     PERF stall gap=312 paint=24 grid=255x66 feed=290 feed_chars=104857
         agent=Agent 3
