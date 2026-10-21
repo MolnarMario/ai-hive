@@ -1794,6 +1794,30 @@ def test_themes():
             w.grab()  # runs paintEvent; raises if the paint path is broken
             w.deleteLater()
 
+    # The Mechanicus aquila draws its right half once and mirrors it with
+    # <use>. QtSvg drops what it can't parse without a word, which would leave
+    # a one-winged or blank crest, so both wings must come out phosphor green.
+    ui_theme.apply_theme("adeptus-mechanicus")
+    pb = PageBorder()
+    pb.resize(900, 120)
+    crest = pb.grab().toImage()
+    pb.deleteLater()
+    ui_theme.apply_theme(ui_theme.DEFAULT_THEME_ID)
+
+    def _phosphor(x0, x1, y0=PageBorder.INSET,
+                  y1=PageBorder.INSET + PageBorder.THICK):
+        return sum(1 for x in range(x0, x1) for y in range(y0, y1)
+                   if (c := crest.pixelColor(x, y)).green() > 170
+                   and c.green() > c.red() + 60)
+    left, right = _phosphor(400, 440), _phosphor(460, 500)
+    check("themes: mechanicus aquila paints both wings",
+          left > 40 and right > 40, f"left={left} right={right}")
+    # The heads sit above the wing arms, so these rows see only the body's
+    # <use>s: about 38 green pixels a side, none with the body dropped.
+    left, right = _phosphor(437, 449, 7, 12), _phosphor(451, 463, 7, 12)
+    check("themes: mechanicus aquila paints both heads",
+          left > 15 and right > 15, f"left={left} right={right}")
+
     # SHAPED-ICON GUARANTEE. The artwork is exported flat on a near-black
     # ground; shipping that unkeyed put a hard black square in the title bar,
     # the taskbar, Alt+Tab and the Start tile (all of which can be light), and

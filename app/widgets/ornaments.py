@@ -2,8 +2,9 @@
 assets). The elaborate illuminated pieces (gilt drop-cap, logo roundel, the
 foliate page border with gilt corner medallions) render only when the active
 theme sets `illuminated`; otherwise the simple gold-on-dark versions are used,
-so the other skins stay clean and light. SVG geometry/colours are lifted from
-the design handoff's inline data-URIs.
+so the other skins stay clean and light. Most SVG geometry and colours are
+lifted from the design handoff's inline data-URIs. The Mechanicus aquila is
+drawn by hand.
 """
 
 import os
@@ -14,9 +15,9 @@ from functools import lru_cache
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
                             QEvent, QObject, QPoint, QRect, QRectF, Qt, QTimer,
                             QVariantAnimation, Signal)
-from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage,
-                           QLinearGradient, QPainter, QPainterPath, QPen,
-                           QPixmap, QRadialGradient)
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QGradient,
+                           QImage, QLinearGradient, QPainter, QPainterPath,
+                           QPen, QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QComboBox, QLabel, QSizePolicy,
                                QToolButton, QWidget)
@@ -103,17 +104,42 @@ _ROUNDEL_VINE = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'>
 <path d='M8 8 Q18 12 15 22'/><path d='M40 8 Q30 12 33 22'/>
 <path d='M8 40 Q18 36 15 26'/><path d='M40 40 Q30 36 33 26'/></g></svg>"""
 
-# --- Adeptus Mechanicus SVG ornaments (from the cogitator handoff) ---
+# --- Adeptus Mechanicus SVG ornaments ---
+# The cog and circuit come from the cogitator handoff. The aquila is redrawn.
 
-_AQUILA = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 64'>
-<g fill='#242b31' stroke='#616b73' stroke-width='0.8'>
-<path d='M60 30 C72 22 88 20 104 26 C92 27 82 30 74 36 C86 31 96 31 105 37 C93 37 83 40 75 45 C86 42 95 43 102 49 C90 48 78 47 68 44 C64 42 61 37 60 33 Z'/>
-<path d='M60 30 C48 22 32 20 16 26 C28 27 38 30 46 36 C34 31 24 31 15 37 C27 37 37 40 45 45 C34 42 25 43 18 49 C30 48 42 47 52 44 C56 42 59 37 60 33 Z'/>
-<path d='M60 26 C63 17 70 15 75 10 C75 16 72 22 66 25 C64 26 62 26 60 27 Z'/>
-<path d='M60 26 C57 17 50 15 45 10 C45 16 48 22 54 25 C56 26 58 26 60 27 Z'/>
-<path d='M55 42 L60 62 L65 42 C63 46 57 46 55 42 Z'/>
-<circle cx='60' cy='31' r='5.4' fill='#2f373d'/>
-<circle cx='60' cy='31' r='2' fill='#0c0f11'/></g></svg>"""
+# The crest plaque's glass. The aquila's cut lines are strokes in this colour,
+# so they read as gaps in the glass. The bloom lifts the glass a little around
+# the crest, which leaves the heads a faint dark outline.
+_MECH_GLASS = "#05140d"
+
+# The double-headed aquila, phosphor green. Only the right half is drawn; <use>
+# mirrors it about x=120. The wings go first: seven fanned feathers on a solid
+# root, under a curved arm. The head, breast, talons and tail go on top with a
+# glass-coloured stroke. At 32px tall that stroke is the only thing keeping the
+# heads and breast from melting into the wing roots. It also runs down x=120,
+# which splits the breast and tail in two.
+_AQUILA = f"""<svg xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink' viewBox='0 0 240 72'>
+<defs><linearGradient id='g' gradientUnits='userSpaceOnUse' x1='0' y1='0' x2='0' y2='72'>
+<stop offset='0' stop-color='#b4ffd9'/><stop offset='0.55' stop-color='#5fe8ac'/>
+<stop offset='1' stop-color='#2f9a76'/></linearGradient>
+<g id='wing'>
+<polygon points='147.2,30.6 231.5,10.6 223.1,19.2 147.8,33.4'/>
+<polygon points='147.8,33.6 216.5,26.1 210.2,32.6 148,36.4'/>
+<polygon points='148,36.6 205.5,37.5 200.4,42.8 147.9,39.4'/>
+<polygon points='147.9,39.6 196.8,46.6 192.5,51 147.4,42.3'/>
+<polygon points='147.4,42.5 189.5,54.1 185.7,58 146.6,45.2'/>
+<polygon points='146.5,45.4 183.2,60.6 179.8,64.2 145.4,48'/>
+<polygon points='145.3,48.2 177.5,66.5 174.3,69.9 143.9,50.6'/>
+<polygon points='124,37 150.3,27.4 151.5,31.7 152,36 151.8,40.4 150.9,44.7 149.4,48.8'/>
+<path d='M130 26 C146 15 176 7 238 1 C206 11 178 18 152 28 C145 30 140 33 136 35 Z'/></g>
+<g id='body'>
+<path d='M120 31 L120 13 C120 6 124.5 2 130.5 2 C135.5 2 138.5 3.8 140.5 6 L144 6.3 C149.5 6.8 152.5 10 152.5 14.5 C152.5 17.5 151 20 148.5 22 C148.5 19 147.5 17 145 16.3 L141 16 C139 18 137 20 135.5 22.5 L134.5 25 L138 26 L142 32 L120 61 Z'/>
+<path d='M126 45 L136 53.5 L145 56.5 L143.5 61 L138.5 60 L142 66 L138 68 L134.5 62.5 L134 69.5 L129.5 69.5 L129.5 59.5 L122.5 51 Z'/>
+<polygon points='120,59 126,54.5 123.5,71.5 120,72'/></g></defs>
+<g fill='url(#g)'><use xlink:href='#wing'/><use xlink:href='#wing' transform='matrix(-1 0 0 1 240 0)'/></g>
+<g fill='url(#g)' stroke='{_MECH_GLASS}' stroke-width='2' stroke-linejoin='round'>
+<use xlink:href='#body'/><use xlink:href='#body' transform='matrix(-1 0 0 1 240 0)'/></g>
+<g fill='{_MECH_GLASS}'><circle cx='135' cy='8.4' r='1.7'/><circle cx='105' cy='8.4' r='1.7'/></g></svg>"""
 
 _COG = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'>
 <polygon points='46,24 39.9,28.3 43,35 35.7,35.7 35,43 28.3,39.9 24,46 19.7,39.9 13,43 12.3,35.7 5,35 8.1,28.3 2,24 8.1,19.7 5,13 12.3,12.3 13,5 19.7,8.1 24,2 28.3,8.1 35,5 35.7,12.3 43,13 39.9,19.7' fill='none' stroke='#5fe8ac' stroke-width='2.2'/>
@@ -187,6 +213,18 @@ def _gunmetal(rect: QRectF) -> QLinearGradient:
     g.setColorAt(0.72, QColor("#1b2126"))
     g.setColorAt(1.0, QColor("#141a1e"))
     return g
+
+
+def _chamfered(rect: QRectF, cut: float) -> QPainterPath:
+    """`rect` with its four corners cut off at 45 degrees, `cut` px deep."""
+    l, t, r, b = rect.left(), rect.top(), rect.right(), rect.bottom()
+    path = QPainterPath()
+    path.moveTo(l + cut, t)
+    for x, y in [(r - cut, t), (r, t + cut), (r, b - cut), (r - cut, b),
+                 (l + cut, b), (l, b - cut), (l, t + cut)]:
+        path.lineTo(x, y)
+    path.closeSubpath()
+    return path
 
 
 class DropCap(QWidget):
@@ -1568,18 +1606,37 @@ class PageBorder(QWidget):
         # aquila crest plaque, centered on the top strip. It stays within the
         # strip (2px proud each side): taller, it hung into the top bar and
         # pushed the eye down onto the usage pills under it.
-        pw, ph = 150, t + 4
-        px = (w - pw) / 2
-        plaque = QRectF(px, ins - 2, pw, ph)
+        pw, ph = 146, t + 4
+        plaque = QRectF((w - pw) / 2, ins - 2, pw, ph)
         pg = QLinearGradient(plaque.topLeft(), plaque.bottomLeft())
         pg.setColorAt(0.0, QColor("#4a555f"))
         pg.setColorAt(1.0, QColor("#232a30"))
         p.setBrush(pg)
         p.setPen(QPen(QColor("#5a656f")))
-        p.drawRoundedRect(plaque, 6, 6)
-        aw, ah = 110, ph - 4
-        aq = _pixmap(_AQUILA, aw, ah)
-        p.drawPixmap(int(px + (pw - aw) / 2), int(plaque.top() + 2), aq)
+        p.drawPath(_chamfered(plaque, 9))
+        # dark glass inset with a faint phosphor bloom behind the crest
+        glass = _chamfered(plaque.adjusted(1.5, 1.5, -1.5, -1.5), 8)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(_MECH_GLASS))
+        p.drawPath(glass)
+        # ObjectMode stretches the gradient's unit circle over the glass, so
+        # the bloom is an ellipse as wide and tall as the plaque
+        bloom = QRadialGradient(0.5, 0.5, 0.5)
+        bloom.setCoordinateMode(QGradient.CoordinateMode.ObjectMode)
+        bloom.setColorAt(0.0, QColor(95, 232, 172, 60))
+        bloom.setColorAt(1.0, QColor(95, 232, 172, 0))
+        p.setBrush(bloom)
+        p.drawPath(glass)
+        p.setPen(QPen(QColor("#2f9a76")))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(glass)
+        # drawn as vectors, not a 1x pixmap, so it stays sharp at 150%
+        c = plaque.center()
+        ah = ph - 4
+        aw = ah * 240 / 72
+        if self._aquila is None:
+            self._aquila = QSvgRenderer(QByteArray(_AQUILA.encode("utf-8")))
+        self._aquila.render(p, QRectF(c.x() - aw / 2, plaque.top() + 2, aw, ah))
         p.end()
 
 
