@@ -41,16 +41,24 @@ command that writes is run. There is no `reset`, no `stash`: fast-forward or
 nothing. Untracked files are left alone; if the update would overwrite one,
 git itself refuses the merge and that refusal is reported.
 
-EVERY LAUNCH PULLS WHAT MERGED
-------------------------------
-Agents work in lanes and the integrator merges from its own lane, so nothing
-else moves this folder after a PR merges. `main.py` calls `startup_update`
-before it imports the app, so the next launch runs what merged. A session
-that worked here on a branch leaves the folder on it, which blocked every
-update until someone switched by hand (0.28.2 sat there for hours). So the
-launch, and only the launch, switches a clean folder back to main when
-`git cherry` finds nothing on its branch that main lacks. It never switches
-away from unmerged commits or local changes.
+THE LAUNCH NEVER WAITS ON GITHUB
+--------------------------------
+Starting AI Hive runs no git at all. It used to fetch and fast-forward
+before the window existed, about a second of blank screen on every launch.
+Now the Options switch "Update AI Hive in the background" (default on) runs
+`background_update` off the GUI thread a minute after launch and then every
+hour (`MainWindow.start_app_update_checks`). With it off, only the version
+button checks. Either way the pulled files run from the next launch.
+
+The background install is the version button's `apply`, pinned to the
+commit `check` just fetched, so an agent's fetch landing in between cannot
+widen it. It skips an update that changes `requirements.txt`: pip would
+replace packages this process has loaded (PySide6 among them) with no
+dialog to report a failure, so that update waits for the user's click. It
+never switches branches: an agent may be committing on the branch this
+folder sits on, so a folder off main is only reported, on the button. The
+integrator's main-checkout step (docs/agents/integration.md) moves a folder
+left on a merged branch back to main.
 
 THE USER RESTARTS, NEVER US
 ---------------------------
@@ -83,8 +91,6 @@ BRANCH = "main"
 UPSTREAM = f"{REMOTE}/{BRANCH}"
 
 FETCH_TIMEOUT_S = 30.0
-# the launch waits on this with no window up yet, so it gives up sooner
-STARTUP_FETCH_TIMEOUT_S = 10.0
 GIT_TIMEOUT_S = 15.0
 MERGE_TIMEOUT_S = 60.0
 PIP_TIMEOUT_S = 600.0
@@ -114,6 +120,9 @@ class Check:
     notes: str = ""         # markdown, the changes the user would get
     blocked: str = ""       # why an available update cannot be applied here
     detail: str = ""        # the error, for Status.ERROR
+    # set by `background_update` alone: the update changes requirements.txt,
+    # so it was left for the user's click
+    needs_packages: bool = False
 
 
 @dataclass
@@ -204,8 +213,8 @@ def _git_error(what: str, rc: int, output: str) -> str:
     return f"{what} failed" + (f": {reason}" if reason else ".")
 
 
-def blocked_reason(runner, repo: str = REPO_DIR) -> str:
-    """Why `git merge --ff-only origin/main` must not run here, or "".
+def blocked_reason(runner, repo: str = REPO_DIR, target: str = UPSTREAM) -> str:
+    """Why `git merge --ff-only <target>` must not run here, or "".
 
     Read-only. Run at check time so the dialog can say it up front, and again
     right before the merge because agents may have changed the folder since."""
@@ -225,7 +234,7 @@ def blocked_reason(runner, repo: str = REPO_DIR) -> str:
         return ("This folder has local changes to AI Hive's files. Commit "
                 "or discard them, then update.")
     rc, out = runner(_git(repo, "merge-base", "--is-ancestor", "HEAD",
-                          UPSTREAM), GIT_TIMEOUT_S)
+                          target), GIT_TIMEOUT_S)
     if rc == 1:
         return ("This folder has commits that are not on GitHub's main, so "
                 "it cannot simply move forward. Update it with git by hand.")
@@ -294,12 +303,14 @@ def _notes(runner, repo, low, high, old_ref, new_ref) -> str:
 
 # ---------------------------------------------------------------- apply ---
 
-def apply(runner, repo: str = REPO_DIR, python: str = "") -> Applied:
-    """Fast-forward to origin/main, then install requirements if they changed.
+def apply(runner, repo: str = REPO_DIR, python: str = "",
+          target: str = UPSTREAM) -> Applied:
+    """Fast-forward to origin/main (or the commit `target` names), then
+    install requirements if they changed.
 
     Assumes `check` fetched moments ago. Re-checks `blocked_reason` first, so
     a folder that changed since the dialog opened is refused, not merged."""
-    blocked = blocked_reason(runner, repo)
+    blocked = blocked_reason(runner, repo, target)
     if blocked:
         return Applied(False, detail=blocked)
     rc, out = runner(_git(repo, "rev-parse", "HEAD"), GIT_TIMEOUT_S)
@@ -307,7 +318,7 @@ def apply(runner, repo: str = REPO_DIR, python: str = "") -> Applied:
     if not old_head:
         return Applied(False, detail=_git_error("Reading the current commit",
                                                 rc, out))
-    rc, out = runner(_git(repo, "merge", "--ff-only", "--quiet", UPSTREAM),
+    rc, out = runner(_git(repo, "merge", "--ff-only", "--quiet", target),
                      MERGE_TIMEOUT_S)
     if rc != 0:
         return Applied(False, detail=_git_error("Updating", rc, out),
@@ -328,66 +339,29 @@ def apply(runner, repo: str = REPO_DIR, python: str = "") -> Applied:
     return result
 
 
-# --------------------------------------------------------------- launch ---
+# ----------------------------------------------------------- background ---
 
-def _leave_merged_branch(runner, repo: str) -> None:
-    """Switch a clean folder back to main when its branch holds nothing that
-    main lacks. A session that worked here on a branch leaves the folder on
-    it after its PR merges, and every update after that is blocked. `git
-    cherry` compares patches, so commits that reached main under new hashes
-    (a cherry-pick, an integration branch) count as merged. It skips merge
-    commits, though, and a merge can carry conflict resolutions, so a branch
-    with a merge commit main lacks is never left."""
-    rc, out = runner(_git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
+def background_update(runner, repo: str = REPO_DIR, running: str = ""):
+    """The Options switch's check: `check`, then `apply` when the update can
+    install with nobody watching. Returns `(Check, Applied or None)`; None
+    means nothing was installed: no update, a blocked folder, or an update
+    that changes requirements.txt (`Check.needs_packages`). Never raises."""
+    found = check(runner, repo, running)
+    if found.status is not Status.UPDATE_AVAILABLE or found.blocked:
+        return found, None
+    rc, out = runner(_git(repo, "rev-parse", "--verify", "--quiet", UPSTREAM),
                      GIT_TIMEOUT_S)
-    branch = _first_line(out) if rc == 0 else ""
-    if branch in ("", "HEAD", BRANCH):
-        return
-    rc, out = runner(_git(repo, "status", "--porcelain",
-                          "--untracked-files=no"), GIT_TIMEOUT_S)
-    if rc != 0 or out.strip():
-        return
-    rc, out = runner(_git(repo, "rev-list", "--merges", f"{UPSTREAM}..HEAD"),
-                     GIT_TIMEOUT_S)
-    if rc != 0 or out.strip():
-        return
-    rc, out = runner(_git(repo, "cherry", UPSTREAM, "HEAD"), GIT_TIMEOUT_S)
-    if rc != 0 or any(ln.startswith("+") for ln in out.splitlines()):
-        return
-    runner(_git(repo, "switch", "--quiet", BRANCH), GIT_TIMEOUT_S)
-
-
-def startup_update(runner, repo: str = REPO_DIR, python: str = ""):
-    """Bring this clone to GitHub's main at launch, before `main.py` imports
-    the app, so whatever merged since the last run is what runs now.
-
-    None when the folder already has everything on main. Otherwise the
-    `Applied`, which is a refusal (`ok=False`) whenever `apply` would refuse:
-    local changes and unmerged commits are never touched."""
-    rc, out = runner(_git(repo, "fetch", "--quiet", REMOTE, BRANCH),
-                     STARTUP_FETCH_TIMEOUT_S)
+    target = _first_line(out) if rc == 0 else ""
+    if not target:
+        return found, None
+    # rc 1 is a change; anything else means git could not tell, and an
+    # install nobody watches only goes ahead on a clear no
+    rc, _ = runner(_git(repo, "diff", "--quiet", "HEAD", target, "--",
+                        "requirements.txt"), GIT_TIMEOUT_S)
     if rc != 0:
-        return Applied(False, detail=_git_error("Checking GitHub", rc, out))
-    rc, _ = runner(_git(repo, "merge-base", "--is-ancestor", UPSTREAM,
-                        "HEAD"), GIT_TIMEOUT_S)
-    if rc == 0:
-        return None
-    _leave_merged_branch(runner, repo)
-    return apply(runner, repo, python)
-
-
-def startup_failure(result) -> str:
-    """What stops the launch after `startup_update`, or "". The pulled code
-    may need packages that failed to install; importing it then dies before
-    any window could say why, so the launch stops with the fix instead."""
-    if (not isinstance(result, Applied) or not result.ok
-            or not result.deps_changed or result.deps_ok):
-        return ""
-    version = f" v{result.version}" if result.version else ""
-    return (f"AI Hive pulled{version} from GitHub, but installing the Python "
-            "packages it needs failed.\n\nIn the AI Hive folder, run:\n"
-            "    .venv\\Scripts\\python.exe -m pip install -r requirements.txt"
-            "\n\nThen start AI Hive again.")
+        found.needs_packages = True
+        return found, None
+    return found, apply(runner, repo, target=target)
 
 
 def applied_text(result: Applied) -> str:
@@ -416,18 +390,21 @@ def venv_python() -> str:
     return exe
 
 
-def audit_line(result) -> str:
-    """One `SELF-UPDATE` line for session forensics."""
+def audit_line(result, tag: str = "") -> str:
+    """One `SELF-UPDATE` line for session forensics. `tag` names who ran it
+    ("background"); the version button's lines carry none."""
+    head = f"SELF-UPDATE {tag} " if tag else "SELF-UPDATE "
     if isinstance(result, Applied):
-        return (f"SELF-UPDATE apply ok={result.ok} version={result.version} "
+        return (f"{head}apply ok={result.ok} version={result.version} "
                 f"deps_changed={result.deps_changed} deps_ok={result.deps_ok} "
                 f"detail={_first_line(result.detail)!r}")
     if isinstance(result, Check):
-        return (f"SELF-UPDATE check status={result.status.value} "
+        return (f"{head}check status={result.status.value} "
                 f"running={result.running} installed={result.installed} "
                 f"remote={result.remote} blocked={bool(result.blocked)} "
+                f"needs_packages={result.needs_packages} "
                 f"detail={_first_line(result.detail)!r}")
-    return "SELF-UPDATE ?"
+    return f"{head}?"
 
 
 # --------------------------------------------------------------- runner ---

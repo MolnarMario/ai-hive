@@ -507,6 +507,9 @@ class TopBar(QFrame):
     # install newer Claude Code / agy CLIs at the NEXT startup, before any
     # agent launches (the only moment those binaries are not locked)
     autoUpdateToggled = Signal(bool)
+    # "Update AI Hive in the background": the hourly check that installs a
+    # newer AI Hive while the app runs (MainWindow.start_app_update_checks)
+    appAutoUpdateToggled = Signal(bool)
     # "Lanes in every workspace": does every new agent start with Own lane
     agentLanesToggled = Signal(bool)
     # "Confirm Ship finished lanes": ask before typing the request (True)
@@ -641,6 +644,16 @@ class TopBar(QFrame):
         self.auto_update_btn = ToggleSwitch(self)
         self.auto_update_btn.clicked.connect(self._on_auto_update_clicked)
         self._refresh_auto_update_btn()
+
+        # AI Hive's own background update. Default ON: the launch stopped
+        # pulling from GitHub, so this is what keeps a clone current, and it
+        # never runs before the window is up.
+        self._app_auto_update = True
+        self.app_auto_update_label = toggle_label("")
+        self.app_auto_update_btn = ToggleSwitch(self)
+        self.app_auto_update_btn.clicked.connect(
+            self._on_app_auto_update_clicked)
+        self._refresh_app_auto_update_btn()
 
         # "Lanes in every workspace". Default OFF: armed, it ticks "Own lane" for every new
         # Claude agent in every git workspace, so it is the user's decision,
@@ -815,6 +828,8 @@ class TopBar(QFrame):
         self.options_panel.add_switch_row(self.usage_left_label,
                                           self.usage_left_btn)
         self.options_panel.add_switch_row(self.taskbar_label, self.taskbar_btn)
+        self.options_panel.add_switch_row(self.app_auto_update_label,
+                                          self.app_auto_update_btn)
         self.options_panel.add_switch_row(self.auto_update_label,
                                           self.auto_update_btn)
         self.options_panel.add_widget(self.install_label)
@@ -1248,6 +1263,36 @@ class TopBar(QFrame):
             "your machine.\nClick to turn on.")
         self.auto_update_btn.setToolTip(tip)
         self.auto_update_label.setToolTip(tip)
+
+    def _on_app_auto_update_clicked(self) -> None:
+        self.set_app_auto_update(not self._app_auto_update)
+        self.appAutoUpdateToggled.emit(self._app_auto_update)
+
+    def set_app_auto_update(self, on: bool) -> None:
+        """Reflect the AI Hive background-update preference (no signal)."""
+        self._app_auto_update = bool(on)
+        self._refresh_app_auto_update_btn()
+
+    def app_auto_update(self) -> bool:
+        return self._app_auto_update
+
+    def _refresh_app_auto_update_btn(self) -> None:
+        self.app_auto_update_btn.setChecked(self._app_auto_update)
+        self.app_auto_update_label.setText(
+            "⬆  Update AI Hive in the background")
+        tip = (
+            "Background updates: ON. A minute after AI Hive opens, and every "
+            "hour after that, it checks GitHub for a newer AI Hive and "
+            "installs it while you work. The new version runs the next time "
+            "you open AI Hive. An update that needs new Python packages "
+            "waits for you to click the button next to the version. Opening "
+            "AI Hive never waits for any of this.\nClick to turn off."
+            if self._app_auto_update else
+            "Background updates: OFF. AI Hive never checks GitHub on its "
+            "own. Click the button next to the version number to check and "
+            "update.\nClick to turn on.")
+        self.app_auto_update_btn.setToolTip(tip)
+        self.app_auto_update_label.setToolTip(tip)
 
     def note_update_pending(self, text: str, tooltip: str = "") -> None:
         """Show (or hide, on an empty text) the last gate's report.
@@ -2598,6 +2643,10 @@ class MainWindow(QMainWindow):
         # and like every other preference here the default MUST be assigned
         # above _restore_ui_state or the restored value is clobbered.
         self._auto_update = False     # user preference (persisted)
+        # "Update AI Hive in the background". Default ON, assigned above
+        # _restore_ui_state like the rest. The check behind it starts only
+        # from main.py (start_app_update_checks), never in the suite.
+        self._app_auto_update = True  # user preference (persisted)
         # "Lanes in every workspace". Default OFF, assigned here for the same
         # reason. Read it only through lane_default(ws).
         self._agent_lanes = False     # user preference (persisted)
@@ -3007,6 +3056,8 @@ class MainWindow(QMainWindow):
         self.top_bar.replyStampsToggled.connect(self._on_reply_stamps_toggled)
         self.top_bar.tooltipsToggled.connect(self._on_tooltips_toggled)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
+        self.top_bar.appAutoUpdateToggled.connect(
+            self._on_app_auto_update_toggled)
         self.top_bar.agentLanesToggled.connect(self._on_agent_lanes_toggled)
         self.top_bar.shipConfirmToggled.connect(self._on_ship_confirm_toggled)
         self.top_bar.closeMergedConfirmToggled.connect(
@@ -4638,6 +4689,15 @@ class MainWindow(QMainWindow):
         self._auto_update = bool(enabled)
         self._schedule_save()
 
+    def _on_app_auto_update_toggled(self, enabled: bool) -> None:
+        """User flipped "Update AI Hive in the background". An additive
+        optional key under "ui" (no SESSION_VERSION bump). Unlike the CLI
+        switch it takes effect now: switched on, it checks at once."""
+        self._app_auto_update = bool(enabled)
+        self._schedule_save()
+        if self._app_auto_update:
+            self._app_auto_update_tick()
+
     # ------------------------------------------------------- agent lanes ---
     # Lane scopes. Two
     # toggles, the Options switch "Lanes in every workspace" and each
@@ -5854,6 +5914,10 @@ class MainWindow(QMainWindow):
 
     APP_UPDATE_FLASH_MS = 6000     # how long "Check failed" stays
     APP_UPDATE_QUIET_MS = 4000     # how long the "Up to date" notice stays
+    # the background check: first a minute after launch, once the restored
+    # agents are up, then hourly
+    APP_UPDATE_FIRST_MS = 60_000
+    APP_UPDATE_EVERY_MS = 3_600_000
 
     def arm_self_update(self, runner=None, repo: str = "") -> None:
         """Let the version button reach GitHub. Called from `main.py` alone:
@@ -5878,6 +5942,15 @@ class MainWindow(QMainWindow):
         if runner is None or getattr(self, "_app_update_job", None) is not None:
             return
         self._app_update_flash().stop()
+        if getattr(self, "_app_auto_job", None) is not None:
+            # the background check is fetching or merging in this folder,
+            # and a second git run would fight it for the lock: show the
+            # click landed and check once it ends
+            self._app_update_click_waiting = True
+            self.top_bar.set_app_update_state(
+                "Checking...", "Asking GitHub for the latest AI Hive",
+                interactive=False)
+            return
         self.top_bar.set_app_update_state(
             "Checking...", "Asking GitHub for the latest AI Hive",
             interactive=False)
@@ -5924,6 +5997,85 @@ class MainWindow(QMainWindow):
             bar.set_app_update_state("Check failed", check.detail)
             self._app_update_flash().start(self.APP_UPDATE_FLASH_MS)
         self._open_self_update_dialog(check)
+
+    def start_app_update_checks(self) -> None:
+        """Run the background update check a minute from now, then hourly.
+        Called by main.py only, after the launch: the suite shares the
+        factory and must never fetch or merge into the clone it runs from.
+        Each tick reads the Options switch, so turning it off stops the
+        checks without stopping the timer."""
+        if getattr(self, "_app_update_timer", None) is not None:
+            return
+        timer = QTimer(self)
+        timer.setInterval(self.APP_UPDATE_EVERY_MS)
+        timer.timeout.connect(self._app_auto_update_tick)
+        timer.start()
+        self._app_update_timer = timer
+        QTimer.singleShot(self.APP_UPDATE_FIRST_MS, self,
+                          self._app_auto_update_tick)
+
+    def _app_auto_update_tick(self) -> None:
+        if (not self._app_auto_update or self._closing
+                or getattr(self, "_app_update_timer", None) is None
+                or getattr(self, "_self_update_runner", None) is None
+                or getattr(self, "_app_auto_job", None) is not None
+                or getattr(self, "_app_update_job", None) is not None
+                or getattr(self, "_self_update_dialog", None) is not None):
+            return
+        from app import self_update
+        from .self_update_dialog import Job
+
+        runner, repo = self._self_update_runner, self._self_update_repo
+        job = Job(lambda: self_update.background_update(runner, repo,
+                                                        __version__),
+                  self, name="ai-hive-self-update-bg")
+        job.finished.connect(self._on_app_auto_update_done)
+        self._app_auto_job = job
+        job.start()
+
+    def _on_app_auto_update_done(self, result) -> None:
+        """Show what the background check did, quietly: no dialog, and
+        nothing at all when AI Hive is up to date or GitHub is unreachable.
+        The audit line has every outcome."""
+        from app import self_update
+        from app.self_update import Status
+
+        self._app_auto_job = None
+        if getattr(self, "_app_update_click_waiting", False):
+            # the user clicked meanwhile: their check shows the full answer
+            self._app_update_click_waiting = False
+            self.check_for_app_update()
+            return
+        if not (isinstance(result, tuple) and len(result) == 2
+                and isinstance(result[0], self_update.Check)):
+            self._audit_install(
+                f"SELF-UPDATE background stopped unexpectedly: {result}")
+            return
+        found, applied = result
+        self._audit_install(self_update.audit_line(found, "background"))
+        if applied is not None:
+            self._audit_install(self_update.audit_line(applied, "background"))
+        if applied is not None and applied.ok:
+            self._app_update_flash().stop()
+            self._note_app_restart_pending(applied.version)
+        elif found.status is Status.RESTART_PENDING:
+            self._app_update_flash().stop()
+            self._note_app_restart_pending(found.installed)
+        elif found.status is Status.UPDATE_AVAILABLE:
+            if applied is not None:
+                why = f"Installing it failed: {applied.detail}"
+            elif found.blocked:
+                why = found.blocked
+            elif found.needs_packages:
+                why = "It needs new Python packages, so it waits for you."
+            else:
+                why = ""
+            self._app_update_flash().stop()
+            self.top_bar.set_app_update_state(
+                f"⬆ v{found.remote}",
+                f"AI Hive v{found.remote} is available. "
+                + (why + " " if why else "")
+                + "Click to see what changed and update.", attention=True)
 
     def _note_app_restart_pending(self, version: str) -> None:
         self.top_bar.set_app_update_state(
@@ -6153,6 +6305,9 @@ class MainWindow(QMainWindow):
         # armed deliberately, once, exactly like the recovery switches were)
         self._auto_update = bool(ui.get("auto_update", False))
         self.top_bar.set_auto_update(self._auto_update)
+        # AI Hive's own background update (default ON)
+        self._app_auto_update = bool(ui.get("app_auto_update", True))
+        self.top_bar.set_app_auto_update(self._app_auto_update)
         # "Lanes in every workspace" (default OFF: it ticks Own lane for
         # every new agent, so it is armed deliberately). The key keeps its
         # old name, so a user who had the old Agent lanes switch on sees no
@@ -7150,6 +7305,7 @@ class MainWindow(QMainWindow):
             "reply_stamps": self._reply_stamps,
             "tooltips": self._tooltips,
             "auto_update": self._auto_update,
+            "app_auto_update": self._app_auto_update,
             "agent_lanes": self._agent_lanes,
             "ship_skip_confirm": self._ship_skip_confirm,
             "close_merged_skip_confirm": self._close_merged_skip_confirm,
