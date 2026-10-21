@@ -1545,6 +1545,14 @@ class AddTerminalDialog(QDialog):
     that started in one of the repo's lanes: picking one revives that lane
     at its identical path (`revive_lane`). Lanes of agents that still have
     a card (`live_lane_roots`) are left out.
+
+    The picker's list is read on a worker thread: over a folder with a
+    hundred transcripts the read took 60 ms warm and 230 ms cold, on every
+    opening, before the dialog appeared. Until it arrives the picker says
+    "Loading conversations" and OK is off for Claude, so Enter can't start
+    a fresh conversation the user meant to resume. `busy_ids` and
+    `live_lane_roots` may be callables, asked again when the list arrives:
+    an agent that started meanwhile holds its conversation by then.
     """
 
     def __init__(self, default_name: str, parent=None,
@@ -1556,12 +1564,14 @@ class AddTerminalDialog(QDialog):
         self.setWindowTitle("New Agent")
         self.setMinimumWidth(420)
         self._cwd = cwd
-        self._busy_ids = set(busy_ids)  # conversations a running agent holds
-        self._resume_loaded = False
+        # conversations a running agent holds
+        self._busy_ids = self._supplier(busy_ids)
+        self._resume_loaded = False     # the read has started (once per dialog)
+        self._resume_job = None         # the read in flight
         self._count = 1
         self._max_count = max(1, max_count)
         self._repo_root = repo_root
-        self._live_lane_roots = set(live_lane_roots)
+        self._live_lane_roots = self._supplier(live_lane_roots)
         # resumable lane conversations by session id (lanes.LaneConversation)
         self._lane_convs: dict = {}
         # the user's own tick, kept while Type is flipped away and back. It
@@ -1604,6 +1614,10 @@ class AddTerminalDialog(QDialog):
         self.resume_combo.setToolTip(
             "Start this Claude agent by resuming a past conversation from this "
             "workspace's folder, instead of a fresh one.")
+        # its list arrives after the first show, and the default policy sizes
+        # the box once, at that show, to "Loading conversations"
+        self.resume_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.command_edit = QLineEdit(self)
         self.command_edit.setPlaceholderText("full launch command (editable)")
 
@@ -1772,15 +1786,16 @@ class AddTerminalDialog(QDialog):
         for w in self._ai_widgets + self._mode_widgets + self._resume_widgets:
             w.setVisible(False)
 
-        # resume picker: Claude-only, shown only when the folder has a
-        # resumable conversation that isn't already held by a running agent
+        # resume picker: Claude-only, shown while its list loads and then
+        # only when the folder has a resumable conversation that isn't
+        # already held by a running agent
         if kind == AgentKind.CLAUDE:
             # startup permission mode (Shift+Tab modes) — Claude only
             self._populate_modes(providers.get("claude"))
             for w in self._mode_widgets:
                 w.setVisible(True)
             self._ensure_resume_loaded()
-            if self.resume_combo.count() > 1:
+            if self.resume_pending() or self.resume_combo.count() > 1:
                 for w in self._resume_widgets:
                     w.setVisible(True)
 
@@ -1849,39 +1864,117 @@ class AddTerminalDialog(QDialog):
         for label, value in prov.permission_modes:
             self.mode_combo.addItem(label, value)  # index 0 = "" = default
 
+    @staticmethod
+    def _supplier(value):
+        """`value` when it is a callable, else one that returns it."""
+        if callable(value):
+            return value
+        fixed = frozenset(value or ())
+        return lambda: fixed
+
+    def resume_pending(self) -> bool:
+        """True while the resume list is being read."""
+        return self._resume_job is not None
+
+    def _resume_held(self) -> bool:
+        # OK waits for the list only where there is a list to wait for
+        return self._kind() == AgentKind.CLAUDE and self.resume_pending()
+
     def _ensure_resume_loaded(self) -> None:
-        """Populate the resume picker once: 'New conversation' plus every past
-        conversation in this workspace's folder and in the repo's lanes
-        (newest first), skipping any a running agent still holds (resuming
-        that would race/truncate it) and any lane that still has a card."""
+        """Start reading the resume picker's list, once per dialog: every past
+        conversation in this workspace's folder and in the repo's lanes. The
+        worker returns plain tuples and `_on_resume_read` fills the picker
+        on the GUI thread."""
         if self._resume_loaded:
             return
         self._resume_loaded = True
         self.resume_combo.clear()
-        self.resume_combo.addItem("New conversation", "")
+        self.resume_combo.addItem("Loading conversations…", None)
+        self.resume_combo.setEnabled(False)
+        cwd, repo = self._cwd, self._repo_root
 
-        from app import session_sync
-        rows = []                      # (mtime, preview, session id, lane)
-        if self._cwd:
-            for conv in session_sync.conversation_previews(self._cwd):
-                if conv.session_id in self._busy_ids:
-                    continue  # in use by a running agent — unsafe to double-resume
-                rows.append((conv.mtime, conv.preview, conv.session_id, ""))
-        if self._repo_root:
-            for conv in lanes.lane_conversations(
-                    self._repo_root, exclude_roots=self._live_lane_roots,
-                    exclude_ids=self._busy_ids):
-                self._lane_convs[conv.session_id] = conv
-                rows.append((conv.mtime, conv.preview, conv.session_id,
-                             conv.lane_name))
-        rows.sort(key=lambda r: r[0], reverse=True)
-        for mtime, preview, sid, lane_name in rows:
+        def read() -> list:
+            # no Qt in here. lane_conversations reads transcripts under
+            # ~/.claude and never a lane folder, so it needs no lane lock
+            from app import session_sync
+            rows = []              # (mtime, preview, session id, lane or None)
+            if cwd:
+                rows += [(c.mtime, c.preview, c.session_id, None)
+                         for c in session_sync.conversation_previews(cwd)]
+            if repo:
+                rows += [(c.mtime, c.preview, c.session_id, c)
+                         for c in lanes.lane_conversations(repo)]
+            return rows
+
+        from .self_update_dialog import Job
+        # the user waits on this one with OK off: poll faster than the
+        # update check's 80 ms, for the 0.1 to 0.3 s the read takes
+        self._resume_job = Job(read, self, name="ai-hive-resume-list",
+                               poll_ms=15)
+        self._resume_job.finished.connect(self._on_resume_read)
+        self._resume_job.start()
+
+    def _on_resume_read(self, rows) -> None:
+        """Fill the picker: 'New conversation' plus the conversations read,
+        newest first. The busy ids and live lanes are asked for now, not when
+        the read started: resuming a conversation a running agent holds
+        races it and truncates its transcript, and a lane that still has a
+        card isn't up for revival."""
+        if self._resume_job is None:
+            return              # the dialog closed first
+        self._resume_job = None
+        if not isinstance(rows, list):
+            rows = []           # the read raised: offer a fresh conversation
+        busy = set(self._busy_ids())
+        live = [r for r in self._live_lane_roots() if r]
+        self.resume_combo.clear()
+        self.resume_combo.addItem("New conversation", "")
+        for mtime, preview, sid, conv in sorted(rows, key=lambda r: r[0],
+                                                reverse=True):
+            if sid in busy:
+                continue  # in use by a running agent — unsafe to double-resume
+            if conv is not None:
+                if any(lanes.same_path(conv.root, r) for r in live):
+                    continue
+                self._lane_convs[sid] = conv
             when = time.strftime("%b %d %H:%M", time.localtime(mtime))
             preview = preview or "(empty session)"
             if len(preview) > 48:
                 preview = preview[:47] + "…"
-            where = f"lane {lane_name}  ·  " if lane_name else ""
+            where = f"lane {conv.lane_name}  ·  " if conv is not None else ""
             self.resume_combo.addItem(f"{when}  ·  {where}{preview}", sid)
+        self.resume_combo.setEnabled(True)
+        if self._kind() == AgentKind.CLAUDE and self.resume_combo.count() <= 1:
+            for w in self._resume_widgets:
+                w.setVisible(False)
+        self._validate()
+        self._set_count(self._count)
+        self._refresh_lane_check()
+        if self.isVisible():
+            self._refit()
+
+    def _refit(self) -> None:
+        """Size the open dialog to its contents again, around the same
+        center. It opened sized for "Loading conversations"; the list
+        widens the picker, or its row goes, and a shown window keeps its
+        size on its own."""
+        center = self.frameGeometry().center()
+        self.layout().activate()    # adjustSize alone reads the stale hint
+        self.adjustSize()
+        self.move(self.pos() + center - self.frameGeometry().center())
+
+    def accept(self) -> None:
+        if self._resume_held():
+            return              # Enter before the list arrives does nothing
+        super().accept()
+
+    def done(self, r: int) -> None:
+        # a list that arrives after the dialog closed is dropped: its Job
+        # goes now, timer and all
+        job, self._resume_job = self._resume_job, None
+        if job is not None:
+            job.deleteLater()
+        super().done(r)
 
     def _resume_id(self) -> str:
         return (self.resume_combo.currentData() or ""
@@ -1946,7 +2039,7 @@ class AddTerminalDialog(QDialog):
             prov = providers.get(AI_KINDS[self._kind()])
             if not providers.detected(prov.key):
                 ok = bool(self.command_edit.text().strip())
-        self._ok_btn.setEnabled(ok)
+        self._ok_btn.setEnabled(ok and not self._resume_held())
 
     def _browse(self) -> None:
         pattern = ("Python scripts (*.py);;All files (*)"
@@ -6592,8 +6685,10 @@ class MainWindow(QMainWindow):
             return
         # per-workspace numbering: each workspace counts Agent 1, 2, 3…
         # busy_ids: conversations a running agent already holds — never offer
-        # them for resume (two agents on one transcript race/truncate it)
-        busy_ids = {a.spec.session_id for a in ws.agents
+        # them for resume (two agents on one transcript race/truncate it).
+        # Asked when the resume list arrives, which is after the dialog shows.
+        def busy_ids() -> set:
+            return {a.spec.session_id for a in ws.agents
                     if a.is_running() and a.spec.session_id}
         free = MAX_AGENTS_PER_WORKSPACE - len(ws.agents)
         # found by a folder walk, not git: with no lane anywhere this dialog
@@ -6605,7 +6700,7 @@ class MainWindow(QMainWindow):
                                    max_count=free,
                                    lane_default=self.lane_default(ws),
                                    repo_root=repo,
-                                   live_lane_roots=self._live_lane_roots())
+                                   live_lane_roots=self._live_lane_roots)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         revive = dialog.revive_lane()
