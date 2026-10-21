@@ -8,6 +8,15 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.46.1
+
+- The New Agent dialog opens without waiting for its list of past
+  conversations. The list loads in the background while the resume picker
+  says "Loading conversations", and OK stays off for a Claude agent until
+  it arrives, so Enter can't start a fresh conversation you meant to
+  resume. Over a folder with 131 conversations, the first opening went
+  from about 400 ms to about 80 ms.
+
 ## 0.46.0
 
 - AI Hive opens much faster when you have many workspaces and agents. The

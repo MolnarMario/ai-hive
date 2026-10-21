@@ -6,7 +6,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from .harness import SCRATCH_CWD, check
+from .harness import SCRATCH_CWD, check, resume_list_loaded
 
 
 # ---------------------------------------------------------------- tiling ----
@@ -1902,6 +1902,7 @@ def test_new_agent_count():
     check("count: minus steps down", dlg.count() == 2)
 
     # resuming a past conversation pins the count to 1
+    resume_list_loaded(dlg)     # or the read lands on the rows below
     dlg.resume_combo.clear()
     dlg.resume_combo.addItem("New conversation", "")
     dlg.resume_combo.addItem("old chat", "11111111-1111-1111-1111-111111111111")

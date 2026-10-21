@@ -1,5 +1,5 @@
 """The "update AI Hive" dialog, and the off-thread runner both it and the top
-bar's check button use.
+bar's check button use (the New Agent dialog's resume list too).
 
 The decisions live in `app/self_update.py`; this is only the display. Git and
 pip shell out, so they never run on the GUI thread (the same rule, and the same
@@ -35,25 +35,30 @@ class Job(QObject):
 
     finished = Signal(object)
 
-    def __init__(self, work, parent=None):
+    def __init__(self, work, parent=None, name: str = "ai-hive-self-update",
+                 poll_ms: int = POLL_MS):
         super().__init__(parent)
         self._work = work
+        self._name = name
         self._events: queue.Queue = queue.Queue()
         self._timer = QTimer(self)
-        self._timer.setInterval(POLL_MS)
+        self._timer.setInterval(poll_ms)
         self._timer.timeout.connect(self._drain)
 
     def start(self) -> "Job":
+        # the thread holds only these two, never the Job: a parent deleted
+        # before the work ends takes the Job with it
+        work, events = self._work, self._events
+
         def body():
             try:
-                result = self._work()
+                result = work()
             except Exception as e:  # noqa: BLE001 - never take the app down
                 result = e
-            self._events.put(result)
+            events.put(result)
 
         self._timer.start()
-        threading.Thread(target=body, name="ai-hive-self-update",
-                         daemon=True).start()
+        threading.Thread(target=body, name=self._name, daemon=True).start()
         return self
 
     def _drain(self) -> None:

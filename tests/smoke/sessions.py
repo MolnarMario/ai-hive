@@ -6,7 +6,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from .harness import SCRATCH_CWD, check
+from .harness import SCRATCH_CWD, check, resume_list_loaded
 
 
 def test_session_migration():
@@ -964,6 +964,7 @@ def test_resume_picker():
               previews[0].preview == "resume me please", previews[0])
 
         dlg = AddTerminalDialog("Agent 9", cwd=str(cwd), busy_ids={BUSY})
+        resume_list_loaded(dlg)
         ids = [dlg.resume_combo.itemData(i)
                for i in range(dlg.resume_combo.count())]
         check("resume: Claude picker offers New + folder conversations",
@@ -1006,6 +1007,291 @@ def test_resume_picker():
                 os.environ[k] = v
         shutil.rmtree(home, ignore_errors=True)
         shutil.rmtree(cwd, ignore_errors=True)
+
+
+def test_resume_list_reads_off_the_gui_thread():
+    """The New Agent dialog shows before its resume list is read. The read
+    runs once, on a worker thread. Until it lands the picker says Loading
+    and Enter does nothing, so a fresh conversation can't start in place of
+    a resume. The list leaves out what is busy when it lands, and a dialog
+    closed first drops it without an error."""
+    import sys
+    import threading
+    import time
+
+    from PySide6.QtCore import QCoreApplication, QEvent, Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication, QDialog
+
+    from app import lanes, session_sync
+    from app.process_worker import AgentKind
+    from app.widgets.main_window import AddTerminalDialog
+
+    app = QApplication.instance() or QApplication([])
+    Conv = session_sync.Conversation
+    A, LATE = ("11111111-0000-4000-8000-00000000000a",
+               "11111111-0000-4000-8000-00000000000b")
+    KEPT, LIVE = ("22222222-0000-4000-8000-00000000000c",
+                  "22222222-0000-4000-8000-00000000000d")
+    repo = os.path.join(SCRATCH_CWD, "repo")
+    lanes_dir = repo + ".lanes"
+
+    def lane_conv(sid, name, mtime):
+        root = os.path.join(lanes_dir, name)
+        return lanes.LaneConversation(
+            session_id=sid, mtime=mtime, preview="a lane chat", root=root,
+            cwd=root, branch="hive/" + name, repo=repo)
+
+    release, reads, off_gui = threading.Event(), [], []
+
+    def previews(cwd):
+        reads.append(cwd)
+        off_gui.append(threading.current_thread() is not threading.main_thread())
+        release.wait(10)
+        return [Conv(A, 400.0, "resume me", 9000),
+                Conv(LATE, 300.0, "started after the dialog opened", 9000)]
+
+    def lane_convs(_repo, exclude_roots=(), exclude_ids=()):
+        return [lane_conv(KEPT, "kept-111111", 200.0),
+                lane_conv(LIVE, "live-222222", 100.0)]
+
+    def pump(ms):
+        end = time.monotonic() + ms / 1000
+        while time.monotonic() < end:
+            app.processEvents()
+            time.sleep(0.005)
+
+    def ids(dlg):
+        return [dlg.resume_combo.itemData(i)
+                for i in range(dlg.resume_combo.count())]
+
+    def runnable(dlg):
+        # with no claude on PATH the dialog asks for a command instead, and
+        # OK waits for that too
+        if not dlg.command_edit.isHidden():
+            dlg.command_edit.setText("claude")
+        return dlg
+
+    errors = []
+    old_hook, sys.excepthook = sys.excepthook, (
+        lambda *exc: errors.append(exc[1]))
+    real_previews, real_lanes = (session_sync.conversation_previews,
+                                 lanes.lane_conversations)
+    session_sync.conversation_previews = previews
+    lanes.lane_conversations = lane_convs
+    try:
+        busy, live = set(), set()
+        dlg = runnable(AddTerminalDialog(
+            "Agent 9", cwd=SCRATCH_CWD, repo_root=repo,
+            busy_ids=lambda: busy, live_lane_roots=lambda: live))
+        dlg.show()
+        app.processEvents()
+        check("resume async: the dialog is up before the list is read",
+              dlg.isVisible() and dlg.resume_pending())
+        check("resume async: the picker says Loading, and can't be opened",
+              not dlg.resume_combo.isHidden()
+              and dlg.resume_combo.currentText().startswith(
+                  "Loading conversations")
+              and not dlg.resume_combo.isEnabled(), ids(dlg))
+        check("resume async: OK is off while the list is pending",
+              not dlg._ok_btn.isEnabled())
+        QTest.keyClick(dlg, Qt.Key.Key_Return)
+        dlg.accept()
+        app.processEvents()
+        check("resume async: Enter while the list is pending does nothing",
+              dlg.isVisible() and dlg.result() != QDialog.DialogCode.Accepted)
+        ps = dlg.kind_combo.findData(AgentKind.POWERSHELL)
+        dlg.kind_combo.setCurrentIndex(ps)
+        check("resume async: a shell needs no list, so OK is on for it",
+              dlg._ok_btn.isEnabled())
+        dlg.kind_combo.setCurrentIndex(dlg.kind_combo.findData(AgentKind.CLAUDE))
+        check("resume async: back on Claude it is still Loading, OK off",
+              dlg.resume_pending() and not dlg._ok_btn.isEnabled()
+              and not dlg.resume_combo.isHidden())
+        # an agent starts on LATE and a card takes the live lane meanwhile
+        busy.add(LATE)
+        live.add(os.path.join(lanes_dir, "live-222222"))
+        release.set()
+        check("resume async: the list arrives", resume_list_loaded(dlg))
+        got = ids(dlg)
+        check("resume async: the list is read once, off the GUI thread",
+              len(reads) == 1 and off_gui == [True], (reads, off_gui))
+        check("resume async: New, then the folder and lane conversations, "
+              "newest first", got == ["", A, KEPT], got)
+        check("resume async: a conversation busy when the list lands is "
+              "left out", LATE not in got, got)
+        check("resume async: a lane with a card when the list lands is left "
+              "out", LIVE not in got and LIVE not in dlg._lane_convs, got)
+        check("resume async: the picker and OK come on with the list",
+              dlg.resume_combo.isEnabled() and dlg._ok_btn.isEnabled())
+        dlg.resume_combo.setCurrentIndex(got.index(KEPT))
+        check("resume async: a lane conversation still revives its lane",
+              dlg.revive_lane() is not None
+              and dlg.revive_lane().session_id == KEPT)
+        dlg.kind_combo.setCurrentIndex(ps)
+        dlg.kind_combo.setCurrentIndex(dlg.kind_combo.findData(AgentKind.CLAUDE))
+        check("resume async: a Type flip after it landed reads nothing again",
+              len(reads) == 1 and ids(dlg) == got, (reads, ids(dlg)))
+        QTest.keyClick(dlg, Qt.Key.Key_Return)
+        check("resume async: once the list is in, Enter is OK",
+              dlg.result() == QDialog.DialogCode.Accepted)
+        dlg.deleteLater()
+
+        # an empty folder: the Loading row goes once the list says so
+        release.clear()
+        reads.clear()
+        session_sync.conversation_previews = lambda cwd: (
+            reads.append(cwd), release.wait(10), [])[-1]
+        lanes.lane_conversations = lambda *a, **k: []
+        empty = runnable(AddTerminalDialog("Agent 9", cwd=SCRATCH_CWD,
+                                           repo_root=repo))
+        empty.show()
+        app.processEvents()
+        release.set()
+        resume_list_loaded(empty)
+        check("resume async: with nothing to resume the picker goes away",
+              empty.resume_combo.isHidden() and empty._ok_btn.isEnabled()
+              and ids(empty) == [""], ids(empty))
+        check("resume async: ...and the open dialog closes its row's gap",
+              empty.height() == empty.sizeHint().height(),
+              (empty.height(), empty.sizeHint().height()))
+        empty.deleteLater()
+
+        # closed while pending: the late list is dropped, quietly
+        release.clear()
+        reads.clear()
+        returned = threading.Event()
+
+        def slow(cwd):
+            reads.append(cwd)
+            release.wait(10)
+            returned.set()
+            return [Conv(A, 400.0, "resume me", 9000)]
+        session_sync.conversation_previews = slow
+        gone = AddTerminalDialog("Agent 9", cwd=SCRATCH_CWD, repo_root=repo)
+        gone.show()
+        app.processEvents()
+        gone.reject()
+        release.set()
+        returned.wait(10)
+        pump(400)           # several polls of the Job's queue
+        check("resume async: a dialog closed first drops the late list",
+              returned.is_set() and not gone.resume_pending()
+              and ids(gone) == [None]
+              and gone.resume_combo.currentText().startswith(
+                  "Loading conversations"), ids(gone))
+        gone.deleteLater()
+
+        # deleted while pending: the Job goes with it
+        release.clear()
+        returned.clear()
+        dead = AddTerminalDialog("Agent 9", cwd=SCRATCH_CWD, repo_root=repo)
+        app.processEvents()
+        dead.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+        release.set()
+        returned.wait(10)
+        pump(400)
+        check("resume async: ...and no error, closed or deleted",
+              errors == [], errors)
+    finally:
+        release.set()
+        session_sync.conversation_previews = real_previews
+        lanes.lane_conversations = real_lanes
+        sys.excepthook = old_hook
+
+
+def test_resume_list_skips_and_reports():
+    """The resume list's lane read skips what is busy when it starts, so it
+    parses no transcript the list would drop. A read that raises leaves a
+    RESUME-LIST-FAIL line in session.log and still offers a fresh
+    conversation. The New Agent click hands the dialog a busy-id lookup
+    that holds the workspace's id, not the workspace."""
+    from PySide6.QtWidgets import QApplication, QDialog
+
+    from app import lanes, session_sync
+    from app.session_store import SessionStore
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    BUSY = "33333333-0000-4000-8000-00000000000e"
+    repo = os.path.join(SCRATCH_CWD, "repo")
+    live_root = os.path.join(repo + ".lanes", "live-333333")
+    asked = []
+
+    def lane_convs(_repo, exclude_roots=(), exclude_ids=()):
+        asked.append((tuple(exclude_roots), frozenset(exclude_ids)))
+        return []
+
+    def broken(_cwd):
+        raise RuntimeError("reader bug")
+
+    real_previews, real_lanes = (session_sync.conversation_previews,
+                                 lanes.lane_conversations)
+    session_sync.conversation_previews = lambda _cwd: []
+    lanes.lane_conversations = lane_convs
+    try:
+        dlg = AddTerminalDialog("Agent 9", cwd=SCRATCH_CWD, repo_root=repo,
+                                busy_ids=lambda: {BUSY},
+                                live_lane_roots=lambda: {live_root, ""})
+        resume_list_loaded(dlg)
+        check("resume skip: the lane read skips the busy ids and live lanes "
+              "of when it started",
+              asked == [((live_root,), frozenset({BUSY}))], asked)
+        dlg.deleteLater()
+
+        lines = []
+        session_sync.conversation_previews = broken
+        bad = AddTerminalDialog("Agent 9", cwd=SCRATCH_CWD, repo_root=repo,
+                                audit=lines.append)
+        if not bad.command_edit.isHidden():
+            bad.command_edit.setText("claude")
+        resume_list_loaded(bad)
+        check("resume skip: a read that raises leaves a RESUME-LIST-FAIL line",
+              lines == ["RESUME-LIST-FAIL RuntimeError: reader bug"], lines)
+        check("resume skip: ...and the dialog still offers a fresh "
+              "conversation, OK on",
+              [bad.resume_combo.itemData(i)
+               for i in range(bad.resume_combo.count())] == [""]
+              and bad._ok_btn.isEnabled())
+        bad.deleteLater()
+    finally:
+        session_sync.conversation_previews = real_previews
+        lanes.lane_conversations = real_lanes
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-resume-skip-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Skip", SCRATCH_CWD)
+    seen = []
+
+    def fake_exec(d):
+        resume_list_loaded(d)
+        seen.append(d)
+        return QDialog.DialogCode.Rejected
+    orig = AddTerminalDialog.exec
+    AddTerminalDialog.exec = fake_exec
+    try:
+        win._on_add_terminal_clicked(ws.id)
+    finally:
+        AddTerminalDialog.exec = orig
+    dlg = seen[-1] if seen else None
+    cells = [c.cell_contents for c in
+             (getattr(getattr(dlg, "_busy_ids", None), "__closure__", None)
+              or ())]
+    check("resume skip: the click's busy-id lookup holds no workspace",
+          dlg is not None and not any(c is ws for c in cells), cells)
+    check("resume skip: the click wires session.log in as the audit",
+          dlg is not None and dlg._audit == win._store_audit)
+    win.manager.remove_workspace(ws.id)
+    check("resume skip: ...and asks nothing of a deleted workspace",
+          dlg is not None and dlg._busy_ids() == set())
+    if dlg is not None:
+        dlg.deleteLater()
+    win.close()
+    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_wake_and_resume_all():

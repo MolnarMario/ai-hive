@@ -16,7 +16,7 @@ import threading
 import time
 from pathlib import Path
 
-from .harness import check
+from .harness import check, resume_list_loaded
 
 _NO_WINDOW = 0x08000000
 
@@ -631,6 +631,7 @@ def test_lanes_window():
         orig = AddTerminalDialog.exec
 
         def fake_exec(dlg):
+            resume_list_loaded(dlg)
             seen.append(dlg)
             if setup is not None:
                 setup(dlg)
@@ -700,6 +701,7 @@ def test_lanes_window():
         _write_transcript(str(work), sid_ws, "main", "an old main chat")
         dlg = AddTerminalDialog("Agent 9", cwd=str(work), lane_default=True,
                                 repo_root=str(work))
+        resume_list_loaded(dlg)
         dlg.resume_combo.setCurrentIndex(dlg.resume_combo.findData(sid_ws))
         check("lanes dialog: resuming a workspace-folder conversation unticks "
               "and disables the lane", not dlg.lane_check.isChecked()
@@ -1480,6 +1482,7 @@ def test_lane_service_window():
         orig = AddTerminalDialog.exec
 
         def fake_exec(dlg):
+            resume_list_loaded(dlg)
             if setup is not None:
                 setup(dlg)
             return QDialog.DialogCode.Accepted
@@ -1952,6 +1955,7 @@ def test_lanes_window_fixes():
         orig = AddTerminalDialog.exec
 
         def fake_exec(dlg):
+            resume_list_loaded(dlg)
             if setup is not None:
                 setup(dlg)
             return QDialog.DialogCode.Accepted
@@ -2837,6 +2841,7 @@ def test_lane_window_37_fixes():
         orig = AddTerminalDialog.exec
 
         def fake_exec(dlg):
+            resume_list_loaded(dlg)
             if setup is not None:
                 setup(dlg)
             return QDialog.DialogCode.Accepted
@@ -3220,6 +3225,7 @@ def test_lane_scopes_window():
         orig = AddTerminalDialog.exec
 
         def fake_exec(dlg):
+            resume_list_loaded(dlg)
             seen.append(dlg)
             if setup is not None:
                 setup(dlg)
@@ -3476,6 +3482,7 @@ def test_restart_in_own_lane():
         orig = AddTerminalDialog.exec
 
         def fake_exec(dlg):
+            resume_list_loaded(dlg)
             if setup is not None:
                 setup(dlg)
             return (QDialog.DialogCode.Accepted if accept
@@ -3703,6 +3710,7 @@ def test_make_integrator_without_lane():
         orig = AddTerminalDialog.exec
 
         def fake_exec(dlg):
+            resume_list_loaded(dlg)
             if setup is not None:
                 setup(dlg)
             return QDialog.DialogCode.Accepted
