@@ -1642,7 +1642,12 @@ def test_pty_width_at_launch():
         win2 = create_main_window(SessionStore(path=tmp / "session.json"))
         win2.show()
         win2.autostart_active_workspace()
-        pump(2500)
+        # the other workspaces' agents follow from the launch queue, one
+        # per tick
+        deadline = time.monotonic() + 10
+        while len(spawned) < 8 and time.monotonic() < deadline:
+            pump(100)
+        pump(1000)
 
         default_cols = pty_worker.DEFAULT_COLS
         check("pty width: every restored child was actually started",

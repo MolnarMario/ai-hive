@@ -1002,9 +1002,10 @@ class WorkspaceManager(QObject):
         # auto-created agents (task-spawned workers) keep their "resume on next
         # open" intent even if the process momentarily died — otherwise a
         # crashed/failed auto-agent silently goes dormant and never comes back.
-        # User-created agents persist their live running state as before.
+        # User-created agents persist their live running state as before. One
+        # the launch queue has not started yet was running, and still is.
         return {**a.spec.to_dict(),
-                "running": (a.is_running()
+                "running": (a.is_running() or a.start_queued()
                             or (a.auto_created and a.autostart_on_restore)),
                 "task": a.current_task,
                 "assignment": a.assignment.value,

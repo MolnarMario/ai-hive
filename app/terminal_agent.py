@@ -487,9 +487,9 @@ class TerminalAgent(QObject):
     # (re)start). Purely a VIEW signal — the card uses it to lift its boot
     # veil — and, like activity/waiting, it must never mark the session dirty.
     prompt_ready_changed = Signal(bool)
-    # `start_coming()` flipped: a held agent that is about to start (its card
-    # shows the loader) or one held for good (its card shows the stopped
-    # banner). VIEW only, never persisted.
+    # `start_coming()` flipped: a held or queued agent that is about to start
+    # (its card shows the loader) or one held for good (its card shows the
+    # stopped banner). VIEW only, never persisted.
     start_coming_changed = Signal(bool)
     # the deferred-message queue changed (added/cancelled/sent/missed). NOT a
     # countdown tick: this list IS persisted, so the manager wires this to a
@@ -596,6 +596,9 @@ class TerminalAgent(QObject):
         # worktree being made), not a stop: the card shows its loader, never
         # the "terminal not running" banner, for the whole wait
         self._start_coming = False
+        # the launch restore owes this agent a start it has not made yet
+        # (MainWindow's launch queue). Transient, see queue_start.
+        self._start_queued = False
         # what AI Hive's lane poller last saw in this agent's lane
         # (lanes.LaneView: ahead, dirty, overlaps), for the board roster.
         # Transient: set by WorkspaceManager.set_lane_views, never persisted.
@@ -783,12 +786,37 @@ class TerminalAgent(QObject):
         return self._start_hold
 
     def start_coming(self) -> bool:
-        return self._start_coming
+        return self._start_coming or self._start_queued
 
     def _set_start_coming(self, coming: bool) -> None:
-        if coming != self._start_coming:
-            self._start_coming = coming
-            self.start_coming_changed.emit(coming)
+        before = self.start_coming()
+        self._start_coming = coming
+        if self.start_coming() != before:
+            self.start_coming_changed.emit(not before)
+
+    def queue_start(self) -> None:
+        """The launch restore will start this agent soon, after the active
+        workspace's agents are up (`MainWindow.autostart_active_workspace`).
+        Until then the card shows its loader rather than the stopped banner,
+        and a save still records the agent as running: a window closed before
+        the queue reached it must bring it back next launch too. Any start
+        ends the wait, whoever makes it (the queue, a waking keystroke, a
+        workspace switch, the limit recovery)."""
+        self._set_start_queued(True)
+
+    def start_queued(self) -> bool:
+        return self._start_queued
+
+    def end_start_queue(self) -> None:
+        """The launch queue is done with this agent without a child starting
+        (a held start): from here the hold decides what the card shows."""
+        self._set_start_queued(False)
+
+    def _set_start_queued(self, queued: bool) -> None:
+        before = self.start_coming()
+        self._start_queued = queued
+        if self.start_coming() != before:
+            self.start_coming_changed.emit(not before)
 
     def _held(self) -> bool:
         if not self._start_hold:
@@ -3123,6 +3151,9 @@ class TerminalAgent(QObject):
 
     def _on_worker_state(self, state: WorkerState) -> None:
         if state is WorkerState.STARTING:
+            # a child is on its way by whatever path, so the launch queue
+            # owes this agent nothing more (restart() never calls start())
+            self._set_start_queued(False)
             if self._fresh_screen:
                 # Restart's new child. _on_pty_output dropped the old one's
                 # last frames while it died, so the buffer is still the

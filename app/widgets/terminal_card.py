@@ -1979,7 +1979,8 @@ class TerminalCard(QFrame):
             self._boot_timer.start(BOOT_VEIL_MAX_MS)
 
     def _awaiting_start(self) -> bool:
-        """A start held for the agent's new lane folder: a boot that has not
+        """A start held for the agent's new lane folder, or queued by the
+        launch restore behind the active workspace: a boot that has not
         reached the child yet."""
         return self.agent.start_coming() and not self.agent.is_running()
 
