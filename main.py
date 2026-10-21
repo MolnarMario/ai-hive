@@ -198,10 +198,12 @@ def create_main_window(store: SessionStore | None = None,
 
     # snapshot every pinned conversation BEFORE any agent launches: whatever
     # a resume might do to Claude's one-and-only transcript file, the copy
-    # taken here survives it (a concurrent resume once truncated one)
+    # taken here survives it (a concurrent resume once truncated one). It
+    # copies on a worker while the window builds, from pins read here, and
+    # TerminalAgent.start() waits for it, so no start can come first.
     from app import transcripts
-    transcripts.backup_for_agents(
-        manager.all_agents(), str(store.path.parent / "transcripts"))
+    transcripts.start_backup(transcripts.backup_entries(manager.all_agents()),
+                             str(store.path.parent / "transcripts"))
 
     # ...and give every restored pty agent back the screen it had at close,
     # BEFORE the window builds its cards: TerminalCard replays pty_replay()
@@ -391,7 +393,8 @@ def main() -> int:
     # LIMIT stopped is started here even if the user's card was left stopped,
     # since it was not the user who stopped it. Reads the user's real
     # transcripts and types into real agents, so like the usage poll it is
-    # opted into here rather than in the factory the smoke suite shares.
+    # opted into here rather than in the factory the smoke suite shares. The
+    # reads run on a worker, and the arming lands once the event loop runs.
     with phases.measure("recovery"):
         window.recover_blocked_at_startup()
     # the launch ends here, and the stall probe takes over from the first

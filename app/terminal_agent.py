@@ -801,6 +801,14 @@ class TerminalAgent(QObject):
     def start(self) -> None:
         if self._held():
             return
+        # The one place every start passes through (autostart, a wake, Resume
+        # all, the limit recovery, a released hold, the fresh fallback), so
+        # the launch's transcript backup is a precondition here and nowhere
+        # else: a resume that began before the copy could truncate the only
+        # transcript. restart() needs no wait: it gives a Claude agent a new
+        # session id before its child spawns, so it never opens a backed-up
+        # transcript.
+        transcripts.wait_for_backup()
         self._set_prompt_ready(False)  # re-armed for the fresh TUI
         self._ready_tail = ""
         self._screen_tail = ""
