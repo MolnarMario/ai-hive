@@ -51,8 +51,8 @@ hour (`MainWindow.start_app_update_checks`). With it off, only the version
 button checks. Either way the pulled files run from the next launch.
 
 The background install is the version button's `apply`, pinned to the
-commit `check` just fetched, so an agent's fetch landing in between cannot
-widen it. It skips an update that changes `requirements.txt`: pip would
+commit `check` read its version and notes from (`Check.commit`), so an
+agent's fetch landing in between cannot widen it. It skips an update that changes `requirements.txt`: pip would
 replace packages this process has loaded (PySide6 among them) with no
 dialog to report a failure, so that update waits for the user's click. It
 never switches branches: an agent may be committing on the branch this
@@ -123,6 +123,8 @@ class Check:
     # set by `background_update` alone: the update changes requirements.txt,
     # so it was left for the user's click
     needs_packages: bool = False
+    commit: str = ""        # the origin/main commit the fetch brought
+                            # ("" when git could not name it)
 
 
 @dataclass
@@ -260,7 +262,14 @@ def check(runner, repo: str = REPO_DIR, running: str = "") -> Check:
     if rc != 0:
         return restart_or(Check(Status.ERROR, running, installed,
                                 detail=_git_error("Checking GitHub", rc, out)))
-    rc, out = runner(_git(repo, "show", f"{UPSTREAM}:app/__init__.py"),
+    # every read below names the commit this fetch brought, not the ref: an
+    # agent's fetch can move origin/main mid-check, and `background_update`
+    # installs exactly what this check read
+    rc, out = runner(_git(repo, "rev-parse", "--verify", "--quiet", UPSTREAM),
+                     GIT_TIMEOUT_S)
+    base.commit = _first_line(out) if rc == 0 else ""
+    ref = base.commit or UPSTREAM
+    rc, out = runner(_git(repo, "show", f"{ref}:app/__init__.py"),
                      GIT_TIMEOUT_S)
     remote = version_from_source(out) if rc == 0 else ""
     if not remote:
@@ -272,8 +281,8 @@ def check(runner, repo: str = REPO_DIR, running: str = "") -> Check:
         return _restart_pending(base, runner, repo) if pending else base
 
     base.status = Status.UPDATE_AVAILABLE
-    base.notes = _notes(runner, repo, installed, remote, "HEAD", UPSTREAM)
-    base.blocked = blocked_reason(runner, repo)
+    base.notes = _notes(runner, repo, installed, remote, "HEAD", ref)
+    base.blocked = blocked_reason(runner, repo, ref)
     return base
 
 
@@ -347,12 +356,9 @@ def background_update(runner, repo: str = REPO_DIR, running: str = ""):
     means nothing was installed: no update, a blocked folder, or an update
     that changes requirements.txt (`Check.needs_packages`). Never raises."""
     found = check(runner, repo, running)
-    if found.status is not Status.UPDATE_AVAILABLE or found.blocked:
-        return found, None
-    rc, out = runner(_git(repo, "rev-parse", "--verify", "--quiet", UPSTREAM),
-                     GIT_TIMEOUT_S)
-    target = _first_line(out) if rc == 0 else ""
-    if not target:
+    target = found.commit
+    if (found.status is not Status.UPDATE_AVAILABLE or found.blocked
+            or not target):
         return found, None
     # rc 1 is a change; anything else means git could not tell, and an
     # install nobody watches only goes ahead on a clear no

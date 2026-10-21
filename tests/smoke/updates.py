@@ -243,6 +243,30 @@ def test_self_update():
           self_update.audit_line(r).startswith("SELF-UPDATE apply ok=False")
           and "status=update_available" in self_update.audit_line(c))
 
+    class MovingGit(FakeGit):
+        """origin/main moves after every look, as when an agent's fetch
+        lands mid-check (GPT-6-Luna review)."""
+        looks = 0
+
+        def __call__(self, argv, timeout=0):
+            if argv[0] == "git" and argv[3:5] == ["rev-parse", "--verify"]:
+                self.calls.append(list(argv))
+                self.looks += 1
+                return (0, f"sha{self.looks}\n")
+            return super().__call__(argv, timeout)
+
+    mg = MovingGit(str(make_repo("0.3.0")))
+    found, applied = self_update.background_update(mg, mg.repo, "0.3.0")
+    pinned = [cl[-1] for cl in mg.calls if cl[0] == "git" and cl[3] == "merge"]
+    reads = [cl[4] for cl in mg.calls if cl[0] == "git" and cl[3] == "show"]
+    deps = [cl for cl in mg.calls if cl[0] == "git" and cl[3] == "diff"]
+    check("self-update: the background install merges the commit its check "
+          "read, even when origin/main moves meanwhile",
+          applied is not None and applied.ok and found.commit == "sha1"
+          and pinned == ["sha1"] and reads
+          and all(rd.startswith("sha1:") for rd in reads)
+          and deps and deps[0][6] == "sha1", (pinned, reads, deps[:1]))
+
     # --- the button and the dialog -------------------------------------------
     from app.session_store import SessionStore
     from main import create_main_window, setup_application
