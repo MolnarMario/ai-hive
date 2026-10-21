@@ -65,33 +65,9 @@ def _single_instance_guard(
     return handle  # held (never closed) for the life of this process
 
 
-# ---- pull what merged on GitHub, before the app's code is imported ---------
-# Only when launched, never on import: the smoke suite imports this module
-# and runs FROM this clone. The pull may change app/ itself, so the few app
-# modules this needed are dropped and everything below imports fresh files.
-# The audit line waits for the session store in main(). The instance lock
-# comes first: a second launch, refused in main(), must not pull new files
-# under the instance that is running. Its time and the imports' time wait
-# for the store the same way, for the PERF startup line.
-_LAUNCH_GUARD = None
-_STARTUP_UPDATE_AUDIT = ""
-_STARTUP_UPDATE_S = 0.0
-if __name__ == "__main__":
-    _LAUNCH_GUARD = _single_instance_guard()
-    if _LAUNCH_GUARD is not None:
-        from app import self_update as _self_update
-        _t = time.perf_counter()
-        _result = _self_update.startup_update(_self_update.subprocess_runner)
-        _STARTUP_UPDATE_S = time.perf_counter() - _t
-        if _result is not None:
-            _STARTUP_UPDATE_AUDIT = _self_update.audit_line(_result)
-        if _self_update.startup_failure(_result):
-            _fatal(_self_update.startup_failure(_result))
-        for _name in [m for m in sys.modules
-                      if m == "app" or m.startswith("app.")]:
-            del sys.modules[_name]
-        del _self_update, _result, _t
-
+# The launch runs no git: AI Hive updates itself in the background once the
+# window is up (MainWindow.start_app_update_checks). The imports' time waits
+# for the session store in main(), for the PERF startup line.
 _t = time.perf_counter()
 from app import perf_audit
 from app import ui_theme
@@ -332,8 +308,7 @@ def main() -> int:
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
-    # held until process exit; taken at launch, above the imports
-    guard = _LAUNCH_GUARD or _single_instance_guard()
+    guard = _single_instance_guard()  # held until process exit
     if guard is None:
         _fatal("AI Hive is already running.\n\nOnly one instance can run at a "
                "time (a second would overwrite the first's saved session). "
@@ -341,8 +316,7 @@ def main() -> int:
     # before the update splash or the main window: the first agent spawn
     # would otherwise allocate a console that takes the keyboard from AI Hive
     ensure_windowless_console()
-    phases = perf_audit.StartupPhases(_STARTED, update=_STARTUP_UPDATE_S,
-                                      imports=_STARTUP_IMPORTS_S)
+    phases = perf_audit.StartupPhases(_STARTED, imports=_STARTUP_IMPORTS_S)
     _name_application(app)
     store = SessionStore()
     session = store.load()
@@ -355,11 +329,6 @@ def main() -> int:
     # autostart_active_workspace. Opting in here rather than in the factory is
     # the same rule as start_usage_polling / recover_blocked_at_startup: the
     # offscreen suite shares the factory and must never shell out.
-    if _STARTUP_UPDATE_AUDIT:
-        try:
-            store.audit(_STARTUP_UPDATE_AUDIT)
-        except Exception:  # noqa: BLE001 - forensics, never fatal
-            pass
     gate = None
     if session.get("ui", {}).get("auto_update", False):
         from app.widgets.update_splash import run_update_gate
@@ -406,6 +375,10 @@ def main() -> int:
     # seconds from now, so a click shows the list at once. Network, so it is
     # opted into here like the usage poll.
     window.start_repo_activity_prefetch()
+    # ...and the AI Hive update check behind the Options switch, a minute
+    # from now and then hourly. It fetches and fast-forwards this clone, so
+    # like the version button it is armed here and never in the suite.
+    window.start_app_update_checks()
     return app.exec()
 
 

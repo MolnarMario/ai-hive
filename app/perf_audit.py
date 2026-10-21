@@ -5,9 +5,9 @@ copy. Every duration is whole milliseconds.
     PERF startup update=1312 imports=412 setup=45 cli_gate=0 window=8123
         show=120 autostart=700 recovery=710 total=12001
 
-One line per launch (`StartupPhases`). `update` and `imports` run at module
-level in main.py, before the session store exists, so main.py carries their
-times forward the way it carries `_STARTUP_UPDATE_AUDIT`. `cli_gate` is 0
+One line per launch (`StartupPhases`). `imports` runs at module level in
+main.py, before the session store exists, so main.py carries it forward.
+`update` stays 0: the launch no longer pulls from GitHub. `cli_gate` is 0
 unless the user opted into CLI auto-update. `total` runs from the moment
 Windows created the process to the end of `recovery`, so it also holds what
 no phase names (interpreter start, the PySide6 import, loading the session
