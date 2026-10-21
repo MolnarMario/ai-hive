@@ -6330,11 +6330,23 @@ class MainWindow(QMainWindow):
             card = page.add_agent(agent)
             if agent.spec.lane:
                 card.set_lane_view(self.lane_service.view(agent.spec.uid))
-            if not page.isVisible():
+            if page.isVisible():
+                # the retile only posted its layout request; run it now so
+                # the new card has its cell before the flush below
+                page.grid.activate()
+            else:
                 # the retile changed every card's width on a page Qt will not
                 # lay out; without this the new card (and its siblings) keep a
                 # width their children would then paint at (see PageStack)
                 self.stack.layout_hidden_pages()
+            # add_terminal starts the agent the moment this returns, and the
+            # child paints at the size it is spawned at (see settle_layout).
+            # A window never shown has no size to give: the first-run agent
+            # is added before show(), and settle_layout sizes it at launch.
+            if (card.is_pty and card.terminal is not None
+                    and self.stack.isVisible()
+                    and not self.stack.contentsRect().isEmpty()):
+                card.terminal.flush_resize()
         if agent.spec.lane:
             # after the add returns: by then the dialog has marked a lane
             # being created as pending, so the first poll skips its folder

@@ -1717,8 +1717,9 @@ class TerminalView(QWidget):
         SPAWNED. A child told its width 120ms late has already painted at the
         wrong one, and nothing downstream can undo that — the child hard-wraps
         its own text, so those lines keep the width they were written for no
-        matter how the raw stream is projected afterwards. See
-        `MainWindow.settle_layout`, the only caller."""
+        matter how the raw stream is projected afterwards. The callers are
+        `MainWindow.settle_layout` at launch and
+        `MainWindow._on_terminal_added` for a card added later."""
         self._resize_timer.stop()
         self._apply_resize()
 

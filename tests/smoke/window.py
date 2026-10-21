@@ -3792,3 +3792,109 @@ def test_ctrl_tab_cycles_agents():
         pump(100)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_new_agent_spawns_at_card_size():
+    """A new agent spawned at the worker's default 100x30, not at its card's
+    size. add_terminal starts it in the same call stack as the retile, while
+    the card's resize still sat in TerminalView's 120 ms debounce. Measured
+    with a stub worker: cards that settled at 56x93 and 56x61 spawned at
+    30x100, so the child drew its first frame at the wrong width, and a
+    conversation resumed from the New Agent dialog wrapped its whole dump
+    at 100 columns. _on_terminal_added now lays the page out and flushes the
+    card's size before add_terminal starts the agent."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app import pty_worker
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.widgets.terminal_view import TerminalView
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    # the size each worker is spawned at; nothing is launched
+    spawned = {}
+    flushes = []
+    orig_start = pty_worker.PtyWorker.start
+    orig_flush = TerminalView.flush_resize
+
+    def flush(view):
+        flushes.append(view)
+        orig_flush(view)
+
+    pty_worker.PtyWorker.start = (
+        lambda w: spawned.setdefault(w.spec.name, (w.rows, w.cols)))
+    TerminalView.flush_resize = flush
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-spawn-size-"))
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        mgr = win.manager
+
+        def add(ws_id, name):
+            agent = mgr.add_terminal(ws_id, build_spec(
+                AgentKind.POWERSHELL, name, cwd=SCRATCH_CWD, pty=True))
+            return win._pages[ws_id].card_for(agent.id)
+
+        def settled(card):
+            return (card.terminal.screen.lines, card.terminal.screen.columns)
+
+        # the first run adds its agent before show(), and so may anything
+        # else: no geometry to flush, and settle_layout sizes them at launch
+        first = mgr.workspaces[0]
+        add(first.id, "Early")
+        check("spawn size: an agent added before the window is shown "
+              "spawns without a flush or an error",
+              "Early" in spawned and not flushes, (spawned, len(flushes)))
+
+        win.resize(1200, 700)
+        win.show()
+        pump(200)
+
+        card = add(first.id, "Visible")
+        pump(400)
+        check("spawn size: a card added to the visible page spawns at its "
+              "settled size", spawned.get("Visible") == settled(card),
+              (spawned.get("Visible"), settled(card)))
+
+        # the first card of an empty page also shows the page's grid
+        empty = mgr.create_workspace("Empty", SCRATCH_CWD)
+        mgr.set_active(empty.id)
+        pump(200)
+        card = add(empty.id, "Lone")
+        pump(400)
+        check("spawn size: the first card on an empty visible page spawns "
+              "at its settled size", spawned.get("Lone") == settled(card),
+              (spawned.get("Lone"), settled(card)))
+
+        hidden = mgr.create_workspace("Hidden", SCRATCH_CWD)
+        pump(200)
+        card = add(hidden.id, "Hidden1")
+        pump(400)
+        check("spawn size: a card added to a hidden page spawns at its "
+              "settled size", spawned.get("Hidden1") == settled(card),
+              (spawned.get("Hidden1"), settled(card)))
+        # a second card retiles the first; opening the page then lays it
+        # out for real, and the new card keeps the size it spawned at
+        card = add(hidden.id, "Hidden2")
+        mgr.set_active(hidden.id)
+        pump(400)
+        check("spawn size: ...and one added beside it keeps its spawn size "
+              "once the page is opened", spawned.get("Hidden2") == settled(card)
+              and card.agent.worker.cols == settled(card)[1],
+              (spawned.get("Hidden2"), settled(card)))
+        check("spawn size: no new card spawned at the worker default",
+              all(size != (pty_worker.DEFAULT_ROWS, pty_worker.DEFAULT_COLS)
+                  for name, size in spawned.items() if name != "Early"),
+              spawned)
+        win.close()
+        pump(100)
+    finally:
+        pty_worker.PtyWorker.start = orig_start
+        TerminalView.flush_resize = orig_flush
+        shutil.rmtree(tmp, ignore_errors=True)
