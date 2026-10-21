@@ -8,6 +8,22 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.47.0
+
+- Opening AI Hive no longer waits on GitHub. It used to fetch and install
+  updates before showing a window, which took about a second on every
+  launch. Now a new Options switch, Update AI Hive in the background (on
+  by default), checks a minute after the window opens and then every hour.
+  It installs a newer version while you work, the button by the version
+  number reads "Restart to update", and the next launch runs it. An update
+  that needs new Python packages waits for your click, and so does a
+  folder that is off `main` or has local changes. Switched off, only the
+  button checks.
+- The launch no longer copies your agents' conversations or scans them
+  for plan-limit stops on the window's thread. Both run in the background
+  while the window builds, which took about 0.6 s of freezing off the
+  launch. Agents still wait for the backup copy before they start.
+
 ## 0.46.1
 
 - The New Agent dialog opens without waiting for its list of past

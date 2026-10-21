@@ -29,6 +29,22 @@ def _as_cli_wrote(rec):
     return rec
 
 
+def _recover(win, timeout_s=10.0):
+    """win.recover_blocked_at_startup(), then pump until its transcript
+    reads have landed on the GUI thread. Returns how many agents it armed,
+    or None when the reads never came back."""
+    import time as _time
+    from PySide6.QtWidgets import QApplication
+    win.recover_blocked_at_startup()
+    deadline = _time.monotonic() + timeout_s
+    while win.startup_scan_pending():
+        if _time.monotonic() > deadline:
+            return None
+        QApplication.processEvents()
+        _time.sleep(0.005)
+    return win._startup_armed
+
+
 def test_limit_blocked_workspace_stats():
     """workspace_stats()'s limit_blocked count -- and the workspaceStatsChanged
     signal it rides on -- must update LIVE on both edges (an agent gets cut off
@@ -1495,7 +1511,7 @@ def test_startup_limit_recovery():
     cut = agent_for("Cut", "sid-cut")
     went_on = agent_for("WentOn", "sid-went-on")
     check("startup-recovery: armed exactly the cut-off agent",
-          win.recover_blocked_at_startup() == 1)
+          _recover(win) == 1)
     check("startup-recovery: the cut-off agent is latched, with its reset time",
           cut.is_limit_blocked() and cut.limit_resets_at() is not None)
     check("startup-recovery: the latch is marked as coming from startup",
@@ -1514,7 +1530,7 @@ def test_startup_limit_recovery():
                                     "write": lambda s, d: True,
                                     "start": lambda s: started.append(1),
                                     "dispose": lambda s: None})()
-    win.recover_blocked_at_startup()
+    _recover(win)
     check("startup-recovery: an agent the LIMIT stopped is started, not left "
           "stopped", stopped.is_limit_blocked() and started == [1])
     check("startup-recovery: it is started as a resume, keeping its pinned "
@@ -1531,7 +1547,7 @@ def test_startup_limit_recovery():
     write_transcript(cwd, "sid-win-new", [assistant(BANNER, newer_at)])
     w_old = agent_for("WinOld", "sid-win-old")
     w_new = agent_for("WinNew", "sid-win-new")
-    win.recover_blocked_at_startup()
+    _recover(win)
     check("startup-recovery: the most recent window is armed",
           w_new.is_limit_blocked())
     check("startup-recovery: an earlier window is left alone",
@@ -1558,9 +1574,90 @@ def test_startup_limit_recovery():
         str(tmp), limit_banner_key(cwd, "sid-win-new", newer_at),
         limit_ledger.RESUMED, tries=1)
     again = agent_for("Again", "sid-win-new")
-    win.recover_blocked_at_startup()
+    _recover(win)
     check("startup-recovery: a cut-off already resolved is not revived",
           not again.is_limit_blocked())
+
+    # --- a pin that moves while the reads run -------------------------------
+    # The transcript reads run on a worker. An agent that moved to another
+    # conversation meanwhile (a /resume, a Restart, a lane) must not be armed
+    # with the cut-off of the one it left; an agent that stayed is armed.
+    import threading as _threading
+    moved_at = now - 3600
+    write_transcript(cwd, "sid-moved", [assistant(BANNER, moved_at)])
+    write_transcript(cwd, "sid-stayed", [assistant(BANNER, moved_at)])
+    moved = agent_for("Moved", "sid-moved")
+    stayed = agent_for("Stayed", "sid-stayed")
+    inside, gate = _threading.Event(), _threading.Event()
+    real_cut_off = transcripts.limit_cut_off
+
+    def held_cut_off(cwd_, sid):
+        inside.set()
+        gate.wait(30)   # bounded: a broken scan fails, never hangs
+        return real_cut_off(cwd_, sid)
+
+    transcripts.limit_cut_off = held_cut_off
+    try:
+        started = win.recover_blocked_at_startup()
+        reading = inside.wait(30)
+        moved.spec.session_id = "sid-elsewhere"
+        gate.set()
+        deadline = _time.monotonic() + 10
+        while win.startup_scan_pending() and _time.monotonic() < deadline:
+            pump(10)
+    finally:
+        gate.set()
+        transcripts.limit_cut_off = real_cut_off
+    check("startup-recovery: the reads run off the GUI thread",
+          started and reading and not win.startup_scan_pending())
+    check("startup-recovery: a result for an agent whose pin changed during "
+          "the scan is dropped",
+          not moved.is_limit_blocked() and win._startup_armed == 1)
+    check("startup-recovery: ...while an agent that kept its pin is armed",
+          stayed.is_limit_blocked())
+    filed = {r.get("session_id") for r in limit_ledger.read_all(str(tmp))}
+    check("startup-recovery: ...and the dropped cut-off is not filed under "
+          "either conversation",
+          "sid-moved" not in filed and "sid-elsewhere" not in filed
+          and "sid-stayed" in filed)
+    log = store.path.with_suffix(".log").read_text(encoding="utf-8")
+    check("startup-recovery: ...and the skip is audited",
+          "STARTUP-SKIP agent=Moved (its conversation changed" in log)
+
+    # --- a conversation that carries on while the reads run -----------------
+    # Autostart resumed the agent and the user typed into it before the
+    # worker's verdict landed. The arming reads the transcript again.
+    write_transcript(cwd, "sid-carried", [assistant(BANNER, moved_at)])
+    carried = agent_for("Carried", "sid-carried")
+    read_once, release = _threading.Event(), _threading.Event()
+
+    def read_then_hold(cwd_, sid):
+        verdict = real_cut_off(cwd_, sid)
+        if sid == "sid-carried":
+            read_once.set()
+            release.wait(30)   # bounded: a broken scan fails, never hangs
+        return verdict
+
+    transcripts.limit_cut_off = read_then_hold
+    try:
+        win.recover_blocked_at_startup()
+        stale_read = read_once.wait(30)
+        write_transcript(cwd, "sid-carried",
+                         [assistant(BANNER, moved_at),
+                          assistant("back at it", moved_at + 60)])
+        release.set()
+        deadline = _time.monotonic() + 10
+        while win.startup_scan_pending() and _time.monotonic() < deadline:
+            pump(10)
+    finally:
+        release.set()
+        transcripts.limit_cut_off = real_cut_off
+    log = store.path.with_suffix(".log").read_text(encoding="utf-8")
+    check("startup-recovery: a conversation that carried on during the scan "
+          "is not armed",
+          stale_read and not win.startup_scan_pending()
+          and not carried.is_limit_blocked()
+          and "STARTUP-SKIP agent=Carried (its conversation carried on" in log)
 
     # The `is_pty` gate above is unreachable for a claude agent, and that is
     # load-bearing rather than incidental: CLAUDE is in PTY_ONLY_KINDS, so
@@ -1579,7 +1676,7 @@ def test_startup_limit_recovery():
     win._startup_recovery = False
     fresh = agent_for("Fresh", "sid-cut")
     check("startup-recovery: scanning is skipped entirely while the toggle is "
-          "off", win.recover_blocked_at_startup() == 0
+          "off", _recover(win) == 0
           and not fresh.is_limit_blocked())
 
     # a startup latch must NOT be resumed by the OTHER toggle

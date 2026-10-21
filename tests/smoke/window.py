@@ -917,11 +917,11 @@ def test_perf_startup_line():
     check("perf-startup: main() measures every phase it doesn't carry",
           measured == [p for p in perf_audit.STARTUP_PHASES
                        if p not in ("update", "imports")], measured)
-    check("perf-startup: the update and imports times are carried from "
-          "module level",
-          "_STARTUP_UPDATE_S = time.perf_counter() - _t" in src
+    check("perf-startup: the imports time is carried from module level, and "
+          "the launch runs no update to time",
+          "_STARTUP_IMPORTS_S = time.perf_counter() - _t" in src
           and isinstance(main_mod._STARTUP_IMPORTS_S, float)
-          and main_mod._STARTUP_UPDATE_S == 0.0)
+          and "update=" not in src.split("StartupPhases(", 1)[1].split(")")[0])
 
 
 def test_repo_activity_browser_url():

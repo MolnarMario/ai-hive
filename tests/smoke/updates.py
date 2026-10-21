@@ -243,6 +243,67 @@ def test_self_update():
           self_update.audit_line(r).startswith("SELF-UPDATE apply ok=False")
           and "status=update_available" in self_update.audit_line(c))
 
+    class MovingGit(FakeGit):
+        """origin/main moves after every look, as when an agent's fetch
+        lands mid-check (GPT-6-Luna review)."""
+        looks = 0
+
+        def __call__(self, argv, timeout=0):
+            if argv[0] == "git" and argv[3:5] == ["rev-parse", "--verify"]:
+                self.calls.append(list(argv))
+                self.looks += 1
+                return (0, f"sha{self.looks}\n")
+            return super().__call__(argv, timeout)
+
+    mg = MovingGit(str(make_repo("0.3.0")))
+    found, applied = self_update.background_update(mg, mg.repo, "0.3.0")
+    pinned = [cl[-1] for cl in mg.calls if cl[0] == "git" and cl[3] == "merge"]
+    reads = [cl[4] for cl in mg.calls if cl[0] == "git" and cl[3] == "show"]
+    deps = [cl for cl in mg.calls if cl[0] == "git" and cl[3] == "diff"]
+    check("self-update: the background install merges the commit its check "
+          "read, even when origin/main moves meanwhile",
+          applied is not None and applied.ok and found.commit == "sha1"
+          and pinned == ["sha1"] and reads
+          and all(rd.startswith("sha1:") for rd in reads)
+          and deps and deps[0][6] == "sha1", (pinned, reads, deps[:1]))
+    check("self-update: ...and compares requirements.txt from the commit the "
+          "merge moves from, not a HEAD read earlier",
+          deps and deps[0][5] == "abc123", deps[:1])
+
+    g = FakeGit(str(make_repo("0.3.0")), deps_changed=True)
+    r = self_update.apply(g, g.repo, python="py.exe", packages=False)
+    check("self-update: an install nobody watches refuses a requirements "
+          "change before the merge",
+          not r.ok and r.deps_changed and g.writes() == []
+          and "Python packages" in r.detail, (r, g.writes()))
+
+    class HeadMovesGit(FakeGit):
+        """HEAD moves between apply's look and its merge: the requirements
+        diff says no change before the merge and a change after it."""
+        diffs = 0
+
+        def __call__(self, argv, timeout=0):
+            if argv[0] == "git" and argv[3] == "diff":
+                self.calls.append(list(argv))
+                self.diffs += 1
+                return (0 if self.diffs == 1 else 1, "")
+            return super().__call__(argv, timeout)
+
+    g = HeadMovesGit(str(make_repo("0.3.0")))
+    r = self_update.apply(g, g.repo, python="py.exe", packages=False)
+    check("self-update: ...and never runs pip, even when HEAD moved under it",
+          r.ok and r.deps_changed and not r.deps_ok
+          and not any(c[0] == "py.exe" for c in g.calls)
+          and "pip install -r requirements.txt" in r.detail, (r, g.calls))
+
+    g = FakeGit(str(make_repo("0.3.0")))
+    found, applied = self_update.background_update(g, g.repo, "0.3.0",
+                                                   lambda: False)
+    check("self-update: the background install stops before the merge once "
+          "it is no longer wanted",
+          found.status is Status.UPDATE_AVAILABLE and applied is None
+          and g.writes() == [], (found.status, applied, g.writes()))
+
     # --- the button and the dialog -------------------------------------------
     from app.session_store import SessionStore
     from main import create_main_window, setup_application
@@ -386,6 +447,164 @@ def test_self_update():
     if win._self_update_dialog is not None:
         win._self_update_dialog.reject()
     pump(30)
+
+    # --- the background update behind the Options switch -----------------
+    bar = win.top_bar
+    tip = bar.app_auto_update_btn.toolTip()
+    check("bg-switch: Options has the AI Hive background-update switch, on by "
+          "default, and says what it does",
+          win._app_auto_update and bar.app_auto_update()
+          and bar.app_auto_update_btn.isChecked()
+          and "AI Hive in the background" in bar.app_auto_update_label.text()
+          and "every hour" in tip and "never waits" in tip
+          and "—" not in tip, (bar.app_auto_update_label.text(), tip))
+    check("bg-switch: ...saved under ui.app_auto_update",
+          win._session_payload()["ui"]["app_auto_update"] is True)
+
+    def idle():
+        flash.stop()
+        bar.set_app_update_state()
+
+    def run_tick(fake, repo_dir):
+        win.arm_self_update(fake, repo=str(repo_dir))
+        idle()
+        win._app_auto_update_tick()
+        wait_until(lambda: getattr(win, "_app_auto_job", None) is None)
+
+    unstarted = FakeGit(str(make_repo(__version__)), remote=newer,
+                        remote_log=wlog)
+    run_tick(unstarted, unstarted.repo)
+    check("bg-switch: no background check until main.py starts the schedule",
+          unstarted.calls == [], unstarted.calls)
+
+    win.start_app_update_checks()
+    timer = win._app_update_timer
+    check("bg-switch: the schedule repeats every hour, the first check a "
+          "minute after launch",
+          timer.isActive() and timer.interval() == 3_600_000
+          and win.APP_UPDATE_FIRST_MS == 60_000, timer.interval())
+
+    audits.clear()
+    bg_repo = make_repo(__version__)
+    bg = FakeGit(str(bg_repo), remote=newer, remote_log=wlog)
+    run_tick(bg, bg_repo)
+    merges = [c for c in bg.calls if c[0] == "git" and c[3] == "merge"]
+    check("bg-switch: a code-only update installs in the background and asks "
+          "for a restart, with no dialog",
+          btn.text() == "Restart to update" and btn.property("attention")
+          and win._self_update_dialog is None
+          and self_update.read_installed_version(str(bg_repo)) == newer
+          and not any(c[0] != "git" for c in bg.calls), btn.text())
+    check("bg-switch: ...merging the commit its check fetched, not whatever "
+          "origin/main points at by then",
+          len(merges) == 1 and merges[0][-1] == "abc123", merges)
+    check("bg-switch: ...and audits both steps as background",
+          any(a.startswith("SELF-UPDATE background check") for a in audits)
+          and any(a.startswith("SELF-UPDATE background apply ok=True")
+                  for a in audits), audits)
+
+    pk_repo = make_repo(__version__)
+    pk = FakeGit(str(pk_repo), remote=newer, remote_log=wlog,
+                 deps_changed=True)
+    run_tick(pk, pk_repo)
+    check("bg-switch: an update that needs new packages lights the button "
+          "and waits for a click",
+          pk.writes() == [] and newer in btn.text()
+          and btn.property("attention") is True
+          and "Python packages" in btn.toolTip()
+          and win._self_update_dialog is None
+          and self_update.read_installed_version(str(pk_repo)) == __version__,
+          (btn.text(), btn.toolTip(), pk.writes()))
+
+    bl = FakeGit(str(make_repo(__version__)), remote=newer, remote_log=wlog,
+                 branch="feature/wip")
+    run_tick(bl, bl.repo)
+    check("bg-switch: a blocked folder is shown on the button, untouched",
+          bl.writes() == [] and "feature/wip" in btn.toolTip()
+          and newer in btn.text(), btn.toolTip())
+
+    for what, fake in (
+            ("up to date", FakeGit(str(current), remote=__version__)),
+            ("offline", FakeGit(str(current), remote=__version__,
+                                fetch=(1, "fatal: unable to access")))):
+        run_tick(fake, current)
+        check(f"bg-switch: {what} shows nothing at all",
+              btn.text() == "" and not flash.isActive()
+              and win._self_update_dialog is None and fake.calls != [],
+              btn.text())
+
+    bar.app_auto_update_btn.click()
+    off = FakeGit(str(make_repo(__version__)), remote=newer, remote_log=wlog)
+    run_tick(off, off.repo)
+    check("bg-switch: switched off, nothing runs in the background",
+          not win._app_auto_update and off.calls == []
+          and win._session_payload()["ui"]["app_auto_update"] is False
+          and win._save_timer.isActive(), off.calls)
+    audits.clear()
+    on = FakeGit(str(make_repo(__version__)), remote=newer, remote_log=wlog,
+                 delay=0.05)
+    win.arm_self_update(on, repo=on.repo)
+    idle()
+    bar.app_auto_update_btn.click()
+    check("bg-switch: switched back on, it checks at once",
+          win._app_auto_update
+          and getattr(win, "_app_auto_job", None) is not None)
+    btn.click()
+    check("bg-switch: a click during a background check waits for it "
+          "instead of running git alongside",
+          btn.text() == "Checking..." and not btn.isEnabled()
+          and getattr(win, "_app_update_job", None) is None, btn.text())
+    wait_until(lambda: getattr(win, "_self_update_dialog", None) is not None)
+    dlg = win._self_update_dialog
+    check("bg-switch: ...then shows the user's check in the dialog",
+          dlg is not None and dlg._check.status is Status.RESTART_PENDING,
+          dlg and dlg._check.status)
+    check("bg-switch: ...and the background install it waited for is still "
+          "audited",
+          any(a.startswith("SELF-UPDATE background apply ok=True")
+              for a in audits), audits)
+    late = FakeGit(str(make_repo(__version__)), remote=newer, remote_log=wlog)
+    win.arm_self_update(late, repo=late.repo)
+    win._app_auto_update_tick()
+    check("bg-switch: no background check while the dialog is open",
+          late.calls == [] and getattr(win, "_app_auto_job", None) is None)
+    if dlg is not None:
+        dlg.reject()
+    pump(30)
+
+    win._closing = True
+    win._app_update_click_waiting = True
+    win._on_app_auto_update_done("boom")
+    closing_job = getattr(win, "_app_update_job", None)
+    win._closing = False
+    win._app_update_click_waiting = False
+    check("bg-switch: a background check that ends while the window closes "
+          "starts no new one, and is still audited",
+          closing_job is None
+          and any("background stopped unexpectedly" in a for a in audits),
+          closing_job)
+
+    racing = FakeGit(str(make_repo(__version__)), remote=newer,
+                     remote_log=wlog, delay=0.05)
+    win.arm_self_update(racing, repo=racing.repo)
+    idle()
+    win._app_auto_update_tick()
+    bar.app_auto_update_btn.click()     # off, while the check runs
+    wait_until(lambda: getattr(win, "_app_auto_job", None) is None)
+    check("bg-switch: turned off during a check, it stops before the merge",
+          not win._app_auto_update and racing.calls != []
+          and racing.writes() == []
+          and self_update.read_installed_version(racing.repo) == __version__,
+          racing.writes())
+
+    win._restore_ui_state({"ui": {"app_auto_update": False}})
+    off_state = (win._app_auto_update, bar.app_auto_update())
+    win._restore_ui_state({"ui": {}})
+    check("bg-switch: the saved choice restores, and a session without it "
+          "comes back on",
+          off_state == (False, False) and win._app_auto_update
+          and bar.app_auto_update(), off_state)
+    timer.stop()
     win.close()
 
 
@@ -1828,15 +2047,16 @@ def _dialog_strings(widget) -> list:
     return out
 
 
-def test_startup_update():
-    """The launch pulls whatever merged on GitHub (self_update.startup_update,
-    called by main.py before it imports the app). Real git against a temp
-    origin and clone, never this clone: 0.28.2 sat unseen for hours because
-    the user's folder was left on a merged branch and nothing pulled."""
+def test_background_update():
+    """The Options switch's check (self_update.background_update): it
+    installs what merged on GitHub while the app runs, and the launch runs
+    no git at all. Real git against a temp origin and clone, never this
+    clone."""
     import subprocess
     from app import self_update
+    from app.self_update import Status
 
-    root = Path(tempfile.mkdtemp(prefix="ai-hive-launchupd-"))
+    root = Path(tempfile.mkdtemp(prefix="ai-hive-bgupd-"))
 
     def git(cwd, *args):
         res = subprocess.run(
@@ -1870,6 +2090,7 @@ def test_startup_update():
         git(base, "init", "-q", "--bare", "-b", "main", str(origin))
         git(base, "clone", "-q", str(origin), str(dev))
         commit(dev, "app/__init__.py", '__version__ = "0.1.0"\n', "0.1.0")
+        commit(dev, "requirements.txt", "pyte>=0.8\n", "deps")
         commit(dev, "notes.txt", "a\n", "notes")
         git(dev, "push", "-q", "origin", "main")
         git(base, "clone", "-q", str(origin), str(user))
@@ -1883,115 +2104,83 @@ def test_startup_update():
 
     _, user, dev = setup("plain")
     merge_new_version(dev)
-    res = self_update.startup_update(run, str(user))
-    check("launch-update: a clean main fast-forwards to what merged",
-          res is not None and res.ok and version(user) == "0.1.1"
-          and branch(user) == "main", (res, version(user)))
-    check("launch-update: a folder already current does nothing",
-          self_update.startup_update(run, str(user)) is None)
+    found, applied = self_update.background_update(run, str(user), "0.1.0")
+    check("bg-update: a clean main installs what merged",
+          found.status is Status.UPDATE_AVAILABLE and applied is not None
+          and applied.ok and version(user) == "0.1.1"
+          and branch(user) == "main" and not applied.deps_changed,
+          (found, applied, version(user)))
+    found, applied = self_update.background_update(run, str(user), "0.1.0")
+    check("bg-update: the next check before a restart installs nothing more",
+          found.status is Status.RESTART_PENDING and applied is None,
+          (found.status, applied))
+    found, applied = self_update.background_update(run, str(user), "0.1.1")
+    check("bg-update: a folder already current does nothing",
+          found.status is Status.UP_TO_DATE and applied is None, found.status)
 
-    # the 0.28.2 case: a session committed on a branch in the user's folder,
-    # the same change reached main under another hash, and main moved on
+    _, user, dev = setup("packages")
+    commit(dev, "requirements.txt", "pyte>=0.8\nnewdep>=1\n", "deps: newdep")
+    merge_new_version(dev)
+    head = git(user, "rev-parse", "HEAD")
+    found, applied = self_update.background_update(run, str(user), "0.1.0")
+    check("bg-update: an update that changes requirements.txt waits for the "
+          "user's click",
+          found.status is Status.UPDATE_AVAILABLE and found.needs_packages
+          and applied is None and version(user) == "0.1.0"
+          and git(user, "rev-parse", "HEAD") == head,
+          (found, applied))
+    check("bg-update: ...and the audit line says why",
+          "needs_packages=True" in self_update.audit_line(found, "background")
+          and self_update.audit_line(found, "background").startswith(
+              "SELF-UPDATE background check"))
+
+    # a session left the folder on a branch whose commits all reached main:
+    # the launch used to switch back, the background never does, because an
+    # agent may be committing on that branch right now
     _, user, dev = setup("merged-branch")
     git(user, "switch", "-q", "-c", "fix/tray")
     commit(user, "notes.txt", "a\nfix\n", "fix: tray")
-    write(user, "untracked.md", "keep me\n")
     commit(dev, "notes.txt", "a\nfix\n", "fix: tray")
     merge_new_version(dev)
-    res = self_update.startup_update(run, str(user))
-    check("launch-update: a clean branch whose commits are all on main "
-          "switches back to main and updates",
-          res is not None and res.ok and branch(user) == "main"
-          and version(user) == "0.1.1", (res, branch(user), version(user)))
-    check("launch-update: untracked files survive the switch",
-          (user / "untracked.md").read_text(encoding="utf-8") == "keep me\n")
-
-    _, user, dev = setup("unmerged-branch")
-    git(user, "switch", "-q", "-c", "feat/wip")
-    commit(user, "notes.txt", "a\nwip\n", "feat: wip")
-    merge_new_version(dev)
-    res = self_update.startup_update(run, str(user))
-    check("launch-update: a branch with unmerged commits is left alone",
-          res is not None and not res.ok and branch(user) == "feat/wip"
-          and version(user) == "0.1.0"
-          and "wip" in (user / "notes.txt").read_text(encoding="utf-8"),
-          (res, branch(user)))
-
-    # git cherry skips merges: a branch whose plain commits all reached main
-    # but that holds its own merge (a conflict resolution) must stay put
-    _, user, dev = setup("merge-commit")
-    git(user, "switch", "-q", "-c", "fix/side")
-    commit(user, "side.txt", "side\n", "fix: side")
-    git(user, "switch", "-q", "-c", "fix/resolve", "main")
-    commit(user, "notes.txt", "a\nresolve\n", "fix: resolve")
-    git(user, "merge", "-q", "--no-ff", "-m", "merge side", "fix/side")
-    commit(dev, "side.txt", "side\n", "fix: side")
-    commit(dev, "notes.txt", "a\nresolve\n", "fix: resolve")
-    merge_new_version(dev)
-    res = self_update.startup_update(run, str(user))
-    check("launch-update: a branch with its own merge commit is left alone",
-          res is not None and not res.ok and branch(user) == "fix/resolve"
-          and version(user) == "0.1.0", (res, branch(user)))
-
-    _, user, dev = setup("dirty")
-    git(user, "switch", "-q", "-c", "fix/done")
-    commit(user, "notes.txt", "a\ndone\n", "fix: done")
-    commit(dev, "notes.txt", "a\ndone\n", "fix: done")
-    merge_new_version(dev)
-    write(user, "notes.txt", "a\ndone\nunsaved\n")
-    res = self_update.startup_update(run, str(user))
-    check("launch-update: local changes block the switch and the update",
-          res is not None and not res.ok and branch(user) == "fix/done"
-          and "unsaved" in (user / "notes.txt").read_text(encoding="utf-8"),
-          (res, branch(user)))
+    found, applied = self_update.background_update(run, str(user), "0.1.0")
+    check("bg-update: a folder on another branch is reported, never switched",
+          found.status is Status.UPDATE_AVAILABLE and "fix/tray" in found.blocked
+          and applied is None and branch(user) == "fix/tray"
+          and version(user) == "0.1.0", (found, branch(user)))
 
     _, user, dev = setup("dirty-main")
     merge_new_version(dev)
     write(user, "notes.txt", "a\nunsaved\n")
-    res = self_update.startup_update(run, str(user))
-    check("launch-update: local changes on main block the update",
-          res is not None and not res.ok and version(user) == "0.1.0"
+    found, applied = self_update.background_update(run, str(user), "0.1.0")
+    check("bg-update: local changes block the install and stay untouched",
+          "local changes" in found.blocked and applied is None
+          and version(user) == "0.1.0"
           and "unsaved" in (user / "notes.txt").read_text(encoding="utf-8"),
-          res)
+          found)
 
     origin, user, dev = setup("offline")
+    merge_new_version(dev)
     git(user, "remote", "set-url", "origin", str(origin) + "-gone")
-    res = self_update.startup_update(run, str(user))
-    check("launch-update: a failed fetch is reported and changes nothing",
-          res is not None and not res.ok and "Checking GitHub" in res.detail
-          and version(user) == "0.1.0", res)
-
-    # pulled code whose new packages failed to install would die on import
-    # with no window to say why (GPT-6-Luna review, round 3)
-    A = self_update.Applied
-    broken = self_update.startup_failure(
-        A(True, version="0.1.1", deps_changed=True, deps_ok=False))
-    check("launch-update: a failed package install stops the launch with "
-          "the command that fixes it",
-          "v0.1.1" in broken and "pip install -r requirements.txt" in broken
-          and "—" not in broken, broken)
-    check("launch-update: nothing else stops the launch",
-          not any(self_update.startup_failure(r) for r in (
-              None, A(False, detail="blocked"), A(True, version="0.1.1"),
-              A(True, version="0.1.1", deps_changed=True, deps_ok=True))))
+    found, applied = self_update.background_update(run, str(user), "0.1.0")
+    check("bg-update: an unreachable GitHub is an error and changes nothing",
+          found.status is Status.ERROR and "Checking GitHub" in found.detail
+          and applied is None and version(user) == "0.1.0", found)
+    shutil.rmtree(root, ignore_errors=True)
 
     src = (ROOT / "main.py").read_text(encoding="utf-8")
-    launched = src.find('if __name__ == "__main__":\n    _LAUNCH_GUARD = '
-                        '_single_instance_guard()\n    if _LAUNCH_GUARD is '
-                        'not None:\n')
-    pull = src.find("startup_update(", max(launched, 0))
-    check("launch-update: main.py pulls only when launched, and before it "
-          "imports the app",
-          0 < launched < pull < src.find("from app.process_worker import"),
-          (launched, pull))
-    # a second launch exits at the instance check; pulling first would
-    # change files under the instance that is running (GPT-6-Luna review)
-    check("launch-update: only the launch that holds the instance lock pulls, "
-          "and main() reuses that lock",
-          launched > 0 and "guard = _LAUNCH_GUARD or _single_instance_guard()"
-          in src, launched)
-    check("launch-update: main.py stops before importing the pulled app "
-          "when its packages failed",
-          pull < src.find("_fatal(_self_update.startup_failure(_result))")
-          < src.find("from app.process_worker import"))
-    shutil.rmtree(root, ignore_errors=True)
+    top, body = src.split("\ndef main() -> int:", 1)
+    before_show = body.split("window.show()")[0]
+    check("bg-update: the launch runs no git before the window",
+          "self_update" not in top and "startup_update" not in src
+          and "self_update." not in before_show
+          and "subprocess_runner" not in before_show,
+          [w for w in ("self_update", "subprocess_runner")
+           if w in top or w + "." in before_show])
+    after = body.find("window.start_app_update_checks()")
+    check("bg-update: main.py starts the background check last, after the "
+          "launch",
+          0 < body.find("window.recover_blocked_at_startup()") < after
+          and body.find("phases.write(store)") < after, after)
+    factory = src.split("def create_main_window(", 1)[1].split("\ndef ")[0]
+    check("bg-update: the factory the suite shares never starts it",
+          "start_app_update_checks" not in factory)

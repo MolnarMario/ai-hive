@@ -275,13 +275,15 @@ workspaces keep executing — switching never pauses anything.
   close and reopen AI Hive yourself, so your agents keep working until you
   choose to restart. That state is read from the files on disk, so it also
   covers a `git pull` you ran by hand.
-- **Every launch pulls what merged.** Before it loads its own code, AI Hive
-  fetches `main` and fast-forwards this folder, so a PR merged since the last
-  run is what you see after a restart. If the folder sits on a branch whose
-  commits are all on `main` already (a session worked here and its PR merged),
-  it switches back to `main` first. Local changes or unmerged commits stop
-  both, and the launch goes ahead on what is there. Offline, it gives up
-  after 10 seconds.
+- **Updates in the background, never at launch.** Opening AI Hive runs no git
+  and never waits on GitHub. With **Update AI Hive in the background** on
+  (Options, on by default) it checks a minute after the window opens and then
+  every hour, and installs a newer version the way **Update** does, so the
+  button reads *Restart to update* and the next launch runs it. An update that
+  changes `requirements.txt` is left for your click, because pip would replace
+  packages the running app has loaded. So is a folder that is off `main` or
+  has local changes: the button lights up and its tooltip says why. Switched
+  off, only the button checks.
 - **Let Claude Code update itself** — the **⬇ button** beside the taskbar toggle
   opens a small **Updates** panel, and what it offers depends on how Claude Code
   is actually installed on your machine (it re-reads that every time, so it is
@@ -593,8 +595,8 @@ workspaces keep executing — switching never pauses anything.
   show without file edges; see below.)
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
-  reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Check for CLI
-  updates at start-up**, **Show usage left**, **Reply times** and **Tooltips** as labelled switches (each with a green/dark LED, so
+  reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Update AI
+  Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times** and **Tooltips** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
   the theme and global font size below. Click outside or press `Esc` to close.
@@ -996,7 +998,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3764 checks drive the real app headlessly (offscreen Qt platform) with real
+3799 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1143,7 +1145,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3764 checks)
+                           (3799 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

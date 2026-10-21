@@ -8,6 +8,10 @@ snapshots: on every app START (before any agent launches — a bad resume can
 never destroy the only copy) and on every graceful CLOSE (captures the day's
 conversation).
 
+The START snapshot runs on a worker thread (`start_backup`) while the window
+builds, and every agent start waits for it (`TerminalAgent.start` calls
+`wait_for_backup`), so no resume can begin before the copy is taken.
+
 Layout under <backup_dir> per session id:
   <id>.jsonl       newest snapshot
   <id>.jsonl.1     previous snapshot (one rotation)
@@ -24,6 +28,7 @@ import os
 import re
 import shutil
 import glob
+import threading
 from datetime import datetime, timedelta, timezone
 
 from . import limit_banner
@@ -54,8 +59,13 @@ _GEMINI_PROMPT_CACHE: dict[str, tuple[float, int, list]] = {}
 _GEMINI_REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
 _CODEX_REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
 
-# cache for limit_cut_off: path -> (mtime, size, verdict dict).
+# cache for limit_cut_off: path -> (mtime, size, verdict dict). The launch's
+# limit scan reads on a worker thread (MainWindow.recover_blocked_at_startup)
+# while the GUI thread may read too. The lock covers each lookup and each
+# store, not the parse between them: two threads that miss together both
+# parse the file and store the same verdict for the same mtime and size.
 _LIMIT_CACHE: dict[str, tuple[float, int, dict]] = {}
+_LIMIT_LOCK = threading.Lock()
 
 # cache for typed_prompts: path -> (mtime, size, [prompt text, ...]).
 _PROMPT_CACHE: dict[str, tuple[float, int, list]] = {}
@@ -691,7 +701,8 @@ def _read_limit_cut_off(path: str) -> dict | None:
         st = os.stat(path)
     except OSError:
         return None
-    cached = _LIMIT_CACHE.get(path)
+    with _LIMIT_LOCK:
+        cached = _LIMIT_CACHE.get(path)
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
         return cached[2]
     found = _no_cut_off()
@@ -813,7 +824,8 @@ def _read_limit_cut_off(path: str) -> dict | None:
         return cached[2] if cached else None
     if closer is not None:
         found["carried_on_at"] = _record_epoch(closer)
-    _LIMIT_CACHE[path] = (st.st_mtime, st.st_size, found)
+    with _LIMIT_LOCK:
+        _LIMIT_CACHE[path] = (st.st_mtime, st.st_size, found)
     return found
 
 
@@ -1602,22 +1614,82 @@ def _backup_one(src: str, backup_dir: str, session_id: str) -> bool:
     return True
 
 
-def backup_for_agents(agents, backup_dir: str) -> int:
-    """Snapshot the transcript of every pinned Claude agent. `agents` is any
-    iterable of objects with .spec (provider/cwd/session_id). Returns how many
-    transcripts were snapshotted; never raises."""
-    done = 0
+def backup_entries(agents) -> list[tuple[str, str, str]]:
+    """(provider, cwd, session_id) of every agent in `agents` (objects with
+    .spec), read now, so a backup on another thread never touches an agent."""
+    entries = []
     for agent in agents:
         try:
             spec = agent.spec
-            if spec.provider != "claude" or not spec.session_id:
+            entries.append((spec.provider, spec.cwd, spec.session_id))
+        except Exception:
+            continue
+    return entries
+
+
+def backup_transcripts(entries, backup_dir: str) -> int:
+    """Snapshot the transcript of every pinned Claude conversation in
+    `entries`, (provider, cwd, session_id) tuples. Returns how many
+    transcripts were snapshotted; never raises."""
+    done = 0
+    for entry in entries:
+        try:
+            provider, cwd, session_id = entry
+            if provider != "claude" or not session_id:
                 continue
-            src = transcript_path(spec.cwd, spec.session_id)
+            src = transcript_path(cwd, session_id)
             if not os.path.isfile(src):
                 continue
             os.makedirs(backup_dir, exist_ok=True)
-            if _backup_one(src, backup_dir, spec.session_id):
+            if _backup_one(src, backup_dir, session_id):
                 done += 1
         except Exception:
             continue  # best-effort: one bad transcript never stops the rest
     return done
+
+
+def backup_for_agents(agents, backup_dir: str) -> int:
+    """`backup_transcripts` for `agents` (objects with .spec), on this thread.
+    Waits for a launch backup still running first: two backups at once
+    would rotate the same snapshots."""
+    wait_for_backup()
+    return backup_transcripts(backup_entries(agents), backup_dir)
+
+
+# Set while no launch backup runs. start_backup replaces it with one that
+# its worker sets when done, and wait_for_backup blocks on whichever is
+# current.
+_backup_idle = threading.Event()
+_backup_idle.set()
+
+
+def start_backup(entries, backup_dir: str) -> None:
+    """Run `backup_transcripts(entries, backup_dir)` on a worker thread and
+    return at once. `wait_for_backup` returns when it is done, whatever it
+    did: a copy that fails is skipped as it is on the caller's thread, and
+    a worker that can't start runs the backup here instead. Either way no
+    start can hang on it."""
+    global _backup_idle
+    wait_for_backup()   # one at a time, the same reason as backup_for_agents
+    idle = threading.Event()
+
+    def body():
+        try:
+            backup_transcripts(entries, backup_dir)
+        except Exception:  # noqa: BLE001 - never raises; the finally matters
+            pass
+        finally:
+            idle.set()
+
+    _backup_idle = idle
+    try:
+        threading.Thread(target=body, name="ai-hive-transcript-backup",
+                         daemon=True).start()
+    except Exception:  # noqa: BLE001 - no thread: today's synchronous copy
+        body()
+
+
+def wait_for_backup() -> None:
+    """Block until the launch backup has finished. Returns at once when
+    none is running."""
+    _backup_idle.wait()

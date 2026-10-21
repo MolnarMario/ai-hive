@@ -325,6 +325,163 @@ def test_transcript_backups():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_launch_backup_gates_starts():
+    """The launch's transcript backup copies on a worker while the window
+    builds, and TerminalAgent.start() waits for it: a resume that began
+    before the copy could truncate the only transcript (it happened once).
+    Here the copy blocks until another thread releases it, so a start can
+    only find its fresh snapshot on disk at spawn time if it waited."""
+    import threading
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+
+    from app import transcripts
+    from app.process_worker import AgentKind, WorkerState, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    QApplication.instance() or QApplication([])
+    home = Path(tempfile.mkdtemp(prefix="ai-hive-backup-gate-"))
+    cwd = str(home / "project")
+    os.makedirs(cwd)
+    bdir = home / "transcripts"
+    store = SessionStore(path=home / "session.json")
+    sids = {"Run": "backup-gate-run", "Stopped": "backup-gate-stopped"}
+    terms = []
+    for name, sid in sids.items():
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=cwd, pty=True)
+        spec.session_id = sid
+        terms.append({**spec.to_dict(), "running": name == "Run"})
+    store.save({"version": 3, "active": "w1", "workspaces": [
+        {"id": "w1", "name": "W", "project_path": cwd, "layout": "auto",
+         "terminals": terms}]})
+    sources = {}
+    for name, sid in sids.items():
+        src = Path(transcripts.transcript_path(cwd, sid))
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text('{"type": "user"}\n' * 20, encoding="utf-8")
+        sources[name] = src
+
+    def fresh(name):
+        """The newest snapshot of `name`'s transcript is its current text."""
+        snap = bdir / f"{sids[name]}.jsonl"
+        return (snap.is_file()
+                and snap.stat().st_size == sources[name].stat().st_size)
+
+    spawned = {}
+
+    def stub(agent):
+        def start():
+            spawned[agent.spec.name] = fresh(agent.spec.name)
+            agent.worker._set_state(WorkerState.STARTING)
+        agent.worker.start = start
+
+    release = threading.Event()
+    real_backup = transcripts.backup_transcripts
+
+    def held_backup(entries, backup_dir):
+        release.wait(30)   # bounded: a broken gate fails, never hangs
+        return real_backup(entries, backup_dir)
+
+    def held_start(fn):
+        """Run fn() while a fresh launch backup is held, releasing it from
+        another thread a moment later."""
+        # the last backup must be over first, or start_backup's own wait for
+        # it would let this copy finish before fn() runs
+        transcripts.wait_for_backup()
+        release.clear()
+        transcripts.start_backup(
+            transcripts.backup_entries(win.manager.all_agents()), str(bdir))
+        threading.Timer(0.2, release.set).start()
+        fn()
+
+    transcripts.backup_transcripts = held_backup
+    win = None
+    try:
+        win = create_main_window(store)
+        check("backup gate: the window build does not wait for the copy",
+              not transcripts._backup_idle.is_set()
+              and not bdir.exists())
+        win.show()
+        agents = {a.spec.name: a for a in win.manager.all_agents()}
+        for agent in agents.values():
+            stub(agent)
+        threading.Timer(0.2, release.set).start()
+        agents["Run"].start()   # Resume all, a menu Start, anything
+        check("backup gate: a start asked for during the copy waits for it",
+              spawned.get("Run") is True, spawned)
+
+        # a keypress on the stopped card, during a second launch backup
+        card = next(c for p in win._pages.values() for c in p.cards
+                    if c.agent is agents["Stopped"])
+        transcripts.wait_for_backup()   # or it copies the text written next
+        sources["Stopped"].write_text('{"type": "user"}\n' * 30,
+                                      encoding="utf-8")
+        check("backup gate: precondition - the snapshot is stale",
+              not fresh("Stopped"))
+        held_start(lambda: QTest.keyClick(card.terminal, Qt.Key.Key_A))
+        check("backup gate: a keypress start on a stopped card waits too",
+              spawned.get("Stopped") is True, spawned)
+
+        # a backup that raises: starts go ahead, as when a copy failed, and
+        # it writes nothing to the audit log
+        log = store.path.with_suffix(".log")
+        before = log.read_text(encoding="utf-8") if log.exists() else ""
+
+        def boom(entries, backup_dir):
+            raise OSError("disk gone")
+
+        transcripts.backup_transcripts = boom
+        transcripts.start_backup([("claude", cwd, sids["Run"])], str(bdir))
+        # a hung gate fails the check instead of the run
+        guard = threading.Timer(20, transcripts._backup_idle.set)
+        guard.start()
+        transcripts.wait_for_backup()
+        hung = not guard.is_alive()
+        guard.cancel()
+        after = log.read_text(encoding="utf-8") if log.exists() else ""
+        agents["Run"].worker._set_state(WorkerState.IDLE)
+        spawned.clear()
+        agents["Run"].start()
+        check("backup gate: a backup that raises still lets starts proceed",
+              not hung and "Run" in spawned, (hung, spawned))
+        check("backup gate: ...and leaves the audit log as it was",
+              after == before, after[len(before):])
+
+        # one copy that fails skips that transcript, never the others
+        transcripts.backup_transcripts = real_backup
+        real_one = transcripts._backup_one
+
+        def picky(src, backup_dir, session_id):
+            if session_id == sids["Run"]:
+                raise OSError("locked")
+            return real_one(src, backup_dir, session_id)
+
+        transcripts._backup_one = picky
+        try:
+            sources["Stopped"].write_text('{"type": "user"}\n' * 40,
+                                          encoding="utf-8")
+            n = transcripts.backup_transcripts(
+                transcripts.backup_entries(agents.values()), str(bdir))
+        finally:
+            transcripts._backup_one = real_one
+        check("backup gate: a failed copy skips only its own transcript",
+              n == 1 and fresh("Stopped"), n)
+    finally:
+        release.set()
+        transcripts.backup_transcripts = real_backup
+        transcripts.wait_for_backup()
+        if win is not None:
+            for agent in win.manager.all_agents():
+                agent.worker._set_state(WorkerState.IDLE)
+            win.close()
+        for src in sources.values():
+            src.unlink(missing_ok=True)
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_session_pinning():
     """Each Claude agent owns ONE conversation, pinned by session id: fresh
     starts declare --session-id, resumes target --resume <id>. Never
@@ -1548,10 +1705,11 @@ def test_screen_snapshots():
         card4.detach(); live.dispose(); pump(50)
 
         # A card whose agent STARTS before it ever got a real size drops the
-        # restored screen entirely. Both launch paths that start an agent
-        # (autostart_active_workspace, recover_blocked_at_startup) run
-        # synchronously right after show(), ahead of TerminalView's 120ms
-        # resize debounce — so this is EVERY agent that comes back running,
+        # restored screen entirely. The launch autostart runs synchronously
+        # right after show(), ahead of TerminalView's 120ms resize debounce,
+        # and recover_blocked_at_startup's starts land a moment later as
+        # resumes, which drop it anyway — so this is EVERY agent that comes
+        # back running,
         # and leaving the seed there parked each of their cards on a mangled
         # narrow fragment until the TUI finished booting. An empty terminal
         # that fills in a few seconds is the pre-snapshot behavior; the whole
