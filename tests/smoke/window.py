@@ -714,6 +714,216 @@ def test_repo_activity_cache():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+def test_perf_stall_probe():
+    """PERF stall (app/perf_audit.py): a 50 ms timer that measures its own
+    lateness names the longest feed and paint inside a gap over 150 ms. The
+    factory the suite shares never arms it; main.py does."""
+    import inspect
+    import re
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    import main as main_mod
+    from app import perf_audit
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.widgets import terminal_view as tv
+    from main import create_main_window
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-perf-"))
+    log = tmp / "s.log"
+
+    def perf_lines():
+        if not log.exists():
+            return []
+        return [ln for ln in log.read_text(encoding="utf-8").splitlines()
+                if " PERF " in ln]
+
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        win.show()
+        ws = win.manager.workspace(win.manager.active_id)
+        agent = win.manager.add_terminal(
+            ws.id, build_spec(AgentKind.CLAUDE, "Stall Probe",
+                              cwd=SCRATCH_CWD, pty=True), autostart=False)
+        pump(200)
+        stall_timers = [t for t in win.findChildren(QTimer, "perfStallTimer")
+                        if t.isActive()]
+        check("perf: create_main_window writes no PERF line",
+              perf_lines() == [], perf_lines())
+        check("perf: ...and starts no stall timer",
+              win._stall_probe is None and not stall_timers, stall_timers)
+        check("perf: only main() arms the probe and writes the startup line",
+              "arm_stall_probe" in inspect.getsource(main_mod.main)
+              and "phases.write" in inspect.getsource(main_mod.main)
+              and "arm_stall_probe" not in
+              inspect.getsource(main_mod.create_main_window))
+
+        view = win._pages[ws.id].card_for(agent.id).terminal
+        real_feed_screen = view._feed_screen
+
+        def slow_feed_screen(data):
+            time.sleep(0.3)      # the feed that holds the event loop
+            real_feed_screen(data)
+
+        view._feed_screen = slow_feed_screen
+        win.arm_stall_probe()
+        check("perf: arm_stall_probe starts the 50 ms timer",
+              win._stall_probe.is_running())
+        QTimer.singleShot(0, lambda: view.feed("x" * 5000))
+        pump(400)
+        view._feed_screen = real_feed_screen
+        named = [ln for ln in perf_lines()
+                 if "PERF stall gap=" in ln and "agent=Stall Probe" in ln]
+        check("perf: a 300 ms feed writes exactly one stall line naming it",
+              len(named) == 1, perf_lines())
+        fields = dict(re.findall(r"(\w+)=(\d+)", named[0])) if named else {}
+        check("perf: the line holds the gap, the feed's ms and its size",
+              int(fields.get("gap", 0)) >= 290
+              and 290 <= int(fields.get("feed", 0)) <= int(fields["gap"])
+              and fields.get("feed_chars") == "5000", fields)
+
+        # the hooks: feed and paint keep the longest call since the last
+        # tick (no events run between these lines, so no tick resets them)
+        tv._perf_feed_s = tv._perf_paint_s = 0.0
+        view.feed("abc")
+        check("perf: feed records itself as the longest feed",
+              tv._perf_feed_view is view and tv._perf_feed_len == 3
+              and tv._perf_feed_s > 0)
+        view.repaint()
+        check("perf: paintEvent records itself as the longest paint",
+              tv._perf_paint_view is view and tv._perf_paint_s > 0)
+        win.close()
+        pump(50)
+        check("perf: closing the window stops the probe",
+              not win._stall_probe.is_running())
+
+        # the rate limit, on a hand-driven clock: no wall time involved
+        lines = []
+        now = [100.0]
+        probe = perf_audit.StallProbe(SimpleNamespace(audit=lines.append),
+                                      lambda v: "Fake Agent",
+                                      clock=lambda: now[0])
+        probe.start()
+        probe._timer.stop()      # driven by hand from here
+        check("perf: starting resets the longest feed and paint",
+              tv._perf_feed_view is None and tv._perf_paint_view is None)
+        for _ in range(20):
+            now[0] += perf_audit.TICK_MS / 1000
+            probe._tick()
+        check("perf: on-time ticks write nothing", lines == [], lines)
+        for i in range(20):
+            tv._perf_feed_s, tv._perf_feed_len = 0.18, 64
+            tv._perf_feed_view = view
+            now[0] += 0.2 + i / 1000
+            probe._tick()
+        stalls = [ln for ln in lines if ln.startswith("PERF stall gap=")]
+        check("perf: a burst of 20 stalls writes no more than the limit",
+              len(stalls) == perf_audit.STALL_LIMIT == len(lines), lines)
+        check("perf: a fake stall line names the feed",
+              all("feed=180 feed_chars=64 agent=Fake Agent" in ln
+                  for ln in stalls), stalls)
+        check("perf: a tick resets the longest feed",
+              tv._perf_feed_view is None and tv._perf_feed_s == 0.0)
+        while now[0] < 100.0 + perf_audit.STALL_WINDOW_S + 2:
+            now[0] += perf_audit.TICK_MS / 1000
+            probe._tick()
+        check("perf: the window's end reports what it suppressed",
+              lines[perf_audit.STALL_LIMIT:]
+              == ["PERF stall suppressed=15 worst_gap=219"],
+              lines[perf_audit.STALL_LIMIT:])
+        now[0] += 0.5
+        probe._tick()
+        check("perf: a stall in the next window is written again",
+              len(lines) == perf_audit.STALL_LIMIT + 2
+              and lines[-1].startswith("PERF stall gap=500 paint=0 grid=-")
+              and lines[-1].endswith("feed=0 feed_chars=0 agent=-"),
+              lines[-1:])
+        for _ in range(perf_audit.STALL_LIMIT):
+            now[0] += 0.3
+            probe._tick()
+        probe.stop()
+        check("perf: stopping reports a count still pending",
+              lines[-1] == "PERF stall suppressed=1 worst_gap=300", lines[-1:])
+        failing = perf_audit.StallProbe(
+            SimpleNamespace(audit=lambda _l: 1 / 0), lambda v: "",
+            clock=lambda: now[0])
+        failing.start()
+        failing._timer.stop()
+        now[0] += 1.0
+        failing._tick()
+        check("perf: a failed write is swallowed", True)
+    finally:
+        perf_audit.StallProbe._reset_max()   # drop the closed view
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_perf_startup_line():
+    """PERF startup: every launch phase in whole ms, and a total from the
+    moment Windows created the process."""
+    import re
+    from types import SimpleNamespace
+
+    from app import perf_audit
+    from app.session_store import SessionStore
+
+    phases = perf_audit.StartupPhases(time.perf_counter(), update=1.25,
+                                      imports=0.4)
+    with phases.measure("setup"):
+        pass
+    with phases.measure("window"):
+        time.sleep(0.01)
+    line = phases.line()
+    check("perf-startup: the line is all key=integer pairs",
+          re.fullmatch(r"PERF startup( \w+=\d+)+", line) is not None, line)
+    fields = dict(re.findall(r"(\w+)=(\d+)", line))
+    check("perf-startup: every phase and the total are present",
+          list(fields) == [*perf_audit.STARTUP_PHASES, "total"], list(fields))
+    check("perf-startup: carried and measured phases in ms",
+          fields["update"] == "1250" and fields["imports"] == "400"
+          and int(fields["window"]) >= 10 and fields["cli_gate"] == "0",
+          fields)
+    age = perf_audit.process_age_s()
+    check("perf-startup: the total counts from the process's creation",
+          sys.platform != "win32" or (age is not None and 0 < age < 86400),
+          age)
+    check("perf-startup: a negative time reads 0, never a minus sign",
+          "total=0" in phases.line(total_s=-0.5), phases.line(total_s=-0.5))
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-perf-startup-"))
+    try:
+        phases.write(SessionStore(path=tmp / "s.json"))
+        text = (tmp / "s.log").read_text(encoding="utf-8")
+        check("perf-startup: write() appends the line to session.log",
+              " PERF startup update=1250 " in text
+              and not (tmp / "s.json").exists(), text)
+        phases.write(SimpleNamespace(audit=lambda _l: 1 / 0))
+        check("perf-startup: a failed write is swallowed", True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    import main as main_mod
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    measured = [p for p in perf_audit.STARTUP_PHASES
+                if f'phases.measure("{p}")' in src]
+    check("perf-startup: main() measures every phase it doesn't carry",
+          measured == [p for p in perf_audit.STARTUP_PHASES
+                       if p not in ("update", "imports")], measured)
+    check("perf-startup: the update and imports times are carried from "
+          "module level",
+          "_STARTUP_UPDATE_S = time.perf_counter() - _t" in src
+          and isinstance(main_mod._STARTUP_IMPORTS_S, float)
+          and main_mod._STARTUP_UPDATE_S == 0.0)
+
+
 def test_repo_activity_browser_url():
     """The origin remote forms git prints map to the github.com page."""
     from app import repo_activity
@@ -3792,212 +4002,3 @@ def test_ctrl_tab_cycles_agents():
         pump(100)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-
-
-def test_perf_stall_probe():
-    """PERF stall (app/perf_audit.py): a 50 ms timer that measures its own
-    lateness names the longest feed and paint inside a gap over 150 ms. The
-    factory the suite shares never arms it; main.py does."""
-    import inspect
-    import re
-    from types import SimpleNamespace
-
-    from PySide6.QtCore import QEventLoop, QTimer
-    from PySide6.QtWidgets import QApplication
-
-    import main as main_mod
-    from app import perf_audit
-    from app.process_worker import AgentKind, build_spec
-    from app.session_store import SessionStore
-    from app.widgets import terminal_view as tv
-    from main import create_main_window
-
-    QApplication.instance() or QApplication([])
-
-    def pump(ms):
-        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
-
-    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-perf-"))
-    log = tmp / "s.log"
-
-    def perf_lines():
-        if not log.exists():
-            return []
-        return [ln for ln in log.read_text(encoding="utf-8").splitlines()
-                if " PERF " in ln]
-
-    try:
-        win = create_main_window(SessionStore(path=tmp / "s.json"))
-        win.show()
-        ws = win.manager.workspace(win.manager.active_id)
-        agent = win.manager.add_terminal(
-            ws.id, build_spec(AgentKind.CLAUDE, "Stall Probe",
-                              cwd=SCRATCH_CWD, pty=True), autostart=False)
-        pump(200)
-        stall_timers = [t for t in win.findChildren(QTimer, "perfStallTimer")
-                        if t.isActive()]
-        check("perf: create_main_window writes no PERF line",
-              perf_lines() == [], perf_lines())
-        check("perf: ...and starts no stall timer",
-              win._stall_probe is None and not stall_timers, stall_timers)
-        check("perf: only main() arms the probe and writes the startup line",
-              "arm_stall_probe" in inspect.getsource(main_mod.main)
-              and "phases.write" in inspect.getsource(main_mod.main)
-              and "arm_stall_probe" not in
-              inspect.getsource(main_mod.create_main_window))
-
-        view = win._pages[ws.id].card_for(agent.id).terminal
-        real_feed_screen = view._feed_screen
-
-        def slow_feed_screen(data):
-            time.sleep(0.3)      # the feed that holds the event loop
-            real_feed_screen(data)
-
-        view._feed_screen = slow_feed_screen
-        win.arm_stall_probe()
-        check("perf: arm_stall_probe starts the 50 ms timer",
-              win._stall_probe.is_running())
-        QTimer.singleShot(0, lambda: view.feed("x" * 5000))
-        pump(400)
-        view._feed_screen = real_feed_screen
-        named = [ln for ln in perf_lines()
-                 if "PERF stall gap=" in ln and "agent=Stall Probe" in ln]
-        check("perf: a 300 ms feed writes exactly one stall line naming it",
-              len(named) == 1, perf_lines())
-        fields = dict(re.findall(r"(\w+)=(\d+)", named[0])) if named else {}
-        check("perf: the line holds the gap, the feed's ms and its size",
-              int(fields.get("gap", 0)) >= 290
-              and 290 <= int(fields.get("feed", 0)) <= int(fields["gap"])
-              and fields.get("feed_chars") == "5000", fields)
-
-        # the hooks: feed and paint keep the longest call since the last
-        # tick (no events run between these lines, so no tick resets them)
-        tv._perf_feed_s = tv._perf_paint_s = 0.0
-        view.feed("abc")
-        check("perf: feed records itself as the longest feed",
-              tv._perf_feed_view is view and tv._perf_feed_len == 3
-              and tv._perf_feed_s > 0)
-        view.repaint()
-        check("perf: paintEvent records itself as the longest paint",
-              tv._perf_paint_view is view and tv._perf_paint_s > 0)
-        win.close()
-        pump(50)
-        check("perf: closing the window stops the probe",
-              not win._stall_probe.is_running())
-
-        # the rate limit, on a hand-driven clock: no wall time involved
-        lines = []
-        now = [100.0]
-        probe = perf_audit.StallProbe(SimpleNamespace(audit=lines.append),
-                                      lambda v: "Fake Agent",
-                                      clock=lambda: now[0])
-        probe.start()
-        probe._timer.stop()      # driven by hand from here
-        check("perf: starting resets the longest feed and paint",
-              tv._perf_feed_view is None and tv._perf_paint_view is None)
-        for _ in range(20):
-            now[0] += perf_audit.TICK_MS / 1000
-            probe._tick()
-        check("perf: on-time ticks write nothing", lines == [], lines)
-        for i in range(20):
-            tv._perf_feed_s, tv._perf_feed_len = 0.18, 64
-            tv._perf_feed_view = view
-            now[0] += 0.2 + i / 1000
-            probe._tick()
-        stalls = [ln for ln in lines if ln.startswith("PERF stall gap=")]
-        check("perf: a burst of 20 stalls writes no more than the limit",
-              len(stalls) == perf_audit.STALL_LIMIT == len(lines), lines)
-        check("perf: a fake stall line names the feed",
-              all("feed=180 feed_chars=64 agent=Fake Agent" in ln
-                  for ln in stalls), stalls)
-        check("perf: a tick resets the longest feed",
-              tv._perf_feed_view is None and tv._perf_feed_s == 0.0)
-        while now[0] < 100.0 + perf_audit.STALL_WINDOW_S + 2:
-            now[0] += perf_audit.TICK_MS / 1000
-            probe._tick()
-        check("perf: the window's end reports what it suppressed",
-              lines[perf_audit.STALL_LIMIT:]
-              == ["PERF stall suppressed=15 worst_gap=219"],
-              lines[perf_audit.STALL_LIMIT:])
-        now[0] += 0.5
-        probe._tick()
-        check("perf: a stall in the next window is written again",
-              len(lines) == perf_audit.STALL_LIMIT + 2
-              and lines[-1].startswith("PERF stall gap=500 paint=0 grid=-")
-              and lines[-1].endswith("feed=0 feed_chars=0 agent=-"),
-              lines[-1:])
-        for _ in range(perf_audit.STALL_LIMIT):
-            now[0] += 0.3
-            probe._tick()
-        probe.stop()
-        check("perf: stopping reports a count still pending",
-              lines[-1] == "PERF stall suppressed=1 worst_gap=300", lines[-1:])
-        failing = perf_audit.StallProbe(
-            SimpleNamespace(audit=lambda _l: 1 / 0), lambda v: "",
-            clock=lambda: now[0])
-        failing.start()
-        failing._timer.stop()
-        now[0] += 1.0
-        failing._tick()
-        check("perf: a failed write is swallowed", True)
-    finally:
-        perf_audit.StallProbe._reset_max()   # drop the closed view
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-def test_perf_startup_line():
-    """PERF startup: every launch phase in whole ms, and a total from the
-    moment Windows created the process."""
-    import re
-    from types import SimpleNamespace
-
-    from app import perf_audit
-    from app.session_store import SessionStore
-
-    phases = perf_audit.StartupPhases(time.perf_counter(), update=1.25,
-                                      imports=0.4)
-    with phases.measure("setup"):
-        pass
-    with phases.measure("window"):
-        time.sleep(0.01)
-    line = phases.line()
-    check("perf-startup: the line is all key=integer pairs",
-          re.fullmatch(r"PERF startup( \w+=\d+)+", line) is not None, line)
-    fields = dict(re.findall(r"(\w+)=(\d+)", line))
-    check("perf-startup: every phase and the total are present",
-          list(fields) == [*perf_audit.STARTUP_PHASES, "total"], list(fields))
-    check("perf-startup: carried and measured phases in ms",
-          fields["update"] == "1250" and fields["imports"] == "400"
-          and int(fields["window"]) >= 10 and fields["cli_gate"] == "0",
-          fields)
-    age = perf_audit.process_age_s()
-    check("perf-startup: the total counts from the process's creation",
-          sys.platform != "win32" or (age is not None and 0 < age < 86400),
-          age)
-    check("perf-startup: a negative time reads 0, never a minus sign",
-          "total=0" in phases.line(total_s=-0.5), phases.line(total_s=-0.5))
-
-    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-perf-startup-"))
-    try:
-        phases.write(SessionStore(path=tmp / "s.json"))
-        text = (tmp / "s.log").read_text(encoding="utf-8")
-        check("perf-startup: write() appends the line to session.log",
-              " PERF startup update=1250 " in text
-              and not (tmp / "s.json").exists(), text)
-        phases.write(SimpleNamespace(audit=lambda _l: 1 / 0))
-        check("perf-startup: a failed write is swallowed", True)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
-    import main as main_mod
-    src = (ROOT / "main.py").read_text(encoding="utf-8")
-    measured = [p for p in perf_audit.STARTUP_PHASES
-                if f'phases.measure("{p}")' in src]
-    check("perf-startup: main() measures every phase it doesn't carry",
-          measured == [p for p in perf_audit.STARTUP_PHASES
-                       if p not in ("update", "imports")], measured)
-    check("perf-startup: the update and imports times are carried from "
-          "module level",
-          "_STARTUP_UPDATE_S = time.perf_counter() - _t" in src
-          and isinstance(main_mod._STARTUP_IMPORTS_S, float)
-          and main_mod._STARTUP_UPDATE_S == 0.0)
