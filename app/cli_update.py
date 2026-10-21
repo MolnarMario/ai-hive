@@ -434,10 +434,13 @@ def apply(target: Target, outcome: Outcome, runner,
     """The INSTALL phase, and then the only question that matters: did the FILE
     change? Success is decided by `--version` on the resolved binary, never by
     what the installer said about itself."""
+    from . import providers
+
     argv = upgrade_argv(target)
     if not argv:
         return outcome
     rc, text = runner(argv, timeout)
+    providers.forget_claude()   # the binary may have moved
 
     vrc, vtext = runner(version_argv(target), CHECK_TIMEOUT_S)
     after = parse_version(vtext) if vrc == 0 else ""

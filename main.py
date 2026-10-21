@@ -6,6 +6,9 @@ Run with the project venv (or double-click "AI Hive.bat" / "AI Hive.lnk"):
 
 import os
 import sys
+import time
+
+_STARTED = time.perf_counter()  # PERF startup's fallback zero
 
 
 def _fatal(message: str) -> None:
@@ -68,14 +71,18 @@ def _single_instance_guard(
 # modules this needed are dropped and everything below imports fresh files.
 # The audit line waits for the session store in main(). The instance lock
 # comes first: a second launch, refused in main(), must not pull new files
-# under the instance that is running.
+# under the instance that is running. Its time and the imports' time wait
+# for the store the same way, for the PERF startup line.
 _LAUNCH_GUARD = None
 _STARTUP_UPDATE_AUDIT = ""
+_STARTUP_UPDATE_S = 0.0
 if __name__ == "__main__":
     _LAUNCH_GUARD = _single_instance_guard()
     if _LAUNCH_GUARD is not None:
         from app import self_update as _self_update
+        _t = time.perf_counter()
         _result = _self_update.startup_update(_self_update.subprocess_runner)
+        _STARTUP_UPDATE_S = time.perf_counter() - _t
         if _result is not None:
             _STARTUP_UPDATE_AUDIT = _self_update.audit_line(_result)
         if _self_update.startup_failure(_result):
@@ -83,14 +90,19 @@ if __name__ == "__main__":
         for _name in [m for m in sys.modules
                       if m == "app" or m.startswith("app.")]:
             del sys.modules[_name]
-        del _self_update, _result
+        del _self_update, _result, _t
 
+_t = time.perf_counter()
+from app import perf_audit
+from app import ui_theme
 from app.process_worker import AgentKind, build_spec
 from app.pty_worker import HAS_CONPTY, ensure_windowless_console
 from app.session_store import SessionStore
 from app.ui_theme import build_qss
 from app.widgets.main_window import MainWindow
 from app.workspace_manager import WorkspaceManager
+_STARTUP_IMPORTS_S = time.perf_counter() - _t
+del _t
 
 
 def _app_icon():
@@ -144,22 +156,44 @@ def _load_bundled_fonts() -> None:
             QFontDatabase.addApplicationFont(os.path.join(fonts_dir, name))
 
 
-def setup_application(app: QApplication) -> None:
+def _name_application(app: QApplication) -> None:
+    # SessionStore() finds its folder by these names
     app.setOrganizationName("AIHive")
     app.setApplicationName("AI Hive")
+
+
+def setup_application(app: QApplication, ui: dict | None = None) -> None:
+    """`ui` is the saved session's "ui" dict. Its theme and console font go
+    live here, before any widget exists, so the window is built in them and
+    this is the launch's only app stylesheet. Applied after the window was
+    built, the two cost 4.5 s of restyling and a full replay per card, and
+    MainWindow._restore_ui_state still does that for a session whose values
+    aren't active yet (the suite's path)."""
+    _name_application(app)
     app.setStyle("Fusion")  # stable base for QSS on Windows
     app.setWindowIcon(_app_icon())
     _load_bundled_fonts()
     chrome = "Inter" if "Inter" in QFontDatabase.families() else "Segoe UI"
     app.setProperty("chromeFamily", chrome)  # reused by live font rescaling
+    if ui:
+        tid = ui_theme.saved_theme_id(ui)
+        if tid:
+            ui_theme.apply_theme(tid)
+        px = ui_theme.saved_console_px(ui)
+        if px:
+            ui_theme.CONSOLE_FONT_PX = px
     app.setStyleSheet(build_qss(chrome))
 
 
-def create_main_window(store: SessionStore | None = None) -> MainWindow:
-    """Factory used by both __main__ and the offscreen smoke test."""
+def create_main_window(store: SessionStore | None = None,
+                       session: dict | None = None) -> MainWindow:
+    """Factory used by both __main__ and the offscreen smoke test. `session`
+    is what main() already loaded from `store`; without it the factory loads
+    it itself."""
     store = store or SessionStore()
     manager = WorkspaceManager()
-    session = store.load()
+    if session is None:
+        session = store.load()
     manager.load_session_dict(session)
 
     # snapshot every pinned conversation BEFORE any agent launches: whatever
@@ -305,7 +339,13 @@ def main() -> int:
     # before the update splash or the main window: the first agent spawn
     # would otherwise allocate a console that takes the keyboard from AI Hive
     ensure_windowless_console()
-    setup_application(app)
+    phases = perf_audit.StartupPhases(_STARTED, update=_STARTUP_UPDATE_S,
+                                      imports=_STARTUP_IMPORTS_S)
+    _name_application(app)
+    store = SessionStore()
+    session = store.load()
+    with phases.measure("setup"):
+        setup_application(app, session.get("ui"))
     # ---- CLI auto-update gate (opt-in, before anything else exists) --------
     # Windows cannot overwrite a running .exe, and every agent IS a claude.exe
     # child held alive by the Job Object, so THIS is the only moment those
@@ -313,8 +353,6 @@ def main() -> int:
     # autostart_active_workspace. Opting in here rather than in the factory is
     # the same rule as start_usage_polling / recover_blocked_at_startup: the
     # offscreen suite shares the factory and must never shell out.
-    store = SessionStore()
-    session = store.load()
     if _STARTUP_UPDATE_AUDIT:
         try:
             store.audit(_STARTUP_UPDATE_AUDIT)
@@ -323,8 +361,10 @@ def main() -> int:
     gate = None
     if session.get("ui", {}).get("auto_update", False):
         from app.widgets.update_splash import run_update_gate
-        gate = run_update_gate(store)
-    window = create_main_window(store)
+        with phases.measure("cli_gate"):
+            gate = run_update_gate(store)
+    with phases.measure("window"):
+        window = create_main_window(store, session)
     window.quit_on_close = True  # closed window == dead process, always
     # opt in to the plan-usage readout here, not in the factory: the smoke
     # suite shares create_main_window and must never hit the network
@@ -340,9 +380,11 @@ def main() -> int:
     window.refresh_install_state()
     if gate is not None:
         window.note_update_outcomes(gate.outcomes, gate.installing)
-    window.show()
+    with phases.measure("show"):
+        window.show()
     _register_relaunch_properties(int(window.winId()))
-    window.autostart_active_workspace()
+    with phases.measure("autostart"):
+        window.autostart_active_workspace()
     # ...then look for agents a spent plan limit stopped BEFORE this run and
     # arm them to be resumed. Follows the autostart so the ordinary restore
     # happens first and this only has to start the stragglers — an agent the
@@ -350,7 +392,13 @@ def main() -> int:
     # since it was not the user who stopped it. Reads the user's real
     # transcripts and types into real agents, so like the usage poll it is
     # opted into here rather than in the factory the smoke suite shares.
-    window.recover_blocked_at_startup()
+    with phases.measure("recovery"):
+        window.recover_blocked_at_startup()
+    # the launch ends here, and the stall probe takes over from the first
+    # turn of the event loop. The suite shares the factory, so like the usage
+    # poll both are opted into here.
+    phases.write(store)
+    window.arm_stall_probe()
     # last: fill the Open repo dropdowns from GitHub in the background, a few
     # seconds from now, so a click shows the list at once. Network, so it is
     # opted into here like the usage poll.

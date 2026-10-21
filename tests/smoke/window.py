@@ -714,6 +714,216 @@ def test_repo_activity_cache():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+def test_perf_stall_probe():
+    """PERF stall (app/perf_audit.py): a 50 ms timer that measures its own
+    lateness names the longest feed and paint inside a gap over 150 ms. The
+    factory the suite shares never arms it; main.py does."""
+    import inspect
+    import re
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    import main as main_mod
+    from app import perf_audit
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.widgets import terminal_view as tv
+    from main import create_main_window
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-perf-"))
+    log = tmp / "s.log"
+
+    def perf_lines():
+        if not log.exists():
+            return []
+        return [ln for ln in log.read_text(encoding="utf-8").splitlines()
+                if " PERF " in ln]
+
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        win.show()
+        ws = win.manager.workspace(win.manager.active_id)
+        agent = win.manager.add_terminal(
+            ws.id, build_spec(AgentKind.CLAUDE, "Stall Probe",
+                              cwd=SCRATCH_CWD, pty=True), autostart=False)
+        pump(200)
+        stall_timers = [t for t in win.findChildren(QTimer, "perfStallTimer")
+                        if t.isActive()]
+        check("perf: create_main_window writes no PERF line",
+              perf_lines() == [], perf_lines())
+        check("perf: ...and starts no stall timer",
+              win._stall_probe is None and not stall_timers, stall_timers)
+        check("perf: only main() arms the probe and writes the startup line",
+              "arm_stall_probe" in inspect.getsource(main_mod.main)
+              and "phases.write" in inspect.getsource(main_mod.main)
+              and "arm_stall_probe" not in
+              inspect.getsource(main_mod.create_main_window))
+
+        view = win._pages[ws.id].card_for(agent.id).terminal
+        real_feed_screen = view._feed_screen
+
+        def slow_feed_screen(data):
+            time.sleep(0.3)      # the feed that holds the event loop
+            real_feed_screen(data)
+
+        view._feed_screen = slow_feed_screen
+        win.arm_stall_probe()
+        check("perf: arm_stall_probe starts the 50 ms timer",
+              win._stall_probe.is_running())
+        QTimer.singleShot(0, lambda: view.feed("x" * 5000))
+        pump(400)
+        view._feed_screen = real_feed_screen
+        named = [ln for ln in perf_lines()
+                 if "PERF stall gap=" in ln and "agent=Stall Probe" in ln]
+        check("perf: a 300 ms feed writes exactly one stall line naming it",
+              len(named) == 1, perf_lines())
+        fields = dict(re.findall(r"(\w+)=(\d+)", named[0])) if named else {}
+        check("perf: the line holds the gap, the feed's ms and its size",
+              int(fields.get("gap", 0)) >= 290
+              and 290 <= int(fields.get("feed", 0)) <= int(fields["gap"])
+              and fields.get("feed_chars") == "5000", fields)
+
+        # the hooks: feed and paint keep the longest call since the last
+        # tick (no events run between these lines, so no tick resets them)
+        tv._perf_feed_s = tv._perf_paint_s = 0.0
+        view.feed("abc")
+        check("perf: feed records itself as the longest feed",
+              tv._perf_feed_view is view and tv._perf_feed_len == 3
+              and tv._perf_feed_s > 0)
+        view.repaint()
+        check("perf: paintEvent records itself as the longest paint",
+              tv._perf_paint_view is view and tv._perf_paint_s > 0)
+        win.close()
+        pump(50)
+        check("perf: closing the window stops the probe",
+              not win._stall_probe.is_running())
+
+        # the rate limit, on a hand-driven clock: no wall time involved
+        lines = []
+        now = [100.0]
+        probe = perf_audit.StallProbe(SimpleNamespace(audit=lines.append),
+                                      lambda v: "Fake Agent",
+                                      clock=lambda: now[0])
+        probe.start()
+        probe._timer.stop()      # driven by hand from here
+        check("perf: starting resets the longest feed and paint",
+              tv._perf_feed_view is None and tv._perf_paint_view is None)
+        for _ in range(20):
+            now[0] += perf_audit.TICK_MS / 1000
+            probe._tick()
+        check("perf: on-time ticks write nothing", lines == [], lines)
+        for i in range(20):
+            tv._perf_feed_s, tv._perf_feed_len = 0.18, 64
+            tv._perf_feed_view = view
+            now[0] += 0.2 + i / 1000
+            probe._tick()
+        stalls = [ln for ln in lines if ln.startswith("PERF stall gap=")]
+        check("perf: a burst of 20 stalls writes no more than the limit",
+              len(stalls) == perf_audit.STALL_LIMIT == len(lines), lines)
+        check("perf: a fake stall line names the feed",
+              all("feed=180 feed_chars=64 agent=Fake Agent" in ln
+                  for ln in stalls), stalls)
+        check("perf: a tick resets the longest feed",
+              tv._perf_feed_view is None and tv._perf_feed_s == 0.0)
+        while now[0] < 100.0 + perf_audit.STALL_WINDOW_S + 2:
+            now[0] += perf_audit.TICK_MS / 1000
+            probe._tick()
+        check("perf: the window's end reports what it suppressed",
+              lines[perf_audit.STALL_LIMIT:]
+              == ["PERF stall suppressed=15 worst_gap=219"],
+              lines[perf_audit.STALL_LIMIT:])
+        now[0] += 0.5
+        probe._tick()
+        check("perf: a stall in the next window is written again",
+              len(lines) == perf_audit.STALL_LIMIT + 2
+              and lines[-1].startswith("PERF stall gap=500 paint=0 grid=-")
+              and lines[-1].endswith("feed=0 feed_chars=0 agent=-"),
+              lines[-1:])
+        for _ in range(perf_audit.STALL_LIMIT):
+            now[0] += 0.3
+            probe._tick()
+        probe.stop()
+        check("perf: stopping reports a count still pending",
+              lines[-1] == "PERF stall suppressed=1 worst_gap=300", lines[-1:])
+        failing = perf_audit.StallProbe(
+            SimpleNamespace(audit=lambda _l: 1 / 0), lambda v: "",
+            clock=lambda: now[0])
+        failing.start()
+        failing._timer.stop()
+        now[0] += 1.0
+        failing._tick()
+        check("perf: a failed write is swallowed", True)
+    finally:
+        perf_audit.StallProbe._reset_max()   # drop the closed view
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_perf_startup_line():
+    """PERF startup: every launch phase in whole ms, and a total from the
+    moment Windows created the process."""
+    import re
+    from types import SimpleNamespace
+
+    from app import perf_audit
+    from app.session_store import SessionStore
+
+    phases = perf_audit.StartupPhases(time.perf_counter(), update=1.25,
+                                      imports=0.4)
+    with phases.measure("setup"):
+        pass
+    with phases.measure("window"):
+        time.sleep(0.01)
+    line = phases.line()
+    check("perf-startup: the line is all key=integer pairs",
+          re.fullmatch(r"PERF startup( \w+=\d+)+", line) is not None, line)
+    fields = dict(re.findall(r"(\w+)=(\d+)", line))
+    check("perf-startup: every phase and the total are present",
+          list(fields) == [*perf_audit.STARTUP_PHASES, "total"], list(fields))
+    check("perf-startup: carried and measured phases in ms",
+          fields["update"] == "1250" and fields["imports"] == "400"
+          and int(fields["window"]) >= 10 and fields["cli_gate"] == "0",
+          fields)
+    age = perf_audit.process_age_s()
+    check("perf-startup: the total counts from the process's creation",
+          sys.platform != "win32" or (age is not None and 0 < age < 86400),
+          age)
+    check("perf-startup: a negative time reads 0, never a minus sign",
+          "total=0" in phases.line(total_s=-0.5), phases.line(total_s=-0.5))
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-perf-startup-"))
+    try:
+        phases.write(SessionStore(path=tmp / "s.json"))
+        text = (tmp / "s.log").read_text(encoding="utf-8")
+        check("perf-startup: write() appends the line to session.log",
+              " PERF startup update=1250 " in text
+              and not (tmp / "s.json").exists(), text)
+        phases.write(SimpleNamespace(audit=lambda _l: 1 / 0))
+        check("perf-startup: a failed write is swallowed", True)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    import main as main_mod
+    src = (ROOT / "main.py").read_text(encoding="utf-8")
+    measured = [p for p in perf_audit.STARTUP_PHASES
+                if f'phases.measure("{p}")' in src]
+    check("perf-startup: main() measures every phase it doesn't carry",
+          measured == [p for p in perf_audit.STARTUP_PHASES
+                       if p not in ("update", "imports")], measured)
+    check("perf-startup: the update and imports times are carried from "
+          "module level",
+          "_STARTUP_UPDATE_S = time.perf_counter() - _t" in src
+          and isinstance(main_mod._STARTUP_IMPORTS_S, float)
+          and main_mod._STARTUP_UPDATE_S == 0.0)
+
+
 def test_repo_activity_browser_url():
     """The origin remote forms git prints map to the github.com page."""
     from app import repo_activity
@@ -1933,6 +2143,123 @@ def test_themes():
 
     ui_theme.apply_theme("scriptorium-dark")  # leave the default active
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_saved_look_before_widgets():
+    """main() makes the saved theme and console font active in
+    setup_application, before any widget exists. Applied after the window
+    was built, each one restyled every widget through
+    QApplication.setStyleSheet (4.5 s for one user's 2700 widgets), and the
+    font branch called set_font_size on every card, a full replay of each
+    restored screen (5.8 s more). A per-agent font still beats the global one,
+    and a session whose values aren't active yet (the suite's path) still
+    gets both from _restore_ui_state."""
+    from PySide6.QtWidgets import QApplication
+
+    from app import ui_theme
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from app.widgets import terminal_card as tc
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-look-"))
+    term = {"role": "", "cwd": str(tmp), "user_program": "", "user_args": [],
+            "provider": "", "model": "", "effort": "", "custom_command": "",
+            "is_orchestrator": False, "task": "", "assignment": "idle",
+            "auto_created": False, "session_id": "", "kind": "powershell",
+            "running": False}
+    terminals = [{**term, "name": "Line", "pty": False, "font_px": 18}]
+    if HAS_CONPTY:
+        terminals += [{**term, "name": "Plain", "pty": True, "font_px": 0},
+                      {**term, "name": "Own", "pty": True, "font_px": 18}]
+    store = SessionStore(path=tmp / "session.json")
+    store.save({"version": 3, "active": "w", "workspaces": [
+        {"id": "w", "name": "W", "project_path": str(tmp), "layout": "auto",
+         "terminals": terminals}],
+        "ui": {"theme": "adeptus-mechanicus", "console_font_px": 15}})
+
+    def cards(win):
+        return {c.agent.spec.name: c
+                for c in win._pages[win.manager.workspaces[0].id].cards}
+
+    def fonts_hold(win, label):
+        by_name = cards(win)
+        check(f"look: {label}: a line-mode agent keeps its own font",
+              "font-size: 18px" in by_name["Line"].console.styleSheet(),
+              by_name["Line"].console.styleSheet())
+        if HAS_CONPTY:
+            check(f"look: {label}: a pty card follows the saved global font",
+                  by_name["Plain"].terminal.font_size() == 15,
+                  by_name["Plain"].terminal.font_size())
+            check(f"look: {label}: a pty agent's own font beats the global one",
+                  by_name["Own"].terminal.font_size() == 18,
+                  by_name["Own"].terminal.font_size())
+
+    real_set = QApplication.setStyleSheet
+    real_init = tc.TerminalCard.__init__
+    restyles, built, loads = [], [], []
+
+    def counting_set(self, qss):
+        if built:
+            restyles.append(len(qss))
+        return real_set(self, qss)
+
+    def marking_init(self, *a, **kw):
+        built.append(True)
+        return real_init(self, *a, **kw)
+
+    chrome = app.property("chromeFamily") or "Segoe UI"
+    try:
+        # main()'s path: load once, apply the look, hand the factory the
+        # session it already has
+        session = store.load()
+        setup_application(app, session.get("ui"))
+        check("look: setup_application makes the saved theme active",
+              ui_theme.ACTIVE_THEME.id == "adeptus-mechanicus")
+        check("look: ...and the saved console font",
+              ui_theme.CONSOLE_FONT_PX == 15)
+        real_load = store.load
+        store.load = lambda: loads.append(True) or real_load()
+        QApplication.setStyleSheet = counting_set
+        tc.TerminalCard.__init__ = marking_init
+        try:
+            win = create_main_window(store, session)
+        finally:
+            QApplication.setStyleSheet = real_set
+            tc.TerminalCard.__init__ = real_init
+            del store.load
+        check("look: precondition - the window built its cards", built)
+        check("look: no app restyle once the first card exists",
+              restyles == [], restyles)
+        check("look: the factory reuses the session main() loaded",
+              loads == [])
+        check("look: the theme dropdown reflects the saved theme",
+              win._theme_id == "adeptus-mechanicus"
+              and win.top_bar.theme_select.currentData()
+              == "adeptus-mechanicus")
+        fonts_hold(win, "main path")
+        win.close()
+
+        # the suite's path: nothing active yet, so _restore_ui_state applies
+        # both late, as it always did
+        ui_theme.apply_theme(ui_theme.DEFAULT_THEME_ID)
+        ui_theme.CONSOLE_FONT_PX = ui_theme.DEFAULT_CONSOLE_PX
+        app.setStyleSheet(ui_theme.build_qss(chrome))
+        win2 = create_main_window(store)
+        check("look: late path: the saved theme is restored",
+              win2._theme_id == "adeptus-mechanicus"
+              and ui_theme.ACTIVE_THEME.id == "adeptus-mechanicus")
+        check("look: late path: ...and the saved console font",
+              ui_theme.CONSOLE_FONT_PX == 15)
+        fonts_hold(win2, "late path")
+        win2.close()
+    finally:
+        # ui_theme is process-wide and later tests expect the default look
+        ui_theme.apply_theme(ui_theme.DEFAULT_THEME_ID)
+        ui_theme.CONSOLE_FONT_PX = ui_theme.DEFAULT_CONSOLE_PX
+        app.setStyleSheet(ui_theme.build_qss(chrome))
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_review_fixes():
@@ -3791,4 +4118,110 @@ def test_ctrl_tab_cycles_agents():
         win.close()
         pump(100)
     finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_new_agent_spawns_at_card_size():
+    """A new agent spawned at the worker's default 100x30, not at its card's
+    size. add_terminal starts it in the same call stack as the retile, while
+    the card's resize still sat in TerminalView's 120 ms debounce. Measured
+    with a stub worker: cards that settled at 56x93 and 56x61 spawned at
+    30x100, so the child drew its first frame at the wrong width, and a
+    conversation resumed from the New Agent dialog wrapped its whole dump
+    at 100 columns. _on_terminal_added now lays the page out and flushes the
+    card's size before add_terminal starts the agent."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app import pty_worker
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.widgets.terminal_view import TerminalView
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    # the size each worker is spawned at; nothing is launched
+    spawned = {}
+    flushes = []
+    orig_start = pty_worker.PtyWorker.start
+    orig_flush = TerminalView.flush_resize
+
+    def flush(view):
+        flushes.append(view)
+        orig_flush(view)
+
+    pty_worker.PtyWorker.start = (
+        lambda w: spawned.setdefault(w.spec.name, (w.rows, w.cols)))
+    TerminalView.flush_resize = flush
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-spawn-size-"))
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        mgr = win.manager
+
+        def add(ws_id, name):
+            agent = mgr.add_terminal(ws_id, build_spec(
+                AgentKind.POWERSHELL, name, cwd=SCRATCH_CWD, pty=True))
+            return win._pages[ws_id].card_for(agent.id)
+
+        def settled(card):
+            return (card.terminal.screen.lines, card.terminal.screen.columns)
+
+        # the first run adds its agent before show(), and so may anything
+        # else: no geometry to flush, and settle_layout sizes them at launch
+        first = mgr.workspaces[0]
+        add(first.id, "Early")
+        check("spawn size: an agent added before the window is shown "
+              "spawns without a flush or an error",
+              "Early" in spawned and not flushes, (spawned, len(flushes)))
+
+        win.resize(1200, 700)
+        win.show()
+        pump(200)
+
+        card = add(first.id, "Visible")
+        pump(400)
+        check("spawn size: a card added to the visible page spawns at its "
+              "settled size", spawned.get("Visible") == settled(card),
+              (spawned.get("Visible"), settled(card)))
+
+        # the first card of an empty page also shows the page's grid
+        empty = mgr.create_workspace("Empty", SCRATCH_CWD)
+        mgr.set_active(empty.id)
+        pump(200)
+        card = add(empty.id, "Lone")
+        pump(400)
+        check("spawn size: the first card on an empty visible page spawns "
+              "at its settled size", spawned.get("Lone") == settled(card),
+              (spawned.get("Lone"), settled(card)))
+
+        hidden = mgr.create_workspace("Hidden", SCRATCH_CWD)
+        pump(200)
+        card = add(hidden.id, "Hidden1")
+        pump(400)
+        check("spawn size: a card added to a hidden page spawns at its "
+              "settled size", spawned.get("Hidden1") == settled(card),
+              (spawned.get("Hidden1"), settled(card)))
+        # a second card retiles the first; opening the page then lays it
+        # out for real, and the new card keeps the size it spawned at
+        card = add(hidden.id, "Hidden2")
+        mgr.set_active(hidden.id)
+        pump(400)
+        check("spawn size: ...and one added beside it keeps its spawn size "
+              "once the page is opened", spawned.get("Hidden2") == settled(card)
+              and card.agent.worker.cols == settled(card)[1],
+              (spawned.get("Hidden2"), settled(card)))
+        check("spawn size: no new card spawned at the worker default",
+              all(size != (pty_worker.DEFAULT_ROWS, pty_worker.DEFAULT_COLS)
+                  for name, size in spawned.items() if name != "Early"),
+              spawned)
+        win.close()
+        pump(100)
+    finally:
+        pty_worker.PtyWorker.start = orig_start
+        TerminalView.flush_resize = orig_flush
         shutil.rmtree(tmp, ignore_errors=True)

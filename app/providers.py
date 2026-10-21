@@ -24,6 +24,13 @@ DEFAULT_EFFORT = ""
 # cache for user_default_model: (mtime, size, model)
 _USER_MODEL_CACHE: tuple = (0.0, -1, "")
 
+# resolve_claude's PATH lookup: (the PATH it searched, the file it found).
+# One `shutil.which` is about 5 ms and every Claude spec built at load asks
+# for it, so the answer is kept for the launch. A miss is never kept, so a
+# CLI installed by hand while AI Hive runs is still found. forget_claude()
+# drops it.
+_CLAUDE_ON_PATH: tuple = ("", "")
+
 
 @dataclass(frozen=True)
 class Provider:
@@ -231,13 +238,17 @@ def resolve_claude() -> str:
     stores `user_program`, and `from_dict` re-runs `build_spec`). An agent that
     already exists in the LIVE process does not, which is why the migration
     also rebuilds those specs (`MainWindow.rebind_claude_specs`).
+
+    Only the PATH lookup is cached (`_claude_on_path`). The native check runs
+    every time, so a migration is seen on the next call even before the
+    install path calls `forget_claude()`.
     """
     native = os.path.join(os.environ.get("USERPROFILE")
                           or os.path.expanduser("~"),
                           ".local", "bin", "claude.exe")
     if os.path.isfile(native):
         return native
-    found = shutil.which("claude")
+    found = _claude_on_path()
     if found:
         return found
     guess = os.path.join(
@@ -246,6 +257,27 @@ def resolve_claude() -> str:
         r"\Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe"
         r"\claude.exe")
     return guess if os.path.isfile(guess) else "claude.exe"
+
+
+def _claude_on_path() -> str:
+    """`shutil.which("claude")`, kept while PATH is unchanged and the file it
+    named is still there. "" when PATH has no claude."""
+    global _CLAUDE_ON_PATH
+    searched = os.environ.get("PATH", "")
+    key, found = _CLAUDE_ON_PATH
+    if found and key == searched and os.path.isfile(found):
+        return found
+    found = shutil.which("claude") or ""
+    _CLAUDE_ON_PATH = (searched, found)
+    return found
+
+
+def forget_claude() -> None:
+    """Drop the cached PATH lookup, so the next `resolve_claude()` searches
+    again. `cli_install` and `cli_update` call it after every step that
+    installs, upgrades or removes a Claude Code binary."""
+    global _CLAUDE_ON_PATH
+    _CLAUDE_ON_PATH = ("", "")
 
 
 def user_default_model() -> str:
@@ -458,8 +490,8 @@ def _codex_package_dirs(program: str) -> list:
 
 def detected(key: str) -> bool:
     if key == "claude":
-        prog = resolve_claude()
-        return bool(shutil.which("claude")) or os.path.isfile(prog)
+        return (os.path.isfile(resolve_claude())
+                or bool(_claude_on_path()))
     p = PROVIDERS.get(key)
     if p is None:
         return False

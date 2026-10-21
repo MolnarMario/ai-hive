@@ -213,6 +213,19 @@ DEFAULT_CONSOLE_PX = 13
 CONSOLE_FONT_PX = DEFAULT_CONSOLE_PX
 
 
+def saved_theme_id(ui: dict) -> str | None:
+    """The session's saved skin, or None when it names no known theme."""
+    tid = ui.get("theme")
+    return tid if tid in THEMES else None
+
+
+def saved_console_px(ui: dict) -> int:
+    """The session's saved console font size, or 0 when it is unset or
+    outside 7 to 40 px."""
+    px = int(ui.get("console_font_px", 0) or 0)
+    return px if 7 <= px <= 40 else 0
+
+
 # ------------------------------------------------------------ vendor inks ---
 # The live model chip (#CardModel) is coloured by WHOSE agent it is, not by the
 # active skin -- so a hive of mixed agents is readable at a glance and the same

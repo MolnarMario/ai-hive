@@ -406,14 +406,35 @@ class PageStack(QStackedWidget):
         self._hidden_layout_timer.setSingleShot(True)
         self._hidden_layout_timer.setInterval(self.LAYOUT_DEBOUNCE_MS)
         self._hidden_layout_timer.timeout.connect(self.layout_hidden_pages)
+        self._batching = False      # see layout_batched
+        self._layout_owed = False
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._hidden_layout_timer.start()
 
+    @contextlib.contextmanager
+    def layout_batched(self):
+        """Hidden-page layouts asked for inside the block become one pass,
+        run when it ends. A session restore adds its pages one at a time
+        (`MainWindow._adopt_existing_model`), and a pass per page went over
+        every page added before it."""
+        self._batching = True
+        self._layout_owed = False
+        try:
+            yield
+        finally:
+            self._batching = False
+            owed, self._layout_owed = self._layout_owed, False
+            if owed:
+                self.layout_hidden_pages()
+
     def layout_hidden_pages(self) -> None:
         """Hand every off-screen page the current page's rect."""
         self._hidden_layout_timer.stop()
+        if self._batching:
+            self._layout_owed = True
+            return
         rect = self.contentsRect()
         if rect.width() <= 0 or rect.height() <= 0:
             return          # not laid out yet; the next resize does it
@@ -2545,6 +2566,8 @@ class MainWindow(QMainWindow):
         # _on_usage_tracker_toggled: a tracker switched on inside the offscreen
         # suite must never start shelling out to the user's real agy CLI.
         self._polling = False
+        # the PERF stall probe (app/perf_audit.py), armed by main.py only
+        self._stall_probe = None
         # taskbar working-count overlay. The default MUST be set here, above
         # _restore_ui_state, or the restored preference is clobbered back to on.
         self._taskbar_badge = True    # user preference (persisted)
@@ -2556,7 +2579,7 @@ class MainWindow(QMainWindow):
         # other preferences or the restored value is clobbered.
         self._reply_stamps = True     # user preference (persisted)
         self._tooltips = True         # user preference (persisted)
-        tooltips.install()            # width cap + switch, app-wide
+        # the tooltip filter goes on at the first show (showEvent), not here
         # startup CLI auto-update. Default OFF (it changes installed software),
         # and like every other preference here the default MUST be assigned
         # above _restore_ui_state or the restored value is clobbered.
@@ -2740,7 +2763,8 @@ class MainWindow(QMainWindow):
         self._rearm_agent_configs()  # restored claude agents re-acquire MCP tools
 
         self._build_ui()
-        self._adopt_existing_model()
+        self._adopt_existing_model(
+            (session or {}).get("ui", {}).get("file_trees_open", []))
         self._wire_model()
         self.lane_service.lanesChanged.connect(self._on_lanes_changed)
         self.lane_service.overlapFound.connect(self._on_lane_overlap)
@@ -3069,19 +3093,35 @@ class MainWindow(QMainWindow):
         if self.top_bar.toggle_btn.sidebar_open() != is_open:
             self.top_bar.toggle_btn.set_sidebar_open(is_open)
 
-    def _adopt_existing_model(self) -> None:
+    def _adopt_existing_model(self, open_trees=()) -> None:
         """Build pages/rows for workspaces created before this window existed
-        (session restore happens before the window is constructed)."""
-        for ws in self.manager.workspaces:
-            self._on_workspace_added(ws)
-            for agent in ws.agents:
-                self._pages[ws.id].add_agent(agent)
-            self.sidebar.set_stats(ws.id, self.manager.workspace_stats(ws.id))
-        # arrange rows into the restored order + categories (rows were appended
-        # top-level as each workspace was added above)
-        self.sidebar.apply_layout(self.manager.sidebar_layout())
-        for ws in self.manager.workspaces:   # re-apply stats after the rebuild
-            self.sidebar.set_stats(ws.id, self.manager.workspace_stats(ws.id))
+        (session restore happens before the window is constructed).
+
+        The sidebar rebuilds once and the hidden pages get one layout pass,
+        after every page has its cards and the rows have their order,
+        categories, stats and open file trees. Workspace by workspace, each
+        add rebuilt the sidebar and laid out every page before it: 0.5 to
+        0.9 s for 15 workspaces, growing with the square of the count, plus
+        the restyle of 135 dead rows (`Sidebar.rebuilds_batched`). The
+        pass still comes before anything that reads a card's width: the font
+        loop in `_restore_ui_state`, each card's REPLAY_SETTLE_MS backstop
+        and `settle_layout`."""
+        with self.sidebar.rebuilds_batched(), self.stack.layout_batched():
+            for ws in self.manager.workspaces:
+                self._on_workspace_added(ws)
+                for agent in ws.agents:
+                    self._pages[ws.id].add_agent(agent)
+                self.sidebar.set_stats(ws.id,
+                                       self.manager.workspace_stats(ws.id))
+            # arrange rows into the restored order + categories (rows were
+            # appended top-level as each workspace was added above)
+            self.sidebar.apply_layout(self.manager.sidebar_layout())
+            self.sidebar.set_open_file_trees(open_trees)
+            # the pass skips the current page, so the active one goes current
+            # first and the pass covers every page that stays hidden
+            page = self._pages.get(self.manager.active_id)
+            if page is not None:
+                self.stack.setCurrentWidget(page)
         active = self.manager.active_id
         if active:
             self._on_active_changed(active)
@@ -3185,6 +3225,27 @@ class MainWindow(QMainWindow):
         self._usage_tick_timer.start()
         for poller in self._usage_pollers.values():
             poller.start()                  # a poller nothing wants stays off
+
+    def arm_stall_probe(self) -> None:
+        """Log event-loop stalls to session.log as `PERF stall` lines
+        (app/perf_audit.py). OPT-IN, called by main.py only, like
+        `start_usage_polling`: the suite builds many windows per process and
+        must never write these lines or run the timer unless a test arms it
+        on purpose."""
+        from ..perf_audit import StallProbe
+        if self._stall_probe is None:
+            self._stall_probe = StallProbe(self.store,
+                                           self._agent_name_for_view, self)
+        self._stall_probe.start()
+
+    def _agent_name_for_view(self, view) -> str:
+        """The name of the agent whose card shows `view`, or "" for a view
+        no card owns any more."""
+        for page in self._pages.values():
+            for card in page.cards:
+                if card.terminal is view:
+                    return card.agent.spec.name
+        return ""
 
     def usage_poller(self, name: str) -> usage_poll.UsagePoller:
         """The poller behind one usage source ("claude", "gemini", "codex")."""
@@ -6006,9 +6067,12 @@ class MainWindow(QMainWindow):
     def _restore_ui_state(self, session: dict) -> None:
         ui = session.get("ui", {})
         # restore the saved skin FIRST so the stylesheet below is built once
-        # with the right palette (and the dropdown reflects it silently)
-        tid = ui.get("theme")
-        if tid in ui_theme.THEMES and tid != ui_theme.ACTIVE_THEME.id:
+        # with the right palette (and the dropdown reflects it silently).
+        # main() makes the saved skin and font active before the window is
+        # built (setup_application), so on a real launch both branches below
+        # find them active and skip the restyle and the per-card font loop.
+        tid = ui_theme.saved_theme_id(ui)
+        if tid and tid != ui_theme.ACTIVE_THEME.id:
             from PySide6.QtWidgets import QApplication
             ui_theme.apply_theme(tid)
             self._theme_id = tid
@@ -6113,8 +6177,8 @@ class MainWindow(QMainWindow):
             self.body_split.setSizes([self._sidebar_saved_width, 1000])
         self._sync_ws_rail()
         # restore the global console font (pages already built → refresh them)
-        px = int(ui.get("console_font_px", 0) or 0)
-        if 7 <= px <= 40 and px != ui_theme.CONSOLE_FONT_PX:
+        px = ui_theme.saved_console_px(ui)
+        if px and px != ui_theme.CONSOLE_FONT_PX:
             from PySide6.QtWidgets import QApplication
             ui_theme.CONSOLE_FONT_PX = px
             app = QApplication.instance()
@@ -6127,9 +6191,8 @@ class MainWindow(QMainWindow):
                         card.terminal.set_font_size(px)
                     elif not card.is_pty and card.agent.spec.font_px:
                         card.reapply_font()
-        # re-open the file trees that were open last session (sidebar rows are
-        # already built by _adopt_existing_model; unknown ids are dropped)
-        self.sidebar.set_open_file_trees(ui.get("file_trees_open", []))
+        # the file trees open last session were re-opened inside
+        # _adopt_existing_model, before its one sidebar rebuild
 
     # ------------------------------------------------------- model events ---
 
@@ -6423,11 +6486,23 @@ class MainWindow(QMainWindow):
             card = page.add_agent(agent)
             if agent.spec.lane:
                 card.set_lane_view(self.lane_service.view(agent.spec.uid))
-            if not page.isVisible():
+            if page.isVisible():
+                # the retile only posted its layout request; run it now so
+                # the new card has its cell before the flush below
+                page.grid.activate()
+            else:
                 # the retile changed every card's width on a page Qt will not
                 # lay out; without this the new card (and its siblings) keep a
                 # width their children would then paint at (see PageStack)
                 self.stack.layout_hidden_pages()
+            # add_terminal starts the agent the moment this returns, and the
+            # child paints at the size it is spawned at (see settle_layout).
+            # A window never shown has no size to give: the first-run agent
+            # is added before show(), and settle_layout sizes it at launch.
+            if (card.is_pty and card.terminal is not None
+                    and self.stack.isVisible()
+                    and not self.stack.contentsRect().isEmpty()):
+                card.terminal.flush_resize()
         if agent.spec.lane:
             # after the add returns: by then the dialog has marked a lane
             # being created as pending, so the first poll skips its folder
@@ -6822,6 +6897,13 @@ class MainWindow(QMainWindow):
         self._page_border.raise_()
         self._page_border.update()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # width cap + switch, app-wide. Installed after the build, and one
+        # pass of the event loop after the show, so neither one's storm of
+        # palette, font and style events goes through Python (tooltips.install)
+        QTimer.singleShot(0, tooltips.install)
+
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
         # left fullscreen some other way than F11 (a Windows shortcut):
@@ -6880,8 +6962,13 @@ class MainWindow(QMainWindow):
         The one exception is a provider whose CLI was still installing when the
         user skipped the update splash: its binary is being rewritten right
         now, so starting an agent could execute a half written file. Those wait
-        for the user (the top-bar pill says so) rather than being started."""
-        self.settle_layout()
+        for the user (the top-bar pill says so) rather than being started.
+
+        The snapshots go BEFORE `settle_layout`. Its resize flush is what
+        projects a restored screen at the settled width, a full replay
+        through pyte per card (0.4 to 0.6 s for a large one), and for a card
+        about to start that projection would only be wiped a moment later."""
+        starting = []
         for ws in self.manager.workspaces:
             page = self._pages.get(ws.id)
             for agent in ws.agents:
@@ -6897,7 +6984,14 @@ class MainWindow(QMainWindow):
                     card = page.card_for(agent.id) if page is not None else None
                     if card is not None:
                         card.drop_restored_screen()
-                    agent.start()
+                    starting.append((ws, agent))
+        self.settle_layout()
+        # settle_layout pumps the event loop, and a queued close in there can
+        # remove an agent or its workspace. Removal disposes the agent, and
+        # start() would still spawn a child nothing owns.
+        for ws, agent in starting:
+            if agent in ws.agents and not agent.is_running():
+                agent.start()
 
     def settle_layout(self) -> None:
         """Give every card its FINAL width before any pty child is spawned.
@@ -6934,12 +7028,18 @@ class MainWindow(QMainWindow):
            columns and was widened to 46 a moment later. So the hidden pages
            are laid out and the window pumped until its size stops changing.
 
+        Each card's settle backstop is held until after the flush
+        (`TerminalCard.hold_settle_backstop`), so a restored screen is
+        projected once, at the settled width.
+
         Cheap and idempotent: `_apply_resize` returns early when nothing
         changed, so calling this again costs a queue pump."""
         from PySide6.QtCore import QEventLoop
         from PySide6.QtWidgets import QApplication
 
         app = QApplication.instance()
+        held = [card for page in self._pages.values() for card in page.cards
+                if card.hold_settle_backstop()]
         if app is not None:
             # let the window reach its real (possibly maximized) geometry, and
             # the visible page tile into it
@@ -6958,10 +7058,14 @@ class MainWindow(QMainWindow):
             app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             if self.size() == before:
                 break
-        for page in self._pages.values():
-            for card in page.cards:
-                if card.is_pty and card.terminal is not None:
-                    card.terminal.flush_resize()
+        cards = [card for page in self._pages.values() for card in page.cards]
+        for card in cards:
+            if card.is_pty and card.terminal is not None:
+                card.terminal.flush_resize()
+        # cards still on a page only: one closed during the pumps is gone
+        for card in cards:
+            if card in held:
+                card.release_settle_backstop()
 
     # -------------------------------------------------------- persistence ---
 
@@ -7093,6 +7197,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._closing = True
+        # teardown blocks the GUI thread on purpose; that is not a stall
+        if self._stall_probe is not None:
+            self._stall_probe.stop()
         # every agent is about to be stopped, and none of that is news
         if self.event_hub is not None:
             self.event_hub.shutdown()

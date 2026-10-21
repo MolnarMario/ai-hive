@@ -864,6 +864,13 @@ Hard-won rules, each with a regression test:
   (tmp + rename). Every save and load-failure appends a forensic line to
   `session.log` (timestamp, pid, per-workspace terminal counts) so any future
   loss is attributable.
+- **Launches and stalls are timed.** Every launch appends one `PERF startup`
+  line to `session.log` with each phase in ms (update check, imports, window
+  build, show, autostart, limit scan) and the total since Windows started the
+  process. A 50 ms timer watches the GUI thread. When it fires more than
+  150 ms late, a `PERF stall` line gives the gap, the longest terminal feed
+  inside it (ms, size, agent) and the longest paint (ms, grid). At most five
+  go out a minute, and one more line counts the rest.
 - **Conversations are backed up.** Claude Code keeps each conversation as a
   single file it owns (`~/.claude/projects/...`) — AI Hive snapshots every
   pinned agent's transcript into `%APPDATA%\AIHive\AI Hive\transcripts\` on
@@ -989,7 +996,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3635 checks drive the real app headlessly (offscreen Qt platform) with real
+3739 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1136,7 +1143,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3635 checks)
+                           (3739 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

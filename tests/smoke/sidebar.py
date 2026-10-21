@@ -996,6 +996,204 @@ def test_manager_categories_persist():
           and all(n["type"] == "workspace" for n in mgr3.sidebar_layout()))
 
 
+def test_restore_builds_rows_once():
+    """A restored session builds the sidebar once and lays the hidden pages out
+    once (MainWindow._adopt_existing_model). Adding the workspaces one at a
+    time rebuilt the sidebar per workspace and laid out every page added so
+    far each time: 17 rebuilds, 150 rows and 15 passes for 15 workspaces.
+    The batched rows must match the one-at-a-time ones, the one pass must
+    come after the last card is added (in a window shown before adoption,
+    every card on a hidden page has its laid-out size when adoption ends),
+    and a workspace added later still gets its row and its layout at once."""
+    from PySide6.QtCore import QEventLoop, Qt, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.widgets import main_window as mw
+    from app.widgets.sidebar import Sidebar, WorkspaceRow
+    from app.workspace_manager import WorkspaceManager
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-batch-"))
+    src = WorkspaceManager()
+    wss = []
+    for i in range(15):
+        folder = tmp / f"ws{i}"
+        (folder / "pkg").mkdir(parents=True)
+        (folder / "readme.md").write_text("x", encoding="utf-8")
+        wss.append(src.create_workspace(f"W{i}", str(folder)))
+    # cards on the first page in sidebar order (ws6: the stack's current page
+    # while the pages are added), the last one (ws14: added after every
+    # earlier pass), one in between and the active one
+    for i, n in ((6, 2), (5, 1), (7, 1), (14, 1)):
+        for k in range(n):
+            src.add_terminal(wss[i].id, build_spec(
+                AgentKind.CMD, f"A{i}{k}", cwd=wss[i].project_path),
+                autostart=False)
+    ids = [w.id for w in wss]
+    src.apply_sidebar_layout([
+        {"type": "workspace", "id": ids[6]},
+        {"type": "category", "id": "cw", "name": "Work", "collapsed": True,
+         "children": [ids[3], ids[4]]},
+        {"type": "category", "id": "cp", "name": "Play", "collapsed": False,
+         "children": [ids[10], ids[2]]},
+    ])
+    src.set_active(ids[7])
+    data = src.to_session_dict()
+    open_trees = [ids[2], ids[3], ids[9]]
+    data["ui"] = {"file_trees_open": open_trees}
+    store = SessionStore(path=tmp / "session.json")
+    store.save(data)
+
+    orig = (Sidebar.rebuild, Sidebar._add_ws_item,
+            mw.PageStack.layout_hidden_pages, mw.MainWindow._adopt_existing_model)
+
+    def build(show_first=False):
+        """create_main_window, counting the work, and with show_first the
+        hidden cards a fresh pass right after adoption would still move."""
+        counts = {"rebuild": 0, "rows": 0, "pass": 0}
+
+        def rebuild(self):
+            counts["rebuild"] += not self._batching
+            orig[0](self)
+
+        def add_ws_item(self, *a):
+            counts["rows"] += 1
+            orig[1](self, *a)
+
+        def layout_hidden_pages(self):
+            counts["pass"] += not self._batching
+            orig[2](self)
+
+        def adopt(self, *a):
+            if show_first:
+                # at launch the window shows after adoption, and a page shown
+                # inside a hidden stack lays out only its own top level, so
+                # no card can have its width yet. Shown first, the pass
+                # reaches the cards.
+                self.resize(1200, 700)
+                self.show()
+            orig[3](self, *a)
+            if show_first:
+                hidden = [c for p in self._pages.values()
+                          if p is not self.stack.currentWidget()
+                          for c in p.cards]
+                was = {c: c.geometry() for c in hidden}
+                orig[2](self.stack)
+                counts["hidden"] = [c.agent.spec.name for c in hidden]
+                counts["moved"] = {c.agent.spec.name: (g, c.geometry())
+                                   for c, g in was.items()
+                                   if g != c.geometry()}
+
+        Sidebar.rebuild = rebuild
+        Sidebar._add_ws_item = add_ws_item
+        mw.PageStack.layout_hidden_pages = layout_hidden_pages
+        mw.MainWindow._adopt_existing_model = adopt
+        try:
+            return create_main_window(store), counts
+        finally:
+            (Sidebar.rebuild, Sidebar._add_ws_item,
+             mw.PageStack.layout_hidden_pages,
+             mw.MainWindow._adopt_existing_model) = orig
+
+    win, built = build()
+    sb = win.sidebar
+    mgr = win.manager
+    check("batch: the window build rebuilds the sidebar once",
+          built["rebuild"] == 1, built)
+    check("batch: one row built per workspace", built["rows"] == 15, built)
+    check("batch: one hidden-page layout pass", built["pass"] == 1, built)
+    # a rebuild's old rows go by deleteLater, and no event loop runs during
+    # the build: every row still alive got re-polished by both stylesheet
+    # applications in _restore_ui_state
+    alive = [w for w in QApplication.allWidgets()
+             if isinstance(w, WorkspaceRow) and win.isAncestorOf(w)]
+    check("batch: no discarded rows outlive the build",
+          len(alive) == 15, len(alive))
+    check("batch: restoring the rows schedules no save",
+          not win._save_timer.isActive())
+
+    # the same rows the one-at-a-time path builds
+    ref = Sidebar()
+    ref.files_root_provider = sb.files_root_provider
+    ref.agents_provider = sb.agents_provider
+    for ws in mgr.workspaces:
+        ref.add_row(ws.id, ws.name, os.path.basename(ws.project_path))
+        ref.set_stats(ws.id, mgr.workspace_stats(ws.id))
+    ref.apply_layout(mgr.sidebar_layout())
+    ref.set_open_file_trees(open_trees)
+    ref.set_active_row(mgr.active_id)
+
+    def shape(bar):
+        def walk(item):
+            data = item.data(0, Qt.ItemDataRole.UserRole) or {}
+            node = [data.get("type"), data.get("id") or data.get("path"),
+                    item.isExpanded()]
+            row = bar.tree.itemWidget(item, 0)
+            if isinstance(row, WorkspaceRow):
+                node += [row.name_label.text(), row._folder, row._last_stats,
+                         bool(row.property("active"))]
+            return node + [[walk(item.child(i))
+                            for i in range(item.childCount())]]
+        top = bar.tree.invisibleRootItem()
+        return [walk(top.child(i)) for i in range(top.childCount())]
+
+    got = shape(sb)
+    check("batch: rows, order, categories, stats and trees match",
+          got == shape(ref), got)
+    check("batch: categories and order restored",
+          sb._snapshot() == ref._snapshot() and ref._ws_node_ids()[:5]
+          == [ids[6], ids[3], ids[4], ids[10], ids[2]], sb._snapshot())
+    check("batch: the open file trees came back with their files",
+          sb.open_file_trees() == sorted(open_trees)
+          and {k[0] for k in sb._file_rows} == {ids[2], ids[3], ids[9]},
+          (sb.open_file_trees(), {k[0] for k in sb._file_rows}))
+    check("batch: the active row is lit",
+          [w for w, r in sb._ws_widgets.items() if r.property("active")]
+          == [ids[7]] and mgr.active_id == ids[7])
+    ref.deleteLater()
+    win.close()
+    pump(50)
+
+    # every card on a hidden page has its laid-out size once adoption ends
+    win, built = build(show_first=True)
+    check("batch: the first, last and middle hidden pages have cards",
+          sorted(built.get("hidden", [])) == ["A140", "A50", "A60", "A61"],
+          built.get("hidden"))
+    first = win._pages[ids[6]].cards
+    check("batch: the cards on the first page were tiled",
+          len(first) == 2 and first[0].geometry() != first[1].geometry(),
+          [c.geometry() for c in first])
+    check("batch: every hidden card was laid out when adoption ended",
+          not built.get("moved", True), built.get("moved"))
+
+    # a workspace added at runtime: its row and its layout come at once
+    pump(200)
+    late_dir = tmp / "late"
+    late_dir.mkdir()
+    rows = len(win.sidebar._ws_widgets)
+    late = win.manager.create_workspace("Late", str(late_dir))
+    page = win._pages.get(late.id)
+    check("batch: a runtime workspace gets its row at once",
+          late.id in win.sidebar._ws_widgets
+          and len(win.sidebar._ws_widgets) == rows + 1
+          and win.sidebar._ws_node_ids()[-1] == late.id)
+    check("batch: a runtime workspace's hidden page is laid out at once",
+          page is not None and not page.isVisible()
+          and page.geometry() == win.stack.contentsRect(),
+          (page.geometry() if page else None, win.stack.contentsRect()))
+    win.close()
+    pump(50)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_category_container():
     """The category container (a tinted box behind a category + its members)
     keys off row-group membership: the header and its child workspaces belong to

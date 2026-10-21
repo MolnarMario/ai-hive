@@ -591,6 +591,16 @@ _BLOCK_RECTS = {
 # them as a stipple would moire against the cell grid at small font sizes.
 _BLOCK_SHADES = {"░": 0.25, "▒": 0.50, "▓": 0.75}
 
+# The longest feed and paint since the stall probe last looked
+# (app/perf_audit.py reads and resets them every tick). feed and paintEvent
+# are the hottest code in the app, so each pays one perf_counter pair and a
+# compare here, and stores a reference only on a new longest.
+_perf_feed_s = 0.0
+_perf_feed_len = 0
+_perf_feed_view = None
+_perf_paint_s = 0.0
+_perf_paint_view = None
+
 
 class TerminalView(QWidget):
     keyInput = Signal(str)        # VT byte sequence for the PTY
@@ -787,6 +797,8 @@ class TerminalView(QWidget):
     # -------------------------------------------------------------- data ---
 
     def feed(self, data: str) -> None:
+        global _perf_feed_s, _perf_feed_len, _perf_feed_view
+        t0 = time.perf_counter()
         # pyte mis-parses CSI sequences with a <, >, or = private-parameter
         # marker (e.g. modifyOtherKeys "ESC[>4;2m" / Kitty keyboard "ESC[>1u")
         # as ordinary SGR — "ESC[>4;2m" becomes SGR-4 = underline and turns it
@@ -834,6 +846,9 @@ class TerminalView(QWidget):
         self.update()
         self._gap_timer.start()
         self._find_dirty()
+        t0 = time.perf_counter() - t0
+        if t0 > _perf_feed_s:
+            _perf_feed_s, _perf_feed_len, _perf_feed_view = t0, len(data), self
 
     def _feed_screen(self, data: str) -> None:
         top_before = self.screen.history.top
@@ -1717,8 +1732,9 @@ class TerminalView(QWidget):
         SPAWNED. A child told its width 120ms late has already painted at the
         wrong one, and nothing downstream can undo that — the child hard-wraps
         its own text, so those lines keep the width they were written for no
-        matter how the raw stream is projected afterwards. See
-        `MainWindow.settle_layout`, the only caller."""
+        matter how the raw stream is projected afterwards. The callers are
+        `MainWindow.settle_layout` at launch and
+        `MainWindow._on_terminal_added` for a card added later."""
         self._resize_timer.stop()
         self._apply_resize()
 
@@ -3181,6 +3197,8 @@ class TerminalView(QWidget):
             painter.fillRect(rx0, ry0, rx1 - rx0, ry1 - ry0, color)
 
     def paintEvent(self, event) -> None:
+        global _perf_paint_s, _perf_paint_view
+        t0 = time.perf_counter()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         painter.fillRect(self.rect(), QColor(Palette.BG_CONSOLE))
@@ -3443,3 +3461,6 @@ class TerminalView(QWidget):
                 self._im_rect = rect
                 QGuiApplication.inputMethod().update(
                     Qt.InputMethodQuery.ImCursorRectangle)
+        t0 = time.perf_counter() - t0
+        if t0 > _perf_paint_s:
+            _perf_paint_s, _perf_paint_view = t0, self

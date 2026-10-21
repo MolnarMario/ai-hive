@@ -1791,6 +1791,25 @@ class TerminalCard(QFrame):
         except (RuntimeError, TypeError):
             pass
 
+    def hold_settle_backstop(self) -> bool:
+        """Stop the REPLAY_SETTLE_MS backstop. True if it was armed, and then
+        the caller owes this card a `release_settle_backstop`.
+
+        `MainWindow.settle_layout` holds them. The window build takes longer
+        than the backstop, so its first queue pump would fire every one and
+        project each restored screen at its constructor's width, only for the
+        resize flush right after to project it again at the settled one."""
+        if not self._settle_timer.isActive():
+            return False
+        self._settle_timer.stop()
+        return True
+
+    def release_settle_backstop(self) -> None:
+        """Run a held backstop now, unless a size change already projected
+        the restored screen."""
+        if self._pending_replay:
+            self._rerender_restored()
+
     def drop_restored_screen(self) -> None:
         """Give the launching child a clean terminal.
 
@@ -1887,11 +1906,11 @@ class TerminalCard(QFrame):
         self._refresh_overlay()
         if seeded and not self.agent.is_running()                 and not self._awaiting_start():
             # this projection IS the stopped card's final picture, so it is
-            # the moment to dissolve. A card about to autostart passes through
-            # here too (settle_layout flushes every resize before any child is
-            # spawned), and does NOT flicker: agent.start() re-raises the veil
-            # in the same call stack, and BootVeil.begin() stops the fader and
-            # resets _fade, so the 260ms fade never paints a frame.
+            # the moment to dissolve. A card about to autostart never gets
+            # here: autostart_active_workspace drops its seed before
+            # settle_layout flushes the resize. A start that does follow a
+            # projection doesn't flicker either: BootVeil.begin() stops the
+            # fader and resets _fade.
             self._end_boot_veil()
 
     def _refresh_overlay(self) -> None:
