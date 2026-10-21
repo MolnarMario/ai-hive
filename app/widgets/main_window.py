@@ -2452,6 +2452,8 @@ class MainWindow(QMainWindow):
         # _on_usage_tracker_toggled: a tracker switched on inside the offscreen
         # suite must never start shelling out to the user's real agy CLI.
         self._polling = False
+        # the PERF stall probe (app/perf_audit.py), armed by main.py only
+        self._stall_probe = None
         # taskbar working-count overlay. The default MUST be set here, above
         # _restore_ui_state, or the restored preference is clobbered back to on.
         self._taskbar_badge = True    # user preference (persisted)
@@ -3092,6 +3094,27 @@ class MainWindow(QMainWindow):
         self._usage_tick_timer.start()
         for poller in self._usage_pollers.values():
             poller.start()                  # a poller nothing wants stays off
+
+    def arm_stall_probe(self) -> None:
+        """Log event-loop stalls to session.log as `PERF stall` lines
+        (app/perf_audit.py). OPT-IN, called by main.py only, like
+        `start_usage_polling`: the suite builds many windows per process and
+        must never write these lines or run the timer unless a test arms it
+        on purpose."""
+        from ..perf_audit import StallProbe
+        if self._stall_probe is None:
+            self._stall_probe = StallProbe(self.store,
+                                           self._agent_name_for_view, self)
+        self._stall_probe.start()
+
+    def _agent_name_for_view(self, view) -> str:
+        """The name of the agent whose card shows `view`, or "" for a view
+        no card owns any more."""
+        for page in self._pages.values():
+            for card in page.cards:
+                if card.terminal is view:
+                    return card.agent.spec.name
+        return ""
 
     def usage_poller(self, name: str) -> usage_poll.UsagePoller:
         """The poller behind one usage source ("claude", "gemini", "codex")."""
@@ -6998,6 +7021,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._closing = True
+        # teardown blocks the GUI thread on purpose; that is not a stall
+        if self._stall_probe is not None:
+            self._stall_probe.stop()
         # every agent is about to be stopped, and none of that is news
         if self.event_hub is not None:
             self.event_hub.shutdown()
