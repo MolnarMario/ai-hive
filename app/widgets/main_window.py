@@ -1572,19 +1572,23 @@ class AddTerminalDialog(QDialog):
     opening, before the dialog appeared. Until it arrives the picker says
     "Loading conversations" and OK is off for Claude, so Enter can't start
     a fresh conversation the user meant to resume. `busy_ids` and
-    `live_lane_roots` may be callables, asked again when the list arrives:
-    an agent that started meanwhile holds its conversation by then.
+    `live_lane_roots` may be callables. The read starts with what they say
+    then, so it skips parsing those transcripts, and they are asked again
+    when the list arrives: an agent that started meanwhile holds its
+    conversation by then. `audit` takes one line for session.log when the
+    read fails.
     """
 
     def __init__(self, default_name: str, parent=None,
                  cwd: str = "", busy_ids=(),
                  max_count: int = MAX_AGENTS_PER_WORKSPACE,
                  lane_default: bool = False, repo_root: str = "",
-                 live_lane_roots=()):
+                 live_lane_roots=(), audit=None):
         super().__init__(parent)
         self.setWindowTitle("New Agent")
         self.setMinimumWidth(420)
         self._cwd = cwd
+        self._audit = audit or (lambda _line: None)
         # conversations a running agent holds
         self._busy_ids = self._supplier(busy_ids)
         self._resume_loaded = False     # the read has started (once per dialog)
@@ -1913,6 +1917,10 @@ class AddTerminalDialog(QDialog):
         self.resume_combo.addItem("Loading conversations…", None)
         self.resume_combo.setEnabled(False)
         cwd, repo = self._cwd, self._repo_root
+        # what is busy now never makes the list, so the read skips parsing
+        # it. `_on_resume_read` filters again for what turned busy meanwhile
+        skip_ids = frozenset(self._busy_ids())
+        skip_roots = tuple(r for r in self._live_lane_roots() if r)
 
         def read() -> list:
             # no Qt in here. lane_conversations reads transcripts under
@@ -1924,7 +1932,9 @@ class AddTerminalDialog(QDialog):
                          for c in session_sync.conversation_previews(cwd)]
             if repo:
                 rows += [(c.mtime, c.preview, c.session_id, c)
-                         for c in lanes.lane_conversations(repo)]
+                         for c in lanes.lane_conversations(
+                             repo, exclude_roots=skip_roots,
+                             exclude_ids=skip_ids)]
             return rows
 
         from .self_update_dialog import Job
@@ -1945,7 +1955,11 @@ class AddTerminalDialog(QDialog):
             return              # the dialog closed first
         self._resume_job = None
         if not isinstance(rows, list):
-            rows = []           # the read raised: offer a fresh conversation
+            # both readers promise never to raise, so this is a bug. Offer a
+            # fresh conversation, and leave a trace: an empty picker alone
+            # looks like a folder with nothing to resume
+            self._audit(f"RESUME-LIST-FAIL {type(rows).__name__}: {rows}")
+            rows = []
         busy = set(self._busy_ids())
         live = [r for r in self._live_lane_roots() if r]
         self.resume_combo.clear()
@@ -1953,7 +1967,7 @@ class AddTerminalDialog(QDialog):
         for mtime, preview, sid, conv in sorted(rows, key=lambda r: r[0],
                                                 reverse=True):
             if sid in busy:
-                continue  # in use by a running agent — unsafe to double-resume
+                continue  # a running agent holds it, and two would race it
             if conv is not None:
                 if any(lanes.same_path(conv.root, r) for r in live):
                     continue
@@ -6759,11 +6773,16 @@ class MainWindow(QMainWindow):
         if ws is None:
             return
         # per-workspace numbering: each workspace counts Agent 1, 2, 3…
-        # busy_ids: conversations a running agent already holds — never offer
+        # busy_ids: conversations a running agent already holds. Never offer
         # them for resume (two agents on one transcript race/truncate it).
-        # Asked when the resume list arrives, which is after the dialog shows.
+        # Asked again when the resume list arrives, after the dialog shows.
+        # It looks the workspace up by id: the dialog outlives this call and
+        # must not keep a deleted workspace alive.
+        ws_id = ws.id
+
         def busy_ids() -> set:
-            return {a.spec.session_id for a in ws.agents
+            now = self.manager.workspace(ws_id)
+            return {a.spec.session_id for a in (now.agents if now else ())
                     if a.is_running() and a.spec.session_id}
         free = MAX_AGENTS_PER_WORKSPACE - len(ws.agents)
         # found by a folder walk, not git: with no lane anywhere this dialog
@@ -6775,7 +6794,8 @@ class MainWindow(QMainWindow):
                                    max_count=free,
                                    lane_default=self.lane_default(ws),
                                    repo_root=repo,
-                                   live_lane_roots=self._live_lane_roots)
+                                   live_lane_roots=self._live_lane_roots,
+                                   audit=self._store_audit)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         revive = dialog.revive_lane()

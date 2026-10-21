@@ -1201,6 +1201,99 @@ def test_resume_list_reads_off_the_gui_thread():
         sys.excepthook = old_hook
 
 
+def test_resume_list_skips_and_reports():
+    """The resume list's lane read skips what is busy when it starts, so it
+    parses no transcript the list would drop. A read that raises leaves a
+    RESUME-LIST-FAIL line in session.log and still offers a fresh
+    conversation. The New Agent click hands the dialog a busy-id lookup
+    that holds the workspace's id, not the workspace."""
+    from PySide6.QtWidgets import QApplication, QDialog
+
+    from app import lanes, session_sync
+    from app.session_store import SessionStore
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    BUSY = "33333333-0000-4000-8000-00000000000e"
+    repo = os.path.join(SCRATCH_CWD, "repo")
+    live_root = os.path.join(repo + ".lanes", "live-333333")
+    asked = []
+
+    def lane_convs(_repo, exclude_roots=(), exclude_ids=()):
+        asked.append((tuple(exclude_roots), frozenset(exclude_ids)))
+        return []
+
+    def broken(_cwd):
+        raise RuntimeError("reader bug")
+
+    real_previews, real_lanes = (session_sync.conversation_previews,
+                                 lanes.lane_conversations)
+    session_sync.conversation_previews = lambda _cwd: []
+    lanes.lane_conversations = lane_convs
+    try:
+        dlg = AddTerminalDialog("Agent 9", cwd=SCRATCH_CWD, repo_root=repo,
+                                busy_ids=lambda: {BUSY},
+                                live_lane_roots=lambda: {live_root, ""})
+        resume_list_loaded(dlg)
+        check("resume skip: the lane read skips the busy ids and live lanes "
+              "of when it started",
+              asked == [((live_root,), frozenset({BUSY}))], asked)
+        dlg.deleteLater()
+
+        lines = []
+        session_sync.conversation_previews = broken
+        bad = AddTerminalDialog("Agent 9", cwd=SCRATCH_CWD, repo_root=repo,
+                                audit=lines.append)
+        if not bad.command_edit.isHidden():
+            bad.command_edit.setText("claude")
+        resume_list_loaded(bad)
+        check("resume skip: a read that raises leaves a RESUME-LIST-FAIL line",
+              lines == ["RESUME-LIST-FAIL RuntimeError: reader bug"], lines)
+        check("resume skip: ...and the dialog still offers a fresh "
+              "conversation, OK on",
+              [bad.resume_combo.itemData(i)
+               for i in range(bad.resume_combo.count())] == [""]
+              and bad._ok_btn.isEnabled())
+        bad.deleteLater()
+    finally:
+        session_sync.conversation_previews = real_previews
+        lanes.lane_conversations = real_lanes
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-resume-skip-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Skip", SCRATCH_CWD)
+    seen = []
+
+    def fake_exec(d):
+        resume_list_loaded(d)
+        seen.append(d)
+        return QDialog.DialogCode.Rejected
+    orig = AddTerminalDialog.exec
+    AddTerminalDialog.exec = fake_exec
+    try:
+        win._on_add_terminal_clicked(ws.id)
+    finally:
+        AddTerminalDialog.exec = orig
+    dlg = seen[-1] if seen else None
+    cells = [c.cell_contents for c in
+             (getattr(getattr(dlg, "_busy_ids", None), "__closure__", None)
+              or ())]
+    check("resume skip: the click's busy-id lookup holds no workspace",
+          dlg is not None and not any(c is ws for c in cells), cells)
+    check("resume skip: the click wires session.log in as the audit",
+          dlg is not None and dlg._audit == win._store_audit)
+    win.manager.remove_workspace(ws.id)
+    check("resume skip: ...and asks nothing of a deleted workspace",
+          dlg is not None and dlg._busy_ids() == set())
+    if dlg is not None:
+        dlg.deleteLater()
+    win.close()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_wake_and_resume_all():
     """The hive comes back WHOLE on reopen: previously-running agents
     autostart in EVERY workspace (not just the active one), every restored
