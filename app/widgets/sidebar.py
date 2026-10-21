@@ -32,6 +32,7 @@ to reveal it, and matches get a `search_hit` tint (`set_search_hit`). Search is
 transient too: it saves/restores the pre-search expansion and never persists.
 """
 
+import contextlib
 import os
 import uuid
 
@@ -1155,6 +1156,8 @@ class Sidebar(QFrame):
         self._ws_data: dict[str, dict] = {}   # ws_id -> {name, folder, stats}
         self._active_id = ""
         self._rail: WorkspaceRail | None = None   # see set_rail
+        self._batching = False        # see rebuilds_batched
+        self._rebuild_owed = False
         # rebuilt each rebuild(): ws_id -> row widget / tree item
         self._ws_widgets: dict[str, WorkspaceRow] = {}
         self._ws_items: dict[str, QTreeWidgetItem] = {}
@@ -1454,9 +1457,33 @@ class Sidebar(QFrame):
 
     # -------------------------------------------------------------- build ---
 
+    @contextlib.contextmanager
+    def rebuilds_batched(self):
+        """Rebuilds asked for inside the block become one, run when it ends.
+        A session restore adds every row, then the saved order and
+        categories, then the open file trees, and each step rebuilt the
+        whole tree: 17 rebuilds and 150 rows for 15 workspaces
+        (`MainWindow._adopt_existing_model`). Worse, the tree drops old rows
+        by deleteLater and no event loop runs while the window builds, so
+        all 150 were still alive for both stylesheet passes in
+        `_restore_ui_state`. Inside the block the row widgets are still the
+        ones from before it."""
+        self._batching = True
+        self._rebuild_owed = False
+        try:
+            yield
+        finally:
+            self._batching = False
+            owed, self._rebuild_owed = self._rebuild_owed, False
+            if owed:
+                self.rebuild()
+
     def rebuild(self) -> None:
         """Recreate every tree item + row widget from `self._nodes`. Cheap (a
         handful of rows) and the single path that reflects model changes."""
+        if self._batching:
+            self._rebuild_owed = True
+            return
         self.tree.clear()
         self._ws_widgets = {}
         self._ws_items = {}
@@ -1700,8 +1727,13 @@ class Sidebar(QFrame):
 
     def set_open_file_trees(self, ids) -> None:
         """Restore which workspaces show their file tree (session restore).
-        Intersected with known workspaces so a stale id is dropped."""
-        self._expanded_files = {i for i in (ids or []) if i in self._ws_data}
+        Intersected with known workspaces so a stale id is dropped. The set
+        it already has rebuilds nothing: the window restores the trees with
+        the rows, and `_restore_ui_state` applies them again."""
+        trees = {i for i in (ids or []) if i in self._ws_data}
+        if trees == self._expanded_files:
+            return
+        self._expanded_files = trees
         self.rebuild()
 
     def _sync_expanded(self) -> None:

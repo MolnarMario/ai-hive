@@ -406,14 +406,35 @@ class PageStack(QStackedWidget):
         self._hidden_layout_timer.setSingleShot(True)
         self._hidden_layout_timer.setInterval(self.LAYOUT_DEBOUNCE_MS)
         self._hidden_layout_timer.timeout.connect(self.layout_hidden_pages)
+        self._batching = False      # see layout_batched
+        self._layout_owed = False
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._hidden_layout_timer.start()
 
+    @contextlib.contextmanager
+    def layout_batched(self):
+        """Hidden-page layouts asked for inside the block become one pass,
+        run when it ends. A session restore adds its pages one at a time
+        (`MainWindow._adopt_existing_model`), and a pass per page went over
+        every page added before it."""
+        self._batching = True
+        self._layout_owed = False
+        try:
+            yield
+        finally:
+            self._batching = False
+            owed, self._layout_owed = self._layout_owed, False
+            if owed:
+                self.layout_hidden_pages()
+
     def layout_hidden_pages(self) -> None:
         """Hand every off-screen page the current page's rect."""
         self._hidden_layout_timer.stop()
+        if self._batching:
+            self._layout_owed = True
+            return
         rect = self.contentsRect()
         if rect.width() <= 0 or rect.height() <= 0:
             return          # not laid out yet; the next resize does it
@@ -2647,7 +2668,8 @@ class MainWindow(QMainWindow):
         self._rearm_agent_configs()  # restored claude agents re-acquire MCP tools
 
         self._build_ui()
-        self._adopt_existing_model()
+        self._adopt_existing_model(
+            (session or {}).get("ui", {}).get("file_trees_open", []))
         self._wire_model()
         self.lane_service.lanesChanged.connect(self._on_lanes_changed)
         self.lane_service.overlapFound.connect(self._on_lane_overlap)
@@ -2976,19 +2998,35 @@ class MainWindow(QMainWindow):
         if self.top_bar.toggle_btn.sidebar_open() != is_open:
             self.top_bar.toggle_btn.set_sidebar_open(is_open)
 
-    def _adopt_existing_model(self) -> None:
+    def _adopt_existing_model(self, open_trees=()) -> None:
         """Build pages/rows for workspaces created before this window existed
-        (session restore happens before the window is constructed)."""
-        for ws in self.manager.workspaces:
-            self._on_workspace_added(ws)
-            for agent in ws.agents:
-                self._pages[ws.id].add_agent(agent)
-            self.sidebar.set_stats(ws.id, self.manager.workspace_stats(ws.id))
-        # arrange rows into the restored order + categories (rows were appended
-        # top-level as each workspace was added above)
-        self.sidebar.apply_layout(self.manager.sidebar_layout())
-        for ws in self.manager.workspaces:   # re-apply stats after the rebuild
-            self.sidebar.set_stats(ws.id, self.manager.workspace_stats(ws.id))
+        (session restore happens before the window is constructed).
+
+        The sidebar rebuilds once and the hidden pages get one layout pass,
+        after every page has its cards and the rows have their order,
+        categories, stats and open file trees. Workspace by workspace, each
+        add rebuilt the sidebar and laid out every page before it: 0.5 to
+        0.9 s for 15 workspaces, growing with the square of the count, plus
+        the restyle of 135 dead rows (`Sidebar.rebuilds_batched`). The
+        pass still comes before anything that reads a card's width: the font
+        loop in `_restore_ui_state`, each card's REPLAY_SETTLE_MS backstop
+        and `settle_layout`."""
+        with self.sidebar.rebuilds_batched(), self.stack.layout_batched():
+            for ws in self.manager.workspaces:
+                self._on_workspace_added(ws)
+                for agent in ws.agents:
+                    self._pages[ws.id].add_agent(agent)
+                self.sidebar.set_stats(ws.id,
+                                       self.manager.workspace_stats(ws.id))
+            # arrange rows into the restored order + categories (rows were
+            # appended top-level as each workspace was added above)
+            self.sidebar.apply_layout(self.manager.sidebar_layout())
+            self.sidebar.set_open_file_trees(open_trees)
+            # the pass skips the current page, so the active one goes current
+            # first and the pass covers every page that stays hidden
+            page = self._pages.get(self.manager.active_id)
+            if page is not None:
+                self.stack.setCurrentWidget(page)
         active = self.manager.active_id
         if active:
             self._on_active_changed(active)
