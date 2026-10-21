@@ -38,15 +38,21 @@ def _gone() -> bool:
     return False
 
 
-def _hover(widget):
+def _hover(widget, pos=None):
     """Send the ToolTip event Qt sends after the mouse rests on `widget`."""
     from PySide6.QtCore import QEvent, QPoint
     from PySide6.QtGui import QHelpEvent
     from PySide6.QtWidgets import QApplication
-    ev = QHelpEvent(QEvent.Type.ToolTip, QPoint(3, 3),
-                    widget.mapToGlobal(QPoint(3, 3)))
+    pos = pos if pos is not None else QPoint(3, 3)
+    ev = QHelpEvent(QEvent.Type.ToolTip, pos, widget.mapToGlobal(pos))
     QApplication.sendEvent(widget, ev)
     QApplication.processEvents()
+
+
+def _shown_tip() -> str:
+    """The text of the tip showing now, "" when none shows."""
+    tip = _tip_label()
+    return tip.text() if tip is not None else ""
 
 
 def test_tooltip_wrap_caps_the_width():
@@ -203,3 +209,96 @@ def test_tooltips_option_toggle():
     finally:
         tooltips.set_enabled(True)   # the flag is global
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+
+def test_tooltip_filter_after_the_build():
+    """The window build passes no event to the tooltip filter: an
+    application filter sees every event in the app, and handing each one to
+    Python cost 1 to 4 s of the build. The main window installs it once it
+    shows. It stays app-wide, so every kind of tip still comes out wrapped:
+    a widget given its tip after it was built, a menu action and an
+    item-view row. The off switch still silences all three."""
+    from PySide6.QtWidgets import (QApplication, QLabel, QListWidget,
+                                   QListWidgetItem, QMenu, QToolTip,
+                                   QVBoxLayout, QWidget)
+
+    from app import tooltips
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-tipfilter-"))
+    installs = []
+    real_install = tooltips.install
+    tooltips.install = lambda app=None: installs.append(app)
+    win = None
+    try:
+        win = create_main_window(SessionStore(path=tmp / "session.json"))
+        win._save_timer.stop()
+        check("tooltip filter: building the window installs no filter",
+              installs == [], installs)
+        win.show()
+        check("tooltip filter: ...nor does the show itself",
+              installs == [], installs)
+        app.processEvents()
+        check("tooltip filter: ...one pass of the event loop later it goes on",
+              len(installs) == 1, installs)
+    finally:
+        tooltips.install = real_install
+        if win is not None:
+            win.close()
+            app.processEvents()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    tooltips.install(app)
+    tooltips.set_enabled(True)
+    wrapped = tooltips.wrap(LONG_TIP)
+    host = QWidget()
+    lay = QVBoxLayout(host)
+    late = QLabel("late", host)
+    view = QListWidget(host)
+    row = QListWidgetItem("row")
+    row.setToolTip(LONG_TIP)
+    view.addItem(row)
+    lay.addWidget(late)
+    lay.addWidget(view)
+    host.show()
+    app.processEvents()
+    late.setToolTip(LONG_TIP)        # after the widget was built and shown
+    menu = QMenu(host)
+    menu.setToolTipsVisible(True)
+    action = menu.addAction("Update lane")
+    action.setToolTip(LONG_TIP)
+    menu.popup(host.mapToGlobal(host.rect().center()))
+    app.processEvents()
+    hovers = (
+        ("a widget given its tip after it was built", lambda: _hover(late)),
+        ("a menu action", lambda: _hover(
+            menu, menu.actionGeometry(action).center())),
+        ("an item-view row", lambda: _hover(
+            view.viewport(), view.visualItemRect(row).center())),
+    )
+
+    def fresh():
+        QToolTip.hideText()
+        _gone()
+
+    try:
+        for label, hover in hovers:
+            fresh()
+            hover()
+            check(f"tooltip filter: {label} shows the wrapped tip",
+                  _shown_tip() == wrapped, _shown_tip()[:80])
+        tooltips.set_enabled(False)
+        for label, hover in hovers:
+            fresh()
+            hover()
+            check(f"tooltip filter: OFF silences {label}", _gone())
+    finally:
+        tooltips.set_enabled(True)
+        menu.close()
+        QToolTip.hideText()
+        host.deleteLater()
+        app.processEvents()

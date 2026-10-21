@@ -75,7 +75,7 @@ import tempfile
 from dataclasses import dataclass
 from enum import Enum
 
-from . import cli_update
+from . import cli_update, providers
 
 # Where the two installs live. Both are documented (code.claude.com/docs/en/
 # setup): the native installer puts the launcher in `%USERPROFILE%\.local\bin`
@@ -739,6 +739,7 @@ def migrate(runner, on_event=None, timeout: float = cli_update.INSTALL_TIMEOUT_S
     launcher = launcher or native_launcher_path()
     _emit(on_event, "install", INSTALL_COMMAND)
     rc, text = runner(install_argv(), timeout)
+    providers.forget_claude()
     _emit(on_event, "output", text or "")
 
     vrc, vtext = runner([launcher, "--version"], cli_update.CHECK_TIMEOUT_S)
@@ -800,6 +801,7 @@ def cleanup(runner, winget_exe: str,
         return Result(False, "cleanup", after=winget_exe,
                       detail=_alive_detail(alive))
     rc, text = runner(winget_uninstall_argv(), timeout)
+    providers.forget_claude()
     if os.path.isfile(winget_exe):
         return Result(False, "cleanup", after=winget_exe,
                       detail=f"the file is still there after the uninstall "
@@ -845,6 +847,7 @@ def revert(runner, on_event=None,
 
     _emit(on_event, "install", " ".join(winget_install_argv()))
     rc, text = runner(winget_install_argv(), timeout)
+    providers.forget_claude()
     _emit(on_event, "output", text or "")
     restored = winget_exe_path()
     if not restored:
@@ -859,6 +862,7 @@ def revert(runner, on_event=None,
                              "version, so the native install was left in place")
 
     removed, problem = _remove_native(home)
+    providers.forget_claude()
     if problem:
         return Result(False, "revert", after=after,
                       detail=f"WinGet Claude Code {after} is back, but the "

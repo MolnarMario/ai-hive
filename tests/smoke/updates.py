@@ -1312,6 +1312,7 @@ def test_cli_native_migration():
     real_which, real_home = providers.shutil.which, os.environ.get("USERPROFILE")
     try:
         providers.shutil.which = lambda name: winget_exe
+        providers.forget_claude()    # an earlier lookup may be cached
         os.environ["USERPROFILE"] = str(home)
         check("cli-install: resolve_claude prefers the native launcher even "
               "when PATH would answer with the winget copy",
@@ -1324,6 +1325,7 @@ def test_cli_native_migration():
               providers.resolve_claude() == winget_exe)
     finally:
         providers.shutil.which = real_which
+        providers.forget_claude()
         if real_home is None:
             os.environ.pop("USERPROFILE", None)
         else:
@@ -1683,6 +1685,133 @@ def test_cli_native_migration():
           "cli_install" not in src and "arm_cli_install" not in src)
     check("cli-install: ...and the real runner is armed from main.py alone",
           "arm_cli_install" in inspect.getsource(main_module.main))
+
+
+def test_claude_lookup_cached():
+    """resolve_claude keeps its PATH lookup for the launch. Each lookup is a
+    `shutil.which` of about 5 ms, and loading a session ran one per Claude
+    agent (80 ms for 14). Every install and update step drops the kept
+    answer, so the next call finds what that step left behind."""
+    from PySide6.QtWidgets import QApplication
+    from app import cli_install, cli_update, providers
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-claude-lookup-"))
+    first, second = tmp / "a" / "claude.exe", tmp / "b" / "claude.exe"
+    for exe in (first, second):
+        exe.parent.mkdir(parents=True)
+        exe.write_text("fake", encoding="utf-8")
+    answer = [str(first)]
+    calls = []
+    real_which = providers.shutil.which
+
+    def fake_which(name, *args, **kwargs):
+        if name != "claude":    # the shutil module is shared: pwsh, cmd...
+            return real_which(name, *args, **kwargs)
+        calls.append(name)
+        return answer[0]
+
+    def primed() -> bool:
+        """Cache `first`, then point PATH's answer at `second`."""
+        providers.forget_claude()
+        answer[0] = str(first)
+        got = providers.resolve_claude()
+        answer[0] = str(second)
+        return got == str(first) and providers.resolve_claude() == str(first)
+
+    saved ={k: os.environ.get(k) for k in ("USERPROFILE", "PATH")}
+    try:
+        providers.shutil.which = fake_which
+        os.environ["USERPROFILE"] = str(tmp / "home")   # no native launcher
+        providers.forget_claude()
+
+        store = SessionStore(path=tmp / "session.json")
+        win = create_main_window(store)
+        win._save_timer.stop()
+        ws = win.manager.create_workspace("Lookup", str(tmp))
+        for i in range(5):
+            win.manager.add_terminal(
+                ws.id, build_spec(AgentKind.CLAUDE, f"C{i}", cwd=str(tmp),
+                                  pty=True), autostart=False)
+        win._save_session()
+        win.close()
+        app.processEvents()
+
+        providers.forget_claude()
+        calls.clear()
+        win = create_main_window(store)
+        win._save_timer.stop()
+        loaded = [a for a in win.manager.all_agents()
+                  if a.spec.provider == "claude"]
+        check("claude lookup: loading 5 Claude agents runs shutil.which once",
+              len(loaded) == 5 and calls == ["claude"], (len(loaded), calls))
+        check("claude lookup: ...and every one launches the file it found",
+              all(a.spec.program == str(first) for a in loaded),
+              [a.spec.program for a in loaded])
+        win.close()
+        app.processEvents()
+
+        calls.clear()
+        check("claude lookup: detected() asks no second lookup",
+              providers.detected("claude") and calls == [], calls)
+
+        # each step that installs, upgrades or removes a binary drops the
+        # kept answer. The fakes change no file, so only the drop can explain
+        # the new answer.
+        steps = (
+            ("the native migration", lambda: cli_install.migrate(
+                _FakeInstall(), launcher=str(tmp / "nowhere.exe"))),
+            ("the revert to WinGet", lambda: cli_install.revert(
+                _FakeInstall(), home=str(tmp / "home"))),
+            ("the WinGet cleanup", lambda: cli_install.cleanup(
+                _FakeInstall(), str(first))),
+            ("the startup update gate's install", lambda: cli_update.apply(
+                cli_update._claude_target(str(first)),
+                cli_update.Outcome("claude", cli_update.Status.UP_TO_DATE,
+                                   before="2.1.224"),
+                _FakeInstall())),
+        )
+        for label, step in steps:
+            check(f"claude lookup: before {label}, the kept answer holds",
+                  primed())
+            step()
+            check(f"claude lookup: after {label}, the next call finds the "
+                  "new binary", providers.resolve_claude() == str(second),
+                  providers.resolve_claude())
+
+        check("claude lookup: a binary that disappears is looked up again",
+              primed())
+        first.unlink()
+        check("claude lookup: ...and the new answer is used",
+              providers.resolve_claude() == str(second))
+        first.write_text("fake", encoding="utf-8")
+
+        check("claude lookup: a changed PATH is searched again", primed())
+        os.environ["PATH"] = (saved["PATH"] or "") + os.pathsep + str(tmp)
+        check("claude lookup: ...and the new answer is used",
+              providers.resolve_claude() == str(second))
+
+        providers.forget_claude()
+        answer[0] = None
+        calls.clear()
+        providers.resolve_claude()
+        answer[0] = str(second)
+        check("claude lookup: a miss is never kept, so a CLI installed while "
+              "AI Hive runs is still found",
+              providers.resolve_claude() == str(second)
+              and calls == ["claude", "claude"], calls)
+    finally:
+        providers.shutil.which = real_which
+        providers.forget_claude()
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _dialog_strings(widget) -> list:

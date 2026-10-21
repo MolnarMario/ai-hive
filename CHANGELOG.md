@@ -8,6 +8,26 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.46.0
+
+- AI Hive opens much faster when you have many workspaces and agents. The
+  saved theme and console font now apply before the window is built,
+  instead of restyling every widget and redrawing every terminal after it,
+  and the sidebar builds once instead of once per workspace. On a copy of
+  a 15 workspace, 18 agent session, building the window went from 14 to
+  18 seconds down to 2 to 3.
+- A new agent starts at its card's real size. It used to start at 100
+  columns by 30 rows and redraw when the card's size caught up, and a
+  conversation resumed from the New Agent dialog stayed wrapped at 100
+  columns in the scrollback.
+- Each launch writes a `PERF startup` line to session.log with how long
+  every step took, and a `PERF stall` line whenever the window freezes for
+  more than 150 ms, naming the terminal output or redraw behind it. Nothing
+  changes on screen.
+- Claude's install is looked up once per launch instead of once per agent,
+  and the tooltip handler starts after the window appears, which trims a
+  little more off the launch.
+
 ## 0.45.3
 
 - The Adeptus Mechanicus theme has a new aquila crest: a double-headed
