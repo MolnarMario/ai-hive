@@ -17,10 +17,12 @@ the session file).
         agent=Agent 3
     PERF stall suppressed=37 worst_gap=812
 
-`StallProbe` runs a 50 ms timer that measures its own lateness. A gap over
-STALL_MS means the GUI thread was busy that long, and the line names the
-longest `TerminalView.feed` and `TerminalView.paintEvent` inside the gap,
-which terminal_view records in module globals. `feed_chars` counts the
+`StallProbe` runs a 50 ms timer that measures its own lateness. `gap` is
+the time between two ticks. The GUI thread was busy for all of it except
+the idle stretch before the block began, which is shorter than one tick,
+so a gap over STALL_MS means at least STALL_MS - TICK_MS of busy time. The
+line names the longest `TerminalView.feed` and `TerminalView.paintEvent`
+inside the gap, which terminal_view records in module globals. `feed_chars` counts the
 decoded text, which is the byte count for ASCII. A gap with no feed and no
 paint was something else: a dialog's build, a save, or the machine sleeping.
 At most STALL_LIMIT lines go out per STALL_WINDOW_S; the rest are counted

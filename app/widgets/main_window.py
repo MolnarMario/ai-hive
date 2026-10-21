@@ -6098,9 +6098,8 @@ class MainWindow(QMainWindow):
                         card.terminal.set_font_size(px)
                     elif not card.is_pty and card.agent.spec.font_px:
                         card.reapply_font()
-        # re-open the file trees that were open last session (sidebar rows are
-        # already built by _adopt_existing_model; unknown ids are dropped)
-        self.sidebar.set_open_file_trees(ui.get("file_trees_open", []))
+        # the file trees open last session were re-opened inside
+        # _adopt_existing_model, before its one sidebar rebuild
 
     # ------------------------------------------------------- model events ---
 
@@ -6890,10 +6889,13 @@ class MainWindow(QMainWindow):
                     card = page.card_for(agent.id) if page is not None else None
                     if card is not None:
                         card.drop_restored_screen()
-                    starting.append(agent)
+                    starting.append((ws, agent))
         self.settle_layout()
-        for agent in starting:
-            if not agent.is_running():
+        # settle_layout pumps the event loop, and a queued close in there can
+        # remove an agent or its workspace. Removal disposes the agent, and
+        # start() would still spawn a child nothing owns.
+        for ws, agent in starting:
+            if agent in ws.agents and not agent.is_running():
                 agent.start()
 
     def settle_layout(self) -> None:

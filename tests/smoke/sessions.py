@@ -1812,6 +1812,82 @@ def test_autostart_skips_discarded_replay():
         shutil.rmtree(home, ignore_errors=True)
 
 
+def test_autostart_skips_agents_closed_during_settle():
+    """The launch autostart picks its agents, then settle_layout pumps the
+    event loop before any of them starts. A close that lands in those pumps
+    disposes its agent, and starting it anyway spawned a child that no card
+    and no workspace owned. Only agents still in their workspace start."""
+    import pathlib
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import WorkerState
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    if not HAS_CONPTY:
+        return
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    home = pathlib.Path(tempfile.mkdtemp(prefix="aihive-autostart-close-"))
+    store = SessionStore(path=home / "session.json")
+    term = {"role": "", "cwd": str(home), "user_program": "", "user_args": [],
+            "pty": True, "provider": "", "model": "", "effort": "",
+            "custom_command": "", "font_px": 0, "is_orchestrator": False,
+            "task": "", "assignment": "idle", "auto_created": False,
+            "kind": "powershell", "running": True}
+    store.save({"version": 3, "active": "w1", "workspaces": [
+        {"id": "w1", "name": "w1", "project_path": str(home), "layout": "auto",
+         "terminals": [{**term, "name": "Keep"}, {**term, "name": "Closed"}]},
+        {"id": "w2", "name": "w2", "project_path": str(home), "layout": "auto",
+         "terminals": [{**term, "name": "Gone"}]}]})
+
+    spawned = []
+
+    def stub_start(agent):
+        def start():
+            spawned.append(agent.spec.name)
+            agent.worker._set_state(WorkerState.STARTING)
+        return start
+
+    try:
+        win = create_main_window(store)
+        agents = {a.spec.name: a for a in win.manager.all_agents()}
+        for agent in agents.values():
+            agent.worker.start = stub_start(agent)
+        check("autostart-close: precondition - three agents autostart",
+              all(a.autostart_on_restore for a in agents.values()),
+              sorted(agents))
+        real_settle = win.settle_layout
+
+        def settle_with_closes():
+            # what a queued card close and workspace delete do when they
+            # run inside settle_layout's pumps
+            win.manager.remove_terminal("w1", agents["Closed"].id)
+            win.manager.remove_workspace("w2")
+            real_settle()
+
+        win.settle_layout = settle_with_closes
+        error = None
+        try:
+            win.show(); win.autostart_active_workspace()
+        except RuntimeError as exc:     # a start on a deleted agent
+            error = exc
+        check("autostart-close: the launch survives the closes", error is None,
+              error)
+        check("autostart-close: only the agent still in its workspace starts",
+              spawned == ["Keep"], spawned)
+        agents["Keep"].worker._set_state(WorkerState.IDLE)
+        win.close(); pump(300)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_restart_veil():
     """Restart covers the card from the click, not from STARTING.
 
