@@ -6532,8 +6532,6 @@ class MainWindow(QMainWindow):
         page = self._pages.get(ws_id)
         if page is not None:
             self.stack.setCurrentWidget(page)
-        # agents the launch has not reached yet: the user is looking now
-        self._start_queued_in(ws_id)
         self.sidebar.set_active_row(ws_id)
         self._fullscreen.page_changed()
         ws = self.manager.workspace(ws_id)
@@ -6546,6 +6544,8 @@ class MainWindow(QMainWindow):
                 and ws is not None):
             self._map_window.set_workspace(ws)
         self._sync_activity_buttons()
+        # agents the launch has not reached yet: the user is looking now
+        self._start_queued_in(ws_id)
 
     # ------------------------------------------------------- activity panel ---
 
