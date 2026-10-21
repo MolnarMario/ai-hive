@@ -8,6 +8,13 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.45.3
+
+- The Adeptus Mechanicus theme has a new aquila crest: a double-headed
+  eagle in phosphor green on a dark glass plate with a green edge. The old
+  grey crest was hard to make out. The new one stays sharp at 150%
+  display scaling.
+
 ## 0.45.2
 
 - A Claude card taller than 48 rows keeps its scrollback when the card
