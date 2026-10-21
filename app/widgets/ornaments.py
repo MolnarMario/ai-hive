@@ -2,8 +2,9 @@
 assets). The elaborate illuminated pieces (gilt drop-cap, logo roundel, the
 foliate page border with gilt corner medallions) render only when the active
 theme sets `illuminated`; otherwise the simple gold-on-dark versions are used,
-so the other skins stay clean and light. SVG geometry/colours are lifted from
-the design handoff's inline data-URIs.
+so the other skins stay clean and light. Most SVG geometry and colours are
+lifted from the design handoff's inline data-URIs. The Mechanicus aquila is
+drawn by hand.
 """
 
 import os
@@ -14,9 +15,9 @@ from functools import lru_cache
 from PySide6.QtCore import (QAbstractAnimation, QByteArray, QEasingCurve,
                             QEvent, QObject, QPoint, QRect, QRectF, Qt, QTimer,
                             QVariantAnimation, Signal)
-from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QImage,
-                           QLinearGradient, QPainter, QPainterPath, QPen,
-                           QPixmap, QRadialGradient)
+from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetrics, QGradient,
+                           QImage, QLinearGradient, QPainter, QPainterPath,
+                           QPen, QPixmap, QRadialGradient)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QComboBox, QLabel, QSizePolicy,
                                QToolButton, QWidget)
@@ -103,18 +104,20 @@ _ROUNDEL_VINE = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'>
 <path d='M8 8 Q18 12 15 22'/><path d='M40 8 Q30 12 33 22'/>
 <path d='M8 40 Q18 36 15 26'/><path d='M40 40 Q30 36 33 26'/></g></svg>"""
 
-# --- Adeptus Mechanicus SVG ornaments (cog + circuit from the cogitator
-# handoff; the aquila was redrawn later) ---
+# --- Adeptus Mechanicus SVG ornaments ---
+# The cog and circuit come from the cogitator handoff. The aquila is redrawn.
 
 # The crest plaque's glass. The aquila's cut lines are strokes in this colour,
-# so the plaque must paint exactly it behind the crest.
+# so they read as gaps in the glass. The bloom lifts the glass a little around
+# the crest, which leaves the heads a faint dark outline.
 _MECH_GLASS = "#05140d"
 
 # The double-headed aquila, phosphor green. Only the right half is drawn; <use>
-# mirrors it about x=120. The wings (seven fanned feathers on a solid root,
-# under a curved arm) go first. The head, breast, talons and tail go on top
-# with a glass-coloured stroke: at 33px tall that stroke is the only thing
-# keeping the heads and breast from melting into the wing roots.
+# mirrors it about x=120. The wings go first: seven fanned feathers on a solid
+# root, under a curved arm. The head, breast, talons and tail go on top with a
+# glass-coloured stroke. At 32px tall that stroke is the only thing keeping the
+# heads and breast from melting into the wing roots. It also runs down x=120,
+# which splits the breast and tail in two.
 _AQUILA = f"""<svg xmlns='http://www.w3.org/2000/svg' xmlns:xlink='http://www.w3.org/1999/xlink' viewBox='0 0 240 72'>
 <defs><linearGradient id='g' gradientUnits='userSpaceOnUse' x1='0' y1='0' x2='0' y2='72'>
 <stop offset='0' stop-color='#b4ffd9'/><stop offset='0.55' stop-color='#5fe8ac'/>
@@ -1616,21 +1619,19 @@ class PageBorder(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(_MECH_GLASS))
         p.drawPath(glass)
-        c = plaque.center()
-        bloom = QRadialGradient(0, 0, 1)
+        # ObjectMode stretches the gradient's unit circle over the glass, so
+        # the bloom is an ellipse as wide and tall as the plaque
+        bloom = QRadialGradient(0.5, 0.5, 0.5)
+        bloom.setCoordinateMode(QGradient.CoordinateMode.ObjectMode)
         bloom.setColorAt(0.0, QColor(95, 232, 172, 60))
         bloom.setColorAt(1.0, QColor(95, 232, 172, 0))
-        p.save()
-        p.setClipPath(glass)
-        p.translate(c)
-        p.scale(pw / 2, ph / 2)
         p.setBrush(bloom)
-        p.drawEllipse(QRectF(-1, -1, 2, 2))
-        p.restore()
+        p.drawPath(glass)
         p.setPen(QPen(QColor("#2f9a76")))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(glass)
-        # drawn as vectors, not a cached pixmap, so it stays sharp at 150%
+        # drawn as vectors, not a 1x pixmap, so it stays sharp at 150%
+        c = plaque.center()
         ah = ph - 4
         aw = ah * 240 / 72
         if self._aquila is None:
