@@ -864,6 +864,13 @@ Hard-won rules, each with a regression test:
   (tmp + rename). Every save and load-failure appends a forensic line to
   `session.log` (timestamp, pid, per-workspace terminal counts) so any future
   loss is attributable.
+- **Launches and stalls are timed.** Every launch appends one `PERF startup`
+  line to `session.log` with each phase in ms (update check, imports, window
+  build, show, autostart, limit scan) and the total since Windows started the
+  process. A 50 ms timer watches the GUI thread. When it fires more than
+  150 ms late, a `PERF stall` line gives the gap, the longest terminal feed
+  inside it (ms, size, agent) and the longest paint (ms, grid). At most five
+  go out a minute, and one more line counts the rest.
 - **Conversations are backed up.** Claude Code keeps each conversation as a
   single file it owns (`~/.claude/projects/...`) — AI Hive snapshots every
   pinned agent's transcript into `%APPDATA%\AIHive\AI Hive\transcripts\` on
