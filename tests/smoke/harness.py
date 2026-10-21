@@ -144,6 +144,20 @@ def check(name, cond, detail=""):
 
 
 
+def resume_list_loaded(dlg, timeout_s=10.0):
+    """Pump events until a New Agent dialog's resume list has arrived. The
+    dialog reads it on a worker thread, so a test that reads the picker
+    right after building the dialog waits here first. True when it came."""
+    from PySide6.QtWidgets import QApplication
+    deadline = time.monotonic() + timeout_s
+    while dlg.resume_pending():
+        if time.monotonic() > deadline:
+            return False
+        QApplication.processEvents()
+        time.sleep(0.005)
+    return True
+
+
 def drop_windows():
     """Delete every top-level widget a test left behind. Tests show windows
     and cards and never delete them, and every app-wide restyle (a theme or
