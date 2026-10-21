@@ -2201,6 +2201,14 @@ def test_autostart_skips_discarded_replay():
         check("autostart-replay: precondition - four agents autostart",
               sorted(starters) == ["Hidden A", "Hidden B", "Run A", "Run B"],
               starters)
+        check("autostart-replay: the active workspace spawns at once",
+              sorted(spawned) == ["Run A", "Run B"], sorted(spawned))
+        check("autostart-replay: ...and the hidden one's agents queue",
+              agents["Hidden A"].start_queued()
+              and agents["Hidden B"].start_queued())
+        deadline = time.monotonic() + 5
+        while len(spawned) < len(starters) and time.monotonic() < deadline:
+            pump(50)
         check("autostart-replay: every autostarting agent was spawned",
               sorted(spawned) == sorted(starters), sorted(spawned))
         check("autostart-replay: no full projection for a card that starts",
@@ -2329,6 +2337,136 @@ def test_autostart_skips_agents_closed_during_settle():
         agents["Keep"].worker._set_state(WorkerState.IDLE)
         win.close(); pump(300)
     finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_launch_starts_active_workspace_first():
+    """The launch restore starts the active workspace's agents and queues the
+    rest. Starting every workspace at once put 14 CLI boots and their resumed
+    conversations on the machine and the GUI thread together, and the two
+    agents the user was looking at loaded behind all of them. The queue waits
+    for the visible agents' prompts, then keeps LAUNCH_BOOT_LIMIT booting at
+    once. Opening a workspace, or a keystroke on a queued card, starts it
+    now, and a queued agent still saves as running."""
+    import pathlib
+    import time
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import WorkerState
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from app.widgets import main_window as mw
+    from main import create_main_window
+
+    if not HAS_CONPTY:
+        return
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def wait_for(pred, timeout_s=5.0):
+        deadline = time.monotonic() + timeout_s
+        while not pred() and time.monotonic() < deadline:
+            pump(25)
+        return pred()
+
+    home = pathlib.Path(tempfile.mkdtemp(prefix="aihive-launch-queue-"))
+    store = SessionStore(path=home / "session.json")
+    term = {"role": "", "cwd": str(home), "user_program": "", "user_args": [],
+            "pty": True, "provider": "claude", "model": "", "effort": "",
+            "custom_command": "", "font_px": 0, "is_orchestrator": False,
+            "task": "", "assignment": "idle", "auto_created": False,
+            "kind": "claude", "running": True}
+    layout = {"w1": ["Front"], "w2": ["Back A", "Back B", "Back C"],
+              "w3": ["Other"], "w4": ["Woken"]}
+    store.save({"version": 3, "active": "w1", "workspaces": [
+        {"id": ws_id, "name": ws_id, "project_path": str(home),
+         "layout": "auto",
+         "terminals": [{**term, "name": n} for n in names]}
+        for ws_id, names in layout.items()]})
+
+    spawned = []
+
+    def stub_start(agent):
+        def start():
+            spawned.append(agent.spec.name)
+            agent.worker._set_state(WorkerState.STARTING)
+        return start
+
+    real_cap = mw.LAUNCH_BOOT_MAX_S
+    win = None
+    try:
+        win = create_main_window(store)
+        agents = {a.spec.name: a for a in win.manager.all_agents()}
+        for agent in agents.values():
+            agent.worker.start = stub_start(agent)
+        cards = {c.agent.spec.name: c for page in win._pages.values()
+                 for c in page.cards}
+        win.show(); win.autostart_active_workspace()
+        check("launch-queue: only the active workspace starts at launch",
+              spawned == ["Front"], spawned)
+        queued = [n for n, a in agents.items() if a.start_queued()]
+        check("launch-queue: every other running agent is queued",
+              sorted(queued) == ["Back A", "Back B", "Back C", "Other",
+                                 "Woken"], queued)
+        check("launch-queue: a queued card shows the loader, not the "
+              "stopped banner",
+              cards["Back A"].boot.is_active()
+              and not cards["Back A"].overlay.isVisible())
+        saved = {t["name"]: t["running"]
+                 for ws in win.manager.to_session_dict()["workspaces"]
+                 for t in ws["terminals"]}
+        check("launch-queue: a queued agent still saves as running",
+              saved.get("Back C") is True, saved)
+
+        pump(mw.LAUNCH_QUEUE_TICK_MS * 4)
+        check("launch-queue: nothing else starts while Front boots",
+              spawned == ["Front"], spawned)
+
+        agents["Front"]._became_prompt_ready()
+        check("launch-queue: Front's prompt lets the queue go",
+              wait_for(lambda: len(spawned) == 3), spawned)
+        check("launch-queue: ...in order, one per tick",
+              spawned == ["Front", "Back A", "Back B"], spawned)
+        pump(mw.LAUNCH_QUEUE_TICK_MS * 3)
+        check("launch-queue: ...and no more than LAUNCH_BOOT_LIMIT boot "
+              "at once", len(spawned) == 1 + mw.LAUNCH_BOOT_LIMIT, spawned)
+
+        win.manager.set_active("w3")
+        check("launch-queue: opening a workspace starts its queued agents "
+              "at once", spawned[-1] == "Other", spawned)
+
+        cards["Woken"]._on_key_input("x")
+        check("launch-queue: a keystroke on a queued card starts it",
+              spawned[-1] == "Woken" and not agents["Woken"].start_queued(),
+              spawned)
+
+        # Other is in the active workspace now, so the queue waits on it
+        # even with room under the limit
+        agents["Back A"]._became_prompt_ready()
+        agents["Back B"]._became_prompt_ready()
+        pump(mw.LAUNCH_QUEUE_TICK_MS * 3)
+        check("launch-queue: the newly opened workspace's boot holds the "
+              "queue", "Back C" not in spawned, spawned)
+
+        # a boot that never shows a prompt (a trust dialog, a plain shell)
+        # stops holding the queue
+        mw.LAUNCH_BOOT_MAX_S = 0.2
+        check("launch-queue: a boot with no prompt stops counting",
+              wait_for(lambda: "Back C" in spawned), spawned)
+        check("launch-queue: each agent started exactly once",
+              sorted(spawned) == sorted(agents), spawned)
+        check("launch-queue: the drained queue stops its timer",
+              wait_for(lambda: not win._launch_timer.isActive()))
+    finally:
+        mw.LAUNCH_BOOT_MAX_S = real_cap
+        if win is not None:
+            for agent in win.manager.all_agents():
+                agent.worker._set_state(WorkerState.IDLE)
+            win.close(); pump(300)
         shutil.rmtree(home, ignore_errors=True)
 
 

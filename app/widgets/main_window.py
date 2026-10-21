@@ -123,6 +123,19 @@ USAGE_TRACKER_LABELS = {
 }
 DEFAULT_USAGE_TRACKERS = {k: True for k in USAGE_TRACKER_KEYS}
 
+# --- launch restore: the active workspace first ---
+# The launch starts the active workspace's agents at once and queues every
+# other workspace's (see MainWindow.autostart_active_workspace). The queue
+# looks this often and starts at most one agent per look.
+LAUNCH_QUEUE_TICK_MS = 200
+# Queued agents still booting (child started, prompt not up yet) at once. A
+# boot is a CLI start plus a resumed conversation that pyte parses on the GUI
+# thread. Fourteen of them at once stalled the visible cards for up to 1.2 s.
+LAUNCH_BOOT_LIMIT = 2
+# A boot stops counting after this long without a prompt. A trust dialog
+# waits for the user, and a plain shell never draws a prompt we can detect.
+LAUNCH_BOOT_MAX_S = 8.0
+
 # --- auto-continue after a plan-limit reset ---
 # Beat between closing the limit's options menu and typing into the prompt
 # underneath it: the menu tears down on the next render, and typing into the
@@ -428,6 +441,11 @@ class PageStack(QStackedWidget):
             owed, self._layout_owed = self._layout_owed, False
             if owed:
                 self.layout_hidden_pages()
+
+    def layout_pending(self) -> bool:
+        """A resize's hidden-page layout is still waiting out its debounce,
+        so a hidden card's size is about to change."""
+        return self._hidden_layout_timer.isActive() or self._layout_owed
 
     def layout_hidden_pages(self) -> None:
         """Hand every off-screen page the current page's rect."""
@@ -2591,6 +2609,15 @@ class MainWindow(QMainWindow):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(SAVE_DEBOUNCE_MS)
         self._save_timer.timeout.connect(self._save_session)
+
+        # the launch restore's agents outside the active workspace, waiting
+        # for it to come up (autostart_active_workspace), and the launched
+        # agents whose boot the queue waits on: (agent, ws_id, started)
+        self._launch_queue: list[tuple] = []
+        self._launch_boots: list[tuple] = []
+        self._launch_timer = QTimer(self)
+        self._launch_timer.setInterval(LAUNCH_QUEUE_TICK_MS)
+        self._launch_timer.timeout.connect(self._drain_launch_queue)
 
         # safety-net heartbeat: re-saves only when live state diverges from
         # disk, so a missed/suppressed signal can't silently strand work
@@ -6505,6 +6532,8 @@ class MainWindow(QMainWindow):
         page = self._pages.get(ws_id)
         if page is not None:
             self.stack.setCurrentWidget(page)
+        # agents the launch has not reached yet: the user is looking now
+        self._start_queued_in(ws_id)
         self.sidebar.set_active_row(ws_id)
         self._fullscreen.page_changed()
         ws = self.manager.workspace(ws_id)
@@ -7224,9 +7253,19 @@ class MainWindow(QMainWindow):
         First it joins the launch's transcript backup, which has been
         copying on a worker since the top of `create_main_window`. Each
         start below would wait for it anyway (`TerminalAgent.start`); the
-        join here keeps the wait out of the middle of the starts."""
+        join here keeps the wait out of the middle of the starts.
+
+        Only the ACTIVE workspace's agents start here. Every other one is
+        queued (`TerminalAgent.queue_start`) and started by
+        `_drain_launch_queue` once the visible agents have their prompt.
+        Each boot is a CLI start plus a resumed conversation fed through pyte
+        on the GUI thread, and one launch that started 14 of them together
+        logged GUI stalls up to 1.2 s while the user watched the two in front
+        of them load. Opening a workspace starts its queued agents at once
+        (`_start_queued_in`)."""
         transcripts.wait_for_backup()
-        starting = []
+        active = self.manager.active_id
+        starting, queued = [], []
         for ws in self.manager.workspaces:
             page = self._pages.get(ws.id)
             for agent in ws.agents:
@@ -7242,7 +7281,11 @@ class MainWindow(QMainWindow):
                     card = page.card_for(agent.id) if page is not None else None
                     if card is not None:
                         card.drop_restored_screen()
-                    starting.append((ws, agent))
+                    if ws.id == active:
+                        starting.append((ws, agent))
+                    else:
+                        agent.queue_start()
+                        queued.append((ws, agent))
         self.settle_layout()
         # settle_layout pumps the event loop, and a queued close in there can
         # remove an agent or its workspace. Removal disposes the agent, and
@@ -7250,6 +7293,76 @@ class MainWindow(QMainWindow):
         for ws, agent in starting:
             if agent in ws.agents and not agent.is_running():
                 agent.start()
+                self._note_launch_boot(ws, agent)
+        known = {id(agent) for _ws, agent in self._launch_queue}
+        self._launch_queue += [(ws, agent) for ws, agent in queued
+                               if id(agent) not in known]
+        if self._launch_queue:
+            self._launch_timer.start()
+
+    def _note_launch_boot(self, ws: Workspace, agent) -> None:
+        """Count a launch start the queue waits on while it boots. A plain
+        shell prints a prompt and little else, so only provider CLIs count."""
+        if agent.is_pty and agent.spec.provider and agent.is_running():
+            self._launch_boots.append((agent, ws.id, time.monotonic()))
+
+    def _drain_launch_queue(self) -> None:
+        """One look at the launch queue. It starts the next queued agent
+        unless an agent of the active workspace is still booting, or
+        LAUNCH_BOOT_LIMIT others are. A wake, a workspace switch or the
+        limit recovery may have started a queued agent meanwhile, and a close
+        may have removed one: either way it leaves the queue."""
+        if self._closing:
+            self._launch_timer.stop()
+            return
+        self._launch_queue = [(ws, agent) for ws, agent in self._launch_queue
+                              if agent.start_queued() and agent in ws.agents]
+        now = time.monotonic()
+        self._launch_boots = [
+            (agent, ws_id, started)
+            for agent, ws_id, started in self._launch_boots
+            if agent.is_running() and not agent.prompt_ready()
+            and now - started < LAUNCH_BOOT_MAX_S]
+        if not self._launch_queue:
+            self._launch_timer.stop()
+            self._launch_boots = []
+            return
+        active = self.manager.active_id
+        if (any(ws_id == active for _a, ws_id, _s in self._launch_boots)
+                or len(self._launch_boots) >= LAUNCH_BOOT_LIMIT
+                # a window resize is still reaching the hidden pages, and a
+                # child spawned now would paint at the width they are losing
+                or self.stack.layout_pending()):
+            return
+        ws, agent = self._launch_queue.pop(0)
+        self._start_launch_queued(ws, agent)
+
+    def _start_queued_in(self, ws_id: str) -> None:
+        """The user opened a workspace whose launch restore is still queued:
+        its agents start now, and the rest of the queue waits on them."""
+        mine = [(ws, agent) for ws, agent in self._launch_queue
+                if ws.id == ws_id]
+        if not mine:
+            return
+        self._launch_queue = [entry for entry in self._launch_queue
+                              if entry[0].id != ws_id]
+        for ws, agent in mine:
+            if agent.start_queued() and agent in ws.agents:
+                self._start_launch_queued(ws, agent)
+
+    def _start_launch_queued(self, ws: Workspace, agent) -> None:
+        """Start one agent the launch queued, at its card's settled width."""
+        page = self._pages.get(ws.id)
+        card = page.card_for(agent.id) if page is not None else None
+        # the card's view debounces its resize, and the child must hear the
+        # real width before it paints anything (see settle_layout)
+        if card is not None and card.is_pty and card.terminal is not None:
+            card.terminal.flush_resize()
+        if not agent.is_running():
+            agent.start()
+        # a held start leaves no child: the hold owns the card from here
+        agent.end_start_queue()
+        self._note_launch_boot(ws, agent)
 
     def settle_layout(self) -> None:
         """Give every card its FINAL width before any pty child is spawned.
@@ -7479,6 +7592,8 @@ class MainWindow(QMainWindow):
         self._model_sync_timer.stop()
         self._bg_shell_timer.stop()
         self._limit_watch_timer.stop()
+        # queued agents stay queued, so the final save records them running
+        self._launch_timer.stop()
         self._usage_tick_timer.stop()
         for poller in self._usage_pollers.values():
             poller.stop()

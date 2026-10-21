@@ -725,8 +725,10 @@ error dialog instead of silently closing. Packaging to a distributable
   restored on launch (including provider/model/effort, the Claude permission
   mode each agent was last in, per-agent font, grid layout, current task, and
   assignment badges). Everything that was running
-  comes back **in every workspace**: previously-running agents autostart, and
-  each Claude agent resumes **its own pinned conversation** (`--resume
+  comes back **in every workspace**: previously-running agents autostart, the
+  workspace AI Hive opens on first. Other workspaces' agents wait until those
+  have their prompt, then start two at a time, and opening a workspace starts
+  its waiting agents straight away. Each Claude agent resumes **its own pinned conversation** (`--resume
   <session-id>` — so two agents sharing a project folder can never race for
   or swap each other's conversations) — falling back to a fresh launch
   instead of a dead card if there's nothing to resume. The pin **tracks the
