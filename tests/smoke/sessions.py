@@ -2381,7 +2381,7 @@ def test_launch_starts_active_workspace_first():
             "task": "", "assignment": "idle", "auto_created": False,
             "kind": "claude", "running": True}
     layout = {"w1": ["Front"], "w2": ["Back A", "Back B", "Back C"],
-              "w3": ["Other"], "w4": ["Woken"]}
+              "w3": ["Other"], "w4": ["Woken"], "w5": ["Late"]}
     store.save({"version": 3, "active": "w1", "workspaces": [
         {"id": ws_id, "name": ws_id, "project_path": str(home),
          "layout": "auto",
@@ -2410,8 +2410,8 @@ def test_launch_starts_active_workspace_first():
               spawned == ["Front"], spawned)
         queued = [n for n, a in agents.items() if a.start_queued()]
         check("launch-queue: every other running agent is queued",
-              sorted(queued) == ["Back A", "Back B", "Back C", "Other",
-                                 "Woken"], queued)
+              sorted(queued) == ["Back A", "Back B", "Back C", "Late",
+                                 "Other", "Woken"], queued)
         check("launch-queue: a queued card shows the loader, not the "
               "stopped banner",
               cards["Back A"].boot.is_active()
@@ -2454,6 +2454,18 @@ def test_launch_starts_active_workspace_first():
         pump(mw.LAUNCH_QUEUE_TICK_MS * 3)
         check("launch-queue: the newly opened workspace's boot holds the "
               "queue", "Back C" not in spawned, spawned)
+
+        # opened while a window resize is still reaching the pages: the page
+        # has its old size, so its agents wait for the layout, then go first
+        win.stack.layout_pending = lambda: True
+        win.manager.set_active("w5")
+        pump(mw.LAUNCH_QUEUE_TICK_MS * 3)
+        check("launch-queue: a workspace opened mid-resize waits for the "
+              "layout", "Late" not in spawned, spawned)
+        del win.stack.layout_pending
+        check("launch-queue: ...and starts once it settles, past the limit",
+              wait_for(lambda: "Late" in spawned)
+              and "Back C" not in spawned, spawned)
 
         # a boot that never shows a prompt (a trust dialog, a plain shell)
         # stops holding the queue

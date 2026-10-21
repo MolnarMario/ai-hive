@@ -2615,6 +2615,9 @@ class MainWindow(QMainWindow):
         # agents whose boot the queue waits on: (agent, ws_id, started)
         self._launch_queue: list[tuple] = []
         self._launch_boots: list[tuple] = []
+        # a workspace opened while a resize was still reaching the pages:
+        # its queued agents start once the layout settles (_start_queued_in)
+        self._launch_opened = ""
         self._launch_timer = QTimer(self)
         self._launch_timer.setInterval(LAUNCH_QUEUE_TICK_MS)
         self._launch_timer.timeout.connect(self._drain_launch_queue)
@@ -7334,8 +7337,14 @@ class MainWindow(QMainWindow):
         if not self._launch_queue:
             self._launch_timer.stop()
             self._launch_boots = []
+            self._launch_opened = ""
             return
         active = self.manager.active_id
+        if self._launch_opened and not self.stack.layout_pending():
+            opened, self._launch_opened = self._launch_opened, ""
+            if opened == active:        # the user is still looking at it
+                self._start_queued_in(opened)
+                return
         if (any(ws_id == active for _a, ws_id, _s in self._launch_boots)
                 or len(self._launch_boots) >= LAUNCH_BOOT_LIMIT
                 # a window resize is still reaching the hidden pages, and a
@@ -7347,10 +7356,20 @@ class MainWindow(QMainWindow):
 
     def _start_queued_in(self, ws_id: str) -> None:
         """The user opened a workspace whose launch restore is still queued:
-        its agents start now, and the rest of the queue waits on them."""
+        its agents start now, and the rest of the queue waits on them.
+
+        Not while a window resize is still reaching the pages. The page just
+        opened keeps its old size until then, and a child spawned at it
+        would wrap its resumed conversation for a width the card is losing.
+        The first queue tick after the layout settles starts them, ahead of
+        the boot limits."""
         mine = [(ws, agent) for ws, agent in self._launch_queue
                 if ws.id == ws_id]
         if not mine:
+            return
+        if self.stack.layout_pending():
+            self._launch_opened = ws_id
+            self._launch_timer.start()
             return
         self._launch_queue = [entry for entry in self._launch_queue
                               if entry[0].id != ws_id]
