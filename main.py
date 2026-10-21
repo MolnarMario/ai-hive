@@ -94,6 +94,7 @@ if __name__ == "__main__":
 
 _t = time.perf_counter()
 from app import perf_audit
+from app import ui_theme
 from app.process_worker import AgentKind, build_spec
 from app.pty_worker import HAS_CONPTY, ensure_windowless_console
 from app.session_store import SessionStore
@@ -155,22 +156,44 @@ def _load_bundled_fonts() -> None:
             QFontDatabase.addApplicationFont(os.path.join(fonts_dir, name))
 
 
-def setup_application(app: QApplication) -> None:
+def _name_application(app: QApplication) -> None:
+    # SessionStore() finds its folder by these names
     app.setOrganizationName("AIHive")
     app.setApplicationName("AI Hive")
+
+
+def setup_application(app: QApplication, ui: dict | None = None) -> None:
+    """`ui` is the saved session's "ui" dict. Its theme and console font go
+    live here, before any widget exists, so the window is built in them and
+    this is the launch's only app stylesheet. Applied after the window was
+    built, the two cost 4.5 s of restyling and a full replay per card, and
+    MainWindow._restore_ui_state still does that for a session whose values
+    aren't active yet (the suite's path)."""
+    _name_application(app)
     app.setStyle("Fusion")  # stable base for QSS on Windows
     app.setWindowIcon(_app_icon())
     _load_bundled_fonts()
     chrome = "Inter" if "Inter" in QFontDatabase.families() else "Segoe UI"
     app.setProperty("chromeFamily", chrome)  # reused by live font rescaling
+    if ui:
+        tid = ui_theme.saved_theme_id(ui)
+        if tid:
+            ui_theme.apply_theme(tid)
+        px = ui_theme.saved_console_px(ui)
+        if px:
+            ui_theme.CONSOLE_FONT_PX = px
     app.setStyleSheet(build_qss(chrome))
 
 
-def create_main_window(store: SessionStore | None = None) -> MainWindow:
-    """Factory used by both __main__ and the offscreen smoke test."""
+def create_main_window(store: SessionStore | None = None,
+                       session: dict | None = None) -> MainWindow:
+    """Factory used by both __main__ and the offscreen smoke test. `session`
+    is what main() already loaded from `store`; without it the factory loads
+    it itself."""
     store = store or SessionStore()
     manager = WorkspaceManager()
-    session = store.load()
+    if session is None:
+        session = store.load()
     manager.load_session_dict(session)
 
     # snapshot every pinned conversation BEFORE any agent launches: whatever
@@ -318,8 +341,11 @@ def main() -> int:
     ensure_windowless_console()
     phases = perf_audit.StartupPhases(_STARTED, update=_STARTUP_UPDATE_S,
                                       imports=_STARTUP_IMPORTS_S)
+    _name_application(app)
+    store = SessionStore()
+    session = store.load()
     with phases.measure("setup"):
-        setup_application(app)
+        setup_application(app, session.get("ui"))
     # ---- CLI auto-update gate (opt-in, before anything else exists) --------
     # Windows cannot overwrite a running .exe, and every agent IS a claude.exe
     # child held alive by the Job Object, so THIS is the only moment those
@@ -327,8 +353,6 @@ def main() -> int:
     # autostart_active_workspace. Opting in here rather than in the factory is
     # the same rule as start_usage_polling / recover_blocked_at_startup: the
     # offscreen suite shares the factory and must never shell out.
-    store = SessionStore()
-    session = store.load()
     if _STARTUP_UPDATE_AUDIT:
         try:
             store.audit(_STARTUP_UPDATE_AUDIT)
@@ -340,7 +364,7 @@ def main() -> int:
         with phases.measure("cli_gate"):
             gate = run_update_gate(store)
     with phases.measure("window"):
-        window = create_main_window(store)
+        window = create_main_window(store, session)
     window.quit_on_close = True  # closed window == dead process, always
     # opt in to the plan-usage readout here, not in the factory: the smoke
     # suite shares create_main_window and must never hit the network

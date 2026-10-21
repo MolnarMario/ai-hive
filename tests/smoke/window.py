@@ -2145,6 +2145,123 @@ def test_themes():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_saved_look_before_widgets():
+    """main() makes the saved theme and console font active in
+    setup_application, before any widget exists. Applied after the window
+    was built, each one restyled every widget through
+    QApplication.setStyleSheet (4.5 s for one user's 2700 widgets), and the
+    font branch called set_font_size on every card, a full replay of each
+    restored screen (5.8 s more). A per-agent font still beats the global one,
+    and a session whose values aren't active yet (the suite's path) still
+    gets both from _restore_ui_state."""
+    from PySide6.QtWidgets import QApplication
+
+    from app import ui_theme
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from app.widgets import terminal_card as tc
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-look-"))
+    term = {"role": "", "cwd": str(tmp), "user_program": "", "user_args": [],
+            "provider": "", "model": "", "effort": "", "custom_command": "",
+            "is_orchestrator": False, "task": "", "assignment": "idle",
+            "auto_created": False, "session_id": "", "kind": "powershell",
+            "running": False}
+    terminals = [{**term, "name": "Line", "pty": False, "font_px": 18}]
+    if HAS_CONPTY:
+        terminals += [{**term, "name": "Plain", "pty": True, "font_px": 0},
+                      {**term, "name": "Own", "pty": True, "font_px": 18}]
+    store = SessionStore(path=tmp / "session.json")
+    store.save({"version": 3, "active": "w", "workspaces": [
+        {"id": "w", "name": "W", "project_path": str(tmp), "layout": "auto",
+         "terminals": terminals}],
+        "ui": {"theme": "adeptus-mechanicus", "console_font_px": 15}})
+
+    def cards(win):
+        return {c.agent.spec.name: c
+                for c in win._pages[win.manager.workspaces[0].id].cards}
+
+    def fonts_hold(win, label):
+        by_name = cards(win)
+        check(f"look: {label}: a line-mode agent keeps its own font",
+              "font-size: 18px" in by_name["Line"].console.styleSheet(),
+              by_name["Line"].console.styleSheet())
+        if HAS_CONPTY:
+            check(f"look: {label}: a pty card follows the saved global font",
+                  by_name["Plain"].terminal.font_size() == 15,
+                  by_name["Plain"].terminal.font_size())
+            check(f"look: {label}: a pty agent's own font beats the global one",
+                  by_name["Own"].terminal.font_size() == 18,
+                  by_name["Own"].terminal.font_size())
+
+    real_set = QApplication.setStyleSheet
+    real_init = tc.TerminalCard.__init__
+    restyles, built, loads = [], [], []
+
+    def counting_set(self, qss):
+        if built:
+            restyles.append(len(qss))
+        return real_set(self, qss)
+
+    def marking_init(self, *a, **kw):
+        built.append(True)
+        return real_init(self, *a, **kw)
+
+    chrome = app.property("chromeFamily") or "Segoe UI"
+    try:
+        # main()'s path: load once, apply the look, hand the factory the
+        # session it already has
+        session = store.load()
+        setup_application(app, session.get("ui"))
+        check("look: setup_application makes the saved theme active",
+              ui_theme.ACTIVE_THEME.id == "adeptus-mechanicus")
+        check("look: ...and the saved console font",
+              ui_theme.CONSOLE_FONT_PX == 15)
+        real_load = store.load
+        store.load = lambda: loads.append(True) or real_load()
+        QApplication.setStyleSheet = counting_set
+        tc.TerminalCard.__init__ = marking_init
+        try:
+            win = create_main_window(store, session)
+        finally:
+            QApplication.setStyleSheet = real_set
+            tc.TerminalCard.__init__ = real_init
+            del store.load
+        check("look: precondition - the window built its cards", built)
+        check("look: no app restyle once the first card exists",
+              restyles == [], restyles)
+        check("look: the factory reuses the session main() loaded",
+              loads == [])
+        check("look: the theme dropdown reflects the saved theme",
+              win._theme_id == "adeptus-mechanicus"
+              and win.top_bar.theme_select.currentData()
+              == "adeptus-mechanicus")
+        fonts_hold(win, "main path")
+        win.close()
+
+        # the suite's path: nothing active yet, so _restore_ui_state applies
+        # both late, as it always did
+        ui_theme.apply_theme(ui_theme.DEFAULT_THEME_ID)
+        ui_theme.CONSOLE_FONT_PX = ui_theme.DEFAULT_CONSOLE_PX
+        app.setStyleSheet(ui_theme.build_qss(chrome))
+        win2 = create_main_window(store)
+        check("look: late path: the saved theme is restored",
+              win2._theme_id == "adeptus-mechanicus"
+              and ui_theme.ACTIVE_THEME.id == "adeptus-mechanicus")
+        check("look: late path: ...and the saved console font",
+              ui_theme.CONSOLE_FONT_PX == 15)
+        fonts_hold(win2, "late path")
+        win2.close()
+    finally:
+        # ui_theme is process-wide and later tests expect the default look
+        ui_theme.apply_theme(ui_theme.DEFAULT_THEME_ID)
+        ui_theme.CONSOLE_FONT_PX = ui_theme.DEFAULT_CONSOLE_PX
+        app.setStyleSheet(ui_theme.build_qss(chrome))
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_review_fixes():
     """Regressions for the Codex-review findings: single-instance mutex guard
     (fail closed), task-assignment state autosave, workspace-bound board

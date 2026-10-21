@@ -1664,6 +1664,154 @@ def test_boot_veil():
     lcard.detach(); live.dispose(); pump(50)
 
 
+def test_autostart_skips_discarded_replay():
+    """The launch autostart drops each starting card's restored screen BEFORE
+    settle_layout, so the flush there projects nothing it would wipe a moment
+    later. Dropped after it, every autostarting card paid a full replay of
+    its snapshot through pyte (0.4 to 0.6 s for a large one) under the boot
+    veil, for nothing. The sizes still settle before any spawn, and a card
+    left stopped still projects its snapshot, once: settle_layout holds the
+    overdue settle backstops, which used to project it at its constructor's
+    width first."""
+    import pathlib
+    import time
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app import screen_snapshot
+    from app.process_worker import WorkerState
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from app.widgets import terminal_card as tc
+    from main import create_main_window
+
+    if not HAS_CONPTY:
+        return
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    home = pathlib.Path(tempfile.mkdtemp(prefix="aihive-autostart-"))
+    store = SessionStore(path=home / "session.json")
+    term = {"role": "", "cwd": str(home), "user_program": "", "user_args": [],
+            "pty": True, "provider": "", "model": "", "effort": "",
+            "custom_command": "", "font_px": 0, "is_orchestrator": False,
+            "task": "", "assignment": "idle", "auto_created": False,
+            "kind": "powershell"}
+    # far past REPLAY_SEED_CAP, so a full projection can't pass for the seed
+    body = "".join(f"old line {i} " + "o" * 40 + "\r\n" for i in range(1500))
+    names = {"w1": [("Run A", True), ("Run B", True), ("Stopped", False)],
+             "w2": [("Hidden A", True), ("Hidden B", True)]}
+    workspaces = []
+    for ws_id, agents in names.items():
+        terms = []
+        for name, running in agents:
+            sid = "autostart-" + name.replace(" ", "-").lower()
+            screen_snapshot.save(str(home), str(home), sid,
+                                 f"HEAD-{sid}\r\n" + body + f"TAIL-{sid}\r\n")
+            terms.append({**term, "name": name, "running": running,
+                          "session_id": sid})
+        workspaces.append({"id": ws_id, "name": ws_id, "project_path": str(home),
+                           "layout": "auto", "terminals": terms})
+    store.save({"version": 3, "active": "w1", "workspaces": workspaces})
+
+    full = {}
+    real_replay = tc.TerminalCard._replay_with_marks
+
+    def counting(self, replay, cap=None, recover=True):
+        if cap is None or cap > tc.REPLAY_SEED_CAP:
+            full[self.agent.spec.name] = full.get(self.agent.spec.name, 0) + 1
+        return real_replay(self, replay, cap=cap, recover=recover)
+
+    spawned = {}
+
+    def stub_start(agent):
+        worker = agent.worker
+
+        def start():
+            # what PtyWorker.start reports, without a child
+            spawned[agent.spec.name] = (worker.rows, worker.cols)
+            worker._set_state(WorkerState.STARTING)
+        return start
+
+    tc.TerminalCard._replay_with_marks = counting
+    try:
+        win = create_main_window(store)
+        # a real window build outlasts the settle backstop (1.6 s for one
+        # user), so every backstop is overdue by the time autostart pumps
+        time.sleep(tc.REPLAY_SETTLE_MS / 1000 + 0.15)
+        agents = {a.spec.name: a for a in win.manager.all_agents()}
+        for agent in agents.values():
+            agent.worker.start = stub_start(agent)
+        card_of = {}
+        for page in win._pages.values():
+            for card in page.cards:
+                card_of[card.agent.spec.name] = card
+        check("autostart-replay: precondition - every agent is seeded",
+              all(a.has_pristine_seed() for a in agents.values()))
+        # main()'s order: show(), then autostart, no turn of the loop between
+        win.show(); win.autostart_active_workspace()
+        starters = [n for n, a in agents.items() if a.autostart_on_restore]
+        check("autostart-replay: precondition - four agents autostart",
+              sorted(starters) == ["Hidden A", "Hidden B", "Run A", "Run B"],
+              starters)
+        check("autostart-replay: every autostarting agent was spawned",
+              sorted(spawned) == sorted(starters), sorted(spawned))
+        check("autostart-replay: no full projection for a card that starts",
+              not any(full.get(n) for n in starters), full)
+        check("autostart-replay: the boot veil is up on every starting card",
+              all(card_of[n].boot.is_active() for n in starters),
+              {n: card_of[n].boot.is_active() for n in starters})
+        sizes = {n: (card_of[n].terminal.screen.lines,
+                     card_of[n].terminal.screen.columns) for n in starters}
+        check("autostart-replay: each spawn got its card's settled size, "
+              "hidden workspace included",
+              all(spawned[n] == sizes[n] for n in starters),
+              (spawned, sizes))
+        pump(tc.REPLAY_SETTLE_MS + 300)   # past every settle backstop
+        check("autostart-replay: ...and no backstop timer projects one later",
+              not any(full.get(n) for n in starters), full)
+        check("autostart-replay: ...nor did a later pass change those sizes",
+              all(spawned[n] == (card_of[n].terminal.screen.lines,
+                                 card_of[n].terminal.screen.columns)
+                  for n in starters))
+        check("autostart-replay: the stopped card projects its snapshot once",
+              full.get("Stopped") == 1, full)
+        stopped = card_of["Stopped"].terminal.screen_text()
+        check("autostart-replay: ...and shows it",
+              "TAIL-autostart-stopped" in stopped, stopped[-200:])
+        check("autostart-replay: ...and it was never started",
+              "Stopped" not in spawned)
+        for agent in agents.values():
+            agent.worker._set_state(WorkerState.IDLE)
+        win.close(); pump(300)
+
+        # the backstop exists for a card whose size never changes, so no
+        # sizeChanged ever projects it: a held one must still project
+        from app.process_worker import AgentKind, build_spec
+        from app.terminal_agent import TerminalAgent
+        quiet = TerminalAgent(build_spec(
+            AgentKind.POWERSHELL, "Quiet", cwd=str(home), pty=True))
+        quiet.seed_pty_replay("HEAD-quiet\r\n" + body)
+        qcard = tc.TerminalCard(quiet)
+        check("autostart-replay: holding an armed backstop stops it",
+              qcard.hold_settle_backstop()
+              and not qcard._settle_timer.isActive())
+        check("autostart-replay: ...and a second hold owes nothing",
+              not qcard.hold_settle_backstop())
+        qcard.release_settle_backstop()
+        check("autostart-replay: releasing it projects a card no resize did",
+              qcard._pending_replay == "" and full.get("Quiet") == 1, full)
+        qcard.release_settle_backstop()
+        check("autostart-replay: ...once", full.get("Quiet") == 1, full)
+        qcard.detach(); quiet.dispose(); pump(50)
+    finally:
+        tc.TerminalCard._replay_with_marks = real_replay
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def test_restart_veil():
     """Restart covers the card from the click, not from STARTING.
 

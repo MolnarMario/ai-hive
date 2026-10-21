@@ -5936,9 +5936,12 @@ class MainWindow(QMainWindow):
     def _restore_ui_state(self, session: dict) -> None:
         ui = session.get("ui", {})
         # restore the saved skin FIRST so the stylesheet below is built once
-        # with the right palette (and the dropdown reflects it silently)
-        tid = ui.get("theme")
-        if tid in ui_theme.THEMES and tid != ui_theme.ACTIVE_THEME.id:
+        # with the right palette (and the dropdown reflects it silently).
+        # main() makes the saved skin and font active before the window is
+        # built (setup_application), so on a real launch both branches below
+        # find them active and skip the restyle and the per-card font loop.
+        tid = ui_theme.saved_theme_id(ui)
+        if tid and tid != ui_theme.ACTIVE_THEME.id:
             from PySide6.QtWidgets import QApplication
             ui_theme.apply_theme(tid)
             self._theme_id = tid
@@ -6043,8 +6046,8 @@ class MainWindow(QMainWindow):
             self.body_split.setSizes([self._sidebar_saved_width, 1000])
         self._sync_ws_rail()
         # restore the global console font (pages already built → refresh them)
-        px = int(ui.get("console_font_px", 0) or 0)
-        if 7 <= px <= 40 and px != ui_theme.CONSOLE_FONT_PX:
+        px = ui_theme.saved_console_px(ui)
+        if px and px != ui_theme.CONSOLE_FONT_PX:
             from PySide6.QtWidgets import QApplication
             ui_theme.CONSOLE_FONT_PX = px
             app = QApplication.instance()
@@ -6820,8 +6823,13 @@ class MainWindow(QMainWindow):
         The one exception is a provider whose CLI was still installing when the
         user skipped the update splash: its binary is being rewritten right
         now, so starting an agent could execute a half written file. Those wait
-        for the user (the top-bar pill says so) rather than being started."""
-        self.settle_layout()
+        for the user (the top-bar pill says so) rather than being started.
+
+        The snapshots go BEFORE `settle_layout`. Its resize flush is what
+        projects a restored screen at the settled width, a full replay
+        through pyte per card (0.4 to 0.6 s for a large one), and for a card
+        about to start that projection would only be wiped a moment later."""
+        starting = []
         for ws in self.manager.workspaces:
             page = self._pages.get(ws.id)
             for agent in ws.agents:
@@ -6837,7 +6845,11 @@ class MainWindow(QMainWindow):
                     card = page.card_for(agent.id) if page is not None else None
                     if card is not None:
                         card.drop_restored_screen()
-                    agent.start()
+                    starting.append(agent)
+        self.settle_layout()
+        for agent in starting:
+            if not agent.is_running():
+                agent.start()
 
     def settle_layout(self) -> None:
         """Give every card its FINAL width before any pty child is spawned.
@@ -6874,12 +6886,18 @@ class MainWindow(QMainWindow):
            columns and was widened to 46 a moment later. So the hidden pages
            are laid out and the window pumped until its size stops changing.
 
+        Each card's settle backstop is held until after the flush
+        (`TerminalCard.hold_settle_backstop`), so a restored screen is
+        projected once, at the settled width.
+
         Cheap and idempotent: `_apply_resize` returns early when nothing
         changed, so calling this again costs a queue pump."""
         from PySide6.QtCore import QEventLoop
         from PySide6.QtWidgets import QApplication
 
         app = QApplication.instance()
+        held = [card for page in self._pages.values() for card in page.cards
+                if card.hold_settle_backstop()]
         if app is not None:
             # let the window reach its real (possibly maximized) geometry, and
             # the visible page tile into it
@@ -6898,10 +6916,14 @@ class MainWindow(QMainWindow):
             app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
             if self.size() == before:
                 break
-        for page in self._pages.values():
-            for card in page.cards:
-                if card.is_pty and card.terminal is not None:
-                    card.terminal.flush_resize()
+        cards = [card for page in self._pages.values() for card in page.cards]
+        for card in cards:
+            if card.is_pty and card.terminal is not None:
+                card.terminal.flush_resize()
+        # cards still on a page only: one closed during the pumps is gone
+        for card in cards:
+            if card in held:
+                card.release_settle_backstop()
 
     # -------------------------------------------------------- persistence ---
 
