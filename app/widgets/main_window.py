@@ -2463,7 +2463,7 @@ class MainWindow(QMainWindow):
         # other preferences or the restored value is clobbered.
         self._reply_stamps = True     # user preference (persisted)
         self._tooltips = True         # user preference (persisted)
-        tooltips.install()            # width cap + switch, app-wide
+        # the tooltip filter goes on at the first show (showEvent), not here
         # startup CLI auto-update. Default OFF (it changes installed software),
         # and like every other preference here the default MUST be assigned
         # above _restore_ui_state or the restored value is clobbered.
@@ -6726,6 +6726,13 @@ class MainWindow(QMainWindow):
         self._page_border.setVisible(lit)
         self._page_border.raise_()
         self._page_border.update()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # width cap + switch, app-wide. Installed after the build, and one
+        # pass of the event loop after the show, so neither one's storm of
+        # palette, font and style events goes through Python (tooltips.install)
+        QTimer.singleShot(0, tooltips.install)
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
