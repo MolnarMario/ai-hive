@@ -10,7 +10,8 @@ Two paths reach `wrap`:
 * `TooltipFilter`, an application-wide event filter. It takes over the
   ToolTip event of every widget with a `toolTip()`, every `QMenu` action
   (menus that set `setToolTipsVisible`) and every item view row
-  (`ToolTipRole`), so a plain `setToolTip(...)` needs no extra code.
+  (`ToolTipRole`), so a plain `setToolTip(...)` needs no extra code. The
+  main window installs it when it first shows, after the build (`install`).
 * `show_text`, for widgets that draw their own hit areas (sidebar rail,
   terminal scrollbar, file map) and call `QToolTip.showText` themselves.
   They call this instead.
@@ -155,7 +156,19 @@ class TooltipFilter(QObject):
 
 
 def install(app: QApplication | None = None) -> None:
-    """Install the filter once per QApplication; later calls do nothing."""
+    """Install the filter once per QApplication; later calls do nothing.
+
+    `MainWindow.showEvent` calls this, so the filter goes on after the window
+    build. An application filter sees every event in the app, and PySide6
+    spends about 17 us handing each one to Python (measured on
+    PaletteChange), a cost no body of `eventFilter` can cut. The build sends
+    about 270k events, mostly palette, font and style changes, which cost 1
+    to 4 s of a 10 s build. No hover tip can come before the window shows.
+    Once it is up, busy agents send a few hundred events a second.
+
+    Not gated on the application being active: PySide6 6.11 can't hand
+    `applicationStateChanged`'s argument to Python, so a slot on it never
+    runs."""
     app = app or QApplication.instance()
     if app is None or app.property("aihiveTooltipFilter"):
         return
