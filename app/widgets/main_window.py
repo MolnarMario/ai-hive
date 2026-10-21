@@ -7311,12 +7311,20 @@ class MainWindow(QMainWindow):
         unless an agent of the active workspace is still booting, or
         LAUNCH_BOOT_LIMIT others are. A wake, a workspace switch or the
         limit recovery may have started a queued agent meanwhile, and a close
-        may have removed one: either way it leaves the queue."""
+        may have removed one: either way it leaves the queue. One started
+        meanwhile is booting all the same, so the queue counts it."""
         if self._closing:
             self._launch_timer.stop()
             return
-        self._launch_queue = [(ws, agent) for ws, agent in self._launch_queue
-                              if agent.start_queued() and agent in ws.agents]
+        waiting = []
+        for ws, agent in self._launch_queue:
+            if agent not in ws.agents:
+                continue
+            if agent.start_queued():
+                waiting.append((ws, agent))
+            else:
+                self._note_launch_boot(ws, agent)
+        self._launch_queue = waiting
         now = time.monotonic()
         self._launch_boots = [
             (agent, ws_id, started)

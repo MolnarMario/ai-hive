@@ -2443,6 +2443,9 @@ def test_launch_starts_active_workspace_first():
         check("launch-queue: a keystroke on a queued card starts it",
               spawned[-1] == "Woken" and not agents["Woken"].start_queued(),
               spawned)
+        check("launch-queue: ...and the queue counts that boot as its own",
+              wait_for(lambda: any(a is agents["Woken"]
+                                   for a, _w, _s in win._launch_boots)))
 
         # Other is in the active workspace now, so the queue waits on it
         # even with room under the limit
