@@ -313,12 +313,16 @@ def _notes(runner, repo, low, high, old_ref, new_ref) -> str:
 # ---------------------------------------------------------------- apply ---
 
 def apply(runner, repo: str = REPO_DIR, python: str = "",
-          target: str = UPSTREAM) -> Applied:
+          target: str = UPSTREAM, packages: bool = True) -> Applied:
     """Fast-forward to origin/main (or the commit `target` names), then
     install requirements if they changed.
 
     Assumes `check` fetched moments ago. Re-checks `blocked_reason` first, so
-    a folder that changed since the dialog opened is refused, not merged."""
+    a folder that changed since the dialog opened is refused, not merged.
+
+    `packages=False` is the install nobody watches: it refuses, before the
+    merge, an update that changes requirements.txt from the commit the merge
+    moves from, and it never runs pip."""
     blocked = blocked_reason(runner, repo, target)
     if blocked:
         return Applied(False, detail=blocked)
@@ -327,6 +331,14 @@ def apply(runner, repo: str = REPO_DIR, python: str = "",
     if not old_head:
         return Applied(False, detail=_git_error("Reading the current commit",
                                                 rc, out))
+    if not packages:
+        # rc 1 is a change; anything else means git could not tell, and an
+        # install nobody watches only goes ahead on a clear no
+        rc, _ = runner(_git(repo, "diff", "--quiet", old_head, target, "--",
+                            "requirements.txt"), GIT_TIMEOUT_S)
+        if rc != 0:
+            return Applied(False, deps_changed=True, detail=(
+                "It needs new Python packages, so it waits for you."))
     rc, out = runner(_git(repo, "merge", "--ff-only", "--quiet", target),
                      MERGE_TIMEOUT_S)
     if rc != 0:
@@ -337,7 +349,11 @@ def apply(runner, repo: str = REPO_DIR, python: str = "",
     rc, _ = runner(_git(repo, "diff", "--quiet", old_head, "HEAD", "--",
                         "requirements.txt"), GIT_TIMEOUT_S)
     result.deps_changed = rc != 0
-    if result.deps_changed:
+    if result.deps_changed and not packages:
+        # HEAD moved between the look above and the merge: the files are
+        # in, the packages are not, and the text says what to run
+        result.deps_ok = False
+    elif result.deps_changed:
         py = python or venv_python()
         rc, out = runner([py, "-m", "pip", "install", "--disable-pip-version-check",
                           "-r", os.path.join(repo, "requirements.txt")],
@@ -350,24 +366,26 @@ def apply(runner, repo: str = REPO_DIR, python: str = "",
 
 # ----------------------------------------------------------- background ---
 
-def background_update(runner, repo: str = REPO_DIR, running: str = ""):
+def background_update(runner, repo: str = REPO_DIR, running: str = "",
+                      wanted=None):
     """The Options switch's check: `check`, then `apply` when the update can
     install with nobody watching. Returns `(Check, Applied or None)`; None
-    means nothing was installed: no update, a blocked folder, or an update
-    that changes requirements.txt (`Check.needs_packages`). Never raises."""
+    means nothing was installed: no update, a blocked folder, an update
+    that changes requirements.txt (`Check.needs_packages`), or `wanted()`
+    saying no once the check is done (the switch went off, or the window is
+    closing). Never raises."""
     found = check(runner, repo, running)
     target = found.commit
     if (found.status is not Status.UPDATE_AVAILABLE or found.blocked
             or not target):
         return found, None
-    # rc 1 is a change; anything else means git could not tell, and an
-    # install nobody watches only goes ahead on a clear no
-    rc, _ = runner(_git(repo, "diff", "--quiet", "HEAD", target, "--",
-                        "requirements.txt"), GIT_TIMEOUT_S)
-    if rc != 0:
+    if wanted is not None and not wanted():
+        return found, None
+    applied = apply(runner, repo, target=target, packages=False)
+    if not applied.ok and applied.deps_changed:
         found.needs_packages = True
         return found, None
-    return found, apply(runner, repo, target=target)
+    return found, applied
 
 
 def applied_text(result: Applied) -> str:

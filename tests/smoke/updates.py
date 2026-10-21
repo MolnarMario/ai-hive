@@ -266,6 +266,43 @@ def test_self_update():
           and pinned == ["sha1"] and reads
           and all(rd.startswith("sha1:") for rd in reads)
           and deps and deps[0][6] == "sha1", (pinned, reads, deps[:1]))
+    check("self-update: ...and compares requirements.txt from the commit the "
+          "merge moves from, not a HEAD read earlier",
+          deps and deps[0][5] == "abc123", deps[:1])
+
+    g = FakeGit(str(make_repo("0.3.0")), deps_changed=True)
+    r = self_update.apply(g, g.repo, python="py.exe", packages=False)
+    check("self-update: an install nobody watches refuses a requirements "
+          "change before the merge",
+          not r.ok and r.deps_changed and g.writes() == []
+          and "Python packages" in r.detail, (r, g.writes()))
+
+    class HeadMovesGit(FakeGit):
+        """HEAD moves between apply's look and its merge: the requirements
+        diff says no change before the merge and a change after it."""
+        diffs = 0
+
+        def __call__(self, argv, timeout=0):
+            if argv[0] == "git" and argv[3] == "diff":
+                self.calls.append(list(argv))
+                self.diffs += 1
+                return (0 if self.diffs == 1 else 1, "")
+            return super().__call__(argv, timeout)
+
+    g = HeadMovesGit(str(make_repo("0.3.0")))
+    r = self_update.apply(g, g.repo, python="py.exe", packages=False)
+    check("self-update: ...and never runs pip, even when HEAD moved under it",
+          r.ok and r.deps_changed and not r.deps_ok
+          and not any(c[0] == "py.exe" for c in g.calls)
+          and "pip install -r requirements.txt" in r.detail, (r, g.calls))
+
+    g = FakeGit(str(make_repo("0.3.0")))
+    found, applied = self_update.background_update(g, g.repo, "0.3.0",
+                                                   lambda: False)
+    check("self-update: the background install stops before the merge once "
+          "it is no longer wanted",
+          found.status is Status.UPDATE_AVAILABLE and applied is None
+          and g.writes() == [], (found.status, applied, g.writes()))
 
     # --- the button and the dialog -------------------------------------------
     from app.session_store import SessionStore
@@ -503,6 +540,7 @@ def test_self_update():
           not win._app_auto_update and off.calls == []
           and win._session_payload()["ui"]["app_auto_update"] is False
           and win._save_timer.isActive(), off.calls)
+    audits.clear()
     on = FakeGit(str(make_repo(__version__)), remote=newer, remote_log=wlog,
                  delay=0.05)
     win.arm_self_update(on, repo=on.repo)
@@ -521,6 +559,10 @@ def test_self_update():
     check("bg-switch: ...then shows the user's check in the dialog",
           dlg is not None and dlg._check.status is Status.RESTART_PENDING,
           dlg and dlg._check.status)
+    check("bg-switch: ...and the background install it waited for is still "
+          "audited",
+          any(a.startswith("SELF-UPDATE background apply ok=True")
+              for a in audits), audits)
     late = FakeGit(str(make_repo(__version__)), remote=newer, remote_log=wlog)
     win.arm_self_update(late, repo=late.repo)
     win._app_auto_update_tick()
@@ -529,6 +571,31 @@ def test_self_update():
     if dlg is not None:
         dlg.reject()
     pump(30)
+
+    win._closing = True
+    win._app_update_click_waiting = True
+    win._on_app_auto_update_done("boom")
+    closing_job = getattr(win, "_app_update_job", None)
+    win._closing = False
+    win._app_update_click_waiting = False
+    check("bg-switch: a background check that ends while the window closes "
+          "starts no new one, and is still audited",
+          closing_job is None
+          and any("background stopped unexpectedly" in a for a in audits),
+          closing_job)
+
+    racing = FakeGit(str(make_repo(__version__)), remote=newer,
+                     remote_log=wlog, delay=0.05)
+    win.arm_self_update(racing, repo=racing.repo)
+    idle()
+    win._app_auto_update_tick()
+    bar.app_auto_update_btn.click()     # off, while the check runs
+    wait_until(lambda: getattr(win, "_app_auto_job", None) is None)
+    check("bg-switch: turned off during a check, it stops before the merge",
+          not win._app_auto_update and racing.calls != []
+          and racing.writes() == []
+          and self_update.read_installed_version(racing.repo) == __version__,
+          racing.writes())
 
     win._restore_ui_state({"ui": {"app_auto_update": False}})
     off_state = (win._app_auto_update, bar.app_auto_update())

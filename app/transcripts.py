@@ -61,7 +61,9 @@ _CODEX_REPLY_CACHE: dict[str, tuple[float, int, list]] = {}
 
 # cache for limit_cut_off: path -> (mtime, size, verdict dict). The launch's
 # limit scan reads on a worker thread (MainWindow.recover_blocked_at_startup)
-# while the GUI thread may read too, so the lock guards every access.
+# while the GUI thread may read too. The lock covers each lookup and each
+# store, not the parse between them: two threads that miss together both
+# parse the file and store the same verdict for the same mtime and size.
 _LIMIT_CACHE: dict[str, tuple[float, int, dict]] = {}
 _LIMIT_LOCK = threading.Lock()
 

@@ -1624,6 +1624,41 @@ def test_startup_limit_recovery():
     check("startup-recovery: ...and the skip is audited",
           "STARTUP-SKIP agent=Moved (its conversation changed" in log)
 
+    # --- a conversation that carries on while the reads run -----------------
+    # Autostart resumed the agent and the user typed into it before the
+    # worker's verdict landed. The arming reads the transcript again.
+    write_transcript(cwd, "sid-carried", [assistant(BANNER, moved_at)])
+    carried = agent_for("Carried", "sid-carried")
+    read_once, release = _threading.Event(), _threading.Event()
+
+    def read_then_hold(cwd_, sid):
+        verdict = real_cut_off(cwd_, sid)
+        if sid == "sid-carried":
+            read_once.set()
+            release.wait(30)   # bounded: a broken scan fails, never hangs
+        return verdict
+
+    transcripts.limit_cut_off = read_then_hold
+    try:
+        win.recover_blocked_at_startup()
+        stale_read = read_once.wait(30)
+        write_transcript(cwd, "sid-carried",
+                         [assistant(BANNER, moved_at),
+                          assistant("back at it", moved_at + 60)])
+        release.set()
+        deadline = _time.monotonic() + 10
+        while win.startup_scan_pending() and _time.monotonic() < deadline:
+            pump(10)
+    finally:
+        release.set()
+        transcripts.limit_cut_off = real_cut_off
+    log = store.path.with_suffix(".log").read_text(encoding="utf-8")
+    check("startup-recovery: a conversation that carried on during the scan "
+          "is not armed",
+          stale_read and not win.startup_scan_pending()
+          and not carried.is_limit_blocked()
+          and "STARTUP-SKIP agent=Carried (its conversation carried on" in log)
+
     # The `is_pty` gate above is unreachable for a claude agent, and that is
     # load-bearing rather than incidental: CLAUDE is in PTY_ONLY_KINDS, so
     # `build_spec` forces pty=True -- including inside `AgentSpec.from_dict`,

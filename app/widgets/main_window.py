@@ -3502,6 +3502,14 @@ class MainWindow(QMainWindow):
                 continue
             if agent.is_limit_blocked():
                 continue        # latched live meanwhile
+            # autostart resumed this agent while the reads ran, and the user
+            # may have typed into it: read the verdict again. A cache hit
+            # unless the transcript changed since the worker read it.
+            info = transcripts.limit_cut_off(cwd, session_id)
+            if not info or not info["cut_off"] or not info["at"]:
+                self._limit_audit(f"STARTUP-SKIP agent={spec.name} (its "
+                                  f"conversation carried on during the scan)")
+                continue
             record = self._ledger_cut_off(agent, info["at"],
                                           info["resets_at"], info["window"],
                                           info["banner"], source="transcript")
@@ -6000,18 +6008,15 @@ class MainWindow(QMainWindow):
         if runner is None or getattr(self, "_app_update_job", None) is not None:
             return
         self._app_update_flash().stop()
-        if getattr(self, "_app_auto_job", None) is not None:
-            # the background check is fetching or merging in this folder,
-            # and a second git run would fight it for the lock: show the
-            # click landed and check once it ends
-            self._app_update_click_waiting = True
-            self.top_bar.set_app_update_state(
-                "Checking...", "Asking GitHub for the latest AI Hive",
-                interactive=False)
-            return
         self.top_bar.set_app_update_state(
             "Checking...", "Asking GitHub for the latest AI Hive",
             interactive=False)
+        if getattr(self, "_app_auto_job", None) is not None:
+            # the background check is fetching or merging in this folder,
+            # and a second git run would fight it for the lock: check once
+            # it ends
+            self._app_update_click_waiting = True
+            return
         repo = self._self_update_repo
         job = Job(lambda: self_update.check(runner, repo, __version__), self)
         job.finished.connect(self._on_app_update_checked)
@@ -6084,8 +6089,14 @@ class MainWindow(QMainWindow):
         from .self_update_dialog import Job
 
         runner, repo = self._self_update_runner, self._self_update_repo
+
+        def wanted() -> bool:
+            # read on the worker, after the fetch: a switch turned off or a
+            # window closing during the check stops it before the merge
+            return self._app_auto_update and not self._closing
+
         job = Job(lambda: self_update.background_update(runner, repo,
-                                                        __version__),
+                                                        __version__, wanted),
                   self, name="ai-hive-self-update-bg")
         job.finished.connect(self._on_app_auto_update_done)
         self._app_auto_job = job
@@ -6099,20 +6110,28 @@ class MainWindow(QMainWindow):
         from app.self_update import Status
 
         self._app_auto_job = None
+        # the audit comes first: whatever happens below, a merge that moved
+        # this folder leaves its line
+        if (isinstance(result, tuple) and len(result) == 2
+                and isinstance(result[0], self_update.Check)):
+            found, applied = result
+            self._audit_install(self_update.audit_line(found, "background"))
+            if applied is not None:
+                self._audit_install(
+                    self_update.audit_line(applied, "background"))
+        else:
+            found = applied = None
+            self._audit_install(
+                f"SELF-UPDATE background stopped unexpectedly: {result}")
+        if self._closing:
+            return
         if getattr(self, "_app_update_click_waiting", False):
             # the user clicked meanwhile: their check shows the full answer
             self._app_update_click_waiting = False
             self.check_for_app_update()
             return
-        if not (isinstance(result, tuple) and len(result) == 2
-                and isinstance(result[0], self_update.Check)):
-            self._audit_install(
-                f"SELF-UPDATE background stopped unexpectedly: {result}")
+        if found is None:
             return
-        found, applied = result
-        self._audit_install(self_update.audit_line(found, "background"))
-        if applied is not None:
-            self._audit_install(self_update.audit_line(applied, "background"))
         if applied is not None and applied.ok:
             self._app_update_flash().stop()
             self._note_app_restart_pending(applied.version)
