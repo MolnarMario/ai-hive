@@ -8,6 +8,16 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.48.0
+
+- At launch AI Hive starts the agents of the workspace it opens on first.
+  Agents in your other workspaces wait until those have their prompt, then
+  start two at a time, and opening one of those workspaces starts its
+  waiting agents straight away. Starting all of them together used to
+  freeze the window for up to 1.2 s while the agents in front of you
+  loaded. A card still waiting shows its loader, and closing AI Hive
+  before it starts brings it back next launch.
+
 ## 0.47.0
 
 - Opening AI Hive no longer waits on GitHub. It used to fetch and install
