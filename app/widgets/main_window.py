@@ -3335,15 +3335,18 @@ class MainWindow(QMainWindow):
             poller.start()                  # a poller nothing wants stays off
 
     def arm_stall_probe(self) -> None:
-        """Log event-loop stalls to session.log as `PERF stall` lines
+        """Log event-loop stalls to session.log as `PERF stall` lines, and
+        the GUI thread's stack in a block of seconds as a `PERF hang` line,
+        from faulthandler's dumps in hang.log beside the session file
         (app/perf_audit.py). OPT-IN, called by main.py only, like
         `start_usage_polling`: the suite builds many windows per process and
         must never write these lines or run the timer unless a test arms it
         on purpose."""
         from ..perf_audit import StallProbe
         if self._stall_probe is None:
-            self._stall_probe = StallProbe(self.store,
-                                           self._agent_name_for_view, self)
+            self._stall_probe = StallProbe(
+                self.store, self._agent_name_for_view, self,
+                dump_path=str(self.store.path.with_name("hang.log")))
         self._stall_probe.start()
 
     def _agent_name_for_view(self, view) -> str:
