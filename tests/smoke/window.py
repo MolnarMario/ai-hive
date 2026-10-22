@@ -866,6 +866,249 @@ def test_perf_stall_probe():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_perf_hang_stack():
+    """PERF hang (app/perf_audit.py): the 95 s "Not Responding" after a
+    0.48.0 launch left only `PERF stall gap=95517` with feed and paint near
+    20 ms, so nothing said where the GUI thread was. faulthandler now dumps
+    every stack while the thread is still stuck, and the tick that ends the
+    stall writes the GUI thread's frames to session.log."""
+    import faulthandler
+    import threading
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app import perf_audit
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    # the fold, on a dump shaped like faulthandler's own
+    root = r"C:\hive"
+    dump = (
+        "Timeout (0:00:03)!\n"
+        "Thread 0x00002134 (most recent call first):\n"
+        '  File "C:\\Python311\\Lib\\threading.py", line 320 in wait\n'
+        "\n"
+        "Thread 0x000052f0 (most recent call first):\n"
+        '  File "C:\\Python311\\Lib\\subprocess.py", line 1209 in wait\n'
+        '  File "C:\\Python311\\Lib\\subprocess.py", line 1500 in _communicate\n'
+        f'  File "{root}\\app\\lanes.py", line 140 in _subprocess_git\n'
+        f'  File "{root}\\.venv\\Lib\\site-packages\\x.py", line 5 in shim\n'
+        f'  File "{root}\\app\\widgets\\main_window.py", line 99 in _on_x\n'
+        '  File "<frozen importlib._bootstrap>", line 241 in _call\n'
+        f'  File "{root}\\main.py", line 382 in main\n')
+    want = ("subprocess.py:1209 wait < .. < app/lanes.py:140 _subprocess_git"
+            " < .. < app/widgets/main_window.py:99 _on_x < .. < main.py:382 main")
+    got = perf_audit.gui_stack(dump, 0x52F0, root)
+    check("perf hang: the fold keeps our frames and folds library runs",
+          got == want, got)
+    check("perf hang: another thread's frames are not the GUI thread's",
+          perf_audit.gui_stack(dump, 0x2134, root)
+          == "threading.py:320 wait"
+          and perf_audit.gui_stack(dump, 0x1, root) == "",
+          perf_audit.gui_stack(dump, 0x2134, root))
+    newer = dump + (
+        "Timeout (0:00:03)!\n"
+        "Current thread 0x000052f0 (most recent call first):\n"
+        f'  File "{root}\\main.py", line 382 in main\n')
+    check("perf hang: the newest dump in the file wins",
+          perf_audit.gui_stack(newer, 0x52F0, root) == "main.py:382 main",
+          perf_audit.gui_stack(newer, 0x52F0, root))
+    deep = "Thread 0x00000007 (most recent call first):\n" + "".join(
+        f'  File "{root}\\app\\a.py", line {n} in f{n}\n' for n in range(40))
+    parts = perf_audit.gui_stack(deep, 7, root).split(" < ")
+    check("perf hang: a deep stack is cut to HANG_FRAMES, innermost first",
+          len(parts) == perf_audit.HANG_FRAMES and parts[0] == "app/a.py:0 f0"
+          and parts[-1] == "..", parts[-2:])
+    # a library run as the last part the cut keeps: one marker, not
+    # ".. < .."
+    cut_at = perf_audit.HANG_FRAMES - 2
+    lib = "Thread 0x00000007 (most recent call first):\n" + "".join(
+        f'  File "{root}\\app\\a.py", line {n} in f{n}\n'
+        if n != cut_at else '  File "C:\\Python311\\Lib\\x.py", line 1 in y\n'
+        for n in range(40))
+    parts = perf_audit.gui_stack(lib, 7, root).split(" < ")
+    check("perf hang: the cut never doubles the '..' marker",
+          parts[-1] == ".." and parts[-2] != "..", parts[-3:])
+
+    # a real dump from a root with a non-ASCII character: faulthandler
+    # escapes it ("\xe9"), and our frames must still read as our own
+    import importlib.util
+    odd_root = Path(tempfile.mkdtemp(prefix="ai-hive-hang-\u00e9-"))
+    try:
+        (odd_root / "pkg").mkdir()
+        (odd_root / "pkg" / "mod.py").write_text(
+            "import faulthandler\n"
+            "def dump_here(fh):\n"
+            "    faulthandler.dump_traceback(file=fh, all_threads=True)\n",
+            encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(
+            "hang_odd_mod", odd_root / "pkg" / "mod.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with open(odd_root / "dump.txt", "w+b") as fh:
+            mod.dump_here(fh)
+            fh.seek(0)
+            text = fh.read().decode("utf-8", "replace")
+        got = perf_audit.gui_stack(text, threading.get_ident(), str(odd_root))
+        check("perf hang: a non-ASCII root still names our own frames",
+              "\\xe9" in text and got.startswith("pkg/mod.py:3 dump_here"),
+              got)
+    finally:
+        shutil.rmtree(odd_root, ignore_errors=True)
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-hang-"))
+    dump_path = tmp / "hang.log"
+    real_max = perf_audit.HANG_DUMP_MAX
+    probes = []
+    try:
+        # live: a real block, a real faulthandler dump, a real fold
+        dump_path.write_text("a dump from a run that was killed\n",
+                             encoding="utf-8")
+        lines = []
+        probe = perf_audit.StallProbe(SimpleNamespace(audit=lines.append),
+                                      lambda v: "", dump_path=str(dump_path),
+                                      hang_s=0.6, rearm_s=0.1)
+        probes.append(probe)
+        probe.start()
+        check("perf hang: a start keeps an unfolded dump as hang.log.1",
+              (tmp / "hang.log.1").read_text(encoding="utf-8")
+              == "a dump from a run that was killed\n"
+              and dump_path.stat().st_size == 0)
+
+        def stuck_in_test_hang():
+            time.sleep(1.2)
+
+        pump(300)
+        QTimer.singleShot(0, stuck_in_test_hang)
+        pump(400)
+        pump(200)   # the quit above may run before the tick after the block
+        hangs = [ln for ln in lines if ln.startswith("PERF hang gap=")]
+        check("perf hang: a 1.2 s block writes one hang line",
+              len(hangs) == 1, lines)
+        line = hangs[0] if hangs else ""
+        gap = int(line.split("gap=")[1].split()[0]) if line else 0
+        frames = line.partition(" stack=")[2].split(" < ")
+        check("perf hang: ...with the gap and the blocking frame first",
+              gap >= 1150
+              and frames[0].startswith("tests/smoke/window.py:")
+              and frames[0].endswith(" stuck_in_test_hang")
+              and any(f.endswith(" pump") for f in frames), line)
+        check("perf hang: the full dump stays in hang.log",
+              "stuck_in_test_hang" in dump_path.read_text(encoding="utf-8"))
+        pump(200)
+        check("perf hang: a dump is folded once",
+              len([ln for ln in lines if ln.startswith("PERF hang")]) == 1,
+              lines)
+
+        # a block the stop() lands in: no tick folds it, the stop does
+        time.sleep(1.2)
+        probe.stop()
+        tail = lines[-1] if lines else ""
+        check("perf hang: stop folds a dump no tick reached",
+              tail.startswith("PERF hang gap=")
+              and int(tail.split("gap=")[1].split()[0]) >= 1150
+              and " test_perf_hang_stack" in tail, tail)
+        size = dump_path.stat().st_size
+        time.sleep(0.9)
+        check("perf hang: a stopped probe leaves the watchdog off",
+              dump_path.stat().st_size == size)
+
+        # the caps, on a hand-driven clock with fake dumps
+        lines.clear()
+        now = [500.0]
+        perf_audit.HANG_DUMP_MAX = 4096
+        capped = perf_audit.StallProbe(SimpleNamespace(audit=lines.append),
+                                       lambda v: "", clock=lambda: now[0],
+                                       dump_path=str(dump_path), hang_s=60)
+        probes.append(capped)
+        capped.start()
+        capped._timer.stop()
+        me = capped._gui_ident
+        for i in range(perf_audit.HANG_LIMIT + 2):
+            fake = (f"Thread 0x{me:08x} (most recent call first):\n"
+                    f'  File "{perf_audit._ROOT}{os.sep}app{os.sep}x.py",'
+                    f" line {i} in f\n").encode() + b"#" * 300 + b"\n"
+            os.write(capped._dump.fileno(), fake)
+            now[0] += 2.0
+            capped._tick()
+        # the same ticks write PERF stall lines too
+        hangs = [ln for ln in lines if ln.startswith("PERF hang")]
+        check("perf hang: no more than HANG_LIMIT lines a run",
+              len(hangs) == perf_audit.HANG_LIMIT
+              and all(ln.startswith("PERF hang gap=2000 ") for ln in hangs)
+              and hangs[0].endswith("stack=app/x.py:0 f")
+              and hangs[-1].endswith(
+                  f"stack=app/x.py:{perf_audit.HANG_LIMIT - 1} f"),
+              hangs[:1] + hangs[-1:])
+        text = dump_path.read_text(encoding="utf-8")
+        check("perf hang: a dump file past its cap drops the older dumps",
+              len(text) <= perf_audit.HANG_DUMP_MAX + 1024
+              and "line 0 in f" not in text
+              and f"line {perf_audit.HANG_LIMIT + 1} in f" in text,
+              len(text))
+        capped.stop()
+        check("perf hang: stopping reports what the limit held back",
+              lines[-1] == "PERF hang suppressed=2", lines[-1:])
+
+        # a re-arm that fails ends the dump, and the fold it makes still
+        # carries the stall's gap: the tick has already moved its clock on
+        lines.clear()
+        now[0] = 900.0
+        failing = perf_audit.StallProbe(SimpleNamespace(audit=lines.append),
+                                        lambda v: "", clock=lambda: now[0],
+                                        dump_path=str(dump_path), hang_s=60)
+        probes.append(failing)
+        failing.start()
+        failing._timer.stop()
+        me = failing._gui_ident
+        os.write(failing._dump.fileno(), (
+            f"Thread 0x{me:08x} (most recent call first):\n"
+            f'  File "{perf_audit._ROOT}{os.sep}app{os.sep}y.py",'
+            " line 7 in g\n").encode())
+        real_later = faulthandler.dump_traceback_later
+
+        def no_watchdog(*a, **kw):
+            raise RuntimeError("can't start new thread")
+        faulthandler.dump_traceback_later = no_watchdog
+        try:
+            now[0] += 40.0
+            failing._tick()
+        finally:
+            faulthandler.dump_traceback_later = real_later
+        hangs = [ln for ln in lines if ln.startswith("PERF hang gap=")]
+        check("perf hang: a failed re-arm folds with the real gap",
+              hangs == ["PERF hang gap=40000 stack=app/y.py:7 g"]
+              and failing._dump is None, lines)
+
+        # the window passes the dump file beside its session file
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        win.arm_stall_probe()
+        probes.append(win._stall_probe)
+        check("perf hang: the window's probe dumps to hang.log",
+              win._stall_probe._dump_path == str(tmp / "hang.log")
+              and win._stall_probe._dump is not None)
+        win.close()
+        pump(50)
+        check("perf hang: closing the window closes the dump file",
+              win._stall_probe._dump is None)
+    finally:
+        perf_audit.HANG_DUMP_MAX = real_max
+        for p in probes:
+            try:
+                p.stop()
+            except RuntimeError:        # its window took it along
+                pass
+        faulthandler.cancel_dump_traceback_later()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_perf_startup_line():
     """PERF startup: every launch phase in whole ms, and a total from the
     moment Windows created the process."""

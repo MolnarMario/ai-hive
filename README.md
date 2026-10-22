@@ -736,9 +736,10 @@ error dialog instead of silently closing. Packaging to a distributable
   or `/clear` in the TUI, a fork), the agent *reports its own new conversation
   id back to AI Hive* through a `SessionStart` hook, so reopen brings back
   *exactly* the conversation that was on each card — reliably, even when two
-  agents share one folder (which the filesystem alone can't disambiguate). A
-  pinned id whose transcript has gone missing still recovers the folder's most
-  recent one instead of erroring. No more manually hunting for a lost chat.
+  agents share one folder (which the filesystem alone can't disambiguate). An
+  agent closed before you typed anything to it has no conversation on disk, so
+  it comes back as a fresh session, not a "No conversation found" error and
+  never with another agent's chat. No more manually hunting for a lost chat.
   Agents that were *stopped* stay stopped, but the card is **not** blank:
   it comes back showing **the conversation that was on it when you closed**,
   exactly as it looked, with a slim `not running · press any key to resume`
@@ -874,7 +875,11 @@ Hard-won rules, each with a regression test:
   process. A 50 ms timer watches the GUI thread. When it fires more than
   150 ms late, a `PERF stall` line gives the gap, the longest terminal feed
   inside it (ms, size, agent) and the longest paint (ms, grid). At most five
-  go out a minute, and one more line counts the rest.
+  go out a minute, and one more line counts the rest. A block of 3 s or
+  more also writes every thread's stack to `hang.log` beside the session
+  file while the window is still stuck, and a `PERF hang` line names the
+  GUI thread's frames. The next launch moves a non-empty `hang.log` to
+  `hang.log.1`, so a hang you had to kill AI Hive in keeps its dump.
 - **Conversations are backed up.** Claude Code keeps each conversation as a
   single file it owns (`~/.claude/projects/...`) — AI Hive snapshots every
   pinned agent's transcript into `%APPDATA%\AIHive\AI Hive\transcripts\` on
@@ -1000,7 +1005,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3830 checks drive the real app headlessly (offscreen Qt platform) with real
+3859 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1147,7 +1152,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3830 checks)
+                           (3859 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

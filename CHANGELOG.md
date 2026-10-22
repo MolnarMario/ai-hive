@@ -8,6 +8,17 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.48.1
+
+- An agent you closed before typing anything to it comes back as a fresh
+  session. It used to show "No conversation found with session ID" above
+  its prompt, and in a folder with other conversations it could come back
+  holding another agent's chat.
+- When the window stops responding for 3 seconds or more, AI Hive writes
+  where it was stuck to hang.log, next to your session file. The next
+  launch moves it to hang.log.1, so a freeze you had to close AI Hive in
+  keeps its record. Attach both to a report of a freeze.
+
 ## 0.48.0
 
 - At launch AI Hive starts the agents of the workspace it opens on first.

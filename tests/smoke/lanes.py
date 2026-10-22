@@ -56,11 +56,29 @@ def _make_repo(tmp: Path, name: str = "proj", remote: bool = True) -> Path:
     return work
 
 
-def _drop_lane_folder(root) -> None:
-    """Delete a lane folder the way a user might, but junction-safe."""
+def _drop_lane_folder(root, lock=None) -> None:
+    """Delete a lane folder the way a user might, but junction-safe.
+
+    A closed window's lane poll runs on a daemon thread that close() does
+    not wait for, and Windows refuses to delete a folder that is some
+    process's cwd. Under a loaded machine its git was still inside the lane
+    (WinError 32). `lock` is the repo's lane lock, which the poller holds
+    around each lane it reads, and a refusal that outlasts it (an indexer,
+    a virus scan) gets retried for a few seconds."""
+    import contextlib
+
     from app import lanes
     lanes.unlink_junctions(str(root))
-    shutil.rmtree(root)
+    with lock if lock is not None else contextlib.nullcontext():
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                shutil.rmtree(root)
+                return
+            except PermissionError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.1)
 
 
 class _stub_starts:
@@ -885,7 +903,8 @@ def test_lanes_window():
         win._save_timer.stop()
         win.close()
         app.processEvents()
-        _drop_lane_folder(live_lane["root"])
+        _drop_lane_folder(live_lane["root"],
+                          win.lane_ops.lock_for(live_lane["repo"]))
         again = create_main_window(SessionStore(path=tmp / "session.json"))
         again._save_timer.stop()
         ws2 = next(w for w in again.manager.workspaces if w.name == "Repo")
