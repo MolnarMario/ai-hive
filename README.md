@@ -725,8 +725,10 @@ error dialog instead of silently closing. Packaging to a distributable
   restored on launch (including provider/model/effort, the Claude permission
   mode each agent was last in, per-agent font, grid layout, current task, and
   assignment badges). Everything that was running
-  comes back **in every workspace**: previously-running agents autostart, and
-  each Claude agent resumes **its own pinned conversation** (`--resume
+  comes back **in every workspace**: previously-running agents autostart, the
+  open workspace's agents first. Other workspaces' agents wait until those
+  have their prompt, then start two at a time, and opening a workspace starts
+  its waiting agents straight away. Each Claude agent resumes **its own pinned conversation** (`--resume
   <session-id>` — so two agents sharing a project folder can never race for
   or swap each other's conversations) — falling back to a fresh launch
   instead of a dead card if there's nothing to resume. The pin **tracks the
@@ -998,7 +1000,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3799 checks drive the real app headlessly (offscreen Qt platform) with real
+3830 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1145,7 +1147,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3799 checks)
+                           (3830 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

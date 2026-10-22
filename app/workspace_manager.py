@@ -920,6 +920,18 @@ class WorkspaceManager(QObject):
                                    started_at=a._session_started)
             for a in running
         ]
+        # An agent the launch queue has not started yet resumes its pin in
+        # that folder within seconds, so it is a folder-mate already. Without
+        # it a running agent looks alone and can be mtime-pinned onto the
+        # queued agent's conversation. started_at 0 keeps it from ever being
+        # given an update itself.
+        infos += [
+            session_sync.AgentInfo(key=a.id, cwd=a.spec.cwd,
+                                   pinned_id=a.spec.session_id, started_at=0.0)
+            for a in self.all_agents()
+            if a.spec.provider == "claude" and a.start_queued()
+            and not a.is_running() and a.spec.session_id
+        ]
         updates = session_sync.resolve_live_ids(infos)
         by_id = {a.id: a for a in running}
         for aid, new in updates.items():
@@ -1002,9 +1014,10 @@ class WorkspaceManager(QObject):
         # auto-created agents (task-spawned workers) keep their "resume on next
         # open" intent even if the process momentarily died — otherwise a
         # crashed/failed auto-agent silently goes dormant and never comes back.
-        # User-created agents persist their live running state as before.
+        # User-created agents persist their live running state as before. One
+        # the launch queue has not started yet was running, and still is.
         return {**a.spec.to_dict(),
-                "running": (a.is_running()
+                "running": (a.is_running() or a.start_queued()
                             or (a.auto_created and a.autostart_on_restore)),
                 "task": a.current_task,
                 "assignment": a.assignment.value,

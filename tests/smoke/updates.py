@@ -1082,6 +1082,9 @@ def test_cli_auto_update():
     for a in again.manager.all_agents():
         a.autostart_on_restore = True
         a.start = (lambda agent=a: started.append(agent.spec.name))
+    # the launch starts the active workspace's agents on the spot and queues
+    # the rest, so this one is active: the checks read `started` right away
+    again.manager.set_active(ws.id)
 
     again.note_update_outcomes([blocked], installing=("gemini",))
     check("cli-update: the pill says which agents are being held back",
