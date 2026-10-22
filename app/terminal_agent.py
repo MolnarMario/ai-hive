@@ -576,7 +576,8 @@ class TerminalAgent(QObject):
         self._resume_attempt = False  # last start() launched with --continue
         self._resume_fallback_done = False  # already retried fresh once
         # set by the restore path (main.py): the NEXT resume start should
-        # verify its pinned conversation still exists and recover if not.
+        # verify its pinned conversation still exists and start fresh if
+        # Claude never wrote it (_recover_missing_resume_target).
         # One-shot, consumed alongside `resume`, so a plain unit-test start()
         # or a manual restart never touches the filesystem.
         self._verify_resume_target = False
@@ -848,6 +849,10 @@ class TerminalAgent(QObject):
         self._submit_gen += 1  # invalidate any pending task-submit Enter
         self._pending_submits.clear()
         self._cancel_reflow()
+        # first, because it can turn this launch into a fresh one
+        if (self.spec.provider in ("claude", "gemini") and self.spec.resume
+                and self._verify_resume_target):
+            self._recover_missing_resume_target()
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
         self._turn_open = False        # nothing asked yet, so nothing to stamp
         self._awaiting_reply = False
@@ -863,9 +868,6 @@ class TerminalAgent(QObject):
             # Codex creates its thread id itself; let the rollout poll bind the
             # new id once Codex has written the session metadata.
             self.spec.session_id = ""
-        elif (self.spec.provider in ("claude", "gemini") and self.spec.resume
-              and self._verify_resume_target):
-            self._recover_missing_resume_target()
         self._session_started = time.time()
         self.worker.start()
         # resume + verify are one-shot restore aids: a manual restart later is
@@ -875,13 +877,21 @@ class TerminalAgent(QObject):
 
     def _recover_missing_resume_target(self) -> None:
         """Before a restore-resume, make sure the pinned conversation still
-        exists on disk. If it doesn't (a stale id, or a fresh id an earlier
-        fallback minted but never used — the case that made `--resume` error
-        with a black terminal), resume the most recent REAL conversation in
-        this folder instead; if the folder has none, leave the resume as-is
-        and let the fast-fail fallback start it fresh. Excludes sibling
-        agents' conversations so two agents sharing a folder never resume the
-        same transcript (that once truncated one)."""
+        exists on disk.
+
+        Claude writes a conversation's transcript with its first message, so
+        an agent closed before anyone typed to it holds a pin that no folder
+        has. `--resume` on that printed "No conversation found with session
+        ID" above the new TUI (Claude 2.1.307). Such an agent starts fresh on
+        a blank screen. A pin found in any folder still resumes, because the
+        CLI finds it from any cwd. A Claude agent is never moved onto another
+        conversation: resuming the folder's newest one handed a never-used
+        agent somebody else's chat, possibly one a claude outside AI Hive was
+        still writing.
+
+        Gemini resumes the most recent conversation in this folder instead,
+        excluding sibling agents' conversations so two agents sharing a
+        folder never resume the same transcript (that once truncated one)."""
         from . import session_sync
         if self.spec.provider == "gemini":
             if session_sync.gemini_transcript_exists(self.spec.cwd, self.spec.session_id):
@@ -897,15 +907,13 @@ class TerminalAgent(QObject):
 
         if session_sync.transcript_exists(self.spec.cwd, self.spec.session_id):
             return
-        if not session_sync.list_transcripts(self.spec.cwd):
-            return  # unused folder: nothing to recover; fallback handles it
-        exclude = set(self._sibling_sessions() if self._sibling_sessions else ())
-        exclude.add(self.spec.session_id)
-        candidate = session_sync.best_recovery_id(self.spec.cwd, exclude=exclude)
-        if candidate:
-            self.notice("[pinned conversation missing; recovering the most "
-                        "recent one in this folder]")
-            self.spec.session_id = candidate
+        if not session_sync.written_nowhere(self.spec.session_id):
+            return
+        self.notice("[no conversation was saved for this agent; "
+                    "starting fresh]")
+        self.spec.resume = False  # start() mints the new pin
+        # the restored snapshot is the never-used TUI: the new one replaces it
+        self.begin_fresh_screen()
 
     def stop(self) -> None:
         if self.worker.is_running():

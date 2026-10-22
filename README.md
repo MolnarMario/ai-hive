@@ -736,9 +736,10 @@ error dialog instead of silently closing. Packaging to a distributable
   or `/clear` in the TUI, a fork), the agent *reports its own new conversation
   id back to AI Hive* through a `SessionStart` hook, so reopen brings back
   *exactly* the conversation that was on each card — reliably, even when two
-  agents share one folder (which the filesystem alone can't disambiguate). A
-  pinned id whose transcript has gone missing still recovers the folder's most
-  recent one instead of erroring. No more manually hunting for a lost chat.
+  agents share one folder (which the filesystem alone can't disambiguate). An
+  agent closed before you typed anything to it has no conversation on disk, so
+  it comes back as a fresh session, not a "No conversation found" error and
+  never with another agent's chat. No more manually hunting for a lost chat.
   Agents that were *stopped* stay stopped, but the card is **not** blank:
   it comes back showing **the conversation that was on it when you closed**,
   exactly as it looked, with a slim `not running · press any key to resume`
