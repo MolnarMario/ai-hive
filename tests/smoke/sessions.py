@@ -653,11 +653,11 @@ def test_two_claude_agents_one_folder_resume_their_own():
 
 def test_session_recovery():
     """A Claude agent's pinned session id must track the conversation it is
-    REALLY writing, and a resume whose pinned transcript is gone must recover
-    the folder's most recent one rather than error on a black terminal.
-    Regression for two live incidents: a stale pin brought back a closed
-    morning thread instead of the afternoon one, and a fresh never-used id
-    made `--resume` fail on reopen."""
+    REALLY writing, and a restore whose pin Claude never wrote must start
+    fresh rather than run `--resume` on it. Regression for live incidents: a
+    stale pin brought back a closed morning thread instead of the afternoon
+    one, and an agent closed before its first message reopened under "No
+    conversation found with session ID"."""
     from app import session_sync
     from app.session_sync import AgentInfo, resolve_live_ids
     from app.process_worker import AgentKind, build_spec
@@ -723,11 +723,6 @@ def test_session_recovery():
                                                  X: 700_000}.get(sid, 0)) == {})
 
     # -- verify-before-resume at start(), against a real temp ~/.claude ----
-    def stub(agent):
-        agent.worker = type("W", (), {
-            "start": lambda s: None, "restart": lambda s: None,
-            "is_running": lambda s: False, "dispose": lambda s: None})()
-
     home = Path(tempfile.mkdtemp(prefix="ai-hive-home-"))
     cwd = Path(tempfile.mkdtemp(prefix="ai-hive-cwd-"))
     proj = home / ".claude" / "projects" / (
@@ -737,66 +732,96 @@ def test_session_recovery():
     old_home, old_up = os.environ.get("HOME"), os.environ.get("USERPROFILE")
     os.environ["HOME"] = os.environ["USERPROFILE"] = str(home)
     try:
-        # pinned id was never written -> recover the folder's real conversation
-        spec = build_spec(AgentKind.CLAUDE, "Rec", cwd=str(cwd), pty=True)
-        spec.session_id, spec.resume = C, True
-        a = TerminalAgent(spec)
-        a._verify_resume_target = True
-        stub(a)
-        a.start()
-        check("recover: resume of a missing pin recovers the real conversation",
-              spec.session_id == D, spec.session_id)
-        check("recover: the recovered launch still resumes (not fresh)",
-              a._resume_attempt is True)
+        def restore(name, folder, pin):
+            """A restored Claude agent's first start, as main.py arms it.
+            Returns the agent and the argv its child was launched with."""
+            spec = build_spec(AgentKind.CLAUDE, name, cwd=str(folder), pty=True)
+            spec.session_id, spec.resume = pin, True
+            agent = TerminalAgent(spec)
+            agent._verify_resume_target = True
+            agent.seed_pty_replay("last session's screen")
+            launched = {}
+            agent.worker = type("W", (), {
+                "start": lambda s: launched.setdefault(
+                    "args", agent.spec.effective_args()),
+                "restart": lambda s: None,
+                "is_running": lambda s: False, "dispose": lambda s: None})()
+            agent.start()
+            return agent, launched.get("args", [])
 
-        # pinned id that DOES exist is left exactly as-is
-        spec2 = build_spec(AgentKind.CLAUDE, "Keep", cwd=str(cwd), pty=True)
-        spec2.session_id, spec2.resume = D, True
-        a_keep = TerminalAgent(spec2)
-        a_keep._verify_resume_target = True
-        stub(a_keep)
-        a_keep.start()
-        check("recover: an existing pinned conversation is never disturbed",
-              spec2.session_id == D)
-
-        # a sibling's conversation is off-limits: recover the OTHER one
-        (proj / f"{A}.jsonl").write_text("{}\n", encoding="utf-8")
-        spec3 = build_spec(AgentKind.CLAUDE, "Sib", cwd=str(cwd), pty=True)
-        spec3.session_id, spec3.resume = C, True
-        a_sib = TerminalAgent(spec3)
-        a_sib._verify_resume_target = True
-        a_sib._sibling_sessions = lambda: {D}  # D belongs to a peer here
-        stub(a_sib)
-        a_sib.start()
-        check("recover: recovery skips a sibling's live conversation",
-              spec3.session_id == A and spec3.session_id != D, spec3.session_id)
-
-        # an unused folder: leave the resume alone (the fast-fail fallback,
-        # not us, decides), so behavior is unchanged where there's nothing
+        # THE BUG: an agent closed before anyone typed to it has a pin Claude
+        # never wrote, and `--resume <pin>` printed "No conversation found
+        # with session ID" above the new TUI. Its fresh lane has no
+        # transcripts at all.
         empty_cwd = Path(tempfile.mkdtemp(prefix="ai-hive-empty-"))
-        spec4 = build_spec(AgentKind.CLAUDE, "New", cwd=str(empty_cwd), pty=True)
-        spec4.session_id, spec4.resume = C, True
-        a_new = TerminalAgent(spec4)
-        a_new._verify_resume_target = True
-        stub(a_new)
-        a_new.start()
-        check("recover: unused folder leaves the pin for the fresh-fallback",
-              spec4.session_id == C and a_new._resume_attempt is True)
+        a_new, args = restore("New", empty_cwd, C)
+        check("recover: a never-written pin launches fresh, not --resume",
+              "--resume" not in args and "--session-id" in args, args)
+        check("recover: ...under a new pin",
+              a_new.spec.session_id not in ("", C)
+              and args[args.index("--session-id") + 1]
+              == a_new.spec.session_id, (a_new.spec.session_id, args))
+        check("recover: ...not counted as a resume attempt",
+              a_new._resume_attempt is False)
+        check("recover: ...and the never-used screen is wiped",
+              a_new.pty_replay() == "" and a_new._fresh_screen is True)
         shutil.rmtree(empty_cwd, ignore_errors=True)
 
-        # recovery prefers a SUBSTANTIAL conversation over a newer empty stub,
-        # so a stray fresh session never wins the resume
-        big_cwd = Path(tempfile.mkdtemp(prefix="ai-hive-big-"))
-        bproj = home / ".claude" / "projects" / (
-            session_sync.transcripts.encode_project_dir(str(big_cwd)))
-        bproj.mkdir(parents=True)
-        (bproj / f"{A}.jsonl").write_text("x" * 50000, encoding="utf-8")  # real
-        (bproj / f"{B}.jsonl").write_text("{}\n", encoding="utf-8")       # stub
-        os.utime(bproj / f"{A}.jsonl", (100.0, 100.0))   # older
-        os.utime(bproj / f"{B}.jsonl", (200.0, 200.0))   # newer, but empty
-        check("recover: a newer empty stub never beats a real conversation",
-              session_sync.best_recovery_id(str(big_cwd)) == A)
-        shutil.rmtree(big_cwd, ignore_errors=True)
+        # the same agent in a folder other conversations live in starts
+        # fresh too: resuming the newest one there gave it a stranger's chat
+        (proj / f"{A}.jsonl").write_text("x" * 50000, encoding="utf-8")
+        a_used, args = restore("Used", cwd, C)
+        check("recover: a never-written pin never takes a folder's conversation",
+              "--resume" not in args
+              and a_used.spec.session_id not in (A, C, D),
+              (a_used.spec.session_id, args))
+
+        # pinned id that DOES exist is left exactly as-is
+        a_keep, args = restore("Keep", cwd, D)
+        check("recover: an existing pinned conversation is never disturbed",
+              a_keep.spec.session_id == D and "--resume" in args
+              and args[args.index("--resume") + 1] == D, args)
+        check("recover: ...and its restored screen stays",
+              a_keep.pty_replay() == "last session's screen")
+
+        # a pin written under ANOTHER folder still resumes: the CLI finds it
+        # from any cwd, so a miss in the agent's own folder proves nothing
+        E = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+        other = home / ".claude" / "projects" / "C--somewhere-else"
+        other.mkdir(parents=True)
+        (other / f"{E}.jsonl").write_text("{}\n", encoding="utf-8")
+        a_far, args = restore("Far", cwd, E)
+        check("recover: a pin written in another folder still resumes",
+              a_far.spec.session_id == E and "--resume" in args
+              and a_far._resume_attempt is True, args)
+
+        check("recover: written_nowhere knows a pin from any folder",
+              session_sync.written_nowhere(C)
+              and not session_sync.written_nowhere(E)
+              and not session_sync.written_nowhere(D))
+        check("recover: written_nowhere never judges a non-uuid pin",
+              not session_sync.written_nowhere("")
+              and not session_sync.written_nowhere("not-a-session"))
+        # a projects "folder" scandir can't list (here a file) is an OSError
+        # other than a missing folder: unknown, so the resume stands
+        odd = home / "odd-config"
+        odd.mkdir()
+        (odd / "projects").write_text("", encoding="utf-8")
+        old_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+        try:
+            os.environ["CLAUDE_CONFIG_DIR"] = str(odd)
+            unreadable = session_sync.written_nowhere(C)
+            os.environ["CLAUDE_CONFIG_DIR"] = str(home / "no-such-config")
+            no_root = session_sync.written_nowhere(C)
+        finally:
+            if old_cfg is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = old_cfg
+        check("recover: an unreadable projects folder keeps the resume",
+              unreadable is False)
+        check("recover: no projects folder at all means never written",
+              no_root is True)
 
         # -- manager surface: sibling lookup, multi-agent safety, lone track --
         mgr = WorkspaceManager()

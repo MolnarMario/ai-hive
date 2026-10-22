@@ -1,5 +1,6 @@
 """Keep each Claude agent's pinned session id in sync with the transcript it
-is ACTUALLY writing — and recover a resume whose pinned conversation is gone.
+is ACTUALLY writing, and spot a pin Claude never wrote, which `--resume`
+cannot open.
 
 AI Hive launches every Claude agent with `--session-id <uuid>` and resumes it
 with `--resume <uuid>`, so normally the pinned id matches the live
@@ -20,6 +21,12 @@ exactly one `<id>.jsonl` per conversation under
 `~/.claude/projects/<encoded-cwd>/`, and the file an agent has been appending
 to during its current run IS its live conversation.
 
+A pin written nowhere (`written_nowhere`) belongs to an agent closed before
+anyone typed to it: Claude creates the transcript with the first message.
+Its restore starts fresh (`TerminalAgent._recover_missing_resume_target`).
+It used to resume the folder's newest conversation instead, which handed a
+never-used agent somebody else's chat.
+
 Qt-free and best-effort throughout, mirroring `transcripts.py`.
 """
 
@@ -38,11 +45,10 @@ _START_SLACK = 3.0
 # A transcript smaller than this is a near-empty STUB — a brand-new chat with
 # nothing but mode/permission/slash-command lines (a fresh session, a glitched
 # resume that started over, an accidental /clear). A pin must NEVER drift from
-# a substantial conversation onto such a stub, and recovery must never resume
-# one when a real conversation exists: a fresh chat has to EARN the pin by
-# accumulating content first, or a stray empty session on reopen would strand
-# a 10 MB conversation (a real incident — the left card came back blank while
-# its big chat sat un-pinned on disk). One real user turn with tool use is
+# a substantial conversation onto such a stub: a fresh chat has to EARN the
+# pin by accumulating content first, or a stray empty session on reopen would
+# strand a 10 MB conversation (a real incident — the left card came back blank
+# while its big chat sat un-pinned on disk). One real user turn with tool use is
 # tens of KB, well above this floor.
 _STUB_BYTES = 4096
 
@@ -261,6 +267,28 @@ def transcript_exists(cwd: str, session_id: str) -> bool:
         transcripts.transcript_path(cwd, session_id))
 
 
+def written_nowhere(session_id: str) -> bool:
+    """True only when Claude has provably never written this conversation:
+    no project folder holds `<id>.jsonl`. `claude --resume <id>` finds a
+    conversation from any cwd (app/lanes.py), so this, not a miss in the
+    agent's own folder, is what makes `--resume` fail. A folder that can't
+    be listed answers False, so a read error never costs an agent its
+    resume."""
+    if not is_session_id(session_id):
+        return False
+    name = f"{session_id}.jsonl"
+    try:
+        with os.scandir(transcripts.projects_root()) as it:
+            for entry in it:
+                if os.path.isfile(os.path.join(entry.path, name)):
+                    return False
+    except FileNotFoundError:
+        return True  # no projects folder: Claude has written nothing at all
+    except OSError:
+        return False
+    return True
+
+
 def transcript_size(cwd: str, session_id: str) -> int:
     """Byte size of a pinned transcript, or 0 if missing/unreadable. Used to
     tell a barely-used STUB launch pin (the mark of an agent that /resumed
@@ -271,24 +299,6 @@ def transcript_size(cwd: str, session_id: str) -> int:
         return os.path.getsize(transcripts.transcript_path(cwd, session_id))
     except OSError:
         return 0
-
-
-def best_recovery_id(cwd: str, exclude=()) -> str | None:
-    """The most recently modified real conversation in this folder, skipping
-    ids in `exclude` (a sibling agent's pin — never recover onto that, or two
-    agents would resume the same transcript and race/truncate it). Near-empty
-    stubs are passed over in favour of substantial conversations, so a stray
-    fresh session never wins the recovery; only if EVERY candidate is a stub
-    do we fall back to the most recent one. None when there is nothing safe to
-    recover."""
-    ex = set(exclude)
-    cands = [(mt, sid) for sid, mt in list_transcripts(cwd).items()
-             if sid not in ex]
-    if not cands:
-        return None
-    cands.sort()  # by mtime, then id
-    real = [c for c in cands if transcript_size(cwd, c[1]) >= _STUB_BYTES]
-    return (real or cands)[-1][1]
 
 
 def resolve_live_ids(agents, lister=list_transcripts,
