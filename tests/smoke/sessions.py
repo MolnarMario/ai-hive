@@ -820,6 +820,26 @@ def test_session_recovery():
                 os.environ["CLAUDE_CONFIG_DIR"] = old_cfg
         check("recover: an unreadable projects folder keeps the resume",
               unreadable is False)
+
+        # one project folder the scan is denied could hold the pin, and
+        # isfile() would have read that as "not there"
+        (home / ".claude" / "projects" / "stray.txt").write_text(
+            "", encoding="utf-8")
+        check("recover: a stray file in the projects folder is not a doubt",
+              session_sync.written_nowhere(C))
+        real_stat = session_sync.os.stat
+
+        def denied_stat(path, *a, **kw):
+            if str(path).endswith(f"{C}.jsonl"):
+                raise PermissionError(13, "denied", str(path))
+            return real_stat(path, *a, **kw)
+        session_sync.os.stat = denied_stat
+        try:
+            denied = session_sync.written_nowhere(C)
+        finally:
+            session_sync.os.stat = real_stat
+        check("recover: a project folder it can't look in keeps the resume",
+              denied is False)
         check("recover: no projects folder at all means never written",
               no_root is True)
 

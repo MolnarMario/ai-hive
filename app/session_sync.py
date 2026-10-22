@@ -272,16 +272,20 @@ def written_nowhere(session_id: str) -> bool:
     no project folder holds `<id>.jsonl`. `claude --resume <id>` finds a
     conversation from any cwd (app/lanes.py), so this, not a miss in the
     agent's own folder, is what makes `--resume` fail. A folder that can't
-    be listed answers False, so a read error never costs an agent its
-    resume."""
+    be read answers False, so a read error never costs an agent its resume.
+    That is why each folder gets an `os.stat` and not `os.path.isfile`,
+    which says False for a file it was denied."""
     if not is_session_id(session_id):
         return False
     name = f"{session_id}.jsonl"
     try:
         with os.scandir(transcripts.projects_root()) as it:
             for entry in it:
-                if os.path.isfile(os.path.join(entry.path, name)):
-                    return False
+                try:
+                    os.stat(os.path.join(entry.path, name))
+                except (FileNotFoundError, NotADirectoryError):
+                    continue  # not in this folder, or a stray file
+                return False
     except FileNotFoundError:
         return True  # no projects folder: Claude has written nothing at all
     except OSError:
