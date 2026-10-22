@@ -926,8 +926,9 @@ def test_perf_hang_stack():
     check("perf hang: a deep stack is cut to HANG_FRAMES, innermost first",
           len(parts) == perf_audit.HANG_FRAMES and parts[0] == "app/a.py:0 f0"
           and parts[-1] == "..", parts[-2:])
-    # a library run right where the cut falls: one marker, not ".. < .."
-    cut_at = perf_audit.HANG_FRAMES - 1
+    # a library run as the last part the cut keeps: one marker, not
+    # ".. < .."
+    cut_at = perf_audit.HANG_FRAMES - 2
     lib = "Thread 0x00000007 (most recent call first):\n" + "".join(
         f'  File "{root}\\app\\a.py", line {n} in f{n}\n'
         if n != cut_at else '  File "C:\\Python311\\Lib\\x.py", line 1 in y\n'
