@@ -5057,6 +5057,9 @@ class MainWindow(QMainWindow):
                       f"Close the card to retire it.]")
             agent.notice(reason)
             agent.hold_start(reason)
+            # the launch queue's start would only be refused, with the
+            # reason a second time: the card shows the stopped banner now
+            agent.end_start_queue()
             return
         new_lane, recreated = result
         self._store_audit(
@@ -7302,6 +7305,9 @@ class MainWindow(QMainWindow):
                                if id(agent) not in known]
         if self._launch_queue:
             self._launch_timer.start()
+        # a close or a click in settle_layout's pumps can open another
+        # workspace before its agents were in the queue to start
+        self._start_queued_in(self.manager.active_id)
 
     def _note_launch_boot(self, ws: Workspace, agent) -> None:
         """Count a launch start the queue waits on while it boots. A plain
@@ -7332,7 +7338,9 @@ class MainWindow(QMainWindow):
         self._launch_boots = [
             (agent, ws_id, started)
             for agent, ws_id, started in self._launch_boots
-            if agent.is_running() and not agent.prompt_ready()
+            # a closed agent still reads as running while its child dies
+            if not getattr(agent, "_disposing", False)
+            and agent.is_running() and not agent.prompt_ready()
             and now - started < LAUNCH_BOOT_MAX_S]
         if not self._launch_queue:
             self._launch_timer.stop()
@@ -7371,24 +7379,34 @@ class MainWindow(QMainWindow):
             self._launch_opened = ws_id
             self._launch_timer.start()
             return
-        self._launch_queue = [entry for entry in self._launch_queue
-                              if entry[0].id != ws_id]
-        for ws, agent in mine:
-            if agent.start_queued() and agent in ws.agents:
+        for entry in mine:
+            # one at a time, so a start that raises leaves the rest queued
+            self._launch_queue.remove(entry)
+            ws, agent = entry
+            if agent not in ws.agents:
+                continue
+            if agent.start_queued():
                 self._start_launch_queued(ws, agent)
+            else:
+                # a keystroke or the limit recovery started it meanwhile
+                self._note_launch_boot(ws, agent)
 
     def _start_launch_queued(self, ws: Workspace, agent) -> None:
         """Start one agent the launch queued, at its card's settled width."""
         page = self._pages.get(ws.id)
         card = page.card_for(agent.id) if page is not None else None
-        # the card's view debounces its resize, and the child must hear the
-        # real width before it paints anything (see settle_layout)
-        if card is not None and card.is_pty and card.terminal is not None:
-            card.terminal.flush_resize()
-        if not agent.is_running():
-            agent.start()
-        # a held start leaves no child: the hold owns the card from here
-        agent.end_start_queue()
+        try:
+            # the card's view debounces its resize, and the child must hear
+            # the real width before it paints anything (see settle_layout)
+            if card is not None and card.is_pty and card.terminal is not None:
+                card.terminal.flush_resize()
+            if not agent.is_running():
+                agent.start()
+        finally:
+            # a held start leaves no child: the hold owns the card from
+            # here. A start that raises left none either, and the card
+            # must not keep its loader for good.
+            agent.end_start_queue()
         self._note_launch_boot(ws, agent)
 
     def settle_layout(self) -> None:

@@ -842,6 +842,36 @@ def test_session_recovery():
         check("recover: a pin change marks the session dirty (persisted)",
               dirty["n"] >= 1)
         shutil.rmtree(solo_cwd, ignore_errors=True)
+
+        # a folder-mate the launch queue has not started yet still counts:
+        # it resumes its pin there within seconds, so the running agent is
+        # not alone and must not be mtime-pinned onto its conversation
+        q_cwd = Path(tempfile.mkdtemp(prefix="ai-hive-queued-"))
+        qproj = home / ".claude" / "projects" / (
+            session_sync.transcripts.encode_project_dir(str(q_cwd)))
+        qproj.mkdir(parents=True)
+        (qproj / f"{D}.jsonl").write_text("x" * 50000, encoding="utf-8")
+        os.utime(qproj / f"{D}.jsonl", (10.0, 10.0))  # touched after the start
+        ws3 = mgr.create_workspace("Queued", project_path=str(q_cwd))
+        s_run = build_spec(AgentKind.CLAUDE, "Run", cwd=str(q_cwd), pty=True)
+        s_run.session_id = C
+        runner = mgr.add_terminal(ws3.id, s_run, autostart=False)
+        runner.worker = type("W", (), {"is_running": lambda s: True})()
+        runner._session_started = 1.0
+        s_wait = build_spec(AgentKind.CLAUDE, "Wait", cwd=str(q_cwd), pty=True)
+        s_wait.session_id = D
+        waiter = mgr.add_terminal(ws3.id, s_wait, autostart=False)
+        waiter.queue_start()
+        changed_q = mgr.sync_live_sessions()
+        check("recover: a queued folder-mate keeps the running agent's pin",
+              s_run.session_id == C and s_wait.session_id == D
+              and not any(c[0] in (runner.id, waiter.id) for c in changed_q),
+              (s_run.session_id, changed_q))
+        waiter.end_start_queue()
+        mgr.sync_live_sessions()
+        check("recover: ...and it was the queue that kept it",
+              s_run.session_id == D, s_run.session_id)
+        shutil.rmtree(q_cwd, ignore_errors=True)
     finally:
         if old_home is None:
             os.environ.pop("HOME", None)
@@ -2478,6 +2508,144 @@ def test_launch_starts_active_workspace_first():
               wait_for(lambda: not win._launch_timer.isActive()))
     finally:
         mw.LAUNCH_BOOT_MAX_S = real_cap
+        if win is not None:
+            for agent in win.manager.all_agents():
+                agent.worker._set_state(WorkerState.IDLE)
+            win.close(); pump(300)
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_launch_queue_edges():
+    """The launch queue's less common paths, each found by review. A
+    workspace opened inside settle_layout's pumps starts at once. A queued
+    agent whose lane cannot be restored shows the stopped banner, and its
+    reason once. Opening a workspace counts a boot a keystroke already
+    started. A start that raises ends its card's loader and strands nobody
+    else. A closed agent's boot stops holding the queue."""
+    import pathlib
+    import time
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import WorkerState
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    if not HAS_CONPTY:
+        return
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def wait_for(pred, timeout_s=5.0):
+        deadline = time.monotonic() + timeout_s
+        while not pred() and time.monotonic() < deadline:
+            pump(25)
+        return pred()
+
+    home = pathlib.Path(tempfile.mkdtemp(prefix="aihive-launch-edges-"))
+    store = SessionStore(path=home / "session.json")
+    term = {"role": "", "cwd": str(home), "user_program": "", "user_args": [],
+            "pty": True, "provider": "claude", "model": "", "effort": "",
+            "custom_command": "", "font_px": 0, "is_orchestrator": False,
+            "task": "", "assignment": "idle", "auto_created": False,
+            "kind": "claude", "running": True}
+    layout = {"w1": ["Front"], "w2": ["Raise A", "Raise B"],
+              "w3": ["Closed"], "w4": ["Early"], "w5": ["Lane"],
+              "w6": ["Switched"], "w7": ["After"]}
+    store.save({"version": 3, "active": "w1", "workspaces": [
+        {"id": ws_id, "name": ws_id, "project_path": str(home),
+         "layout": "auto",
+         "terminals": [{**term, "name": n} for n in names]}
+        for ws_id, names in layout.items()]})
+
+    spawned = []
+
+    def stub_start(agent):
+        def start():
+            spawned.append(agent.spec.name)
+            agent.worker._set_state(WorkerState.STARTING)
+        return start
+
+    def raising_start():
+        raise RuntimeError("spawn failed")
+
+    win = None
+    try:
+        win = create_main_window(store)
+        agents = {a.spec.name: a for a in win.manager.all_agents()}
+        for agent in agents.values():
+            agent.worker.start = stub_start(agent)
+        agents["Raise A"].worker.start = raising_start
+        # a real close kills on its own time: the worker keeps reading as
+        # running for a while after it
+        agents["Closed"].worker.dispose = lambda: None
+        cards = {c.agent.spec.name: c for page in win._pages.values()
+                 for c in page.cards}
+
+        # a click or a close inside settle_layout's pumps opens w6 before
+        # its agent is in the queue
+        real_settle = win.settle_layout
+
+        def settle():
+            win.manager.set_active("w6")
+            real_settle()
+        win.settle_layout = settle
+        win.show(); win.autostart_active_workspace()
+        del win.settle_layout
+        check("launch-edges: a workspace opened while the launch settles "
+              "starts at once", spawned == ["Front", "Switched"], spawned)
+
+        lane = agents["Lane"]
+        notices = []
+        real_notice = lane.notice
+        lane.notice = lambda text: (notices.append(text), real_notice(text))
+        win._finish_lane_repair(
+            "w5", lane.id, lane.spec.uid, "Lane",
+            {"root": str(home / "lane"), "branch": "hive/lane"}, False, None,
+            RuntimeError("the folder is gone"))
+        check("launch-edges: a queued agent whose lane is lost shows the "
+              "stopped banner", not lane.start_coming()
+              and not lane.start_queued())
+
+        cards["Early"]._on_key_input("x")
+        win.manager.set_active("w4")
+        check("launch-edges: opening a workspace counts a boot a keystroke "
+              "started", any(a is agents["Early"]
+                             for a, _w, _s in win._launch_boots),
+              win._launch_boots)
+
+        try:
+            win._start_queued_in("w2")
+            raised = False
+        except RuntimeError:
+            raised = True
+        check("launch-edges: precondition - the first start raised", raised)
+        check("launch-edges: a start that raises ends its card's loader",
+              not agents["Raise A"].start_coming())
+        check("launch-edges: ...and leaves the workspace's others queued",
+              agents["Raise B"].start_queued()
+              and any(a is agents["Raise B"] for _w, a in win._launch_queue))
+
+        win.manager.set_active("w3")
+        check("launch-edges: precondition - Closed boots in the open "
+              "workspace", "Closed" in spawned, spawned)
+        win.manager.remove_terminal("w3", agents["Closed"].id)
+        for name in ("Front", "Switched", "Early"):
+            agents[name]._became_prompt_ready()
+        # LAUNCH_BOOT_MAX_S is 8 s, so a stale boot would hold this long past
+        # the wait
+        check("launch-edges: a closed agent's boot stops holding the queue",
+              wait_for(lambda: "After" in spawned, 2.0), spawned)
+        check("launch-edges: the agent behind the raise still started",
+              "Raise B" in spawned, spawned)
+        check("launch-edges: the lost lane's reason shows once",
+              sum("could not be restored" in n for n in notices) == 1,
+              notices)
+    finally:
         if win is not None:
             for agent in win.manager.all_agents():
                 agent.worker._set_state(WorkerState.IDLE)

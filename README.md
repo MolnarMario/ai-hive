@@ -726,7 +726,7 @@ error dialog instead of silently closing. Packaging to a distributable
   mode each agent was last in, per-agent font, grid layout, current task, and
   assignment badges). Everything that was running
   comes back **in every workspace**: previously-running agents autostart, the
-  workspace AI Hive opens on first. Other workspaces' agents wait until those
+  open workspace's agents first. Other workspaces' agents wait until those
   have their prompt, then start two at a time, and opening a workspace starts
   its waiting agents straight away. Each Claude agent resumes **its own pinned conversation** (`--resume
   <session-id>` — so two agents sharing a project folder can never race for
