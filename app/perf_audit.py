@@ -43,8 +43,9 @@ paint at about 20 ms each, so neither hook could name it, and a dozen 1 to
 `faulthandler.dump_traceback_later(HANG_S)`. If the GUI thread misses that
 deadline, faulthandler's own C thread writes every thread's stack to the
 dump file while the GUI thread is still stuck, without needing the GIL, so a
-C call that holds it is caught too. A block of HANG_S - HANG_REARM_S or more
-always gets a dump. The tick that ends the stall folds the GUI thread's
+C call that holds it is caught too. A block of HANG_S or more always gets a
+dump. One of HANG_S - HANG_REARM_S may, if it starts just before a re-arm
+was due. The tick that ends the stall folds the GUI thread's
 frames into one `PERF hang` line, innermost first: our own frames
 (app/, main.py) in full and each run of library frames as "..". A stack
 that is only `main.py ... main` was blocked inside Qt or Windows under
@@ -52,7 +53,8 @@ app.exec, or the machine slept. The other threads stay in the dump file,
 which keeps every dump until it passes HANG_DUMP_MAX bytes and then only
 the newest. A hang the user killed AI Hive in never gets its line, so the
 next start moves a non-empty dump file to `<name>.1` rather than
-truncating it. A re-arm is measured at
+truncating it: `<name>.1` holds the last run that had a dump, folded or
+not. A re-arm is measured at
 about 0.3 ms (it joins faulthandler's old thread and starts a new one),
 which is why it runs once a second and not on every tick. At most
 HANG_LIMIT hang lines go out per run, and a `suppressed` line counts the
@@ -106,6 +108,13 @@ def _own_path(path: str, root: str) -> str:
     never ours, though relpath would place it under the cwd."""
     if not os.path.isabs(path):
         return ""
+    # faulthandler writes each non-ASCII character as an escape ("\xe9"),
+    # which reads as a path separator here, so under a root with one the
+    # dumped path only matches the root spelled the same way
+    dumped = root.encode("ascii", "backslashreplace").decode("ascii")
+    if dumped != root and os.path.normcase(path).startswith(
+            os.path.normcase(dumped)):
+        path = root + path[len(dumped):]
     try:
         rel = os.path.relpath(path, root)
     except ValueError:          # another drive
@@ -143,7 +152,9 @@ def gui_stack(dump: str, ident: int, root: str = _ROOT) -> str:
             continue
         parts.append(f"{own or os.path.basename(path)}:{lineno} {func}")
     if len(parts) > HANG_FRAMES:
-        parts = parts[:HANG_FRAMES - 1] + [".."]
+        parts = parts[:HANG_FRAMES - 1]
+        if parts[-1] != "..":
+            parts.append("..")
     return " < ".join(parts)
 
 
@@ -265,7 +276,7 @@ class StallProbe(QObject):
         if self._dump is not None and (
                 stalled or now - self._armed_at >= self._rearm_s):
             # first: re-arming waits for a dump still being written
-            self._arm(now)
+            self._arm(now, gap)
         if stalled:
             self._on_stall(gap, now)
             if self._dump is not None:
@@ -281,7 +292,8 @@ class StallProbe(QObject):
         if not self._dump_path or self._dump is not None:
             return
         try:
-            # a dump nobody folded is a hang AI Hive was killed in: keep it
+            # an earlier run's dumps, and one nobody folded is a hang AI
+            # Hive was killed in: keep them
             if os.path.getsize(self._dump_path) > 0:
                 os.replace(self._dump_path, self._dump_path + ".1")
         except OSError:
@@ -297,21 +309,24 @@ class StallProbe(QObject):
         self._gui_ident = threading.get_ident()
         self._arm(self._clock())
 
-    def _arm(self, now: float) -> None:
+    def _arm(self, now: float, gap: float = 0.0) -> None:
+        """`gap` is the stall the calling tick ends, for the fold a failed
+        re-arm makes: the tick has already moved `_last` up to now."""
         self._armed_at = now
         try:
             faulthandler.dump_traceback_later(self._hang_s, file=self._dump)
         except (OSError, ValueError, RuntimeError):
-            self._close_dump()
+            self._close_dump(gap)
 
-    def _close_dump(self) -> None:
+    def _close_dump(self, gap: float | None = None) -> None:
         if self._dump is None:
             return
         with contextlib.suppress(Exception):
             faulthandler.cancel_dump_traceback_later()
         with contextlib.suppress(Exception):
             # a dump no tick has folded yet: the block ran up to now
-            self._fold_hang(self._clock() - self._last)
+            self._fold_hang(self._clock() - self._last if gap is None
+                            else gap)
         with contextlib.suppress(Exception):
             self._dump.close()
         self._dump = None

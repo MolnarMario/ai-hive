@@ -776,6 +776,16 @@ def test_session_recovery():
               and a_used.spec.session_id not in (A, C, D),
               (a_used.spec.session_id, args))
 
+        # no pin at all (WorkspaceManager clears one a folder-mate holds
+        # too): never `--continue`, which opens the folder's newest
+        # conversation, maybe that folder-mate's
+        a_dup, args = restore("Dup", cwd, "")
+        check("recover: a restored agent with no pin never runs --continue",
+              "--continue" not in args and "--resume" not in args
+              and "--session-id" in args
+              and a_dup.spec.session_id not in ("", A, C, D),
+              (a_dup.spec.session_id, args))
+
         # pinned id that DOES exist is left exactly as-is
         a_keep, args = restore("Keep", cwd, D)
         check("recover: an existing pinned conversation is never disturbed",
@@ -811,8 +821,14 @@ def test_session_recovery():
         try:
             os.environ["CLAUDE_CONFIG_DIR"] = str(odd)
             unreadable = session_sync.written_nowhere(C)
-            os.environ["CLAUDE_CONFIG_DIR"] = str(home / "no-such-config")
+            bare = home / "bare-config"     # Claude's config dir, no projects
+            bare.mkdir()
+            os.environ["CLAUDE_CONFIG_DIR"] = str(bare)
             no_root = session_sync.written_nowhere(C)
+            # a config dir on a drive not mounted yet raises the same
+            # FileNotFoundError and proves nothing
+            os.environ["CLAUDE_CONFIG_DIR"] = str(home / "no-such-config")
+            no_config = session_sync.written_nowhere(C)
         finally:
             if old_cfg is None:
                 os.environ.pop("CLAUDE_CONFIG_DIR", None)
@@ -842,6 +858,8 @@ def test_session_recovery():
               denied is False)
         check("recover: no projects folder at all means never written",
               no_root is True)
+        check("recover: a missing config dir keeps the resume",
+              no_config is False)
 
         # -- manager surface: sibling lookup, multi-agent safety, lone track --
         mgr = WorkspaceManager()

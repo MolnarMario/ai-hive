@@ -905,11 +905,23 @@ class TerminalAgent(QObject):
                 self.spec.session_id = candidate
             return
 
+        if not self.spec.session_id:
+            # no pin of its own: WorkspaceManager._wire_agent cleared one a
+            # folder-mate held too. `--resume` has nothing to open, and
+            # effective_args would fall back to `--continue`, which opens the
+            # folder's newest conversation, quite possibly that folder-mate's.
+            self.notice("[this agent has no conversation of its own to "
+                        "resume; starting fresh]")
+            self.spec.resume = False  # start() mints the new pin
+            self.begin_fresh_screen()
+            return
         if session_sync.transcript_exists(self.spec.cwd, self.spec.session_id):
             return
         if not session_sync.written_nowhere(self.spec.session_id):
             return
-        self.notice("[no conversation was saved for this agent; "
+        # never written, or deleted since (Claude purges old transcripts):
+        # either way `--resume` can't open it
+        self.notice("[no saved conversation found for this agent; "
                     "starting fresh]")
         self.spec.resume = False  # start() mints the new pin
         # the restored snapshot is the never-used TUI: the new one replaces it

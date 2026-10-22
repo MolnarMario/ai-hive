@@ -873,6 +873,7 @@ def test_perf_hang_stack():
     every stack while the thread is still stuck, and the tick that ends the
     stall writes the GUI thread's frames to session.log."""
     import faulthandler
+    import threading
     from types import SimpleNamespace
 
     from PySide6.QtCore import QEventLoop, QTimer
@@ -925,6 +926,41 @@ def test_perf_hang_stack():
     check("perf hang: a deep stack is cut to HANG_FRAMES, innermost first",
           len(parts) == perf_audit.HANG_FRAMES and parts[0] == "app/a.py:0 f0"
           and parts[-1] == "..", parts[-2:])
+    # a library run right where the cut falls: one marker, not ".. < .."
+    cut_at = perf_audit.HANG_FRAMES - 1
+    lib = "Thread 0x00000007 (most recent call first):\n" + "".join(
+        f'  File "{root}\\app\\a.py", line {n} in f{n}\n'
+        if n != cut_at else '  File "C:\\Python311\\Lib\\x.py", line 1 in y\n'
+        for n in range(40))
+    parts = perf_audit.gui_stack(lib, 7, root).split(" < ")
+    check("perf hang: the cut never doubles the '..' marker",
+          parts[-1] == ".." and parts[-2] != "..", parts[-3:])
+
+    # a real dump from a root with a non-ASCII character: faulthandler
+    # escapes it ("\xe9"), and our frames must still read as our own
+    import importlib.util
+    odd_root = Path(tempfile.mkdtemp(prefix="ai-hive-hang-\u00e9-"))
+    try:
+        (odd_root / "pkg").mkdir()
+        (odd_root / "pkg" / "mod.py").write_text(
+            "import faulthandler\n"
+            "def dump_here(fh):\n"
+            "    faulthandler.dump_traceback(file=fh, all_threads=True)\n",
+            encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(
+            "hang_odd_mod", odd_root / "pkg" / "mod.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with open(odd_root / "dump.txt", "w+b") as fh:
+            mod.dump_here(fh)
+            fh.seek(0)
+            text = fh.read().decode("utf-8", "replace")
+        got = perf_audit.gui_stack(text, threading.get_ident(), str(odd_root))
+        check("perf hang: a non-ASCII root still names our own frames",
+              "\\xe9" in text and got.startswith("pkg/mod.py:3 dump_here"),
+              got)
+    finally:
+        shutil.rmtree(odd_root, ignore_errors=True)
 
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-hang-"))
     dump_path = tmp / "hang.log"
@@ -1019,6 +1055,36 @@ def test_perf_hang_stack():
         capped.stop()
         check("perf hang: stopping reports what the limit held back",
               lines[-1] == "PERF hang suppressed=2", lines[-1:])
+
+        # a re-arm that fails ends the dump, and the fold it makes still
+        # carries the stall's gap: the tick has already moved its clock on
+        lines.clear()
+        now[0] = 900.0
+        failing = perf_audit.StallProbe(SimpleNamespace(audit=lines.append),
+                                        lambda v: "", clock=lambda: now[0],
+                                        dump_path=str(dump_path), hang_s=60)
+        probes.append(failing)
+        failing.start()
+        failing._timer.stop()
+        me = failing._gui_ident
+        os.write(failing._dump.fileno(), (
+            f"Thread 0x{me:08x} (most recent call first):\n"
+            f'  File "{perf_audit._ROOT}{os.sep}app{os.sep}y.py",'
+            " line 7 in g\n").encode())
+        real_later = faulthandler.dump_traceback_later
+
+        def no_watchdog(*a, **kw):
+            raise RuntimeError("can't start new thread")
+        faulthandler.dump_traceback_later = no_watchdog
+        try:
+            now[0] += 40.0
+            failing._tick()
+        finally:
+            faulthandler.dump_traceback_later = real_later
+        hangs = [ln for ln in lines if ln.startswith("PERF hang gap=")]
+        check("perf hang: a failed re-arm folds with the real gap",
+              hangs == ["PERF hang gap=40000 stack=app/y.py:7 g"]
+              and failing._dump is None, lines)
 
         # the window passes the dump file beside its session file
         win = create_main_window(SessionStore(path=tmp / "s.json"))

@@ -15,9 +15,9 @@ em dashes: this text is shown in the app.
   its prompt, and in a folder with other conversations it could come back
   holding another agent's chat.
 - When the window stops responding for 3 seconds or more, AI Hive writes
-  where it was stuck to hang.log, next to your session file, and keeps
-  the previous launch's dump as hang.log.1. Attach both to a report of a
-  freeze.
+  where it was stuck to hang.log, next to your session file. The next
+  launch moves it to hang.log.1, so a freeze you had to close AI Hive in
+  keeps its record. Attach both to a report of a freeze.
 
 ## 0.48.0
 

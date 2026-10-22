@@ -875,7 +875,11 @@ Hard-won rules, each with a regression test:
   process. A 50 ms timer watches the GUI thread. When it fires more than
   150 ms late, a `PERF stall` line gives the gap, the longest terminal feed
   inside it (ms, size, agent) and the longest paint (ms, grid). At most five
-  go out a minute, and one more line counts the rest.
+  go out a minute, and one more line counts the rest. A block of 3 s or
+  more also writes every thread's stack to `hang.log` beside the session
+  file while the window is still stuck, and a `PERF hang` line names the
+  GUI thread's frames. The next launch moves a non-empty `hang.log` to
+  `hang.log.1`, so a hang you had to kill AI Hive in keeps its dump.
 - **Conversations are backed up.** Claude Code keeps each conversation as a
   single file it owns (`~/.claude/projects/...`) — AI Hive snapshots every
   pinned agent's transcript into `%APPDATA%\AIHive\AI Hive\transcripts\` on

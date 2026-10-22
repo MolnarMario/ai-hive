@@ -47,8 +47,8 @@ _START_SLACK = 3.0
 # resume that started over, an accidental /clear). A pin must NEVER drift from
 # a substantial conversation onto such a stub: a fresh chat has to EARN the
 # pin by accumulating content first, or a stray empty session on reopen would
-# strand a 10 MB conversation (a real incident — the left card came back blank
-# while its big chat sat un-pinned on disk). One real user turn with tool use is
+# strand a 10 MB conversation (a real incident, where the left card came back
+# blank while its big chat sat un-pinned on disk). One real user turn with tool use is
 # tens of KB, well above this floor.
 _STUB_BYTES = 4096
 
@@ -287,7 +287,10 @@ def written_nowhere(session_id: str) -> bool:
                     continue  # not in this folder, or a stray file
                 return False
     except FileNotFoundError:
-        return True  # no projects folder: Claude has written nothing at all
+        # no projects folder in a config dir that exists: Claude has written
+        # nothing at all. A missing config dir (a drive not mounted yet)
+        # raises the same error and proves nothing.
+        return os.path.isdir(os.path.dirname(transcripts.projects_root()))
     except OSError:
         return False
     return True
@@ -318,10 +321,10 @@ def resolve_live_ids(agents, lister=list_transcripts,
     conversations or strands one on an empty stub. That happened repeatedly
     (a good conversation got pushed onto a fresh /recap session while its real
     chat sat un-pinned on disk), so multi-agent folders are deliberately left
-    exactly as launched/restored. A genuinely BROKEN pin (a missing transcript)
-    is still repaired at resume time by `_recover_missing_resume_target`, which
-    excludes sibling pins and avoids stubs — the only place multi-agent folders
-    are touched, and only when a pin points at nothing.
+    exactly as launched/restored. A Claude pin with no transcript in any
+    folder starts that agent fresh at restore
+    (`TerminalAgent._recover_missing_resume_target`), and no Claude agent is
+    ever moved onto another conversation there.
 
     For the single-agent case it proposes a transcript that:
       * is NOT the agent's own pin (nothing to do);
