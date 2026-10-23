@@ -1930,11 +1930,19 @@ class AddTerminalDialog(QDialog):
                   (prov.models if prov else ()))
         for label, value in models:
             self.model_combo.addItem(label, value)
+        if prov is not None and prov.key == "claude":
+            self._name_claude_default(
+                self.model_combo, self._claude_default_model(), "/model",
+                "--model", "run /model in a terminal and choose Default")
 
     def _populate_efforts(self, prov) -> None:
         self.effort_combo.clear()
         for tok in prov.efforts:
             self.effort_combo.addItem(tok.capitalize() if tok else "Default", tok)
+        if prov.key == "claude":
+            self._name_claude_default(
+                self.effort_combo, providers.user_default_effort(), "/effort",
+                "--effort", "run /effort auto in a terminal")
         # Ultracode isn't a launch flag (claude --effort only takes
         # low/medium/high/xhigh/max); it's an in-session mode. Show it, greyed
         # out, so users know to enable it manually in the terminal.
@@ -1944,6 +1952,43 @@ class AddTerminalDialog(QDialog):
             model = self.effort_combo.model()
             item = model.item(self.effort_combo.count() - 1)
             item.setEnabled(False)  # visible but non-selectable
+
+    @staticmethod
+    def _claude_default_model() -> str:
+        """The saved /model pick as the picker labels it ("opus" -> "Opus
+        5.5"), or "" when nothing is saved. A "[1m]" pick names the same
+        model as the bare alias."""
+        raw = providers.user_default_model()
+        if not raw or raw.lower() == "default":
+            return ""
+        bare = raw.lower().replace("[1m]", "").strip()
+        for label, value in providers.CLAUDE_MODELS:
+            if value and value == bare:
+                return label
+        return transcripts.model_display(raw)
+
+    @staticmethod
+    def _name_claude_default(combo, saved: str, command: str, flag: str,
+                             reset: str) -> None:
+        """Say on the Default entry what Claude will run. Default launches
+        without `flag`, so the CLI uses the pick `command` last saved from
+        ANY terminal, not Anthropic's recommendation; users read it as the
+        previous agent's settings carrying over. No launch flag undoes a
+        saved pick (providers.user_default_effort), so the label says it."""
+        i = combo.findData("")
+        if i < 0:
+            return
+        if saved:
+            combo.setItemText(i, f"Default ({saved}, saved by {command})")
+            tip = (f"Launches without {flag}, so Claude uses the pick "
+                   f"{command} last saved in any terminal. To go back to "
+                   f"the recommended default, {reset}.")
+        else:
+            combo.setItemText(i, "Default (recommended)")
+            tip = (f"Launches without {flag}, so Claude picks its "
+                   f"recommended default. A {command} pick in any terminal "
+                   f"becomes the new default.")
+        combo.setItemData(i, tip, Qt.ItemDataRole.ToolTipRole)
 
     def _populate_modes(self, prov) -> None:
         # populate once so a user's choice survives toggling Type away and back

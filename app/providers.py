@@ -2,8 +2,8 @@
 
 Each provider maps to a CLI. Claude Code is fully wired — its real
 `--model` / `--effort` flags (verified on this machine: effort tokens are
-low|medium|high|xhigh|max; model aliases include opus|sonnet|haiku|fable,
-their [1m] variants and opusplan).
+low|medium|high|xhigh|max; model aliases include opus|sonnet|haiku|fable
+and opusplan, and full ids name the older models).
 Other providers are editable command templates that only launch once their
 CLI is installed; until then the dialog shows them as "not detected".
 
@@ -21,8 +21,8 @@ from dataclasses import dataclass, field
 DEFAULT_MODEL = ""   # empty = omit the flag, use the CLI's own default
 DEFAULT_EFFORT = ""
 
-# cache for user_default_model: (mtime, size, model)
-_USER_MODEL_CACHE: tuple = (0.0, -1, "")
+# cache for _claude_user_defaults: (mtime, size, model, effort)
+_USER_DEFAULTS_CACHE: tuple = (0.0, -1, "", "")
 
 # resolve_claude's PATH lookup: (the PATH it searched, the file it found).
 # One `shutil.which` is about 5 ms and every Claude spec built at load asks
@@ -62,17 +62,29 @@ class Provider:
 RESUME_PROVIDERS = ("claude", "gemini", "grok")
 
 
-# Values are the CLI's own aliases (verified in claude 2.1.296), which resolve
-# client-side to the newest model the installed CLI knows. The version in each
-# label is what that alias meant when this list was last refreshed; update the
-# labels when a new model ships. "[1m]" is the 1M-context variant, "opusplan"
-# plans with Opus and executes with Sonnet.
+# The models claude's own /model menu lists, in its order (claude 2.1.309).
+# The newest of each family goes by the CLI's alias, which resolves
+# client-side to the newest model the installed CLI knows; the version in its
+# label is what the alias meant when this list was last refreshed, so update
+# the labels when a new model ships. Older models go by full id. There are no
+# "[1m]" entries: the fable, opus and sonnet aliases resolve to models with a
+# native 1M window, so "opus[1m]" launched the same model as "opus", and
+# claude's menu offers no 1M variant of Opus 4.6 or Sonnet 4.6 either. "opusplan" plans with Opus
+# and executes with Sonnet; the menu doesn't list it but --model takes it.
 CLAUDE_MODELS = (
     ("Default", ""),
-    ("Fable 5.1", "fable"), ("Fable 5.1 (1M context)", "fable[1m]"),
-    ("Opus 5.5", "opus"), ("Opus 5.5 (1M context)", "opus[1m]"),
-    ("Sonnet 5.5", "sonnet"), ("Sonnet 5.5 (1M context)", "sonnet[1m]"),
+    ("Opus 5.5", "opus"),
+    ("Sonnet 5.5", "sonnet"),
+    ("Fable 5.1", "fable"),
     ("Haiku 5.5", "haiku"),
+    ("Haiku 4.5", "claude-haiku-4-5"),
+    ("Sonnet 5", "claude-sonnet-5"),
+    ("Opus 5", "claude-opus-5"),
+    ("Fable 5", "claude-fable-5"),
+    ("Opus 4.8", "claude-opus-4-8"),
+    ("Opus 4.7", "claude-opus-4-7"),
+    ("Opus 4.6", "claude-opus-4-6"),
+    ("Sonnet 4.6", "claude-sonnet-4-6"),
     ("Opus Plan (Opus plans, Sonnet executes)", "opusplan"),
 )
 CLAUDE_EFFORTS = ("", "low", "medium", "high", "xhigh", "max")
@@ -283,28 +295,53 @@ def forget_claude() -> None:
 def user_default_model() -> str:
     """The model the Claude CLI will pick when AI Hive passes no --model, i.e.
     the user's own `~/.claude/settings.json` "model" setting (what `/model`
-    writes when it says "saved as your default"). Only a COLD-START seed for
-    the card's model label: once the conversation has a transcript, the
-    transcript is the truth. "" when unset/unreadable. Cheap to call (cached by
-    mtime+size); never raises."""
-    global _USER_MODEL_CACHE
+    writes when it says "saved as your default"). A cold-start seed for the
+    card's model label (once the conversation has a transcript, the
+    transcript is the truth) and what the New Agent dialog's "Default" names.
+    "" when unset/unreadable. Cheap to call (cached by mtime+size); never
+    raises."""
+    return _claude_user_defaults()[0]
+
+
+def user_default_effort() -> str:
+    """The effort the Claude CLI will pick when AI Hive passes no --effort:
+    the "effortLevel" that `/effort` saves in `~/.claude/settings.json` from
+    ANY terminal ("saved as your default for new sessions"). The CLI reads
+    only low|medium|high|xhigh from there (max is session-only), so anything
+    else is "", the model's own default. Measured on claude 2.1.309: no
+    launch flag undoes a saved level, and `--settings '{"effortLevel":
+    "auto"}'` still ran at the saved "high". So the New Agent dialog names
+    this rather than promising the recommended effort. Never raises."""
+    return _claude_user_defaults()[1]
+
+
+def _claude_user_defaults() -> tuple[str, str]:
+    """(model, effort) from `~/.claude/settings.json`, cached by mtime+size.
+    An unreadable file keeps the last good reading."""
+    global _USER_DEFAULTS_CACHE
     path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
     try:
         st = os.stat(path)
     except OSError:
-        return ""
-    if _USER_MODEL_CACHE[0] == st.st_mtime and _USER_MODEL_CACHE[1] == st.st_size:
-        return _USER_MODEL_CACHE[2]
-    model = ""
+        return ("", "")
+    cached = _USER_DEFAULTS_CACHE
+    if cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return (cached[2], cached[3])
+    model = effort = ""
     try:
         with open(path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
-        if isinstance(data, dict) and isinstance(data.get("model"), str):
-            model = data["model"].strip()
+        if isinstance(data, dict):
+            if isinstance(data.get("model"), str):
+                model = data["model"].strip()
+            level = data.get("effortLevel")
+            if isinstance(level, str) and level.strip().lower() in (
+                    "low", "medium", "high", "xhigh"):
+                effort = level.strip().lower()
     except (OSError, ValueError):
-        return _USER_MODEL_CACHE[2]
-    _USER_MODEL_CACHE = (st.st_mtime, st.st_size, model)
-    return model
+        return (cached[2], cached[3])
+    _USER_DEFAULTS_CACHE = (st.st_mtime, st.st_size, model, effort)
+    return (model, effort)
 
 
 _GEMINI_SETTINGS_CACHE: tuple = (0.0, -1, {})

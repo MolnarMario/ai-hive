@@ -671,6 +671,9 @@ error dialog instead of silently closing. Packaging to a distributable
 - **Agents** — `+ Terminal` (or `Ctrl+T` / `Ctrl+Shift+T`), or click any empty grid slot.
   The dialog groups **AI agents** (Claude with model + effort + mode dropdowns —
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;
+  the model list matches claude's own `/model` menu, and **Default** names what
+  it resolves to, because Claude then uses the last `/model` or `/effort` pick
+  saved from any terminal, e.g. "Default (high, saved by /effort)";
   Gemini/Antigravity with its model list; Grok via the xAI CLI; OpenAI as an
   editable command template), **shells** (PowerShell, cmd), and **scripts**
   (Python, custom);
