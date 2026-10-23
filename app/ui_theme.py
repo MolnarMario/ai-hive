@@ -1099,6 +1099,10 @@ QPlainTextEdit:focus, QTextEdit:focus {{ border-color: {p.ACCENT_BLUE}; }}
 QComboBox {{
     background: {p.BG_INPUT}; border: 1px solid {p.BORDER};
     border-radius: 3px; padding: 4px 8px;
+    /* Fusion's default list overlays the combo with the current item over
+       the box, so near the bottom or on a late item it sits above. 0 makes it
+       a plain list that drops below, and flips up only when it can't fit. */
+    combobox-popup: 0;
 }}
 QComboBox:focus {{ border-color: {p.ACCENT_BLUE}; }}
 QComboBox QAbstractItemView {{
