@@ -2179,13 +2179,12 @@ class AddTerminalDialog(QDialog):
                     continue
                 self._lane_convs[sid] = conv
             when = time.strftime("%b %d %H:%M", time.localtime(mtime))
-            preview = preview or "(empty session)"
-            if len(preview) > 48:
-                preview = preview[:47] + "…"
+            full = preview or "(empty session)"
+            preview = full if len(full) <= 48 else full[:47] + "…"
             where = f"lane {conv.lane_name}  ·  " if conv is not None else ""
             self.resume_combo.addItem(f"{when}  ·  {where}{preview}", sid)
             self.resume_combo.setItemData(
-                self.resume_combo.count() - 1, f"{where}{preview}",
+                self.resume_combo.count() - 1, f"{where}{full}",
                 Qt.ItemDataRole.ToolTipRole)
         self.resume_combo.setEnabled(True)
         if self._kind() == AgentKind.CLAUDE and self.resume_combo.count() <= 1:
