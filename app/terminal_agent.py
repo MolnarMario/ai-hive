@@ -390,13 +390,24 @@ class PromptMark:
 
     `seq` orders it against a ScreenSize at the same `pos`: a resize changes
     the rows a mark anchors to, so a replay has to apply the two in the order
-    they happened (see TerminalAgent._order_seq)."""
+    they happened (see TerminalAgent._order_seq).
+
+    `kind` is MARK_PROMPT for a prompt the user typed and MARK_ANSWER for the
+    answers to one of Claude's AskUserQuestion forms (note_answer_submitted).
+    They share the list, the cap and the `pos` reasoning. The kind picks the
+    dot's colour and the anchor a replay uses
+    (TerminalView.answer_echo_line)."""
 
     uid: int
     pos: int
     text: str
     ts: float
     seq: int = 0
+    kind: str = "prompt"
+
+
+MARK_PROMPT = "prompt"
+MARK_ANSWER = "answer"
 
 
 @dataclass
@@ -1307,9 +1318,32 @@ class TerminalAgent(QObject):
         self.user_prompted.emit(text)
         if not self.is_pty:
             return None
+        return self._add_mark(text, MARK_PROMPT)
+
+    def note_answer_submitted(self, answers):
+        """Record that the user submitted an AskUserQuestion form, at the
+        current stream position. `answers` is the hook's ["<header>:
+        <answer>", ...] for the tooltip ([] when the payload had none).
+        Returns the mark, or None if it was not recorded.
+
+        Called from WorkspaceManager.sync_prompt_events off the form's
+        PostToolUse edge, which fires only for a form the user answered (a
+        cancelled one ends on Stop). Not gated on a card existing, like a
+        reply mark: a hidden workspace's card places it on its next replay.
+        The edge arrives up to a poll after the answer, by which time Claude
+        has printed its "User answered" line above the stream position, and
+        that line is what the card anchors the dot to."""
+        if not self.is_pty:
+            return None
+        text = ("Answered: " + "; ".join(answers) if answers
+                else "Answered a question")
+        return self._add_mark(text, MARK_ANSWER)
+
+    def _add_mark(self, text: str, kind: str) -> PromptMark:
         self._mark_seq += 1
         mark = PromptMark(uid=self._mark_seq, pos=self._pty_total,
-                          text=text, ts=time.time(), seq=self._next_seq())
+                          text=text, ts=time.time(), seq=self._next_seq(),
+                          kind=kind)
         self._prompt_marks.append(mark)
         while len(self._prompt_marks) > PROMPT_MARK_CAP:
             self._prompt_marks.pop(0)

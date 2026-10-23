@@ -220,6 +220,25 @@ def is_reply_footer(text: str) -> bool:
     return bool(_REPLY_FOOTER_RE.match(text.strip()))
 
 
+# The line Claude Code prints once an AskUserQuestion form is answered:
+# "● User answered Claude's questions:" (claude 2.1, read off a saved screen).
+# Anchored at the row start, past at most one bullet glyph, so a prompt the
+# user typed that happens to quote it ("> User answered...") never matches.
+_ANSWER_ECHO_RE = re.compile(r"^\s*(?:[^\w\s>❯]\s*)?User answered Claude\b")
+# How far back from the bottom of the live screen answer_echo_line()
+# looks for that line. The hook edge that mints the mark lands up to a poll
+# (PROMPT_SYNC_MS) after the answer, and a fast reply can stream a screen or
+# two past it by then.
+_ANSWER_ANCHOR_SCAN = 300
+
+
+def is_answer_echo(text: str) -> bool:
+    """True when a row is Claude's "User answered Claude's questions" line.
+    Shared with TerminalCard._recover_marks so a live answer dot and a
+    recovered one land on the same row."""
+    return bool(_ANSWER_ECHO_RE.match(text))
+
+
 # The Unicode Box Drawing block. Claude Code paints a horizontal rule (plain
 # dashes, or a rounded-corner box border) directly between the input box and
 # its footer hint, with no blank line either side -- a row built ENTIRELY
@@ -809,6 +828,9 @@ class TerminalView(QWidget):
         # Pure VIEW data -- the durable copy lives on the agent, because a card
         # rebuild throws this widget away (see TerminalCard._replay_with_marks).
         self._marks: list[tuple[int, str]] = []
+        # answers to Claude's AskUserQuestion forms, the same shape and the
+        # same contract as _marks, painted in their own colour
+        self._answer_marks: list[tuple[int, str]] = []
         # reply-finished milestones painted INLINE in the terminal content
         # itself (a small date/time stamp above the input box, next to
         # Claude's own "for Ns" footer) rather than on the scrollbar. Same
@@ -1362,6 +1384,28 @@ class TerminalView(QWidget):
             return self.history_pushed() + r    # nothing below to use
         return None
 
+    def answer_echo_line(self) -> int | None:
+        """Absolute line of the newest "User answered Claude's questions"
+        row within _ANSWER_ANCHOR_SCAN rows of the bottom, or None. Used at
+        BOTH the live capture (TerminalCard._mark_anchor) and replay
+        re-anchoring, like anchor_line(): the mark is minted after Claude
+        printed that row, so the same screen state gives the same row on
+        both sides."""
+        pushed = self.history_pushed()
+        for r in range(self.screen.lines - 1, -1, -1):
+            if is_answer_echo(self._row_text(self.screen.buffer[r])):
+                return pushed + r
+        hist = self.screen.history.top
+        left = _ANSWER_ANCHOR_SCAN - self.screen.lines
+        for i in range(len(hist) - 1, max(-1, len(hist) - 1 - left), -1):
+            if is_answer_echo(self._row_text(hist[i])):
+                return pushed - len(hist) + i
+        return None
+
+    def _row_text(self, row) -> str:
+        cols = self.screen.columns
+        return "".join(row[c].data or " " for c in range(cols))
+
     def scroll_to_abs(self, abs_line: int, lead: int = 2) -> None:
         """Put `abs_line` `lead` rows below the top of the view.
 
@@ -1386,6 +1430,15 @@ class TerminalView(QWidget):
 
     def marks(self) -> list[tuple[int, str]]:
         return list(self._marks)
+
+    def set_answer_marks(self, marks) -> None:
+        # update() for the same reason as set_marks
+        self._answer_marks = list(marks)
+        self._notify_view(immediate=True)
+        self.update()
+
+    def answer_marks(self) -> list[tuple[int, str]]:
+        return list(self._answer_marks)
 
     def set_reply_marks(self, marks) -> None:
         # A reply stamp is minted 2 s after the last output (BUSY_IDLE_MS),
@@ -1458,6 +1511,7 @@ class TerminalView(QWidget):
         self._frame_ref = None
         self._scroll_offset = 0
         self._marks = []
+        self._answer_marks = []
         self._reply_marks = []
         self._vs_cache = None
         self._vs_sig = None
