@@ -4009,3 +4009,558 @@ def test_terminal_find():
     card.close()
     agent.deleteLater()
     app.processEvents()
+
+
+# ------------------------------------------------- terminal font picker ---
+
+def _reset_terminal_font():
+    """The picker's state is process-wide (ui_theme), and later tests expect
+    the default look."""
+    from app import ui_theme
+    ui_theme.TERMINAL_FONT = ui_theme.DEFAULT_TERMINAL_FONT
+    ui_theme.TERMINAL_LETTER_PX = 0
+
+
+def test_terminal_font_option_persists():
+    """Options > Terminal font and Letter spacing: two rows in the panel,
+    the stepper stops at 0 and 3 px, every change marks the session for
+    saving, both keys go to ui and come back through a temp SessionStore,
+    and junk values fall back to Default and 0 px."""
+    import shutil
+    from PySide6.QtWidgets import QApplication
+
+    from app import ui_theme
+    from app.session_store import SessionStore
+    from app.widgets.main_window import TopBar
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-termfont-"))
+    try:
+        bar = TopBar()
+        sel = bar.terminal_font_select
+        ids = [sel.itemData(i) for i in range(sel.count())]
+        check("term font: the dropdown offers the whole table, Default first",
+              ids == list(ui_theme.TERMINAL_FONTS) and ids[0] == "default",
+              ids)
+        check("term font: a fresh bar shows Default and 0 px",
+              sel.currentData() == "default"
+              and bar.letter_px_label.text() == "0 px",
+              (sel.currentData(), bar.letter_px_label.text()))
+        check("term font: both rows sit in the Options panel",
+              all(bar.options_panel.isAncestorOf(w)
+                  for w in (sel, bar.letter_dec_btn, bar.letter_px_label,
+                            bar.letter_inc_btn)))
+        fonts, deltas = [], []
+        bar.terminalFontChanged.connect(fonts.append)
+        bar.letterSpacingDelta.connect(deltas.append)
+        sel.setCurrentIndex(sel.findData("plex"))
+        bar.letter_inc_btn.click()
+        bar.letter_dec_btn.click()
+        check("term font: the rows emit the font id and -1 / +1",
+              fonts == ["plex"] and deltas == [1, -1], (fonts, deltas))
+        bar.set_terminal_font("default")
+        bar.set_letter_spacing(2)
+        check("term font: set_terminal_font and set_letter_spacing reflect "
+              "without re-emitting",
+              fonts == ["plex"] and sel.currentData() == "default"
+              and bar.letter_px_label.text() == "2 px")
+        bar.deleteLater()
+
+        win = create_main_window(SessionStore(path=tmp / "session.json"))
+        win._save_timer.stop()
+        win._change_terminal_font("jetbrains")
+        check("term font: picking a font marks the session for saving",
+              ui_theme.TERMINAL_FONT == "jetbrains"
+              and win._save_timer.isActive())
+        win._save_timer.stop()
+        for _ in range(5):
+            win._change_letter_spacing(+1)
+        check("term font: letter spacing stops at 3 px and saves",
+              ui_theme.TERMINAL_LETTER_PX == 3
+              and win.top_bar.letter_px_label.text() == "3 px"
+              and win._save_timer.isActive(),
+              ui_theme.TERMINAL_LETTER_PX)
+        for _ in range(5):
+            win._change_letter_spacing(-1)
+        check("term font: ...and at 0 px on the way down",
+              ui_theme.TERMINAL_LETTER_PX == 0)
+        win._change_letter_spacing(+1)
+        win._change_letter_spacing(+1)
+        ui = win._session_payload()["ui"]
+        check("term font: both are persisted under ui",
+              ui.get("terminal_font") == "jetbrains"
+              and ui.get("terminal_letter_px") == 2, ui)
+        win._save_session()
+        win._save_timer.stop()
+        win.close()
+        app.processEvents()
+
+        _reset_terminal_font()
+        again = create_main_window(SessionStore(path=tmp / "session.json"))
+        check("term font: both survive a close and reopen",
+              ui_theme.TERMINAL_FONT == "jetbrains"
+              and ui_theme.TERMINAL_LETTER_PX == 2
+              and again.top_bar.terminal_font_select.currentData()
+              == "jetbrains"
+              and again.top_bar.letter_px_label.text() == "2 px",
+              (ui_theme.TERMINAL_FONT, ui_theme.TERMINAL_LETTER_PX))
+        again._restore_ui_state({"ui": {"terminal_font": "comic-sans",
+                                        "terminal_letter_px": "wide"}})
+        check("term font: junk values restore as Default and 0 px",
+              ui_theme.TERMINAL_FONT == "default"
+              and ui_theme.TERMINAL_LETTER_PX == 0
+              and again.top_bar.terminal_font_select.currentData()
+              == "default"
+              and again.top_bar.letter_px_label.text() == "0 px")
+        got = [ui_theme.saved_letter_px({"terminal_letter_px": v})
+               for v in (7, -2, True, 2.5, None, "2", 3)]
+        check("term font: a saved spacing is clamped to 0..3, non-ints are 0",
+              got == [3, 0, 0, 0, 0, 0, 3], got)
+        got = [ui_theme.saved_terminal_font(ui) for ui in
+               ({}, {"terminal_font": None}, {"terminal_font": 5},
+                {"terminal_font": "theme"})]
+        check("term font: a saved font id must be in the table",
+              got == ["default", "default", "default", "theme"], got)
+        again._save_timer.stop()
+        again.close()
+        app.processEvents()
+    finally:
+        _reset_terminal_font()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_terminal_font_follows_theme():
+    """Default keeps today's look on every skin: Consolas in the pty
+    terminals, the skin's console_font in line-mode cards. Theme font
+    re-resolves on a theme switch; a picked family ignores one. A card with
+    its own font size keeps it through a family change."""
+    import shutil
+    from PySide6.QtGui import QFontInfo
+    from PySide6.QtWidgets import QApplication
+
+    from app import ui_theme
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    if not HAS_CONPTY:
+        skip("term font: theme follow", "no ConPTY, so no pty cards")
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-termtheme-"))
+    chrome = app.property("chromeFamily") or "Segoe UI"
+    try:
+        for tid in ui_theme.THEMES:
+            ui_theme.apply_theme(tid)
+            check(f"term font: Default is Consolas in the terminals on {tid}",
+                  ui_theme.terminal_font_families() == ["Consolas"])
+            check(f"term font: Default leaves line mode on {tid}'s font",
+                  ui_theme.line_console_font() == ui_theme.CONSOLE_FONT)
+        ui_theme.apply_theme(ui_theme.DEFAULT_THEME_ID)
+
+        win = create_main_window(SessionStore(path=tmp / "session.json"))
+        win._save_timer.stop()
+        ws = win.manager.workspaces[0]
+        plain = win.manager.add_terminal(
+            ws.id, build_spec(AgentKind.POWERSHELL, "Plain", cwd=SCRATCH_CWD,
+                              pty=True), autostart=False)
+        own = win.manager.add_terminal(
+            ws.id, build_spec(AgentKind.POWERSHELL, "Own", cwd=SCRATCH_CWD,
+                              pty=True, font_px=19), autostart=False)
+        line = win.manager.add_terminal(
+            ws.id, build_spec(AgentKind.CMD, "Line", cwd=SCRATCH_CWD,
+                              pty=False), autostart=False)
+        page = win._pages[ws.id]
+        pv = page.card_for(plain.id).terminal
+        ov = page.card_for(own.id).terminal
+        lc = page.card_for(line.id).console
+
+        def line_family():
+            lc.ensurePolished()
+            return QFontInfo(lc.font()).family()
+
+        check("term font: a new pty card starts in Consolas, no spacing",
+              pv.font_families() == ["Consolas"]
+              and pv.letter_spacing() == 0
+              and pv._font.letterSpacing() == 0)
+        win._change_theme("adeptus-mechanicus")
+        check("term font: Default stays Consolas on Adeptus Mechanicus",
+              pv.font_families() == ["Consolas"]
+              and QFontInfo(pv._font).family() == "Consolas")
+        check("term font: ...while line mode keeps Share Tech Mono",
+              line_family() == "Share Tech Mono", line_family())
+
+        win._change_terminal_font("theme")
+        check("term font: Theme font puts the skin's font in the terminals",
+              pv.font_families() == ["Share Tech Mono", "Consolas"]
+              and QFontInfo(pv._font).family() == "Share Tech Mono",
+              pv.font_families())
+        win._change_theme("obsidian")
+        check("term font: Theme font follows a theme switch",
+              pv.font_families() == ["Consolas", "Cascadia Mono"],
+              pv.font_families())
+
+        win._change_terminal_font("plex")
+        check("term font: a picked family reaches the pty cards",
+              QFontInfo(pv._font).family() == "IBM Plex Mono"
+              and QFontInfo(ov._font).family() == "IBM Plex Mono")
+        check("term font: ...and the line-mode console",
+              line_family() == "IBM Plex Mono", line_family())
+        win._change_theme("adeptus-mechanicus")
+        check("term font: a picked family ignores a theme switch",
+              pv.font_families() == ["IBM Plex Mono", "Consolas"]
+              and line_family() == "IBM Plex Mono",
+              (pv.font_families(), line_family()))
+        check("term font: a card's own font size survives a family change",
+              ov.font_size() == 19
+              and pv.font_size() == ui_theme.CONSOLE_FONT_PX,
+              (ov.font_size(), pv.font_size()))
+        win._change_letter_spacing(+1)
+        check("term font: letter spacing reaches every pty card at its size",
+              pv.letter_spacing() == 1 and ov.letter_spacing() == 1
+              and ov.font_size() == 19)
+        win._save_timer.stop()
+        win.close()
+        app.processEvents()
+    finally:
+        _reset_terminal_font()
+        ui_theme.apply_theme(ui_theme.DEFAULT_THEME_ID)
+        app.setStyleSheet(ui_theme.build_qss(chrome))
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_terminal_font_setters_debounce():
+    """The family, spacing and size setters measure the new cell at once and
+    resize the pty once, through the 120 ms debounce, however many clicks
+    came first. Ctrl+wheel zoom still resizes at once. Spacing adds exactly
+    its px to the cell."""
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import CELL_PAD_X, CELL_PAD_Y, TerminalView
+
+    QApplication.instance() or QApplication([])
+    tv = TerminalView(rows=10, cols=60)
+    tv.resize(int(60 * tv._cell_w) + 2 * CELL_PAD_X + 1,
+              int(10 * tv._cell_h) + 2 * CELL_PAD_Y + 1)
+    tv.flush_resize()
+    sizes = []
+    tv.sizeChanged.connect(lambda r, c: sizes.append((r, c)))
+    cw = tv._cell_w
+    tv.set_letter_spacing(1)
+    tv.set_letter_spacing(2)
+    tv.set_letter_spacing(3)
+    check("term font: spacing grows the cell by exactly its px",
+          tv._cell_w == cw + 3, (cw, tv._cell_w))
+    tv.set_font_families(["IBM Plex Mono", "Consolas"])
+    tv.set_font_size(15)
+    check("term font: a burst of setters resizes nothing yet",
+          sizes == [] and tv._resize_timer.isActive(), sizes)
+    tv.flush_resize()   # what the debounce timer does when it fires
+    check("term font: ...then the pty resizes once", len(sizes) == 1, sizes)
+    sizes.clear()
+    ev = QWheelEvent(QPointF(10, 10), QPointF(10, 10), QPoint(0, 0),
+                     QPoint(0, 120), Qt.MouseButton.NoButton,
+                     Qt.KeyboardModifier.ControlModifier,
+                     Qt.ScrollPhase.NoScrollPhase, False)
+    tv.wheelEvent(ev)
+    check("term font: Ctrl+wheel zoom still resizes at once",
+          tv.font_size() == 16 and len(sizes) == 1
+          and not tv._resize_timer.isActive(), (tv.font_size(), sizes))
+    tv.deleteLater()
+
+
+def test_terminal_font_families_resolve():
+    """Every font in the table resolves to its own family, headless, with
+    the bundled files registered, and every bundled family ships its
+    license as a static face."""
+    import os
+    from PySide6.QtGui import QFont, QFontDatabase, QFontInfo
+    from PySide6.QtWidgets import QApplication
+
+    from app import ui_theme
+    from main import setup_application
+    from .harness import ROOT
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    have = set(QFontDatabase.families())
+    fonts = ROOT / "app" / "assets" / "fonts"
+    bundled = {"cascadia": "CascadiaMono-OFL.txt",
+               "jetbrains": "JetBrainsMono-OFL.txt",
+               "plex": "IBMPlexMono-OFL.txt",
+               "atkinson": "AtkinsonHyperlegibleMono-OFL.txt",
+               "opendyslexic": "OpenDyslexicMono-LICENSE.txt"}
+    for fid in ui_theme.TERMINAL_FONTS:
+        families = ui_theme.terminal_font_families(fid)
+        want = families[0]
+        if fid not in bundled and want not in have:
+            skip(f"term font: {fid} resolves", f"{want} is not installed")
+            continue
+        got = QFontInfo(QFont(families)).family()
+        check(f"term font: {fid} resolves to {want}", got == want, got)
+    for fid, name in bundled.items():
+        check(f"term font: {fid} ships its license",
+              (fonts / "licenses" / name).is_file(), name)
+    faces = [n for n in os.listdir(fonts)
+             if n.lower().endswith((".ttf", ".otf"))]
+    check("term font: every bundled face is a static file",
+          not [n for n in faces if "[" in n or "variable" in n.lower()],
+          faces)
+
+
+def test_terminal_box_lines_meet():
+    """A box-drawing line meets its neighbour at every cell edge, with
+    letter spacing on and in a family with no box drawing of its own. With
+    Consolas at 0 px the font still draws them, as before."""
+    from PySide6.QtGui import QColor
+    from PySide6.QtWidgets import QApplication
+
+    from app import ui_theme
+    from app.widgets.terminal_view import (_BOX_ARMS, CELL_PAD_X, CELL_PAD_Y,
+                                           TerminalView)
+    from main import setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    WHITE = "\x1b[38;2;255;255;255m"
+
+    def view(families, spacing):
+        tv = TerminalView(rows=4, cols=12)
+        tv.set_font_families(families)
+        tv.set_letter_spacing(spacing)
+        tv.resize(int(12 * tv._cell_w) + 2 * CELL_PAD_X + 1,
+                  int(4 * tv._cell_h) + 2 * CELL_PAD_Y + 1)
+        tv.flush_resize()
+        tv.feed(WHITE + "──────────\r\n╭────╮ ┌┬┐\r\n│    │ ├┼┤")
+        return tv, tv.grab().toImage()
+
+    def lit(img, x, y):
+        return QColor(img.pixel(x, y)).red() > 128
+
+    tv, _ = view(["Consolas"], 0)
+    fonted = [ch for ch in _BOX_ARMS if not tv._draws_as_box(ch, False, False)]
+    check("box: Consolas at 0 px keeps drawing box lines with the font",
+          len(fonted) == len(_BOX_ARMS),
+          [hex(ord(ch)) for ch in _BOX_ARMS if ch not in fonted])
+    tv.deleteLater()
+    for families, spacing in ((["Consolas"], 3),
+                              (ui_theme.terminal_font_families("opendyslexic"),
+                               0)):
+        tv, img = view(families, spacing)
+        label = f"{families[0]} at {spacing} px"
+        check(f"box: {label} draws box lines as geometry",
+              tv._draws_as_box("─", False, False))
+        x0, y0, _, y1 = tv.cell_bounds(0, 0)
+        x1 = tv.cell_bounds(9, 0)[2]
+        rows = [y for y in range(y0, y1)
+                if all(lit(img, x, y) for x in range(x0, x1))]
+        check(f"box: {label}: a rule of 10 is one unbroken line",
+              bool(rows), label)
+        # the ╭ at row 1, col 0: its arc reaches the cell's right edge,
+        # where the "─" beside it picks it up, and its bottom edge, where
+        # the "│" below does
+        bx0, by0, bx1, by1 = tv.cell_bounds(0, 1)
+        mid = rows[0] - y0 + by0 if rows else by0
+        check(f"box: {label}: a rounded corner meets the line beside it",
+              lit(img, bx1 - 1, mid) and lit(img, bx1, mid))
+        vx = [x for x in range(bx0, bx1) if lit(img, x, by1 - 1)]
+        check(f"box: {label}: ...and the one below it",
+              bool(vx) and all(lit(img, x, by1) for x in vx), vx)
+        tx0, _, tx1, ty1 = tv.cell_bounds(8, 1)   # the ┬ above the ┼
+        cols = [x for x in range(tx0, tx1) if lit(img, x, ty1 - 1)]
+        check(f"box: {label}: a tee meets the cross below it",
+              bool(cols) and all(lit(img, x, ty1) for x in cols), cols)
+        tv.deleteLater()
+
+
+def test_terminal_styled_redraws():
+    """The find overlay and the focused cursor redraw a cell in its own
+    style: a bold match stays bold under the yellow box, and the cursor over
+    a bold letter inverts a bold letter. The reply stamp carries the letter
+    spacing, so it ends in the cell it counted on."""
+    from PySide6.QtGui import QColor
+    from PySide6.QtWidgets import QApplication
+
+    from app.ui_theme import Palette
+    from app.widgets.terminal_view import CELL_PAD_X, CELL_PAD_Y, TerminalView
+
+    QApplication.instance() or QApplication([])
+
+    def view(text, cols=30, spacing=0):
+        tv = TerminalView(rows=3, cols=cols)
+        tv.set_letter_spacing(spacing)
+        tv.resize(int(cols * tv._cell_w) + 2 * CELL_PAD_X + 1,
+                  int(3 * tv._cell_h) + 2 * CELL_PAD_Y + 1)
+        tv.flush_resize()
+        tv.feed(text)
+        return tv
+
+    def count(img, tv, c0, c1, row, test):
+        x0, y0, _, y1 = tv.cell_bounds(c0, row)
+        x1 = tv.cell_bounds(c1, row)[2]
+        return sum(1 for x in range(x0, x1) for y in range(y0, y1)
+                   if test(QColor(img.pixel(x, y))))
+
+    def dark(c):
+        return c.red() + c.green() + c.blue() < 200
+
+    # find: the box covers the main pass's text, then the overlay redraws it
+    inks = {}
+    for name, text in (("bold", "\x1b[1mhello\x1b[0m world"),
+                       ("regular", "hello world")):
+        tv = view(text)
+        tv.set_find_query("hello")
+        inks[name] = count(tv.grab().toImage(), tv, 0, 4, 0, dark)
+        tv.deleteLater()
+    check("styled: a bold find match is redrawn bold",
+          inks["bold"] > inks["regular"] > 0, inks)
+
+    # cursor: the regular " x" run is painted last, so a cursor that kept
+    # the painter's font would draw the bold W regular. The letter is
+    # inverted, dark on the cursor's orange.
+    bg = QColor(Palette.BG_CONSOLE)
+    inks = {}
+    for name, text in (("bold", "\x1b[1mW\x1b[0m x\x1b[1;1H"),
+                       ("regular", "W x\x1b[1;1H")):
+        tv = view(text)
+        tv.hasFocus = lambda: True
+        inks[name] = count(tv.grab().toImage(), tv, 0, 0, 0, dark)
+        tv.deleteLater()
+    check("styled: the focused cursor inverts a bold letter in bold",
+          inks["bold"] > inks["regular"] > 0, inks)
+
+    # reply stamp: right-aligned, one blank column after it, placed by
+    # counting len(text) columns
+    stamp = "Oct 23, 14:05"
+    tv = view("\x1b[1mdone\x1b[0m", cols=40, spacing=3)
+    tv.set_reply_marks([(0, stamp)])
+    img = tv.grab().toImage()
+    _, y0, _, y1 = tv.cell_bounds(0, 0)
+    right = max((x for x in range(tv.cell_bounds(20, 0)[0],
+                                  tv.cell_bounds(39, 0)[2])
+                 for y in range(y0, y1)
+                 if QColor(img.pixel(x, y)) != bg), default=-1)
+    last = tv.cell_bounds(40 - 2, 0)
+    check("styled: with spacing on, the reply stamp ends in its last cell",
+          last[0] <= right <= last[2] + 1, (right, last))
+    tv.deleteLater()
+
+
+# Painted alignment has to run on the real Windows platform: synthetic bold
+# advances more there than offscreen reports for some families, and only
+# painted pixels show where a run really ends. A child process, because the
+# suite's Qt is offscreen for the whole run. It measures fonts and paints
+# into a QImage; it never shows a window and starts no AI CLI.
+_ALIGN_PROBE = r'''
+import json, os, sys
+root = sys.argv[1]
+sys.path.insert(0, root)
+from PySide6.QtGui import QColor, QFontDatabase, QFontInfo, QImage
+from PySide6.QtWidgets import QApplication
+app = QApplication(sys.argv[:1])
+fonts = os.path.join(root, "app", "assets", "fonts")
+for name in os.listdir(fonts):
+    if name.lower().endswith((".ttf", ".otf")):
+        QFontDatabase.addApplicationFont(os.path.join(fonts, name))
+from app import ui_theme
+from app.widgets.terminal_view import CELL_PAD_X, CELL_PAD_Y, TerminalView
+STYLES = {"regular": "", "bold": "1", "italic": "3", "bold italic": "1;3",
+          "underline": "4"}
+WHITE = "38;2;255;255;255"
+
+
+def render(seq, size):
+    tv = TerminalView(rows=2, cols=44, font_px=size)
+    tv.resize(int(44 * tv._cell_w) + 2 * CELL_PAD_X + 1,
+              int(2 * tv._cell_h) + 2 * CELL_PAD_Y + 1)
+    tv.flush_resize()
+    tv.feed("[?25l" + seq)   # no cursor box after the run
+    img = QImage(tv.size(), QImage.Format.Format_RGB32)
+    img.setDevicePixelRatio(1)
+    tv.render(img)
+    _, y0, _, y1 = tv.cell_bounds(0, 0)
+    right = -1
+    for x in range(img.width() - 1, -1, -1):
+        if any(min(QColor(img.pixel(x, y)).getRgb()[:3]) > 128
+               for y in range(y0, y1)):
+            right = x
+            break
+    return tv, right
+
+
+out = []
+cases = [(fid, ui_theme.DEFAULT_THEME_ID) for fid in ui_theme.TERMINAL_FONTS
+         if fid != "theme"] + [("theme", "adeptus-mechanicus")]
+for fid, theme in cases:
+    ui_theme.apply_theme(theme)
+    ui_theme.TERMINAL_FONT = fid
+    for size in (13, 17):
+        for px in (0, 3):
+            ui_theme.TERMINAL_LETTER_PX = px
+            for style, sgr in STYLES.items():
+                pre = "\x1b[" + WHITE + (";" + sgr if sgr else "") + "m"
+                tv, run = render(pre + "M" * 40, size)
+                _, lone = render("\x1b[1;40H" + pre + "M", size)
+                out.append({"font": fid,
+                            "family": QFontInfo(tv._font).family(),
+                            "size": size, "px": px, "style": style,
+                            "run": run, "lone": lone,
+                            "cell": list(tv.cell_bounds(39, 0)),
+                            "cw": tv._cell_w})
+print(json.dumps(out))
+'''
+
+
+def test_terminal_font_alignment_windows():
+    """For every font in the table (Share Tech Mono through Theme font on
+    Adeptus Mechanicus), every style, 13 and 17 px, and letter spacing 0
+    and 3: a 40-char run of "M" painted on the real Windows platform puts
+    its last glyph exactly where a lone "M" in cell 40 goes, and its ink
+    ends in cell 40 (an italic may lean a pixel or two past it). Without
+    _run_font's correction, Share Tech Mono's synthetic bold ran 5 cells
+    long at 13 px."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from app import ui_theme
+    from .harness import ROOT
+
+    env = dict(os.environ, QT_QPA_PLATFORM="windows")
+    try:
+        r = subprocess.run([sys.executable, "-c", _ALIGN_PROBE, str(ROOT)],
+                           capture_output=True, text=True, env=env,
+                           timeout=180, cwd=SCRATCH_CWD)
+    except subprocess.TimeoutExpired:
+        check("align: the Windows-platform probe finished", False, "timeout")
+        return
+    if r.returncode != 0:
+        err = (r.stderr or "").lower()
+        if "platform plugin" in err or "could not connect" in err:
+            skip("align: painted alignment on the Windows platform",
+                 "the windows platform plugin could not start here")
+            return
+        check("align: the Windows-platform probe ran", False,
+              (r.stderr or "")[-800:])
+        return
+    rows = json.loads(r.stdout.strip().splitlines()[-1])
+    check("align: the probe covered every font, size, spacing and style",
+          len(rows) == len(ui_theme.TERMINAL_FONTS) * 2 * 2 * 5, len(rows))
+    for fid in ui_theme.TERMINAL_FONTS:
+        mine = [row for row in rows if row["font"] == fid]
+        family = mine[0]["family"] if mine else "?"
+        off = [row for row in mine if abs(row["run"] - row["lone"]) > 1]
+        check(f"align: {fid} ({family}): glyph 40 of a run lands where a "
+              "lone one in cell 40 does, every size, spacing and style",
+              mine and not off, off)
+        out = [row for row in mine if not (
+            row["cell"][0] <= row["run"] < row["cell"][2] + row["cw"] / 2)]
+        check(f"align: {fid} ({family}): a 40-char run's ink ends in cell 40",
+              mine and not out, out)
