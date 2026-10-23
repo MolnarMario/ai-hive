@@ -444,12 +444,12 @@ workspaces keep executing — switching never pauses anything.
   there. The ▾ beside Open repo lists the GitHub repository's recent pull
   requests and commits. AI Hive loads that list in the background a few
   seconds after startup and keeps it, so the menu opens already filled.
-- **Bold word starts.** ⚙ Options > Appearance > **Bold word starts** (off by
+- **Bionic reading.** ⚙ Options > Appearance > **Bionic reading** (off by
   default) draws the first half of each prose word in the agent terminals in
   bold, which some readers, dyslexic readers among them, find easier to
   track. Only words change: code, paths, flags, numbers, links, the line
   you're typing and anything the agent already made bold keep their weight,
-  and vim, less and other full-screen apps are left alone. **Boldness** −/+
+  and vim, less and other full-screen apps are left alone. **Contrast** −/+ (shown only while Bionic reading is on)
   right under it sets how much the word starts stand out, 1 to 5. Level 1
   is the font's plain bold, which in most monospace fonts is only a little
   heavier than regular. Level 2 thickens the bold start, and levels 3 to 5
@@ -626,7 +626,7 @@ workspaces keep executing — switching never pauses anything.
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
   reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Update AI
-  Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times**, **Tooltips** and **Bold word starts** as labelled switches (each with a green/dark LED, so
+  Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times**, **Tooltips** and **Bionic reading** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
   the theme, global font size, terminal font and letter spacing below. Click outside or press `Esc` to close.
