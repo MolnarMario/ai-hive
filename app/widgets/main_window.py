@@ -20,8 +20,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QFrame, QHBoxLayout,
                                QLabel, QLineEdit, QMainWindow, QMenu,
                                QMessageBox, QPlainTextEdit, QPushButton,
-                               QProgressDialog, QScrollArea, QSplitter, QStackedWidget,
-                               QToolButton, QVBoxLayout, QWidget)
+                               QProgressDialog, QScrollArea, QSizePolicy, QSplitter,
+                               QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 from .. import __version__
 from .. import chime
@@ -1808,7 +1808,7 @@ class AddTerminalDialog(QDialog):
                  live_lane_roots=(), audit=None):
         super().__init__(parent)
         self.setWindowTitle("New Agent")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(480)
         self._cwd = cwd
         self._audit = audit or (lambda _line: None)
         # conversations a running agent holds
@@ -1861,10 +1861,16 @@ class AddTerminalDialog(QDialog):
         self.resume_combo.setToolTip(
             "Start this Claude agent by resuming a past conversation from this "
             "workspace's folder, instead of a fresh one.")
-        # its list arrives after the first show, and the default policy sizes
-        # the box once, at that show, to "Loading conversations"
+        # its list arrives after the first show. Sized to its text, the box
+        # (and the dialog with it) opened at the width of "Loading
+        # conversations" and jumped wider when a preview came in. A fixed
+        # contents length and the other rows' stretch keep the width the
+        # same before and after; a long row is elided, its tooltip is whole
         self.resume_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToContents)
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.resume_combo.setMinimumContentsLength(24)
+        self.resume_combo.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                        QSizePolicy.Policy.Fixed)
         self.command_edit = QLineEdit(self)
         self.command_edit.setPlaceholderText("full launch command (editable)")
 
@@ -2241,11 +2247,13 @@ class AddTerminalDialog(QDialog):
                     continue
                 self._lane_convs[sid] = conv
             when = time.strftime("%b %d %H:%M", time.localtime(mtime))
-            preview = preview or "(empty session)"
-            if len(preview) > 48:
-                preview = preview[:47] + "…"
+            full = preview or "(empty session)"
+            preview = full if len(full) <= 48 else full[:47] + "…"
             where = f"lane {conv.lane_name}  ·  " if conv is not None else ""
             self.resume_combo.addItem(f"{when}  ·  {where}{preview}", sid)
+            self.resume_combo.setItemData(
+                self.resume_combo.count() - 1, f"{where}{full}",
+                Qt.ItemDataRole.ToolTipRole)
         self.resume_combo.setEnabled(True)
         if self._kind() == AgentKind.CLAUDE and self.resume_combo.count() <= 1:
             for w in self._resume_widgets:

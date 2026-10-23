@@ -1345,6 +1345,7 @@ def test_resume_list_reads_off_the_gui_thread():
               and not dlg.resume_combo.isEnabled(), ids(dlg))
         check("resume async: OK is off while the list is pending",
               not dlg._ok_btn.isEnabled())
+        loading_size = (dlg.width(), dlg.resume_combo.width())
         QTest.keyClick(dlg, Qt.Key.Key_Return)
         dlg.accept()
         app.processEvents()
@@ -1374,6 +1375,12 @@ def test_resume_list_reads_off_the_gui_thread():
               "out", LIVE not in got and LIVE not in dlg._lane_convs, got)
         check("resume async: the picker and OK come on with the list",
               dlg.resume_combo.isEnabled() and dlg._ok_btn.isEnabled())
+        check("resume async: the dialog and picker keep their width when the "
+              "list lands",
+              (dlg.width(), dlg.resume_combo.width()) == loading_size
+              and dlg.resume_combo.width() == dlg.model_combo.width(),
+              (loading_size, dlg.width(), dlg.resume_combo.width(),
+               dlg.model_combo.width()))
         dlg.resume_combo.setCurrentIndex(got.index(KEPT))
         check("resume async: a lane conversation still revives its lane",
               dlg.revive_lane() is not None
