@@ -132,14 +132,14 @@ prompt is never counted). Fail-closed: a selection that escapes the input box
 nothing -- inference from painted rows must never corrupt what it can't be sure
 of. To empty the whole prompt at once, use Ctrl+A then Backspace (the
 clear-prompt gesture above).
-Options > Bold word starts (off by default, one class flag for every view)
+Options > Bionic reading (off by default, one class flag for every view)
 draws the first half of each prose word in bold. app/word_starts.py picks
 the cells from a whole row; _word_start_rows runs it over the visible rows
 once per paint, skipping the alternate screen, the live input rows and the
 link spans, and caches each row's result by its cells (text and bold). The
 main pass, the find overlay and the focused cursor all draw those cells
 with _run_font's bold, so the effect never blinks off under an overlay.
-Options > Boldness (_word_strength, a level of WORD_STRENGTHS) sets how hard
+Options > Contrast (_word_strength, a level of WORD_STRENGTHS) sets how hard
 the heads contrast. Most terminal fonts draw Bold only a little heavier
 than Regular, and the bundled ones have nothing heavier, so the higher
 levels draw the bold head twice, a fraction of a pixel apart, and paint
@@ -201,11 +201,11 @@ _NAMED = {
     "brightwhite": ANSI_16[15],
 }
 
-# Options > Boldness for Bold word starts, level 1 to 5. Per level: how
+# Options > Contrast for Bionic reading, level 1 to 5. Per level: how
 # far right the bold head of each word is drawn a second time, as a share
 # of the font's pixel size, and the opacity of the rest of the word. Level
 # 1 is plain Bold with nothing faded, which most terminal fonts draw only a
-# little heavier than Regular. Bold word starts reads by contrast between
+# little heavier than Regular. Bionic reading reads by contrast between
 # the head and the rest, so the default fades the rest as well.
 WORD_STRENGTHS = ((0.0, 1.0), (0.05, 1.0), (0.06, 0.78), (0.07, 0.64),
                   (0.07, 0.5))
@@ -798,7 +798,7 @@ class TerminalView(QWidget):
         # because classifying a token can stat the filesystem.
         self._link_spans: list[tuple[int, int, int]] = []  # (row, c0, c1)
         self._link_sig = None
-        # Bold word starts (_word_start_rows): each visible row's bold mask
+        # Bionic reading (_word_start_rows): each visible row's bold mask
         # keyed by its cells, the input rows keyed by what they read, and
         # the bold pass's laid-out text for the font it was laid out in
         self._ws_rows: dict = {}
@@ -1506,7 +1506,7 @@ class TerminalView(QWidget):
     def reply_stamps_enabled(cls) -> bool:
         return cls._reply_stamps_enabled
 
-    # The "Bold word starts" switch in Options. One flag for every terminal,
+    # The "Bionic reading" switch in Options. One flag for every terminal,
     # read at paint time like the one above. Default OFF.
     _word_starts_enabled = False
 
@@ -1524,7 +1524,7 @@ class TerminalView(QWidget):
     def word_starts_enabled(cls) -> bool:
         return cls._word_starts_enabled
 
-    # Options > Boldness, how hard Bold word starts contrasts, the same for
+    # Options > Contrast, how hard Bionic reading contrasts, the same for
     # every terminal (MainWindow keeps one level per terminal font). Read
     # at paint time, so a change only repaints.
     _word_strength = DEFAULT_WORD_STRENGTH
@@ -2554,8 +2554,33 @@ class TerminalView(QWidget):
         seq = ("\x1bO" if self._app_cursor_keys else "\x1b[") + final
         self.keyInput.emit(seq * count)
 
-    def _input_block_span(self):
+    def _typing_span(self):
+        """_input_block_span for Bionic reading, which has to cover one more
+        case. Typed text that fills its last row to the edge leaves the
+        caret alone at the start of the blank row below, and
+        _input_block_span returns None for a blank caret row. The prompt
+        then lost its exemption and the typed words went bold as the
+        caret wrapped. Here a blank caret row takes the box of the row
+        above it, when that box opens with a prompt glyph."""
+        span = self._input_block_span()
+        cy = self.screen.cursor.y
+        if span is not None or cy < 1 \
+                or self._row_content(cy) != (-1, -1):
+            return span
+        # its bottom is always cy - 1, since row cy is blank
+        above = self._input_block_span(cy - 1)
+        if above is None:
+            return None
+        first, _ = self._row_content(above[0])
+        if first < 0 or self.screen.buffer[above[0]][first].data \
+                not in _INPUT_PROMPTS:
+            return None
+        return above[0], cy
+
+    def _input_block_span(self, cy=None):
         """(top, bottom) live-screen rows of the contiguous input box, or None.
+        `cy` is the caret row, the cursor's own unless a caller asks about
+        another row.
         `top` is the nearest '>'/'❯' prompt row at/above the caret (as
         _select_input_line finds it -- when there is no prompt glyph it stays on
         the caret's own row, so a promptless transcript above is never absorbed);
@@ -2571,7 +2596,8 @@ class TerminalView(QWidget):
         on the transcript or on blank space below the box never drives the
         child's caret."""
         buf = self.screen.buffer
-        cy = self.screen.cursor.y
+        if cy is None:
+            cy = self.screen.cursor.y
         if self._row_content(cy) == (-1, -1):
             return None
         top = cy
@@ -3395,7 +3421,7 @@ class TerminalView(QWidget):
         return QColor(default)
 
     def _word_start_rows(self, lines, hist, off):
-        """Per visible row, a mask with a 1 in each column Bold word starts
+        """Per visible row, a mask with a 1 in each column Bionic reading
         draws in bold and a 2 in the rest of each word (word_spans), or
         None for a row with no word. None for the whole
         screen while the switch is off or the alternate screen is up: vim
@@ -3444,18 +3470,18 @@ class TerminalView(QWidget):
             tail = cells[-1].data if cells else None
         self._ws_rows = cache
         # The live input rows, where a prefix would jump about as the user
-        # types. _input_block_span is a Claude-shaped guess in live-screen
-        # rows (visible row = live row + off); when it finds nothing, every
+        # types. _typing_span is a Claude-shaped guess in live-screen rows
+        # (visible row = live row + off); when it finds nothing, every
         # row keeps its prefixes. Under a block of output it scans every row
         # above the caret twice, so on the live view its answer is kept
         # until the rows' text (the link signature) or the caret row moves.
         if off < len(rows):
             if off:
-                span = self._input_block_span()
+                span = self._typing_span()
             else:
                 key = (self._link_sig, self.screen.cursor.y)
                 if self._ws_input[0] != key:
-                    self._ws_input = (key, self._input_block_span())
+                    self._ws_input = (key, self._typing_span())
                 span = self._ws_input[1]
             if span is not None:
                 for r in range(span[0] + off,
@@ -3476,7 +3502,7 @@ class TerminalView(QWidget):
         """drawText one grid-safe piece, cells [i, j) of `line`, with the
         painter holding the piece's font and pen. Cells `starts` marks (a
         row of _word_start_rows, or None) with a 1 go out in bold, and at
-        a Boldness level that fades the rest of a word, the 2s at that
+        a Contrast level that fades the rest of a word, the 2s at that
         opacity. `text` is the piece's text when the caller has already
         joined it.
 
@@ -3492,7 +3518,7 @@ class TerminalView(QWidget):
         drawText per stretch made a paint cost about 2x the plain one, a
         second full-width drawText about 1.45x, and the bold pass as a
         QStaticText about 1.25x: the bold strings repeat paint after paint,
-        and the static text keeps their layout. At Boldness 1 the bold
+        and the static text keeps their layout. At Contrast 1 the bold
         pass paints the same pixels as the child's own bold would
         (tests/smoke/word_starts.py checks it)."""
         x = int(CELL_PAD_X + i * self._cell_w)
@@ -3734,7 +3760,7 @@ class TerminalView(QWidget):
         if sig != self._link_sig:
             self._link_sig = sig
             self._rescan_links(lines)
-        # Bold word starts, after the link scan it leaves alone
+        # Bionic reading, after the link scan it leaves alone
         starts = self._word_start_rows(lines, hist, off)
 
         # selection highlight (drawn under the text)

@@ -556,7 +556,7 @@ class TopBar(QFrame):
     replyStampsToggled = Signal(bool)      # date/time under each finished reply
     tooltipsToggled = Signal(bool)         # hover tooltips, app-wide
     boldWordStartsToggled = Signal(bool)   # first half of each word in bold
-    wordStrengthDelta = Signal(int)        # -1 / +1 Boldness level
+    wordStrengthDelta = Signal(int)        # -1 / +1 Contrast level
     # install newer Claude Code / agy CLIs at the NEXT startup, before any
     # agent launches (the only moment those binaries are not locked)
     autoUpdateToggled = Signal(bool)
@@ -855,7 +855,7 @@ class TopBar(QFrame):
         self.tooltips_btn = ToggleSwitch(self)
         self.tooltips_btn.clicked.connect(self._on_tooltips_clicked)
         self._refresh_tooltips_btn()
-        # "Bold word starts": every terminal draws the first half of each
+        # "Bionic reading": every terminal draws the first half of each
         # prose word in bold (TerminalView._word_starts_enabled). Default
         # OFF, an opt-in comfort setting.
         self._bold_word_starts = False
@@ -864,20 +864,23 @@ class TopBar(QFrame):
         self.bold_word_starts_btn.clicked.connect(
             self._on_bold_word_starts_clicked)
         self._refresh_bold_word_starts_btn()
-        # "Boldness": how hard Bold word starts contrasts, 1 to
-        # len(WORD_STRENGTHS). MainWindow keeps a level per terminal font,
+        # "Contrast": how far the bold start of each word stands out from
+        # the rest of it, 1 to len(WORD_STRENGTHS). The row shows only while
+        # Bionic reading is on. MainWindow keeps a level per terminal font,
         # since every font's Bold sits at its own distance from Regular.
 
         self.word_strength_dec_btn = step_btn(
-            "−", "Lighter bold word starts", self.wordStrengthDelta, -1)
+            "−", "Less contrast between the bold start and the rest of "
+            "each word", self.wordStrengthDelta, -1)
         self.word_strength_inc_btn = step_btn(
-            "+", "Heavier bold word starts", self.wordStrengthDelta, +1)
+            "+", "More contrast between the bold start and the rest of "
+            "each word", self.wordStrengthDelta, +1)
         self.word_strength_label = QLabel(self)
         self.word_strength_label.setObjectName("OptionsRowLabel")
         self.word_strength_label.setToolTip(
-            "How much Bold word starts stands out, 1 to "
-            f"{len(WORD_STRENGTHS)}. 1 is the font's plain bold. Higher "
-            "levels thicken the bold start and fade the rest of each word. "
+            "How far the bold start of each word stands out from the rest "
+            f"of it, 1 to {len(WORD_STRENGTHS)}. 1 is the font's plain "
+            "bold. Higher levels thicken the start and fade the rest. "
             "Each terminal font keeps its own level.")
         self.set_word_strength(DEFAULT_WORD_STRENGTH)
         for key, pill in self._usage_pills.items():
@@ -969,9 +972,10 @@ class TopBar(QFrame):
                                           self.tooltips_btn)
         self.options_panel.add_switch_row(self.bold_word_starts_label,
                                           self.bold_word_starts_btn)
-        self.options_panel.add_row("Boldness", self.word_strength_dec_btn,
-                                   self.word_strength_label,
-                                   self.word_strength_inc_btn)
+        self._word_strength_row = self.options_panel.add_row(
+            "Contrast", self.word_strength_dec_btn,
+            self.word_strength_label, self.word_strength_inc_btn)
+        self._refresh_word_strength_row()
         self.options_panel.add_row("Theme", self.theme_select)
         self.options_panel.add_row("Font size", self.font_dec_btn,
                                    self.font_inc_btn)
@@ -1263,23 +1267,36 @@ class TopBar(QFrame):
         self.boldWordStartsToggled.emit(self._bold_word_starts)
 
     def set_bold_word_starts(self, on: bool) -> None:
-        """Reflect the "Bold word starts" switch (no signal emitted)."""
+        """Reflect the "Bionic reading" switch (no signal emitted)."""
         self._bold_word_starts = bool(on)
         self._refresh_bold_word_starts_btn()
+        self._refresh_word_strength_row()
+
+    def _refresh_word_strength_row(self) -> None:
+        """The Contrast row has nothing to adjust while Bionic reading is
+        off, so it shows only when the switch is on."""
+        self.options_panel.set_row_visible(self._word_strength_row,
+                                           self._bold_word_starts)
 
     def _refresh_bold_word_starts_btn(self) -> None:
         self.bold_word_starts_btn.setChecked(self._bold_word_starts)
-        self.bold_word_starts_label.setText("📖  Bold word starts")
+        self.bold_word_starts_label.setText("📖  Bionic reading")
         # an opt-in comfort setting: the tests published so far show no
         # reading-speed gain, so the tip promises none
+        why = (
+            "The bold start gives the eye an anchor in each word, so the "
+            "eye can jump from start to start and the mind fills in the "
+            "rest. Some readers, people with dyslexia or ADHD among them, "
+            "report that this keeps their place in a line. Studies have "
+            "not shown a reading speed gain, so treat it as a comfort "
+            "setting.")
         tip = (
-            "Bold word starts: ON. The terminals draw the first half of each "
+            "Bionic reading: ON. The terminals draw the first half of each "
             "word in bold. Code, paths, links and the line you are typing "
-            "keep their regular weight.\nClick to turn it off."
+            "keep their regular weight.\n" + why + "\nClick to turn it off."
             if self._bold_word_starts else
-            "Bold word starts: OFF.\nClick to draw the first half of each "
-            "word in the terminals in bold. Some readers, dyslexic readers "
-            "among them, find a line easier to follow that way.")
+            "Bionic reading: OFF.\nClick to draw the first half of each "
+            "word in the terminals in bold.\n" + why)
         self.bold_word_starts_btn.setToolTip(tip)
         self.bold_word_starts_label.setToolTip(tip)
 
@@ -1781,7 +1798,7 @@ class TopBar(QFrame):
         self.letter_px_label.setText(f"{int(px)} px")
 
     def set_word_strength(self, level: int) -> None:
-        """Reflect the Boldness level between its two buttons."""
+        """Reflect the Contrast level between its two buttons."""
         self.word_strength_label.setText(
             f"{int(level)} of {len(WORD_STRENGTHS)}")
         self.word_strength_dec_btn.setEnabled(level > 1)
@@ -2910,7 +2927,7 @@ class MainWindow(QMainWindow):
         self._reply_stamps = True     # user preference (persisted)
         self._tooltips = True         # user preference (persisted)
         self._bold_word_starts = False   # user preference (persisted)
-        # Options > Boldness, a level per terminal font id (persisted); a
+        # Options > Contrast, a level per terminal font id (persisted); a
         # font with no entry uses DEFAULT_WORD_STRENGTH
         self._word_strengths: dict[str, int] = {}
         # the tooltip filter goes on at the first show (showEvent), not here
@@ -5027,7 +5044,7 @@ class MainWindow(QMainWindow):
         self._schedule_save()
 
     def _on_bold_word_starts_toggled(self, enabled: bool) -> None:
-        """User flipped "Bold word starts". Every terminal repaints at once.
+        """User flipped "Bionic reading". Every terminal repaints at once.
         Nothing reflows and no pty resizes: the bold faces advance one cell
         like the regular one, so only the visible rows are segmented again.
         An additive optional key under "ui" (no SESSION_VERSION bump),
@@ -5037,19 +5054,19 @@ class MainWindow(QMainWindow):
         self._schedule_save()
 
     def _word_strength(self) -> int:
-        """The Boldness level of the active terminal font."""
+        """The Contrast level of the active terminal font."""
         return self._word_strengths.get(ui_theme.TERMINAL_FONT,
                                         DEFAULT_WORD_STRENGTH)
 
     def _apply_word_strength(self) -> None:
-        """Hand the active font's Boldness level to the bar and every
+        """Hand the active font's Contrast level to the bar and every
         terminal. Runs when the level or the terminal font changes."""
         level = self._word_strength()
         self.top_bar.set_word_strength(level)
         TerminalView.set_word_strength(level)
 
     def _change_word_strength(self, delta: int) -> None:
-        """Options > Boldness - / +, for the active terminal font only. An
+        """Options > Contrast - / +, for the active terminal font only. An
         additive optional key under "ui" (no SESSION_VERSION bump), saved
         on the debounced timer."""
         level = max(1, min(len(WORD_STRENGTHS),
@@ -6710,7 +6727,7 @@ class MainWindow(QMainWindow):
         self._bold_word_starts = bool(ui.get("bold_word_starts", False))
         self.top_bar.set_bold_word_starts(self._bold_word_starts)
         TerminalView.set_word_starts_enabled(self._bold_word_starts)
-        # its Boldness per terminal font id; a bad entry is dropped, so
+        # its Contrast per terminal font id; a bad entry is dropped, so
         # that font falls back to the default level
         saved = ui.get("bold_word_strength")
         self._word_strengths = {

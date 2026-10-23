@@ -110,6 +110,21 @@ class OptionsPanel(QWidget):
         self._lay.addLayout(row)
         return row
 
+    def set_row_visible(self, row: QHBoxLayout, visible: bool) -> None:
+        """Show or hide every widget of a row `add_row` returned. A row with
+        nothing visible takes no height, spacing included. A popup never
+        resizes itself when its layout changes, so an open panel is sized
+        and placed again, or a hidden row leaves a gap and a shown one
+        grows past the window's bottom edge."""
+        for i in range(row.count()):
+            w = row.itemAt(i).widget()
+            if w is not None:
+                w.setVisible(visible)
+        if self.isVisible() and self._anchor is not None:
+            self._lay.activate()
+            self.adjustSize()
+            self.move(anchored_popup_pos(self._anchor, self.size()))
+
     def add_widget(self, widget) -> None:
         """A widget that spans the panel on its own (a caption, a pill)."""
         widget.setParent(self)

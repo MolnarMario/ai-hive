@@ -444,13 +444,14 @@ workspaces keep executing — switching never pauses anything.
   there. The ▾ beside Open repo lists the GitHub repository's recent pull
   requests and commits. AI Hive loads that list in the background a few
   seconds after startup and keeps it, so the menu opens already filled.
-- **Bold word starts.** ⚙ Options > Appearance > **Bold word starts** (off by
+- **Bionic reading.** ⚙ Options > Appearance > **Bionic reading** (off by
   default) draws the first half of each prose word in the agent terminals in
   bold, which some readers, dyslexic readers among them, find easier to
   track. Only words change: code, paths, flags, numbers, links, the line
   you're typing and anything the agent already made bold keep their weight,
-  and vim, less and other full-screen apps are left alone. **Boldness** −/+
-  right under it sets how much the word starts stand out, 1 to 5. Level 1
+  and vim, less and other full-screen apps are left alone. **Contrast** −/+
+  right under it shows while the switch is on and sets how much the word
+  starts stand out, 1 to 5. Level 1
   is the font's plain bold, which in most monospace fonts is only a little
   heavier than regular. Level 2 thickens the bold start, and levels 3 to 5
   also fade the rest of each word, more at each step. It starts at 3, and
@@ -626,7 +627,7 @@ workspaces keep executing — switching never pauses anything.
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
   reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Update AI
-  Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times**, **Tooltips** and **Bold word starts** as labelled switches (each with a green/dark LED, so
+  Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times**, **Tooltips** and **Bionic reading** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
   the theme, global font size, terminal font and letter spacing below. Click outside or press `Esc` to close.
@@ -1038,7 +1039,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4111 checks drive the real app headlessly (offscreen Qt platform) with real
+4118 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1187,7 +1188,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4111 checks)
+                           (4118 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
