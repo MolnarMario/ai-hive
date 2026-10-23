@@ -3228,6 +3228,162 @@ def test_terminal_scrollbar():
     c2.deleteLater()
 
 
+def test_answer_marks():
+    """An answered AskUserQuestion form gets its own scrollbar dot.
+
+    The PostToolUse hook carries the chosen answers, the manager mints the
+    mark off that edge, and the card anchors it to Claude's "User answered"
+    row, live and on a rebuild alike. Prompt dots are untouched, the colour
+    differs from theirs, and a restored screen gets its answer rows back."""
+    import os
+
+    from PySide6.QtGui import QColor
+    from PySide6.QtWidgets import QApplication
+
+    from app import session_hook as sh
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import MARK_ANSWER, TerminalAgent
+    from app.widgets.terminal_card import TerminalCard
+    from app.widgets.terminal_scrollbar import answer_colour
+    from app.widgets.terminal_view import is_answer_echo
+    from app.workspace_manager import WorkspaceManager
+
+    app = QApplication.instance() or QApplication([])
+
+    # ---- the hook: answers ride on the tool_clear edge ------------------
+    payload = {"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion",
+               "tool_response": {
+                   "questions": [{"question": "Where should it live?",
+                                  "header": "Placement"},
+                                 {"question": "Ship it now?", "header": ""}],
+                   "answers": {"Ship it now?": "Yes",
+                               "Where should it live?": "New pane"}}}
+    check("answers: the summary is header: answer, in question order",
+          sh.answer_summary(payload) == ["Placement: New pane",
+                                         "Ship it now?: Yes"],
+          sh.answer_summary(payload))
+    check("answers: ExitPlanMode and a malformed payload give none",
+          sh.answer_summary({**payload, "tool_name": "ExitPlanMode"}) == []
+          and sh.answer_summary({"tool_name": "AskUserQuestion",
+                                 "tool_response": "text"}) == [])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-answers-"))
+    events = str(tmp / "events.jsonl")
+    sh.reset_events(events)
+    # the reader drops a record with no agent id, so the env must carry one
+    # (it does when the suite runs from an AI Hive agent, not elsewhere)
+    held_id = os.environ.get(sh.AGENT_ID_ENV)
+    os.environ[sh.AGENT_ID_ENV] = "agent-answers"
+    try:
+        sh._dispatch(None, events, payload)
+    finally:
+        if held_id is None:
+            os.environ.pop(sh.AGENT_ID_ENV, None)
+        else:
+            os.environ[sh.AGENT_ID_ENV] = held_id
+    recs, _ = sh.read_prompt_events(events, 0)
+    check("answers: PostToolUse writes them on its tool_clear",
+          [(r["kind"], r.get("answers")) for r in recs]
+          == [(sh.EV_TOOL_CLEAR, ["Placement: New pane", "Ship it now?: Yes"])],
+          repr(recs))
+
+    # ---- the manager mints one answer mark per answered form ------------
+    sh.reset_events(events)
+    mgr = WorkspaceManager()
+    mgr.prompt_events_path = events
+    ws = mgr.create_workspace("Answers", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Ask",
+                                               cwd=SCRATCH_CWD, pty=True),
+                             autostart=False)
+    agent.worker.start = lambda: None
+    card = TerminalCard(agent)
+    card.resize(640, 420)
+    t = card.terminal
+
+    def emit(kind, **extra):
+        os.environ[sh.AGENT_ID_ENV] = agent.id
+        try:
+            sh._append_event(events, kind, extra)
+        finally:
+            os.environ.pop(sh.AGENT_ID_ENV, None)
+
+    def out(text):
+        agent._on_pty_output("pty", text)
+        app.processEvents()
+
+    out("".join(f"conversation line {i}\r\n" for i in range(30)))
+    out("● User answered Claude's questions:\r\n"
+        "  ⎿  · Where should it live? → New pane\r\n")
+    echo = t.history_pushed() + t.screen.cursor.y - 2
+    check("answers: the test screen holds the echo row where expected",
+          is_answer_echo(t._row_text(t.screen.buffer[t.screen.cursor.y - 2])))
+    out("● Building the pane now.\r\n" + "reply line\r\n" * 5)
+    emit(sh.EV_TOOL_CLEAR, tool="AskUserQuestion",
+         answers=["Placement: New pane"])
+    mgr.sync_prompt_events()
+    marks = [m for m in agent.prompt_marks() if m.kind == MARK_ANSWER]
+    check("answers: the AskUserQuestion clear mints an answer mark",
+          [m.text for m in marks] == ["Answered: Placement: New pane"],
+          agent.prompt_marks())
+    check("answers: ...on the 'User answered' row, not the input box",
+          t.answer_marks() == [(echo, "Answered: Placement: New pane")],
+          (t.answer_marks(), echo))
+    check("answers: ...and never among the prompt dots", t.marks() == [],
+          t.marks())
+
+    emit(sh.EV_TOOL_CLEAR, tool="ExitPlanMode")
+    emit(sh.EV_TOOL_CLEAR, tool="stop")
+    mgr.sync_prompt_events()
+    check("answers: a plan approval or a Stop mints none",
+          len(agent.prompt_marks()) == 1, agent.prompt_marks())
+
+    # a second form whose row has not printed yet does not steal the first's
+    emit(sh.EV_TOOL_CLEAR, tool="AskUserQuestion")
+    mgr.sync_prompt_events()
+    lines = [line for line, _ in t.answer_marks()]
+    check("answers: an older form's row is never reused for a new answer",
+          len(lines) == 2 and lines[0] == echo and lines[1] != echo,
+          t.answer_marks())
+    check("answers: a form with no answers in the payload still gets a dot",
+          agent.prompt_marks()[-1].text == "Answered a question")
+
+    # ---- a rebuild re-derives the same line ------------------------------
+    c2 = TerminalCard(agent)
+    c2.resize(640, 420)
+    app.processEvents()
+    check("answers: a rebuilt card places the answers on the same lines",
+          c2._mark_lines == card._mark_lines,
+          (c2._mark_lines, card._mark_lines))
+
+    # ---- a restored screen: the echo row alone brings the dot back ------
+    rag = TerminalAgent(build_spec(AgentKind.CLAUDE, "Restored",
+                                   cwd=SCRATCH_CWD, pty=True))
+    rag.worker.start = lambda: None
+    rc = TerminalCard(rag)
+    rc.resize(640, 420)
+    rc.terminal.feed("".join(f"old line {i}\r\n" for i in range(10))
+                     + "● User answered Claude's questions:\r\n"
+                     + "> User answered Claude in a prompt\r\n")
+    rc._recover_marks(rc._scrollback_rows())
+    rc._refresh_marks()
+    check("answers: a restored 'User answered' row gets a dot, a typed quote "
+          "of it does not",
+          [text for _, text in rc.terminal.answer_marks()]
+          == ["Answered a question"], rc.terminal.answer_marks())
+
+    # ---- the colour ------------------------------------------------------
+    orange = QColor("#e8983a")
+    check("answers: the dot is a near neighbour of the prompt colour",
+          answer_colour(orange) != orange
+          and abs(answer_colour(orange).hue() - orange.hue()) == 30,
+          answer_colour(orange).name())
+
+    for c in (card, c2, rc):
+        c.detach()
+        c.deleteLater()
+    rag.deleteLater()
+    app.processEvents()
+
+
 def test_header_tools_tray_has_no_dead_space():
     """The hover tray (A- / A+ / maximize) must be solid buttons edge to edge,
     as tall as its header strip, and must close when the pointer is above or

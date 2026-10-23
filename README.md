@@ -375,10 +375,13 @@ workspaces keep executing — switching never pauses anything.
   is the conversation's table of contents: the dots are the milestones, and the
   stretch between two of them is one exchange. Nothing AI Hive types itself gets
   a dot (delivered tasks, scheduled messages, auto-continue nudges), and neither
-  does answering a permission menu or a question, so the marks are only ever
-  your own instructions. The bar hides itself when there is nothing to scroll,
-  so a fresh terminal shows none, and a **`/clear`** takes the scrollback and its
-  dots with it.
+  does answering a permission menu, so the marks are only ever your own
+  instructions. Answering one of Claude's question forms (the AskUserQuestion
+  picker, where you choose an option or type your own) gets a dot in a
+  neighbouring colour instead, on Claude's "User answered Claude's questions"
+  line, and its tooltip lists what you picked. The bar hides itself when there
+  is nothing to scroll, so a fresh terminal shows none, and a **`/clear`** takes
+  the scrollback and its dots with it.
   Dots are **not lost when you reopen AI Hive**: milestones are only minted from
   a live keystroke, so a restored conversation would otherwise come back with
   none, and that is exactly the conversation long enough to want to jump around

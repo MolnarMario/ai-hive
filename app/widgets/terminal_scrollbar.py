@@ -3,8 +3,10 @@
 A slim bar overlaid on a TerminalView's right edge, showing how far back the
 conversation reaches and marking every point where the USER submitted a typed
 prompt, so a long session can be jumped through by milestone rather than
-scrubbed through by hand. While a Ctrl+F search is open it also carries
-Chrome's find ticks, one per row with a match.
+scrubbed through by hand. Answers to Claude's AskUserQuestion forms get a
+marker of their own, in the prompt colour turned ANSWER_HUE_SHIFT degrees
+round the hue wheel. While a Ctrl+F search is open it also carries Chrome's
+find ticks, one per row with a match.
 
 Three decisions worth keeping:
 
@@ -46,6 +48,18 @@ _MARK_W = 6         # marker dash, px
 _MARK_H = 3
 _INSET = 3          # keeps the first/last marker off the rounded ends
 _FIND_TICK_H = 2    # px, a find match's tick
+# An answer marker's hue, relative to the prompt marker's. Derived rather
+# than a fixed colour so it stays a near neighbour of the prompt colour in
+# every skin: the default orange turns amber-yellow, a blue accent violet.
+ANSWER_HUE_SHIFT = 30
+
+
+def answer_colour(prompt: QColor) -> QColor:
+    """The answer marker's colour for a given prompt marker colour."""
+    h, s, v, a = prompt.getHsv()
+    if h < 0:       # achromatic: no hue to turn, so lighten it instead
+        return prompt.lighter(140)
+    return QColor.fromHsv((h + ANSWER_HUE_SHIFT) % 360, s, v, a)
 
 
 class TerminalScrollBar(QScrollBar):
@@ -121,7 +135,7 @@ class TerminalScrollBar(QScrollBar):
         """The nearest marker within MARK_HIT_PX of `y`, or None."""
         best = None
         best_d = MARK_HIT_PX + 1
-        for abs_line, text in self._view.marks():
+        for abs_line, text in self._view.marks() + self._view.answer_marks():
             d = abs(self._y_for(abs_line) - y)
             if d < best_d:
                 best, best_d = (abs_line, text), d
@@ -160,8 +174,9 @@ class TerminalScrollBar(QScrollBar):
     def paintEvent(self, event) -> None:
         super().paintEvent(event)       # groove + handle, straight from the QSS
         marks = self._view.marks()
+        answers = self._view.answer_marks()
         finds, active = self._view.find_lines()
-        if not marks and not finds:
+        if not marks and not answers and not finds:
             return
         oldest, span = self._span()
         newest = oldest + span
@@ -174,13 +189,14 @@ class TerminalScrollBar(QScrollBar):
         colour = QColor(Palette.ACCENT_ORANGE)
         colour.setAlpha(210)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(colour)
         x = (self.width() - _MARK_W) / 2.0
-        for abs_line, _text in marks:
-            if not (oldest <= abs_line <= newest):
-                continue    # scrolled out of history: no honest place to draw it
-            y = self._y_for(abs_line) - _MARK_H / 2.0
-            painter.drawRoundedRect(x, y, _MARK_W, _MARK_H, 1.5, 1.5)
+        for group, brush in ((marks, colour), (answers, answer_colour(colour))):
+            painter.setBrush(brush)
+            for abs_line, _text in group:
+                if not (oldest <= abs_line <= newest):
+                    continue    # scrolled out of history: no honest place
+                y = self._y_for(abs_line) - _MARK_H / 2.0
+                painter.drawRoundedRect(x, y, _MARK_W, _MARK_H, 1.5, 1.5)
         painter.end()
 
     def _paint_find_ticks(self, painter, lines, active, span) -> None:
