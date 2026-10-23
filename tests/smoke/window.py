@@ -105,16 +105,24 @@ def test_live_model_effort():
     # --- the New Terminal model picker offers the CLI's current aliases ---
     claude_prov = providers.get("claude")
     picker_values = [v for _, v in claude_prov.models]
-    check("model picker: Default first, then every current CLI alias",
+    check("model picker: Default first, then every model claude's /model "
+          "lists",
           picker_values[0] == "" and set(picker_values) >= {
-              "fable", "fable[1m]", "opus", "opus[1m]", "sonnet",
-              "sonnet[1m]", "haiku", "opusplan"}, picker_values)
+              "opus", "sonnet", "fable", "haiku", "claude-haiku-4-5",
+              "claude-sonnet-5", "claude-opus-5", "claude-fable-5",
+              "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+              "claude-sonnet-4-6", "opusplan"}, picker_values)
+    # the aliases' models run a native 1M window, so a [1m] entry was a
+    # second name for the same model
+    check("model picker: no [1m] duplicates and no repeated value",
+          not any("[1m]" in v or "1M" in label
+                  for label, v in claude_prov.models)
+          and len(set(picker_values)) == len(picker_values), picker_values)
     check("model picker: labels carry the model version",
           all(any(ch.isdigit() for ch in label)
-              for label, v in claude_prov.models if v in (
-                  "fable", "opus", "sonnet", "haiku")),
+              for label, v in claude_prov.models if v not in ("", "opusplan")),
           [label for label, _ in claude_prov.models])
-    check("model picker: a 1M alias launches as --model <alias>[1m]",
+    check("model picker: a saved [1m] agent still launches as it was",
           providers.build_invocation("claude", model="opus[1m]")[1][:2]
           == ["--model", "opus[1m]"])
     check("model picker: efforts match claude --effort exactly",
@@ -482,6 +490,73 @@ def test_live_model_effort():
     card.close(); card2.close()
     a.deleteLater(); b.deleteLater()
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_new_agent_default_names_saved_pick():
+    """The New Agent dialog's Default launches Claude with no --model or
+    --effort, so the CLI uses whatever /model and /effort last saved from
+    any terminal. That read as the previous agent's settings carrying over,
+    so Default now says what it resolves to."""
+    import json as _json
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    from app import providers
+    from app.process_worker import AgentKind
+    from app.widgets.main_window import AddTerminalDialog
+
+    QApplication.instance() or QApplication([])
+    settings = Path(os.path.expanduser("~")) / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    before = settings.read_bytes() if settings.exists() else None
+
+    def dialog_defaults(saved):
+        if saved is None:
+            settings.unlink(missing_ok=True)
+        else:
+            settings.write_text(_json.dumps(saved), encoding="utf-8")
+        providers._USER_DEFAULTS_CACHE = (0.0, -1, "", "")
+        dlg = AddTerminalDialog("Agent 1", cwd=str(SCRATCH_CWD))
+        try:
+            i = dlg.kind_combo.findData(AgentKind.CLAUDE)
+            dlg.kind_combo.setCurrentIndex(i)
+            m = dlg.model_combo.findData("")
+            e = dlg.effort_combo.findData("")
+            return (dlg.model_combo.itemText(m), dlg.effort_combo.itemText(e),
+                    dlg.effort_combo.itemData(e, Qt.ItemDataRole.ToolTipRole),
+                    dlg.result_spec(str(SCRATCH_CWD)))
+        finally:
+            dlg.done(0)
+            dlg.deleteLater()
+
+    try:
+        model, effort, tip, spec = dialog_defaults(
+            {"model": "opus", "effortLevel": "high"})
+        check("default: names the model /model saved",
+              model == "Default (Opus 5.5, saved by /model)", model)
+        check("default: names the effort /effort saved",
+              effort == "Default (high, saved by /effort)", effort)
+        check("default: the tooltip says how to go back",
+              "/effort auto" in (tip or ""), tip)
+        check("default: still launches with no --model or --effort",
+              spec.model == "" and spec.effort == ""
+              and "--model" not in spec.args and "--effort" not in spec.args,
+              (spec.model, spec.effort, spec.args))
+        model, effort, _tip, _spec = dialog_defaults(
+            {"model": "sonnet[1m]", "effortLevel": "max"})
+        check("default: a saved [1m] pick names the plain model",
+              model == "Default (Sonnet 5.5, saved by /model)", model)
+        check("default: a level claude won't read from settings is ignored",
+              effort == "Default (recommended)", effort)
+        model, effort, _tip, _spec = dialog_defaults(None)
+        check("default: nothing saved reads as recommended",
+              (model, effort) == ("Default (recommended)",
+                                  "Default (recommended)"), (model, effort))
+    finally:
+        if before is None:
+            settings.unlink(missing_ok=True)
+        else:
+            settings.write_bytes(before)
+        providers._USER_DEFAULTS_CACHE = (0.0, -1, "", "")
 
 
 def test_narrow_header_drops_words_not_letters():
