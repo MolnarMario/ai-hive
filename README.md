@@ -443,6 +443,15 @@ workspaces keep executing — switching never pauses anything.
   seconds after startup and keeps it, so the menu opens already filled.
 - **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ under
   **⚙ Options**; sizes persist.
+- **Terminal font and letter spacing.** Under **⚙ Options**, pick the agent
+  terminals' font and add 0 to 3 px between letters, which helps some
+  dyslexic readers. **Default** keeps Consolas, **Theme font** uses the
+  skin's own, and Cascadia Mono, JetBrains Mono, IBM Plex Mono, Atkinson
+  Hyperlegible Mono and OpenDyslexic Mono ship with the app (licenses in
+  `app/assets/fonts/licenses`). Both apply to every agent; a per-agent font
+  size stays. Bold and italic keep to the column grid even where Qt has to
+  fake them, and box-drawing lines are drawn as shapes whenever the font's
+  own glyphs would leave a gap, so borders stay joined with spacing on.
 - **Shared agent awareness** — agents in a workspace coordinate through a
   shared board (`.aihive/board.md`): Claude agents launch with `--add-dir` +
   an appended system prompt so they can read peers' status and post their own,
@@ -599,7 +608,7 @@ workspaces keep executing — switching never pauses anything.
   Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times** and **Tooltips** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
-  the theme and global font size below. Click outside or press `Esc` to close.
+  the theme, global font size, terminal font and letter spacing below. Click outside or press `Esc` to close.
   The bar itself keeps only what you actually glance at: the usage pills and
   their `+`, and `+ Terminal`, so it fits on a laptop instead of hiding
   controls behind a scrollbar.
@@ -614,7 +623,7 @@ workspaces keep executing — switching never pauses anything.
   bundled Cinzel / EB Garamond / Spectral fonts), **Adeptus Mechanicus** (a
   Warhammer 40K cogitator — green-phosphor CRT on a brushed-gunmetal casing
   with corner bolts, an aquila crest, a radiant green cog logo, servo-initial
-  drop-caps, amber accents, and Share Tech Mono terminals), and **Obsidian**
+  drop-caps, amber accents, and Share Tech Mono as its **Theme font**), and **Obsidian**
   (clean modern dark). Each skin picks its own terminal treatment and ANSI
   palette; the choice persists. Ornaments are painted with QPainter +
   QSvgRenderer (`app/widgets/ornaments.py`), keyed per theme, and each shows
@@ -1135,7 +1144,9 @@ app/
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   repo_activity.py         Open repo dropdown: GitHub PRs + commits, origin URL (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
-  assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
+  assets/fonts/            bundled fonts: the manuscript ones (Cinzel/EB Garamond/
+                           Spectral) and the Terminal font picker's mono families,
+                           with their licenses in licenses/
   widgets/                 main_window, sidebar (drag-reorder + categories +
                            inline agent list w/ "?" + inline file explorer),
                            workspace_page, terminal_card, terminal_view (pyte grid;

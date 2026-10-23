@@ -2420,7 +2420,8 @@ def test_saved_look_before_widgets():
     store.save({"version": 3, "active": "w", "workspaces": [
         {"id": "w", "name": "W", "project_path": str(tmp), "layout": "auto",
          "terminals": terminals}],
-        "ui": {"theme": "adeptus-mechanicus", "console_font_px": 15}})
+        "ui": {"theme": "adeptus-mechanicus", "console_font_px": 15,
+               "terminal_font": "theme", "terminal_letter_px": 2}})
 
     def cards(win):
         return {c.agent.spec.name: c
@@ -2438,6 +2439,13 @@ def test_saved_look_before_widgets():
             check(f"look: {label}: a pty agent's own font beats the global one",
                   by_name["Own"].terminal.font_size() == 18,
                   by_name["Own"].terminal.font_size())
+            # Terminal font "theme" on Adeptus Mechanicus, and spacing, reach
+            # both, the Own card at its own size
+            faces = [(c.terminal.font_families(), c.terminal.letter_spacing())
+                     for c in (by_name["Plain"], by_name["Own"])]
+            check(f"look: {label}: every pty card has the saved terminal "
+                  "font and letter spacing",
+                  faces == [(["Share Tech Mono", "Consolas"], 2)] * 2, faces)
 
     real_set = QApplication.setStyleSheet
     real_init = tc.TerminalCard.__init__
@@ -2462,6 +2470,9 @@ def test_saved_look_before_widgets():
               ui_theme.ACTIVE_THEME.id == "adeptus-mechanicus")
         check("look: ...and the saved console font",
               ui_theme.CONSOLE_FONT_PX == 15)
+        check("look: ...and the terminal font and letter spacing",
+              ui_theme.TERMINAL_FONT == "theme"
+              and ui_theme.TERMINAL_LETTER_PX == 2)
         real_load = store.load
         store.load = lambda: loads.append(True) or real_load()
         QApplication.setStyleSheet = counting_set
@@ -2488,6 +2499,8 @@ def test_saved_look_before_widgets():
         # both late, as it always did
         ui_theme.apply_theme(ui_theme.DEFAULT_THEME_ID)
         ui_theme.CONSOLE_FONT_PX = ui_theme.DEFAULT_CONSOLE_PX
+        ui_theme.TERMINAL_FONT = ui_theme.DEFAULT_TERMINAL_FONT
+        ui_theme.TERMINAL_LETTER_PX = 0
         app.setStyleSheet(ui_theme.build_qss(chrome))
         win2 = create_main_window(store)
         check("look: late path: the saved theme is restored",
@@ -2501,6 +2514,8 @@ def test_saved_look_before_widgets():
         # ui_theme is process-wide and later tests expect the default look
         ui_theme.apply_theme(ui_theme.DEFAULT_THEME_ID)
         ui_theme.CONSOLE_FONT_PX = ui_theme.DEFAULT_CONSOLE_PX
+        ui_theme.TERMINAL_FONT = ui_theme.DEFAULT_TERMINAL_FONT
+        ui_theme.TERMINAL_LETTER_PX = 0
         app.setStyleSheet(ui_theme.build_qss(chrome))
         shutil.rmtree(tmp, ignore_errors=True)
 
