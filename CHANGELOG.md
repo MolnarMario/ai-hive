@@ -8,6 +8,23 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.50.0
+
+- Changing the terminal font or letter spacing no longer flickers through
+  the old screen in the new font. Each terminal on screen shows "applying
+  the new font" until the agent has redrawn, at most 3 seconds.
+- Options > Terminal font ends with "Load a custom font...". It takes
+  .ttf, .otf and .ttc files, explains why it refused anything else, and
+  keeps the font across restarts.
+- Bold word starts has a Boldness setting from 1 to 5 under the switch.
+  Level 1 is the old plain bold, level 2 draws a heavier bold, and levels
+  3 to 5 also fade the rest of each word. It starts at 3, and each
+  terminal font remembers its own level.
+- Dropdowns open below their box instead of covering it.
+- The New Agent dialog keeps one width while its conversation list loads.
+  Long conversation previews are cut short in the list and show in full
+  in their tooltip.
+
 ## 0.49.0
 
 - Options > Appearance has a Terminal font picker and Letter spacing for
