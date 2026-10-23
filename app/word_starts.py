@@ -1,13 +1,13 @@
-"""Bold word starts: which cells of one terminal row to draw in bold.
+"""Bionic reading: which cells of one terminal row to draw in bold.
 
-Options > Appearance > Bold word starts draws the first half of each prose
+Options > Appearance > Bionic reading draws the first half of each prose
 word in bold, "**read**ing **th**is **li**ne". Some readers, dyslexic
 readers among them, find a line easier to track that way. The published
 tests show no reading-speed gain, so it is an opt-in comfort setting.
 
 The effect works by contrast between a word's head and its rest, and a
 terminal font's Bold is often barely heavier than its Regular. So Options
-> Boldness can also thicken the head and fade the rest (word_spans hands
+> Contrast can also thicken the head and fade the rest (word_spans hands
 TerminalView both parts); WORD_STRENGTHS in widgets/terminal_view.py
 has the levels.
 

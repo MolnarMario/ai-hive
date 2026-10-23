@@ -110,6 +110,15 @@ class OptionsPanel(QWidget):
         self._lay.addLayout(row)
         return row
 
+    @staticmethod
+    def set_row_visible(row: QHBoxLayout, visible: bool) -> None:
+        """Show or hide every widget of a row `add_row` returned. A row with
+        nothing visible takes no height, spacing included."""
+        for i in range(row.count()):
+            w = row.itemAt(i).widget()
+            if w is not None:
+                w.setVisible(visible)
+
     def add_widget(self, widget) -> None:
         """A widget that spans the panel on its own (a caption, a pill)."""
         widget.setParent(self)

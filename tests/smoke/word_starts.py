@@ -1,5 +1,5 @@
-"""Bold word starts: the Qt-free segmentation in app/word_starts.py, the
-Options switch that draws it in every terminal, and Options > Boldness."""
+"""Bionic reading: the Qt-free segmentation in app/word_starts.py, the
+Options switch that draws it in every terminal, and Options > Contrast."""
 
 import collections
 
@@ -196,9 +196,21 @@ def test_word_starts_option_toggle():
                  bar.word_strength_label.toolTip(),
                  bar.word_strength_dec_btn.toolTip(),
                  bar.word_strength_inc_btn.toolTip())
-        check("word starts toggle: no trademarked name in label or tooltip",
-              not any("bionic" in t.lower() for t in
-                      tips + (bar.bold_word_starts_label.text(),)), tips)
+        check("word starts toggle: the switch is named Bionic reading and "
+              "its tooltip says why the bold start can help",
+              "Bionic reading" in bar.bold_word_starts_label.text()
+              and "anchor" in tips[1] and "anchor" in tips[0], tips)
+        bar.set_bold_word_starts(False)
+        check("word starts toggle: the Contrast row shows only while the "
+              "switch is on",
+              not bar.word_strength_inc_btn.isVisibleTo(bar.options_panel)
+              and not bar.word_strength_dec_btn.isVisibleTo(bar.options_panel)
+              and not bar.word_strength_label.isVisibleTo(bar.options_panel))
+        bar.set_bold_word_starts(True)
+        check("word starts toggle: ...and comes back when it is turned on",
+              bar.word_strength_inc_btn.isVisibleTo(bar.options_panel)
+              and bar.word_strength_dec_btn.isVisibleTo(bar.options_panel)
+              and bar.word_strength_label.isVisibleTo(bar.options_panel))
         bar.deleteLater()
 
         win = create_main_window(SessionStore(path=tmp / "session.json"))
@@ -306,6 +318,27 @@ def test_word_starts_paint():
     check("word starts paint: ...the reply above it is not",
           masks[0] == [0, 1, 2, 3, 8, 9, 13, 14]
           and _band(box, box_on, 0) != _band(box, box_off, 0), masks)
+    # typed text that fills its last row leaves the caret alone on the blank
+    # row below; the prompt must keep its regular weight there too
+    cols = 24
+    full = "> typing words here abc"      # 22 characters
+    full = full + "d"                    # 23
+    full = full + "e"                    # 24 = cols
+    more = "typing words here abcde!"    # 24
+    for name, text in (("one row", full), ("two rows", full + more)):
+        wrapped = _view(_PROSE + "\r\n\r\n" + text + "\r\n",
+                        rows=8, cols=cols)
+        masks = _with_switch(True, lambda: _masks(wrapped))
+        top = wrapped.screen.cursor.y
+        check(f"word starts paint: a caret on the blank row below a full "
+              f"prompt ({name}) leaves the prompt alone",
+              masks[0] is not None
+              and all(masks[r] is None for r in range(2, top)), masks)
+    # a blank caret row under plain output, no prompt glyph, still applies
+    plainout = _view(_PROSE + "\r\n" + _PROSE + "\r\n")
+    check("word starts paint: a blank caret row under output without a "
+          "prompt keeps every row's prefixes",
+          _with_switch(True, lambda: _masks(plainout))[1] is not None)
     # when the guess finds no input box, every row keeps its prefixes
     shell = _view(_PROSE + "\r\n\r\n")
     check("word starts paint: no input box found, every row applies",
@@ -336,7 +369,7 @@ def test_word_starts_overlays():
     child = _view(_PROSE_BOLD + "\x1b[1;2H")
     for tv in (plain, child):
         tv.hasFocus = lambda: True
-    plain._input_block_span = lambda: None
+    plain._input_block_span = lambda cy=None: None
     check("word starts overlay: the focused cursor keeps the prefix",
           _with_switch(True, lambda: plain.grab().toImage())
           == child.grab().toImage())
