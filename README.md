@@ -449,7 +449,12 @@ workspaces keep executing — switching never pauses anything.
   bold, which some readers, dyslexic readers among them, find easier to
   track. Only words change: code, paths, flags, numbers, links, the line
   you're typing and anything the agent already made bold keep their weight,
-  and vim, less and other full-screen apps are left alone.
+  and vim, less and other full-screen apps are left alone. **Boldness** −/+
+  right under it sets how much the word starts stand out, 1 to 5. Level 1
+  is the font's plain bold, which in most monospace fonts is only a little
+  heavier than regular. Level 2 thickens the bold start, and levels 3 to 5
+  also fade the rest of each word, more at each step. It starts at 3, and
+  each terminal font remembers its own level.
 - **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ under
   **⚙ Options**; sizes persist.
 - **Terminal font and letter spacing.** Under **⚙ Options**, pick the agent

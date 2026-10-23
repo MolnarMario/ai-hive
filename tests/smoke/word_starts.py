@@ -1,5 +1,5 @@
-"""Bold word starts: the Qt-free segmentation in app/word_starts.py, and the
-Options switch that draws it in every terminal."""
+"""Bold word starts: the Qt-free segmentation in app/word_starts.py, the
+Options switch that draws it in every terminal, and Options > Boldness."""
 
 import collections
 
@@ -134,17 +134,21 @@ def _masks(tv) -> list:
     rows = tv._word_start_rows(lines, hist, off)
     if rows is None:
         return None
-    return [None if m is None else [c for c, v in enumerate(m) if v]
+    return [None if m is None else [c for c, v in enumerate(m) if v == 1]
             for m in rows]
 
 
-def _with_switch(on: bool, fn):
-    from app.widgets.terminal_view import TerminalView
+def _with_switch(on: bool, fn, strength: int = 1):
+    """Run fn with the switch set, at Boldness `strength`. Level 1 is the
+    plain bold the pixel checks compare with the child's own."""
+    from app.widgets.terminal_view import DEFAULT_WORD_STRENGTH, TerminalView
     TerminalView.set_word_starts_enabled(on)
+    TerminalView.set_word_strength(strength)
     try:
         return fn()
     finally:
         TerminalView.set_word_starts_enabled(False)
+        TerminalView.set_word_strength(DEFAULT_WORD_STRENGTH)
 
 
 # "reading this line" as the child would send it with those prefixes in
@@ -188,7 +192,10 @@ def test_word_starts_option_toggle():
               bar.options_panel.isAncestorOf(bar.bold_word_starts_btn))
         tips = (bar.bold_word_starts_btn.toolTip(),)
         bar.set_bold_word_starts(True)
-        tips += (bar.bold_word_starts_btn.toolTip(),)
+        tips += (bar.bold_word_starts_btn.toolTip(),
+                 bar.word_strength_label.toolTip(),
+                 bar.word_strength_dec_btn.toolTip(),
+                 bar.word_strength_inc_btn.toolTip())
         check("word starts toggle: no trademarked name in label or tooltip",
               not any("bionic" in t.lower() for t in
                       tips + (bar.bold_word_starts_label.text(),)), tips)
@@ -377,3 +384,207 @@ def test_word_starts_rows():
     tv._word_start_rows([], None, 0)
     check("word starts rows: switched off, the cache is dropped",
           tv._ws_rows == {})
+
+
+def test_word_starts_spans_rest():
+    """word_spans gives each letter run its bold head and its rest, the
+    part the higher Boldness levels fade."""
+    from app.word_starts import word_spans
+    check("word spans: head and rest of each word",
+          word_spans(_row("reading this")) == [(0, 4, 7), (8, 10, 12)],
+          word_spans(_row("reading this")))
+    check("word spans: a joined word has a head and rest per run, the "
+          "joiner in neither",
+          word_spans(_row("well-known")) == [(0, 2, 4), (5, 8, 10)],
+          word_spans(_row("well-known")))
+    check("word spans: punctuation stays out of the rest",
+          word_spans(_row("Done.")) == [(0, 2, 4)],
+          word_spans(_row("Done.")))
+    from PySide6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    tv = _view(_PROSE + "\r\n")
+    hist, off = tv._view_state()
+    lines = [tv._visible_line(r, hist, off) for r in range(tv.screen.lines)]
+    rows = _with_switch(True, lambda: tv._word_start_rows(lines, hist, off))
+    check("word spans: the row mask marks heads 1 and rests 2",
+          rows[0][:17] == bytes([1, 1, 1, 1, 2, 2, 2, 0, 1, 1, 2, 2, 0,
+                                 1, 1, 2, 2]), rows[0][:17])
+
+
+def _ink(tv, img, row: int, c0: int, c1: int) -> int:
+    """Summed brightness of cells [c0, c1) of one visible row."""
+    from app.widgets.terminal_view import CELL_PAD_X, CELL_PAD_Y
+    x0 = int(CELL_PAD_X + c0 * tv._cell_w)
+    x1 = int(CELL_PAD_X + c1 * tv._cell_w)
+    y0 = int(CELL_PAD_Y + row * tv._cell_h)
+    total = 0
+    for y in range(y0, y0 + int(tv._cell_h)):
+        for x in range(x0, x1):
+            c = img.pixelColor(x, y)
+            total += c.red() + c.green() + c.blue()
+    return total
+
+
+def test_word_starts_strength_paint():
+    """Boldness: every level above 1 inks the heads heavier, the fading
+    levels paint the rest of each word dimmer, and code stays as it was
+    at every level."""
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import WORD_STRENGTHS
+    QApplication.instance() or QApplication([])
+
+    # "reading" head 0-3, rest 4-6; a path after it in columns 8-15
+    tv = _view("reading app/x.py\r\n")
+    shots = [_with_switch(True, lambda: tv.grab().toImage(), level)
+             for level in range(1, len(WORD_STRENGTHS) + 1)]
+    heads = [_ink(tv, img, 0, 0, 4) for img in shots]
+    rests = [_ink(tv, img, 0, 5, 7) for img in shots]
+    code = [_ink(tv, img, 0, 8, 16) for img in shots]
+    check("boldness paint: every level above 1 inks the head heavier",
+          all(h > heads[0] for h in heads[1:]), heads)
+    check("boldness paint: the head never gets lighter going up",
+          all(b >= a for a, b in zip(heads, heads[1:])), heads)
+    fades = [lvl for lvl, (_s, f) in enumerate(WORD_STRENGTHS) if f < 1]
+    check("boldness paint: the fading levels dim the rest of the word, "
+          "more at each level",
+          fades and all(rests[a] < rests[a - 1] for a in fades), rests)
+    check("boldness paint: a level that does not fade leaves the rest as "
+          "level 1 paints it",
+          all(rests[lvl] == rests[0] for lvl, (_s, f)
+              in enumerate(WORD_STRENGTHS) if f >= 1), rests)
+    check("boldness paint: code keeps its pixels at every level",
+          len(set(code)) == 1, code)
+    off = tv.grab().toImage()
+    check("boldness paint: with the switch off no level changes a pixel",
+          all(_with_switch(False, lambda: tv.grab().toImage(), level)
+              == off for level in range(1, len(WORD_STRENGTHS) + 1)))
+    # the find overlay redraws the text: it keeps the level's look
+    found = _view("reading app/x.py\r\n")
+    found.set_find_query("reading")
+    found._find_refresh()
+    top = len(WORD_STRENGTHS)
+    lo, hi = (_with_switch(True, lambda: found.grab().toImage(), level)
+              for level in (1, top))
+    check("boldness paint: a find match keeps the level under its box",
+          _ink(found, hi, 0, 5, 7) != _ink(found, lo, 0, 5, 7))
+
+
+def test_word_starts_strength_option():
+    """Options > Boldness: a -/+ row next to the switch, a level per
+    terminal font, persisted under ui and restored."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from PySide6.QtWidgets import QApplication
+
+    from app import ui_theme
+    from app.session_store import SessionStore
+    from app.widgets.main_window import TopBar
+    from app.widgets.terminal_view import (DEFAULT_WORD_STRENGTH,
+                                           WORD_STRENGTHS, TerminalView)
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    top = len(WORD_STRENGTHS)
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-wordstrength-"))
+    font0 = ui_theme.TERMINAL_FONT
+    try:
+        bar = TopBar()
+        check("boldness option: the row is in the Options panel",
+              bar.options_panel.isAncestorOf(bar.word_strength_inc_btn)
+              and bar.options_panel.isAncestorOf(bar.word_strength_label))
+        check("boldness option: the label reads the default level",
+              bar.word_strength_label.text()
+              == f"{DEFAULT_WORD_STRENGTH} of {top}",
+              bar.word_strength_label.text())
+        emitted = []
+        bar.wordStrengthDelta.connect(emitted.append)
+        bar.word_strength_inc_btn.click()
+        bar.word_strength_dec_btn.click()
+        check("boldness option: + and - emit +1 and -1",
+              emitted == [1, -1], emitted)
+        bar.set_word_strength(1)
+        check("boldness option: - is disabled at level 1",
+              not bar.word_strength_dec_btn.isEnabled()
+              and bar.word_strength_inc_btn.isEnabled())
+        bar.set_word_strength(top)
+        check("boldness option: + is disabled at the top level",
+              bar.word_strength_dec_btn.isEnabled()
+              and not bar.word_strength_inc_btn.isEnabled())
+        bar.deleteLater()
+
+        win = create_main_window(SessionStore(path=tmp / "session.json"))
+        win._save_timer.stop()
+        check("boldness option: a fresh window has the default level",
+              TerminalView.word_strength() == DEFAULT_WORD_STRENGTH)
+        tv = _view(_PROSE + "\r\n")
+        TerminalView.set_word_starts_enabled(True)
+        before = tv.grab().toImage()
+        win._change_word_strength(+1)
+        check("boldness option: + raises the level of every terminal",
+              TerminalView.word_strength() == DEFAULT_WORD_STRENGTH + 1
+              and tv.grab().toImage() != before
+              and win.top_bar.word_strength_label.text()
+              == f"{DEFAULT_WORD_STRENGTH + 1} of {top}")
+        check("boldness option: a change marks the session for saving",
+              win._save_timer.isActive())
+        for _ in range(top + 2):
+            win._change_word_strength(+1)
+        check("boldness option: the level stops at the top",
+              TerminalView.word_strength() == top)
+        for _ in range(top + 2):
+            win._change_word_strength(-1)
+        check("boldness option: ...and at 1",
+              TerminalView.word_strength() == 1)
+        first = ui_theme.TERMINAL_FONT
+        other = next(f for f in ui_theme.TERMINAL_FONTS if f != first)
+        win._change_terminal_font(other)
+        check("boldness option: another font starts at its own level",
+              TerminalView.word_strength() == DEFAULT_WORD_STRENGTH
+              and win.top_bar.word_strength_label.text()
+              == f"{DEFAULT_WORD_STRENGTH} of {top}")
+        win._change_word_strength(+1)
+        win._change_terminal_font(first)
+        check("boldness option: switching back brings the font's level back",
+              TerminalView.word_strength() == 1)
+        payload = win._session_payload()
+        check("boldness option: the levels are persisted per font under ui",
+              payload["ui"]["bold_word_strength"]
+              == {first: 1, other: DEFAULT_WORD_STRENGTH + 1},
+              payload["ui"])
+
+        win._restore_ui_state({"ui": {
+            "terminal_font": other,
+            "bold_word_strength": {first: 2, other: 4, "x": 99,
+                                   "y": "3", "z": True}}})
+        check("boldness option: restore applies the saved font's level and "
+              "drops bad entries",
+              TerminalView.word_strength() == 4
+              and win._word_strengths == {first: 2, other: 4},
+              win._word_strengths)
+        win._restore_ui_state({"ui": {"terminal_font": first}})
+        check("boldness option: a session that predates it gets the default",
+              TerminalView.word_strength() == DEFAULT_WORD_STRENGTH
+              and win._word_strengths == {})
+
+        win._change_word_strength(-1)
+        win._save_session()
+        win.close()
+        app.processEvents()
+        TerminalView.set_word_strength(DEFAULT_WORD_STRENGTH)
+        again = create_main_window(SessionStore(path=tmp / "session.json"))
+        check("boldness option: the level survives a close and reopen",
+              TerminalView.word_strength() == DEFAULT_WORD_STRENGTH - 1
+              and again.top_bar.word_strength_label.text()
+              == f"{DEFAULT_WORD_STRENGTH - 1} of {top}")
+        again._save_timer.stop()
+        again.close()
+        app.processEvents()
+        tv.deleteLater()
+    finally:
+        ui_theme.TERMINAL_FONT = font0
+        TerminalView.set_word_starts_enabled(False)   # both are global
+        TerminalView.set_word_strength(DEFAULT_WORD_STRENGTH)
+        shutil.rmtree(tmp, ignore_errors=True)
