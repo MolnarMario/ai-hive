@@ -38,6 +38,13 @@ _LINE_BREAKS = re.compile(r"[\r\n]")
 # child that never emits the ready signal at all (an exotic pty shell) can
 # never leave the user looking at a cover instead of their terminal.
 BOOT_VEIL_MAX_MS = 25_000
+# The same veil covers a terminal while it takes a new font (begin_font_veil).
+# It lifts once the pty has its new size and the child has printed nothing for
+# FONT_VEIL_QUIET_MS, which is the end of the child's redraw at the new size,
+# or after FONT_VEIL_MAX_MS, because a working agent's spinner never goes
+# quiet.
+FONT_VEIL_QUIET_MS = 300
+FONT_VEIL_MAX_MS = 3000
 # How much of an agent's raw pty tail is replayed when a card is (re)built or
 # a restored snapshot changes width. This is a COMPROMISE, not a free bound: re-measured
 # on real classic-renderer captures at ~100 cols, 128 KiB projects only 844-1519
@@ -825,6 +832,15 @@ class TerminalCard(QFrame):
         self._boot_timer = QTimer(self)
         self._boot_timer.setSingleShot(True)
         self._boot_timer.timeout.connect(self._dismiss_boot_veil)
+        # the veil is up for a font change, not a boot (see begin_font_veil)
+        self._font_veil = False
+        self._font_quiet_timer = QTimer(self)
+        self._font_quiet_timer.setSingleShot(True)
+        self._font_quiet_timer.setInterval(FONT_VEIL_QUIET_MS)
+        self._font_quiet_timer.timeout.connect(self._on_font_quiet)
+        self._font_cap_timer = QTimer(self)
+        self._font_cap_timer.setSingleShot(True)
+        self._font_cap_timer.timeout.connect(self._end_font_veil)
         self._follow = True  # sticky auto-scroll (survives resizes/retiles)
         self._history: list[str] = []
         self._hist_idx = 0
@@ -1171,6 +1187,7 @@ class TerminalCard(QFrame):
             self.terminal.keyInput.connect(self._on_key_input)
             self.terminal.sizeChanged.connect(self.agent.resize)
             self.terminal.sizeChanged.connect(self._reproject_on_size)
+            self.terminal.sizeChanged.connect(self._on_font_resized)
             # relative paths in the output resolve against the agent's cwd, and
             # Ctrl+clicking a file bubbles up so the app can reveal it
             self.terminal.set_base_dir(getattr(self.agent.spec, "cwd", "") or "")
@@ -1297,6 +1314,8 @@ class TerminalCard(QFrame):
 
     def _on_pty_output(self, text: str) -> None:
         self.terminal.feed(text)
+        if self._font_veil:
+            self._font_quiet_timer.start()   # still redrawing
         if self._answer_wait is not None and not self._answer_timer.isActive():
             self._answer_timer.start()
         if self.agent.spec.provider in _RECOVERABLE:
@@ -1994,6 +2013,7 @@ class TerminalCard(QFrame):
         # would go into a box nobody can see. The conversation is redrawn
         # under the veil anyway.
         self.find_bar.close_find()
+        self._stop_font_veil()   # a boot owns the veil from here
         self.boot.begin(caption)
         self._place_overlay()
         if self._awaiting_start():
@@ -2008,18 +2028,70 @@ class TerminalCard(QFrame):
         return self.agent.start_coming() and not self.agent.is_running()
 
     def _end_boot_veil(self) -> None:
-        """Ready: dissolve, so the conversation appears rather than snaps in."""
+        """Ready: dissolve, so the conversation appears rather than snaps in.
+        A font change's veil ignores this: the child is still redrawing at
+        the new size, and the font veil's own timers lift it."""
         self._boot_timer.stop()
         self._restarting = False
-        if self.is_pty:
+        if self.is_pty and not self._font_veil:
             self.boot.finish()
 
     def _dismiss_boot_veil(self) -> None:
         """Drop it immediately (stopped, typed into, or timed out)."""
         self._boot_timer.stop()
         self._restarting = False
+        self._stop_font_veil()
         if self.is_pty:
             self.boot.dismiss()
+
+    def begin_font_veil(self) -> None:
+        """Cover the terminal while it takes a new font or letter spacing.
+
+        A font change used to show three wrong frames in a row: the old
+        screen in the new font (wider or narrower than the grid), the screen
+        cut to the new grid 120 ms later, then the child's redraw at the new
+        size. The boot veil covers all three and dissolves once the pty has
+        its new size and the output has gone quiet (`_on_font_quiet`), or at
+        `FONT_VEIL_MAX_MS`. Call it BEFORE the view gets the font, so the
+        first wrong frame is never painted. A terminal still booting keeps
+        its boot veil, which lifts on the child's prompt as usual. A veil
+        that is already dissolving, from a boot or the last font change,
+        goes back up: otherwise a second click inside its fade showed the
+        frames this hides."""
+        if not self.is_pty or (self.boot.is_active()
+                               and not self.boot.is_leaving()
+                               and not self._font_veil):
+            return
+        self._font_veil = True
+        self.boot.begin("applying the new font…")
+        self._font_quiet_timer.start()
+        self._font_cap_timer.start(FONT_VEIL_MAX_MS)
+
+    def font_veil_active(self) -> bool:
+        return self._font_veil
+
+    def _on_font_resized(self, *_) -> None:
+        """The pty learns its new size now: wait for the child's redraw."""
+        if self._font_veil:
+            self._font_quiet_timer.start()
+
+    def _on_font_quiet(self) -> None:
+        if self.terminal is not None and self.terminal.resize_pending():
+            self._font_quiet_timer.start()   # the grid has not changed yet
+            return
+        self._end_font_veil()
+
+    def _end_font_veil(self) -> None:
+        """The new font is on screen: dissolve, as a boot does."""
+        if not self._font_veil:
+            return
+        self._stop_font_veil()
+        self.boot.finish()
+
+    def _stop_font_veil(self) -> None:
+        self._font_veil = False
+        self._font_quiet_timer.stop()
+        self._font_cap_timer.stop()
 
     def _on_restart_clicked(self) -> None:
         """Restart, with the veil up from the click rather than from STARTING.

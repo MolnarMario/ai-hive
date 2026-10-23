@@ -252,6 +252,13 @@ TERMINAL_FONTS: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 DEFAULT_TERMINAL_FONT = "default"
 TERMINAL_FONT = DEFAULT_TERMINAL_FONT
+# Fonts the user loaded from a file (app/custom_fonts.py), in the same shape.
+# The id is CUSTOM_FONT_PREFIX plus the copy's file name in the fonts folder
+# beside session.json, so a saved pick resolves only once launch has
+# registered that file again, and a deleted file falls back to Default like
+# any unknown id.
+CUSTOM_FONT_PREFIX = "custom:"
+CUSTOM_TERMINAL_FONTS: dict[str, tuple[str, tuple[str, ...]]] = {}
 # extra px between letters in the agent terminals (Options > Letter spacing)
 MAX_LETTER_PX = 3
 TERMINAL_LETTER_PX = 0
@@ -276,13 +283,19 @@ def css_families(chain: str) -> list[str]:
     return out
 
 
+def terminal_fonts() -> dict[str, tuple[str, tuple[str, ...]]]:
+    """Every font the picker offers: the built-in table, then the user's."""
+    return {**TERMINAL_FONTS, **CUSTOM_TERMINAL_FONTS}
+
+
 def terminal_font_families(font_id: str | None = None) -> list[str]:
     """The families an agent terminal hands QFont.setFamilies for `font_id`
     (the active pick when None), most wanted first."""
     fid = TERMINAL_FONT if font_id is None else font_id
     if fid == "theme":
         return css_families(CONSOLE_FONT) or [_FALLBACK_FAMILY]
-    fams = list(TERMINAL_FONTS.get(fid, TERMINAL_FONTS[DEFAULT_TERMINAL_FONT])[1])
+    table = terminal_fonts()
+    fams = list(table.get(fid, table[DEFAULT_TERMINAL_FONT])[1])
     if _FALLBACK_FAMILY not in fams:
         fams.append(_FALLBACK_FAMILY)
     return fams
@@ -300,7 +313,7 @@ def saved_terminal_font(ui: dict) -> str:
     """The session's terminal font id, or the default for a missing or
     unknown one."""
     fid = ui.get("terminal_font")
-    return fid if isinstance(fid, str) and fid in TERMINAL_FONTS \
+    return fid if isinstance(fid, str) and fid in terminal_fonts() \
         else DEFAULT_TERMINAL_FONT
 
 
@@ -1099,6 +1112,10 @@ QPlainTextEdit:focus, QTextEdit:focus {{ border-color: {p.ACCENT_BLUE}; }}
 QComboBox {{
     background: {p.BG_INPUT}; border: 1px solid {p.BORDER};
     border-radius: 3px; padding: 4px 8px;
+    /* Fusion's default list overlays the combo with the current item over
+       the box, so near the bottom or on a late item it sits above. 0 makes it
+       a plain list that drops below, and flips up only when it can't fit. */
+    combobox-popup: 0;
 }}
 QComboBox:focus {{ border-color: {p.ACCENT_BLUE}; }}
 QComboBox QAbstractItemView {{

@@ -69,6 +69,7 @@ def _single_instance_guard(
 # window is up (MainWindow.start_app_update_checks). The imports' time waits
 # for the session store in main(), for the PERF startup line.
 _t = time.perf_counter()
+from app import custom_fonts
 from app import perf_audit
 from app import ui_theme
 from app.process_worker import AgentKind, build_spec
@@ -140,18 +141,23 @@ def _name_application(app: QApplication) -> None:
     app.setApplicationName("AI Hive")
 
 
-def setup_application(app: QApplication, ui: dict | None = None) -> None:
+def setup_application(app: QApplication, ui: dict | None = None,
+                      fonts_dir: str | None = None) -> None:
     """`ui` is the saved session's "ui" dict. Its theme and console font
     (size, terminal font, letter spacing) go live here, before any widget
     exists, so the window is built in them and this is the launch's only
     app stylesheet. Applied after the window was built, theme and font size
     cost 4.5 s of restyling and a full replay per card, and
     MainWindow._restore_ui_state still does that for a session whose values
-    aren't active yet (the suite's path)."""
+    aren't active yet (the suite's path). `fonts_dir` holds the fonts the
+    user loaded (app/custom_fonts.py), registered before the saved terminal
+    font is read so a custom pick resolves."""
     _name_application(app)
     app.setStyle("Fusion")  # stable base for QSS on Windows
     app.setWindowIcon(_app_icon())
     _load_bundled_fonts()
+    if fonts_dir:
+        custom_fonts.load_dir(fonts_dir)
     chrome = "Inter" if "Inter" in QFontDatabase.families() else "Segoe UI"
     app.setProperty("chromeFamily", chrome)  # reused by live font rescaling
     if ui:
@@ -329,7 +335,8 @@ def main() -> int:
     store = SessionStore()
     session = store.load()
     with phases.measure("setup"):
-        setup_application(app, session.get("ui"))
+        setup_application(app, session.get("ui"),
+                          custom_fonts.fonts_dir(store.path.parent))
     # ---- CLI auto-update gate (opt-in, before anything else exists) --------
     # Windows cannot overwrite a running .exe, and every agent IS a claude.exe
     # child held alive by the Job Object, so THIS is the only moment those

@@ -449,7 +449,12 @@ workspaces keep executing — switching never pauses anything.
   bold, which some readers, dyslexic readers among them, find easier to
   track. Only words change: code, paths, flags, numbers, links, the line
   you're typing and anything the agent already made bold keep their weight,
-  and vim, less and other full-screen apps are left alone.
+  and vim, less and other full-screen apps are left alone. **Boldness** −/+
+  right under it sets how much the word starts stand out, 1 to 5. Level 1
+  is the font's plain bold, which in most monospace fonts is only a little
+  heavier than regular. Level 2 thickens the bold start, and levels 3 to 5
+  also fade the rest of each word, more at each step. It starts at 3, and
+  each terminal font remembers its own level.
 - **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ under
   **⚙ Options**; sizes persist.
 - **Terminal font and letter spacing.** Under **⚙ Options**, pick the agent
@@ -457,10 +462,17 @@ workspaces keep executing — switching never pauses anything.
   dyslexic readers. **Default** keeps Consolas, **Theme font** uses the
   skin's own, and Cascadia Mono, JetBrains Mono, IBM Plex Mono, Atkinson
   Hyperlegible Mono and OpenDyslexic Mono ship with the app (licenses in
-  `app/assets/fonts/licenses`). Both apply to every agent; a per-agent font
-  size stays. Bold and italic keep to the column grid even where Qt has to
-  fake them, and box-drawing lines are drawn as shapes whenever the font's
-  own glyphs would leave a gap, so borders stay joined with spacing on.
+  `app/assets/fonts/licenses`). **Load a custom font…** at the bottom of the
+  list adds your own `.ttf`, `.otf` or `.ttc` file. AI Hive checks the file's
+  first bytes as well as its name, so a renamed image or PDF gets a message
+  saying why, and keeps a copy in a `fonts` folder beside `session.json`.
+  Both apply to every agent; a per-agent font size stays. While a terminal
+  takes a new font or spacing, the startup loader covers it with "applying
+  the new font…" until the agent has redrawn at the new size, so the
+  in-between frames never show. Bold and italic keep to the column grid
+  even where Qt has to fake them, and box-drawing lines are drawn as shapes
+  whenever the font's own glyphs would leave a gap, so borders stay joined
+  with spacing on.
 - **Shared agent awareness** — agents in a workspace coordinate through a
   shared board (`.aihive/board.md`): Claude agents launch with `--add-dir` +
   an appended system prompt so they can read peers' status and post their own,
@@ -1026,7 +1038,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4037 checks drive the real app headlessly (offscreen Qt platform) with real
+4111 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1175,7 +1187,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4037 checks)
+                           (4111 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

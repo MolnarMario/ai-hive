@@ -1345,6 +1345,7 @@ def test_resume_list_reads_off_the_gui_thread():
               and not dlg.resume_combo.isEnabled(), ids(dlg))
         check("resume async: OK is off while the list is pending",
               not dlg._ok_btn.isEnabled())
+        loading_size = (dlg.width(), dlg.resume_combo.width())
         QTest.keyClick(dlg, Qt.Key.Key_Return)
         dlg.accept()
         app.processEvents()
@@ -1374,6 +1375,12 @@ def test_resume_list_reads_off_the_gui_thread():
               "out", LIVE not in got and LIVE not in dlg._lane_convs, got)
         check("resume async: the picker and OK come on with the list",
               dlg.resume_combo.isEnabled() and dlg._ok_btn.isEnabled())
+        check("resume async: the dialog and picker keep their width when the "
+              "list lands",
+              (dlg.width(), dlg.resume_combo.width()) == loading_size
+              and dlg.resume_combo.width() == dlg.model_combo.width(),
+              (loading_size, dlg.width(), dlg.resume_combo.width(),
+               dlg.model_combo.width()))
         dlg.resume_combo.setCurrentIndex(got.index(KEPT))
         check("resume async: a lane conversation still revives its lane",
               dlg.revive_lane() is not None
@@ -2965,6 +2972,30 @@ def test_agent_kind_is_always_an_enum():
           spec.to_dict()["kind"] == "claude")
     check("agent-kind: an enum in still comes out unchanged",
           build_spec(AgentKind.CMD, "S", cwd=SCRATCH_CWD).kind is AgentKind.CMD)
+
+
+def test_combo_boxes_drop_down():
+    """Every combo uses a plain dropdown list, not Fusion's overlay popup.
+
+    With the overlay style the list is placed so the current item sits over
+    the box, which put long lists above the combo ("dropdowns going up")."""
+    from PySide6.QtWidgets import (QApplication, QComboBox, QStyle,
+                                   QStyleOptionComboBox)
+    from app import ui_theme
+
+    app = QApplication.instance() or QApplication([])
+    old = app.styleSheet()
+    try:
+        app.setStyleSheet(ui_theme.build_qss())
+        combo = QComboBox()
+        combo.addItems(["a", "b", "c"])
+        opt = QStyleOptionComboBox()
+        combo.initStyleOption(opt)
+        hint = combo.style().styleHint(
+            QStyle.StyleHint.SH_ComboBox_Popup, opt, combo)
+        check("combo: popup is a dropdown list, not an overlay", hint == 0)
+    finally:
+        app.setStyleSheet(old)
 
 
 def test_gemini_session_pinning():

@@ -4289,9 +4289,10 @@ def test_terminal_font_option_persists():
         bar = TopBar()
         sel = bar.terminal_font_select
         ids = [sel.itemData(i) for i in range(sel.count())]
-        check("term font: the dropdown offers the whole table, Default first",
-              ids == list(ui_theme.TERMINAL_FONTS) and ids[0] == "default",
-              ids)
+        check("term font: the dropdown offers the whole table, Default "
+              "first, Load a custom font last",
+              ids == [*ui_theme.TERMINAL_FONTS, None, "load-custom-font"]
+              and ids[0] == "default", ids)
         check("term font: a fresh bar shows Default and 0 px",
               sel.currentData() == "default"
               and bar.letter_px_label.text() == "0 px",
@@ -4560,6 +4561,377 @@ def test_terminal_font_families_resolve():
     check("term font: every bundled face is a static file",
           not [n for n in faces if "[" in n or "variable" in n.lower()],
           faces)
+
+
+def _font_fixtures(folder: Path) -> dict:
+    """A real font no built-in entry draws (Spectral, a manuscript face),
+    and files that only pretend to be fonts."""
+    import shutil
+    from .harness import ROOT
+    good = folder / "Spectral-Regular.ttf"
+    shutil.copyfile(ROOT / "app" / "assets" / "fonts" / "Spectral-Regular.ttf",
+                    good)
+    files = {"good": good}
+    for key, name, data in (
+            ("txt", "notes.txt", b"just some text\n"),
+            ("pdf", "manual.pdf", b"%PDF-1.7\n"),
+            ("jpeg", "photo.jpeg", b"\xff\xd8\xff\xe0JFIF"),
+            ("woff", "web.woff", b"wOFF\x00\x01\x00\x00"),
+            ("fake_ttf", "photo.ttf", b"\xff\xd8\xff\xe0JFIF"),
+            ("woff_ttf", "web.ttf", b"wOF2\x00\x01\x00\x00"),
+            ("empty", "empty.otf", b""),
+            ("broken", "broken.ttf", b"\x00\x01\x00\x00" + b"\x00" * 60)):
+        files[key] = folder / name
+        files[key].write_bytes(data)
+    return files
+
+
+def test_custom_font_install():
+    """Load a custom font: only .ttf, .otf and .ttc files whose first bytes
+    say font get in, with a reason the user can act on for everything else.
+    A good file is copied beside session.json, offered under its family
+    name, and loading it again adds nothing."""
+    import os
+    import shutil
+    from PySide6.QtGui import QFont, QFontInfo
+    from PySide6.QtWidgets import QApplication
+
+    from app import custom_fonts, ui_theme
+    from main import setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-customfont-"))
+    store_fonts = custom_fonts.fonts_dir(tmp / "store")
+    try:
+        src = _font_fixtures(tmp)
+        check("custom font: a real TTF passes the check",
+              custom_fonts.validate(str(src["good"])) is None)
+        for key in ("txt", "pdf", "jpeg", "woff"):
+            reason = custom_fonts.validate(str(src[key])) or ""
+            check(f"custom font: a .{src[key].suffix[1:]} is refused by name",
+                  "is not a font file" in reason and ".ttf" in reason,
+                  reason)
+        reason = custom_fonts.validate(str(src["fake_ttf"])) or ""
+        check("custom font: a JPEG named .ttf is refused by its bytes",
+              "even though its name ends in .ttf" in reason, reason)
+        reason = custom_fonts.validate(str(src["woff_ttf"])) or ""
+        check("custom font: a WOFF named .ttf asks for the TTF or OTF",
+              "web font" in reason, reason)
+        check("custom font: an empty file is refused",
+              custom_fonts.validate(str(src["empty"])) == "The file is empty.")
+        check("custom font: a missing file is refused",
+              custom_fonts.validate(str(tmp / "gone.ttf"))
+              == "The file could not be read.")
+
+        fid, reason = custom_fonts.install(str(src["broken"]), store_fonts)
+        check("custom font: a font Qt can't read is refused, no copy kept",
+              fid is None and "could not read a font" in (reason or "")
+              and not os.listdir(store_fonts), (fid, reason))
+        fid, reason = custom_fonts.install(str(src["txt"]), store_fonts)
+        check("custom font: a refused file is never copied",
+              fid is None and reason and not os.listdir(store_fonts))
+
+        fid, reason = custom_fonts.install(str(src["good"]), store_fonts)
+        check("custom font: a good file installs under a custom id",
+              reason is None and fid == "custom:Spectral-Regular.ttf",
+              (fid, reason))
+        check("custom font: ...copied beside the session",
+              os.listdir(store_fonts) == ["Spectral-Regular.ttf"],
+              os.listdir(store_fonts))
+        check("custom font: ...offered under its family name",
+              ui_theme.terminal_fonts().get(fid, ("",))[0] == "Spectral",
+              ui_theme.CUSTOM_TERMINAL_FONTS)
+        families = ui_theme.terminal_font_families(fid)
+        check("custom font: ...and it draws",
+              families == ["Spectral", "Consolas"]
+              and QFontInfo(QFont(families)).family() == "Spectral",
+              families)
+        again, reason = custom_fonts.install(str(src["good"]), store_fonts)
+        check("custom font: loading the same font again adds nothing",
+              again == fid and reason is None
+              and os.listdir(store_fonts) == ["Spectral-Regular.ttf"]
+              and len(ui_theme.CUSTOM_TERMINAL_FONTS) == 1,
+              (again, os.listdir(store_fonts)))
+        # the Italic of the same family: kept, so Qt draws the real face,
+        # but the picker still has one Spectral
+        styles = custom_fonts.styles_dir(store_fonts)
+        italic_src = tmp / "Spectral-Italic.ttf"
+        shutil.copyfile(Path(ui_theme.__file__).parent / "assets" / "fonts"
+                        / "Spectral-Italic.ttf", italic_src)
+        italic, reason = custom_fonts.install(str(italic_src), store_fonts)
+        check("custom font: another style of the family maps to its entry",
+              italic == fid and reason is None
+              and len(ui_theme.CUSTOM_TERMINAL_FONTS) == 1, (italic, reason))
+        check("custom font: ...and keeps its file in the styles folder",
+              sorted(os.listdir(store_fonts))
+              == ["Spectral-Regular.ttf", "styles"]
+              and os.listdir(styles) == ["Spectral-Italic.ttf"],
+              os.listdir(store_fonts))
+        custom_fonts.install(str(italic_src), store_fonts)
+        check("custom font: loading that style again adds nothing",
+              os.listdir(styles) == ["Spectral-Italic.ttf"],
+              os.listdir(styles))
+        shutil.copyfile(Path(ui_theme.__file__).parent / "assets" / "fonts"
+                        / "IBMPlexMono-Regular.ttf", tmp / "Plex.ttf")
+        plex, reason = custom_fonts.install(str(tmp / "Plex.ttf"), store_fonts)
+        check("custom font: a built-in family maps to its built-in entry",
+              plex == "plex" and reason is None
+              and sorted(os.listdir(store_fonts))
+              == ["Spectral-Regular.ttf", "styles"]
+              and os.listdir(styles) == ["Spectral-Italic.ttf"],
+              (plex, os.listdir(store_fonts)))
+
+        # what a new process has: nothing offered, nothing registered
+        ui_theme.CUSTOM_TERMINAL_FONTS.clear()
+        from PySide6.QtGui import QFontDatabase
+        italic_key = custom_fonts._key(os.path.join(styles,
+                                                    "Spectral-Italic.ttf"))
+        QFontDatabase.removeApplicationFont(
+            custom_fonts._registered.pop(italic_key)[0])
+        custom_fonts.load_dir(store_fonts)
+        check("custom font: a launch offers the saved copies again",
+              list(ui_theme.CUSTOM_TERMINAL_FONTS) == [fid]
+              and ui_theme.saved_terminal_font({"terminal_font": fid}) == fid)
+        check("custom font: ...and registers the style files unoffered",
+              italic_key in custom_fonts._registered)
+        custom_fonts.forget(fid, store_fonts)
+        check("custom font: forget() drops the entry and the copy",
+              not ui_theme.CUSTOM_TERMINAL_FONTS
+              and not os.listdir(store_fonts)
+              and ui_theme.saved_terminal_font({"terminal_font": fid})
+              == "default")
+    finally:
+        for fid in list(ui_theme.CUSTOM_TERMINAL_FONTS):
+            custom_fonts.forget(fid, store_fonts)
+        _reset_terminal_font()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_custom_font_in_options():
+    """The dropdown's Load a custom font item asks for a file and keeps the
+    font in use showing. A bad file shows a warning and changes nothing; a
+    good one joins the dropdown, becomes the terminal font and survives a
+    close and reopen."""
+    import os
+    import shutil
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from app import custom_fonts, ui_theme
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-fontopt-"))
+    store = SessionStore(path=tmp / "session.json")
+    real_warning = QMessageBox.warning
+    warned = []
+    QMessageBox.warning = staticmethod(
+        lambda _parent, title, text, *a, **k: warned.append((title, text)))
+    win = again = None
+    try:
+        src = _font_fixtures(tmp)
+        win = create_main_window(store)
+        win._save_timer.stop()
+        win._change_terminal_font("plex")
+        sel = win.top_bar.terminal_font_select
+        asked = []
+        win.top_bar.customFontRequested.connect(lambda: asked.append(1))
+        win.top_bar.customFontRequested.disconnect(
+            win._on_custom_font_requested)   # no real file dialog
+        sel.setCurrentIndex(sel.findData("load-custom-font"))
+        check("custom font: the Load item asks for a file",
+              asked == [1], asked)
+        check("custom font: ...and the dropdown keeps the font in use",
+              sel.currentData() == "plex" and ui_theme.TERMINAL_FONT == "plex",
+              sel.currentData())
+        # stepping the closed box past the last font, with a key or the
+        # wheel, lands on the Load item without opening a file dialog
+        from PySide6.QtCore import QPoint, QPointF, Qt
+        from PySide6.QtGui import QWheelEvent
+        from PySide6.QtTest import QTest
+        QTest.keyClick(sel, Qt.Key.Key_End)
+        sel.setCurrentIndex(sel.findData("load-custom-font") - 2)
+        app.sendEvent(sel, QWheelEvent(
+            QPointF(5, 5), QPointF(sel.mapToGlobal(QPoint(5, 5))), QPoint(),
+            QPoint(0, -120), Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase,
+            False))
+        check("custom font: a key or the wheel on the Load item asks nothing",
+              asked == [1] and sel.currentData() != "load-custom-font",
+              (asked, sel.currentData()))
+        win._change_terminal_font("plex")
+
+        reason = win.load_custom_font(str(src["fake_ttf"]))
+        check("custom font: a bad file shows the reason in a warning",
+              warned == [("Font not loaded", reason)] and reason, warned)
+        check("custom font: ...and changes nothing",
+              ui_theme.TERMINAL_FONT == "plex"
+              and sel.findData("custom:photo.ttf") < 0)
+
+        check("custom font: a good file loads",
+              win.load_custom_font(str(src["good"])) is None)
+        fid = "custom:Spectral-Regular.ttf"
+        ids = [sel.itemData(i) for i in range(sel.count())]
+        check("custom font: ...joins the dropdown above the Load item",
+              ids[-3:] == [fid, None, "load-custom-font"]
+              and sel.itemText(ids.index(fid)) == "Spectral", ids)
+        check("custom font: ...and becomes the terminal font",
+              ui_theme.TERMINAL_FONT == fid and sel.currentData() == fid
+              and win._save_timer.isActive())
+        check("custom font: ...copied into the fonts folder by the session",
+              os.listdir(tmp / "fonts") == ["Spectral-Regular.ttf"])
+        win._save_session()
+        win._save_timer.stop()
+        win.close()
+        win = None
+        app.processEvents()
+
+        ui_theme.CUSTOM_TERMINAL_FONTS.clear()   # what a new process has
+        _reset_terminal_font()
+        again = create_main_window(SessionStore(path=tmp / "session.json"))
+        check("custom font: the pick survives a close and reopen",
+              ui_theme.TERMINAL_FONT == fid
+              and again.top_bar.terminal_font_select.currentData() == fid,
+              ui_theme.TERMINAL_FONT)
+        again._save_timer.stop()
+    finally:
+        QMessageBox.warning = real_warning
+        for w in (win, again):
+            if w is not None:
+                w._save_timer.stop()
+                w.close()
+        app.processEvents()
+        for fid in list(ui_theme.CUSTOM_TERMINAL_FONTS):
+            custom_fonts.forget(fid, str(tmp / "fonts"))
+        _reset_terminal_font()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_font_change_veil():
+    """A font or letter spacing change covers each card on screen with the
+    loader until the new size is in and the output has gone quiet, so the
+    user never sees the frames in between. A card in a hidden workspace is
+    left alone, a booting card keeps its boot caption, and a child that
+    keeps printing is uncovered at FONT_VEIL_MAX_MS."""
+    import shutil
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app import ui_theme
+    from app.process_worker import AgentKind, build_spec
+    from app.pty_worker import HAS_CONPTY
+    from app.session_store import SessionStore
+    from app.widgets.terminal_card import FONT_VEIL_MAX_MS, FONT_VEIL_QUIET_MS
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    if not HAS_CONPTY:
+        skip("font veil", "no ConPTY, so no pty cards")
+        return
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-fontveil-"))
+    win = None
+    try:
+        win = create_main_window(SessionStore(path=tmp / "session.json"))
+        win._save_timer.stop()
+        mgr = win.manager
+        here = mgr.workspaces[0]
+        agent = mgr.add_terminal(here.id, build_spec(
+            AgentKind.POWERSHELL, "Seen", cwd=SCRATCH_CWD, pty=True),
+            autostart=False)
+        away = mgr.create_workspace("Away", SCRATCH_CWD)
+        hidden_agent = mgr.add_terminal(away.id, build_spec(
+            AgentKind.POWERSHELL, "Unseen", cwd=SCRATCH_CWD, pty=True),
+            autostart=False)
+        mgr.set_active(here.id)
+        win.resize(1200, 800)
+        win.show()
+        pump(200)
+        card = win._pages[here.id].card_for(agent.id)
+        hidden = win._pages[away.id].card_for(hidden_agent.id)
+        card.boot.dismiss()
+        hidden.boot.dismiss()
+
+        win._change_terminal_font("plex")
+        check("font veil: a font change covers the card on screen",
+              card.font_veil_active() and card.boot.is_active()
+              and card.boot._caption == "applying the new font…",
+              card.boot._caption)
+        check("font veil: ...but not one in a hidden workspace",
+              not hidden.font_veil_active() and not hidden.boot.is_active()
+              and hidden.terminal.font_families()[0] == "IBM Plex Mono")
+        card._end_boot_veil()   # a prompt_ready during the redraw
+        check("font veil: a boot's end does not lift a font veil",
+              card.font_veil_active())
+        pump(FONT_VEIL_QUIET_MS // 2)
+        check("font veil: still up while the grid change is pending",
+              card.font_veil_active())
+        pump(FONT_VEIL_QUIET_MS + 700)   # debounce, quiet, the 260 ms fade
+        check("font veil: lifts once the size is in and output is quiet",
+              not card.font_veil_active() and not card.boot.is_active())
+
+        win._change_letter_spacing(+1)
+        check("font veil: letter spacing gets the same cover",
+              card.font_veil_active() and card.boot.is_active())
+        start = time.monotonic()
+        while card.font_veil_active() \
+                and time.monotonic() - start < FONT_VEIL_MAX_MS / 1000 + 2:
+            card._on_pty_output("")   # a child that never goes quiet
+            pump(50)
+        took = time.monotonic() - start
+        check("font veil: a child that keeps printing is uncovered at the cap",
+              not card.font_veil_active()
+              and FONT_VEIL_MAX_MS / 1000 - 0.2 <= took
+              <= FONT_VEIL_MAX_MS / 1000 + 1, took)
+        pump(400)
+
+        # a second change inside the veil's 260 ms fade
+        card.begin_font_veil()
+        card._end_font_veil()
+        check("font veil: (the veil is dissolving)",
+              card.boot.is_active() and card.boot.is_leaving())
+        card.begin_font_veil()
+        check("font veil: a change during the fade puts the veil back up",
+              card.font_veil_active() and not card.boot.is_leaving()
+              and card.boot._caption == "applying the new font…")
+        card._end_font_veil()
+        card._begin_boot_veil()
+        card._end_boot_veil()   # a boot veil that is dissolving
+        card.begin_font_veil()
+        check("font veil: ...and so does one during a boot veil's fade",
+              card.font_veil_active() and not card.boot.is_leaving())
+        card._end_font_veil()
+        pump(400)
+
+        card._begin_boot_veil()   # the agent is booting
+        card.begin_font_veil()
+        check("font veil: a booting card keeps its boot caption",
+              not card.font_veil_active()
+              and card.boot._caption != "applying the new font…",
+              card.boot._caption)
+        card._dismiss_boot_veil()
+        card.begin_font_veil()
+        card._begin_boot_veil()
+        check("font veil: a boot that starts under it takes the veil over",
+              not card.font_veil_active()
+              and not card._font_cap_timer.isActive()
+              and card.boot.is_active())
+        card._dismiss_boot_veil()
+    finally:
+        if win is not None:
+            win._save_timer.stop()
+            win.close()
+        app.processEvents()
+        _reset_terminal_font()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_terminal_box_lines_meet():

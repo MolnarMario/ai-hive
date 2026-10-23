@@ -575,6 +575,10 @@ class BootVeil(QWidget):
         """Is the veil up? (See `_up`: not the same as being on screen.)"""
         return self._up
 
+    def is_leaving(self) -> bool:
+        """Is the veil dissolving after a finish()? It still counts as up."""
+        return self._fader.state() == QAbstractAnimation.State.Running
+
     # ------------------------------------------------------------- painting ---
 
     def _on_spin(self, value):

@@ -5,6 +5,12 @@ word in bold, "**read**ing **th**is **li**ne". Some readers, dyslexic
 readers among them, find a line easier to track that way. The published
 tests show no reading-speed gain, so it is an opt-in comfort setting.
 
+The effect works by contrast between a word's head and its rest, and a
+terminal font's Bold is often barely heavier than its Regular. So Options
+> Boldness can also thicken the head and fade the rest (word_spans hands
+TerminalView both parts); WORD_STRENGTHS in widgets/terminal_view.py
+has the levels.
+
 This module only decides the cells. It is Qt-free, like providers.py, and
 works on anything with `.data` and `.bold` per column (pyte's Char), so its
 tests need no display. TerminalView.paintEvent draws the result.
@@ -33,7 +39,14 @@ def _is_letter(data: str) -> bool:
 
 
 def word_start_spans(cells, prev_row_tail=None) -> list[tuple[int, int]]:
-    """Half-open column spans to draw bold on one row.
+    """Half-open column spans to draw bold on one row (word_spans' heads)."""
+    return [(a, b) for a, b, _e in word_spans(cells, prev_row_tail)]
+
+
+def word_spans(cells, prev_row_tail=None) -> list[tuple[int, int, int]]:
+    """(start, mid, end) per letter run of each prose word on one row:
+    columns [start, mid) are the bold head, [mid, end) the rest of the
+    run, which the higher strengths draw fainter.
 
     `cells` holds one object per column. `prev_row_tail` is the data of the
     last cell of the row above, None for the first row. When that cell and
@@ -87,5 +100,5 @@ def _token_spans(cells, datas, start: int, end: int, out: list) -> None:
         while run < end and _is_letter(datas[run]):
             run += 1
         if run - k >= 2:
-            out.append((k, k + (run - k + 1) // 2))
+            out.append((k, k + (run - k + 1) // 2, run))
         k = run + 1   # past the joiner
