@@ -8,6 +8,29 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.49.0
+
+- Options > Appearance has a Terminal font picker and Letter spacing for
+  the agent terminals. Pick Cascadia Mono, JetBrains Mono NL, IBM Plex
+  Mono, Atkinson Hyperlegible Mono or OpenDyslexic Mono, or Theme font for
+  the skin's own (Share Tech Mono in Adeptus Mechanicus). Default keeps
+  Consolas, so nothing changes until you pick. Letter spacing adds 0 to 3
+  px between letters, and box-drawing lines stay solid at any spacing.
+- A new Bold word starts switch in Options > Appearance draws the first
+  half of each word in bold in every terminal. Code, paths, links and the
+  line you are typing keep their regular weight. It starts off.
+- The New Agent model list matches Claude's own /model menu, older models
+  included (Opus 4.8, Sonnet 4.6 and the rest). The "[1m]" entries are
+  gone: Opus, Sonnet and Fable already run with a 1M context window.
+  Agents saved on one still launch as before.
+- The Default model and effort entries in New Agent say what Claude will
+  run, for example "Default (high, saved by /effort)". Default uses the
+  last pick /model or /effort saved in any terminal, which looked like
+  the previous agent's settings carrying over.
+- Answering one of Claude's question forms puts a dot on the terminal
+  scrollbar, a yellower shade of your prompt dots, so you can scroll back
+  to what you answered.
+
 ## 0.48.1
 
 - An agent you closed before typing anything to it comes back as a fresh

@@ -48,11 +48,12 @@ from pathlib import Path
 from smoke import harness  # first: sets up the sandbox profile
 from smoke import (attention, board, e2e, lanes, limits, processes,
                    reply_marks, runner, sessions, sidebar, terminal, tooltips,
-                   updates, usage, window)
+                   updates, usage, window, word_starts)
 from smoke.harness import check
 
 # Run order with -j 1. e2e last: it launches a real claude.
-MODULES = [sidebar, attention, processes, terminal, reply_marks, sessions,
+MODULES = [sidebar, attention, processes, terminal, word_starts,
+           reply_marks, sessions,
            limits, usage, board, window, updates, lanes, runner, tooltips,
            e2e]
 

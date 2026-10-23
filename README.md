@@ -375,10 +375,13 @@ workspaces keep executing — switching never pauses anything.
   is the conversation's table of contents: the dots are the milestones, and the
   stretch between two of them is one exchange. Nothing AI Hive types itself gets
   a dot (delivered tasks, scheduled messages, auto-continue nudges), and neither
-  does answering a permission menu or a question, so the marks are only ever
-  your own instructions. The bar hides itself when there is nothing to scroll,
-  so a fresh terminal shows none, and a **`/clear`** takes the scrollback and its
-  dots with it.
+  does answering a permission menu, so the marks are only ever your own
+  instructions. Answering one of Claude's question forms (the AskUserQuestion
+  picker, where you choose an option or type your own) gets a dot in a
+  neighbouring colour instead, on Claude's "User answered Claude's questions"
+  line, and its tooltip lists what you picked. The bar hides itself when there
+  is nothing to scroll, so a fresh terminal shows none, and a **`/clear`** takes
+  the scrollback and its dots with it.
   Dots are **not lost when you reopen AI Hive**: milestones are only minted from
   a live keystroke, so a restored conversation would otherwise come back with
   none, and that is exactly the conversation long enough to want to jump around
@@ -441,8 +444,23 @@ workspaces keep executing — switching never pauses anything.
   there. The ▾ beside Open repo lists the GitHub repository's recent pull
   requests and commits. AI Hive loads that list in the background a few
   seconds after startup and keeps it, so the menu opens already filled.
+- **Bold word starts.** ⚙ Options > Appearance > **Bold word starts** (off by
+  default) draws the first half of each prose word in the agent terminals in
+  bold, which some readers, dyslexic readers among them, find easier to
+  track. Only words change: code, paths, flags, numbers, links, the line
+  you're typing and anything the agent already made bold keep their weight,
+  and vim, less and other full-screen apps are left alone.
 - **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ under
   **⚙ Options**; sizes persist.
+- **Terminal font and letter spacing.** Under **⚙ Options**, pick the agent
+  terminals' font and add 0 to 3 px between letters, which helps some
+  dyslexic readers. **Default** keeps Consolas, **Theme font** uses the
+  skin's own, and Cascadia Mono, JetBrains Mono, IBM Plex Mono, Atkinson
+  Hyperlegible Mono and OpenDyslexic Mono ship with the app (licenses in
+  `app/assets/fonts/licenses`). Both apply to every agent; a per-agent font
+  size stays. Bold and italic keep to the column grid even where Qt has to
+  fake them, and box-drawing lines are drawn as shapes whenever the font's
+  own glyphs would leave a gap, so borders stay joined with spacing on.
 - **Shared agent awareness** — agents in a workspace coordinate through a
   shared board (`.aihive/board.md`): Claude agents launch with `--add-dir` +
   an appended system prompt so they can read peers' status and post their own,
@@ -596,10 +614,10 @@ workspaces keep executing — switching never pauses anything.
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
   reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Update AI
-  Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times** and **Tooltips** as labelled switches (each with a green/dark LED, so
+  Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times**, **Tooltips** and **Bold word starts** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
-  the theme and global font size below. Click outside or press `Esc` to close.
+  the theme, global font size, terminal font and letter spacing below. Click outside or press `Esc` to close.
   The bar itself keeps only what you actually glance at: the usage pills and
   their `+`, and `+ Terminal`, so it fits on a laptop instead of hiding
   controls behind a scrollbar.
@@ -614,7 +632,7 @@ workspaces keep executing — switching never pauses anything.
   bundled Cinzel / EB Garamond / Spectral fonts), **Adeptus Mechanicus** (a
   Warhammer 40K cogitator — green-phosphor CRT on a brushed-gunmetal casing
   with corner bolts, an aquila crest, a radiant green cog logo, servo-initial
-  drop-caps, amber accents, and Share Tech Mono terminals), and **Obsidian**
+  drop-caps, amber accents, and Share Tech Mono as its **Theme font**), and **Obsidian**
   (clean modern dark). Each skin picks its own terminal treatment and ANSI
   palette; the choice persists. Ornaments are painted with QPainter +
   QSvgRenderer (`app/widgets/ornaments.py`), keyed per theme, and each shows
@@ -671,6 +689,9 @@ error dialog instead of silently closing. Packaging to a distributable
 - **Agents** — `+ Terminal` (or `Ctrl+T` / `Ctrl+Shift+T`), or click any empty grid slot.
   The dialog groups **AI agents** (Claude with model + effort + mode dropdowns —
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;
+  the model list matches claude's own `/model` menu, and **Default** names what
+  it resolves to, because Claude then uses the last `/model` or `/effort` pick
+  saved from any terminal, e.g. "Default (high, saved by /effort)";
   Gemini/Antigravity with its model list; Grok via the xAI CLI; OpenAI as an
   editable command template), **shells** (PowerShell, cmd), and **scripts**
   (Python, custom);
@@ -1005,7 +1026,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-3859 checks drive the real app headlessly (offscreen Qt platform) with real
+4037 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1135,7 +1156,9 @@ app/
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   repo_activity.py         Open repo dropdown: GitHub PRs + commits, origin URL (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
-  assets/fonts/            bundled OFL manuscript fonts (Cinzel/EB Garamond/Spectral)
+  assets/fonts/            bundled fonts: the manuscript ones (Cinzel/EB Garamond/
+                           Spectral) and the Terminal font picker's mono families,
+                           with their licenses in licenses/
   widgets/                 main_window, sidebar (drag-reorder + categories +
                            inline agent list w/ "?" + inline file explorer),
                            workspace_page, terminal_card, terminal_view (pyte grid;
@@ -1152,7 +1175,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (3859 checks)
+                           (4037 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

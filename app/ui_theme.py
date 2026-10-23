@@ -226,6 +226,93 @@ def saved_console_px(ui: dict) -> int:
     return px if 7 <= px <= 40 else 0
 
 
+# ------------------------------------------------------- terminal font ---
+# Options > Appearance > Terminal font: id -> (dropdown label, families).
+# The session stores the id, never a family, so "theme" keeps following the
+# skin. The families are the names Qt reports for the bundled files in
+# app/assets/fonts (QFontDatabase.applicationFontFamilies), which is why
+# JetBrains Mono is "JetBrains Mono NL" (the no-ligature build: a ligature
+# draws two cells as one glyph) and OpenDyslexic Mono is "OpenDyslexicMono".
+#
+# "default" is what AI Hive drew before the picker existed, and stays the
+# default so nobody's terminals change on upgrade: Consolas in the agent
+# terminals (TerminalView hardcoded it), the skin's console_font in
+# line-mode cards (#Console/#CardInput read CONSOLE_FONT). The two differ
+# only in Adeptus Mechanicus, whose console_font is Share Tech Mono. "theme"
+# puts the skin's font in both.
+TERMINAL_FONTS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "default": ("Default", ("Consolas",)),
+    "theme": ("Theme font", ()),
+    "consolas": ("Consolas", ("Consolas",)),
+    "cascadia": ("Cascadia Mono", ("Cascadia Mono",)),
+    "jetbrains": ("JetBrains Mono", ("JetBrains Mono NL",)),
+    "plex": ("IBM Plex Mono", ("IBM Plex Mono",)),
+    "atkinson": ("Atkinson Hyperlegible Mono", ("Atkinson Hyperlegible Mono",)),
+    "opendyslexic": ("OpenDyslexic Mono", ("OpenDyslexicMono",)),
+}
+DEFAULT_TERMINAL_FONT = "default"
+TERMINAL_FONT = DEFAULT_TERMINAL_FONT
+# extra px between letters in the agent terminals (Options > Letter spacing)
+MAX_LETTER_PX = 3
+TERMINAL_LETTER_PX = 0
+# Where a picked family has no glyph, Qt tries the next family in the list
+# before its system-wide fallback. Consolas covers box drawing and most of
+# what Claude prints, and OpenDyslexic Mono and Atkinson Hyperlegible Mono
+# have neither.
+_FALLBACK_FAMILY = "Consolas"
+_GENERIC_FAMILIES = {"monospace", "sans-serif", "serif", "cursive",
+                     "fantasy", "system-ui"}
+
+
+def css_families(chain: str) -> list[str]:
+    """The family names in a CSS font-family chain, in order, quotes
+    stripped and generic families dropped: '"Share Tech Mono", Consolas,
+    monospace' gives ["Share Tech Mono", "Consolas"]."""
+    out: list[str] = []
+    for part in chain.split(","):
+        name = part.strip().strip("\"'").strip()
+        if name and name.lower() not in _GENERIC_FAMILIES and name not in out:
+            out.append(name)
+    return out
+
+
+def terminal_font_families(font_id: str | None = None) -> list[str]:
+    """The families an agent terminal hands QFont.setFamilies for `font_id`
+    (the active pick when None), most wanted first."""
+    fid = TERMINAL_FONT if font_id is None else font_id
+    if fid == "theme":
+        return css_families(CONSOLE_FONT) or [_FALLBACK_FAMILY]
+    fams = list(TERMINAL_FONTS.get(fid, TERMINAL_FONTS[DEFAULT_TERMINAL_FONT])[1])
+    if _FALLBACK_FAMILY not in fams:
+        fams.append(_FALLBACK_FAMILY)
+    return fams
+
+
+def line_console_font() -> str:
+    """The font-family chain of the line-mode console and its input box.
+    "default" keeps the skin's console_font there, as before the picker."""
+    if TERMINAL_FONT == DEFAULT_TERMINAL_FONT:
+        return CONSOLE_FONT
+    return ", ".join(f'"{f}"' for f in terminal_font_families()) + ", monospace"
+
+
+def saved_terminal_font(ui: dict) -> str:
+    """The session's terminal font id, or the default for a missing or
+    unknown one."""
+    fid = ui.get("terminal_font")
+    return fid if isinstance(fid, str) and fid in TERMINAL_FONTS \
+        else DEFAULT_TERMINAL_FONT
+
+
+def saved_letter_px(ui: dict) -> int:
+    """The session's terminal letter spacing, clamped to 0..MAX_LETTER_PX.
+    Anything that isn't a whole number is 0."""
+    px = ui.get("terminal_letter_px", 0)
+    if isinstance(px, bool) or not isinstance(px, int):
+        return 0
+    return max(0, min(MAX_LETTER_PX, px))
+
+
 # ------------------------------------------------------------ vendor inks ---
 # The live model chip (#CardModel) is coloured by WHOSE agent it is, not by the
 # active skin -- so a hive of mixed agents is readable at a glance and the same
@@ -367,6 +454,9 @@ CAT_HOVER_ALPHA = 0.11
 def build_qss(chrome_family: str = "Segoe UI", console_px: int | None = None) -> str:
     p = Palette
     cpx = int(console_px if console_px else CONSOLE_FONT_PX)
+    # the line-mode console follows Options > Terminal font; the chrome's
+    # other CONSOLE_FONT readers (activity log, files, lanes) stay on the skin
+    line_font = line_console_font()
     # checked-indicator glyph (written to disk; see _check_icon_path). Empty
     # string if the write failed -- the accent fill alone still reads as checked.
     _check_icon = _check_icon_path(p.ACCENT_GOLD)
@@ -439,12 +529,14 @@ QMenu::indicator:checked {{
 #AppUpdateBtn:disabled, #AppUpdateBtn:disabled:hover {{
     background: transparent; border-color: transparent; color: {p.TEXT_DIM};
 }}
-#ThemeSelect {{
+#ThemeSelect, #TerminalFontSelect {{
     background: {p.BG_INPUT}; border: 1px solid {p.BORDER}; border-radius: 3px;
     padding: 2px 8px; color: {p.TEXT}; font-size: 11px;
 }}
-#ThemeSelect:hover {{ border-color: {p.ACCENT_GOLD}; }}
-#ThemeSelect QAbstractItemView {{
+#ThemeSelect:hover, #TerminalFontSelect:hover {{
+    border-color: {p.ACCENT_GOLD};
+}}
+#ThemeSelect QAbstractItemView, #TerminalFontSelect QAbstractItemView {{
     background: {p.BG_PANEL}; border: 1px solid {p.BORDER};
     selection-background-color: {p.BG_ACTIVE}; color: {p.TEXT};
 }}
@@ -768,7 +860,7 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 #Console {{
     background: {p.BG_CONSOLE};
     border: none;
-    font-family: {CONSOLE_FONT};
+    font-family: {line_font};
     font-size: {cpx}px;
     color: {p.CONSOLE_FG};
     selection-background-color: {p.SELECTION};
@@ -779,7 +871,7 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
     background: {p.BG_INPUT};
     border: none; border-top: 1px solid {p.BORDER};
     border-bottom-left-radius: 4px; border-bottom-right-radius: 4px;
-    font-family: {CONSOLE_FONT};
+    font-family: {line_font};
     font-size: {cpx}px;
     padding: 5px 8px;
     color: {p.CONSOLE_FG};

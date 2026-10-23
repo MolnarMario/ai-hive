@@ -6,6 +6,7 @@
 
 # Binary assets — never touch line endings or try to diff.
 *.ttf binary
+*.otf binary
 *.png binary
 *.zip binary
 *.lnk binary

@@ -268,7 +268,8 @@ def test_reply_stamp_survives_a_reopen():
     def unhook(agent, card):
         # detach() leaves the two mark signals _wire() connects (see
         # test_reply_stamp_repaint_and_merge), so they go by hand
-        for sig, slot in ((agent.prompt_marks_changed, card._refresh_marks),
+        for sig, slot in ((agent.prompt_marks_changed,
+                           card._on_prompt_marks_changed),
                           (agent.reply_marks_changed,
                            card._on_reply_mark_added)):
             try:
@@ -592,7 +593,8 @@ def test_reply_stamp_repaint_and_merge():
     # detach() does NOT unhook the two mark signals _wire() connects, so drop
     # them by hand as well; a card left listening to an agent it no longer
     # paints is how a torn-down widget keeps taking work in later checks
-    for sig, slot in ((agent.prompt_marks_changed, card._refresh_marks),
+    for sig, slot in ((agent.prompt_marks_changed,
+                       card._on_prompt_marks_changed),
                       (agent.reply_marks_changed, card._on_reply_mark_added)):
         try:
             sig.disconnect(slot)

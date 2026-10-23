@@ -119,9 +119,11 @@ def _app_icon():
 
 
 def _load_bundled_fonts() -> None:
-    """Register the manuscript fonts (Cinzel/EB Garamond/Spectral) so themes
-    that name them resolve exactly instead of falling back to a system serif.
-    Best-effort: missing files just mean the QSS fallback chain kicks in."""
+    """Register the bundled fonts: the manuscript ones (Cinzel/EB Garamond/
+    Spectral) so themes that name them resolve exactly instead of falling
+    back to a system serif, and the mono families Options > Terminal font
+    offers (ui_theme.TERMINAL_FONTS). Best-effort: missing files just mean
+    the fallback chain kicks in. Their licenses are in fonts/licenses."""
     from PySide6.QtGui import QFontDatabase
     fonts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "app", "assets", "fonts")
@@ -139,10 +141,11 @@ def _name_application(app: QApplication) -> None:
 
 
 def setup_application(app: QApplication, ui: dict | None = None) -> None:
-    """`ui` is the saved session's "ui" dict. Its theme and console font go
-    live here, before any widget exists, so the window is built in them and
-    this is the launch's only app stylesheet. Applied after the window was
-    built, the two cost 4.5 s of restyling and a full replay per card, and
+    """`ui` is the saved session's "ui" dict. Its theme and console font
+    (size, terminal font, letter spacing) go live here, before any widget
+    exists, so the window is built in them and this is the launch's only
+    app stylesheet. Applied after the window was built, theme and font size
+    cost 4.5 s of restyling and a full replay per card, and
     MainWindow._restore_ui_state still does that for a session whose values
     aren't active yet (the suite's path)."""
     _name_application(app)
@@ -158,6 +161,10 @@ def setup_application(app: QApplication, ui: dict | None = None) -> None:
         px = ui_theme.saved_console_px(ui)
         if px:
             ui_theme.CONSOLE_FONT_PX = px
+        # Options > Terminal font and Letter spacing: every card is then
+        # built and replayed once, with the cell these give
+        ui_theme.TERMINAL_FONT = ui_theme.saved_terminal_font(ui)
+        ui_theme.TERMINAL_LETTER_PX = ui_theme.saved_letter_px(ui)
     app.setStyleSheet(build_qss(chrome))
 
 

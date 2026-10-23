@@ -23,12 +23,13 @@ from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
 from .. import scheduled_send, transcripts, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
 from ..process_worker import AI_KINDS, describe_pid
-from ..terminal_agent import (BUSY_IDLE_MS, STREAM_INPUT, STREAM_SYSTEM,
+from ..terminal_agent import (ANSWER_TEXT, BUSY_IDLE_MS, MARK_ANSWER,
+                              MARK_PROMPT, STREAM_INPUT, STREAM_SYSTEM,
                               AgentStatus, TerminalAgent)
 from ..ui_theme import Palette, repolish
 from .header_icons import LaneChip
 from .ornaments import BootVeil, ElidingLabel, close_on_anchor_press
-from .terminal_view import is_reply_footer
+from .terminal_view import is_answer_echo, is_reply_footer
 
 _LINE_BREAKS = re.compile(r"[\r\n]")
 
@@ -101,6 +102,14 @@ _STAMP_MERGE_SLACK = 3
 # providers whose transcript records say when each reply finished (see
 # TerminalCard._recover_marks)
 _RECOVERABLE = ("claude", "gemini", "openai")
+
+# How long an answer dot placed before Claude printed its "User answered"
+# row keeps watching the output for that row (TerminalCard._mark_anchor).
+# The row follows the PostToolUse hook by one render, well inside this.
+_ANSWER_WAIT_S = 10.0
+# ...and how often it looks. One look scans up to _ANSWER_ANCHOR_SCAN rows,
+# about 4 ms at 120 columns, too much for every chunk of a streaming reply.
+_ANSWER_POLL_MS = 100
 
 
 def _norm_line(text: str) -> str:
@@ -751,6 +760,17 @@ class TerminalCard(QFrame):
         # did not watch being typed (a restored conversation); recomputed on
         # every projection, never persisted
         self._recovered: list[tuple[int, str]] = []
+        # same, for the "User answered Claude's questions" rows: lines only,
+        # found on screen rather than in the transcript (see _recover_marks)
+        self._recovered_answers: list[int] = []
+        # (uid, deadline) of an answer mark placed before its "User answered"
+        # row printed; output starts _answer_timer, which moves it there
+        # (see _mark_anchor)
+        self._answer_wait: tuple[int, float] | None = None
+        self._answer_timer = QTimer(self)
+        self._answer_timer.setSingleShot(True)
+        self._answer_timer.setInterval(_ANSWER_POLL_MS)
+        self._answer_timer.timeout.connect(self._place_waiting_answer)
         # same, for reply-finished stamps: (absolute line, epoch)
         self._recovered_replies: list[tuple[int, float]] = []
         # typed-prompt texts for _recover_marks and finished-reply times for
@@ -1177,7 +1197,8 @@ class TerminalCard(QFrame):
             # Claude to redraw. request_repaint() is already a no-op when the
             # agent isn't a running pty, so no extra guard is needed here.
             self.terminal.staleLayoutDetected.connect(self.agent.request_repaint)
-            self.agent.prompt_marks_changed.connect(self._refresh_marks)
+            self.agent.prompt_marks_changed.connect(
+                self._on_prompt_marks_changed)
             self.agent.reply_marks_changed.connect(self._on_reply_mark_added)
             self.agent.conversation_replaced.connect(
                 self.terminal.clear_history)
@@ -1276,6 +1297,8 @@ class TerminalCard(QFrame):
 
     def _on_pty_output(self, text: str) -> None:
         self.terminal.feed(text)
+        if self._answer_wait is not None and not self._answer_timer.isActive():
+            self._answer_timer.start()
         if self.agent.spec.provider in _RECOVERABLE:
             self._stamp_timer.start()   # restarted by every chunk
 
@@ -2176,7 +2199,7 @@ class TerminalCard(QFrame):
                 if kind == "size":
                     self.terminal.project_size(mark.rows, mark.cols)
                 elif kind == "prompt":
-                    self._mark_lines[mark.uid] = self.terminal.anchor_line()
+                    self._mark_lines[mark.uid] = self._mark_anchor(mark)
                 else:
                     line = self.terminal.reply_anchor_line()
                     if line is not None:
@@ -2225,13 +2248,16 @@ class TerminalCard(QFrame):
         recovered one in _refresh_marks. A new conversation changes session_id
         (a pin change or /clear), which changes the key and re-reads."""
         self._recovered = []
+        self._recovered_answers = []
         if not self.is_pty or self.agent.spec.provider not in _RECOVERABLE:
             return
+        self._recover_answers(rows)
         self._load_recovery()
         prompts = self._recover_prompts
         reflowed = getattr(self.agent, "reflowed_at", 0)
         unplaced = [m for m in self.agent.prompt_marks()
-                    if m.uid not in self._mark_lines and m.pos < reflowed]
+                    if m.uid not in self._mark_lines and m.pos < reflowed
+                    and m.kind == MARK_PROMPT]
         if not prompts and not unplaced:
             return
         oldest, raw = rows if rows is not None else self._scrollback_rows()
@@ -2271,6 +2297,47 @@ class TerminalCard(QFrame):
                     self._mark_lines[mark.uid] = oldest + i
                     at = i + 1
                     break
+
+    def _recover_answers(self, rows=None) -> None:
+        """Find the "User answered Claude's questions" rows in the
+        scrollback, for the answer dots a live capture did not place: a
+        restored conversation, or a reflow that reprinted the rows the live
+        marks pointed at.
+
+        Read off the SCREEN, not the transcript: the row is Claude's own
+        record of the answer, it sits exactly where a live mark anchors
+        (TerminalView.answer_echo_line), and the scan costs no file read.
+        A live answer placed on the input box before its row printed moves
+        onto a row within _STAMP_MERGE_SLACK of it. A live answer from
+        before the newest reflow takes back one of these rows, newest with
+        newest, so it keeps its tooltip of the chosen answers. Rows within _STAMP_MERGE_SLACK of a placed live answer are
+        that answer's own and are left out."""
+        if self.agent.spec.provider != "claude":
+            return
+        oldest, raw = rows if rows is not None else self._scrollback_rows()
+        found = [oldest + i for i, text in enumerate(raw)
+                 if is_answer_echo(text)]
+        marks = [m for m in self.agent.prompt_marks() if m.kind == MARK_ANSWER]
+        # a mark placed before its row printed sits near it, not on it
+        echoes = set(found)
+        for m in marks:
+            line = self._mark_lines.get(m.uid)
+            if line is None or line in echoes:
+                continue
+            near = [f for f in found if abs(f - line) <= _STAMP_MERGE_SLACK
+                    and f not in self._mark_lines.values()]
+            if near:
+                self._mark_lines[m.uid] = min(near, key=lambda f: abs(f - line))
+        held = [self._mark_lines[m.uid] for m in marks
+                if m.uid in self._mark_lines]
+        found = [line for line in found
+                 if all(abs(line - h) > _STAMP_MERGE_SLACK for h in held)]
+        reflowed = getattr(self.agent, "reflowed_at", 0)
+        lost = [m for m in marks
+                if m.uid not in self._mark_lines and m.pos < reflowed]
+        while lost and found:
+            self._mark_lines[lost.pop().uid] = found.pop()
+        self._recovered_answers = found
 
     def _load_recovery(self, fresh_replies: bool = False) -> None:
         """Read this conversation's typed prompts and finished replies once
@@ -2392,8 +2459,11 @@ class TerminalCard(QFrame):
         guessed at."""
         if not self.is_pty:
             return
-        live = [(self._mark_lines[m.uid], m.text)
-                for m in self.agent.prompt_marks() if m.uid in self._mark_lines]
+        live, answers = [], []
+        for m in self.agent.prompt_marks():
+            if m.uid in self._mark_lines:
+                (answers if m.kind == MARK_ANSWER else live).append(
+                    (self._mark_lines[m.uid], m.text))
         # A milestone captured live is exact; a recovered one was located by
         # matching text, so where both point at the same line the live one
         # wins and the recovered duplicate is dropped.
@@ -2401,6 +2471,94 @@ class TerminalCard(QFrame):
         merged = live + [(line, text) for line, text in self._recovered
                          if line not in taken]
         self.terminal.set_marks(sorted(merged))
+        # again here, not only in _recover_answers: a scan can find the row
+        # in the poll between Claude printing it and the mark arriving
+        held = [line for line, _ in answers]
+        answers += [(line, ANSWER_TEXT)
+                    for line in self._recovered_answers
+                    if all(abs(line - h) > _STAMP_MERGE_SLACK for h in held)]
+        self.terminal.set_answer_marks(sorted(answers))
+
+    def _mark_anchor(self, mark, live: bool = False) -> int:
+        """The line a mark goes on, at the stream position it was minted
+        at: the input box for a typed prompt, the "User answered" row for
+        an answer. Shared by the live capture and the replay, so both read
+        the same screen state the same way. An answer row that can't be
+        this answer's (_answer_row) is an older form's, and the input box
+        stands in."""
+        if mark.kind != MARK_ANSWER:
+            return self.terminal.anchor_line()
+        line = self._answer_row(mark, live)
+        if line is None:
+            # the hook edge beat the row to the screen: the input box is
+            # where it is about to print, until _place_waiting_answer (live)
+            # or _recover_answers (a replay) finds the row itself. Only a
+            # live mark waits: a replayed one's row is never coming, and a
+            # later form's row must not be taken for it.
+            if live:
+                self._answer_wait = (mark.uid,
+                                     time.monotonic() + _ANSWER_WAIT_S)
+            return self.terminal.anchor_line()
+        return line
+
+    def _answer_row(self, mark, live: bool) -> int | None:
+        """The newest "User answered" row near the bottom if it can be
+        `mark`'s, else None. Not one another answer holds, and not one above
+        a reply that ended before `mark` was minted: that row is an older
+        turn's, like a restored screen's, which no answer mark holds. Live,
+        the replies recovered from the transcript count too; in a replay
+        their lines are the old view's, and only the reply marks placed so
+        far stand in."""
+        line = self.terminal.answer_echo_line()
+        if line is None or line in self._answer_lines(mark.uid):
+            return None
+        ends = [self._reply_mark_lines[m.uid] for m in self.agent.reply_marks()
+                if m.seq < mark.seq and m.uid in self._reply_mark_lines]
+        if live:
+            ends += [ln for ln, when in self._recovered_replies
+                     if when < mark.ts]
+        if ends and line <= max(ends):
+            return None
+        return line
+
+    def _answer_lines(self, but: int) -> set:
+        """Lines the answer marks other than uid `but` sit on."""
+        return {self._mark_lines[m.uid] for m in self.agent.prompt_marks()
+                if m.kind == MARK_ANSWER and m.uid != but
+                and m.uid in self._mark_lines}
+
+    def _place_waiting_answer(self) -> None:
+        """Output arrived while an answer mark waits for its "User
+        answered" row: move the mark onto the row once it is drawn. Gives
+        up after _ANSWER_WAIT_S, leaving it on the input box line."""
+        uid, deadline = self._answer_wait
+        mark = next((m for m in self.agent.prompt_marks() if m.uid == uid),
+                    None)
+        if (time.monotonic() > deadline or uid not in self._mark_lines
+                or mark is None):
+            self._answer_wait = None
+            return
+        line = self._answer_row(mark, live=True)
+        if line is None:
+            return      # not printed yet: the newest row is an older form's
+        self._answer_wait = None
+        self._mark_lines[uid] = line
+        self._refresh_marks()
+
+    def _on_prompt_marks_changed(self) -> None:
+        """A milestone was added or the set cleared. A typed prompt's line
+        comes from the Enter that made it (_on_prompt_submitted, right after
+        this). An answer's is placed here: it is minted off a hook edge,
+        with no keystroke to carry one, and only the newest mark can be
+        new."""
+        if not self.is_pty:
+            return
+        marks = self.agent.prompt_marks()
+        if (marks and marks[-1].kind == MARK_ANSWER
+                and marks[-1].uid not in self._mark_lines):
+            self._mark_lines[marks[-1].uid] = self._mark_anchor(marks[-1],
+                                                                live=True)
+        self._refresh_marks()
 
     def _on_prompt_submitted(self, text: str, abs_line: int) -> None:
         """A bare Enter in the terminal. Record it as a milestone unless the
@@ -2446,6 +2604,7 @@ class TerminalCard(QFrame):
         and re-arm the stamp check. The milestones themselves stay."""
         self._mark_lines = {}
         self._recovered = []
+        self._recovered_answers = []
         self._reply_mark_lines = {}
         self._recovered_replies = []
         self._recover_target = None

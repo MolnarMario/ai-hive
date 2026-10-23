@@ -313,6 +313,45 @@ def _ends_with_question(text) -> bool:
     return text.rstrip(" \t\r\n\"'`*)]}").endswith("?")
 
 
+# an answered AskUserQuestion's choices ride on its tool_clear edge, for the
+# scrollbar answer dot's tooltip. Bounded: the events file is read every poll.
+ANSWER_TOOL = "AskUserQuestion"
+_ANSWER_MAX = 8
+_ANSWER_CHARS = 160
+
+
+def answer_summary(payload: dict) -> list:
+    """["<header>: <answer>", ...] from an AskUserQuestion PostToolUse, in
+    question order, or [] when the payload has none. tool_response is what
+    the transcript stores as toolUseResult: {"questions": [{"question",
+    "header", ...}], "answers": {question text: answer}}. A question with no
+    header is shown by its text."""
+    if payload.get("tool_name") != ANSWER_TOOL:
+        return []
+    resp = payload.get("tool_response")
+    if not isinstance(resp, dict) or not isinstance(resp.get("answers"), dict):
+        return []
+    answers = resp["answers"]
+    questions = resp.get("questions")
+    order = []
+    if isinstance(questions, list):
+        for q in questions:
+            if isinstance(q, dict) and isinstance(q.get("question"), str):
+                order.append((q["question"], q.get("header")))
+    known = {text for text, _ in order}
+    order += [(text, None) for text in answers if text not in known]
+    out = []
+    for text, header in order:
+        answer = answers.get(text)
+        if not isinstance(answer, str) or not answer.strip():
+            continue
+        label = header if isinstance(header, str) and header.strip() else text
+        out.append(f"{label.strip()}: {answer.strip()}"[:_ANSWER_CHARS])
+        if len(out) >= _ANSWER_MAX:
+            break
+    return out
+
+
 def _append_event(events_path: str, kind: str, extra: dict | None = None) -> None:
     record = {"agent_id": os.environ.get(AGENT_ID_ENV, ""),
               "kind": kind, "ts": time.time()}
@@ -736,8 +775,11 @@ def _dispatch(mapping_path, events_path, payload: dict) -> str:
             _append_event(events_path, EV_TOOL_SET, extra)
     elif event == "PostToolUse":
         if payload.get("tool_name") in _WAITING_TOOL_SET:
-            _append_event(events_path, EV_TOOL_CLEAR,
-                          {"tool": payload.get("tool_name")})
+            extra = {"tool": payload.get("tool_name")}
+            answers = answer_summary(payload)
+            if answers:
+                extra["answers"] = answers
+            _append_event(events_path, EV_TOOL_CLEAR, extra)
     return ""
 
 

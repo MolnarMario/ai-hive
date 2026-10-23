@@ -689,6 +689,11 @@ class WorkspaceManager(QObject):
                     agent.set_tool_waiting(True)
             elif kind == session_hook.EV_TOOL_CLEAR:
                 self._unconfirmed_tools.pop(ident, None)
+                if rec.get("tool") == session_hook.ANSWER_TOOL:
+                    answers = rec.get("answers")
+                    agent.note_answer_submitted(
+                        [a for a in answers if isinstance(a, str)]
+                        if isinstance(answers, list) else [])
                 agent.set_tool_waiting(False)
             elif kind == session_hook.EV_TURN_SET:
                 # every Stop writes exactly one TURN_SET or TURN_CLEAR, and
