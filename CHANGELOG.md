@@ -8,6 +8,15 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.51.0
+
+- Bold word starts is now called Bionic reading, and its tooltip explains
+  how a bold start helps some readers keep their place in a line.
+- Boldness is now called Contrast, and Options shows it only while Bionic
+  reading is on.
+- With Bionic reading on, the line you are typing no longer turns bold
+  when its text fills a row and the caret moves to the row below.
+
 ## 0.50.0
 
 - Changing the terminal font or letter spacing no longer flickers through
