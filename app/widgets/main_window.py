@@ -69,7 +69,8 @@ from .sidebar import SIDEBAR_WIDTH, Sidebar, WorkspaceRail
 
 SIDEBAR_MIN, SIDEBAR_MAX = 170, 700  # drag bounds (ultrawide-friendly)
 from .terminal_card import TerminalCard, _snippet
-from .terminal_view import TerminalView
+from .terminal_view import (DEFAULT_WORD_STRENGTH, WORD_STRENGTHS,
+                            TerminalView)
 from .workspace_page import WorkspacePage
 
 SAVE_DEBOUNCE_MS = 800
@@ -525,6 +526,7 @@ class TopBar(QFrame):
     replyStampsToggled = Signal(bool)      # date/time under each finished reply
     tooltipsToggled = Signal(bool)         # hover tooltips, app-wide
     boldWordStartsToggled = Signal(bool)   # first half of each word in bold
+    wordStrengthDelta = Signal(int)        # -1 / +1 Boldness level
     # install newer Claude Code / agy CLIs at the NEXT startup, before any
     # agent launches (the only moment those binaries are not locked)
     autoUpdateToggled = Signal(bool)
@@ -831,6 +833,31 @@ class TopBar(QFrame):
         self.bold_word_starts_btn.clicked.connect(
             self._on_bold_word_starts_clicked)
         self._refresh_bold_word_starts_btn()
+        # "Boldness": how hard Bold word starts contrasts, 1 to
+        # len(WORD_STRENGTHS). MainWindow keeps a level per terminal font,
+        # since every font's Bold sits at its own distance from Regular.
+
+        def strength_btn(text, tip, delta):
+            b = QToolButton(self)
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setObjectName("GlobalFontBtn")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda: self.wordStrengthDelta.emit(delta))
+            return b
+
+        self.word_strength_dec_btn = strength_btn(
+            "−", "Lighter bold word starts", -1)
+        self.word_strength_inc_btn = strength_btn(
+            "+", "Heavier bold word starts", +1)
+        self.word_strength_label = QLabel(self)
+        self.word_strength_label.setObjectName("OptionsRowLabel")
+        self.word_strength_label.setToolTip(
+            "How much Bold word starts stands out, 1 to "
+            f"{len(WORD_STRENGTHS)}. 1 is the font's plain bold. Higher "
+            "levels thicken the bold start and fade the rest of each word. "
+            "Each terminal font keeps its own level.")
+        self.set_word_strength(DEFAULT_WORD_STRENGTH)
         for key, pill in self._usage_pills.items():
             pill.setVisible(False)
             pill.refreshRequested.connect(self.usageRefreshRequested)
@@ -920,6 +947,9 @@ class TopBar(QFrame):
                                           self.tooltips_btn)
         self.options_panel.add_switch_row(self.bold_word_starts_label,
                                           self.bold_word_starts_btn)
+        self.options_panel.add_row("Boldness", self.word_strength_dec_btn,
+                                   self.word_strength_label,
+                                   self.word_strength_inc_btn)
         self.options_panel.add_row("Theme", self.theme_select)
         self.options_panel.add_row("Font size", self.font_dec_btn,
                                    self.font_inc_btn)
@@ -1699,6 +1729,13 @@ class TopBar(QFrame):
     def set_letter_spacing(self, px: int) -> None:
         """Reflect the letter spacing between its two buttons."""
         self.letter_px_label.setText(f"{int(px)} px")
+
+    def set_word_strength(self, level: int) -> None:
+        """Reflect the Boldness level between its two buttons."""
+        self.word_strength_label.setText(
+            f"{int(level)} of {len(WORD_STRENGTHS)}")
+        self.word_strength_dec_btn.setEnabled(level > 1)
+        self.word_strength_inc_btn.setEnabled(level < len(WORD_STRENGTHS))
 
 
 class AddTerminalDialog(QDialog):
@@ -2815,6 +2852,9 @@ class MainWindow(QMainWindow):
         self._reply_stamps = True     # user preference (persisted)
         self._tooltips = True         # user preference (persisted)
         self._bold_word_starts = False   # user preference (persisted)
+        # Options > Boldness, a level per terminal font id (persisted); a
+        # font with no entry uses DEFAULT_WORD_STRENGTH
+        self._word_strengths: dict[str, int] = {}
         # the tooltip filter goes on at the first show (showEvent), not here
         # startup CLI auto-update. Default OFF (it changes installed software),
         # and like every other preference here the default MUST be assigned
@@ -3240,6 +3280,7 @@ class MainWindow(QMainWindow):
         self.top_bar.tooltipsToggled.connect(self._on_tooltips_toggled)
         self.top_bar.boldWordStartsToggled.connect(
             self._on_bold_word_starts_toggled)
+        self.top_bar.wordStrengthDelta.connect(self._change_word_strength)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.appAutoUpdateToggled.connect(
             self._on_app_auto_update_toggled)
@@ -4931,6 +4972,30 @@ class MainWindow(QMainWindow):
         TerminalView.set_word_starts_enabled(self._bold_word_starts)
         self._schedule_save()
 
+    def _word_strength(self) -> int:
+        """The Boldness level of the active terminal font."""
+        return self._word_strengths.get(ui_theme.TERMINAL_FONT,
+                                        DEFAULT_WORD_STRENGTH)
+
+    def _apply_word_strength(self) -> None:
+        """Hand the active font's Boldness level to the bar and every
+        terminal. Runs when the level or the terminal font changes."""
+        level = self._word_strength()
+        self.top_bar.set_word_strength(level)
+        TerminalView.set_word_strength(level)
+
+    def _change_word_strength(self, delta: int) -> None:
+        """Options > Boldness - / +, for the active terminal font only. An
+        additive optional key under "ui" (no SESSION_VERSION bump), saved
+        on the debounced timer."""
+        level = max(1, min(len(WORD_STRENGTHS),
+                           self._word_strength() + delta))
+        if level == self._word_strength():
+            return
+        self._word_strengths[ui_theme.TERMINAL_FONT] = level
+        self._apply_word_strength()
+        self._schedule_save()
+
     def _on_auto_update_toggled(self, enabled: bool) -> None:
         """User flipped the startup CLI auto-update switch. An ordinary UI
         preference: additive optional key under "ui", saved on the debounced
@@ -6581,6 +6646,15 @@ class MainWindow(QMainWindow):
         self._bold_word_starts = bool(ui.get("bold_word_starts", False))
         self.top_bar.set_bold_word_starts(self._bold_word_starts)
         TerminalView.set_word_starts_enabled(self._bold_word_starts)
+        # its Boldness per terminal font id; a bad entry is dropped, so
+        # that font falls back to the default level
+        saved = ui.get("bold_word_strength")
+        self._word_strengths = {
+            fid: level for fid, level in (
+                saved.items() if isinstance(saved, dict) else ())
+            if isinstance(fid, str) and type(level) is int
+            and 1 <= level <= len(WORD_STRENGTHS)}
+        self._apply_word_strength()
         # startup CLI auto-update (default OFF: it installs software, so it is
         # armed deliberately, once, exactly like the recovery switches were)
         self._auto_update = bool(ui.get("auto_update", False))
@@ -7324,6 +7398,7 @@ class MainWindow(QMainWindow):
         if ui_theme.line_console_font() != line_font:
             self._restyle_line_consoles()
         self._sync_terminal_fonts()
+        self._apply_word_strength()
         self._schedule_save()
 
     def _change_letter_spacing(self, delta: int) -> None:
@@ -7779,6 +7854,7 @@ class MainWindow(QMainWindow):
             "reply_stamps": self._reply_stamps,
             "tooltips": self._tooltips,
             "bold_word_starts": self._bold_word_starts,
+            "bold_word_strength": dict(self._word_strengths),
             "auto_update": self._auto_update,
             "app_auto_update": self._app_auto_update,
             "agent_lanes": self._agent_lanes,

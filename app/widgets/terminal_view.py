@@ -139,6 +139,11 @@ once per paint, skipping the alternate screen, the live input rows and the
 link spans, and caches each row's result by its cells (text and bold). The
 main pass, the find overlay and the focused cursor all draw those cells
 with _run_font's bold, so the effect never blinks off under an overlay.
+Options > Boldness (_word_strength, a level of WORD_STRENGTHS) sets how hard
+the heads contrast. Most terminal fonts draw Bold only a little heavier
+than Regular, and the bundled ones have nothing heavier, so the higher
+levels draw the bold head twice, a fraction of a pixel apart, and paint
+the rest of each word at a lower opacity. Level 1 is the plain bold.
 Ctrl+F finds text in the conversation the way Chrome's find bar does: the
 view emits findRequested and the card opens its FindBar (terminal_find.py),
 which feeds the query back through set_find_query. The view owns the search
@@ -183,7 +188,7 @@ from .. import ui_theme
 from ..terminal_agent import (REFLOW_BEGIN, REFLOW_END, _CLAUDE_READY_HINTS,
                               _NUM_OPTION_RE)
 from ..ui_theme import ANSI_16, Palette
-from ..word_starts import word_start_spans
+from ..word_starts import word_spans
 
 _NAMED = {
     "black": ANSI_16[0], "red": ANSI_16[1], "green": ANSI_16[2],
@@ -195,6 +200,18 @@ _NAMED = {
     "brightmagenta": ANSI_16[13], "brightcyan": ANSI_16[14],
     "brightwhite": ANSI_16[15],
 }
+
+# Options > Boldness for Bold word starts, level 1 to 5. Per level: how
+# far right the bold head of each word is drawn a second time, as a share
+# of the font's pixel size, and the opacity of the rest of the word. Level
+# 1 is plain Bold with nothing faded, which most terminal fonts draw only a
+# little heavier than Regular. Bold word starts reads by contrast between
+# the head and the rest, so the default fades the rest as well.
+WORD_STRENGTHS = ((0.0, 1.0), (0.05, 1.0), (0.06, 0.78), (0.07, 0.64),
+                  (0.07, 0.5))
+DEFAULT_WORD_STRENGTH = 3
+# runs of one value in a _word_start_rows mask
+_MASK_RUNS = re.compile(rb"\x00+|\x01+|\x02+")
 
 # First glyph of an input-box line, used by Ctrl+A to find where the prompt
 # you're typing into begins (so the highlight stops there, not up in the
@@ -1506,6 +1523,26 @@ class TerminalView(QWidget):
     @classmethod
     def word_starts_enabled(cls) -> bool:
         return cls._word_starts_enabled
+
+    # Options > Boldness, how hard Bold word starts contrasts, the same for
+    # every terminal (MainWindow keeps one level per terminal font). Read
+    # at paint time, so a change only repaints.
+    _word_strength = DEFAULT_WORD_STRENGTH
+
+    @classmethod
+    def set_word_strength(cls, level: int) -> None:
+        level = max(1, min(len(WORD_STRENGTHS), int(level)))
+        if level == cls._word_strength:
+            return
+        cls._word_strength = level
+        if cls._word_starts_enabled:
+            for w in QApplication.allWidgets():
+                if isinstance(w, TerminalView):
+                    w.update()
+
+    @classmethod
+    def word_strength(cls) -> int:
+        return cls._word_strength
 
     def clear_history(self) -> None:
         """Drop the scrollback but leave the LIVE screen alone.
@@ -3355,7 +3392,8 @@ class TerminalView(QWidget):
 
     def _word_start_rows(self, lines, hist, off):
         """Per visible row, a mask with a 1 in each column Bold word starts
-        draws in bold, or None for a row with none. None for the whole
+        draws in bold and a 2 in the rest of each word (word_spans), or
+        None for a row with no word. None for the whole
         screen while the switch is off or the alternate screen is up: vim
         and less own every cell there.
 
@@ -3374,7 +3412,7 @@ class TerminalView(QWidget):
             self._ws_font = QFont(self._font)
         cols = self.screen.columns
         # the row above the view, so a word wrapped onto the top row gets
-        # its prefix only once (word_start_spans' prev_row_tail)
+        # its prefix only once (word_spans' prev_row_tail)
         above = None
         if hist is not None and off:
             if len(hist) > off:
@@ -3390,11 +3428,12 @@ class TerminalView(QWidget):
             mask = old.get(key, False)
             if mask is False:
                 mask = None
-                spans = word_start_spans(cells, tail)
+                spans = word_spans(cells, tail)
                 if spans:
                     buf = bytearray(cols)
-                    for a, b in spans:
+                    for a, b, e in spans:
                         buf[a:b] = b"\x01" * (b - a)
+                        buf[b:e] = b"\x02" * (e - b)
                     mask = bytes(buf)
             cache[key] = mask
             rows.append(mask)
@@ -3432,26 +3471,31 @@ class TerminalView(QWidget):
                     text: str | None = None) -> None:
         """drawText one grid-safe piece, cells [i, j) of `line`, with the
         painter holding the piece's font and pen. Cells `starts` marks (a
-        row of _word_start_rows, or None) go out in bold. `text` is the
-        piece's text when the caller has already joined it.
+        row of _word_start_rows, or None) with a 1 go out in bold, and at
+        a Boldness level that fades the rest of a word, the 2s at that
+        opacity. `text` is the piece's text when the caller has already
+        joined it.
 
-        Two passes, never one call per word: the regular text goes out
-        with blanks where the bold cells are, then the bold text with
-        blanks everywhere else. A grid-safe piece holds only glyphs that
-        advance one cell, and _run_font's bold advances the same, blanks
-        included, so both passes land on the grid. The underline comes from
-        the regular pass only, so it runs unbroken at one thickness.
+        One pass per style, never one call per word: the regular text goes
+        out with blanks where the other cells are, then the faded text and
+        the bold text the same way. A grid-safe piece holds only glyphs
+        that advance one cell, and _run_font's bold advances the same,
+        blanks included, so every pass lands on the grid. The underline
+        comes from the regular pass only, so it runs unbroken at one
+        thickness.
 
         Measured on a 120x50 screen of prose with a find query showing, a
         drawText per stretch made a paint cost about 2x the plain one, a
         second full-width drawText about 1.45x, and the bold pass as a
         QStaticText about 1.25x: the bold strings repeat paint after paint,
-        and the static text keeps their layout. Either pass paints the
-        same pixels as the child's own bold would (tests/smoke/
-        word_starts.py checks it)."""
+        and the static text keeps their layout. At Boldness 1 the bold
+        pass paints the same pixels as the child's own bold would
+        (tests/smoke/word_starts.py checks it)."""
         x = int(CELL_PAD_X + i * self._cell_w)
         base = int(y + self._ascent)
-        if starts is None or starts.find(1, i, j) < 0:
+        stroke, fade = WORD_STRENGTHS[TerminalView._word_strength - 1]
+        if starts is None or (starts.find(1, i, j) < 0 and (
+                fade >= 1 or starts.find(2, i, j) < 0)):
             if text is None:
                 text = "".join(line[k].data or " " for k in range(i, j))
             painter.drawText(x, base, text)
@@ -3459,37 +3503,54 @@ class TerminalView(QWidget):
         # one cell per entry: a cell with a combining mark is two code
         # points, so the joined text can't be sliced by column
         cells = [line[k].data or " " for k in range(i, j)]
-        regular, bold = [], []
-        k = i
-        while k < j:
-            a = starts.find(1, k, j)
-            if a < 0:
-                a = j
-            b = starts.find(0, a, j) if a < j else j
-            if b < 0:
-                b = j
-            regular += cells[k - i:a - i]
-            regular.append(" " * (b - a))
-            bold.append(" " * (a - k))
-            bold += cells[a - i:b - i]
-            k = b
-        text = "".join(regular)
+        # by mask value: 0 regular, 1 bold, 2 faded (None: drawn regular)
+        passes = ([], [], [] if fade < 1 else None)
+        for m in _MASK_RUNS.finditer(starts, i, j):
+            a, b = m.start(), m.end()
+            kind = starts[a]
+            if passes[kind] is None:
+                kind = 0
+            for k, out in enumerate(passes):
+                if out is None:
+                    continue
+                if k == kind:
+                    out += cells[a - i:b - i]
+                else:
+                    out.append(" " * (b - a))
+        text = "".join(passes[0])
         if underline or text.strip():
             painter.drawText(x, base, text)
-        font = self._run_font(True, italic, False)
-        painter.setFont(font)
-        text = "".join(bold)
-        entry = self._ws_static.get((text, italic))
-        if entry is None:
-            if len(self._ws_static) > 8 * self.screen.lines:
-                self._ws_static = {}
-            st = QStaticText(text)
-            st.setTextFormat(Qt.TextFormat.PlainText)
-            # placed by its top edge, so the baseline lands where drawText
-            # would put it only with the bold font's own ascent
-            entry = (st, QFontMetricsF(font).ascent())
-            self._ws_static[(text, italic)] = entry
-        painter.drawStaticText(QPointF(x, base - entry[1]), entry[0])
+        if passes[2] is not None:
+            text = "".join(passes[2])
+            if text.strip():
+                pen = painter.pen()
+                ink = QColor(pen.color())
+                ink.setAlphaF(ink.alphaF() * fade)
+                painter.setPen(ink)
+                painter.drawText(x, base, text)
+                painter.setPen(pen)
+        text = "".join(passes[1])
+        if text.strip():
+            font = self._run_font(True, italic, False)
+            painter.setFont(font)
+            entry = self._ws_static.get((text, italic))
+            if entry is None:
+                if len(self._ws_static) > 8 * self.screen.lines:
+                    self._ws_static = {}
+                st = QStaticText(text)
+                st.setTextFormat(Qt.TextFormat.PlainText)
+                # placed by its top edge, so the baseline lands where
+                # drawText would put it only with the bold font's own ascent
+                entry = (st, QFontMetricsF(font).ascent())
+                self._ws_static[(text, italic)] = entry
+            top = base - entry[1]
+            painter.drawStaticText(QPointF(x, top), entry[0])
+            if stroke:
+                # the same text again a little to the right thickens every
+                # stem, in any font: the bundled ones stop at Bold
+                painter.drawStaticText(
+                    QPointF(x + stroke * self._font.pixelSize(), top),
+                    entry[0])
         painter.setFont(self._run_font(False, italic, underline))
 
     def cell_bounds(self, col: int, row: int) -> tuple[int, int, int, int]:
@@ -3921,7 +3982,7 @@ class TerminalView(QWidget):
                     cur = starts[cursor.y] if starts else None
                     painter.setFont(self._run_font(
                         ch_cell.bold or bool(cur and cursor.x < len(cur)
-                                             and cur[cursor.x]),
+                                             and cur[cursor.x] == 1),
                         ch_cell.italics, ch_cell.underscore))
                     painter.drawText(int(cx), int(cy + self._ascent), data)
             else:  # hollow box when unfocused
