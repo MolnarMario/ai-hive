@@ -441,6 +441,12 @@ workspaces keep executing — switching never pauses anything.
   there. The ▾ beside Open repo lists the GitHub repository's recent pull
   requests and commits. AI Hive loads that list in the background a few
   seconds after startup and keeps it, so the menu opens already filled.
+- **Bold word starts.** ⚙ Options > Appearance > **Bold word starts** (off by
+  default) draws the first half of each prose word in the agent terminals in
+  bold, which some readers, dyslexic readers among them, find easier to
+  track. Only words change: code, paths, flags, numbers, links, the line
+  you're typing and anything the agent already made bold keep their weight,
+  and vim, less and other full-screen apps are left alone.
 - **Font controls** — per-agent A−/A+ (and `Ctrl+±`) plus a global A−/A+ under
   **⚙ Options**; sizes persist.
 - **Shared agent awareness** — agents in a workspace coordinate through a
@@ -596,7 +602,7 @@ workspaces keep executing — switching never pauses anything.
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
   reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Update AI
-  Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times** and **Tooltips** as labelled switches (each with a green/dark LED, so
+  Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times**, **Tooltips** and **Bold word starts** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), the detected
   Claude Code install method with a **Manage…** door to the Updates panel, and
   the theme and global font size below. Click outside or press `Esc` to close.

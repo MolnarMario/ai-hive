@@ -132,6 +132,13 @@ prompt is never counted). Fail-closed: a selection that escapes the input box
 nothing -- inference from painted rows must never corrupt what it can't be sure
 of. To empty the whole prompt at once, use Ctrl+A then Backspace (the
 clear-prompt gesture above).
+Options > Bold word starts (off by default, one class flag for every view)
+draws the first half of each prose word in bold. app/word_starts.py picks
+the cells from a whole row; _word_start_rows runs it over the visible rows
+once per paint, skipping the alternate screen, the live input rows and the
+link spans, and caches each row's result by its cells (text and bold). The
+main pass, the find overlay and the focused cursor all draw those cells
+with _run_font's bold, so the effect never blinks off under an overlay.
 Ctrl+F finds text in the conversation the way Chrome's find bar does: the
 view emits findRequested and the card opens its FindBar (terminal_find.py),
 which feeds the query back through set_find_query. The view owns the search
@@ -156,15 +163,16 @@ import re
 import time
 
 import pyte
-from PySide6.QtCore import QEvent, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPointF, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
-                           QPainter, QWheelEvent)
+                           QPainter, QStaticText, QWheelEvent)
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import ui_theme
 from ..terminal_agent import (REFLOW_BEGIN, REFLOW_END, _CLAUDE_READY_HINTS,
                               _NUM_OPTION_RE)
 from ..ui_theme import ANSI_16, Palette
+from ..word_starts import word_start_spans
 
 _NAMED = {
     "black": ANSI_16[0], "red": ANSI_16[1], "green": ANSI_16[2],
@@ -703,6 +711,13 @@ class TerminalView(QWidget):
         # because classifying a token can stat the filesystem.
         self._link_spans: list[tuple[int, int, int]] = []  # (row, c0, c1)
         self._link_sig = None
+        # Bold word starts (_word_start_rows): each visible row's bold mask
+        # keyed by its cells, the input rows keyed by what they read, and
+        # the bold pass's laid-out text for the font it was laid out in
+        self._ws_rows: dict = {}
+        self._ws_input = (None, None)
+        self._ws_static: dict = {}
+        self._ws_font = None
         self._bracketed_paste = False  # tracked from the stream (pyte ignores 2004)
         self._alt_screen = False       # ?1049/?1047/?47 — app owns the screen
         self._mouse_tracking = False   # ?1000/?1002/?1003 — app wants mouse
@@ -1369,6 +1384,24 @@ class TerminalView(QWidget):
     @classmethod
     def reply_stamps_enabled(cls) -> bool:
         return cls._reply_stamps_enabled
+
+    # The "Bold word starts" switch in Options. One flag for every terminal,
+    # read at paint time like the one above. Default OFF.
+    _word_starts_enabled = False
+
+    @classmethod
+    def set_word_starts_enabled(cls, on: bool) -> None:
+        on = bool(on)
+        if on == cls._word_starts_enabled:
+            return
+        cls._word_starts_enabled = on
+        for w in QApplication.allWidgets():
+            if isinstance(w, TerminalView):
+                w.update()
+
+    @classmethod
+    def word_starts_enabled(cls) -> bool:
+        return cls._word_starts_enabled
 
     def clear_history(self) -> None:
         """Drop the scrollback but leave the LIVE screen alone.
@@ -3155,6 +3188,145 @@ class TerminalView(QWidget):
             return QColor("#" + value)
         return QColor(default)
 
+    def _word_start_rows(self, lines, hist, off):
+        """Per visible row, a mask with a 1 in each column Bold word starts
+        draws in bold, or None for a row with none. None for the whole
+        screen while the switch is off or the alternate screen is up: vim
+        and less own every cell there.
+
+        Segmenting a 120x50 screen of prose costs about 5 ms, a third of a
+        whole paint, against 0.24 ms to look the rows up. So each row's
+        mask is kept, keyed by its cells (text and bold together: a row
+        the child re-bolds is a new key) and the cell above it. The cache
+        holds only the rows on screen, so scrolling by a line segments one
+        row."""
+        if not TerminalView._word_starts_enabled or self._alt_screen:
+            if self._ws_rows or self._ws_static:
+                self._ws_rows, self._ws_static = {}, {}
+            return None
+        if self._ws_font != self._font:   # A+/A- sets the size in place
+            self._ws_static = {}
+            self._ws_font = QFont(self._font)
+        cols = self.screen.columns
+        # the row above the view, so a word wrapped onto the top row gets
+        # its prefix only once (word_start_spans' prev_row_tail)
+        above = None
+        if hist is not None and off:
+            if len(hist) > off:
+                above = hist[len(hist) - off - 1]
+        elif self.screen.history.top:
+            above = self.screen.history.top[-1]
+        tail = above[cols - 1].data if above is not None else None
+        old, cache = self._ws_rows, {}
+        rows = []
+        for line in lines:
+            cells = tuple(line[c] for c in range(cols))
+            key = (cells, tail)
+            mask = old.get(key, False)
+            if mask is False:
+                mask = None
+                spans = word_start_spans(cells, tail)
+                if spans:
+                    buf = bytearray(cols)
+                    for a, b in spans:
+                        buf[a:b] = b"\x01" * (b - a)
+                    mask = bytes(buf)
+            cache[key] = mask
+            rows.append(mask)
+            tail = cells[-1].data if cells else None
+        self._ws_rows = cache
+        # The live input rows, where a prefix would jump about as the user
+        # types. _input_block_span is a Claude-shaped guess in live-screen
+        # rows (visible row = live row + off); when it finds nothing, every
+        # row keeps its prefixes. Under a block of output it scans every row
+        # above the caret twice, so on the live view its answer is kept
+        # until the rows' text (the link signature) or the caret row moves.
+        if off < len(rows):
+            if off:
+                span = self._input_block_span()
+            else:
+                key = (self._link_sig, self.screen.cursor.y)
+                if self._ws_input[0] != key:
+                    self._ws_input = (key, self._input_block_span())
+                span = self._ws_input[1]
+            if span is not None:
+                for r in range(span[0] + off,
+                               min(span[1] + off + 1, len(rows))):
+                    rows[r] = None
+        # what the view treats as a link keeps its regular weight, whatever
+        # the token rules made of it
+        for r, c0, c1 in self._link_spans:
+            if r < len(rows) and rows[r] is not None:
+                mask = bytearray(rows[r])
+                mask[c0:c1 + 1] = bytes(c1 - c0 + 1)
+                rows[r] = bytes(mask)
+        return rows
+
+    def _draw_piece(self, painter, line, i: int, j: int, y: float, starts,
+                    italic: bool, underline: bool,
+                    text: str | None = None) -> None:
+        """drawText one grid-safe piece, cells [i, j) of `line`, with the
+        painter holding the piece's font and pen. Cells `starts` marks (a
+        row of _word_start_rows, or None) go out in bold. `text` is the
+        piece's text when the caller has already joined it.
+
+        Two passes, never one call per word: the regular text goes out
+        with blanks where the bold cells are, then the bold text with
+        blanks everywhere else. A grid-safe piece holds only glyphs that
+        advance one cell, and _run_font's bold advances the same, blanks
+        included, so both passes land on the grid. The underline comes from
+        the regular pass only, so it runs unbroken at one thickness.
+
+        Measured on a 120x50 screen of prose with a find query showing, a
+        drawText per stretch made a paint cost about 2x the plain one, a
+        second full-width drawText about 1.45x, and the bold pass as a
+        QStaticText about 1.25x: the bold strings repeat paint after paint,
+        and the static text keeps their layout. Either pass paints the
+        same pixels as the child's own bold would (tests/smoke/
+        word_starts.py checks it)."""
+        x = int(CELL_PAD_X + i * self._cell_w)
+        base = int(y + self._ascent)
+        if starts is None or starts.find(1, i, j) < 0:
+            if text is None:
+                text = "".join(line[k].data or " " for k in range(i, j))
+            painter.drawText(x, base, text)
+            return
+        # one cell per entry: a cell with a combining mark is two code
+        # points, so the joined text can't be sliced by column
+        cells = [line[k].data or " " for k in range(i, j)]
+        regular, bold = [], []
+        k = i
+        while k < j:
+            a = starts.find(1, k, j)
+            if a < 0:
+                a = j
+            b = starts.find(0, a, j) if a < j else j
+            if b < 0:
+                b = j
+            regular += cells[k - i:a - i]
+            regular.append(" " * (b - a))
+            bold.append(" " * (a - k))
+            bold += cells[a - i:b - i]
+            k = b
+        text = "".join(regular)
+        if underline or text.strip():
+            painter.drawText(x, base, text)
+        font = self._run_font(True, italic, False)
+        painter.setFont(font)
+        text = "".join(bold)
+        entry = self._ws_static.get((text, italic))
+        if entry is None:
+            if len(self._ws_static) > 8 * self.screen.lines:
+                self._ws_static = {}
+            st = QStaticText(text)
+            st.setTextFormat(Qt.TextFormat.PlainText)
+            # placed by its top edge, so the baseline lands where drawText
+            # would put it only with the bold font's own ascent
+            entry = (st, QFontMetricsF(font).ascent())
+            self._ws_static[(text, italic)] = entry
+        painter.drawStaticText(QPointF(x, base - entry[1]), entry[0])
+        painter.setFont(self._run_font(False, italic, underline))
+
     def cell_bounds(self, col: int, row: int) -> tuple[int, int, int, int]:
         """Device-pixel (x0, y0, x1, y1) of one cell, ROUNDED on the shared
         grid so cell N's right edge is bit-identical to cell N+1's left edge.
@@ -3165,6 +3337,20 @@ class TerminalView(QWidget):
                 round(CELL_PAD_Y + row * self._cell_h),
                 round(CELL_PAD_X + (col + 1) * self._cell_w),
                 round(CELL_PAD_Y + (row + 1) * self._cell_h))
+
+    def _run_font(self, bold: bool, italic: bool, underline: bool) -> QFont:
+        """The font a run in this style paints with. Consolas's Bold face
+        advances exactly one cell, so the base font with the style set is
+        enough here; a family whose synthetic bold is wider needs this to
+        hold its advance to the cell."""
+        font = QFont(self._font)
+        if bold:
+            font.setWeight(QFont.Weight.Bold)
+        if italic:
+            font.setItalic(True)
+        if underline:
+            font.setUnderline(True)
+        return font
 
     def _is_grid_glyph(self, data: str) -> bool:
         """True when this character advances exactly one cell in the terminal
@@ -3222,6 +3408,8 @@ class TerminalView(QWidget):
         if sig != self._link_sig:
             self._link_sig = sig
             self._rescan_links(lines)
+        # Bold word starts, after the link scan it leaves alone
+        starts = self._word_start_rows(lines, hist, off)
 
         # selection highlight (drawn under the text)
         rng = self._selection_range()
@@ -3237,6 +3425,7 @@ class TerminalView(QWidget):
                     int((ec - sc + 1) * cw), int(ch) + 1, sel)
         for row in range(self.screen.lines):
             line = lines[row]
+            row_starts = starts[row] if starts else None
             y = CELL_PAD_Y + row * ch
             col = 0
             while col < self.screen.columns:
@@ -3269,14 +3458,9 @@ class TerminalView(QWidget):
                     bx1 = self.cell_bounds(run_end - 1, row)[2]
                     painter.fillRect(bx0, by0, bx1 - bx0, by1 - by0, bg)
                 if text.strip():
-                    font = QFont(self._font)
-                    if char.bold:
-                        font.setWeight(QFont.Weight.Bold)
-                    if char.italics:
-                        font.setItalic(True)
-                    if char.underscore:
-                        font.setUnderline(True)
-                    painter.setFont(font)
+                    bold, italic = char.bold, char.italics
+                    painter.setFont(
+                        self._run_font(bold, italic, char.underscore))
                     # guarantee the glyph is readable on its real background,
                     # whatever color the child emitted (dark-tuned on a light
                     # theme, or vice versa)
@@ -3303,9 +3487,8 @@ class TerminalView(QWidget):
                             j += 1
                         if j == i:  # a lone off-grid glyph, placed by hand
                             j = i + 1
-                        painter.drawText(
-                            int(CELL_PAD_X + i * cw), int(y + self._ascent),
-                            "".join(line[k].data or " " for k in range(i, j)))
+                        self._draw_piece(painter, line, i, j, y, row_starts,
+                                         italic, char.underscore)
                         i = j
                 col = run_end
 
@@ -3316,7 +3499,7 @@ class TerminalView(QWidget):
         # nothing would show what Ctrl+C copies.
         if self._find_rows:
             top_line = self.history_pushed() - off
-            painter.setFont(self._font)
+            font_style = None   # the style the painter's font is in
             hit, active = QColor(FIND_HIT), QColor(FIND_ACTIVE)
             ink = QColor(FIND_INK)
             sel = QColor(Palette.SELECTION)
@@ -3326,6 +3509,7 @@ class TerminalView(QWidget):
                 if not spans:
                     continue
                 line = lines[row]
+                row_starts = starts[row] if starts else None
                 y = CELL_PAD_Y + row * ch
                 for c0, c1, idx in spans:
                     if c0 >= _cols:
@@ -3347,20 +3531,33 @@ class TerminalView(QWidget):
                     painter.setPen(ink)
                     # grid-safe pieces, one drawText each, as for the text
                     # itself: a glyph per call made a page of one-letter
-                    # matches cost 90 ms a paint
+                    # matches cost 90 ms a paint. A piece also ends where the
+                    # cells' style does, so a match keeps its weight, slant
+                    # and bold word starts under the box.
                     i = c0
                     while i <= c1:
+                        cell = line[i]
+                        style = (cell.bold, cell.italics, cell.underscore)
                         j = i
-                        while j <= c1 and self._is_grid_glyph(
-                                line[j].data or " "):
+                        while j <= c1:
+                            nxt = line[j]
+                            if ((nxt.bold, nxt.italics, nxt.underscore)
+                                    != style or not self._is_grid_glyph(
+                                        nxt.data or " ")):
+                                break
                             j += 1
                         if j == i:  # a lone off-grid glyph, placed by hand
                             j = i + 1
                         text = "".join(line[k].data or " "
                                        for k in range(i, j))
                         if text.strip():
-                            painter.drawText(int(CELL_PAD_X + i * cw),
-                                             int(y + self._ascent), text)
+                            # _draw_piece hands the font back in `style`
+                            if style != font_style:
+                                painter.setFont(self._run_font(*style))
+                                font_style = style
+                            self._draw_piece(painter, line, i, j, y,
+                                             row_starts, style[1], style[2],
+                                             text)
                         i = j
 
         # reply-finished stamps: a dim date/time drawn into the RIGHT-hand
@@ -3428,6 +3625,14 @@ class TerminalView(QWidget):
                 ch_cell = self.screen.buffer[cursor.y][cursor.x]
                 if ch_cell.data.strip():
                     painter.setPen(QColor(Palette.BG_CONSOLE))
+                    # the cell's own style and word-start bold, as the main
+                    # pass drew it: the painter still holds whatever font
+                    # the last pass left
+                    cur = starts[cursor.y] if starts else None
+                    painter.setFont(self._run_font(
+                        ch_cell.bold or bool(cur and cursor.x < len(cur)
+                                             and cur[cursor.x]),
+                        ch_cell.italics, ch_cell.underscore))
                     painter.drawText(int(cx), int(cy + self._ascent), ch_cell.data)
             else:  # hollow box when unfocused
                 painter.setPen(QColor(Palette.ACCENT_ORANGE))

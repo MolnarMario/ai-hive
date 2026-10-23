@@ -522,6 +522,7 @@ class TopBar(QFrame):
     usageLeftToggled = Signal(bool)        # usage pills say "% left", not "% used"
     replyStampsToggled = Signal(bool)      # date/time under each finished reply
     tooltipsToggled = Signal(bool)         # hover tooltips, app-wide
+    boldWordStartsToggled = Signal(bool)   # first half of each word in bold
     # install newer Claude Code / agy CLIs at the NEXT startup, before any
     # agent launches (the only moment those binaries are not locked)
     autoUpdateToggled = Signal(bool)
@@ -782,6 +783,15 @@ class TopBar(QFrame):
         self.tooltips_btn = ToggleSwitch(self)
         self.tooltips_btn.clicked.connect(self._on_tooltips_clicked)
         self._refresh_tooltips_btn()
+        # "Bold word starts": every terminal draws the first half of each
+        # prose word in bold (TerminalView._word_starts_enabled). Default
+        # OFF, an opt-in comfort setting.
+        self._bold_word_starts = False
+        self.bold_word_starts_label = toggle_label("")
+        self.bold_word_starts_btn = ToggleSwitch(self)
+        self.bold_word_starts_btn.clicked.connect(
+            self._on_bold_word_starts_clicked)
+        self._refresh_bold_word_starts_btn()
         for key, pill in self._usage_pills.items():
             pill.setVisible(False)
             pill.refreshRequested.connect(self.usageRefreshRequested)
@@ -869,6 +879,8 @@ class TopBar(QFrame):
                                           self.reply_stamps_btn)
         self.options_panel.add_switch_row(self.tooltips_label,
                                           self.tooltips_btn)
+        self.options_panel.add_switch_row(self.bold_word_starts_label,
+                                          self.bold_word_starts_btn)
         self.options_panel.add_row("Theme", self.theme_select)
         self.options_panel.add_row("Font size", self.font_dec_btn,
                                    self.font_inc_btn)
@@ -1151,6 +1163,31 @@ class TopBar(QFrame):
             "Click to turn the explanations back on.")
         self.tooltips_btn.setToolTip(tip)
         self.tooltips_label.setToolTip(tip)
+
+    def _on_bold_word_starts_clicked(self) -> None:
+        self.set_bold_word_starts(not self._bold_word_starts)
+        self.boldWordStartsToggled.emit(self._bold_word_starts)
+
+    def set_bold_word_starts(self, on: bool) -> None:
+        """Reflect the "Bold word starts" switch (no signal emitted)."""
+        self._bold_word_starts = bool(on)
+        self._refresh_bold_word_starts_btn()
+
+    def _refresh_bold_word_starts_btn(self) -> None:
+        self.bold_word_starts_btn.setChecked(self._bold_word_starts)
+        self.bold_word_starts_label.setText("📖  Bold word starts")
+        # an opt-in comfort setting: the tests published so far show no
+        # reading-speed gain, so the tip promises none
+        tip = (
+            "Bold word starts: ON. The terminals draw the first half of each "
+            "word in bold. Code, paths, links and the line you are typing "
+            "keep their regular weight.\nClick to turn it off."
+            if self._bold_word_starts else
+            "Bold word starts: OFF.\nClick to draw the first half of each "
+            "word in the terminals in bold. Some readers, dyslexic readers "
+            "among them, find a line easier to follow that way.")
+        self.bold_word_starts_btn.setToolTip(tip)
+        self.bold_word_starts_label.setToolTip(tip)
 
     def _on_agent_lanes_clicked(self) -> None:
         self.set_agent_lanes(not self._agent_lanes)
@@ -2677,6 +2714,7 @@ class MainWindow(QMainWindow):
         # other preferences or the restored value is clobbered.
         self._reply_stamps = True     # user preference (persisted)
         self._tooltips = True         # user preference (persisted)
+        self._bold_word_starts = False   # user preference (persisted)
         # the tooltip filter goes on at the first show (showEvent), not here
         # startup CLI auto-update. Default OFF (it changes installed software),
         # and like every other preference here the default MUST be assigned
@@ -3098,6 +3136,8 @@ class MainWindow(QMainWindow):
         self.top_bar.usageLeftToggled.connect(self._on_usage_left_toggled)
         self.top_bar.replyStampsToggled.connect(self._on_reply_stamps_toggled)
         self.top_bar.tooltipsToggled.connect(self._on_tooltips_toggled)
+        self.top_bar.boldWordStartsToggled.connect(
+            self._on_bold_word_starts_toggled)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.appAutoUpdateToggled.connect(
             self._on_app_auto_update_toggled)
@@ -4779,6 +4819,16 @@ class MainWindow(QMainWindow):
         tooltips.set_enabled(self._tooltips)
         self._schedule_save()
 
+    def _on_bold_word_starts_toggled(self, enabled: bool) -> None:
+        """User flipped "Bold word starts". Every terminal repaints at once.
+        Nothing reflows and no pty resizes: the bold faces advance one cell
+        like the regular one, so only the visible rows are segmented again.
+        An additive optional key under "ui" (no SESSION_VERSION bump),
+        saved on the debounced timer."""
+        self._bold_word_starts = bool(enabled)
+        TerminalView.set_word_starts_enabled(self._bold_word_starts)
+        self._schedule_save()
+
     def _on_auto_update_toggled(self, enabled: bool) -> None:
         """User flipped the startup CLI auto-update switch. An ordinary UI
         preference: additive optional key under "ui", saved on the debounced
@@ -6414,6 +6464,10 @@ class MainWindow(QMainWindow):
         self._tooltips = bool(ui.get("tooltips", True))
         self.top_bar.set_tooltips(self._tooltips)
         tooltips.set_enabled(self._tooltips)
+        # first half of each prose word in bold (default OFF)
+        self._bold_word_starts = bool(ui.get("bold_word_starts", False))
+        self.top_bar.set_bold_word_starts(self._bold_word_starts)
+        TerminalView.set_word_starts_enabled(self._bold_word_starts)
         # startup CLI auto-update (default OFF: it installs software, so it is
         # armed deliberately, once, exactly like the recovery switches were)
         self._auto_update = bool(ui.get("auto_update", False))
@@ -7548,6 +7602,7 @@ class MainWindow(QMainWindow):
             "usage_left": self._usage_left,
             "reply_stamps": self._reply_stamps,
             "tooltips": self._tooltips,
+            "bold_word_starts": self._bold_word_starts,
             "auto_update": self._auto_update,
             "app_auto_update": self._app_auto_update,
             "agent_lanes": self._agent_lanes,
