@@ -2567,8 +2567,9 @@ class TerminalView(QWidget):
         if span is not None or cy < 1 \
                 or self._row_content(cy) != (-1, -1):
             return span
+        # its bottom is always cy - 1, since row cy is blank
         above = self._input_block_span(cy - 1)
-        if above is None or above[1] != cy - 1:
+        if above is None:
             return None
         first, _ = self._row_content(above[0])
         if first < 0 or self.screen.buffer[above[0]][first].data \

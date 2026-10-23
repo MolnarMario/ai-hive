@@ -139,7 +139,7 @@ def _masks(tv) -> list:
 
 
 def _with_switch(on: bool, fn, strength: int = 1):
-    """Run fn with the switch set, at Boldness `strength`. Level 1 is the
+    """Run fn with the switch set, at Contrast `strength`. Level 1 is the
     plain bold the pixel checks compare with the child's own."""
     from app.widgets.terminal_view import DEFAULT_WORD_STRENGTH, TerminalView
     TerminalView.set_word_starts_enabled(on)
@@ -159,7 +159,7 @@ _PROSE_BOLD = ("\x1b[1mread\x1b[22ming \x1b[1mth\x1b[22mis "
 
 
 def test_word_starts_option_toggle():
-    """The "Bold word starts" switch in Options defaults OFF, persists under
+    """The "Bionic reading" switch in Options defaults OFF, persists under
     ui through a temp SessionStore, and repaints every terminal."""
     import shutil
     import tempfile
@@ -211,6 +211,25 @@ def test_word_starts_option_toggle():
               bar.word_strength_inc_btn.isVisibleTo(bar.options_panel)
               and bar.word_strength_dec_btn.isVisibleTo(bar.options_panel)
               and bar.word_strength_label.isVisibleTo(bar.options_panel))
+        # the switch sits in the panel, so it is flipped with the panel open
+        bar.show()
+        bar._open_options()
+        app.processEvents()
+        panel = bar.options_panel
+        tall = panel.height()
+        bar.bold_word_starts_btn.click()
+        app.processEvents()
+        short = panel.height()
+        check("word starts toggle: turning it off with the panel open "
+              "shrinks the panel to fit",
+              panel.isVisible() and short < tall
+              and short == panel.sizeHint().height(), (tall, short))
+        bar.bold_word_starts_btn.click()
+        app.processEvents()
+        check("word starts toggle: ...and turning it on grows it back",
+              panel.height() == tall, (tall, panel.height()))
+        panel.hide()
+        bar.hide()
         bar.deleteLater()
 
         win = create_main_window(SessionStore(path=tmp / "session.json"))
@@ -321,10 +340,9 @@ def test_word_starts_paint():
     # typed text that fills its last row leaves the caret alone on the blank
     # row below; the prompt must keep its regular weight there too
     cols = 24
-    full = "> typing words here abc"      # 22 characters
-    full = full + "d"                    # 23
-    full = full + "e"                    # 24 = cols
+    full = "> typing words here abcd"     # 24 = cols
     more = "typing words here abcde!"    # 24
+    assert len(full) == len(more) == cols
     for name, text in (("one row", full), ("two rows", full + more)):
         wrapped = _view(_PROSE + "\r\n\r\n" + text + "\r\n",
                         rows=8, cols=cols)
@@ -421,7 +439,7 @@ def test_word_starts_rows():
 
 def test_word_starts_spans_rest():
     """word_spans gives each letter run its bold head and its rest, the
-    part the higher Boldness levels fade."""
+    part the higher Contrast levels fade."""
     from app.word_starts import word_spans
     check("word spans: head and rest of each word",
           word_spans(_row("reading this")) == [(0, 4, 7), (8, 10, 12)],
@@ -459,7 +477,7 @@ def _ink(tv, img, row: int, c0: int, c1: int) -> int:
 
 
 def test_word_starts_strength_paint():
-    """Boldness: every level above 1 inks the heads heavier, the fading
+    """Contrast: every level above 1 inks the heads heavier, the fading
     levels paint the rest of each word dimmer, and code stays as it was
     at every level."""
     from PySide6.QtWidgets import QApplication
@@ -473,22 +491,22 @@ def test_word_starts_strength_paint():
     heads = [_ink(tv, img, 0, 0, 4) for img in shots]
     rests = [_ink(tv, img, 0, 5, 7) for img in shots]
     code = [_ink(tv, img, 0, 8, 16) for img in shots]
-    check("boldness paint: every level above 1 inks the head heavier",
+    check("contrast paint: every level above 1 inks the head heavier",
           all(h > heads[0] for h in heads[1:]), heads)
-    check("boldness paint: the head never gets lighter going up",
+    check("contrast paint: the head never gets lighter going up",
           all(b >= a for a, b in zip(heads, heads[1:])), heads)
     fades = [lvl for lvl, (_s, f) in enumerate(WORD_STRENGTHS) if f < 1]
-    check("boldness paint: the fading levels dim the rest of the word, "
+    check("contrast paint: the fading levels dim the rest of the word, "
           "more at each level",
           fades and all(rests[a] < rests[a - 1] for a in fades), rests)
-    check("boldness paint: a level that does not fade leaves the rest as "
+    check("contrast paint: a level that does not fade leaves the rest as "
           "level 1 paints it",
           all(rests[lvl] == rests[0] for lvl, (_s, f)
               in enumerate(WORD_STRENGTHS) if f >= 1), rests)
-    check("boldness paint: code keeps its pixels at every level",
+    check("contrast paint: code keeps its pixels at every level",
           len(set(code)) == 1, code)
     off = tv.grab().toImage()
-    check("boldness paint: with the switch off no level changes a pixel",
+    check("contrast paint: with the switch off no level changes a pixel",
           all(_with_switch(False, lambda: tv.grab().toImage(), level)
               == off for level in range(1, len(WORD_STRENGTHS) + 1)))
     # the find overlay redraws the text: it keeps the level's look
@@ -498,12 +516,12 @@ def test_word_starts_strength_paint():
     top = len(WORD_STRENGTHS)
     lo, hi = (_with_switch(True, lambda: found.grab().toImage(), level)
               for level in (1, top))
-    check("boldness paint: a find match keeps the level under its box",
+    check("contrast paint: a find match keeps the level under its box",
           _ink(found, hi, 0, 5, 7) != _ink(found, lo, 0, 5, 7))
 
 
 def test_word_starts_strength_option():
-    """Options > Boldness: a -/+ row next to the switch, a level per
+    """Options > Contrast: a -/+ row next to the switch, a level per
     terminal font, persisted under ui and restored."""
     import shutil
     import tempfile
@@ -525,10 +543,10 @@ def test_word_starts_strength_option():
     font0 = ui_theme.TERMINAL_FONT
     try:
         bar = TopBar()
-        check("boldness option: the row is in the Options panel",
+        check("contrast option: the row is in the Options panel",
               bar.options_panel.isAncestorOf(bar.word_strength_inc_btn)
               and bar.options_panel.isAncestorOf(bar.word_strength_label))
-        check("boldness option: the label reads the default level",
+        check("contrast option: the label reads the default level",
               bar.word_strength_label.text()
               == f"{DEFAULT_WORD_STRENGTH} of {top}",
               bar.word_strength_label.text())
@@ -536,54 +554,54 @@ def test_word_starts_strength_option():
         bar.wordStrengthDelta.connect(emitted.append)
         bar.word_strength_inc_btn.click()
         bar.word_strength_dec_btn.click()
-        check("boldness option: + and - emit +1 and -1",
+        check("contrast option: + and - emit +1 and -1",
               emitted == [1, -1], emitted)
         bar.set_word_strength(1)
-        check("boldness option: - is disabled at level 1",
+        check("contrast option: - is disabled at level 1",
               not bar.word_strength_dec_btn.isEnabled()
               and bar.word_strength_inc_btn.isEnabled())
         bar.set_word_strength(top)
-        check("boldness option: + is disabled at the top level",
+        check("contrast option: + is disabled at the top level",
               bar.word_strength_dec_btn.isEnabled()
               and not bar.word_strength_inc_btn.isEnabled())
         bar.deleteLater()
 
         win = create_main_window(SessionStore(path=tmp / "session.json"))
         win._save_timer.stop()
-        check("boldness option: a fresh window has the default level",
+        check("contrast option: a fresh window has the default level",
               TerminalView.word_strength() == DEFAULT_WORD_STRENGTH)
         tv = _view(_PROSE + "\r\n")
         TerminalView.set_word_starts_enabled(True)
         before = tv.grab().toImage()
         win._change_word_strength(+1)
-        check("boldness option: + raises the level of every terminal",
+        check("contrast option: + raises the level of every terminal",
               TerminalView.word_strength() == DEFAULT_WORD_STRENGTH + 1
               and tv.grab().toImage() != before
               and win.top_bar.word_strength_label.text()
               == f"{DEFAULT_WORD_STRENGTH + 1} of {top}")
-        check("boldness option: a change marks the session for saving",
+        check("contrast option: a change marks the session for saving",
               win._save_timer.isActive())
         for _ in range(top + 2):
             win._change_word_strength(+1)
-        check("boldness option: the level stops at the top",
+        check("contrast option: the level stops at the top",
               TerminalView.word_strength() == top)
         for _ in range(top + 2):
             win._change_word_strength(-1)
-        check("boldness option: ...and at 1",
+        check("contrast option: ...and at 1",
               TerminalView.word_strength() == 1)
         first = ui_theme.TERMINAL_FONT
         other = next(f for f in ui_theme.TERMINAL_FONTS if f != first)
         win._change_terminal_font(other)
-        check("boldness option: another font starts at its own level",
+        check("contrast option: another font starts at its own level",
               TerminalView.word_strength() == DEFAULT_WORD_STRENGTH
               and win.top_bar.word_strength_label.text()
               == f"{DEFAULT_WORD_STRENGTH} of {top}")
         win._change_word_strength(+1)
         win._change_terminal_font(first)
-        check("boldness option: switching back brings the font's level back",
+        check("contrast option: switching back brings the font's level back",
               TerminalView.word_strength() == 1)
         payload = win._session_payload()
-        check("boldness option: the levels are persisted per font under ui",
+        check("contrast option: the levels are persisted per font under ui",
               payload["ui"]["bold_word_strength"]
               == {first: 1, other: DEFAULT_WORD_STRENGTH + 1},
               payload["ui"])
@@ -592,13 +610,13 @@ def test_word_starts_strength_option():
             "terminal_font": other,
             "bold_word_strength": {first: 2, other: 4, "x": 99,
                                    "y": "3", "z": True}}})
-        check("boldness option: restore applies the saved font's level and "
+        check("contrast option: restore applies the saved font's level and "
               "drops bad entries",
               TerminalView.word_strength() == 4
               and win._word_strengths == {first: 2, other: 4},
               win._word_strengths)
         win._restore_ui_state({"ui": {"terminal_font": first}})
-        check("boldness option: a session that predates it gets the default",
+        check("contrast option: a session that predates it gets the default",
               TerminalView.word_strength() == DEFAULT_WORD_STRENGTH
               and win._word_strengths == {})
 
@@ -608,7 +626,7 @@ def test_word_starts_strength_option():
         app.processEvents()
         TerminalView.set_word_strength(DEFAULT_WORD_STRENGTH)
         again = create_main_window(SessionStore(path=tmp / "session.json"))
-        check("boldness option: the level survives a close and reopen",
+        check("contrast option: the level survives a close and reopen",
               TerminalView.word_strength() == DEFAULT_WORD_STRENGTH - 1
               and again.top_bar.word_strength_label.text()
               == f"{DEFAULT_WORD_STRENGTH - 1} of {top}")

@@ -449,8 +449,9 @@ workspaces keep executing — switching never pauses anything.
   bold, which some readers, dyslexic readers among them, find easier to
   track. Only words change: code, paths, flags, numbers, links, the line
   you're typing and anything the agent already made bold keep their weight,
-  and vim, less and other full-screen apps are left alone. **Contrast** −/+ (shown only while Bionic reading is on)
-  right under it sets how much the word starts stand out, 1 to 5. Level 1
+  and vim, less and other full-screen apps are left alone. **Contrast** −/+
+  right under it shows while the switch is on and sets how much the word
+  starts stand out, 1 to 5. Level 1
   is the font's plain bold, which in most monospace fonts is only a little
   heavier than regular. Level 2 thickens the bold start, and levels 3 to 5
   also fade the rest of each word, more at each step. It starts at 3, and
