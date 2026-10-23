@@ -215,7 +215,7 @@ def is_reply_footer(text: str) -> bool:
 # Anchored at the row start, past at most one bullet glyph, so a prompt the
 # user typed that happens to quote it ("> User answered...") never matches.
 _ANSWER_ECHO_RE = re.compile(r"^\s*(?:[^\w\s>❯]\s*)?User answered Claude\b")
-# How far back from the bottom of the live screen answer_anchor_line()
+# How far back from the bottom of the live screen answer_echo_line()
 # looks for that line. The hook edge that mints the mark lands up to a poll
 # (PROMPT_SYNC_MS) after the answer, and a fast reply can stream a screen or
 # two past it by then.
@@ -1331,15 +1331,13 @@ class TerminalView(QWidget):
             return self.history_pushed() + r    # nothing below to use
         return None
 
-    def answer_anchor_line(self) -> int:
+    def answer_echo_line(self) -> int | None:
         """Absolute line of the newest "User answered Claude's questions"
-        row within _ANSWER_ANCHOR_SCAN rows of the bottom, else
-        anchor_line(). Used at BOTH the live capture
-        (TerminalCard._on_prompt_marks_changed) and replay re-anchoring, like
-        anchor_line(): the mark is minted after Claude printed that row, so
-        the same screen state gives the same row on both sides. The fallback
-        covers a poll that beat the row to the screen; the input box is then
-        the row just under where it will print."""
+        row within _ANSWER_ANCHOR_SCAN rows of the bottom, or None. Used at
+        BOTH the live capture (TerminalCard._mark_anchor) and replay
+        re-anchoring, like anchor_line(): the mark is minted after Claude
+        printed that row, so the same screen state gives the same row on
+        both sides."""
         pushed = self.history_pushed()
         for r in range(self.screen.lines - 1, -1, -1):
             if is_answer_echo(self._row_text(self.screen.buffer[r])):
@@ -1349,7 +1347,7 @@ class TerminalView(QWidget):
         for i in range(len(hist) - 1, max(-1, len(hist) - 1 - left), -1):
             if is_answer_echo(self._row_text(hist[i])):
                 return pushed - len(hist) + i
-        return self.anchor_line()
+        return None
 
     def _row_text(self, row) -> str:
         cols = self.screen.columns

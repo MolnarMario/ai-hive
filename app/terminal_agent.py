@@ -396,7 +396,7 @@ class PromptMark:
     answers to one of Claude's AskUserQuestion forms (note_answer_submitted).
     They share the list, the cap and the `pos` reasoning. The kind picks the
     dot's colour and the anchor a replay uses
-    (TerminalView.answer_anchor_line)."""
+    (TerminalView.answer_echo_line)."""
 
     uid: int
     pos: int

@@ -3345,14 +3345,30 @@ def test_answer_marks():
           t.answer_marks())
     check("answers: a form with no answers in the payload still gets a dot",
           agent.prompt_marks()[-1].text == "Answered a question")
+    # the edge beat the row to the screen: the dot moves once it prints
+    early = lines[1]
+    out("still drawing\r\n" * 2
+        + "● User answered Claude's questions:\r\n"
+        "  ⎿  · Ship it now? → Yes\r\n" + "more reply\r\n" * 3)
+    late = t.history_pushed() + t.screen.cursor.y - 5
+    lines = [line for line, _ in t.answer_marks()]
+    check("answers: a dot placed before its row printed moves onto the row",
+          lines == [echo, late] and late == early + 2
+          and card._answer_wait is None, (t.answer_marks(), early, late))
 
     # ---- a rebuild re-derives the same line ------------------------------
     c2 = TerminalCard(agent)
     c2.resize(640, 420)
-    app.processEvents()
-    check("answers: a rebuilt card places the answers on the same lines",
-          c2._mark_lines == card._mark_lines,
-          (c2._mark_lines, card._mark_lines))
+    # the settled projection, the one that runs recovery (the seed skips it):
+    # the late answer's replay anchor is the input box, and recovery moves it
+    c2._clear_for_projection()
+    c2._replay_with_marks(agent.pty_replay())
+    oldest, raw = c2._scrollback_rows()
+    rows = [oldest + i for i, text in enumerate(raw) if is_answer_echo(text)]
+    check("answers: a rebuilt card puts each answer on its own answered row",
+          sorted(c2._mark_lines.values()) == rows and len(rows) == 2
+          and [line for line, _ in c2.terminal.answer_marks()] == rows,
+          (c2._mark_lines, rows, c2.terminal.answer_marks()))
 
     # ---- a restored screen: the echo row alone brings the dot back ------
     rag = TerminalAgent(build_spec(AgentKind.CLAUDE, "Restored",
