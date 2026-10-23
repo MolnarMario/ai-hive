@@ -2,6 +2,7 @@
 input editor, scrollback and the scrollbar."""
 
 import tempfile
+import time
 from pathlib import Path
 
 from .harness import SCRATCH_CWD, check, skip
@@ -3314,8 +3315,10 @@ def test_answer_marks():
     out("● User answered Claude's questions:\r\n"
         "  ⎿  · Where should it live? → New pane\r\n")
     echo = t.history_pushed() + t.screen.cursor.y - 2
+    row = t.screen.buffer[t.screen.cursor.y - 2]
     check("answers: the test screen holds the echo row where expected",
-          is_answer_echo(t._row_text(t.screen.buffer[t.screen.cursor.y - 2])))
+          is_answer_echo("".join(row[c].data
+                                 for c in range(t.screen.columns))))
     out("● Building the pane now.\r\n" + "reply line\r\n" * 5)
     emit(sh.EV_TOOL_CLEAR, tool="AskUserQuestion",
          answers=["Placement: New pane"])
@@ -3345,11 +3348,26 @@ def test_answer_marks():
           t.answer_marks())
     check("answers: a form with no answers in the payload still gets a dot",
           agent.prompt_marks()[-1].text == "Answered a question")
-    # the edge beat the row to the screen: the dot moves once it prints
+    # the edge beat the row to the screen: the dot moves once it prints,
+    # looked for on a timer, not on every chunk (a look scans 300 rows)
     early = lines[1]
-    out("still drawing\r\n" * 2
-        + "● User answered Claude's questions:\r\n"
-        "  ⎿  · Ship it now? → Yes\r\n" + "more reply\r\n" * 3)
+    scans = []
+    real_scan = t.answer_echo_line
+    t.answer_echo_line = lambda: scans.append(1) or real_scan()
+    # no event loop between the chunks, so the timer can't fire in between
+    for chunk in ["still drawing\r\n"] * 2 + [
+            "● User answered Claude's questions:\r\n"
+            "  ⎿  · Ship it now? → Yes\r\n", "more reply\r\n" * 3]:
+        agent._on_pty_output("pty", chunk)
+    check("answers: a waiting dot never scans for its row per chunk",
+          scans == [] and card._answer_timer.isActive(), len(scans))
+    end = time.monotonic() + 2
+    while card._answer_wait is not None and time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.01)
+    del t.answer_echo_line
+    check("answers: ...but once for the burst, on its timer", len(scans) == 1,
+          len(scans))
     late = t.history_pushed() + t.screen.cursor.y - 5
     lines = [line for line, _ in t.answer_marks()]
     check("answers: a dot placed before its row printed moves onto the row",
@@ -3386,6 +3404,63 @@ def test_answer_marks():
           [text for _, text in rc.terminal.answer_marks()]
           == ["Answered a question"], rc.terminal.answer_marks())
 
+    # ---- an older turn's row is never a new answer's ---------------------
+    # A reply ended below it, and no answer mark holds it (a restored
+    # screen's row, or one whose mark aged out), so the newest row is not
+    # proof the new form's row has printed
+    oag = TerminalAgent(build_spec(AgentKind.CLAUDE, "Older",
+                                   cwd=SCRATCH_CWD, pty=True))
+    oag.worker.start = lambda: None
+    oc = TerminalCard(oag)
+    oc.resize(640, 420)
+
+    def oout(text):
+        oag._on_pty_output("pty", text)
+        app.processEvents()
+
+    def echo_rows(c):
+        oldest, raw = c._scrollback_rows()
+        return [oldest + i for i, text in enumerate(raw)
+                if is_answer_echo(text)]
+
+    # the caret waits in the input box, which the reply's stamp anchors to
+    oout("".join(f"old line {i}\r\n" for i in range(10))
+         + "● User answered Claude's questions:\r\n"
+         "  ⎿  · Old form? → Yes\r\n\r\n● Old reply.\r\n\r\n"
+         "✻ Cooked for 12s\r\n\r\n" + "─" * 40 + "\r\n> ")
+    oag.note_reply_settled()
+    old_row = echo_rows(oc)
+    check("answers: the older turn's reply has its stamp below its row",
+          len(old_row) == 1 and list(oc._reply_mark_lines.values())
+          and min(oc._reply_mark_lines.values()) > old_row[0],
+          (old_row, oc._reply_mark_lines))
+    oout("next prompt\r\n\r\n● Asking first.\r\n")
+    oag.note_answer_submitted(["Next: Go"])
+    (uid,) = [m.uid for m in oag.prompt_marks() if m.kind == MARK_ANSWER]
+    check("answers: a new answer whose row hasn't printed skips the older "
+          "turn's row", oc._mark_lines.get(uid) not in old_row
+          and oc._answer_wait is not None, (oc._mark_lines, old_row))
+    oout("● User answered Claude's questions:\r\n"
+         "  ⎿  · Next? → Go\r\n")
+    end = time.monotonic() + 2
+    while oc._answer_wait is not None and time.monotonic() < end:
+        app.processEvents()
+        time.sleep(0.01)
+    rows = echo_rows(oc)
+    check("answers: ...and moves onto its own row once it prints",
+          len(rows) == 2 and oc._mark_lines.get(uid) == rows[1],
+          (oc._mark_lines, rows))
+    oc2 = TerminalCard(oag)
+    oc2.resize(640, 420)
+    oc2._clear_for_projection()
+    oc2._replay_with_marks(oag.pty_replay())
+    rows = echo_rows(oc2)
+    check("answers: a rebuilt card skips the older turn's row the same way",
+          len(rows) == 2 and oc2._mark_lines.get(uid) == rows[1]
+          and [text for _, text in oc2.terminal.answer_marks()]
+          == ["Answered a question", "Answered: Next: Go"],
+          (oc2._mark_lines, rows, oc2.terminal.answer_marks()))
+
     # ---- the colour ------------------------------------------------------
     orange = QColor("#e8983a")
     check("answers: the dot is a near neighbour of the prompt colour",
@@ -3393,10 +3468,11 @@ def test_answer_marks():
           and abs(answer_colour(orange).hue() - orange.hue()) == 30,
           answer_colour(orange).name())
 
-    for c in (card, c2, rc):
+    for c in (card, c2, rc, oc, oc2):
         c.detach()
         c.deleteLater()
     rag.deleteLater()
+    oag.deleteLater()
     app.processEvents()
 
 

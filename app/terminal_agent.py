@@ -408,6 +408,9 @@ class PromptMark:
 
 MARK_PROMPT = "prompt"
 MARK_ANSWER = "answer"
+# an answer mark's tooltip when the hook carried no answers, and a recovered
+# answer row's (TerminalCard._refresh_marks): one dot, one wording
+ANSWER_TEXT = "Answered a question"
 
 
 @dataclass
@@ -1336,7 +1339,7 @@ class TerminalAgent(QObject):
         if not self.is_pty:
             return None
         text = ("Answered: " + "; ".join(answers) if answers
-                else "Answered a question")
+                else ANSWER_TEXT)
         return self._add_mark(text, MARK_ANSWER)
 
     def _add_mark(self, text: str, kind: str) -> PromptMark:

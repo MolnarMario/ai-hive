@@ -547,6 +547,9 @@ def test_new_agent_default_names_saved_pick():
               model == "Default (Sonnet 5.5, saved by /model)", model)
         check("default: a level claude won't read from settings is ignored",
               effort == "Default (recommended)", effort)
+        model, _effort, _tip, _spec = dialog_defaults({"model": "opusplan"})
+        check("default: a model label's own bracketed note is left out",
+              model == "Default (Opus Plan, saved by /model)", model)
         model, effort, _tip, _spec = dialog_defaults(None)
         check("default: nothing saved reads as recommended",
               (model, effort) == ("Default (recommended)",

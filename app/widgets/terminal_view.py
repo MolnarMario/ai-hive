@@ -1408,19 +1408,16 @@ class TerminalView(QWidget):
         printed that row, so the same screen state gives the same row on
         both sides."""
         pushed = self.history_pushed()
+        cols, blank = self.screen.columns, self.screen.default_char
         for r in range(self.screen.lines - 1, -1, -1):
-            if is_answer_echo(self._row_text(self.screen.buffer[r])):
+            if is_answer_echo(_row_text(self.screen.buffer[r], cols, blank)):
                 return pushed + r
         hist = self.screen.history.top
         left = _ANSWER_ANCHOR_SCAN - self.screen.lines
         for i in range(len(hist) - 1, max(-1, len(hist) - 1 - left), -1):
-            if is_answer_echo(self._row_text(hist[i])):
+            if is_answer_echo(_row_text(hist[i], cols, blank)):
                 return pushed - len(hist) + i
         return None
-
-    def _row_text(self, row) -> str:
-        cols = self.screen.columns
-        return "".join(row[c].data or " " for c in range(cols))
 
     def scroll_to_abs(self, abs_line: int, lead: int = 2) -> None:
         """Put `abs_line` `lead` rows below the top of the view.

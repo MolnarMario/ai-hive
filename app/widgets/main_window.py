@@ -2048,14 +2048,15 @@ class AddTerminalDialog(QDialog):
     def _claude_default_model() -> str:
         """The saved /model pick as the picker labels it ("opus" -> "Opus
         5.5"), or "" when nothing is saved. A "[1m]" pick names the same
-        model as the bare alias."""
+        model as the bare alias, and a label's own note in brackets is
+        left out, since the Default entry wraps the name in brackets."""
         raw = providers.user_default_model()
         if not raw or raw.lower() == "default":
             return ""
         bare = raw.lower().replace("[1m]", "").strip()
         for label, value in providers.CLAUDE_MODELS:
             if value and value == bare:
-                return label
+                return label.split(" (", 1)[0]
         return transcripts.model_display(raw)
 
     @staticmethod

@@ -23,9 +23,9 @@ from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
 from .. import scheduled_send, transcripts, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
 from ..process_worker import AI_KINDS, describe_pid
-from ..terminal_agent import (BUSY_IDLE_MS, MARK_ANSWER, MARK_PROMPT,
-                              STREAM_INPUT, STREAM_SYSTEM, AgentStatus,
-                              TerminalAgent)
+from ..terminal_agent import (ANSWER_TEXT, BUSY_IDLE_MS, MARK_ANSWER,
+                              MARK_PROMPT, STREAM_INPUT, STREAM_SYSTEM,
+                              AgentStatus, TerminalAgent)
 from ..ui_theme import Palette, repolish
 from .header_icons import LaneChip
 from .ornaments import BootVeil, ElidingLabel, close_on_anchor_press
@@ -107,6 +107,9 @@ _RECOVERABLE = ("claude", "gemini", "openai")
 # row keeps watching the output for that row (TerminalCard._mark_anchor).
 # The row follows the PostToolUse hook by one render, well inside this.
 _ANSWER_WAIT_S = 10.0
+# ...and how often it looks. One look scans up to _ANSWER_ANCHOR_SCAN rows,
+# about 4 ms at 120 columns, too much for every chunk of a streaming reply.
+_ANSWER_POLL_MS = 100
 
 
 def _norm_line(text: str) -> str:
@@ -761,8 +764,13 @@ class TerminalCard(QFrame):
         # found on screen rather than in the transcript (see _recover_marks)
         self._recovered_answers: list[int] = []
         # (uid, deadline) of an answer mark placed before its "User answered"
-        # row printed; _on_pty_output moves it there (see _mark_anchor)
+        # row printed; output starts _answer_timer, which moves it there
+        # (see _mark_anchor)
         self._answer_wait: tuple[int, float] | None = None
+        self._answer_timer = QTimer(self)
+        self._answer_timer.setSingleShot(True)
+        self._answer_timer.setInterval(_ANSWER_POLL_MS)
+        self._answer_timer.timeout.connect(self._place_waiting_answer)
         # same, for reply-finished stamps: (absolute line, epoch)
         self._recovered_replies: list[tuple[int, float]] = []
         # typed-prompt texts for _recover_marks and finished-reply times for
@@ -1289,8 +1297,8 @@ class TerminalCard(QFrame):
 
     def _on_pty_output(self, text: str) -> None:
         self.terminal.feed(text)
-        if self._answer_wait is not None:
-            self._place_waiting_answer()
+        if self._answer_wait is not None and not self._answer_timer.isActive():
+            self._answer_timer.start()
         if self.agent.spec.provider in _RECOVERABLE:
             self._stamp_timer.start()   # restarted by every chunk
 
@@ -2466,7 +2474,7 @@ class TerminalCard(QFrame):
         # again here, not only in _recover_answers: a scan can find the row
         # in the poll between Claude printing it and the mark arriving
         held = [line for line, _ in answers]
-        answers += [(line, "Answered a question")
+        answers += [(line, ANSWER_TEXT)
                     for line in self._recovered_answers
                     if all(abs(line - h) > _STAMP_MERGE_SLACK for h in held)]
         self.terminal.set_answer_marks(sorted(answers))
@@ -2475,12 +2483,13 @@ class TerminalCard(QFrame):
         """The line a mark goes on, at the stream position it was minted
         at: the input box for a typed prompt, the "User answered" row for
         an answer. Shared by the live capture and the replay, so both read
-        the same screen state the same way. An answer row another answer
-        already holds is an older form's, and the input box stands in."""
+        the same screen state the same way. An answer row that can't be
+        this answer's (_answer_row) is an older form's, and the input box
+        stands in."""
         if mark.kind != MARK_ANSWER:
             return self.terminal.anchor_line()
-        line = self.terminal.answer_echo_line()
-        if line is None or line in self._answer_lines(mark.uid):
+        line = self._answer_row(mark, live)
+        if line is None:
             # the hook edge beat the row to the screen: the input box is
             # where it is about to print, until _place_waiting_answer (live)
             # or _recover_answers (a replay) finds the row itself. Only a
@@ -2490,6 +2499,26 @@ class TerminalCard(QFrame):
                 self._answer_wait = (mark.uid,
                                      time.monotonic() + _ANSWER_WAIT_S)
             return self.terminal.anchor_line()
+        return line
+
+    def _answer_row(self, mark, live: bool) -> int | None:
+        """The newest "User answered" row near the bottom if it can be
+        `mark`'s, else None. Not one another answer holds, and not one above
+        a reply that ended before `mark` was minted: that row is an older
+        turn's, like a restored screen's, which no answer mark holds. Live,
+        the replies recovered from the transcript count too; in a replay
+        their lines are the old view's, and only the reply marks placed so
+        far stand in."""
+        line = self.terminal.answer_echo_line()
+        if line is None or line in self._answer_lines(mark.uid):
+            return None
+        ends = [self._reply_mark_lines[m.uid] for m in self.agent.reply_marks()
+                if m.seq < mark.seq and m.uid in self._reply_mark_lines]
+        if live:
+            ends += [ln for ln, when in self._recovered_replies
+                     if when < mark.ts]
+        if ends and line <= max(ends):
+            return None
         return line
 
     def _answer_lines(self, but: int) -> set:
@@ -2503,12 +2532,14 @@ class TerminalCard(QFrame):
         answered" row: move the mark onto the row once it is drawn. Gives
         up after _ANSWER_WAIT_S, leaving it on the input box line."""
         uid, deadline = self._answer_wait
+        mark = next((m for m in self.agent.prompt_marks() if m.uid == uid),
+                    None)
         if (time.monotonic() > deadline or uid not in self._mark_lines
-                or uid not in {m.uid for m in self.agent.prompt_marks()}):
+                or mark is None):
             self._answer_wait = None
             return
-        line = self.terminal.answer_echo_line()
-        if line is None or line in self._answer_lines(uid):
+        line = self._answer_row(mark, live=True)
+        if line is None:
             return      # not printed yet: the newest row is an older form's
         self._answer_wait = None
         self._mark_lines[uid] = line
