@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
 
 from .. import __version__
 from .. import chime
+from .. import custom_fonts
 from .. import claude_usage
 from .. import codex_usage
 from .. import fsopen
@@ -96,6 +97,10 @@ MODEL_SYNC_MS = 1500
 # (drives the gear badge). A single cheap syscall per agent, so a short
 # interval is fine.
 BG_SHELL_POLL_MS = 2000
+
+# Options > Terminal font: the data of the dropdown's last item, which opens
+# a file picker instead of being a font (never a valid font id)
+LOAD_CUSTOM_FONT = "load-custom-font"
 
 # Every usage pill polls on ONE shared policy, in `app.usage_poll`: 90 s while
 # that provider's agents are working, 30 s from 90% used, 6 minutes while none
@@ -503,7 +508,8 @@ class TopBar(QFrame):
     sidebarToggleClicked = Signal()
     globalFontDelta = Signal(int)
     themeChanged = Signal(str)   # theme id
-    terminalFontChanged = Signal(str)   # ui_theme.TERMINAL_FONTS id
+    terminalFontChanged = Signal(str)   # ui_theme.terminal_fonts() id
+    customFontRequested = Signal()      # the "Load a custom font" item
     letterSpacingDelta = Signal(int)    # -1 / +1 px between letters
     soundToggled = Signal(bool)  # question chime enabled/muted
     replySoundToggled = Signal(bool)  # reply-finished chime enabled/muted
@@ -607,12 +613,12 @@ class TopBar(QFrame):
             "The font of the agent terminals. Default keeps Consolas, as "
             "before. Theme font uses the skin's own terminal font, Share "
             "Tech Mono in Adeptus Mechanicus. OpenDyslexic Mono is drawn "
-            "for dyslexic readers, Atkinson Hyperlegible Mono for low vision.")
-        for fid, (label, _families) in ui_theme.TERMINAL_FONTS.items():
-            self.terminal_font_select.addItem(label, fid)
+            "for dyslexic readers, Atkinson Hyperlegible Mono for low vision. "
+            "Load a custom font adds your own .ttf, .otf or .ttc file.")
+        self._font_pick = ui_theme.TERMINAL_FONT
+        self.fill_terminal_fonts()
         self.terminal_font_select.currentIndexChanged.connect(
-            lambda _i: self.terminalFontChanged.emit(
-                self.terminal_font_select.currentData()))
+            self._on_terminal_font_picked)
 
         def spacing_btn(text, tip, delta):
             b = QToolButton(self)
@@ -1692,9 +1698,34 @@ class TopBar(QFrame):
         """Reflect the terminal font in the dropdown without re-emitting."""
         i = self.terminal_font_select.findData(font_id)
         if i >= 0:
+            self._font_pick = font_id
             self.terminal_font_select.blockSignals(True)
             self.terminal_font_select.setCurrentIndex(i)
             self.terminal_font_select.blockSignals(False)
+
+    def fill_terminal_fonts(self) -> None:
+        """(Re)build the terminal font dropdown: the built-in fonts, the
+        user's own, then the item that loads another. The pick stays, and
+        nothing is emitted."""
+        sel = self.terminal_font_select
+        sel.blockSignals(True)
+        sel.clear()
+        for fid, (label, _families) in ui_theme.terminal_fonts().items():
+            sel.addItem(label, fid)
+        sel.insertSeparator(sel.count())
+        sel.addItem("Load a custom font…", LOAD_CUSTOM_FONT)
+        sel.blockSignals(False)
+        self.set_terminal_font(self._font_pick)
+
+    def _on_terminal_font_picked(self, _index: int) -> None:
+        fid = self.terminal_font_select.currentData()
+        if fid == LOAD_CUSTOM_FONT:
+            # the dropdown keeps showing the font in use until a file loads
+            self.set_terminal_font(self._font_pick)
+            self.customFontRequested.emit()
+        elif fid:
+            self._font_pick = fid
+            self.terminalFontChanged.emit(fid)
 
     def set_letter_spacing(self, px: int) -> None:
         """Reflect the letter spacing between its two buttons."""
@@ -3023,6 +3054,11 @@ class MainWindow(QMainWindow):
         self.event_hub = EventHub(self.manager,
                                   event_log.log_dir(str(session_dir)), self)
         self.event_hub.openChanged.connect(self.top_bar.set_log_attention)
+        # the user's own fonts, before the saved pick is read. main() has
+        # registered them already (setup_application); this covers a window
+        # built without that, and a file registered twice is a no-op.
+        custom_fonts.load_dir(self.fonts_dir())
+        self.top_bar.fill_terminal_fonts()
         self._restore_ui_state(session or {})
         self._apply_page_border()   # frame matches the restored skin
         self._ready = True  # from here on, structural changes save immediately
@@ -3223,6 +3259,7 @@ class MainWindow(QMainWindow):
         self.top_bar.globalFontDelta.connect(self._change_global_font)
         self.top_bar.themeChanged.connect(self._change_theme)
         self.top_bar.terminalFontChanged.connect(self._change_terminal_font)
+        self.top_bar.customFontRequested.connect(self._on_custom_font_requested)
         self.top_bar.letterSpacingDelta.connect(self._change_letter_spacing)
         self.top_bar.soundToggled.connect(self._on_sound_toggled)
         self.top_bar.replySoundToggled.connect(self._on_reply_sound_toggled)
@@ -7315,7 +7352,7 @@ class MainWindow(QMainWindow):
         """Options > Terminal font. Every pty card takes the family at its
         own pixel size, and the line-mode consoles follow through the
         stylesheet."""
-        if (font_id not in ui_theme.TERMINAL_FONTS
+        if (font_id not in ui_theme.terminal_fonts()
                 or font_id == ui_theme.TERMINAL_FONT):
             return
         line_font = ui_theme.line_console_font()
@@ -7323,8 +7360,38 @@ class MainWindow(QMainWindow):
         self.top_bar.set_terminal_font(font_id)
         if ui_theme.line_console_font() != line_font:
             self._restyle_line_consoles()
-        self._sync_terminal_fonts()
+        self._sync_terminal_fonts(veil=True)
         self._schedule_save()
+
+    def fonts_dir(self) -> str:
+        """Where the user's own terminal fonts live: beside session.json."""
+        return custom_fonts.fonts_dir(self.store.path.parent)
+
+    def _on_custom_font_requested(self) -> None:
+        # deferred, like _on_chime_sound_choose: the request arrives while
+        # the dropdown's popup is closing, and a modal dialog opened in
+        # there fights it and the Options popup for the mouse grab
+        QTimer.singleShot(0, self._choose_custom_font)
+
+    def _choose_custom_font(self) -> None:
+        self.top_bar.options_panel.hide()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load a terminal font", "",
+            "Fonts (*.ttf *.otf *.ttc);;All files (*)")
+        if path:
+            self.load_custom_font(path)
+
+    def load_custom_font(self, source: str) -> str | None:
+        """Copy `source` in, offer it in the dropdown and make it the
+        terminal font. Returns None on success, else the reason (also shown
+        to the user in a message box)."""
+        font_id, reason = custom_fonts.install(source, self.fonts_dir())
+        if reason is not None:
+            QMessageBox.warning(self, "Font not loaded", reason)
+            return reason
+        self.top_bar.fill_terminal_fonts()
+        self._change_terminal_font(font_id)
+        return None
 
     def _change_letter_spacing(self, delta: int) -> None:
         """Options > Letter spacing, for the pty cards only: a line-mode
@@ -7336,7 +7403,7 @@ class MainWindow(QMainWindow):
             return
         ui_theme.TERMINAL_LETTER_PX = px
         self.top_bar.set_letter_spacing(px)
-        self._sync_terminal_fonts()
+        self._sync_terminal_fonts(veil=True)
         self._schedule_save()
 
     def _restyle_line_consoles(self) -> None:
@@ -7354,17 +7421,28 @@ class MainWindow(QMainWindow):
                 if not card.is_pty and card.agent.spec.font_px:
                     card.reapply_font()
 
-    def _sync_terminal_fonts(self) -> None:
+    def _sync_terminal_fonts(self, veil: bool = False) -> None:
         """Hand every pty card the active family and letter spacing. A view
         that already has them does nothing, and one that changes waits out
-        its resize debounce, so a burst of clicks resizes each pty once."""
+        its resize debounce, so a burst of clicks resizes each pty once.
+
+        `veil` (a change the user made) covers each card on screen whose
+        font changes with its loader until the child has redrawn
+        (TerminalCard.begin_font_veil). Without it the user watched the old
+        frame in the new font, then the regridded one, then the child's
+        redraw. A card in a hidden workspace settles unseen."""
         families = ui_theme.terminal_font_families()
+        letter_px = ui_theme.TERMINAL_LETTER_PX
         for page in self._pages.values():
             for card in page.cards:
                 if card.is_pty and card.terminal is not None:
-                    card.terminal.set_font_families(families)
-                    card.terminal.set_letter_spacing(
-                        ui_theme.TERMINAL_LETTER_PX)
+                    view = card.terminal
+                    if veil and card.isVisibleTo(self) and (
+                            view.font_families() != families
+                            or view.letter_spacing() != letter_px):
+                        card.begin_font_veil()
+                    view.set_font_families(families)
+                    view.set_letter_spacing(letter_px)
 
     def _change_theme(self, theme_id: str) -> None:
         """Swap the active skin live: repaint chrome, terminals, and ornaments,
@@ -7390,7 +7468,7 @@ class MainWindow(QMainWindow):
                 card.update()
         # Terminal font "Theme font" follows the skin; any other pick
         # leaves every view as it is
-        self._sync_terminal_fonts()
+        self._sync_terminal_fonts(veil=True)
         self._apply_page_border()   # show/hide the foliate frame for this skin
         self._schedule_save()
 

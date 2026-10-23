@@ -1922,6 +1922,10 @@ class TerminalView(QWidget):
         super().resizeEvent(event)
         self._resize_timer.start()  # debounce retile storms
 
+    def resize_pending(self) -> bool:
+        """Is a debounced resize still waiting to reach the screen?"""
+        return self._resize_timer.isActive()
+
     def flush_resize(self) -> None:
         """Apply a pending debounced resize NOW.
 

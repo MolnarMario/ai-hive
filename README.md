@@ -457,10 +457,17 @@ workspaces keep executing — switching never pauses anything.
   dyslexic readers. **Default** keeps Consolas, **Theme font** uses the
   skin's own, and Cascadia Mono, JetBrains Mono, IBM Plex Mono, Atkinson
   Hyperlegible Mono and OpenDyslexic Mono ship with the app (licenses in
-  `app/assets/fonts/licenses`). Both apply to every agent; a per-agent font
-  size stays. Bold and italic keep to the column grid even where Qt has to
-  fake them, and box-drawing lines are drawn as shapes whenever the font's
-  own glyphs would leave a gap, so borders stay joined with spacing on.
+  `app/assets/fonts/licenses`). **Load a custom font…** at the bottom of the
+  list adds your own `.ttf`, `.otf` or `.ttc` file. AI Hive checks the file's
+  first bytes as well as its name, so a renamed image or PDF gets a message
+  saying why, and keeps a copy in a `fonts` folder beside `session.json`.
+  Both apply to every agent; a per-agent font size stays. While a terminal
+  takes a new font or spacing, the startup loader covers it with "applying
+  the new font…" until the agent has redrawn at the new size, so the
+  in-between frames never show. Bold and italic keep to the column grid
+  even where Qt has to fake them, and box-drawing lines are drawn as shapes
+  whenever the font's own glyphs would leave a gap, so borders stay joined
+  with spacing on.
 - **Shared agent awareness** — agents in a workspace coordinate through a
   shared board (`.aihive/board.md`): Claude agents launch with `--add-dir` +
   an appended system prompt so they can read peers' status and post their own,
