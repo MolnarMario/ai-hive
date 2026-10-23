@@ -4653,19 +4653,48 @@ def test_custom_font_install():
               and os.listdir(store_fonts) == ["Spectral-Regular.ttf"]
               and len(ui_theme.CUSTOM_TERMINAL_FONTS) == 1,
               (again, os.listdir(store_fonts)))
+        # the Italic of the same family: kept, so Qt draws the real face,
+        # but the picker still has one Spectral
+        styles = custom_fonts.styles_dir(store_fonts)
+        italic_src = tmp / "Spectral-Italic.ttf"
+        shutil.copyfile(Path(ui_theme.__file__).parent / "assets" / "fonts"
+                        / "Spectral-Italic.ttf", italic_src)
+        italic, reason = custom_fonts.install(str(italic_src), store_fonts)
+        check("custom font: another style of the family maps to its entry",
+              italic == fid and reason is None
+              and len(ui_theme.CUSTOM_TERMINAL_FONTS) == 1, (italic, reason))
+        check("custom font: ...and keeps its file in the styles folder",
+              sorted(os.listdir(store_fonts))
+              == ["Spectral-Regular.ttf", "styles"]
+              and os.listdir(styles) == ["Spectral-Italic.ttf"],
+              os.listdir(store_fonts))
+        custom_fonts.install(str(italic_src), store_fonts)
+        check("custom font: loading that style again adds nothing",
+              os.listdir(styles) == ["Spectral-Italic.ttf"],
+              os.listdir(styles))
         shutil.copyfile(Path(ui_theme.__file__).parent / "assets" / "fonts"
                         / "IBMPlexMono-Regular.ttf", tmp / "Plex.ttf")
         plex, reason = custom_fonts.install(str(tmp / "Plex.ttf"), store_fonts)
         check("custom font: a built-in family maps to its built-in entry",
               plex == "plex" and reason is None
-              and os.listdir(store_fonts) == ["Spectral-Regular.ttf"],
+              and sorted(os.listdir(store_fonts))
+              == ["Spectral-Regular.ttf", "styles"]
+              and os.listdir(styles) == ["Spectral-Italic.ttf"],
               (plex, os.listdir(store_fonts)))
 
+        # what a new process has: nothing offered, nothing registered
         ui_theme.CUSTOM_TERMINAL_FONTS.clear()
+        from PySide6.QtGui import QFontDatabase
+        italic_key = custom_fonts._key(os.path.join(styles,
+                                                    "Spectral-Italic.ttf"))
+        QFontDatabase.removeApplicationFont(
+            custom_fonts._registered.pop(italic_key)[0])
         custom_fonts.load_dir(store_fonts)
         check("custom font: a launch offers the saved copies again",
               list(ui_theme.CUSTOM_TERMINAL_FONTS) == [fid]
               and ui_theme.saved_terminal_font({"terminal_font": fid}) == fid)
+        check("custom font: ...and registers the style files unoffered",
+              italic_key in custom_fonts._registered)
         custom_fonts.forget(fid, store_fonts)
         check("custom font: forget() drops the entry and the copy",
               not ui_theme.CUSTOM_TERMINAL_FONTS
@@ -4717,6 +4746,22 @@ def test_custom_font_in_options():
         check("custom font: ...and the dropdown keeps the font in use",
               sel.currentData() == "plex" and ui_theme.TERMINAL_FONT == "plex",
               sel.currentData())
+        # stepping the closed box past the last font, with a key or the
+        # wheel, lands on the Load item without opening a file dialog
+        from PySide6.QtCore import QPoint, QPointF, Qt
+        from PySide6.QtGui import QWheelEvent
+        from PySide6.QtTest import QTest
+        QTest.keyClick(sel, Qt.Key.Key_End)
+        sel.setCurrentIndex(sel.findData("load-custom-font") - 2)
+        app.sendEvent(sel, QWheelEvent(
+            QPointF(5, 5), QPointF(sel.mapToGlobal(QPoint(5, 5))), QPoint(),
+            QPoint(0, -120), Qt.MouseButton.NoButton,
+            Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase,
+            False))
+        check("custom font: a key or the wheel on the Load item asks nothing",
+              asked == [1] and sel.currentData() != "load-custom-font",
+              (asked, sel.currentData()))
+        win._change_terminal_font("plex")
 
         reason = win.load_custom_font(str(src["fake_ttf"]))
         check("custom font: a bad file shows the reason in a warning",
@@ -4846,6 +4891,24 @@ def test_font_change_veil():
               not card.font_veil_active()
               and FONT_VEIL_MAX_MS / 1000 - 0.2 <= took
               <= FONT_VEIL_MAX_MS / 1000 + 1, took)
+        pump(400)
+
+        # a second change inside the veil's 260 ms fade
+        card.begin_font_veil()
+        card._end_font_veil()
+        check("font veil: (the veil is dissolving)",
+              card.boot.is_active() and card.boot.is_leaving())
+        card.begin_font_veil()
+        check("font veil: a change during the fade puts the veil back up",
+              card.font_veil_active() and not card.boot.is_leaving()
+              and card.boot._caption == "applying the new font…")
+        card._end_font_veil()
+        card._begin_boot_veil()
+        card._end_boot_veil()   # a boot veil that is dissolving
+        card.begin_font_veil()
+        check("font veil: ...and so does one during a boot veil's fade",
+              card.font_veil_active() and not card.boot.is_leaving())
+        card._end_font_veil()
         pump(400)
 
         card._begin_boot_veil()   # the agent is booting

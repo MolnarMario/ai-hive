@@ -504,6 +504,30 @@ def usage_sources() -> tuple:
     )
 
 
+class _FontComboBox(DropDownComboBox):
+    """The Terminal font dropdown. `stepping` is True while the wheel or a
+    key on the closed box changes the pick, which QComboBox does for every
+    enabled item, "Load a custom font..." included. A key in the open list
+    goes to the list, not here, so a pick made there never counts as a
+    step."""
+
+    stepping = False
+
+    def wheelEvent(self, event) -> None:
+        self.stepping = True
+        try:
+            super().wheelEvent(event)
+        finally:
+            self.stepping = False
+
+    def keyPressEvent(self, event) -> None:
+        self.stepping = True
+        try:
+            super().keyPressEvent(event)
+        finally:
+            self.stepping = False
+
+
 class TopBar(QFrame):
     addTerminalClicked = Signal()
     sidebarToggleClicked = Signal()
@@ -608,7 +632,7 @@ class TopBar(QFrame):
         # "Terminal font" and "Letter spacing": the agent terminals' family
         # and the extra px between their letters, for every agent at once.
         # A per-agent font size stays that agent's own.
-        self.terminal_font_select = DropDownComboBox(self)
+        self.terminal_font_select = _FontComboBox(self)
         self.terminal_font_select.setObjectName("TerminalFontSelect")
         self.terminal_font_select.setCursor(Qt.CursorShape.PointingHandCursor)
         self.terminal_font_select.setToolTip(
@@ -622,24 +646,25 @@ class TopBar(QFrame):
         self.terminal_font_select.currentIndexChanged.connect(
             self._on_terminal_font_picked)
 
-        def spacing_btn(text, tip, delta):
+        def step_btn(text, tip, signal, delta):
             b = QToolButton(self)
             b.setText(text)
             b.setToolTip(tip)
             b.setObjectName("GlobalFontBtn")
             b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(lambda: self.letterSpacingDelta.emit(delta))
+            b.clicked.connect(lambda: signal.emit(delta))
             return b
 
-        self.letter_dec_btn = spacing_btn("−", "Less space between letters", -1)
-        self.letter_inc_btn = spacing_btn("+", "More space between letters", +1)
+        self.letter_dec_btn = step_btn(
+            "−", "Less space between letters", self.letterSpacingDelta, -1)
+        self.letter_inc_btn = step_btn(
+            "+", "More space between letters", self.letterSpacingDelta, +1)
         self.letter_px_label = QLabel(self)
         self.letter_px_label.setObjectName("OptionsRowLabel")
         self.letter_px_label.setToolTip(
             "Extra space between the letters in the agent terminals, 0 to "
             f"{ui_theme.MAX_LETTER_PX} px. Wider spacing helps some dyslexic "
             "readers.")
-        self.set_terminal_font(ui_theme.TERMINAL_FONT)
         self.set_letter_spacing(ui_theme.TERMINAL_LETTER_PX)
 
         # Every switch below is one row of the Options panel: a plain-words
@@ -843,19 +868,10 @@ class TopBar(QFrame):
         # len(WORD_STRENGTHS). MainWindow keeps a level per terminal font,
         # since every font's Bold sits at its own distance from Regular.
 
-        def strength_btn(text, tip, delta):
-            b = QToolButton(self)
-            b.setText(text)
-            b.setToolTip(tip)
-            b.setObjectName("GlobalFontBtn")
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            b.clicked.connect(lambda: self.wordStrengthDelta.emit(delta))
-            return b
-
-        self.word_strength_dec_btn = strength_btn(
-            "−", "Lighter bold word starts", -1)
-        self.word_strength_inc_btn = strength_btn(
-            "+", "Heavier bold word starts", +1)
+        self.word_strength_dec_btn = step_btn(
+            "−", "Lighter bold word starts", self.wordStrengthDelta, -1)
+        self.word_strength_inc_btn = step_btn(
+            "+", "Heavier bold word starts", self.wordStrengthDelta, +1)
         self.word_strength_label = QLabel(self)
         self.word_strength_label.setObjectName("OptionsRowLabel")
         self.word_strength_label.setToolTip(
@@ -1750,9 +1766,12 @@ class TopBar(QFrame):
     def _on_terminal_font_picked(self, _index: int) -> None:
         fid = self.terminal_font_select.currentData()
         if fid == LOAD_CUSTOM_FONT:
-            # the dropdown keeps showing the font in use until a file loads
+            # the dropdown keeps showing the font in use until a file loads,
+            # and the wheel or an arrow key stepping onto the item never
+            # opens the file picker: only a pick from the open list does
             self.set_terminal_font(self._font_pick)
-            self.customFontRequested.emit()
+            if not self.terminal_font_select.stepping:
+                self.customFontRequested.emit()
         elif fid:
             self._font_pick = fid
             self.terminalFontChanged.emit(fid)

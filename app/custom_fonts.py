@@ -7,6 +7,11 @@ breaks nothing. Every launch registers that folder again with `load_dir`
 before the session's font id is read (main.setup_application and
 MainWindow.__init__), which is what lets a saved custom pick resolve.
 
+The picker offers one entry per family. Another file of a family it already
+offers (the Bold of a Regular loaded earlier) goes into a `styles` folder
+inside the fonts folder: `load_dir` registers it but never offers it, so Qt
+draws bold with the real face while the saved pick keeps its id.
+
 Qt's addApplicationFont reads TrueType, OpenType and TrueType collection
 files, and those three are all we accept. The check reads the first four
 bytes as well as the name, because a JPEG renamed to .ttf has the right name
@@ -15,6 +20,7 @@ and Qt's own failure says nothing the user can act on.
 
 from __future__ import annotations
 
+import filecmp
 import os
 import shutil
 
@@ -34,6 +40,21 @@ _registered: dict[str, tuple[int, list[str]]] = {}
 def fonts_dir(store_dir) -> str:
     """Where custom font copies live: beside session.json."""
     return os.path.join(str(store_dir), "fonts")
+
+
+def styles_dir(folder: str) -> str:
+    """Where the other files of an offered family live, inside `folder`."""
+    return os.path.join(folder, "styles")
+
+
+def _font_files(folder: str) -> list[str]:
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return []
+    return [os.path.join(folder, n) for n in names
+            if n.lower().endswith(FONT_EXTS)
+            and os.path.isfile(os.path.join(folder, n))]
 
 
 def validate(path: str) -> str | None:
@@ -115,28 +136,19 @@ def _offered_id(family: str) -> str | None:
 
 
 def load_dir(folder: str) -> None:
-    """Register every font file in `folder` and offer it in the picker. A
-    file Qt can't read is skipped, so a damaged copy costs only itself."""
-    try:
-        names = sorted(os.listdir(folder))
-    except OSError:
-        return
-    for name in names:
-        if not name.lower().endswith(FONT_EXTS):
-            continue
-        families = register(os.path.join(folder, name))
+    """Register every font file in `folder` and offer it in the picker, and
+    register the files in its styles folder without offering them. A file
+    Qt can't read is skipped, so a damaged copy costs only itself."""
+    for path in _font_files(folder):
+        families = register(path)
         if families:
-            _offer(name, families)
+            _offer(os.path.basename(path), families)
+    for path in _font_files(styles_dir(folder)):
+        register(path)
 
 
-def install(source: str, folder: str) -> tuple[str | None, str | None]:
-    """Validate `source`, copy it into `folder`, register the copy and offer
-    it. Returns (font id, None), or (None, the reason to show the user). A
-    font whose family the picker already has returns that entry's id and
-    keeps no copy, so loading a file twice adds one entry."""
-    reason = validate(source)
-    if reason is not None:
-        return None, reason
+def _copy_into(source: str, folder: str) -> str:
+    """Copy `source` into `folder` under a free name; returns the copy."""
     base, ext = os.path.splitext(os.path.basename(source))
     ext = ext.lower()
     target = os.path.join(folder, base + ext)
@@ -144,9 +156,23 @@ def install(source: str, folder: str) -> tuple[str | None, str | None]:
     while os.path.exists(target):
         target = os.path.join(folder, f"{base}-{n}{ext}")
         n += 1
+    os.makedirs(folder, exist_ok=True)
+    shutil.copyfile(source, target)
+    return target
+
+
+def install(source: str, folder: str) -> tuple[str | None, str | None]:
+    """Validate `source`, copy it into `folder`, register the copy and offer
+    it. Returns (font id, None), or (None, the reason to show the user). A
+    font whose family the picker already has returns that entry's id. A
+    built-in family or a byte-identical copy keeps no file, so loading a
+    file twice adds nothing. Any other file of a custom family is kept in
+    the styles folder."""
+    reason = validate(source)
+    if reason is not None:
+        return None, reason
     try:
-        os.makedirs(folder, exist_ok=True)
-        shutil.copyfile(source, target)
+        target = _copy_into(source, folder)
     except OSError as e:
         return None, f"The file could not be copied: {e.strerror or e}"
     families = register(target)
@@ -155,15 +181,32 @@ def install(source: str, folder: str) -> tuple[str | None, str | None]:
         return None, ("Windows could not read a font from this file. It may "
                       "be damaged.")
     known = _offered_id(families[0])
-    if known is not None:
-        _drop(target)
+    if known is None:
+        return _offer(os.path.basename(target), families), None
+    _drop(target)
+    if known not in ui_theme.CUSTOM_TERMINAL_FONTS or any(
+            filecmp.cmp(source, path, shallow=False)
+            for path in _font_files(folder)
+            + _font_files(styles_dir(folder))):
         return known, None
-    return _offer(os.path.basename(target), families), None
+    try:
+        register(_copy_into(source, styles_dir(folder)))
+    except OSError as e:
+        return None, f"The file could not be copied: {e.strerror or e}"
+    return known, None
 
 
 def forget(font_id: str, folder: str) -> None:
     """Take a custom font out of the picker, unregister it and delete its
-    copy. A built-in id is left alone."""
-    if ui_theme.CUSTOM_TERMINAL_FONTS.pop(font_id, None) is None:
+    copy and its family's style files. A built-in id is left alone."""
+    entry = ui_theme.CUSTOM_TERMINAL_FONTS.pop(font_id, None)
+    if entry is None:
         return
     _drop(os.path.join(folder, font_id[len(ui_theme.CUSTOM_FONT_PREFIX):]))
+    for path in _font_files(styles_dir(folder)):
+        if register(path)[:1] == [entry[1][0]]:
+            _drop(path)
+    try:
+        os.rmdir(styles_dir(folder))
+    except OSError:
+        pass   # missing, or another family's styles are still in it

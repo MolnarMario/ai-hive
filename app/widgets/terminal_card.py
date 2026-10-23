@@ -2054,8 +2054,12 @@ class TerminalCard(QFrame):
         its new size and the output has gone quiet (`_on_font_quiet`), or at
         `FONT_VEIL_MAX_MS`. Call it BEFORE the view gets the font, so the
         first wrong frame is never painted. A terminal still booting keeps
-        its boot veil, which lifts on the child's prompt as usual."""
+        its boot veil, which lifts on the child's prompt as usual. A veil
+        that is already dissolving, from a boot or the last font change,
+        goes back up: otherwise a second click inside its fade showed the
+        frames this hides."""
         if not self.is_pty or (self.boot.is_active()
+                               and not self.boot.is_leaving()
                                and not self._font_veil):
             return
         self._font_veil = True
