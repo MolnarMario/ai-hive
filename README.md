@@ -637,6 +637,8 @@ workspaces keep executing — switching never pauses anything.
   Every tooltip in the app is held to one width (360 px, never over 28% of the
   screen) so long explanations wrap into a block instead of one wide strip, and
   the **Tooltips** switch turns all of them off.
+- **Instant menus.** Menus and dropdown lists open complete on their first
+  frame. AI Hive turns off Qt's 140 ms menu fade and combo slide at startup.
 - **Themes (Winamp-style skins)** — a dropdown under **⚙ Options** swaps the whole
   chrome palette live: **Scriptorium (Dark)** (the shipped warm-parchment/gold
   look), **Illuminated Manuscript** (light vellum, ultramarine running-heads,
@@ -965,7 +967,10 @@ Hard-won rules, each with a regression test:
   arrow keys — exact on the caret's own line, and best-effort on another line of
   a multi-line prompt (Up/Down to the row, then Left/Right to the predicted
   landing column) — so you can jump into your typed text without arrow-key
-  walking; a drag selects instead and never moves the caret. Double-click selects
+  walking; a drag selects instead and never moves the caret. A drag held above
+  or below the view scrolls through history and keeps selecting, up to 10
+  lines per 50 ms the further past the edge you hold it, and a selection stays
+  on its text when the wheel or scrollbar moves the view. Double-click selects
   the whitespace-delimited word under the pointer, **Shift+click** extends the
   selection, and a **triple-click** selects the whole line. You can also select
   from the **keyboard** like a desktop text area: **Shift+Arrow/Home/End** grows
