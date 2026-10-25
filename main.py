@@ -141,6 +141,17 @@ def _name_application(app: QApplication) -> None:
     app.setApplicationName("AI Hive")
 
 
+def _instant_popups() -> None:
+    """Menus and combo lists appear in one frame. Qt fades a QMenu in and
+    scrolls a QComboBox list down for about 140 ms (sampled off the screen
+    with the effects on and off); neither animates on close, so the open is
+    the only part to cut. The effects are process-wide flags and the style
+    does not matter: Fusion honours them like any other."""
+    for effect in (Qt.UIEffect.UI_AnimateMenu, Qt.UIEffect.UI_FadeMenu,
+                   Qt.UIEffect.UI_AnimateCombo):
+        QApplication.setEffectEnabled(effect, False)
+
+
 def setup_application(app: QApplication, ui: dict | None = None,
                       fonts_dir: str | None = None) -> None:
     """`ui` is the saved session's "ui" dict. Its theme and console font
@@ -154,6 +165,7 @@ def setup_application(app: QApplication, ui: dict | None = None,
     font is read so a custom pick resolves."""
     _name_application(app)
     app.setStyle("Fusion")  # stable base for QSS on Windows
+    _instant_popups()
     app.setWindowIcon(_app_icon())
     _load_bundled_fonts()
     if fonts_dir:

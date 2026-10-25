@@ -4561,3 +4561,22 @@ def test_new_agent_spawns_at_card_size():
         pty_worker.PtyWorker.start = orig_start
         TerminalView.flush_resize = orig_flush
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_menus_and_combos_open_instantly():
+    """Qt fades a QMenu in and scrolls a QComboBox list down for about 140 ms
+    unless the process-wide effect flags are off. setup_application turns
+    them off, so a dropdown shows complete on its first frame."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from main import setup_application
+
+    app = QApplication.instance() or QApplication([])
+    for effect in (Qt.UIEffect.UI_AnimateMenu, Qt.UIEffect.UI_FadeMenu,
+                   Qt.UIEffect.UI_AnimateCombo):
+        QApplication.setEffectEnabled(effect, True)
+    setup_application(app)
+    for name in ("UI_AnimateMenu", "UI_FadeMenu", "UI_AnimateCombo"):
+        check(f"instant popups: {name} is off after setup",
+              not QApplication.isEffectEnabled(getattr(Qt.UIEffect, name)))
