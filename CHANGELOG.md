@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.52.0
+
+- Dragging a selection past the top or bottom of an agent's window now
+  scrolls through its history and keeps selecting, faster the further
+  past the edge you hold the pointer. The selection also stays on its
+  text when you scroll with the wheel or the scrollbar.
+- Menus and dropdown lists open at once instead of fading or sliding in.
+
 ## 0.51.0
 
 - Bold word starts is now called Bionic reading, and its tooltip explains
