@@ -1494,6 +1494,358 @@ def test_scrollback():
           sent == ["\x1b[I", "\x1b[O"], sent)
 
 
+def test_drag_select_autoscroll():
+    """A drag held above the view scrolls history under it and the
+    selection grows into the rows that scroll in. Before, the drag's end
+    stuck at the top row and nothing above the view could be selected. The
+    selection keeps its text whenever the view scrolls, so its start can
+    sit far off screen and still copy."""
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent, QWheelEvent
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                           DRAG_SCROLL_MAX_LINES,
+                                           DRAG_SCROLL_MS, TerminalView)
+    QApplication.instance() or QApplication([])
+    left, none = Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton
+    plain = Qt.KeyboardModifier.NoModifier
+
+    def view(n=60):
+        v = TerminalView(rows=10, cols=40)
+        v.resize(int(2 * CELL_PAD_X + 40 * v._cell_w) + 1,
+                 int(2 * CELL_PAD_Y + 10 * v._cell_h) + 1)
+        for i in range(n):
+            v.feed(f"line-{i:02d}\r\n")
+        return v
+
+    def at(v, row, col):
+        return QPointF(CELL_PAD_X + (col + 0.5) * v._cell_w,
+                       CELL_PAD_Y + (row + 0.5) * v._cell_h)
+
+    def press(v, pos):
+        v.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, pos,
+                                      left, left, plain))
+
+    def move(v, pos, buttons=left):
+        v.mouseMoveEvent(QMouseEvent(QEvent.Type.MouseMove, pos, none,
+                                     buttons, plain))
+
+    def release(v, pos):
+        v.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, pos,
+                                        left, none, plain))
+
+    # live: rows 0-8 hold line-51..line-59, history holds line-00..line-50
+    v = view()
+    sent = []
+    v.keyInput.connect(sent.append)
+    x = at(v, 0, 6).x()
+    above = QPointF(x, -5)
+    step = v._drag_scroll_step(above)
+    check("drag-scroll: just past the top edge scrolls a little",
+          0 < step < DRAG_SCROLL_MAX_LINES, step)
+    check("drag-scroll: far past the top edge scrolls at full speed",
+          v._drag_scroll_step(QPointF(x, -500)) == DRAG_SCROLL_MAX_LINES)
+    check("drag-scroll: past the bottom edge scrolls toward live",
+          v._drag_scroll_step(QPointF(x, v.height() + 5)) < 0)
+    check("drag-scroll: inside the view nothing scrolls",
+          v._drag_scroll_step(at(v, 0, 0)) == 0)
+
+    press(v, at(v, 5, 6))                       # the end of line-56
+    move(v, above)
+    check("drag-scroll: a drag above the view starts the timer",
+          v._drag_timer.isActive())
+    check("drag-scroll: above the view the drag takes the top row whole",
+          v._sel_end == (0, 0), v._sel_end)
+    for _ in range(5):
+        v._drag_scroll_tick()
+    off = v.scroll_offset()
+    check("drag-scroll: each tick scrolls back into history",
+          off == 5 * step, (off, step))
+    check("drag-scroll: the anchor stays on its text off screen",
+          v._sel_anchor == (5 + off, 6), v._sel_anchor)
+    got = v.selected_text().splitlines()
+    check("drag-scroll: the selection takes the rows that scrolled in",
+          got[:1] == [f"line-{51 - off:02d}"] and got[-1:] == ["line-56"]
+          and len(got) == 6 + off, got)
+
+    for _ in range(100):
+        if not v._drag_timer.isActive():
+            break
+        v._drag_scroll_tick()
+    check("drag-scroll: stops at the oldest line",
+          not v._drag_timer.isActive()
+          and v.scroll_offset() == len(v.screen.history.top),
+          (v._drag_timer.isActive(), v.scroll_offset()))
+    got = v.selected_text().splitlines()
+    check("drag-scroll: the drag reaches the oldest line",
+          got[:1] == ["line-00"] and got[-1:] == ["line-56"]
+          and len(got) == 57, (got[:2], got[-2:], len(got)))
+    check("drag-scroll: paints with the anchor far off screen",
+          not v.grab().isNull())
+    release(v, above)
+    check("drag-scroll: release stops it and keeps the selection",
+          not v._drag_timer.isActive() and v._drag_pos is None
+          and v.selected_text().splitlines()[:1] == ["line-00"])
+    check("drag-scroll: nothing reaches the child", sent == [], sent)
+
+    # down from the top of history: below the view scrolls toward live
+    press(v, at(v, 2, 0))                       # line-02
+    below = QPointF(x, v.height() + 5)
+    move(v, below)
+    check("drag-scroll: below the view the drag takes the bottom row whole",
+          v._sel_end == (9, 39), v._sel_end)
+    top = v.scroll_offset()
+    for _ in range(3):
+        v._drag_scroll_tick()
+    down = top - v.scroll_offset()
+    got = v.selected_text().splitlines()
+    check("drag-scroll: a drag below the view scrolls toward live",
+          down == -3 * v._drag_scroll_step(below), down)
+    check("drag-scroll: the start scrolled off the top still copies",
+          v._sel_anchor == (2 - down, 0) and got[:1] == ["line-02"]
+          and len(got) == 8 + down, (v._sel_anchor, got[:1], len(got)))
+    release(v, below)
+
+    # the real timer is wired up
+    v2 = view()
+    press(v2, at(v2, 5, 6))
+    move(v2, QPointF(x, -500))
+    QTest.qWait(DRAG_SCROLL_MS * 4)
+    check("drag-scroll: the timer scrolls a held drag on its own",
+          v2.scroll_offset() > 0, v2.scroll_offset())
+    # a move with no button means the release went elsewhere
+    move(v2, QPointF(x, -500), buttons=none)
+    check("drag-scroll: a buttonless move stops a lost drag",
+          not v2._drag_timer.isActive())
+
+    # a selection keeps its text when the view scrolls
+    v3 = view()
+    v3.scroll_by(10)
+    press(v3, at(v3, 1, 0))
+    move(v3, at(v3, 1, 6))
+    release(v3, at(v3, 1, 6))
+    picked = v3.selected_text()
+    v3.scroll_by(4)
+    check("drag-scroll: a scroll keeps the selection on its text",
+          v3.selected_text() == picked == "line-42", (picked,
+                                                      v3.selected_text()))
+    v3.scroll_by(-14)
+    check("drag-scroll: the selection survives a scroll to live",
+          v3.selected_text() == picked, v3.selected_text())
+
+    # a wheel mid-drag grows the selection to the row under the pointer
+    v4 = view()
+    press(v4, at(v4, 8, 6))                     # the end of line-59
+    v4.wheelEvent(QWheelEvent(at(v4, 0, 0), at(v4, 0, 0), QPoint(0, 0),
+                              QPoint(0, 120), left, plain,
+                              Qt.ScrollPhase.NoScrollPhase, False))
+    got = v4.selected_text().splitlines()
+    check("drag-scroll: a wheel mid-drag selects what scrolled under it",
+          got[:1] == ["line-48"] and got[-1:] == ["line-59"], got)
+    release(v4, at(v4, 0, 0))
+
+    # mouse tracking: a press on (0, 0) dragged above stays at (0, 0), and
+    # leaving the view is still a drag, never a forwarded click
+    v5 = view()
+    v5.feed("\x1b[?1000;1006h")
+    fwd = []
+    v5.keyInput.connect(fwd.append)
+    press(v5, at(v5, 0, 0))
+    move(v5, above)
+    v5._drag_scroll_tick()
+    release(v5, above)
+    check("drag-scroll: under mouse tracking it selects, never clicks",
+          fwd == [] and v5.selected_text() != "", (fwd, v5.selected_text()))
+
+    # the alternate screen keeps its own scrolling
+    v6 = view()
+    v6.feed("\x1b[?1049h")
+    press(v6, at(v6, 5, 6))
+    move(v6, above)
+    check("drag-scroll: never on the alternate screen",
+          not v6._drag_timer.isActive() and v6.scroll_offset() == 0)
+    release(v6, above)
+    for w in (v, v2, v3, v4, v5, v6):
+        w.deleteLater()
+
+
+def test_drag_select_offscreen_selection():
+    """A selection a drag carried off screen keeps its text through every
+    path that moves the view or reads its rows. Before: Shift+Up after the
+    drag clamped the end to the live screen and dropped the history part,
+    a history wipe or alternate-screen entry left the selection on
+    unrelated text, a wheel with the left button held on the scrollbar
+    rewrote a finished selection, and a hidden view kept auto-scrolling."""
+    from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+    from PySide6.QtGui import QHideEvent, QMouseEvent, QWheelEvent
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import REFLOW_BEGIN, REFLOW_END
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                           HISTORY_LINES, TerminalView)
+    QApplication.instance() or QApplication([])
+    left, none = Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton
+    plain = Qt.KeyboardModifier.NoModifier
+
+    def view(n=60):
+        v = TerminalView(rows=10, cols=40)
+        v.resize(int(2 * CELL_PAD_X + 40 * v._cell_w) + 1,
+                 int(2 * CELL_PAD_Y + 10 * v._cell_h) + 1)
+        for i in range(n):
+            v.feed(f"line-{i:02d}\r\n")
+        return v
+
+    def at(v, row, col):
+        return QPointF(CELL_PAD_X + (col + 0.5) * v._cell_w,
+                       CELL_PAD_Y + (row + 0.5) * v._cell_h)
+
+    def press(v, pos):
+        v.mousePressEvent(QMouseEvent(QEvent.Type.MouseButtonPress, pos,
+                                      left, left, plain))
+
+    def move(v, pos, buttons=left):
+        v.mouseMoveEvent(QMouseEvent(QEvent.Type.MouseMove, pos, none,
+                                     buttons, plain))
+
+    def release(v, pos):
+        v.mouseReleaseEvent(QMouseEvent(QEvent.Type.MouseButtonRelease, pos,
+                                        left, none, plain))
+
+    def wheel(v, pos, buttons):
+        v.wheelEvent(QWheelEvent(pos, pos, QPoint(0, 0), QPoint(0, 120),
+                                 buttons, plain,
+                                 Qt.ScrollPhase.NoScrollPhase, False))
+
+    def drag_up(v, ticks):
+        above = QPointF(at(v, 0, 6).x(), -5)
+        press(v, at(v, 5, 6))                   # the end of line-56
+        move(v, above)
+        for _ in range(ticks):
+            v._drag_scroll_tick()
+        release(v, above)
+
+    # Shift+Arrow after the drag: the end it left in history stays there
+    v = view()
+    drag_up(v, 5)
+    off = v.scroll_offset()
+    first = f"line-{51 - off:02d}"
+    v._extend_kbd_selection(Qt.Key.Key_Up, False)
+    got = v.selected_text().splitlines()
+    check("offscreen sel: Shift+Up keeps the history part of a drag",
+          v.scroll_offset() == 0 and got[:1] == [first]
+          and got[-1:] == ["line-56"], (v.scroll_offset(), got[:1], got[-1:]))
+    v._extend_kbd_selection(Qt.Key.Key_Down, False)
+    got = v.selected_text().splitlines()
+    check("offscreen sel: Shift+Down moves an off-screen end toward live",
+          got[:1] == [f"line-{52 - off:02d}"], got[:1])
+    v._extend_kbd_selection(Qt.Key.Key_End, False)
+    check("offscreen sel: Shift+End reads the off-screen row's text",
+          v._sel_end == (1 - off, 6), v._sel_end)
+    v._extend_kbd_selection(Qt.Key.Key_Left, True)
+    check("offscreen sel: Ctrl+Shift+Left finds words off screen",
+          v._sel_end == (1 - off, 0), v._sel_end)
+
+    # a live selection reads no history (it is copied on every new push)
+    v2 = view()
+    press(v2, at(v2, 2, 0))
+    move(v2, at(v2, 2, 6))
+    release(v2, at(v2, 2, 6))
+    calls = []
+    real = v2._history_list
+    v2._history_list = lambda: calls.append(1) or real()
+    picked = v2.selected_text()
+    check("offscreen sel: a live selection never copies history",
+          picked == "line-53" and calls == [], (picked, calls))
+    del v2._history_list
+
+    # reflow BEGIN wipes history and keeps the screen: a live selection
+    # keeps its text, one that reached history goes
+    v2.feed(REFLOW_BEGIN)
+    check("offscreen sel: a wipe keeps a selection on the live screen",
+          v2.selected_text() == "line-53", v2.selected_text())
+    v2b = view()
+    drag_up(v2b, 3)
+    v2b.feed(REFLOW_BEGIN)
+    check("offscreen sel: a wipe drops a selection that reached history",
+          v2b._sel_anchor is None and v2b.selected_text() == "",
+          (v2b._sel_anchor, v2b.selected_text()))
+    v2b.deleteLater()
+
+    # alternate-screen entry from scrollback: the selection keeps its text
+    v3 = view()
+    v3.scroll_by(10)
+    press(v3, at(v3, 1, 0))
+    move(v3, at(v3, 1, 6))
+    release(v3, at(v3, 1, 6))
+    picked = v3.selected_text()
+    v3.feed("\x1b[?1049h")
+    check("offscreen sel: alt-screen entry keeps the selection on its text",
+          v3.scroll_offset() == 0 and v3.selected_text() == picked
+          == "line-42", (v3.scroll_offset(), picked, v3.selected_text()))
+
+    # reflow END pulls rows back out of history: a live selection follows
+    v4 = view()
+    v4.feed("\x1b[5;1H\x1b[J")                  # rows 4-9 blank, cursor on 4
+    press(v4, at(v4, 2, 0))
+    move(v4, at(v4, 2, 6))
+    release(v4, at(v4, 2, 6))
+    picked = v4.selected_text()
+    v4.feed(REFLOW_END)
+    check("offscreen sel: reflow END keeps the selection on its text",
+          v4._sel_anchor[0] > 2 and v4.selected_text() == picked,
+          (v4._sel_anchor, picked, v4.selected_text()))
+
+    # a wheel from an overlay with the left button held there
+    v5 = view()
+    press(v5, at(v5, 8, 0))
+    move(v5, at(v5, 8, 6))
+    release(v5, at(v5, 8, 6))
+    picked = v5.selected_text()
+    wheel(v5, at(v5, 0, 39), left)              # button held on the scrollbar
+    check("offscreen sel: a wheel not from a view drag keeps the selection",
+          v5.selected_text() == picked == "line-59", v5.selected_text())
+
+    # output that scrolls the live screen carries the selection with it,
+    # here an end a drag left in history and a start on screen
+    v7 = view()
+    drag_up(v7, 2)
+    v7.scroll_by(-v7.scroll_offset())
+    picked = v7.selected_text()
+    for i in range(60, 64):
+        v7.feed(f"line-{i:02d}\r\n")
+    check("offscreen sel: live output keeps the selection on its text",
+          v7.selected_text() == picked and picked.endswith("line-56"),
+          (picked, v7.selected_text()))
+
+    # a full history held at its oldest line: eviction moves the text
+    # under the view, and a selection whose rows all left history goes
+    v8 = view(HISTORY_LINES + 20)
+    v8.scroll_by(HISTORY_LINES)
+    press(v8, at(v8, 4, 0))
+    move(v8, at(v8, 4, 6))
+    release(v8, at(v8, 4, 6))
+    picked = v8.selected_text()
+    v8.feed("next-0\r\nnext-1\r\n")
+    check("offscreen sel: eviction at the oldest line keeps the selection",
+          v8.scroll_offset() == HISTORY_LINES
+          and v8.selected_text() == picked, (picked, v8.selected_text()))
+    for i in range(5):
+        v8.feed(f"more-{i}\r\n")
+    check("offscreen sel: a selection history evicted whole goes",
+          v8._sel_anchor is None and v8.selected_text() == "",
+          (v8._sel_anchor, v8.selected_text()))
+
+    # a view hidden mid-drag stops scrolling
+    v6 = view()
+    press(v6, at(v6, 5, 6))
+    move(v6, QPointF(at(v6, 0, 6).x(), -5))
+    v6.hideEvent(QHideEvent())
+    check("offscreen sel: hiding the view stops a held drag",
+          not v6._drag_timer.isActive() and v6._drag_pos is None)
+    for w in (v, v2, v3, v4, v5, v6, v7, v8):
+        w.deleteLater()
+
+
 def test_projection_happens_once():
     """The scrollback is projected ONCE, at the card's settled width.
 

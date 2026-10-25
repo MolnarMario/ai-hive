@@ -132,6 +132,17 @@ prompt is never counted). Fail-closed: a selection that escapes the input box
 nothing -- inference from painted rows must never corrupt what it can't be sure
 of. To empty the whole prompt at once, use Ctrl+A then Backspace (the
 clear-prompt gesture above).
+A drag held above or below the view scrolls history under it, faster the
+further past the edge, and selects whole rows to that edge. A held pointer
+sends no moves, so a timer drives it (_drag_scroll_tick). The selection is
+kept in visual rows, and every scroll of the view (wheel, scrollbar,
+Shift+PageUp, a keystroke's snap to live) moves it with its text
+(_set_offset), so its ends can sit off screen: selected_text reads those
+rows from history, paint draws only the part on screen, and deletion fails
+closed on them. Output that scrolls rows into history moves it with its
+text too (_feed_screen), and it goes once history evicts all of it. The alternate
+screen never auto-scrolls, for the same reason the wheel doesn't scroll
+history there.
 Options > Bionic reading (off by default, one class flag for every view)
 draws the first half of each prose word in bold. app/word_starts.py picks
 the cells from a whole row; _word_start_rows runs it over the visible rows
@@ -341,6 +352,13 @@ EVICTED_KEEP = 512
 CELL_PAD_X = 6   # left/right inner padding (real terminals aren't flush)
 CELL_PAD_Y = 4   # top/bottom inner padding
 VIEW_NOTIFY_MS = 50   # coalescing window for viewChanged
+# A drag held above or below the view scrolls history one step per
+# DRAG_SCROLL_MS: 1 line just past the edge, ramping to DRAG_SCROLL_MAX_LINES
+# at DRAG_SCROLL_RAMP_PX past it (xterm.js uses the same shape). At the
+# fastest, HISTORY_LINES takes about 10 s to cross.
+DRAG_SCROLL_MS = 50
+DRAG_SCROLL_MAX_LINES = 10
+DRAG_SCROLL_RAMP_PX = 60
 # how far above the caret to look for the submitted input when the caret
 # itself is parked on a blank row (see TerminalView._submitted_input)
 _INPUT_SCAN_ROWS = 6
@@ -766,8 +784,18 @@ class TerminalView(QWidget):
         # persistent (legitimately short) gap is checked once and left alone
         # rather than re-triggering a repaint on every settle
         self._input_gap_row = None
-        self._sel_anchor = None  # (row, col) selection start, in screen coords
-        self._sel_end = None     # (row, col) selection end
+        # (row, col) selection start and end, in VISUAL rows. A scroll moves
+        # both with the text (_set_offset), so either can sit off screen:
+        # below the view (row >= lines) or above it (row < 0).
+        self._sel_anchor = None
+        self._sel_end = None
+        # pointer of a drag held past the top or bottom edge, in view
+        # coordinates, while _drag_timer scrolls history (_drag_scroll_tick)
+        self._drag_pos = None
+        # the left button went down in the view and is still down: only then
+        # does a wheel grow the selection. A press held on the scrollbar or
+        # the find bar forwards its wheel here with the left button down too.
+        self._mouse_selecting = False
         self._input_selected = False  # Ctrl+A input-line highlight is active
         # Keyboard-driven selection (Shift+Arrow/Home/End, Ctrl for word) reuses
         # _sel_anchor/_sel_end -- purely a local copy overlay, no child bytes.
@@ -838,6 +866,10 @@ class TerminalView(QWidget):
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(120)
         self._resize_timer.timeout.connect(self._apply_resize)
+
+        self._drag_timer = QTimer(self)
+        self._drag_timer.setInterval(DRAG_SCROLL_MS)
+        self._drag_timer.timeout.connect(self._drag_scroll_tick)
 
         # debounce that coalesces a typing burst into ONE undo snapshot (see
         # _snapshot_input / _kick_snapshot)
@@ -932,6 +964,7 @@ class TerminalView(QWidget):
                 elif tok in ("1049", "1047", "47"):
                     self._alt_screen = on
                     if on:  # the app owns the screen now — leave scrollback
+                        self._shift_selection(-self._scroll_offset)
                         self._scroll_offset = 0
                         self._notify_view()
                 elif tok in ("1000", "1002", "1003"):
@@ -968,27 +1001,39 @@ class TerminalView(QWidget):
         # Use the true push count (not the deque length) so the anchor holds
         # even after history saturates — once full, append-then-evict pins len()
         # and the naive delta reads 0, which let the view drift a line per line.
-        if self._scroll_offset:
-            top_after = self.screen.history.top
-            pushed_after = getattr(top_after, "pushed", None)
-            if pushed_before is not None and pushed_after is not None:
-                grown = pushed_after - pushed_before
-            else:
-                grown = len(top_after) - hist_before
-            # a drop (_feed_frames) that takes back rows an earlier feed
-            # pushed lowers the count, and the offset that grew for them
-            # shrinks back with it
-            if grown:
-                self._scroll_offset = max(0, min(self._scroll_offset + grown,
-                                                 len(top_after)))
+        top_after = self.screen.history.top
         # A SHRINK can only be _reset_history (pyte's ED 3 or screen.reset()):
         # history otherwise just grows toward maxlen, evicting from the front
         # without changing len() once saturated. That is the cheapest reliable
         # "the conversation was wiped" edge available from the stream itself.
         # Rows _feed_frames took back are not a wipe: once history is full,
         # their pushes evicted as many rows from the front.
-        if len(self.screen.history.top) + dropped < hist_before:
+        if len(top_after) + dropped < hist_before:
             self._on_history_wiped()
+            return
+        pushed_after = getattr(top_after, "pushed", None)
+        if pushed_before is not None and pushed_after is not None:
+            grown = pushed_after - pushed_before
+        else:
+            grown = len(top_after) - hist_before
+        before = self._scroll_offset
+        # a drop (_feed_frames) that takes back rows an earlier feed pushed
+        # lowers the count, and the offset that grew for them shrinks back
+        # with it
+        if before and grown:
+            self._scroll_offset = max(0, min(before + grown, len(top_after)))
+        if self._sel_anchor is None or not grown:
+            return
+        # Visual row r shows line id pushed - offset + r, so the selection
+        # keeps its text by moving (offset change - grown) rows. That is 0
+        # while the view follows the content, and moves it up with the text
+        # while live or held at the oldest line of a full history.
+        self._shift_selection(self._scroll_offset - before - grown)
+        # gone entirely once both ends left the front of history
+        oldest = self._scroll_offset - len(top_after)
+        if self._sel_anchor[0] < oldest and (
+                self._sel_end is None or self._sel_end[0] < oldest):
+            self._sel_anchor = self._sel_end = None
 
     def _apply_reflow_marker(self, marker: str) -> None:
         """Act on a marker TerminalAgent wrote around a reflow (see
@@ -1038,7 +1083,11 @@ class TerminalView(QWidget):
                 top.pushed -= n
             scr.cursor.y += n
             scr.dirty.update(range(scr.lines))
-            self._scroll_offset = max(0, self._scroll_offset - n)
+            # every line keeps its place in history-plus-screen, so a row
+            # moves down by the n rows minus what the offset gave back
+            off = max(0, self._scroll_offset - n)
+            self._shift_selection(n - (self._scroll_offset - off))
+            self._scroll_offset = off
             self._vs_cache = None
             self._vs_sig = None
             # the popped rows are screen rows again and will be drawn over,
@@ -1300,6 +1349,7 @@ class TerminalView(QWidget):
         self._esc_carry = ""
         self._input_gap_row = None
         self._sel_anchor = self._sel_end = None
+        self._stop_drag_scroll()
         self._input_selected = False
         self._pending_fwd = None
         self._hover_link = None
@@ -1577,6 +1627,12 @@ class TerminalView(QWidget):
 
     def _forget_view_history(self) -> None:
         self._frame_ref = None
+        # a selection that reaches into history lost its text with it; one
+        # wholly on the live screen keeps it, since the screen stays
+        if self._scroll_offset or any(
+                p is not None and p[0] < 0
+                for p in (self._sel_anchor, self._sel_end)):
+            self._sel_anchor = self._sel_end = None
         self._scroll_offset = 0
         self._marks = []
         self._answer_marks = []
@@ -1642,6 +1698,11 @@ class TerminalView(QWidget):
         (e.g. a full reset) while scrolled back."""
         if not self._scroll_offset:
             return None, 0
+        hist = self._history_list()
+        return hist, min(self._scroll_offset, len(hist))
+
+    def _history_list(self) -> list:
+        """history.top as a list, for indexing."""
         top = self.screen.history.top
         # The copy is cached on (pushed, len): paintEvent, visible_text,
         # selected_text and every _visible_line call land here, so a user simply
@@ -1651,8 +1712,7 @@ class TerminalView(QWidget):
         sig = (getattr(top, "pushed", 0), len(top))
         if sig != self._vs_sig or self._vs_cache is None:
             self._vs_sig, self._vs_cache = sig, list(top)
-        hist = self._vs_cache
-        return hist, min(self._scroll_offset, len(hist))
+        return self._vs_cache
 
     def _visible_line(self, r: int, hist, off: int):
         """Line shown at visual row r: history tail first, then the live
@@ -1663,6 +1723,27 @@ class TerminalView(QWidget):
         if idx < len(hist):
             return hist[idx]
         return self.screen.buffer[idx - len(hist)]
+
+    def _line_at_row(self, r: int, hist: list, off: int):
+        """_visible_line for any row, on screen or not: a selection carried
+        off screen by a scroll still has its rows. None past either end of
+        history plus the live screen, rather than the blank line pyte's
+        buffer would make up for a row it doesn't have."""
+        idx = len(hist) - off + r
+        if idx < 0:
+            return None
+        if idx < len(hist):
+            return hist[idx]
+        idx -= len(hist)
+        return self.screen.buffer[idx] if idx < self.screen.lines else None
+
+    def _row_line(self, r: int):
+        """_line_at_row at the current offset. History is copied only when
+        row r or the view is in it, so a live selection read while an agent
+        streams doesn't rebuild the history list on every call."""
+        hist = (self._history_list() if r < 0 or self._scroll_offset
+                else [])
+        return self._line_at_row(r, hist, min(self._scroll_offset, len(hist)))
 
     def visible_text(self) -> str:
         """Plain text of what is actually painted (honors scrollback)."""
@@ -1675,12 +1756,33 @@ class TerminalView(QWidget):
     def scroll_by(self, lines: int) -> None:
         """Scroll the view: positive = back into history, negative = toward
         live; clamped to [0, history]."""
-        new = max(0, min(len(self.screen.history.top),
-                         self._scroll_offset + lines))
-        if new != self._scroll_offset:
-            self._scroll_offset = new
-            self._notify_view(immediate=True)
-            self.update()
+        self._set_offset(max(0, min(len(self.screen.history.top),
+                                    self._scroll_offset + lines)))
+
+    def _set_offset(self, new: int) -> None:
+        """Move the view to scroll offset `new`. The selection moves with
+        the text under it, a row down per line scrolled back, the way an
+        editor's does. A drag that auto-scrolls carries its start off screen
+        this way and still copies it, and a selection survives a wheel."""
+        delta = new - self._scroll_offset
+        if not delta:
+            return
+        self._scroll_offset = new
+        self._shift_selection(delta)
+        self._notify_view(immediate=True)
+        self.update()
+
+    def _shift_selection(self, delta: int) -> None:
+        """Move the selection `delta` visual rows down, to follow its text
+        when the view moves. Every write of _scroll_offset that moves the
+        text under the view goes through here."""
+        if not delta:
+            return
+        if self._sel_anchor is not None:
+            self._sel_anchor = (self._sel_anchor[0] + delta,
+                                self._sel_anchor[1])
+        if self._sel_end is not None:
+            self._sel_end = (self._sel_end[0] + delta, self._sel_end[1])
 
     def scroll_offset(self) -> int:
         return self._scroll_offset
@@ -2016,9 +2118,19 @@ class TerminalView(QWidget):
     def focusOutEvent(self, event) -> None:
         if self._focus_reporting:
             self.keyInput.emit("\x1b[O")
+        # whatever took focus may keep the release
+        self._mouse_selecting = False
+        self._stop_drag_scroll()
         self._preedit = ""
         self._im_rect = None
         super().focusOutEvent(event)
+
+    def hideEvent(self, event) -> None:
+        # a workspace switch can hide the view mid-drag without taking its
+        # focus, and the release then never reaches it
+        self._mouse_selecting = False
+        self._stop_drag_scroll()
+        super().hideEvent(event)
 
     def inputMethodQuery(self, query):
         # The panels and IME candidate windows open next to this rectangle.
@@ -2349,6 +2461,12 @@ class TerminalView(QWidget):
         else:
             # normal buffer: scroll our own history view
             self.scroll_by(steps if up else -steps)
+            # a wheel mid-drag grows the selection to the text that scrolled
+            # under the pointer, as a browser does
+            if (self._mouse_selecting
+                    and event.buttons() & Qt.MouseButton.LeftButton
+                    and self._sel_anchor is not None):
+                self._sel_end = self._drag_cell(event.position())
         event.accept()
 
     def overlay_wheel(self, event) -> None:
@@ -2386,10 +2504,7 @@ class TerminalView(QWidget):
                 + chr(32 + min(col + 1, 222)) + chr(32 + min(row + 1, 222)))
 
     def _snap_to_bottom(self) -> None:
-        if self._scroll_offset:
-            self._scroll_offset = 0
-            self._notify_view(immediate=True)
-            self.update()
+        self._set_offset(0)
 
     # -------------------------------------------------- mouse / clipboard ---
 
@@ -2399,6 +2514,53 @@ class TerminalView(QWidget):
         col = max(0, min(self.screen.columns - 1, col))
         row = max(0, min(self.screen.lines - 1, row))
         return row, col
+
+    def _drag_cell(self, pos) -> tuple[int, int]:
+        """The cell a drag at `pos` selects to. Above the view that is the
+        start of the top row and below it the end of the bottom row, so a
+        drag that leaves the view takes whole rows whatever its x."""
+        if pos.y() < 0:
+            return 0, 0
+        if pos.y() >= self.height():
+            return self.screen.lines - 1, self.screen.columns - 1
+        return self._cell_at(pos)
+
+    def _drag_scroll_step(self, pos) -> int:
+        """Lines one auto-scroll tick moves for a drag at `pos`: positive
+        (back into history) above the view, negative (toward live) below
+        it, 0 inside it. Also 0 on the alternate screen, where the app
+        owns scrolling and the wheel doesn't scroll our history either."""
+        if self._alt_screen:
+            return 0
+        y = pos.y()
+        if y < 0:
+            past, sign = -y, 1
+        elif y >= self.height():
+            past, sign = y - self.height() + 1, -1
+        else:
+            return 0
+        ramp = min(past, DRAG_SCROLL_RAMP_PX) / DRAG_SCROLL_RAMP_PX
+        return sign * (1 + round(ramp * (DRAG_SCROLL_MAX_LINES - 1)))
+
+    def _drag_scroll_tick(self) -> None:
+        """One step of a drag held past an edge: scroll, then pull the
+        selection's end to the row that just scrolled in. A held pointer
+        sends no moves, so the timer drives this, not mouseMoveEvent."""
+        pos = self._drag_pos
+        step = self._drag_scroll_step(pos) if pos is not None else 0
+        if not step or self._sel_anchor is None:
+            self._stop_drag_scroll()
+            return
+        before = self._scroll_offset
+        self.scroll_by(step)
+        if self._scroll_offset == before:   # oldest line or live reached
+            self._stop_drag_scroll()
+            return
+        self._sel_end = self._drag_cell(pos)   # scroll_by queued the repaint
+
+    def _stop_drag_scroll(self) -> None:
+        self._drag_timer.stop()
+        self._drag_pos = None
 
     def mousePressEvent(self, event):
         # Ctrl+click (or a scroll-wheel/middle click) opens a URL / local file
@@ -2439,6 +2601,7 @@ class TerminalView(QWidget):
             # selection (mouseMoveEvent needs _sel_anchor to track the drag).
         if event.button() == Qt.MouseButton.LeftButton:
             self.setFocus()
+            self._mouse_selecting = True
             self._input_selected = False  # a mouse drag is a copy selection
             cell = self._cell_at(event.position())
             if shift and self._sel_anchor is not None:
@@ -2485,15 +2648,29 @@ class TerminalView(QWidget):
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.MouseButton.LeftButton and self._sel_anchor:
-            self._sel_end = self._cell_at(event.position())
+            pos = event.position()
+            self._sel_end = self._drag_cell(pos)
             # moving off the press cell makes this a DRAG (a local selection),
             # so a pending mouse-tracking forward is cancelled — the child never
             # sees the click, and the drag is ours to copy.
             if self._pending_fwd is not None and self._sel_end != self._pending_fwd:
                 self._pending_fwd = None
+            # past the top or bottom edge, history scrolls under the drag
+            # until the pointer comes back or the button comes up
+            if self._drag_scroll_step(pos):
+                self._pending_fwd = None
+                self._drag_pos = pos
+                if not self._drag_timer.isActive():
+                    self._drag_timer.start()
+            else:
+                self._stop_drag_scroll()
             self.update()
             super().mouseMoveEvent(event)
             return
+        # no button: a release that never reached us (a popup took the
+        # grab) must not leave the drag scrolling
+        self._mouse_selecting = False
+        self._stop_drag_scroll()
         # hover (no drag): every link is already underlined; hovering one just
         # emphasizes it and shows the hand cursor. Look it up in the cached scan
         # (no filesystem work here), only re-checking when the cell changes.
@@ -2518,6 +2695,9 @@ class TerminalView(QWidget):
         super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._mouse_selecting = False
+            self._stop_drag_scroll()
         # A DEFERRED mouse-tracking press that never dragged is a CLICK: forward
         # it now (press + release at the press cell) so the child's menu responds
         # under the pointer, exactly as a live report would. A drag would have
@@ -2761,18 +2941,26 @@ class TerminalView(QWidget):
         elif key == Qt.Key.Key_Home:
             c = 0
         elif key == Qt.Key.Key_End:
-            c = self._row_content(r)[1]
-            if c < 0:
-                c = 0
-        self._sel_end = (max(0, min(rows - 1, r)), max(0, min(cols - 1, c)))
+            line = self._row_line(r)
+            c = max((i for i in range(cols)
+                     if line is not None and line[i].data not in ("", " ")),
+                    default=0)
+        # the snap above carried an end that a drag scrolled into history
+        # off the top (row < 0). It stays there and moves from there, but a
+        # key never pushes the end further into history than it already was,
+        # where the user can't see what it takes.
+        top = min(0, self._sel_end[0])
+        self._sel_end = (max(top, min(rows - 1, r)), max(0, min(cols - 1, c)))
         self.update()
 
     def _word_col(self, r: int, c: int, direction: int) -> int:
         """Column one word away from (r, c) in `direction` (+1 right / -1 left),
         for Ctrl+Shift+Arrow selection. Same whitespace-run notion as the
-        double-click word select (_word_at)."""
-        hist, off = self._view_state()
-        line = self._visible_line(r, hist, off)
+        double-click word select (_word_at). Row r may sit off screen, where
+        a drag's auto-scroll left the selection's end."""
+        line = self._row_line(r)
+        if line is None:
+            return c
         cols = self.screen.columns
 
         def blank(i):
@@ -2938,12 +3126,17 @@ class TerminalView(QWidget):
         if rng is None:
             return ""
         (r0, c0), (r1, c1) = rng
-        hist, off = self._view_state()  # copy what is painted, incl. history
+        # copy what is painted, plus any rows a scroll carried off screen
+        hist = (self._history_list() if r0 < 0 or self._scroll_offset
+                else [])
+        off = min(self._scroll_offset, len(hist))
         lines = []
         for r in range(r0, r1 + 1):
+            row = self._line_at_row(r, hist, off)
+            if row is None:     # history wiped under the selection
+                continue
             start = c0 if r == r0 else 0
             end = c1 if r == r1 else self.screen.columns - 1
-            row = self._visible_line(r, hist, off)
             lines.append("".join(row[c].data for c in range(start, end + 1)).rstrip())
         return "\n".join(lines)
 
@@ -3769,7 +3962,8 @@ class TerminalView(QWidget):
             (r0, c0), (r1, c1) = rng
             sel = QColor(Palette.SELECTION)
             sel.setAlpha(90)
-            for r in range(r0, r1 + 1):
+            # only the rows on screen: a drag can reach far off it
+            for r in range(max(r0, 0), min(r1, self.screen.lines - 1) + 1):
                 sc = c0 if r == r0 else 0
                 ec = c1 if r == r1 else self.screen.columns - 1
                 painter.fillRect(
