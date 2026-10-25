@@ -1681,7 +1681,8 @@ def test_drag_select_offscreen_selection():
     from PySide6.QtGui import QHideEvent, QMouseEvent, QWheelEvent
     from PySide6.QtWidgets import QApplication
     from app.terminal_agent import REFLOW_BEGIN, REFLOW_END
-    from app.widgets.terminal_view import CELL_PAD_X, CELL_PAD_Y, TerminalView
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                           HISTORY_LINES, TerminalView)
     QApplication.instance() or QApplication([])
     left, none = Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton
     plain = Qt.KeyboardModifier.NoModifier
@@ -1804,6 +1805,36 @@ def test_drag_select_offscreen_selection():
     check("offscreen sel: a wheel not from a view drag keeps the selection",
           v5.selected_text() == picked == "line-59", v5.selected_text())
 
+    # output that scrolls the live screen carries the selection with it,
+    # here an end a drag left in history and a start on screen
+    v7 = view()
+    drag_up(v7, 2)
+    v7.scroll_by(-v7.scroll_offset())
+    picked = v7.selected_text()
+    for i in range(60, 64):
+        v7.feed(f"line-{i:02d}\r\n")
+    check("offscreen sel: live output keeps the selection on its text",
+          v7.selected_text() == picked and picked.endswith("line-56"),
+          (picked, v7.selected_text()))
+
+    # a full history held at its oldest line: eviction moves the text
+    # under the view, and a selection whose rows all left history goes
+    v8 = view(HISTORY_LINES + 20)
+    v8.scroll_by(HISTORY_LINES)
+    press(v8, at(v8, 4, 0))
+    move(v8, at(v8, 4, 6))
+    release(v8, at(v8, 4, 6))
+    picked = v8.selected_text()
+    v8.feed("next-0\r\nnext-1\r\n")
+    check("offscreen sel: eviction at the oldest line keeps the selection",
+          v8.scroll_offset() == HISTORY_LINES
+          and v8.selected_text() == picked, (picked, v8.selected_text()))
+    for i in range(5):
+        v8.feed(f"more-{i}\r\n")
+    check("offscreen sel: a selection history evicted whole goes",
+          v8._sel_anchor is None and v8.selected_text() == "",
+          (v8._sel_anchor, v8.selected_text()))
+
     # a view hidden mid-drag stops scrolling
     v6 = view()
     press(v6, at(v6, 5, 6))
@@ -1811,7 +1842,7 @@ def test_drag_select_offscreen_selection():
     v6.hideEvent(QHideEvent())
     check("offscreen sel: hiding the view stops a held drag",
           not v6._drag_timer.isActive() and v6._drag_pos is None)
-    for w in (v, v2, v3, v4, v5, v6):
+    for w in (v, v2, v3, v4, v5, v6, v7, v8):
         w.deleteLater()
 
 

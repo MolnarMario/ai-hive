@@ -139,7 +139,8 @@ kept in visual rows, and every scroll of the view (wheel, scrollbar,
 Shift+PageUp, a keystroke's snap to live) moves it with its text
 (_set_offset), so its ends can sit off screen: selected_text reads those
 rows from history, paint draws only the part on screen, and deletion fails
-closed on them. Output arriving while live doesn't move it. The alternate
+closed on them. Output that scrolls rows into history moves it with its
+text too (_feed_screen), and it goes once history evicts all of it. The alternate
 screen never auto-scrolls, for the same reason the wheel doesn't scroll
 history there.
 Options > Bionic reading (off by default, one class flag for every view)
@@ -1000,27 +1001,39 @@ class TerminalView(QWidget):
         # Use the true push count (not the deque length) so the anchor holds
         # even after history saturates — once full, append-then-evict pins len()
         # and the naive delta reads 0, which let the view drift a line per line.
-        if self._scroll_offset:
-            top_after = self.screen.history.top
-            pushed_after = getattr(top_after, "pushed", None)
-            if pushed_before is not None and pushed_after is not None:
-                grown = pushed_after - pushed_before
-            else:
-                grown = len(top_after) - hist_before
-            # a drop (_feed_frames) that takes back rows an earlier feed
-            # pushed lowers the count, and the offset that grew for them
-            # shrinks back with it
-            if grown:
-                self._scroll_offset = max(0, min(self._scroll_offset + grown,
-                                                 len(top_after)))
+        top_after = self.screen.history.top
         # A SHRINK can only be _reset_history (pyte's ED 3 or screen.reset()):
         # history otherwise just grows toward maxlen, evicting from the front
         # without changing len() once saturated. That is the cheapest reliable
         # "the conversation was wiped" edge available from the stream itself.
         # Rows _feed_frames took back are not a wipe: once history is full,
         # their pushes evicted as many rows from the front.
-        if len(self.screen.history.top) + dropped < hist_before:
+        if len(top_after) + dropped < hist_before:
             self._on_history_wiped()
+            return
+        pushed_after = getattr(top_after, "pushed", None)
+        if pushed_before is not None and pushed_after is not None:
+            grown = pushed_after - pushed_before
+        else:
+            grown = len(top_after) - hist_before
+        before = self._scroll_offset
+        # a drop (_feed_frames) that takes back rows an earlier feed pushed
+        # lowers the count, and the offset that grew for them shrinks back
+        # with it
+        if before and grown:
+            self._scroll_offset = max(0, min(before + grown, len(top_after)))
+        if self._sel_anchor is None or not grown:
+            return
+        # Visual row r shows line id pushed - offset + r, so the selection
+        # keeps its text by moving (offset change - grown) rows. That is 0
+        # while the view follows the content, and moves it up with the text
+        # while live or held at the oldest line of a full history.
+        self._shift_selection(self._scroll_offset - before - grown)
+        # gone entirely once both ends left the front of history
+        oldest = self._scroll_offset - len(top_after)
+        if self._sel_anchor[0] < oldest and (
+                self._sel_end is None or self._sel_end[0] < oldest):
+            self._sel_anchor = self._sel_end = None
 
     def _apply_reflow_marker(self, marker: str) -> None:
         """Act on a marker TerminalAgent wrote around a reflow (see
