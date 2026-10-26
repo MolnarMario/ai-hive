@@ -23,12 +23,15 @@ from DECSET private modes in the stream, which pyte itself ignores):
 
 Editing shortcuts follow Windows conventions rather than pure terminal
 semantics: Ctrl+C copies the selection (falling back to the 0x03 interrupt
-when nothing is selected), Ctrl+V pastes (a clipboard IMAGE is spilled to a
-temp PNG and its path pasted, since Claude Code reads images by path and a
-native-Windows child can't take a raw clipboard image), Ctrl+Shift+A selects
-all painted text. Ctrl+A highlights the text you're typing (best-effort: the
-contiguous block of non-blank rows around the cursor, so wrapped/multi-line
-input highlights in full, like Cursor / the Claude desktop input box) and
+when nothing is selected), and the copy joins rows that only wrapped back
+into one line (app/soft_wrap.py), so a pasted reply keeps its paragraphs
+instead of breaking at every row. Ctrl+V pastes (a clipboard IMAGE is
+spilled to a temp PNG and its path pasted, since Claude Code reads images
+by path and a native-Windows child can't take a raw clipboard image),
+Ctrl+Shift+A selects all painted text. Ctrl+A highlights the text you're
+typing (best-effort: the contiguous block of non-blank rows around the
+cursor, so wrapped/multi-line input highlights in full, like Cursor / the
+Claude desktop input box) and
 Backspace/Del on that highlight clears the child's ENTIRE input via
 double-Escape (0x1b 0x1b, Claude Code's clear-prompt gesture, which unlike its
 line-local Ctrl+A/Ctrl+K empties multi-line input too). Typing a printable
@@ -198,7 +201,7 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
                            QWheelEvent)
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
-from .. import ui_theme
+from .. import soft_wrap, ui_theme
 from ..terminal_agent import (REFLOW_BEGIN, REFLOW_END, _CLAUDE_READY_HINTS,
                               _NUM_OPTION_RE)
 from ..ui_theme import ANSI_16, Palette
@@ -3150,15 +3153,42 @@ class TerminalView(QWidget):
         hist = (self._history_list() if r0 < 0 or self._scroll_offset
                 else [])
         off = min(self._scroll_offset, len(hist))
-        lines = []
+        cols = self.screen.columns
+        rows, texts = [], []
         for r in range(r0, r1 + 1):
             row = self._line_at_row(r, hist, off)
             if row is None:     # history wiped under the selection
                 continue
+            cells = [row[c].data for c in range(cols)]
             start = c0 if r == r0 else 0
-            end = c1 if r == r1 else self.screen.columns - 1
-            lines.append("".join(row[c].data for c in range(start, end + 1)).rstrip())
-        return "\n".join(lines)
+            end = c1 if r == r1 else cols - 1
+            rows.append(cells)
+            texts.append("".join(cells[start:end + 1]).rstrip())
+
+        def above():
+            # whole rows over the selection, nearest first, for soft_wrap
+            # to see whether it starts inside a tool result. A live
+            # selection walks history from its end instead of copying it.
+            if hist:
+                lines = (self._line_at_row(r, hist, off)
+                         for r in range(r0 - 1, off - len(hist) - 1, -1))
+            else:
+                lines = (self.screen.buffer[r] for r in range(r0 - 1, -1, -1))
+            for row in lines:
+                yield [row[c].data for c in range(cols)]
+            if not hist:
+                for row in reversed(self.screen.history.top):
+                    yield [row[c].data for c in range(cols)]
+
+        # a row Claude wrapped joins the one above it, so a pasted
+        # paragraph stays one paragraph
+        out = texts[:1]
+        for sep, text in zip(soft_wrap.joins(rows, cols, above()), texts[1:]):
+            if sep is None:
+                out.append(text)
+            else:
+                out[-1] += sep + text.lstrip()
+        return "\n".join(out)
 
     def copy_selection(self) -> None:
         text = self.selected_text()

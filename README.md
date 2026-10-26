@@ -962,7 +962,10 @@ Hard-won rules, each with a regression test:
   Keystrokes go straight to the child; the input box is replaced by the live
   screen. **Clipboard** (Windows-editor style): `Ctrl+C` copies the selection
   or, with nothing selected, sends the interrupt (0x03) — copying clears the
-  selection so the next `Ctrl+C` interrupts; `Ctrl+Shift+A` selects all painted
+  selection so the next `Ctrl+C` interrupts. A copy keeps only the real line
+  breaks: rows Claude wrapped to fit the card join back into one line, in a
+  reply, a prompt and a tool call, while a tool's output keeps every line;
+  `Ctrl+Shift+A` selects all painted
   text (screen + scrollback); `Ctrl+V` / `Ctrl+Shift+V` paste (bracketed-paste
   aware for multi-line); `Ctrl+Shift+C` also copies; and a right-click
   Copy/Paste/Select-all menu. The Win+V clipboard and Win+. emoji panels
