@@ -26,11 +26,12 @@ semantics: Ctrl+C copies the selection (falling back to the 0x03 interrupt
 when nothing is selected), and the copy joins rows that only wrapped back
 into one line (app/soft_wrap.py), so a pasted reply keeps its paragraphs
 instead of breaking at every row. Ctrl+V pastes (a clipboard IMAGE is
-spilled to a temp PNG and its path pasted, since Claude Code reads images by path and a
-native-Windows child can't take a raw clipboard image), Ctrl+Shift+A selects
-all painted text. Ctrl+A highlights the text you're typing (best-effort: the
-contiguous block of non-blank rows around the cursor, so wrapped/multi-line
-input highlights in full, like Cursor / the Claude desktop input box) and
+spilled to a temp PNG and its path pasted, since Claude Code reads images
+by path and a native-Windows child can't take a raw clipboard image),
+Ctrl+Shift+A selects all painted text. Ctrl+A highlights the text you're
+typing (best-effort: the contiguous block of non-blank rows around the
+cursor, so wrapped/multi-line input highlights in full, like Cursor / the
+Claude desktop input box) and
 Backspace/Del on that highlight clears the child's ENTIRE input via
 double-Escape (0x1b 0x1b, Claude Code's clear-prompt gesture, which unlike its
 line-local Ctrl+A/Ctrl+K empties multi-line input too). Typing a printable
