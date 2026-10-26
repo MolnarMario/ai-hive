@@ -1065,8 +1065,9 @@ rename in the card header (double-click) plus
 a per-agent task summary beside the name, the per-card maximize/restore toggle
 (solo one agent full-area without touching any sibling's process, then restore
 the exact prior tiling), the context-window usage badge beside the summary
-("N% of 1M/200K", read from the transcript's last usage record — transient,
-never persisted), and a date-and-time stamp under every finished reply
+("N% of 1M/200K", read from the transcript's last usage record, and after a
+compaction from the size Claude records for what it kept, so it drops before
+the next turn; transient, never persisted), and a date-and-time stamp under every finished reply
 (Claude, Codex and Gemini alike, hidden by the **Reply times** switch in
 Options without discarding any), drawn inline in the terminal directly beneath the agent's own "✻ Worked for
 16m 36s" footer (a second FIFO-capped milestone type mirroring the
