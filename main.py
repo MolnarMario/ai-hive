@@ -68,20 +68,58 @@ def _single_instance_guard(
 # the self-update module's RESTART_FLAG. The launch must not import it (no git
 # before the window, a smoke check), so the flag is spelled out here too
 RESTART_FLAG = "--restarted"
-RESTART_WAIT_S = 90.0   # the old window's final save, backups and teardown
+RESTART_WAIT_S = 300.0  # the old window's final save, backups and teardown
+RESTART_GRACE_S = 2.0   # its process gone, the mutex may lag a moment
 
 
-def _await_single_instance(timeout_s: float = RESTART_WAIT_S,
-                           poll_s: float = 0.25) -> "object | None":
-    """`_single_instance_guard`, retried while the instance that restarted us
-    closes (`--restarted`, from the Restart to update button). It still fails
-    closed: each try is the same atomic mutex, and only a try that owns it
-    alone returns a handle."""
+def _restarted_from(argv: list) -> "int | None":
+    """The pid after `--restarted`: the AI Hive that started this one."""
+    try:
+        return int(argv[argv.index(RESTART_FLAG) + 1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _process_watch(pid: "int | None"):
+    """A callable that says whether process `pid` still runs. It holds the
+    process handle, so a pid Windows hands out again later never looks
+    alive. Without a pid, or off Windows, it always says yes and only the
+    timeout ends the wait."""
+    if pid is None or sys.platform != "win32":
+        return lambda: True
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    handle = k32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
+    if not handle:
+        return lambda: False                           # already gone
+    return lambda: k32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT
+
+
+def _await_single_instance(old_alive=lambda: True,
+                           timeout_s: float = RESTART_WAIT_S,
+                           poll_s: float = 0.25) -> tuple:
+    """`_single_instance_guard`, retried while the AI Hive that restarted us
+    closes (`--restarted <pid>`, from the Restart to update button). Returns
+    `(handle, why)`. It still fails closed: each try is the same atomic
+    mutex, and only a try that owns it alone returns a handle. `why` is
+    "taken" when the old process ended and another AI Hive holds the mutex
+    (the user opened one by hand meanwhile), else "timeout"."""
     deadline = time.monotonic() + timeout_s
+    gone = False
     while True:
         guard = _single_instance_guard()
-        if guard is not None or time.monotonic() >= deadline:
-            return guard
+        if guard is not None:
+            return guard, ""
+        if not gone and not old_alive():
+            gone = True
+            deadline = min(deadline, time.monotonic() + RESTART_GRACE_S)
+        if time.monotonic() >= deadline:
+            return None, "taken" if gone else "timeout"
         time.sleep(poll_s)
 
 
@@ -356,13 +394,17 @@ def main() -> int:
     app = QApplication(sys.argv)
     # held until process exit. A restart waits for the old window to finish
     # closing: it saves the session this launch is about to load.
-    restarted = RESTART_FLAG in sys.argv[1:]
-    guard = (_await_single_instance() if restarted
-             else _single_instance_guard())
-    if guard is None and restarted:
-        _fatal("AI Hive could not restart.\n\nThe previous AI Hive window "
-               f"was still open after {int(RESTART_WAIT_S)} seconds. Close "
-               "it, then open AI Hive again.")
+    if RESTART_FLAG in sys.argv[1:]:
+        guard, why = _await_single_instance(
+            _process_watch(_restarted_from(sys.argv)))
+        if why == "taken":
+            return 0    # the user opened AI Hive by hand meanwhile: it runs
+        if guard is None:
+            _fatal("AI Hive could not restart.\n\nThe previous AI Hive "
+                   f"window was still open after {int(RESTART_WAIT_S // 60)} "
+                   "minutes. Close it, then open AI Hive again.")
+    else:
+        guard = _single_instance_guard()
     if guard is None:
         _fatal("AI Hive is already running.\n\nOnly one instance can run at a "
                "time (a second would overwrite the first's saved session). "

@@ -4729,7 +4729,10 @@ class MainWindow(QMainWindow):
     def _on_stats_for_timers(self, *_) -> None:
         self._sync_schedule_timer()
         self._schedule_taskbar_badge()
-        if getattr(self, "_app_restart_waiting", False):
+        # never over a held "Restarting..." or a newer update a background
+        # check painted: the click must keep meaning what the button says
+        if (getattr(self, "_app_restart_waiting", False)
+                and self._app_restart_on_button()):
             self._show_app_restart_state()
 
     def _sync_schedule_timer(self) -> None:
@@ -6478,7 +6481,8 @@ class MainWindow(QMainWindow):
             self._app_restart_queued = False
             if applied is not None:
                 self._on_app_update_applied(applied)
-            self._restart_app()
+            self._restart_app(getattr(self, "_app_restart_allowed",
+                                      frozenset()))
             return
         if getattr(self, "_app_update_click_waiting", False):
             # the user clicked meanwhile: their check shows the full answer
@@ -6517,11 +6521,17 @@ class MainWindow(QMainWindow):
         self._show_app_restart_state()
 
     def _app_can_restart(self) -> bool:
-        """The button restarts AI Hive: an update is installed, main.py armed
-        the relaunch, and no package install failed (the new code would
-        die on import, in a pythonw that shows no error)."""
+        """The button restarts AI Hive: an update is installed and
+        `_app_relaunch_ready`."""
         return (getattr(self, "_app_restart_version", None) is not None
-                and getattr(self, "_app_relauncher", None) is not None
+                and self._app_relaunch_ready())
+
+    def _app_relaunch_ready(self) -> bool:
+        """main.py armed the relaunch and no package install failed (the new
+        code would die on import, in a pythonw that shows no error). The
+        update dialog asks this too, so it never offers a restart the
+        button refuses."""
+        return (getattr(self, "_app_relauncher", None) is not None
                 and not getattr(self, "_app_restart_needs_pip", False))
 
     def _app_restart_on_button(self) -> bool:
@@ -6564,11 +6574,11 @@ class MainWindow(QMainWindow):
         self.top_bar.set_app_update_state(text, tip, attention=attention)
 
     def _restart_interruptions(self) -> list:
-        """`(workspace, agent, what it is doing)` for every agent a restart
-        would cut off, in sidebar order. The same predicates as the taskbar
-        badge (`_taskbar_state`): working, waiting on the user, or running
-        a background command. An agent idle at its prompt is left out: it
-        reopens in its conversation and loses nothing."""
+        """`(workspace, agent, what it is doing, agent uid)` for every agent a
+        restart would cut off, in sidebar order. The same predicates as the
+        taskbar badge (`_taskbar_state`): working, waiting on the user, or
+        running a background command. An agent idle at its prompt is left
+        out: it reopens in its conversation and loses nothing."""
         from app import providers
         found = []
         for ws in self.manager.workspaces:
@@ -6584,13 +6594,13 @@ class MainWindow(QMainWindow):
                             else "running a command")
                 else:
                     continue
-                found.append((ws.name, agent.spec.name, what))
+                found.append((ws.name, agent.spec.name, what, agent.spec.uid))
         return found
 
     @staticmethod
     def _restart_interruption_text(busy: list) -> str:
         lines, last_ws = [], None
-        for ws_name, name, what in busy:
+        for ws_name, name, what, _uid in busy:
             if ws_name != last_ws:
                 lines.append(ws_name)
                 last_ws = ws_name
@@ -6632,7 +6642,9 @@ class MainWindow(QMainWindow):
             self._app_restart_box = None
             box.deleteLater()
             if box.clickedButton() is restart:
-                self._restart_app()
+                # the user agreed to these: one that started while the box
+                # was up gets a question of its own
+                self._restart_app(frozenset(b[3] for b in busy))
             else:
                 self._audit_install(
                     f"SELF-UPDATE restart waits on {len(busy)} agent(s)")
@@ -6643,10 +6655,12 @@ class MainWindow(QMainWindow):
         self._app_restart_box = box
         box.open()
 
-    def _restart_app(self) -> None:
+    def _restart_app(self, allowed: frozenset = frozenset()) -> None:
         """Start the new AI Hive, then close this window the ordinary way
         (`closeEvent` saves first, and main.py's quit_on_close ends the
-        process, which frees the mutex the new one waits on)."""
+        process, which frees the mutex the new one waits on). `allowed` is
+        the uids of the busy agents the user agreed to interrupt. Any other
+        agent working by now sends the user back to the question."""
         if self._closing or getattr(self, "_app_restarting", False):
             return
         if not self._app_can_restart():
@@ -6660,11 +6674,17 @@ class MainWindow(QMainWindow):
             # restart now could import half of the new files: restart once
             # it ends (_on_app_auto_update_done)
             self._app_restart_queued = True
+            self._app_restart_allowed = allowed
             self.top_bar.set_app_update_state(
                 "Restarting...", "Waiting for the background update to "
                 "finish", interactive=False)
             return
         busy = self._restart_interruptions()
+        if any(b[3] not in allowed for b in busy):
+            self._app_restart_shown = None
+            self._show_app_restart_state()
+            self.request_app_restart()
+            return
         try:
             why = relauncher()
         except Exception as e:  # noqa: BLE001 - reported, never fatal
@@ -6688,11 +6708,7 @@ class MainWindow(QMainWindow):
 
         dialog = SelfUpdateDialog(check, runner=self._self_update_runner,
                                   repo=self._self_update_repo, parent=self,
-                                  can_restart=(
-                                      getattr(self, "_app_relauncher", None)
-                                      is not None and not getattr(
-                                          self, "_app_restart_needs_pip",
-                                          False)))
+                                  can_restart=self._app_relaunch_ready)
         dialog.auditRequested.connect(self._audit_install)
         dialog.applied.connect(self._on_app_update_applied)
         dialog.restartRequested.connect(self._on_dialog_restart)

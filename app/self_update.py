@@ -70,10 +70,12 @@ the version this process imported. That also covers a user who ran `git pull`
 by hand.
 
 The "Restart to update" button restarts on the user's click. `relaunch`
-starts a detached `main.py --restarted`, then the window closes as usual.
-The new process cannot run beside the old one (the single-instance mutex),
-so `--restarted` makes it wait for that mutex to come free before it loads
-the session, which the old process saves on its way out. Before restarting,
+starts a detached `main.py --restarted <pid>`, then the window closes as
+usual. The new process cannot run beside the old one (the single-instance
+mutex), so `--restarted` makes it wait for that mutex to come free, while
+the old pid runs, before it loads the session the old process saves on its
+way out. If the old one is gone and the mutex is still held, the user
+opened AI Hive by hand meanwhile, and the new process exits quietly. Before restarting,
 MainWindow names every agent a restart would interrupt and lets the user
 wait for them instead.
 
@@ -447,7 +449,8 @@ CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 def relaunch_argv(repo: str = REPO_DIR) -> list:
     """The command that starts AI Hive again: the clone's windowless venv
     python, which is what `AI Hive.bat` starts, else the running interpreter
-    without its console."""
+    without its console. It passes this process's pid, the one holding the
+    mutex, so the new one waits exactly as long as this one runs."""
     main_py = os.path.join(repo, "main.py")
     exe = os.path.join(repo, ".venv", "Scripts", "pythonw.exe")
     if not os.path.isfile(exe):
@@ -456,7 +459,7 @@ def relaunch_argv(repo: str = REPO_DIR) -> list:
         windowless = os.path.join(folder, "pythonw.exe")
         if name.lower() == "python.exe" and os.path.isfile(windowless):
             exe = windowless
-    return [exe, main_py, RESTART_FLAG]
+    return [exe, main_py, RESTART_FLAG, str(os.getpid())]
 
 
 def job_kills_on_close() -> bool:

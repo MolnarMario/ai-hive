@@ -76,14 +76,17 @@ class SelfUpdateDialog(QDialog):
     """Shows one `self_update.Check`, and applies it on request.
 
     `runner` is injected; with None the Update button stays disabled, so the
-    offscreen suite can open the dialog without any way to touch the repo."""
+    offscreen suite can open the dialog without any way to touch the repo.
+    `can_restart` says whether a restart can start the new code. It is asked
+    on every refresh: a package install in this dialog that succeeds after
+    an earlier one failed brings Restart now back."""
 
     applied = Signal(object)        # self_update.Applied
     auditRequested = Signal(str)
     restartRequested = Signal()
 
     def __init__(self, check, runner=None, repo: str = self_update.REPO_DIR,
-                 parent=None, can_restart: bool = False):
+                 parent=None, can_restart=lambda: False):
         super().__init__(parent)
         self.setWindowTitle("Update AI Hive")
         self.setMinimumWidth(520)
@@ -190,14 +193,14 @@ class SelfUpdateDialog(QDialog):
         # not have, and a restart into it would die on import
         pip_failed = (result is not None and result.deps_changed
                       and not result.deps_ok)
-        self.restart_btn.setVisible(installed and self._can_restart
+        self.restart_btn.setVisible(installed and self._can_restart()
                                     and not pip_failed)
         if self.restart_btn.isVisibleTo(self):
             self.restart_btn.setDefault(True)
         self.close_btn.setEnabled(not self._busy)
 
     def _how_to_restart(self) -> str:
-        return "" if self._can_restart else (
+        return "" if self._can_restart() else (
             " To restart, close the window and open AI Hive again.")
 
     # ------------------------------------------------------------- actions ---
@@ -221,8 +224,10 @@ class SelfUpdateDialog(QDialog):
         self._busy = False
         self._result = result
         self.auditRequested.emit(self_update.audit_line(result))
-        self._refresh()
+        # applied first: the window clears its failed-install latch there,
+        # and the refresh asks `can_restart` after it
         self.applied.emit(result)
+        self._refresh()
 
     # a running merge must be allowed to finish and report; closing the
     # dialog mid-update would hide whether the folder moved at all

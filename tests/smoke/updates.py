@@ -2214,9 +2214,16 @@ def test_restart_to_update():
 
     # --- the relaunch and the new process's wait ---------------------------
     argv = self_update.relaunch_argv(str(ROOT))
-    check("restart: the relaunch starts main.py with the restart flag",
-          argv[-2:] == [str(ROOT / "main.py"), self_update.RESTART_FLAG]
-          and main_mod.RESTART_FLAG == self_update.RESTART_FLAG, argv)
+    check("restart: the relaunch starts main.py with the restart flag and "
+          "this process's pid",
+          argv[1:] == [str(ROOT / "main.py"), self_update.RESTART_FLAG,
+                       str(os.getpid())]
+          and main_mod.RESTART_FLAG == self_update.RESTART_FLAG
+          and main_mod._restarted_from(argv) == os.getpid(), argv)
+    check("restart: a flag without a pid waits on the timeout alone",
+          main_mod._restarted_from(["main.py", "--restarted"]) is None
+          and main_mod._restarted_from(["main.py", "--restarted", "x"])
+          is None)
     # breakaway refused: retry inside the job only when it won't kill us
     real_probe = self_update.job_kills_on_close
     starts = []
@@ -2253,17 +2260,46 @@ def test_restart_to_update():
     real_guard = main_mod._single_instance_guard
     answers = [None, None, "held"]
     main_mod._single_instance_guard = lambda: answers.pop(0)
+    real_grace = main_mod.RESTART_GRACE_S
     try:
         got = main_mod._await_single_instance(timeout_s=5, poll_s=0.01)
         check("restart: the new process takes the mutex once the old one "
-              "lets go", got == "held" and answers == [], (got, answers))
+              "lets go", got == ("held", "") and answers == [],
+              (got, answers))
         main_mod._single_instance_guard = lambda: None
         t0 = time.monotonic()
         got = main_mod._await_single_instance(timeout_s=0.2, poll_s=0.01)
         check("restart: ...and still fails closed if it never does",
-              got is None and time.monotonic() - t0 < 2, got)
+              got == (None, "timeout") and time.monotonic() - t0 < 2, got)
+        # the old AI Hive gone and the mutex still held: the user opened one
+        # by hand. That one runs, and no error box covers it
+        main_mod.RESTART_GRACE_S = 0.1
+        t0 = time.monotonic()
+        got = main_mod._await_single_instance(lambda: False, timeout_s=30,
+                                              poll_s=0.01)
+        check("restart: once the old process is gone, a mutex someone else "
+              "holds ends the wait as taken, not after the timeout",
+              got == (None, "taken") and time.monotonic() - t0 < 5, got)
+        answers[:] = [None, None, "held"]
+        main_mod._single_instance_guard = lambda: answers.pop(0)
+        got = main_mod._await_single_instance(lambda: False, timeout_s=30,
+                                              poll_s=0.01)
+        check("restart: ...but a mutex freed just after the process ended "
+              "is still taken", got == ("held", ""), got)
     finally:
         main_mod._single_instance_guard = real_guard
+        main_mod.RESTART_GRACE_S = real_grace
+    check("restart: the process watch sees this process running",
+          main_mod._process_watch(os.getpid())() is True
+          and main_mod._process_watch(None)() is True)
+    if os.name == "nt":
+        import subprocess
+        import sys
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        watch = main_mod._process_watch(child.pid)
+        child.wait(timeout=30)
+        check("restart: ...and a process that ended as gone",
+              watch() is False)
 
     # --- the window -------------------------------------------------------
     setup_application(app)
@@ -2386,6 +2422,28 @@ def test_restart_to_update():
     closes.clear()
     a1._busy = False
 
+    # an agent that starts while the question is up is asked about too
+    a1._busy = True
+    btn.click()
+    box = getattr(win, "_app_restart_box", None)
+    first = box
+    b1._waiting = True
+    pressed = box is not None and press("Restart now")
+    box = getattr(win, "_app_restart_box", None)
+    check("restart: an agent that started while the question was up is "
+          "asked about, not interrupted",
+          pressed and launches == [] and closes == [] and box is not None
+          and box is not first and "B1, waiting" in box.text(),
+          (launches, box.text() if box is not None else None))
+    check("restart: ...and Restart now on that question restarts",
+          box is not None and press("Restart now")
+          and launches == [1] and closes == [1], (launches, closes))
+    win._app_restarting = False
+    launches.clear()
+    closes.clear()
+    a1._busy = False
+    b1._waiting = False
+
     # a failed relaunch keeps the window and says so
     warned = []
     real_warning = mw_mod.QMessageBox.warning
@@ -2421,6 +2479,34 @@ def test_restart_to_update():
     win._app_restarting = False
     launches.clear()
     closes.clear()
+
+    # waiting, a held restart keeps its paint, and an agent that started
+    # meanwhile is asked about before the held restart goes ahead
+    win._app_restart_waiting = True
+    win._note_app_restart_pending("9.9.9")
+    win._app_auto_job = object()
+    btn.click()
+    a1._busy = True
+    mgr._recompute(alpha.id)
+    check("restart: a stats change while a restart is held keeps "
+          "Restarting...", btn.text() == "Restarting..."
+          and not btn.isEnabled() and launches == [], btn.text())
+    win._on_app_auto_update_done(
+        (self_update.Check(Status.RESTART_PENDING, running=__version__,
+                           installed="9.9.9"), None))
+    box = getattr(win, "_app_restart_box", None)
+    check("restart: an agent that started while the restart was held is "
+          "asked about first", launches == [] and closes == []
+          and box is not None and "A1, working" in box.text(),
+          (launches, closes))
+    if box is not None:
+        press("Wait until they finish")
+    win.top_bar.set_app_update_state("⬆ v9.9.10", "newer", attention=True)
+    a1._busy = False
+    mgr._recompute(alpha.id)
+    check("restart: ...and a stats change while waiting never paints over a "
+          "newer update", btn.text() == "⬆ v9.9.10", btn.text())
+    win._app_restart_waiting = False
 
     # a newer update shown on the button is not a restart button
     win.top_bar.set_app_update_state("⬆ v9.9.10", "newer", attention=True)
@@ -2492,6 +2578,22 @@ def test_restart_to_update():
     win._on_app_update_applied(self_update.Applied(True, version="9.9.11"))
     check("restart: a later update that changes no packages keeps the "
           "close and reopen", not win._app_can_restart())
+    win._open_self_update_dialog(self_update.Check(
+        Status.UPDATE_AVAILABLE, running=__version__, installed="9.9.11",
+        remote="9.9.12"))
+    dlg = win._self_update_dialog
+    hidden = dlg is not None and not dlg.restart_btn.isVisibleTo(dlg)
+    if dlg is not None:
+        dlg._on_applied(self_update.Applied(
+            True, version="9.9.12", deps_changed=True, deps_ok=True))
+    check("restart: a package install that succeeds in the dialog brings "
+          "its Restart now back", hidden and dlg.restart_btn.isVisibleTo(dlg)
+          and "close the window" not in dlg.body_label.text()
+          and win._app_can_restart(),
+          dlg.body_label.text() if dlg is not None else None)
+    if dlg is not None:
+        dlg.reject()
+        pump(20)
     win._on_app_update_applied(self_update.Applied(
         True, version="9.9.12", deps_changed=True, deps_ok=True))
     check("restart: ...and one whose pip install succeeds brings the restart "
