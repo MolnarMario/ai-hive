@@ -6714,8 +6714,10 @@ class MainWindow(QMainWindow):
 
     def _on_app_update_applied(self, result) -> None:
         if result.ok:
-            if result.deps_changed and not result.deps_ok:
-                self._app_restart_needs_pip = True
+            # pip ran on the whole requirements.txt: a success there puts
+            # back whatever an earlier failure left out
+            if result.deps_changed:
+                self._app_restart_needs_pip = not result.deps_ok
             self._note_app_restart_pending(result.version)
 
     # ------------------------------------------------- the Updates panel ---

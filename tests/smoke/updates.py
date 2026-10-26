@@ -2489,6 +2489,15 @@ def test_restart_to_update():
         dlg.reject()
         pump(20)
 
+    win._on_app_update_applied(self_update.Applied(True, version="9.9.11"))
+    check("restart: a later update that changes no packages keeps the "
+          "close and reopen", not win._app_can_restart())
+    win._on_app_update_applied(self_update.Applied(
+        True, version="9.9.12", deps_changed=True, deps_ok=True))
+    check("restart: ...and one whose pip install succeeds brings the restart "
+          "back", win._app_can_restart()
+          and "Click to restart AI Hive" in btn.toolTip(), btn.toolTip())
+
     del win.close
     win.close()
     win.deleteLater()
