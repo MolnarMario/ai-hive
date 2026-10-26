@@ -2448,6 +2448,21 @@ def test_restart_to_update():
     launches.clear()
     closes.clear()
 
+    # a held restart whose background merge left packages uninstalled (the
+    # race apply() reports as ok with deps_ok False) does not restart
+    win._note_app_restart_pending("9.9.9")
+    win._app_auto_job = object()
+    btn.click()
+    win._on_app_auto_update_done(
+        (self_update.Check(Status.UPDATE_AVAILABLE, running=__version__,
+                           installed="9.9.9", remote="9.9.10"),
+         self_update.Applied(True, version="9.9.10", deps_changed=True,
+                             deps_ok=False)))
+    check("restart: a held restart whose merge left packages missing does "
+          "not restart", launches == [] and closes == []
+          and not win._app_can_restart()
+          and "Close the window" in btn.toolTip(), (launches, btn.toolTip()))
+
     # a package install that failed: the new code would die on import
     win._on_app_update_applied(self_update.Applied(
         True, version="9.9.9", deps_changed=True, deps_ok=False))

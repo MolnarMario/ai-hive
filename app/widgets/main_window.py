@@ -6476,8 +6476,8 @@ class MainWindow(QMainWindow):
             return
         if getattr(self, "_app_restart_queued", False):
             self._app_restart_queued = False
-            if applied is not None and applied.ok:
-                self._note_app_restart_pending(applied.version)
+            if applied is not None:
+                self._on_app_update_applied(applied)
             self._restart_app()
             return
         if getattr(self, "_app_update_click_waiting", False):
@@ -6489,7 +6489,7 @@ class MainWindow(QMainWindow):
             return
         if applied is not None and applied.ok:
             self._app_update_flash().stop()
-            self._note_app_restart_pending(applied.version)
+            self._on_app_update_applied(applied)
         elif found.status is Status.RESTART_PENDING:
             self._app_update_flash().stop()
             self._note_app_restart_pending(found.installed)
@@ -6649,9 +6649,12 @@ class MainWindow(QMainWindow):
         process, which frees the mutex the new one waits on)."""
         if self._closing or getattr(self, "_app_restarting", False):
             return
-        relauncher = getattr(self, "_app_relauncher", None)
-        if relauncher is None:
+        if not self._app_can_restart():
+            # a merge just now may have left packages uninstalled
+            self._app_restart_shown = None
+            self._show_app_restart_state()
             return
+        relauncher = self._app_relauncher
         if getattr(self, "_app_auto_job", None) is not None:
             # the background update may be merging into this folder, and a
             # restart now could import half of the new files: restart once
