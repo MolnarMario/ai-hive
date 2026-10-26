@@ -8,6 +8,12 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.53.1
+
+- Copying text from an agent's window keeps a wrapped paragraph as one
+  line, so a reply or prompt pastes the way Claude wrote it instead of
+  breaking at every row. Tool output still keeps every line.
+
 ## 0.53.0
 
 - Restart to update now restarts AI Hive for you. It saves, closes and
