@@ -61,6 +61,24 @@ def test_token_usage_badge():
     used2, _ = transcripts._read_latest_token_usage(str(tpath))
     check("tokens: re-reads when the transcript changes", used2 == 300000, used2)
 
+    # a compaction writes no usage record: until the next turn, the reading
+    # is the smallest prompt seen (110 above) plus the summary at 4 chars/token
+    with open(tpath, "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps({"type": "system", "subtype": "compact_boundary",
+                              "compactMetadata": {"trigger": "auto",
+                                                  "preTokens": 300000}}) + "\n")
+        fh.write(_json.dumps({"type": "user", "isCompactSummary": True,
+                              "message": {"role": "user",
+                                          "content": "s" * 4000}}) + "\n")
+    used3, _ = transcripts._read_latest_token_usage(str(tpath))
+    check("tokens: a compaction drops the reading without waiting for a turn",
+          used3 == 110 + 1000, used3)
+    with open(tpath, "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps(_asst(2, 0, 49998, 0)) + "\n")   # -> 50000
+    used4, _ = transcripts._read_latest_token_usage(str(tpath))
+    check("tokens: the next real turn replaces the compaction estimate",
+          used4 == 50000, used4)
+
     # --- agent badge formatting + transient emission ---
     a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd=SCRATCH_CWD))
     seen = []
