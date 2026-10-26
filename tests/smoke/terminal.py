@@ -1892,6 +1892,112 @@ def test_drag_select_offscreen_selection():
         w.deleteLater()
 
 
+def _cells(text: str, cols: int) -> list:
+    """One cell string per column, as TerminalView hands soft_wrap a row."""
+    return list(text.ljust(cols))
+
+
+def test_copy_joins_wrapped_rows():
+    """A copy joins the rows Claude wrapped and keeps the line breaks the
+    text had. Before, every row pasted as its own paragraph."""
+    from app.soft_wrap import joins
+
+    def j(rows, cols=40, above=()):
+        return joins([_cells(r, cols) for r in rows], cols,
+                     (_cells(r, cols) for r in above))
+
+    check("unwrap: a word that didn't fit joins with a space",
+          j(["● one two three four five six seven", "  eightfold"]) == [" "],
+          j(["● one two three four five six seven", "  eightfold"]))
+    check("unwrap: a word that would have fit keeps the break",
+          j(["● one two three four five six", "  eight"]) == [None],
+          j(["● one two three four five six", "  eight"]))
+    item = "  - alpha beta gamma delta epsilon zeta"
+    check("unwrap: a list item joins the row lined up under its text",
+          j([item, "    etaeta"]) == [" "], j([item, "    etaeta"]))
+    check("unwrap: a row at the item's own indent is not its tail",
+          j([item, "  Alphabetical"]) == [None], j([item, "  Alphabetical"]))
+    check("unwrap: a list item starts a line",
+          j(["  some prose that runs right up to the", "  - item"])
+          == [None])
+    check("unwrap: table rows keep their breaks",
+          j(["  │ a cell that is long enough to fill │", "  │ two │"])
+          == [None])
+    tool = ["     a line of tool output that ends", "     here"]
+    check("unwrap: a tool result keeps every line",
+          j(tool, above=["", "  ⎿  first line of the result"]) == [None],
+          j(tool, above=["", "  ⎿  first line of the result"]))
+    check("unwrap: the same rows in a reply join",
+          j(tool, above=["● a reply"]) == [" "], j(tool, above=["● a reply"]))
+    check("unwrap: a full shell row continues mid-word at column 0",
+          j(["x" * 40, "yyy"]) == [""], j(["x" * 40, "yyy"]))
+    check("unwrap: a shell row short of the edge keeps its break",
+          j(["x" * 39, "yyy"]) == [None], j(["x" * 39, "yyy"]))
+    # a wide glyph fills two cells, the second one ""
+    wide = [" ", " "] + ["漢", ""] * 19
+    under = [" ", " ", "字", ""] + [" "] * 36
+    check("unwrap: wrapped CJK joins with nothing between",
+          joins([wide, under], 40) == [""], joins([wide, under], 40))
+
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import TerminalView
+    QApplication.instance() or QApplication([])
+    import textwrap
+    reply = ("Clicking the button now restarts AI Hive. The work is "
+             "committed on the lane and flagged, ready for the integrator.")
+    busy = ("Nothing busy: AI Hive saves, closes and opens again straight "
+            "away, so nothing is lost.")
+    lines = ["● " + "\r\n  ".join(textwrap.wrap(reply, 58)), "",
+             "  What a click does now",
+             "  - " + "\r\n    ".join(textwrap.wrap(busy, 56)),
+             "  - Something busy: a box lists the agents.", "",
+             '● Bash(git log --oneline --format="%h %s" --max-count=5',
+             "      --reverse)",
+             "  ⎿  aabf9ef fix: a later successful pip install brings th",
+             "     e restart back", "",
+             # the input box as claude 2.1.310 drew it at 60 columns, after
+             # typing one long line, Shift+Enter, and a 70-letter word
+             "❯ the quick brown fox jumps over the lazy dog and keeps",
+             "  running past the old barn until it reaches the river",
+             "  bank where it stops",
+             "  second line after a real newline" + "x" * 24,
+             "  " + "x" * 46]
+    text = "\r\n".join(lines)
+    v = TerminalView(rows=text.count("\r\n") + 1, cols=60)
+    v.feed(text)
+    v.select_all()
+    want = "\n".join([
+        "● " + reply, "", "  What a click does now", "  - " + busy,
+        "  - Something busy: a box lists the agents.", "",
+        '● Bash(git log --oneline --format="%h %s" --max-count=5 --reverse)',
+        "  ⎿  aabf9ef fix: a later successful pip install brings th",
+        "     e restart back", "",
+        "❯ the quick brown fox jumps over the lazy dog and keeps running "
+        "past the old barn until it reaches the river bank where it stops",
+        "  second line after a real newline" + "x" * 70])
+    got = v.selected_text()
+    check("unwrap: a copied reply, tool call and prompt keep only real breaks",
+          got == want, got)
+    v.deleteLater()
+
+    # the result's first row scrolled into history: the rows left on
+    # screen still read as tool output, and history isn't copied for it
+    v = TerminalView(rows=3, cols=60)
+    v.feed("\r\n".join(["● Bash(ls)", "  ⎿  " + "y" * 55, "     " + "z" * 55,
+                        "     tail", "> "]))
+    calls = []
+    real = v._history_list
+    v._history_list = lambda: calls.append(1) or real()
+    v._sel_anchor, v._sel_end = (0, 0), (1, 59)
+    got = v.selected_text()
+    check("unwrap: a tool result whose first row is in history keeps its "
+          "breaks", got == "     " + "z" * 55 + "\n     tail", got)
+    check("unwrap: a live selection walks history without copying it",
+          calls == [], calls)
+    del v._history_list
+    v.deleteLater()
+
+
 def test_projection_happens_once():
     """The scrollback is projected ONCE, at the card's settled width.
 
