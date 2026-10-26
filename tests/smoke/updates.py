@@ -2217,6 +2217,34 @@ def test_restart_to_update():
     check("restart: the relaunch starts main.py with the restart flag",
           argv[-2:] == [str(ROOT / "main.py"), self_update.RESTART_FLAG]
           and main_mod.RESTART_FLAG == self_update.RESTART_FLAG, argv)
+    # breakaway refused: retry inside the job only when it won't kill us
+    real_probe = self_update.job_kills_on_close
+    starts = []
+
+    def fake_popen(argv, **kw):
+        starts.append(kw.get("creationflags", 0))
+        if kw.get("creationflags", 0) & self_update.CREATE_BREAKAWAY_FROM_JOB:
+            raise PermissionError("Access is denied")
+        return None
+
+    try:
+        self_update.job_kills_on_close = lambda: True
+        why = self_update.relaunch(str(ROOT), popen=fake_popen)
+        check("restart: inside a kill-on-close job that forbids breakaway, "
+              "the relaunch refuses instead of starting a doomed copy",
+              os.name != "nt" or ("job" in why and len(starts) == 1),
+              (why, starts))
+        starts.clear()
+        self_update.job_kills_on_close = lambda: False
+        why = self_update.relaunch(str(ROOT), popen=fake_popen)
+        check("restart: ...and starts inside a job that outlives us",
+              why == "" and len(starts) == (2 if os.name == "nt" else 1),
+              (why, starts))
+    finally:
+        self_update.job_kills_on_close = real_probe
+    check("restart: the job probe answers without raising here",
+          isinstance(self_update.job_kills_on_close(), bool))
+
     factory = (ROOT / "main.py").read_text(encoding="utf-8").split(
         "def create_main_window(", 1)[1].split("\ndef ")[0]
     check("restart: the factory the suite shares never arms the relaunch",
