@@ -65,6 +65,26 @@ def _single_instance_guard(
     return handle  # held (never closed) for the life of this process
 
 
+# the self-update module's RESTART_FLAG. The launch must not import it (no git
+# before the window, a smoke check), so the flag is spelled out here too
+RESTART_FLAG = "--restarted"
+RESTART_WAIT_S = 90.0   # the old window's final save, backups and teardown
+
+
+def _await_single_instance(timeout_s: float = RESTART_WAIT_S,
+                           poll_s: float = 0.25) -> "object | None":
+    """`_single_instance_guard`, retried while the instance that restarted us
+    closes (`--restarted`, from the Restart to update button). It still fails
+    closed: each try is the same atomic mutex, and only a try that owns it
+    alone returns a handle."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        guard = _single_instance_guard()
+        if guard is not None or time.monotonic() >= deadline:
+            return guard
+        time.sleep(poll_s)
+
+
 # The launch runs no git: AI Hive updates itself in the background once the
 # window is up (MainWindow.start_app_update_checks). The imports' time waits
 # for the session store in main(), for the PERF startup line.
@@ -334,7 +354,15 @@ def main() -> int:
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
-    guard = _single_instance_guard()  # held until process exit
+    # held until process exit. A restart waits for the old window to finish
+    # closing: it saves the session this launch is about to load.
+    restarted = RESTART_FLAG in sys.argv[1:]
+    guard = (_await_single_instance() if restarted
+             else _single_instance_guard())
+    if guard is None and restarted:
+        _fatal("AI Hive could not restart.\n\nThe previous AI Hive window "
+               f"was still open after {int(RESTART_WAIT_S)} seconds. Close "
+               "it, then open AI Hive again.")
     if guard is None:
         _fatal("AI Hive is already running.\n\nOnly one instance can run at a "
                "time (a second would overwrite the first's saved session). "
@@ -375,6 +403,9 @@ def main() -> int:
     # this clone. The suite runs FROM this clone, so it must never be armed
     # there.
     window.arm_self_update()
+    # ...and Restart to update starting a new AI Hive. The suite opens and
+    # closes many windows in one process and must never launch an app.
+    window.arm_app_restart()
     window.refresh_install_state()
     if gate is not None:
         window.note_update_outcomes(gate.outcomes, gate.installing)

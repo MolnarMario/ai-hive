@@ -2187,3 +2187,258 @@ def test_background_update():
     factory = src.split("def create_main_window(", 1)[1].split("\ndef ")[0]
     check("bg-update: the factory the suite shares never starts it",
           "start_app_update_checks" not in factory)
+
+
+def test_restart_to_update():
+    """Restart to update restarts AI Hive (MainWindow.request_app_restart).
+    With nothing working it restarts at once. Otherwise it names every agent
+    the restart would interrupt, by workspace, and the user restarts anyway
+    or waits while the button counts down. The relaunch is a stub: the suite
+    must never start a second app."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    import main as main_mod
+    from app import __version__, self_update
+    from app.process_worker import AgentKind, build_spec
+    from app.self_update import Status
+    from app.session_store import SessionStore
+    from app.widgets import main_window as mw_mod
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    # --- the relaunch and the new process's wait ---------------------------
+    argv = self_update.relaunch_argv(str(ROOT))
+    check("restart: the relaunch starts main.py with the restart flag",
+          argv[-2:] == [str(ROOT / "main.py"), self_update.RESTART_FLAG]
+          and main_mod.RESTART_FLAG == self_update.RESTART_FLAG, argv)
+    factory = (ROOT / "main.py").read_text(encoding="utf-8").split(
+        "def create_main_window(", 1)[1].split("\ndef ")[0]
+    check("restart: the factory the suite shares never arms the relaunch",
+          "arm_app_restart" not in factory)
+
+    real_guard = main_mod._single_instance_guard
+    answers = [None, None, "held"]
+    main_mod._single_instance_guard = lambda: answers.pop(0)
+    try:
+        got = main_mod._await_single_instance(timeout_s=5, poll_s=0.01)
+        check("restart: the new process takes the mutex once the old one "
+              "lets go", got == "held" and answers == [], (got, answers))
+        main_mod._single_instance_guard = lambda: None
+        t0 = time.monotonic()
+        got = main_mod._await_single_instance(timeout_s=0.2, poll_s=0.01)
+        check("restart: ...and still fails closed if it never does",
+              got is None and time.monotonic() - t0 < 2, got)
+    finally:
+        main_mod._single_instance_guard = real_guard
+
+    # --- the window -------------------------------------------------------
+    setup_application(app)
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-restart-"))
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    pump(50)
+    btn = win.top_bar.app_update_btn
+    audits = []
+    win._audit_install = audits.append
+    mgr = win.manager
+
+    win._note_app_restart_pending("9.9.9")
+    check("restart: unarmed (the suite) the button keeps saying close and "
+          "reopen", not win._app_can_restart()
+          and btn.text() == "Restart to update"
+          and "Close the window" in btn.toolTip(), btn.toolTip())
+
+    launches, closes = [], []
+    outcome = [""]
+
+    def relauncher():
+        launches.append(1)
+        return outcome[0]
+
+    win.arm_app_restart(relauncher)
+    win.close = lambda: closes.append(1)
+    win._note_app_restart_pending("9.9.9")
+    check("restart: armed, the button says a click restarts",
+          win._app_can_restart() and btn.text() == "Restart to update"
+          and btn.property("attention") is True
+          and "Click to restart AI Hive" in btn.toolTip(), btn.toolTip())
+
+    btn.click()
+    check("restart: with nothing working one click relaunches and closes",
+          launches == [1] and closes == [1]
+          and getattr(win, "_app_restart_box", None) is None
+          and any(a.startswith("SELF-UPDATE restart interrupting=0")
+                  for a in audits), (launches, closes, audits))
+    btn.click()
+    check("restart: ...once", launches == [1] and closes == [1])
+    win._app_restarting = False
+    launches.clear()
+    closes.clear()
+
+    alpha = mgr.create_workspace("Alpha", str(tmp))
+    beta = mgr.create_workspace("Beta", str(tmp))
+    a1 = mgr.add_terminal(alpha.id, build_spec(AgentKind.CLAUDE, "A1",
+                                               cwd=str(tmp)), autostart=False)
+    s1 = mgr.add_terminal(alpha.id, build_spec(AgentKind.POWERSHELL, "S1",
+                                               cwd=str(tmp)), autostart=False)
+    b1 = mgr.add_terminal(beta.id, build_spec(AgentKind.CLAUDE, "B1",
+                                              cwd=str(tmp)), autostart=False)
+    mgr.add_terminal(beta.id, build_spec(AgentKind.CLAUDE, "B2",
+                                         cwd=str(tmp)), autostart=False)
+    a1._busy = True
+    s1._bg_shell = True
+    b1._waiting = True
+
+    btn.click()
+    box = getattr(win, "_app_restart_box", None)
+    text = box.text() if box is not None else ""
+    check("restart: busy agents get a question first, not a restart",
+          box is not None and launches == [] and closes == [], text)
+    check("restart: ...naming each agent and what it is doing, under its "
+          "workspace",
+          "Alpha\n    A1, working\n    S1, running a command\n" in text
+          and "Beta\n    B1, waiting for your answer" in text
+          and "B2" not in text and "—" not in text, text)
+    btn.click()
+    check("restart: a second click raises the same question",
+          win._app_restart_box is box and launches == [])
+
+    def press(label):
+        hit = [b for b in box.buttons() if b.text() == label]
+        if hit:
+            hit[0].click()
+        pump(20)
+        return bool(hit)
+
+    check("restart: ...and Wait closes it without restarting",
+          press("Wait until they finish")
+          and getattr(win, "_app_restart_box", None) is None
+          and launches == [] and closes == [])
+    check("restart: waiting, the button counts what is left and is not lit",
+          btn.text() == "Restart waits on 3"
+          and btn.property("attention") is False
+          and "A1, working" in btn.toolTip() and btn.isEnabled(),
+          (btn.text(), btn.toolTip()))
+
+    a1._busy = False
+    mgr._recompute(alpha.id)
+    check("restart: ...counting down as agents finish",
+          btn.text() == "Restart waits on 2", btn.text())
+    s1._bg_shell = False
+    b1._waiting = False
+    mgr._recompute(alpha.id)
+    mgr._recompute(beta.id)
+    check("restart: ...and lights up once it is safe",
+          btn.text() == "Restart to update"
+          and btn.property("attention") is True
+          and "safe to restart" in btn.toolTip() and launches == [],
+          (btn.text(), btn.toolTip()))
+
+    a1._busy = True
+    mgr._recompute(alpha.id)
+    check("restart: new work while waiting shows on the count again",
+          btn.text() == "Restart waits on 1", btn.text())
+    btn.click()
+    box = getattr(win, "_app_restart_box", None)
+    check("restart: clicking while waiting asks again, and Restart now "
+          "restarts anyway",
+          box is not None and press("Restart now")
+          and launches == [1] and closes == [1]
+          and any(a.startswith("SELF-UPDATE restart interrupting=1")
+                  for a in audits), (launches, closes))
+    win._app_restarting = False
+    launches.clear()
+    closes.clear()
+    a1._busy = False
+
+    # a failed relaunch keeps the window and says so
+    warned = []
+    real_warning = mw_mod.QMessageBox.warning
+    mw_mod.QMessageBox.warning = staticmethod(
+        lambda *a, **k: warned.append(a[2] if len(a) > 2 else ""))
+    outcome[0] = "no python"
+    try:
+        win._restart_app()
+    finally:
+        mw_mod.QMessageBox.warning = real_warning
+        outcome[0] = ""
+    check("restart: a relaunch that fails keeps the window open and says why",
+          launches == [1] and closes == [] and warned
+          and "no python" in warned[0]
+          and any("restart failed: no python" in a for a in audits)
+          and btn.text().startswith("Restart"), (warned, btn.text()))
+    launches.clear()
+
+    # a background merge in flight: restart after it, never mid-merge
+    win._app_restart_waiting = False
+    win._note_app_restart_pending("9.9.9")
+    win._app_auto_job = object()
+    btn.click()
+    check("restart: a background update in flight holds the restart",
+          launches == [] and closes == [] and btn.text() == "Restarting..."
+          and win._app_restart_queued, btn.text())
+    win._on_app_auto_update_done(
+        (self_update.Check(Status.RESTART_PENDING, running=__version__,
+                           installed="9.9.9"), None))
+    check("restart: ...and restarts once it ends",
+          launches == [1] and closes == [1]
+          and not win._app_restart_queued, (launches, closes))
+    win._app_restarting = False
+    launches.clear()
+    closes.clear()
+
+    # a newer update shown on the button is not a restart button
+    win.top_bar.set_app_update_state("⬆ v9.9.10", "newer", attention=True)
+    btn.click()
+    pump(20)
+    check("restart: a newer update on the button opens no restart",
+          launches == [] and getattr(win, "_app_restart_box", None) is None)
+
+    # the dialog's Restart now (a runner that fails every call: the
+    # dialog must not need git to restart)
+    win.arm_self_update(lambda argv, timeout=0: (1, ""), repo=str(tmp))
+    win._open_self_update_dialog(self_update.Check(
+        Status.RESTART_PENDING, running=__version__, installed="9.9.9"))
+    dlg = win._self_update_dialog
+    check("restart: the update dialog offers Restart now once installed",
+          dlg is not None and dlg.restart_btn.isVisibleTo(dlg)
+          and "close the window" not in dlg.body_label.text())
+    if dlg is not None:
+        dlg.restart_btn.click()
+    pump(30)
+    check("restart: ...which closes the dialog and restarts",
+          win._self_update_dialog is None and launches == [1]
+          and closes == [1], (launches, closes))
+    win._app_restarting = False
+    launches.clear()
+    closes.clear()
+
+    # a package install that failed: the new code would die on import
+    win._on_app_update_applied(self_update.Applied(
+        True, version="9.9.9", deps_changed=True, deps_ok=False))
+    tip = btn.toolTip()
+    btn.click()
+    pump(20)
+    check("restart: after a failed package install the button only says "
+          "close and reopen", not win._app_can_restart() and launches == []
+          and "Close the window" in tip, tip)
+    if getattr(win, "_app_update_job", None) is not None:
+        deadline = time.monotonic() + 5
+        while win._app_update_job is not None and time.monotonic() < deadline:
+            pump(20)
+    if win._self_update_dialog is not None:
+        win._self_update_dialog.reject()
+        pump(20)
+
+    del win.close
+    win.close()
+    win.deleteLater()
+    pump(20)
+    shutil.rmtree(tmp, ignore_errors=True)

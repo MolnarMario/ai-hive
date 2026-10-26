@@ -63,11 +63,19 @@ left on a merged branch back to main.
 THE USER RESTARTS, NEVER US
 ---------------------------
 Python has already imported the running code, so the pulled files take effect
-on the next launch. Closing the window is the user's call (their agents are
-running), so an applied update only ever says "restart to finish". The
-restart-pending state is DERIVED, not stored: the version in the file on disk
-is higher than the version this process imported. That also covers a user who
-ran `git pull` by hand.
+on the next launch. Restarting is the user's call (their agents are running),
+so an applied update only ever says "restart to finish". The restart-pending
+state is DERIVED, not stored: the version in the file on disk is higher than
+the version this process imported. That also covers a user who ran `git pull`
+by hand.
+
+The "Restart to update" button restarts on the user's click. `relaunch`
+starts a detached `main.py --restarted`, then the window closes as usual.
+The new process cannot run beside the old one (the single-instance mutex),
+so `--restarted` makes it wait for that mutex to come free before it loads
+the session, which the old process saves on its way out. Before restarting,
+MainWindow names every agent a restart would interrupt and lets the user
+wait for them instead.
 
 No em dash in any string below: `detail` and `blocked` are read by the user.
 """
@@ -391,9 +399,8 @@ def background_update(runner, repo: str = REPO_DIR, running: str = "",
 def applied_text(result: Applied) -> str:
     if not result.ok:
         return result.detail
-    text = (f"Updated to v{result.version}. Restart AI Hive to use it: close "
-            "the window and open it again. Your agents keep running until "
-            "you do.") if result.version else (
+    text = (f"Updated to v{result.version}. Restart AI Hive to use it. Your "
+            "agents keep running until you do.") if result.version else (
             "Updated. Restart AI Hive to use it.")
     if result.deps_changed and not result.deps_ok:
         text += ("\n\nThe update needs new Python packages and installing "
@@ -429,6 +436,54 @@ def audit_line(result, tag: str = "") -> str:
                 f"needs_packages={result.needs_packages} "
                 f"detail={_first_line(result.detail)!r}")
     return f"{head}?"
+
+
+# ------------------------------------------------------------- restart ---
+
+RESTART_FLAG = "--restarted"
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def relaunch_argv(repo: str = REPO_DIR) -> list:
+    """The command that starts AI Hive again: the clone's windowless venv
+    python, which is what `AI Hive.bat` starts, else the running interpreter
+    without its console."""
+    main_py = os.path.join(repo, "main.py")
+    exe = os.path.join(repo, ".venv", "Scripts", "pythonw.exe")
+    if not os.path.isfile(exe):
+        exe = sys.executable or "pythonw"
+        folder, name = os.path.split(exe)
+        windowless = os.path.join(folder, "pythonw.exe")
+        if name.lower() == "python.exe" and os.path.isfile(windowless):
+            exe = windowless
+    return [exe, main_py, RESTART_FLAG]
+
+
+def relaunch(repo: str = REPO_DIR) -> str:
+    """Start a new AI Hive that outlives this one. Returns "" once it has
+    started, else why it could not. Never called from the smoke suite.
+
+    Detached, and out of any job this process sits in: a job that closes
+    with this process would take the new one down too. A job that forbids
+    breakaway refuses that flag, so the start is retried without it."""
+    argv = relaunch_argv(repo)
+    if os.name == "nt":
+        base = (subprocess.DETACHED_PROCESS
+                | subprocess.CREATE_NEW_PROCESS_GROUP)
+        attempts = (base | CREATE_BREAKAWAY_FROM_JOB, base)
+    else:
+        attempts = (0,)
+    why = ""
+    for flags in attempts:
+        try:
+            subprocess.Popen(argv, cwd=repo, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True,
+                             creationflags=flags)
+            return ""
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            why = str(e) or type(e).__name__
+    return why
 
 
 # --------------------------------------------------------------- runner ---
