@@ -835,8 +835,9 @@ def _message_text(rec: dict) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return " ".join(b.get("text", "") for b in content
-                        if isinstance(b, dict) and b.get("text"))
+        return " ".join(b["text"] for b in content
+                        if isinstance(b, dict) and b.get("text")
+                        and isinstance(b["text"], str))
     return ""
 
 
@@ -859,7 +860,21 @@ def latest_token_usage(cwd: str, session_id: str) -> tuple[int, int]:
     (skipping sub-agent sidechains, whose usage is a separate context) and size
     the window from that record's model. Returns (0, 0) when there is no file /
     no usage yet. Cached by (mtime,size) so polling several agents stays cheap.
-    Never raises."""
+    Never raises.
+
+    A compaction writes no usage record of its own, only a `compact_boundary`
+    and the summary, and an idle compaction may be the last thing written for
+    hours. Until the next turn reports real numbers, the reading after a
+    boundary is the smallest prompt sent before the first compaction (system
+    prompt, tools and memory, which a compacted conversation sends again)
+    plus what the compaction kept. Newer Claude versions record that on the
+    boundary as `compactMetadata.postTokens`, the summary and the preserved
+    tail together. Older ones don't, and the summary at 4 characters a token
+    stands in. On 5 real compactions with a following turn, postTokens
+    landed within 6K of that turn's prompt every time. The summary estimate
+    did within 3K in 4 of them and missed by 14K on the one with a large
+    preserved tail. A later turn can't set the floor: its prompt carries an
+    old summary, which a second compaction replaces."""
     if not session_id or not cwd:
         return (0, 0)
     return _read_latest_token_usage(transcript_path(cwd, session_id))
@@ -874,10 +889,17 @@ def _read_latest_token_usage(path: str) -> tuple[int, int]:
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
         return (cached[2], cached[3])
     used, window = 0, 0
+    last = 0           # the last real reading, which sizes the window
+    floor = 0          # the smallest prompt before the first compaction
+    compacted = False
+    summary = -1       # summary characters since the last boundary, -1: none
+    kept = 0           # the last boundary's postTokens, 0: not recorded
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
-                if '"usage"' not in line:  # cheap prefilter before JSON parse
+                # cheap prefilter before JSON parse
+                if ('"usage"' not in line and '"compact_boundary"' not in line
+                        and '"isCompactSummary"' not in line):
                     continue
                 try:
                     rec = json.loads(line)
@@ -885,22 +907,39 @@ def _read_latest_token_usage(path: str) -> tuple[int, int]:
                     continue  # a partial last line while Claude is writing
                 if rec.get("isSidechain"):
                     continue  # a sub-agent's context, not this conversation's
+                if (rec.get("type") == "system"
+                        and rec.get("subtype") == "compact_boundary"):
+                    summary, compacted = 0, True
+                    post = (rec.get("compactMetadata") or {}).get("postTokens")
+                    kept = post if isinstance(post, int) and post > 0 else 0
+                    continue
                 msg = rec.get("message") or {}
+                if rec.get("isCompactSummary"):
+                    if summary >= 0:
+                        summary += len(_message_text(rec))
+                    continue
                 usage = msg.get("usage")
                 if not isinstance(usage, dict):
                     continue
-                total = (usage.get("input_tokens", 0)
-                         + usage.get("cache_creation_input_tokens", 0)
-                         + usage.get("cache_read_input_tokens", 0)
-                         + usage.get("output_tokens", 0))
+                prompt = (usage.get("input_tokens", 0)
+                          + usage.get("cache_creation_input_tokens", 0)
+                          + usage.get("cache_read_input_tokens", 0))
+                total = prompt + usage.get("output_tokens", 0)
                 if total <= 0:
                     continue
-                used = total
+                used = last = total
                 window = context_window_for(msg.get("model", ""))
+                if prompt > 0 and not compacted:
+                    floor = min(floor, prompt) if floor else prompt
+                summary = -1   # a real reading supersedes any estimate
     except OSError:
         return (cached[2], cached[3]) if cached else (0, 0)
-    # a turn that overflowed the sized window means the larger beta is active
-    if used > window:
+    if summary >= 0 and floor:
+        used = floor + (kept or summary // 4)
+    # a turn that overflowed the sized window means the larger beta is
+    # active. The real reading decides it: a compaction doesn't shrink the
+    # window, only what is in it.
+    if last > window:
         window = 1_000_000
     _USAGE_CACHE[path] = (st.st_mtime, st.st_size, used, window)
     return (used, window)

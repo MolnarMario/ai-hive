@@ -1052,7 +1052,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4229 checks drive the real app headlessly (offscreen Qt platform) with real
+4236 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1065,8 +1065,9 @@ rename in the card header (double-click) plus
 a per-agent task summary beside the name, the per-card maximize/restore toggle
 (solo one agent full-area without touching any sibling's process, then restore
 the exact prior tiling), the context-window usage badge beside the summary
-("N% of 1M/200K", read from the transcript's last usage record — transient,
-never persisted), and a date-and-time stamp under every finished reply
+("N% of 1M/200K", read from the transcript's last usage record, and after a
+compaction from the size Claude records for what it kept, so it drops before
+the next turn; transient, never persisted), and a date-and-time stamp under every finished reply
 (Claude, Codex and Gemini alike, hidden by the **Reply times** switch in
 Options without discarding any), drawn inline in the terminal directly beneath the agent's own "✻ Worked for
 16m 36s" footer (a second FIFO-capped milestone type mirroring the
@@ -1201,7 +1202,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4229 checks)
+                           (4236 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

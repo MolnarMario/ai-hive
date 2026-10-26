@@ -8,6 +8,12 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.53.2
+
+- The context badge on a Claude card drops as soon as the conversation
+  compacts, instead of showing the old, full reading until the next
+  turn.
+
 ## 0.53.1
 
 - Copying text from a Claude agent's window keeps a wrapped paragraph as

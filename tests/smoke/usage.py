@@ -61,6 +61,70 @@ def test_token_usage_badge():
     used2, _ = transcripts._read_latest_token_usage(str(tpath))
     check("tokens: re-reads when the transcript changes", used2 == 300000, used2)
 
+    # a compaction writes no usage record: until the next turn, the reading
+    # is the smallest prompt seen (110 above) plus the summary at 4 chars/token
+    with open(tpath, "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps({"type": "system", "subtype": "compact_boundary",
+                              "compactMetadata": {"trigger": "auto",
+                                                  "preTokens": 300000}}) + "\n")
+        fh.write(_json.dumps({"type": "user", "isCompactSummary": True,
+                              "message": {"role": "user",
+                                          "content": "s" * 4000}}) + "\n")
+    used3, _ = transcripts._read_latest_token_usage(str(tpath))
+    check("tokens: a compaction drops the reading without waiting for a turn",
+          used3 == 110 + 1000, used3)
+    with open(tpath, "a", encoding="utf-8") as fh:
+        fh.write(_json.dumps(_asst(2, 0, 49998, 0)) + "\n")   # -> 50000
+    used4, _ = transcripts._read_latest_token_usage(str(tpath))
+    check("tokens: the next real turn replaces the compaction estimate",
+          used4 == 50000, used4)
+
+    def _boundary(post=None, side=False):
+        meta = {"trigger": "auto", "preTokens": 300000}
+        if post is not None:
+            meta["postTokens"] = post
+        return {"type": "system", "subtype": "compact_boundary",
+                "isSidechain": side, "compactMetadata": meta}
+
+    def _summary(chars):
+        return {"type": "user", "isCompactSummary": True,
+                "message": {"role": "user", "content": "s" * chars}}
+
+    def _read(recs, name):
+        p = tmp / name
+        p.write_text("\n".join(_json.dumps(r) for r in recs) + "\n",
+                     encoding="utf-8")
+        return transcripts._read_latest_token_usage(str(p))
+
+    # newer Claude records what the compaction kept, preserved tail included
+    used5, _ = _read([_asst(0, 0, 60000, 10), _boundary(9000),
+                      _summary(4000)], "post.jsonl")
+    check("tokens: a boundary's postTokens beats the summary estimate",
+          used5 == 60000 + 9000, used5)
+    # a turn after a compaction carries the old summary, so it can't be the
+    # floor even when its prompt is smaller than the first turn's
+    used6, _ = _read([_asst(0, 0, 60000, 10), _boundary(), _summary(400),
+                      _asst(0, 0, 40000, 10), _boundary(5000),
+                      _summary(400)], "twice.jsonl")
+    check("tokens: the floor comes from before the first compaction",
+          used6 == 60000 + 5000, used6)
+    used7, _ = _read([_asst(0, 0, 60000, 10), _boundary(5000, side=True),
+                      _summary(400)], "side.jsonl")
+    check("tokens: a sub-agent's compaction leaves the reading alone",
+          used7 == 60010, used7)
+    # haiku sizes at 200K: a 300K turn means the 1M beta, which a compaction
+    # doesn't take away
+    used8, window8 = _read([_asst(0, 0, 50000, 0, model="claude-haiku-4-5"),
+                            _asst(0, 0, 300000, 0, model="claude-haiku-4-5"),
+                            _boundary(5000)], "beta.jsonl")
+    check("tokens: a compaction keeps the 1M window a turn proved",
+          (used8, window8) == (55000, 1_000_000), (used8, window8))
+    check("tokens: a summary block whose text isn't a string never raises",
+          transcripts._message_text(
+              {"message": {"content": [{"type": "text", "text": 5},
+                                       {"type": "text", "text": "ok"}]}})
+          == "ok")
+
     # --- agent badge formatting + transient emission ---
     a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Solo", cwd=SCRATCH_CWD))
     seen = []
