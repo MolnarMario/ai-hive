@@ -328,6 +328,49 @@ def test_row_name_fades_under_badges():
     row.deleteLater()
 
 
+def test_row_name_color_follows_active():
+    """The gold bold name comes from `WorkspaceRow[active] #WsName`. Qt does
+    not re-evaluate a child's rules when the parent's property flips, so
+    after a selection change the old row kept its gold name while the new
+    row got the bar and tint but a plain name (reported live)."""
+    from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
+    from app import ui_theme
+    from app.widgets.sidebar import WorkspaceRow
+
+    app = QApplication.instance() or QApplication([])
+    old_qss = app.styleSheet()
+    app.setStyleSheet(ui_theme.build_qss())
+    host = QWidget()
+    lay = QVBoxLayout(host)
+    a = WorkspaceRow("a", "AI Hive", "C:/x")
+    b = WorkspaceRow("b", "HiraKata", "C:/y")
+    lay.addWidget(a)
+    lay.addWidget(b)
+    host.show()
+    app.processEvents()
+
+    def ink(row):
+        lab = row.name_label
+        return lab.palette().color(lab.foregroundRole()).name()
+
+    plain = ink(b)
+    a.set_active(True)
+    app.processEvents()
+    gold = ink(a)
+    check("row name: the active row's name leaves the plain color",
+          gold != plain, (gold, plain))
+    a.set_active(False)
+    b.set_active(True)
+    app.processEvents()
+    check("row name: the new active row's name turns gold",
+          ink(b) == gold, (ink(b), gold))
+    check("row name: the row that lost the selection drops its gold",
+          ink(a) == plain, (ink(a), plain))
+    host.close()
+    host.deleteLater()
+    app.setStyleSheet(old_qss)
+
+
 def test_working_pulses_share_one_phase():
     """The count badges and the collapsed rail each run their own frame clock,
     but the breath they paint comes from one shared clock. Two pulses started
