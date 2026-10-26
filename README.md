@@ -271,10 +271,15 @@ workspaces keep executing — switching never pauses anything.
   origin/main` and, if `requirements.txt` changed, `pip install`. It never
   resets, stashes or checks out: on another branch, with local changes to
   tracked files, or with local commits it explains why and does nothing. It
-  **never closes the app**: the button reads *Restart to update* until you
-  close and reopen AI Hive yourself, so your agents keep working until you
-  choose to restart. That state is read from the files on disk, so it also
-  covers a `git pull` you ran by hand.
+  **never restarts on its own**: the button reads *Restart to update*, and a
+  click on it (or **Restart now** in the dialog) saves, closes and opens AI
+  Hive again. If any agent is working, waiting on your answer or running a
+  command, it first lists them by workspace. **Restart now** interrupts them
+  (agents reopen in their conversations, shells start fresh). **Wait until
+  they finish** keeps them running while the button counts what is left
+  (*Restart waits on 2*) and lights up again once restarting is safe. That
+  state is read from the files on disk, so it also covers a `git pull` you
+  ran by hand.
 - **Updates in the background, never at launch.** Opening AI Hive runs no git
   and never waits on GitHub. With **Update AI Hive in the background** on
   (Options, on by default) it checks a minute after the window opens and then
@@ -1044,7 +1049,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4159 checks drive the real app headlessly (offscreen Qt platform) with real
+4210 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1193,7 +1198,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4159 checks)
+                           (4210 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

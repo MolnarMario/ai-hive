@@ -63,11 +63,21 @@ left on a merged branch back to main.
 THE USER RESTARTS, NEVER US
 ---------------------------
 Python has already imported the running code, so the pulled files take effect
-on the next launch. Closing the window is the user's call (their agents are
-running), so an applied update only ever says "restart to finish". The
-restart-pending state is DERIVED, not stored: the version in the file on disk
-is higher than the version this process imported. That also covers a user who
-ran `git pull` by hand.
+on the next launch. Restarting is the user's call (their agents are running),
+so an applied update only ever says "restart to finish". The restart-pending
+state is DERIVED, not stored: the version in the file on disk is higher than
+the version this process imported. That also covers a user who ran `git pull`
+by hand.
+
+The "Restart to update" button restarts on the user's click. `relaunch`
+starts a detached `main.py --restarted <pid>`, then the window closes as
+usual. The new process cannot run beside the old one (the single-instance
+mutex), so `--restarted` makes it wait for that mutex to come free, while
+the old pid runs, before it loads the session the old process saves on its
+way out. If the old one is gone and the mutex is still held, the user
+opened AI Hive by hand meanwhile, and the new process exits quietly. Before restarting,
+MainWindow names every agent a restart would interrupt and lets the user
+wait for them instead.
 
 No em dash in any string below: `detail` and `blocked` are read by the user.
 """
@@ -391,9 +401,8 @@ def background_update(runner, repo: str = REPO_DIR, running: str = "",
 def applied_text(result: Applied) -> str:
     if not result.ok:
         return result.detail
-    text = (f"Updated to v{result.version}. Restart AI Hive to use it: close "
-            "the window and open it again. Your agents keep running until "
-            "you do.") if result.version else (
+    text = (f"Updated to v{result.version}. Restart AI Hive to use it. Your "
+            "agents keep running until you do.") if result.version else (
             "Updated. Restart AI Hive to use it.")
     if result.deps_changed and not result.deps_ok:
         text += ("\n\nThe update needs new Python packages and installing "
@@ -429,6 +438,92 @@ def audit_line(result, tag: str = "") -> str:
                 f"needs_packages={result.needs_packages} "
                 f"detail={_first_line(result.detail)!r}")
     return f"{head}?"
+
+
+# ------------------------------------------------------------- restart ---
+
+RESTART_FLAG = "--restarted"
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def relaunch_argv(repo: str = REPO_DIR) -> list:
+    """The command that starts AI Hive again: the clone's windowless venv
+    python, which is what `AI Hive.bat` starts, else the running interpreter
+    without its console. It passes this process's pid, the one holding the
+    mutex, so the new one waits exactly as long as this one runs."""
+    main_py = os.path.join(repo, "main.py")
+    exe = os.path.join(repo, ".venv", "Scripts", "pythonw.exe")
+    if not os.path.isfile(exe):
+        exe = sys.executable or "pythonw"
+        folder, name = os.path.split(exe)
+        windowless = os.path.join(folder, "pythonw.exe")
+        if name.lower() == "python.exe" and os.path.isfile(windowless):
+            exe = windowless
+    return [exe, main_py, RESTART_FLAG, str(os.getpid())]
+
+
+def job_kills_on_close() -> bool:
+    """This process sits in a Windows job that kills its processes when the
+    job closes. A child that cannot break away from it may die with us."""
+    if os.name != "nt":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    query = k32.QueryInformationJobObject
+    query.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                      wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    query.restype = wintypes.BOOL
+    info = BasicLimits()
+    # a NULL job is the calling process's own; the call fails outside one.
+    # 2 is JobObjectBasicLimitInformation, 0x2000 KILL_ON_JOB_CLOSE
+    if not query(None, 2, ctypes.byref(info), ctypes.sizeof(info), None):
+        return False
+    return bool(info.LimitFlags & 0x2000)
+
+
+def relaunch(repo: str = REPO_DIR, popen=None) -> str:
+    """Start a new AI Hive that outlives this one. Returns "" once it has
+    started, else why it could not. Never called from the smoke suite.
+
+    Detached, and out of any job this process sits in: a job that closes
+    with this process would take the new one down too. A job that forbids
+    breakaway refuses that flag. The start is retried inside the job only
+    when the job does not kill its processes on close. `popen` is for
+    tests."""
+    argv = relaunch_argv(repo)
+    popen = popen or subprocess.Popen
+    if os.name == "nt":
+        base = (subprocess.DETACHED_PROCESS
+                | subprocess.CREATE_NEW_PROCESS_GROUP)
+        attempts = (base | CREATE_BREAKAWAY_FROM_JOB, base)
+    else:
+        attempts = (0,)
+    why = ""
+    for flags in attempts:
+        if flags != attempts[0] and job_kills_on_close():
+            return ("AI Hive runs inside a job that would close the new "
+                    "copy along with this one")
+        try:
+            popen(argv, cwd=repo, stdin=subprocess.DEVNULL,
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                  close_fds=True, creationflags=flags)
+            return ""
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            why = str(e) or type(e).__name__
+    return why
 
 
 # --------------------------------------------------------------- runner ---

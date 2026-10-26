@@ -1724,26 +1724,72 @@ def test_drag_select_offscreen_selection():
             v._drag_scroll_tick()
         release(v, above)
 
-    # Shift+Arrow after the drag: the end it left in history stays there
+    # Shift+Arrow after the drag grows it where it is. Before, the view
+    # jumped to live first and the end moved out of sight above it.
     v = view()
     drag_up(v, 5)
     off = v.scroll_offset()
-    first = f"line-{51 - off:02d}"
+    v._extend_kbd_selection(Qt.Key.Key_Right, False)
+    check("offscreen sel: Shift+Right after a drag leaves the view put",
+          v.scroll_offset() == off and v._sel_end == (0, 1),
+          (v.scroll_offset(), v._sel_end))
+    v._extend_kbd_selection(Qt.Key.Key_Left, False)
     v._extend_kbd_selection(Qt.Key.Key_Up, False)
     got = v.selected_text().splitlines()
-    check("offscreen sel: Shift+Up keeps the history part of a drag",
-          v.scroll_offset() == 0 and got[:1] == [first]
-          and got[-1:] == ["line-56"], (v.scroll_offset(), got[:1], got[-1:]))
+    check("offscreen sel: Shift+Up at the top row scrolls one line back",
+          v.scroll_offset() == off + 1 and v._sel_end == (0, 0)
+          and got[:1] == [f"line-{50 - off:02d}"]
+          and got[-1:] == ["line-56"], (v.scroll_offset(), v._sel_end,
+                                        got[:1], got[-1:]))
+    off = v.scroll_offset()
     v._extend_kbd_selection(Qt.Key.Key_Down, False)
     got = v.selected_text().splitlines()
-    check("offscreen sel: Shift+Down moves an off-screen end toward live",
-          got[:1] == [f"line-{52 - off:02d}"], got[:1])
+    check("offscreen sel: Shift+Down moves the end without scrolling",
+          v.scroll_offset() == off and got[:1] == [f"line-{52 - off:02d}"],
+          (v.scroll_offset(), got[:1]))
     v._extend_kbd_selection(Qt.Key.Key_End, False)
-    check("offscreen sel: Shift+End reads the off-screen row's text",
-          v._sel_end == (1 - off, 6), v._sel_end)
+    check("offscreen sel: Shift+End reads the end's row",
+          v._sel_end == (1, 6), v._sel_end)
     v._extend_kbd_selection(Qt.Key.Key_Left, True)
-    check("offscreen sel: Ctrl+Shift+Left finds words off screen",
-          v._sel_end == (1 - off, 0), v._sel_end)
+    check("offscreen sel: Ctrl+Shift+Left finds the word",
+          v._sel_end == (1, 0), v._sel_end)
+    # an end the wheel scrolled out of view (row 1 to row -4) comes back
+    # into it, at the top row, which takes 4 of those 5 lines back
+    v.scroll_by(-5)
+    v._extend_kbd_selection(Qt.Key.Key_Right, False)
+    check("offscreen sel: Shift+Right scrolls an off-screen end back in",
+          v.scroll_offset() == off - 1 and v._sel_end == (0, 1),
+          (v.scroll_offset(), v._sel_end))
+    # past the bottom row while scrolled back, toward live
+    off = v.scroll_offset()
+    for _ in range(10):
+        v._extend_kbd_selection(Qt.Key.Key_Down, False)
+    check("offscreen sel: Shift+Down at the bottom row scrolls toward live",
+          v.scroll_offset() == off - 1 and v._sel_end == (9, 1),
+          (v.scroll_offset(), v._sel_end))
+    # the oldest line is as far as the end goes
+    v.scroll_by(10 ** 6)
+    v._sel_end = (0, 0)
+    v._extend_kbd_selection(Qt.Key.Key_Up, False)
+    check("offscreen sel: Shift+Up stops at the oldest line",
+          v.scroll_offset() == len(v.screen.history.top)
+          and v._sel_end == (0, 0), (v.scroll_offset(), v._sel_end))
+    # a fresh keyboard selection still starts at the caret, on live
+    v._sel_anchor = v._sel_end = None
+    v._extend_kbd_selection(Qt.Key.Key_Left, False)
+    check("offscreen sel: a new Shift+Arrow selection snaps to live",
+          v.scroll_offset() == 0
+          and v._sel_anchor == (v.screen.cursor.y, v.screen.cursor.x),
+          (v.scroll_offset(), v._sel_anchor))
+    # the alternate screen keeps the end on its rows
+    va = view()
+    va.feed("\x1b[?1049h")
+    va._sel_anchor, va._sel_end = (3, 0), (0, 0)
+    va._extend_kbd_selection(Qt.Key.Key_Up, False)
+    check("offscreen sel: Shift+Up on the alternate screen never scrolls",
+          va.scroll_offset() == 0 and va._sel_end == (0, 0),
+          (va.scroll_offset(), va._sel_end))
+    va.deleteLater()
 
     # a live selection reads no history (it is copied on every new push)
     v2 = view()

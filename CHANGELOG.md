@@ -8,6 +8,18 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.53.0
+
+- Restart to update now restarts AI Hive for you. It saves, closes and
+  opens the app again. If agents are still working, waiting on you or
+  running a command, it lists them first: Restart now interrupts them,
+  Wait keeps them running and the button counts down what is left. The
+  update dialog has a Restart now button too.
+- Shift+Arrow, Home and End grow a selection you made in an agent's
+  history where it is, instead of jumping back to the live screen.
+- The sidebar no longer leaves the gold name on a workspace you just
+  switched away from.
+
 ## 0.52.0
 
 - Dragging a selection past the top or bottom of an agent's window now
