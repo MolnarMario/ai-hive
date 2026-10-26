@@ -10,9 +10,9 @@ em dashes: this text is shown in the app.
 
 ## 0.53.1
 
-- Copying text from an agent's window keeps a wrapped paragraph as one
-  line, so a reply or prompt pastes the way Claude wrote it instead of
-  breaking at every row. Tool output still keeps every line.
+- Copying text from a Claude agent's window keeps a wrapped paragraph as
+  one line, so a reply or prompt pastes the way Claude wrote it instead
+  of breaking at every row. Tool output still keeps every line.
 
 ## 0.53.0
 
