@@ -6685,9 +6685,11 @@ class MainWindow(QMainWindow):
 
         dialog = SelfUpdateDialog(check, runner=self._self_update_runner,
                                   repo=self._self_update_repo, parent=self,
-                                  can_restart=getattr(
-                                      self, "_app_relauncher", None)
-                                  is not None)
+                                  can_restart=(
+                                      getattr(self, "_app_relauncher", None)
+                                      is not None and not getattr(
+                                          self, "_app_restart_needs_pip",
+                                          False)))
         dialog.auditRequested.connect(self._audit_install)
         dialog.applied.connect(self._on_app_update_applied)
         dialog.restartRequested.connect(self._on_dialog_restart)

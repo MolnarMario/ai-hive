@@ -2464,6 +2464,15 @@ def test_restart_to_update():
     if win._self_update_dialog is not None:
         win._self_update_dialog.reject()
         pump(20)
+    win._open_self_update_dialog(self_update.Check(
+        Status.RESTART_PENDING, running=__version__, installed="9.9.9"))
+    dlg = win._self_update_dialog
+    check("restart: ...and a later check's dialog offers no Restart now "
+          "either", dlg is not None and not dlg.restart_btn.isVisibleTo(dlg)
+          and "close the window" in dlg.body_label.text())
+    if dlg is not None:
+        dlg.reject()
+        pump(20)
 
     del win.close
     win.close()
