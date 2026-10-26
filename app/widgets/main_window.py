@@ -4729,6 +4729,8 @@ class MainWindow(QMainWindow):
     def _on_stats_for_timers(self, *_) -> None:
         self._sync_schedule_timer()
         self._schedule_taskbar_badge()
+        if getattr(self, "_app_restart_waiting", False):
+            self._show_app_restart_state()
 
     def _sync_schedule_timer(self) -> None:
         """Run the countdown tick only while something is actually queued.
@@ -6308,9 +6310,9 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------ updating AI Hive ---
     # `app/self_update.py` decides and `self_update_dialog.py` shows. Nothing
-    # here is persisted (the state is re-derived by every check) and nothing
-    # here closes the window: after an update lands, the user restarts when
-    # their agents are at a good point.
+    # here is persisted (the state is re-derived by every check). Only the
+    # user's click on Restart to update closes the window, and first it names
+    # every agent the restart would interrupt so the user can wait for them.
 
     APP_UPDATE_FLASH_MS = 6000     # how long "Check failed" stays
     APP_UPDATE_QUIET_MS = 4000     # how long the "Up to date" notice stays
@@ -6327,9 +6329,18 @@ class MainWindow(QMainWindow):
         self._self_update_runner = runner or self_update.subprocess_runner
         self._self_update_repo = repo or self_update.REPO_DIR
 
+    def arm_app_restart(self, relauncher=None) -> None:
+        """Let Restart to update start a new AI Hive. Called from `main.py`
+        alone, like `arm_self_update`: the suite must never launch a second
+        app. `relauncher` takes no arguments and returns "" once the new
+        process has started, else why not."""
+        from app import self_update
+        self._app_relauncher = relauncher or self_update.relaunch
+
     def check_for_app_update(self) -> None:
         """The button beside the version: fetch main off the GUI thread, then
-        show what was found. A click while the dialog is open raises it."""
+        show what was found. A click while the dialog is open raises it, and
+        once an update is installed the click restarts AI Hive."""
         from app import self_update
         from .self_update_dialog import Job
 
@@ -6337,6 +6348,9 @@ class MainWindow(QMainWindow):
         if dialog is not None:
             dialog.raise_()
             dialog.activateWindow()
+            return
+        if self._app_can_restart() and self._app_restart_on_button():
+            self.request_app_restart()
             return
         runner = getattr(self, "_self_update_runner", None)
         if runner is None or getattr(self, "_app_update_job", None) is not None:
@@ -6427,7 +6441,8 @@ class MainWindow(QMainWindow):
         def wanted() -> bool:
             # read on the worker, after the fetch: a switch turned off or a
             # window closing during the check stops it before the merge
-            return self._app_auto_update and not self._closing
+            return (self._app_auto_update and not self._closing
+                    and not getattr(self, "_app_restart_queued", False))
 
         job = Job(lambda: self_update.background_update(runner, repo,
                                                         __version__, wanted),
@@ -6459,6 +6474,12 @@ class MainWindow(QMainWindow):
                 f"SELF-UPDATE background stopped unexpectedly: {result}")
         if self._closing:
             return
+        if getattr(self, "_app_restart_queued", False):
+            self._app_restart_queued = False
+            if applied is not None:
+                self._on_app_update_applied(applied)
+            self._restart_app()
+            return
         if getattr(self, "_app_update_click_waiting", False):
             # the user clicked meanwhile: their check shows the full answer
             self._app_update_click_waiting = False
@@ -6468,7 +6489,7 @@ class MainWindow(QMainWindow):
             return
         if applied is not None and applied.ok:
             self._app_update_flash().stop()
-            self._note_app_restart_pending(applied.version)
+            self._on_app_update_applied(applied)
         elif found.status is Status.RESTART_PENDING:
             self._app_update_flash().stop()
             self._note_app_restart_pending(found.installed)
@@ -6489,19 +6510,192 @@ class MainWindow(QMainWindow):
                 + "Click to see what changed and update.", attention=True)
 
     def _note_app_restart_pending(self, version: str) -> None:
-        self.top_bar.set_app_update_state(
-            "Restart to update",
-            (f"AI Hive v{version} is installed. " if version else "")
-            + "Close the window and open AI Hive again to use it.",
-            attention=True)
+        # latched: once the files on disk are newer, every later check says
+        # restart too, until this process is gone
+        self._app_restart_version = version or ""
+        self._app_restart_shown = None      # something else may have painted
+        self._show_app_restart_state()
+
+    def _app_can_restart(self) -> bool:
+        """The button restarts AI Hive: an update is installed, main.py armed
+        the relaunch, and no package install failed (the new code would
+        die on import, in a pythonw that shows no error)."""
+        return (getattr(self, "_app_restart_version", None) is not None
+                and getattr(self, "_app_relauncher", None) is not None
+                and not getattr(self, "_app_restart_needs_pip", False))
+
+    def _app_restart_on_button(self) -> bool:
+        """The button shows the restart state, not a newer update a later
+        background check found while this one waits for a restart."""
+        shown = getattr(self, "_app_restart_shown", None)
+        return (shown is not None
+                and self.top_bar.app_update_btn.text() == shown[0])
+
+    def _show_app_restart_state(self) -> None:
+        """Paint the restart button. Once the user chose to wait, it counts
+        the agents still in the way and lights up when there are none.
+        Called on every stats change while waiting, so it repaints only
+        when what it shows changed."""
+        version = getattr(self, "_app_restart_version", None)
+        if version is None:
+            return
+        head = f"AI Hive v{version} is installed. " if version else ""
+        if not self._app_can_restart():
+            state = ("Restart to update", head + "Close the window and open "
+                     "AI Hive again to use it.", True)
+        elif getattr(self, "_app_restart_waiting", False):
+            busy = self._restart_interruptions()
+            if busy:
+                state = (f"Restart waits on {len(busy)}",
+                         head + "The restart waits for:\n"
+                         + self._restart_interruption_text(busy)
+                         + "\n\nClick to restart now anyway.", False)
+            else:
+                state = ("Restart to update", head + "Nothing is working "
+                         "now, so it is safe to restart. Click to restart "
+                         "AI Hive.", True)
+        else:
+            state = ("Restart to update", head + "Click to restart AI Hive "
+                     "and use it.", True)
+        if state == getattr(self, "_app_restart_shown", None):
+            return
+        self._app_restart_shown = state
+        text, tip, attention = state
+        self.top_bar.set_app_update_state(text, tip, attention=attention)
+
+    def _restart_interruptions(self) -> list:
+        """`(workspace, agent, what it is doing)` for every agent a restart
+        would cut off, in sidebar order. The same predicates as the taskbar
+        badge (`_taskbar_state`): working, waiting on the user, or running
+        a background command. An agent idle at its prompt is left out: it
+        reopens in its conversation and loses nothing."""
+        from app import providers
+        found = []
+        for ws in self.manager.workspaces:
+            for agent in ws.agents:
+                ai = agent.spec.provider in providers.AI_PROVIDER_KEYS
+                if agent.is_waiting():
+                    what = "waiting for your answer" if ai else \
+                        "waiting for input"
+                elif agent.is_busy():
+                    what = "working" if ai else "running a command"
+                elif agent.is_bg_shell_busy():
+                    what = ("running a background command" if ai
+                            else "running a command")
+                else:
+                    continue
+                found.append((ws.name, agent.spec.name, what))
+        return found
+
+    @staticmethod
+    def _restart_interruption_text(busy: list) -> str:
+        lines, last_ws = [], None
+        for ws_name, name, what in busy:
+            if ws_name != last_ws:
+                lines.append(ws_name)
+                last_ws = ws_name
+            lines.append(f"    {name}, {what}")
+        return "\n".join(lines)
+
+    def request_app_restart(self) -> None:
+        """Restart to update was clicked. With nothing working, restart now.
+        Otherwise name what a restart would interrupt, workspace by
+        workspace, and let the user restart anyway or wait."""
+        box = getattr(self, "_app_restart_box", None)
+        if box is not None:
+            box.raise_()
+            box.activateWindow()
+            return
+        if self._closing or not self._app_can_restart():
+            return
+        busy = self._restart_interruptions()
+        if not busy:
+            self._restart_app()
+            return
+        box = QMessageBox(
+            QMessageBox.Icon.Warning, "Restart AI Hive",
+            "Restarting now would interrupt:\n\n"
+            + self._restart_interruption_text(busy)
+            + "\n\nRestart now stops what they are doing. Agents reopen in "
+            "their conversations, and shells start fresh.\n\nWait keeps "
+            "everything running. The Restart button counts what is left and "
+            "lights up once it is safe to restart.", parent=self)
+        box.setTextFormat(Qt.TextFormat.PlainText)    # it holds agent names
+        restart = box.addButton("Restart now",
+                                QMessageBox.ButtonRole.DestructiveRole)
+        wait = box.addButton("Wait until they finish",
+                             QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(wait)
+        box.setEscapeButton(wait)
+
+        def done(_result=0) -> None:
+            self._app_restart_box = None
+            box.deleteLater()
+            if box.clickedButton() is restart:
+                self._restart_app()
+            else:
+                self._audit_install(
+                    f"SELF-UPDATE restart waits on {len(busy)} agent(s)")
+                self._app_restart_waiting = True
+                self._show_app_restart_state()
+
+        box.finished.connect(done)
+        self._app_restart_box = box
+        box.open()
+
+    def _restart_app(self) -> None:
+        """Start the new AI Hive, then close this window the ordinary way
+        (`closeEvent` saves first, and main.py's quit_on_close ends the
+        process, which frees the mutex the new one waits on)."""
+        if self._closing or getattr(self, "_app_restarting", False):
+            return
+        if not self._app_can_restart():
+            # a merge just now may have left packages uninstalled
+            self._app_restart_shown = None
+            self._show_app_restart_state()
+            return
+        relauncher = self._app_relauncher
+        if getattr(self, "_app_auto_job", None) is not None:
+            # the background update may be merging into this folder, and a
+            # restart now could import half of the new files: restart once
+            # it ends (_on_app_auto_update_done)
+            self._app_restart_queued = True
+            self.top_bar.set_app_update_state(
+                "Restarting...", "Waiting for the background update to "
+                "finish", interactive=False)
+            return
+        busy = self._restart_interruptions()
+        try:
+            why = relauncher()
+        except Exception as e:  # noqa: BLE001 - reported, never fatal
+            why = str(e) or type(e).__name__
+        if why:
+            self._audit_install(f"SELF-UPDATE restart failed: {why}")
+            self._app_restart_shown = None
+            self._show_app_restart_state()
+            QMessageBox.warning(
+                self, "AI Hive did not restart",
+                f"AI Hive could not start again ({why}). Close the window "
+                "and open AI Hive again to use the update.")
+            return
+        self._app_restarting = True
+        self._audit_install(
+            f"SELF-UPDATE restart interrupting={len(busy)}")
+        self.close()
 
     def _open_self_update_dialog(self, check) -> None:
         from .self_update_dialog import SelfUpdateDialog
 
         dialog = SelfUpdateDialog(check, runner=self._self_update_runner,
-                                  repo=self._self_update_repo, parent=self)
+                                  repo=self._self_update_repo, parent=self,
+                                  can_restart=(
+                                      getattr(self, "_app_relauncher", None)
+                                      is not None and not getattr(
+                                          self, "_app_restart_needs_pip",
+                                          False)))
         dialog.auditRequested.connect(self._audit_install)
         dialog.applied.connect(self._on_app_update_applied)
+        dialog.restartRequested.connect(self._on_dialog_restart)
         dialog.finished.connect(self._on_self_update_dialog_closed)
         self._self_update_dialog = dialog
         dialog.open()
@@ -6512,8 +6706,18 @@ class MainWindow(QMainWindow):
         if dialog is not None:
             dialog.deleteLater()
 
+    def _on_dialog_restart(self) -> None:
+        dialog = getattr(self, "_self_update_dialog", None)
+        if dialog is not None:
+            dialog.accept()
+        self.request_app_restart()
+
     def _on_app_update_applied(self, result) -> None:
         if result.ok:
+            # pip ran on the whole requirements.txt: a success there puts
+            # back whatever an earlier failure left out
+            if result.deps_changed:
+                self._app_restart_needs_pip = not result.deps_ok
             self._note_app_restart_pending(result.version)
 
     # ------------------------------------------------- the Updates panel ---

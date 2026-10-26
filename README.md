@@ -271,10 +271,15 @@ workspaces keep executing — switching never pauses anything.
   origin/main` and, if `requirements.txt` changed, `pip install`. It never
   resets, stashes or checks out: on another branch, with local changes to
   tracked files, or with local commits it explains why and does nothing. It
-  **never closes the app**: the button reads *Restart to update* until you
-  close and reopen AI Hive yourself, so your agents keep working until you
-  choose to restart. That state is read from the files on disk, so it also
-  covers a `git pull` you ran by hand.
+  **never restarts on its own**: the button reads *Restart to update*, and a
+  click on it (or **Restart now** in the dialog) saves, closes and opens AI
+  Hive again. If any agent is working, waiting on your answer or running a
+  command, it first lists them by workspace. **Restart now** interrupts them
+  (agents reopen in their conversations, shells start fresh). **Wait until
+  they finish** keeps them running while the button counts what is left
+  (*Restart waits on 2*) and lights up again once restarting is safe. That
+  state is read from the files on disk, so it also covers a `git pull` you
+  ran by hand.
 - **Updates in the background, never at launch.** Opening AI Hive runs no git
   and never waits on GitHub. With **Update AI Hive in the background** on
   (Options, on by default) it checks a minute after the window opens and then

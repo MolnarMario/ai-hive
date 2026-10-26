@@ -7,8 +7,9 @@ thread + `queue.Queue` + `QTimer` shape, as `update_panel.py`). The dialog is
 opened with `open()`, not `exec()`, so the window and its agents keep painting
 while it is up.
 
-It never closes the app. After an update lands the dialog says to restart, and
-the user closes the window when their agents are at a good point.
+It never closes the app itself. After an update lands it offers Restart now,
+which hands over to `MainWindow.request_app_restart` (that one asks about
+working agents first), and Close leaves the restart for later.
 
 No em dash in any string below: this is all read by the user.
 """
@@ -79,9 +80,10 @@ class SelfUpdateDialog(QDialog):
 
     applied = Signal(object)        # self_update.Applied
     auditRequested = Signal(str)
+    restartRequested = Signal()
 
     def __init__(self, check, runner=None, repo: str = self_update.REPO_DIR,
-                 parent=None):
+                 parent=None, can_restart: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Update AI Hive")
         self.setMinimumWidth(520)
@@ -90,6 +92,7 @@ class SelfUpdateDialog(QDialog):
         self._repo = repo
         self._busy = False
         self._result = None
+        self._can_restart = can_restart
 
         root = QVBoxLayout(self)
         self.title_label = QLabel("", self)
@@ -123,6 +126,9 @@ class SelfUpdateDialog(QDialog):
         self.update_btn.setDefault(True)
         self.update_btn.clicked.connect(self._on_update)
         buttons.addWidget(self.update_btn)
+        self.restart_btn = QPushButton("Restart now", self)
+        self.restart_btn.clicked.connect(self.restartRequested)
+        buttons.addWidget(self.restart_btn)
         self.close_btn = QPushButton("Close", self)
         self.close_btn.clicked.connect(self.reject)
         buttons.addWidget(self.close_btn)
@@ -138,7 +144,7 @@ class SelfUpdateDialog(QDialog):
         if result is not None and result.ok:
             self.title_label.setText(f"AI Hive v{result.version} is installed"
                                      if result.version else "AI Hive updated")
-            self.body_label.setText(result.detail)
+            self.body_label.setText(result.detail + self._how_to_restart())
         elif c.status is Status.UPDATE_AVAILABLE:
             self.title_label.setText(f"AI Hive v{c.remote} is available")
             self.body_label.setText(f"You are running v{c.running}. Updating "
@@ -148,8 +154,8 @@ class SelfUpdateDialog(QDialog):
             self.title_label.setText(f"AI Hive v{c.installed} is installed")
             self.body_label.setText(
                 f"You are still running v{c.running}. Restart AI Hive to use "
-                "it: close the window and open it again. Your agents keep "
-                "running until you do.")
+                "it. Your agents keep running until you do."
+                + self._how_to_restart())
         elif c.status is Status.UP_TO_DATE:
             self.title_label.setText("AI Hive is up to date")
             self.body_label.setText(f"You are running v{c.running}.")
@@ -178,7 +184,21 @@ class SelfUpdateDialog(QDialog):
         self.update_btn.setText("Updating..." if self._busy
                                 else ("Try again" if result is not None
                                       else "Update"))
+        installed = ((c.status is Status.RESTART_PENDING and result is None)
+                     or (result is not None and result.ok))
+        # a failed package install leaves code that needs packages it does
+        # not have, and a restart into it would die on import
+        pip_failed = (result is not None and result.deps_changed
+                      and not result.deps_ok)
+        self.restart_btn.setVisible(installed and self._can_restart
+                                    and not pip_failed)
+        if self.restart_btn.isVisibleTo(self):
+            self.restart_btn.setDefault(True)
         self.close_btn.setEnabled(not self._busy)
+
+    def _how_to_restart(self) -> str:
+        return "" if self._can_restart else (
+            " To restart, close the window and open AI Hive again.")
 
     # ------------------------------------------------------------- actions ---
 
