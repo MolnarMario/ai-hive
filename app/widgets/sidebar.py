@@ -300,6 +300,10 @@ class WorkspaceRow(QFrame):
         if self.property("active") != active:
             self.setProperty("active", active)
             repolish(self)
+            # The name's color comes from `WorkspaceRow[active] #WsName`, and
+            # Qt does not re-evaluate a child's rules when the parent's
+            # property flips: the old active row kept its gold name.
+            repolish(self.name_label)
 
     def set_search_hit(self, hit: bool) -> None:
         """Tint the row when it matches the active sidebar search."""
