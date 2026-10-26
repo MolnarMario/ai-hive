@@ -119,7 +119,10 @@ repaint; hover then reads the cached spans (_span_at) with no filesystem work.
 A selection can also be built from the KEYBOARD, like a desktop text area:
 Shift+Arrow/Home/End grows a local copy selection (Ctrl adds word granularity),
 sending NOTHING to the child -- it's a visual overlay that feeds copy/cut, so it
-works regardless of wrapping (_extend_kbd_selection). A plain (unshifted) arrow
+works regardless of wrapping (_extend_kbd_selection). A new one starts at the
+child's caret, on the live screen. Extending one that exists, say a drag into
+history, leaves the view where it is and scrolls only to keep the moving end
+on screen. A plain (unshifted) arrow
 collapses it, then forwards to move the child's caret. Shift+click EXTENDS the
 current selection to the clicked cell; a TRIPLE-click selects the whole line.
 A selection (mouse OR keyboard) is EDITABLE like any editor selection: Ctrl+C
@@ -2921,15 +2924,22 @@ class TerminalView(QWidget):
         text-selection, exactly like a desktop text area. Anchors at the child
         caret on first use; the moving end is _sel_end. Purely visual, so it
         works regardless of wrapping and feeds copy/cut just like the mouse
-        selection."""
-        self._snap_to_bottom()
+        selection.
+
+        Only a fresh selection snaps the view to live, because the caret is
+        a live row. An existing one grows where it is, a drag's end in
+        history included, and the view scrolls just enough to keep the
+        moving end on screen, as an editor keeps its caret in view. Snapping
+        it to live moved the end out of sight above the view."""
         self._input_selected = False
         rows, cols = self.screen.lines, self.screen.columns
         if self._sel_anchor is None or self._sel_end is None:
+            self._snap_to_bottom()
             start = (self.screen.cursor.y, self.screen.cursor.x)
             self._sel_anchor = start
             self._sel_end = start
         r, c = self._sel_end
+        was = r
         if key == Qt.Key.Key_Left:
             c = self._word_col(r, c, -1) if word else c - 1
         elif key == Qt.Key.Key_Right:
@@ -2945,12 +2955,22 @@ class TerminalView(QWidget):
             c = max((i for i in range(cols)
                      if line is not None and line[i].data not in ("", " ")),
                     default=0)
-        # the snap above carried an end that a drag scrolled into history
-        # off the top (row < 0). It stays there and moves from there, but a
-        # key never pushes the end further into history than it already was,
-        # where the user can't see what it takes.
-        top = min(0, self._sel_end[0])
-        self._sel_end = (max(top, min(rows - 1, r)), max(0, min(cols - 1, c)))
+        if self._alt_screen:
+            # the app owns scrolling there (see _drag_scroll_step): the end
+            # stays on the screen rows, or, already off them, goes no further
+            lo, hi = min(0, was), max(rows - 1, was)
+        else:
+            # visual rows of the oldest history line and the last live row
+            hist = len(self.screen.history.top)
+            off = min(self._scroll_offset, hist)
+            lo, hi = off - hist, off + rows - 1
+        r = max(lo, min(hi, r))
+        self._sel_end = (r, max(0, min(cols - 1, c)))
+        if not self._alt_screen:
+            if r < 0:
+                self.scroll_by(-r)              # _set_offset carries the end
+            elif r >= rows:
+                self.scroll_by(rows - 1 - r)
         self.update()
 
     def _word_col(self, r: int, c: int, direction: int) -> int:
