@@ -962,7 +962,10 @@ Hard-won rules, each with a regression test:
   Keystrokes go straight to the child; the input box is replaced by the live
   screen. **Clipboard** (Windows-editor style): `Ctrl+C` copies the selection
   or, with nothing selected, sends the interrupt (0x03) — copying clears the
-  selection so the next `Ctrl+C` interrupts; `Ctrl+Shift+A` selects all painted
+  selection so the next `Ctrl+C` interrupts. In a Claude card a copy joins
+  the rows Claude wrapped to fit the card, so a reply or a prompt pastes
+  with only its own line breaks. A tool's output keeps every row;
+  `Ctrl+Shift+A` selects all painted
   text (screen + scrollback); `Ctrl+V` / `Ctrl+Shift+V` paste (bracketed-paste
   aware for multi-line); `Ctrl+Shift+C` also copies; and a right-click
   Copy/Paste/Select-all menu. The Win+V clipboard and Win+. emoji panels
@@ -1049,7 +1052,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4210 checks drive the real app headlessly (offscreen Qt platform) with real
+4229 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1198,7 +1201,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4210 checks)
+                           (4229 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

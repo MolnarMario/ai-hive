@@ -23,12 +23,15 @@ from DECSET private modes in the stream, which pyte itself ignores):
 
 Editing shortcuts follow Windows conventions rather than pure terminal
 semantics: Ctrl+C copies the selection (falling back to the 0x03 interrupt
-when nothing is selected), Ctrl+V pastes (a clipboard IMAGE is spilled to a
-temp PNG and its path pasted, since Claude Code reads images by path and a
-native-Windows child can't take a raw clipboard image), Ctrl+Shift+A selects
-all painted text. Ctrl+A highlights the text you're typing (best-effort: the
-contiguous block of non-blank rows around the cursor, so wrapped/multi-line
-input highlights in full, like Cursor / the Claude desktop input box) and
+when nothing is selected), and the copy joins rows that only wrapped back
+into one line (app/soft_wrap.py), so a pasted reply keeps its paragraphs
+instead of breaking at every row. Ctrl+V pastes (a clipboard IMAGE is
+spilled to a temp PNG and its path pasted, since Claude Code reads images
+by path and a native-Windows child can't take a raw clipboard image),
+Ctrl+Shift+A selects all painted text. Ctrl+A highlights the text you're
+typing (best-effort: the contiguous block of non-blank rows around the
+cursor, so wrapped/multi-line input highlights in full, like Cursor / the
+Claude desktop input box) and
 Backspace/Del on that highlight clears the child's ENTIRE input via
 double-Escape (0x1b 0x1b, Claude Code's clear-prompt gesture, which unlike its
 line-local Ctrl+A/Ctrl+K empties multi-line input too). Typing a printable
@@ -198,7 +201,7 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
                            QWheelEvent)
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
-from .. import ui_theme
+from .. import soft_wrap, ui_theme
 from ..terminal_agent import (REFLOW_BEGIN, REFLOW_END, _CLAUDE_READY_HINTS,
                               _NUM_OPTION_RE)
 from ..ui_theme import ANSI_16, Palette
@@ -763,7 +766,8 @@ class TerminalView(QWidget):
         # take back the copies a Claude repaint from the top row scrolls
         # into history (see _drop_repaint_copies). Only Claude cards: the
         # bytes can't tell that repaint from a program reprinting rows on
-        # purpose, and Claude's classic renderer is the one measured.
+        # purpose, and Claude's classic renderer is the one measured. A copy
+        # unwraps Claude's rows only here too (selected_text).
         self._claude_repaints = claude_repaints
         self.setObjectName("TerminalView")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -3141,7 +3145,12 @@ class TerminalView(QWidget):
         a, b = self._sel_anchor, self._sel_end
         return (a, b) if a <= b else (b, a)
 
-    def selected_text(self) -> str:
+    def selected_text(self, unwrap: bool = True) -> str:
+        """The selection as text. With `unwrap`, rows Claude wrapped join
+        back into one line (app/soft_wrap.py), in a Claude card on the main
+        screen only: the rules read Claude's layout, and a shell or a
+        full-screen program breaks lines where they look the same. The
+        find bar passes False, since its search matches row by row."""
         rng = self._selection_range()
         if rng is None:
             return ""
@@ -3150,15 +3159,52 @@ class TerminalView(QWidget):
         hist = (self._history_list() if r0 < 0 or self._scroll_offset
                 else [])
         off = min(self._scroll_offset, len(hist))
-        lines = []
+        cols = self.screen.columns
+        rows, texts, wide = [], [], []
         for r in range(r0, r1 + 1):
             row = self._line_at_row(r, hist, off)
             if row is None:     # history wiped under the selection
                 continue
+            cells = [row[c].data for c in range(cols)]
             start = c0 if r == r0 else 0
-            end = c1 if r == r1 else self.screen.columns - 1
-            lines.append("".join(row[c].data for c in range(start, end + 1)).rstrip())
-        return "\n".join(lines)
+            end = c1 if r == r1 else cols - 1
+            rows.append(cells)
+            texts.append("".join(cells[start:end + 1]).rstrip())
+            # a history row from before the card narrowed: pyte trims the
+            # live rows on a resize but not history, and a row cut at the
+            # new edge would look full and join
+            wide.append(any(k >= cols and ch.data.strip()
+                            for k, ch in row.items()))
+        if not (unwrap and self._claude_repaints
+                and not self.screen.mode & _ALT_SCREEN_MODES):
+            return "\n".join(texts)
+
+        def above():
+            # whole rows over the selection, nearest first, for soft_wrap
+            # to see whether it starts inside a tool result. A live
+            # selection walks history from its end instead of copying it.
+            if hist:
+                lines = (self._line_at_row(r, hist, off)
+                         for r in range(r0 - 1, off - len(hist) - 1, -1))
+            else:
+                lines = (self.screen.buffer[r] for r in range(r0 - 1, -1, -1))
+            for row in lines:
+                yield [row[c].data for c in range(cols)]
+            if not hist:
+                for row in reversed(self.screen.history.top):
+                    yield [row[c].data for c in range(cols)]
+
+        # a row Claude wrapped joins the one above it, so a pasted
+        # paragraph stays one paragraph
+        out = texts[:1]
+        seps = soft_wrap.joins(rows, cols, above())
+        for i, (sep, text) in enumerate(zip(seps, texts[1:])):
+            if sep is None or wide[i] or wide[i + 1]:
+                out.append(text)
+            else:
+                # no space after a first row the selection holds none of
+                out[-1] += (sep if out[-1] else "") + text.lstrip()
+        return "\n".join(out)
 
     def copy_selection(self) -> None:
         text = self.selected_text()
