@@ -766,7 +766,8 @@ class TerminalView(QWidget):
         # take back the copies a Claude repaint from the top row scrolls
         # into history (see _drop_repaint_copies). Only Claude cards: the
         # bytes can't tell that repaint from a program reprinting rows on
-        # purpose, and Claude's classic renderer is the one measured.
+        # purpose, and Claude's classic renderer is the one measured. A copy
+        # unwraps Claude's rows only here too (selected_text).
         self._claude_repaints = claude_repaints
         self.setObjectName("TerminalView")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -3144,7 +3145,12 @@ class TerminalView(QWidget):
         a, b = self._sel_anchor, self._sel_end
         return (a, b) if a <= b else (b, a)
 
-    def selected_text(self) -> str:
+    def selected_text(self, unwrap: bool = True) -> str:
+        """The selection as text. With `unwrap`, rows Claude wrapped join
+        back into one line (app/soft_wrap.py), in a Claude card on the main
+        screen only: the rules read Claude's layout, and a shell or a
+        full-screen program breaks lines where they look the same. The
+        find bar passes False, since its search matches row by row."""
         rng = self._selection_range()
         if rng is None:
             return ""
@@ -3154,7 +3160,7 @@ class TerminalView(QWidget):
                 else [])
         off = min(self._scroll_offset, len(hist))
         cols = self.screen.columns
-        rows, texts = [], []
+        rows, texts, wide = [], [], []
         for r in range(r0, r1 + 1):
             row = self._line_at_row(r, hist, off)
             if row is None:     # history wiped under the selection
@@ -3164,6 +3170,14 @@ class TerminalView(QWidget):
             end = c1 if r == r1 else cols - 1
             rows.append(cells)
             texts.append("".join(cells[start:end + 1]).rstrip())
+            # a history row from before the card narrowed: pyte trims the
+            # live rows on a resize but not history, and a row cut at the
+            # new edge would look full and join
+            wide.append(any(k >= cols and ch.data.strip()
+                            for k, ch in row.items()))
+        if not (unwrap and self._claude_repaints
+                and not self.screen.mode & _ALT_SCREEN_MODES):
+            return "\n".join(texts)
 
         def above():
             # whole rows over the selection, nearest first, for soft_wrap
@@ -3183,11 +3197,13 @@ class TerminalView(QWidget):
         # a row Claude wrapped joins the one above it, so a pasted
         # paragraph stays one paragraph
         out = texts[:1]
-        for sep, text in zip(soft_wrap.joins(rows, cols, above()), texts[1:]):
-            if sep is None:
+        seps = soft_wrap.joins(rows, cols, above())
+        for i, (sep, text) in enumerate(zip(seps, texts[1:])):
+            if sep is None or wide[i] or wide[i + 1]:
                 out.append(text)
             else:
-                out[-1] += sep + text.lstrip()
+                # no space after a first row the selection holds none of
+                out[-1] += (sep if out[-1] else "") + text.lstrip()
         return "\n".join(out)
 
     def copy_selection(self) -> None:

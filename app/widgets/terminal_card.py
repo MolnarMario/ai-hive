@@ -2790,7 +2790,7 @@ class TerminalCard(QFrame):
 
     def _open_find(self) -> None:
         """Ctrl+F in the terminal. Text selected there becomes the query."""
-        self.find_bar.open(self.terminal.selected_text())
+        self.find_bar.open(self.terminal.selected_text(unwrap=False))
 
     def _on_scroll_value(self, value: int) -> None:
         self._follow = value >= self.console.verticalScrollBar().maximum()

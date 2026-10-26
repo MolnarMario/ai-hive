@@ -13,7 +13,9 @@ rows, and it answers from the rows' layout:
 - An indented row is how Claude continues a wrapped line. The break was a
   wrap when the row's first word would not have fit at the end of the row
   above. Claude never moves a word that fits, so a word that would have fit
-  means the text itself had a line break there.
+  means the text itself had a line break there. The row lines up under
+  the text of the row above, or deeper only under a tool call's first row,
+  so indented code in a reply keeps its lines.
 
 Claude's replies run to the last column. Its input box ends two columns
 short of it, and the row after an exactly full row has one column less
@@ -121,7 +123,10 @@ def join_text(above, below, cols: int):
     if end + 1 + head <= cols - WRAP_SLACK:
         return None
     marker = _MARKER.match(top)
-    if start < (marker.end() if marker else _indent(above)):
+    base = marker.end() if marker else _indent(above)
+    # only a tool call's first row ("● Bash(") continues deeper than its
+    # text; anywhere else a deeper row is indented code or a hanging line
+    if start < base or (start > base and top.lstrip()[:1] != "●"):
         return None
     tail = end
     while tail > 0 and not above[tail - 1].isspace():

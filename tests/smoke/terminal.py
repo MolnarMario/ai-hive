@@ -1963,7 +1963,8 @@ def test_copy_joins_wrapped_rows():
              "  second line after a real newline" + "x" * 24,
              "  " + "x" * 46]
     text = "\r\n".join(lines)
-    v = TerminalView(rows=text.count("\r\n") + 1, cols=60)
+    v = TerminalView(rows=text.count("\r\n") + 1, cols=60,
+                     claude_repaints=True)
     v.feed(text)
     v.select_all()
     want = "\n".join([
@@ -1978,6 +1979,45 @@ def test_copy_joins_wrapped_rows():
     got = v.selected_text()
     check("unwrap: a copied reply, tool call and prompt keep only real breaks",
           got == want, got)
+    raw = v.selected_text(unwrap=False)
+    check("unwrap: the find bar's prefill keeps every row",
+          raw.count("\n") == text.count("\r\n"), raw)
+    v.deleteLater()
+
+    # the same rows in a shell or Codex card: soft_wrap reads Claude's layout
+    v = TerminalView(rows=text.count("\r\n") + 1, cols=60)
+    v.feed(text)
+    v.select_all()
+    got = v.selected_text()
+    check("unwrap: a card that isn't Claude keeps every row",
+          got.count("\n") == text.count("\r\n"), got)
+    v.deleteLater()
+
+    code = ["  result = compute_everything(alpha, beta, gamma, delta)",
+            "      another_long_identifier = 5"]
+    check("unwrap: a deeper indented code row keeps its break",
+          j(code, cols=60, above=["● Here is the code:"]) == [None],
+          j(code, cols=60, above=["● Here is the code:"]))
+
+    # a selection that starts past the first row's ink: no leading space
+    v = TerminalView(rows=2, cols=40, claude_repaints=True)
+    v.feed("● one two three four five six seven\r\n  eightfold")
+    v._sel_anchor, v._sel_end = (0, 38), (1, 39)
+    got = v.selected_text()
+    check("unwrap: a selection starting in a row's blank tail has no "
+          "leading space", got == "eightfold", repr(got))
+    v.deleteLater()
+
+    # history from before the card narrowed is wider than the screen: pyte
+    # trims only the live rows, and a row cut at the edge looks full
+    v = TerminalView(rows=2, cols=60, claude_repaints=True)
+    v.feed("\r\n".join(["● " + "w" * 44 + " end of line", "  next", "x",
+                        "y"]))
+    v.screen.resize(2, 40)
+    v._sel_anchor, v._sel_end = (-2, 0), (-1, 39)
+    got = v.selected_text()
+    check("unwrap: a history row wider than the screen keeps its break",
+          got == "● " + "w" * 38 + "\n  next", repr(got))
     v.deleteLater()
 
     # the result's first row scrolled into history: the rows left on

@@ -962,9 +962,9 @@ Hard-won rules, each with a regression test:
   Keystrokes go straight to the child; the input box is replaced by the live
   screen. **Clipboard** (Windows-editor style): `Ctrl+C` copies the selection
   or, with nothing selected, sends the interrupt (0x03) — copying clears the
-  selection so the next `Ctrl+C` interrupts. A copy keeps only the real line
-  breaks: rows Claude wrapped to fit the card join back into one line, in a
-  reply, a prompt and a tool call, while a tool's output keeps every line;
+  selection so the next `Ctrl+C` interrupts. In a Claude card a copy joins
+  the rows Claude wrapped to fit the card, so a reply or a prompt pastes
+  with only its own line breaks. A tool's output keeps every row;
   `Ctrl+Shift+A` selects all painted
   text (screen + scrollback); `Ctrl+V` / `Ctrl+Shift+V` paste (bracketed-paste
   aware for multi-line); `Ctrl+Shift+C` also copies; and a right-click
