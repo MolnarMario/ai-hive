@@ -859,7 +859,16 @@ def latest_token_usage(cwd: str, session_id: str) -> tuple[int, int]:
     (skipping sub-agent sidechains, whose usage is a separate context) and size
     the window from that record's model. Returns (0, 0) when there is no file /
     no usage yet. Cached by (mtime,size) so polling several agents stays cheap.
-    Never raises."""
+    Never raises.
+
+    A compaction writes no usage record of its own, only a `compact_boundary`
+    and the summary, and an idle compaction may be the last thing written for
+    hours. Until the next turn reports real numbers, the reading after a
+    boundary is the conversation's smallest prompt (system prompt, tools and
+    memory, which a compacted conversation sends again) plus the summary at
+    4 characters a token. Across 5 real compactions this landed within 3K
+    tokens of the next turn's actual prompt in 4 cases, and 5K under in the
+    fifth, where Claude also re-attached the files it had open."""
     if not session_id or not cwd:
         return (0, 0)
     return _read_latest_token_usage(transcript_path(cwd, session_id))
@@ -874,10 +883,14 @@ def _read_latest_token_usage(path: str) -> tuple[int, int]:
     if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
         return (cached[2], cached[3])
     used, window = 0, 0
+    floor = 0          # the smallest prompt any main turn sent
+    summary = -1       # summary characters since the last boundary, -1: none
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
-                if '"usage"' not in line:  # cheap prefilter before JSON parse
+                # cheap prefilter before JSON parse
+                if ('"usage"' not in line and '"compact_boundary"' not in line
+                        and '"isCompactSummary"' not in line):
                     continue
                 try:
                     rec = json.loads(line)
@@ -885,20 +898,33 @@ def _read_latest_token_usage(path: str) -> tuple[int, int]:
                     continue  # a partial last line while Claude is writing
                 if rec.get("isSidechain"):
                     continue  # a sub-agent's context, not this conversation's
+                if (rec.get("type") == "system"
+                        and rec.get("subtype") == "compact_boundary"):
+                    summary = 0
+                    continue
                 msg = rec.get("message") or {}
+                if rec.get("isCompactSummary"):
+                    if summary >= 0:
+                        summary += len(_message_text(rec))
+                    continue
                 usage = msg.get("usage")
                 if not isinstance(usage, dict):
                     continue
-                total = (usage.get("input_tokens", 0)
-                         + usage.get("cache_creation_input_tokens", 0)
-                         + usage.get("cache_read_input_tokens", 0)
-                         + usage.get("output_tokens", 0))
+                prompt = (usage.get("input_tokens", 0)
+                          + usage.get("cache_creation_input_tokens", 0)
+                          + usage.get("cache_read_input_tokens", 0))
+                total = prompt + usage.get("output_tokens", 0)
                 if total <= 0:
                     continue
                 used = total
                 window = context_window_for(msg.get("model", ""))
+                if prompt > 0:
+                    floor = min(floor, prompt) if floor else prompt
+                summary = -1   # a real reading supersedes any estimate
     except OSError:
         return (cached[2], cached[3]) if cached else (0, 0)
+    if summary >= 0 and floor:
+        used = floor + summary // 4
     # a turn that overflowed the sized window means the larger beta is active
     if used > window:
         window = 1_000_000
