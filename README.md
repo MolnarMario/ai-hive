@@ -124,6 +124,20 @@ workspaces keep executing — switching never pauses anything.
   taskbar's one overlay square too: when nothing is busy or asking but a
   shell is still running, the disc turns **violet** with the count, instead
   of showing nothing at all.
+- **Free up RAM.** Every running agent is a whole CLI process, 150 to 300 MB
+  for Claude. ⚙ Options > Free up RAM > **Sleep inactive agents** (off by
+  default) stops an agent after 1 hour without activity (set it from 1 to
+  24 hours under **Asleep after**). Activity is output it prints, a key you
+  type into it, or a start. Its card turns black with the conversation's
+  summary and **Click to resume conversation**, its sidebar dot turns gray,
+  and a click or a key resumes the same conversation with `--resume <id>`.
+  Only Claude, Antigravity and Codex agents with a pinned conversation
+  sleep, and never while one is working, asking you something, running a
+  background command, waiting out the plan limit or holding a scheduled
+  message. **Keep them asleep at startup** (on whenever you turn sleep on)
+  leaves an agent idle that long at close asleep when AI Hive opens.
+  Switch it off and every agent that was running or asleep resumes, as
+  before.
 - **Plan usage readout** — two top-bar badges, one
   per Claude rate-limit window, showing how much you've burned and when it
   comes back: the **5-hour** pill reads `5h Claude 21% used, resets in 1h20m

@@ -25,6 +25,11 @@ from .pty_worker import PtyWorker
 
 LOG_CAP = 4000  # retained (stream, text) segments per agent
 
+# The providers whose CLI resumes a pinned conversation id, so an agent of
+# theirs can be stopped to save memory and brought back exactly (see
+# TerminalAgent.can_sleep).
+SLEEP_PROVIDERS = ("claude", "gemini", "openai")
+
 
 class AgentStatus(Enum):
     IDLE = "idle"
@@ -541,6 +546,10 @@ class TerminalAgent(QObject):
     # its view too, or the new TUI paints over the old frame from the old
     # cursor (see _on_worker_state). Transient view signal.
     screen_reset = Signal()
+    # Options > Free up RAM put this agent to sleep (True) or something
+    # started it again (False). The save reads is_asleep() through the
+    # status change that comes with it, so this one is view only.
+    asleep_changed = Signal(bool)
 
     def __init__(self, spec: AgentSpec, parent: QObject | None = None):
         super().__init__(parent)
@@ -633,6 +642,13 @@ class TerminalAgent(QObject):
         self._last_work_ts = 0.0
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
         self._last_resize_ts = 0.0    # walltime the child was last resized
+        # the last activity a previous run saved (see last_active_at), so an
+        # agent idle since yesterday reads as idle before it starts today
+        self._active_floor = 0.0
+        # stopped by Options > Free up RAM, to be resumed by a click (see
+        # put_to_sleep). Saved as running, so a launch that does not keep it
+        # asleep brings it back like any other running agent.
+        self._asleep = False
         self._awaiting_reply = False  # a submitted turn is open (TURN_QUIET_S)
         # (session id, reply time) of each STAMP-MISS a card of this agent
         # wrote, kept here so a card rebuild doesn't log the same reply again.
@@ -844,6 +860,7 @@ class TerminalAgent(QObject):
     def start(self) -> None:
         if self._held():
             return
+        self._wake()
         # The one place every start passes through (autostart, a wake, Resume
         # all, the limit recovery, a released hold, the fresh fallback), so
         # the launch's transcript backup is a precondition here and nowhere
@@ -949,9 +966,90 @@ class TerminalAgent(QObject):
     def kill(self) -> None:
         self.worker.kill()
 
+    # ---- sleep (Options > Free up RAM) -----------------------------------
+    # Every running agent is a whole CLI process, 150 to 300 MB for Claude,
+    # and a hive keeps them all alive. A sleeping agent has no child: its
+    # card keeps the conversation's summary and resumes the same
+    # conversation on a click. MainWindow decides when (_sleep_tick, and
+    # autostart_active_workspace at launch); this class decides whether.
+
+    def can_sleep(self) -> bool:
+        """Would a later start bring this exact conversation back? Only for
+        a CLI that resumes a pinned id: Claude (--resume), Antigravity
+        (--conversation) and Codex (resume <id>). Grok only has the folder's
+        newest session and a shell has nothing to resume, so they never
+        sleep."""
+        return (self.is_pty and bool(self.spec.session_id)
+                and self.spec.provider in SLEEP_PROVIDERS)
+
+    def is_asleep(self) -> bool:
+        return self._asleep
+
+    def last_active_at(self) -> float:
+        """Wall time of this agent's last activity: work it printed, a key
+        the user typed, a line submitted, or a start. Reads the time an
+        earlier run saved until this run has something newer. 0.0 when
+        nothing is known."""
+        return max(self._active_floor, self._last_work_ts,
+                   self._last_input_ts, self._last_submit_ts,
+                   self._session_started)
+
+    def restore_last_active(self, when) -> None:
+        """The last activity a saved session recorded (0 or junk: unknown)."""
+        if isinstance(when, (int, float)) and when > 0:
+            self._active_floor = float(when)
+
+    def sleep_due(self, idle_s: float, now: float | None = None) -> bool:
+        """Has this running agent been idle for `idle_s` with nothing that
+        a stopped child would lose? Never while it works, asks the user
+        something, runs a background command, has a turn open, waits for
+        the plan limit, or holds a scheduled message: each of those needs
+        the live child."""
+        if (not self.can_sleep() or self._asleep or self._disposing
+                or self.status is not AgentStatus.RUNNING
+                or not self._prompt_ready):
+            return False
+        if (self._busy or self._waiting or self._bg_shell
+                or self._limit_blocked or self.turn_pending()
+                or self.pending_scheduled()):
+            return False
+        now = time.time() if now is None else now
+        return now - self.last_active_at() >= idle_s
+
+    def put_to_sleep(self) -> None:
+        """Stop the child to give its memory back. The next start of any
+        kind (a click on the card, a keystroke, a launch) resumes the same
+        conversation, verified the way a launch restore is, so an agent
+        nobody ever typed to starts fresh instead of failing its resume."""
+        if not self.can_sleep():
+            return
+        self.spec.resume = True
+        self._verify_resume_target = self.spec.provider in ("claude",
+                                                            "gemini")
+        self._set_asleep(True)
+        if self.worker.is_running():
+            self.notice("[asleep to free memory; click to resume]")
+            self.worker.stop()
+
+    def mark_asleep(self) -> None:
+        """A launch that keeps idle agents asleep: this one stays stopped,
+        with the sleep screen instead of the stopped banner. main.py has
+        already armed its resume."""
+        if self.can_sleep() and not self.is_running():
+            self._set_asleep(True)
+
+    def _wake(self) -> None:
+        self._set_asleep(False)
+
+    def _set_asleep(self, asleep: bool) -> None:
+        if asleep != self._asleep:
+            self._asleep = asleep
+            self.asleep_changed.emit(asleep)
+
     def restart(self) -> None:
         if self._held():
             return
+        self._wake()
         self._set_prompt_ready(False)
         self._ready_tail = ""
         self._screen_tail = ""
@@ -1788,7 +1886,7 @@ class TerminalAgent(QObject):
             # title, else the assigned task. An assigned task goes stale once
             # it is done, while the title follows the work. With only the task
             # this column read "-" for almost every agent.
-            "status": self.status.value,
+            "status": "asleep" if self._asleep else self.status.value,
             "task": self.summary(),
             "assignment": ASSIGNMENT_LABEL.get(self.assignment, ""),
         }

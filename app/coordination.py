@@ -47,6 +47,7 @@ ARCHIVE_HEADER = ("# AI Hive: board archive\n\n"
 _STATUS_ICON = {
     "running": "🟢", "starting": "🟡", "idle": "⚪", "stopping": "🟡",
     "exited": "⚪", "exited-err": "🔴", "crashed": "🔴", "failed": "🔴",
+    "asleep": "⚫",
 }
 
 

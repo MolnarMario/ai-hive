@@ -710,6 +710,71 @@ class _HeaderTools(QWidget):
             self._set_open(False)
 
 
+# the sleep screen's summary is a few lines in the middle of the card, not
+# the whole title: a longer one is cut here
+_SLEEP_SUMMARY_CHARS = 240
+
+
+class SleepScreen(QFrame):
+    """What a card shows while its agent is asleep to free memory (Options >
+    Free up RAM): black, the conversation's summary in the middle, when it
+    was last active, and the way back. A click anywhere on it resumes the
+    conversation, and so does a key, like on any stopped card."""
+
+    resumeRequested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("SleepScreen")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(10)
+        lay.addStretch(1)
+        self.caption = QLabel("ASLEEP TO FREE MEMORY", self)
+        self.caption.setObjectName("SleepCaption")
+        self.summary = QLabel(self)
+        self.summary.setObjectName("SleepSummary")
+        self.summary.setWordWrap(True)
+        self.since = QLabel(self)
+        self.since.setObjectName("SleepSince")
+        for label in (self.caption, self.summary, self.since):
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lay.addWidget(label)
+        lay.addSpacing(6)
+        self.resume_btn = QToolButton(self)
+        self.resume_btn.setObjectName("SleepResume")
+        self.resume_btn.setText("Click to resume conversation")
+        self.resume_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.resume_btn.clicked.connect(self.resumeRequested)
+        lay.addWidget(self.resume_btn, 0, Qt.AlignmentFlag.AlignHCenter)
+        lay.addStretch(1)
+        self.hide()
+
+    def set_agent_text(self, summary: str, last_active: float) -> None:
+        summary = " ".join(summary.split())
+        if len(summary) > _SLEEP_SUMMARY_CHARS:
+            summary = summary[:_SLEEP_SUMMARY_CHARS - 3].rstrip() + "..."
+        self.summary.setText(summary or "No summary yet")
+        when = ""
+        if last_active > 0:
+            at = datetime.datetime.fromtimestamp(last_active)
+            fmt = ("%H:%M" if at.date() == datetime.date.today()
+                   else "%b %d, %H:%M")
+            when = f"Last active {at.strftime(fmt)}"
+        self.since.setText(when)
+        self.since.setVisible(bool(when))
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            event.accept()
+            self.resumeRequested.emit()
+            return
+        super().mousePressEvent(event)
+
+
 class TerminalCard(QFrame):
     closeRequested = Signal(str)     # agent id
     focusGained = Signal(object)     # self
@@ -1126,6 +1191,9 @@ class TerminalCard(QFrame):
             # child's half-drawn boot frame, which at app launch is drawn at
             # the pre-layout width and cannot reflow (see BootVeil).
             self.boot = BootVeil(self.terminal)
+            # ...and an agent asleep to free memory shows its summary on
+            # black, over everything else (see SleepScreen)
+            self.sleep_screen = SleepScreen(self.terminal)
         else:
             self.console = QPlainTextEdit(self)
             self.console.setObjectName("Console")
@@ -1184,6 +1252,9 @@ class TerminalCard(QFrame):
             self.agent.pty_output.connect(self._on_pty_output)
             self.agent.prompt_ready_changed.connect(self._on_prompt_ready)
             self.agent.start_coming_changed.connect(self._on_start_coming)
+            self.agent.asleep_changed.connect(self._on_asleep)
+            self.agent.summary_changed.connect(self._refresh_sleep_screen)
+            self.sleep_screen.resumeRequested.connect(self._resume_from_sleep)
             self.terminal.keyInput.connect(self._on_key_input)
             self.terminal.sizeChanged.connect(self.agent.resize)
             self.terminal.sizeChanged.connect(self._reproject_on_size)
@@ -1297,6 +1368,9 @@ class TerminalCard(QFrame):
                           self._on_prompt_ready))
             pairs.append((self.agent.start_coming_changed,
                           self._on_start_coming))
+            pairs.append((self.agent.asleep_changed, self._on_asleep))
+            pairs.append((self.agent.summary_changed,
+                          self._refresh_sleep_screen))
             pairs.append((self.agent.screen_reset, self._on_screen_reset))
             pairs.append((self.agent.turn_closed, self._on_turn_closed))
             self._stamp_timer.stop()
@@ -1348,6 +1422,32 @@ class TerminalCard(QFrame):
             self.agent.write(seq)
         else:
             self.agent.start()  # the waking keystroke is deliberately eaten
+
+    def _on_asleep(self, _asleep: bool) -> None:
+        """The agent was put to sleep or woken: the glyph, the stopped
+        banner and the sleep screen all follow from the status pass."""
+        self._on_status(self.agent.status)
+
+    def _refresh_sleep_screen(self, *_args) -> None:
+        if not self.is_pty:
+            return
+        screen = self.sleep_screen
+        if not self.agent.is_asleep():
+            screen.hide()
+            return
+        screen.set_agent_text(self.agent.summary() or self.agent.spec.name,
+                              self.agent.last_active_at())
+        screen.setGeometry(self.terminal.rect())
+        screen.show()
+        screen.raise_()
+
+    def _resume_from_sleep(self) -> None:
+        """A click on the sleep screen. While the child it stopped is still
+        exiting there is nothing to resume yet, so the click waits for it:
+        the screen stays up and the next click resumes."""
+        if not self.agent.is_running():
+            self.agent.start()
+        self.terminal.setFocus()
 
     def _on_assignment(self, state) -> None:
         # The lifecycle state is no longer painted as a header badge: what an
@@ -2771,6 +2871,7 @@ class TerminalCard(QFrame):
         if not self.is_pty:
             return
         self.boot.setGeometry(self.terminal.rect())
+        self.sleep_screen.setGeometry(self.terminal.rect())
         # pinned to the right edge, full height. Because it is a CHILD of the
         # terminal it costs no columns: _apply_resize still derives the child's
         # width from terminal.width(), so nothing re-wraps.
@@ -2979,13 +3080,18 @@ class TerminalCard(QFrame):
 
     def _on_status(self, status: AgentStatus) -> None:
         busy = bool(getattr(self.agent, "is_busy", lambda: False)())
+        asleep = self.agent.is_asleep()
         state = "busy" if (busy and status is AgentStatus.RUNNING) else _GLYPH_STATE.get(status, "idle")
+        if asleep:
+            state = "asleep"
         self.glyph.setProperty("state", state)
         repolish(self.glyph)
         running = status in (AgentStatus.STARTING, AgentStatus.RUNNING)
         exit_info = self.agent.worker.exit_info
         tip = "working…" if (busy and status is AgentStatus.RUNNING) else f"{status.value}"
-        if exit_info and not running:
+        if asleep:
+            tip = "asleep to free memory, click the card to resume"
+        elif exit_info and not running:
             tip += f" (code {exit_info[0]})"
         self.glyph.setToolTip(tip)
         if self.header_tools.is_open():
@@ -3012,12 +3118,15 @@ class TerminalCard(QFrame):
             # a start held for the agent's new lane folder is a boot that has
             # not reached the child yet: same loader, never the banner
             awaiting = self._awaiting_start()
+            # an agent asleep to free memory has its own screen instead
             self.overlay.setVisible(not running and not restarting
-                                    and not awaiting
+                                    and not awaiting and not asleep
                                     and status is not AgentStatus.STOPPING)
-            if not running and not restarting and not awaiting:
+            if not running and not restarting and not awaiting \
+                    and not asleep:
                 self._refresh_overlay()
                 self.overlay.raise_()
+            self._refresh_sleep_screen()
             # a booting child and a stopped one are mutually exclusive states,
             # and the wake banner owns the stopped one
             if running and not self.agent.prompt_ready():

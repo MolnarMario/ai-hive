@@ -574,6 +574,8 @@ class WorkspaceManager(QObject):
         agent.assignment_changed.connect(lambda *_: self._touch(wid))
         agent.name_changed.connect(lambda *_: self._touch(wid))
         agent.font_changed.connect(lambda *_: self.dirty.emit())
+        # asleep is saved as running, and the roster says "asleep"
+        agent.asleep_changed.connect(lambda *_: self._touch(wid))
         # recovery (verify-before-resume) must never land on a peer's
         # conversation, so give the agent a live view of its folder-mates' pins
         agent._sibling_sessions = lambda a=agent: self.sibling_session_ids(a)
@@ -1020,10 +1022,18 @@ class WorkspaceManager(QObject):
         # open" intent even if the process momentarily died — otherwise a
         # crashed/failed auto-agent silently goes dormant and never comes back.
         # User-created agents persist their live running state as before. One
-        # the launch queue has not started yet was running, and still is.
+        # the launch queue has not started yet was running, and still is. So
+        # is one asleep: the next launch decides whether it stays asleep
+        # (MainWindow.autostart_active_workspace).
         return {**a.spec.to_dict(),
                 "running": (a.is_running() or a.start_queued()
+                            or a.is_asleep()
                             or (a.auto_created and a.autostart_on_restore)),
+                # additive and read with a default, like "lanes": a file
+                # without it only means no agent sleeps at the next launch.
+                # Not saved on every keystroke: each save writes the live
+                # value, and the close's final save writes the newest one.
+                "last_active": round(a.last_active_at(), 1),
                 "task": a.current_task,
                 "assignment": a.assignment.value,
                 # messages the user deferred (app/scheduled_send). Only the
@@ -1212,6 +1222,7 @@ class WorkspaceManager(QObject):
                 # sit on the card for good: every agent restores IDLE
                 agent.assignment = AssignmentState.IDLE
                 agent.autostart_on_restore = bool(td.get("running", False))
+                agent.restore_last_active(td.get("last_active"))
                 # Codex owns its transcript and thread id. Restore the saved
                 # thread for both running agents (which autostart) and stopped
                 # cards (which resume when the user wakes them). Older builds

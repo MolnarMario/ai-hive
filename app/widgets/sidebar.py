@@ -846,6 +846,21 @@ class AgentRow(QFrame):
         busy = bool(getattr(agent, "is_busy", lambda: False)())
         icon = "🟡" if (busy and agent.status == AgentStatus.RUNNING) \
             else _ICON.get(agent.status, "⚪")
+        # asleep to free memory (Options > Free up RAM): a gray dot and a
+        # dimmed row. No emoji circle is gray, so it is a plain glyph the
+        # QSS colors.
+        asleep = bool(getattr(agent, "is_asleep", lambda: False)())
+        if asleep:
+            icon = "⬤"
+        self.dot.setToolTip("Asleep to free memory. Click the card to "
+                            "resume the conversation." if asleep else "")
+        if bool(self.property("asleep")) != asleep:
+            self.setProperty("asleep", asleep)
+            self.dot.setProperty("asleep", asleep)
+            repolish(self)
+            repolish(self.dot)
+            repolish(self.name)
+            repolish(self.summary)
         self.dot.setText(icon)
         self.name.setText(agent.spec.name)
         waiting = bool(getattr(agent, "is_waiting", lambda: False)())

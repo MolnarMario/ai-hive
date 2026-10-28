@@ -103,6 +103,13 @@ BG_SHELL_POLL_MS = 2000
 # a file picker instead of being a font (never a valid font id)
 LOAD_CUSTOM_FONT = "load-custom-font"
 
+# Options > Free up RAM: how many hours without activity put an agent to
+# sleep, and how often the window looks. A minute late on a one-hour
+# threshold costs nothing, and the look is a few attribute reads per agent.
+SLEEP_HOURS_DEFAULT = 1
+SLEEP_HOURS_MAX = 24
+SLEEP_TICK_MS = 60_000
+
 # Every usage pill polls on ONE shared policy, in `app.usage_poll`: 90 s while
 # that provider's agents are working, 30 s from 90% used, 6 minutes while none
 # are. The cadence, the quick retry, the 429 backoff, the wake-from-sleep poll
@@ -569,6 +576,11 @@ class TopBar(QFrame):
     shipConfirmToggled = Signal(bool)
     # "Confirm Close merged agents": ask before closing them (True)
     closeMergedConfirmToggled = Signal(bool)
+    # Free up RAM: "Sleep inactive agents", its hours, and "Keep them asleep
+    # at startup" (MainWindow._sleep_tick, autostart_active_workspace)
+    sleepIdleToggled = Signal(bool)
+    sleepHoursChanged = Signal(int)
+    sleepAtStartupToggled = Signal(bool)
     # the down-arrow button: open the Updates panel (the install-method control
     # and the startup-check checkbox live there, so the bar gains no button)
     updatesPanelRequested = Signal()
@@ -772,6 +784,43 @@ class TopBar(QFrame):
             self._on_close_merged_confirm_clicked)
         self._refresh_close_merged_confirm_btn()
 
+        # Free up RAM. "Sleep inactive agents" stops an agent that has been
+        # idle for the hours below, and its card resumes the conversation
+        # on a click. Default OFF: it stops processes the user started.
+        # "Keep them asleep at startup" only means something while the
+        # first is on, so it and the hours show only then.
+        self._sleep_idle = False
+        self._sleep_hours = SLEEP_HOURS_DEFAULT
+        self._sleep_at_startup = True
+        self.sleep_idle_label = toggle_label("")
+        self.sleep_idle_btn = ToggleSwitch(self)
+        self.sleep_idle_btn.clicked.connect(self._on_sleep_idle_clicked)
+
+        def hours_btn(text, tip, delta):
+            b = QToolButton(self)
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setObjectName("GlobalFontBtn")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda: self._step_sleep_hours(delta))
+            return b
+
+        self.sleep_hours_dec_btn = hours_btn(
+            "−", "Put agents to sleep sooner", -1)
+        self.sleep_hours_inc_btn = hours_btn(
+            "+", "Let agents stay idle longer before they sleep", +1)
+        self.sleep_hours_label = QLabel(self)
+        self.sleep_hours_label.setObjectName("OptionsRowLabel")
+        self.sleep_hours_label.setToolTip(
+            "Hours without activity before an agent is put to sleep, 1 to "
+            f"{SLEEP_HOURS_MAX}. Activity is output it prints, a key you "
+            "type into it, or a start.")
+        self.sleep_startup_label = toggle_label("")
+        self.sleep_startup_btn = ToggleSwitch(self)
+        self.sleep_startup_btn.clicked.connect(
+            self._on_sleep_startup_clicked)
+        self._refresh_sleep_btns()
+
         # The detected Claude Code install method, under the switch it explains.
         # It used to be reachable only by hovering the down-arrow; the panel has
         # room to state it.
@@ -962,6 +1011,16 @@ class TopBar(QFrame):
                                           self.ship_confirm_btn)
         self.options_panel.add_switch_row(self.close_merged_confirm_label,
                                           self.close_merged_confirm_btn)
+        self.options_panel.add_separator()
+        self.options_panel.add_section("Free up RAM")
+        self.options_panel.add_switch_row(self.sleep_idle_label,
+                                          self.sleep_idle_btn)
+        self._sleep_hours_row = self.options_panel.add_row(
+            "Asleep after", self.sleep_hours_dec_btn,
+            self.sleep_hours_label, self.sleep_hours_inc_btn)
+        self._sleep_startup_row = self.options_panel.add_switch_row(
+            self.sleep_startup_label, self.sleep_startup_btn)
+        self._refresh_sleep_rows()
         self.options_panel.add_separator()
         self.options_panel.add_section("Appearance")
         self.options_panel.add_switch_row(self.fullscreen_label,
@@ -1376,6 +1435,86 @@ class TopBar(QFrame):
             "Click to be asked first again.")
         self.close_merged_confirm_btn.setToolTip(tip)
         self.close_merged_confirm_label.setToolTip(tip)
+
+    def _on_sleep_idle_clicked(self) -> None:
+        on = not self._sleep_idle
+        if on and not self._sleep_at_startup:
+            # turning sleep on starts its startup switch on, every time
+            self.set_sleep_at_startup(True)
+            self.sleepAtStartupToggled.emit(True)
+        self.set_sleep_idle(on)
+        self.sleepIdleToggled.emit(on)
+
+    def _on_sleep_startup_clicked(self) -> None:
+        self.set_sleep_at_startup(not self._sleep_at_startup)
+        self.sleepAtStartupToggled.emit(self._sleep_at_startup)
+
+    def _step_sleep_hours(self, delta: int) -> None:
+        hours = max(1, min(SLEEP_HOURS_MAX, self._sleep_hours + delta))
+        if hours != self._sleep_hours:
+            self.set_sleep_hours(hours)
+            self.sleepHoursChanged.emit(hours)
+
+    def set_sleep_idle(self, on: bool) -> None:
+        """Reflect "Sleep inactive agents" (no signal)."""
+        self._sleep_idle = bool(on)
+        self._refresh_sleep_btns()
+        self._refresh_sleep_rows()
+
+    def set_sleep_hours(self, hours: int) -> None:
+        """Reflect the hours before an idle agent sleeps (no signal)."""
+        self._sleep_hours = max(1, min(SLEEP_HOURS_MAX, int(hours)))
+        self._refresh_sleep_btns()
+
+    def set_sleep_at_startup(self, on: bool) -> None:
+        """Reflect "Keep them asleep at startup" (no signal)."""
+        self._sleep_at_startup = bool(on)
+        self._refresh_sleep_btns()
+
+    def _refresh_sleep_rows(self) -> None:
+        # built after the switches, so the first refresh has no rows yet
+        if hasattr(self, "_sleep_startup_row"):
+            self.options_panel.set_row_visible(self._sleep_hours_row,
+                                               self._sleep_idle)
+            self.options_panel.set_row_visible(self._sleep_startup_row,
+                                               self._sleep_idle)
+
+    def _refresh_sleep_btns(self) -> None:
+        hours = self._sleep_hours
+        span = f"{hours} hour" + ("" if hours == 1 else "s")
+        self.sleep_idle_btn.setChecked(self._sleep_idle)
+        self.sleep_idle_label.setText("☾  Sleep inactive agents")
+        tip = (
+            f"Sleep inactive agents: ON. An agent with no activity for {span} "
+            "is stopped to give its memory back. Its card turns black with "
+            "the conversation's summary, and a click resumes the same "
+            "conversation. An agent that is working, asking you something, "
+            "running a background command or holding a scheduled message "
+            "is never put to sleep.\nClick to turn off. Sleeping agents stay "
+            "asleep until you click them."
+            if self._sleep_idle else
+            "Sleep inactive agents: OFF. Every agent keeps running, and "
+            "using memory, until you stop or close it.\nClick to stop agents "
+            "that have been idle for a while. A click on the card brings "
+            "the conversation back.")
+        self.sleep_idle_btn.setToolTip(tip)
+        self.sleep_idle_label.setToolTip(tip)
+        self.sleep_hours_label.setText(f"{hours} h")
+        self.sleep_hours_dec_btn.setEnabled(hours > 1)
+        self.sleep_hours_inc_btn.setEnabled(hours < SLEEP_HOURS_MAX)
+        self.sleep_startup_btn.setChecked(self._sleep_at_startup)
+        self.sleep_startup_label.setText("↻  Keep them asleep at startup")
+        tip = (
+            "Keep them asleep at startup: ON. When AI Hive opens, an agent "
+            f"that had no activity for {span} before it closed stays asleep "
+            "instead of resuming. A click on its card resumes it.\nClick to "
+            "resume every agent at startup, as before."
+            if self._sleep_at_startup else
+            "Keep them asleep at startup: OFF. When AI Hive opens, every "
+            "agent that was running or asleep resumes.\nClick to keep the "
+            "inactive ones asleep.")
+        self.sleep_startup_btn.setToolTip(tip)
+        self.sleep_startup_label.setToolTip(tip)
 
     def _on_auto_update_clicked(self) -> None:
         """Arm or disarm the startup update gate, like every other row here.
@@ -2898,6 +3037,12 @@ class MainWindow(QMainWindow):
         self._bg_shell_timer = QTimer(self)
         self._bg_shell_timer.setInterval(BG_SHELL_POLL_MS)
         self._bg_shell_timer.timeout.connect(self.manager.poll_bg_shell_activity)
+        # Options > Free up RAM: the look for agents idle long enough to
+        # sleep. Runs only while "Sleep inactive agents" is on
+        # (_sync_sleep_timer).
+        self._sleep_timer = QTimer(self)
+        self._sleep_timer.setInterval(SLEEP_TICK_MS)
+        self._sleep_timer.timeout.connect(self._sleep_tick)
 
         # ---- Claude plan usage (top-bar readout + limit-reached edges) ----
         # PURELY TRANSIENT: a reading refreshes the badge and may emit the
@@ -2947,6 +3092,10 @@ class MainWindow(QMainWindow):
         self._ship_skip_confirm = False   # user preference (persisted)
         # Close merged agents likewise, with its own switch and key.
         self._close_merged_skip_confirm = False   # user preference (persisted)
+        # Options > Free up RAM (persisted user preferences)
+        self._sleep_idle = False
+        self._sleep_hours = SLEEP_HOURS_DEFAULT
+        self._sleep_at_startup = True
         # uids whose lane Close merged agents is reading again right now
         self._close_merged_reading: set[str] = set()
         # every mutating lane git operation runs here, one at a time per repo
@@ -3369,6 +3518,10 @@ class MainWindow(QMainWindow):
         self.top_bar.shipConfirmToggled.connect(self._on_ship_confirm_toggled)
         self.top_bar.closeMergedConfirmToggled.connect(
             self._on_close_merged_confirm_toggled)
+        self.top_bar.sleepIdleToggled.connect(self._on_sleep_idle_toggled)
+        self.top_bar.sleepHoursChanged.connect(self._on_sleep_hours_changed)
+        self.top_bar.sleepAtStartupToggled.connect(
+            self._on_sleep_at_startup_toggled)
         self.top_bar.updatesPanelRequested.connect(self.open_updates_panel)
         self.top_bar.autoContinueToggled.connect(self._on_auto_continue)
         self.top_bar.startupRecoveryToggled.connect(self._on_startup_recovery)
@@ -5135,6 +5288,65 @@ class MainWindow(QMainWindow):
         dialog's "Don't ask again". A UI preference like the one above."""
         self._close_merged_skip_confirm = not enabled
         self._schedule_save()
+
+    # ------------------------------------------------------- free up RAM ---
+    # "Sleep inactive agents" stops an agent idle for `_sleep_hours`, and
+    # "Keep them asleep at startup" keeps one that was idle that long at
+    # close from resuming at launch. The agent decides whether it may sleep
+    # (TerminalAgent.sleep_due); these decide when. Both are UI preferences
+    # under "ui", like the confirm switches above.
+
+    def _on_sleep_idle_toggled(self, enabled: bool) -> None:
+        """Turning it off leaves sleeping agents asleep: waking them all
+        would spend the memory the user just chose to save."""
+        self._sleep_idle = bool(enabled)
+        self._schedule_save()
+        self._sync_sleep_timer()
+        if self._sleep_idle:
+            self._sleep_tick()
+
+    def _on_sleep_hours_changed(self, hours: int) -> None:
+        self._sleep_hours = int(hours)
+        self._schedule_save()
+
+    def _on_sleep_at_startup_toggled(self, enabled: bool) -> None:
+        self._sleep_at_startup = bool(enabled)
+        self._schedule_save()
+
+    def _sync_sleep_timer(self) -> None:
+        if self._sleep_idle and not self._closing:
+            self._sleep_timer.start()
+        else:
+            self._sleep_timer.stop()
+
+    def _sleep_idle_s(self) -> float:
+        return self._sleep_hours * 3600.0
+
+    def _sleep_tick(self) -> None:
+        """Put every agent idle for the chosen hours to sleep, in every
+        workspace."""
+        if not self._sleep_idle or self._closing:
+            return
+        idle_s = self._sleep_idle_s()
+        now = time.time()
+        for ws in self.manager.workspaces:
+            for agent in ws.agents:
+                if agent.sleep_due(idle_s, now):
+                    self._audit_install(
+                        f"SLEEP agent={agent.spec.name!r} idle="
+                        f"{int(now - agent.last_active_at())}s")
+                    agent.put_to_sleep()
+
+    def _keeps_asleep_at_launch(self, agent, now: float) -> bool:
+        """Should the launch restore leave this saved-running agent asleep?
+        Only with both switches on, and only for an agent whose saved last
+        activity is old enough: a session written before this feature has
+        none, and those agents resume as they always did."""
+        if not (self._sleep_idle and self._sleep_at_startup):
+            return False
+        last = agent.last_active_at()
+        return (agent.can_sleep() and last > 0
+                and now - last >= self._sleep_idle_s())
 
     def lane_default(self, ws) -> bool:
         """Should a new Claude agent in `ws` start with "Own lane" ticked?
@@ -6976,6 +7188,17 @@ class MainWindow(QMainWindow):
             ui.get("close_merged_skip_confirm", False))
         self.top_bar.set_close_merged_confirm(
             not self._close_merged_skip_confirm)
+        # Free up RAM (default OFF: it stops processes the user started)
+        self._sleep_idle = ui.get("sleep_idle") is True
+        hours = ui.get("sleep_hours")
+        self._sleep_hours = (hours if type(hours) is int
+                             and 1 <= hours <= SLEEP_HOURS_MAX
+                             else SLEEP_HOURS_DEFAULT)
+        self._sleep_at_startup = ui.get("sleep_at_startup") is not False
+        self.top_bar.set_sleep_idle(self._sleep_idle)
+        self.top_bar.set_sleep_hours(self._sleep_hours)
+        self.top_bar.set_sleep_at_startup(self._sleep_at_startup)
+        self._sync_sleep_timer()
         self._auto_continue = bool(ui.get("auto_continue", True))
         self.top_bar.set_auto_continue(self._auto_continue)
         self._startup_recovery = bool(ui.get("startup_recovery", True))
@@ -7895,6 +8118,9 @@ class MainWindow(QMainWindow):
         user skipped the update splash: its binary is being rewritten right
         now, so starting an agent could execute a half written file. Those wait
         for the user (the top-bar pill says so) rather than being started.
+        And with Options > Free up RAM keeping idle agents asleep at startup,
+        an agent idle for the chosen hours before the close stays asleep
+        (`_keeps_asleep_at_launch`).
 
         The snapshots go BEFORE `settle_layout`. Its resize flush is what
         projects a restored screen at the settled width, a full replay
@@ -7917,10 +8143,21 @@ class MainWindow(QMainWindow):
         transcripts.wait_for_backup()
         active = self.manager.active_id
         starting, queued = [], []
+        now = time.time()
         for ws in self.manager.workspaces:
             page = self._pages.get(ws.id)
             for agent in ws.agents:
                 if agent.autostart_on_restore and not agent.is_running():
+                    if self._keeps_asleep_at_launch(agent, now):
+                        # Options > Free up RAM: idle long enough at close
+                        # to stay asleep. Its card keeps last session's
+                        # screen under the sleep screen, and a click
+                        # resumes it.
+                        agent.mark_asleep()
+                        self._audit_install(
+                            f"SLEEP-AT-LAUNCH agent={agent.spec.name!r} "
+                            f"idle={int(now - agent.last_active_at())}s")
+                        continue
                     if agent.spec.provider in self._update_installing:
                         agent.notice("[not started: a CLI update is still "
                                      "installing]")
@@ -8202,6 +8439,9 @@ class MainWindow(QMainWindow):
             "agent_lanes": self._agent_lanes,
             "ship_skip_confirm": self._ship_skip_confirm,
             "close_merged_skip_confirm": self._close_merged_skip_confirm,
+            "sleep_idle": self._sleep_idle,
+            "sleep_hours": self._sleep_hours,
+            "sleep_at_startup": self._sleep_at_startup,
             "auto_continue": self._auto_continue,
             "startup_recovery": self._startup_recovery,
             "terminal_scrollback": self._terminal_scrollback,

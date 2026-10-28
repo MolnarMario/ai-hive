@@ -70,7 +70,7 @@ class OptionsPanel(QWidget):
         self._lay.addWidget(label)
         return label
 
-    def add_switch_row(self, label, switch, *extra) -> None:
+    def add_switch_row(self, label, switch, *extra) -> QHBoxLayout:
         """A named row ending in a `ToggleSwitch`: label left, switch right.
 
         Unlike `add_row`, the label is a widget the caller already built (so
@@ -93,6 +93,7 @@ class OptionsPanel(QWidget):
         switch.setParent(self)
         row.addWidget(switch)
         self._lay.addLayout(row)
+        return row
 
     def add_row(self, label: str, *widgets) -> QHBoxLayout:
         """A named row: caption on the left, controls right-aligned."""
