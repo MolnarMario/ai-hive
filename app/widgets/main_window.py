@@ -1490,8 +1490,9 @@ class TopBar(QFrame):
             "the conversation's summary, and a click resumes the same "
             "conversation. An agent that is working, asking you something, "
             "running a background command or holding a scheduled message "
-            "is never put to sleep.\nClick to turn off. Sleeping agents stay "
-            "asleep until you click them."
+            "is never put to sleep.\nClick to turn off. Agents asleep now "
+            "stay asleep until you click them, and resume when AI Hive "
+            "opens again."
             if self._sleep_idle else
             "Sleep inactive agents: OFF. Every agent keeps running, and "
             "using memory, until you stop or close it.\nClick to stop agents "
@@ -1506,8 +1507,9 @@ class TopBar(QFrame):
         self.sleep_startup_label.setText("↻  Keep them asleep at startup")
         tip = (
             "Keep them asleep at startup: ON. When AI Hive opens, an agent "
-            f"that had no activity for {span} before it closed stays asleep "
-            "instead of resuming. A click on its card resumes it.\nClick to "
+            "that was asleep when it closed, or had no activity for "
+            f"{span} before then, stays asleep instead of resuming. A click "
+            "on its card resumes it.\nClick to "
             "resume every agent at startup, as before."
             if self._sleep_at_startup else
             "Keep them asleep at startup: OFF. When AI Hive opens, every "
@@ -5330,8 +5332,14 @@ class MainWindow(QMainWindow):
         idle_s = self._sleep_idle_s()
         now = time.time()
         for ws in self.manager.workspaces:
+            page = self._pages.get(ws.id)
             for agent in ws.agents:
                 if agent.sleep_due(idle_s, now):
+                    # the stop's Ctrl+C would clear a prompt typed but not
+                    # sent, and Claude keeps no copy of it
+                    card = page.card_for(agent.id) if page else None
+                    if card is not None and card.has_draft():
+                        continue
                     self._audit_install(
                         f"SLEEP agent={agent.spec.name!r} idle="
                         f"{int(now - agent.last_active_at())}s")
@@ -5339,14 +5347,19 @@ class MainWindow(QMainWindow):
 
     def _keeps_asleep_at_launch(self, agent, now: float) -> bool:
         """Should the launch restore leave this saved-running agent asleep?
-        Only with both switches on, and only for an agent whose saved last
-        activity is old enough: a session written before this feature has
-        none, and those agents resume as they always did."""
+        Only with both switches on: the user asked for startup to resume
+        everything otherwise. Then an agent asleep at close stays asleep
+        (raising the hours since must not wake it), and so does one whose
+        saved last activity is old enough. A session written before this
+        feature has neither, and those agents resume as they always did."""
         if not (self._sleep_idle and self._sleep_at_startup):
             return False
+        if not agent.can_sleep():
+            return False
+        if agent.restored_asleep:
+            return True
         last = agent.last_active_at()
-        return (agent.can_sleep() and last > 0
-                and now - last >= self._sleep_idle_s())
+        return last > 0 and now - last >= self._sleep_idle_s()
 
     def lane_default(self, ws) -> bool:
         """Should a new Claude agent in `ws` start with "Own lane" ticked?
@@ -6028,6 +6041,11 @@ class MainWindow(QMainWindow):
         done = self._finished_lanes(ws, agent)
         if not done:
             why = "No lane has a \"Task done\" commit that the base lacks."
+        elif agent.is_asleep():
+            # never "Restart": a restart starts a new conversation, and the
+            # integrator's is the one that knows what it already merged
+            why = ("The integrator is asleep to free memory. Click its card "
+                   "to resume its conversation first.")
         elif not agent.is_running():
             why = "The integrator is stopped. Restart it first."
         elif agent.is_busy() or agent.is_waiting():
@@ -8528,6 +8546,7 @@ class MainWindow(QMainWindow):
         self._prompt_sync_timer.stop()
         self._model_sync_timer.stop()
         self._bg_shell_timer.stop()
+        self._sleep_timer.stop()
         self._limit_watch_timer.stop()
         # queued agents stay queued, so the final save records them running
         self._launch_timer.stop()

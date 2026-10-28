@@ -133,11 +133,12 @@ workspaces keep executing — switching never pauses anything.
   and a click or a key resumes the same conversation with `--resume <id>`.
   Only Claude, Antigravity and Codex agents with a pinned conversation
   sleep, and never while one is working, asking you something, running a
-  background command, waiting out the plan limit or holding a scheduled
-  message. **Keep them asleep at startup** (on whenever you turn sleep on)
-  leaves an agent idle that long at close asleep when AI Hive opens.
-  Switch it off and every agent that was running or asleep resumes, as
-  before.
+  background command, waiting out the plan limit, holding a scheduled
+  message or holding a prompt you typed but didn't send. **Keep them
+  asleep at startup** (on whenever you turn sleep on) leaves an agent that
+  was asleep at close, or idle that long, asleep when AI Hive opens.
+  Switch either one off and every agent that was running or asleep
+  resumes at startup, as before.
 - **Plan usage readout** — two top-bar badges, one
   per Claude rate-limit window, showing how much you've burned and when it
   comes back: the **5-hour** pill reads `5h Claude 21% used, resets in 1h20m

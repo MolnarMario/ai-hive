@@ -560,7 +560,7 @@ QMenu::indicator:checked {{
     color: {p.ACCENT_GOLD}; font-family: {DISPLAY_FONT}; font-size: 12px;
     letter-spacing: 2px; font-weight: 700;
 }}
-#WsCount {{ color: {p.TEXT_FAINT}; font-size: 15px; font-weight: 700; }}
+#WsCount {{ color: {p.TEXT_FAINT}; font-size: 11px; font-weight: 700; }}
 #WsList {{ background: transparent; border: none; }}
 #WsList::item {{ background: transparent; border: none; padding: 0; }}
 #WsList::item:selected {{ background: transparent; }}
@@ -761,7 +761,7 @@ WorkspaceRow[search_hit="true"] {{
 #WsTreeIcon {{ font-size: 11px; }}
 #WsTreeName {{ font-family: {BODY_FONT}; font-size: 12px; color: {p.TEXT}; }}
 #WsTreeRow[dir="true"] #WsTreeName {{ font-weight: 600; }}
-#WsTreeMore {{ color: {p.TEXT_FAINT}; font-size: 15px; font-style: italic;
+#WsTreeMore {{ color: {p.TEXT_FAINT}; font-size: 11px; font-style: italic;
               padding-left: 24px; }}
 
 /* ----------------------------------------------------- terminal card --- */

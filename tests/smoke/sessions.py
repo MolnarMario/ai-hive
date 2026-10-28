@@ -3199,14 +3199,16 @@ def test_sleep_idle_agents():
                if t["name"] == "Sleeper")
     check("sleep: a sleeping agent saves as running, with its last activity",
           rec["running"] is True
-          and abs(rec["last_active"] - (now - 2 * hour)) < 1, rec)
+          and abs(rec["last_active"] - (now - 2 * hour)) <= 60
+          and rec["asleep"] is True, rec)
     mgr2 = WorkspaceManager()
     mgr2.load_session_dict(mgr.to_session_dict())
     back = next(a for a in mgr2.workspaces[0].agents
                 if a.spec.name == "Sleeper")
-    check("sleep: load restores the saved last activity",
-          abs(back.last_active_at() - (now - 2 * hour)) < 1,
+    check("sleep: load restores the saved last activity, to the minute",
+          abs(back.last_active_at() - (now - 2 * hour)) <= 60,
           back.last_active_at())
+    check("sleep: load remembers it was asleep", back.restored_asleep)
     mgr3 = WorkspaceManager()
     old = mgr.to_session_dict()
     for t in old["workspaces"][0]["terminals"]:
@@ -3295,10 +3297,59 @@ def test_sleep_idle_agents():
           card.sleep_screen.summary.text()
           == "Port the parser to the new grammar",
           card.sleep_screen.summary.text())
+    win._finished_lanes = lambda _ws, _a: ["a done lane"]
+    _lanes, why = win._ship_state(wws, idle)
+    check("sleep: Ship finished lanes says to resume an asleep integrator, "
+          "never to restart it", "asleep" in why and "Restart" not in why,
+          why)
+    del win._finished_lanes
     card.sleep_screen.resume_btn.click()
     check("sleep: a click resumes the conversation",
           icalls[-1] == "start" and not idle.is_asleep()
           and card.sleep_screen.isHidden(), icalls)
+
+    # a wake during the stop's grace waits for the exit, and the dying
+    # child never gets the key
+    ilive["on"] = True
+    idle._set_status(AgentStatus.RUNNING)
+    idle._session_started = time.time() - 2 * hour
+    idle.put_to_sleep()
+    idle._set_status(AgentStatus.STOPPING)
+    sent = []
+    idle.worker.write = lambda data: sent.append(data) or True
+    icalls.clear()
+    card._on_key_input("x")
+    check("sleep: a key while the child exits starts nothing yet",
+          icalls == [] and sent == [] and card._wake_pending, icalls)
+    ilive["on"] = False
+    idle._set_status(AgentStatus.EXITED_ERR)
+    pump(50)
+    check("sleep: ...and resumes once it has exited",
+          icalls == ["start"] and not idle.is_asleep(), icalls)
+
+    # a prompt typed but not sent keeps its agent awake: the stop's
+    # Ctrl+C would clear it
+    ilive["on"] = True
+    idle._set_status(AgentStatus.RUNNING)
+    idle._prompt_ready = True
+    idle._session_started = time.time() - 2 * hour
+    icalls.clear()
+    term = card.terminal
+    term.feed("\x1b[2J\x1b[H> half a prompt")
+    check("sleep: the view sees an unsent prompt", term.has_draft())
+    win._sleep_tick()
+    check("sleep: the tick leaves an agent with an unsent prompt awake",
+          icalls == [] and not idle.is_asleep(), icalls)
+    term.feed("\x1b[2J\x1b[H> ")
+    check("sleep: an empty box is no draft", not term.has_draft())
+    term.feed("\x1b[2J\x1b[H> Try \"fix the tests\"\x1b[1;3H")
+    check("sleep: Claude's hint behind a caret at the start is no draft",
+          not term.has_draft())
+    term.feed("\x1b[2J\x1b[H> first line\r\n  second")
+    check("sleep: a second line of input is a draft", term.has_draft())
+    term.feed("\x1b[2J\x1b[H› Ask Codex anything\x1b[1;3H")
+    check("sleep: a box without a '>' prompt is never read as a draft",
+          not term.has_draft())
     win._sleep_idle = False
     for a in list(wws.agents):
         win._close_agent(wws.id, a.id)
@@ -3330,7 +3381,7 @@ def test_sleep_at_launch():
     ws = win.manager.workspaces[0]
     now = time.time()
     cases = {}
-    for i, (name, last) in enumerate((("Old", now - 3 * 3600),
+    for i, (name, last) in enumerate((("Old", now - 6 * 3600),
                                       ("Fresh", now - 60),
                                       ("Unknown", 0.0))):
         agent, calls, live = _sleepy_claude(
@@ -3344,6 +3395,18 @@ def test_sleep_at_launch():
         agent.autostart_on_restore = True
         agent.spec.resume = True
         cases[name] = (agent, calls)
+
+    # slept at close after 2 hours, then the hours went up to 5
+    agent, calls, live = _sleepy_claude(
+        win.manager, ws.id, "Slept", SCRATCH_CWD,
+        sid="5ee9a6e7-0000-4000-8000-000000000019")
+    live["on"] = False
+    agent._set_status(agent.status.IDLE)
+    agent.restore_last_active(now - 2 * 3600)
+    agent.restored_asleep = True
+    agent.autostart_on_restore = True
+    cases["Slept"] = (agent, calls)
+    win._sleep_hours = 5
 
     def launch(idle_on, startup_on):
         for agent, calls in cases.values():
@@ -3362,6 +3425,8 @@ def test_sleep_at_launch():
           got["Fresh"] == (False, ["start"]), got)
     check("sleep launch: no recorded activity resumes as before",
           got["Unknown"] == (False, ["start"]), got)
+    check("sleep launch: asleep at close stays asleep though the hours "
+          "went up since", got["Slept"] == (True, []), got)
     card = win._pages[ws.id].card_for(cases["Old"][0].id)
     check("sleep launch: its card shows the sleep screen",
           not card.sleep_screen.isHidden() and card.overlay.isHidden())

@@ -1029,11 +1029,14 @@ class WorkspaceManager(QObject):
                 "running": (a.is_running() or a.start_queued()
                             or a.is_asleep()
                             or (a.auto_created and a.autostart_on_restore)),
-                # additive and read with a default, like "lanes": a file
-                # without it only means no agent sleeps at the next launch.
-                # Not saved on every keystroke: each save writes the live
-                # value, and the close's final save writes the newest one.
-                "last_active": round(a.last_active_at(), 1),
+                # both additive and read with a default, like "lanes": a
+                # file without them only means no agent sleeps at the next
+                # launch. Activity raises no dirty of its own: the heartbeat
+                # save writes any change within HEARTBEAT_SAVE_MS, and the
+                # minute rounding keeps a working agent from rewriting the
+                # file on every heartbeat.
+                "last_active": a.last_active_at() // 60 * 60,
+                "asleep": a.is_asleep(),
                 "task": a.current_task,
                 "assignment": a.assignment.value,
                 # messages the user deferred (app/scheduled_send). Only the
@@ -1223,6 +1226,7 @@ class WorkspaceManager(QObject):
                 agent.assignment = AssignmentState.IDLE
                 agent.autostart_on_restore = bool(td.get("running", False))
                 agent.restore_last_active(td.get("last_active"))
+                agent.restored_asleep = td.get("asleep") is True
                 # Codex owns its transcript and thread id. Restore the saved
                 # thread for both running agents (which autostart) and stopped
                 # cards (which resume when the user wakes them). Older builds

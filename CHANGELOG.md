@@ -15,11 +15,11 @@ em dashes: this text is shown in the app.
   so its memory goes back to Windows. Its card turns black with the
   conversation's summary, its dot in the sidebar turns gray, and a click
   resumes the same conversation. An agent that is working, asking you
-  something or running a command is never put to sleep. It is off until
-  you turn it on.
+  something, running a command or holding a prompt you haven't sent is
+  never put to sleep. It is off until you turn it on.
 - Keep them asleep at startup, on as soon as you turn sleep on, leaves
-  agents that were idle that long asleep when AI Hive opens instead of
-  starting them all. Turn it off and every agent resumes at startup, as
+  agents that were asleep or idle that long asleep when AI Hive opens
+  instead of starting them all. Turn it off and every agent resumes at startup, as
   before.
 
 ## 0.53.2

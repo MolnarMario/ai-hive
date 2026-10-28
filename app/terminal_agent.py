@@ -570,6 +570,8 @@ class TerminalAgent(QObject):
         self.assignment = AssignmentState.IDLE  # task-assignment lifecycle
         self.auto_created = False  # only ever restored from older sessions
         self.autostart_on_restore = False  # set from persisted run state
+        # ...and whether it was asleep (Options > Free up RAM) at that save
+        self.restored_asleep = False
         self.log: deque = deque(maxlen=LOG_CAP)  # line-mode segments
         self._pty_buffer: list[str] = []         # pty raw tail (for replay)
         self._pty_bytes = 0
@@ -1023,9 +1025,10 @@ class TerminalAgent(QObject):
         nobody ever typed to starts fresh instead of failing its resume."""
         if not self.can_sleep():
             return
+        # armed the way main.py arms a launch restore
         self.spec.resume = True
-        self._verify_resume_target = self.spec.provider in ("claude",
-                                                            "gemini")
+        self._verify_resume_target = (self.spec.provider
+                                      in providers.RESUME_PROVIDERS)
         self._set_asleep(True)
         if self.worker.is_running():
             self.notice("[asleep to free memory; click to resume]")

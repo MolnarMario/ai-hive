@@ -821,6 +821,9 @@ class TerminalCard(QFrame):
         # did the user click Restart and the new child is not up yet? Holds
         # the veil over the old child's dying frame (see _on_restart_clicked)
         self._restarting = False
+        # a click or key woke this sleeping card while the child the sleep
+        # stopped was still exiting (see _resume_from_sleep)
+        self._wake_pending = False
         # prompt milestone uid -> absolute line IN THIS VIEW. Per-card because
         # a rebuilt view has a different `pushed` origin; keyed on uid because
         # id() is reused after a FIFO eviction (see PromptMark).
@@ -1415,7 +1418,12 @@ class TerminalCard(QFrame):
     def _on_key_input(self, seq: str) -> None:
         """Keystrokes reach the process — and a stopped terminal is never a
         dead end: the first keypress starts (or resumes) the session."""
-        if self.agent.is_running():
+        if self.agent.is_asleep():
+            # a sleeping card wakes like a click on its screen, even while
+            # the child the sleep stopped is still exiting: that child must
+            # not get the key
+            self._resume_from_sleep()
+        elif self.agent.is_running():
             # typing into a still-booting child means the user wants the
             # terminal, not the loader: the veil gets out of the way at once
             self._dismiss_boot_veil()
@@ -1441,13 +1449,20 @@ class TerminalCard(QFrame):
         screen.show()
         screen.raise_()
 
+    def has_draft(self) -> bool:
+        """Text typed into the terminal's input box and not sent yet."""
+        return self.is_pty and self.terminal.has_draft()
+
     def _resume_from_sleep(self) -> None:
-        """A click on the sleep screen. While the child it stopped is still
-        exiting there is nothing to resume yet, so the click waits for it:
-        the screen stays up and the next click resumes."""
-        if not self.agent.is_running():
-            self.agent.start()
+        """A click on the sleep screen, or a key on a sleeping card. The
+        child the sleep stopped may still be exiting (PtyWorker.stop's
+        grace), and a start then would be refused, so the wake waits for
+        the exit (`_on_status`)."""
         self.terminal.setFocus()
+        if self.agent.is_running():
+            self._wake_pending = True
+        else:
+            self.agent.start()
 
     def _on_assignment(self, state) -> None:
         # The lifecycle state is no longer painted as a header badge: what an
@@ -3127,6 +3142,11 @@ class TerminalCard(QFrame):
                 self._refresh_overlay()
                 self.overlay.raise_()
             self._refresh_sleep_screen()
+            if self._wake_pending and not self.agent.is_running():
+                # a wake asked for while the sleep's child was exiting
+                self._wake_pending = False
+                if self.agent.is_asleep():
+                    QTimer.singleShot(0, self, self._resume_from_sleep)
             # a booting child and a stopped one are mutually exclusive states,
             # and the wake banner owns the stopped one
             if running and not self.agent.prompt_ready():
