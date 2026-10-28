@@ -3107,3 +3107,337 @@ def test_multi_agent_session_isolation():
     mgr.sync_live_sessions()
     check("iso: sync_live_sessions keeps agent1 and agent2 distinct",
           agent1.spec.session_id != agent2.spec.session_id)
+
+
+def _sleepy_claude(mgr, ws_id, name, cwd, sid="5ee9a6e7-0000-4000-8000-00000000000a"):
+    """A pty Claude agent whose worker is stubbed to look RUNNING at its
+    prompt, so the sleep rules can be driven without a real child. Records
+    every stop and start the agent asks its worker for."""
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus
+
+    agent = mgr.add_terminal(ws_id, build_spec(AgentKind.CLAUDE, name,
+                                               cwd=cwd, pty=True),
+                             autostart=False)
+    agent.spec.session_id = sid
+    calls = []
+    live = {"on": True}
+    agent.worker.is_running = lambda: live["on"]
+    agent.worker.stop = lambda *a: calls.append("stop")
+    agent.worker.start = lambda: calls.append("start")
+    agent._set_status(AgentStatus.RUNNING)
+    agent._prompt_ready = True
+    return agent, calls, live
+
+
+def test_sleep_idle_agents():
+    """Options > Free up RAM: which agents may sleep, what a sleep does to
+    the agent, its save record and its card, and the Options switches."""
+    import time
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from app.terminal_agent import AgentStatus
+    from app.workspace_manager import WorkspaceManager
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    # -- the agent's own rules ---------------------------------------------
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Sleep", SCRATCH_CWD)
+    agent, calls, live = _sleepy_claude(mgr, ws.id, "Sleeper", SCRATCH_CWD)
+    hour = 3600.0
+    now = time.time()
+    agent._session_started = now - 60
+    check("sleep: an agent active a minute ago is not due",
+          not agent.sleep_due(hour, now))
+    agent._session_started = now - 2 * hour
+    check("sleep: an agent idle past the hours is due",
+          agent.sleep_due(hour, now))
+    agent._last_input_ts = now - 30
+    check("sleep: a key typed into it counts as activity",
+          not agent.sleep_due(hour, now))
+    agent._last_input_ts = 0.0
+    for attr, label in (("_busy", "working"), ("_waiting", "asking the user"),
+                        ("_bg_shell", "running a background command"),
+                        ("_limit_blocked", "cut off by the plan limit")):
+        setattr(agent, attr, True)
+        due = agent.sleep_due(hour, now)
+        setattr(agent, attr, False)
+        check(f"sleep: never while {label}", not due)
+    agent._prompt_ready = False
+    check("sleep: never before its prompt is up", not agent.sleep_due(hour, now))
+    agent._prompt_ready = True
+    shell = mgr.add_terminal(ws.id, build_spec(
+        AgentKind.POWERSHELL, "Shell", cwd=SCRATCH_CWD, pty=True),
+        autostart=False)
+    check("sleep: a shell has nothing to resume, so it never sleeps",
+          not shell.can_sleep())
+    pinless, _c, _l = _sleepy_claude(mgr, ws.id, "Pinless", SCRATCH_CWD, sid="")
+    check("sleep: a Claude agent without a pinned id never sleeps",
+          not pinless.can_sleep())
+
+    seen = []
+    agent.asleep_changed.connect(seen.append)
+    agent.put_to_sleep()
+    live["on"] = False
+    agent._set_status(AgentStatus.EXITED_OK)
+    check("sleep: put_to_sleep stops the child and arms a resume",
+          calls == ["stop"] and agent.spec.resume and agent.is_asleep()
+          and seen == [True], (calls, agent.spec.resume, seen))
+    check("sleep: the board roster says asleep",
+          agent.roster_row()["status"] == "asleep")
+    rec = next(t for t in mgr.to_session_dict()["workspaces"][0]["terminals"]
+               if t["name"] == "Sleeper")
+    check("sleep: a sleeping agent saves as running, with its last activity",
+          rec["running"] is True
+          and abs(rec["last_active"] - (now - 2 * hour)) <= 60
+          and rec["asleep"] is True, rec)
+    mgr2 = WorkspaceManager()
+    mgr2.load_session_dict(mgr.to_session_dict())
+    back = next(a for a in mgr2.workspaces[0].agents
+                if a.spec.name == "Sleeper")
+    check("sleep: load restores the saved last activity, to the minute",
+          abs(back.last_active_at() - (now - 2 * hour)) <= 60,
+          back.last_active_at())
+    check("sleep: load remembers it was asleep", back.restored_asleep)
+    mgr3 = WorkspaceManager()
+    old = mgr.to_session_dict()
+    for t in old["workspaces"][0]["terminals"]:
+        t.pop("last_active", None)
+    mgr3.load_session_dict(old)
+    check("sleep: a session without last_active loads as unknown (0)",
+          all(a.last_active_at() == 0.0 for a in mgr3.workspaces[0].agents))
+    agent.start()
+    check("sleep: any start wakes it", not agent.is_asleep()
+          and calls[-1] == "start" and seen == [True, False], (calls, seen))
+
+    # -- the window: Options switches, the tick, the card -------------------
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-sleep-"))
+    win = create_main_window(SessionStore(path=tmp / "s.json"))
+    win.show(); pump(120)
+    tb = win.top_bar
+    check("sleep: off by default, its two rows hidden",
+          not win._sleep_idle and not tb.sleep_idle_btn.isChecked()
+          and tb.sleep_startup_btn.isHidden() and tb.sleep_hours_label.isHidden())
+    tb.set_sleep_at_startup(False)
+    win._sleep_at_startup = False
+    tb.sleep_idle_btn.click()
+    ui = win._session_payload()["ui"]
+    check("sleep: turning it on shows the rows and turns startup on",
+          win._sleep_idle and win._sleep_at_startup
+          and not tb.sleep_startup_btn.isHidden()
+          and tb.sleep_startup_btn.isChecked()
+          and ui["sleep_idle"] is True and ui["sleep_at_startup"] is True, ui)
+    check("sleep: the tick runs only while it is on", win._sleep_timer.isActive())
+    check("sleep: the default is one hour", win._sleep_hours == 1
+          and tb.sleep_hours_label.text() == "1 h")
+    tb.sleep_hours_dec_btn.click()
+    check("sleep: the hours stop at one", win._sleep_hours == 1)
+    tb.sleep_hours_inc_btn.click()
+    check("sleep: + adds an hour and saves it", win._sleep_hours == 2
+          and win._session_payload()["ui"]["sleep_hours"] == 2)
+    tb.sleep_startup_btn.click()
+    check("sleep: the startup switch turns off on its own",
+          win._sleep_at_startup is False and win._sleep_idle)
+    tb.sleep_idle_btn.click()
+    check("sleep: turning it off stops the tick and hides the rows",
+          not win._sleep_idle and not win._sleep_timer.isActive()
+          and tb.sleep_startup_btn.isHidden())
+    tb.sleep_idle_btn.click()
+    check("sleep: turning it on again turns startup back on",
+          win._sleep_at_startup is True)
+    win._restore_ui_state({"ui": {"sleep_idle": True, "sleep_hours": 99,
+                                  "sleep_at_startup": False}})
+    check("sleep: restore reads the switches and drops bad hours",
+          win._sleep_idle and win._sleep_hours == 1
+          and not win._sleep_at_startup
+          and not tb.sleep_startup_btn.isChecked())
+    win._restore_ui_state({"ui": {}})
+    check("sleep: a session without the keys loads it off, startup on",
+          not win._sleep_idle and win._sleep_at_startup
+          and not win._sleep_timer.isActive())
+
+    wws = win.manager.workspaces[0]
+    idle, icalls, ilive = _sleepy_claude(win.manager, wws.id, "Idle",
+                                         SCRATCH_CWD)
+    busy, bcalls, _bl = _sleepy_claude(
+        win.manager, wws.id, "Busy", SCRATCH_CWD,
+        sid="5ee9a6e7-0000-4000-8000-00000000000b")
+    idle._session_started = time.time() - 2 * hour
+    busy._session_started = time.time() - 2 * hour
+    busy._busy = True
+    win._sleep_tick()
+    check("sleep: the tick does nothing while the switch is off",
+          icalls == [] and bcalls == [])
+    win._sleep_idle = True
+    win._sleep_tick()
+    check("sleep: the tick sleeps the idle agent and spares the busy one",
+          icalls == ["stop"] and bcalls == [] and idle.is_asleep()
+          and not busy.is_asleep(), (icalls, bcalls))
+    busy._busy = False
+    ilive["on"] = False
+    idle._set_status(AgentStatus.EXITED_OK)
+    pump(50)
+    card = win._pages[wws.id].card_for(idle.id)
+    check("sleep: the card shows the sleep screen, not the stopped banner",
+          not card.sleep_screen.isHidden() and card.overlay.isHidden())
+    check("sleep: the header glyph reads asleep",
+          card.glyph.property("state") == "asleep")
+    idle.set_ai_title("Port the parser to the new grammar")
+    check("sleep: the sleep screen shows the conversation's summary",
+          card.sleep_screen.summary.text()
+          == "Port the parser to the new grammar",
+          card.sleep_screen.summary.text())
+    win._finished_lanes = lambda _ws, _a: ["a done lane"]
+    _lanes, why = win._ship_state(wws, idle)
+    check("sleep: Ship finished lanes says to resume an asleep integrator, "
+          "never to restart it", "asleep" in why and "Restart" not in why,
+          why)
+    del win._finished_lanes
+    card.sleep_screen.resume_btn.click()
+    check("sleep: a click resumes the conversation",
+          icalls[-1] == "start" and not idle.is_asleep()
+          and card.sleep_screen.isHidden(), icalls)
+
+    # a wake during the stop's grace waits for the exit, and the dying
+    # child never gets the key
+    ilive["on"] = True
+    idle._set_status(AgentStatus.RUNNING)
+    idle._session_started = time.time() - 2 * hour
+    idle.put_to_sleep()
+    idle._set_status(AgentStatus.STOPPING)
+    sent = []
+    idle.worker.write = lambda data: sent.append(data) or True
+    icalls.clear()
+    card._on_key_input("x")
+    check("sleep: a key while the child exits starts nothing yet",
+          icalls == [] and sent == [] and card._wake_pending, icalls)
+    ilive["on"] = False
+    idle._set_status(AgentStatus.EXITED_ERR)
+    pump(50)
+    check("sleep: ...and resumes once it has exited",
+          icalls == ["start"] and not idle.is_asleep(), icalls)
+
+    # a prompt typed but not sent keeps its agent awake: the stop's
+    # Ctrl+C would clear it
+    ilive["on"] = True
+    idle._set_status(AgentStatus.RUNNING)
+    idle._prompt_ready = True
+    idle._session_started = time.time() - 2 * hour
+    icalls.clear()
+    term = card.terminal
+    term.feed("\x1b[2J\x1b[H> half a prompt")
+    check("sleep: the view sees an unsent prompt", term.has_draft())
+    win._sleep_tick()
+    check("sleep: the tick leaves an agent with an unsent prompt awake",
+          icalls == [] and not idle.is_asleep(), icalls)
+    term.feed("\x1b[2J\x1b[H> ")
+    check("sleep: an empty box is no draft", not term.has_draft())
+    term.feed("\x1b[2J\x1b[H> Try \"fix the tests\"\x1b[1;3H")
+    check("sleep: Claude's hint behind a caret at the start is no draft",
+          not term.has_draft())
+    term.feed("\x1b[2J\x1b[H> first line\r\n  second")
+    check("sleep: a second line of input is a draft", term.has_draft())
+    term.feed("\x1b[2J\x1b[H› Ask Codex anything\x1b[1;3H")
+    check("sleep: a box without a '>' prompt is never read as a draft",
+          not term.has_draft())
+    win._sleep_idle = False
+    for a in list(wws.agents):
+        win._close_agent(wws.id, a.id)
+    win.close(); pump(120)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_sleep_at_launch():
+    """With both Free up RAM switches on, a launch leaves an agent that was
+    idle for the hours at close asleep. Either switch off, or a session with
+    no recorded activity, and it resumes as it always did."""
+    import time
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-sleeplaunch-"))
+    win = create_main_window(SessionStore(path=tmp / "s.json"))
+    win.show(); pump(120)
+    ws = win.manager.workspaces[0]
+    now = time.time()
+    cases = {}
+    for i, (name, last) in enumerate((("Old", now - 6 * 3600),
+                                      ("Fresh", now - 60),
+                                      ("Unknown", 0.0))):
+        agent, calls, live = _sleepy_claude(
+            win.manager, ws.id, name, SCRATCH_CWD,
+            sid=f"5ee9a6e7-0000-4000-8000-00000000001{i}")
+        live["on"] = False
+        agent._set_status(agent.status.IDLE)
+        agent._prompt_ready = False
+        agent.restore_last_active(last)
+        agent._session_started = 0.0
+        agent.autostart_on_restore = True
+        agent.spec.resume = True
+        cases[name] = (agent, calls)
+
+    # slept at close after 2 hours, then the hours went up to 5
+    agent, calls, live = _sleepy_claude(
+        win.manager, ws.id, "Slept", SCRATCH_CWD,
+        sid="5ee9a6e7-0000-4000-8000-000000000019")
+    live["on"] = False
+    agent._set_status(agent.status.IDLE)
+    agent.restore_last_active(now - 2 * 3600)
+    agent.restored_asleep = True
+    agent.autostart_on_restore = True
+    cases["Slept"] = (agent, calls)
+    win._sleep_hours = 5
+
+    def launch(idle_on, startup_on):
+        for agent, calls in cases.values():
+            calls.clear()
+            agent._asleep = False
+            agent._session_started = 0.0
+        win._sleep_idle, win._sleep_at_startup = idle_on, startup_on
+        win.autostart_active_workspace()
+        pump(50)
+        return {n: (a.is_asleep(), list(c)) for n, (a, c) in cases.items()}
+
+    got = launch(True, True)
+    check("sleep launch: the agent idle past the hours stays asleep",
+          got["Old"] == (True, []), got)
+    check("sleep launch: a recently active agent resumes",
+          got["Fresh"] == (False, ["start"]), got)
+    check("sleep launch: no recorded activity resumes as before",
+          got["Unknown"] == (False, ["start"]), got)
+    check("sleep launch: asleep at close stays asleep though the hours "
+          "went up since", got["Slept"] == (True, []), got)
+    card = win._pages[ws.id].card_for(cases["Old"][0].id)
+    check("sleep launch: its card shows the sleep screen",
+          not card.sleep_screen.isHidden() and card.overlay.isHidden())
+    got = launch(True, False)
+    check("sleep launch: startup switch off resumes every agent",
+          all(v == (False, ["start"]) for v in got.values()), got)
+    got = launch(False, True)
+    check("sleep launch: sleep switch off resumes every agent",
+          all(v == (False, ["start"]) for v in got.values()), got)
+    win._sleep_idle = False
+    for a in list(ws.agents):
+        win._close_agent(ws.id, a.id)
+    win.close(); pump(120)
+    shutil.rmtree(tmp, ignore_errors=True)

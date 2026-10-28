@@ -8,6 +8,20 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.54.0
+
+- New in Options: Free up RAM. Sleep inactive agents stops an agent
+  that has been idle for an hour, or for up to 24 hours if you set it,
+  so its memory goes back to Windows. Its card turns black with the
+  conversation's summary, its dot in the sidebar turns gray, and a click
+  resumes the same conversation. An agent that is working, asking you
+  something, running a command or holding a prompt you haven't sent is
+  never put to sleep. It is off until you turn it on.
+- Keep them asleep at startup, on as soon as you turn sleep on, leaves
+  agents that were asleep or idle that long asleep when AI Hive opens
+  instead of starting them all. Turn it off and every agent resumes at startup, as
+  before.
+
 ## 0.53.2
 
 - The context badge on a Claude card drops as soon as the conversation

@@ -707,6 +707,14 @@ WorkspaceRow[search_hit="true"] {{
 #WsAgentDot {{ font-size: 10px; }}
 #WsAgentName {{ font-family: {BODY_FONT}; font-size: 13px; font-weight: 600; }}
 #WsAgentTask {{ color: {p.TEXT_DIM}; font-size: 13px; }}
+/* asleep (Options > Free up RAM): a plain gray dot, since no emoji circle
+   is gray, and the whole row dimmed a step */
+#WsAgentDot[asleep="true"] {{
+    color: {p.TEXT_FAINT}; font-size: 15px;
+    min-width: 13px; max-width: 13px; qproperty-alignment: AlignCenter;
+}}
+#WsAgentRow[asleep="true"] #WsAgentName {{ color: {p.TEXT_DIM}; }}
+#WsAgentRow[asleep="true"] #WsAgentTask {{ color: {p.TEXT_FAINT}; }}
 #WsAgentQ {{ color: {p.YELLOW}; font-size: 14px; font-weight: 800; }}
 /* cut off by the usage limit: amber like the "?", but deliberately NOT the
    error red: the agent is fine, it is only waiting for the window to reopen.
@@ -773,6 +781,25 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 #StatusGlyph[state="busy"] {{ color: {p.YELLOW}; }}
 #StatusGlyph[state="running"] {{ color: {p.GREEN}; }}
 #StatusGlyph[state="dead"] {{ color: {p.RED}; }}
+#StatusGlyph[state="asleep"] {{ color: {p.TEXT_FAINT}; }}
+/* a card asleep to free memory (TerminalCard.sleep_screen): black, with the
+   conversation's summary and the way back in the middle */
+#SleepScreen {{ background: #000000; }}
+#SleepCaption {{
+    color: {p.TEXT_FAINT}; font-family: {BODY_FONT}; font-size: 11px;
+    font-weight: 700; letter-spacing: 2px;
+}}
+#SleepSummary {{
+    color: {p.TEXT}; font-family: {BODY_FONT}; font-size: 17px;
+    font-weight: 600;
+}}
+#SleepSince {{ color: {p.TEXT_DIM}; font-family: {BODY_FONT}; font-size: 12px; }}
+#SleepResume {{
+    background: transparent; color: {p.ACCENT_ORANGE};
+    border: 1px solid {p.ACCENT_ORANGE}; border-radius: 6px;
+    padding: 8px 18px; font-family: {BODY_FONT}; font-size: 13px;
+}}
+#SleepResume:hover {{ background: rgba(232,152,58,0.20); }}
 #CardTitle {{ font-family: {DISPLAY_FONT}; font-size: 13px; font-weight: 700;
               color: {p.CARDHEAD_FG}; }}
 #CardTitleEdit {{

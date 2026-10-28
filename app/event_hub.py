@@ -298,7 +298,10 @@ class EventHub(QObject):
             return
         if prev is AgentStatus.STOPPING and status in (
                 AgentStatus.IDLE, AgentStatus.EXITED_OK, *_ERROR_STATES):
-            self._record(el.LIFECYCLE, agent, text="stopped")   # the user did
+            # the user did, or Options > Free up RAM did
+            asleep = getattr(agent, "is_asleep", lambda: False)()
+            self._record(el.LIFECYCLE, agent,
+                         text="asleep to free memory" if asleep else "stopped")
             return
         if status in _ERROR_STATES:
             self._record(el.CRASHED, agent, text={

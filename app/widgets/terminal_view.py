@@ -3336,6 +3336,26 @@ class TerminalView(QWidget):
             out.append("".join(buf[r][c].data for c in range(start, last + 1)))
         return "\n".join(out).strip("\n")
 
+    def has_draft(self) -> bool:
+        """Does the input box hold text typed but not sent? Read from the
+        caret, not from `_input_text`: Claude draws its dim "Try ..." hint
+        inside an empty box, behind a caret parked at the box's start, while
+        typed text leaves the caret after it. False without a '>'/'❯'
+        prompt row, since there is no box to read then (Codex draws '›')."""
+        span = self._input_block_span()
+        if span is None:
+            return False
+        top, _bottom = span
+        first, last = self._row_content(top)
+        row = self.screen.buffer[top]
+        if last < 0 or row[first].data not in _INPUT_PROMPTS:
+            return False
+        cy, cx = self.screen.cursor.y, self.screen.cursor.x
+        if cy > top:
+            return True        # a second line of input
+        return any(row[c].data not in ("", " ")
+                   for c in range(first + 1, min(cx, last + 1)))
+
     def _note_prompt_submit(self) -> None:
         """Record that the user just submitted a TYPED prompt, for the
         scrollbar's milestone dots.

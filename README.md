@@ -124,6 +124,21 @@ workspaces keep executing — switching never pauses anything.
   taskbar's one overlay square too: when nothing is busy or asking but a
   shell is still running, the disc turns **violet** with the count, instead
   of showing nothing at all.
+- **Free up RAM.** Every running agent is a whole CLI process, 150 to 300 MB
+  for Claude. ⚙ Options > Free up RAM > **Sleep inactive agents** (off by
+  default) stops an agent after 1 hour without activity (set it from 1 to
+  24 hours under **Asleep after**). Activity is output it prints, a key you
+  type into it, or a start. Its card turns black with the conversation's
+  summary and **Click to resume conversation**, its sidebar dot turns gray,
+  and a click or a key resumes the same conversation with `--resume <id>`.
+  Only Claude, Antigravity and Codex agents with a pinned conversation
+  sleep, and never while one is working, asking you something, running a
+  background command, waiting out the plan limit, holding a scheduled
+  message or holding a prompt you typed but didn't send. **Keep them
+  asleep at startup** (on whenever you turn sleep on) leaves an agent that
+  was asleep at close, or idle that long, asleep when AI Hive opens.
+  Switch either one off and every agent that was running or asleep
+  resumes at startup, as before.
 - **Plan usage readout** — two top-bar badges, one
   per Claude rate-limit window, showing how much you've burned and when it
   comes back: the **5-hour** pill reads `5h Claude 21% used, resets in 1h20m
@@ -1052,7 +1067,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4236 checks drive the real app headlessly (offscreen Qt platform) with real
+4286 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1202,7 +1217,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4236 checks)
+                           (4286 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
