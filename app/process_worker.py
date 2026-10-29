@@ -14,7 +14,8 @@ this module encodes, all empirically verified on the target machine:
   is stdin EOF (closeWriteChannel); the hard stop is a Job Object tree
   kill, which also reaps grandchildren (`ping -t` etc.). KILL_ON_JOB_CLOSE
   reaps everything else if this GUI process dies. The one way
-  out is a process that explicitly asks to break away (see WinJob).
+  out is a process in a Codex agent that explicitly asks to break away
+  (see WinJob).
 """
 
 import codecs
@@ -512,6 +513,16 @@ if sys.platform == "win32":
         ctypes.POINTER(wintypes.ULONG)]
     _ntdll.NtQueryInformationProcess.restype = ctypes.c_long
 
+    _ProcessBasicInformation = 0
+
+    class _PROCESS_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [("ExitStatus", ctypes.c_long),
+                    ("PebBaseAddress", ctypes.c_void_p),
+                    ("AffinityMask", ctypes.c_size_t),
+                    ("BasePriority", ctypes.c_long),
+                    ("UniqueProcessId", ctypes.c_size_t),
+                    ("InheritedFromUniqueProcessId", ctypes.c_size_t)]
+
     class _UNICODE_STRING(ctypes.Structure):
         _fields_ = [("Length", wintypes.USHORT),
                     ("MaximumLength", wintypes.USHORT),
@@ -531,19 +542,28 @@ if sys.platform == "win32":
 class WinJob:
     """One Job Object per worker: tree kill + crash-safe reaping.
 
-    A process the agent starts with CREATE_BREAKAWAY_FROM_JOB leaves the job
-    (BREAKAWAY_OK); every other descendant stays and dies with it. Only a
-    program meant to outlive whoever launched it asks for that: Codex's
-    app-server daemon and its updater, which every Codex client on the
-    account shares. Without the flag Windows does not refuse the request when
-    the asker sits in a nested job that allows breakaway, and node puts every
+    With `breakaway` (job_allows_breakaway), a process the agent starts with
+    CREATE_BREAKAWAY_FROM_JOB leaves the job (BREAKAWAY_OK); every other
+    descendant stays and dies with it. Codex's app-server daemon and its
+    updater ask for that, since every Codex client on the account shares
+    them. Without the flag Windows does not refuse the request when the
+    asker sits in a nested job that allows breakaway, and node puts every
     child it spawns in one. It quietly keeps the process here instead, so
     closing whichever agent started the daemon killed it for everyone
     (measured: the daemon and updater stayed in this job, and a plain child
     of the same parent still stays with the flag set). SILENT_BREAKAWAY_OK
-    stays off: it would let every child out."""
+    stays off: it would let every child out.
 
-    def __init__(self):
+    Git Bash asks for breakaway on EVERY program it starts once its job
+    allows it (Cygwin's spawn checks the job's limit flags), so under
+    BREAKAWAY_OK a Claude agent's hooks and Bash tool commands all left the
+    job. A dev server outlived the agent's Stop, close and sleep, and the
+    gear never counted it. Bash also starts each program suspended and
+    resumes it a moment later, so a tree kill in between left the program
+    frozen outside any job for good (measured: two session_hook.py
+    launchers from e2e runs, suspended for days)."""
+
+    def __init__(self, breakaway: bool = False):
         self._handle = None
         self._assigned = False
         if sys.platform != "win32":
@@ -553,7 +573,8 @@ class WinJob:
             return
         info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         info.BasicLimitInformation.LimitFlags = (
-            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | (_JOB_OBJECT_LIMIT_BREAKAWAY_OK if breakaway else 0))
         ok = _k32.SetInformationJobObject(
             handle, _JobObjectExtendedLimitInformation,
             ctypes.byref(info), ctypes.sizeof(info))
@@ -609,6 +630,16 @@ class WinJob:
             _k32.CloseHandle(self._handle)
             self._handle = None
             self._assigned = False
+
+
+def job_allows_breakaway(spec: "AgentSpec") -> bool:
+    """Only a Codex agent that may start Codex's shared daemon gets a job
+    that lets a process break away (see WinJob): the daemon has to outlive
+    the agent that started it. That is a Codex launch without --no-daemon,
+    an older Codex or a custom command. Everything else an agent starts
+    dies with it."""
+    return (spec.provider == "openai"
+            and "--no-daemon" not in spec.effective_args())
 
 
 def _taskkill_tree(pid: int) -> None:
@@ -667,6 +698,43 @@ def process_command_line(pid: int) -> str:
         return ""
     finally:
         _k32.CloseHandle(handle)
+
+
+def process_parent_id(pid: int) -> int:
+    """The pid that started a live process, or 0 when it can't be read
+    (already exited, access denied, non-Windows). Windows reuses pids, so
+    the parent may since have exited and its number gone to another
+    process; callers only trust it among a job's current members."""
+    if sys.platform != "win32" or not pid:
+        return 0
+    handle = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False,
+                              int(pid))
+    if not handle:
+        return 0
+    try:
+        info = _PROCESS_BASIC_INFORMATION()
+        status = _ntdll.NtQueryInformationProcess(
+            handle, _ProcessBasicInformation, ctypes.byref(info),
+            ctypes.sizeof(info), None)
+        return int(info.InheritedFromUniqueProcessId) if status == 0 else 0
+    finally:
+        _k32.CloseHandle(handle)
+
+
+# Shells an agent runs its commands in: Claude's Bash tool (Git Bash) and
+# PowerShell tool, and Codex's commands. cmd.exe is left out on purpose:
+# MCP servers are commonly configured as `cmd /c npx ...`.
+_SHELL_IMAGES = ("bash.exe", "sh.exe", "zsh.exe", "powershell.exe",
+                 "pwsh.exe")
+
+
+def is_shell_pid(pid: int) -> bool:
+    """True when `pid` runs one of the shells an agent runs commands in. A
+    resting agent has none in its job, so TerminalAgent.poll_bg_shell never
+    learns one, or anything under one, as resting overhead once the user
+    has asked for something."""
+    path = process_image_path(pid)
+    return bool(path) and _image_name(path) in _SHELL_IMAGES
 
 
 def describe_pid(pid: int) -> str:
@@ -1062,7 +1130,7 @@ class ProcessWorker(QObject):
             self.state_changed.emit(state)
 
     def _on_started(self) -> None:
-        self._job = WinJob()
+        self._job = WinJob(job_allows_breakaway(self.spec))
         self._job.assign(self._proc.processId())
         for line in self.spec.init_lines:
             data = (line + self.spec.line_ending).encode(self.spec.encoding_in,

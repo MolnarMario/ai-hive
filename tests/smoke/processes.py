@@ -334,6 +334,101 @@ def test_bg_shell_settle_relearn():
         process_worker_mod.process_image_path = orig_image
 
 
+def test_bg_shell_settle_skips_commands():
+    """A background command started inside the first 16 s of a launch was
+    learned by the settle window as resting overhead, so the gear never lit
+    and Free up RAM's sleep ended it an hour later. After the launch's
+    first submit the settle window adopts no shell and nothing under one.
+    It still adopts a late MCP server, and a submit inside the warmup
+    doesn't cut the warmup short."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import (AgentStatus, BG_SHELL_DEBOUNCE_S,
+                                     BG_SHELL_SETTLE_S, BG_SHELL_WARMUP_S)
+    from app.workspace_manager import WorkspaceManager
+    from app.process_worker import AgentKind, build_spec
+    import app.terminal_agent as terminal_agent_mod
+    import app.process_worker as process_worker_mod
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bgshell-submit-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("BgShellSubmit", str(tmp))
+    agent = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Quick",
+                                               cwd=str(tmp)), autostart=False)
+    agent.status = AgentStatus.RUNNING
+
+    # the agent (100), its bash (104), the dev server bash runs (108) and an
+    # MCP server claude starts late (112)
+    root, bash, server, mcp = 100, 104, 108, 112
+    parents = {bash: root, server: bash, mcp: root}
+    job = [root]
+    fake_now = [1000.0]
+    agent._session_started = fake_now[0]
+    saved = (terminal_agent_mod.time.time, agent.worker.job_process_ids,
+             process_worker_mod.process_image_path,
+             terminal_agent_mod.is_shell_pid,
+             terminal_agent_mod.process_parent_id)
+    terminal_agent_mod.time.time = lambda: fake_now[0]
+    agent.worker.job_process_ids = lambda: list(job)
+    process_worker_mod.process_image_path = lambda pid: ""
+    terminal_agent_mod.is_shell_pid = lambda pid: pid == bash
+    terminal_agent_mod.process_parent_id = lambda pid: parents.get(pid, 0)
+    try:
+        fake_now[0] += 3.0   # a task lands inside the warmup
+        agent._note_submit()
+        job[:] = [root, bash, server]   # ...and starts a dev server at 4 s
+        fake_now[0] += 1.0
+        agent.poll_bg_shell()
+        check("bg shell settle commands: a submit leaves the warmup in place",
+              agent._bg_baseline is None, agent._bg_baseline)
+
+        fake_now[0] = 1000.0 + BG_SHELL_WARMUP_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell settle commands: the shell and what it runs are not "
+              "learned as overhead", agent._bg_baseline == 1
+              and agent._bg_baseline_pids == {root},
+              (agent._bg_baseline, agent._bg_baseline_pids))
+
+        job.append(mcp)
+        fake_now[0] += 2.0
+        agent.poll_bg_shell()
+        check("bg shell settle commands: a late MCP server still is",
+              agent._bg_baseline == 2
+              and agent._bg_baseline_pids == {root, mcp},
+              (agent._bg_baseline, agent._bg_baseline_pids))
+
+        fake_now[0] = 1000.0 + BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S + 0.1
+        agent.poll_bg_shell()
+        fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell settle commands: the dev server lights the gear",
+              agent.is_bg_shell_busy())
+        check("bg shell settle commands: the kill menu lists the shell and "
+              "the server, never the MCP server",
+              sorted(agent.bg_shell_extra_pids()) == [bash, server],
+              agent.bg_shell_extra_pids())
+
+        agent._reset_bg_shell()   # a restart: nothing asked yet
+        check("bg shell settle commands: a restart forgets the submit",
+              not agent._bg_submitted)
+        fake_now[0] = 1000.0 + BG_SHELL_WARMUP_S + 0.1
+        agent.poll_bg_shell()
+        check("bg shell settle commands: before any submit everything in "
+              "the job is learned", agent._bg_baseline == 4,
+              agent._bg_baseline)
+        agent._note_submit()
+        fake_now[0] += 1.0
+        agent.poll_bg_shell()
+        check("bg shell settle commands: a submit unlearns a shell an "
+              "earlier sample took in", agent._bg_baseline_pids == {root, mcp},
+              agent._bg_baseline_pids)
+    finally:
+        (terminal_agent_mod.time.time, agent.worker.job_process_ids,
+         process_worker_mod.process_image_path,
+         terminal_agent_mod.is_shell_pid,
+         terminal_agent_mod.process_parent_id) = saved
+
+
 def test_bg_shell_kill_extras():
     """kill_bg_shell_extras() is a no-op unless the gear is actually lit (a
     stray click on a just-cleared marker must not kill anything), and once
@@ -1120,21 +1215,30 @@ sys.stdin.readline()
 '''
 
 
-def test_winjob_breakaway_only_on_request():
-    """A child that asks to break away leaves the agent's job, and every
-    other child stays and dies with it. Codex starts its shared app-server
-    daemon that way from a TUI that node put in a nested job. Before
-    BREAKAWAY_OK, Windows kept the daemon in the agent's job without failing
-    the launch, and closing that one agent killed the daemon every Codex
-    client was using. Real processes, since the flags only matter to the
-    kernel."""
-    if sys.platform != "win32":
-        skip('winjob breakaway', 'non-Windows: job objects are Windows-only')
-        return
+def _breakaway_scenario(job):
+    """Run _BREAKAWAY_CHILD inside `job`. Returns its four children (plain,
+    asked, plain under a node-style nested job, asked under it), the job's
+    members once they started, and the parent to reap; pids is [] when the
+    parent didn't report four."""
+    from app.process_worker import CREATE_NO_WINDOW
+
+    script = Path(tempfile.mkdtemp()) / "breakaway_child.py"
+    script.write_text(_BREAKAWAY_CHILD, encoding="utf-8")
+    parent = subprocess.Popen([sys.executable, str(script)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              text=True, creationflags=CREATE_NO_WINDOW)
+    joined = job.assign(parent.pid)
+    parent.stdin.write("go\n")
+    parent.stdin.flush()
+    pids = [int(p) for p in parent.stdout.readline().split()]
+    return joined, (pids if len(pids) == 4 else []), \
+        set(job.process_ids()), parent
+
+
+def _breakaway_procs():
+    """alive(pid) and kill(pid) on real processes, for the breakaway tests."""
     import ctypes
     from ctypes import wintypes
-
-    from app.process_worker import CREATE_NO_WINDOW, WinJob
 
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.OpenProcess.restype = wintypes.HANDLE
@@ -1157,25 +1261,43 @@ def test_winjob_breakaway_only_on_request():
             k32.TerminateProcess(h, 1)
             k32.CloseHandle(h)
 
-    script = Path(tempfile.mkdtemp()) / "breakaway_child.py"
-    script.write_text(_BREAKAWAY_CHILD, encoding="utf-8")
-    job = WinJob()
-    parent = subprocess.Popen([sys.executable, str(script)],
-                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              text=True, creationflags=CREATE_NO_WINDOW)
-    pids = []
+    return alive, kill
+
+
+def _reap_breakaway(job, pids, parent, kill):
+    job.terminate_tree()
+    job.close()
+    for pid in pids:
+        kill(pid)
     try:
-        check("winjob breakaway: the parent joins the job",
-              job.assign(parent.pid))
-        parent.stdin.write("go\n")
-        parent.stdin.flush()
-        pids = [int(p) for p in parent.stdout.readline().split()]
+        parent.wait(timeout=5)
+    except Exception:
+        parent.kill()
+
+
+def test_winjob_breakaway_only_on_request():
+    """In a Codex agent's job, a child that asks to break away leaves it,
+    and every other child stays and dies with it. Codex starts its shared
+    app-server daemon that way from a TUI that node put in a nested job.
+    Before BREAKAWAY_OK, Windows kept the daemon in the agent's job without
+    failing the launch, and closing that one agent killed the daemon every
+    Codex client was using. Real processes, since the flags only matter to
+    the kernel."""
+    if sys.platform != "win32":
+        skip('winjob breakaway', 'non-Windows: job objects are Windows-only')
+        return
+    from app.process_worker import WinJob
+
+    alive, kill = _breakaway_procs()
+    job = WinJob(breakaway=True)
+    joined, pids, ids, parent = _breakaway_scenario(job)
+    try:
+        check("winjob breakaway: the parent joins the job", joined)
         check("winjob breakaway: the parent started its four children",
               len(pids) == 4, pids)
         if len(pids) != 4:
             return
         plain, asked, plain_nested, asked_nested = pids
-        ids = set(job.process_ids())
         check("winjob breakaway: a plain child stays in the job",
               plain in ids, (plain, sorted(ids)))
         check("winjob breakaway: a child that asks to break away leaves it",
@@ -1195,14 +1317,127 @@ def test_winjob_breakaway_only_on_request():
         check("winjob breakaway: and leaves the ones that broke away running",
               alive(asked) and alive(asked_nested))
     finally:
+        _reap_breakaway(job, pids, parent, kill)
+
+
+def test_winjob_keeps_children_that_ask():
+    """Every agent but Codex gets a job without BREAKAWAY_OK. Git Bash asks
+    to break away for every program it starts whenever its job allows it,
+    so under the old flag a Claude agent's hooks and Bash tool commands
+    left the job: a dev server outlived Stop, and a tree kill landing while
+    Bash had a program created but not yet resumed left it suspended
+    outside any job (two session_hook.py launchers sat frozen for days).
+    Here a child that asks stays, nested or not, and dies with the job."""
+    if sys.platform != "win32":
+        skip('winjob keeps', 'non-Windows: job objects are Windows-only')
+        return
+    from app.process_worker import (AgentKind, WinJob, build_spec,
+                                    job_allows_breakaway)
+
+    codex = build_spec(AgentKind.OPENAI, "C")
+    codex.args = [a for a in codex.args if a != "--no-daemon"]
+    import app.providers as providers_mod
+    saved = providers_mod.codex_has_no_daemon
+    try:
+        providers_mod.codex_has_no_daemon = lambda program: False
+        check("winjob keeps: a Codex that may start the daemon allows "
+              "breakaway", job_allows_breakaway(codex))
+        providers_mod.codex_has_no_daemon = lambda program: True
+        check("winjob keeps: a Codex launched with --no-daemon doesn't",
+              not job_allows_breakaway(codex))
+    finally:
+        providers_mod.codex_has_no_daemon = saved
+    check("winjob keeps: no other agent's job allows breakaway",
+          not job_allows_breakaway(build_spec(AgentKind.CLAUDE, "A"))
+          and not job_allows_breakaway(build_spec(AgentKind.GEMINI, "G")))
+    alive, kill = _breakaway_procs()
+    job = WinJob()
+    joined, pids, ids, parent = _breakaway_scenario(job)
+    try:
+        check("winjob keeps: the parent joins the job", joined)
+        check("winjob keeps: the parent started its four children",
+              len(pids) == 4, pids)
+        if len(pids) != 4:
+            return
+        check("winjob keeps: every child stays, the ones that asked too",
+              set(pids) <= ids, (pids, sorted(ids)))
+        job.terminate_tree()
+        deadline = time.monotonic() + 5
+        while any(alive(p) for p in pids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        check("winjob keeps: the tree kill takes all four",
+              not any(alive(p) for p in pids))
+    finally:
+        _reap_breakaway(job, pids, parent, kill)
+
+
+def test_winjob_keeps_git_bash_children():
+    """The real case behind test_winjob_keeps_children_that_ask: Git Bash
+    (Cygwin's spawn) asks to break away for every program it starts when
+    its job allows that. In an agent's default job the program stays and
+    dies with it."""
+    if sys.platform != "win32":
+        skip('winjob git bash', 'non-Windows: job objects are Windows-only')
+        return
+    bash = Path(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                "Git", "bin", "bash.exe")
+    if not bash.is_file():
+        skip('winjob git bash', f'no Git Bash at {bash}')
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    from app.process_worker import (CREATE_NO_WINDOW, WinJob, describe_pid,
+                                    is_shell_pid, process_parent_id)
+
+    check("winjob git bash: process_parent_id reads a real parent",
+          process_parent_id(os.getpid()) == os.getppid(),
+          (process_parent_id(os.getpid()), os.getppid()))
+    check("winjob git bash: python is no shell", not is_shell_pid(os.getpid()))
+    ntdll = ctypes.WinDLL("ntdll")
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    alive, kill = _breakaway_procs()
+    python = sys.executable.replace("\\", "/")
+    job = WinJob()
+    # suspended until it is in the job, so bash can't start python first
+    proc = subprocess.Popen(
+        [str(bash), "-c", f"'{python}' -c 'import time; time.sleep(30)'"],
+        creationflags=CREATE_NO_WINDOW | 0x00000004)  # CREATE_SUSPENDED
+    pythons = []
+    try:
+        check("winjob git bash: bash joins the job", job.assign(proc.pid))
+        check("winjob git bash: bash is a shell", is_shell_pid(proc.pid))
+        h = k32.OpenProcess(0x0800, False, proc.pid)  # PROCESS_SUSPEND_RESUME
+        ntdll.NtResumeProcess(h)
+        k32.CloseHandle(h)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            pythons = [p for p in job.process_ids()
+                       if describe_pid(p).lower().startswith("python")]
+            if pythons:
+                break
+            time.sleep(0.1)
+        check("winjob git bash: the program bash started is in the job",
+              bool(pythons), sorted(describe_pid(p)
+                                    for p in job.process_ids()))
+        job.terminate_tree()
+        deadline = time.monotonic() + 5
+        while any(alive(p) for p in pythons) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        check("winjob git bash: and dies with it",
+              not any(alive(p) for p in pythons))
+    finally:
         job.terminate_tree()
         job.close()
-        for pid in pids:
-            kill(pid)
+        for p in pythons:
+            kill(p)
         try:
-            parent.wait(timeout=5)
+            proc.wait(timeout=5)
         except Exception:
-            parent.kill()
+            proc.kill()
 
 
 _NPM_CMD_SHIM = r'''@ECHO off

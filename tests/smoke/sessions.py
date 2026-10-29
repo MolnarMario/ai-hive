@@ -3130,6 +3130,45 @@ def _sleepy_claude(mgr, ws_id, name, cwd, sid="5ee9a6e7-0000-4000-8000-000000000
     return agent, calls, live
 
 
+def test_last_active_marks_dirty():
+    """last_active rode on the 20 s heartbeat save alone, against the rule
+    that a persisted field's mutation path marks the session dirty. The end
+    of a busy burst now marks dirty when it moves the saved minute, and
+    only then, so a working agent doesn't rewrite the file on every burst."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("LastActive", SCRATCH_CWD)
+    agent, _calls, _live = _sleepy_claude(mgr, ws.id, "Busy", SCRATCH_CWD)
+    agent._session_started = 0.0
+    agent._last_work_ts = 100 * 60 + 5
+    agent.activity_changed.emit(False)   # settles the starting minute
+    dirties = []
+    mgr.dirty.connect(lambda: dirties.append(1))
+
+    agent._last_work_ts = 101 * 60 + 5
+    agent.activity_changed.emit(True)
+    check("last active: a burst starting marks nothing", not dirties,
+          len(dirties))
+    agent.activity_changed.emit(False)
+    check("last active: a burst ending in a new minute marks dirty",
+          len(dirties) == 1, len(dirties))
+    agent._last_work_ts = 101 * 60 + 40
+    agent.activity_changed.emit(False)
+    check("last active: another burst in the same minute marks nothing",
+          len(dirties) == 1, len(dirties))
+    agent._last_work_ts = 102 * 60 + 1
+    agent.activity_changed.emit(False)
+    check("last active: the next minute marks dirty again",
+          len(dirties) == 2, len(dirties))
+    check("last active: the save record carries that minute",
+          mgr._agent_dict(agent)["last_active"] == 102 * 60,
+          mgr._agent_dict(agent)["last_active"])
+
+
 def test_sleep_idle_agents():
     """Options > Free up RAM: which agents may sleep, what a sleep does to
     the agent, its save record and its card, and the Options switches."""

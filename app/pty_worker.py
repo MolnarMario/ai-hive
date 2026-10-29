@@ -25,7 +25,8 @@ import threading
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from .process_worker import (WinJob, WorkerState, _taskkill_tree, AgentSpec,
-                             enable_ctrl_c_for_children)
+                             enable_ctrl_c_for_children,
+                             job_allows_breakaway)
 
 
 def agent_environment() -> dict:
@@ -208,7 +209,7 @@ class PtyWorker(QObject):
             self.failed.emit(f"failed to start: {self.spec.program} ({exc})")
             return
 
-        self._job = WinJob()
+        self._job = WinJob(job_allows_breakaway(self.spec))
         self._job.assign(self._proc.pid)
         self._reader = _PtyReader(self._proc)
         self._reader.chunk.connect(self._on_chunk)

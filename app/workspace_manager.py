@@ -583,9 +583,19 @@ class WorkspaceManager(QObject):
         # latch (see TerminalAgent._note_limit_skip). Routed through the
         # manager's own hook, so it is a no-op until MainWindow sets one.
         agent.audit = self._audit
-        # busy/standby is TRANSIENT (not persisted): refresh the badge only,
-        # never mark dirty — otherwise every output burst would thrash saves
-        agent.activity_changed.connect(lambda *_: self._recompute(wid))
+        # busy/standby is TRANSIENT (not persisted): refresh the badge. The
+        # one persisted thing it moves is last_active, saved to the minute
+        # (see _agent_dict), so only a burst that ends in a new minute marks
+        # dirty. Marking it on every burst would thrash saves.
+        saved_minute = [agent.last_active_at() // 60]
+
+        def on_activity(busy, a=agent):
+            self._recompute(wid)
+            minute = a.last_active_at() // 60
+            if not busy and minute != saved_minute[0]:
+                saved_minute[0] = minute
+                self.dirty.emit()
+        agent.activity_changed.connect(on_activity)
         # waiting-for-input is likewise transient (drives the "?" indicator):
         # refresh the badge AND announce the rising edge so the UI can chime
         agent.waiting_changed.connect(
@@ -1031,10 +1041,9 @@ class WorkspaceManager(QObject):
                             or (a.auto_created and a.autostart_on_restore)),
                 # both additive and read with a default, like "lanes": a
                 # file without them only means no agent sleeps at the next
-                # launch. Activity raises no dirty of its own: the heartbeat
-                # save writes any change within HEARTBEAT_SAVE_MS, and the
-                # minute rounding keeps a working agent from rewriting the
-                # file on every heartbeat.
+                # launch. The end of a burst in a new minute marks dirty
+                # (_wire_agent), and the minute rounding keeps a working
+                # agent from rewriting the file on every heartbeat.
                 "last_active": a.last_active_at() // 60 * 60,
                 "asleep": a.is_asleep(),
                 "task": a.current_task,
