@@ -58,7 +58,7 @@ from .activity_panel import PANEL_WIDTH as ACTIVITY_PANEL_WIDTH, ActivityPanel
 from .agent_file_map import AgentFileMapWindow
 from .event_log_window import EventLogWindow
 from .fullscreen import FullscreenController
-from .lanes_help import show_lanes_explainer
+from .lanes_help import help_link as lanes_help_link
 from .shortcuts_help import show_shortcuts_help
 from . import ornaments
 from .ornaments import (DropDownComboBox, LogoRoundel,
@@ -2076,13 +2076,7 @@ class AddTerminalDialog(QDialog):
         if repo_root:
             self.lane_check = QCheckBox("Own lane (git worktree)", self)
             self.lane_check.toggled.connect(self._on_lane_toggled)
-            self.lanes_help = QLabel("<a href='lanes'>What are lanes?</a>",
-                                     self)
-            self.lanes_help.setObjectName("LanesHelpLink")
-            self.lanes_help.setTextInteractionFlags(
-                Qt.TextInteractionFlag.LinksAccessibleByMouse)
-            self.lanes_help.linkActivated.connect(
-                lambda _href: show_lanes_explainer(self))
+            self.lanes_help = lanes_help_link(self)
 
         # how many agents to open: [-] n [+]
         self.count_minus = QPushButton("-", self)
@@ -2920,16 +2914,10 @@ class NewWorkspaceDialog(QDialog):
 
         self.lanes_check = QCheckBox(self.LANES_TEXT, self)
         self.lanes_check.toggled.connect(self._on_lanes_toggled)
-        lanes_help = QLabel("<a href='lanes'>What are lanes?</a>", self)
-        lanes_help.setObjectName("LanesHelpLink")
-        lanes_help.setTextInteractionFlags(
-            Qt.TextInteractionFlag.LinksAccessibleByMouse)
-        lanes_help.linkActivated.connect(
-            lambda _href: show_lanes_explainer(self))
         lanes_row = QHBoxLayout()
         lanes_row.addWidget(self.lanes_check)
         lanes_row.addStretch(1)
-        lanes_row.addWidget(lanes_help)
+        lanes_row.addWidget(lanes_help_link(self))
         root.addLayout(lanes_row)
 
         buttons = QDialogButtonBox(
@@ -2942,7 +2930,14 @@ class NewWorkspaceDialog(QDialog):
 
         self.source_combo.currentIndexChanged.connect(self._show_source)
         self.repo_edit.textChanged.connect(self._suggest_repo_name)
-        self.folder_edit.textChanged.connect(self._refresh_lanes_check)
+        # the repository check walks the folder's parents, and on a network
+        # path each step can stall for seconds: once per pause, not per key
+        self._lanes_timer = QTimer(self)
+        self._lanes_timer.setSingleShot(True)
+        self._lanes_timer.setInterval(250)
+        self._lanes_timer.timeout.connect(self._refresh_lanes_check)
+        self.folder_edit.textChanged.connect(
+            lambda _text: self._lanes_timer.start())
         self._show_source(0)
 
     def _show_source(self, index: int) -> None:
@@ -2964,11 +2959,29 @@ class NewWorkspaceDialog(QDialog):
         if self.lanes_check.isEnabled():
             self._lanes_wanted = bool(on)
 
+    def _settle_lanes(self) -> None:
+        """Run the check the debounce still holds, so OK never reads a box
+        that is behind the folder field."""
+        if self._lanes_timer.isActive():
+            self._lanes_timer.stop()
+            self._refresh_lanes_check()
+
     def _refresh_lanes_check(self) -> None:
         cb = self.lanes_check
         folder = self.folder_edit.text().strip()
         cb.blockSignals(True)
-        if self._lanes_forced:
+        # a relative path, "" included, would resolve against AI Hive's own
+        # working folder
+        if (self.source_combo.currentIndex() == 0
+                and not (os.path.isabs(folder)
+                         and lanes.find_repo_root(folder))):
+            cb.setText("Lanes (needs a git repository)")
+            cb.setChecked(False)
+            cb.setEnabled(False)
+            cb.setToolTip(
+                "This folder is not in a git repository. A lane is a git "
+                "worktree, so lanes need one.")
+        elif self._lanes_forced:
             cb.setText(self.LANES_TEXT)
             cb.setChecked(True)
             cb.setEnabled(False)
@@ -2976,15 +2989,6 @@ class NewWorkspaceDialog(QDialog):
                 "Lanes are on for every workspace (the Options switch "
                 "\"Lanes in every workspace\"). Turn that off to choose per "
                 "workspace.")
-        elif (self.source_combo.currentIndex() == 0
-              and not (folder and lanes.find_repo_root(folder))):
-            # "" would resolve to AI Hive's own working folder
-            cb.setText("Lanes (needs a git repository)")
-            cb.setChecked(False)
-            cb.setEnabled(False)
-            cb.setToolTip(
-                "This folder is not in a git repository. A lane is a git "
-                "worktree, so lanes need one.")
         else:
             cb.setText(self.LANES_TEXT)
             cb.setChecked(self._lanes_wanted)
@@ -3000,6 +3004,7 @@ class NewWorkspaceDialog(QDialog):
 
     def wants_lanes(self) -> bool:
         """Should the new workspace start with its Lanes toggle on?"""
+        self._settle_lanes()
         return self.lanes_check.isEnabled() and self.lanes_check.isChecked()
 
     def _browse_folder(self):

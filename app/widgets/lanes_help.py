@@ -9,7 +9,7 @@ dialogs.
 """
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QLabel, QMessageBox
 
 TITLE = "What are lanes?"
 
@@ -79,3 +79,13 @@ def show_lanes_explainer(parent=None) -> QMessageBox:
     box.setObjectName("LanesExplainer")
     box.show()
     return box
+
+
+def help_link(parent) -> QLabel:
+    """The "What are lanes?" link the New Agent and New Workspace dialogs
+    put beside their lane box. It opens the explainer over `parent`."""
+    link = QLabel("<a href='lanes'>What are lanes?</a>", parent)
+    link.setObjectName("LanesHelpLink")
+    link.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+    link.linkActivated.connect(lambda _href: show_lanes_explainer(parent))
+    return link

@@ -262,6 +262,7 @@ def test_new_workspace_lanes_box():
     the Options switch the box shows locked on and sets nothing."""
     import app.widgets.main_window as mw
     from PySide6.QtWidgets import QApplication, QDialog
+    from app import lanes
     from app.session_store import SessionStore
     from app.widgets.main_window import NewWorkspaceDialog
     from main import create_main_window
@@ -282,15 +283,34 @@ def test_new_workspace_lanes_box():
     cb.click()
     check("new ws lanes: ticking it asks for lanes",
           dlg.result_data()["lanes"] is True)
-    dlg.folder_edit.setText(str(plain))
+    walks = []
+    real_find = lanes.find_repo_root
+    lanes.find_repo_root = lambda path: walks.append(path) or real_find(path)
+    try:
+        for i in range(1, 6):
+            dlg.folder_edit.setText(str(plain)[:len(str(plain)) - 5 + i])
+        typed = len(walks)
+        dlg._settle_lanes()
+    finally:
+        lanes.find_repo_root = real_find
+    check("new ws lanes: typing a folder walks it once per pause, not per "
+          "key (a network path stalls each walk)",
+          typed == 0 and len(walks) == 1, walks)
     check("new ws lanes: a folder outside git greys the box out and says why",
           not cb.isEnabled() and not cb.isChecked()
           and "git repository" in cb.text()
           and dlg.result_data()["lanes"] is False, cb.text())
     dlg.folder_edit.setText("")
-    check("new ws lanes: an empty folder field is no repository (\"\" "
-          "would resolve to AI Hive's own folder)", not cb.isEnabled())
+    dlg._settle_lanes()
+    check("new ws lanes: an empty folder field is no repository",
+          not cb.isEnabled())
+    dlg.folder_edit.setText(".")
+    dlg._settle_lanes()
+    check("new ws lanes: a relative folder is no repository (it would "
+          "resolve against AI Hive's own folder)", not cb.isEnabled())
     dlg.folder_edit.setText(str(repo))
+    check("new ws lanes: OK reads the folder typed last, even inside the "
+          "pause", dlg.result_data()["lanes"] is True)
     check("new ws lanes: back in the repository the user's tick returns",
           cb.isEnabled() and cb.isChecked())
     folder_h = dlg.sizeHint().height()
@@ -318,6 +338,12 @@ def test_new_workspace_lanes_box():
           "and sets nothing", forced.lanes_check.isChecked()
           and not forced.lanes_check.isEnabled()
           and forced.result_data()["lanes"] is False)
+    forced.folder_edit.setText(str(plain))
+    forced._settle_lanes()
+    check("new ws lanes: ...but never claims lanes for a folder outside git",
+          not forced.lanes_check.isChecked()
+          and "git repository" in forced.lanes_check.text(),
+          forced.lanes_check.text())
     forced.deleteLater()
 
     # --- through the window -------------------------------------------------
@@ -342,8 +368,12 @@ def test_new_workspace_lanes_box():
         app.processEvents()
         return [w for w in win.manager.workspaces if w.id not in before]
 
-    def ticked(d):
+    def in_repo(d):
         d.folder_edit.setText(str(repo))
+        d._settle_lanes()
+
+    def ticked(d):
+        in_repo(d)
         d.lanes_check.click()
 
     try:
@@ -360,12 +390,12 @@ def test_new_workspace_lanes_box():
         check("new ws lanes: ...and the toggle is saved",
               saved and saved[0]["lanes"] is True, saved)
 
-        new = create(lambda d: d.folder_edit.setText(str(repo)))
+        new = create(in_repo)
         check("new ws lanes: left unticked the workspace starts with lanes off",
               len(new) == 1 and new[0].lanes is False)
 
         win._agent_lanes = True
-        new = create(lambda d: d.folder_edit.setText(str(repo)))
+        new = create(in_repo)
         check("new ws lanes: the window passes the Options switch to the "
               "dialog", seen[-1].lanes_check.isChecked()
               and not seen[-1].lanes_check.isEnabled())
@@ -375,9 +405,11 @@ def test_new_workspace_lanes_box():
 
         # a GitHub clone carries the tick across the clone thread
         orig_clone = mw.clone_default_branch
+        cloned_once = threading.Event()
 
         def fake_clone(_remote, destination):
             os.makedirs(os.path.join(destination, ".git"))
+            cloned_once.set()
             return ""
 
         def clone_ticked(d):
@@ -395,12 +427,16 @@ def test_new_workspace_lanes_box():
                 app.processEvents()
                 time.sleep(0.01)
         finally:
+            # the clone thread looks the function up when it runs: put the
+            # real one back only once the fake ran, or it clones for real
+            cloned_once.wait(30)
             mw.clone_default_branch = orig_clone
         cloned = [w for w in win.manager.workspaces if w.name == "cloned"]
         check("new ws lanes: a clone made with the box ticked starts with its "
               "toggle on", len(cloned) == 1 and cloned[0].lanes is True,
               [w.name for w in win.manager.workspaces])
     finally:
+        win._agent_lanes = False
         for d in seen:
             d.deleteLater()
         win._save_timer.stop()
