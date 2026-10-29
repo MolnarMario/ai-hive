@@ -14,7 +14,8 @@ this module encodes, all empirically verified on the target machine:
   is stdin EOF (closeWriteChannel); the hard stop is a Job Object tree
   kill, which also reaps grandchildren (`ping -t` etc.). KILL_ON_JOB_CLOSE
   reaps everything else if this GUI process dies. The one way
-  out is a process that explicitly asks to break away (see WinJob).
+  out is a process in a Codex agent that explicitly asks to break away
+  (see WinJob).
 """
 
 import codecs
@@ -531,19 +532,28 @@ if sys.platform == "win32":
 class WinJob:
     """One Job Object per worker: tree kill + crash-safe reaping.
 
-    A process the agent starts with CREATE_BREAKAWAY_FROM_JOB leaves the job
-    (BREAKAWAY_OK); every other descendant stays and dies with it. Only a
-    program meant to outlive whoever launched it asks for that: Codex's
-    app-server daemon and its updater, which every Codex client on the
-    account shares. Without the flag Windows does not refuse the request when
-    the asker sits in a nested job that allows breakaway, and node puts every
+    With `breakaway` (job_allows_breakaway), a process the agent starts with
+    CREATE_BREAKAWAY_FROM_JOB leaves the job (BREAKAWAY_OK); every other
+    descendant stays and dies with it. Codex's app-server daemon and its
+    updater ask for that, since every Codex client on the account shares
+    them. Without the flag Windows does not refuse the request when the
+    asker sits in a nested job that allows breakaway, and node puts every
     child it spawns in one. It quietly keeps the process here instead, so
     closing whichever agent started the daemon killed it for everyone
     (measured: the daemon and updater stayed in this job, and a plain child
     of the same parent still stays with the flag set). SILENT_BREAKAWAY_OK
-    stays off: it would let every child out."""
+    stays off: it would let every child out.
 
-    def __init__(self):
+    Git Bash asks for breakaway on EVERY program it starts once its job
+    allows it (Cygwin's spawn checks the job's limit flags), so under
+    BREAKAWAY_OK a Claude agent's hooks and Bash tool commands all left the
+    job. A dev server outlived the agent's Stop, close and sleep, and the
+    gear never counted it. Bash also starts each program suspended and
+    resumes it a moment later, so a tree kill in between left the program
+    frozen outside any job for good (measured: two session_hook.py
+    launchers from e2e runs, suspended for days)."""
+
+    def __init__(self, breakaway: bool = False):
         self._handle = None
         self._assigned = False
         if sys.platform != "win32":
@@ -553,7 +563,8 @@ class WinJob:
             return
         info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         info.BasicLimitInformation.LimitFlags = (
-            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | _JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+            _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | (_JOB_OBJECT_LIMIT_BREAKAWAY_OK if breakaway else 0))
         ok = _k32.SetInformationJobObject(
             handle, _JobObjectExtendedLimitInformation,
             ctypes.byref(info), ctypes.sizeof(info))
@@ -609,6 +620,13 @@ class WinJob:
             _k32.CloseHandle(self._handle)
             self._handle = None
             self._assigned = False
+
+
+def job_allows_breakaway(spec: "AgentSpec") -> bool:
+    """Only a Codex agent's job lets a process break away (see WinJob): its
+    shared daemon has to outlive the agent that started it. Everything else
+    an agent starts dies with it."""
+    return spec.provider == "openai"
 
 
 def _taskkill_tree(pid: int) -> None:
@@ -1062,7 +1080,7 @@ class ProcessWorker(QObject):
             self.state_changed.emit(state)
 
     def _on_started(self) -> None:
-        self._job = WinJob()
+        self._job = WinJob(job_allows_breakaway(self.spec))
         self._job.assign(self._proc.processId())
         for line in self.spec.init_lines:
             data = (line + self.spec.line_ending).encode(self.spec.encoding_in,

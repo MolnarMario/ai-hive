@@ -738,6 +738,9 @@ class TerminalAgent(QObject):
         # Mirrors _bg_baseline's own rules: replaced outright during the
         # settle window, only ever intersected (never grown) after.
         self._bg_baseline_pids: set[int] | None = None
+        # set by the launch's first submit (see _end_bg_settle): from then
+        # on nothing new joins the baseline, settle window or not
+        self._bg_settled = False
         self._bg_extra_since: float | None = None
         self._bg_shell = False
         # single-shot: (re)armed on each output burst; firing = output went
@@ -1173,6 +1176,7 @@ class TerminalAgent(QObject):
         than either falling silent or littering the turn with stamps. For
         Claude that movement ends at the Stop hook: see note_reply_stopped."""
         self._last_submit_ts = time.time()
+        self._end_bg_settle()
         self._awaiting_reply = True
         self._turn_open = True
         self._turn_mark_uid = None    # the next settle starts this turn's mark
@@ -2295,10 +2299,31 @@ class TerminalAgent(QObject):
         anything."""
         self._bg_baseline = None
         self._bg_baseline_pids = None
+        self._bg_settled = False
         self._bg_extra_since = None
         if self._bg_shell:
             self._bg_shell = False
             self.bg_shell_changed.emit(False)
+
+    def _end_bg_settle(self) -> None:
+        """The launch's first submit closes the baseline's settle window
+        early. Before it, the agent has run nothing, so every process in
+        its job is resting overhead. After it, a new process may be a
+        command the agent started. A background one that the settle window
+        adopted never lit the gear, so Free up RAM's sleep ended it. The
+        baseline is taken from the job right now instead and only ratchets
+        down from here (see poll_bg_shell)."""
+        if self._bg_settled:
+            return
+        self._bg_settled = True
+        if (time.time() - self._session_started
+                >= BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S):
+            return  # settled already, the baseline keeps what it learned
+        ids = self.worker.job_process_ids()
+        if not ids:
+            return  # unknown: the first poll seeds it as before
+        self._bg_baseline = len(ids) - len(self._job_tooling_pids(ids))
+        self._bg_baseline_pids = set(ids)
 
     def poll_bg_shell(self) -> None:
         """Externally ticked (see WorkspaceManager.poll_bg_shell_activity):
@@ -2314,8 +2339,10 @@ class TerminalAgent(QObject):
             return
         elapsed = time.time() - self._session_started
         # let the process tree settle before trusting any sample as the
-        # resting baseline (see BG_SHELL_WARMUP_S)
-        if elapsed < BG_SHELL_WARMUP_S:
+        # resting baseline (see BG_SHELL_WARMUP_S). A submit ends both
+        # windows (see _end_bg_settle).
+        settling = not self._bg_settled
+        if settling and elapsed < BG_SHELL_WARMUP_S:
             return
         # one query for both the count and the identities: a process born
         # between two queries would make the count one too low, and the
@@ -2324,7 +2351,7 @@ class TerminalAgent(QObject):
         if not ids:
             return  # query unsupported/failed -- don't flap on missing data
         count = len(ids) - len(self._job_tooling_pids(ids))
-        if elapsed < BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S:
+        if settling and elapsed < BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S:
             # still settling: track the latest count outright (up or down)
             # rather than only ratcheting down, so a steady-state process
             # that spawns a little late (see BG_SHELL_SETTLE_S) is learned as

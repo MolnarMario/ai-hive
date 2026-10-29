@@ -8,6 +8,18 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.54.1
+
+- A program a Claude agent starts through Git Bash, like a dev server,
+  now ends when you stop or close the agent, or when it goes to sleep.
+  Before, it kept running on its own, and the gear on the card never
+  showed it.
+- A background command an agent starts in its first 16 seconds now
+  lights the gear, so sleep leaves that agent awake instead of ending
+  the command.
+- The time an agent was last active is saved as soon as it changes, not
+  up to 20 seconds later.
+
 ## 0.54.0
 
 - New in Options: Free up RAM. Sleep inactive agents stops an agent
