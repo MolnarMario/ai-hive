@@ -1406,6 +1406,26 @@ def test_winjob_keeps_git_bash_children():
             proc.kill()
 
 
+_NPM_CMD_SHIM = r'''@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
+'''
+
+
 def _codex_package(root, version, name="@openai/codex"):
     pkg = Path(root, "node_modules", "@openai", "codex")
     (pkg / "bin").mkdir(parents=True, exist_ok=True)
