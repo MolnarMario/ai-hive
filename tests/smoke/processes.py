@@ -334,12 +334,13 @@ def test_bg_shell_settle_relearn():
         process_worker_mod.process_image_path = orig_image
 
 
-def test_bg_shell_submit_ends_settle():
+def test_bg_shell_settle_skips_commands():
     """A background command started inside the first 16 s of a launch was
-    adopted by the settle window as resting overhead, so the gear never lit
-    and Free up RAM's sleep ended it an hour later. The launch's first
-    submit now takes the baseline and ends the settle window: whatever
-    shows up after it counts as extra."""
+    learned by the settle window as resting overhead, so the gear never lit
+    and Free up RAM's sleep ended it an hour later. After the launch's
+    first submit the settle window adopts no shell and nothing under one.
+    It still adopts a late MCP server, and a submit inside the warmup
+    doesn't cut the warmup short."""
     from PySide6.QtWidgets import QApplication
     from app.terminal_agent import (AgentStatus, BG_SHELL_DEBOUNCE_S,
                                      BG_SHELL_SETTLE_S, BG_SHELL_WARMUP_S)
@@ -356,61 +357,70 @@ def test_bg_shell_submit_ends_settle():
                                                cwd=str(tmp)), autostart=False)
     agent.status = AgentStatus.RUNNING
 
+    # the agent (100), its bash (104), the dev server bash runs (108) and an
+    # MCP server claude starts late (112)
+    root, bash, server, mcp = 100, 104, 108, 112
+    parents = {bash: root, server: bash, mcp: root}
+    job = [root]
     fake_now = [1000.0]
     agent._session_started = fake_now[0]
-    orig_time = terminal_agent_mod.time.time
-    orig_ids = agent.worker.job_process_ids
-    orig_image = process_worker_mod.process_image_path
-    count = [1]
+    saved = (terminal_agent_mod.time.time, agent.worker.job_process_ids,
+             process_worker_mod.process_image_path,
+             terminal_agent_mod.is_shell_pid,
+             terminal_agent_mod.process_parent_id)
     terminal_agent_mod.time.time = lambda: fake_now[0]
-    agent.worker.job_process_ids = lambda: _fake_job_ids(count[0])
+    agent.worker.job_process_ids = lambda: list(job)
     process_worker_mod.process_image_path = lambda pid: ""
+    terminal_agent_mod.is_shell_pid = lambda pid: pid == bash
+    terminal_agent_mod.process_parent_id = lambda pid: parents.get(pid, 0)
     try:
         fake_now[0] += 3.0   # a task lands inside the warmup
         agent._note_submit()
-        check("bg shell submit: the first submit seeds the baseline",
-              agent._bg_baseline == 1 and agent._bg_baseline_pids
-              == set(_fake_job_ids(1)), agent._bg_baseline)
+        job[:] = [root, bash, server]   # ...and starts a dev server at 4 s
+        fake_now[0] += 1.0
+        agent.poll_bg_shell()
+        check("bg shell settle commands: a submit leaves the warmup in place",
+              agent._bg_baseline is None, agent._bg_baseline)
 
-        count[0] = 2   # the agent starts a background command at 5 s
         fake_now[0] = 1000.0 + BG_SHELL_WARMUP_S + 0.1
         agent.poll_bg_shell()
-        check("bg shell submit: the settle window no longer adopts a "
-              "process started after the submit", agent._bg_baseline == 1,
-              agent._bg_baseline)
+        check("bg shell settle commands: the shell and what it runs are not "
+              "learned as overhead", agent._bg_baseline == 1
+              and agent._bg_baseline_pids == {root},
+              (agent._bg_baseline, agent._bg_baseline_pids))
+
+        job.append(mcp)
+        fake_now[0] += 2.0
+        agent.poll_bg_shell()
+        check("bg shell settle commands: a late MCP server still is",
+              agent._bg_baseline == 2
+              and agent._bg_baseline_pids == {root, mcp},
+              (agent._bg_baseline, agent._bg_baseline_pids))
+
+        fake_now[0] = 1000.0 + BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S + 0.1
+        agent.poll_bg_shell()
         fake_now[0] += BG_SHELL_DEBOUNCE_S + 0.1
         agent.poll_bg_shell()
-        check("bg shell submit: that command lights the gear while still "
-              "inside the old settle window",
-              agent.is_bg_shell_busy()
-              and fake_now[0] < 1000.0 + BG_SHELL_WARMUP_S
-              + BG_SHELL_SETTLE_S)
-        check("bg shell submit: the kill menu lists it",
-              agent.bg_shell_extra_pids() == [_fake_job_ids(2)[1]],
+        check("bg shell settle commands: the dev server lights the gear",
+              agent.is_bg_shell_busy())
+        check("bg shell settle commands: the kill menu lists the shell and "
+              "the server, never the MCP server",
+              sorted(agent.bg_shell_extra_pids()) == [bash, server],
               agent.bg_shell_extra_pids())
-        agent._note_submit()   # a later submit must not re-seed
-        check("bg shell submit: a later submit keeps the baseline",
-              agent._bg_baseline == 1, agent._bg_baseline)
 
-        agent._reset_bg_shell()   # a restart learns from scratch again
-        check("bg shell submit: a restart reopens the settle window",
-              not agent._bg_settled and agent._bg_baseline is None)
-
-        # a launch with no submit inside the windows: a submit after them
-        # leaves the learned baseline alone
-        count[0] = 3
-        fake_now[0] = 1000.0 + BG_SHELL_WARMUP_S + 1.0
+        agent._reset_bg_shell()   # a restart: nothing asked yet
+        check("bg shell settle commands: a restart forgets the submit",
+              not agent._bg_submitted)
+        fake_now[0] = 1000.0 + BG_SHELL_WARMUP_S + 0.1
         agent.poll_bg_shell()
-        fake_now[0] = 1000.0 + BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S + 1.0
-        count[0] = 4
-        agent._note_submit()
-        check("bg shell submit: a submit after the settle window keeps the "
-              "learned baseline", agent._bg_baseline == 3,
+        check("bg shell settle commands: before any submit everything in "
+              "the job is learned", agent._bg_baseline == 4,
               agent._bg_baseline)
     finally:
-        terminal_agent_mod.time.time = orig_time
-        agent.worker.job_process_ids = orig_ids
-        process_worker_mod.process_image_path = orig_image
+        (terminal_agent_mod.time.time, agent.worker.job_process_ids,
+         process_worker_mod.process_image_path,
+         terminal_agent_mod.is_shell_pid,
+         terminal_agent_mod.process_parent_id) = saved
 
 
 def test_bg_shell_kill_extras():
@@ -1318,9 +1328,21 @@ def test_winjob_keeps_children_that_ask():
     from app.process_worker import (AgentKind, WinJob, build_spec,
                                     job_allows_breakaway)
 
-    check("winjob keeps: only a Codex agent's job allows breakaway",
-          job_allows_breakaway(build_spec(AgentKind.OPENAI, "C"))
-          and not job_allows_breakaway(build_spec(AgentKind.CLAUDE, "A"))
+    codex = build_spec(AgentKind.OPENAI, "C")
+    codex.args = [a for a in codex.args if a != "--no-daemon"]
+    import app.providers as providers_mod
+    saved = providers_mod.codex_has_no_daemon
+    try:
+        providers_mod.codex_has_no_daemon = lambda program: False
+        check("winjob keeps: a Codex that may start the daemon allows "
+              "breakaway", job_allows_breakaway(codex))
+        providers_mod.codex_has_no_daemon = lambda program: True
+        check("winjob keeps: a Codex launched with --no-daemon doesn't",
+              not job_allows_breakaway(codex))
+    finally:
+        providers_mod.codex_has_no_daemon = saved
+    check("winjob keeps: no other agent's job allows breakaway",
+          not job_allows_breakaway(build_spec(AgentKind.CLAUDE, "A"))
           and not job_allows_breakaway(build_spec(AgentKind.GEMINI, "G")))
     alive, kill = _breakaway_procs()
     job = WinJob()
@@ -1359,8 +1381,13 @@ def test_winjob_keeps_git_bash_children():
     import ctypes
     from ctypes import wintypes
 
-    from app.process_worker import CREATE_NO_WINDOW, WinJob, describe_pid
+    from app.process_worker import (CREATE_NO_WINDOW, WinJob, describe_pid,
+                                    is_shell_pid, process_parent_id)
 
+    check("winjob git bash: process_parent_id reads a real parent",
+          process_parent_id(os.getpid()) == os.getppid(),
+          (process_parent_id(os.getpid()), os.getppid()))
+    check("winjob git bash: python is no shell", not is_shell_pid(os.getpid()))
     ntdll = ctypes.WinDLL("ntdll")
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.OpenProcess.restype = wintypes.HANDLE
@@ -1376,6 +1403,7 @@ def test_winjob_keeps_git_bash_children():
     pythons = []
     try:
         check("winjob git bash: bash joins the job", job.assign(proc.pid))
+        check("winjob git bash: bash is a shell", is_shell_pid(proc.pid))
         h = k32.OpenProcess(0x0800, False, proc.pid)  # PROCESS_SUSPEND_RESUME
         ntdll.NtResumeProcess(h)
         k32.CloseHandle(h)

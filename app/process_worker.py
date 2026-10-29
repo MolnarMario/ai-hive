@@ -513,6 +513,16 @@ if sys.platform == "win32":
         ctypes.POINTER(wintypes.ULONG)]
     _ntdll.NtQueryInformationProcess.restype = ctypes.c_long
 
+    _ProcessBasicInformation = 0
+
+    class _PROCESS_BASIC_INFORMATION(ctypes.Structure):
+        _fields_ = [("ExitStatus", ctypes.c_long),
+                    ("PebBaseAddress", ctypes.c_void_p),
+                    ("AffinityMask", ctypes.c_size_t),
+                    ("BasePriority", ctypes.c_long),
+                    ("UniqueProcessId", ctypes.c_size_t),
+                    ("InheritedFromUniqueProcessId", ctypes.c_size_t)]
+
     class _UNICODE_STRING(ctypes.Structure):
         _fields_ = [("Length", wintypes.USHORT),
                     ("MaximumLength", wintypes.USHORT),
@@ -623,10 +633,13 @@ class WinJob:
 
 
 def job_allows_breakaway(spec: "AgentSpec") -> bool:
-    """Only a Codex agent's job lets a process break away (see WinJob): its
-    shared daemon has to outlive the agent that started it. Everything else
-    an agent starts dies with it."""
-    return spec.provider == "openai"
+    """Only a Codex agent that may start Codex's shared daemon gets a job
+    that lets a process break away (see WinJob): the daemon has to outlive
+    the agent that started it. That is a Codex launch without --no-daemon,
+    an older Codex or a custom command. Everything else an agent starts
+    dies with it."""
+    return (spec.provider == "openai"
+            and "--no-daemon" not in spec.effective_args())
 
 
 def _taskkill_tree(pid: int) -> None:
@@ -685,6 +698,43 @@ def process_command_line(pid: int) -> str:
         return ""
     finally:
         _k32.CloseHandle(handle)
+
+
+def process_parent_id(pid: int) -> int:
+    """The pid that started a live process, or 0 when it can't be read
+    (already exited, access denied, non-Windows). Windows reuses pids, so
+    the parent may since have exited and its number gone to another
+    process; callers only trust it among a job's current members."""
+    if sys.platform != "win32" or not pid:
+        return 0
+    handle = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False,
+                              int(pid))
+    if not handle:
+        return 0
+    try:
+        info = _PROCESS_BASIC_INFORMATION()
+        status = _ntdll.NtQueryInformationProcess(
+            handle, _ProcessBasicInformation, ctypes.byref(info),
+            ctypes.sizeof(info), None)
+        return int(info.InheritedFromUniqueProcessId) if status == 0 else 0
+    finally:
+        _k32.CloseHandle(handle)
+
+
+# Shells an agent runs its commands in: Claude's Bash tool (Git Bash) and
+# PowerShell tool, and Codex's commands. cmd.exe is left out on purpose:
+# MCP servers are commonly configured as `cmd /c npx ...`.
+_SHELL_IMAGES = ("bash.exe", "sh.exe", "zsh.exe", "powershell.exe",
+                 "pwsh.exe")
+
+
+def is_shell_pid(pid: int) -> bool:
+    """True when `pid` runs one of the shells an agent runs commands in. A
+    resting agent has none in its job, so TerminalAgent.poll_bg_shell never
+    learns one, or anything under one, as resting overhead once the user
+    has asked for something."""
+    path = process_image_path(pid)
+    return bool(path) and _image_name(path) in _SHELL_IMAGES
 
 
 def describe_pid(pid: int) -> str:

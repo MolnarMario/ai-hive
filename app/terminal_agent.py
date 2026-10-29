@@ -20,7 +20,7 @@ from .ansi_parser import _PARTIAL_RE as _ESC_PARTIAL_RE
 from .coordination import sanitize_text
 from .scheduled_send import MISSED, PENDING, SENT, ScheduledMessage
 from .process_worker import (AgentSpec, ProcessWorker, WorkerState,
-                             is_job_tooling)
+                             is_job_tooling, is_shell_pid, process_parent_id)
 from .pty_worker import PtyWorker
 
 LOG_CAP = 4000  # retained (stream, text) segments per agent
@@ -738,9 +738,9 @@ class TerminalAgent(QObject):
         # Mirrors _bg_baseline's own rules: replaced outright during the
         # settle window, only ever intersected (never grown) after.
         self._bg_baseline_pids: set[int] | None = None
-        # set by the launch's first submit (see _end_bg_settle): from then
-        # on nothing new joins the baseline, settle window or not
-        self._bg_settled = False
+        # set by the launch's first submit: from then on the settle window
+        # adopts no shell and nothing under one (see _bg_adoptable)
+        self._bg_submitted = False
         self._bg_extra_since: float | None = None
         self._bg_shell = False
         # single-shot: (re)armed on each output burst; firing = output went
@@ -1176,7 +1176,7 @@ class TerminalAgent(QObject):
         than either falling silent or littering the turn with stamps. For
         Claude that movement ends at the Stop hook: see note_reply_stopped."""
         self._last_submit_ts = time.time()
-        self._end_bg_settle()
+        self._bg_submitted = True
         self._awaiting_reply = True
         self._turn_open = True
         self._turn_mark_uid = None    # the next settle starts this turn's mark
@@ -2299,31 +2299,42 @@ class TerminalAgent(QObject):
         anything."""
         self._bg_baseline = None
         self._bg_baseline_pids = None
-        self._bg_settled = False
+        self._bg_submitted = False
         self._bg_extra_since = None
         if self._bg_shell:
             self._bg_shell = False
             self.bg_shell_changed.emit(False)
 
-    def _end_bg_settle(self) -> None:
-        """The launch's first submit closes the baseline's settle window
-        early. Before it, the agent has run nothing, so every process in
-        its job is resting overhead. After it, a new process may be a
-        command the agent started. A background one that the settle window
-        adopted never lit the gear, so Free up RAM's sleep ended it. The
-        baseline is taken from the job right now instead and only ratchets
-        down from here (see poll_bg_shell)."""
-        if self._bg_settled:
-            return
-        self._bg_settled = True
-        if (time.time() - self._session_started
-                >= BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S):
-            return  # settled already, the baseline keeps what it learned
-        ids = self.worker.job_process_ids()
-        if not ids:
-            return  # unknown: the first poll seeds it as before
-        self._bg_baseline = len(ids) - len(self._job_tooling_pids(ids))
-        self._bg_baseline_pids = set(ids)
+    def _bg_adoptable(self, ids) -> set[int]:
+        """The members of `ids` the settle window may learn as resting
+        overhead. Before the launch's first submit that is all of them: the
+        agent has run nothing yet. After it, a shell (is_shell_pid) and
+        anything under one is a command the agent ran, so it stays out.
+        Before this, a background command started in the first 16 s was
+        learned as overhead, never lit the gear, and Free up RAM's sleep
+        ended it. A late MCP server is no shell and is still adopted. A
+        parent that can't be read, or that left the job, adopts its child,
+        as before."""
+        if not self._bg_submitted:
+            return set(ids)
+        known = set(self._bg_baseline_pids or ())
+        root = self.worker.pid()
+        members = set(ids)
+        verdict: dict[int, bool] = {}
+
+        def adoptable(pid: int, depth: int = 0) -> bool:
+            if pid in known or pid == root:
+                return True
+            if pid not in verdict:
+                if is_shell_pid(pid):
+                    verdict[pid] = False
+                else:
+                    parent = process_parent_id(pid)
+                    verdict[pid] = (parent not in members or depth > 32
+                                    or adoptable(parent, depth + 1))
+            return verdict[pid]
+
+        return {p for p in ids if adoptable(p)}
 
     def poll_bg_shell(self) -> None:
         """Externally ticked (see WorkspaceManager.poll_bg_shell_activity):
@@ -2339,10 +2350,8 @@ class TerminalAgent(QObject):
             return
         elapsed = time.time() - self._session_started
         # let the process tree settle before trusting any sample as the
-        # resting baseline (see BG_SHELL_WARMUP_S). A submit ends both
-        # windows (see _end_bg_settle).
-        settling = not self._bg_settled
-        if settling and elapsed < BG_SHELL_WARMUP_S:
+        # resting baseline (see BG_SHELL_WARMUP_S)
+        if elapsed < BG_SHELL_WARMUP_S:
             return
         # one query for both the count and the identities: a process born
         # between two queries would make the count one too low, and the
@@ -2350,15 +2359,19 @@ class TerminalAgent(QObject):
         ids = self.worker.job_process_ids()
         if not ids:
             return  # query unsupported/failed -- don't flap on missing data
-        count = len(ids) - len(self._job_tooling_pids(ids))
-        if settling and elapsed < BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S:
+        tooling = self._job_tooling_pids(ids)
+        count = len(ids) - len(tooling)
+        if elapsed < BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S:
             # still settling: track the latest count outright (up or down)
             # rather than only ratcheting down, so a steady-state process
             # that spawns a little late (see BG_SHELL_SETTLE_S) is learned as
             # baseline instead of being locked in as "extra" forever. Same
             # replace-outright treatment for the PID identities behind it.
-            self._bg_baseline = count
-            self._bg_baseline_pids = set(ids)
+            # A command the agent already runs is never learned
+            # (_bg_adoptable).
+            adopted = self._bg_adoptable(ids)
+            self._bg_baseline = len(adopted - tooling)
+            self._bg_baseline_pids = adopted
             self._bg_extra_since = None
             if self._bg_shell:
                 self._bg_shell = False

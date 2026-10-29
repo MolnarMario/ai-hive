@@ -957,14 +957,14 @@ Hard-won rules, each with a regression test:
   verified). Hard kill is a Windows **Job Object** tree kill, so shells AND
   their grandchildren (`ping -t`, spawned scripts) die with the card, and
   `KILL_ON_JOB_CLOSE` reaps everything even if the app crashes. No zombies.
-  Only a Codex card's job lets a process that asks Windows to outlive its
-  launcher go, for Codex's app-server daemon, which every Codex window on
-  the account shares: closing one card no longer kills it for the rest.
   Codex cards launch with `--no-daemon` (Codex 0.156 and later), so their
-  session and every command it runs stay inside the card's job. Every other
-  card refuses: Git Bash asks to outlive its launcher for every program it
-  starts, so a Claude agent's Bash commands escaped the job and outlived
-  the card.
+  session and every command it runs stay inside the card's job. Only a
+  Codex card without that flag (an older Codex, a custom command) lets a
+  process that asks Windows to outlive its launcher go, for Codex's
+  app-server daemon, which every Codex window on the account shares:
+  closing one card doesn't kill it for the rest. Every other card refuses.
+  Git Bash asks to outlive its launcher for every program it starts, so a
+  Claude agent's Bash commands escaped the job and outlived the card.
 - Output decoding is UTF-8-first with cp437 fallback per chunk (cmd/PS 5.1
   builtins emit OEM cp437 on pipes; modern tools emit UTF-8 — sometimes in
   the same session). PowerShell sessions are switched to UTF-8 end-to-end at
