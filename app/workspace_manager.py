@@ -238,11 +238,13 @@ class WorkspaceManager(QObject):
     # ----------------------------------------------------------- mutation ---
 
     def create_workspace(self, name: str, project_path: str = "",
-                         layout: str = DEFAULT_LAYOUT) -> Workspace:
+                         layout: str = DEFAULT_LAYOUT,
+                         lanes: bool = False) -> Workspace:
         path = project_path or os.path.expanduser("~")
         ws = Workspace(id=uuid.uuid4().hex, name=name, project_path=path,
                        layout=layout or DEFAULT_LAYOUT,
-                       board=coordination.WorkspaceBoard(path))
+                       board=coordination.WorkspaceBoard(path),
+                       lanes=bool(lanes))
         self._workspaces.append(ws)
         self.workspaceAdded.emit(ws)
         self.dirty.emit()

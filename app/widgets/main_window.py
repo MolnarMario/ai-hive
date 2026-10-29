@@ -58,7 +58,7 @@ from .activity_panel import PANEL_WIDTH as ACTIVITY_PANEL_WIDTH, ActivityPanel
 from .agent_file_map import AgentFileMapWindow
 from .event_log_window import EventLogWindow
 from .fullscreen import FullscreenController
-from .lanes_help import show_lanes_explainer
+from .lanes_help import help_link as lanes_help_link
 from .shortcuts_help import show_shortcuts_help
 from . import ornaments
 from .ornaments import (DropDownComboBox, LogoRoundel,
@@ -2076,13 +2076,7 @@ class AddTerminalDialog(QDialog):
         if repo_root:
             self.lane_check = QCheckBox("Own lane (git worktree)", self)
             self.lane_check.toggled.connect(self._on_lane_toggled)
-            self.lanes_help = QLabel("<a href='lanes'>What are lanes?</a>",
-                                     self)
-            self.lanes_help.setObjectName("LanesHelpLink")
-            self.lanes_help.setTextInteractionFlags(
-                Qt.TextInteractionFlag.LinksAccessibleByMouse)
-            self.lanes_help.linkActivated.connect(
-                lambda _href: show_lanes_explainer(self))
+            self.lanes_help = lanes_help_link(self)
 
         # how many agents to open: [-] n [+]
         self.count_minus = QPushButton("-", self)
@@ -2853,12 +2847,26 @@ def _read_cut_offs(targets) -> list[tuple]:
 
 class NewWorkspaceDialog(QDialog):
     """Choose an existing project folder or clone a GitHub repository's
-    default branch (see `clone_default_branch`)."""
+    default branch (see `clone_default_branch`).
 
-    def __init__(self, start_dir: str, parent=None):
+    The Lanes box starts the workspace with its ⎇ Lanes toggle on
+    (`Workspace.lanes`), so the first Claude agent opens with Own lane
+    ticked and its card offers Make integrator right away. The box needs a
+    git repository: an existing folder outside one greys it out
+    (`lanes.find_repo_root`, a folder walk, no git), a clone always is one.
+    With the Options switch "Lanes in every workspace" on, the box shows
+    ticked and locked and sets nothing, so turning that switch off later
+    leaves the workspace as the user left it.
+    """
+
+    LANES_TEXT = "Lanes (each agent in its own git worktree)"
+
+    def __init__(self, start_dir: str, parent=None, lanes_forced: bool = False):
         super().__init__(parent)
         self.setWindowTitle("New Workspace")
         self.setMinimumWidth(480)
+        self._lanes_forced = bool(lanes_forced)
+        self._lanes_wanted = False  # the user's tick, kept while greyed out
 
         root = QVBoxLayout(self)
         form = QFormLayout()
@@ -2904,6 +2912,14 @@ class NewWorkspaceDialog(QDialog):
         self.pages.addWidget(repo_page)
         root.addWidget(self.pages)
 
+        self.lanes_check = QCheckBox(self.LANES_TEXT, self)
+        self.lanes_check.toggled.connect(self._on_lanes_toggled)
+        lanes_row = QHBoxLayout()
+        lanes_row.addWidget(self.lanes_check)
+        lanes_row.addStretch(1)
+        lanes_row.addWidget(lanes_help_link(self))
+        root.addLayout(lanes_row)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel |
             QDialogButtonBox.StandardButton.Ok, parent=self)
@@ -2912,8 +2928,84 @@ class NewWorkspaceDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-        self.source_combo.currentIndexChanged.connect(self.pages.setCurrentIndex)
+        self.source_combo.currentIndexChanged.connect(self._show_source)
         self.repo_edit.textChanged.connect(self._suggest_repo_name)
+        # the repository check walks the folder's parents, and on a network
+        # path each step can stall for seconds: once per pause, not per key
+        self._lanes_timer = QTimer(self)
+        self._lanes_timer.setSingleShot(True)
+        self._lanes_timer.setInterval(250)
+        self._lanes_timer.timeout.connect(self._refresh_lanes_check)
+        self.folder_edit.textChanged.connect(
+            lambda _text: self._lanes_timer.start())
+        self._show_source(0)
+
+    def _show_source(self, index: int) -> None:
+        """Show one source's page, as tall as that page alone. A stacked
+        widget takes its tallest page's height, so the one-row folder page
+        left a gap the GitHub page's four rows fill, above the Lanes row."""
+        for i in range(self.pages.count()):
+            self.pages.widget(i).setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Preferred if i == index
+                else QSizePolicy.Policy.Ignored)
+        self.pages.setCurrentIndex(index)
+        self.pages.updateGeometry()
+        self._refresh_lanes_check()
+        if self.isVisible():
+            self.resize(self.width(), self.sizeHint().height())
+
+    def _on_lanes_toggled(self, on: bool) -> None:
+        if self.lanes_check.isEnabled():
+            self._lanes_wanted = bool(on)
+
+    def _settle_lanes(self) -> None:
+        """Run the check the debounce still holds, so OK never reads a box
+        that is behind the folder field."""
+        if self._lanes_timer.isActive():
+            self._lanes_timer.stop()
+            self._refresh_lanes_check()
+
+    def _refresh_lanes_check(self) -> None:
+        cb = self.lanes_check
+        folder = self.folder_edit.text().strip()
+        cb.blockSignals(True)
+        # a relative path, "" included, would resolve against AI Hive's own
+        # working folder
+        if (self.source_combo.currentIndex() == 0
+                and not (os.path.isabs(folder)
+                         and lanes.find_repo_root(folder))):
+            cb.setText("Lanes (needs a git repository)")
+            cb.setChecked(False)
+            cb.setEnabled(False)
+            cb.setToolTip(
+                "This folder is not in a git repository. A lane is a git "
+                "worktree, so lanes need one.")
+        elif self._lanes_forced:
+            cb.setText(self.LANES_TEXT)
+            cb.setChecked(True)
+            cb.setEnabled(False)
+            cb.setToolTip(
+                "Lanes are on for every workspace (the Options switch "
+                "\"Lanes in every workspace\"). Turn that off to choose per "
+                "workspace.")
+        else:
+            cb.setText(self.LANES_TEXT)
+            cb.setChecked(self._lanes_wanted)
+            cb.setEnabled(True)
+            cb.setToolTip(
+                "Turns on this workspace's Lanes toggle: the New Agent dialog "
+                "ticks Own lane for each new Claude agent, so it works in its "
+                "own git worktree and branch beside the repository and agents "
+                "cannot overwrite each other's work. Pick one of them as the "
+                "integrator to ship their finished work.\nThe toggle in the "
+                "workspace header changes it later.")
+        cb.blockSignals(False)
+
+    def wants_lanes(self) -> bool:
+        """Should the new workspace start with its Lanes toggle on?"""
+        self._settle_lanes()
+        return self.lanes_check.isEnabled() and self.lanes_check.isChecked()
 
     def _browse_folder(self):
         path = QFileDialog.getExistingDirectory(
@@ -2943,10 +3035,12 @@ class NewWorkspaceDialog(QDialog):
         if self.source_combo.currentIndex() == 0:
             path = self.folder_edit.text().strip()
             return {"mode": "folder", "path": path,
-                    "name": os.path.basename(os.path.normpath(path)) or "Workspace"}
+                    "name": os.path.basename(os.path.normpath(path)) or "Workspace",
+                    "lanes": self.wants_lanes()}
         return {"mode": "github", "url": self.repo_edit.text().strip(),
                 "name": self.repo_name_edit.text().strip(),
-                "parent": self.parent_edit.text().strip()}
+                "parent": self.parent_edit.text().strip(),
+                "lanes": self.wants_lanes()}
 
 
 class MainWindow(QMainWindow):
@@ -2960,7 +3054,8 @@ class MainWindow(QMainWindow):
     planLimitReached = Signal(object)   # claude_usage.Limit
     planLimitCleared = Signal()
     repoActivityLoaded = Signal(str, str, object)  # ws_id, path, result
-    workspaceCloneFinished = Signal(str, str, str, str)
+    # name, path, repo url, git's error, the dialog's Lanes box
+    workspaceCloneFinished = Signal(str, str, str, str, bool)
 
     def __init__(self, manager: WorkspaceManager, store: SessionStore,
                  session: dict | None = None):
@@ -7747,7 +7842,8 @@ class MainWindow(QMainWindow):
         active = self.manager.workspace(self.manager.active_id)
         if active and os.path.isdir(active.project_path):
             start_dir = active.project_path
-        dialog = NewWorkspaceDialog(start_dir, self)
+        dialog = NewWorkspaceDialog(start_dir, self,
+                                    lanes_forced=self._agent_lanes)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         data = dialog.result_data()
@@ -7757,7 +7853,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "AI Hive",
                                     "Choose an existing project folder.")
                 return
-            ws = self.manager.create_workspace(data["name"], path)
+            ws = self.manager.create_workspace(data["name"], path,
+                                               lanes=data["lanes"])
             self.manager.set_active(ws.id)
             self.sidebar.begin_rename(ws.id)
             return
@@ -7767,6 +7864,7 @@ class MainWindow(QMainWindow):
         parts = [part for part in urlparse(repo_url).path.split("/") if part]
         name = data["name"].strip()
         parent = data["parent"].strip()
+        want_lanes = data["lanes"]
         if not repo_url or len(parts) != 2:
             QMessageBox.warning(self, "AI Hive",
                                 "Enter a GitHub repository URL with an owner and repository name.")
@@ -7797,13 +7895,15 @@ class MainWindow(QMainWindow):
 
         def clone() -> None:
             error = clone_default_branch(remote, destination)
-            self.workspaceCloneFinished.emit(name, destination, repo_url, error)
+            self.workspaceCloneFinished.emit(name, destination, repo_url,
+                                             error, want_lanes)
 
         threading.Thread(target=clone, name="github-workspace-clone",
                          daemon=True).start()
 
     def _on_workspace_clone_finished(self, name: str, path: str,
-                                     repo_url: str, error: str) -> None:
+                                     repo_url: str, error: str,
+                                     want_lanes: bool = False) -> None:
         if self._clone_progress is not None:
             self._clone_progress.close()
             self._clone_progress.deleteLater()
@@ -7815,7 +7915,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "GitHub clone failed",
                                 "Git reported success, but the cloned folder was not found.")
             return
-        ws = self.manager.create_workspace(name, path)
+        ws = self.manager.create_workspace(name, path, lanes=want_lanes)
         self.manager.set_active(ws.id)
 
     def _on_add_terminal_clicked(self, ws_id: str = "") -> None:

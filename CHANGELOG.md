@@ -8,6 +8,15 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.55.0
+
+- The New Workspace dialog has a Lanes box. Tick it and the workspace
+  starts with Lanes on, so the first Claude agent you add gets its own
+  lane and you can make it the integrator right away. It needs a git
+  repository, and a GitHub clone always is one.
+- In New Workspace, an existing folder no longer leaves an empty gap
+  sized for the GitHub fields.
+
 ## 0.54.1
 
 - A program a Claude agent starts through Git Bash, like a dev server,
