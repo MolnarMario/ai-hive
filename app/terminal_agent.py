@@ -2314,16 +2314,17 @@ class TerminalAgent(QObject):
         learned as overhead, never lit the gear, and Free up RAM's sleep
         ended it. A late MCP server is no shell and is still adopted. A
         parent that can't be read, or that left the job, adopts its child,
-        as before."""
+        as before. Every member is checked again on each poll, even one an
+        earlier sample learned: a shell that started before the submit is
+        still a command."""
         if not self._bg_submitted:
             return set(ids)
-        known = set(self._bg_baseline_pids or ())
         root = self.worker.pid()
         members = set(ids)
         verdict: dict[int, bool] = {}
 
         def adoptable(pid: int, depth: int = 0) -> bool:
-            if pid in known or pid == root:
+            if pid == root:
                 return True
             if pid not in verdict:
                 if is_shell_pid(pid):

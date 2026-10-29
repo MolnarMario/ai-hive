@@ -416,6 +416,12 @@ def test_bg_shell_settle_skips_commands():
         check("bg shell settle commands: before any submit everything in "
               "the job is learned", agent._bg_baseline == 4,
               agent._bg_baseline)
+        agent._note_submit()
+        fake_now[0] += 1.0
+        agent.poll_bg_shell()
+        check("bg shell settle commands: a submit unlearns a shell an "
+              "earlier sample took in", agent._bg_baseline_pids == {root, mcp},
+              agent._bg_baseline_pids)
     finally:
         (terminal_agent_mod.time.time, agent.worker.job_process_ids,
          process_worker_mod.process_image_path,
