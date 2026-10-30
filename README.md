@@ -651,9 +651,12 @@ workspaces keep executing — switching never pauses anything.
   used to compete for room up there: **Recover at start-up**, **Resume on usage
   reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Update AI
   Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times**, **Tooltips** and **Bionic reading** as labelled switches (each with a green/dark LED, so
-  "will my work resume by itself?" is answerable at a glance), the detected
-  Claude Code install method with a **Manage…** door to the Updates panel, and
-  the theme, global font size, terminal font and letter spacing below. Click outside or press `Esc` to close.
+  "will my work resume by itself?" is answerable at a glance), a **Manage…**
+  door to the Updates panel whose tooltip names the detected Claude Code install
+  method, and the theme, global font size, terminal font and letter spacing. The
+  panel lays its sections out in two columns, about 450 px tall with every row
+  showing, so it fits a 1080p laptop screen; a window shorter than that scrolls
+  it. Click outside or press `Esc` to close.
   The bar itself keeps only what you actually glance at: the usage pills and
   their `+`, and `+ Terminal`, so it fits on a laptop instead of hiding
   controls behind a scrollbar.
@@ -1073,7 +1076,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4332 checks drive the real app headlessly (offscreen Qt platform) with real
+4353 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1223,7 +1226,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4332 checks)
+                           (4353 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

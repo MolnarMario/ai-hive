@@ -1904,6 +1904,21 @@ class OrnamentDivider(QWidget):
         p.end()
 
 
+def popup_bounds(anchor):
+    """`(left, top, right, bottom)`, right and bottom exclusive, that a popup
+    under `anchor` stays inside: the window intersected with the screen's
+    available geometry. `anchored_popup_pos` places in it and the Options
+    panel caps its height to it, so the two can't disagree."""
+    from PySide6.QtWidgets import QApplication
+
+    screen = anchor.screen() or QApplication.primaryScreen()
+    avail = screen.availableGeometry()
+    win = anchor.window().geometry()  # client area in global coords
+    return (max(avail.x(), win.x()), max(avail.y(), win.y()),
+            min(avail.x() + avail.width(), win.x() + win.width()),
+            min(avail.y() + avail.height(), win.y() + win.height()))
+
+
 def anchored_popup_pos(anchor, size, align_right=False):
     """Where to put a popup dropped under `anchor`, kept inside the app window
     AND the screen.
@@ -1922,19 +1937,12 @@ def anchored_popup_pos(anchor, size, align_right=False):
     a window pushed off-screen nor a taskbar can strand the panel.
     """
     from PySide6.QtCore import QPoint
-    from PySide6.QtWidgets import QApplication
 
     w, h = size.width(), size.height()
     bl = anchor.mapToGlobal(anchor.rect().bottomLeft())
     br = anchor.mapToGlobal(anchor.rect().bottomRight())
     tl = anchor.mapToGlobal(anchor.rect().topLeft())
-    screen = anchor.screen() or QApplication.primaryScreen()
-    avail = screen.availableGeometry()
-    win = anchor.window().geometry()  # client area in global coords
-    left = max(avail.x(), win.x())
-    top = max(avail.y(), win.y())
-    right = min(avail.x() + avail.width(), win.x() + win.width())
-    bottom = min(avail.y() + avail.height(), win.y() + win.height())
+    left, top, right, bottom = popup_bounds(anchor)
     x = bl.x()
     if align_right or x + w > right:
         x = br.x() - w                        # right-align under the button

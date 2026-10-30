@@ -216,18 +216,24 @@ def test_word_starts_option_toggle():
         bar._open_options()
         app.processEvents()
         panel = bar.options_panel
-        tall = panel.height()
+        # the panel is as tall as its taller column, so the column the row
+        # sits in is what must shrink; the panel must then match its hint
+        col = bar.word_strength_label.parentWidget()
+        tall, col_tall = panel.height(), col.sizeHint().height()
         bar.bold_word_starts_btn.click()
         app.processEvents()
-        short = panel.height()
+        short, col_short = panel.height(), col.sizeHint().height()
         check("word starts toggle: turning it off with the panel open "
               "shrinks the panel to fit",
-              panel.isVisible() and short < tall
-              and short == panel.sizeHint().height(), (tall, short))
+              panel.isVisible() and col_short < col_tall and short <= tall
+              and short == panel.sizeHint().height(),
+              (tall, short, col_tall, col_short))
         bar.bold_word_starts_btn.click()
         app.processEvents()
         check("word starts toggle: ...and turning it on grows it back",
-              panel.height() == tall, (tall, panel.height()))
+              panel.height() == tall
+              and col.sizeHint().height() == col_tall,
+              (tall, panel.height()))
         panel.hide()
         bar.hide()
         bar.deleteLater()
