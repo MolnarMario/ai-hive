@@ -3833,6 +3833,37 @@ def test_options_panel():
     bar.deleteLater()
 
 
+def test_options_panel_text_at_body_size():
+    """The Options rows draw at the app's 13px body size. At 12px (sections
+    at 11px) the panel read as a smaller, blurrier font than the window
+    behind it (reported live)."""
+    from PySide6.QtWidgets import QApplication, QLabel
+    from app import ui_theme
+    from app.widgets.main_window import TopBar
+
+    app = QApplication.instance() or QApplication([])
+    app.setStyleSheet(ui_theme.build_qss())
+    bar = TopBar()
+    bar.resize(1400, 42)
+    bar.show()
+    bar.options_panel.open_under(bar.options_btn)
+    app.processEvents()
+    panel = bar.options_panel
+    sizes = {lbl.objectName(): lbl.font().pixelSize()
+             for lbl in panel.findChildren(QLabel)
+             if lbl.objectName() in ("OptionsRowLabel", "OptionsSection")}
+    check("options: row labels use the 13px body size",
+          sizes.get("OptionsRowLabel") == 13, sizes)
+    check("options: section captions are no smaller than 12px",
+          (sizes.get("OptionsSection") or 0) >= 12, sizes)
+    check("options: action buttons use the 13px body size",
+          bar.shortcuts_btn.font().pixelSize() == 13,
+          bar.shortcuts_btn.font().pixelSize())
+    panel.grab().save(str(SHOTS / "options_panel.png"))
+    panel.hide()
+    bar.deleteLater()
+
+
 def test_topbar_extras_grow_with_window():
     """The extras row must take every pixel a wider window can give it.
 

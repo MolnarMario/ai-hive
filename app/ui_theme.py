@@ -1030,20 +1030,22 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     background: {p.BG_PANEL}; border: 1px solid {p.ACCENT_GOLD_DIM};
     border-radius: 4px;
 }}
+/* row text at the app's 13px body size: at 12px the panel read as a
+   smaller, blurrier font than the window behind it */
 #OptionsSection {{
-    color: {p.TEXT_DIM}; font-size: 11px; font-weight: 700;
+    color: {p.TEXT_DIM}; font-size: 12px; font-weight: 700;
     letter-spacing: 0.8px;
 }}
-#OptionsRowLabel {{ color: {p.TEXT}; font-size: 12px; }}
+#OptionsRowLabel {{ color: {p.TEXT}; font-size: 13px; }}
 #OptionsSep {{ background: {p.BORDER}; border: none; max-height: 1px; }}
 /* secondary actions inside the panel (the Updates door) */
 #OptionsAction {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;
-    padding: 3px 10px; color: {p.TEXT_DIM}; font-size: 12px;
+    padding: 3px 10px; color: {p.TEXT_DIM}; font-size: 13px;
 }}
 /* the chime rows' note button: as tall as the ToggleSwitch beside it (18px),
    so those two rows keep the same rhythm as the others */
-#OptionsAction[compact="true"] {{ padding: 0px 7px; font-size: 11px; }}
+#OptionsAction[compact="true"] {{ padding: 0px 7px; font-size: 12px; }}
 #OptionsAction:hover {{
     background: {p.BG_HOVER}; border-color: {p.ACCENT_GOLD}; color: {p.TEXT};
 }}
