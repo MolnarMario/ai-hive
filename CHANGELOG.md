@@ -8,6 +8,16 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.55.1
+
+- The Options panel lays its settings out in two columns, so the whole
+  panel fits on a 1080p laptop screen. A window too short for it scrolls
+  the panel, and one too narrow for two columns stacks them.
+- Options panel text is the same 13px size as the rest of the window
+  instead of a smaller, blurrier one.
+- The detected Claude Code install method moved from a caption in the
+  Options panel to the tooltip of its Manage button.
+
 ## 0.55.0
 
 - The New Workspace dialog has a Lanes box. Tick it and the workspace
