@@ -40,7 +40,9 @@ next setting would have run off the bottom. `add_column` starts the right
 column, which halves the height and keeps every setting in view. The rows
 still sit in a frameless `QScrollArea`: `sizeHint` caps the height at the
 room inside the window and screen bounds `anchored_popup_pos` places in, so a
-short window scrolls the panel instead of clipping its last rows. The panel
+short window scrolls the panel instead of clipping its last rows. A window
+narrower than the two columns stacks them again (`_set_stacked`), and the
+height cap scrolls the result, so no row lands past the right edge. The panel
 computes its own size hint from the body's because `QScrollArea.sizeHint` is
 bounded to 24 lines of text. The rows are children of their column widget,
 so tests ask `panel.isAncestorOf(w)`, not `w.parent() is panel`.
@@ -51,12 +53,14 @@ No em dash in any string below: this is all read by the user.
 from __future__ import annotations
 
 from PySide6.QtCore import QRect, QSize, Qt
-from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel,
-                               QScrollArea, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QBoxLayout, QFrame, QHBoxLayout,
+                               QLabel, QScrollArea, QVBoxLayout, QWidget)
 
 from .ornaments import anchored_popup_pos
 
 COLUMN_MIN_W = 280
+COLUMN_GAP = 12
+STACKED_GAP = 6
 MIN_ROOM = 120  # never cap the panel below this, however short the window
 
 
@@ -79,10 +83,12 @@ class OptionsPanel(QWidget):
         self._body.setObjectName("OptionsBody")
         self._cols_lay = QHBoxLayout(self._body)
         self._cols_lay.setContentsMargins(10, 10, 10, 10)
-        self._cols_lay.setSpacing(12)
+        self._cols_lay.setSpacing(COLUMN_GAP)
         self._scroll.setWidget(self._body)
         self._col = None
         self._lay = None
+        self._stacked = False
+        self._col_seps: list[tuple[QFrame, QFrame]] = []
         self._anchor = None
         self.add_column()
 
@@ -93,12 +99,23 @@ class OptionsPanel(QWidget):
         it. Columns align to the top, so a shorter one leaves its gap at the
         bottom instead of spreading its rows apart."""
         if self._col is not None:
-            line = QFrame(self._body)
-            line.setObjectName("OptionsColSep")
-            line.setFrameShape(QFrame.Shape.VLine)
-            line.setFrameShadow(QFrame.Shadow.Plain)
-            line.setFixedWidth(1)
-            self._cols_lay.addWidget(line)
+            # a vertical rule between columns, and the horizontal one that
+            # replaces it when a narrow window stacks them (`_set_stacked`)
+            vline = QFrame(self._body)
+            vline.setObjectName("OptionsColSep")
+            vline.setFrameShape(QFrame.Shape.VLine)
+            vline.setFrameShadow(QFrame.Shadow.Plain)
+            vline.setFixedWidth(1)
+            hline = QFrame(self._body)
+            hline.setObjectName("OptionsSep")
+            hline.setFrameShape(QFrame.Shape.HLine)
+            hline.setFrameShadow(QFrame.Shadow.Plain)
+            hline.setFixedHeight(1)
+            hline.setVisible(self._stacked)
+            vline.setVisible(not self._stacked)
+            self._cols_lay.addWidget(vline)
+            self._cols_lay.addWidget(hline)
+            self._col_seps.append((vline, hline))
         self._col = QWidget(self._body)
         self._col.setMinimumWidth(COLUMN_MIN_W)
         self._lay = QVBoxLayout(self._col)
@@ -187,16 +204,18 @@ class OptionsPanel(QWidget):
 
     # --- sizing ----------------------------------------------------------
 
-    def _room(self) -> int:
-        """The tallest the panel may be: from under the anchor to the bottom
-        of the window intersected with the screen's available geometry, the
-        bound `anchored_popup_pos` uses. Measured from the anchor, not the
-        window's top, so a capped panel still drops under the Options button
-        instead of flipping up over the bar."""
+    def _room(self) -> QSize:
+        """The most room the panel may take: from under the anchor to the
+        bottom of the window intersected with the screen's available
+        geometry, the bound `anchored_popup_pos` uses, and that bound's full
+        width. Measured from the anchor, not the window's top, so a capped
+        panel still drops under the Options button instead of flipping up
+        over the bar."""
         anchor = self._anchor
         screen = ((anchor.screen() if anchor is not None else self.screen())
                   or QApplication.primaryScreen())
         avail = screen.availableGeometry()
+        left, right = avail.left(), avail.right() + 1
         top, bottom = avail.top(), avail.bottom() + 1
         if anchor is not None:
             win = anchor.window().geometry()
@@ -204,7 +223,26 @@ class OptionsPanel(QWidget):
             below = anchor.mapToGlobal(anchor.rect().bottomLeft()).y()
             top = max(top, win.top(), below)
             bottom = min(bottom, win.bottom() + 1)
-        return max(MIN_ROOM, bottom - top)
+            left, right = max(left, win.left()), min(right, win.right() + 1)
+        return QSize(right - left, max(MIN_ROOM, bottom - top))
+
+    def _bar_w(self) -> int:
+        return self._scroll.verticalScrollBar().sizeHint().width()
+
+    def _set_stacked(self, stacked: bool) -> None:
+        """Columns side by side, or one under the other with a horizontal
+        rule between them. A window narrower than the two columns stacks
+        them, and the height cap then scrolls the taller panel, so no
+        setting ends up past the window's right edge."""
+        self._stacked = stacked
+        self._cols_lay.setDirection(
+            QBoxLayout.Direction.TopToBottom if stacked
+            else QBoxLayout.Direction.LeftToRight)
+        self._cols_lay.setSpacing(STACKED_GAP if stacked else COLUMN_GAP)
+        for vline, hline in self._col_seps:
+            vline.setVisible(not stacked)
+            hline.setVisible(stacked)
+        self._cols_lay.activate()
 
     def sizeHint(self) -> QSize:
         """Every row at its natural size, or, when that is taller than the
@@ -213,12 +251,17 @@ class OptionsPanel(QWidget):
         self._cols_lay.activate()
         body = self._body.sizeHint()
         room = self._room()
-        if body.height() <= room:
+        if body.height() <= room.height():
             return body
-        bar = self._scroll.verticalScrollBar().sizeHint().width()
-        return QSize(body.width() + bar, room)
+        return QSize(body.width() + self._bar_w(), room.height())
 
     def _fit(self) -> None:
+        # side by side when the columns (and a scroll bar, should the
+        # height cap need one) fit the width; stacked otherwise
+        self._set_stacked(False)
+        room = self._room()
+        if self._col_seps and self.sizeHint().width() > room.width():
+            self._set_stacked(True)
         self.resize(self.sizeHint())
         self.move(anchored_popup_pos(self._anchor, self.size()))
 

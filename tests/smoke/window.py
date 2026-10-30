@@ -3869,7 +3869,7 @@ def test_options_panel_fits_a_laptop():
     setting would have run off the bottom (reported live). It is two columns
     now, and a window too short even for that scrolls the panel rather than
     clipping its last rows."""
-    from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+    from PySide6.QtWidgets import QApplication, QLayout, QVBoxLayout, QWidget
     from app import ui_theme
     from app.widgets.main_window import TopBar
 
@@ -3927,6 +3927,32 @@ def test_options_panel_fits_a_laptop():
           panel._scroll.viewport().width() >= panel._body.minimumSizeHint()
           .width(), (panel._scroll.viewport().width(),
                      panel._body.minimumSizeHint().width()))
+    panel.hide()
+
+    # narrower than the two columns: they stack, and the panel scrolls.
+    # The bar's layout would hold the test window wider than this.
+    lay.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
+    win.setMinimumSize(0, 0)
+    win.resize(500, 600)
+    app.processEvents()
+    panel.open_under(bar.options_btn)
+    app.processEvents()
+    check("options fit: a narrow window stacks the columns",
+          panel._stacked and right.y() > left.y() and right.x() == left.x(),
+          ((left.x(), left.y()), (right.x(), right.y())))
+    check("options fit: ...and the stacked panel stays inside the window",
+          win.geometry().contains(panel.geometry())
+          and panel._scroll.verticalScrollBar().maximum() > 0,
+          (panel.geometry().getRect(), win.geometry().getRect()))
+    panel.hide()
+    win.resize(1366, 760)
+    app.processEvents()
+    panel.open_under(bar.options_btn)
+    app.processEvents()
+    check("options fit: ...and a wide window puts them side by side again",
+          not panel._stacked and right.x() > left.x()
+          and not panel._col_seps[0][1].isVisible(),
+          (left.x(), right.x()))
     panel.hide()
     win.close()
     win.deleteLater()
