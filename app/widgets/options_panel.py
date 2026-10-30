@@ -39,7 +39,8 @@ TWO COLUMNS, AND A HEIGHT CAP. Stacked in one column the panel grew to about
 next setting would have run off the bottom. `add_column` starts the right
 column, which halves the height and keeps every setting in view. The rows
 still sit in a frameless `QScrollArea`: `sizeHint` caps the height at the
-room inside the window and screen bounds `anchored_popup_pos` places in, so a
+room inside the window and screen bounds (`ornaments.popup_bounds`) that
+`anchored_popup_pos` places in, so a
 short window scrolls the panel instead of clipping its last rows. A window
 narrower than the two columns stacks them again (`_set_stacked`), and the
 height cap scrolls the result, so no row lands past the right edge. The panel
@@ -52,11 +53,11 @@ No em dash in any string below: this is all read by the user.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, QSize, Qt
+from PySide6.QtCore import QEvent, QRect, QSize, Qt
 from PySide6.QtWidgets import (QApplication, QBoxLayout, QFrame, QHBoxLayout,
                                QLabel, QScrollArea, QVBoxLayout, QWidget)
 
-from .ornaments import anchored_popup_pos
+from .ornaments import anchored_popup_pos, popup_bounds
 
 COLUMN_MIN_W = 280
 COLUMN_GAP = 12
@@ -71,7 +72,8 @@ class OptionsPanel(QWidget):
         super().__init__(parent, Qt.WindowType.Popup)
         self.setObjectName("OptionsPanel")
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        # inside the panel's 1px QSS border, or a scroll bar draws over it
+        outer.setContentsMargins(1, 1, 1, 1)
         self._scroll = QScrollArea(self)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.setWidgetResizable(True)
@@ -85,6 +87,8 @@ class OptionsPanel(QWidget):
         self._cols_lay.setContentsMargins(10, 10, 10, 10)
         self._cols_lay.setSpacing(COLUMN_GAP)
         self._scroll.setWidget(self._body)
+        self._body.installEventFilter(self)
+        self._fitted = QSize()  # the body's hint when `_fit` last ran
         self._col = None
         self._lay = None
         self._stacked = False
@@ -212,18 +216,13 @@ class OptionsPanel(QWidget):
         panel still drops under the Options button instead of flipping up
         over the bar."""
         anchor = self._anchor
-        screen = ((anchor.screen() if anchor is not None else self.screen())
-                  or QApplication.primaryScreen())
-        avail = screen.availableGeometry()
-        left, right = avail.left(), avail.right() + 1
-        top, bottom = avail.top(), avail.bottom() + 1
-        if anchor is not None:
-            win = anchor.window().geometry()
-            # the row `anchored_popup_pos` puts the panel's top on
-            below = anchor.mapToGlobal(anchor.rect().bottomLeft()).y()
-            top = max(top, win.top(), below)
-            bottom = min(bottom, win.bottom() + 1)
-            left, right = max(left, win.left()), min(right, win.right() + 1)
+        if anchor is None:
+            avail = (self.screen() or QApplication.primaryScreen()
+                     ).availableGeometry()
+            return QSize(avail.width(), max(MIN_ROOM, avail.height()))
+        left, top, right, bottom = popup_bounds(anchor)
+        # the row `anchored_popup_pos` puts the panel's top on
+        top = max(top, anchor.mapToGlobal(anchor.rect().bottomLeft()).y())
         return QSize(right - left, max(MIN_ROOM, bottom - top))
 
     def _bar_w(self) -> int:
@@ -249,7 +248,8 @@ class OptionsPanel(QWidget):
         room there is, that room plus a scroll bar's width, so the bar does
         not squeeze the rows sideways."""
         self._cols_lay.activate()
-        body = self._body.sizeHint()
+        m = self.layout().contentsMargins()
+        body = self._body.sizeHint().grownBy(m)
         room = self._room()
         if body.height() <= room.height():
             return body
@@ -264,6 +264,19 @@ class OptionsPanel(QWidget):
             self._set_stacked(True)
         self.resize(self.sizeHint())
         self.move(anchored_popup_pos(self._anchor, self.size()))
+        self._fitted = self._body.sizeHint()
+
+    def eventFilter(self, obj, event) -> bool:
+        """Fit an open panel again when its rows change size outside
+        `set_row_visible`: the update pill appearing, a label's text
+        growing. A popup never resizes itself, and the scroll area would
+        clip the switches at the right edge. Only on a changed hint,
+        because `_fit` posts layout requests of its own."""
+        if (obj is self._body and event.type() == QEvent.Type.LayoutRequest
+                and self.isVisible() and self._anchor is not None
+                and self._body.sizeHint() != self._fitted):
+            self._fit()
+        return super().eventFilter(obj, event)
 
     # --- opening ---------------------------------------------------------
 

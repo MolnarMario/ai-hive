@@ -3901,8 +3901,10 @@ def test_options_panel_fits_a_laptop():
     check("options fit: every row showing, the panel is under 560px tall",
           panel.height() < 560 and panel.height() == panel.sizeHint().height(),
           panel.size().toTuple())
-    check("options fit: ...and needs no scroll bar in a 760px window",
-          panel._scroll.verticalScrollBar().maximum() == 0)
+    # the offscreen screen is 800x600, so the bound in force here is the
+    # screen's, about 558px under the button, not the 760px window's
+    check("options fit: ...and needs no scroll bar in the 600px offscreen "
+          "screen", panel._scroll.verticalScrollBar().maximum() == 0)
     check("options fit: the install note no longer takes a row",
           not hasattr(bar, "install_label"))
     panel.grab().save(str(SHOTS / "options_panel.png"))
@@ -3953,6 +3955,59 @@ def test_options_panel_fits_a_laptop():
           not panel._stacked and right.x() > left.x()
           and not panel._col_seps[0][1].isVisible(),
           (left.x(), right.x()))
+    panel.hide()
+    win.close()
+    win.deleteLater()
+
+
+def test_options_panel_refits_while_open():
+    """A row that grows while the Options panel is open (the update pill
+    appearing) must fit the panel again. A popup never resizes itself, and
+    inside the scroll area the wider body was clipped at the right edge,
+    switches included. The scroll area also sits inside the panel's 1px
+    border, so a scroll bar can't draw over it."""
+    from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+    from app import ui_theme
+    from app.widgets.main_window import TopBar
+
+    app = QApplication.instance() or QApplication([])
+    app.setStyleSheet(ui_theme.build_qss())
+    win = QWidget()
+    lay = QVBoxLayout(win)
+    lay.setContentsMargins(0, 0, 0, 0)
+    bar = TopBar(win)
+    lay.addWidget(bar)
+    lay.addStretch(1)
+    win.resize(1366, 560)
+    win.move(0, 0)
+    win.show()
+    panel = bar.options_panel
+    panel.open_under(bar.options_btn)
+    app.processEvents()
+    before = panel.width()
+    bar.note_update_pending("Claude Code 9.9.9 is waiting for a restart "
+                            "of AI Hive before it can install")
+    for _ in range(3):
+        app.processEvents()
+    body_min = panel._body.minimumSizeHint().width()
+    check("options refit: a pill shown with the panel open widens it",
+          panel.width() > before and panel.size() == panel.sizeHint(),
+          (before, panel.width(), panel.sizeHint().toTuple()))
+    check("options refit: ...so the rows are not clipped at the right edge",
+          panel._scroll.viewport().width() >= body_min,
+          (panel._scroll.viewport().width(), body_min))
+    check("options refit: ...and the panel stays inside the window",
+          win.geometry().contains(panel.geometry()),
+          (panel.geometry().getRect(), win.geometry().getRect()))
+    bar.note_update_pending("")
+    for _ in range(3):
+        app.processEvents()
+    check("options refit: hiding the pill shrinks it back",
+          panel.width() == before, (before, panel.width()))
+    check("options refit: the rows sit inside the panel's 1px border",
+          panel._scroll.geometry().topLeft().toTuple() == (1, 1)
+          and panel._scroll.geometry().right() == panel.width() - 2,
+          panel._scroll.geometry().getRect())
     panel.hide()
     win.close()
     win.deleteLater()

@@ -1554,8 +1554,8 @@ class TopBar(QFrame):
         self.auto_update_label.setText("⬇  Check for CLI updates at start-up")
         # the tooltip states plainly what the armed switch does, because it
         # changes software on the user's machine rather than anything inside
-        # the app. The detected install state is on the Manage button's
-        # tooltip, beside this row (`note_install_state`).
+        # the app. The detected install state is on the tooltip of the
+        # Manage button, on the row below (`note_install_state`).
         tip = (
             "Startup check: ON. Next time AI Hive starts, it checks for a "
             "newer Claude Code and Gemini (agy) CLI and installs it BEFORE "

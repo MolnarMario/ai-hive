@@ -13,8 +13,8 @@ em dashes: this text is shown in the app.
 - The Options panel lays its settings out in two columns, so the whole
   panel fits on a 1080p laptop screen. A window too short for it scrolls
   the panel, and one too narrow for two columns stacks them.
-- Options panel text is the same 13px size as the rest of the window
-  instead of a smaller, blurrier one.
+- The Options panel's labels and buttons use the same 13px text as the
+  rest of the window instead of a smaller, blurrier size.
 - The detected Claude Code install method moved from a caption in the
   Options panel to the tooltip of its Manage button.
 
