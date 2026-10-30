@@ -998,8 +998,8 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
     padding: 2px 7px; color: {p.TEXT_DIM}; font-weight: 700;
 }}
 #GlobalFontBtn:hover {{ border-color: {p.ACCENT_BLUE}; color: {p.TEXT}; }}
-/* dim caption text: the Updates panel's version/hint lines, and the Options
-   panel's detected-install-method line under its updates switch */
+/* dim caption text: the Updates panel's version/hint lines and the
+   self-update dialog's blocked line */
 #RecoveryLabel {{ color: {p.TEXT_DIM}; font-size: 12px; }}
 /* The X revealed inside a usage pill on hover, and the + that brings a closed
    pill back. These two are ordinary chrome, so QSS; the pill BODY around them
@@ -1038,6 +1038,10 @@ QToolButton:disabled {{ color: {p.TEXT_FAINT}; }}
 }}
 #OptionsRowLabel {{ color: {p.TEXT}; font-size: 13px; }}
 #OptionsSep {{ background: {p.BORDER}; border: none; max-height: 1px; }}
+#OptionsColSep {{ background: {p.BORDER}; border: none; max-width: 1px; }}
+/* the rows sit in a scroll area inside the popup; the panel's own fill
+   must show through it */
+#OptionsBody {{ background: transparent; }}
 /* secondary actions inside the panel (the Updates door) */
 #OptionsAction {{
     background: transparent; border: 1px solid {p.BORDER}; border-radius: 3px;

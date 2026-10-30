@@ -821,23 +821,15 @@ class TopBar(QFrame):
             self._on_sleep_startup_clicked)
         self._refresh_sleep_btns()
 
-        # The detected Claude Code install method, under the switch it explains.
-        # It used to be reachable only by hovering the down-arrow; the panel has
-        # room to state it.
-        self.install_label = QLabel("", self)
-        self.install_label.setObjectName("RecoveryLabel")
-        self.install_label.setWordWrap(True)
-        self.install_label.setVisible(False)
-
-        # ...and the everything-about-updates door. Separate from the switch
-        # above because the two do different things: one arms the startup gate,
-        # the other opens the install-method control.
+        # The everything-about-updates door. Separate from the switch above
+        # because the two do different things: one arms the startup gate, the
+        # other opens the install-method control. Its tooltip names the
+        # detected install method (`note_install_state`), and the Updates
+        # panel behind it states it in full.
         self.updates_manage_btn = QToolButton(self)
         self.updates_manage_btn.setObjectName("OptionsAction")
         self.updates_manage_btn.setText("Manage...")
-        self.updates_manage_btn.setToolTip(
-            "Open the Updates panel: how Claude Code is installed, and whether "
-            "it may update itself in the background.")
+        self._refresh_updates_manage_tip()
         self.updates_manage_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.updates_manage_btn.clicked.connect(self.updatesPanelRequested)
 
@@ -1000,7 +992,6 @@ class TopBar(QFrame):
                                           self.app_auto_update_btn)
         self.options_panel.add_switch_row(self.auto_update_label,
                                           self.auto_update_btn)
-        self.options_panel.add_widget(self.install_label)
         self.options_panel.add_row("", self.update_pill,
                                    self.updates_manage_btn)
         self.options_panel.add_separator()
@@ -1011,7 +1002,8 @@ class TopBar(QFrame):
                                           self.ship_confirm_btn)
         self.options_panel.add_switch_row(self.close_merged_confirm_label,
                                           self.close_merged_confirm_btn)
-        self.options_panel.add_separator()
+        # the right column: about as tall as the left with every row shown
+        self.options_panel.add_column()
         self.options_panel.add_section("Free up RAM")
         self.options_panel.add_switch_row(self.sleep_idle_label,
                                           self.sleep_idle_btn)
@@ -1542,21 +1534,28 @@ class TopBar(QFrame):
         return self._auto_update
 
     def note_install_state(self, text: str) -> None:
-        """Name the detected Claude Code install state under the switch it
-        explains. It used to be tooltip-only, which meant the answer to "how is
-        my Claude Code installed?" was reachable only by hovering."""
+        """Name the detected Claude Code install state on the Manage button's
+        tooltip. It sat under the switch as a two-line caption, which cost
+        the Options panel about 40px on a laptop screen it already filled.
+        The Updates panel the button opens states it in full."""
         self._install_state = text or ""
-        self.install_label.setText(self._install_state)
-        self.install_label.setVisible(bool(self._install_state))
+        self._refresh_updates_manage_tip()
         self._refresh_auto_update_btn()
+
+    def _refresh_updates_manage_tip(self) -> None:
+        tip = ("Open the Updates panel: how Claude Code is installed, and "
+               "whether it may update itself in the background.")
+        if self._install_state:
+            tip = f"{self._install_state}\n\n{tip}"
+        self.updates_manage_btn.setToolTip(tip)
 
     def _refresh_auto_update_btn(self) -> None:
         self.auto_update_btn.setChecked(self._auto_update)
         self.auto_update_label.setText("⬇  Check for CLI updates at start-up")
         # the tooltip states plainly what the armed switch does, because it
         # changes software on the user's machine rather than anything inside
-        # the app. The detected install state is no longer crammed in here:
-        # `install_label` says it in full, right under this row.
+        # the app. The detected install state is on the Manage button's
+        # tooltip, beside this row (`note_install_state`).
         tip = (
             "Startup check: ON. Next time AI Hive starts, it checks for a "
             "newer Claude Code and Gemini (agy) CLI and installs it BEFORE "

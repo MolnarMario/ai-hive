@@ -3654,12 +3654,12 @@ def test_options_panel():
                      bar.usage_add_btn],
           [w.objectName() or type(w).__name__ for w in on_row])
     moved = [bar.recover_btn, bar.resume_btn, bar.sound_btn, bar.taskbar_btn,
-             bar.auto_update_btn, bar.updates_manage_btn, bar.install_label,
+             bar.auto_update_btn, bar.updates_manage_btn,
              bar.update_pill, bar.theme_select, bar.font_dec_btn,
              bar.font_inc_btn]
-    check("options: every setting is parented to the panel, not the bar",
-          all(w.parent() is panel for w in moved),
-          [type(w).__name__ for w in moved if w.parent() is not panel])
+    check("options: every setting lives in the panel, not on the bar",
+          all(panel.isAncestorOf(w) for w in moved),
+          [type(w).__name__ for w in moved if not panel.isAncestorOf(w)])
     check("options: the two essential actions stay pinned on the bar",
           bar.toggle_btn.parent() is bar
           and bar.add_terminal_btn.parent() is bar
@@ -3859,9 +3859,77 @@ def test_options_panel_text_at_body_size():
     check("options: action buttons use the 13px body size",
           bar.shortcuts_btn.font().pixelSize() == 13,
           bar.shortcuts_btn.font().pixelSize())
-    panel.grab().save(str(SHOTS / "options_panel.png"))
     panel.hide()
     bar.deleteLater()
+
+
+def test_options_panel_fits_a_laptop():
+    """Stacked in one column, the Options panel grew to about 820 logical px,
+    the whole usable height of a 15" 1080p laptop at 125%, so the next
+    setting would have run off the bottom (reported live). It is two columns
+    now, and a window too short even for that scrolls the panel rather than
+    clipping its last rows."""
+    from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+    from app import ui_theme
+    from app.widgets.main_window import TopBar
+
+    app = QApplication.instance() or QApplication([])
+    app.setStyleSheet(ui_theme.build_qss())
+    win = QWidget()
+    lay = QVBoxLayout(win)
+    lay.setContentsMargins(0, 0, 0, 0)
+    bar = TopBar(win)
+    lay.addWidget(bar)
+    lay.addStretch(1)
+    win.resize(1366, 760)
+    win.move(0, 0)
+    win.show()
+    # every optional row showing: the tallest the panel gets today
+    bar.set_sleep_idle(True)
+    bar.bold_word_starts_btn.click()
+    panel = bar.options_panel
+    panel.open_under(bar.options_btn)
+    app.processEvents()
+    left = bar.recover_btn.parentWidget()
+    right = bar.theme_select.parentWidget()
+    check("options fit: Automation and Appearance sit in separate columns",
+          left is not right and left.parentWidget() is right.parentWidget()
+          and left.x() < right.x(), (left.x(), right.x()))
+    check("options fit: Agents stays left, Free up RAM goes right",
+          bar.agent_lanes_btn.parentWidget() is left
+          and bar.sleep_idle_btn.parentWidget() is right)
+    check("options fit: every row showing, the panel is under 560px tall",
+          panel.height() < 560 and panel.height() == panel.sizeHint().height(),
+          panel.size().toTuple())
+    check("options fit: ...and needs no scroll bar in a 760px window",
+          panel._scroll.verticalScrollBar().maximum() == 0)
+    check("options fit: the install note no longer takes a row",
+          not hasattr(bar, "install_label"))
+    panel.grab().save(str(SHOTS / "options_panel.png"))
+    panel.hide()
+
+    win.resize(1366, 360)
+    app.processEvents()
+    panel.open_under(bar.options_btn)
+    app.processEvents()
+    sb = panel._scroll.verticalScrollBar()
+    anchor_bottom = bar.options_btn.mapToGlobal(
+        bar.options_btn.rect().bottomLeft()).y()
+    check("options fit: a short window caps the panel inside the window",
+          win.geometry().contains(panel.geometry()),
+          (panel.geometry().getRect(), win.geometry().getRect()))
+    check("options fit: ...still dropped under the Options button, not "
+          "flipped up over the bar", panel.y() >= anchor_bottom,
+          (panel.y(), anchor_bottom))
+    check("options fit: ...and the rows scroll instead of being clipped",
+          sb.isVisible() and sb.maximum() > 0, sb.maximum())
+    check("options fit: ...with the scroll bar beside the rows, not over them",
+          panel._scroll.viewport().width() >= panel._body.minimumSizeHint()
+          .width(), (panel._scroll.viewport().width(),
+                     panel._body.minimumSizeHint().width()))
+    panel.hide()
+    win.close()
+    win.deleteLater()
 
 
 def test_topbar_extras_grow_with_window():
