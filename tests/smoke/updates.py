@@ -1000,12 +1000,18 @@ def test_cli_auto_update():
           "behind a closed panel is not a secret",
           bar.options_btn.property("attention") is True
           and "something" in bar.options_btn.toolTip())
-    # the detected install method is stated in full under the switch, not
-    # crammed into a tooltip
+    # the detected install method is on the Manage button's tooltip: as a
+    # caption under the switch it cost the panel two lines on a laptop
     bar.note_install_state("Claude Code, WinGet package")
-    check("cli-update: the install method is named under the switch",
-          bar.install_label.text() == "Claude Code, WinGet package"
-          and bar.install_label.isVisibleTo(bar.options_panel))
+    check("cli-update: the install method is named on Manage's tooltip",
+          bar.updates_manage_btn.toolTip().startswith(
+              "Claude Code, WinGet package\n")
+          and "Updates panel" in bar.updates_manage_btn.toolTip(),
+          bar.updates_manage_btn.toolTip())
+    bar.note_install_state("")
+    check("cli-update: ...and an unknown method leaves just the door's tip",
+          bar.updates_manage_btn.toolTip().startswith("Open the Updates"),
+          bar.updates_manage_btn.toolTip())
     bar.deleteLater()
 
     # --- 10. ui.auto_update round-trips, defaults False, no version bump ---

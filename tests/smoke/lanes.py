@@ -175,8 +175,8 @@ def test_agent_lanes_switch():
     check("lanes switch: defaults to OFF",
           not bar._agent_lanes and not bar.agent_lanes_btn.isChecked())
     check("lanes switch: it lives in the Options panel, not on the bar",
-          bar.agent_lanes_btn.parent() is bar.options_panel
-          and bar.agent_lanes_label.parent() is bar.options_panel)
+          bar.options_panel.isAncestorOf(bar.agent_lanes_btn)
+          and bar.options_panel.isAncestorOf(bar.agent_lanes_label))
     check("lanes switch: the label says it covers every workspace",
           "Lanes in every workspace" in bar.agent_lanes_label.text(),
           bar.agent_lanes_label.text())

@@ -651,9 +651,12 @@ workspaces keep executing — switching never pauses anything.
   used to compete for room up there: **Recover at start-up**, **Resume on usage
   reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Update AI
   Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times**, **Tooltips** and **Bionic reading** as labelled switches (each with a green/dark LED, so
-  "will my work resume by itself?" is answerable at a glance), the detected
-  Claude Code install method with a **Manage…** door to the Updates panel, and
-  the theme, global font size, terminal font and letter spacing below. Click outside or press `Esc` to close.
+  "will my work resume by itself?" is answerable at a glance), a **Manage…**
+  door to the Updates panel whose tooltip names the detected Claude Code install
+  method, and the theme, global font size, terminal font and letter spacing. The
+  panel lays its sections out in two columns, about 450 px tall with every row
+  showing, so it fits a 1080p laptop screen; a window shorter than that scrolls
+  it. Click outside or press `Esc` to close.
   The bar itself keeps only what you actually glance at: the usage pills and
   their `+`, and `+ Terminal`, so it fits on a laptop instead of hiding
   controls behind a scrollbar.
