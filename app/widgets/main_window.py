@@ -227,6 +227,14 @@ SCHEDULE_TICK_MS = 1000
 # surprise, not a hand-off. The user still sees the missed entry and can send it
 # by hand.
 SCHEDULE_GIVE_UP_S = 900
+# --- waking a sleeping agent to type into it (`_wake_agent`) ---
+# Ship finished lanes on an asleep integrator wakes it, then sends the request
+# once its resumed conversation sits at a free prompt. A resume boots in a few
+# seconds; a long conversation replays through pyte for longer, and a prompt
+# that never frees up (a menu left on screen) must not hold the request for
+# good. Past the timeout the user is told and nothing is sent.
+SHIP_WAKE_POLL_MS = 500
+SHIP_WAKE_TIMEOUT_S = 120
 # Slack past a reset time READ OFF THE SCREEN before acting on it. The account
 # does not free up on the exact second its banner named — the clock is printed
 # to the minute, the server rounds, and a nudge into a still-shut window costs
@@ -1482,9 +1490,11 @@ class TopBar(QFrame):
             "the conversation's summary, and a click resumes the same "
             "conversation. An agent that is working, asking you something, "
             "running a background command or holding a scheduled message "
-            "is never put to sleep.\nClick to turn off. Agents asleep now "
-            "stay asleep until you click them, and resume when AI Hive "
-            "opens again."
+            "is never put to sleep. A sleeping agent wakes on its own only "
+            "when AI Hive has to type into it: Ship finished lanes into the "
+            "integrator, or a message you scheduled for it.\nClick to turn "
+            "off. Agents asleep now stay asleep until you click them, and "
+            "resume when AI Hive opens again."
             if self._sleep_idle else
             "Sleep inactive agents: OFF. Every agent keeps running, and "
             "using memory, until you stop or close it.\nClick to stop agents "
@@ -3194,6 +3204,12 @@ class MainWindow(QMainWindow):
         self._sleep_at_startup = True
         # uids whose lane Close merged agents is reading again right now
         self._close_merged_reading: set[str] = set()
+        # integrator uid -> the ship request waiting for it to wake
+        # (_wake_to_ship). Transient: a close drops it unsent.
+        self._ship_waking: dict[str, dict] = {}
+        # a due scheduled message wakes at most one sleeping agent per tick
+        # (_deliver_scheduled), so a batch due together boots staggered
+        self._schedule_woke = False
         # every mutating lane git operation runs here, one at a time per repo
         # (app/lane_ops.py). Created whatever the toggles say: repairing,
         # retiring and reviving an existing lane never ask them.
@@ -5011,6 +5027,7 @@ class MainWindow(QMainWindow):
         if self._closing or not self._ready:
             return
         now = time.time()
+        self._schedule_woke = False
         for agent in self.manager.all_agents():
             if not agent.scheduled_messages():
                 continue
@@ -5037,6 +5054,13 @@ class MainWindow(QMainWindow):
         `SCHEDULE_GIVE_UP_S` is it given up on - and even then it is kept,
         MISSED, rather than dropped: the user chose a moment and it did not
         happen, which they need to be able to see.
+
+        An agent asleep to free memory is woken for its message, one per
+        tick, and the retries deliver it once its prompt is up. A sleep
+        never stops an agent that holds a message (`sleep_due`), but a
+        launch can keep one asleep and the sidebar's clock schedules onto a
+        sleeping card. Not for a message already past the give-up: that one
+        would go MISSED before the boot finished.
         """
         blocked = agent.is_limit_blocked()
         if not blocked and agent.nudge(msg.text):
@@ -5047,6 +5071,12 @@ class MainWindow(QMainWindow):
             self._schedule_audit(f"SENT agent={agent.spec.name} "
                                  f"late={int(now - msg.due_ts)}s")
             return
+        if (agent.is_asleep() and not self._schedule_woke
+                and now - msg.due_ts < SCHEDULE_GIVE_UP_S
+                and self._wake_agent(agent)):
+            self._schedule_woke = True
+            self._schedule_audit(f"WAKE agent={agent.spec.name} "
+                                 f"late={int(now - msg.due_ts)}s")
         agent.note_scheduled_attempt(msg.id)
         if now - msg.due_ts < SCHEDULE_GIVE_UP_S:
             return
@@ -5438,6 +5468,28 @@ class MainWindow(QMainWindow):
                         f"SLEEP agent={agent.spec.name!r} idle="
                         f"{int(now - agent.last_active_at())}s")
                     agent.put_to_sleep()
+
+    def _wake_agent(self, agent) -> bool:
+        """Resume a sleeping agent because AI Hive has to type into it: Ship
+        finished lanes into the integrator (_wake_to_ship), or a scheduled
+        message that came due (_deliver_scheduled). Nothing else wakes an
+        agent on its own. A lane agent whose work ships sleeps through it:
+        the integrator merges commits, the lane fast-forwards without its
+        child, and Close merged agents closes it asleep.
+
+        It starts the agent the way a click on the sleep screen does, but
+        leaves the keyboard focus where the user has it. The card's view
+        hears its settled width first, as a launch-queued start does, and
+        the start resumes the pinned conversation the sleep armed. False
+        when nothing started: the child the sleep stopped is still exiting,
+        or the start is held."""
+        if not agent.is_asleep() or agent.is_running():
+            return False
+        card = self._card_for_agent(agent.id)
+        if card is not None and card.is_pty and card.terminal is not None:
+            card.terminal.flush_resize()
+        agent.start()
+        return not agent.is_asleep()
 
     def _keeps_asleep_at_launch(self, agent, now: float) -> bool:
         """Should the launch restore leave this saved-running agent asleep?
@@ -6129,17 +6181,19 @@ class MainWindow(QMainWindow):
                 found.append((agent, view))
         return found
 
-    def _ship_state(self, ws, agent) -> tuple:
+    def _ship_state(self, ws, agent, waking: bool = False) -> tuple:
         """(finished lanes, why the integrator can't take a ship request
-        now or "")."""
+        now or ""). An integrator asleep to free memory can take one: Ship
+        wakes it first (_wake_to_ship). `waking` is that wake's own look,
+        which the request already waiting for it would otherwise refuse."""
         done = self._finished_lanes(ws, agent)
         if not done:
             why = "No lane has a \"Task done\" commit that the base lacks."
+        elif not waking and agent.spec.uid in self._ship_waking:
+            why = ("The integrator is waking up to take your last ship "
+                   "request.")
         elif agent.is_asleep():
-            # never "Restart": a restart starts a new conversation, and the
-            # integrator's is the one that knows what it already merged
-            why = ("The integrator is asleep to free memory. Click its card "
-                   "to resume its conversation first.")
+            why = ""
         elif not agent.is_running():
             why = "The integrator is stopped. Restart it first."
         elif agent.is_busy() or agent.is_waiting():
@@ -6159,9 +6213,12 @@ class MainWindow(QMainWindow):
         if why:
             return (label, False, why)
         names = ", ".join(a.spec.name for a, _ in done)
+        asks = (f"Resumes {agent.spec.name}'s conversation, which is asleep "
+                f"to free memory, then asks it" if agent.is_asleep()
+                else "Asks the integrator")
         return (label, True,
-                f"Asks the integrator to ship {names}: one pull request, "
-                f"reviewed and tested, then merged.")
+                f"{asks} to ship {names}: one pull request, reviewed and "
+                f"tested, then merged.")
 
     def _ship_lanes(self, ws_id: str, agent) -> None:
         """The integrator chip's Ship finished lanes: the user asking the
@@ -6169,7 +6226,9 @@ class MainWindow(QMainWindow):
         "Task done" commit the user confirmed, so a lane flagged (or
         flagged again) after the click waits for the next ask. Only this
         click types into the integrator; a flag never does
-        (_log_done_lanes)."""
+        (_log_done_lanes). An integrator asleep to free memory is woken
+        for it (_wake_to_ship). The lanes' own agents are not: what ships
+        is their commits."""
         ws = self.manager.workspace(ws_id)
         if ws is None or agent is None or not self.manager.is_integrator(agent):
             return
@@ -6191,6 +6250,14 @@ class MainWindow(QMainWindow):
                                why or f"{agent.spec.name} is no longer the "
                                       f"integrator.")
             return
+        if agent.is_asleep():
+            self._wake_to_ship(ws_id, agent, done)
+            return
+        self._send_ship(agent, done)
+
+    def _send_ship(self, agent, done: list) -> None:
+        """Type the ship request naming `done`, the lanes the user
+        confirmed, into the integrator."""
         lanes_at = ", ".join(f"{view.branch} at {view.done[:12]}"
                              for _a, view in done)
         text = (f"Ship the finished lanes now: {lanes_at}. Merge each of "
@@ -6204,6 +6271,106 @@ class MainWindow(QMainWindow):
         self._store_audit(f"LANE-SHIP agent={agent.spec.name!r} "
                           f"lanes={lanes_at}")
 
+    def _wake_to_ship(self, ws_id: str, agent, done: list) -> None:
+        """Ship finished lanes on an integrator asleep to free memory: wake
+        it, then send the request once its prompt is free (_ship_wake_tick).
+
+        The request goes only into the conversation the integrator slept
+        in. A start can fall back to a new conversation (the pinned
+        transcript is gone, or the resume failed fast), and that one gets
+        nothing, because only the old one knows what it already merged.
+        That is also why this never restarts it."""
+        name = agent.spec.name
+        sid = agent.spec.session_id
+        if not self._wake_agent(agent):
+            self._lane_message(
+                "Nothing shipped",
+                f"{name} is still stopping from its sleep. Try again in a "
+                f"moment." if agent.is_running() else
+                f"{name} could not be woken. Click its card to resume it, "
+                f"then ship again.")
+            return
+        uid = agent.spec.uid
+        timer = QTimer(self)
+        timer.setInterval(SHIP_WAKE_POLL_MS)
+        timer.timeout.connect(lambda u=uid: self._ship_wake_tick(u))
+        self._ship_waking[uid] = {
+            "ws_id": ws_id, "agent": agent, "sid": sid,
+            "done": [(a.spec.uid, v.done) for a, v in done],
+            "woke_at": time.time(),
+            "deadline": time.monotonic() + SHIP_WAKE_TIMEOUT_S,
+            "timer": timer}
+        self._store_audit(f"LANE-SHIP-WAKE agent={name!r}")
+        timer.start()
+        # the start itself may already have moved it onto a new conversation
+        self._ship_wake_tick(uid)
+
+    def _ship_wake_tick(self, uid: str) -> None:
+        """One look at an integrator woken for a ship request. It sends the
+        request once the prompt is free, waits while the integrator boots,
+        and drops the request, saying why, once it can no longer go in as
+        the user confirmed it."""
+        entry = self._ship_waking.get(uid)
+        if entry is None:
+            return
+        agent = entry["agent"]
+        ws = self.manager.workspace(entry["ws_id"])
+        name = agent.spec.name
+        if self._closing or ws is None or agent not in ws.agents:
+            # a close, of the window or of the card, drops it unsent
+            self._end_ship_wake(uid, "")
+            return
+        if not self.manager.is_integrator(agent):
+            self._end_ship_wake(uid, f"{name} is no longer the integrator.")
+            return
+        if agent.spec.session_id != entry["sid"]:
+            self._end_ship_wake(
+                uid, f"{name} could not resume its conversation and started "
+                     f"a new one, so it was not asked to ship. Only the old "
+                     f"conversation knows what it already merged. Check its "
+                     f"card, then ship again if the new one should do it.")
+            return
+        if agent.last_submit_at() > entry["woke_at"]:
+            self._end_ship_wake(
+                uid, f"You sent {name} something while it woke up, so it was "
+                     f"not asked to ship. Ship again once it has answered.")
+            return
+        done, why = self._ship_state(ws, agent, waking=True)
+        if [(a.spec.uid, v.done) for a, v in done] != entry["done"]:
+            self._end_ship_wake(
+                uid, f"The finished lanes changed while {name} woke up. Open "
+                     f"the menu again to see the new list.")
+            return
+        card = self._card_for_agent(agent.id)
+        if not why and card is not None and card.has_draft():
+            # the user is typing into it: the request must not land in
+            # their draft
+            why = "draft"
+        if why:
+            if time.monotonic() >= entry["deadline"]:
+                self._end_ship_wake(
+                    uid, f"{name} did not reach a free prompt within "
+                         f"{SHIP_WAKE_TIMEOUT_S} seconds of waking up, so it "
+                         f"was not asked to ship. Ship again once it is at "
+                         f"its prompt.")
+            return
+        self._end_ship_wake(uid, "")
+        self._send_ship(agent, done)
+
+    def _end_ship_wake(self, uid: str, why: str) -> None:
+        """Forget the ship request waiting for a woken integrator. `why`
+        says to the user why it was not sent; empty when it was, or when a
+        close dropped it."""
+        entry = self._ship_waking.pop(uid, None)
+        if entry is None:
+            return
+        entry["timer"].stop()
+        entry["timer"].deleteLater()
+        if why:
+            self._store_audit(f"LANE-SHIP-DROP agent="
+                              f"{entry['agent'].spec.name!r}: {why}")
+            self._lane_message("Nothing shipped", why)
+
     def _confirm_ship(self, agent, done: list) -> bool:
         """The user's go-ahead for Ship finished lanes (tests replace it).
         Ticking "Don't ask again" and pressing OK stops this dialog
@@ -6211,10 +6378,12 @@ class MainWindow(QMainWindow):
         finished lanes" turns it back on; Cancel keeps asking."""
         lines = "\n".join(f"  {a.spec.name}: {view.branch} at "
                           f"{view.done[:7]}" for a, view in done)
+        wake = (f"\n\n{agent.spec.name} is asleep to free memory. OK resumes "
+                f"its conversation first." if agent.is_asleep() else "")
         box = QMessageBox(
             QMessageBox.Icon.Question, "Ship finished lanes",
             f"{agent.spec.name} combines these lanes into one pull request, "
-            f"gets it reviewed and tested, and merges it:\n\n{lines}",
+            f"gets it reviewed and tested, and merges it:\n\n{lines}{wake}",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             self)
         box.setDefaultButton(QMessageBox.StandardButton.Cancel)

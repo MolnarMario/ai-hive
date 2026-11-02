@@ -134,7 +134,12 @@ workspaces keep executing — switching never pauses anything.
   Only Claude, Antigravity and Codex agents with a pinned conversation
   sleep, and never while one is working, asking you something, running a
   background command, waiting out the plan limit, holding a scheduled
-  message or holding a prompt you typed but didn't send. **Keep them
+  message or holding a prompt you typed but didn't send. A sleeping agent
+  wakes on its own only when AI Hive has to type into it: **Ship finished
+  lanes** into an asleep integrator, or a message you scheduled for it
+  coming due. Lane agents sleep through a ship, because the integrator
+  merges their commits, and **Close merged agents** closes them asleep.
+  **Keep them
   asleep at startup** (on whenever you turn sleep on) leaves an agent that
   was asleep at close, or idle that long, asleep when AI Hive opens.
   Switch either one off and every agent that was running or asleep
@@ -585,7 +590,8 @@ workspaces keep executing — switching never pauses anything.
   or click the integrator's `integrator` chip (its icon shows two lanes
   merging) and pick **Ship finished
   lanes**. That asks you to confirm the list, then types the request into
-  the integrator. The dialog's "Don't ask again" skips the question from
+  the integrator, resuming its conversation first if it is asleep to free
+  memory. The dialog's "Don't ask again" skips the question from
   then on; ⚙ Options > Agents > **Confirm Ship finished lanes** brings it
   back. It gathers the lanes you name, or every lane with an unmerged `Task done`
   commit, into one `integrate/` branch. If the base branch has
