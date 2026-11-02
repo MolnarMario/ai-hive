@@ -1298,6 +1298,25 @@ def test_terminal_click_over_collapsed_paste():
           click(wrapped, (1, 16), (0, 90)) == [U, R * 66],
           click(wrapped, (1, 16), (0, 90)))
 
+    # a word longer than the row breaks wherever the row ends, here inside
+    # the token: "[Pas" / "ted text #1 +4 lines]" (60 columns)
+    def click60(rows, caret, at):
+        view = TerminalView(rows=8, cols=60)
+        view.feed("\r\n".join(rows)
+                  + "\x1b[%d;%dH" % (caret[0] + 1, caret[1] + 1))
+        out = []
+        view.keyInput.connect(out.append)
+        view._reposition_cursor(*at)
+        return out
+
+    split = [P + "b" * 54 + "[Pas", "  ted text #1 +4 lines] tail"]
+    check("pastecaret: a token split mid-word still ends where it ends",
+          click60(split, (1, 28), (1, 5)) == [L * 5],
+          click60(split, (1, 28), (1, 5)))
+    check("pastecaret: a token split mid-word still starts where it starts",
+          click60(split, (1, 28), (0, 58)) == [U, R * 28],
+          click60(split, (1, 28), (0, 58)))
+
     # Up keeps the column and parks the caret inside the token; from there
     # Left moves one column at a time to the token's start (measured)
     two = [TOKEN_ROW, "  0123456789012345678901234567890123456789"]

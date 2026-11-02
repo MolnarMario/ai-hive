@@ -31,9 +31,27 @@ cell at col, and tuple order is reading order.
 
 import re
 
-# \s+ between the words: a token that wraps loses the space at the break.
+# A token that wraps is matched across the "\n" that joins its rows. Word
+# wrap breaks at a space and drops it, which \s+ covers. A word longer than
+# the row (a path typed right up to the paste) breaks wherever the row
+# ends, even inside the token, so a break may sit between any two of its
+# characters.
+_BREAK = r"\n?"
+_SPACE = r"\s+"
+_NUM = r"\d(?:\n?\d)*"
+
+
+def _word(text: str) -> str:
+    return _BREAK.join(re.escape(ch) for ch in text)
+
+
 TOKEN = re.compile(
-    r"\[(?:Pasted\s+text\s+#\d+(?:\s+\+\d+\s+lines?)?|Image\s+#\d+)\]")
+    r"\[" + _BREAK + "(?:"
+    + _word("Pasted") + _SPACE + _word("text") + _SPACE + "#" + _BREAK + _NUM
+    + "(?:" + _SPACE + r"\+" + _BREAK + _NUM + _SPACE + _word("line")
+    + "(?:" + _BREAK + "s)?)?"
+    + "|" + _word("Image") + _SPACE + "#" + _BREAK + _NUM
+    + ")" + _BREAK + r"\]")
 
 _BLANK = ("", " ")
 # What follows the prompt glyph. Claude paints "❯" and a no-break space, so
