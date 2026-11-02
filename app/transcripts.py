@@ -1292,11 +1292,7 @@ def claude_model_label(raw: str) -> str:
     text = (raw or "").strip()
     if not text or text.lower() == "default":
         return ""
-    bare = text.lower().replace("[1m]", "").strip()
-    for label, value in providers.CLAUDE_MODELS:
-        if value and value == bare:
-            return label.split(" (", 1)[0]
-    return model_display(text)
+    return providers.claude_picker_label(text) or model_display(text)
 
 
 def latest_model_effort(cwd: str, session_id: str) -> tuple[str, str, str]:
