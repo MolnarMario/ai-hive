@@ -783,7 +783,7 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 #StatusGlyph[state="dead"] {{ color: {p.RED}; }}
 #StatusGlyph[state="asleep"] {{ color: {p.TEXT_FAINT}; }}
 /* a card asleep to free memory (TerminalCard.sleep_screen): black, with the
-   conversation's summary and the way back in the middle */
+   conversation's summary, Claude's recap and the way back in the middle */
 #SleepScreen {{ background: #000000; }}
 #SleepCaption {{
     color: {p.TEXT_FAINT}; font-family: {BODY_FONT}; font-size: 11px;
@@ -792,6 +792,9 @@ TerminalCard[focused="true"] {{ border: 1px solid {p.ACCENT_ORANGE}; }}
 #SleepSummary {{
     color: {p.TEXT}; font-family: {BODY_FONT}; font-size: 17px;
     font-weight: 600;
+}}
+#SleepRecap {{
+    color: {p.TEXT_DIM}; font-family: {BODY_FONT}; font-size: 13px;
 }}
 #SleepSince {{ color: {p.TEXT_DIM}; font-family: {BODY_FONT}; font-size: 12px; }}
 #SleepResume {{
