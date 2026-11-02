@@ -3144,23 +3144,23 @@ def test_last_active_marks_dirty():
     ws = mgr.create_workspace("LastActive", SCRATCH_CWD)
     agent, _calls, _live = _sleepy_claude(mgr, ws.id, "Busy", SCRATCH_CWD)
     agent._session_started = 0.0
-    agent._last_work_ts = 100 * 60 + 5
+    agent._last_reply_ts = 100 * 60 + 5
     agent.activity_changed.emit(False)   # settles the starting minute
     dirties = []
     mgr.dirty.connect(lambda: dirties.append(1))
 
-    agent._last_work_ts = 101 * 60 + 5
+    agent._last_reply_ts = 101 * 60 + 5
     agent.activity_changed.emit(True)
     check("last active: a burst starting marks nothing", not dirties,
           len(dirties))
     agent.activity_changed.emit(False)
     check("last active: a burst ending in a new minute marks dirty",
           len(dirties) == 1, len(dirties))
-    agent._last_work_ts = 101 * 60 + 40
+    agent._last_reply_ts = 101 * 60 + 40
     agent.activity_changed.emit(False)
     check("last active: another burst in the same minute marks nothing",
           len(dirties) == 1, len(dirties))
-    agent._last_work_ts = 102 * 60 + 1
+    agent._last_reply_ts = 102 * 60 + 1
     agent.activity_changed.emit(False)
     check("last active: the next minute marks dirty again",
           len(dirties) == 2, len(dirties))
@@ -3257,10 +3257,10 @@ def test_sleep_idle_agents():
     agent._session_started = now - 2 * hour
     check("sleep: an agent idle past the hours is due",
           agent.sleep_due(hour, now))
-    agent._last_input_ts = now - 30
+    agent._last_key_ts = now - 30
     check("sleep: a key typed into it counts as activity",
           not agent.sleep_due(hour, now))
-    agent._last_input_ts = 0.0
+    agent._last_key_ts = 0.0
     for attr, label in (("_busy", "working"), ("_waiting", "asking the user"),
                         ("_bg_shell", "running a background command"),
                         ("_limit_blocked", "cut off by the plan limit")):
@@ -3466,6 +3466,86 @@ def test_sleep_idle_agents():
         win._close_agent(wws.id, a.id)
     win.close(); pump(120)
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_sleep_idle_ignores_focus_and_redraws():
+    """Free up RAM never slept an agent anyone looked at. A focus change
+    sends the child "\\x1b[I"/"\\x1b[O" through write(), which stamped it as
+    a key, and output with no turn open (a workspace switch's redraw,
+    Claude's away recap) stamped it as work, so every look gave the agent a
+    fresh idle hour. Measured live: an agent idle two hours past a one hour
+    setting read active "now" the moment a dialog took its focus. Only a
+    real key, a submit, a start, a turn's output or a Stop counts."""
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from app.terminal_agent import TURN_QUIET_S
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("SleepFocus", SCRATCH_CWD)
+    agent, _calls, _live = _sleepy_claude(mgr, ws.id, "Looked at",
+                                          SCRATCH_CWD)
+    agent.worker.write = lambda data: True
+    hour = 3600.0
+    idle_since = time.time() - 2 * hour
+    agent._session_started = idle_since
+
+    agent.write("\x1b[O")
+    agent.write("\x1b[I")
+    check("sleep focus: focus reports are not activity",
+          agent.last_active_at() == idle_since
+          and agent.sleep_due(hour), agent.last_active_at() - idle_since)
+    check("sleep focus: a focus report still opens the echo window",
+          time.time() - agent._last_input_ts < 5)
+
+    agent._last_input_ts = 0.0          # past the echo window
+    agent._mark_busy()                  # a redraw or recap, no turn open
+    agent._idle_timer.stop()
+    agent._on_idle_timeout()
+    check("sleep focus: output with no turn open is not activity",
+          agent.last_active_at() == idle_since
+          and agent.sleep_due(hour), agent.last_active_at() - idle_since)
+
+    agent.write("x")
+    check("sleep focus: a real key still counts",
+          not agent.sleep_due(hour))
+    agent._last_key_ts = 0.0
+
+    agent._last_submit_ts = time.time() - 30
+    agent._awaiting_reply = True        # a turn submitted 30 s ago
+    agent._last_input_ts = 0.0
+    agent._mark_busy()
+    agent._idle_timer.stop()
+    agent._on_idle_timeout()
+    check("sleep focus: a turn's output counts",
+          time.time() - agent._last_reply_ts < 5)
+    agent._awaiting_reply = False
+    agent._last_submit_ts = 0.0
+    agent._last_reply_ts = 0.0
+
+    agent._last_submit_ts = time.time() - TURN_QUIET_S - 60
+    agent._last_work_ts = agent._last_submit_ts
+    agent._awaiting_reply = True        # a turn whose Stop never came
+    agent._mark_busy()
+    agent._idle_timer.stop()
+    agent._on_idle_timeout()
+    check("sleep focus: output long after an unclosed turn is a redraw",
+          agent._last_reply_ts == 0.0, agent._last_reply_ts)
+    agent._awaiting_reply = False
+    agent._last_submit_ts = 0.0
+
+    agent.note_reply_stopped(time.time() - 3 * hour)
+    check("sleep focus: a Stop older than the idle time moves nothing",
+          agent.last_active_at() == idle_since)
+    agent.note_reply_stopped(time.time() - 10)
+    check("sleep focus: a Stop with no turn open counts (Claude replied "
+          "on its own)", not agent.sleep_due(hour))
+    agent.note_reply_stopped(time.time() - 3 * hour)
+    check("sleep focus: a late older Stop never moves it back",
+          time.time() - agent.last_active_at() < 60)
 
 
 def test_scheduled_message_wakes_sleeping_agent():

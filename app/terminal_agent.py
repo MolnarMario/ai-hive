@@ -96,6 +96,14 @@ BUSY_IDLE_MS = 2000
 # pulses a beat later. Seconds, compared against time.time().
 INPUT_ECHO_S = 0.8
 
+# What the view sends for a focus change once the child asked for focus
+# events (?1004, which Claude does). It goes through write() like a key and
+# keeps the echo window, but it is not the user doing anything to the agent:
+# counted as activity, every switch between cards, workspaces or apps gave
+# the card left and the card landed on a fresh idle hour, and Free up RAM
+# never slept an agent anyone looked at.
+FOCUS_REPORTS = ("\x1b[I", "\x1b[O")
+
 # A resize makes a full-screen TUI redraw its whole frame, and that redraw is
 # not work either. Opening or closing the sidebar resizes every visible card,
 # which used to light every idle workspace amber for the 2 s idle window.
@@ -643,6 +651,12 @@ class TerminalAgent(QObject):
         # the usage poll's cadence follows it (see usage_poll.provider_active)
         self._last_work_ts = 0.0
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
+        # ...and the two stamps the idle sleep reads (last_active_at): a key
+        # that is not a focus report, and output while a submitted turn is
+        # open or a Stop hook. Output outside a turn is a redraw or Claude's
+        # away recap, which nobody asked for.
+        self._last_key_ts = 0.0
+        self._last_reply_ts = 0.0
         self._last_resize_ts = 0.0    # walltime the child was last resized
         # the last activity a previous run saved (see last_active_at), so an
         # agent idle since yesterday reads as idle before it starts today
@@ -991,12 +1005,18 @@ class TerminalAgent(QObject):
         return self._asleep
 
     def last_active_at(self) -> float:
-        """Wall time of this agent's last activity: work it printed, a key
-        the user typed, a line submitted, or a start. Reads the time an
+        """Wall time of this agent's last activity: a reply it printed, a
+        key the user typed, a line submitted, or a start. Reads the time an
         earlier run saved until this run has something newer. 0.0 when
-        nothing is known."""
-        return max(self._active_floor, self._last_work_ts,
-                   self._last_input_ts, self._last_submit_ts,
+        nothing is known.
+
+        Not every output burst or write is activity. A focus report is not
+        a key (FOCUS_REPORTS), and output with no turn open is a redraw or
+        the recap Claude prints when the user comes back, so neither moves
+        this. Both did once, and an idle agent never reached its sleep
+        hour."""
+        return max(self._active_floor, self._last_reply_ts,
+                   self._last_key_ts, self._last_submit_ts,
                    self._session_started)
 
     def restore_last_active(self, when) -> None:
@@ -1121,6 +1141,8 @@ class TerminalAgent(QObject):
         # echo of that typing apart from genuine agent output — echo must not
         # light the "working" pulse (see _mark_busy / INPUT_ECHO_S).
         self._last_input_ts = time.time()
+        if data not in FOCUS_REPORTS:
+            self._last_key_ts = self._last_input_ts
         submit = submits_a_line(data)
         if submit:
             self._note_submit()
@@ -1569,6 +1591,11 @@ class TerminalAgent(QObject):
         (a background task finished), which is a new ending for the same
         turn, so it reopens the mark to follow that one instead."""
         self._close_awaited_turn()      # the turn ended (TURN_QUIET_S)
+        # a reply ended then, even one Claude gave on its own after a
+        # background task, whose output opened no turn (last_active_at).
+        # max(): a Stop polled in late or replayed must not move it back.
+        if isinstance(ts, (int, float)) and ts <= time.time():
+            self._last_reply_ts = max(self._last_reply_ts, float(ts))
         if not self.is_pty or not self._turn_open:
             return
         self._turn_end_ts = ts
@@ -2557,6 +2584,11 @@ class TerminalAgent(QObject):
         # a pulse left over from real work still drops on schedule instead of
         # being held alive by the typing). Genuine work outlasts the window.
         if now - self._last_input_ts >= INPUT_ECHO_S:
+            # read before this burst stamps _last_work_ts, which would keep
+            # any turn ever opened pending; the TURN_QUIET_S bound covers a
+            # Claude whose Stop hook never comes
+            if self.turn_pending():
+                self._last_reply_ts = now
             self._last_work_ts = now
             if not self._busy:
                 self._busy = True
