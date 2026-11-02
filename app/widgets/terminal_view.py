@@ -133,15 +133,17 @@ on screen. A plain (unshifted) arrow
 collapses it, then forwards to move the child's caret. Shift+click EXTENDS the
 current selection to the clicked cell; a TRIPLE-click selects the whole line.
 A selection (mouse OR keyboard) is EDITABLE like any editor selection: Ctrl+C
-copies it, Ctrl+X cuts it, and Backspace/Del deletes it. Deletion/cut drive the
+copies it, Ctrl+X cuts it, Backspace/Del deletes it, and typing (a key or a
+committed IME/emoji string) replaces it. Deletion/cut/replace drive the
 child's caret to the selection end + Backspace over it, so they act on any
 selection INSIDE the live input box -- single OR multi-row/wrapped (the box maps
 to the child's logical line, one Backspace per row transition; the leading '> '
 prompt is never counted). Fail-closed: a selection that escapes the input box
-(output/scrollback) or a scrolled-back view drops the selection and touches
+(output/scrollback) or a scrolled-back view drops the selection and deletes
 nothing -- inference from painted rows must never corrupt what it can't be sure
-of. To empty the whole prompt at once, use Ctrl+A then Backspace (the
-clear-prompt gesture above).
+of. Backspace/Del then send nothing; a typed character still goes in at the
+caret, so no keystroke is lost. To empty the whole prompt at once, use Ctrl+A
+then Backspace (the clear-prompt gesture above).
 A drag held above or below the view scrolls history under it, faster the
 further past the edge, and selects whole rows to that edge. A held pointer
 sends no moves, so a timer drives it (_drag_scroll_tick). The selection is
@@ -2172,6 +2174,8 @@ class TerminalView(QWidget):
         if text:
             if self._input_selected:
                 self._clear_input_selection(send=True)  # replace, as typing does
+            elif self._selection_range() is not None:
+                self._delete_and_drop_selection()
             if "\r" in text or "\n" in text:
                 self._paste_text(
                     text.replace("\r\n", "\r").replace("\n", "\r"))
@@ -2312,7 +2316,7 @@ class TerminalView(QWidget):
             # itself is sent and becomes the fresh input. Control/navigation
             # keys (arrows, Enter, Ctrl-combos) instead just drop the highlight,
             # the way an editor collapses a selection without deleting it.
-            if event.text() and event.text().isprintable() and not ctrl and not alt:
+            if self._types_char(event, ctrl, alt):
                 self._clear_input_selection(send=True)
                 # fall through -> _sequence_for emits the typed character below
             else:
@@ -2327,11 +2331,19 @@ class TerminalView(QWidget):
         if (not self._input_selected and self._selection_range() is not None
                 and key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete)
                 and not ctrl and not alt):
-            self._delete_selection()
-            self._sel_anchor = self._sel_end = None
-            self.update()
+            self._delete_and_drop_selection()
             event.accept()
             return
+        # Typing over that selection replaces it: delete it as Backspace
+        # does, then fall through so the character lands where it was.
+        # Without this the character went in at the caret and the selected
+        # text stayed. A selection _delete_selection refuses (off the input
+        # box, scrolled back, a menu open) is only dropped, and the key
+        # still reaches the child as it would with nothing selected.
+        if (not self._input_selected and self._selection_range() is not None
+                and self._types_char(event, ctrl, alt)):
+            self._delete_and_drop_selection()
+            # fall through -> _sequence_for emits the typed character below
 
         # clipboard / editing shortcuts, Windows-editor style. These win over
         # the terminal control byte the same combo would otherwise send.
@@ -2358,9 +2370,7 @@ class TerminalView(QWidget):
         if ctrl and not shift and key == Qt.Key.Key_X \
                 and self._selection_range() is not None:
             self.copy_selection()
-            self._delete_selection()
-            self._sel_anchor = self._sel_end = None
-            self.update()
+            self._delete_and_drop_selection()
             event.accept()
             return
         # Ctrl+Shift+A selects ALL painted text (screen + scrollback) for
@@ -2939,6 +2949,25 @@ class TerminalView(QWidget):
         self._drive_caret(carets, end)        # caret to just past the span end
         self.keyInput.emit("\x7f" * count)    # then Backspace over it
         return True
+
+    def _delete_and_drop_selection(self) -> None:
+        """Delete a mouse or keyboard selection when _delete_selection can,
+        and drop it either way: Backspace/Del, Ctrl+X, and typed text over
+        it. Typed text is sent next, so it lands where the selection was,
+        or at the caret when the selection couldn't be deleted."""
+        self._delete_selection()
+        self._sel_anchor = self._sel_end = None
+        self.update()
+
+    @staticmethod
+    def _types_char(event, ctrl: bool, alt: bool) -> bool:
+        """The key types a character: printable text with neither Ctrl nor
+        Alt. Qt on Windows reports AltGr as Ctrl+Alt, and _sequence_for
+        sends Alt text ESC-prefixed (meta), so an AltGr key must not count
+        here until it goes out as plain text: replacing would delete the
+        selection and then send the meta sequence, not the character."""
+        text = event.text()
+        return bool(text) and text.isprintable() and not ctrl and not alt
 
     def _extend_kbd_selection(self, key, word: bool) -> None:
         """Grow the LOCAL copy selection by one cell (or one word with Ctrl)

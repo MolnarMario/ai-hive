@@ -128,8 +128,9 @@ workspaces keep executing — switching never pauses anything.
 - **Free up RAM.** Every running agent is a whole CLI process, 150 to 300 MB
   for Claude. ⚙ Options > Free up RAM > **Sleep inactive agents** (off by
   default) stops an agent after 1 hour without activity (set it from 1 to
-  24 hours under **Asleep after**). Activity is output it prints, a key you
-  type into it, or a start. Its card turns black with the conversation's
+  24 hours under **Asleep after**). Activity is a reply it prints, a key you
+  type into it, or a start. Switching to its card, workspace or window is
+  not. Its card turns black with the conversation's
   summary, Claude's last recap under it (the "recap:" line Claude prints a
   few minutes after a reply, shown only if no work came after it) and
   **Click to resume conversation**, its sidebar dot turns gray,
@@ -1096,7 +1097,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4454 checks drive the real app headlessly (offscreen Qt platform) with real
+4486 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1246,7 +1247,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4454 checks)
+                           (4486 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

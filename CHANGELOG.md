@@ -8,6 +8,17 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.56.2
+
+- Free up RAM puts an idle agent to sleep on time again. Switching to a
+  card, a workspace or another app used to count as activity and restart
+  its idle clock, so an agent you only looked at never slept. Now only a
+  key you type, a reply it gives or a start counts, and clicking away from
+  a sleeping card no longer wakes it.
+- Typing over text you selected in a card's input box replaces it, the
+  way Backspace already deleted it. Before, the character went in at the
+  caret and the selection stayed.
+
 ## 0.56.1
 
 - Internal: the Claude model picker's labels and the per-model effort

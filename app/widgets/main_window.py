@@ -832,8 +832,8 @@ class TopBar(QFrame):
         self.sleep_hours_label.setObjectName("OptionsRowLabel")
         self.sleep_hours_label.setToolTip(
             "Hours without activity before an agent is put to sleep, 1 to "
-            f"{SLEEP_HOURS_MAX}. Activity is output it prints, a key you "
-            "type into it, or a start.")
+            f"{SLEEP_HOURS_MAX}. Activity is a reply it prints, a key you "
+            "type into it, or a start. Looking at an agent is not.")
         self.sleep_startup_label = toggle_label("")
         self.sleep_startup_btn = ToggleSwitch(self)
         self.sleep_startup_btn.clicked.connect(

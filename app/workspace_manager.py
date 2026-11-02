@@ -712,16 +712,26 @@ class WorkspaceManager(QObject):
             elif kind == session_hook.EV_TURN_SET:
                 # every Stop writes exactly one TURN_SET or TURN_CLEAR, and
                 # either way the reply ended then (a question is a reply too)
-                agent.note_reply_stopped(_event_ts(rec))
+                self._note_reply_stopped(agent, rec)
                 if not agent.is_busy():
                     agent.set_turn_waiting(True)
             elif kind == session_hook.EV_TURN_CLEAR:
                 # the Stop hook's "turn ended on a statement": Claude's exact
                 # reply-finished edge (the other providers time it instead)
-                agent.note_reply_stopped(_event_ts(rec))
+                self._note_reply_stopped(agent, rec)
                 agent.set_turn_waiting(False)
                 agent.note_turn_ended()
         self._confirm_tool_prompts()
+
+    def _note_reply_stopped(self, agent, rec) -> None:
+        """A Stop can move the persisted last_active on its own: a reply
+        Claude gives after a background task opens no turn, so its output
+        stamped nothing and the burst's save (see on_activity) saw the old
+        minute. Save when the minute moved, as on_activity does."""
+        before = agent.last_active_at() // 60
+        agent.note_reply_stopped(_event_ts(rec))
+        if agent.last_active_at() // 60 != before:
+            self.dirty.emit()
 
     def _confirm_tool_prompts(self) -> None:
         """Light the "?" for a tool prompt only once its call is in the

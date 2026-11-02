@@ -1104,6 +1104,135 @@ def test_terminal_selection_edit():
           v3.selected_text() == "")
 
 
+def test_terminal_selection_typing_replaces():
+    """Typing over a double-clicked or dragged word in the input box replaces
+    it, as in an editor. The bug: the character went in at the caret and the
+    selected text stayed, while Backspace/Del did delete it. A selection the
+    view can't delete is dropped and the character still reaches the child."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QInputMethodEvent, QKeyEvent, QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                            TerminalView)
+
+    QApplication.instance() or QApplication([])
+    K = Qt.Key
+    LB = Qt.MouseButton.LeftButton
+    NOMOD = Qt.KeyboardModifier.NoModifier
+
+    def pos(view, row, col):
+        return QPointF(CELL_PAD_X + (col + 0.5) * view._cell_w,
+                       CELL_PAD_Y + (row + 0.5) * view._cell_h)
+
+    def dbl(view, row, col):
+        view.mouseDoubleClickEvent(QMouseEvent(
+            QEvent.Type.MouseButtonDblClick, pos(view, row, col), LB, LB,
+            NOMOD))
+
+    def drag(view, row, c0, c1):
+        view.mousePressEvent(QMouseEvent(
+            QEvent.Type.MouseButtonPress, pos(view, row, c0), LB, LB, NOMOD))
+        view.mouseMoveEvent(QMouseEvent(
+            QEvent.Type.MouseMove, pos(view, row, c1), Qt.MouseButton.NoButton,
+            LB, NOMOD))
+        view.mouseReleaseEvent(QMouseEvent(
+            QEvent.Type.MouseButtonRelease, pos(view, row, c1), LB,
+            Qt.MouseButton.NoButton, NOMOD))
+
+    def type_key(view, key, text, mods=NOMOD):
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, mods, text))
+
+    def fresh(text):
+        view = TerminalView(rows=6, cols=80)
+        view.feed(text)
+        sent = []
+        view.keyInput.connect(sent.append)
+        return view, sent
+
+    # "hello world", caret at col 11. Double-click "hello" and type "x":
+    # 6 Lefts park the caret after "hello", 5 Backspaces delete it, then
+    # the "x" goes where it was.
+    v, sent = fresh("hello world")
+    dbl(v, 0, 2)
+    check("seltype: double-click selects the word", v.selected_text() == "hello",
+          v.selected_text())
+    type_key(v, K.Key_X, "x")
+    check("seltype: typing over a double-clicked word replaces it",
+          sent == ["\x1b[D" * 6, "\x7f" * 5, "x"], sent)
+    check("seltype: typing drops the selection", v._selection_range() is None)
+    sent.clear()
+    type_key(v, K.Key_Y, "y")
+    check("seltype: the next character is plain typing",
+          sent == ["y"], sent)
+
+    # a drag over "world" (cols 6-10), with Shift held for a capital: the
+    # caret already sits just past it, so no arrows
+    v, sent = fresh("hello world")
+    drag(v, 0, 6, 10)
+    check("seltype: a drag selects the word", v.selected_text() == "world",
+          v.selected_text())
+    check("seltype: the drag itself sends nothing", sent == [], sent)
+    type_key(v, K.Key_W, "W", Qt.KeyboardModifier.ShiftModifier)
+    check("seltype: typing over a dragged span replaces it",
+          sent == ["\x7f" * 5, "W"], sent)
+
+    # a space is typing too
+    v, sent = fresh("hello world")
+    dbl(v, 0, 8)
+    type_key(v, K.Key_Space, " ")
+    check("seltype: a space replaces the selection",
+          sent == ["\x7f" * 5, " "], sent)
+
+    # a keyboard selection (Ctrl+Shift+Left) is replaced the same way
+    v, sent = fresh("hello world")
+    type_key(v, K.Key_Left, "", Qt.KeyboardModifier.ControlModifier
+             | Qt.KeyboardModifier.ShiftModifier)
+    check("seltype: Ctrl+Shift+Left selects 'world'",
+          v.selected_text() == "world", v.selected_text())
+    type_key(v, K.Key_Z, "z")
+    check("seltype: typing over a keyboard selection replaces it",
+          sent == ["\x7f" * 5, "z"], sent)
+
+    # committed IME or emoji-panel text replaces it too
+    v, sent = fresh("hello world")
+    dbl(v, 0, 2)
+    ev = QInputMethodEvent()
+    ev.setCommitString("é")
+    v.inputMethodEvent(ev)
+    check("seltype: an IME commit replaces the selection",
+          sent == ["\x1b[D" * 6, "\x7f" * 5, "é"], sent)
+    check("seltype: the IME commit drops the selection",
+          v._selection_range() is None)
+
+    # a word off the input line can't be deleted: it is dropped and the
+    # character goes in at the caret, never swallowed
+    v, sent = fresh("aaa\r\nbbb")
+    dbl(v, 0, 1)
+    check("seltype: word on another row is selected",
+          v.selected_text() == "aaa", v.selected_text())
+    type_key(v, K.Key_Q, "q")
+    check("seltype: typing over an off-line selection only types",
+          sent == ["q"], sent)
+    check("seltype: the off-line selection is dropped",
+          v._selection_range() is None)
+
+    # an open menu: no caret moves or Backspaces, the key still reaches it
+    v, sent = fresh("hello world")
+    dbl(v, 0, 2)
+    v.set_waiting_probe(lambda: True)
+    type_key(v, K.Key_1, "1")
+    check("seltype: over a waiting menu only the key is sent",
+          sent == ["1"], sent)
+
+    # a key that isn't text deletes nothing: Tab still goes to the child
+    v, sent = fresh("hello world")
+    dbl(v, 0, 2)
+    type_key(v, K.Key_Tab, "\t")
+    check("seltype: Tab over a selection deletes nothing",
+          sent == ["\t"], sent)
+
+
 def test_terminal_input_editor():
     """Desktop-text-area conveniences layered on the passthrough terminal:
     keyboard text-selection (Shift+Arrow/Home/End, Ctrl for word), Shift+click
