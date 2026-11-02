@@ -256,9 +256,16 @@ def test_live_model_effort():
           transcripts._read_model_effort(str(tpath)))
 
     # translation: the transcript's names are not all launch flags
-    check("mode: 'default' is spelled by omitting the flag",
-          providers.normalize_permission_mode("default") == ""
-          and providers.normalize_permission_mode("manual") == "")
+    # claude 2.1.316 starts in auto without a flag, so ask-each-time needs
+    # the explicit "manual" or a manual agent comes back in auto on reopen
+    check("mode: 'default' relaunches as the explicit manual flag",
+          providers.normalize_permission_mode("default") == "manual"
+          and providers.normalize_permission_mode("manual") == "manual"
+          and providers.normalize_permission_mode("") == "")
+    _, manual_args = providers.build_invocation("claude",
+                                                permission_mode="manual")
+    check("mode: 'manual' reaches the command line",
+          manual_args == ["--permission-mode", "manual"], manual_args)
     check("mode: a real CLI token passes through",
           providers.normalize_permission_mode("auto") == "auto"
           and providers.normalize_permission_mode("plan") == "plan")
@@ -298,7 +305,7 @@ def test_live_model_effort():
     seen = []
     a.model_changed.connect(seen.append)
     check("model: badge seeded from the launch flags",
-          a.model_badge() == "Opus · high · manual", a.model_badge())
+          a.model_badge() == "Opus 5.5 · high · manual", a.model_badge())
     a.set_live_model("Sonnet 5", "max")
     check("model: badge follows the live reading",
           a.model_badge() == "Sonnet 5 · max · manual"
@@ -430,18 +437,19 @@ def test_live_model_effort():
     dirtied.clear()
     mgr.refresh_model_effort()
     check("mode: an unchanged mode never re-saves", not dirtied, dirtied)
-    # the ask-each-time mode is written "default" in the transcript and has no
-    # flag spelling, so it must clear the flag rather than launch a bogus one
+    # the ask-each-time mode is written "default" in the transcript. Omitting
+    # the flag starts claude 2.1.316 in auto, so it relaunches as "manual"
     conv.write_text(_json.dumps(_turn(model="claude-sonnet-5", effort="low"))
                     + "\n" + _json.dumps(_mode("default")) + "\n",
                     encoding="utf-8")
     mgr.refresh_model_effort()
-    check("mode: going back to ask-each-time clears the flag",
-          live.spec.permission_mode == ""
-          and "--permission-mode" not in live.spec.args, live.spec.args)
-    check("mode: clearing it reaches the persisted session record too",
+    check("mode: going back to ask-each-time relaunches as manual",
+          live.spec.permission_mode == "manual"
+          and live.spec.args[-2:] == ["--permission-mode", "manual"],
+          live.spec.args)
+    check("mode: manual reaches the persisted session record too",
           mgr.to_session_dict()["workspaces"][0]["terminals"][0].get(
-              "permission_mode", "-") == "")
+              "permission_mode", "-") == "manual")
     shutil.rmtree(conv.parent, ignore_errors=True)
 
     # --- the summary uses the width it was actually given ---
@@ -508,28 +516,137 @@ def test_new_agent_default_names_saved_pick():
     settings = Path(os.path.expanduser("~")) / ".claude" / "settings.json"
     settings.parent.mkdir(parents=True, exist_ok=True)
     before = settings.read_bytes() if settings.exists() else None
+    state = Path(os.path.expanduser("~")) / ".claude.json"
+    state_before = state.read_bytes() if state.exists() else None
+    project = Path(tempfile.mkdtemp(prefix="defaults-", dir=SCRATCH_CWD))
+    project_settings = project / ".claude" / "settings.json"
+    project_settings.parent.mkdir(parents=True)
 
-    def dialog_defaults(saved):
+    def dialog_defaults(saved, models=()):
+        """(model Default, effort Default, its tooltip, the spec), then the
+        effort Default after picking each of `models` in the Model box."""
         if saved is None:
             settings.unlink(missing_ok=True)
         else:
             settings.write_text(_json.dumps(saved), encoding="utf-8")
-        providers._USER_DEFAULTS_CACHE = (0.0, -1, "", "")
+        providers._JSON_CACHE.clear()
         dlg = AddTerminalDialog("Agent 1", cwd=str(SCRATCH_CWD))
         try:
             i = dlg.kind_combo.findData(AgentKind.CLAUDE)
             dlg.kind_combo.setCurrentIndex(i)
             m = dlg.model_combo.findData("")
             e = dlg.effort_combo.findData("")
-            return (dlg.model_combo.itemText(m), dlg.effort_combo.itemText(e),
-                    dlg.effort_combo.itemData(e, Qt.ItemDataRole.ToolTipRole),
-                    dlg.result_spec(str(SCRATCH_CWD)))
+            first = (dlg.model_combo.itemText(m), dlg.effort_combo.itemText(e),
+                     dlg.effort_combo.itemData(e, Qt.ItemDataRole.ToolTipRole),
+                     dlg.result_spec(str(SCRATCH_CWD)))
+            picked = []
+            for value in models:
+                dlg.model_combo.setCurrentIndex(dlg.model_combo.findData(value))
+                picked.append(dlg.effort_combo.itemText(
+                    dlg.effort_combo.findData("")))
+            return first + (picked,)
+        finally:
+            dlg.done(0)
+            dlg.deleteLater()
+
+    def mode_default(cwd):
+        providers._JSON_CACHE.clear()
+        dlg = AddTerminalDialog("Agent 1", cwd=str(cwd))
+        try:
+            dlg.kind_combo.setCurrentIndex(
+                dlg.kind_combo.findData(AgentKind.CLAUDE))
+            return (dlg.mode_combo.itemText(dlg.mode_combo.findData("")),
+                    dlg.mode_combo.findData("manual") >= 0)
         finally:
             dlg.done(0)
             dlg.deleteLater()
 
     try:
-        model, effort, tip, spec = dialog_defaults(
+        # claude 2.1.316 saves /effort per model; the top-level level was a
+        # leftover "high" while Opus ran at xhigh, and Default said high
+        per_model = {"model": "opus", "effortLevel": "high",
+                     "modelSettings": {
+                         "claude-opus-5-5": {"effortLevel": "xhigh"},
+                         "claude-sonnet-5-5[1m]": {"effortLevel": "medium"},
+                         "claude-haiku-5-5": {"effortLevel": "max"}}}
+        _m, effort, _tip, _spec, picked = dialog_defaults(
+            per_model, models=("sonnet", "claude-opus-4-8", "haiku", ""))
+        check("default: names the effort /effort saved for that model",
+              effort == "Default (xhigh, saved by /effort)", effort)
+        check("default: the effort Default follows the Model pick",
+              picked == ["Default (medium, saved by /effort)",
+                         "Default (high, saved by /effort)",
+                         "Default (high, saved by /effort)",
+                         "Default (xhigh, saved by /effort)"], picked)
+        check("default: per-model effort by full id, [1m] or not",
+              providers.user_default_effort("claude-opus-5-5[1m]") == "xhigh"
+              and providers.user_default_effort("sonnet[1m]") == "medium"
+              and providers.user_default_effort("opusplan") == "high",
+              [providers.user_default_effort(x) for x in
+               ("claude-opus-5-5[1m]", "sonnet[1m]", "opusplan")])
+
+        # no /model pick: claude runs the account's default model, so the
+        # per-model levels count only when they all agree
+        def no_pick_effort(models):
+            providers._JSON_CACHE.clear()
+            settings.write_text(_json.dumps({
+                "effortLevel": "high", "modelSettings": {
+                    m: {"effortLevel": lvl} for m, lvl in models.items()}}),
+                encoding="utf-8")
+            return providers.user_default_effort()
+        agree = no_pick_effort({"claude-opus-5-5": "xhigh",
+                                "claude-sonnet-5-5": "xhigh"})
+        differ = no_pick_effort({"claude-opus-5-5": "xhigh",
+                                 "claude-sonnet-5-5": "low"})
+        check("default: no model pick takes the per-model level they share",
+              (agree, differ) == ("xhigh", "high"), (agree, differ))
+        providers._JSON_CACHE.clear()
+
+        # the startup mode: claude 2.1.316 starts in auto with no flag
+        settings.unlink(missing_ok=True)
+        state.unlink(missing_ok=True)
+        check("default mode: an older CLI's default reads as manual",
+              mode_default(SCRATCH_CWD) == ("Default (manual)", True),
+              mode_default(SCRATCH_CWD))
+        state.write_text(_json.dumps({"hasSeenAutoDefaultNotice": True}),
+                         encoding="utf-8")
+        check("default mode: the CLI's auto default is named",
+              mode_default(SCRATCH_CWD)[0] == "Default (auto)",
+              mode_default(SCRATCH_CWD))
+        state.write_text(_json.dumps({
+            "hasSeenAutoDefaultNotice": True,
+            "cachedGrowthBookFeatures": {"tengu_harbor_willow": False}}),
+            encoding="utf-8")
+        check("default mode: auto default switched off reads as manual",
+              mode_default(SCRATCH_CWD)[0] == "Default (manual)",
+              mode_default(SCRATCH_CWD))
+        state.write_text(_json.dumps({"hasSeenAutoDefaultNotice": True}),
+                         encoding="utf-8")
+        project_settings.write_text(_json.dumps(
+            {"permissions": {"defaultMode": "plan"}}), encoding="utf-8")
+        check("default mode: the project's defaultMode beats auto",
+              mode_default(project)[0] == "Default (plan)",
+              mode_default(project))
+        project_settings.write_text(_json.dumps(
+            {"permissions": {"defaultMode": "manual"}}), encoding="utf-8")
+        check("default mode: a defaultMode of manual beats auto too",
+              mode_default(project)[0] == "Default (manual)",
+              mode_default(project))
+        project_settings.write_text(_json.dumps(
+            {"permissions": {"disableAutoMode": "disable"}}),
+            encoding="utf-8")
+        check("default mode: auto mode disabled in settings reads as manual",
+              mode_default(project)[0] == "Default (manual)",
+              mode_default(project))
+        settings.write_text(_json.dumps(
+            {"permissions": {"defaultMode": "acceptEdits"}}), encoding="utf-8")
+        project_settings.write_text("{}", encoding="utf-8")
+        check("default mode: the user's own defaultMode is named",
+              mode_default(project)[0] == "Default (auto edits)",
+              mode_default(project))
+        settings.unlink()
+
+        model, effort, tip, spec, _p = dialog_defaults(
             {"model": "opus", "effortLevel": "high"})
         check("default: names the model /model saved",
               model == "Default (Opus 5.5, saved by /model)", model)
@@ -541,25 +658,84 @@ def test_new_agent_default_names_saved_pick():
               spec.model == "" and spec.effort == ""
               and "--model" not in spec.args and "--effort" not in spec.args,
               (spec.model, spec.effort, spec.args))
-        model, effort, _tip, _spec = dialog_defaults(
+        model, effort, _tip, _spec, _p = dialog_defaults(
             {"model": "sonnet[1m]", "effortLevel": "max"})
         check("default: a saved [1m] pick names the plain model",
               model == "Default (Sonnet 5.5, saved by /model)", model)
         check("default: a level claude won't read from settings is ignored",
               effort == "Default (recommended)", effort)
-        model, _effort, _tip, _spec = dialog_defaults({"model": "opusplan"})
+        model, _effort, _tip, _spec, _p = dialog_defaults(
+            {"model": "opusplan"})
         check("default: a model label's own bracketed note is left out",
               model == "Default (Opus Plan, saved by /model)", model)
-        model, effort, _tip, _spec = dialog_defaults(None)
+        model, effort, _tip, _spec, _p = dialog_defaults(None)
         check("default: nothing saved reads as recommended",
               (model, effort) == ("Default (recommended)",
                                   "Default (recommended)"), (model, effort))
     finally:
-        if before is None:
-            settings.unlink(missing_ok=True)
-        else:
-            settings.write_bytes(before)
-        providers._USER_DEFAULTS_CACHE = (0.0, -1, "", "")
+        for path, saved in ((settings, before), (state, state_before)):
+            if saved is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(saved)
+        shutil.rmtree(project, ignore_errors=True)
+        providers._JSON_CACHE.clear()
+
+
+def test_new_card_names_what_claude_starts_on():
+    """Claude writes no transcript until the first prompt, so a new card on
+    Default showed its seed: "Opus · manual" over a terminal that said
+    "Opus 5.5 with xhigh effort" and "auto mode on". The seed now names the
+    model as the picker does, the effort /effort saved for that model and
+    the mode a new conversation starts in."""
+    import json as _json
+    from PySide6.QtWidgets import QApplication
+    from app import providers
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+
+    QApplication.instance() or QApplication([])
+    home = Path(os.path.expanduser("~"))
+    settings = home / ".claude" / "settings.json"
+    state = home / ".claude.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    saved = {p: (p.read_bytes() if p.exists() else None)
+             for p in (settings, state)}
+    try:
+        settings.write_text(_json.dumps({
+            "model": "opus", "effortLevel": "high",
+            "modelSettings": {"claude-opus-5-5": {"effortLevel": "xhigh"}}}),
+            encoding="utf-8")
+        state.write_text(_json.dumps({"hasSeenAutoDefaultNotice": True}),
+                         encoding="utf-8")
+        providers._JSON_CACHE.clear()
+        a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Fresh",
+                                     cwd=SCRATCH_CWD))
+        check("seed: a Default card names model, saved effort and auto",
+              a.model_badge() == "Opus 5.5 · xhigh · auto", a.model_badge())
+        check("seed: the launch flags stay off",
+              not ({"--model", "--effort", "--permission-mode"}
+                   & set(a.spec.args)), a.spec.args)
+        b = TerminalAgent(build_spec(AgentKind.CLAUDE, "Picked",
+                                     cwd=SCRATCH_CWD, model="sonnet",
+                                     permission_mode="plan"))
+        check("seed: a picked model takes the top-level effort, a picked "
+              "mode wins",
+              b.model_badge() == "Sonnet 5.5 · high · plan", b.model_badge())
+        c = TerminalAgent(build_spec(AgentKind.CLAUDE, "Manual",
+                                     cwd=SCRATCH_CWD, effort="low",
+                                     permission_mode="manual"))
+        check("seed: an explicit manual launch reads as manual",
+              c.model_badge() == "Opus 5.5 · low · manual", c.model_badge())
+        for agent in (a, b, c):
+            agent.deleteLater()
+    finally:
+        for path, before in saved.items():
+            if before is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(before)
+        providers._JSON_CACHE.clear()
 
 
 def test_narrow_header_drops_words_not_letters():
@@ -3831,6 +4007,150 @@ def test_options_panel():
                                bar.app_update_btn},
           [w.objectName() for w in bar_buttons])
     bar.deleteLater()
+
+
+def test_keep_awake():
+    """Options > Keep the PC awake (app/keep_awake.py): off by default, one
+    Windows call per change and none repeated, the screen held only on a
+    Modern Standby laptop on battery, and released when the switch goes off
+    or the window closes. The Windows calls are stubbed for the window part,
+    so the suite never holds the test machine awake."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import keep_awake
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    # -- the policy -----------------------------------------------------------
+    check("keep-awake: off holds nothing, whatever the machine",
+          keep_awake.wanted(False, True, True) == (False, False))
+    check("keep-awake: on holds the system, not the screen, on AC power",
+          keep_awake.wanted(True, False, True) == (True, False))
+    check("keep-awake: ...and on battery without Modern Standby",
+          keep_awake.wanted(True, True, False) == (True, False))
+    check("keep-awake: a Modern Standby laptop on battery holds the screen "
+          "too", keep_awake.wanted(True, True, True) == (True, True))
+    if sys.platform == "win32":
+        # harmless on the real machine: released on the next line, and the
+        # state belongs to this test process anyway
+        check("keep-awake: the real Windows calls succeed",
+              keep_awake.hold(True) and keep_awake.release())
+        check("keep-awake: the machine facts read as bools",
+              isinstance(keep_awake.modern_standby(), bool)
+              and isinstance(keep_awake.on_battery(), bool))
+
+    # -- the window, with Windows stubbed -------------------------------------
+    calls = []
+    fake = {"ok": True, "standby": False, "battery": False}
+
+    def fake_hold(system, display=False):
+        calls.append((system, display))
+        return fake["ok"]
+
+    saved = (keep_awake.hold, keep_awake.modern_standby, keep_awake.on_battery)
+    keep_awake.hold = fake_hold
+    keep_awake.modern_standby = lambda: fake["standby"]
+    keep_awake.on_battery = lambda: fake["battery"]
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-awake-"))
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        win.show(); pump(60)
+        tb = win.top_bar
+        check("keep-awake: off by default, no Windows call, saved as false",
+              not win._keep_awake and not tb.keep_awake_btn.isChecked()
+              and calls == []
+              and win._session_payload()["ui"]["keep_awake"] is False, calls)
+        check("keep-awake: the switch sits in Options > Automation",
+              tb.keep_awake_btn.parentWidget()
+              is tb.recover_btn.parentWidget()
+              and "Keep the PC awake" in tb.keep_awake_label.text()
+              and "OFF" in tb.keep_awake_btn.toolTip())
+        emitted = []
+        tb.keepAwakeToggled.connect(emitted.append)
+        tb.set_keep_awake(True); tb.set_keep_awake(False)
+        check("keep-awake: set_keep_awake reflects without emitting",
+              emitted == [] and calls == [])
+
+        tb.keep_awake_btn.click()
+        check("keep-awake: on holds the system once and saves it",
+              win._keep_awake and calls == [(True, False)]
+              and emitted == [True]
+              and win._session_payload()["ui"]["keep_awake"] is True
+              and "ON" in tb.keep_awake_btn.toolTip(), calls)
+        check("keep-awake: without Modern Standby nothing runs after that",
+              not win._keep_awake_timer.isActive())
+        win._apply_keep_awake()
+        check("keep-awake: an unchanged need makes no second call",
+              calls == [(True, False)], calls)
+
+        tb.keep_awake_btn.click()
+        check("keep-awake: off releases", not win._keep_awake
+              and calls[-1] == (False, False), calls)
+
+        fake["standby"] = True
+        del calls[:]
+        tb.keep_awake_btn.click()
+        check("keep-awake: a Modern Standby laptop on AC holds only the "
+              "system and watches the power source",
+              calls == [(True, False)] and win._keep_awake_timer.isActive()
+              and win._keep_awake_timer.interval()
+              == win.KEEP_AWAKE_POLL_MS, calls)
+        fake["battery"] = True
+        win._keep_awake_timer.timeout.emit()
+        check("keep-awake: unplugged, the next tick holds the screen too",
+              calls[-1] == (True, True), calls)
+        fake["battery"] = False
+        win._keep_awake_timer.timeout.emit()
+        check("keep-awake: plugged back in, it lets the screen go",
+              calls[-1] == (True, False), calls)
+
+        fake["ok"] = False
+        fake["battery"] = True
+        win._keep_awake_timer.timeout.emit()
+        check("keep-awake: a failed call keeps the last hold that took",
+              win._keep_awake_held == (True, False))
+        fake["ok"] = True
+        win._keep_awake_timer.timeout.emit()
+        check("keep-awake: ...so the next tick tries again",
+              calls[-1] == (True, True)
+              and win._keep_awake_held == (True, True), calls)
+
+        # a failed change leaves the screen hold in force, so the
+        # switch-off below must still release it
+        fake["ok"] = False
+        fake["battery"] = False
+        win._keep_awake_timer.timeout.emit()
+        fake["ok"] = True
+        del calls[:]
+        tb.keep_awake_btn.click()
+        check("keep-awake: off after a failed change still releases",
+              calls == [(False, False)], calls)
+        tb.keep_awake_btn.click()
+        tb.keep_awake_btn.click()
+        check("keep-awake: off releases and stops the timer",
+              calls[-1] == (False, False)
+              and not win._keep_awake_timer.isActive(), calls)
+
+        fake["standby"] = False
+        del calls[:]
+        win._restore_ui_state({"ui": {"keep_awake": True}})
+        check("keep-awake: a saved ON holds the system at load",
+              win._keep_awake and tb.keep_awake_btn.isChecked()
+              and calls == [(True, False)], calls)
+        win.close(); pump(30)
+        check("keep-awake: closing the window releases it",
+              calls[-1] == (False, False), calls)
+        win.deleteLater(); pump(30)
+    finally:
+        (keep_awake.hold, keep_awake.modern_standby,
+         keep_awake.on_battery) = saved
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_options_panel_text_at_body_size():

@@ -227,6 +227,14 @@ SCHEDULE_TICK_MS = 1000
 # surprise, not a hand-off. The user still sees the missed entry and can send it
 # by hand.
 SCHEDULE_GIVE_UP_S = 900
+# --- waking a sleeping agent to type into it (`_wake_agent`) ---
+# Ship finished lanes on an asleep integrator wakes it, then sends the request
+# once its resumed conversation sits at a free prompt. A resume boots in a few
+# seconds; a long conversation replays through pyte for longer, and a prompt
+# that never frees up (a menu left on screen) must not hold the request for
+# good. Past the timeout the user is told and nothing is sent.
+SHIP_WAKE_POLL_MS = 500
+SHIP_WAKE_TIMEOUT_S = 120
 # Slack past a reset time READ OFF THE SCREEN before acting on it. The account
 # does not free up on the exact second its banner named — the clock is printed
 # to the minute, the server rounds, and a nudge into a still-shut window costs
@@ -570,6 +578,9 @@ class TopBar(QFrame):
     # "Update AI Hive in the background": the hourly check that installs a
     # newer AI Hive while the app runs (MainWindow.start_app_update_checks)
     appAutoUpdateToggled = Signal(bool)
+    # "Keep the PC awake": hold off Windows sleep while AI Hive runs
+    # (MainWindow._apply_keep_awake, app/keep_awake.py)
+    keepAwakeToggled = Signal(bool)
     # "Lanes in every workspace": does every new agent start with Own lane
     agentLanesToggled = Signal(bool)
     # "Confirm Ship finished lanes": ask before typing the request (True)
@@ -757,6 +768,14 @@ class TopBar(QFrame):
         self.app_auto_update_btn.clicked.connect(
             self._on_app_auto_update_clicked)
         self._refresh_app_auto_update_btn()
+
+        # "Keep the PC awake". Default OFF: it changes how the whole machine
+        # behaves, so the user arms it.
+        self._keep_awake = False
+        self.keep_awake_label = toggle_label("")
+        self.keep_awake_btn = ToggleSwitch(self)
+        self.keep_awake_btn.clicked.connect(self._on_keep_awake_clicked)
+        self._refresh_keep_awake_btn()
 
         # "Lanes in every workspace". Default OFF: armed, it ticks "Own lane" for every new
         # Claude agent in every git workspace, so it is the user's decision,
@@ -979,6 +998,8 @@ class TopBar(QFrame):
         self.options_panel.add_section("Automation")
         self.options_panel.add_switch_row(self.recover_label, self.recover_btn)
         self.options_panel.add_switch_row(self.resume_label, self.resume_btn)
+        self.options_panel.add_switch_row(self.keep_awake_label,
+                                          self.keep_awake_btn)
         self.options_panel.add_switch_row(
             self.sound_label, self.sound_btn,
             self.chime_sound_btns[chime.QUESTION])
@@ -1482,9 +1503,11 @@ class TopBar(QFrame):
             "the conversation's summary, and a click resumes the same "
             "conversation. An agent that is working, asking you something, "
             "running a background command or holding a scheduled message "
-            "is never put to sleep.\nClick to turn off. Agents asleep now "
-            "stay asleep until you click them, and resume when AI Hive "
-            "opens again."
+            "is never put to sleep. A sleeping agent wakes on its own only "
+            "when AI Hive has to type into it: Ship finished lanes into the "
+            "integrator, or a message you scheduled for it.\nClick to turn "
+            "off. Agents asleep now stay asleep until you click them, and "
+            "resume when AI Hive opens again."
             if self._sleep_idle else
             "Sleep inactive agents: OFF. Every agent keeps running, and "
             "using memory, until you stop or close it.\nClick to stop agents "
@@ -1599,6 +1622,37 @@ class TopBar(QFrame):
             "update.\nClick to turn on.")
         self.app_auto_update_btn.setToolTip(tip)
         self.app_auto_update_label.setToolTip(tip)
+
+    def _on_keep_awake_clicked(self) -> None:
+        self.set_keep_awake(not self._keep_awake)
+        self.keepAwakeToggled.emit(self._keep_awake)
+
+    def set_keep_awake(self, on: bool) -> None:
+        """Reflect the Keep the PC awake preference (no signal)."""
+        self._keep_awake = bool(on)
+        self._refresh_keep_awake_btn()
+
+    def keep_awake(self) -> bool:
+        return self._keep_awake
+
+    def _refresh_keep_awake_btn(self) -> None:
+        self.keep_awake_btn.setChecked(self._keep_awake)
+        self.keep_awake_label.setText("\u2615  Keep the PC awake")
+        tip = (
+            "Keep the PC awake: ON. While AI Hive is open, Windows does not "
+            "sleep on its idle timer, the way it stays awake for a playing "
+            "video, so agents keep working while you are away. The screen "
+            "still turns off and locks as usual. On battery, a laptop with "
+            "Modern Standby also keeps its screen on, since Windows would "
+            "sleep anyway 5 minutes after its sleep timeout. Closing the lid "
+            "or pressing the power button still sleeps. It costs one Windows "
+            "call, plus a power-source check once a minute on a Modern "
+            "Standby laptop.\nClick to turn off."
+            if self._keep_awake else
+            "Keep the PC awake: OFF. Windows sleeps on its normal timer, "
+            "which stops every agent until the PC wakes.\nClick to turn on.")
+        self.keep_awake_btn.setToolTip(tip)
+        self.keep_awake_label.setToolTip(tip)
 
     def note_update_pending(self, text: str, tooltip: str = "") -> None:
         """Show (or hide, on an empty text) the last gate's report.
@@ -2025,13 +2079,14 @@ class AddTerminalDialog(QDialog):
         self.provider_note.setWordWrap(True)
         self.model_combo = QComboBox(self)
         self.effort_combo = QComboBox(self)
-        # startup permission mode — the modes the Claude TUI cycles through
-        # with Shift+Tab (Claude only). Default omits the flag = today's behavior.
+        # startup permission mode: the modes the Claude TUI cycles through
+        # with Shift+Tab (Claude only). Default omits the flag.
         self.mode_combo = QComboBox(self)
         self.mode_combo.setToolTip(
             "Which permission mode this Claude agent starts in: the same modes "
-            "you flip through with Shift+Tab in the terminal. 'Normal' is the "
-            "current default; the agent can still switch modes once running.")
+            "you flip through with Shift+Tab in the terminal. Default is the "
+            "mode Claude starts in on its own; the agent can still switch "
+            "modes once running.")
         # resume an existing conversation from this workspace folder (Claude)
         self.resume_combo = QComboBox(self)
         self.resume_combo.setToolTip(
@@ -2147,6 +2202,9 @@ class AddTerminalDialog(QDialog):
         root.addWidget(buttons)
 
         self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
+        # claude saves /effort per model, so the effort Default follows it
+        self.model_combo.currentIndexChanged.connect(
+            lambda _i: self._name_effort_default())
         self.program_edit.textChanged.connect(self._validate)
         self.command_edit.textChanged.connect(self._validate)
         self.browse_btn.clicked.connect(self._browse)
@@ -2275,9 +2333,7 @@ class AddTerminalDialog(QDialog):
         for tok in prov.efforts:
             self.effort_combo.addItem(tok.capitalize() if tok else "Default", tok)
         if prov.key == "claude":
-            self._name_claude_default(
-                self.effort_combo, providers.user_default_effort(), "/effort",
-                "--effort", "run /effort auto in a terminal")
+            self._name_effort_default()
         # Ultracode isn't a launch flag (claude --effort only takes
         # low/medium/high/xhigh/max); it's an in-session mode. Show it, greyed
         # out, so users know to enable it manually in the terminal.
@@ -2288,20 +2344,22 @@ class AddTerminalDialog(QDialog):
             item = model.item(self.effort_combo.count() - 1)
             item.setEnabled(False)  # visible but non-selectable
 
+    def _name_effort_default(self) -> None:
+        """Name the effort Default for the model picked above it. claude
+        2.1.316 saves /effort per model, so Opus at xhigh and Sonnet at high
+        are both "the saved effort" (providers.user_default_effort)."""
+        if self._kind() != AgentKind.CLAUDE:
+            return
+        model = self.model_combo.currentData() or ""
+        self._name_claude_default(
+            self.effort_combo, providers.user_default_effort(model),
+            "/effort", "--effort", "run /effort auto in a terminal")
+
     @staticmethod
     def _claude_default_model() -> str:
         """The saved /model pick as the picker labels it ("opus" -> "Opus
-        5.5"), or "" when nothing is saved. A "[1m]" pick names the same
-        model as the bare alias, and a label's own note in brackets is
-        left out, since the Default entry wraps the name in brackets."""
-        raw = providers.user_default_model()
-        if not raw or raw.lower() == "default":
-            return ""
-        bare = raw.lower().replace("[1m]", "").strip()
-        for label, value in providers.CLAUDE_MODELS:
-            if value and value == bare:
-                return label.split(" (", 1)[0]
-        return transcripts.model_display(raw)
+        5.5"), or "" when nothing is saved."""
+        return transcripts.claude_model_label(providers.user_default_model())
 
     @staticmethod
     def _name_claude_default(combo, saved: str, command: str, flag: str,
@@ -2332,6 +2390,19 @@ class AddTerminalDialog(QDialog):
             return
         for label, value in prov.permission_modes:
             self.mode_combo.addItem(label, value)  # index 0 = "" = default
+        # Default launches with no --permission-mode, which claude 2.1.316
+        # starts in auto, not ask-each-time: name what it resolves to
+        mode = providers.permission_mode_display(
+            providers.user_default_permission_mode(self._cwd))
+        i = self.mode_combo.findData("")
+        if i >= 0:
+            self.mode_combo.setItemText(i, f"Default ({mode})")
+            self.mode_combo.setItemData(
+                i, "Launches without --permission-mode, so Claude starts in "
+                   "the mode your Claude settings name "
+                   "(permissions.defaultMode), else its own default. Pick "
+                   "Manual to be asked before each action.",
+                Qt.ItemDataRole.ToolTipRole)
 
     @staticmethod
     def _supplier(value):
@@ -3180,6 +3251,16 @@ class MainWindow(QMainWindow):
         # _restore_ui_state like the rest. The check behind it starts only
         # from main.py (start_app_update_checks), never in the suite.
         self._app_auto_update = True  # user preference (persisted)
+        # "Keep the PC awake". Default OFF, assigned here for the same reason.
+        # _keep_awake_held is what this thread asked Windows for last, as
+        # (system, display); the timer runs only while the display half may
+        # be needed (_apply_keep_awake).
+        self._keep_awake = False      # user preference (persisted)
+        self._keep_awake_held = (False, False)
+        self._keep_awake_timer = QTimer(self)
+        self._keep_awake_timer.setTimerType(Qt.TimerType.VeryCoarseTimer)
+        self._keep_awake_timer.setInterval(self.KEEP_AWAKE_POLL_MS)
+        self._keep_awake_timer.timeout.connect(self._apply_keep_awake)
         # "Lanes in every workspace". Default OFF, assigned here for the same
         # reason. Read it only through lane_default(ws).
         self._agent_lanes = False     # user preference (persisted)
@@ -3194,6 +3275,12 @@ class MainWindow(QMainWindow):
         self._sleep_at_startup = True
         # uids whose lane Close merged agents is reading again right now
         self._close_merged_reading: set[str] = set()
+        # integrator uid -> the ship request waiting for it to wake
+        # (_wake_to_ship). Transient: a close drops it unsent.
+        self._ship_waking: dict[str, dict] = {}
+        # a due scheduled message wakes at most one sleeping agent per tick
+        # (_deliver_scheduled), so a batch due together boots staggered
+        self._schedule_woke = False
         # every mutating lane git operation runs here, one at a time per repo
         # (app/lane_ops.py). Created whatever the toggles say: repairing,
         # retiring and reviving an existing lane never ask them.
@@ -3610,6 +3697,7 @@ class MainWindow(QMainWindow):
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.appAutoUpdateToggled.connect(
             self._on_app_auto_update_toggled)
+        self.top_bar.keepAwakeToggled.connect(self._on_keep_awake_toggled)
         self.top_bar.agentLanesToggled.connect(self._on_agent_lanes_toggled)
         self.top_bar.shipConfirmToggled.connect(self._on_ship_confirm_toggled)
         self.top_bar.closeMergedConfirmToggled.connect(
@@ -5011,6 +5099,7 @@ class MainWindow(QMainWindow):
         if self._closing or not self._ready:
             return
         now = time.time()
+        self._schedule_woke = False
         for agent in self.manager.all_agents():
             if not agent.scheduled_messages():
                 continue
@@ -5037,6 +5126,13 @@ class MainWindow(QMainWindow):
         `SCHEDULE_GIVE_UP_S` is it given up on - and even then it is kept,
         MISSED, rather than dropped: the user chose a moment and it did not
         happen, which they need to be able to see.
+
+        An agent asleep to free memory is woken for its message, one per
+        tick, and the retries deliver it once its prompt is up. A sleep
+        never stops an agent that holds a message (`sleep_due`), but a
+        launch can keep one asleep and the sidebar's clock schedules onto a
+        sleeping card. Not for a message already past the give-up: that one
+        would go MISSED before the boot finished.
         """
         blocked = agent.is_limit_blocked()
         if not blocked and agent.nudge(msg.text):
@@ -5047,6 +5143,12 @@ class MainWindow(QMainWindow):
             self._schedule_audit(f"SENT agent={agent.spec.name} "
                                  f"late={int(now - msg.due_ts)}s")
             return
+        if (agent.is_asleep() and not self._schedule_woke
+                and now - msg.due_ts < SCHEDULE_GIVE_UP_S
+                and self._wake_agent(agent)):
+            self._schedule_woke = True
+            self._schedule_audit(f"WAKE agent={agent.spec.name} "
+                                 f"late={int(now - msg.due_ts)}s")
         agent.note_scheduled_attempt(msg.id)
         if now - msg.due_ts < SCHEDULE_GIVE_UP_S:
             return
@@ -5349,6 +5451,48 @@ class MainWindow(QMainWindow):
         if self._app_auto_update:
             self._app_auto_update_tick()
 
+    # how often a Modern Standby machine holding the system reads its power
+    # source; Windows allows 5 minutes past its sleep timeout on battery
+    KEEP_AWAKE_POLL_MS = 60_000
+
+    def _on_keep_awake_toggled(self, enabled: bool) -> None:
+        """User flipped "Keep the PC awake". An additive optional key under
+        "ui" (no SESSION_VERSION bump). It takes effect at once."""
+        self._keep_awake = bool(enabled)
+        self._schedule_save()
+        self._apply_keep_awake()
+
+    def _apply_keep_awake(self) -> None:
+        """Ask Windows for what the switch and the power source need now
+        (keep_awake.wanted), calling it only when that changes.
+
+        A desktop, or any machine without Modern Standby, needs one call
+        and nothing after it. A Modern Standby laptop must also hold the
+        screen on battery, so while the switch is on the timer reads the
+        power source once a minute: an unplug is caught well inside the 5
+        minutes Windows allows after its sleep timeout."""
+        from .. import keep_awake
+        on = self._keep_awake and not self._closing
+        standby = on and keep_awake.modern_standby()
+        battery = standby and keep_awake.on_battery()
+        want = keep_awake.wanted(on, battery, standby)
+        if want != self._keep_awake_held:
+            ok = keep_awake.hold(*want)
+            self.store.audit(
+                f"KEEP-AWAKE system={int(want[0])} display={int(want[1])}"
+                f"{'' if ok else ' FAILED'}")
+            # a failed call changes nothing, so the last state that took is
+            # still held. Recording the wish would stop later ticks from
+            # trying again, and recording (False, False) would let a
+            # switch-off skip the release of a hold still in force.
+            if ok:
+                self._keep_awake_held = want
+        if standby:
+            if not self._keep_awake_timer.isActive():
+                self._keep_awake_timer.start()
+        else:
+            self._keep_awake_timer.stop()
+
     # ------------------------------------------------------- agent lanes ---
     # Lane scopes. Two
     # toggles, the Options switch "Lanes in every workspace" and each
@@ -5438,6 +5582,28 @@ class MainWindow(QMainWindow):
                         f"SLEEP agent={agent.spec.name!r} idle="
                         f"{int(now - agent.last_active_at())}s")
                     agent.put_to_sleep()
+
+    def _wake_agent(self, agent) -> bool:
+        """Resume a sleeping agent because AI Hive has to type into it: Ship
+        finished lanes into the integrator (_wake_to_ship), or a scheduled
+        message that came due (_deliver_scheduled). Nothing else wakes an
+        agent on its own. A lane agent whose work ships sleeps through it:
+        the integrator merges commits, the lane fast-forwards without its
+        child, and Close merged agents closes it asleep.
+
+        It starts the agent the way a click on the sleep screen does, but
+        leaves the keyboard focus where the user has it. The card's view
+        hears its settled width first, as a launch-queued start does, and
+        the start resumes the pinned conversation the sleep armed. False
+        when nothing started: the child the sleep stopped is still exiting,
+        or the start is held."""
+        if not agent.is_asleep() or agent.is_running():
+            return False
+        card = self._card_for_agent(agent.id)
+        if card is not None and card.is_pty and card.terminal is not None:
+            card.terminal.flush_resize()
+        agent.start()
+        return not agent.is_asleep()
 
     def _keeps_asleep_at_launch(self, agent, now: float) -> bool:
         """Should the launch restore leave this saved-running agent asleep?
@@ -6129,17 +6295,19 @@ class MainWindow(QMainWindow):
                 found.append((agent, view))
         return found
 
-    def _ship_state(self, ws, agent) -> tuple:
+    def _ship_state(self, ws, agent, waking: bool = False) -> tuple:
         """(finished lanes, why the integrator can't take a ship request
-        now or "")."""
+        now or ""). An integrator asleep to free memory can take one: Ship
+        wakes it first (_wake_to_ship). `waking` is that wake's own look,
+        which the request already waiting for it would otherwise refuse."""
         done = self._finished_lanes(ws, agent)
         if not done:
             why = "No lane has a \"Task done\" commit that the base lacks."
+        elif not waking and agent.spec.uid in self._ship_waking:
+            why = ("The integrator is waking up to take your last ship "
+                   "request.")
         elif agent.is_asleep():
-            # never "Restart": a restart starts a new conversation, and the
-            # integrator's is the one that knows what it already merged
-            why = ("The integrator is asleep to free memory. Click its card "
-                   "to resume its conversation first.")
+            why = ""
         elif not agent.is_running():
             why = "The integrator is stopped. Restart it first."
         elif agent.is_busy() or agent.is_waiting():
@@ -6159,9 +6327,12 @@ class MainWindow(QMainWindow):
         if why:
             return (label, False, why)
         names = ", ".join(a.spec.name for a, _ in done)
+        asks = (f"Resumes {agent.spec.name}'s conversation, which is asleep "
+                f"to free memory, then asks it" if agent.is_asleep()
+                else "Asks the integrator")
         return (label, True,
-                f"Asks the integrator to ship {names}: one pull request, "
-                f"reviewed and tested, then merged.")
+                f"{asks} to ship {names}: one pull request, reviewed and "
+                f"tested, then merged.")
 
     def _ship_lanes(self, ws_id: str, agent) -> None:
         """The integrator chip's Ship finished lanes: the user asking the
@@ -6169,7 +6340,9 @@ class MainWindow(QMainWindow):
         "Task done" commit the user confirmed, so a lane flagged (or
         flagged again) after the click waits for the next ask. Only this
         click types into the integrator; a flag never does
-        (_log_done_lanes)."""
+        (_log_done_lanes). An integrator asleep to free memory is woken
+        for it (_wake_to_ship). The lanes' own agents are not: what ships
+        is their commits."""
         ws = self.manager.workspace(ws_id)
         if ws is None or agent is None or not self.manager.is_integrator(agent):
             return
@@ -6191,6 +6364,14 @@ class MainWindow(QMainWindow):
                                why or f"{agent.spec.name} is no longer the "
                                       f"integrator.")
             return
+        if agent.is_asleep():
+            self._wake_to_ship(ws_id, agent, done)
+            return
+        self._send_ship(agent, done)
+
+    def _send_ship(self, agent, done: list) -> None:
+        """Type the ship request naming `done`, the lanes the user
+        confirmed, into the integrator."""
         lanes_at = ", ".join(f"{view.branch} at {view.done[:12]}"
                              for _a, view in done)
         text = (f"Ship the finished lanes now: {lanes_at}. Merge each of "
@@ -6204,6 +6385,120 @@ class MainWindow(QMainWindow):
         self._store_audit(f"LANE-SHIP agent={agent.spec.name!r} "
                           f"lanes={lanes_at}")
 
+    def _wake_to_ship(self, ws_id: str, agent, done: list) -> None:
+        """Ship finished lanes on an integrator asleep to free memory: wake
+        it, then send the request once its prompt is free (_ship_wake_tick).
+
+        The request goes only into the conversation the integrator slept
+        in. A start can fall back to a new conversation (the pinned
+        transcript is gone, or the resume failed fast), and that one gets
+        nothing, because only the old one knows what it already merged.
+        That is also why this never restarts it."""
+        name = agent.spec.name
+        sid = agent.spec.session_id
+        if not self._wake_agent(agent):
+            self._lane_message(
+                "Nothing shipped",
+                f"{name} is still stopping from its sleep. Try again in a "
+                f"moment." if agent.is_running() else
+                f"{name} could not be woken. Click its card to resume it, "
+                f"then ship again.")
+            return
+        uid = agent.spec.uid
+        timer = QTimer(self)
+        timer.setInterval(SHIP_WAKE_POLL_MS)
+        timer.timeout.connect(lambda u=uid: self._ship_wake_tick(u))
+        self._ship_waking[uid] = {
+            "ws_id": ws_id, "agent": agent, "sid": sid,
+            "done": [(a.spec.uid, v.done) for a, v in done],
+            "woke_at": time.time(),
+            "deadline": time.monotonic() + SHIP_WAKE_TIMEOUT_S,
+            "timer": timer}
+        self._store_audit(f"LANE-SHIP-WAKE agent={name!r}")
+        timer.start()
+        # the start itself may already have moved it onto a new conversation
+        self._ship_wake_tick(uid)
+
+    def _ship_wake_tick(self, uid: str) -> None:
+        """One look at an integrator woken for a ship request. It sends the
+        request once the prompt is free, waits while the integrator boots,
+        and drops the request, saying why, once it can no longer go in as
+        the user confirmed it."""
+        entry = self._ship_waking.get(uid)
+        if entry is None:
+            return
+        agent = entry["agent"]
+        ws = self.manager.workspace(entry["ws_id"])
+        name = agent.spec.name
+        if self._closing or ws is None or agent not in ws.agents:
+            # a close, of the window or of the card, drops it unsent
+            self._end_ship_wake(uid, "")
+            return
+        if not self.manager.is_integrator(agent):
+            self._end_ship_wake(uid, f"{name} is no longer the integrator.")
+            return
+        if agent.spec.session_id != entry["sid"]:
+            self._end_ship_wake(
+                uid, f"{name} could not resume its conversation and started "
+                     f"a new one, so it was not asked to ship. Only the old "
+                     f"conversation knows what it already merged. Check its "
+                     f"card, then ship again if the new one should do it.")
+            return
+        if agent.last_submit_at() > entry["woke_at"]:
+            # typed by the user or a scheduled message of theirs coming due
+            self._end_ship_wake(
+                uid, f"{name} got another message while it woke up, so it "
+                     f"was not asked to ship. Ship again once it has "
+                     f"answered.")
+            return
+        if agent.is_running():
+            entry["ran"] = True
+        elif entry.get("ran") and agent.status in (
+                AgentStatus.EXITED_OK, AgentStatus.EXITED_ERR,
+                AgentStatus.CRASHED, AgentStatus.FAILED):
+            # the woken child died. Only after one was seen running: an
+            # asleep agent still reads as exited until its new child spawns.
+            # Waiting out the deadline would end in the wrong reason.
+            self._end_ship_wake(
+                uid, f"{name} stopped while it woke up, so it was not asked "
+                     f"to ship. Check its card, then ship again.")
+            return
+        done, why = self._ship_state(ws, agent, waking=True)
+        if [(a.spec.uid, v.done) for a, v in done] != entry["done"]:
+            self._end_ship_wake(
+                uid, f"The finished lanes changed while {name} woke up. Open "
+                     f"the menu again to see the new list.")
+            return
+        card = self._card_for_agent(agent.id)
+        if not why and card is not None and card.has_draft():
+            # the user is typing into it: the request must not land in
+            # their draft
+            why = "draft"
+        if why:
+            if time.monotonic() >= entry["deadline"]:
+                self._end_ship_wake(
+                    uid, f"{name} did not reach a free prompt within "
+                         f"{SHIP_WAKE_TIMEOUT_S} seconds of waking up, so it "
+                         f"was not asked to ship. Ship again once it is at "
+                         f"its prompt.")
+            return
+        self._end_ship_wake(uid, "")
+        self._send_ship(agent, done)
+
+    def _end_ship_wake(self, uid: str, why: str) -> None:
+        """Forget the ship request waiting for a woken integrator. `why`
+        says to the user why it was not sent; empty when it was, or when a
+        close dropped it."""
+        entry = self._ship_waking.pop(uid, None)
+        if entry is None:
+            return
+        entry["timer"].stop()
+        entry["timer"].deleteLater()
+        if why:
+            self._store_audit(f"LANE-SHIP-DROP agent="
+                              f"{entry['agent'].spec.name!r}: {why}")
+            self._lane_message("Nothing shipped", why)
+
     def _confirm_ship(self, agent, done: list) -> bool:
         """The user's go-ahead for Ship finished lanes (tests replace it).
         Ticking "Don't ask again" and pressing OK stops this dialog
@@ -6211,10 +6506,12 @@ class MainWindow(QMainWindow):
         finished lanes" turns it back on; Cancel keeps asking."""
         lines = "\n".join(f"  {a.spec.name}: {view.branch} at "
                           f"{view.done[:7]}" for a, view in done)
+        wake = (f"\n\n{agent.spec.name} is asleep to free memory. OK resumes "
+                f"its conversation first." if agent.is_asleep() else "")
         box = QMessageBox(
             QMessageBox.Icon.Question, "Ship finished lanes",
             f"{agent.spec.name} combines these lanes into one pull request, "
-            f"gets it reviewed and tested, and merges it:\n\n{lines}",
+            f"gets it reviewed and tested, and merges it:\n\n{lines}{wake}",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             self)
         box.setDefaultButton(QMessageBox.StandardButton.Cancel)
@@ -7287,6 +7584,10 @@ class MainWindow(QMainWindow):
         # AI Hive's own background update (default ON)
         self._app_auto_update = bool(ui.get("app_auto_update", True))
         self.top_bar.set_app_auto_update(self._app_auto_update)
+        # Keep the PC awake (default OFF), held from the moment it loads
+        self._keep_awake = bool(ui.get("keep_awake", False))
+        self.top_bar.set_keep_awake(self._keep_awake)
+        self._apply_keep_awake()
         # "Lanes in every workspace" (default OFF: it ticks Own lane for
         # every new agent, so it is armed deliberately). The key keeps its
         # old name, so a user who had the old Agent lanes switch on sees no
@@ -8553,6 +8854,7 @@ class MainWindow(QMainWindow):
             "bold_word_strength": dict(self._word_strengths),
             "auto_update": self._auto_update,
             "app_auto_update": self._app_auto_update,
+            "keep_awake": self._keep_awake,
             "agent_lanes": self._agent_lanes,
             "ship_skip_confirm": self._ship_skip_confirm,
             "close_merged_skip_confirm": self._close_merged_skip_confirm,
@@ -8647,6 +8949,9 @@ class MainWindow(QMainWindow):
         self._bg_shell_timer.stop()
         self._sleep_timer.stop()
         self._limit_watch_timer.stop()
+        # let the PC sleep again (_closing is set, so this releases). Exit
+        # would release it too, but teardown below can take seconds.
+        self._apply_keep_awake()
         # queued agents stay queued, so the final save records them running
         self._launch_timer.stop()
         self._usage_tick_timer.stop()

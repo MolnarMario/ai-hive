@@ -13,7 +13,8 @@ workspaces keep executing — switching never pauses anything.
 
 - **AI-agent creation** — pick a provider (Claude fully wired with **model** +
   **effort** + **mode** dropdowns → real `--model`/`--effort`/`--permission-mode`
-  flags; the **mode** picker is the Shift+Tab permission modes — Normal (default),
+  flags; the **mode** picker is the Shift+Tab permission modes — Default (named
+  for the mode Claude starts in without a flag, auto on claude 2.1.316), Manual,
   Accept edits, Plan, Bypass permissions — so an agent can start pre-set; **Gemini via the
   Antigravity CLI** (`agy`) with its full model list incl. Gemini 3.x, and
   `--continue` resume + shared-board `--add-dir`, verified against agy 1.0.16;
@@ -129,16 +130,32 @@ workspaces keep executing — switching never pauses anything.
   default) stops an agent after 1 hour without activity (set it from 1 to
   24 hours under **Asleep after**). Activity is output it prints, a key you
   type into it, or a start. Its card turns black with the conversation's
-  summary and **Click to resume conversation**, its sidebar dot turns gray,
+  summary, Claude's last recap under it (the "recap:" line Claude prints a
+  few minutes after a reply, shown only if no work came after it) and
+  **Click to resume conversation**, its sidebar dot turns gray,
   and a click or a key resumes the same conversation with `--resume <id>`.
   Only Claude, Antigravity and Codex agents with a pinned conversation
   sleep, and never while one is working, asking you something, running a
   background command, waiting out the plan limit, holding a scheduled
-  message or holding a prompt you typed but didn't send. **Keep them
+  message or holding a prompt you typed but didn't send. A sleeping agent
+  wakes on its own only when AI Hive has to type into it: **Ship finished
+  lanes** into an asleep integrator, or a message you scheduled for it
+  coming due. Lane agents sleep through a ship, because the integrator
+  merges their commits, and **Close merged agents** closes them asleep.
+  **Keep them
   asleep at startup** (on whenever you turn sleep on) leaves an agent that
   was asleep at close, or idle that long, asleep when AI Hive opens.
   Switch either one off and every agent that was running or asleep
   resumes at startup, as before.
+- **Keep the PC awake.** ⚙ Options > Automation > **Keep the PC awake** (off
+  by default) stops Windows from sleeping on its idle timer while AI Hive is
+  open, the way a playing video does, so agents keep working overnight. It
+  is one `SetThreadExecutionState` call, and Windows drops it when AI Hive
+  exits. The screen still turns off and locks
+  as usual. A Modern Standby laptop on battery holds the screen on too,
+  because Windows ends a sleep block there 5 minutes after its sleep
+  timeout; only there does AI Hive check the power source, once a minute.
+  Closing the lid or pressing the power button still sleeps.
 - **Plan usage readout** — two top-bar badges, one
   per Claude rate-limit window, showing how much you've burned and when it
   comes back: the **5-hour** pill reads `5h Claude 21% used, resets in 1h20m
@@ -585,7 +602,8 @@ workspaces keep executing — switching never pauses anything.
   or click the integrator's `integrator` chip (its icon shows two lanes
   merging) and pick **Ship finished
   lanes**. That asks you to confirm the list, then types the request into
-  the integrator. The dialog's "Don't ask again" skips the question from
+  the integrator, resuming its conversation first if it is asleep to free
+  memory. The dialog's "Don't ask again" skips the question from
   then on; ⚙ Options > Agents > **Confirm Ship finished lanes** brings it
   back. It gathers the lanes you name, or every lane with an unmerged `Task done`
   commit, into one `integrate/` branch. If the base branch has
@@ -649,7 +667,7 @@ workspaces keep executing — switching never pauses anything.
   show without file edges; see below.)
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
-  reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Update AI
+  reset**, **Keep the PC awake**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Update AI
   Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times**, **Tooltips** and **Bionic reading** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), a **Manage…**
   door to the Updates panel whose tooltip names the detected Claude Code install
@@ -732,7 +750,9 @@ error dialog instead of silently closing. Packaging to a distributable
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;
   the model list matches claude's own `/model` menu, and **Default** names what
   it resolves to, because Claude then uses the last `/model` or `/effort` pick
-  saved from any terminal, e.g. "Default (high, saved by /effort)";
+  saved from any terminal, e.g. "Default (high, saved by /effort)". Effort is
+  saved per model, so its Default follows the Model pick, and the mode's
+  Default names the mode Claude starts in, e.g. "Default (auto)";
   Gemini/Antigravity with its model list; Grok via the xAI CLI; OpenAI as an
   editable command template), **shells** (PowerShell, cmd), and **scripts**
   (Python, custom);
@@ -1076,7 +1096,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4353 checks drive the real app headlessly (offscreen Qt platform) with real
+4450 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1226,7 +1246,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4353 checks)
+                           (4450 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

@@ -40,6 +40,17 @@ _ENCODE_RE = re.compile(r"[^A-Za-z0-9]")
 # actually changed so polling several agents stays cheap.
 _TITLE_CACHE: dict[str, tuple[float, int, str]] = {}
 
+# cache for latest_recap: transcript path -> (mtime, size, recap text).
+_RECAP_CACHE: dict[str, tuple[float, int, str]] = {}
+
+# latest_recap reads only this much of the transcript's end, with a full-scan
+# fallback when the tail holds neither a recap nor any turn
+_RECAP_TAIL_BYTES = 256 * 1024
+
+# what Claude appends to some recaps, a hint for the terminal and not part
+# of the recap itself
+_RECAP_HINT_RE = re.compile(r"\s*\(disable recaps in /config\)\s*$")
+
 # cache for latest_token_usage: transcript path -> (mtime, size, used, window).
 _USAGE_CACHE: dict[str, tuple[float, int, int, int]] = {}
 
@@ -196,6 +207,73 @@ def _read_latest_ai_title(path: str) -> str:
         return cached[2] if cached else ""
     _TITLE_CACHE[path] = (st.st_mtime, st.st_size, title)
     return title
+
+
+def latest_recap(cwd: str, session_id: str) -> str:
+    """Claude's newest "recap" of this conversation, if nothing happened
+    after it. "" otherwise, and for no file.
+
+    A few minutes after a turn ends, Claude writes a system record with
+    `subtype: "away_summary"` (the "recap: ..." line it prints in the
+    terminal): what was asked, where the work stands, what comes next. The
+    sleep screen shows it under the summary (TerminalCard.sleep_screen).
+
+    A recap describes the moment it was written. Any reply or real prompt
+    after it means the work moved on, so a recap followed by one is stale
+    and reads as "". Tool results and injected meta records do not count:
+    they belong to a turn, and a turn has assistant records anyway.
+    Cached by (mtime,size) like every other reader here. Never raises."""
+    if not session_id or not cwd:
+        return ""
+    return _read_latest_recap(transcript_path(cwd, session_id))
+
+
+def _read_latest_recap(path: str) -> str:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    cached = _RECAP_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2]
+    try:
+        recap, seen = _scan_recap(_tail_lines(path, _RECAP_TAIL_BYTES))
+        if not seen and st.st_size > _RECAP_TAIL_BYTES:
+            # one tool result longer than the whole tail: pay for the full
+            # scan once, then the cache holds until the file changes
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                recap, _seen = _scan_recap(fh)
+    except OSError:
+        return cached[2] if cached else ""
+    _RECAP_CACHE[path] = (st.st_mtime, st.st_size, recap)
+    return recap
+
+
+def _scan_recap(lines) -> tuple[str, bool]:
+    """(the recap still standing at the end of `lines`, whether `lines` held
+    a recap or a turn at all)."""
+    recap = ""
+    seen = False
+    for line in lines:
+        if ('"away_summary"' not in line and '"assistant"' not in line
+                and '"user"' not in line):
+            continue      # cheap prefilter before the JSON parse
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue      # a partial last line while Claude is writing
+        if rec.get("isSidechain"):
+            continue      # a sub-agent's turn, not this conversation's
+        kind = rec.get("type")
+        if kind == "system" and rec.get("subtype") == "away_summary":
+            text = rec.get("content")
+            if isinstance(text, str):
+                recap = _RECAP_HINT_RE.sub("", text).strip()
+                seen = True
+        elif kind == "assistant" or (kind == "user" and _is_real_prompt(rec)):
+            recap = ""
+            seen = True
+    return recap, seen
 
 
 def latest_gemini_ai_title(cwd: str, session_id: str) -> str:
@@ -1201,6 +1279,24 @@ def model_display(raw: str) -> str:
         return "Opus Plan" + (" (1M)" if big else "")
     # already friendly ("Opus 4.8 (1M context)"): only shorten the window note
     return text.replace("(1M context)", "(1M)").strip()
+
+
+def claude_model_label(raw: str) -> str:
+    """A Claude --model value or saved /model pick as the New Agent picker
+    labels it: "opus" -> "Opus 5.5", where `model_display` says only "Opus".
+    The card seeds its chip with this, so a fresh card names the same model
+    the dialog did and the transcript will. A "[1m]" pick names the same
+    model as the bare alias, and a label's own note in brackets is left out.
+    "" for nothing picked or "default" (the CLI's own choice)."""
+    from . import providers
+    text = (raw or "").strip()
+    if not text or text.lower() == "default":
+        return ""
+    bare = text.lower().replace("[1m]", "").strip()
+    for label, value in providers.CLAUDE_MODELS:
+        if value and value == bare:
+            return label.split(" (", 1)[0]
+    return model_display(text)
 
 
 def latest_model_effort(cwd: str, session_id: str) -> tuple[str, str, str]:

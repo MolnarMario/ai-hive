@@ -5046,6 +5046,220 @@ def test_ship_lanes_from_integrator_chip():
             _drop_lane_folder(lane["root"])
     shutil.rmtree(tmp, ignore_errors=True)
 
+
+def test_ship_wakes_only_the_asleep_integrator():
+    """Shipping needs one agent awake, the integrator. Ship finished lanes
+    on an asleep integrator resumes its conversation and types the request
+    once its prompt is free, never sooner. A resume that fell back to a new
+    conversation, a line the user sent meanwhile, a draft in its box or a
+    prompt that never frees up sends nothing. The lane agent whose work
+    ships stays asleep: its flag counts, its idle lane fast-forwards, and
+    Close merged agents takes it asleep."""
+    import types
+
+    from PySide6.QtWidgets import QApplication
+    from app import lanes
+    from app.process_worker import AgentKind, build_spec
+    from app.session_store import SessionStore
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-ship-wake-"))
+    work = _make_repo(tmp)
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    ws = win.manager.create_workspace("Repo", str(work))
+    made = []
+
+    def laned(name, uid, sid):
+        lane = _lane_for(work, name, uid)
+        made.append(lane)
+        spec = build_spec(AgentKind.CLAUDE, name, cwd=lane["root"], pty=True)
+        spec.uid = uid
+        spec.lane = lane
+        agent = win.manager.add_terminal(ws.id, spec, autostart=False)
+        agent.spec.session_id = sid
+        return agent
+
+    with _stub_starts() as starts:
+        a = laned("Agent A", "5c1e01" + "0" * 26,
+                  "5c1e0a00-0000-4000-8000-000000000001")
+        i = laned("Integrator", "5c1eee" + "0" * 26,
+                  "5c1e0a00-0000-4000-8000-0000000000ee")
+        app.processEvents()
+        win._toggle_integrator(ws.id, i)
+        state = {"is_running": False, "prompt_ready": False,
+                 "is_busy": False, "is_waiting": False}
+        for attr in state:
+            setattr(i, attr, lambda k=attr: state[k])
+        sid = i.spec.session_id
+
+        def asleep(agent, verify=False):
+            # put_to_sleep's arming, on an agent whose child has exited.
+            # verify=True has the start check the pinned transcript first.
+            if agent is i:
+                state.update(is_running=False, prompt_ready=False)
+                i.spec.session_id = sid
+            agent.spec.resume = True
+            agent._verify_resume_target = verify
+            agent.mark_asleep()
+
+        def boot():
+            state.update(is_running=True, prompt_ready=True)
+
+        asleep(a)
+        asleep(i)
+        delivered, audit, told, asked = [], [], [], []
+        i.nudge = lambda text: (delivered.append(text), True)[1]
+        win._store_audit = audit.append
+        win._lane_message = lambda title, text: told.append(text)
+        win._confirm_ship = lambda agent, done: (
+            asked.append(agent.is_asleep()), True)[1]
+        views = {a.spec.uid: lanes.LaneView(
+            uid=a.spec.uid, branch=a.spec.lane["branch"],
+            root=a.spec.lane["root"], ahead=1, done="a" * 40)}
+        win._on_lanes_changed(ws.id, dict(views))
+        uid = i.spec.uid
+
+        label, enabled, tip = win._ship_offer(ws, i)
+        check("ship wake: an asleep integrator keeps Ship enabled and says "
+              "it resumes it", enabled and "Resumes Integrator's" in tip
+              and "Agent A" in tip, (enabled, tip))
+        win._ship_lanes(ws.id, i)
+        check("ship wake: the user confirmed while it slept",
+              asked == [True], asked)
+        check("ship wake: OK starts the integrator, and only it",
+              starts.cwds("Integrator") == [i.spec.lane["root"]]
+              and starts.cwds("Agent A") == [] and not i.is_asleep()
+              and a.is_asleep(), starts.calls)
+        check("ship wake: the start resumes the slept-in conversation",
+              i.spec.session_id == sid
+              and "--resume" in starts.calls[-1][2], starts.calls[-1])
+        check("ship wake: nothing is typed while it boots",
+              delivered == [] and uid in win._ship_waking
+              and any(ln.startswith("LANE-SHIP-WAKE") for ln in audit),
+              (delivered, audit))
+        _l, enabled, tip = win._ship_offer(ws, i)
+        check("ship wake: a second Ship waits for the first",
+              not enabled and "waking up" in tip, tip)
+        state["is_running"] = True
+        win._ship_wake_tick(uid)
+        check("ship wake: a child without its prompt yet gets nothing",
+              delivered == [] and uid in win._ship_waking)
+        boot()
+        state["is_busy"] = True
+        win._ship_wake_tick(uid)
+        check("ship wake: a resume still drawing its replay gets nothing",
+              delivered == [] and uid in win._ship_waking)
+        state["is_busy"] = False
+        term = win._pages[ws.id].card_for(i.id).terminal
+        term.feed("\x1b[2J\x1b[H> half a prompt")
+        win._ship_wake_tick(uid)
+        check("ship wake: a draft in its box holds the request",
+              delivered == [] and uid in win._ship_waking)
+        term.feed("\x1b[2J\x1b[H> ")
+        win._ship_wake_tick(uid)
+        check("ship wake: a free prompt gets the request, once",
+              len(delivered) == 1 and a.spec.lane["branch"] in delivered[0]
+              and ("a" * 12) in delivered[0] and uid not in win._ship_waking
+              and told == [], (delivered, told))
+        win._ship_wake_tick(uid)
+        check("ship wake: the lane agent slept through it",
+              len(delivered) == 1 and a.is_asleep()
+              and starts.cwds("Agent A") == [])
+
+        # a start that falls back to a new conversation gets nothing. The
+        # sandbox has no Claude projects folder, which proves nothing, so
+        # the pinned transcript is made provably gone here.
+        from app import session_sync
+        delivered.clear()
+        asleep(i, verify=True)
+        real_nowhere = session_sync.written_nowhere
+        session_sync.written_nowhere = lambda _sid: True
+        try:
+            win._ship_lanes(ws.id, i)
+        finally:
+            session_sync.written_nowhere = real_nowhere
+        check("ship wake: a resume that started a new conversation is not "
+              "asked to ship", delivered == [] and i.spec.session_id != sid
+              and uid not in win._ship_waking
+              and "started a new one" in told[-1], (delivered, told))
+
+        # the user's own line goes first
+        asleep(i)
+        win._ship_lanes(ws.id, i)
+        boot()
+        i._last_submit_ts = time.time() + 5
+        win._ship_wake_tick(uid)
+        i._last_submit_ts = 0.0
+        check("ship wake: a line the user sent while it woke cancels it",
+              delivered == [] and uid not in win._ship_waking
+              and "Integrator got another message" in told[-1], told[-1:])
+
+        # a woken child that dies ends the wait at once, with that reason
+        from app.terminal_agent import AgentStatus
+        asleep(i)
+        win._ship_lanes(ws.id, i)
+        state["is_running"] = True
+        win._ship_wake_tick(uid)
+        state["is_running"] = False
+        i.status = AgentStatus.CRASHED
+        win._ship_wake_tick(uid)
+        i.status = AgentStatus.IDLE
+        check("ship wake: an integrator that dies while it wakes says so",
+              delivered == [] and uid not in win._ship_waking
+              and "stopped while it woke up" in told[-1], told[-1:])
+
+        # a prompt that never frees up gives up, saying so
+        asleep(i)
+        win._ship_lanes(ws.id, i)
+        boot()
+        state["is_waiting"] = True
+        win._ship_wake_tick(uid)
+        check("ship wake: a prompt that is not free yet waits",
+              delivered == [] and uid in win._ship_waking)
+        win._ship_waking[uid]["deadline"] = 0.0
+        win._ship_wake_tick(uid)
+        state["is_waiting"] = False
+        check("ship wake: ...until the timeout, which tells the user",
+              delivered == [] and uid not in win._ship_waking
+              and "did not reach a free prompt" in told[-1], told[-1:])
+        check("ship wake: every drop is audited",
+              sum(ln.startswith("LANE-SHIP-DROP") for ln in audit) == 4,
+              audit)
+
+        # the asleep lane agent needs nothing awake after the merge either
+        submitted = []
+        real_submit = win.lane_ops.submit
+        win.lane_ops.submit = lambda repo, fn, *args, **kw: submitted.append(
+            kw.get("label"))
+        try:
+            win._refresh_idle_lanes(ws.id, {a.spec.uid: lanes.LaneView(
+                uid=a.spec.uid, branch=a.spec.lane["branch"],
+                root=a.spec.lane["root"], behind=1, base_ref="origin/main")})
+        finally:
+            win.lane_ops.submit = real_submit
+            win._auto_refreshing.discard(a.spec.uid)
+        check("ship wake: an asleep lane agent's idle lane still "
+              "fast-forwards", submitted == ["auto-refresh"] and a.is_asleep(),
+              submitted)
+        snap = types.SimpleNamespace(error="", exists=True, ahead=0,
+                                     dirty=[], landed="a" * 40,
+                                     read_at=time.time())
+        check("ship wake: Close merged agents takes an asleep lane agent",
+              win._close_merged_qualifies(ws.id, a, snap, None)
+              and a.is_asleep())
+
+        for agent in list(ws.agents):
+            win._close_agent(ws.id, agent.id)
+        win.lane_ops.drain(60)
+    win.close()
+    app.processEvents()
+    for lane in made:
+        if os.path.isdir(lane["root"]):
+            _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
 def test_ship_confirm_dont_ask_again():
     """Ticking "Don't ask again" on the Ship finished lanes dialog and
     pressing OK skips that dialog from then on, and the choice survives a

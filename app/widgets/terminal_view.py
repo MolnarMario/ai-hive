@@ -90,9 +90,13 @@ CLAUDE.md's terminal-scrollback invariant -- which never negotiates mouse
 tracking at all, even while showing a clickable-looking AskUserQuestion/plan/
 permission menu), a plain left-click places the input caret where you clicked,
 by sending the child arrow keys (a terminal can't set the child's cursor
-directly): exact on the caret's own line (Left/Right by the column delta), and
-best-effort on another line of a multi-line prompt (Up/Down to the row, then
-Left/Right to the predicted landing column -- see _reposition_cursor). Only
+directly): exact on the caret's own line, and best-effort on another line
+of a multi-line prompt (Up/Down to the row, then Left/Right from the
+predicted landing column -- see _reposition_cursor). A Left/Right is one
+column only for plain text: Claude's collapsed paste "[Pasted text #1 +4
+lines]" is one press wide and a wide glyph two columns, so the presses
+come from app/input_caret.py, and a click on a token goes to its nearer
+edge, never inside it. Only
 rows inside the input box are touched, so clicking the transcript never nudges
 the prompt -- and while the agent is parked on an interactive menu
 (waiting_probe, wired to agent.is_waiting()) a click is inert instead, because
@@ -201,7 +205,7 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
                            QWheelEvent)
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
-from .. import soft_wrap, ui_theme
+from .. import input_caret, soft_wrap, ui_theme
 from ..terminal_agent import (REFLOW_BEGIN, REFLOW_END, _CLAUDE_READY_HINTS,
                               _NUM_OPTION_RE)
 from ..ui_theme import ANSI_16, Palette
@@ -2816,8 +2820,15 @@ class TerminalView(QWidget):
         self-clamping (readline stops at the input's start/end), so a
         mispredicted landing is at worst a few columns off, never data loss.
 
-        On the caret's OWN row it is exact: each Left/Right == one column on an
-        unwrapped line. On ANOTHER row of a multi-line prompt it is best-effort:
+        On the caret's OWN row it is exact: the Left/Right count comes from
+        input_caret.CaretMap, where a collapsed paste ("[Pasted text #1 +4
+        lines]", "[Image #2]") is ONE press wide. Counting one press per
+        column overshot the click by the token's width less one, the bug
+        that put the caret left of a click before a paste and right of one
+        after it. A click inside a token goes to its nearer edge, since
+        typing inside one edits the token's text. A click past the row's
+        end goes to the end, so it can't spill onto the next line. On
+        ANOTHER row of a multi-line prompt it is best-effort:
         Up/Down move by one visual row carrying the caret's "goal column" (its
         current column, which the editor clamps to the target line's length), so
         we PREDICT the landing column from the painted row and correct with
@@ -2851,36 +2862,54 @@ class TerminalView(QWidget):
         span = self._input_block_span()
         if span is None or not (span[0] <= row <= span[1]):
             return  # off the input box: leave the child's caret alone
-        cy = self.screen.cursor.y
-        cx = self.screen.cursor.x
-        if row == cy:
-            self._emit_arrows("C" if col > cx else "D", abs(col - cx))
-            return
-        # 1. vertical: Up/Down carry the goal column (cx), clamped to the target
-        #    line's end. Consecutive presses keep the same goal, so N moves land
-        #    on `row` at min(cx, line-end).
-        self._emit_arrows("B" if row > cy else "A", abs(row - cy))
-        # 2. predict that landing, then correct horizontally on the target row.
-        #    Clamp the requested column into the row's content so the Left/Right
-        #    run can't spill onto an adjacent line.
-        _, last = self._row_content(row)
-        line_end = last + 1 if last >= 0 else 0
-        landing = min(cx, line_end)
-        target = max(0, min(col, line_end))
-        self._emit_arrows("C" if target > landing else "D", abs(target - landing))
+        carets = self._caret_map(span)
+        self._drive_caret(carets, carets.snap((row, col)))
+
+    def _caret_map(self, span) -> input_caret.CaretMap:
+        """The caret stops of the live input box rows `span` (top, bottom):
+        a collapsed paste is one press wide, see app/input_caret.py."""
+        buf, cols = self.screen.buffer, self.screen.columns
+        cells = {r: [buf[r][c].data for c in range(cols)]
+                 for r in range(span[0], span[1] + 1)}
+        return input_caret.CaretMap(
+            cells, (self.screen.cursor.y, self.screen.cursor.x),
+            _INPUT_PROMPTS)
+
+    def _drive_caret(self, carets, target) -> None:
+        """Send the arrows that walk the child's caret to `target`, a caret
+        stop of `carets`. On the caret's own row that is the Left/Right run
+        `carets` counts. On another row Up/Down go first and carry the
+        caret's column, which the editor clamps to the target row's end,
+        and the Left/Right run starts from that predicted landing."""
+        cy, cx = self.screen.cursor.y, self.screen.cursor.x
+        row = target[0]
+        src = (cy, cx)
+        if row != cy:
+            self._emit_arrows("B" if row > cy else "A", abs(row - cy))
+            src = (row, max(carets.row_start(row),
+                            min(cx, carets.row_end(row))))
+        n = carets.presses(src, target)
+        if n:
+            self._emit_arrows("C" if target > src else "D", n)
 
     def _delete_selection(self) -> bool:
         """Delete a selection by driving the child's caret to its end, then
         Backspacing over it -- a terminal can't edit a span of the child's
         buffer directly. Works for a selection anywhere INSIDE the live input
         box (single OR multi-row/wrapped): the box's rows map to the child's
-        logical line, so the character count is the painted cells across the
-        span plus one Backspace per row transition (each soft-wrap / explicit
-        newline is one editable char). Fail-closed: a scrolled-back view or a
+        logical line, so the Backspace count is the Left presses that walk
+        the caret from the span's end to its start (input_caret.CaretMap):
+        one per glyph, one per row transition (each soft-wrap / explicit
+        newline is one editable char), and ONE for a whole collapsed paste,
+        which Backspace deletes in one go. Counting its painted cells
+        instead deleted that many characters of the text before it. A
+        selection that touches part of a token grows to hold all of it.
+        Fail-closed: a scrolled-back view or a
         selection that escapes the input box (output/scrollback) is left
         untouched and returns False -- inference from painted rows must never
         corrupt what it can't be sure of. The leading prompt run ('> ') on the
-        box's first row is never counted as deletable input.
+        box's first row is never counted as deletable input, and neither is
+        the indent Claude paints on the rows below it.
 
         Also fails closed while waiting_probe() is true: _input_block_span's
         heuristics can misjudge a printed interactive menu as part of the
@@ -2898,27 +2927,16 @@ class TerminalView(QWidget):
         span = self._input_block_span()
         if span is None or not (span[0] <= r0 and r1 <= span[1]):
             return False  # selection escapes the input box
-        buf = self.screen.buffer
-        count = 0
-        for r in range(r0, r1 + 1):
-            first, last = self._row_content(r)
-            if last >= 0:
-                start = c0 if r == r0 else 0
-                end = min(c1 if r == r1 else last, last)
-                # don't count the box's leading '> ' prompt as input
-                if r == span[0] and buf[r][first].data in _INPUT_PROMPTS:
-                    pstart = first + 1
-                    while pstart <= last and buf[r][pstart].data in ("", " "):
-                        pstart += 1
-                    start = max(start, pstart)
-                if end >= start:
-                    count += end - start + 1
-            if r < r1:
-                count += 1  # the wrap/newline joining this row to the next
-        if count <= 0:
+        # The count is the Left presses from the span's end back to its
+        # start, so a collapsed paste costs one and the prompt and the
+        # indent of the rows below it cost none (app/input_caret.py).
+        carets = self._caret_map(span)
+        start, end = carets.widen((r0, c0), (r1, c1 + 1))
+        count = carets.presses(end, start) if start < end else None
+        if not count:
             return False
         self._snap_to_bottom()
-        self._reposition_cursor(r1, c1 + 1)   # caret to just past the span end
+        self._drive_caret(carets, end)        # caret to just past the span end
         self.keyInput.emit("\x7f" * count)    # then Backspace over it
         return True
 
@@ -3331,7 +3349,9 @@ class TerminalView(QWidget):
             start = first
             if r == top and buf[r][first].data in _INPUT_PROMPTS:
                 start = first + 1
-                while start <= last and buf[r][start].data in ("", " "):
+                # Claude's "❯" is followed by a no-break space
+                while start <= last \
+                        and buf[r][start].data in input_caret.PROMPT_GAP:
                     start += 1
             out.append("".join(buf[r][c].data for c in range(start, last + 1)))
         return "\n".join(out).strip("\n")
@@ -3341,7 +3361,10 @@ class TerminalView(QWidget):
         caret, not from `_input_text`: Claude draws its dim "Try ..." hint
         inside an empty box, behind a caret parked at the box's start, while
         typed text leaves the caret after it. False without a '>'/'❯'
-        prompt row, since there is no box to read then (Codex draws '›')."""
+        prompt row, since there is no box to read then (Codex draws '›').
+        The cell after "❯" is a no-break space (Claude 2.1.316), not
+        typed text: read as text, it made every empty box a draft, and
+        the idle sleep skips an agent with a draft, so none ever slept."""
         span = self._input_block_span()
         if span is None:
             return False
@@ -3353,7 +3376,7 @@ class TerminalView(QWidget):
         cy, cx = self.screen.cursor.y, self.screen.cursor.x
         if cy > top:
             return True        # a second line of input
-        return any(row[c].data not in ("", " ")
+        return any(row[c].data not in input_caret.PROMPT_GAP
                    for c in range(first + 1, min(cx, last + 1)))
 
     def _note_prompt_submit(self) -> None:

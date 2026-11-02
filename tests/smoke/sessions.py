@@ -3169,6 +3169,62 @@ def test_last_active_marks_dirty():
           mgr._agent_dict(agent)["last_active"])
 
 
+def test_sleep_recap_reader():
+    """The sleep screen's recap is Claude's newest `away_summary` record,
+    without the terminal's /config hint, and only while no reply or real
+    prompt has come after it: a recap the work moved past is stale."""
+    import json as _json
+    import tempfile
+    from pathlib import Path
+
+    from app import transcripts
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-recap-"))
+    path = tmp / "conv.jsonl"
+
+    def write(*recs):
+        path.write_text("".join(_json.dumps(r) + "\n" for r in recs),
+                        encoding="utf-8")
+        transcripts._RECAP_CACHE.clear()
+        return transcripts._read_latest_recap(str(path))
+
+    prompt = {"type": "user", "message": {"role": "user", "content": "go"}}
+    reply = {"type": "assistant",
+             "message": {"content": [{"type": "text", "text": "done"}]}}
+    tool = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}}
+    meta = {"type": "user", "isMeta": True, "message": {"content": "ctx"}}
+    old = {"type": "system", "subtype": "away_summary",
+           "content": "Old recap."}
+    new = {"type": "system", "subtype": "away_summary",
+           "content": "You asked for X. Next, Y. (disable recaps in /config)"}
+    side = dict(reply, isSidechain=True)
+    check("recap: the newest one wins, without the /config hint",
+          write(prompt, reply, old, prompt, reply, new)
+          == "You asked for X. Next, Y.")
+    check("recap: a reply after it makes it stale",
+          write(prompt, reply, new, reply) == "")
+    check("recap: a real prompt after it makes it stale",
+          write(prompt, reply, new, prompt) == "")
+    check("recap: tool results, meta and sub-agent records leave it current",
+          write(prompt, reply, new, tool, meta, side)
+          == "You asked for X. Next, Y.")
+    check("recap: none written reads empty", write(prompt, reply) == "")
+    check("recap: a missing file reads empty",
+          transcripts._read_latest_recap(str(tmp / "nope.jsonl")) == "")
+    check("recap: no session id reads empty",
+          transcripts.latest_recap(str(tmp), "") == "")
+    write(prompt, reply, new)
+    pad = {"type": "progress", "data": "x" * 4096}
+    with open(path, "a", encoding="utf-8") as fh:
+        for _ in range(transcripts._RECAP_TAIL_BYTES // 4096 + 4):
+            fh.write(_json.dumps(pad) + "\n")
+    transcripts._RECAP_CACHE.clear()
+    check("recap: one older than the tail is found by the full scan",
+          transcripts._read_latest_recap(str(path))
+          == "You asked for X. Next, Y.")
+
+
 def test_sleep_idle_agents():
     """Options > Free up RAM: which agents may sleep, what a sleep does to
     the agent, its save record and its card, and the Options switches."""
@@ -3331,16 +3387,24 @@ def test_sleep_idle_agents():
           not card.sleep_screen.isHidden() and card.overlay.isHidden())
     check("sleep: the header glyph reads asleep",
           card.glyph.property("state") == "asleep")
+    check("sleep: no recap on disk, so no recap line",
+          card.sleep_screen.recap.isHidden())
+    idle.recap = lambda: "We ported the lexer. Next, the parser."
     idle.set_ai_title("Port the parser to the new grammar")
     check("sleep: the sleep screen shows the conversation's summary",
           card.sleep_screen.summary.text()
           == "Port the parser to the new grammar",
           card.sleep_screen.summary.text())
+    check("sleep: ...and Claude's recap under it",
+          not card.sleep_screen.recap.isHidden()
+          and card.sleep_screen.recap.text()
+          == "We ported the lexer. Next, the parser.",
+          card.sleep_screen.recap.text())
+    del idle.recap
     win._finished_lanes = lambda _ws, _a: ["a done lane"]
     _lanes, why = win._ship_state(wws, idle)
-    check("sleep: Ship finished lanes says to resume an asleep integrator, "
-          "never to restart it", "asleep" in why and "Restart" not in why,
-          why)
+    check("sleep: an asleep integrator can take Ship finished lanes (the "
+          "ship wakes it)", why == "", why)
     del win._finished_lanes
     card.sleep_screen.resume_btn.click()
     check("sleep: a click resumes the conversation",
@@ -3384,12 +3448,114 @@ def test_sleep_idle_agents():
     term.feed("\x1b[2J\x1b[H> Try \"fix the tests\"\x1b[1;3H")
     check("sleep: Claude's hint behind a caret at the start is no draft",
           not term.has_draft())
+    # what Claude 2.1.316 really paints: a no-break space after the glyph,
+    # which read as typed text and kept every idle agent awake
+    term.feed("\x1b[2J\x1b[H❯\xa0Try \"fix the tests\"\x1b[1;3H")
+    check("sleep: the no-break space after Claude's prompt is no draft",
+          not term.has_draft())
+    term.feed("\x1b[2J\x1b[H❯\xa0hi")
+    check("sleep: text after Claude's real prompt is a draft",
+          term.has_draft())
     term.feed("\x1b[2J\x1b[H> first line\r\n  second")
     check("sleep: a second line of input is a draft", term.has_draft())
     term.feed("\x1b[2J\x1b[H› Ask Codex anything\x1b[1;3H")
     check("sleep: a box without a '>' prompt is never read as a draft",
           not term.has_draft())
     win._sleep_idle = False
+    for a in list(wws.agents):
+        win._close_agent(wws.id, a.id)
+    win.close(); pump(120)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_scheduled_message_wakes_sleeping_agent():
+    """A message scheduled for an agent asleep to free memory wakes it when
+    it comes due, and goes in once the resumed prompt is up. Only an agent
+    with a message due wakes, one per tick, so a batch due together boots
+    staggered. A message already past the give-up wakes nothing: it would
+    go MISSED before the boot finished."""
+    import time
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.session_store import SessionStore
+    from app.terminal_agent import AgentStatus
+    from app.widgets.main_window import SCHEDULE_GIVE_UP_S
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-sched-wake-"))
+    win = create_main_window(SessionStore(path=tmp / "s.json"))
+    win.show(); pump(120)
+    wws = win.manager.workspaces[0]
+    sent = {}
+
+    def sleeper(name, n):
+        agent, calls, live = _sleepy_claude(
+            win.manager, wws.id, name, SCRATCH_CWD,
+            sid=f"5ee9a6e7-0000-4000-8000-0000000005{n:02d}")
+        live["on"] = False
+        agent._set_status(AgentStatus.EXITED_OK)
+        # put_to_sleep's arming, minus the transcript check: the pinned
+        # conversation is taken as there
+        agent.spec.resume = True
+        agent._verify_resume_target = False
+        agent.mark_asleep()
+        sent[name] = []
+        agent.nudge = lambda text: (
+            agent._prompt_ready and live["on"]
+            and (sent[name].append(text) or True))
+        return agent, calls, live
+
+    now = time.time()
+    first, fcalls, flive = sleeper("Due first", 1)
+    second, scalls, slive = sleeper("Due second", 2)
+    late, lcalls, _ll = sleeper("Long overdue", 3)
+    later, tcalls, _tl = sleeper("Due tomorrow", 4)
+    first.schedule_message("carry on", now - 2)
+    second.schedule_message("and you", now - 1)
+    late.schedule_message("too late", now - SCHEDULE_GIVE_UP_S - 60)
+    later.schedule_message("tomorrow", now + 86400)
+    check("sched wake: all four start asleep",
+          all(a.is_asleep() for a in (first, second, late, later)))
+    audits = []
+    win._schedule_audit = audits.append
+
+    win._tick_schedules()
+    check("sched wake: a due message wakes its agent, one per tick",
+          fcalls == ["start"] and scalls == [] and not first.is_asleep()
+          and second.is_asleep(), (fcalls, scalls))
+    check("sched wake: nothing is typed before the prompt is up",
+          sent["Due first"] == [] and first.pending_scheduled())
+    check("sched wake: a message past the give-up wakes nothing",
+          lcalls == [] and late.is_asleep()
+          and late.missed_scheduled(), lcalls)
+    check("sched wake: an agent with nothing due sleeps on",
+          tcalls == [] and later.is_asleep())
+
+    # the resumed child is up at its prompt
+    flive["on"] = True
+    first._set_status(AgentStatus.RUNNING)
+    first._prompt_ready = True
+    win._tick_schedules()
+    check("sched wake: the next tick delivers into the woken agent",
+          sent["Due first"] == ["carry on"]
+          and not first.pending_scheduled(), sent["Due first"])
+    check("sched wake: ...and wakes the next agent with a message due",
+          scalls == ["start"] and not second.is_asleep(), scalls)
+    check("sched wake: each wake is audited",
+          [ln.split(" late=")[0] for ln in audits
+           if ln.startswith("WAKE")]
+          == ["WAKE agent=Due first", "WAKE agent=Due second"], audits)
+    check("sched wake: the far-off message still sleeps",
+          tcalls == [] and later.is_asleep() and later.pending_scheduled())
+
     for a in list(wws.agents):
         win._close_agent(wws.id, a.id)
     win.close(); pump(120)

@@ -1713,6 +1713,16 @@ class TerminalAgent(QObject):
         """
         return self._ai_title or self.current_task
 
+    def recap(self) -> str:
+        """Claude's newest recap of this conversation, unless work followed
+        it (transcripts.latest_recap). "" for other providers, which write
+        none. Read when the sleep screen shows, so it is never stored."""
+        spec = self.spec
+        if spec.provider != "claude" or not spec.session_id:
+            return ""
+        return sanitize_text(
+            transcripts.latest_recap(spec.cwd, spec.session_id)).strip()
+
     def set_ai_title(self, text: str) -> None:
         """Adopt the provider's latest conversation summary.
         Transient — never persisted; refreshed by the manager's poll."""
@@ -1750,11 +1760,24 @@ class TerminalAgent(QObject):
 
     def _seed_live_state(self) -> None:
         """Set the live model, effort and permission mode from the launch spec,
-        which is what a brand-new agent of this kind shows."""
+        which is what a brand-new agent of this kind shows.
+
+        A Claude flag left on Default is filled from what the CLI will pick
+        without it: the saved effort for that model and the mode a new
+        conversation starts in. Claude writes no transcript until the first
+        prompt, so a new card said "Opus · manual" over a terminal that was
+        on Opus 5.5 at xhigh in auto mode until the user typed something."""
         spec = self.spec
         self._live_effort = (spec.effort or "").strip()
         self._live_mode = (getattr(spec, "permission_mode", "") or "").strip()
         self._live_model = self._seed_model()
+        if spec.provider == "claude":
+            if not self._live_effort:
+                self._live_effort = providers.user_default_effort(
+                    (spec.model or "").strip())
+            if not self._live_mode:
+                self._live_mode = providers.user_default_permission_mode(
+                    spec.cwd)
         if spec.provider == "openai" and not self._live_effort:
             _, configured_effort = transcripts.codex_user_defaults()
             self._live_effort = configured_effort.strip()
@@ -1787,7 +1810,8 @@ class TerminalAgent(QObject):
         Other providers show spec.model verbatim."""
         chosen = (self.spec.model or "").strip()
         if self.spec.provider == "claude":
-            return transcripts.model_display(chosen or providers.user_default_model())
+            return transcripts.claude_model_label(
+                chosen or providers.user_default_model())
         if self.spec.provider == "gemini":
             raw = chosen or providers.gemini_user_default_model()
             model, effort = transcripts.parse_gemini_model_effort(raw)
@@ -1825,9 +1849,10 @@ class TerminalAgent(QObject):
 
     def permission_mode(self) -> str:
         """The raw permission-mode token this agent is in, as the CLI names it
-        ("", "default", "auto", "plan", ...). "" for a fresh Claude agent means
-        the CLI's own ask-each-time default; for anything else it means the
-        concept does not apply."""
+        ("", "default", "auto", "plan", ...). "" for a Claude agent means
+        nothing says what the CLI starts in (providers.
+        user_default_permission_mode) and reads as manual; for anything else
+        it means the concept does not apply."""
         return self._live_mode
 
     def permission_mode_label(self) -> str:
