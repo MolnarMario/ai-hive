@@ -8,6 +8,29 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.56.0
+
+- Options > Automation > Keep the PC awake (off by default) stops Windows
+  from going to sleep on its idle timer while AI Hive is open, so agents
+  keep working overnight. The screen still turns off and locks.
+- A sleeping agent's card shows Claude's last recap under the
+  conversation's summary, when no work came after it.
+- Ship finished lanes works on an integrator that is asleep: AI Hive
+  resumes its conversation and types the request once it is ready. A
+  scheduled message that comes due on a sleeping agent wakes it too,
+  instead of being missed. Lane agents stay asleep through a ship.
+- A new Claude card names the model and permission mode Claude really
+  starts on, such as "Opus 5.5" and auto, instead of "Opus" and manual.
+  In New Agent, the effort Default follows the model you pick, the mode
+  Default names the mode Claude starts in, and a new Manual entry asks
+  before each action. An agent set to ask before each action reopens
+  that way instead of in auto mode.
+- Clicking in Claude's input box after a collapsed paste such as
+  "[Pasted text #1 +4 lines]" puts the caret where you clicked, and
+  deleting a selection across one no longer eats the text before it.
+- An empty Claude input box no longer counts as an unsent draft, so idle
+  Claude agents fall asleep again.
+
 ## 0.55.1
 
 - The Options panel lays its settings out in two columns, so the whole
