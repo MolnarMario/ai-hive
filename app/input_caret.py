@@ -62,8 +62,9 @@ class CaretMap:
         self.cells = cells
         self.top, self.bottom = min(cells), max(cells)
         self.caret = caret
+        self._spans = {r: _content(row) for r, row in cells.items()}
         row = cells[self.top]
-        first, _ = _content(row)
+        first, _ = self._spans[self.top]
         self.indent = 0
         if first >= 0 and row[first] in prompts:
             self.indent = first + 1
@@ -76,19 +77,20 @@ class CaretMap:
         self._find_tokens()
 
     def row_start(self, r: int) -> int:
-        """Leftmost caret column of row r. A row below the first starts at
-        the indent, or further left when the text there does: then the
-        cells left of the indent hold typed text, and counting them deletes
-        less, never more."""
+        """Leftmost caret column of row r. Rows below the first start at
+        the indent Claude paints, or at their text when it starts further
+        left, as on a TUI that paints no indent. A row whose real start
+        lies left of both reads short, so a delete across it takes less
+        text, never more."""
         if r == self.top:
             return self.indent
-        first, _ = _content(self.cells[r])
+        first, _ = self._spans[r]
         return self.indent if first < 0 else min(self.indent, first)
 
     def row_end(self, r: int) -> int:
         """Rightmost caret column of row r: after its last glyph, or at the
         caret on its own row, which counts blanks typed at the end."""
-        _, last = _content(self.cells[r])
+        _, last = self._spans[r]
         end = max(last + 1, self.row_start(r))
         if r == self.caret[0]:
             end = max(end, self.caret[1])
