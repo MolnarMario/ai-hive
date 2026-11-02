@@ -8,6 +8,16 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.56.3
+
+- Characters typed with AltGr, like '@' or '{' on a Hungarian or German
+  keyboard, reach Claude as those characters. They used to arrive as an
+  Alt key combination, so the '@' never showed up in the prompt.
+- Pasting with Ctrl+V or the right-click menu replaces text you selected
+  in the input box, the same way typing over it does.
+- Typing over the whole prompt after Ctrl+A replaces it again. Claude
+  used to ignore both the clear and the key, so the old prompt stayed.
+
 ## 0.56.2
 
 - Free up RAM puts an idle agent to sleep on time again. Switching to a

@@ -439,8 +439,10 @@ def test_terminal_keys():
           sent == ["\x7f"], sent)
 
     # Typing a printable character over the Ctrl+A highlight REPLACES the input,
-    # like any editor: the child's prompt is cleared (double-Esc) THEN the typed
+    # like any editor: the highlighted text is Backspaced away THEN the typed
     # character is sent, so it becomes the fresh input rather than appending.
+    # Not the double-Esc clear: measured live, Claude read "\x1b\x1b" with
+    # "x" right behind it as Escape plus Alt+x and the prompt stayed as it was.
     def type_char(ch):
         view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, K.Key_X,
                                      Qt.KeyboardModifier.NoModifier, ch))
@@ -449,8 +451,8 @@ def test_terminal_keys():
     check("keys: Ctrl+A re-highlights the input", view.selected_text() == "> my prompt")
     sent.clear()
     type_char("x")
-    check("keys: typing over the highlight clears then sends the char",
-          sent == ["\x1b\x1b", "x"], sent)
+    check("keys: typing over the highlight Backspaces it then sends the char",
+          sent == ["\x7f" * len("my prompt"), "x"], sent)
     check("keys: typing over the highlight drops the highlight",
           view.selected_text() == "")
 
@@ -1102,6 +1104,87 @@ def test_terminal_selection_edit():
     check("seledit: Backspace off the input line sends nothing", sent3 == [], sent3)
     check("seledit: off-line Backspace still clears the selection",
           v3.selected_text() == "")
+
+
+def test_terminal_altgr_and_paste_replace():
+    """Two gaps next to typing-over-a-selection. Qt on Windows reports AltGr
+    as Ctrl+Alt (measured on a Hungarian layout: AltGr+V is Key_At, both
+    modifiers, text "@"), so '@' went to Claude ESC-prefixed as Alt+@ and
+    never as '@', and it didn't replace a selection either. And a paste,
+    Ctrl+V or the context menu, went in at the caret and left the selection
+    (or the Ctrl+A highlight) in place."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QGuiApplication, QKeyEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    K = Qt.Key
+    M = Qt.KeyboardModifier
+    altgr = M.ControlModifier | M.AltModifier
+    clip = QGuiApplication.clipboard()
+
+    def fresh(text="hello world", select=True):
+        view = TerminalView(rows=6, cols=80)
+        view.feed("\x1b[?2004h" + text)     # bracketed paste, as Claude asks
+        if select:
+            view._sel_anchor, view._sel_end = (0, 6), (0, 10)   # "world"
+        sent = []
+        view.keyInput.connect(sent.append)
+        return view, sent
+
+    def key(view, k, mods, text=""):
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, k, mods, text))
+
+    v, sent = fresh(select=False)
+    key(v, K.Key_At, altgr, "@")
+    check("altgr: '@' goes out as '@', not ESC-prefixed", sent == ["@"], sent)
+
+    v, sent = fresh()
+    check("altgr: the selection is set", v.selected_text() == "world",
+          v.selected_text())
+    key(v, K.Key_BraceLeft, altgr, "{")
+    check("altgr: an AltGr character replaces the selection",
+          sent == ["\x7f" * 5, "{"], sent)
+    check("altgr: ...and drops it", v._selection_range() is None)
+
+    v, sent = fresh(select=False)
+    key(v, K.Key_Home, altgr)
+    check("altgr: Ctrl+Alt with no character keeps its modifiers",
+          sent == ["\x1b[1;7H"], sent)
+
+    clip.setText("HI")
+    v, sent = fresh()
+    key(v, K.Key_V, M.ControlModifier)
+    check("paste: Ctrl+V over a selection replaces it",
+          sent == ["\x7f" * 5, "\x1b[200~HI\x1b[201~"], sent)
+    check("paste: ...and drops it", v._selection_range() is None)
+
+    v, sent = fresh()
+    v.paste_clipboard()                 # the context menu's Paste
+    check("paste: the menu's Paste replaces a selection too",
+          sent == ["\x7f" * 5, "\x1b[200~HI\x1b[201~"], sent)
+
+    clip.setText("")
+    v, sent = fresh()
+    key(v, K.Key_V, M.ControlModifier)
+    check("paste: an empty clipboard deletes nothing and keeps the selection",
+          sent == [] and v.selected_text() == "world",
+          (sent, v.selected_text()))
+
+    clip.setText("NEW")
+    v, sent = fresh("recap\r\n> old prompt", select=False)
+    key(v, K.Key_A, M.ControlModifier)
+    check("paste: Ctrl+A highlights the prompt",
+          v.selected_text() == "> old prompt", v.selected_text())
+    key(v, K.Key_V, M.ControlModifier)
+    check("paste: Ctrl+V over the Ctrl+A highlight Backspaces it first, "
+          "never the double-Esc (live, a paste behind it got appended)",
+          sent == ["\x7f" * len("old prompt"), "\x1b[200~NEW\x1b[201~"], sent)
+    check("paste: ...and drops the highlight",
+          not v._input_selected and v.selected_text() == "")
+    clip.setText("")
 
 
 def test_terminal_selection_typing_replaces():

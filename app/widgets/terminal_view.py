@@ -133,8 +133,9 @@ on screen. A plain (unshifted) arrow
 collapses it, then forwards to move the child's caret. Shift+click EXTENDS the
 current selection to the clicked cell; a TRIPLE-click selects the whole line.
 A selection (mouse OR keyboard) is EDITABLE like any editor selection: Ctrl+C
-copies it, Ctrl+X cuts it, Backspace/Del deletes it, and typing (a key or a
-committed IME/emoji string) replaces it. Deletion/cut/replace drive the
+copies it, Ctrl+X cuts it, Backspace/Del deletes it, and typing (a key, an
+AltGr character, a committed IME/emoji string) or a paste (Ctrl+V, the
+context menu) replaces it. Deletion/cut/replace drive the
 child's caret to the selection end + Backspace over it, so they act on any
 selection INSIDE the live input box -- single OR multi-row/wrapped (the box maps
 to the child's logical line, one Backspace per row transition; the leading '> '
@@ -2172,10 +2173,7 @@ class TerminalView(QWidget):
         # newline would reach Claude as Enter.
         text = event.commitString()
         if text:
-            if self._input_selected:
-                self._clear_input_selection(send=True)  # replace, as typing does
-            elif self._selection_range() is not None:
-                self._delete_and_drop_selection()
+            self._replace_selection_with_text()
             if "\r" in text or "\n" in text:
                 self._paste_text(
                     text.replace("\r\n", "\r").replace("\n", "\r"))
@@ -2232,6 +2230,15 @@ class TerminalView(QWidget):
         ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
         shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
         alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        # Qt on Windows reports AltGr as Ctrl+Alt. Measured on a Hungarian
+        # layout: AltGr+V arrives as Key_At with both modifiers and text
+        # "@". A key that types printable text with both held is that
+        # character, so everything below sees plain typing. Without this,
+        # _sequence_for sent it ESC-prefixed as Alt+@ and Claude never got
+        # the '@'. A Ctrl+Alt combo that types nothing (Ctrl+Alt+Home)
+        # carries no text and keeps its modifiers.
+        if ctrl and alt and event.text() and event.text().isprintable():
+            ctrl = alt = False
 
         # scrollback paging, as in Windows Terminal: Shift+PageUp/PageDown
         # move the VIEW through history without sending anything to the app
@@ -2311,14 +2318,17 @@ class TerminalView(QWidget):
                 event.accept()
                 return
             # Typing a printable character over the highlight REPLACES the
-            # input, like any editor: clear the child's whole prompt (the same
-            # double-Escape gesture) first, then FALL THROUGH so the character
+            # input, like any editor: Backspace over the highlighted text
+            # first (not the double-Escape, which Claude reads as Alt+key
+            # with a key right behind it), then FALL THROUGH so the character
             # itself is sent and becomes the fresh input. Control/navigation
             # keys (arrows, Enter, Ctrl-combos) instead just drop the highlight,
             # the way an editor collapses a selection without deleting it.
             if self._types_char(event, ctrl, alt):
-                self._clear_input_selection(send=True)
+                self._delete_and_drop_selection()
                 # fall through -> _sequence_for emits the typed character below
+            elif ctrl and key == Qt.Key.Key_V:
+                pass    # paste_clipboard replaces the highlighted input
             else:
                 self._clear_input_selection(send=False)
 
@@ -2951,21 +2961,28 @@ class TerminalView(QWidget):
         return True
 
     def _delete_and_drop_selection(self) -> None:
-        """Delete a mouse or keyboard selection when _delete_selection can,
-        and drop it either way: Backspace/Del, Ctrl+X, and typed text over
-        it. Typed text is sent next, so it lands where the selection was,
-        or at the caret when the selection couldn't be deleted."""
+        """Delete a selection when _delete_selection can, and drop it either
+        way: Backspace/Del and Ctrl+X on a mouse or keyboard selection, and
+        typed or pasted text over any selection, the Ctrl+A highlight
+        included. Text sent next lands where the selection was, or at the
+        caret when the selection couldn't be deleted.
+
+        Text over the highlight takes this path, not the highlight's
+        double-Escape clear. Measured live: "\\x1b\\x1b" with a key right
+        behind it reached Claude as Escape plus Alt+key, so the prompt was
+        neither cleared nor typed into, and a paste behind it was cleared
+        or not depending on how the bytes split. Arrows and Backspaces
+        followed by text arrive intact however they split."""
         self._delete_selection()
+        self._input_selected = False
         self._sel_anchor = self._sel_end = None
         self.update()
 
     @staticmethod
     def _types_char(event, ctrl: bool, alt: bool) -> bool:
         """The key types a character: printable text with neither Ctrl nor
-        Alt. Qt on Windows reports AltGr as Ctrl+Alt, and _sequence_for
-        sends Alt text ESC-prefixed (meta), so an AltGr key must not count
-        here until it goes out as plain text: replacing would delete the
-        selection and then send the meta sequence, not the character."""
+        Alt. keyPressEvent has already cleared both for an AltGr key, so
+        an AltGr character counts too and goes out as plain text."""
         text = event.text()
         return bool(text) and text.isprintable() and not ctrl and not alt
 
@@ -3651,15 +3668,25 @@ class TerminalView(QWidget):
         # when the clipboard carries both (a copied file can expose both).
         if md is not None and md.hasImage() and not md.hasText():
             path = self._spill_clipboard_image(cb.image())
-            if path:
-                # quote only when needed -- a bare path is what Claude's
-                # image-path detection expects; spaces would split the token
-                self._paste_text(f'"{path}"' if " " in path else path)
-            return
-        text = cb.text()
-        if not text:
-            return
-        self._paste_text(text.replace("\r\n", "\r").replace("\n", "\r"))
+            if not path:
+                return
+            # quote only when needed -- a bare path is what Claude's
+            # image-path detection expects; spaces would split the token
+            payload = f'"{path}"' if " " in path else path
+        else:
+            text = cb.text()
+            if not text:
+                return      # nothing to paste: the selection stays
+            payload = text.replace("\r\n", "\r").replace("\n", "\r")
+        self._replace_selection_with_text()
+        self._paste_text(payload)
+
+    def _replace_selection_with_text(self) -> None:
+        """Text is about to go in (a paste, a committed IME/emoji string), so
+        a selection, the Ctrl+A highlight included, gives way the way it
+        does for a typed key: deleted when it can be, dropped either way."""
+        if self._input_selected or self._selection_range() is not None:
+            self._delete_and_drop_selection()
 
     def _paste_text(self, text: str) -> None:
         self._snap_to_bottom()
