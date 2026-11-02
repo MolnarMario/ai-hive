@@ -2962,11 +2962,12 @@ class TerminalView(QWidget):
     @staticmethod
     def _types_char(event, ctrl: bool, alt: bool) -> bool:
         """The key types a character: printable text with neither Ctrl nor
-        Alt, or with both, which is how Qt on Windows reports AltGr ('@'
-        and '{' on a Hungarian or German layout). A Ctrl+Alt combo with no
-        AltGr character carries no printable text."""
+        Alt. Qt on Windows reports AltGr as Ctrl+Alt, and _sequence_for
+        sends Alt text ESC-prefixed (meta), so an AltGr key must not count
+        here until it goes out as plain text: replacing would delete the
+        selection and then send the meta sequence, not the character."""
         text = event.text()
-        return bool(text) and text.isprintable() and ctrl == alt
+        return bool(text) and text.isprintable() and not ctrl and not alt
 
     def _extend_kbd_selection(self, key, word: bool) -> None:
         """Grow the LOCAL copy selection by one cell (or one word with Ctrl)
