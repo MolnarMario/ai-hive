@@ -1760,11 +1760,24 @@ class TerminalAgent(QObject):
 
     def _seed_live_state(self) -> None:
         """Set the live model, effort and permission mode from the launch spec,
-        which is what a brand-new agent of this kind shows."""
+        which is what a brand-new agent of this kind shows.
+
+        A Claude flag left on Default is filled from what the CLI will pick
+        without it: the saved effort for that model and the mode a new
+        conversation starts in. Claude writes no transcript until the first
+        prompt, so a new card said "Opus · manual" over a terminal that was
+        on Opus 5.5 at xhigh in auto mode until the user typed something."""
         spec = self.spec
         self._live_effort = (spec.effort or "").strip()
         self._live_mode = (getattr(spec, "permission_mode", "") or "").strip()
         self._live_model = self._seed_model()
+        if spec.provider == "claude":
+            if not self._live_effort:
+                self._live_effort = providers.user_default_effort(
+                    (spec.model or "").strip())
+            if not self._live_mode:
+                self._live_mode = providers.user_default_permission_mode(
+                    spec.cwd)
         if spec.provider == "openai" and not self._live_effort:
             _, configured_effort = transcripts.codex_user_defaults()
             self._live_effort = configured_effort.strip()
@@ -1797,7 +1810,8 @@ class TerminalAgent(QObject):
         Other providers show spec.model verbatim."""
         chosen = (self.spec.model or "").strip()
         if self.spec.provider == "claude":
-            return transcripts.model_display(chosen or providers.user_default_model())
+            return transcripts.claude_model_label(
+                chosen or providers.user_default_model())
         if self.spec.provider == "gemini":
             raw = chosen or providers.gemini_user_default_model()
             model, effort = transcripts.parse_gemini_model_effort(raw)

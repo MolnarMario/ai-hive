@@ -21,8 +21,8 @@ from dataclasses import dataclass, field
 DEFAULT_MODEL = ""   # empty = omit the flag, use the CLI's own default
 DEFAULT_EFFORT = ""
 
-# cache for _claude_user_defaults: (mtime, size, model, effort)
-_USER_DEFAULTS_CACHE: tuple = (0.0, -1, "", "")
+# _json_file's cache of Claude's settings files: path -> (mtime, size, dict)
+_JSON_CACHE: dict = {}
 
 # resolve_claude's PATH lookup: (the PATH it searched, the file it found).
 # One `shutil.which` is about 5 ms and every Claude spec built at load asks
@@ -108,15 +108,18 @@ GEMINI_MODELS = (
 )
 GEMINI_EFFORTS = ("", "low", "medium", "high")
 # The startup permission modes the interactive TUI cycles through with
-# Shift+Tab. "" launches with NO --permission-mode flag (the CLI's own default,
-# i.e. today's behavior) and is the dialog default. acceptEdits/plan are the
-# other two steps of the ordinary Shift+Tab cycle; bypassPermissions is the
-# opt-in mode that only appears in the cycle once launched with it. (Verified
-# against `claude --permission-mode` choices on 2.1.x: acceptEdits, auto,
-# bypassPermissions, manual, dontAsk, plan — note there is NO "default" token,
-# so "Normal" must OMIT the flag rather than pass one.)
+# Shift+Tab. "" launches with NO --permission-mode flag and is the dialog
+# default; the dialog names what that resolves to
+# (user_default_permission_mode), because since claude 2.1.316 it is auto,
+# not ask-each-time. "manual" is the explicit ask-each-time launch, the only
+# way to get it once the CLI's own default is auto. acceptEdits/plan are the
+# other steps of the ordinary Shift+Tab cycle; bypassPermissions is the opt-in
+# mode that only appears in the cycle once launched with it. (Verified
+# against `claude --permission-mode` choices on 2.1.316: acceptEdits, auto,
+# bypassPermissions, manual, dontAsk, plan. There is NO "default" token.)
 CLAUDE_PERMISSION_MODES = (
-    ("Normal", ""),
+    ("Default", ""),
+    ("Manual (ask before each action)", "manual"),
     ("Accept edits (auto-approve file edits)", "acceptEdits"),
     ("Plan mode (read-only until you approve)", "plan"),
     ("Bypass permissions (skip all prompts)", "bypassPermissions"),
@@ -128,15 +131,17 @@ CLAUDE_PERMISSION_MODES = (
 # dialog never offers ("auto" is what a current CLI records where an older
 # build said "acceptEdits"). Note there is NO "default" token even though the
 # transcript writes that name for the ask-each-time mode: it is spelled
-# "manual" on the command line, or reproduced exactly by omitting the flag.
+# "manual" on the command line.
 CLAUDE_CLI_PERMISSION_MODES = ("acceptEdits", "auto", "bypassPermissions",
                                "manual", "dontAsk", "plan")
 
 # transcript token -> the launch flag that reproduces it. Only the modes whose
 # names differ between the two need an entry; anything else passes through if
-# the CLI accepts it. "default"/"manual" both mean ask-each-time, which is what
-# omitting the flag already does, so they map to "".
-_MODE_LAUNCH = {"": "", "default": "", "manual": ""}
+# the CLI accepts it. "default" is the transcript's name for ask-each-time and
+# must become the explicit "manual" flag: omitting the flag starts claude
+# 2.1.316 in auto mode, so an agent the user put in manual mode came back in
+# auto on every reopen.
+_MODE_LAUNCH = {"": "", "default": "manual", "manual": "manual"}
 
 # ...and how each reads on the card. Short lowercase words, since this sits in
 # a header chip beside the model and effort.
@@ -300,48 +305,149 @@ def user_default_model() -> str:
     transcript is the truth) and what the New Agent dialog's "Default" names.
     "" when unset/unreadable. Cheap to call (cached by mtime+size); never
     raises."""
-    return _claude_user_defaults()[0]
+    model = _claude_user_settings().get("model")
+    return model.strip() if isinstance(model, str) else ""
 
 
-def user_default_effort() -> str:
-    """The effort the Claude CLI will pick when AI Hive passes no --effort:
-    the "effortLevel" that `/effort` saves in `~/.claude/settings.json` from
-    ANY terminal ("saved as your default for new sessions"). The CLI reads
-    only low|medium|high|xhigh from there (max is session-only), so anything
-    else is "", the model's own default. Measured on claude 2.1.309: no
-    launch flag undoes a saved level, and `--settings '{"effortLevel":
-    "auto"}'` still ran at the saved "high". So the New Agent dialog names
-    this rather than promising the recommended effort. Never raises."""
-    return _claude_user_defaults()[1]
+# the levels claude reads back from settings; "max" is session-only
+_SAVED_EFFORTS = ("low", "medium", "high", "xhigh")
 
 
-def _claude_user_defaults() -> tuple[str, str]:
-    """(model, effort) from `~/.claude/settings.json`, cached by mtime+size.
-    An unreadable file keeps the last good reading."""
-    global _USER_DEFAULTS_CACHE
-    path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+def user_default_effort(model: str = "") -> str:
+    """The effort the Claude CLI will pick for `model` when AI Hive passes no
+    --effort ("" = the model `user_default_model` names). `/effort` saves
+    "as your default for new sessions" from ANY terminal, and since claude
+    2.1.316 it saves per model: `modelSettings.<model id>.effortLevel` in
+    `~/.claude/settings.json`, with the top-level "effortLevel" the fallback
+    for a model that has none. A user on Opus 5.5 at xhigh had a top-level
+    "high" left over, and the dialog and the card both said high.
+
+    The CLI reads only low|medium|high|xhigh from there (max is
+    session-only), so anything else is "", the model's own default.
+    Measured on claude 2.1.309: no launch flag undoes a saved level, and
+    `--settings '{"effortLevel": "auto"}'` still ran at the saved "high". So
+    the New Agent dialog names this rather than promising the recommended
+    effort. Never raises."""
+    data = _claude_user_settings()
+    key = _claude_model_key(model or user_default_model())
+    per_model = data.get("modelSettings")
+    if key and isinstance(per_model, dict):
+        for name, conf in per_model.items():
+            if (isinstance(name, str) and isinstance(conf, dict)
+                    and _claude_model_key(name) == key):
+                level = _saved_effort(conf.get("effortLevel"))
+                if level:
+                    return level
+    return _saved_effort(data.get("effortLevel"))
+
+
+def _saved_effort(level) -> str:
+    if isinstance(level, str) and level.strip().lower() in _SAVED_EFFORTS:
+        return level.strip().lower()
+    return ""
+
+
+def _claude_model_key(model: str) -> str:
+    """`model` as claude keys it under settings' "modelSettings": the full id,
+    lowercase, without a "[1m]" window suffix. An alias resolves through the
+    label CLAUDE_MODELS gives it ("opus" -> "Opus 5.5" -> "claude-opus-5-5"),
+    since the CLI saves the model the alias meant, not the alias. "" for a
+    pick with no single model behind it ("opusplan") or no pick at all."""
+    bare = (model or "").strip().lower().replace("[1m]", "").strip()
+    if not bare or bare == "default":
+        return ""
+    if bare.startswith("claude-"):
+        return bare
+    for label, value in CLAUDE_MODELS:
+        if value and value == bare:
+            m = re.fullmatch(r"([a-z]+) (\d+(?:\.\d+)?)",
+                             label.split(" (", 1)[0].lower())
+            return f"claude-{m.group(1)}-{m.group(2).replace('.', '-')}" if m else ""
+    return ""
+
+
+# the startup modes a settings file's permissions.defaultMode may name
+_SETTINGS_MODES = ("default", "acceptEdits", "plan", "auto",
+                   "bypassPermissions", "dontAsk")
+
+
+def user_default_permission_mode(cwd: str = "") -> str:
+    """The permission mode a NEW Claude conversation in `cwd` starts in when
+    AI Hive passes no --permission-mode, as the transcript names it ("auto",
+    "default" for ask-each-time, "plan", ...). The card shows it until the
+    transcript says, and the New Agent dialog's Default names it.
+
+    A settings file's `permissions.defaultMode` wins, the most specific file
+    first: `<cwd>/.claude/settings.local.json`, `<cwd>/.claude/settings.json`,
+    then `~/.claude/settings.json`. Without one, the CLI's own default.
+    claude 2.1.316 starts in auto, so "no flag" stopped meaning ask-each-time
+    and every new card said "manual" over a terminal in auto mode. Whether
+    the CLI does that is read off `~/.claude.json`: it sets
+    "hasSeenAutoDefaultNotice" the first time a session starts in auto by
+    default, and keeps the gate behind it as
+    `cachedGrowthBookFeatures.tengu_harbor_willow`. A settings file that turns
+    auto mode off (`disableAutoMode: "disable"`) rules auto out either way.
+    Never raises; "" when nothing says, which reads as manual on the card."""
+    files = [_claude_user_settings()]
+    if cwd:
+        files[:0] = [_json_file(os.path.join(cwd, ".claude", name))
+                     for name in ("settings.local.json", "settings.json")]
+    auto_off = any(_auto_mode_disabled(d) for d in files)
+    for data in files:
+        perms = data.get("permissions")
+        mode = perms.get("defaultMode") if isinstance(perms, dict) else None
+        if isinstance(mode, str) and mode.strip() in _SETTINGS_MODES:
+            mode = mode.strip()
+            if mode != "auto":
+                return mode
+            if not auto_off:
+                return "auto"
+            break
+    if auto_off:
+        return ""
+    state = _json_file(os.path.join(os.path.expanduser("~"), ".claude.json"))
+    gates = state.get("cachedGrowthBookFeatures")
+    gate = gates.get("tengu_harbor_willow") if isinstance(gates, dict) else None
+    if state.get("hasSeenAutoDefaultNotice") is True and gate is not False:
+        return "auto"
+    return ""
+
+
+def _auto_mode_disabled(data: dict) -> bool:
+    perms = data.get("permissions")
+    return (data.get("disableAutoMode") == "disable"
+            or (isinstance(perms, dict)
+                and perms.get("disableAutoMode") == "disable"))
+
+
+def _claude_user_settings() -> dict:
+    """`~/.claude/settings.json` as a dict, {} when missing or unreadable."""
+    return _json_file(os.path.join(os.path.expanduser("~"), ".claude",
+                                   "settings.json"))
+
+
+def _json_file(path: str) -> dict:
+    """The JSON object in `path`, cached by mtime+size so a caller that runs
+    on every card build costs one stat. {} when the file is missing or is
+    not an object. An unreadable or half-written file keeps the last good
+    reading: claude rewrites these files while AI Hive reads them."""
     try:
         st = os.stat(path)
     except OSError:
-        return ("", "")
-    cached = _USER_DEFAULTS_CACHE
-    if cached[0] == st.st_mtime and cached[1] == st.st_size:
-        return (cached[2], cached[3])
-    model = effort = ""
+        _JSON_CACHE.pop(path, None)
+        return {}
+    cached = _JSON_CACHE.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2]
     try:
         with open(path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
-        if isinstance(data, dict):
-            if isinstance(data.get("model"), str):
-                model = data["model"].strip()
-            level = data.get("effortLevel")
-            if isinstance(level, str) and level.strip().lower() in (
-                    "low", "medium", "high", "xhigh"):
-                effort = level.strip().lower()
     except (OSError, ValueError):
-        return (cached[2], cached[3])
-    _USER_DEFAULTS_CACHE = (st.st_mtime, st.st_size, model, effort)
-    return (model, effort)
+        return cached[2] if cached else {}
+    if not isinstance(data, dict):
+        data = {}
+    _JSON_CACHE[path] = (st.st_mtime, st.st_size, data)
+    return data
 
 
 _GEMINI_SETTINGS_CACHE: tuple = (0.0, -1, {})

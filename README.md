@@ -13,7 +13,8 @@ workspaces keep executing — switching never pauses anything.
 
 - **AI-agent creation** — pick a provider (Claude fully wired with **model** +
   **effort** + **mode** dropdowns → real `--model`/`--effort`/`--permission-mode`
-  flags; the **mode** picker is the Shift+Tab permission modes — Normal (default),
+  flags; the **mode** picker is the Shift+Tab permission modes — Default (named
+  for the mode Claude starts in without a flag, auto on claude 2.1.316), Manual,
   Accept edits, Plan, Bypass permissions — so an agent can start pre-set; **Gemini via the
   Antigravity CLI** (`agy`) with its full model list incl. Gemini 3.x, and
   `--continue` resume + shared-board `--add-dir`, verified against agy 1.0.16;
@@ -734,7 +735,9 @@ error dialog instead of silently closing. Packaging to a distributable
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;
   the model list matches claude's own `/model` menu, and **Default** names what
   it resolves to, because Claude then uses the last `/model` or `/effort` pick
-  saved from any terminal, e.g. "Default (high, saved by /effort)";
+  saved from any terminal, e.g. "Default (high, saved by /effort)". Effort is
+  saved per model, so its Default follows the Model pick, and the mode's
+  Default names the mode Claude starts in, e.g. "Default (auto)";
   Gemini/Antigravity with its model list; Grok via the xAI CLI; OpenAI as an
   editable command template), **shells** (PowerShell, cmd), and **scripts**
   (Python, custom);

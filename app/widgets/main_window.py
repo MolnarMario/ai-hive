@@ -2025,13 +2025,14 @@ class AddTerminalDialog(QDialog):
         self.provider_note.setWordWrap(True)
         self.model_combo = QComboBox(self)
         self.effort_combo = QComboBox(self)
-        # startup permission mode — the modes the Claude TUI cycles through
-        # with Shift+Tab (Claude only). Default omits the flag = today's behavior.
+        # startup permission mode: the modes the Claude TUI cycles through
+        # with Shift+Tab (Claude only). Default omits the flag.
         self.mode_combo = QComboBox(self)
         self.mode_combo.setToolTip(
             "Which permission mode this Claude agent starts in: the same modes "
-            "you flip through with Shift+Tab in the terminal. 'Normal' is the "
-            "current default; the agent can still switch modes once running.")
+            "you flip through with Shift+Tab in the terminal. Default is the "
+            "mode Claude starts in on its own; the agent can still switch "
+            "modes once running.")
         # resume an existing conversation from this workspace folder (Claude)
         self.resume_combo = QComboBox(self)
         self.resume_combo.setToolTip(
@@ -2147,6 +2148,9 @@ class AddTerminalDialog(QDialog):
         root.addWidget(buttons)
 
         self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
+        # claude saves /effort per model, so the effort Default follows it
+        self.model_combo.currentIndexChanged.connect(
+            lambda _i: self._name_effort_default())
         self.program_edit.textChanged.connect(self._validate)
         self.command_edit.textChanged.connect(self._validate)
         self.browse_btn.clicked.connect(self._browse)
@@ -2275,9 +2279,7 @@ class AddTerminalDialog(QDialog):
         for tok in prov.efforts:
             self.effort_combo.addItem(tok.capitalize() if tok else "Default", tok)
         if prov.key == "claude":
-            self._name_claude_default(
-                self.effort_combo, providers.user_default_effort(), "/effort",
-                "--effort", "run /effort auto in a terminal")
+            self._name_effort_default()
         # Ultracode isn't a launch flag (claude --effort only takes
         # low/medium/high/xhigh/max); it's an in-session mode. Show it, greyed
         # out, so users know to enable it manually in the terminal.
@@ -2288,20 +2290,22 @@ class AddTerminalDialog(QDialog):
             item = model.item(self.effort_combo.count() - 1)
             item.setEnabled(False)  # visible but non-selectable
 
+    def _name_effort_default(self) -> None:
+        """Name the effort Default for the model picked above it. claude
+        2.1.316 saves /effort per model, so Opus at xhigh and Sonnet at high
+        are both "the saved effort" (providers.user_default_effort)."""
+        if self._kind() != AgentKind.CLAUDE:
+            return
+        model = self.model_combo.currentData() or ""
+        self._name_claude_default(
+            self.effort_combo, providers.user_default_effort(model),
+            "/effort", "--effort", "run /effort auto in a terminal")
+
     @staticmethod
     def _claude_default_model() -> str:
         """The saved /model pick as the picker labels it ("opus" -> "Opus
-        5.5"), or "" when nothing is saved. A "[1m]" pick names the same
-        model as the bare alias, and a label's own note in brackets is
-        left out, since the Default entry wraps the name in brackets."""
-        raw = providers.user_default_model()
-        if not raw or raw.lower() == "default":
-            return ""
-        bare = raw.lower().replace("[1m]", "").strip()
-        for label, value in providers.CLAUDE_MODELS:
-            if value and value == bare:
-                return label.split(" (", 1)[0]
-        return transcripts.model_display(raw)
+        5.5"), or "" when nothing is saved."""
+        return transcripts.claude_model_label(providers.user_default_model())
 
     @staticmethod
     def _name_claude_default(combo, saved: str, command: str, flag: str,
@@ -2332,6 +2336,19 @@ class AddTerminalDialog(QDialog):
             return
         for label, value in prov.permission_modes:
             self.mode_combo.addItem(label, value)  # index 0 = "" = default
+        # Default launches with no --permission-mode, which claude 2.1.316
+        # starts in auto, not ask-each-time: name what it resolves to
+        mode = providers.permission_mode_display(
+            providers.user_default_permission_mode(self._cwd))
+        i = self.mode_combo.findData("")
+        if i >= 0:
+            self.mode_combo.setItemText(i, f"Default ({mode})")
+            self.mode_combo.setItemData(
+                i, "Launches without --permission-mode, so Claude starts in "
+                   "the mode your Claude settings name "
+                   "(permissions.defaultMode), else its own default. Pick "
+                   "Manual to be asked before each action.",
+                Qt.ItemDataRole.ToolTipRole)
 
     @staticmethod
     def _supplier(value):

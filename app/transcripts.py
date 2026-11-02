@@ -1281,6 +1281,24 @@ def model_display(raw: str) -> str:
     return text.replace("(1M context)", "(1M)").strip()
 
 
+def claude_model_label(raw: str) -> str:
+    """A Claude --model value or saved /model pick as the New Agent picker
+    labels it: "opus" -> "Opus 5.5", where `model_display` says only "Opus".
+    The card seeds its chip with this, so a fresh card names the same model
+    the dialog did and the transcript will. A "[1m]" pick names the same
+    model as the bare alias, and a label's own note in brackets is left out.
+    "" for nothing picked or "default" (the CLI's own choice)."""
+    from . import providers
+    text = (raw or "").strip()
+    if not text or text.lower() == "default":
+        return ""
+    bare = text.lower().replace("[1m]", "").strip()
+    for label, value in providers.CLAUDE_MODELS:
+        if value and value == bare:
+            return label.split(" (", 1)[0]
+    return model_display(text)
+
+
 def latest_model_effort(cwd: str, session_id: str) -> tuple[str, str, str]:
     """What this conversation is running with RIGHT NOW, as
     (model_display, effort, permission_mode). All three can change mid-session
