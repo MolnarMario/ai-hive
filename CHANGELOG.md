@@ -13,7 +13,8 @@ em dashes: this text is shown in the app.
 - Free up RAM puts an idle agent to sleep on time again. Switching to a
   card, a workspace or another app used to count as activity and restart
   its idle clock, so an agent you only looked at never slept. Now only a
-  key you type, a reply it gives or a start counts.
+  key you type, a reply it gives or a start counts, and clicking away from
+  a sleeping card no longer wakes it.
 - Typing over text you selected in a card's input box replaces it, the
   way Backspace already deleted it. Before, the character went in at the
   caret and the selection stayed.

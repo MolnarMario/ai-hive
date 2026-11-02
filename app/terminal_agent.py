@@ -2556,6 +2556,10 @@ class TerminalAgent(QObject):
             return
         now = time.time()
         self._last_output_ts = now
+        # read once, before this burst stamps _last_work_ts, which would keep
+        # any turn ever opened pending; the TURN_QUIET_S bound covers a
+        # Claude whose Stop hook never comes
+        pending = self.turn_pending()
         # A redraw answering a resize (RESIZE_REDRAW_S) is not work, and it
         # answers no question either, so it lights nothing and keeps the
         # waiting flags. It still arms the settle: `_on_idle_timeout`
@@ -2565,7 +2569,7 @@ class TerminalAgent(QObject):
         # and never while a submitted turn is open (TURN_QUIET_S), whose
         # output inside the window would otherwise be lost. A reflow's
         # reprint is such a redraw for as long as it takes.
-        if (not self._busy and not self.turn_pending()
+        if (not self._busy and not pending
                 and (self._reflow_step
                      or now - self._last_resize_ts < RESIZE_REDRAW_S)):
             self._idle_timer.start()
@@ -2584,10 +2588,7 @@ class TerminalAgent(QObject):
         # a pulse left over from real work still drops on schedule instead of
         # being held alive by the typing). Genuine work outlasts the window.
         if now - self._last_input_ts >= INPUT_ECHO_S:
-            # read before this burst stamps _last_work_ts, which would keep
-            # any turn ever opened pending; the TURN_QUIET_S bound covers a
-            # Claude whose Stop hook never comes
-            if self.turn_pending():
+            if pending:
                 self._last_reply_ts = now
             self._last_work_ts = now
             if not self._busy:

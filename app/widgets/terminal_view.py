@@ -2175,7 +2175,7 @@ class TerminalView(QWidget):
             if self._input_selected:
                 self._clear_input_selection(send=True)  # replace, as typing does
             elif self._selection_range() is not None:
-                self._replace_selection()
+                self._delete_and_drop_selection()
             if "\r" in text or "\n" in text:
                 self._paste_text(
                     text.replace("\r\n", "\r").replace("\n", "\r"))
@@ -2316,7 +2316,7 @@ class TerminalView(QWidget):
             # itself is sent and becomes the fresh input. Control/navigation
             # keys (arrows, Enter, Ctrl-combos) instead just drop the highlight,
             # the way an editor collapses a selection without deleting it.
-            if event.text() and event.text().isprintable() and not ctrl and not alt:
+            if self._types_char(event, ctrl, alt):
                 self._clear_input_selection(send=True)
                 # fall through -> _sequence_for emits the typed character below
             else:
@@ -2331,9 +2331,7 @@ class TerminalView(QWidget):
         if (not self._input_selected and self._selection_range() is not None
                 and key in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete)
                 and not ctrl and not alt):
-            self._delete_selection()
-            self._sel_anchor = self._sel_end = None
-            self.update()
+            self._delete_and_drop_selection()
             event.accept()
             return
         # Typing over that selection replaces it: delete it as Backspace
@@ -2343,9 +2341,8 @@ class TerminalView(QWidget):
         # box, scrolled back, a menu open) is only dropped, and the key
         # still reaches the child as it would with nothing selected.
         if (not self._input_selected and self._selection_range() is not None
-                and event.text() and event.text().isprintable()
-                and not ctrl and not alt):
-            self._replace_selection()
+                and self._types_char(event, ctrl, alt)):
+            self._delete_and_drop_selection()
             # fall through -> _sequence_for emits the typed character below
 
         # clipboard / editing shortcuts, Windows-editor style. These win over
@@ -2373,9 +2370,7 @@ class TerminalView(QWidget):
         if ctrl and not shift and key == Qt.Key.Key_X \
                 and self._selection_range() is not None:
             self.copy_selection()
-            self._delete_selection()
-            self._sel_anchor = self._sel_end = None
-            self.update()
+            self._delete_and_drop_selection()
             event.accept()
             return
         # Ctrl+Shift+A selects ALL painted text (screen + scrollback) for
@@ -2955,14 +2950,23 @@ class TerminalView(QWidget):
         self.keyInput.emit("\x7f" * count)    # then Backspace over it
         return True
 
-    def _replace_selection(self) -> None:
-        """Make room for typed text over a mouse or keyboard selection:
-        delete it when _delete_selection can, and drop it either way. The
-        caller sends the text next, so it lands where the selection was,
+    def _delete_and_drop_selection(self) -> None:
+        """Delete a mouse or keyboard selection when _delete_selection can,
+        and drop it either way: Backspace/Del, Ctrl+X, and typed text over
+        it. Typed text is sent next, so it lands where the selection was,
         or at the caret when the selection couldn't be deleted."""
         self._delete_selection()
         self._sel_anchor = self._sel_end = None
         self.update()
+
+    @staticmethod
+    def _types_char(event, ctrl: bool, alt: bool) -> bool:
+        """The key types a character: printable text with neither Ctrl nor
+        Alt, or with both, which is how Qt on Windows reports AltGr ('@'
+        and '{' on a Hungarian or German layout). A Ctrl+Alt combo with no
+        AltGr character carries no printable text."""
+        text = event.text()
+        return bool(text) and text.isprintable() and ctrl == alt
 
     def _extend_kbd_selection(self, key, word: bool) -> None:
         """Grow the LOCAL copy selection by one cell (or one word with Ctrl)

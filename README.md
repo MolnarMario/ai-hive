@@ -128,8 +128,9 @@ workspaces keep executing — switching never pauses anything.
 - **Free up RAM.** Every running agent is a whole CLI process, 150 to 300 MB
   for Claude. ⚙ Options > Free up RAM > **Sleep inactive agents** (off by
   default) stops an agent after 1 hour without activity (set it from 1 to
-  24 hours under **Asleep after**). Activity is output it prints, a key you
-  type into it, or a start. Its card turns black with the conversation's
+  24 hours under **Asleep after**). Activity is a reply it prints, a key you
+  type into it, or a start. Switching to its card, workspace or window is
+  not. Its card turns black with the conversation's
   summary, Claude's last recap under it (the "recap:" line Claude prints a
   few minutes after a reply, shown only if no work came after it) and
   **Click to resume conversation**, its sidebar dot turns gray,

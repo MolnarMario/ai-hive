@@ -1104,6 +1104,44 @@ def test_terminal_selection_edit():
           v3.selected_text() == "")
 
 
+def test_terminal_selection_altgr_replaces():
+    """Qt on Windows reports AltGr as Ctrl+Alt, so '@' or '{' typed with
+    AltGr on a Hungarian or German layout failed the "no Ctrl, no Alt" test
+    for typing and left the selection in place. A Ctrl+Alt combo with no
+    printable text is still not typing."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    K = Qt.Key
+    M = Qt.KeyboardModifier
+    altgr = M.ControlModifier | M.AltModifier
+
+    def fresh():
+        view = TerminalView(rows=6, cols=80)
+        view.feed("hello world")
+        view._sel_anchor, view._sel_end = (0, 6), (0, 10)   # "world"
+        sent = []
+        view.keyInput.connect(sent.append)
+        return view, sent
+
+    v, sent = fresh()
+    check("altgr: the selection is set", v.selected_text() == "world",
+          v.selected_text())
+    v.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, K.Key_At, altgr, "@"))
+    check("altgr: an AltGr character deletes the selection first",
+          sent[:1] == ["\x7f" * 5] and len(sent) == 2, sent)
+    check("altgr: ...and drops it", v._selection_range() is None)
+
+    v, sent = fresh()
+    v.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, K.Key_Home, altgr, ""))
+    check("altgr: a Ctrl+Alt key with no character deletes nothing",
+          "\x7f" * 5 not in sent, sent)
+
+
 def test_terminal_selection_typing_replaces():
     """Typing over a double-clicked or dragged word in the input box replaces
     it, as in an editor. The bug: the character went in at the caret and the

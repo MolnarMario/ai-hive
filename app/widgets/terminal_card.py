@@ -23,9 +23,9 @@ from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
 from .. import scheduled_send, transcripts, ui_theme
 from ..ansi_parser import AnsiSgrParser, CharStyle
 from ..process_worker import AI_KINDS, describe_pid
-from ..terminal_agent import (ANSWER_TEXT, BUSY_IDLE_MS, MARK_ANSWER,
-                              MARK_PROMPT, STREAM_INPUT, STREAM_SYSTEM,
-                              AgentStatus, TerminalAgent)
+from ..terminal_agent import (ANSWER_TEXT, BUSY_IDLE_MS, FOCUS_REPORTS,
+                              MARK_ANSWER, MARK_PROMPT, STREAM_INPUT,
+                              STREAM_SYSTEM, AgentStatus, TerminalAgent)
 from ..ui_theme import Palette, repolish
 from .header_icons import LaneChip
 from .ornaments import BootVeil, ElidingLabel, close_on_anchor_press
@@ -1443,6 +1443,15 @@ class TerminalCard(QFrame):
     def _on_key_input(self, seq: str) -> None:
         """Keystrokes reach the process — and a stopped terminal is never a
         dead end: the first keypress starts (or resumes) the session."""
+        if seq in FOCUS_REPORTS:
+            # The view sends these when focus enters or leaves it, and its
+            # ?1004 mode outlives a child that slept or exited. Clicking
+            # another card is not a key: it reaches a running child, but
+            # never wakes, starts or unveils one, or Free up RAM's sleeping
+            # card woke and pulled focus back the moment you left it.
+            if self.agent.is_running() and not self.agent.is_asleep():
+                self.agent.write(seq)
+            return
         if self.agent.is_asleep():
             # a sleeping card wakes like a click on its screen, even while
             # the child the sleep stopped is still exiting: that child must

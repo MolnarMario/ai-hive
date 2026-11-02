@@ -3169,6 +3169,103 @@ def test_last_active_marks_dirty():
           mgr._agent_dict(agent)["last_active"])
 
 
+def test_last_active_stop_marks_dirty():
+    """A reply Claude gives on its own after a background task opens no
+    turn, so only its Stop hook moves last_active, and nothing marked the
+    session dirty for it: a crash before the next burst saved the older
+    minute, and a launch that keeps idle agents asleep then slept an agent
+    that had just replied."""
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from app import session_hook as sh
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-stopdirty-"))
+    try:
+        events = str(tmp / "events.jsonl")
+        sh.reset_events(events)
+        mgr = WorkspaceManager()
+        mgr.prompt_events_path = events
+        ws = mgr.create_workspace("StopDirty", SCRATCH_CWD)
+        agent, _calls, _live = _sleepy_claude(mgr, ws.id, "Background",
+                                              SCRATCH_CWD)
+        agent._session_started = time.time() - 7200
+        dirties = []
+        mgr.dirty.connect(lambda: dirties.append(1))
+
+        def stop(kind):
+            os.environ[sh.AGENT_ID_ENV] = agent.id
+            try:
+                sh._append_event(events, kind)
+            finally:
+                os.environ.pop(sh.AGENT_ID_ENV, None)
+            mgr.sync_prompt_events()
+
+        stop(sh.EV_TURN_CLEAR)
+        check("last active stop: a Stop that moves the minute marks dirty",
+              len(dirties) == 1 and time.time() - agent.last_active_at() < 60,
+              len(dirties))
+        dirties.clear()
+        agent._last_reply_ts = time.time() + 120   # already in a later minute
+        stop(sh.EV_TURN_SET)
+        check("last active stop: a Stop that moves nothing marks nothing",
+              dirties == [], len(dirties))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_focus_report_never_wakes_a_card():
+    """The view's focus mode (?1004) outlives a child that slept, so
+    clicking from a sleeping card to another sent it "\\x1b[O", and the card
+    took that for a key: it woke the agent Free up RAM had just put to
+    sleep and pulled focus back to it. A focus report reaches a running
+    child and does nothing else."""
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from app.terminal_agent import AgentStatus
+    from app.widgets.terminal_card import TerminalCard
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("FocusWake", SCRATCH_CWD)
+    agent, calls, live = _sleepy_claude(mgr, ws.id, "Left behind",
+                                        SCRATCH_CWD)
+    sent = []
+    agent.worker.write = lambda data: sent.append(data) or True
+    card = TerminalCard(agent)
+    try:
+        card._on_key_input("\x1b[I")
+        check("focus wake: a running child still gets the focus report",
+              sent == ["\x1b[I"], sent)
+        agent._session_started = time.time() - 7200
+        agent.put_to_sleep()
+        live["on"] = False
+        agent._set_status(AgentStatus.EXITED_OK)
+        calls.clear()
+        sent.clear()
+        card._on_key_input("\x1b[O")
+        card._on_key_input("\x1b[I")
+        check("focus wake: a focus report leaves a sleeping agent asleep",
+              agent.is_asleep() and calls == [] and sent == [],
+              (agent.is_asleep(), calls, sent))
+        agent._wake()
+        card._on_key_input("\x1b[I")
+        check("focus wake: ...and starts no stopped agent",
+              calls == [] and sent == [], (calls, sent))
+        card._on_key_input("x")
+        check("focus wake: a real key still starts it", calls == ["start"],
+              calls)
+    finally:
+        card.detach()
+        card.deleteLater()
+
+
 def test_sleep_recap_reader():
     """The sleep screen's recap is Claude's newest `away_summary` record,
     without the terminal's /config hint, and only while no reply or real
