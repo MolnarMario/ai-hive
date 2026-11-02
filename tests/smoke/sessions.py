@@ -3384,6 +3384,14 @@ def test_sleep_idle_agents():
     term.feed("\x1b[2J\x1b[H> Try \"fix the tests\"\x1b[1;3H")
     check("sleep: Claude's hint behind a caret at the start is no draft",
           not term.has_draft())
+    # what Claude 2.1.316 really paints: a no-break space after the glyph,
+    # which read as typed text and kept every idle agent awake
+    term.feed("\x1b[2J\x1b[H❯\xa0Try \"fix the tests\"\x1b[1;3H")
+    check("sleep: the no-break space after Claude's prompt is no draft",
+          not term.has_draft())
+    term.feed("\x1b[2J\x1b[H❯\xa0hi")
+    check("sleep: text after Claude's real prompt is a draft",
+          term.has_draft())
     term.feed("\x1b[2J\x1b[H> first line\r\n  second")
     check("sleep: a second line of input is a draft", term.has_draft())
     term.feed("\x1b[2J\x1b[H› Ask Codex anything\x1b[1;3H")
