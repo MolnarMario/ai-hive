@@ -772,14 +772,21 @@ def test_terminal_mouse_words_links():
     check("mouse: click left of the caret sends Left arrows",
           moves == ["\x1b[D" * 3], moves)
     moves.clear()
-    caret_click(0, 7)   # 2 columns right of the caret (pty is inert in-test)
+    v3.feed("\x1b[1;3H")  # the pty is inert in-test: move its caret to col 2
+    caret_click(0, 4)   # 2 columns right of the caret
     check("mouse: click right of the caret sends Right arrows",
           moves == ["\x1b[C" * 2], moves)
+    moves.clear()
+    # past the text's end: Right only up to it, so a click can't spill onto
+    # the next line of a multi-line prompt
+    caret_click(0, 7)
+    check("mouse: click past the text's end stops at its end",
+          moves == ["\x1b[C" * 3], moves)
     moves.clear()
     caret_click(3, 4)   # a row that isn't the caret's line
     check("mouse: click off the caret's line never nudges it", moves == [], moves)
     moves.clear()
-    caret_click(0, 5)   # exactly on the caret -> nothing to send
+    caret_click(0, 2)   # exactly on the caret -> nothing to send
     check("mouse: click on the caret sends nothing", moves == [], moves)
 
     # Multi-line prompt: clicking a DIFFERENT line of the input box repositions
@@ -1233,6 +1240,124 @@ def test_terminal_input_editor():
     check("undo: submit resets the undo/redo history",
           view._undo_stack == [] and view._undo_last == "",
           (view._undo_stack, view._undo_last))
+
+
+def test_terminal_click_over_collapsed_paste():
+    """Click-to-caret and selection delete over Claude's collapsed paste.
+    Claude 2.1.316 shows a long paste as "[Pasted text #1 +4 lines]" and
+    one Left/Right/Backspace crosses all of it, so counting one press per
+    column put the caret left of a click before the paste and right of one
+    after it, and a delete across it took that many extra characters. The
+    screens are the ones the real Claude painted: "❯" plus a no-break
+    space, and rows below the first indented by two."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    L, R, U = "\x1b[D", "\x1b[C", "\x1b[A"
+    P = "❯\xa0"
+    TOKEN_ROW = P + "abc [Pasted text #1 +4 lines] xyz"   # token: cols 6..30
+
+    def box(rows, caret, cols=100):
+        view = TerminalView(rows=8, cols=cols)
+        view.feed("\r\n".join(rows)
+                  + "\x1b[%d;%dH" % (caret[0] + 1, caret[1] + 1))
+        out = []
+        view.keyInput.connect(out.append)
+        return view, out
+
+    def click(rows, caret, at):
+        view, out = box(rows, caret)
+        view._reposition_cursor(*at)
+        return out
+
+    # the reported bug: caret at the end, click on "b" before the paste
+    check("pastecaret: a click before the token counts it as one Left",
+          click([TOKEN_ROW], (0, 35), (0, 3)) == [L * 8],
+          click([TOKEN_ROW], (0, 35), (0, 3)))
+    check("pastecaret: a click after the token counts it as one Right",
+          click([TOKEN_ROW], (0, 2), (0, 33)) == [R * 7],
+          click([TOKEN_ROW], (0, 2), (0, 33)))
+    check("pastecaret: a click in the token's left half goes to its start",
+          click([TOKEN_ROW], (0, 35), (0, 12)) == [L * 5],
+          click([TOKEN_ROW], (0, 35), (0, 12)))
+    check("pastecaret: a click in the token's right half goes to its end",
+          click([TOKEN_ROW], (0, 35), (0, 26)) == [L * 4],
+          click([TOKEN_ROW], (0, 35), (0, 26)))
+    check("pastecaret: [Image #N] is one press too",
+          click([P + "abc [Image #4] xyz"], (0, 20), (0, 3)) == [L * 8],
+          click([P + "abc [Image #4] xyz"], (0, 20), (0, 3)))
+
+    # a token near the row end wraps; it still moves as one unit
+    wrapped = [P + "a" * 80 + "[Pasted text #5", "  +4 lines] tail"]
+    check("pastecaret: a click on a wrapped token's tail goes to its end",
+          click(wrapped, (1, 16), (1, 5)) == [L * 5],
+          click(wrapped, (1, 16), (1, 5)))
+    check("pastecaret: a click on its head goes to its start, a row up",
+          click(wrapped, (1, 16), (0, 90)) == [U, R * 66],
+          click(wrapped, (1, 16), (0, 90)))
+
+    # a word longer than the row breaks wherever the row ends, here inside
+    # the token: "[Pas" / "ted text #1 +4 lines]" (60 columns)
+    def click60(rows, caret, at):
+        view = TerminalView(rows=8, cols=60)
+        view.feed("\r\n".join(rows)
+                  + "\x1b[%d;%dH" % (caret[0] + 1, caret[1] + 1))
+        out = []
+        view.keyInput.connect(out.append)
+        view._reposition_cursor(*at)
+        return out
+
+    split = [P + "b" * 54 + "[Pas", "  ted text #1 +4 lines] tail"]
+    check("pastecaret: a token split mid-word still ends where it ends",
+          click60(split, (1, 28), (1, 5)) == [L * 5],
+          click60(split, (1, 28), (1, 5)))
+    check("pastecaret: a token split mid-word still starts where it starts",
+          click60(split, (1, 28), (0, 58)) == [U, R * 28],
+          click60(split, (1, 28), (0, 58)))
+
+    # Up keeps the column and parks the caret inside the token; from there
+    # Left moves one column at a time to the token's start (measured)
+    two = [TOKEN_ROW, "  0123456789012345678901234567890123456789"]
+    check("pastecaret: Up into a token, then Lefts to its start",
+          click(two, (1, 12), (0, 12)) == [U, L * 6],
+          click(two, (1, 12), (0, 12)))
+    check("pastecaret: a click on the indent of a lower row stops at its text",
+          click(two, (1, 20), (1, 0)) == [L * 18],
+          click(two, (1, 20), (1, 0)))
+    check("pastecaret: a click past a row's end can't spill onto the next row",
+          click(two, (0, 33), (0, 70)) == [R * 2],
+          click(two, (0, 33), (0, 70)))
+
+    # a wide glyph is two cells and one press; its right half means before it
+    wide = [P + "日本語 abc"]                 # glyphs at 2, 4, 6
+    check("pastecaret: wide glyphs take one press each",
+          click(wide, (0, 12), (0, 5)) == [L * 6],
+          click(wide, (0, 12), (0, 5)))
+
+    # delete across the token: "c [Pasted text #1 +4 lines] x"
+    view, out = box([TOKEN_ROW], (0, 35))
+    view._sel_anchor, view._sel_end = (0, 4), (0, 32)
+    view._delete_selection()
+    check("pastecaret: a delete counts the token as one Backspace",
+          out == [L * 2, "\x7f" * 5], out)
+    # a selection inside the token takes all of it
+    view, out = box([TOKEN_ROW], (0, 35))
+    view._sel_anchor, view._sel_end = (0, 10), (0, 14)
+    view._delete_selection()
+    check("pastecaret: a selection inside a token deletes the whole token",
+          out == [L * 4, "\x7f"], out)
+    # "line here\nsecond" across Claude's two-space indent: 16, not 18
+    view, out = box([P + "first line here", "  second line"], (1, 13))
+    view._sel_anchor, view._sel_end = (0, 8), (1, 7)
+    view._delete_selection()
+    check("pastecaret: a multi-row delete skips the indent below the prompt",
+          out == [L * 5, "\x7f" * 16], out)
+
+    view, _ = box([P + "hello"], (0, 7))
+    check("pastecaret: the inferred input drops the no-break space",
+          view._input_text() == "hello", repr(view._input_text()))
 
 
 def test_input_gap_self_heal():
