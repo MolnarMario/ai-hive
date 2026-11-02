@@ -570,6 +570,9 @@ class TopBar(QFrame):
     # "Update AI Hive in the background": the hourly check that installs a
     # newer AI Hive while the app runs (MainWindow.start_app_update_checks)
     appAutoUpdateToggled = Signal(bool)
+    # "Keep the PC awake": hold off Windows sleep while AI Hive runs
+    # (MainWindow._apply_keep_awake, app/keep_awake.py)
+    keepAwakeToggled = Signal(bool)
     # "Lanes in every workspace": does every new agent start with Own lane
     agentLanesToggled = Signal(bool)
     # "Confirm Ship finished lanes": ask before typing the request (True)
@@ -757,6 +760,14 @@ class TopBar(QFrame):
         self.app_auto_update_btn.clicked.connect(
             self._on_app_auto_update_clicked)
         self._refresh_app_auto_update_btn()
+
+        # "Keep the PC awake". Default OFF: it changes how the whole machine
+        # behaves, so the user arms it.
+        self._keep_awake = False
+        self.keep_awake_label = toggle_label("")
+        self.keep_awake_btn = ToggleSwitch(self)
+        self.keep_awake_btn.clicked.connect(self._on_keep_awake_clicked)
+        self._refresh_keep_awake_btn()
 
         # "Lanes in every workspace". Default OFF: armed, it ticks "Own lane" for every new
         # Claude agent in every git workspace, so it is the user's decision,
@@ -979,6 +990,8 @@ class TopBar(QFrame):
         self.options_panel.add_section("Automation")
         self.options_panel.add_switch_row(self.recover_label, self.recover_btn)
         self.options_panel.add_switch_row(self.resume_label, self.resume_btn)
+        self.options_panel.add_switch_row(self.keep_awake_label,
+                                          self.keep_awake_btn)
         self.options_panel.add_switch_row(
             self.sound_label, self.sound_btn,
             self.chime_sound_btns[chime.QUESTION])
@@ -1599,6 +1612,37 @@ class TopBar(QFrame):
             "update.\nClick to turn on.")
         self.app_auto_update_btn.setToolTip(tip)
         self.app_auto_update_label.setToolTip(tip)
+
+    def _on_keep_awake_clicked(self) -> None:
+        self.set_keep_awake(not self._keep_awake)
+        self.keepAwakeToggled.emit(self._keep_awake)
+
+    def set_keep_awake(self, on: bool) -> None:
+        """Reflect the Keep the PC awake preference (no signal)."""
+        self._keep_awake = bool(on)
+        self._refresh_keep_awake_btn()
+
+    def keep_awake(self) -> bool:
+        return self._keep_awake
+
+    def _refresh_keep_awake_btn(self) -> None:
+        self.keep_awake_btn.setChecked(self._keep_awake)
+        self.keep_awake_label.setText("\u2615  Keep the PC awake")
+        tip = (
+            "Keep the PC awake: ON. While AI Hive is open, Windows does not "
+            "sleep on its idle timer, the way it stays awake for a playing "
+            "video, so agents keep working while you are away. The screen "
+            "still turns off and locks as usual. On battery, a laptop with "
+            "Modern Standby also keeps its screen on, since Windows would "
+            "sleep anyway 5 minutes after its sleep timeout. Closing the lid "
+            "or pressing the power button still sleeps. It costs one Windows "
+            "call, plus a power-source check once a minute on a Modern "
+            "Standby laptop.\nClick to turn off."
+            if self._keep_awake else
+            "Keep the PC awake: OFF. Windows sleeps on its normal timer, "
+            "which stops every agent until the PC wakes.\nClick to turn on.")
+        self.keep_awake_btn.setToolTip(tip)
+        self.keep_awake_label.setToolTip(tip)
 
     def note_update_pending(self, text: str, tooltip: str = "") -> None:
         """Show (or hide, on an empty text) the last gate's report.
@@ -3180,6 +3224,16 @@ class MainWindow(QMainWindow):
         # _restore_ui_state like the rest. The check behind it starts only
         # from main.py (start_app_update_checks), never in the suite.
         self._app_auto_update = True  # user preference (persisted)
+        # "Keep the PC awake". Default OFF, assigned here for the same reason.
+        # _keep_awake_held is what this thread asked Windows for last, as
+        # (system, display); the timer runs only while the display half may
+        # be needed (_apply_keep_awake).
+        self._keep_awake = False      # user preference (persisted)
+        self._keep_awake_held = (False, False)
+        self._keep_awake_timer = QTimer(self)
+        self._keep_awake_timer.setTimerType(Qt.TimerType.VeryCoarseTimer)
+        self._keep_awake_timer.setInterval(self.KEEP_AWAKE_POLL_MS)
+        self._keep_awake_timer.timeout.connect(self._apply_keep_awake)
         # "Lanes in every workspace". Default OFF, assigned here for the same
         # reason. Read it only through lane_default(ws).
         self._agent_lanes = False     # user preference (persisted)
@@ -3610,6 +3664,7 @@ class MainWindow(QMainWindow):
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
         self.top_bar.appAutoUpdateToggled.connect(
             self._on_app_auto_update_toggled)
+        self.top_bar.keepAwakeToggled.connect(self._on_keep_awake_toggled)
         self.top_bar.agentLanesToggled.connect(self._on_agent_lanes_toggled)
         self.top_bar.shipConfirmToggled.connect(self._on_ship_confirm_toggled)
         self.top_bar.closeMergedConfirmToggled.connect(
@@ -5348,6 +5403,45 @@ class MainWindow(QMainWindow):
         self._schedule_save()
         if self._app_auto_update:
             self._app_auto_update_tick()
+
+    # how often a Modern Standby machine holding the system reads its power
+    # source; Windows allows 5 minutes past its sleep timeout on battery
+    KEEP_AWAKE_POLL_MS = 60_000
+
+    def _on_keep_awake_toggled(self, enabled: bool) -> None:
+        """User flipped "Keep the PC awake". An additive optional key under
+        "ui" (no SESSION_VERSION bump). It takes effect at once."""
+        self._keep_awake = bool(enabled)
+        self._schedule_save()
+        self._apply_keep_awake()
+
+    def _apply_keep_awake(self) -> None:
+        """Ask Windows for what the switch and the power source need now
+        (keep_awake.wanted), calling it only when that changes.
+
+        A desktop, or any machine without Modern Standby, needs one call
+        and nothing after it. A Modern Standby laptop must also hold the
+        screen on battery, so while the switch is on the timer reads the
+        power source once a minute: an unplug is caught well inside the 5
+        minutes Windows allows after its sleep timeout."""
+        from .. import keep_awake
+        on = self._keep_awake and not self._closing
+        standby = on and keep_awake.modern_standby()
+        battery = standby and keep_awake.on_battery()
+        want = keep_awake.wanted(on, battery, standby)
+        if want != self._keep_awake_held:
+            ok = keep_awake.hold(*want)
+            self.store.audit(
+                f"KEEP-AWAKE system={int(want[0])} display={int(want[1])}"
+                f"{'' if ok else ' FAILED'}")
+            # a failed call holds nothing; recording the wish anyway would
+            # stop every later tick from trying again
+            self._keep_awake_held = want if ok else (False, False)
+        if standby:
+            if not self._keep_awake_timer.isActive():
+                self._keep_awake_timer.start()
+        else:
+            self._keep_awake_timer.stop()
 
     # ------------------------------------------------------- agent lanes ---
     # Lane scopes. Two
@@ -7287,6 +7381,10 @@ class MainWindow(QMainWindow):
         # AI Hive's own background update (default ON)
         self._app_auto_update = bool(ui.get("app_auto_update", True))
         self.top_bar.set_app_auto_update(self._app_auto_update)
+        # Keep the PC awake (default OFF), held from the moment it loads
+        self._keep_awake = bool(ui.get("keep_awake", False))
+        self.top_bar.set_keep_awake(self._keep_awake)
+        self._apply_keep_awake()
         # "Lanes in every workspace" (default OFF: it ticks Own lane for
         # every new agent, so it is armed deliberately). The key keeps its
         # old name, so a user who had the old Agent lanes switch on sees no
@@ -8553,6 +8651,7 @@ class MainWindow(QMainWindow):
             "bold_word_strength": dict(self._word_strengths),
             "auto_update": self._auto_update,
             "app_auto_update": self._app_auto_update,
+            "keep_awake": self._keep_awake,
             "agent_lanes": self._agent_lanes,
             "ship_skip_confirm": self._ship_skip_confirm,
             "close_merged_skip_confirm": self._close_merged_skip_confirm,
@@ -8647,6 +8746,9 @@ class MainWindow(QMainWindow):
         self._bg_shell_timer.stop()
         self._sleep_timer.stop()
         self._limit_watch_timer.stop()
+        # let the PC sleep again (_closing is set, so this releases). Exit
+        # would release it too, but teardown below can take seconds.
+        self._apply_keep_awake()
         # queued agents stay queued, so the final save records them running
         self._launch_timer.stop()
         self._usage_tick_timer.stop()

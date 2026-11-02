@@ -139,6 +139,15 @@ workspaces keep executing — switching never pauses anything.
   was asleep at close, or idle that long, asleep when AI Hive opens.
   Switch either one off and every agent that was running or asleep
   resumes at startup, as before.
+- **Keep the PC awake.** ⚙ Options > Automation > **Keep the PC awake** (off
+  by default) stops Windows from sleeping on its idle timer while AI Hive is
+  open, the way a playing video does, so agents keep working overnight. It
+  is one `SetThreadExecutionState` call, and Windows drops it when AI Hive
+  exits. The screen still turns off and locks
+  as usual. A Modern Standby laptop on battery holds the screen on too,
+  because Windows ends a sleep block there 5 minutes after its sleep
+  timeout; only there does AI Hive check the power source, once a minute.
+  Closing the lid or pressing the power button still sleeps.
 - **Plan usage readout** — two top-bar badges, one
   per Claude rate-limit window, showing how much you've burned and when it
   comes back: the **5-hour** pill reads `5h Claude 21% used, resets in 1h20m
@@ -649,7 +658,7 @@ workspaces keep executing — switching never pauses anything.
   show without file edges; see below.)
 - **⚙ Options** — one button on the top bar opens a panel with everything that
   used to compete for room up there: **Recover at start-up**, **Resume on usage
-  reset**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Update AI
+  reset**, **Keep the PC awake**, **Question chime**, **Reply finished chime**, **Taskbar count**, **Update AI
   Hive in the background**, **Check for CLI updates at start-up**, **Show usage left**, **Reply times**, **Tooltips** and **Bionic reading** as labelled switches (each with a green/dark LED, so
   "will my work resume by itself?" is answerable at a glance), a **Manage…**
   door to the Updates panel whose tooltip names the detected Claude Code install

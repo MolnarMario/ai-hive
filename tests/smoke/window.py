@@ -3833,6 +3833,139 @@ def test_options_panel():
     bar.deleteLater()
 
 
+def test_keep_awake():
+    """Options > Keep the PC awake (app/keep_awake.py): off by default, one
+    Windows call per change and none repeated, the screen held only on a
+    Modern Standby laptop on battery, and released when the switch goes off
+    or the window closes. The Windows calls are stubbed for the window part,
+    so the suite never holds the test machine awake."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import keep_awake
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    # -- the policy -----------------------------------------------------------
+    check("keep-awake: off holds nothing, whatever the machine",
+          keep_awake.wanted(False, True, True) == (False, False))
+    check("keep-awake: on holds the system, not the screen, on AC power",
+          keep_awake.wanted(True, False, True) == (True, False))
+    check("keep-awake: ...and on battery without Modern Standby",
+          keep_awake.wanted(True, True, False) == (True, False))
+    check("keep-awake: a Modern Standby laptop on battery holds the screen "
+          "too", keep_awake.wanted(True, True, True) == (True, True))
+    if sys.platform == "win32":
+        # harmless on the real machine: released on the next line, and the
+        # state belongs to this test process anyway
+        check("keep-awake: the real Windows calls succeed",
+              keep_awake.hold(True) and keep_awake.release())
+        check("keep-awake: the machine facts read as bools",
+              isinstance(keep_awake.modern_standby(), bool)
+              and isinstance(keep_awake.on_battery(), bool))
+
+    # -- the window, with Windows stubbed -------------------------------------
+    calls = []
+    fake = {"ok": True, "standby": False, "battery": False}
+
+    def fake_hold(system, display=False):
+        calls.append((system, display))
+        return fake["ok"]
+
+    saved = (keep_awake.hold, keep_awake.modern_standby, keep_awake.on_battery)
+    keep_awake.hold = fake_hold
+    keep_awake.modern_standby = lambda: fake["standby"]
+    keep_awake.on_battery = lambda: fake["battery"]
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-awake-"))
+    try:
+        win = create_main_window(SessionStore(path=tmp / "s.json"))
+        win.show(); pump(60)
+        tb = win.top_bar
+        check("keep-awake: off by default, no Windows call, saved as false",
+              not win._keep_awake and not tb.keep_awake_btn.isChecked()
+              and calls == []
+              and win._session_payload()["ui"]["keep_awake"] is False, calls)
+        check("keep-awake: the switch sits in Options > Automation",
+              tb.keep_awake_btn.parentWidget()
+              is tb.recover_btn.parentWidget()
+              and "Keep the PC awake" in tb.keep_awake_label.text()
+              and "OFF" in tb.keep_awake_btn.toolTip())
+        emitted = []
+        tb.keepAwakeToggled.connect(emitted.append)
+        tb.set_keep_awake(True); tb.set_keep_awake(False)
+        check("keep-awake: set_keep_awake reflects without emitting",
+              emitted == [] and calls == [])
+
+        tb.keep_awake_btn.click()
+        check("keep-awake: on holds the system once and saves it",
+              win._keep_awake and calls == [(True, False)]
+              and emitted == [True]
+              and win._session_payload()["ui"]["keep_awake"] is True
+              and "ON" in tb.keep_awake_btn.toolTip(), calls)
+        check("keep-awake: without Modern Standby nothing runs after that",
+              not win._keep_awake_timer.isActive())
+        win._apply_keep_awake()
+        check("keep-awake: an unchanged need makes no second call",
+              calls == [(True, False)], calls)
+
+        tb.keep_awake_btn.click()
+        check("keep-awake: off releases", not win._keep_awake
+              and calls[-1] == (False, False), calls)
+
+        fake["standby"] = True
+        del calls[:]
+        tb.keep_awake_btn.click()
+        check("keep-awake: a Modern Standby laptop on AC holds only the "
+              "system and watches the power source",
+              calls == [(True, False)] and win._keep_awake_timer.isActive()
+              and win._keep_awake_timer.interval()
+              == win.KEEP_AWAKE_POLL_MS, calls)
+        fake["battery"] = True
+        win._keep_awake_timer.timeout.emit()
+        check("keep-awake: unplugged, the next tick holds the screen too",
+              calls[-1] == (True, True), calls)
+        fake["battery"] = False
+        win._keep_awake_timer.timeout.emit()
+        check("keep-awake: plugged back in, it lets the screen go",
+              calls[-1] == (True, False), calls)
+
+        fake["ok"] = False
+        fake["battery"] = True
+        win._keep_awake_timer.timeout.emit()
+        check("keep-awake: a failed call is not recorded as held",
+              win._keep_awake_held == (False, False))
+        fake["ok"] = True
+        win._keep_awake_timer.timeout.emit()
+        check("keep-awake: ...so the next tick tries again",
+              calls[-1] == (True, True)
+              and win._keep_awake_held == (True, True), calls)
+
+        tb.keep_awake_btn.click()
+        check("keep-awake: off releases and stops the timer",
+              calls[-1] == (False, False)
+              and not win._keep_awake_timer.isActive(), calls)
+
+        fake["standby"] = False
+        del calls[:]
+        win._restore_ui_state({"ui": {"keep_awake": True}})
+        check("keep-awake: a saved ON holds the system at load",
+              win._keep_awake and tb.keep_awake_btn.isChecked()
+              and calls == [(True, False)], calls)
+        win.close(); pump(30)
+        check("keep-awake: closing the window releases it",
+              calls[-1] == (False, False), calls)
+        win.deleteLater(); pump(30)
+    finally:
+        (keep_awake.hold, keep_awake.modern_standby,
+         keep_awake.on_battery) = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_options_panel_text_at_body_size():
     """The Options rows draw at the app's 13px body size. At 12px (sections
     at 11px) the panel read as a smaller, blurrier font than the window
