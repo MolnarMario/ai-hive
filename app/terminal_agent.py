@@ -1713,6 +1713,16 @@ class TerminalAgent(QObject):
         """
         return self._ai_title or self.current_task
 
+    def recap(self) -> str:
+        """Claude's newest recap of this conversation, unless work followed
+        it (transcripts.latest_recap). "" for other providers, which write
+        none. Read when the sleep screen shows, so it is never stored."""
+        spec = self.spec
+        if spec.provider != "claude" or not spec.session_id:
+            return ""
+        return sanitize_text(
+            transcripts.latest_recap(spec.cwd, spec.session_id)).strip()
+
     def set_ai_title(self, text: str) -> None:
         """Adopt the provider's latest conversation summary.
         Transient — never persisted; refreshed by the manager's poll."""

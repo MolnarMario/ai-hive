@@ -129,7 +129,9 @@ workspaces keep executing — switching never pauses anything.
   default) stops an agent after 1 hour without activity (set it from 1 to
   24 hours under **Asleep after**). Activity is output it prints, a key you
   type into it, or a start. Its card turns black with the conversation's
-  summary and **Click to resume conversation**, its sidebar dot turns gray,
+  summary, Claude's last recap under it (the "recap:" line Claude prints a
+  few minutes after a reply, shown only if no work came after it) and
+  **Click to resume conversation**, its sidebar dot turns gray,
   and a click or a key resumes the same conversation with `--resume <id>`.
   Only Claude, Antigravity and Codex agents with a pinned conversation
   sleep, and never while one is working, asking you something, running a

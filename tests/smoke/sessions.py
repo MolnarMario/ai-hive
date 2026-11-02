@@ -3169,6 +3169,62 @@ def test_last_active_marks_dirty():
           mgr._agent_dict(agent)["last_active"])
 
 
+def test_sleep_recap_reader():
+    """The sleep screen's recap is Claude's newest `away_summary` record,
+    without the terminal's /config hint, and only while no reply or real
+    prompt has come after it: a recap the work moved past is stale."""
+    import json as _json
+    import tempfile
+    from pathlib import Path
+
+    from app import transcripts
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-recap-"))
+    path = tmp / "conv.jsonl"
+
+    def write(*recs):
+        path.write_text("".join(_json.dumps(r) + "\n" for r in recs),
+                        encoding="utf-8")
+        transcripts._RECAP_CACHE.clear()
+        return transcripts._read_latest_recap(str(path))
+
+    prompt = {"type": "user", "message": {"role": "user", "content": "go"}}
+    reply = {"type": "assistant",
+             "message": {"content": [{"type": "text", "text": "done"}]}}
+    tool = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}}
+    meta = {"type": "user", "isMeta": True, "message": {"content": "ctx"}}
+    old = {"type": "system", "subtype": "away_summary",
+           "content": "Old recap."}
+    new = {"type": "system", "subtype": "away_summary",
+           "content": "You asked for X. Next, Y. (disable recaps in /config)"}
+    side = dict(reply, isSidechain=True)
+    check("recap: the newest one wins, without the /config hint",
+          write(prompt, reply, old, prompt, reply, new)
+          == "You asked for X. Next, Y.")
+    check("recap: a reply after it makes it stale",
+          write(prompt, reply, new, reply) == "")
+    check("recap: a real prompt after it makes it stale",
+          write(prompt, reply, new, prompt) == "")
+    check("recap: tool results, meta and sub-agent records leave it current",
+          write(prompt, reply, new, tool, meta, side)
+          == "You asked for X. Next, Y.")
+    check("recap: none written reads empty", write(prompt, reply) == "")
+    check("recap: a missing file reads empty",
+          transcripts._read_latest_recap(str(tmp / "nope.jsonl")) == "")
+    check("recap: no session id reads empty",
+          transcripts.latest_recap(str(tmp), "") == "")
+    write(prompt, reply, new)
+    pad = {"type": "progress", "data": "x" * 4096}
+    with open(path, "a", encoding="utf-8") as fh:
+        for _ in range(transcripts._RECAP_TAIL_BYTES // 4096 + 4):
+            fh.write(_json.dumps(pad) + "\n")
+    transcripts._RECAP_CACHE.clear()
+    check("recap: one older than the tail is found by the full scan",
+          transcripts._read_latest_recap(str(path))
+          == "You asked for X. Next, Y.")
+
+
 def test_sleep_idle_agents():
     """Options > Free up RAM: which agents may sleep, what a sleep does to
     the agent, its save record and its card, and the Options switches."""
@@ -3331,11 +3387,20 @@ def test_sleep_idle_agents():
           not card.sleep_screen.isHidden() and card.overlay.isHidden())
     check("sleep: the header glyph reads asleep",
           card.glyph.property("state") == "asleep")
+    check("sleep: no recap on disk, so no recap line",
+          card.sleep_screen.recap.isHidden())
+    idle.recap = lambda: "We ported the lexer. Next, the parser."
     idle.set_ai_title("Port the parser to the new grammar")
     check("sleep: the sleep screen shows the conversation's summary",
           card.sleep_screen.summary.text()
           == "Port the parser to the new grammar",
           card.sleep_screen.summary.text())
+    check("sleep: ...and Claude's recap under it",
+          not card.sleep_screen.recap.isHidden()
+          and card.sleep_screen.recap.text()
+          == "We ported the lexer. Next, the parser.",
+          card.sleep_screen.recap.text())
+    del idle.recap
     win._finished_lanes = lambda _ws, _a: ["a done lane"]
     _lanes, why = win._ship_state(wws, idle)
     check("sleep: Ship finished lanes says to resume an asleep integrator, "

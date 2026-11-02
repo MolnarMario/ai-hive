@@ -713,12 +713,17 @@ class _HeaderTools(QWidget):
 # the sleep screen's summary is a few lines in the middle of the card, not
 # the whole title: a longer one is cut here
 _SLEEP_SUMMARY_CHARS = 240
+# Claude's recaps run two or three sentences, about 300 characters; this cut
+# only stops a freak one from pushing the resume button off a small card
+_SLEEP_RECAP_CHARS = 600
+_SLEEP_RECAP_WIDTH = 560
 
 
 class SleepScreen(QFrame):
     """What a card shows while its agent is asleep to free memory (Options >
-    Free up RAM): black, the conversation's summary in the middle, when it
-    was last active, and the way back. A click anywhere on it resumes the
+    Free up RAM): black, the conversation's summary in the middle, Claude's
+    recap of where the work stands under it (when it wrote one that is still
+    current), when it was last active, and the way back. A click anywhere on it resumes the
     conversation, and so does a key, like on any stopped card."""
 
     resumeRequested = Signal()
@@ -737,9 +742,13 @@ class SleepScreen(QFrame):
         self.summary = QLabel(self)
         self.summary.setObjectName("SleepSummary")
         self.summary.setWordWrap(True)
+        self.recap = QLabel(self)
+        self.recap.setObjectName("SleepRecap")
+        self.recap.setWordWrap(True)
+        self.recap.hide()
         self.since = QLabel(self)
         self.since.setObjectName("SleepSince")
-        for label in (self.caption, self.summary, self.since):
+        for label in (self.caption, self.summary, self.recap, self.since):
             label.setTextFormat(Qt.TextFormat.PlainText)
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lay.addWidget(label)
@@ -753,11 +762,17 @@ class SleepScreen(QFrame):
         lay.addStretch(1)
         self.hide()
 
-    def set_agent_text(self, summary: str, last_active: float) -> None:
+    def set_agent_text(self, summary: str, last_active: float,
+                       recap: str = "") -> None:
         summary = " ".join(summary.split())
         if len(summary) > _SLEEP_SUMMARY_CHARS:
             summary = summary[:_SLEEP_SUMMARY_CHARS - 3].rstrip() + "..."
         self.summary.setText(summary or "No summary yet")
+        recap = " ".join(recap.split())
+        if len(recap) > _SLEEP_RECAP_CHARS:
+            recap = recap[:_SLEEP_RECAP_CHARS - 3].rstrip() + "..."
+        self.recap.setText(recap)
+        self.recap.setVisible(bool(recap))
         when = ""
         if last_active > 0:
             at = datetime.datetime.fromtimestamp(last_active)
@@ -766,6 +781,16 @@ class SleepScreen(QFrame):
             when = f"Last active {at.strftime(fmt)}"
         self.since.setText(when)
         self.since.setVisible(bool(when))
+
+    def resizeEvent(self, event) -> None:
+        # A recap is a paragraph, and on a maximized card a line the card's
+        # full width is too long to read. Side margins keep its lines near
+        # 80 characters. A maximum width would not do: a word-wrapped label
+        # that the layout does not stretch gets a height for the wrong
+        # width and loses its last lines.
+        side = max(0, (event.size().width() - 48 - _SLEEP_RECAP_WIDTH) // 2)
+        self.recap.setContentsMargins(side, 0, side, 0)
+        super().resizeEvent(event)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1444,7 +1469,8 @@ class TerminalCard(QFrame):
             screen.hide()
             return
         screen.set_agent_text(self.agent.summary() or self.agent.spec.name,
-                              self.agent.last_active_at())
+                              self.agent.last_active_at(),
+                              self.agent.recap())
         screen.setGeometry(self.terminal.rect())
         screen.show()
         screen.raise_()
