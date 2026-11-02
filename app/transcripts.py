@@ -1291,6 +1291,7 @@ def claude_model_label(raw: str) -> str:
     from . import providers
     text = (raw or "").strip()
     if not text or text.lower() == "default":
+        # before the fallback: model_display would show "default" verbatim
         return ""
     return providers.claude_picker_label(text) or model_display(text)
 
