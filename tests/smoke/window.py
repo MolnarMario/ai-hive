@@ -682,6 +682,75 @@ def test_new_agent_default_names_saved_pick():
         providers._JSON_CACHE.clear()
 
 
+def test_claude_model_table_lookups():
+    """The picker label and the modelSettings key both come from one read
+    of CLAUDE_MODELS (providers.claude_picker_label). The key parses the
+    label, so a label renamed for display would lose the per-model effort;
+    every alias here must still reach its full id."""
+    from app import providers, transcripts
+
+    labels = {v: transcripts.claude_model_label(v)
+              for v in ("opus", "sonnet[1m]", "haiku", "opusplan",
+                        "claude-opus-4-8", "default", "")}
+    check("model table: the card label is the picker's, note left out",
+          labels == {"opus": "Opus 5.5", "sonnet[1m]": "Sonnet 5.5",
+                     "haiku": "Haiku 5.5", "opusplan": "Opus Plan",
+                     "claude-opus-4-8": "Opus 4.8", "default": "",
+                     "": ""}, labels)
+    keys = {v: providers._claude_model_key(v)
+            for v in ("opus", "Sonnet[1M]", "fable", "haiku", "opusplan",
+                      "claude-opus-5-5[1m]", "default", "")}
+    check("model table: each alias reaches the full id claude saves under",
+          keys == {"opus": "claude-opus-5-5",
+                   "Sonnet[1M]": "claude-sonnet-5-5",
+                   "fable": "claude-fable-5-1", "haiku": "claude-haiku-5-5",
+                   "opusplan": "", "claude-opus-5-5[1m]": "claude-opus-5-5",
+                   "default": "", "": ""}, keys)
+    unparsed = [label for label, value in providers.CLAUDE_MODELS
+                if value and value != "opusplan"
+                and not providers._claude_model_key(value)]
+    check("model table: every single-model label still parses to an id",
+          unparsed == [], unparsed)
+
+
+def test_gemini_settings_reader():
+    """Antigravity's settings go through the same cached reader as
+    Claude's (providers._json_file): a good file is read, a half-written
+    one keeps the last good reading, a non-object reads as empty and a
+    deleted file stops being cached."""
+    import json as _json
+    from app import providers
+
+    path = (Path(os.path.expanduser("~")) / ".gemini" / "antigravity-cli"
+            / "settings.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    before = path.read_bytes() if path.exists() else None
+    try:
+        providers._JSON_CACHE.clear()
+        path.write_text(_json.dumps({"model": "Gemini Test"}),
+                        encoding="utf-8")
+        good = providers.gemini_user_default_model()
+        path.write_text("{half", encoding="utf-8")
+        os.utime(path, (1, 1))
+        half = providers.gemini_user_default_model()
+        path.write_text("[1]", encoding="utf-8")
+        os.utime(path, (2, 2))
+        listed = providers.gemini_user_default_settings()
+        path.unlink()
+        gone = providers.gemini_user_default_settings()
+        check("gemini settings: read, kept over a half write, emptied by a "
+              "non-object and dropped with the file",
+              (good, half, listed, gone, str(path) in providers._JSON_CACHE)
+              == ("Gemini Test", "Gemini Test", {}, {}, False),
+              (good, half, listed, gone))
+    finally:
+        if before is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(before)
+        providers._JSON_CACHE.clear()
+
+
 def test_new_card_names_what_claude_starts_on():
     """Claude writes no transcript until the first prompt, so a new card on
     Default showed its seed: "Opus · manual" over a terminal that said

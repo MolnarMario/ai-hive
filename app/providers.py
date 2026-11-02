@@ -21,7 +21,8 @@ from dataclasses import dataclass, field
 DEFAULT_MODEL = ""   # empty = omit the flag, use the CLI's own default
 DEFAULT_EFFORT = ""
 
-# _json_file's cache of Claude's settings files: path -> (mtime, size, dict)
+# _json_file's cache of the CLIs' settings files (Claude's and
+# Antigravity's): path -> (mtime, size, dict)
 _JSON_CACHE: dict = {}
 
 # resolve_claude's PATH lookup: (the PATH it searched, the file it found).
@@ -358,23 +359,41 @@ def _saved_effort(level) -> str:
     return ""
 
 
+def claude_picker_label(model: str) -> str:
+    """The label CLAUDE_MODELS gives the --model value `model`, without the
+    label's own note in brackets: "opus" -> "Opus 5.5", "sonnet[1m]" ->
+    "Sonnet 5.5". "" when the table has no entry for it, or for "" and
+    "default". transcripts.claude_model_label and _claude_model_key both
+    read the table through this, so the card's label and the modelSettings
+    key can't disagree."""
+    bare = _bare_claude_model(model)
+    if not bare or bare == "default":
+        return ""
+    for label, value in CLAUDE_MODELS:
+        if value and value == bare:
+            return label.split(" (", 1)[0]
+    return ""
+
+
+def _bare_claude_model(model: str) -> str:
+    """`model` lowercase, without a "[1m]" window suffix."""
+    return (model or "").strip().lower().replace("[1m]", "").strip()
+
+
 def _claude_model_key(model: str) -> str:
     """`model` as claude keys it under settings' "modelSettings": the full id,
     lowercase, without a "[1m]" window suffix. An alias resolves through the
     label CLAUDE_MODELS gives it ("opus" -> "Opus 5.5" -> "claude-opus-5-5"),
     since the CLI saves the model the alias meant, not the alias. "" for a
-    pick with no single model behind it ("opusplan") or no pick at all."""
-    bare = (model or "").strip().lower().replace("[1m]", "").strip()
-    if not bare or bare == "default":
-        return ""
+    pick with no single model behind it ("opusplan") or no pick at all.
+    This parses the label, so a picker label must stay "<Family> <version>"
+    (a smoke check holds every alias to its full id)."""
+    bare = _bare_claude_model(model)
     if bare.startswith("claude-"):
         return bare
-    for label, value in CLAUDE_MODELS:
-        if value and value == bare:
-            m = re.fullmatch(r"([a-z]+) (\d+(?:\.\d+)?)",
-                             label.split(" (", 1)[0].lower())
-            return f"claude-{m.group(1)}-{m.group(2).replace('.', '-')}" if m else ""
-    return ""
+    m = re.fullmatch(r"([a-z]+) (\d+(?:\.\d+)?)",
+                     claude_picker_label(bare).lower())
+    return f"claude-{m.group(1)}-{m.group(2).replace('.', '-')}" if m else ""
 
 
 # the startup modes a settings file's permissions.defaultMode may name
@@ -443,7 +462,7 @@ def _json_file(path: str) -> dict:
     """The JSON object in `path`, cached by mtime+size so a caller that runs
     on every card build costs one stat. {} when the file is missing or is
     not an object. An unreadable or half-written file keeps the last good
-    reading: claude rewrites these files while AI Hive reads them."""
+    reading: the CLIs rewrite these files while AI Hive reads them."""
     try:
         st = os.stat(path)
     except OSError:
@@ -463,29 +482,11 @@ def _json_file(path: str) -> dict:
     return data
 
 
-_GEMINI_SETTINGS_CACHE: tuple = (0.0, -1, {})
-
-
 def gemini_user_default_settings() -> dict:
-    """Read ~/.gemini/antigravity-cli/settings.json safely. Cached by mtime+size."""
-    global _GEMINI_SETTINGS_CACHE
-    path = os.path.join(os.path.expanduser("~"), ".gemini", "antigravity-cli", "settings.json")
-    try:
-        st = os.stat(path)
-    except OSError:
-        return {}
-    if _GEMINI_SETTINGS_CACHE[0] == st.st_mtime and _GEMINI_SETTINGS_CACHE[1] == st.st_size:
-        return _GEMINI_SETTINGS_CACHE[2]
-    data = {}
-    try:
-        with open(path, "r", encoding="utf-8-sig") as fh:
-            data = json.load(fh)
-        if not isinstance(data, dict):
-            data = {}
-    except (OSError, ValueError):
-        return _GEMINI_SETTINGS_CACHE[2]
-    _GEMINI_SETTINGS_CACHE = (st.st_mtime, st.st_size, data)
-    return data
+    """~/.gemini/antigravity-cli/settings.json as a dict, {} when missing.
+    Cached by mtime+size, like the Claude settings (_json_file)."""
+    return _json_file(os.path.join(os.path.expanduser("~"), ".gemini",
+                                   "antigravity-cli", "settings.json"))
 
 
 def gemini_user_default_model() -> str:

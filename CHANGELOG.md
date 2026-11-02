@@ -8,6 +8,12 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.56.1
+
+- Internal: the Claude model picker's labels and the per-model effort
+  lookup read the model table through one function, and the Antigravity
+  settings use the same cached reader as Claude's. No change to the app.
+
 ## 0.56.0
 
 - Options > Automation > Keep the PC awake (off by default) stops Windows
