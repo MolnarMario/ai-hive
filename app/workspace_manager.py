@@ -840,7 +840,7 @@ class WorkspaceManager(QObject):
                         spec.cwd, spec.session_id)
                     a.set_live_model(model, effort, mode)
                     # the transcript names modes the command line cannot ("default"
-                    # is spelled by omitting the flag), so translate before storing:
+                    # is spelled "manual"), so translate before storing:
                     # spec.permission_mode is a LAUNCH flag, not a reading
                     if mode and spec.set_permission_mode(
                             providers.normalize_permission_mode(mode)):

@@ -256,9 +256,16 @@ def test_live_model_effort():
           transcripts._read_model_effort(str(tpath)))
 
     # translation: the transcript's names are not all launch flags
-    check("mode: 'default' is spelled by omitting the flag",
-          providers.normalize_permission_mode("default") == ""
-          and providers.normalize_permission_mode("manual") == "")
+    # claude 2.1.316 starts in auto without a flag, so ask-each-time needs
+    # the explicit "manual" or a manual agent comes back in auto on reopen
+    check("mode: 'default' relaunches as the explicit manual flag",
+          providers.normalize_permission_mode("default") == "manual"
+          and providers.normalize_permission_mode("manual") == "manual"
+          and providers.normalize_permission_mode("") == "")
+    _, manual_args = providers.build_invocation("claude",
+                                                permission_mode="manual")
+    check("mode: 'manual' reaches the command line",
+          manual_args == ["--permission-mode", "manual"], manual_args)
     check("mode: a real CLI token passes through",
           providers.normalize_permission_mode("auto") == "auto"
           and providers.normalize_permission_mode("plan") == "plan")
@@ -298,7 +305,7 @@ def test_live_model_effort():
     seen = []
     a.model_changed.connect(seen.append)
     check("model: badge seeded from the launch flags",
-          a.model_badge() == "Opus · high · manual", a.model_badge())
+          a.model_badge() == "Opus 5.5 · high · manual", a.model_badge())
     a.set_live_model("Sonnet 5", "max")
     check("model: badge follows the live reading",
           a.model_badge() == "Sonnet 5 · max · manual"
@@ -430,18 +437,19 @@ def test_live_model_effort():
     dirtied.clear()
     mgr.refresh_model_effort()
     check("mode: an unchanged mode never re-saves", not dirtied, dirtied)
-    # the ask-each-time mode is written "default" in the transcript and has no
-    # flag spelling, so it must clear the flag rather than launch a bogus one
+    # the ask-each-time mode is written "default" in the transcript. Omitting
+    # the flag starts claude 2.1.316 in auto, so it relaunches as "manual"
     conv.write_text(_json.dumps(_turn(model="claude-sonnet-5", effort="low"))
                     + "\n" + _json.dumps(_mode("default")) + "\n",
                     encoding="utf-8")
     mgr.refresh_model_effort()
-    check("mode: going back to ask-each-time clears the flag",
-          live.spec.permission_mode == ""
-          and "--permission-mode" not in live.spec.args, live.spec.args)
-    check("mode: clearing it reaches the persisted session record too",
+    check("mode: going back to ask-each-time relaunches as manual",
+          live.spec.permission_mode == "manual"
+          and live.spec.args[-2:] == ["--permission-mode", "manual"],
+          live.spec.args)
+    check("mode: manual reaches the persisted session record too",
           mgr.to_session_dict()["workspaces"][0]["terminals"][0].get(
-              "permission_mode", "-") == "")
+              "permission_mode", "-") == "manual")
     shutil.rmtree(conv.parent, ignore_errors=True)
 
     # --- the summary uses the width it was actually given ---
@@ -508,28 +516,115 @@ def test_new_agent_default_names_saved_pick():
     settings = Path(os.path.expanduser("~")) / ".claude" / "settings.json"
     settings.parent.mkdir(parents=True, exist_ok=True)
     before = settings.read_bytes() if settings.exists() else None
+    state = Path(os.path.expanduser("~")) / ".claude.json"
+    state_before = state.read_bytes() if state.exists() else None
+    project = Path(tempfile.mkdtemp(prefix="defaults-", dir=SCRATCH_CWD))
+    project_settings = project / ".claude" / "settings.json"
+    project_settings.parent.mkdir(parents=True)
 
-    def dialog_defaults(saved):
+    def dialog_defaults(saved, models=()):
+        """(model Default, effort Default, its tooltip, the spec), then the
+        effort Default after picking each of `models` in the Model box."""
         if saved is None:
             settings.unlink(missing_ok=True)
         else:
             settings.write_text(_json.dumps(saved), encoding="utf-8")
-        providers._USER_DEFAULTS_CACHE = (0.0, -1, "", "")
+        providers._JSON_CACHE.clear()
         dlg = AddTerminalDialog("Agent 1", cwd=str(SCRATCH_CWD))
         try:
             i = dlg.kind_combo.findData(AgentKind.CLAUDE)
             dlg.kind_combo.setCurrentIndex(i)
             m = dlg.model_combo.findData("")
             e = dlg.effort_combo.findData("")
-            return (dlg.model_combo.itemText(m), dlg.effort_combo.itemText(e),
-                    dlg.effort_combo.itemData(e, Qt.ItemDataRole.ToolTipRole),
-                    dlg.result_spec(str(SCRATCH_CWD)))
+            first = (dlg.model_combo.itemText(m), dlg.effort_combo.itemText(e),
+                     dlg.effort_combo.itemData(e, Qt.ItemDataRole.ToolTipRole),
+                     dlg.result_spec(str(SCRATCH_CWD)))
+            picked = []
+            for value in models:
+                dlg.model_combo.setCurrentIndex(dlg.model_combo.findData(value))
+                picked.append(dlg.effort_combo.itemText(
+                    dlg.effort_combo.findData("")))
+            return first + (picked,)
+        finally:
+            dlg.done(0)
+            dlg.deleteLater()
+
+    def mode_default(cwd):
+        providers._JSON_CACHE.clear()
+        dlg = AddTerminalDialog("Agent 1", cwd=str(cwd))
+        try:
+            dlg.kind_combo.setCurrentIndex(
+                dlg.kind_combo.findData(AgentKind.CLAUDE))
+            return (dlg.mode_combo.itemText(dlg.mode_combo.findData("")),
+                    dlg.mode_combo.findData("manual") >= 0)
         finally:
             dlg.done(0)
             dlg.deleteLater()
 
     try:
-        model, effort, tip, spec = dialog_defaults(
+        # claude 2.1.316 saves /effort per model; the top-level level was a
+        # leftover "high" while Opus ran at xhigh, and Default said high
+        per_model = {"model": "opus", "effortLevel": "high",
+                     "modelSettings": {
+                         "claude-opus-5-5": {"effortLevel": "xhigh"},
+                         "claude-sonnet-5-5[1m]": {"effortLevel": "medium"},
+                         "claude-haiku-5-5": {"effortLevel": "max"}}}
+        _m, effort, _tip, _spec, picked = dialog_defaults(
+            per_model, models=("sonnet", "claude-opus-4-8", "haiku", ""))
+        check("default: names the effort /effort saved for that model",
+              effort == "Default (xhigh, saved by /effort)", effort)
+        check("default: the effort Default follows the Model pick",
+              picked == ["Default (medium, saved by /effort)",
+                         "Default (high, saved by /effort)",
+                         "Default (high, saved by /effort)",
+                         "Default (xhigh, saved by /effort)"], picked)
+        check("default: per-model effort by full id, [1m] or not",
+              providers.user_default_effort("claude-opus-5-5[1m]") == "xhigh"
+              and providers.user_default_effort("sonnet[1m]") == "medium"
+              and providers.user_default_effort("opusplan") == "high",
+              [providers.user_default_effort(x) for x in
+               ("claude-opus-5-5[1m]", "sonnet[1m]", "opusplan")])
+
+        # the startup mode: claude 2.1.316 starts in auto with no flag
+        settings.unlink(missing_ok=True)
+        state.unlink(missing_ok=True)
+        check("default mode: an older CLI's default reads as manual",
+              mode_default(SCRATCH_CWD) == ("Default (manual)", True),
+              mode_default(SCRATCH_CWD))
+        state.write_text(_json.dumps({"hasSeenAutoDefaultNotice": True}),
+                         encoding="utf-8")
+        check("default mode: the CLI's auto default is named",
+              mode_default(SCRATCH_CWD)[0] == "Default (auto)",
+              mode_default(SCRATCH_CWD))
+        state.write_text(_json.dumps({
+            "hasSeenAutoDefaultNotice": True,
+            "cachedGrowthBookFeatures": {"tengu_harbor_willow": False}}),
+            encoding="utf-8")
+        check("default mode: auto default switched off reads as manual",
+              mode_default(SCRATCH_CWD)[0] == "Default (manual)",
+              mode_default(SCRATCH_CWD))
+        state.write_text(_json.dumps({"hasSeenAutoDefaultNotice": True}),
+                         encoding="utf-8")
+        project_settings.write_text(_json.dumps(
+            {"permissions": {"defaultMode": "plan"}}), encoding="utf-8")
+        check("default mode: the project's defaultMode beats auto",
+              mode_default(project)[0] == "Default (plan)",
+              mode_default(project))
+        project_settings.write_text(_json.dumps(
+            {"permissions": {"disableAutoMode": "disable"}}),
+            encoding="utf-8")
+        check("default mode: auto mode disabled in settings reads as manual",
+              mode_default(project)[0] == "Default (manual)",
+              mode_default(project))
+        settings.write_text(_json.dumps(
+            {"permissions": {"defaultMode": "acceptEdits"}}), encoding="utf-8")
+        project_settings.write_text("{}", encoding="utf-8")
+        check("default mode: the user's own defaultMode is named",
+              mode_default(project)[0] == "Default (auto edits)",
+              mode_default(project))
+        settings.unlink()
+
+        model, effort, tip, spec, _p = dialog_defaults(
             {"model": "opus", "effortLevel": "high"})
         check("default: names the model /model saved",
               model == "Default (Opus 5.5, saved by /model)", model)
@@ -541,25 +636,84 @@ def test_new_agent_default_names_saved_pick():
               spec.model == "" and spec.effort == ""
               and "--model" not in spec.args and "--effort" not in spec.args,
               (spec.model, spec.effort, spec.args))
-        model, effort, _tip, _spec = dialog_defaults(
+        model, effort, _tip, _spec, _p = dialog_defaults(
             {"model": "sonnet[1m]", "effortLevel": "max"})
         check("default: a saved [1m] pick names the plain model",
               model == "Default (Sonnet 5.5, saved by /model)", model)
         check("default: a level claude won't read from settings is ignored",
               effort == "Default (recommended)", effort)
-        model, _effort, _tip, _spec = dialog_defaults({"model": "opusplan"})
+        model, _effort, _tip, _spec, _p = dialog_defaults(
+            {"model": "opusplan"})
         check("default: a model label's own bracketed note is left out",
               model == "Default (Opus Plan, saved by /model)", model)
-        model, effort, _tip, _spec = dialog_defaults(None)
+        model, effort, _tip, _spec, _p = dialog_defaults(None)
         check("default: nothing saved reads as recommended",
               (model, effort) == ("Default (recommended)",
                                   "Default (recommended)"), (model, effort))
     finally:
-        if before is None:
-            settings.unlink(missing_ok=True)
-        else:
-            settings.write_bytes(before)
-        providers._USER_DEFAULTS_CACHE = (0.0, -1, "", "")
+        for path, saved in ((settings, before), (state, state_before)):
+            if saved is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(saved)
+        shutil.rmtree(project, ignore_errors=True)
+        providers._JSON_CACHE.clear()
+
+
+def test_new_card_names_what_claude_starts_on():
+    """Claude writes no transcript until the first prompt, so a new card on
+    Default showed its seed: "Opus · manual" over a terminal that said
+    "Opus 5.5 with xhigh effort" and "auto mode on". The seed now names the
+    model as the picker does, the effort /effort saved for that model and
+    the mode a new conversation starts in."""
+    import json as _json
+    from PySide6.QtWidgets import QApplication
+    from app import providers
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+
+    QApplication.instance() or QApplication([])
+    home = Path(os.path.expanduser("~"))
+    settings = home / ".claude" / "settings.json"
+    state = home / ".claude.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    saved = {p: (p.read_bytes() if p.exists() else None)
+             for p in (settings, state)}
+    try:
+        settings.write_text(_json.dumps({
+            "model": "opus", "effortLevel": "high",
+            "modelSettings": {"claude-opus-5-5": {"effortLevel": "xhigh"}}}),
+            encoding="utf-8")
+        state.write_text(_json.dumps({"hasSeenAutoDefaultNotice": True}),
+                         encoding="utf-8")
+        providers._JSON_CACHE.clear()
+        a = TerminalAgent(build_spec(AgentKind.CLAUDE, "Fresh",
+                                     cwd=SCRATCH_CWD))
+        check("seed: a Default card names model, saved effort and auto",
+              a.model_badge() == "Opus 5.5 · xhigh · auto", a.model_badge())
+        check("seed: the launch flags stay off",
+              not ({"--model", "--effort", "--permission-mode"}
+                   & set(a.spec.args)), a.spec.args)
+        b = TerminalAgent(build_spec(AgentKind.CLAUDE, "Picked",
+                                     cwd=SCRATCH_CWD, model="sonnet",
+                                     permission_mode="plan"))
+        check("seed: a picked model takes the top-level effort, a picked "
+              "mode wins",
+              b.model_badge() == "Sonnet 5.5 · high · plan", b.model_badge())
+        c = TerminalAgent(build_spec(AgentKind.CLAUDE, "Manual",
+                                     cwd=SCRATCH_CWD, effort="low",
+                                     permission_mode="manual"))
+        check("seed: an explicit manual launch reads as manual",
+              c.model_badge() == "Opus 5.5 · low · manual", c.model_badge())
+        for agent in (a, b, c):
+            agent.deleteLater()
+    finally:
+        for path, before in saved.items():
+            if before is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(before)
+        providers._JSON_CACHE.clear()
 
 
 def test_narrow_header_drops_words_not_letters():
