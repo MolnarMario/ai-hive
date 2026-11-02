@@ -3403,9 +3403,8 @@ def test_sleep_idle_agents():
     del idle.recap
     win._finished_lanes = lambda _ws, _a: ["a done lane"]
     _lanes, why = win._ship_state(wws, idle)
-    check("sleep: Ship finished lanes says to resume an asleep integrator, "
-          "never to restart it", "asleep" in why and "Restart" not in why,
-          why)
+    check("sleep: an asleep integrator can take Ship finished lanes (the "
+          "ship wakes it)", why == "", why)
     del win._finished_lanes
     card.sleep_screen.resume_btn.click()
     check("sleep: a click resumes the conversation",
@@ -3463,6 +3462,100 @@ def test_sleep_idle_agents():
     check("sleep: a box without a '>' prompt is never read as a draft",
           not term.has_draft())
     win._sleep_idle = False
+    for a in list(wws.agents):
+        win._close_agent(wws.id, a.id)
+    win.close(); pump(120)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_scheduled_message_wakes_sleeping_agent():
+    """A message scheduled for an agent asleep to free memory wakes it when
+    it comes due, and goes in once the resumed prompt is up. Only an agent
+    with a message due wakes, one per tick, so a batch due together boots
+    staggered. A message already past the give-up wakes nothing: it would
+    go MISSED before the boot finished."""
+    import time
+
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.session_store import SessionStore
+    from app.terminal_agent import AgentStatus
+    from app.widgets.main_window import SCHEDULE_GIVE_UP_S
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-sched-wake-"))
+    win = create_main_window(SessionStore(path=tmp / "s.json"))
+    win.show(); pump(120)
+    wws = win.manager.workspaces[0]
+    sent = {}
+
+    def sleeper(name, n):
+        agent, calls, live = _sleepy_claude(
+            win.manager, wws.id, name, SCRATCH_CWD,
+            sid=f"5ee9a6e7-0000-4000-8000-0000000005{n:02d}")
+        live["on"] = False
+        agent._set_status(AgentStatus.EXITED_OK)
+        # put_to_sleep's arming, minus the transcript check: the pinned
+        # conversation is taken as there
+        agent.spec.resume = True
+        agent._verify_resume_target = False
+        agent.mark_asleep()
+        sent[name] = []
+        agent.nudge = lambda text: (
+            agent._prompt_ready and live["on"]
+            and (sent[name].append(text) or True))
+        return agent, calls, live
+
+    now = time.time()
+    first, fcalls, flive = sleeper("Due first", 1)
+    second, scalls, slive = sleeper("Due second", 2)
+    late, lcalls, _ll = sleeper("Long overdue", 3)
+    later, tcalls, _tl = sleeper("Due tomorrow", 4)
+    first.schedule_message("carry on", now - 2)
+    second.schedule_message("and you", now - 1)
+    late.schedule_message("too late", now - SCHEDULE_GIVE_UP_S - 60)
+    later.schedule_message("tomorrow", now + 86400)
+    check("sched wake: all four start asleep",
+          all(a.is_asleep() for a in (first, second, late, later)))
+    audits = []
+    win._schedule_audit = audits.append
+
+    win._tick_schedules()
+    check("sched wake: a due message wakes its agent, one per tick",
+          fcalls == ["start"] and scalls == [] and not first.is_asleep()
+          and second.is_asleep(), (fcalls, scalls))
+    check("sched wake: nothing is typed before the prompt is up",
+          sent["Due first"] == [] and first.pending_scheduled())
+    check("sched wake: a message past the give-up wakes nothing",
+          lcalls == [] and late.is_asleep()
+          and late.missed_scheduled(), lcalls)
+    check("sched wake: an agent with nothing due sleeps on",
+          tcalls == [] and later.is_asleep())
+
+    # the resumed child is up at its prompt
+    flive["on"] = True
+    first._set_status(AgentStatus.RUNNING)
+    first._prompt_ready = True
+    win._tick_schedules()
+    check("sched wake: the next tick delivers into the woken agent",
+          sent["Due first"] == ["carry on"]
+          and not first.pending_scheduled(), sent["Due first"])
+    check("sched wake: ...and wakes the next agent with a message due",
+          scalls == ["start"] and not second.is_asleep(), scalls)
+    check("sched wake: each wake is audited",
+          [ln.split(" late=")[0] for ln in audits
+           if ln.startswith("WAKE")]
+          == ["WAKE agent=Due first", "WAKE agent=Due second"], audits)
+    check("sched wake: the far-off message still sleeps",
+          tcalls == [] and later.is_asleep() and later.pending_scheduled())
+
     for a in list(wws.agents):
         win._close_agent(wws.id, a.id)
     win.close(); pump(120)
