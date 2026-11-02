@@ -1335,6 +1335,12 @@ def test_terminal_click_over_collapsed_paste():
     check("pastecaret: wide glyphs take one press each",
           click(wide, (0, 12), (0, 5)) == [L * 6],
           click(wide, (0, 12), (0, 5)))
+    # a row ending in a wide glyph ends after its right half, so a click
+    # past that end lands after the glyph, not before it
+    wide_end = [P + "日本語", "  0123"]         # glyphs at 2, 4, 6
+    check("pastecaret: a click past a wide last glyph lands after it",
+          click(wide_end, (1, 6), (0, 30)) == [U, R],
+          click(wide_end, (1, 6), (0, 30)))
 
     # delete across the token: "c [Pasted text #1 +4 lines] x"
     view, out = box([TOKEN_ROW], (0, 35))

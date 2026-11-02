@@ -109,6 +109,9 @@ class CaretMap:
         """Rightmost caret column of row r: after its last glyph, or at the
         caret on its own row, which counts blanks typed at the end."""
         _, last = self._spans[r]
+        row = self.cells[r]
+        if 0 <= last < len(row) - 1 and row[last + 1] == "":
+            last += 1          # the right half of a wide last glyph
         end = max(last + 1, self.row_start(r))
         if r == self.caret[0]:
             end = max(end, self.caret[1])

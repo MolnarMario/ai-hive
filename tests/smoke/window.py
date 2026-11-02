@@ -585,6 +585,23 @@ def test_new_agent_default_names_saved_pick():
               [providers.user_default_effort(x) for x in
                ("claude-opus-5-5[1m]", "sonnet[1m]", "opusplan")])
 
+        # no /model pick: claude runs the account's default model, so the
+        # per-model levels count only when they all agree
+        def no_pick_effort(models):
+            providers._JSON_CACHE.clear()
+            settings.write_text(_json.dumps({
+                "effortLevel": "high", "modelSettings": {
+                    m: {"effortLevel": lvl} for m, lvl in models.items()}}),
+                encoding="utf-8")
+            return providers.user_default_effort()
+        agree = no_pick_effort({"claude-opus-5-5": "xhigh",
+                                "claude-sonnet-5-5": "xhigh"})
+        differ = no_pick_effort({"claude-opus-5-5": "xhigh",
+                                 "claude-sonnet-5-5": "low"})
+        check("default: no model pick takes the per-model level they share",
+              (agree, differ) == ("xhigh", "high"), (agree, differ))
+        providers._JSON_CACHE.clear()
+
         # the startup mode: claude 2.1.316 starts in auto with no flag
         settings.unlink(missing_ok=True)
         state.unlink(missing_ok=True)
@@ -609,6 +626,11 @@ def test_new_agent_default_names_saved_pick():
             {"permissions": {"defaultMode": "plan"}}), encoding="utf-8")
         check("default mode: the project's defaultMode beats auto",
               mode_default(project)[0] == "Default (plan)",
+              mode_default(project))
+        project_settings.write_text(_json.dumps(
+            {"permissions": {"defaultMode": "manual"}}), encoding="utf-8")
+        check("default mode: a defaultMode of manual beats auto too",
+              mode_default(project)[0] == "Default (manual)",
               mode_default(project))
         project_settings.write_text(_json.dumps(
             {"permissions": {"disableAutoMode": "disable"}}),
@@ -4091,14 +4113,25 @@ def test_keep_awake():
         fake["ok"] = False
         fake["battery"] = True
         win._keep_awake_timer.timeout.emit()
-        check("keep-awake: a failed call is not recorded as held",
-              win._keep_awake_held == (False, False))
+        check("keep-awake: a failed call keeps the last hold that took",
+              win._keep_awake_held == (True, False))
         fake["ok"] = True
         win._keep_awake_timer.timeout.emit()
         check("keep-awake: ...so the next tick tries again",
               calls[-1] == (True, True)
               and win._keep_awake_held == (True, True), calls)
 
+        # a failed change leaves the screen hold in force, so the
+        # switch-off below must still release it
+        fake["ok"] = False
+        fake["battery"] = False
+        win._keep_awake_timer.timeout.emit()
+        fake["ok"] = True
+        del calls[:]
+        tb.keep_awake_btn.click()
+        check("keep-awake: off after a failed change still releases",
+              calls == [(False, False)], calls)
+        tb.keep_awake_btn.click()
         tb.keep_awake_btn.click()
         check("keep-awake: off releases and stops the timer",
               calls[-1] == (False, False)

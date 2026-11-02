@@ -5194,7 +5194,21 @@ def test_ship_wakes_only_the_asleep_integrator():
         i._last_submit_ts = 0.0
         check("ship wake: a line the user sent while it woke cancels it",
               delivered == [] and uid not in win._ship_waking
-              and "You sent Integrator" in told[-1], told[-1:])
+              and "Integrator got another message" in told[-1], told[-1:])
+
+        # a woken child that dies ends the wait at once, with that reason
+        from app.terminal_agent import AgentStatus
+        asleep(i)
+        win._ship_lanes(ws.id, i)
+        state["is_running"] = True
+        win._ship_wake_tick(uid)
+        state["is_running"] = False
+        i.status = AgentStatus.CRASHED
+        win._ship_wake_tick(uid)
+        i.status = AgentStatus.IDLE
+        check("ship wake: an integrator that dies while it wakes says so",
+              delivered == [] and uid not in win._ship_waking
+              and "stopped while it woke up" in told[-1], told[-1:])
 
         # a prompt that never frees up gives up, saying so
         asleep(i)
@@ -5211,7 +5225,7 @@ def test_ship_wakes_only_the_asleep_integrator():
               delivered == [] and uid not in win._ship_waking
               and "did not reach a free prompt" in told[-1], told[-1:])
         check("ship wake: every drop is audited",
-              sum(ln.startswith("LANE-SHIP-DROP") for ln in audit) == 3,
+              sum(ln.startswith("LANE-SHIP-DROP") for ln in audit) == 4,
               audit)
 
         # the asleep lane agent needs nothing awake after the merge either

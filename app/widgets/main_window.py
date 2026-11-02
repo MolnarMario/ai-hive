@@ -5481,9 +5481,12 @@ class MainWindow(QMainWindow):
             self.store.audit(
                 f"KEEP-AWAKE system={int(want[0])} display={int(want[1])}"
                 f"{'' if ok else ' FAILED'}")
-            # a failed call holds nothing; recording the wish anyway would
-            # stop every later tick from trying again
-            self._keep_awake_held = want if ok else (False, False)
+            # a failed call changes nothing, so the last state that took is
+            # still held. Recording the wish would stop later ticks from
+            # trying again, and recording (False, False) would let a
+            # switch-off skip the release of a hold still in force.
+            if ok:
+                self._keep_awake_held = want
         if standby:
             if not self._keep_awake_timer.isActive():
                 self._keep_awake_timer.start()
@@ -6442,9 +6445,23 @@ class MainWindow(QMainWindow):
                      f"card, then ship again if the new one should do it.")
             return
         if agent.last_submit_at() > entry["woke_at"]:
+            # typed by the user or a scheduled message of theirs coming due
             self._end_ship_wake(
-                uid, f"You sent {name} something while it woke up, so it was "
-                     f"not asked to ship. Ship again once it has answered.")
+                uid, f"{name} got another message while it woke up, so it "
+                     f"was not asked to ship. Ship again once it has "
+                     f"answered.")
+            return
+        if agent.is_running():
+            entry["ran"] = True
+        elif entry.get("ran") and agent.status in (
+                AgentStatus.EXITED_OK, AgentStatus.EXITED_ERR,
+                AgentStatus.CRASHED, AgentStatus.FAILED):
+            # the woken child died. Only after one was seen running: an
+            # asleep agent still reads as exited until its new child spawns.
+            # Waiting out the deadline would end in the wrong reason.
+            self._end_ship_wake(
+                uid, f"{name} stopped while it woke up, so it was not asked "
+                     f"to ship. Check its card, then ship again.")
             return
         done, why = self._ship_state(ws, agent, waking=True)
         if [(a.spec.uid, v.done) for a, v in done] != entry["done"]:

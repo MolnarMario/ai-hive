@@ -157,9 +157,9 @@ def normalize_permission_mode(raw: str) -> str:
 
     `raw` is a mode as the CLI names it internally (what a transcript record
     carries), which is not always a launchable token: the ask-each-time mode is
-    written "default" and has no flag spelling at all. Anything unrecognized
-    becomes "" (omit the flag) rather than a bogus flag that would stop the
-    agent launching."""
+    written "default" and launches as "manual", since no flag at all starts
+    claude 2.1.316 in auto. Anything unrecognized becomes "" (omit the flag)
+    rather than a bogus flag that would stop the agent launching."""
     token = (raw or "").strip()
     if token in _MODE_LAUNCH:
         return _MODE_LAUNCH[token]
@@ -169,7 +169,9 @@ def normalize_permission_mode(raw: str) -> str:
 def permission_mode_display(raw: str) -> str:
     """A permission mode as a short label for the card header, e.g.
     "default" -> "manual". Unknown tokens show verbatim (a newer CLI's mode is
-    better shown as-is than hidden); "" is the CLI default, i.e. "manual"."""
+    better shown as-is than hidden). "" reads as "manual": it is what
+    user_default_permission_mode returns when nothing says the CLI starts
+    elsewhere."""
     token = (raw or "").strip()
     return _MODE_DISPLAY.get(token, token)
 
@@ -327,17 +329,26 @@ def user_default_effort(model: str = "") -> str:
     Measured on claude 2.1.309: no launch flag undoes a saved level, and
     `--settings '{"effortLevel": "auto"}'` still ran at the saved "high". So
     the New Agent dialog names this rather than promising the recommended
-    effort. Never raises."""
+    effort.
+
+    With no model pick at all, claude runs its own default model, which
+    depends on the account. The per-model levels then name it only when
+    they all agree. Never raises."""
     data = _claude_user_settings()
     key = _claude_model_key(model or user_default_model())
     per_model = data.get("modelSettings")
-    if key and isinstance(per_model, dict):
+    if isinstance(per_model, dict):
+        levels = set()
         for name, conf in per_model.items():
-            if (isinstance(name, str) and isinstance(conf, dict)
-                    and _claude_model_key(name) == key):
-                level = _saved_effort(conf.get("effortLevel"))
-                if level:
-                    return level
+            if not (isinstance(name, str) and isinstance(conf, dict)):
+                continue
+            level = _saved_effort(conf.get("effortLevel"))
+            if key and _claude_model_key(name) == key and level:
+                return level
+            levels.add(level)
+        if (not key and not (model or user_default_model())
+                and len(levels) == 1 and "" not in levels):
+            return levels.pop()
     return _saved_effort(data.get("effortLevel"))
 
 
@@ -367,7 +378,7 @@ def _claude_model_key(model: str) -> str:
 
 
 # the startup modes a settings file's permissions.defaultMode may name
-_SETTINGS_MODES = ("default", "acceptEdits", "plan", "auto",
+_SETTINGS_MODES = ("default", "manual", "acceptEdits", "plan", "auto",
                    "bypassPermissions", "dontAsk")
 
 
@@ -398,6 +409,8 @@ def user_default_permission_mode(cwd: str = "") -> str:
         mode = perms.get("defaultMode") if isinstance(perms, dict) else None
         if isinstance(mode, str) and mode.strip() in _SETTINGS_MODES:
             mode = mode.strip()
+            if mode == "manual":
+                return "default"   # the transcript's name for it
             if mode != "auto":
                 return mode
             if not auto_off:

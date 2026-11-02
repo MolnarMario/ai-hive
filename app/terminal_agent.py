@@ -1849,9 +1849,10 @@ class TerminalAgent(QObject):
 
     def permission_mode(self) -> str:
         """The raw permission-mode token this agent is in, as the CLI names it
-        ("", "default", "auto", "plan", ...). "" for a fresh Claude agent means
-        the CLI's own ask-each-time default; for anything else it means the
-        concept does not apply."""
+        ("", "default", "auto", "plan", ...). "" for a Claude agent means
+        nothing says what the CLI starts in (providers.
+        user_default_permission_mode) and reads as manual; for anything else
+        it means the concept does not apply."""
         return self._live_mode
 
     def permission_mode_label(self) -> str:
