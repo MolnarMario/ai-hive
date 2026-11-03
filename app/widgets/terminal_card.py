@@ -1488,6 +1488,12 @@ class TerminalCard(QFrame):
         """Text typed into the terminal's input box and not sent yet."""
         return self.is_pty and self.terminal.has_draft()
 
+    def input_erase_keys(self) -> str | None:
+        """The keys that empty the terminal's input box, "" when it is
+        empty, None when it can't be emptied (TerminalView.input_erase_keys).
+        A line-mode card keeps no box of the child's to empty."""
+        return self.terminal.input_erase_keys() if self.is_pty else ""
+
     def _resume_from_sleep(self) -> None:
         """A click on the sleep screen, or a key on a sleeping card. The
         child the sleep stopped may still be exiting (PtyWorker.stop's

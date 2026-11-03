@@ -6371,19 +6371,30 @@ class MainWindow(QMainWindow):
 
     def _send_ship(self, agent, done: list) -> None:
         """Type the ship request naming `done`, the lanes the user
-        confirmed, into the integrator."""
+        confirmed, into the integrator. The request replaces whatever sits
+        in its input box: typed beside a leftover draft, the two went in as
+        one message. A box the view can't empty gets nothing."""
         lanes_at = ", ".join(f"{view.branch} at {view.done[:12]}"
                              for _a, view in done)
         text = (f"Ship the finished lanes now: {lanes_at}. Merge each of "
                 f"those \"Task done\" commits into one integrate/ branch and "
                 f"follow your integrator instructions through to the merge.")
-        if not agent.nudge(text):
+        card = self._card_for_agent(agent.id)
+        erase = card.input_erase_keys() if card is not None else ""
+        if erase is None:
+            self._lane_message("Nothing shipped",
+                               f"AI Hive could not clear the text in "
+                               f"{agent.spec.name}'s input box. Clear it, "
+                               f"then ship again.")
+            return
+        if not agent.nudge(text, erase=erase):
             self._lane_message("Nothing shipped",
                                f"{agent.spec.name} could not take the "
                                f"request. Try again once it is at its prompt.")
             return
         self._store_audit(f"LANE-SHIP agent={agent.spec.name!r} "
-                          f"lanes={lanes_at}")
+                          f"lanes={lanes_at}"
+                          + (" cleared=input" if erase else ""))
 
     def _wake_to_ship(self, ws_id: str, agent, done: list) -> None:
         """Ship finished lanes on an integrator asleep to free memory: wake
@@ -6471,8 +6482,8 @@ class MainWindow(QMainWindow):
             return
         card = self._card_for_agent(agent.id)
         if not why and card is not None and card.has_draft():
-            # the user is typing into it: the request must not land in
-            # their draft
+            # the user typed this after the click, while it woke: waited
+            # out, not erased like a box left over from before (_send_ship)
             why = "draft"
         if why:
             if time.monotonic() >= entry["deadline"]:
@@ -6506,12 +6517,19 @@ class MainWindow(QMainWindow):
         finished lanes" turns it back on; Cancel keeps asking."""
         lines = "\n".join(f"  {a.spec.name}: {view.branch} at "
                           f"{view.done[:7]}" for a, view in done)
-        wake = (f"\n\n{agent.spec.name} is asleep to free memory. OK resumes "
-                f"its conversation first." if agent.is_asleep() else "")
+        card = self._card_for_agent(agent.id)
+        if agent.is_asleep():
+            note = (f"\n\n{agent.spec.name} is asleep to free memory. OK "
+                    f"resumes its conversation first.")
+        elif card is not None and card.has_draft():
+            # _send_ship erases it: say so while Cancel can still keep it
+            note = "\n\nThe request replaces the unsent text in its input box."
+        else:
+            note = ""
         box = QMessageBox(
             QMessageBox.Icon.Question, "Ship finished lanes",
             f"{agent.spec.name} combines these lanes into one pull request, "
-            f"gets it reviewed and tested, and merges it:\n\n{lines}{wake}",
+            f"gets it reviewed and tested, and merges it:\n\n{lines}{note}",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             self)
         box.setDefaultButton(QMessageBox.StandardButton.Cancel)

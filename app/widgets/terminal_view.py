@@ -2795,10 +2795,16 @@ class TerminalView(QWidget):
     def _emit_arrows(self, final: str, count: int) -> None:
         """Send `count` copies of one arrow key (final 'A'/'B'/'C'/'D' == Up/
         Down/Right/Left), honouring the child's cursor-key mode (DECCKM)."""
+        seq = self._arrow_keys(final, count)
+        if seq:
+            self._send(seq)
+
+    def _arrow_keys(self, final: str, count: int) -> str:
+        """`count` copies of one arrow key, as _emit_arrows sends them."""
         if count <= 0:
-            return
-        seq = ("\x1bO" if self._app_cursor_keys else "\x1b[") + final
-        self._send(seq * count)
+            return ""
+        return (("\x1bO" if self._app_cursor_keys else "\x1b[") + final) \
+            * count
 
     def _typing_span(self):
         """_input_block_span for Bionic reading, which has to cover one more
@@ -2932,20 +2938,29 @@ class TerminalView(QWidget):
 
     def _drive_caret(self, carets, target) -> None:
         """Send the arrows that walk the child's caret to `target`, a caret
-        stop of `carets`. On the caret's own row that is the Left/Right run
+        stop of `carets` (_caret_keys)."""
+        for seq in self._caret_keys(carets, target):
+            self._send(seq)
+
+    def _caret_keys(self, carets, target) -> list[str]:
+        """The arrows that walk the child's caret to `target`, a caret stop
+        of `carets`. On the caret's own row that is the Left/Right run
         `carets` counts. On another row Up/Down go first and carry the
         caret's column, which the editor clamps to the target row's end,
         and the Left/Right run starts from that predicted landing."""
+        keys = []
         cy, cx = self.screen.cursor.y, self.screen.cursor.x
         row = target[0]
         src = (cy, cx)
         if row != cy:
-            self._emit_arrows("B" if row > cy else "A", abs(row - cy))
+            keys.append(self._arrow_keys("B" if row > cy else "A",
+                                         abs(row - cy)))
             src = (row, max(carets.row_start(row),
                             min(cx, carets.row_end(row))))
         n = carets.presses(src, target)
         if n:
-            self._emit_arrows("C" if target > src else "D", n)
+            keys.append(self._arrow_keys("C" if target > src else "D", n))
+        return [seq for seq in keys if seq]
 
     def _delete_selection(self, rng=None) -> bool:
         """Delete a selection by driving the child's caret to its end, then
@@ -2975,16 +2990,29 @@ class TerminalView(QWidget):
         guard.
 
         `rng` deletes that span instead of the selection, which stays."""
-        if self._waiting_probe():
-            return False
         if rng is None:
             rng = self._selection_range()
         if rng is None or self._scroll_offset:
             return False
+        keys = self._erase_keys(rng)
+        if keys is None:
+            return False
+        self._snap_to_bottom()
+        for seq in keys:
+            self._send(seq)
+        return True
+
+    def _erase_keys(self, rng) -> list[str] | None:
+        """The keys that delete live-screen span `rng` of the input box:
+        the arrows that drive the child's caret to just past its end, then
+        the Backspaces over it. None, under the rules _delete_selection
+        documents, when the span can't be mapped."""
+        if self._waiting_probe():
+            return None
         (r0, c0), (r1, c1) = rng
         span = self._input_block_span()
         if span is None or not (span[0] <= r0 and r1 <= span[1]):
-            return False  # selection escapes the input box
+            return None  # the span escapes the input box
         # The count is the Left presses from the span's end back to its
         # start, so a collapsed paste costs one and the prompt and the
         # indent of the rows below it cost none (app/input_caret.py).
@@ -2992,11 +3020,29 @@ class TerminalView(QWidget):
         start, end = carets.widen((r0, c0), (r1, c1 + 1))
         count = carets.presses(end, start) if start < end else None
         if not count:
-            return False
-        self._snap_to_bottom()
-        self._drive_caret(carets, end)        # caret to just past the span end
-        self._send("\x7f" * count)    # then Backspace over it
-        return True
+            return None
+        return self._caret_keys(carets, end) + ["\x7f" * count]
+
+    def input_erase_keys(self) -> str | None:
+        """The keys that empty Claude's input box, for text that goes to
+        the child without passing through the view (Ship finished lanes,
+        MainWindow._send_ship). The caller sends them itself, right before
+        its text, so nothing it sends can wait behind _send's hold.
+
+        "" when the box holds no typed text (Claude's hint is none), so an
+        empty box gets nothing. None when it holds text the view can't map
+        (_erase_keys), or while one of the view's own clears is still
+        landing: keys sent past the hold would arrive ahead of the ones
+        it holds. Then nothing should go in on top of the text."""
+        if not self._input_text():
+            return ""
+        if self._held_keys is not None:
+            return None
+        span = self._input_block_span()     # set: _input_text read the box
+        last = self._row_content(span[1])[1]
+        keys = (self._erase_keys(((span[0], 0), (span[1], last)))
+                if last >= 0 else None)
+        return None if keys is None else "".join(keys)
 
     def _delete_and_drop_selection(self) -> None:
         """Delete a mouse or keyboard selection when _delete_selection can,

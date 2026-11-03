@@ -3273,6 +3273,20 @@ def test_task_submit_waits_for_echo():
     check("submit-echo: other TUIs keep the plain fixed beat",
           writes[-1:] == ["\r"], writes)
 
+    # Ship finished lanes hands nudge the keys that empty the input box
+    a, writes = agent()
+    a.nudge(task, erase="\x1b[C\x1b[C\x7f\x7f\x7f")
+    check("submit-echo: erase keys go right before the text",
+          writes == ["\x1b[C\x1b[C\x7f\x7f\x7f", task], writes)
+    a._on_pty_output("", drawn)
+    pump(floor)
+    check("submit-echo: ...and the Enter still follows the echo",
+          writes[-1:] == ["\r"] and writes.count("\r") == 1, writes)
+    a, writes = agent()
+    a._prompt_ready = False
+    check("submit-echo: a refused nudge erases nothing",
+          a.nudge(task, erase="\x7f\x7f") is False and writes == [], writes)
+
 
 def test_scheduled_send():
     """A message the user writes now and has typed in LATER.

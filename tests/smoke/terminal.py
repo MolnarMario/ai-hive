@@ -1496,6 +1496,23 @@ def test_terminal_input_editor():
           view._delete_selection() is False)
     check("multidel: off-input-box delete sends nothing", out == [], out)
 
+    # input_erase_keys: the same Backspaces, handed back for a send that
+    # bypasses the view (Ship finished lanes), never sent by the view
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0line one\r\n  line two\x1b[1;5H")   # caret inside row 0
+    out = []
+    view.keyInput.connect(out.append)
+    check("erasekeys: a two-row box: Down, Rights to its end, Backspaces",
+          view.input_erase_keys() == "\x1b[B" + "\x1b[C" * 6 + "\x7f" * 17,
+          repr(view.input_erase_keys()))
+    check("erasekeys: the view sends none of them itself", out == [], out)
+    view.set_waiting_probe(lambda: True)
+    check("erasekeys: an open menu over the box can't be mapped",
+          view.input_erase_keys() is None)
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0")
+    check("erasekeys: an empty box needs none", view.input_erase_keys() == "")
+
     # --- approximate undo / redo --------------------------------------------
     view = TerminalView(rows=6, cols=80)
     view.feed("> ")                     # empty prompt
