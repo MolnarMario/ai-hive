@@ -1245,6 +1245,32 @@ def test_terminal_altgr_and_paste_replace():
           sent == ["\x1b\x1b"], sent)
 
 
+def test_terminal_word_stops_at_no_break_space():
+    """Claude paints a no-break space after its prompt glyph, and a word only
+    ended at a plain space: double-clicking the prompt's first word selected
+    the glyph too and copied as ">\\xa0hello". Ctrl+Shift+Arrow word steps
+    share the same notion of a word."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                            TerminalView)
+
+    QApplication.instance() or QApplication([])
+    LB = Qt.MouseButton.LeftButton
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0hello world")
+    pos = QPointF(CELL_PAD_X + 3.5 * view._cell_w, CELL_PAD_Y + 0.5 * view._cell_h)
+    view.mouseDoubleClickEvent(QMouseEvent(
+        QEvent.Type.MouseButtonDblClick, pos, LB, LB,
+        Qt.KeyboardModifier.NoModifier))
+    check("word: double-click on the prompt's first word selects just it",
+          view.selected_text() == "hello", repr(view.selected_text()))
+    check("word: a word step left from 'hello' stops at its start",
+          view._word_col(0, 4, -1) == 2, view._word_col(0, 4, -1))
+
+
 def test_terminal_selection_typing_replaces():
     """Typing over a double-clicked or dragged word in the input box replaces
     it, as in an editor. The bug: the character went in at the caret and the
@@ -1481,17 +1507,46 @@ def test_terminal_input_editor():
           view._undo_stack == [""] and view._undo_last == "hi",
           (view._undo_stack, view._undo_last))
     press(view, K.Key_Z, ctrl=True)     # undo -> restore ""
-    check("undo: Ctrl+Z clears the prompt (empty restore = just the clear)",
-          out == ["\x1b\x1b"], out)
+    check("undo: Ctrl+Z Backspaces the prompt (empty restore = just that)",
+          out == ["\x7f" * len("hi")], out)
     check("undo: undo pushes the current input onto the redo stack",
           view._redo_stack == ["hi"], view._redo_stack)
+    view.feed("\r\x1b[2K> ")            # Claude draws the emptied prompt
     out.clear()
     press(view, K.Key_Y, ctrl=True)     # redo -> restore "hi"
-    check("undo: Ctrl+Y clears first and holds the paste for the empty box",
+    check("undo: Ctrl+Y into an empty box just pastes, nothing before it",
+          out == ["hi"], out)
+
+    # Claude's empty box holds a dim hint, which is not input: undo never
+    # snapshots it, so Ctrl+Z back to an empty prompt can't paste the hint
+    hint = "❯\xa0Try \"edit <filepath> to...\""
+    view = TerminalView(rows=6, cols=80)
+    view.feed(hint + "\x1b[1;3H")       # caret parked at the box's start
+    check("undo: the hint is no draft", view._draft_text() == "",
+          view._draft_text())
+    out = []
+    view.keyInput.connect(out.append)
+    view.feed("\r\x1b[2K❯\xa0hi")    # the user typed "hi"
+    view._snapshot_input()
+    check("undo: the empty box snapshots as empty, not as the hint",
+          view._undo_stack == [""], view._undo_stack)
+    view.feed("\r\x1b[2K" + hint + "\x1b[1;3H")
+    sent_sched = []
+    view.scheduleRequested.connect(sent_sched.append)
+    press(view, K.Key_Return, ctrl=True, shift=True)
+    check("undo: Schedule from an empty box prefills nothing, not the hint",
+          sent_sched == [""], sent_sched)
+
+    # a box without Claude's prompt glyph (Codex draws '›') can't be
+    # read for a draft, so undo there keeps the double-Esc and holds the paste
+    view = TerminalView(rows=6, cols=80)
+    view.feed("› old")
+    out = []
+    view.keyInput.connect(out.append)
+    view._undo_stack.append("new")
+    press(view, K.Key_Z, ctrl=True)
+    check("undo: a box without Claude's prompt keeps the double-Esc",
           out == ["\x1b\x1b"], out)
-    view.feed("\x1b[2J\x1b[H> ")        # Claude draws the cleared prompt
-    check("undo: Ctrl+Y re-applies the undone input (clear + paste)",
-          out == ["\x1b\x1b", "hi"], out)
 
     # empty stacks fall through to the legacy control bytes
     view = TerminalView(rows=6, cols=80)
