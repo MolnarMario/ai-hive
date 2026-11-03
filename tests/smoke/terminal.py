@@ -463,7 +463,7 @@ def test_terminal_keys():
     view.feed("\r\x1b[2K> my prompt")
     press(K.Key_A, ctrl=True)
     sent.clear()
-    view._delete_selection = lambda: False
+    view._delete_selection = lambda *a: False
     press(K.Key_Backspace)
     del view._delete_selection
     check("keys: an unmappable box falls back to the double-Esc clear",
@@ -1245,6 +1245,32 @@ def test_terminal_altgr_and_paste_replace():
           sent == ["\x1b\x1b"], sent)
 
 
+def test_terminal_word_stops_at_no_break_space():
+    """Claude paints a no-break space after its prompt glyph, and a word only
+    ended at a plain space: double-clicking the prompt's first word selected
+    the glyph too and copied as ">\\xa0hello". Ctrl+Shift+Arrow word steps
+    share the same notion of a word."""
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import (CELL_PAD_X, CELL_PAD_Y,
+                                            TerminalView)
+
+    QApplication.instance() or QApplication([])
+    LB = Qt.MouseButton.LeftButton
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0hello world")
+    pos = QPointF(CELL_PAD_X + 3.5 * view._cell_w, CELL_PAD_Y + 0.5 * view._cell_h)
+    view.mouseDoubleClickEvent(QMouseEvent(
+        QEvent.Type.MouseButtonDblClick, pos, LB, LB,
+        Qt.KeyboardModifier.NoModifier))
+    check("word: double-click on the prompt's first word selects just it",
+          view.selected_text() == "hello", repr(view.selected_text()))
+    check("word: a word step left from 'hello' stops at its start",
+          view._word_col(0, 4, -1) == 2, view._word_col(0, 4, -1))
+
+
 def test_terminal_selection_typing_replaces():
     """Typing over a double-clicked or dragged word in the input box replaces
     it, as in an editor. The bug: the character went in at the caret and the
@@ -1481,17 +1507,89 @@ def test_terminal_input_editor():
           view._undo_stack == [""] and view._undo_last == "hi",
           (view._undo_stack, view._undo_last))
     press(view, K.Key_Z, ctrl=True)     # undo -> restore ""
-    check("undo: Ctrl+Z clears the prompt (empty restore = just the clear)",
-          out == ["\x1b\x1b"], out)
+    check("undo: Ctrl+Z Backspaces the prompt (empty restore = just that)",
+          out == ["\x7f" * len("hi")], out)
     check("undo: undo pushes the current input onto the redo stack",
           view._redo_stack == ["hi"], view._redo_stack)
+    view.feed("\r\x1b[2K> ")            # Claude draws the emptied prompt
     out.clear()
     press(view, K.Key_Y, ctrl=True)     # redo -> restore "hi"
-    check("undo: Ctrl+Y clears first and holds the paste for the empty box",
+    check("undo: Ctrl+Y into an empty box just pastes, nothing before it",
+          out == ["hi"], out)
+
+    # Claude's empty box holds a dim hint, which is not input: undo never
+    # snapshots it, so Ctrl+Z back to an empty prompt can't paste the hint
+    hint = "❯\xa0Try \"edit <filepath> to...\""
+    view = TerminalView(rows=6, cols=80)
+    view.feed(hint + "\x1b[1;3H")       # caret parked at the box's start
+    check("undo: the hint is no draft", view._input_text() == "",
+          view._input_text())
+    narrow = TerminalView(rows=6, cols=24)
+    narrow.feed(hint + "\x1b[1;3H")     # wraps onto a second row
+    check("undo: a hint wrapped in a narrow card is no draft either",
+          narrow._painted_input().count("\n") >= 1
+          and narrow._input_text() == "", repr(narrow._painted_input()))
+    narrow.feed("\x1b[2;5H")            # caret on the second row: typed text
+    check("undo: text with the caret past the first row stays input",
+          narrow._input_text() != "", narrow._input_text())
+    out = []
+    view.keyInput.connect(out.append)
+    view.feed("\r\x1b[2K❯\xa0hi")    # the user typed "hi"
+    view._snapshot_input()
+    check("undo: the empty box snapshots as empty, not as the hint",
+          view._undo_stack == [""], view._undo_stack)
+    view.feed("\r\x1b[2K" + hint + "\x1b[1;3H")
+    sent_sched = []
+    view.scheduleRequested.connect(sent_sched.append)
+    press(view, K.Key_Return, ctrl=True, shift=True)
+    check("undo: Schedule from an empty box prefills nothing, not the hint",
+          sent_sched == [""], sent_sched)
+
+    # a box without Claude's prompt glyph (Codex draws '›') can't be
+    # read for a draft, so undo there keeps the double-Esc and holds the paste
+    view = TerminalView(rows=6, cols=80)
+    view.feed("› old")
+    out = []
+    view.keyInput.connect(out.append)
+    view._undo_stack.append("new")
+    press(view, K.Key_Z, ctrl=True)
+    check("undo: a box without Claude's prompt keeps the double-Esc",
           out == ["\x1b\x1b"], out)
-    view.feed("\x1b[2J\x1b[H> ")        # Claude draws the cleared prompt
-    check("undo: Ctrl+Y re-applies the undone input (clear + paste)",
-          out == ["\x1b\x1b", "hi"], out)
+    view.feed("\r\x1b[2K› old")      # output that is no cleared box
+    check("undo: there the paste waits out the hold, not the next output",
+          out == ["\x1b\x1b"], out)
+    view._hold_timer.timeout.emit()
+    check("undo: ...and goes at the hold's ceiling",
+          out == ["\x1b\x1b", "new"], out)
+
+    # real text behind a caret parked at the box start (Home) is a draft:
+    # undo Backspaces it rather than pasting in front of it
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0hello world\x1b[1;3H")
+    check("undo: text before a caret at the box start still reads as input",
+          view._input_text() == "hello world", view._input_text())
+    out = []
+    view.keyInput.connect(out.append)
+    view._undo_stack.append("earlier")
+    view._sel_anchor, view._sel_end = (0, 2), (0, 6)    # "hello", copy me
+    press(view, K.Key_Z, ctrl=True)
+    check("undo: Ctrl+Z empties a box whose caret sits at its start",
+          "\x7f" * len("hello world") in out and out[-1] == "earlier", out)
+    check("undo: undo leaves the user's selection alone",
+          view.selected_text() == "hello", view.selected_text())
+
+    # a key-repeated Ctrl+Z faster than Claude redraws is dropped, or its
+    # Backspace count and redo entry would come off the stale screen
+    out.clear()
+    view._undo_stack.append("older")
+    press(view, K.Key_Z, ctrl=True)
+    check("undo: a second Ctrl+Z before the redraw is dropped",
+          out == [] and view._undo_stack == ["older"], (out, view._undo_stack))
+    view.feed("\r\x1b[2K❯\xa0earlier")   # Claude drew the first undo
+    press(view, K.Key_Z, ctrl=True)
+    check("undo: once drawn, the next Ctrl+Z goes",
+          out and out[-1] == "older" and view._redo_stack[-1] == "earlier",
+          (out, view._redo_stack))
 
     # empty stacks fall through to the legacy control bytes
     view = TerminalView(rows=6, cols=80)
