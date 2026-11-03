@@ -4313,6 +4313,66 @@ def test_task_done_flag_core():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_task_done_empty_flag_beside_other_empty_flags():
+    """A lane's empty "Task done" commit stands for the work before it. Git
+    gives every empty commit the same patch id, so once another lane's empty
+    flag landed in the base, `--cherry-pick` took this lane's flag for
+    landed too, and Ship finished lanes left the lane out with its work
+    unshipped. The flag holds while the base lacks the lane's work and
+    clears once the base has it, merged or picked as another commit. A lane
+    whose only commit is an empty flag has nothing to ship."""
+    from app import lanes
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-empty-flag-"))
+    work = _make_repo(tmp)
+    a = _lane_for(work, "Agent A", "e3f1a0" + "0" * 26)
+    b = _lane_for(work, "Agent B", "e3f1b0" + "0" * 26)
+    c = _lane_for(work, "Agent C", "e3f1c0" + "0" * 26)
+    ea, eb, ec = (_entry("A", "Agent A", a), _entry("B", "Agent B", b),
+                  _entry("C", "Agent C", c))
+
+    def done(entry):
+        return lanes.lane_snap(entry, {}).done
+
+    def flag(root):
+        _git(root, "commit", "-q", "--allow-empty", "-m",
+             "review clean\n\nTask done")
+        return _git(root, "rev-parse", "HEAD")
+
+    def publish():
+        _git(work, "push", "-q", "origin", "main")
+        _git(work, "fetch", "-q")
+
+    _commit(a["root"], "fa.txt", "a\n", "a's work")
+    a_work = _git(a["root"], "rev-parse", "HEAD")
+    a_flag = flag(a["root"])
+    _commit(b["root"], "fb.txt", "b\n", "b's work")
+    b_flag = flag(b["root"])
+    check("task-done-empty: an empty flag after real work flags the lane",
+          done(ea) == a_flag and done(eb) == b_flag)
+
+    # the integrator ships B alone: B's empty flag is in the base now, and
+    # A forked before it
+    _git(work, "merge", "-q", "--no-ff", "-m", "integrate B", b_flag)
+    publish()
+    check("task-done-empty: another lane's empty flag in the base leaves "
+          "this lane's flag up", done(ea) == a_flag, done(ea))
+    check("task-done-empty: the shipped lane's flag clears", done(eb) == "")
+
+    flag(c["root"])
+    check("task-done-empty: a lane whose only commit is an empty flag has "
+          "nothing to ship", done(ec) == "")
+
+    # A's work reaches the base as another commit; its empty flag doesn't
+    _git(work, "cherry-pick", a_work)
+    publish()
+    check("task-done-empty: the flag clears once the base picked the work "
+          "as another commit", done(ea) == ""
+          and _git(work, "rev-parse", "HEAD") != a_work)
+    for lane in (a, b, c):
+        _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_done_chip_follows_the_flagged_commit():
     """The integrator merges a lane's "Task done" commit, not its head, so a
     done lane's chip takes its conflicts from that commit: work after the

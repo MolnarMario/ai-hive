@@ -100,6 +100,9 @@ CREATE_NO_WINDOW = 0x08000000
 # matches it per line, so a subject that mentions it in passing doesn't count.
 DONE_MARK = "Task done"
 DONE_GREP = r"^[[:space:]]*task done[.!]?[[:space:]]*$"
+# every `--diff-filter` status letter: `git log` with it lists only commits
+# that change something, which leaves empty commits out (_done_commit)
+_ANY_CHANGE = "ACDMRTUXB"
 
 # reflog actions that record a commit made in the lane. The branch's
 # creation ("branch: Created from") and a fast-forward to the base ("merge
@@ -1072,8 +1075,9 @@ class LaneSnap:
     # "integrator" for the workspace integrator's lane: it holds other
     # lanes' commits by design, so it is never anyone's overlap peer
     role: str = ""
-    # the newest of the lane's own commits flagged "Task done" (DONE_GREP)
-    # that the base doesn't have yet, by ancestry or as a patch-equal commit
+    # the newest of the lane's own commits flagged "Task done" (DONE_GREP),
+    # while the base lacks some change the lane made up to it, by ancestry
+    # or as patch-equal commits (_done_commit)
     done: str = ""
     # with `done`: the paths that commit changed since its fork from the base
     done_paths: list = field(default_factory=list)
@@ -1292,24 +1296,36 @@ def _fork(root: str, head: str, base_ref: str, cache) -> str:
 
 
 def _done_commit(root: str, head: str, base_ref: str, cache) -> str:
-    """The newest commit in `head` flagged "Task done" whose change the
-    base lacks, or "". `--cherry-pick` leaves out a flagged commit the base
+    """The newest commit in `head` flagged "Task done", when the base lacks
+    some change the lane made up to it, or "". The flag is often an empty
+    commit (`--allow-empty`, the lane prompt's last step) that stands for
+    the work before it, so the test is the lane's commits up to the flag,
+    not the flag's own patch. `--cherry-pick` leaves out a commit the base
     took as another commit (a cherry-pick or rebase merge), so a lane that
-    already landed stops asking. Cached by (head, base sha) like `_fork`."""
+    already landed stops asking. The diff filter leaves out empty commits:
+    git gives every empty commit the same patch id, so a lane's empty flag
+    passed for landed as soon as the base held another lane's, and Ship
+    finished lanes left that lane out. Cached by (head, base sha) like
+    `_fork`."""
     r = git(["rev-parse", base_ref], root)
     if not r.ok:
         return ""
     key = ("done", head, r.out)
     if cache is not None and key in cache:
         return cache[key]
-    grep = ["log", "-1", "--format=%H", "-i", "-E", f"--grep={DONE_GREP}"]
     # the cheap read first: most lanes have no flag at all, and only a
     # flagged one is worth the patch ids --cherry-pick computes
-    m = git(grep + [f"{r.out}..{head}"], root)
-    if m.ok and m.out:
-        m = git(grep + ["--right-only", "--cherry-pick",
-                        f"{r.out}...{head}"], root)
+    m = git(["log", "-1", "--format=%H", "-i", "-E", f"--grep={DONE_GREP}",
+             f"{r.out}..{head}"], root)
     done = m.out if m.ok else ""
+    if done:
+        # an older flag's commits are a subset of the newest one's, so if
+        # the base has everything up to the newest flag, it has them too
+        w = git(["log", "-1", "--format=%H", "--right-only", "--cherry-pick",
+                 "--no-merges", f"--diff-filter={_ANY_CHANGE}",
+                 f"{r.out}...{done}"], root)
+        if not (w.ok and w.out):
+            done = ""
     if cache is not None:
         cache[key] = done
     return done
