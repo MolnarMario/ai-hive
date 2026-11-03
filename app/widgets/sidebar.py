@@ -87,8 +87,10 @@ def ws_state(stats: dict) -> str:
     running-but-quiet agent (standby, no errors) reads green. Working wins over
     a stale error, so an active row is amber even if a sibling errored. Red is
     only for an agent that crashed, failed or exited with an error. A row
-    whose every agent is asleep to free memory reads grey, a little brighter
-    than an empty row's."""
+    where no agent has a live process (all asleep to free memory, stopped,
+    or not started yet) reads grey, a shade stronger than an empty row's.
+    Green needs at least one running agent: a requested stop ends EXITED_OK,
+    so keying grey on the sleepers alone left a hand-stopped row green."""
     total = stats.get("total", 0)
     if not total:
         return "empty"
@@ -96,7 +98,7 @@ def ws_state(stats: dict) -> str:
         return "working"
     if stats.get("error", 0) > 0:
         return "error"
-    return "asleep" if stats.get("asleep", 0) >= total else "idle"
+    return "idle" if stats.get("active", 0) > 0 else "stopped"
 
 
 class WorkspaceRow(QFrame):

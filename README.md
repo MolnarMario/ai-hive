@@ -43,8 +43,10 @@ workspaces keep executing — switching never pauses anything.
   are alive and healthy (running, no errors) and **pulses amber** while an agent
   is actually **working** (streaming output — thinking, generating, running a
   command), so working reads as motion rather than resting green. It turns
-  **red** on error and dims when empty (the working/running/error breakdown is
-  in the row's hover tooltip). A matching **sweeping-arc spinner** with the live
+  **red** when an agent crashes or exits with an error (a Stop or a sleep to
+  free memory is not an error), **grey** when no agent has a live process
+  (all asleep, stopped or not started yet), and dims when empty (the
+  working/running/error/asleep breakdown is in the row's hover tooltip). A matching **sweeping-arc spinner** with the live
   working count appears at the row's right edge while any agent is working and
   vanishes when all are idle. Opening a workspace's folder or deleting it are
   buttons in its own header bar now (see **First-class folders** below), not

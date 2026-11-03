@@ -202,8 +202,8 @@ class WorkspaceManager(QObject):
         # (a Bash run_in_background call, a shell's `cmd &`) is still running;
         # drives the row's gear badge, mirroring the three indicators above
         bg_shell = sum(1 for a in agents if a.is_bg_shell_busy())
-        # "asleep" = stopped by Options > Free up RAM; when it covers every
-        # agent the badge goes grey (sidebar.ws_state)
+        # "asleep" = stopped by Options > Free up RAM; counted in the row and
+        # rail tooltips (the badge's grey keys on active == 0, sidebar.ws_state)
         asleep = sum(1 for a in agents if a.is_asleep())
         return {"total": len(agents), "active": active, "error": error,
                 "busy": busy, "waiting": waiting, "limit_blocked": limit_blocked,

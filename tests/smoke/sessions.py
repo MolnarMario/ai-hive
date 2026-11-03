@@ -2971,11 +2971,26 @@ def test_requested_stop_is_not_an_error():
           calls == ["stop"] and agent.status is AgentStatus.EXITED_OK
           and stats["error"] == 0, (calls, agent.status, stats))
     check("requested-stop: a workspace whose agents all sleep reads grey",
-          stats["asleep"] == 1 and ws_state(stats) == "asleep", stats)
+          stats["asleep"] == 1 and ws_state(stats) == "stopped", stats)
+    # waking restarts the child: the badge follows the live process
     agent._wake()
+    live["on"] = True
+    agent._on_worker_state(WorkerState.RUNNING)
     stats = mgr.workspace_stats(ws.id)
     check("requested-stop: ...and green once one is awake again",
           stats["asleep"] == 0 and ws_state(stats) == "idle", stats)
+
+    # a hand Stop: no sleeper left, but no running child either, so grey
+    # (keying grey on the sleepers alone left this row green)
+    agent.stop()
+    agent._on_worker_state(WorkerState.STOPPING)
+    live["on"] = False
+    agent._on_worker_state(WorkerState.DEAD)
+    agent._on_finished(1, False)
+    stats = mgr.workspace_stats(ws.id)
+    check("requested-stop: a hand-stopped workspace reads grey, not green",
+          agent.status is AgentStatus.EXITED_OK and stats["asleep"] == 0
+          and ws_state(stats) == "stopped", (agent.status, stats))
 
     # a pipe worker's kill reports a crash exit; a stop asked for it
     live["on"] = True

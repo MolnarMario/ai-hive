@@ -14,9 +14,10 @@ em dashes: this text is shown in the app.
   workspace's count badge red. Stopping it ended with exit code 1 and AI
   Hive read that as an error. The card now says "[stopped]". Red is back
   to meaning an agent crashed or quit on its own with an error.
-- A workspace whose agents are all asleep shows a grey count badge, a
-  shade brighter than an empty workspace's. The row and rail tooltips
-  count the sleeping agents.
+- A workspace where no agent is running shows a grey count badge instead
+  of green, whether its agents are asleep, stopped or not started yet.
+  Green now always means at least one agent is running. The row and rail
+  tooltips count the sleeping agents.
 
 ## 0.56.7
 

@@ -2232,8 +2232,8 @@ def test_providers_grid_and_workspace():
     row = win.sidebar._rows[wa.id][1]
     check("v2 dashboard: count badge shows the agent tally",
           row.count_badge._count == 1, row.count_badge._count)
-    check("v2 dashboard: one idle agent -> idle (amber) state",
-          row.count_badge._state == "idle", row.count_badge._state)
+    check("v2 dashboard: one agent not started yet -> stopped (grey) state",
+          row.count_badge._state == "stopped", row.count_badge._state)
 
     # folder change (#3) updates model + new agents' cwd
     win.manager.set_workspace_path(wa.id, str(proj_b))
