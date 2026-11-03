@@ -52,6 +52,10 @@ class _PendingTool:
     give_up: float          # time.time() after which it is dropped
     gen: int                # the agent's waiting_gen when it arrived
     resume: int | None = None   # where the next scan starts (scan_tool_use)
+    # Claude's id for the sub-agent or fork that made the call. `path` is
+    # then the parent's transcript, and the call is looked for in the
+    # sub-agent's own (transcripts.subagent_transcript)
+    sub_agent: str = ""
 
 
 # Shell kinds whose pre-v2 (line-mode-default) instances are upgraded to
@@ -701,10 +705,13 @@ class WorkspaceManager(QObject):
                     anchor = rec.get("transcript_size")
                     if not isinstance(anchor, int) or anchor < 0:
                         anchor = None
+                    sub = rec.get(session_hook.EV_SUB_AGENT)
                     self._unconfirmed_tools.setdefault(ident, []).append(
                         _PendingTool(tool_id, path, anchor,
                                      time.time() + TOOL_CONFIRM_S,
-                                     agent.waiting_gen))
+                                     agent.waiting_gen,
+                                     sub_agent=(sub if session_hook._plain_id(sub)
+                                                else "")))
                 else:       # a hook from before tool ids were recorded
                     agent.set_tool_waiting(True)
             elif kind == session_hook.EV_TOOL_CLEAR:
@@ -751,6 +758,15 @@ class WorkspaceManager(QObject):
         had asked nothing. A real call's transcript line was stamped 150 ms
         before its hook ran, so a real prompt confirms on the first poll.
 
+        The same phantom came back on 2026-11-03 (Claude 2.1.317) 3 s after
+        an integrator's Stop, this time marked as a sub-agent's call, which
+        lit the "?" with no check at all. Its source is Claude's prompt
+        suggestion (the next prompt it pre-fills in the input box): a fork
+        with every tool denied and no transcript, whose PreToolUse hook
+        still runs. A sub-agent's call is now looked for in the sub-agent's
+        own transcript, which a real sub-agent writes and the fork never
+        does.
+
         A call the transcript has not shown after TOOL_CONFIRM_S is dropped
         and audited. An unreadable transcript lights the "?": a missed
         question costs the user more than a stray badge. A prompt from before
@@ -766,13 +782,23 @@ class WorkspaceManager(QObject):
             for tool in pending:
                 if tool.gen != agent.waiting_gen:
                     continue
-                seen, tool.resume = transcripts.scan_tool_use(
-                    tool.path, tool.tool_id, tool.anchor, tool.resume)
+                path = tool.path
+                if tool.sub_agent:
+                    path = transcripts.subagent_transcript(
+                        tool.path, tool.sub_agent)
+                if path:
+                    seen, tool.resume = transcripts.scan_tool_use(
+                        path, tool.tool_id, tool.anchor, tool.resume)
+                else:
+                    seen = False    # no sub-agent transcript (yet)
                 if seen is not False:       # True, or None = unreadable
                     agent.set_tool_waiting(True)
                 elif now >= tool.give_up:
+                    who = (f" of sub-agent {tool.sub_agent}"
+                           if tool.sub_agent else "")
                     self._audit(f"PROMPT-SKIP {agent.spec.name}: tool prompt "
-                                f"{tool.tool_id} never reached the transcript")
+                                f"{tool.tool_id}{who} never reached the "
+                                f"transcript")
                 else:
                     keep.append(tool)
             if keep:

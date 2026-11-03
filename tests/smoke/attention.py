@@ -1225,18 +1225,7 @@ def test_tool_prompt_needs_transcript_call():
     hook({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion"})
     mgr.sync_prompt_events()
 
-    # a sub-agent's call never reaches the parent transcript the hook names,
-    # so its question lights at once instead of waiting to be dropped
-    hook({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion",
-          "tool_use_id": "toolu_sub", "agent_id": "a1b2",
-          "transcript_path": str(transcript)})
-    recs, _off = sh.read_prompt_events(events, 0)
-    mgr.sync_prompt_events()
-    check("phantom: a sub-agent's question lights '?' at once",
-          "tool_use_id" not in recs[-1] and agent.is_waiting()
-          and not mgr._unconfirmed_tools, recs[-1])
-    hook({"hook_event_name": "PostToolUse", "tool_name": "AskUserQuestion"})
-    mgr.sync_prompt_events()
+    # (a sub-agent's call: test_subagent_tool_prompt_needs_its_transcript)
 
     # a phantom on top of a real prompt that hasn't confirmed yet: the real
     # one must still light when its line lands
@@ -1286,6 +1275,140 @@ def test_tool_prompt_needs_transcript_call():
     check("phantom: a call cut in half by a poll is found on the next",
           half is False and whole is True, (half, whole))
     shutil.rmtree(tmp, ignore_errors=True)   # the 4 MiB+ padding
+
+
+def test_subagent_tool_prompt_needs_its_transcript():
+    """Regression: 3 s after an integrator's turn ended, Claude 2.1.317 fired
+    a PreToolUse hook for AskUserQuestion marked with a sub-agent's id. The
+    "?" lit at once and stayed lit on an agent that had asked nothing. The
+    caller was Claude's prompt suggestion fork, which denies every tool and
+    writes no transcript. A sub-agent's call now lights the "?" only once it
+    is in the sub-agent's own transcript, which a real sub-agent writes."""
+    import json as _json
+    from PySide6.QtWidgets import QApplication
+    from app import session_hook as sh
+    from app import transcripts
+    from app import workspace_manager as wm
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import AgentStatus
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-subask-"))
+    try:
+        events = str(tmp / "events.jsonl")
+        transcript = tmp / "conv.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        subs = tmp / "conv" / "subagents"
+        sh.reset_events(events)
+        mgr = wm.WorkspaceManager()
+        mgr.prompt_events_path = events
+        audit = []
+        mgr.audit = audit.append
+        ws = mgr.create_workspace("SubAsk", str(tmp))
+        agent = mgr.add_terminal(ws.id, build_spec(
+            AgentKind.CLAUDE, "Ask", cwd=str(tmp)), autostart=False)
+        agent.status = AgentStatus.RUNNING
+        rings = []
+        mgr.agentWaiting.connect(lambda wid, aid: rings.append(aid))
+
+        def hook(payload):
+            os.environ[sh.AGENT_ID_ENV] = agent.id
+            try:
+                sh._dispatch("", events, payload)
+            finally:
+                os.environ.pop(sh.AGENT_ID_ENV, None)
+
+        def pre_tool(tool_id, sub):
+            hook({"hook_event_name": "PreToolUse",
+                  "tool_name": "AskUserQuestion", "tool_use_id": tool_id,
+                  "agent_id": sub, "transcript_path": str(transcript)})
+
+        def write_call(path, tool_id):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            rec = {"type": "assistant", "isSidechain": True, "message": {
+                "content": [{"type": "tool_use", "id": tool_id,
+                             "name": "AskUserQuestion"}]}}
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(_json.dumps(rec, separators=(",", ":")) + "\n")
+
+        def clear():
+            hook({"hook_event_name": "PostToolUse",
+                  "tool_name": "AskUserQuestion"})
+            mgr.sync_prompt_events()
+
+        # the reported shape: a Stop, then a fork's call with no transcript
+        hook({"hook_event_name": "Stop",
+              "last_assistant_message": "Nothing was left unfixed."})
+        pre_tool("toolu_fork", "a5ee0c3b9d")
+        recs, _off = sh.read_prompt_events(events, 0)
+        check("subask: the hook records the call and the sub-agent id",
+              recs[-1].get("tool_use_id") == "toolu_fork"
+              and recs[-1].get(sh.EV_SUB_AGENT) == "a5ee0c3b9d"
+              and recs[-1].get("agent_id") == agent.id
+              and "transcript_size" not in recs[-1], recs[-1])
+        mgr.sync_prompt_events()
+        check("subask: a fork's call with no transcript lights no '?'",
+              not agent.is_waiting() and not rings, rings)
+        real_confirm = wm.TOOL_CONFIRM_S
+        wm.TOOL_CONFIRM_S = 0.0
+        try:
+            mgr._unconfirmed_tools.clear()
+            pre_tool("toolu_fork2", "a5ee0c3b9d")
+            mgr.sync_prompt_events()
+        finally:
+            wm.TOOL_CONFIRM_S = real_confirm
+        check("subask: the fork's call is dropped and audited",
+              not agent.is_waiting() and not mgr._unconfirmed_tools
+              and any("PROMPT-SKIP" in line and "toolu_fork2" in line
+                      and "a5ee0c3b9d" in line for line in audit), audit)
+
+        # the call in the PARENT transcript is not the sub-agent's
+        write_call(transcript, "toolu_parent")
+        pre_tool("toolu_parent", "b1")
+        mgr.sync_prompt_events()
+        check("subask: only the sub-agent's own transcript counts",
+              not agent.is_waiting())
+        mgr._unconfirmed_tools.clear()
+
+        # a real sub-agent: its hook can run before its line is written
+        pre_tool("toolu_sub", "c2")
+        mgr.sync_prompt_events()
+        check("subask: a real sub-agent's call waits for its transcript",
+              not agent.is_waiting())
+        write_call(subs / "agent-c2.jsonl", "toolu_sub")
+        mgr.sync_prompt_events()
+        check("subask: the call in the sub-agent's transcript lights '?'",
+              agent.is_waiting() and rings == [agent.id], rings)
+        clear()
+        check("subask: PostToolUse clears it", not agent.is_waiting())
+
+        # Claude puts some sub-agents in a folder below subagents/
+        write_call(subs / "workflows" / "w1" / "agent-d3.jsonl", "toolu_deep")
+        check("subask: a nested sub-agent transcript is found",
+              transcripts.subagent_transcript(str(transcript), "d3")
+              == str(subs / "workflows" / "w1" / "agent-d3.jsonl"))
+        pre_tool("toolu_deep", "d3")
+        mgr.sync_prompt_events()
+        check("subask: a nested sub-agent's call lights '?'",
+              agent.is_waiting())
+        clear()
+
+        # an id that can't name a file records no ids and lights at once,
+        # as every sub-agent call did before
+        pre_tool("toolu_odd", "..\\x")
+        recs, _off = sh.read_prompt_events(events, 0)
+        mgr.sync_prompt_events()
+        check("subask: an id unfit for a file name lights '?' at once",
+              "tool_use_id" not in recs[-1] and sh.EV_SUB_AGENT not in recs[-1]
+              and agent.is_waiting(), recs[-1])
+        clear()
+        check("subask: _plain_id takes Claude's ids and nothing else",
+              sh._plain_id("a4caf7168b861a4cb") and sh._plain_id("w_1-x")
+              and not sh._plain_id("") and not sh._plain_id("a/b")
+              and not sh._plain_id("..") and not sh._plain_id("é")
+              and not sh._plain_id(7))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_input_echo_not_busy():

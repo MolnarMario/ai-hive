@@ -2454,7 +2454,8 @@ def test_render_perm_mode_bridge():
         from app import mcp_server
         mgr = WorkspaceManager()
         ws = mgr.create_workspace("W", str(tmp))
-        bridge = OrchestratorBridge(mgr, active_ws=lambda: ws.id)
+        bridge = OrchestratorBridge(mgr, str(tmp / "bridge"),
+                                    active_ws=lambda: ws.id)
         check("v3 bridge: named pipe listening", bridge.start())
         os.environ["AIHIVE_PIPE"] = bridge.pipe_name
         os.environ["AIHIVE_WS"] = ws.id
@@ -2484,6 +2485,62 @@ def test_render_perm_mode_bridge():
 
     pump(200)
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_bridge_files_follow_the_store():
+    """The board bridge keeps orchestrator.json and the agents' mcp configs
+    next to the session file. It used to find its folder through
+    QStandardPaths, which on Windows ignores the suite's sandbox APPDATA, so
+    every test window purged the RUNNING app's mcp folder and each live agent
+    failed its next /clear with "MCP config file not found"."""
+    from PySide6.QtCore import QEventLoop, QStandardPaths, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app.session_store import SessionStore
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def under(path, root):
+        path = os.path.normcase(os.path.abspath(path))
+        root = os.path.normcase(os.path.abspath(root))
+        return path == root or path.startswith(root + os.sep)
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-bridge-dir-"))
+    store_dir = tmp / "store"
+    stale = store_dir / "mcp" / "aihive-0123456789ab.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("{}", encoding="utf-8")
+    try:
+        win = create_main_window(SessionStore(path=store_dir / "s.json"))
+        bridge = win.bridge
+        check("bridge-dir: the bridge is listening", bridge.enabled)
+        check("bridge-dir: the endpoint file sits next to the session",
+              Path(bridge.endpoint_path) == store_dir / "orchestrator.json"
+              and Path(bridge.endpoint_path).is_file(), bridge.endpoint_path)
+        check("bridge-dir: start() purges stale configs from the store's "
+              "own mcp folder", not stale.exists())
+        cfg = bridge.mcp_config_path_for("0123456789abcdef")
+        check("bridge-dir: an agent's mcp config lands in the store's folder",
+              Path(cfg) == store_dir / "mcp" / "aihive-0123456789ab.json"
+              and Path(cfg).is_file(), cfg)
+        # Qt's own answer here is the user's REAL AppData folder, whatever
+        # the sandbox did to APPDATA. The bridge must stay out of it.
+        qt_appdata = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.AppDataLocation)
+        check("bridge-dir: nothing of the bridge's is in Qt's AppData folder",
+              not any(under(p, qt_appdata)
+                      for p in (bridge.endpoint_path, bridge._mcp_dir, cfg)),
+              qt_appdata)
+        win.close(); pump(30)
+        check("bridge-dir: closing removes the endpoint from the store folder",
+              not (store_dir / "orchestrator.json").exists())
+        win.deleteLater(); pump(30)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_themes():
@@ -2927,7 +2984,7 @@ def test_review_fixes():
     mgr.remove_workspace(ws_c.id)
 
     # --- workspace-bound board log_activity via the bridge dispatch ---
-    bridge = OrchestratorBridge(mgr, active_ws=lambda: ws_a.id)
+    bridge = OrchestratorBridge(mgr, str(tmp), active_ws=lambda: ws_a.id)
     logged = bridge._dispatch(
         "log_activity", {"agent": "Docs Writer", "message": "wrote the docs"},
         ws=ws_a.id)
@@ -2963,7 +3020,6 @@ def test_review_fixes():
 
     # --- per-workspace mcp config carries the binding (WS only, no role) ---
     bridge.pipe_name = "test-pipe"
-    bridge._mcp_dir = str(tmp / "mcp")
     cfg_path = bridge.mcp_config_path_for(ws_a.id)
     cfg = _json.loads(Path(cfg_path).read_text(encoding="utf-8"))
     env = cfg["mcpServers"]["aihive"]["env"]
@@ -3097,7 +3153,8 @@ def test_review_hardening_fixes():
     # -- #3: oversized no-newline pipe request is dropped ---------------------
     from app.orchestrator_bridge import OrchestratorBridge, _MAX_REQUEST_BYTES
     br_mgr = WorkspaceManager()
-    bridge = OrchestratorBridge(br_mgr, active_ws=lambda: "", parent=None)
+    bridge = OrchestratorBridge(br_mgr, str(tmp / "bridge"),
+                                active_ws=lambda: "", parent=None)
 
     class _FakeBA:
         def __init__(self, d): self._d = d

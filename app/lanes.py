@@ -1072,8 +1072,9 @@ class LaneSnap:
     # "integrator" for the workspace integrator's lane: it holds other
     # lanes' commits by design, so it is never anyone's overlap peer
     role: str = ""
-    # the newest of the lane's own commits flagged "Task done" (DONE_GREP)
-    # that the base doesn't have yet, by ancestry or as a patch-equal commit
+    # the newest of the lane's own commits flagged "Task done" (DONE_GREP),
+    # while the base lacks some change the lane made up to it, by ancestry
+    # or as patch-equal commits (_done_commit)
     done: str = ""
     # with `done`: the paths that commit changed since its fork from the base
     done_paths: list = field(default_factory=list)
@@ -1292,24 +1293,32 @@ def _fork(root: str, head: str, base_ref: str, cache) -> str:
 
 
 def _done_commit(root: str, head: str, base_ref: str, cache) -> str:
-    """The newest commit in `head` flagged "Task done" whose change the
-    base lacks, or "". `--cherry-pick` leaves out a flagged commit the base
-    took as another commit (a cherry-pick or rebase merge), so a lane that
-    already landed stops asking. Cached by (head, base sha) like `_fork`."""
+    """The newest commit in `head` flagged "Task done", when the base lacks
+    some change the lane made up to it, or "". The flag is often an empty
+    commit (`--allow-empty`, the lane prompt's last step) that stands for
+    the work before it, so the test is everything up to the flag, not the
+    flag's own patch. `_landed` makes it, the same test that lets a lane
+    go on close: a lane the base took as other commits (a cherry-pick,
+    rebase or squash merge) stops asking, and a merge commit's own change
+    keeps the flag up. Asking `--cherry-pick` about the flag alone lost
+    lanes: git gives every empty commit the same patch id, so a lane's
+    empty flag passed for landed as soon as the base held another lane's,
+    and Ship finished lanes left that lane out. Only the newest flag is
+    tested: an older one holds less of the lane's work. Cached by (head,
+    base sha) like `_fork`."""
     r = git(["rev-parse", base_ref], root)
     if not r.ok:
         return ""
     key = ("done", head, r.out)
     if cache is not None and key in cache:
         return cache[key]
-    grep = ["log", "-1", "--format=%H", "-i", "-E", f"--grep={DONE_GREP}"]
     # the cheap read first: most lanes have no flag at all, and only a
-    # flagged one is worth the patch ids --cherry-pick computes
-    m = git(grep + [f"{r.out}..{head}"], root)
-    if m.ok and m.out:
-        m = git(grep + ["--right-only", "--cherry-pick",
-                        f"{r.out}...{head}"], root)
+    # flagged one is worth the patch ids and merge _landed computes
+    m = git(["log", "-1", "--format=%H", "-i", "-E", f"--grep={DONE_GREP}",
+             f"{r.out}..{head}"], root)
     done = m.out if m.ok else ""
+    if done and _landed(root, done, r.out):
+        done = ""
     if cache is not None:
         cache[key] = done
     return done

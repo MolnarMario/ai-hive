@@ -8,6 +8,20 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.56.7
+
+- A lane whose agent flagged its work with an empty "Task done" commit no
+  longer loses its check mark, and drops out of Ship finished lanes, once
+  another lane's work ships. It stays flagged until its own work is in
+  main.
+- A card no longer shows a "?" when nothing asked you anything. Claude's
+  prompt suggestion runs in the background and its question to itself
+  looked like a sub-agent's. AI Hive now lights the "?" for a sub-agent
+  only once its question shows up in that sub-agent's transcript.
+- Running AI Hive's tests no longer breaks the agents of the AI Hive you
+  have open. The tests used to overwrite and then delete its MCP config,
+  and each agent's next /clear failed with "MCP config file not found".
+
 ## 0.56.6
 
 - Ship finished lanes clears whatever unsent text sits in the integrator's
