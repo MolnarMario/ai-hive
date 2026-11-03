@@ -14,9 +14,11 @@ em dashes: this text is shown in the app.
   input box before it types the ship request. Before, the request was
   added after the leftover text and the two went to Claude as one message.
   The confirm dialog says when there is text it will replace, so Cancel
-  can still keep it.
-- If you type into the integrator while AI Hive clears its box, or the box
-  can't be cleared, nothing is sent and AI Hive tells you why.
+  can still keep it, and Ctrl+Z in the card brings it back afterwards.
+  A draft taller than about a third of the card comes back only in part.
+- If you type into the integrator while AI Hive clears its box, a
+  scheduled message comes due, the integrator restarts, or the box can't
+  be cleared, nothing is sent and AI Hive tells you why.
 
 ## 0.56.5
 

@@ -1494,15 +1494,30 @@ class TerminalCard(QFrame):
         `failed(why)` when it can't be emptied
         (TerminalView.empty_input_then). Its keys go out only while the
         child runs awake, since a key on a stopped or sleeping card starts
-        or wakes it. A line-mode card keeps no box of the child's: `done()`
-        at once."""
+        or wakes it. A task or nudge AI Hive types into the box meanwhile
+        (a scheduled message coming due) ends it with `why` "sent": the
+        next round would Backspace that text, and a box read empty before
+        Claude drew it would get the request typed after it. A line-mode
+        card keeps no box of the child's: `done()` at once."""
         if not self.is_pty:
             done()
             return True
         agent = self.agent
-        return self.terminal.empty_input_then(
-            done, failed,
-            lambda: agent.is_running() and not agent.is_asleep())
+        typed = agent.typed_tasks()
+
+        def ready():
+            return (agent.is_running() and not agent.is_asleep()
+                    and agent.typed_tasks() == typed)
+
+        def emptied():
+            if agent.typed_tasks() == typed:
+                done()
+            else:
+                failed("sent")
+
+        def why(cause):
+            failed(cause or ("sent" if agent.typed_tasks() != typed else ""))
+        return self.terminal.empty_input_then(emptied, why, ready)
 
     def is_emptying_input(self) -> bool:
         return self.is_pty and self.terminal.is_emptying()

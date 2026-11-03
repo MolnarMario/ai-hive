@@ -687,6 +687,10 @@ class TerminalAgent(QObject):
         # walltime a line last went in (typed, a task, a nudge): a lane read
         # older than it may predate work that line started (_note_submit)
         self._last_submit_ts = 0.0
+        # tasks and nudges typed so far (_write_task_to_pty): Ship's emptying
+        # of the box (TerminalCard.empty_input_then) stops when one comes in,
+        # or its next round would Backspace that text
+        self._typed_tasks = 0
         # "a line has been submitted to this child since it launched", and the
         # mark that turn owns. See _note_submit / _on_idle_timeout: a settle is
         # only a REPLY when something was asked, and nothing else may stamp a
@@ -2287,6 +2291,7 @@ class TerminalAgent(QObject):
         # words, and the echo watch would read them as the task drawn and
         # release the Enter early. The child gets the card's rows back first.
         self._end_reflow()
+        self._typed_tasks += 1
         body = text.replace("\r\n", "\r").replace("\n", "\r")
         if "\r" in body:  # multi-line: bracketed paste, then submit
             self.worker.write("\x1b[200~" + body + "\x1b[201~")
@@ -2405,6 +2410,11 @@ class TerminalAgent(QObject):
         """Wall time a line was last submitted to this agent's child (typed,
         a task or a nudge), or 0.0 if none was this run."""
         return self._last_submit_ts
+
+    def typed_tasks(self) -> int:
+        """How many tasks and nudges AI Hive has typed into the child's
+        input box (_write_task_to_pty). Only a change in it means anything."""
+        return self._typed_tasks
 
     def _has_stop_hook(self) -> bool:
         """Claude reports each turn's end through its Stop hook, which is

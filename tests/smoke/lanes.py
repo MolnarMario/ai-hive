@@ -5105,7 +5105,31 @@ def test_ship_lanes_from_integrator_chip():
               keyed == ["\x1b[C" * 14, "\x7f" * 14], keyed)
         term.reset()                    # the child restarts meanwhile
         check("ship: a restart mid-clear drops the request and says why",
-              delivered == [] and "could not clear" in told[-1]
+              delivered == [] and "restarted while" in told[-1]
+              and not term.is_emptying(), (delivered, told[-1:]))
+        # a scheduled message coming due mid-clear is typed straight to the
+        # pty (_write_task_to_pty): the next round must not Backspace it
+        keyed.clear()
+        term.feed("\x1b[2J\x1b[H❯\xa0half a thought")
+        win._ship_lanes(ws.id, i)
+        i._write_task_to_pty("due now")
+        term.feed("\x1b[2J\x1b[H❯\xa0due now")     # Claude draws it
+        pump(settle)
+        check("ship: a message typed in mid-clear keeps its text, and says "
+              "why nothing shipped",
+              delivered == [] and len(keyed) == 1
+              and "got another message" in told[-1]
+              and not term.is_emptying(), (delivered, keyed, told[-1:]))
+        # ...and one typed after the box was drawn empty, not drawn yet:
+        # the request would go in after it as one message
+        keyed.clear()
+        term.feed("\x1b[2J\x1b[H❯\xa0half a thought")
+        win._ship_lanes(ws.id, i)
+        term.feed("\r\x1b[2K❯\xa0")
+        i._write_task_to_pty("due now")
+        pump(settle)
+        check("ship: ...a message typed as the box empties holds it too",
+              delivered == [] and "got another message" in told[-1]
               and not term.is_emptying(), (delivered, told[-1:]))
         term.feed("\x1b[2J\x1b[H❯\xa0half a thought")
         win._ship_lanes(ws.id, i)
@@ -5288,6 +5312,12 @@ def test_ship_wakes_only_the_asleep_integrator():
         win._ship_wake_tick(uid)
         check("ship wake: a draft in its box holds the request",
               delivered == [] and uid in win._ship_waking)
+        term.feed("\x1b[2J\x1b[H> half a prompt\x1b[1;3H")
+        win._ship_wake_tick(uid)
+        check("ship wake: ...a draft behind a caret at the box start too, "
+              "which has_draft misses",
+              delivered == [] and uid in win._ship_waking
+              and not term.has_draft())
         term.feed("\x1b[2J\x1b[H> ")
         win._ship_wake_tick(uid)
         check("ship wake: a free prompt gets the request, once",

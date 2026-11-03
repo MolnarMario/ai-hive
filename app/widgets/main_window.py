@@ -6394,11 +6394,18 @@ class MainWindow(QMainWindow):
         name = agent.spec.name
 
         def failed(cause):
-            why = (f"You typed into {name} while AI Hive cleared its input "
-                   f"box, so it was not asked to ship. Ship again once you "
-                   f"are done with it." if cause == "typed" else
-                   f"AI Hive could not clear the text in {name}'s input "
-                   f"box. Clear it, then ship again.")
+            why = {
+                "typed": f"You typed into {name} while AI Hive cleared its "
+                         f"input box, so it was not asked to ship. Ship "
+                         f"again once you are done with it.",
+                "sent": f"{name} got another message while AI Hive cleared "
+                        f"its input box, so it was not asked to ship. Ship "
+                        f"again once it has answered.",
+                "restarted": f"{name} restarted while AI Hive cleared its "
+                             f"input box, so it was not asked to ship. Ship "
+                             f"again once it is at its prompt.",
+            }.get(cause, f"AI Hive could not clear the text in {name}'s "
+                         f"input box. Clear it, then ship again.")
             self._store_audit(f"LANE-SHIP-DROP agent={name!r}: {why}")
             self._lane_message("Nothing shipped", why)
         if not card.empty_input_then(
@@ -6532,9 +6539,11 @@ class MainWindow(QMainWindow):
                      f"the menu again to see the new list.")
             return
         card = self._card_for_agent(agent.id)
-        if not why and card is not None and card.has_draft():
+        if not why and card is not None and card.input_box_has_text():
             # the user typed this after the click, while it woke: waited
-            # out, not erased like a box left over from before (_send_ship)
+            # out, not erased like a box left over from before (_send_ship).
+            # Not has_draft, which misses text behind a caret parked at the
+            # box's start, and _send_ship would erase that
             why = "draft"
         if why:
             if time.monotonic() >= entry["deadline"]:

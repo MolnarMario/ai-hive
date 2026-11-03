@@ -1015,6 +1015,10 @@ class TerminalView(QWidget):
         self._empty_timer.setSingleShot(True)
         self._empty_timer.setInterval(EMPTY_SETTLE_MS)
         self._empty_timer.timeout.connect(self._empty_step)
+        # its own timer: steady output restarts the settle one forever
+        self._empty_deadline = QTimer(self)
+        self._empty_deadline.setSingleShot(True)
+        self._empty_deadline.timeout.connect(self._empty_timed_out)
 
     # -------------------------------------------------------------- data ---
 
@@ -1607,7 +1611,7 @@ class TerminalView(QWidget):
         self._held_keys = None      # meant for the old child's prompt
         self._hold_timer.stop()
         if self._emptying is not None:      # so was this
-            self._end_emptying(self._emptying["failed"], "")
+            self._end_emptying(self._emptying["failed"], "restarted")
         rows, cols = self.screen.lines, self.screen.columns
         pushed = getattr(self.screen.history.top, "pushed", 0)
         self.screen = _new_history_screen(cols, rows)
@@ -2742,7 +2746,8 @@ class TerminalView(QWidget):
             # the app asked for mouse events (Claude Code does): forward the
             # wheel as mouse reports — the app scrolls its own transcript
             row, col = self._cell_at(event.position())
-            self._send(self._wheel_report(up, row, col) * steps)
+            self._send(self._wheel_report(up, row, col) * steps,
+                       typing=False)
         elif self._alt_screen:
             # fullscreen app without mouse tracking (vim, less): "alternate
             # scroll" — the wheel becomes arrow keys, as Windows Terminal does
@@ -3017,15 +3022,9 @@ class TerminalView(QWidget):
             self.update()
         super().mouseReleaseEvent(event)
 
-    def _emit_arrows(self, final: str, count: int) -> None:
-        """Send `count` copies of one arrow key (final 'A'/'B'/'C'/'D' == Up/
-        Down/Right/Left), honouring the child's cursor-key mode (DECCKM)."""
-        seq = self._arrow_keys(final, count)
-        if seq:
-            self._send(seq)
-
     def _arrow_keys(self, final: str, count: int) -> str:
-        """`count` copies of one arrow key, as _emit_arrows sends them."""
+        """`count` copies of one arrow key (final 'A'/'B'/'C'/'D' == Up/
+        Down/Right/Left), honouring the child's cursor-key mode (DECCKM)."""
         if count <= 0:
             return ""
         return (("\x1bO" if self._app_cursor_keys else "\x1b[") + final) \
@@ -3261,7 +3260,9 @@ class TerminalView(QWidget):
     def empty_input_then(self, done, failed, ready) -> bool:
         """Empty Claude's input box, then call `done()` once it reads empty,
         or `failed(why)` when it can't be emptied: `why` is "typed" when
-        the user typed into the box meanwhile (_send), "" otherwise.
+        the user typed into the box meanwhile (_send), "restarted" when the
+        child restarted (reset), "" otherwise. The draft goes onto the undo
+        stack, so Ctrl+Z brings back what the box painted of it.
         Returns False, calling neither, while an earlier emptying is still
         running. `ready()` is asked before every round: a key on a stopped
         or sleeping card starts or wakes its child
@@ -3281,10 +3282,14 @@ class TerminalView(QWidget):
         if self._box_is_empty():
             done()
             return True
+        # the draft's last keys may still be coalescing (_kick_snapshot):
+        # settle them now, so the snapshot taken once the box reads empty
+        # pushes the whole draft
+        self._snap_timer.stop()
+        self._snapshot_input()
         self._emptying = {"done": done, "failed": failed, "ready": ready,
-                          "erased": None, "own": False,
-                          "deadline": time.monotonic()
-                          + EMPTY_TIMEOUT_MS / 1000}
+                          "erased": None, "own": False}
+        self._empty_deadline.start(EMPTY_TIMEOUT_MS)
         if not self._empty_round():
             self._end_emptying(failed, "")
         return True
@@ -3352,17 +3357,23 @@ class TerminalView(QWidget):
         if state is None:
             return
         if self._box_is_empty():
+            self._snapshot_input()      # Ctrl+Z restores the erased draft
             self._end_emptying(state["done"])
-        elif time.monotonic() >= state["deadline"]:
-            self._end_emptying(state["failed"], "")
         elif self._box_look() == state["erased"]:
             self._empty_timer.start()   # not redrawn yet: wait for it
         elif not self._empty_round():
             self._end_emptying(state["failed"], "")
 
+    def _empty_timed_out(self) -> None:
+        """EMPTY_TIMEOUT_MS since the emptying began, however long Claude's
+        output kept _empty_step from running."""
+        if self._emptying is not None:
+            self._end_emptying(self._emptying["failed"], "")
+
     def _end_emptying(self, then, *args) -> None:
         self._emptying = None
         self._empty_timer.stop()
+        self._empty_deadline.stop()
         then(*args)
 
     def _delete_and_drop_selection(self) -> None:
@@ -3787,13 +3798,15 @@ class TerminalView(QWidget):
         if not deleted:
             self._clear_prompt()
 
-    def _send(self, seq: str) -> None:
+    def _send(self, seq: str, typing: bool = True) -> None:
         """Everything the view sends the child goes through here, so that
         while Claude clears its prompt (_clear_prompt) it waits, in order.
         A key of the user's ends an emptying (empty_input_then): the next
-        round would Backspace what they typed after asking for it."""
+        round would Backspace what they typed after asking for it.
+        `typing` False marks a send that leaves the box alone, as a wheel
+        report does; a focus report always does."""
         state = self._emptying
-        if state is not None and not state["own"] \
+        if state is not None and typing and not state["own"] \
                 and seq not in FOCUS_REPORTS:
             self._end_emptying(state["failed"], "typed")
         if self._held_keys is not None:

@@ -1585,6 +1585,58 @@ def test_terminal_input_editor():
           view._input_text() != "" and out == [] and got == ["failed"],
           (view._input_text(), out, got))
 
+    # a wheel over the card mid-clear scrolls Claude's transcript (it asks
+    # for mouse reports) and leaves the box alone: the clear goes on
+    from PySide6.QtCore import QEventLoop, QPoint, QTimer
+    from PySide6.QtGui import QWheelEvent
+    from app.widgets import terminal_view as tv
+    view = TerminalView(rows=6, cols=80)
+    view.feed("\x1b[?1000h\x1b[?1006h❯\xa0old draft")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    view.wheelEvent(QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(0, 0),
+                                QPoint(0, 120), Qt.MouseButton.NoButton,
+                                Qt.KeyboardModifier.NoModifier,
+                                Qt.ScrollPhase.NoScrollPhase, False))
+    check("emptybox: a wheel report goes out and leaves the clear running",
+          len(out) == 2 and out[-1].startswith("\x1b[<64;")
+          and view.is_emptying() and got == [], (out, got))
+    view.feed("\x1b[2J\x1b[H❯\xa0")
+    view._empty_step()
+    check("emptybox: ...and the box drawn empty still calls done",
+          got == ["done"], got)
+    # Ctrl+Z brings the erased draft back, as after any other erase
+    check("emptybox: the erased draft is on the undo stack",
+          view._undo_stack[-1:] == ["old draft"] and view._undo_last == "",
+          (view._undo_stack[-1:], view._undo_last))
+
+    # steady output keeps the settle timer from firing: the deadline has
+    # a timer of its own
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+    saved = tv.EMPTY_TIMEOUT_MS
+    tv.EMPTY_TIMEOUT_MS = 250
+    try:
+        view = TerminalView(rows=6, cols=80)
+        view.feed("❯\xa0old draft")
+        started, got = emptying(view)
+        for _ in range(8):              # a spinner redrawing every 60 ms
+            view.feed("\x1b[s\x1b[6;1H*\x1b[u")
+            pump(60)
+    finally:
+        tv.EMPTY_TIMEOUT_MS = saved
+    check("emptybox: output that never goes quiet still hits the deadline",
+          got == ["failed"] and not view.is_emptying(), got)
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0old draft")
+    started, got = emptying(view)
+    view.reset()
+    check("emptybox: a restart ends it as restarted",
+          got == ["failed:restarted"] and not view.is_emptying(), got)
+
     # --- approximate undo / redo --------------------------------------------
     view = TerminalView(rows=6, cols=80)
     view.feed("> ")                     # empty prompt
