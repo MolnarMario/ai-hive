@@ -87,6 +87,13 @@ This file holds only the rules that protect user data or fail silently.
   only its own PR after a clean GPT-6-Luna review and a passing full suite
   on the PR head, with `--merge --match-head-commit` (never a squash: lanes
   clear their flag and fast-forward by ancestry).
+- `request_repaint` takes a ROW away and gives it back, never a column.
+  Claude redraws a width change from the home position with its old line
+  choice, so one column narrower writes past the screen and leaves a copy
+  of the top row in the scrollback per repaint. The take-back rules and
+  `RENDER-DUP` (doubled rows in session.log, with a replayable dump) are
+  in `docs/agents/terminal-rendering.md`; read it after a Claude Code
+  update or a doubled-text report.
 - Nothing renames an agent except the user.
 - No em dash in any string the user sees. `test_no_em_dashes_in_visible_text`
   enforces it for non-docstring literals.
@@ -141,6 +148,9 @@ pollute resume ordering. Use a scratch cwd.
 
 Issues live as markdown under `.scratch/<feature-slug>/`, see
 `docs/agents/issue-tracker.md`. Triage labels are in
-`docs/agents/triage-labels.md`, domain docs in `docs/agents/domain.md`. The
+`docs/agents/triage-labels.md`, domain docs in `docs/agents/domain.md`.
+Doubled text in Claude cards, its known shapes and the capture and replay
+tools (`tools/render_capture.py`, `tools/render_replay.py`) are in
+`docs/agents/terminal-rendering.md`. The
 integrator's checklist is `docs/agents/integration.md`; the integrator reads
 it from the base branch every time the user asks it to ship.

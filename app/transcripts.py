@@ -1382,6 +1382,28 @@ def scan_tool_use(path: str, tool_use_id: str, anchor: int | None = None,
     return needle in data, resume
 
 
+def latest_cli_version(cwd: str, session_id: str) -> str:
+    """The Claude Code version that last wrote this conversation: every record
+    carries a top-level `version` ("2.1.316"). "" when there is no file or no
+    such record. Reads only the tail; never raises."""
+    if not session_id or not cwd:
+        return ""
+    try:
+        lines = _tail_lines(transcript_path(cwd, session_id), 64 * 1024)
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        if '"version"' not in line:
+            continue
+        try:
+            version = json.loads(line).get("version")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(version, str) and version:
+            return version
+    return ""
+
+
 def _tail_lines(path: str, limit: int) -> list[str]:
     """The last `limit` bytes of `path` as whole lines (a leading partial line
     is dropped, since it cannot be parsed anyway)."""

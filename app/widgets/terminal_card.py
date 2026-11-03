@@ -1313,6 +1313,7 @@ class TerminalCard(QFrame):
             # Claude to redraw. request_repaint() is already a no-op when the
             # agent isn't a running pty, so no extra guard is needed here.
             self.terminal.staleLayoutDetected.connect(self.agent.request_repaint)
+            self.terminal.duplicateRowsSeen.connect(self._on_duplicate_rows)
             self.agent.prompt_marks_changed.connect(
                 self._on_prompt_marks_changed)
             self.agent.reply_marks_changed.connect(self._on_reply_mark_added)
@@ -2837,6 +2838,15 @@ class TerminalCard(QFrame):
         self._recovered_replies = []
         self._recover_target = None
         self._recover_tries = _RECOVER_RESCAN_TRIES
+
+    def _on_duplicate_rows(self, info: dict) -> None:
+        """Doubled rows reached the scrollback live
+        (TerminalView.duplicateRowsSeen): the agent logs it and saves the
+        stream. A projection replays bytes the live view already judged, and
+        starts mid-stream, so it reports nothing."""
+        if self._reprojecting:
+            return
+        self.agent.note_render_dup(info)
 
     def _on_reflow_ended(self) -> None:
         """The reprint is in: place the milestones on it, as a projection
