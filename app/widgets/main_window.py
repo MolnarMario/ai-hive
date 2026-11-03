@@ -6393,8 +6393,11 @@ class MainWindow(QMainWindow):
             return
         name = agent.spec.name
 
-        def failed():
-            why = (f"AI Hive could not clear the text in {name}'s input "
+        def failed(cause):
+            why = (f"You typed into {name} while AI Hive cleared its input "
+                   f"box, so it was not asked to ship. Ship again once you "
+                   f"are done with it." if cause == "typed" else
+                   f"AI Hive could not clear the text in {name}'s input "
                    f"box. Clear it, then ship again.")
             self._store_audit(f"LANE-SHIP-DROP agent={name!r}: {why}")
             self._lane_message("Nothing shipped", why)

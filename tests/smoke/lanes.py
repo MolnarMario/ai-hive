@@ -5107,6 +5107,15 @@ def test_ship_lanes_from_integrator_chip():
         check("ship: a restart mid-clear drops the request and says why",
               delivered == [] and "could not clear" in told[-1]
               and not term.is_emptying(), (delivered, told[-1:]))
+        term.feed("\x1b[2J\x1b[H❯\xa0half a thought")
+        win._ship_lanes(ws.id, i)
+        term._send("y")                 # the user types meanwhile
+        term.feed("\x1b[2J\x1b[H❯\xa0y")
+        pump(settle)
+        check("ship: typing into the box mid-clear keeps what was typed, "
+              "and says why nothing shipped",
+              delivered == [] and keyed[-1] == "y"
+              and "You typed into" in told[-1], (delivered, told[-1:]))
 
         keyed.clear()
         told.clear()

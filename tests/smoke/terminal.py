@@ -1500,8 +1500,10 @@ def test_terminal_input_editor():
     # whole box, then a callback once the box reads empty
     def emptying(view, ready=lambda: True):
         got = []
-        started = view.empty_input_then(lambda: got.append("done"),
-                                        lambda: got.append("failed"), ready)
+        started = view.empty_input_then(
+            lambda: got.append("done"),
+            lambda why: got.append("failed:" + why if why else "failed"),
+            ready)
         return started, got
 
     view = TerminalView(rows=6, cols=80)
@@ -1518,6 +1520,25 @@ def test_terminal_input_editor():
     view._empty_step()                  # the settle timer's look
     check("emptybox: the box read empty calls done",
           got == ["done"] and not view.is_emptying(), got)
+
+    # a key of the user's while the box is being cleared ends the clear:
+    # the next round would Backspace what they typed after asking for it
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0old draft")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    view._send("\x1b[I")                # a focus report is no typing
+    check("emptybox: a focus report leaves the clear running",
+          view.is_emptying() and got == [], got)
+    press(view, K.Key_X, text="x")
+    check("emptybox: a typed key ends it, and the key still goes out",
+          got == ["failed:typed"] and not view.is_emptying()
+          and out[-1] == "x", (got, out))
+    view.feed("\x1b[2J\x1b[H❯\xa0x")
+    view._empty_step()
+    check("emptybox: ...and no later round erases it",
+          out[-1] == "x" and got == ["failed:typed"], (out, got))
 
     view = TerminalView(rows=6, cols=80)
     view.feed("❯\xa0draft")

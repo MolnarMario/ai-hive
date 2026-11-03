@@ -218,8 +218,9 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import input_caret, soft_wrap, ui_theme
-from ..terminal_agent import (REFLOW_BEGIN, REFLOW_END, REPAINT_DONE,
-                              _CLAUDE_READY_HINTS, _NUM_OPTION_RE)
+from ..terminal_agent import (FOCUS_REPORTS, REFLOW_BEGIN, REFLOW_END,
+                              REPAINT_DONE, _CLAUDE_READY_HINTS,
+                              _NUM_OPTION_RE)
 from ..ui_theme import ANSI_16, Palette
 from ..word_starts import word_spans
 
@@ -1606,7 +1607,7 @@ class TerminalView(QWidget):
         self._held_keys = None      # meant for the old child's prompt
         self._hold_timer.stop()
         if self._emptying is not None:      # so was this
-            self._end_emptying(self._emptying["failed"])
+            self._end_emptying(self._emptying["failed"], "")
         rows, cols = self.screen.lines, self.screen.columns
         pushed = getattr(self.screen.history.top, "pushed", 0)
         self.screen = _new_history_screen(cols, rows)
@@ -3259,10 +3260,12 @@ class TerminalView(QWidget):
 
     def empty_input_then(self, done, failed, ready) -> bool:
         """Empty Claude's input box, then call `done()` once it reads empty,
-        or `failed()` when it can't be emptied. Returns False, calling
-        neither, while an earlier emptying is still running. `ready()` is
-        asked before every round: a key on a stopped or sleeping card
-        starts or wakes its child (TerminalCard._on_key_input).
+        or `failed(why)` when it can't be emptied: `why` is "typed" when
+        the user typed into the box meanwhile (_send), "" otherwise.
+        Returns False, calling neither, while an earlier emptying is still
+        running. `ready()` is asked before every round: a key on a stopped
+        or sleeping card starts or wakes its child
+        (TerminalCard._on_key_input).
 
         An empty box (Claude's hint is no text) calls `done` at once and
         sends nothing. Otherwise rounds go out until the box reads empty:
@@ -3271,18 +3274,19 @@ class TerminalView(QWidget):
         EMPTY_SETTLE_MS. It fails at once on a box it can't map, or while
         one of the view's own clears is landing (its held keys would follow
         ours, computed for a box that is gone), and later when a round
-        can't be mapped, after EMPTY_TIMEOUT_MS, or when the child
-        restarts (reset)."""
+        can't be mapped, after EMPTY_TIMEOUT_MS, when the child restarts
+        (reset), and when the user types a key of their own."""
         if self._emptying is not None:
             return False
         if self._box_is_empty():
             done()
             return True
         self._emptying = {"done": done, "failed": failed, "ready": ready,
-                          "erased": None, "deadline": time.monotonic()
+                          "erased": None, "own": False,
+                          "deadline": time.monotonic()
                           + EMPTY_TIMEOUT_MS / 1000}
         if not self._empty_round():
-            self._end_emptying(failed)
+            self._end_emptying(failed, "")
         return True
 
     def is_emptying(self) -> bool:
@@ -3330,10 +3334,15 @@ class TerminalView(QWidget):
                     if last >= 0 else None)
             if keys is None:
                 return False
-        self._emptying["erased"] = self._box_look()
+        state = self._emptying
+        state["erased"] = self._box_look()
         self._snap_to_bottom()
-        for seq in keys:
-            self._send(seq)
+        state["own"] = True             # _send: these keys are no user's
+        try:
+            for seq in keys:
+                self._send(seq)
+        finally:
+            state["own"] = False
         self._empty_timer.start()
         return True
 
@@ -3345,16 +3354,16 @@ class TerminalView(QWidget):
         if self._box_is_empty():
             self._end_emptying(state["done"])
         elif time.monotonic() >= state["deadline"]:
-            self._end_emptying(state["failed"])
+            self._end_emptying(state["failed"], "")
         elif self._box_look() == state["erased"]:
             self._empty_timer.start()   # not redrawn yet: wait for it
         elif not self._empty_round():
-            self._end_emptying(state["failed"])
+            self._end_emptying(state["failed"], "")
 
-    def _end_emptying(self, then) -> None:
+    def _end_emptying(self, then, *args) -> None:
         self._emptying = None
         self._empty_timer.stop()
-        then()
+        then(*args)
 
     def _delete_and_drop_selection(self) -> None:
         """Delete a mouse or keyboard selection when _delete_selection can,
@@ -3780,7 +3789,13 @@ class TerminalView(QWidget):
 
     def _send(self, seq: str) -> None:
         """Everything the view sends the child goes through here, so that
-        while Claude clears its prompt (_clear_prompt) it waits, in order."""
+        while Claude clears its prompt (_clear_prompt) it waits, in order.
+        A key of the user's ends an emptying (empty_input_then): the next
+        round would Backspace what they typed after asking for it."""
+        state = self._emptying
+        if state is not None and not state["own"] \
+                and seq not in FOCUS_REPORTS:
+            self._end_emptying(state["failed"], "typed")
         if self._held_keys is not None:
             self._held_keys.append(seq)
         else:

@@ -1490,11 +1490,12 @@ class TerminalCard(QFrame):
         return self.is_pty and self.terminal.has_draft()
 
     def empty_input_then(self, done, failed) -> bool:
-        """Empty the terminal's input box, then call `done()`, or `failed()`
-        when it can't be emptied (TerminalView.empty_input_then). Its keys
-        go out only while the child runs awake, since a key on a stopped
-        or sleeping card starts or wakes it. A line-mode card keeps no box
-        of the child's: `done()` at once."""
+        """Empty the terminal's input box, then call `done()`, or
+        `failed(why)` when it can't be emptied
+        (TerminalView.empty_input_then). Its keys go out only while the
+        child runs awake, since a key on a stopped or sleeping card starts
+        or wakes it. A line-mode card keeps no box of the child's: `done()`
+        at once."""
         if not self.is_pty:
             done()
             return True
