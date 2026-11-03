@@ -1506,6 +1506,10 @@ class TerminalCard(QFrame):
     def is_emptying_input(self) -> bool:
         return self.is_pty and self.terminal.is_emptying()
 
+    def input_box_has_text(self) -> bool:
+        """empty_input_then would erase something."""
+        return self.is_pty and self.terminal.input_box_has_text()
+
     def _resume_from_sleep(self) -> None:
         """A click on the sleep screen, or a key on a sleeping card. The
         child the sleep stopped may still be exiting (PtyWorker.stop's

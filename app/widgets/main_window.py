@@ -6569,7 +6569,7 @@ class MainWindow(QMainWindow):
         if agent.is_asleep():
             note = (f"\n\n{agent.spec.name} is asleep to free memory. OK "
                     f"resumes its conversation first.")
-        elif card is not None and card.has_draft():
+        elif card is not None and card.input_box_has_text():
             # _send_ship erases it: say so while Cancel can still keep it
             note = "\n\nThe request replaces the unsent text in its input box."
         else:

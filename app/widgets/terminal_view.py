@@ -3288,6 +3288,11 @@ class TerminalView(QWidget):
     def is_emptying(self) -> bool:
         return self._emptying is not None
 
+    def input_box_has_text(self) -> bool:
+        """empty_input_then would have text to erase. Unlike has_draft it
+        counts text behind a caret parked at the box's start."""
+        return not self._box_is_empty()
+
     def _caret_below_box(self) -> bool:
         """The caret sits alone on the blank row under Claude's box, where
         typed text that fills the box's last row to the edge leaves it

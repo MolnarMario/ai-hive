@@ -5128,6 +5128,30 @@ def test_ship_lanes_from_integrator_chip():
         check("ship: a box that never empties gives up, unsent",
               delivered == [] and told and "could not clear" in told[-1]
               and not term.is_emptying(), (delivered, told))
+        # the real dialog says the draft goes, caret at the box start too,
+        # and its Cancel keeps it
+        from PySide6.QtWidgets import QMessageBox
+        shown = []
+        real_exec = QMessageBox.exec
+        QMessageBox.exec = lambda box: (shown.append(box.text()),
+                                        QMessageBox.StandardButton.Cancel)[1]
+        del win._confirm_ship           # back to the real one
+        keyed.clear()
+        try:
+            term.feed("\x1b[2J\x1b[H❯\xa0kept draft\x1b[1;3H")
+            win._ship_lanes(ws.id, i)
+            term.feed("\x1b[2J\x1b[H❯\xa0")
+            win._ship_lanes(ws.id, i)
+        finally:
+            QMessageBox.exec = real_exec
+            win._confirm_ship = lambda agent, done: True
+        check("ship: the dialog warns about text behind a caret at the box "
+              "start", len(shown) == 2
+              and "replaces the unsent text" in shown[0], shown)
+        check("ship: ...but not for an empty box",
+              "replaces the unsent text" not in shown[1], shown[1:])
+        check("ship: ...and Cancel keeps the draft",
+              keyed == [] and delivered == [], (keyed, delivered))
         keyed.clear()
         term.feed("\x1b[2J\x1b[H❯\xa0Try \"edit <filepath> to...\"\x1b[1;3H")
         win._ship_lanes(ws.id, i)
