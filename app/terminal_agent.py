@@ -3635,6 +3635,16 @@ class TerminalAgent(QObject):
             self.notice("[no earlier session to resume; starting fresh]")
             self.start()
             return
+        if self.status is AgentStatus.STOPPING:
+            # An exit AI Hive asked for (Stop, Restart, sleep to free memory)
+            # is not an error. The stop's grace kill ends the job with code 1
+            # (WinJob.terminate_tree), and Claude at its prompt never quits
+            # on the one Ctrl+C before it, so every sleep read EXITED_ERR and
+            # turned its workspace badge red with nothing wrong. The code is
+            # the kill's own number, so it tells the user nothing.
+            self._emit(STREAM_SYSTEM, "[stopped]\n")
+            self._set_status(AgentStatus.EXITED_OK)
+            return
         if crashed:
             self._emit(STREAM_SYSTEM, "[process crashed]\n")
             self._set_status(AgentStatus.CRASHED)
