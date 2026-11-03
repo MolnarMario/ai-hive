@@ -224,10 +224,21 @@ BG_SHELL_WARMUP_S = 6.0
 # late children.
 BG_SHELL_SETTLE_S = 10.0
 
-# How long `request_repaint` holds the child one column narrower before giving
-# the width back. Long enough that ConPTY delivers two distinct size changes
+# How long `request_repaint` holds the child one row shorter before giving
+# the row back. Long enough that ConPTY delivers two distinct size changes
 # rather than coalescing them into nothing, short enough that no one sees it.
 REPAINT_RESTORE_MS = 120
+# Claude's redraw for that row has arrived once the child is this quiet after
+# the row came back (it lands within ~100 ms, measured on claude 2.1.316).
+# Then REPAINT_DONE goes into the stream. ms.
+REPAINT_QUIET_MS = 300
+# ...and a child that never goes quiet gets the marker after this long. ms.
+REPAINT_MAX_MS = 2000
+# Written into the agent's own pty stream once a `request_repaint` redraw is
+# in, like the REFLOW markers. The view takes the rows the redraw brought
+# back onto the screen out of the scrollback there
+# (TerminalView._pull_back_redrawn).
+REPAINT_DONE = "\x1b]7766;aihive-repaint-done\x07"
 
 # How long after a launch a Gemini agent's output can still be its previous
 # conversation being redrawn (`agy --continue`). A quota message inside this
@@ -792,6 +803,22 @@ class TerminalAgent(QObject):
         self._reflow_cap.setSingleShot(True)
         self._reflow_cap.setInterval(REFLOW_MAX_MS)
         self._reflow_cap.timeout.connect(self._end_reflow)
+        # `request_repaint`: the size the child gets back while it is one row
+        # short, then True while its redraw settles (see REPAINT_DONE)
+        self._repaint_size = None
+        self._repaint_settling = False
+        self._repaint_restore = QTimer(self)
+        self._repaint_restore.setSingleShot(True)
+        self._repaint_restore.setInterval(REPAINT_RESTORE_MS)
+        self._repaint_restore.timeout.connect(self._restore_after_repaint)
+        self._repaint_quiet = QTimer(self)
+        self._repaint_quiet.setSingleShot(True)
+        self._repaint_quiet.setInterval(REPAINT_QUIET_MS)
+        self._repaint_quiet.timeout.connect(self._end_repaint)
+        self._repaint_cap = QTimer(self)
+        self._repaint_cap.setSingleShot(True)
+        self._repaint_cap.setInterval(REPAINT_MAX_MS)
+        self._repaint_cap.timeout.connect(self._end_repaint)
         if self.is_pty:
             self.worker = PtyWorker(spec, parent=self)
             self.worker.output.connect(self._on_pty_output)
@@ -1254,6 +1281,9 @@ class TerminalAgent(QObject):
         self._reflow_due = False
         if tall <= rows:
             return
+        # the reprint replaces the scrollback a repaint would have tidied,
+        # and _end_reflow gives the child the card's rows back
+        self._cancel_repaint()
         self._reflow_step = "tall"
         if not self._resize_child(tall, cols):
             self._reflow_step = ""
@@ -1326,6 +1356,7 @@ class TerminalAgent(QObject):
         self._reflow_timer.stop()
         self._reflow_quiet.stop()
         self._reflow_cap.stop()
+        self._cancel_repaint()
         if held and child_lives:
             self._read_pty(held)
 
@@ -1405,7 +1436,7 @@ class TerminalAgent(QObject):
 
         A size change is the only portable way to make a full-screen TUI repaint
         on demand, and it is what an ordinary terminal emitter does whenever its
-        window is dragged. Sending one column narrower and back is a no-op for
+        window is dragged. Sending one row shorter and back is a no-op for
         the user (the card re-sends its true size on the next `sizeChanged`
         anyway) but forces a fresh frame.
 
@@ -1415,23 +1446,78 @@ class TerminalAgent(QObject):
         called, and nothing asks the child to redraw. If that child's prompt
         footer was missed on the way past (see `_on_idle_timeout`), the agent
         looks un-nudgeable until the user clicks the workspace — which is not a
-        recovery mechanism.
+        recovery mechanism. The card also asks for one when a dropdown left
+        Claude's input box stranded (TerminalView._check_input_gap).
+
+        The ROW, never a column. Claude answers any resize by clearing its
+        screen from the home position and drawing it again at the new size.
+        One column narrower, every row that reached the last column wraps onto
+        one more, the redraw overflows the card's height, and each extra row
+        pushes a copy of the screen's top row into the scrollback. Giving the
+        column back draws the screen again, so the copies stay: one per
+        repaint, which is how a reply's row showed up three times over in a
+        card (measured on claude 2.1.316 at 30 and 36 rows). One row shorter
+        wraps nothing and pushes nothing.
+
+        Claude's redraw also brings back onto the screen the rows a dropdown
+        had scrolled into the scrollback, so those were on screen and in the
+        scrollback both. Once the redraw is in, REPAINT_DONE goes into the
+        stream and the view takes them back out (_end_repaint).
 
         Deliberately a request and not a policy: the caller decides when an
         agent has waited long enough to be worth poking.
         """
         if (not self.is_pty or not self.worker.is_running()
-                or self._reflow_step):
+                or self._reflow_step or self._repaint_size is not None
+                or self._repaint_settling):
             return False
         rows, cols = self.worker.rows, self.worker.cols
-        if cols <= 10:      # already at PtyWorker's floor; nothing to give back
+        if rows <= 2:       # already at PtyWorker's floor; nothing to give back
             return False
-        self._resize_child(rows, cols - 1)
-        # a reflow that started meanwhile owns the child's size until it ends
-        QTimer.singleShot(REPAINT_RESTORE_MS,
-                          lambda: self._reflow_step
-                          or self._resize_child(rows, cols))
+        if not self._resize_child(rows - 1, cols):
+            return False
+        self._repaint_size = (rows, cols)
+        self._repaint_restore.start()
         return True
+
+    def _restore_after_repaint(self) -> None:
+        """Give the child back the row `request_repaint` took, then wait for
+        its redraw to settle (REPAINT_DONE)."""
+        size, self._repaint_size = self._repaint_size, None
+        if size is None or self._reflow_step:
+            return      # a reflow started meanwhile and owns the child's size
+        rows, cols = size
+        if (self.worker.rows, self.worker.cols) != (rows - 1, cols):
+            return      # the view resized the child meanwhile: that size stands
+        if not self._resize_child(rows, cols):
+            return
+        self._repaint_settling = True
+        self._repaint_quiet.start()
+        self._repaint_cap.start()
+
+    def _end_repaint(self) -> None:
+        """The redraw after the row came back is in: mark it in the stream so
+        the live view and every replay pull back the same rows."""
+        if not self._repaint_settling:
+            return
+        self._repaint_settling = False
+        self._repaint_quiet.stop()
+        self._repaint_cap.stop()
+        if self._reflow_step or self._alt_screen:
+            return
+        flush = getattr(self.worker, "flush", None)
+        if flush is not None:
+            flush()     # redraw bytes still batched belong before the marker
+        self._append_stream(REPAINT_DONE)
+
+    def _cancel_repaint(self) -> None:
+        """Forget a repaint in flight: a new child, or a reflow taking over
+        the child's size and the scrollback."""
+        self._repaint_size = None
+        self._repaint_settling = False
+        self._repaint_restore.stop()
+        self._repaint_quiet.stop()
+        self._repaint_cap.stop()
 
     def pty_replay(self) -> str:
         return "".join(self._pty_buffer)
@@ -3297,6 +3383,8 @@ class TerminalAgent(QObject):
                 self._append_stream(REFLOW_BEGIN)
         if self._reflow_step == "reprint":
             self._reflow_quiet.start()
+        if self._repaint_settling:
+            self._repaint_quiet.start()
         self._read_pty(text)
 
     def _read_pty(self, text: str) -> None:

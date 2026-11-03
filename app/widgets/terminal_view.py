@@ -214,8 +214,8 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import input_caret, soft_wrap, ui_theme
-from ..terminal_agent import (REFLOW_BEGIN, REFLOW_END, _CLAUDE_READY_HINTS,
-                              _NUM_OPTION_RE)
+from ..terminal_agent import (REFLOW_BEGIN, REFLOW_END, REPAINT_DONE,
+                              _CLAUDE_READY_HINTS, _NUM_OPTION_RE)
 from ..ui_theme import ANSI_16, Palette
 from ..word_starts import word_spans
 
@@ -617,10 +617,12 @@ _TRAILING_PARTIAL_RE = re.compile(
 # whole stream into _esc_carry forever and freeze the screen. Mirrors
 # ansi_parser.MAX_CARRY.
 _MAX_ESC_CARRY = 4096
-# TerminalAgent's reflow markers, split out of a chunk so each part of it
-# is fed on its own side of the marker (see _apply_reflow_marker)
+# TerminalAgent's reflow and repaint markers, split out of a chunk so each
+# part of it is fed on its own side of the marker (see _apply_reflow_marker
+# and _pull_back_redrawn). All three share the _REFLOW_TAG prefix.
 _REFLOW_RE = re.compile("(" + re.escape(REFLOW_BEGIN) + "|"
-                        + re.escape(REFLOW_END) + ")")
+                        + re.escape(REFLOW_END) + "|"
+                        + re.escape(REPAINT_DONE) + ")")
 _REFLOW_TAG = REFLOW_BEGIN[:7]
 # ConPTY opens every frame it paints with a visible cursor by hiding it, and
 # closes it by showing the cursor again (see TerminalView._feed_frames)
@@ -1008,7 +1010,9 @@ class TerminalView(QWidget):
                     self._focus_reporting = on
         if _REFLOW_TAG in data:
             for i, part in enumerate(_REFLOW_RE.split(data)):
-                if i % 2:
+                if i % 2 and part == REPAINT_DONE:
+                    self._pull_back_redrawn()
+                elif i % 2:
                     self._apply_reflow_marker(part)
                 elif part:
                     self._feed_screen(part)
