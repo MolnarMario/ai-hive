@@ -1524,6 +1524,14 @@ def test_terminal_input_editor():
     view.feed(hint + "\x1b[1;3H")       # caret parked at the box's start
     check("undo: the hint is no draft", view._input_text() == "",
           view._input_text())
+    narrow = TerminalView(rows=6, cols=24)
+    narrow.feed(hint + "\x1b[1;3H")     # wraps onto a second row
+    check("undo: a hint wrapped in a narrow card is no draft either",
+          narrow._painted_input().count("\n") >= 1
+          and narrow._input_text() == "", repr(narrow._painted_input()))
+    narrow.feed("\x1b[2;5H")            # caret on the second row: typed text
+    check("undo: text with the caret past the first row stays input",
+          narrow._input_text() != "", narrow._input_text())
     out = []
     view.keyInput.connect(out.append)
     view.feed("\r\x1b[2K❯\xa0hi")    # the user typed "hi"

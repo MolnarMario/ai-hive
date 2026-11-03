@@ -3475,13 +3475,13 @@ class TerminalView(QWidget):
 
         The hint ('Try "create a util logging.py that..."') is painted like
         typed text: measured live, its cells carry no attribute pyte keeps.
-        What gives it away is its shape, one row opening 'Try "' behind a
-        caret parked at the box's start (has_draft). Read as text, undo
-        pasted it back as a prompt, Schedule prefilled it, and a bare Enter
-        on an empty box filed it as a milestone."""
+        What gives it away is its shape: text opening 'Try "' behind a caret
+        parked at the start of the box's first row (has_draft is False only
+        there). It may wrap onto more rows in a narrow card. Read as text,
+        undo pasted it back as a prompt, Schedule prefilled it, and a bare
+        Enter on an empty box filed it as a milestone."""
         text = self._painted_input()
-        if text.startswith(_HINT_OPEN) and "\n" not in text \
-                and not self.has_draft():
+        if text.startswith(_HINT_OPEN) and not self.has_draft():
             return ""
         return text
 
