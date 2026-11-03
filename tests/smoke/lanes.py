@@ -4318,17 +4318,21 @@ def test_task_done_empty_flag_beside_other_empty_flags():
     gives every empty commit the same patch id, so once another lane's empty
     flag landed in the base, `--cherry-pick` took this lane's flag for
     landed too, and Ship finished lanes left the lane out with its work
-    unshipped. The flag holds while the base lacks the lane's work and
-    clears once the base has it, merged or picked as another commit. A lane
-    whose only commit is an empty flag has nothing to ship."""
+    unshipped. The flag holds while the base lacks the lane's work, a
+    merge commit's own change included, and clears once the base has it:
+    merged, picked as another commit or squashed. A lane whose only commit
+    is an empty flag has nothing to ship."""
     from app import lanes
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-empty-flag-"))
     work = _make_repo(tmp)
     a = _lane_for(work, "Agent A", "e3f1a0" + "0" * 26)
     b = _lane_for(work, "Agent B", "e3f1b0" + "0" * 26)
     c = _lane_for(work, "Agent C", "e3f1c0" + "0" * 26)
+    d = _lane_for(work, "Agent D", "e3f1d0" + "0" * 26)
+    s = _lane_for(work, "Agent S", "e3f1e0" + "0" * 26)
     ea, eb, ec = (_entry("A", "Agent A", a), _entry("B", "Agent B", b),
                   _entry("C", "Agent C", c))
+    ed, es = _entry("D", "Agent D", d), _entry("S", "Agent S", s)
 
     def done(entry):
         return lanes.lane_snap(entry, {}).done
@@ -4368,7 +4372,33 @@ def test_task_done_empty_flag_beside_other_empty_flags():
     check("task-done-empty: the flag clears once the base picked the work "
           "as another commit", done(ea) == ""
           and _git(work, "rev-parse", "HEAD") != a_work)
-    for lane in (a, b, c):
+
+    # D merges the base in with a change of its own in the merge (a
+    # conflict resolution) and flags. Then its one commit reaches the base
+    # as a pick: every non-merge commit of D's now matches the base
+    _commit(d["root"], "fd.txt", "d\n", "d's work")
+    d_work = _git(d["root"], "rev-parse", "HEAD")
+    _git(d["root"], "merge", "-q", "--no-ff", "--no-commit", "origin/main")
+    (Path(d["root"]) / "resolved.txt").write_text("only in the merge\n")
+    _git(d["root"], "add", "-A")
+    _git(d["root"], "commit", "-q", "-m", "merge main")
+    d_flag = flag(d["root"])
+    _git(work, "cherry-pick", d_work)
+    publish()
+    check("task-done-empty: a merge's own change keeps the flag up after "
+          "the lane's commits landed", done(ed) == d_flag, done(ed))
+
+    # S lands as one squashed commit: none of its commits match by patch
+    _commit(s["root"], "fs1.txt", "1\n", "s first")
+    _commit(s["root"], "fs2.txt", "2\n", "s second")
+    s_flag = flag(s["root"])
+    check("task-done-empty: a two-commit lane is flagged", done(es) == s_flag)
+    _git(work, "merge", "-q", "--squash", s_flag)
+    _git(work, "commit", "-q", "-m", "squashed S")
+    publish()
+    check("task-done-empty: a squash merge of the lane clears the flag",
+          done(es) == "", done(es))
+    for lane in (a, b, c, d, s):
         _drop_lane_folder(lane["root"])
     shutil.rmtree(tmp, ignore_errors=True)
 
