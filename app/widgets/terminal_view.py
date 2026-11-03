@@ -65,8 +65,9 @@ keeps no local edit buffer, so this can't be a real per-keystroke history; it is
 a coarse "restore previous input" built from snapshots of the INFERRED input
 text (the painted input-box rows, debounced into one step per typing burst).
 Undo empties the prompt (Backspaces in Claude's box, see _apply_input_text) and
-re-pastes the prior snapshot. Claude's dim hint in an empty box is not input
-(_draft_text). Its
+re-pastes the prior snapshot. Claude's hint in an empty box is not input
+(_input_text), and a repeated Ctrl+Z waits for the last one's redraw
+(_undo_settling). Its
 limits are inherent: granularity is the whole prompt, not a character; a very
 long horizontally-scrolled input truncates in the snapshot; restore leaves the
 caret at the end; and a submit (bare Enter) forgets the history so it never
@@ -249,10 +250,13 @@ _MASK_RUNS = re.compile(rb"\x00+|\x01+|\x02+")
 # you're typing into begins (so the highlight stops there, not up in the
 # transcript). Claude Code draws '>'; '❯' covers common shell/other prompts.
 _INPUT_PROMPTS = (">", "❯")
-# Cells that end a word for double-click and Ctrl+Shift+Arrow. Claude paints
-# a no-break space after its '❯' prompt, so without it a double-click on the
-# prompt's first word grabbed the glyph too and copied as ">\xa0hello".
-_WORD_GAPS = ("", " ", "\xa0")
+# Cells that end a word for double-click and Ctrl+Shift+Arrow: the cells
+# between Claude's prompt glyph and the input. Claude paints a no-break space
+# after its '❯', so with only a plain space a double-click on the prompt's
+# first word grabbed the glyph too and copied as ">\xa0hello".
+_WORD_GAPS = input_caret.PROMPT_GAP
+# How Claude's hint in an empty input box opens (see _input_text)
+_HINT_OPEN = 'Try "'
 
 # How many rule and hint rows reply_anchor_line() skips above the freshly
 # redrawn input box on its way to the finished reply's own footer row
@@ -842,6 +846,9 @@ class TerminalView(QWidget):
         self._undo_stack: list[str] = []
         self._redo_stack: list[str] = []
         self._undo_last = ""
+        # (text, deadline) of the last undo/redo until Claude has drawn it
+        # (_undo_settling), else None
+        self._undo_applied: tuple[str, float] | None = None
         self._pending_fwd = None       # (row, col) of a press on a mouse-tracking
         #   app that is NOT YET forwarded: held until release so we can tell a
         #   click (forward it) from a drag (select locally). None = not pending.
@@ -2307,7 +2314,7 @@ class TerminalView(QWidget):
         if ctrl and shift and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if self._input_selected:
                 self._clear_input_selection(send=False)  # visual mark only
-            self.scheduleRequested.emit(self._draft_text())
+            self.scheduleRequested.emit(self._input_text())
             event.accept()
             return
 
@@ -2940,7 +2947,7 @@ class TerminalView(QWidget):
         if n:
             self._emit_arrows("C" if target > src else "D", n)
 
-    def _delete_selection(self) -> bool:
+    def _delete_selection(self, rng=None) -> bool:
         """Delete a selection by driving the child's caret to its end, then
         Backspacing over it -- a terminal can't edit a span of the child's
         buffer directly. Works for a selection anywhere INSIDE the live input
@@ -2965,10 +2972,13 @@ class TerminalView(QWidget):
         function sends REAL Backspace bytes to the child regardless of
         whether the caret-repositioning it does first actually moved
         anything -- so this must not rely solely on _reposition_cursor's own
-        guard."""
+        guard.
+
+        `rng` deletes that span instead of the selection, which stays."""
         if self._waiting_probe():
             return False
-        rng = self._selection_range()
+        if rng is None:
+            rng = self._selection_range()
         if rng is None or self._scroll_offset:
             return False
         (r0, c0), (r1, c1) = rng
@@ -3404,9 +3414,9 @@ class TerminalView(QWidget):
             top, bottom = span
             last = self._row_content(bottom)[1]
             if last >= 0:
-                self._sel_anchor, self._sel_end = (top, 0), (bottom, last)
-                deleted = self._delete_selection()
-        self._sel_anchor = self._sel_end = None
+                # a span of its own: undo must not wipe a transcript
+                # selection the user still means to copy
+                deleted = self._delete_selection(((top, 0), (bottom, last)))
         if not deleted:
             self._clear_prompt()
 
@@ -3436,8 +3446,11 @@ class TerminalView(QWidget):
         self._hold_timer.start()
 
     def _prompt_cleared(self) -> bool:
-        """The input box is on screen and holds no typed text."""
-        return self._input_block_span() is not None and not self.has_draft()
+        """Claude's input box is on screen and holds no typed text. A box
+        without Claude's prompt glyph can't be read that way (has_draft is
+        always False there), so its hold runs to CLEAR_HOLD_MS: releasing
+        on the next output chunk sent the paste before the clear landed."""
+        return self._has_prompt_box() and not self._input_text()
 
     def _release_held_keys(self) -> None:
         held, self._held_keys = self._held_keys, None
@@ -3458,7 +3471,22 @@ class TerminalView(QWidget):
     def _input_text(self) -> str:
         """The inferred current input: the painted input-box rows joined, with
         the leading '> ' prompt stripped. Empty when the caret isn't in an
-        input box."""
+        input box, and for Claude's empty box with its hint in it.
+
+        The hint ('Try "create a util logging.py that..."') is painted like
+        typed text: measured live, its cells carry no attribute pyte keeps.
+        What gives it away is its shape, one row opening 'Try "' behind a
+        caret parked at the box's start (has_draft). Read as text, undo
+        pasted it back as a prompt, Schedule prefilled it, and a bare Enter
+        on an empty box filed it as a milestone."""
+        text = self._painted_input()
+        if text.startswith(_HINT_OPEN) and "\n" not in text \
+                and not self.has_draft():
+            return ""
+        return text
+
+    def _painted_input(self) -> str:
+        """_input_text without the hint check: every painted input row."""
         span = self._input_block_span()
         if span is None:
             return ""
@@ -3586,7 +3614,7 @@ class TerminalView(QWidget):
     def _snapshot_input(self) -> None:
         """Push the PREVIOUS input onto the undo stack when the input changed --
         the coalesced unit for one undo step."""
-        cur = self._draft_text()
+        cur = self._input_text()
         if cur != self._undo_last:
             self._undo_stack.append(self._undo_last)
             if len(self._undo_stack) > 50:
@@ -3698,6 +3726,7 @@ class TerminalView(QWidget):
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._undo_last = ""
+        self._undo_applied = None
 
     def _apply_input_text(self, text: str) -> None:
         """Replace the child's whole input with `text`: empty the box, then
@@ -3709,14 +3738,32 @@ class TerminalView(QWidget):
         whenever the '@' file menu was open, its first Escape only closing
         the menu. An already empty box gets nothing, so the paste can't trip
         a suggestion or Escape's other uses. A box without Claude's prompt
-        glyph keeps the double-Escape, with the paste held behind it."""
+        glyph keeps the double-Escape, with the paste held behind it.
+
+        The next undo or redo waits until Claude has drawn this one
+        (_undo_settling): its Backspace count and its redo entry are read
+        off the screen, which still shows the old text until the redraw."""
         if self._has_prompt_box():
-            if self.has_draft():
+            if self._input_text():
                 self._empty_input_box()
         else:
             self._clear_prompt()     # the paste waits for the cleared box
         if text:
             self._paste_text(text)
+        self._undo_applied = (text, time.monotonic() + CLEAR_HOLD_MS / 1000)
+
+    def _undo_settling(self) -> bool:
+        """The last undo/redo's text is not on screen yet. A key-repeated
+        Ctrl+Z arrives faster than Claude redraws, and a step taken from the
+        old screen Backspaced the wrong count and pushed the wrong redo
+        entry, so such a press is dropped. CLEAR_HOLD_MS ends the wait."""
+        if self._undo_applied is None:
+            return False
+        target, deadline = self._undo_applied
+        if self._input_text() == target or time.monotonic() >= deadline:
+            self._undo_applied = None
+            return False
+        return True
 
     def _has_prompt_box(self) -> bool:
         """The input box is on screen and opens with Claude's prompt glyph,
@@ -3728,25 +3775,17 @@ class TerminalView(QWidget):
         return last >= 0 and self.screen.buffer[span[0]][first].data \
             in _INPUT_PROMPTS
 
-    def _draft_text(self) -> str:
-        """The text typed into the input box, "" for an empty one. Claude
-        paints a dim hint ('Try "edit <filepath> to..."') inside its empty
-        box, and _input_text reads that as text: undo then pasted the hint
-        back as a prompt, and Schedule prefilled it. A box without Claude's
-        prompt glyph has no hint to skip and reads as before."""
-        if self._has_prompt_box() and not self.has_draft():
-            return ""
-        return self._input_text()
-
     def _undo(self) -> bool:
         """Restore the previous input snapshot. Returns False (so the caller
         forwards the 0x1a control byte instead) when there is nothing to undo."""
+        if self._undo_settling():
+            return True                   # dropped: see _undo_settling
         if self._snap_timer.isActive():   # flush a pending coalesced edit first
             self._snap_timer.stop()
             self._snapshot_input()
         if not self._undo_stack:
             return False
-        self._redo_stack.append(self._draft_text())
+        self._redo_stack.append(self._input_text())
         target = self._undo_stack.pop()
         self._apply_input_text(target)
         self._undo_last = target
@@ -3755,10 +3794,12 @@ class TerminalView(QWidget):
     def _redo(self) -> bool:
         """Re-apply the most recently undone snapshot. Returns False when there
         is nothing to redo."""
+        if self._undo_settling():
+            return True                   # dropped: see _undo_settling
         if not self._redo_stack:
             return False
         self._snap_timer.stop()
-        self._undo_stack.append(self._draft_text())
+        self._undo_stack.append(self._input_text())
         target = self._redo_stack.pop()
         self._apply_input_text(target)
         self._undo_last = target
