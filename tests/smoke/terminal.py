@@ -430,17 +430,21 @@ def test_terminal_keys():
           "recap" not in view.selected_text(), view.selected_text())
     check("keys: Ctrl+A is visual-only (nothing to the pty)", sent == [], sent)
     press(K.Key_Backspace)
-    check("keys: Backspace on the highlight clears input via double-Esc",
-          sent == ["\x1b\x1b"], sent)
+    check("keys: Backspace on the highlight Backspaces the whole input box",
+          sent == ["\x7f" * len("my prompt")], sent)
     check("keys: clearing drops the highlight", view.selected_text() == "")
+    view.feed("\r\x1b[2K> ")            # Claude draws the cleared prompt
     sent.clear()
     press(K.Key_Backspace)
     check("keys: plain Backspace (no highlight) forwards to the child (0x7f)",
           sent == ["\x7f"], sent)
 
     # Typing a printable character over the Ctrl+A highlight REPLACES the input,
-    # like any editor: the child's prompt is cleared (double-Esc) THEN the typed
+    # like any editor: the whole input box is Backspaced away THEN the typed
     # character is sent, so it becomes the fresh input rather than appending.
+    # Not the double-Esc clear: measured live, Claude read "\x1b\x1b" with "x"
+    # right behind it as Escape plus Alt+x, and behind an open '@' menu the
+    # first Escape only closed the menu.
     def type_char(ch):
         view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, K.Key_X,
                                      Qt.KeyboardModifier.NoModifier, ch))
@@ -449,10 +453,48 @@ def test_terminal_keys():
     check("keys: Ctrl+A re-highlights the input", view.selected_text() == "> my prompt")
     sent.clear()
     type_char("x")
-    check("keys: typing over the highlight clears then sends the char",
-          sent == ["\x1b\x1b", "x"], sent)
+    check("keys: typing over the highlight Backspaces the box then sends "
+          "the char", sent == ["\x7f" * len("my prompt"), "x"], sent)
     check("keys: typing over the highlight drops the highlight",
-          view.selected_text() == "")
+          view.selected_text() == "" and not view._input_selected)
+
+    # a box the view can't map (here _delete_selection refuses) falls back
+    # to Claude's double-Esc clear
+    view.feed("\r\x1b[2K> my prompt")
+    press(K.Key_A, ctrl=True)
+    sent.clear()
+    view._delete_selection = lambda: False
+    press(K.Key_Backspace)
+    del view._delete_selection
+    check("keys: an unmappable box falls back to the double-Esc clear",
+          sent == ["\x1b\x1b"], sent)
+
+    # after a double-Esc clear, the next keys wait until Claude has drawn
+    # the empty box, then go out in order
+    type_char("x")
+    type_char("y")
+    check("keys: keys right after the clear are held",
+          sent == ["\x1b\x1b"], sent)
+    view.feed("\r\x1b[2K> ")            # Claude draws the cleared prompt
+    check("keys: the held chars go out in order once the box is empty",
+          sent == ["\x1b\x1b", "x", "y"], sent)
+    sent.clear()
+    type_char("z")
+    check("keys: after the release, typing goes straight out",
+          sent == ["z"], sent)
+
+    # a clear Claude never draws holds the keys CLEAR_HOLD_MS at most, then
+    # sends them anyway: a key that lands after the old prompt beats a lost one
+    view.feed("\r\x1b[2K> stuck")
+    sent.clear()
+    view._clear_prompt()
+    type_char("q")
+    view.feed("\r\x1b[2K> stuck")       # redrawn, still not empty
+    check("keys: a prompt that is not empty yet keeps holding",
+          sent == ["\x1b\x1b"], sent)
+    view._hold_timer.timeout.emit()
+    check("keys: the hold's ceiling releases the held key",
+          sent == ["\x1b\x1b", "q"], sent)
 
     # a navigation key over the highlight only collapses it -- no clear, no char
     press(K.Key_A, ctrl=True)
@@ -479,8 +521,8 @@ def test_terminal_keys():
     check("keys: Ctrl+C over the highlight drops the highlight",
           view.selected_text() == "")
 
-    # Ctrl+X over the highlight copies too, THEN clears the child's input (the
-    # double-Esc clear-prompt gesture) -- a cut.
+    # Ctrl+X over the highlight copies too, THEN empties the child's input box
+    # (Backspaces, as Backspace on the highlight does) -- a cut.
     view.feed("recap\r\n> cut me")
     press(K.Key_A, ctrl=True)
     sent.clear()
@@ -489,8 +531,8 @@ def test_terminal_keys():
     check("keys: Ctrl+X over the highlight copies it",
           QGuiApplication.clipboard().text() == "> cut me",
           QGuiApplication.clipboard().text())
-    check("keys: Ctrl+X over the highlight clears input (double-Esc)",
-          sent == ["\x1b\x1b"], sent)
+    check("keys: Ctrl+X over the highlight empties the input box",
+          sent == ["\x7f" * len("cut me")], sent)
 
     # a multi-line prompt (the '>' first line + continuation) highlights in full
     # but still excludes the output above it
@@ -1104,6 +1146,105 @@ def test_terminal_selection_edit():
           v3.selected_text() == "")
 
 
+def test_terminal_altgr_and_paste_replace():
+    """Two gaps next to typing-over-a-selection. Qt on Windows reports AltGr
+    as Ctrl+Alt (measured on a Hungarian layout: AltGr+V is Key_At, both
+    modifiers, text "@"), so '@' went to Claude ESC-prefixed as Alt+@ and
+    never as '@', and it didn't replace a selection either. And a paste,
+    Ctrl+V or the context menu, went in at the caret and left the selection
+    (or the Ctrl+A highlight) in place."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QGuiApplication, QKeyEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    K = Qt.Key
+    M = Qt.KeyboardModifier
+    altgr = M.ControlModifier | M.AltModifier
+    clip = QGuiApplication.clipboard()
+
+    def fresh(text="hello world", select=True):
+        view = TerminalView(rows=6, cols=80)
+        view.feed("\x1b[?2004h" + text)     # bracketed paste, as Claude asks
+        if select:
+            view._sel_anchor, view._sel_end = (0, 6), (0, 10)   # "world"
+        sent = []
+        view.keyInput.connect(sent.append)
+        return view, sent
+
+    def key(view, k, mods, text=""):
+        view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, k, mods, text))
+
+    v, sent = fresh(select=False)
+    key(v, K.Key_At, altgr, "@")
+    check("altgr: '@' goes out as '@', not ESC-prefixed", sent == ["@"], sent)
+
+    v, sent = fresh()
+    check("altgr: the selection is set", v.selected_text() == "world",
+          v.selected_text())
+    key(v, K.Key_BraceLeft, altgr, "{")
+    check("altgr: an AltGr character replaces the selection",
+          sent == ["\x7f" * 5, "{"], sent)
+    check("altgr: ...and drops it", v._selection_range() is None)
+
+    v, sent = fresh(select=False)
+    key(v, K.Key_Home, altgr)
+    check("altgr: Ctrl+Alt with no character keeps its modifiers",
+          sent == ["\x1b[1;7H"], sent)
+
+    clip.setText("HI")
+    v, sent = fresh()
+    key(v, K.Key_V, M.ControlModifier)
+    check("paste: Ctrl+V over a selection replaces it",
+          sent == ["\x7f" * 5, "\x1b[200~HI\x1b[201~"], sent)
+    check("paste: ...and drops it", v._selection_range() is None)
+
+    v, sent = fresh()
+    v.paste_clipboard()                 # the context menu's Paste
+    check("paste: the menu's Paste replaces a selection too",
+          sent == ["\x7f" * 5, "\x1b[200~HI\x1b[201~"], sent)
+
+    clip.setText("")
+    v, sent = fresh()
+    key(v, K.Key_V, M.ControlModifier)
+    check("paste: an empty clipboard deletes nothing and keeps the selection",
+          sent == [] and v.selected_text() == "world",
+          (sent, v.selected_text()))
+
+    clip.setText("NEW")
+    v, sent = fresh("recap\r\n> old prompt", select=False)
+    key(v, K.Key_A, M.ControlModifier)
+    check("paste: Ctrl+A highlights the prompt",
+          v.selected_text() == "> old prompt", v.selected_text())
+    key(v, K.Key_V, M.ControlModifier)
+    check("paste: Ctrl+V over the Ctrl+A highlight Backspaces the box first",
+          sent == ["\x7f" * len("old prompt"), "\x1b[200~NEW\x1b[201~"], sent)
+    check("paste: ...and drops the highlight",
+          not v._input_selected and v.selected_text() == "")
+
+    # the caret moved up a row: the highlight stops at the caret's row, but
+    # the replace still takes the whole box, the row below included
+    v, sent = fresh("> line one\r\n  line two\x1b[1;11H", select=False)
+    key(v, K.Key_A, M.ControlModifier)
+    check("paste: with the caret up, the highlight covers the first row",
+          v.selected_text() == "> line one", v.selected_text())
+    key(v, K.Key_V, M.ControlModifier)
+    check("paste: ...but the replace Backspaces the whole box",
+          sent[-1] == "\x1b[200~NEW\x1b[201~"
+          and sent[-2] == "\x7f" * len("line one\nline two"), sent)
+    clip.setText("")
+
+    v, sent = fresh("> old prompt", select=False)
+    v._clear_prompt()
+    key(v, K.Key_X, M.NoModifier, "x")
+    v.reset()
+    v._hold_timer.timeout.emit()
+    check("hold: a reset drops keys held for the old child's prompt",
+          sent == ["\x1b\x1b"], sent)
+
+
 def test_terminal_selection_typing_replaces():
     """Typing over a double-clicked or dragged word in the input box replaces
     it, as in an editor. The bug: the character went in at the caret and the
@@ -1346,6 +1487,9 @@ def test_terminal_input_editor():
           view._redo_stack == ["hi"], view._redo_stack)
     out.clear()
     press(view, K.Key_Y, ctrl=True)     # redo -> restore "hi"
+    check("undo: Ctrl+Y clears first and holds the paste for the empty box",
+          out == ["\x1b\x1b"], out)
+    view.feed("\x1b[2J\x1b[H> ")        # Claude draws the cleared prompt
     check("undo: Ctrl+Y re-applies the undone input (clear + paste)",
           out == ["\x1b\x1b", "hi"], out)
 

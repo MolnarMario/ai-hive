@@ -32,12 +32,17 @@ Ctrl+Shift+A selects all painted text. Ctrl+A highlights the text you're
 typing (best-effort: the contiguous block of non-blank rows around the
 cursor, so wrapped/multi-line input highlights in full, like Cursor / the
 Claude desktop input box) and
-Backspace/Del on that highlight clears the child's ENTIRE input via
-double-Escape (0x1b 0x1b, Claude Code's clear-prompt gesture, which unlike its
-line-local Ctrl+A/Ctrl+K empties multi-line input too). Typing a printable
-character over the highlight REPLACES the input the same way: the prompt is
-cleared first, then the character is sent as the fresh input (navigation keys
-just drop the highlight, as an editor collapses a selection). Ctrl+C over the
+Backspace/Del on that highlight empties the child's ENTIRE input box, every
+row of it, whatever the highlight covers, by Backspacing over it
+(_empty_input_box). Typing a printable character, a paste or an IME commit
+over the highlight REPLACES the input: the box is emptied the same way, then
+the text is sent as the fresh input. Claude Code's double-Escape clear-prompt
+gesture is only the fallback for a box the view can't map: measured live, its
+first Escape just closes an open '@' menu, and Escape interrupts a working
+Claude. Whatever the view sends right after a double-Escape (that fallback,
+undo/redo) waits until Claude has drawn the empty box (_clear_prompt): sent
+right behind it, Claude read the Escapes and the key as Alt+key. Navigation
+keys just drop the highlight, as an editor collapses a selection. Ctrl+C over the
 highlight COPIES it (Ctrl+X copies then clears) -- the highlight is a real
 selection, so it must reach the clipboard rather than fall through to the 0x03
 interrupt, which would clear the child's input instead. The highlight is
@@ -133,8 +138,9 @@ on screen. A plain (unshifted) arrow
 collapses it, then forwards to move the child's caret. Shift+click EXTENDS the
 current selection to the clicked cell; a TRIPLE-click selects the whole line.
 A selection (mouse OR keyboard) is EDITABLE like any editor selection: Ctrl+C
-copies it, Ctrl+X cuts it, Backspace/Del deletes it, and typing (a key or a
-committed IME/emoji string) replaces it. Deletion/cut/replace drive the
+copies it, Ctrl+X cuts it, Backspace/Del deletes it, and typing (a key, an
+AltGr character, a committed IME/emoji string) or a paste (Ctrl+V, the
+context menu) replaces it. Deletion/cut/replace drive the
 child's caret to the selection end + Backspace over it, so they act on any
 selection INSIDE the live input box -- single OR multi-row/wrapped (the box maps
 to the child's logical line, one Backspace per row transition; the leading '> '
@@ -382,6 +388,11 @@ _WIDE_GAP_RE = re.compile(r"\s{8,}")
 # Ctrl+F: the longest a streaming agent waits for its matches to catch up
 # with new output. A ceiling, not a debounce (see _find_dirty).
 FIND_RESCAN_MS = 120
+# The longest the view holds what it sends behind Claude's double-Escape
+# clear (_clear_prompt) when it never sees the box come back empty. The
+# held keys then go anyway: a key that lands after an uncleared prompt
+# beats a key that is lost.
+CLEAR_HOLD_MS = 1500
 # Chrome's own find colors. Fixed rather than Palette reads: a match has to
 # stand out on every skin's console background, the light one included, and
 # the text on it is redrawn in FIND_INK so it stays legible whatever color
@@ -946,6 +957,13 @@ class TerminalView(QWidget):
         self._find_timer.setSingleShot(True)
         self._find_timer.setInterval(FIND_RESCAN_MS)
         self._find_timer.timeout.connect(self._find_refresh)
+        # what the view sends while Claude clears its prompt (_clear_prompt),
+        # None when nothing is held
+        self._held_keys: list[str] | None = None
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.setInterval(CLEAR_HOLD_MS)
+        self._hold_timer.timeout.connect(self._release_held_keys)
 
     # -------------------------------------------------------------- data ---
 
@@ -1000,6 +1018,8 @@ class TerminalView(QWidget):
         self.update()
         self._gap_timer.start()
         self._find_dirty()
+        if self._held_keys is not None and self._prompt_cleared():
+            self._release_held_keys()
         t0 = time.perf_counter() - t0
         if t0 > _perf_feed_s:
             _perf_feed_s, _perf_feed_len, _perf_feed_view = t0, len(data), self
@@ -1349,6 +1369,8 @@ class TerminalView(QWidget):
         a Restart's new child. Nothing of the old screen survives, a
         selection or a hovered link included, but `pushed` carries over so
         absolute line ids stay monotonic (see the coordinate block below)."""
+        self._held_keys = None      # meant for the old child's prompt
+        self._hold_timer.stop()
         rows, cols = self.screen.lines, self.screen.columns
         pushed = getattr(self.screen.history.top, "pushed", 0)
         self.screen = _new_history_screen(cols, rows)
@@ -2125,12 +2147,12 @@ class TerminalView(QWidget):
 
     def focusInEvent(self, event) -> None:
         if self._focus_reporting:  # app asked for focus events (?1004)
-            self.keyInput.emit("\x1b[I")
+            self._send("\x1b[I")
         super().focusInEvent(event)
 
     def focusOutEvent(self, event) -> None:
         if self._focus_reporting:
-            self.keyInput.emit("\x1b[O")
+            self._send("\x1b[O")
         # whatever took focus may keep the release
         self._mouse_selecting = False
         self._stop_drag_scroll()
@@ -2172,16 +2194,13 @@ class TerminalView(QWidget):
         # newline would reach Claude as Enter.
         text = event.commitString()
         if text:
-            if self._input_selected:
-                self._clear_input_selection(send=True)  # replace, as typing does
-            elif self._selection_range() is not None:
-                self._delete_and_drop_selection()
+            self._replace_selection_with_text()
             if "\r" in text or "\n" in text:
                 self._paste_text(
                     text.replace("\r\n", "\r").replace("\n", "\r"))
             else:
                 self._snap_to_bottom()
-                self.keyInput.emit(text)
+                self._send(text)
                 self._kick_snapshot(None, text)
         preedit = event.preeditString()
         if preedit != self._preedit:
@@ -2232,6 +2251,15 @@ class TerminalView(QWidget):
         ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
         shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
         alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        # Qt on Windows reports AltGr as Ctrl+Alt. Measured on a Hungarian
+        # layout: AltGr+V arrives as Key_At with both modifiers and text
+        # "@". A key that types printable text with both held is that
+        # character, so everything below sees plain typing. Without this,
+        # _sequence_for sent it ESC-prefixed as Alt+@ and Claude never got
+        # the '@'. A Ctrl+Alt combo that types nothing (Ctrl+Alt+Home)
+        # carries no text and keeps its modifiers.
+        if ctrl and alt and event.text() and event.text().isprintable():
+            ctrl = alt = False
 
         # scrollback paging, as in Windows Terminal: Shift+PageUp/PageDown
         # move the VIEW through history without sending anything to the app
@@ -2285,9 +2313,9 @@ class TerminalView(QWidget):
             self._select_input_line()
             event.accept()
             return
-        # With that highlight active, Backspace/Del clears the child's entire
-        # input via double-Escape (Claude Code's "clear prompt" gesture; see
-        # _clear_input_selection). Any other real key just dismisses the
+        # With that highlight active, Backspace/Del empties the child's whole
+        # input box (_clear_input_selection), and a typed character or a
+        # paste empties it first too. Any other real key just dismisses the
         # highlight, then is handled normally -- as an editor drops its
         # selection on the next keypress. Bare modifiers don't dismiss (so
         # Ctrl+A then a chorded combo still works).
@@ -2299,7 +2327,7 @@ class TerminalView(QWidget):
             # this, Ctrl+C dropped the highlight here and fell through to the
             # 0x03 interrupt below, which CLEARS the child's input: the text was
             # deleted instead of copied (the reported bug). Ctrl+X also empties
-            # the prompt (the double-Esc clear, like Backspace); Ctrl+C leaves
+            # the prompt, like Backspace; Ctrl+C leaves
             # the text in place, the way any editor does.
             if ctrl and key in (Qt.Key.Key_C, Qt.Key.Key_X):
                 self.copy_selection()
@@ -2311,14 +2339,17 @@ class TerminalView(QWidget):
                 event.accept()
                 return
             # Typing a printable character over the highlight REPLACES the
-            # input, like any editor: clear the child's whole prompt (the same
-            # double-Escape gesture) first, then FALL THROUGH so the character
-            # itself is sent and becomes the fresh input. Control/navigation
+            # input, like any editor: Backspace over the whole input box
+            # first (_empty_input_box), then FALL THROUGH so the
+            # character itself is sent and becomes the fresh input.
+            # Control/navigation
             # keys (arrows, Enter, Ctrl-combos) instead just drop the highlight,
             # the way an editor collapses a selection without deleting it.
             if self._types_char(event, ctrl, alt):
                 self._clear_input_selection(send=True)
                 # fall through -> _sequence_for emits the typed character below
+            elif ctrl and key == Qt.Key.Key_V:
+                pass    # paste_clipboard replaces the highlighted input
             else:
                 self._clear_input_selection(send=False)
 
@@ -2416,7 +2447,7 @@ class TerminalView(QWidget):
         seq = self._sequence_for(key, ctrl, shift, alt, event.text())
         if seq:
             self._snap_to_bottom()
-            self.keyInput.emit(seq)
+            self._send(seq)
             # keep the undo snapshot cadence: a submit (bare Enter) ends this
             # input's history; other edit keys (re)arm the coalescing snapshot.
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) \
@@ -2472,13 +2503,13 @@ class TerminalView(QWidget):
             # the app asked for mouse events (Claude Code does): forward the
             # wheel as mouse reports — the app scrolls its own transcript
             row, col = self._cell_at(event.position())
-            self.keyInput.emit(self._wheel_report(up, row, col) * steps)
+            self._send(self._wheel_report(up, row, col) * steps)
         elif self._alt_screen:
             # fullscreen app without mouse tracking (vim, less): "alternate
             # scroll" — the wheel becomes arrow keys, as Windows Terminal does
             arrow = ("\x1bOA" if self._app_cursor_keys else "\x1b[A") if up \
                 else ("\x1bOB" if self._app_cursor_keys else "\x1b[B")
-            self.keyInput.emit(arrow * steps)
+            self._send(arrow * steps)
         else:
             # normal buffer: scroll our own history view
             self.scroll_by(steps if up else -steps)
@@ -2729,8 +2760,8 @@ class TerminalView(QWidget):
             row, col = self._pending_fwd
             self._pending_fwd = None
             self._sel_anchor = self._sel_end = None
-            self.keyInput.emit(self._mouse_button_report(0, row, col, True))
-            self.keyInput.emit(self._mouse_button_report(0, row, col, False))
+            self._send(self._mouse_button_report(0, row, col, True))
+            self._send(self._mouse_button_report(0, row, col, False))
             self.update()
             event.accept()
             return
@@ -2753,7 +2784,7 @@ class TerminalView(QWidget):
         if count <= 0:
             return
         seq = ("\x1bO" if self._app_cursor_keys else "\x1b[") + final
-        self.keyInput.emit(seq * count)
+        self._send(seq * count)
 
     def _typing_span(self):
         """_input_block_span for Bionic reading, which has to cover one more
@@ -2947,14 +2978,16 @@ class TerminalView(QWidget):
             return False
         self._snap_to_bottom()
         self._drive_caret(carets, end)        # caret to just past the span end
-        self.keyInput.emit("\x7f" * count)    # then Backspace over it
+        self._send("\x7f" * count)    # then Backspace over it
         return True
 
     def _delete_and_drop_selection(self) -> None:
         """Delete a mouse or keyboard selection when _delete_selection can,
-        and drop it either way: Backspace/Del, Ctrl+X, and typed text over
-        it. Typed text is sent next, so it lands where the selection was,
-        or at the caret when the selection couldn't be deleted."""
+        and drop it either way: Backspace/Del, Ctrl+X, and typed or pasted
+        text over it. Text sent next lands where the selection was, or at
+        the caret when the selection couldn't be deleted. Arrows and
+        Backspaces with text right behind them reach Claude intact however
+        the bytes split (checked live), unlike the highlight's clear."""
         self._delete_selection()
         self._sel_anchor = self._sel_end = None
         self.update()
@@ -2962,10 +2995,8 @@ class TerminalView(QWidget):
     @staticmethod
     def _types_char(event, ctrl: bool, alt: bool) -> bool:
         """The key types a character: printable text with neither Ctrl nor
-        Alt. Qt on Windows reports AltGr as Ctrl+Alt, and _sequence_for
-        sends Alt text ESC-prefixed (meta), so an AltGr key must not count
-        here until it goes out as plain text: replacing would delete the
-        selection and then send the meta sequence, not the character."""
+        Alt. keyPressEvent has already cleared both for an AltGr key, so
+        an AltGr character counts too and goes out as plain text."""
         text = event.text()
         return bool(text) and text.isprintable() and not ctrl and not alt
 
@@ -3312,8 +3343,10 @@ class TerminalView(QWidget):
         before a blank line or the top of the screen, we fall back to the
         cursor's row only: better to under-reach than to grab output. A terminal
         can't see the child's real buffer, so this is inference from painted
-        rows. Purely a view mark; Backspace/Del acts on it via
-        _clear_input_selection. A blank cursor row selects nothing."""
+        rows. Purely a view mark. Backspace/Del, Ctrl+X, a typed character
+        and a paste act on it via _clear_input_selection, which empties the
+        whole input box whatever the highlight covers (_empty_input_box). A
+        blank cursor row selects nothing."""
         self._snap_to_bottom()  # cursor.y is a live-screen row; align the view
         buf = self.screen.buffer
         cy = self.screen.cursor.y
@@ -3336,19 +3369,74 @@ class TerminalView(QWidget):
         self.update()
 
     def _clear_input_selection(self, send: bool) -> None:
-        """Drop the Ctrl+A input highlight. With send=True (Backspace/Del on the
-        highlight) also clear the child's ENTIRE input via double-Escape
-        (0x1b 0x1b) -- Claude Code's documented "clear the prompt" gesture,
-        which empties single, wrapped, AND explicit multi-line input in one go
-        (its Ctrl+A/Ctrl+K are only line-local, so they can't). This is tuned
-        for Claude Code; a plain shell clears its line differently."""
+        """Drop the Ctrl+A input highlight. With send=True (Backspace/Del,
+        Ctrl+X, a typed character or a paste over the highlight) also empty
+        the child's ENTIRE input first (_empty_input_box)."""
         had = self._input_selected
         self._input_selected = False
         self._sel_anchor = self._sel_end = None
         if send and had:
-            self._snap_to_bottom()
-            self.keyInput.emit("\x1b\x1b")
+            self._empty_input_box()
         self.update()
+
+    def _empty_input_box(self) -> None:
+        """Backspace over the WHOLE input box, not just the rows the Ctrl+A
+        highlight painted (it stops at the caret's row).
+
+        Not Claude's double-Escape clear-prompt gesture, measured live: the
+        first Escape only closes an open menu (a prompt ending in '@' has
+        the file picker up), so the prompt stayed and whatever came next
+        was appended. Escape also interrupts a Claude that is working, and
+        the box takes typing then. Backspaces have neither problem. The
+        clear, with what follows held behind it (_clear_prompt), is only
+        the fallback for a box _delete_selection can't map: scrolled back,
+        a menu printed over it, input wider than what is painted."""
+        deleted = False
+        span = self._input_block_span()
+        if span is not None:
+            top, bottom = span
+            last = self._row_content(bottom)[1]
+            if last >= 0:
+                self._sel_anchor, self._sel_end = (top, 0), (bottom, last)
+                deleted = self._delete_selection()
+        self._sel_anchor = self._sel_end = None
+        if not deleted:
+            self._clear_prompt()
+
+    def _send(self, seq: str) -> None:
+        """Everything the view sends the child goes through here, so that
+        while Claude clears its prompt (_clear_prompt) it waits, in order."""
+        if self._held_keys is not None:
+            self._held_keys.append(seq)
+        else:
+            self.keyInput.emit(seq)
+
+    def _clear_prompt(self) -> None:
+        """Claude's double-Escape clear-prompt gesture, with whatever the
+        view sends next held back until Claude has drawn the empty box.
+
+        Measured live: "\\x1b\\x1b" with a key right behind it reached
+        Claude as Escape plus Alt+key, so typing over the Ctrl+A highlight
+        neither cleared the prompt nor typed the key, and a paste behind it
+        was cleared or appended depending on how the bytes split. Held
+        until the box is empty, the clear and the text arrive apart. The
+        hold ends at CLEAR_HOLD_MS at the latest, so no key is ever lost."""
+        if self._held_keys is not None:
+            self._release_held_keys()   # an earlier clear's keys go first
+        self._snap_to_bottom()
+        self.keyInput.emit("\x1b\x1b")
+        self._held_keys = []
+        self._hold_timer.start()
+
+    def _prompt_cleared(self) -> bool:
+        """The input box is on screen and holds no typed text."""
+        return self._input_block_span() is not None and not self.has_draft()
+
+    def _release_held_keys(self) -> None:
+        held, self._held_keys = self._held_keys, None
+        self._hold_timer.stop()
+        for seq in held or ():
+            self.keyInput.emit(seq)
 
     # ------------------------------------------------- approximate undo ---
     # A terminal keeps no local edit buffer, so this can't be a real per-
@@ -3608,8 +3696,7 @@ class TerminalView(QWidget):
         """Replace the child's whole input with `text`: clear the prompt, then
         paste it (bracketed if the child enabled it). Coarse -- the caret ends
         at the end of the pasted text."""
-        self._snap_to_bottom()
-        self.keyInput.emit("\x1b\x1b")   # clear-prompt gesture
+        self._clear_prompt()     # the paste waits for the cleared box
         if text:
             self._paste_text(text)
 
@@ -3651,24 +3738,38 @@ class TerminalView(QWidget):
         # when the clipboard carries both (a copied file can expose both).
         if md is not None and md.hasImage() and not md.hasText():
             path = self._spill_clipboard_image(cb.image())
-            if path:
-                # quote only when needed -- a bare path is what Claude's
-                # image-path detection expects; spaces would split the token
-                self._paste_text(f'"{path}"' if " " in path else path)
-            return
-        text = cb.text()
-        if not text:
-            return
-        self._paste_text(text.replace("\r\n", "\r").replace("\n", "\r"))
+            if not path:
+                return
+            # quote only when needed -- a bare path is what Claude's
+            # image-path detection expects; spaces would split the token
+            payload = f'"{path}"' if " " in path else path
+        else:
+            text = cb.text()
+            if not text:
+                return      # nothing to paste: the selection stays
+            payload = text.replace("\r\n", "\r").replace("\n", "\r")
+        self._replace_selection_with_text()
+        self._paste_text(payload)
+
+    def _replace_selection_with_text(self) -> None:
+        """Text is about to go in (a paste, a committed IME/emoji string), so
+        a selection gives way the way it does for a typed key: the Ctrl+A
+        highlight takes the whole input box with it (_empty_input_box), and
+        a mouse or keyboard selection is deleted when it can be and dropped
+        either way."""
+        if self._input_selected:
+            self._clear_input_selection(send=True)
+        elif self._selection_range() is not None:
+            self._delete_and_drop_selection()
 
     def _paste_text(self, text: str) -> None:
         self._snap_to_bottom()
         # bracketed paste (if the app enabled mode 2004, e.g. Claude Code) so a
         # multi-line/large paste is delivered as one block, not line-by-line
         if self._bracketed_paste:
-            self.keyInput.emit("\x1b[200~" + text + "\x1b[201~")
+            self._send("\x1b[200~" + text + "\x1b[201~")
         else:
-            self.keyInput.emit(text)
+            self._send(text)
 
     def _spill_clipboard_image(self, image) -> str:
         """Write a clipboard QImage to a temp PNG and return its path (or "").
