@@ -1512,6 +1512,11 @@ def test_terminal_input_editor():
     view = TerminalView(rows=6, cols=80)
     view.feed("❯\xa0")
     check("erasekeys: an empty box needs none", view.input_erase_keys() == "")
+    view = TerminalView(rows=3, cols=20)
+    view.feed("❯\xa0" + "word " * 14)  # taller than the screen: the ❯ row
+    check("erasekeys: a draft whose prompt row scrolled off can't be "
+          "mapped", view._input_text() != ""   # is gone, its tail remains
+          and view.input_erase_keys() is None, repr(view._input_text()))
 
     # --- approximate undo / redo --------------------------------------------
     view = TerminalView(rows=6, cols=80)

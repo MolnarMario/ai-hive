@@ -3033,10 +3033,15 @@ class TerminalView(QWidget):
         empty box gets nothing. None when it holds text the view can't map
         (_erase_keys), or while one of the view's own clears is still
         landing: keys sent past the hold would arrive ahead of the ones
-        it holds. Then nothing should go in on top of the text."""
+        it holds. Then nothing should go in on top of the text.
+
+        Also None when the text's first row is not Claude's prompt row. A
+        draft taller than the screen pushes that row off the top, the view
+        sees only the rows still painted, and their Backspaces would leave
+        the start of the draft in front of the request."""
         if not self._input_text():
             return ""
-        if self._held_keys is not None:
+        if self._held_keys is not None or not self._has_prompt_box():
             return None
         span = self._input_block_span()     # set: _input_text read the box
         last = self._row_content(span[1])[1]
