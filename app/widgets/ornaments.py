@@ -25,6 +25,28 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QLabel, QSizePolicy,
 from .. import ui_theme, usage_poll
 from ..ui_theme import Palette
 
+
+def _mix(a: str, b: str, t: float) -> str:
+    """The colour `t` of the way from `a` to `b` (0 is a, 1 is b), as #rrggbb."""
+    ca, cb = QColor(a), QColor(b)
+    return QColor(round(ca.red() + (cb.red() - ca.red()) * t),
+                  round(ca.green() + (cb.green() - ca.green()) * t),
+                  round(ca.blue() + (cb.blue() - ca.blue()) * t)).name()
+
+
+# HSL saturation cap (of 255) that keeps the stopped badge grey
+_STOPPED_MAX_SAT = 40
+
+
+def _stopped_grey() -> str:
+    """The count badge of a workspace with no live agent: 40% of the way
+    from the empty grey toward body text, a step past an empty row (brighter
+    on a dark skin, darker ink on a light one), then drained of colour.
+    Adeptus Mechanicus draws its text in green, so the mix alone came out
+    mint and read as the idle green."""
+    h, s, l, _ = QColor(_mix(Palette.TEXT_DIM, Palette.TEXT, 0.4)).getHsl()
+    return QColor.fromHsl(max(h, 0), min(s, _STOPPED_MAX_SAT), l).name()
+
 # --- lifted SVG ornament tiles (transparent grounds; colours are the design's) ---
 
 _BORDER_H = """<svg xmlns='http://www.w3.org/2000/svg' width='220' height='32'>
@@ -318,7 +340,9 @@ def working_pulse(owner: QObject, on_value) -> QVariantAnimation:
 class AgentCountBadge(QWidget):
     """A workspace's agent tally: a rounded badge showing how many agents are
     open, colour-coded by state — pulsing amber while any agent is working,
-    green when all are idle (running, no errors), red on error, dim when empty.
+    green when agents run with no errors, red on error, grey when no agent
+    has a live process (asleep, stopped or not started), and a fainter grey
+    when empty.
     Colours are read from the live `Palette` at paint time so the badge tracks
     every skin (no per-skin QSS needed). The pulse runs ONLY in the working
     state; every other state is static, so idle rows cost nothing. Clicking it
@@ -332,6 +356,7 @@ class AgentCountBadge(QWidget):
         "working": lambda: Palette.YELLOW,
         "idle": lambda: Palette.GREEN,
         "error": lambda: Palette.RED,
+        "stopped": _stopped_grey,
         "empty": lambda: Palette.TEXT_DIM,
     }
 

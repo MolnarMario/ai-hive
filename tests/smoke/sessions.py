@@ -2944,6 +2944,79 @@ def test_resume_fallback():
     check("resume-fallback: user-stopped resume not relaunched", c3["start"] == 1)
 
 
+def test_requested_stop_is_not_an_error():
+    """A stop AI Hive asked for (sleep to free memory, Stop, Restart) ends
+    in the stop's grace kill, exit code 1. It recorded EXITED_ERR, so every
+    agent put to sleep turned its workspace badge red with nothing wrong."""
+    from PySide6.QtWidgets import QApplication
+
+    from app.process_worker import WorkerState
+    from app.terminal_agent import AgentStatus
+    from app.widgets.sidebar import ws_state
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Stops", SCRATCH_CWD)
+    agent, calls, live = _sleepy_claude(mgr, ws.id, "Sleeper", SCRATCH_CWD)
+
+    # the real worker's order: STOPPING on stop(), DEAD, then finished(1)
+    agent.put_to_sleep()
+    agent._on_worker_state(WorkerState.STOPPING)
+    live["on"] = False
+    agent._on_worker_state(WorkerState.DEAD)
+    agent._on_finished(1, False)
+    stats = mgr.workspace_stats(ws.id)
+    check("requested-stop: a sleep's kill exit is not an error",
+          calls == ["stop"] and agent.status is AgentStatus.EXITED_OK
+          and stats["error"] == 0, (calls, agent.status, stats))
+    check("requested-stop: a workspace whose agents all sleep reads grey",
+          stats["asleep"] == 1 and ws_state(stats) == "stopped", stats)
+    # waking restarts the child: the badge follows the live process
+    agent._wake()
+    live["on"] = True
+    agent._on_worker_state(WorkerState.RUNNING)
+    stats = mgr.workspace_stats(ws.id)
+    check("requested-stop: ...and green once one is awake again",
+          stats["asleep"] == 0 and ws_state(stats) == "idle", stats)
+
+    # a hand Stop: no sleeper left, but no running child either, so grey
+    # (keying grey on the sleepers alone left this row green)
+    agent.stop()
+    agent._on_worker_state(WorkerState.STOPPING)
+    live["on"] = False
+    agent._on_worker_state(WorkerState.DEAD)
+    agent._on_finished(1, False)
+    stats = mgr.workspace_stats(ws.id)
+    check("requested-stop: a hand-stopped workspace reads grey, not green",
+          agent.status is AgentStatus.EXITED_OK and stats["asleep"] == 0
+          and ws_state(stats) == "stopped", (agent.status, stats))
+
+    # a pipe worker's kill reports a crash exit; a stop asked for it
+    live["on"] = True
+    agent._set_status(AgentStatus.RUNNING)
+    agent._on_worker_state(WorkerState.STOPPING)
+    live["on"] = False
+    agent._on_finished(1, True)
+    check("requested-stop: a killed pipe child after Stop is not a crash",
+          agent.status is AgentStatus.EXITED_OK, agent.status)
+
+    # an exit nobody asked for still reads as the error it is
+    live["on"] = True
+    agent._set_status(AgentStatus.RUNNING)
+    live["on"] = False
+    agent._on_finished(1, False)
+    stats = mgr.workspace_stats(ws.id)
+    check("requested-stop: an unrequested error exit still turns the "
+          "badge red", agent.status is AgentStatus.EXITED_ERR
+          and stats["error"] == 1 and ws_state(stats) == "error",
+          (agent.status, stats))
+    agent._set_status(AgentStatus.RUNNING)
+    agent._on_finished(0, True)
+    check("requested-stop: an unrequested crash is still a crash",
+          agent.status is AgentStatus.CRASHED, agent.status)
+
+
 def test_agent_kind_is_always_an_enum():
     """`build_spec` coerces `kind`, so an agent can always be serialized.
 

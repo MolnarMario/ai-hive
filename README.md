@@ -43,8 +43,10 @@ workspaces keep executing — switching never pauses anything.
   are alive and healthy (running, no errors) and **pulses amber** while an agent
   is actually **working** (streaming output — thinking, generating, running a
   command), so working reads as motion rather than resting green. It turns
-  **red** on error and dims when empty (the working/running/error breakdown is
-  in the row's hover tooltip). A matching **sweeping-arc spinner** with the live
+  **red** when an agent crashes or exits with an error (a Stop or a sleep to
+  free memory is not an error), **grey** when no agent has a live process
+  (all asleep, stopped or not started yet), and dims when empty (the
+  working/running/error/asleep breakdown is in the row's hover tooltip). A matching **sweeping-arc spinner** with the live
   working count appears at the row's right edge while any agent is working and
   vanishes when all are idle. Opening a workspace's folder or deleting it are
   buttons in its own header bar now (see **First-class folders** below), not
@@ -1106,7 +1108,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4631 checks drive the real app headlessly (offscreen Qt platform) with real
+4641 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1256,7 +1258,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4631 checks)
+                           (4641 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

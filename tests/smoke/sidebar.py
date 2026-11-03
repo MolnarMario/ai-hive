@@ -440,6 +440,42 @@ def test_collapsed_sidebar_rail():
                        "waiting": 1})
     sb.set_stats("c", {"total": 1, "active": 0, "busy": 0, "error": 1})
 
+    # no agent with a live process (asleep, stopped, not started): grey
+    from PySide6.QtGui import QColor
+
+    from app import ui_theme
+    from app.widgets.ornaments import AgentCountBadge
+    check("badge: no running agent reads stopped, not idle or empty",
+          ws_state({"total": 2, "active": 0, "asleep": 2}) == "stopped"
+          and ws_state({"total": 2, "active": 0, "asleep": 0}) == "stopped"
+          and ws_state({"total": 2, "active": 1, "asleep": 1}) == "idle"
+          and ws_state({"total": 0, "active": 0}) == "empty")
+    check("badge: a working or errored agent still wins over the stopped",
+          ws_state({"total": 2, "active": 1, "asleep": 1, "busy": 1})
+          == "working"
+          and ws_state({"total": 2, "active": 0, "asleep": 1, "error": 1})
+          == "error")
+    colors = AgentCountBadge._STATE_COLOR
+    was = ui_theme.ACTIVE_THEME.id
+    off = []
+    try:
+        for tid, t in ui_theme.THEMES.items():
+            ui_theme.apply_theme(tid)
+            stopped_c = QColor(colors["stopped"]())
+            empty_c = QColor(colors["empty"]())
+            idle_c = QColor(colors["idle"]())
+            bg_l = QColor(t.bg_panel).lightness()
+            if (stopped_c.hslSaturation() > 48
+                    or stopped_c.name() in (empty_c.name(), idle_c.name())
+                    or abs(stopped_c.lightness() - bg_l)
+                    <= abs(empty_c.lightness() - bg_l)):
+                off.append((tid, stopped_c.name(), empty_c.name(),
+                            idle_c.name()))
+    finally:
+        ui_theme.apply_theme(was)
+    check("badge: on every skin the stopped badge is a grey a step past the "
+          "empty one, apart from the idle green", not off, off)
+
     check("rail: one entry per workspace, in sidebar order",
           [e[0] for e in rail._entries] == ["a", "b", "c"], rail._entries)
     check("rail: strips share the count badge's states",
