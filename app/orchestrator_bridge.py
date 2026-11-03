@@ -21,13 +21,21 @@ JSON-RPC the server speaks to the CLI on its own stdio.
 
 Everything is additive and guarded: if QtNetwork/listen fails the bridge just
 disables itself and the base app is unaffected.
+
+The endpoint file and the mcp/ configs live in the folder the caller names,
+which MainWindow takes from its SessionStore. The bridge must never look the
+folder up through QStandardPaths itself: on Windows Qt asks the shell for
+AppData and ignores the APPDATA variable, so the smoke suite's sandbox
+profile never reached it. Every test window's start() purged the RUNNING
+app's mcp/ folder, and each live agent then failed its next /clear with
+"MCP config file not found".
 """
 
 import json
 import os
 import secrets
 
-from PySide6.QtCore import QObject, QStandardPaths
+from PySide6.QtCore import QObject
 
 from .process_worker import HIVE_BRIDGE_ARGS
 
@@ -44,17 +52,12 @@ except ImportError:  # pragma: no cover
 _MAX_REQUEST_BYTES = 1 << 20  # 1 MiB
 
 
-def _appdata_dir() -> str:
-    base = QStandardPaths.writableLocation(
-        QStandardPaths.StandardLocation.AppDataLocation)
-    os.makedirs(base, exist_ok=True)
-    return base
-
-
 class OrchestratorBridge(QObject):
-    """Named-pipe RPC server that maps the log_activity op onto the board."""
+    """Named-pipe RPC server that maps the log_activity op onto the board.
+    `base_dir` holds orchestrator.json and mcp/ (see the module docstring
+    for why it has no default)."""
 
-    def __init__(self, manager, active_ws=None, parent=None):
+    def __init__(self, manager, base_dir: str, active_ws=None, parent=None):
         super().__init__(parent)
         self.manager = manager
         self._active_ws = active_ws or (lambda: manager.active_id)
@@ -62,8 +65,8 @@ class OrchestratorBridge(QObject):
         self.pipe_name = ""
         self._server = None
         self._buffers = {}   # QLocalSocket -> bytearray
-        self.endpoint_path = os.path.join(_appdata_dir(), "orchestrator.json")
-        self._mcp_dir = os.path.join(_appdata_dir(), "mcp")
+        self.endpoint_path = os.path.join(base_dir, "orchestrator.json")
+        self._mcp_dir = os.path.join(base_dir, "mcp")
 
     # ------------------------------------------------------------ lifecycle ---
 
@@ -96,6 +99,8 @@ class OrchestratorBridge(QObject):
 
     def _write_endpoint(self) -> None:
         try:
+            # a first run starts before the session store has saved anything
+            os.makedirs(os.path.dirname(self.endpoint_path), exist_ok=True)
             with open(self.endpoint_path, "w", encoding="utf-8") as f:
                 json.dump({"version": 1, "pipe": self.pipe_name,
                            "pid": os.getpid()}, f)
