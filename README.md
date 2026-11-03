@@ -604,7 +604,9 @@ workspaces keep executing — switching never pauses anything.
   merging) and pick **Ship finished
   lanes**. That asks you to confirm the list, then types the request into
   the integrator, resuming its conversation first if it is asleep to free
-  memory. The dialog's "Don't ask again" skips the question from
+  memory. Unsent text left in the integrator's input box is cleared first,
+  so the request goes in alone. Ctrl+Z in its card brings the text back,
+  all of it unless the draft was taller than about a third of the card. The dialog's "Don't ask again" skips the question from
   then on; ⚙ Options > Agents > **Confirm Ship finished lanes** brings it
   back. It gathers the lanes you name, or every lane with an unmerged `Task done`
   commit, into one `integrate/` branch. If the base branch has
@@ -1104,7 +1106,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4569 checks drive the real app headlessly (offscreen Qt platform) with real
+4607 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1254,7 +1256,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4569 checks)
+                           (4607 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

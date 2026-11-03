@@ -6308,6 +6308,9 @@ class MainWindow(QMainWindow):
         elif not waking and agent.spec.uid in self._ship_waking:
             why = ("The integrator is waking up to take your last ship "
                    "request.")
+        elif self._emptying_for_ship(agent):
+            why = ("The integrator's input box is being cleared for your "
+                   "last ship request.")
         elif agent.is_asleep():
             why = ""
         elif not agent.is_running():
@@ -6319,6 +6322,12 @@ class MainWindow(QMainWindow):
         else:
             why = ""
         return done, why
+
+    def _emptying_for_ship(self, agent) -> bool:
+        """Ship is clearing this integrator's input box (_send_ship). The
+        card holds that state, so a closed card can't leave it stuck."""
+        card = self._card_for_agent(agent.id)
+        return card is not None and card.is_emptying_input()
 
     def _ship_offer(self, ws, agent) -> tuple:
         """(label, enabled, tooltip) for the integrator chip's Ship finished
@@ -6372,8 +6381,66 @@ class MainWindow(QMainWindow):
         self._send_ship(agent, done)
 
     def _send_ship(self, agent, done: list) -> None:
-        """Type the ship request naming `done`, the lanes the user
-        confirmed, into the integrator."""
+        """Send the ship request naming `done`, the lanes the user
+        confirmed, once the integrator's input box is empty. Typed beside
+        a leftover draft, the two went in as one message, so the card
+        empties the box first (TerminalCard.empty_input_then) and the
+        request follows once Claude has drawn it empty (_ship_emptied). An
+        empty box sends it at once."""
+        card = self._card_for_agent(agent.id)
+        if card is None:
+            self._type_ship(agent, done)
+            return
+        name = agent.spec.name
+
+        def failed(cause):
+            why = {
+                "typed": f"You typed into {name} while AI Hive cleared its "
+                         f"input box, so it was not asked to ship. Ship "
+                         f"again once you are done with it.",
+                "sent": f"{name} got another message while AI Hive cleared "
+                        f"its input box, so it was not asked to ship. Ship "
+                        f"again once it has answered.",
+                "restarted": f"{name} restarted while AI Hive cleared its "
+                             f"input box, so it was not asked to ship. Ship "
+                             f"again once it is at its prompt.",
+            }.get(cause, f"AI Hive could not clear the text in {name}'s "
+                         f"input box. Clear it, then ship again.")
+            self._store_audit(f"LANE-SHIP-DROP agent={name!r}: {why}")
+            self._lane_message("Nothing shipped", why)
+        if not card.empty_input_then(
+                lambda: self._ship_emptied(agent, done), failed):
+            # _ship_state turns a second click away before it gets here
+            self._lane_message("Nothing shipped",
+                               f"{name}'s input box is still being cleared "
+                               f"for your last ship request.")
+        elif card.is_emptying_input():
+            self._store_audit(f"LANE-SHIP-CLEAR agent={name!r}")
+
+    def _ship_emptied(self, agent, done: list) -> None:
+        """The integrator's input box reads empty: type the request, unless
+        what the user confirmed no longer holds. A box that needed clearing
+        took a moment, and anything may have moved meanwhile."""
+        ws = self.manager.workspace_of(agent.id)
+        if self._closing or ws is None:
+            return
+        again, why = self._ship_state(ws, agent)
+        if not why and ([(a.spec.uid, v.done) for a, v in again]
+                        != [(a.spec.uid, v.done) for a, v in done]):
+            why = ("The finished lanes changed while the integrator's input "
+                   "box was cleared. Open the menu again to see the new "
+                   "list.")
+        if not why and not self.manager.is_integrator(agent):
+            why = f"{agent.spec.name} is no longer the integrator."
+        if why:
+            self._store_audit(f"LANE-SHIP-DROP agent={agent.spec.name!r}: "
+                              f"{why}")
+            self._lane_message("Nothing shipped", why)
+            return
+        self._type_ship(agent, done)
+
+    def _type_ship(self, agent, done: list) -> None:
+        """Type the ship request naming `done` into the integrator."""
         lanes_at = ", ".join(f"{view.branch} at {view.done[:12]}"
                              for _a, view in done)
         text = (f"Ship the finished lanes now: {lanes_at}. Merge each of "
@@ -6472,9 +6539,11 @@ class MainWindow(QMainWindow):
                      f"the menu again to see the new list.")
             return
         card = self._card_for_agent(agent.id)
-        if not why and card is not None and card.has_draft():
-            # the user is typing into it: the request must not land in
-            # their draft
+        if not why and card is not None and card.input_box_has_text():
+            # the user typed this after the click, while it woke: waited
+            # out, not erased like a box left over from before (_send_ship).
+            # Not has_draft, which misses text behind a caret parked at the
+            # box's start, and _send_ship would erase that
             why = "draft"
         if why:
             if time.monotonic() >= entry["deadline"]:
@@ -6508,12 +6577,19 @@ class MainWindow(QMainWindow):
         finished lanes" turns it back on; Cancel keeps asking."""
         lines = "\n".join(f"  {a.spec.name}: {view.branch} at "
                           f"{view.done[:7]}" for a, view in done)
-        wake = (f"\n\n{agent.spec.name} is asleep to free memory. OK resumes "
-                f"its conversation first." if agent.is_asleep() else "")
+        card = self._card_for_agent(agent.id)
+        if agent.is_asleep():
+            note = (f"\n\n{agent.spec.name} is asleep to free memory. OK "
+                    f"resumes its conversation first.")
+        elif card is not None and card.input_box_has_text():
+            # _send_ship erases it: say so while Cancel can still keep it
+            note = "\n\nThe request replaces the unsent text in its input box."
+        else:
+            note = ""
         box = QMessageBox(
             QMessageBox.Icon.Question, "Ship finished lanes",
             f"{agent.spec.name} combines these lanes into one pull request, "
-            f"gets it reviewed and tested, and merges it:\n\n{lines}{wake}",
+            f"gets it reviewed and tested, and merges it:\n\n{lines}{note}",
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
             self)
         box.setDefaultButton(QMessageBox.StandardButton.Cancel)

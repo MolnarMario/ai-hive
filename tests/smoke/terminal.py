@@ -1496,6 +1496,147 @@ def test_terminal_input_editor():
           view._delete_selection() is False)
     check("multidel: off-input-box delete sends nothing", out == [], out)
 
+    # empty_input_then (Ship finished lanes): the same Backspaces over the
+    # whole box, then a callback once the box reads empty
+    def emptying(view, ready=lambda: True):
+        got = []
+        started = view.empty_input_then(
+            lambda: got.append("done"),
+            lambda why: got.append("failed:" + why if why else "failed"),
+            ready)
+        return started, got
+
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0line one\r\n  line two\x1b[1;5H")   # caret inside row 0
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    check("emptybox: a two-row box: Down, Rights to its end, Backspaces",
+          started and out == ["\x1b[B", "\x1b[C" * 6, "\x7f" * 17]
+          and got == [] and view.is_emptying(), (out, got))
+    check("emptybox: one emptying at a time",
+          emptying(view)[0] is False and len(out) == 3, out)
+    view.feed("\x1b[2J\x1b[H❯\xa0")
+    view._empty_step()                  # the settle timer's look
+    check("emptybox: the box read empty calls done",
+          got == ["done"] and not view.is_emptying(), got)
+
+    # a key of the user's while the box is being cleared ends the clear:
+    # the next round would Backspace what they typed after asking for it
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0old draft")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    view._send("\x1b[I")                # a focus report is no typing
+    check("emptybox: a focus report leaves the clear running",
+          view.is_emptying() and got == [], got)
+    press(view, K.Key_X, text="x")
+    check("emptybox: a typed key ends it, and the key still goes out",
+          got == ["failed:typed"] and not view.is_emptying()
+          and out[-1] == "x", (got, out))
+    view.feed("\x1b[2J\x1b[H❯\xa0x")
+    view._empty_step()
+    check("emptybox: ...and no later round erases it",
+          out[-1] == "x" and got == ["failed:typed"], (out, got))
+
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0draft")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view, ready=lambda: False)
+    check("emptybox: a child that can't take keys gets none",
+          out == [] and got == ["failed"], (out, got))
+    view.set_waiting_probe(lambda: True)
+    started, got = emptying(view)
+    check("emptybox: an open menu over the box can't be mapped",
+          out == [] and got == ["failed"], (out, got))
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    check("emptybox: an empty box calls done at once, sending nothing",
+          out == [] and got == ["done"] and not view.is_emptying(), (out, got))
+    # text filling the box's last row to the edge leaves Claude's caret
+    # alone on the blank row below, where _input_text reads nothing
+    view = TerminalView(rows=6, cols=20)
+    view.feed("❯\xa0" + "a" * 18 + "\r\n")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    check("emptybox: a caret parked under a full row is no empty box",
+          view._input_text() == "" and got == [] and out == ["\x7f"],
+          (out, got))
+    view.feed("\x1b[2J\x1b[H❯\xa0" + "a" * 17)   # back on the box's row
+    view._empty_step()
+    check("emptybox: ...its one Backspace brings the caret back, then a "
+          "round maps the rest", out == ["\x7f", "\x7f" * 17] and got == [],
+          (out, got))
+    view.feed("\x1b[2J\x1b[H❯\xa0")
+    view._empty_step()
+    check("emptybox: ...and the empty box calls done", got == ["done"], got)
+    view = TerminalView(rows=3, cols=20)
+    view.feed("❯\xa0" + "word " * 14)  # taller than the screen: the ❯ row
+    out = []                           # is gone, its tail remains
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    check("emptybox: a box whose prompt row scrolled off can't be mapped",
+          view._input_text() != "" and out == [] and got == ["failed"],
+          (view._input_text(), out, got))
+
+    # a wheel over the card mid-clear scrolls Claude's transcript (it asks
+    # for mouse reports) and leaves the box alone: the clear goes on
+    from PySide6.QtCore import QEventLoop, QPoint, QTimer
+    from PySide6.QtGui import QWheelEvent
+    from app.widgets import terminal_view as tv
+    view = TerminalView(rows=6, cols=80)
+    view.feed("\x1b[?1000h\x1b[?1006h❯\xa0old draft")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    view.wheelEvent(QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(0, 0),
+                                QPoint(0, 120), Qt.MouseButton.NoButton,
+                                Qt.KeyboardModifier.NoModifier,
+                                Qt.ScrollPhase.NoScrollPhase, False))
+    check("emptybox: a wheel report goes out and leaves the clear running",
+          len(out) == 2 and out[-1].startswith("\x1b[<64;")
+          and view.is_emptying() and got == [], (out, got))
+    view.feed("\x1b[2J\x1b[H❯\xa0")
+    view._empty_step()
+    check("emptybox: ...and the box drawn empty still calls done",
+          got == ["done"], got)
+    # Ctrl+Z brings the erased draft back, as after any other erase
+    check("emptybox: the erased draft is on the undo stack",
+          view._undo_stack[-1:] == ["old draft"] and view._undo_last == "",
+          (view._undo_stack[-1:], view._undo_last))
+
+    # steady output keeps the settle timer from firing: the deadline has
+    # a timer of its own
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+    saved = tv.EMPTY_TIMEOUT_MS
+    tv.EMPTY_TIMEOUT_MS = 250
+    try:
+        view = TerminalView(rows=6, cols=80)
+        view.feed("❯\xa0old draft")
+        started, got = emptying(view)
+        for _ in range(8):              # a spinner redrawing every 60 ms
+            view.feed("\x1b[s\x1b[6;1H*\x1b[u")
+            pump(60)
+    finally:
+        tv.EMPTY_TIMEOUT_MS = saved
+    check("emptybox: output that never goes quiet still hits the deadline",
+          got == ["failed"] and not view.is_emptying(), got)
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0old draft")
+    started, got = emptying(view)
+    view.reset()
+    check("emptybox: a restart ends it as restarted",
+          got == ["failed:restarted"] and not view.is_emptying(), got)
+
     # --- approximate undo / redo --------------------------------------------
     view = TerminalView(rows=6, cols=80)
     view.feed("> ")                     # empty prompt
