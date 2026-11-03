@@ -5006,6 +5006,9 @@ def test_ship_lanes_from_integrator_chip():
         check("ship: the request is audited",
               any(ln.startswith("LANE-SHIP") and a.spec.lane["branch"] in ln
                   for ln in audit), audit)
+        check("ship: an empty input box is not cleared first",
+              not any(ln.startswith("LANE-SHIP-CLEAR") for ln in audit),
+              audit)
         delivered.clear()
 
         # the confirm dialog runs its own event loop: what changed while it
@@ -5036,6 +5039,134 @@ def test_ship_lanes_from_integrator_chip():
         delivered.clear()
         win._ship_lanes(ws.id, a)
         check("ship: a non-integrator cannot ship", delivered == [])
+
+        # text left in the integrator's input box is replaced, not typed
+        # beside: the card Backspaces it away, and the request goes in once
+        # Claude has drawn the box empty
+        from PySide6.QtCore import QEventLoop, QTimer
+        from app.widgets import terminal_view as tv
+
+        def pump(ms):
+            loop = QEventLoop()
+            QTimer.singleShot(ms, loop.quit)
+            loop.exec()
+        settle = tv.EMPTY_SETTLE_MS + 150
+        # the lane service's own polls would put the real, unflagged lanes
+        # back while this part runs the event loop
+        win.lane_service.blockSignals(True)
+        win._on_lanes_changed(ws.id, dict(views))
+        win._confirm_ship = lambda agent, done: True
+        term = card.terminal
+        keyed = []
+        term.keyInput.connect(keyed.append)
+        term.feed("\x1b[2J\x1b[H❯\xa0half a thought")
+        win._ship_lanes(ws.id, i)
+        check("ship: a leftover draft is Backspaced away first",
+              keyed == ["\x7f" * len("half a thought")], keyed)
+        check("ship: ...and the request waits for the box to be drawn empty",
+              delivered == [] and audit
+              and audit[-1].startswith("LANE-SHIP-CLEAR"),
+              (delivered, audit[-1:]))
+        act = ship_action(i)
+        check("ship: a second ship waits while the box is being cleared",
+              not act.isEnabled() and "being cleared" in act.toolTip(),
+              act.toolTip())
+        pump(settle)
+        check("ship: ...the box not redrawn yet, nothing more goes out",
+              delivered == [] and len(keyed) == 1, (delivered, keyed))
+        term.feed("\r\x1b[2K❯\xa0")         # Claude draws the emptied box
+        pump(settle)
+        check("ship: the box drawn empty, the request goes in once",
+              len(delivered) == 1 and len(keyed) == 1
+              and audit[-1].startswith("LANE-SHIP "), (delivered, audit[-1:]))
+
+        # Claude windows a tall draft: Backspacing what is painted brings
+        # the rows above it into view, and they get a round of their own
+        delivered.clear()
+        keyed.clear()
+        term.feed("\x1b[2J\x1b[H❯\xa0the painted tail")
+        win._ship_lanes(ws.id, i)
+        term.feed("\x1b[2J\x1b[H❯\xa0the start")     # the rows above it
+        pump(settle)
+        check("ship: a windowed draft gets a round per window",
+              keyed == ["\x7f" * len("the painted tail"),
+                        "\x7f" * len("the start")] and delivered == [],
+              (keyed, delivered))
+        term.feed("\r\x1b[2K❯\xa0")
+        pump(settle)
+        check("ship: ...then the request", len(delivered) == 1, delivered)
+
+        # a caret parked at the box start walks right before Backspacing
+        delivered.clear()
+        keyed.clear()
+        term.feed("\x1b[2J\x1b[H❯\xa0half a thought\x1b[1;3H")
+        win._ship_lanes(ws.id, i)
+        check("ship: a caret at the box start walks right, then Backspaces",
+              keyed == ["\x1b[C" * 14, "\x7f" * 14], keyed)
+        term.reset()                    # the child restarts meanwhile
+        check("ship: a restart mid-clear drops the request and says why",
+              delivered == [] and "could not clear" in told[-1]
+              and not term.is_emptying(), (delivered, told[-1:]))
+        term.feed("\x1b[2J\x1b[H❯\xa0half a thought")
+        win._ship_lanes(ws.id, i)
+        term._send("y")                 # the user types meanwhile
+        term.feed("\x1b[2J\x1b[H❯\xa0y")
+        pump(settle)
+        check("ship: typing into the box mid-clear keeps what was typed, "
+              "and says why nothing shipped",
+              delivered == [] and keyed[-1] == "y"
+              and "You typed into" in told[-1], (delivered, told[-1:]))
+
+        keyed.clear()
+        told.clear()
+        term.feed("❯\xa0half a thought")
+        term._held_keys = []            # a clear of the user's still landing
+        win._ship_lanes(ws.id, i)
+        term._held_keys = None
+        check("ship: a box that can't be emptied gets nothing, and says why",
+              delivered == [] and keyed == [] and told
+              and "could not clear" in told[-1], (delivered, told))
+        saved = tv.EMPTY_TIMEOUT_MS
+        tv.EMPTY_TIMEOUT_MS = 300
+        try:
+            told.clear()
+            win._ship_lanes(ws.id, i)
+            pump(600)                   # Claude never redraws the box
+        finally:
+            tv.EMPTY_TIMEOUT_MS = saved
+        check("ship: a box that never empties gives up, unsent",
+              delivered == [] and told and "could not clear" in told[-1]
+              and not term.is_emptying(), (delivered, told))
+        # the real dialog says the draft goes, caret at the box start too,
+        # and its Cancel keeps it
+        from PySide6.QtWidgets import QMessageBox
+        shown = []
+        real_exec = QMessageBox.exec
+        QMessageBox.exec = lambda box: (shown.append(box.text()),
+                                        QMessageBox.StandardButton.Cancel)[1]
+        del win._confirm_ship           # back to the real one
+        keyed.clear()
+        try:
+            term.feed("\x1b[2J\x1b[H❯\xa0kept draft\x1b[1;3H")
+            win._ship_lanes(ws.id, i)
+            term.feed("\x1b[2J\x1b[H❯\xa0")
+            win._ship_lanes(ws.id, i)
+        finally:
+            QMessageBox.exec = real_exec
+            win._confirm_ship = lambda agent, done: True
+        check("ship: the dialog warns about text behind a caret at the box "
+              "start", len(shown) == 2
+              and "replaces the unsent text" in shown[0], shown)
+        check("ship: ...but not for an empty box",
+              "replaces the unsent text" not in shown[1], shown[1:])
+        check("ship: ...and Cancel keeps the draft",
+              keyed == [] and delivered == [], (keyed, delivered))
+        keyed.clear()
+        term.feed("\x1b[2J\x1b[H❯\xa0Try \"edit <filepath> to...\"\x1b[1;3H")
+        win._ship_lanes(ws.id, i)
+        check("ship: Claude's hint in an empty box is not cleared",
+              len(delivered) == 1 and keyed == [], (delivered, keyed))
+        win.lane_service.blockSignals(False)
         for agent in list(ws.agents):
             win._close_agent(ws.id, agent.id)
         win.lane_ops.drain(60)

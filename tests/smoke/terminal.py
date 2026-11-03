@@ -1496,6 +1496,95 @@ def test_terminal_input_editor():
           view._delete_selection() is False)
     check("multidel: off-input-box delete sends nothing", out == [], out)
 
+    # empty_input_then (Ship finished lanes): the same Backspaces over the
+    # whole box, then a callback once the box reads empty
+    def emptying(view, ready=lambda: True):
+        got = []
+        started = view.empty_input_then(
+            lambda: got.append("done"),
+            lambda why: got.append("failed:" + why if why else "failed"),
+            ready)
+        return started, got
+
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0line one\r\n  line two\x1b[1;5H")   # caret inside row 0
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    check("emptybox: a two-row box: Down, Rights to its end, Backspaces",
+          started and out == ["\x1b[B", "\x1b[C" * 6, "\x7f" * 17]
+          and got == [] and view.is_emptying(), (out, got))
+    check("emptybox: one emptying at a time",
+          emptying(view)[0] is False and len(out) == 3, out)
+    view.feed("\x1b[2J\x1b[H❯\xa0")
+    view._empty_step()                  # the settle timer's look
+    check("emptybox: the box read empty calls done",
+          got == ["done"] and not view.is_emptying(), got)
+
+    # a key of the user's while the box is being cleared ends the clear:
+    # the next round would Backspace what they typed after asking for it
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0old draft")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    view._send("\x1b[I")                # a focus report is no typing
+    check("emptybox: a focus report leaves the clear running",
+          view.is_emptying() and got == [], got)
+    press(view, K.Key_X, text="x")
+    check("emptybox: a typed key ends it, and the key still goes out",
+          got == ["failed:typed"] and not view.is_emptying()
+          and out[-1] == "x", (got, out))
+    view.feed("\x1b[2J\x1b[H❯\xa0x")
+    view._empty_step()
+    check("emptybox: ...and no later round erases it",
+          out[-1] == "x" and got == ["failed:typed"], (out, got))
+
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0draft")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view, ready=lambda: False)
+    check("emptybox: a child that can't take keys gets none",
+          out == [] and got == ["failed"], (out, got))
+    view.set_waiting_probe(lambda: True)
+    started, got = emptying(view)
+    check("emptybox: an open menu over the box can't be mapped",
+          out == [] and got == ["failed"], (out, got))
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    check("emptybox: an empty box calls done at once, sending nothing",
+          out == [] and got == ["done"] and not view.is_emptying(), (out, got))
+    # text filling the box's last row to the edge leaves Claude's caret
+    # alone on the blank row below, where _input_text reads nothing
+    view = TerminalView(rows=6, cols=20)
+    view.feed("❯\xa0" + "a" * 18 + "\r\n")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    check("emptybox: a caret parked under a full row is no empty box",
+          view._input_text() == "" and got == [] and out == ["\x7f"],
+          (out, got))
+    view.feed("\x1b[2J\x1b[H❯\xa0" + "a" * 17)   # back on the box's row
+    view._empty_step()
+    check("emptybox: ...its one Backspace brings the caret back, then a "
+          "round maps the rest", out == ["\x7f", "\x7f" * 17] and got == [],
+          (out, got))
+    view.feed("\x1b[2J\x1b[H❯\xa0")
+    view._empty_step()
+    check("emptybox: ...and the empty box calls done", got == ["done"], got)
+    view = TerminalView(rows=3, cols=20)
+    view.feed("❯\xa0" + "word " * 14)  # taller than the screen: the ❯ row
+    out = []                           # is gone, its tail remains
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    check("emptybox: a box whose prompt row scrolled off can't be mapped",
+          view._input_text() != "" and out == [] and got == ["failed"],
+          (view._input_text(), out, got))
+
     # --- approximate undo / redo --------------------------------------------
     view = TerminalView(rows=6, cols=80)
     view.feed("> ")                     # empty prompt

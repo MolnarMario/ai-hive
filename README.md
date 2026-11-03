@@ -604,7 +604,8 @@ workspaces keep executing — switching never pauses anything.
   merging) and pick **Ship finished
   lanes**. That asks you to confirm the list, then types the request into
   the integrator, resuming its conversation first if it is asleep to free
-  memory. The dialog's "Don't ask again" skips the question from
+  memory. Unsent text left in the integrator's input box is cleared first,
+  so the request goes in alone. The dialog's "Don't ask again" skips the question from
   then on; ⚙ Options > Agents > **Confirm Ship finished lanes** brings it
   back. It gathers the lanes you name, or every lane with an unmerged `Task done`
   commit, into one `integrate/` branch. If the base branch has
