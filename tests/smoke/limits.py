@@ -1732,7 +1732,8 @@ def test_limit_recovery_reliability():
     from PySide6.QtWidgets import QApplication
     from app.process_worker import AgentKind, build_spec
     from app.session_store import SessionStore
-    from app.terminal_agent import (REPAINT_RESTORE_MS, AgentStatus,
+    from app.terminal_agent import (REPAINT_DONE, REPAINT_QUIET_MS,
+                                    REPAINT_RESTORE_MS, AgentStatus,
                                     TerminalAgent)
     from app.widgets.main_window import LIMIT_REPAINT_AFTER_WAITS
     from main import create_main_window
@@ -1829,12 +1830,81 @@ def test_limit_recovery_reliability():
     resizes: list = []
     f.worker.rows, f.worker.cols = 30, 100
     f.worker.is_running = lambda: True
-    f.worker.resize = lambda r, c: resizes.append((r, c))
+
+    def took(r, c, w=f.worker):
+        resizes.append((r, c))
+        w.rows, w.cols = r, c
+        return True
+    f.worker.resize = took
     check("repaint: accepted for a live pty agent", f.request_repaint())
-    check("repaint: narrows first", resizes == [(30, 99)])
+    # a row, never a column: one column narrower re-wraps Claude's rows and
+    # its redraw pushes copies into the scrollback (request_repaint)
+    check("repaint: takes a row first", resizes == [(29, 100)], resizes)
     pump(REPAINT_RESTORE_MS + 120)
-    check("repaint: and gives the width straight back",
-          resizes == [(30, 99), (30, 100)])
+    check("repaint: and gives the row straight back",
+          resizes == [(29, 100), (30, 100)], resizes)
+    check("repaint: (fixture) no marker before the redraw settles",
+          REPAINT_DONE not in f.pty_replay())
+    f._on_pty_output("pty", "\x1b[?25l\x1b[Hredrawn\x1b[?25h")
+    pump(REPAINT_QUIET_MS + 150)
+    check("repaint: once it settles, REPAINT_DONE follows the redraw",
+          f.pty_replay().endswith("redrawn\x1b[?25h" + REPAINT_DONE),
+          f.pty_replay()[-60:])
+    # The view asks once per stranded box (_check_input_gap), so a request
+    # refused while another was in flight was never retried and the box
+    # stayed stranded. It is queued instead, and runs once that redraw is in.
+    check("repaint: ...and the next one is allowed", f.request_repaint())
+    n = len(resizes)
+    check("repaint: one asked while another is in flight is queued",
+          f.request_repaint() and len(resizes) == n, resizes[-3:])
+    pump(REPAINT_RESTORE_MS + 60)
+    f._end_repaint()                   # the quiet timer, without the wait
+    check("repaint: the queued one starts once the first redraw is in",
+          f.pty_replay().count(REPAINT_DONE) == 2
+          and resizes[n:] == [(30, 100), (29, 100)], resizes[n - 1:])
+    pump(REPAINT_RESTORE_MS + 60)
+    f._end_repaint()
+    check("repaint: ...and runs once, not again",
+          f.pty_replay().count(REPAINT_DONE) == 3
+          and resizes[n:] == [(30, 100), (29, 100), (30, 100)]
+          and not f._repaint_again, resizes[n - 1:])
+    check("repaint: (fixture) a fourth starts", f.request_repaint())
+    f.resize(30, 100)                  # the view sized the child meanwhile
+    pump(REPAINT_RESTORE_MS + REPAINT_QUIET_MS + 150)
+    check("repaint: a size the view gave meanwhile stands, with no marker",
+          resizes[-1] == (30, 100)
+          and f.pty_replay().count(REPAINT_DONE) == 3, resizes)
+    # a view that shrank by exactly the row taken leaves the child at the
+    # size request_repaint gave it, so the worker's size alone can't tell
+    check("repaint: (fixture) another starts", f.request_repaint())
+    f.resize(29, 100)
+    pump(REPAINT_RESTORE_MS + REPAINT_QUIET_MS + 150)
+    check("repaint: a view one row shorter meanwhile keeps the child there",
+          resizes[-1] == (29, 100) and f.worker.rows == 29
+          and f.pty_replay().count(REPAINT_DONE) == 3, resizes[-3:])
+    f.resize(30, 100)
+    # a stop, an exit or a Restart inside the window (_cancel_reflow) still
+    # gives the row back: the next child spawns at the worker's size
+    check("repaint: (fixture) one starts before a stop",
+          f.request_repaint() and f.worker.rows == 29)
+    f._cancel_reflow()
+    check("repaint: a stop inside the window gives the row back",
+          f.worker.rows == 30 and resizes[-1] == (30, 100), resizes[-3:])
+    pump(REPAINT_RESTORE_MS + REPAINT_QUIET_MS + 150)
+    check("repaint: ...once, with no marker",
+          resizes[-1] == (30, 100) and resizes[-2] == (29, 100)
+          and f.pty_replay().count(REPAINT_DONE) == 3, resizes[-3:])
+    # a reflow that starts meanwhile owns the child's size and replaces the
+    # scrollback the marker would have tidied
+    f._reflow_timer.stop()
+    f._reflow_due = False
+    check("repaint: (fixture) the next one starts", f.request_repaint())
+    f._begin_reflow()
+    pump(REPAINT_RESTORE_MS + REPAINT_QUIET_MS + 150)
+    check("repaint: a reflow that starts meanwhile cancels it, no marker",
+          f._reflow_step == "tall" and resizes[-1][0] > 30
+          and f.pty_replay().count(REPAINT_DONE) == 3, resizes[-3:])
+    f._cancel_reflow()
 
     # --- 5. the banner under Claude's own tool-result gutter ----------------
     # A 429 that lands while a tool is still running is painted as a TOOL-RESULT

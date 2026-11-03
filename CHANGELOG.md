@@ -8,6 +8,18 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.56.5
+
+- A Claude reply no longer shows up two or three times over in a card.
+  AI Hive's repaint used to shrink the card by one column, and Claude's
+  redraw at the narrower width pushed a copy of the top row into the
+  scrollback each time. The repaint now shrinks it by a row instead.
+- Closing Claude's '/' or '@' menu no longer leaves about 15 repeated rows
+  above the prompt.
+- If doubled rows still reach a card, AI Hive writes a RENDER-DUP line to
+  session.log and saves the raw terminal output under render_dumps, so
+  the next report comes with something to replay.
+
 ## 0.56.4
 
 - Ctrl+Z and Ctrl+Y in a card's input box restore the earlier text even

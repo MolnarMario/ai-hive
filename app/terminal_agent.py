@@ -224,10 +224,24 @@ BG_SHELL_WARMUP_S = 6.0
 # late children.
 BG_SHELL_SETTLE_S = 10.0
 
-# How long `request_repaint` holds the child one column narrower before giving
-# the width back. Long enough that ConPTY delivers two distinct size changes
+# How long `request_repaint` holds the child one row shorter before giving
+# the row back. Long enough that ConPTY delivers two distinct size changes
 # rather than coalescing them into nothing, short enough that no one sees it.
 REPAINT_RESTORE_MS = 120
+# Claude's redraw for that row has arrived once the child is this quiet after
+# the row came back (it lands within ~100 ms, measured on claude 2.1.316).
+# Then REPAINT_DONE goes into the stream. ms.
+REPAINT_QUIET_MS = 300
+# ...and a child that never goes quiet gets the marker after this long. ms.
+REPAINT_MAX_MS = 2000
+# At most one RENDER-DUP line and dump per agent this often
+# (see note_render_dup). Seconds.
+RENDER_DUP_REPORT_S = 600.0
+# Written into the agent's own pty stream once a `request_repaint` redraw is
+# in, like the REFLOW markers. The view takes the rows the redraw brought
+# back onto the screen out of the scrollback there
+# (TerminalView._pull_back_redrawn).
+REPAINT_DONE = "\x1b]7766;aihive-repaint-done\x07"
 
 # How long after a launch a Gemini agent's output can still be its previous
 # conversation being redrawn (`agy --continue`). A quota message inside this
@@ -712,8 +726,13 @@ class TerminalAgent(QObject):
         self._limit_last_clock = ""
         self._limit_last_reset = 0.0
         # optional hook (set by WorkspaceManager._wire_agent): a line into
-        # session.log. Only used by _note_limit_skip; None is a no-op.
+        # session.log. None is a no-op.
         self.audit = None
+        # optional hook (set by WorkspaceManager._wire_agent): save a render
+        # dump, callable(agent, payload) -> path or "" (see note_render_dup).
+        # None is a no-op.
+        self.render_dump = None
+        self._render_dup_at = 0.0
         # last (reason, banner) reported by _note_limit_skip, so a rejection
         # that persists across hundreds of repaints is recorded ONCE
         self._limit_last_skip = None
@@ -792,6 +811,26 @@ class TerminalAgent(QObject):
         self._reflow_cap.setSingleShot(True)
         self._reflow_cap.setInterval(REFLOW_MAX_MS)
         self._reflow_cap.timeout.connect(self._end_reflow)
+        # `request_repaint`: the size the child gets back while it is one row
+        # short and the view's size when it asked, then True while its redraw
+        # settles (see REPAINT_DONE), and whether another was asked for
+        # meanwhile
+        self._repaint_size = None
+        self._repaint_view = None
+        self._repaint_settling = False
+        self._repaint_again = False
+        self._repaint_restore = QTimer(self)
+        self._repaint_restore.setSingleShot(True)
+        self._repaint_restore.setInterval(REPAINT_RESTORE_MS)
+        self._repaint_restore.timeout.connect(self._restore_after_repaint)
+        self._repaint_quiet = QTimer(self)
+        self._repaint_quiet.setSingleShot(True)
+        self._repaint_quiet.setInterval(REPAINT_QUIET_MS)
+        self._repaint_quiet.timeout.connect(self._end_repaint)
+        self._repaint_cap = QTimer(self)
+        self._repaint_cap.setSingleShot(True)
+        self._repaint_cap.setInterval(REPAINT_MAX_MS)
+        self._repaint_cap.timeout.connect(self._end_repaint)
         if self.is_pty:
             self.worker = PtyWorker(spec, parent=self)
             self.worker.output.connect(self._on_pty_output)
@@ -1254,6 +1293,9 @@ class TerminalAgent(QObject):
         self._reflow_due = False
         if tall <= rows:
             return
+        # the reprint replaces the scrollback a repaint would have tidied,
+        # and _end_reflow gives the child the card's rows back
+        self._cancel_repaint()
         self._reflow_step = "tall"
         if not self._resize_child(tall, cols):
             self._reflow_step = ""
@@ -1326,6 +1368,7 @@ class TerminalAgent(QObject):
         self._reflow_timer.stop()
         self._reflow_quiet.stop()
         self._reflow_cap.stop()
+        self._cancel_repaint(give_back=True)
         if held and child_lives:
             self._read_pty(held)
 
@@ -1405,7 +1448,7 @@ class TerminalAgent(QObject):
 
         A size change is the only portable way to make a full-screen TUI repaint
         on demand, and it is what an ordinary terminal emitter does whenever its
-        window is dragged. Sending one column narrower and back is a no-op for
+        window is dragged. Sending one row shorter and back is a no-op for
         the user (the card re-sends its true size on the next `sizeChanged`
         anyway) but forces a fresh frame.
 
@@ -1415,26 +1458,149 @@ class TerminalAgent(QObject):
         called, and nothing asks the child to redraw. If that child's prompt
         footer was missed on the way past (see `_on_idle_timeout`), the agent
         looks un-nudgeable until the user clicks the workspace — which is not a
-        recovery mechanism.
+        recovery mechanism. The card also asks for one when a dropdown left
+        Claude's input box stranded (TerminalView._check_input_gap).
+
+        The ROW, never a column. Claude answers any resize by clearing its
+        screen from the home position and drawing it again at the new size.
+        One column narrower, every row that reached the last column wraps onto
+        one more, the redraw overflows the card's height, and each extra row
+        pushes a copy of the screen's top row into the scrollback. Giving the
+        column back draws the screen again, so the copies stay: one per
+        repaint, which is how a reply's row showed up three times over in a
+        card (measured on claude 2.1.316 at 30 and 36 rows). One row shorter
+        wraps nothing and pushes nothing.
+
+        Claude's redraw also brings back onto the screen the rows a dropdown
+        had scrolled into the scrollback, so those were on screen and in the
+        scrollback both. Once the redraw is in, REPAINT_DONE goes into the
+        stream and the view takes them back out (_end_repaint).
+
+        A request while one is still in flight is queued, not refused: it runs
+        once that redraw is in. The view asks once per stranded box
+        (TerminalView._check_input_gap), so a refusal there was never retried
+        and the box stayed stranded.
 
         Deliberately a request and not a policy: the caller decides when an
         agent has waited long enough to be worth poking.
         """
-        if (not self.is_pty or not self.worker.is_running()
-                or self._reflow_step):
+        if not self.is_pty or not self.worker.is_running() or self._reflow_step:
             return False
+        if self._repaint_size is not None or self._repaint_settling:
+            self._repaint_again = True
+            return True
         rows, cols = self.worker.rows, self.worker.cols
-        if cols <= 10:      # already at PtyWorker's floor; nothing to give back
+        if rows <= 2:       # already at PtyWorker's floor; nothing to give back
             return False
-        self._resize_child(rows, cols - 1)
-        # a reflow that started meanwhile owns the child's size until it ends
-        QTimer.singleShot(REPAINT_RESTORE_MS,
-                          lambda: self._reflow_step
-                          or self._resize_child(rows, cols))
+        if not self._resize_child(rows - 1, cols):
+            return False
+        self._repaint_size = (rows, cols)
+        self._repaint_view = self._view_size
+        self._repaint_restore.start()
         return True
+
+    def _repaint_owes_row(self, size) -> bool:
+        """The child is still one row short of `size` and the view asked for
+        no size since `request_repaint` took the row. A view that shrank by
+        exactly that row leaves the child at the same size, so the worker's
+        size alone can't tell."""
+        rows, cols = size
+        return ((self.worker.rows, self.worker.cols) == (rows - 1, cols)
+                and self._view_size == self._repaint_view)
+
+    def _restore_after_repaint(self) -> None:
+        """Give the child back the row `request_repaint` took, then wait for
+        its redraw to settle (REPAINT_DONE)."""
+        size, self._repaint_size = self._repaint_size, None
+        # a reflow started meanwhile or the view resized the child: either
+        # one owns its size and redraws it, a queued request included
+        if (size is None or self._reflow_step
+                or not self._repaint_owes_row(size)
+                or not self._resize_child(*size)):
+            self._repaint_again = False
+            return
+        self._repaint_settling = True
+        self._repaint_quiet.start()
+        self._repaint_cap.start()
+
+    def _end_repaint(self) -> None:
+        """The redraw after the row came back is in: mark it in the stream so
+        the live view and every replay pull back the same rows, then run a
+        request that came in meanwhile."""
+        if not self._repaint_settling:
+            return
+        self._repaint_settling = False
+        self._repaint_quiet.stop()
+        self._repaint_cap.stop()
+        again, self._repaint_again = self._repaint_again, False
+        if self._reflow_step or self._alt_screen:
+            return
+        flush = getattr(self.worker, "flush", None)
+        if flush is not None:
+            flush()     # redraw bytes still batched belong before the marker
+        self._append_stream(REPAINT_DONE)
+        if again:
+            self.request_repaint()
+
+    def _cancel_repaint(self, give_back: bool = False) -> None:
+        """Forget a repaint in flight: a new child, or a reflow taking over
+        the child's size and the scrollback. `give_back` returns the row the
+        child is still short of. The next spawn takes the worker's size, so
+        without it a Restart inside REPAINT_RESTORE_MS started Claude one row
+        shorter than its card. A reflow passes False, since it resizes the
+        child itself."""
+        size, self._repaint_size = self._repaint_size, None
+        self._repaint_settling = False
+        self._repaint_again = False
+        self._repaint_restore.stop()
+        self._repaint_quiet.stop()
+        self._repaint_cap.stop()
+        if (give_back and size is not None and not self._disposing
+                and self._repaint_owes_row(size)):
+            self._resize_child(*size)
 
     def pty_replay(self) -> str:
         return "".join(self._pty_buffer)
+
+    def note_render_dup(self, info: dict) -> None:
+        """The card's view saw doubled rows reach the scrollback
+        (TerminalView._scan_for_copies): one RENDER-DUP line in session.log,
+        naming the Claude version, and a dump of the stream with the sizes it
+        was drawn at (app/render_dump.py). At most once per
+        RENDER_DUP_REPORT_S, since a stream that doubles rows tends to keep
+        doing it, and one dump holds the bytes."""
+        now = time.time()
+        if self._render_dup_at and now - self._render_dup_at < RENDER_DUP_REPORT_S:
+            return
+        self._render_dup_at = now
+        version = (transcripts.latest_cli_version(self.spec.cwd,
+                                                  self.spec.session_id)
+                   if self.spec.provider == "claude" else "") or "?"
+        path = ""
+        if self.render_dump is not None:
+            payload = {
+                "agent": self.spec.name,
+                "provider": self.spec.provider,
+                "claude_version": version,
+                "detected": dict(info),
+                "geometry": [[off, g.rows, g.cols]
+                             for off, g in self.replay_geometry()],
+                "stream": self.pty_replay(),
+            }
+            try:
+                path = self.render_dump(self, payload) or ""
+            except Exception:
+                path = ""
+        if self.audit is not None:
+            try:
+                self.audit(
+                    f"RENDER-DUP agent={self.spec.name} claude={version} "
+                    f"size={info.get('rows')}x{info.get('cols')} "
+                    f"period={info.get('period')} run={info.get('run')} "
+                    f"text={str(info.get('text', ''))[:60]!r}"
+                    + (f" dump={path}" if path else ""))
+            except Exception:
+                pass
 
     # ------------------------------------------------- prompt milestones ---
 
@@ -3297,6 +3463,8 @@ class TerminalAgent(QObject):
                 self._append_stream(REFLOW_BEGIN)
         if self._reflow_step == "reprint":
             self._reflow_quiet.start()
+        if self._repaint_settling:
+            self._repaint_quiet.start()
         self._read_pty(text)
 
     def _read_pty(self, text: str) -> None:
