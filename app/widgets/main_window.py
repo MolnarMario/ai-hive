@@ -3451,6 +3451,8 @@ class MainWindow(QMainWindow):
         self.manager.prompt_events_path = self._prompt_events_path
         manager.arm_agent = self._arm_agent_mcp  # arm new agents before they start
         manager.audit = self._store_audit   # so a degraded save leaves a trace
+        # doubled rows in a card's scrollback save their stream next to it
+        manager.render_dump_dir = str(self.store.path.parent)
         self._rearm_agent_configs()  # restored claude agents re-acquire MCP tools
 
         self._build_ui()

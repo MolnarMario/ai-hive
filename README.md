@@ -963,6 +963,13 @@ Hard-won rules, each with a regression test:
   file while the window is still stuck, and a `PERF hang` line names the
   GUI thread's frames. The next launch moves a non-empty `hang.log` to
   `hang.log.1`, so a hang you had to kill AI Hive in keeps its dump.
+- **Doubled rows are reported.** When a row, or a run of rows, lands twice
+  in a row in a Claude terminal's scrollback, AI Hive writes a `RENDER-DUP`
+  line to `session.log` with the Claude version and saves that terminal's
+  raw output, with the sizes it was drawn at, to `render_dumps\` beside the
+  session file. At most one per agent every 10 minutes; the newest five
+  are kept. `tools/render_replay.py` replays one, and
+  `docs/agents/terminal-rendering.md` says what to look for.
 - **Conversations are backed up.** Claude Code keeps each conversation as a
   single file it owns (`~/.claude/projects/...`) — AI Hive snapshots every
   pinned agent's transcript into `%APPDATA%\AIHive\AI Hive\transcripts\` on

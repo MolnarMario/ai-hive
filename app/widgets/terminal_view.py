@@ -218,8 +218,8 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from .. import input_caret, soft_wrap, ui_theme
-from ..terminal_agent import (REFLOW_BEGIN, REFLOW_END, _CLAUDE_READY_HINTS,
-                              _NUM_OPTION_RE)
+from ..terminal_agent import (REFLOW_BEGIN, REFLOW_END, REPAINT_DONE,
+                              _CLAUDE_READY_HINTS, _NUM_OPTION_RE)
 from ..ui_theme import ANSI_16, Palette
 from ..word_starts import word_spans
 
@@ -378,6 +378,11 @@ HISTORY_LINES = 2000
 # copies pushed out. On a full history, a repaint that copied more rows than
 # this keeps its copies.
 EVICTED_KEEP = 512
+# _scan_for_copies: a row counts toward a doubled run when it holds at least
+# this many letters and digits (a prose row, not a rule or a short code line),
+# and a new row is compared with this many screens of rows before it
+DUP_TEXT_CHARS = 24
+DUP_WINDOW_SCREENS = 2
 CELL_PAD_X = 6   # left/right inner padding (real terminals aren't flush)
 CELL_PAD_Y = 4   # top/bottom inner padding
 VIEW_NOTIFY_MS = 50   # coalescing window for viewChanged
@@ -628,10 +633,12 @@ _TRAILING_PARTIAL_RE = re.compile(
 # whole stream into _esc_carry forever and freeze the screen. Mirrors
 # ansi_parser.MAX_CARRY.
 _MAX_ESC_CARRY = 4096
-# TerminalAgent's reflow markers, split out of a chunk so each part of it
-# is fed on its own side of the marker (see _apply_reflow_marker)
+# TerminalAgent's reflow and repaint markers, split out of a chunk so each
+# part of it is fed on its own side of the marker (see _apply_reflow_marker
+# and _pull_back_redrawn). All three share the _REFLOW_TAG prefix.
 _REFLOW_RE = re.compile("(" + re.escape(REFLOW_BEGIN) + "|"
-                        + re.escape(REFLOW_END) + ")")
+                        + re.escape(REFLOW_END) + "|"
+                        + re.escape(REPAINT_DONE) + ")")
 _REFLOW_TAG = REFLOW_BEGIN[:7]
 # ConPTY opens every frame it paints with a visible cursor by hiding it, and
 # closes it by showing the cursor again (see TerminalView._feed_frames)
@@ -772,6 +779,10 @@ class TerminalView(QWidget):
     # is unchanged, so the agent's milestones stay and only move.
     reflowStarted = Signal()
     reflowEnded = Signal()
+    # doubled rows reached a Claude card's scrollback past every take-back
+    # rule: {"period", "run", "text", "rows", "cols"} (see _scan_for_copies).
+    # Forensics only; the card hands it to TerminalAgent.note_render_dup.
+    duplicateRowsSeen = Signal(dict)
     # the user submitted a TYPED prompt: (inferred text, absolute line).
     # Emitted from the bare-Enter branch of keyPressEvent and nowhere else --
     # see _note_prompt_submit for why every other candidate source is wrong.
@@ -899,6 +910,14 @@ class TerminalView(QWidget):
         # between REFLOW_BEGIN and REFLOW_END: the tall reprint is fresh
         # history, not a repaint over it (see _drop_repaint_copies)
         self._reflowing = False
+        # the stream is inside a ConPTY frame (ESC[?25l seen, no ESC[?25h
+        # yet), and _scan_for_copies' place in it: the push count it has
+        # read up to (None: start over), the newest rows' text and the
+        # repeat runs ending at the newest row, keyed by their period
+        self._frame_open = False
+        self._dup_pushed = None
+        self._dup_texts: list[str] = []
+        self._dup_runs: dict = {}
 
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -1022,7 +1041,9 @@ class TerminalView(QWidget):
                     self._focus_reporting = on
         if _REFLOW_TAG in data:
             for i, part in enumerate(_REFLOW_RE.split(data)):
-                if i % 2:
+                if i % 2 and part == REPAINT_DONE:
+                    self._pull_back_redrawn()
+                elif i % 2:
                     self._apply_reflow_marker(part)
                 elif part:
                     self._feed_screen(part)
@@ -1145,6 +1166,93 @@ class TerminalView(QWidget):
             self._frame_ref = None
         self.reflowEnded.emit()
 
+    def _pull_back_redrawn(self) -> int:
+        """At REPAINT_DONE: take out of the scrollback the rows Claude's
+        redraw brought back onto the screen. Returns how many.
+
+        TerminalAgent.request_repaint asks Claude to redraw by giving its
+        pty one row less and then the row back. Claude answers by clearing
+        the screen from the home position and drawing the bottom of its
+        output again. When a dropdown (the / or @ menu) had scrolled the
+        screen to make room and left the input box stranded above blank
+        rows, that redraw pins the box back to the bottom and pulls the rows
+        the dropdown scrolled off down onto the screen. They are still in
+        the scrollback too, so scrolling up showed them twice, and once new
+        output scrolled them off again they stayed doubled. Measured on
+        claude 2.1.316 at 30 rows: the / menu scrolled 14 rows off, and after
+        the redraw the scrollback's last 14 rows equal the screen's first 14.
+
+        So: the longest run of rows ending the scrollback that equals, cell
+        for cell, the same number of rows starting the screen goes, holding
+        at least one row with text. Those rows keep their line ids as screen
+        rows, as at REFLOW_END. A redraw that brought nothing back leaves no
+        such run, so nothing goes. Only a Claude card, on the main screen,
+        outside a reflow: the marker says AI Hive asked for this redraw, and
+        Claude's classic renderer is the one measured."""
+        scr = self.screen
+        top = scr.history.top
+        if (not self._claude_repaints or self._reflowing
+                or scr.mode & _ALT_SCREEN_MODES or not hasattr(top, "pushed")):
+            return 0
+        cols = scr.columns
+        blank = scr.default_char
+        size = len(top)
+        screen_text = [_row_text(scr.buffer.get(y, {}), cols, blank)
+                       for y in range(scr.lines)]
+        hist_text: dict = {}
+
+        def text(i: int) -> str:
+            t = hist_text.get(i)
+            if t is None:
+                t = hist_text[i] = _row_text(top[i], cols, blank)
+            return t
+
+        k = 0
+        for h in range(min(scr.lines - 1, size), 0, -1):
+            first = size - h
+            if text(first) != screen_text[0]:
+                continue
+            if not all(text(first + i) == screen_text[i] for i in range(h)):
+                continue
+            if not any(screen_text[i] for i in range(h)):
+                continue
+            if all(_row_cells(top[first + i], cols, blank)
+                   == _row_cells(scr.buffer.get(i, {}), cols, blank)
+                   for i in range(h)):
+                k = h
+                break
+        if not k:
+            return 0
+        # a full history evicted a row for each of those pushes; the rows it
+        # kept come back in front (_take_back)
+        full = top.maxlen is not None and size == top.maxlen
+        back = min(k, len(getattr(top, "recent_evicted", ()))) if full else 0
+        off_before = self._scroll_offset
+        hist_before = size
+        if not self._take_back(k, k, getattr(top, "evicted", 0) - back):
+            return 0
+        # Row i of history-plus-screen keeps its text: a popped row's twin is
+        # the screen row now standing at its index, and the screen moved up
+        # by k. A scrolled-back view stays on the same text.
+        off = max(0, off_before - k)
+        hist_after = len(top)
+
+        def moved(p):
+            if p is None:
+                return None
+            row, col = p
+            i = hist_before - off_before + row
+            i = i + back if i < hist_before else i - k + back
+            return (i - hist_after + off, col)
+
+        self._sel_anchor = moved(self._sel_anchor)
+        self._sel_end = moved(self._sel_end)
+        self._scroll_offset = off
+        scr.top_jumps = []
+        self._find_cache = {}
+        self._frame_ref = None
+        return k
+
     def _feed_frames(self, data: str) -> int:
         """Feed pyte, then take back the rows a frame pushed into history
         that are copies of rows already there. Returns how many.
@@ -1190,6 +1298,7 @@ class TerminalView(QWidget):
                 dropped += self._drop_repaint_copies()   # the last frame ended
                 part = _FRAME_START + part
                 self._frame_ref = self._screen_ref()
+                self._frame_open = True
                 ref = None                 # same screen as the frame's
             else:
                 ref = self._screen_ref()
@@ -1197,12 +1306,89 @@ class TerminalView(QWidget):
             for piece in pieces[:-1]:
                 self.stream.feed(piece + _FRAME_END)
                 dropped += self._drop_repaint_copies()
+                self._frame_open = False
             if pieces[-1]:
                 self.stream.feed(pieces[-1])
             for r in (ref, self._frame_ref):
                 if r is not None:
                     dropped += self._drop_repeated_push(r)
+        # only between frames: a repaint split across two reads pushes its
+        # copies in the first and has them taken back in the second
+        if self._claude_repaints and not self._frame_open:
+            self._scan_for_copies()
         return dropped
+
+    def _scan_for_copies(self) -> None:
+        """Watch the rows reaching a Claude card's scrollback for doubled
+        text that got past every rule above, and say so
+        (duplicateRowsSeen). Changes nothing on screen or in history.
+
+        Each new row is compared with the rows before it, up to
+        DUP_WINDOW_SCREENS screens back. A doubled block is a run of rows
+        that repeats the run right before it: row i equals row i - d for d
+        rows in a row (one row three times over is d = 1). That is the
+        shape every copy measured so far left: a repaint's copies of the
+        scrollback's end, a narrow redraw's copy of the screen's top row,
+        the rows a redraw pulled back onto the screen once they scrolled
+        off again. A run counts when at least one of its rows holds
+        DUP_TEXT_CHARS letters or digits, two when d > 1. Rules, borders
+        and short code lines repeat legitimately, and so does a todo list
+        Claude prints again further down, which is never right after the
+        last one.
+
+        The card turns a sighting into a RENDER-DUP line in session.log and
+        a dump of the stream (TerminalAgent.note_render_dup), so the next
+        shape Claude Code finds can be replayed from real bytes. See
+        docs/agents/terminal-rendering.md."""
+        scr = self.screen
+        top = scr.history.top
+        pushed = getattr(top, "pushed", None)
+        if (pushed is None or self._reflowing
+                or scr.mode & _ALT_SCREEN_MODES):
+            self._dup_pushed = None
+            return
+        window = max(8, DUP_WINDOW_SCREENS * scr.lines)
+        new = (pushed - self._dup_pushed if self._dup_pushed is not None
+               else -1)
+        self._dup_pushed = pushed
+        if new == 0:
+            return
+        cols = scr.columns
+        blank = scr.default_char
+        size = len(top)
+        if new < 0 or new > window or new > size:
+            # a take-back, a wipe or a burst longer than the window: start
+            # over from what history holds now
+            self._dup_texts = [_row_text(top[i], cols, blank)
+                               for i in range(max(0, size - window), size)]
+            self._dup_runs = {}
+            return
+        texts = self._dup_texts
+        runs = self._dup_runs
+        hit = None
+        for i in range(size - new, size):
+            t = _row_text(top[i], cols, blank)
+            strong = sum(ch.isalnum() for ch in t) >= DUP_TEXT_CHARS
+            n = len(texts)
+            grown = {}
+            for d in range(1, min(n, window) + 1):
+                if texts[n - d] != t:
+                    continue
+                run, heavy = runs.get(d, (0, 0))
+                run, heavy = run + 1, heavy + strong
+                grown[d] = (run, heavy)
+                if (hit is None and run >= d
+                        and heavy >= min(d, 2)):
+                    hit = {"period": d, "run": run, "text": t.strip()[:120]}
+            runs = grown
+            texts.append(t)
+        if len(texts) > window:
+            del texts[:len(texts) - window]
+        self._dup_texts = texts
+        self._dup_runs = runs
+        if hit is not None:
+            hit.update(rows=scr.lines, cols=cols)
+            self.duplicateRowsSeen.emit(hit)
 
     def _drop_repaint_copies(self) -> int:
         """At the end of a ConPTY frame: take back the rows it pushed after
@@ -1395,6 +1581,7 @@ class TerminalView(QWidget):
         self.stream = pyte.Stream(self.screen)
         self._frame_ref = None
         self._reflowing = False
+        self._frame_open = False
         self._esc_carry = ""
         self._input_gap_row = None
         self._sel_anchor = self._sel_end = None
@@ -1676,6 +1863,7 @@ class TerminalView(QWidget):
 
     def _forget_view_history(self) -> None:
         self._frame_ref = None
+        self._dup_pushed = None
         # a selection that reaches into history lost its text with it; one
         # wholly on the live screen keeps it, since the screen stays
         if self._scroll_offset or any(
