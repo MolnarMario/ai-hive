@@ -517,6 +517,7 @@ class _FastHistoryScreen(pyte.HistoryScreen):
 
     def __init__(self, *args, **kwargs) -> None:
         self.top_jumps = []
+        self.history_resets = 0
         super().__init__(*args, **kwargs)
 
     def cursor_up(self, count=None) -> None:
@@ -537,6 +538,9 @@ class _FastHistoryScreen(pyte.HistoryScreen):
     def _reset_history(self) -> None:
         super()._reset_history()
         self.top_jumps = []
+        # ED 3 clears history.top in place and `pushed` carries on, so this
+        # count is how TerminalView._scan_for_copies sees a wipe mid-chunk
+        self.history_resets += 1
 
     def resize(self, lines=None, columns=None) -> None:
         # a jump from before a resize describes another layout
@@ -916,6 +920,7 @@ class TerminalView(QWidget):
         # repeat runs ending at the newest row, keyed by their period
         self._frame_open = False
         self._dup_pushed = None
+        self._dup_resets = 0      # the screen's history_resets it last read
         self._dup_texts: list[str] = []
         self._dup_runs: dict = {}
 
@@ -1184,7 +1189,8 @@ class TerminalView(QWidget):
 
         So: the longest run of rows ending the scrollback that equals, cell
         for cell, the same number of rows starting the screen goes, holding
-        at least one row with text. Those rows keep their line ids as screen
+        at least one row with text and not repeated once more on either side
+        (output that repeats every h rows is real and stays). Those rows keep their line ids as screen
         rows, as at REFLOW_END. A redraw that brought nothing back leaves no
         such run, so nothing goes. Only a Claude card, on the main screen,
         outside a reflow: the marker says AI Hive asked for this redraw, and
@@ -1215,6 +1221,14 @@ class TerminalView(QWidget):
             if not all(text(first + i) == screen_text[i] for i in range(h)):
                 continue
             if not any(screen_text[i] for i in range(h)):
+                continue
+            # output that repeats every h rows matches too, and it is real
+            # (as _drop_repeated_push leaves it): the same run right before
+            # this one in the scrollback, or right after it on the screen
+            if first >= h and all(text(first - h + i) == screen_text[i]
+                                  for i in range(h)):
+                continue
+            if 2 * h <= scr.lines and screen_text[h:2 * h] == screen_text[:h]:
                 continue
             if all(_row_cells(top[first + i], cols, blank)
                    == _row_cells(scr.buffer.get(i, {}), cols, blank)
@@ -1343,6 +1357,12 @@ class TerminalView(QWidget):
         scr = self.screen
         top = scr.history.top
         pushed = getattr(top, "pushed", None)
+        resets = getattr(scr, "history_resets", 0)
+        if resets != self._dup_resets:
+            # an ED 3 in this chunk wiped the rows the new ones would be
+            # held against: _feed_screen sees the wipe only after this runs
+            self._dup_resets = resets
+            self._dup_pushed = None
         if (pushed is None or self._reflowing
                 or scr.mode & _ALT_SCREEN_MODES):
             self._dup_pushed = None

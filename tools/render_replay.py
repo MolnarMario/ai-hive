@@ -69,7 +69,8 @@ def replay(src: dict, raw: bool, show: int) -> int:
     from app.widgets.terminal_view import TerminalView, _row_text
 
     stream = src["stream"]
-    sizes = sorted(src["sizes"])
+    # by offset only: a resize storm keeps its sizes in the order they came
+    sizes = sorted(src["sizes"], key=lambda s: s[0])
     _, rows, cols = sizes[0]
     view = TerminalView(rows=rows, cols=cols, claude_repaints=not raw)
     view.screen.resize(rows, cols)

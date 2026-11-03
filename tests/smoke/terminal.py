@@ -3602,6 +3602,22 @@ def test_requested_redraw_takes_back_rows_it_brought_back():
           hist(v5) == before == output[:first] and screen(v5) == redrawn,
           hist(v5)[-3:])
 
+    # output that repeats where the scrollback meets the screen matches
+    # cell for cell too, and it is real: the marker takes none of it
+    same = "the same long line of real output"
+    rep = ([f"reply paragraph line {i:02d}" for i in range(12)]
+           + [same] * 10 + [">", "-- footer --"])
+    v8 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
+    v8.feed("".join(t + "\r\n" for t in rep))
+    before = hist(v8)
+    check("redraw-back: (fixture) repeated rows straddle the screen's top",
+          before[-3:] == [same] * 3 and screen(v8)[:3] == [same] * 3,
+          (before[-3:], screen(v8)[:3]))
+    v8.feed(_claude_resize_redraw(rep, rows - 1)
+            + _claude_resize_redraw(rep, rows) + REPAINT_DONE)
+    check("redraw-back: rows that repeat across the screen's top stay",
+          hist(v8) == before, hist(v8)[-4:])
+
     # only a Claude card acts on it
     v6 = stranded(TerminalView(rows=rows, cols=cols))
     v6.feed(redraw + REPAINT_DONE)
@@ -3699,6 +3715,15 @@ def test_doubled_scrollback_rows_are_reported():
     check("dup-report: (fixture) the repaint's copies were taken back",
           v.history_pushed() == first, v.history_pushed())
     check("dup-report: copies taken back are not reported", not seen, seen)
+
+    # an ED 3 and the reprint after it in one read: the reprinted rows are
+    # held against the history left after the wipe, not the rows it wiped
+    v, seen = view()
+    v.feed("\x1b[H\x1b[2J\x1b[3J" + "".join(t + "\r\n" for t in output))
+    check("dup-report: (fixture) the reprint refilled the wiped history",
+          len(v.screen.history.top) == first, len(v.screen.history.top))
+    check("dup-report: a reprint after a wipe in the same read is not "
+          "reported", not seen, seen)
 
     v, seen = view(claude=False)
     v.feed(wiggle + wiggle)

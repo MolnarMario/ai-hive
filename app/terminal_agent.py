@@ -812,9 +812,13 @@ class TerminalAgent(QObject):
         self._reflow_cap.setInterval(REFLOW_MAX_MS)
         self._reflow_cap.timeout.connect(self._end_reflow)
         # `request_repaint`: the size the child gets back while it is one row
-        # short, then True while its redraw settles (see REPAINT_DONE)
+        # short and the view's size when it asked, then True while its redraw
+        # settles (see REPAINT_DONE), and whether another was asked for
+        # meanwhile
         self._repaint_size = None
+        self._repaint_view = None
         self._repaint_settling = False
+        self._repaint_again = False
         self._repaint_restore = QTimer(self)
         self._repaint_restore.setSingleShot(True)
         self._repaint_restore.setInterval(REPAINT_RESTORE_MS)
@@ -1364,7 +1368,7 @@ class TerminalAgent(QObject):
         self._reflow_timer.stop()
         self._reflow_quiet.stop()
         self._reflow_cap.stop()
-        self._cancel_repaint()
+        self._cancel_repaint(give_back=True)
         if held and child_lives:
             self._read_pty(held)
 
@@ -1472,32 +1476,48 @@ class TerminalAgent(QObject):
         scrollback both. Once the redraw is in, REPAINT_DONE goes into the
         stream and the view takes them back out (_end_repaint).
 
+        A request while one is still in flight is queued, not refused: it runs
+        once that redraw is in. The view asks once per stranded box
+        (TerminalView._check_input_gap), so a refusal there was never retried
+        and the box stayed stranded.
+
         Deliberately a request and not a policy: the caller decides when an
         agent has waited long enough to be worth poking.
         """
-        if (not self.is_pty or not self.worker.is_running()
-                or self._reflow_step or self._repaint_size is not None
-                or self._repaint_settling):
+        if not self.is_pty or not self.worker.is_running() or self._reflow_step:
             return False
+        if self._repaint_size is not None or self._repaint_settling:
+            self._repaint_again = True
+            return True
         rows, cols = self.worker.rows, self.worker.cols
         if rows <= 2:       # already at PtyWorker's floor; nothing to give back
             return False
         if not self._resize_child(rows - 1, cols):
             return False
         self._repaint_size = (rows, cols)
+        self._repaint_view = self._view_size
         self._repaint_restore.start()
         return True
+
+    def _repaint_owes_row(self, size) -> bool:
+        """The child is still one row short of `size` and the view asked for
+        no size since `request_repaint` took the row. A view that shrank by
+        exactly that row leaves the child at the same size, so the worker's
+        size alone can't tell."""
+        rows, cols = size
+        return ((self.worker.rows, self.worker.cols) == (rows - 1, cols)
+                and self._view_size == self._repaint_view)
 
     def _restore_after_repaint(self) -> None:
         """Give the child back the row `request_repaint` took, then wait for
         its redraw to settle (REPAINT_DONE)."""
         size, self._repaint_size = self._repaint_size, None
-        if size is None or self._reflow_step:
-            return      # a reflow started meanwhile and owns the child's size
-        rows, cols = size
-        if (self.worker.rows, self.worker.cols) != (rows - 1, cols):
-            return      # the view resized the child meanwhile: that size stands
-        if not self._resize_child(rows, cols):
+        # a reflow started meanwhile or the view resized the child: either
+        # one owns its size and redraws it, a queued request included
+        if (size is None or self._reflow_step
+                or not self._repaint_owes_row(size)
+                or not self._resize_child(*size)):
+            self._repaint_again = False
             return
         self._repaint_settling = True
         self._repaint_quiet.start()
@@ -1505,27 +1525,39 @@ class TerminalAgent(QObject):
 
     def _end_repaint(self) -> None:
         """The redraw after the row came back is in: mark it in the stream so
-        the live view and every replay pull back the same rows."""
+        the live view and every replay pull back the same rows, then run a
+        request that came in meanwhile."""
         if not self._repaint_settling:
             return
         self._repaint_settling = False
         self._repaint_quiet.stop()
         self._repaint_cap.stop()
+        again, self._repaint_again = self._repaint_again, False
         if self._reflow_step or self._alt_screen:
             return
         flush = getattr(self.worker, "flush", None)
         if flush is not None:
             flush()     # redraw bytes still batched belong before the marker
         self._append_stream(REPAINT_DONE)
+        if again:
+            self.request_repaint()
 
-    def _cancel_repaint(self) -> None:
+    def _cancel_repaint(self, give_back: bool = False) -> None:
         """Forget a repaint in flight: a new child, or a reflow taking over
-        the child's size and the scrollback."""
-        self._repaint_size = None
+        the child's size and the scrollback. `give_back` returns the row the
+        child is still short of. The next spawn takes the worker's size, so
+        without it a Restart inside REPAINT_RESTORE_MS started Claude one row
+        shorter than its card. A reflow passes False, since it resizes the
+        child itself."""
+        size, self._repaint_size = self._repaint_size, None
         self._repaint_settling = False
+        self._repaint_again = False
         self._repaint_restore.stop()
         self._repaint_quiet.stop()
         self._repaint_cap.stop()
+        if (give_back and size is not None and not self._disposing
+                and self._repaint_owes_row(size)):
+            self._resize_child(*size)
 
     def pty_replay(self) -> str:
         return "".join(self._pty_buffer)
