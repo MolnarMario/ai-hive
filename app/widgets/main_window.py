@@ -5046,8 +5046,8 @@ class MainWindow(QMainWindow):
         if prefill.strip():
             # The text now lives in AI Hive, so leaving a copy in the child's
             # input box would submit it twice the moment the user hits Enter.
-            # Double-Escape is Claude Code's clear-prompt gesture (the same one
-            # TerminalView uses for Backspace over a Ctrl+A highlight), and
+            # Double-Escape is Claude Code's clear-prompt gesture (TerminalView
+            # falls back to it for a box it can't Backspace over), and
             # `write` is right for it: it stamps _last_input_ts, so the pty's
             # echo of the Escapes is not mistaken for the agent working.
             # Under Claude's own limit timer they also cancel it, which is a

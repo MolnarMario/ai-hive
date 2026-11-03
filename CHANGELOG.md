@@ -15,8 +15,9 @@ em dashes: this text is shown in the app.
   Alt key combination, so the '@' never showed up in the prompt.
 - Pasting with Ctrl+V or the right-click menu replaces text you selected
   in the input box, the same way typing over it does.
-- Typing over the whole prompt after Ctrl+A replaces it again. Claude
-  used to ignore both the clear and the key, so the old prompt stayed.
+- After Ctrl+A, typing, pasting or Backspace empties the whole prompt,
+  every line of it, even while Claude's '@' file list is open. Typing
+  used to leave the old prompt in place and drop the key.
 
 ## 0.56.2
 
