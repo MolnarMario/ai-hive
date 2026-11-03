@@ -3479,6 +3479,279 @@ def test_repaint_take_back_edges():
           hist(v) == hist0, hist(v)[-6:])
 
 
+def _claude_resize_redraw(lines, child_rows, width=0):
+    """What claude 2.1.316's classic renderer sends for a resize (captured in
+    a pywinpty pty): hide the cursor, erase rows from the home position down,
+    home again, then the lines that filled the screen, each followed by a
+    line break, the last one parking the cursor on the blank bottom row. It
+    picks those lines by the rows they took before the resize, so at a
+    `width` that wraps one of them onto one more row it writes past the
+    bottom of the screen, and the card scrolls."""
+    shown = lines[-(child_rows - 1):]
+    if width:
+        shown = [t[i:i + width] for t in shown
+                 for i in range(0, max(len(t), 1), width)]
+    return ("\x1b[?25l\x1b[2D\x1b[3B\x1b[H" + "\x1b[2K\x1b[1B" * child_rows
+            + "\x1b[H" + "".join(t + "\r\n" for t in shown) + "\x1b[?25h")
+
+
+def test_requested_redraw_takes_back_rows_it_brought_back():
+    """REPAINT_DONE (TerminalAgent.request_repaint) takes out of the
+    scrollback the rows Claude's redraw pulled back onto the screen.
+
+    The shape is a live capture's (claude 2.1.316 at 30x155): the / menu
+    scrolled 14 rows into the scrollback to make room, closing it left the
+    input box above 15 blank rows, and the redraw that request_repaint asks
+    for pinned the box back to the bottom, which puts those 14 rows on screen
+    while they were still in the scrollback. Scrolling up showed them twice,
+    and once new output scrolled them off they stayed doubled."""
+    from PySide6.QtWidgets import QApplication
+    from app.terminal_agent import REPAINT_DONE
+    from app.widgets import terminal_view as tvm
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    rows, cols = 10, 40
+    output = [f"reply paragraph line {i:02d}" for i in range(20)] + [
+        ">", "-- footer --"]
+    k = 3                                    # rows the dropdown scrolled off
+    first = len(output) - (rows - 1)         # the row the screen starts at
+
+    def rt(line):
+        return "".join(line[x].data for x in range(cols)).rstrip()
+
+    def hist(v):
+        return [rt(r) for r in v.screen.history.top]
+
+    def screen(v):
+        return [rt(v.screen.buffer[y]) for y in range(rows)]
+
+    def stranded(v, before=()):
+        """The conversation, the cursor on the blank row under the footer,
+        then a 3-row dropdown opened there and closed again."""
+        v.feed("".join(t + "\r\n" for t in list(before) + output))
+        v.feed("".join(f"menu item {i}\r\n" for i in range(k)))
+        v.feed("\x1b[1A\x1b[2K" * k)
+        return v
+
+    redraw = (_claude_resize_redraw(output, rows - 1)
+              + _claude_resize_redraw(output, rows))
+    redrawn = output[first:] + [""]
+
+    v = stranded(TerminalView(rows=rows, cols=cols, claude_repaints=True))
+    check("redraw-back: (fixture) the box is stranded above blank rows",
+          screen(v)[rows - k - 1:] == [""] * (k + 1)
+          and screen(v)[rows - k - 2] == "-- footer --", screen(v))
+    check("redraw-back: (fixture) the dropdown pushed its rows",
+          hist(v) == output[:first + k], hist(v)[-4:])
+    v.feed(redraw)
+    check("redraw-back: (fixture) the redraw pins the box back down",
+          screen(v) == redrawn, screen(v))
+    check("redraw-back: (fixture) those rows are on screen and in history",
+          hist(v)[-k:] == screen(v)[:k], hist(v)[-k:])
+    pushed = v.history_pushed()
+    v.feed(REPAINT_DONE)
+    check("redraw-back: REPAINT_DONE takes them out of the scrollback",
+          hist(v) == output[:first] and screen(v) == redrawn, hist(v)[-4:])
+    check("redraw-back: ...and they keep their line ids as screen rows",
+          v.history_pushed() == pushed - k, v.history_pushed())
+    v.feed("".join(f"new output {i}\r\n" for i in range(4)))
+    check("redraw-back: later output scrolls each row off once",
+          hist(v) == output[:first + 4], hist(v)[-6:])
+
+    # the marker in the same feed as the redraw, as a replay meets it
+    v2 = stranded(TerminalView(rows=rows, cols=cols, claude_repaints=True))
+    v2.feed(redraw + REPAINT_DONE)
+    check("redraw-back: a replay in one feed takes back the same rows",
+          hist(v2) == output[:first], hist(v2)[-4:])
+
+    # scrolled back while the marker lands: the view stays on its top row,
+    # and a selection keeps its text
+    v3 = stranded(TerminalView(rows=rows, cols=cols, claude_repaints=True))
+    v3.feed(redraw)
+    v3.scroll_by(6)
+    top_row = v3.visible_text().splitlines()[0]
+    v3._sel_anchor, v3._sel_end = (0, 0), (1, 25)
+    picked = v3.selected_text()
+    v3.feed(REPAINT_DONE)
+    check("redraw-back: a scrolled-back view keeps its top row",
+          v3.scroll_offset() == 6 - k
+          and v3.visible_text().splitlines()[0] == top_row,
+          (v3.scroll_offset(), v3.visible_text().splitlines()[:2]))
+    check("redraw-back: ...and its selection keeps its text",
+          picked and v3.selected_text() == picked,
+          (picked, v3.selected_text()))
+    for sel in (((-6, 0), (-5, 25)), ((4, 0), (5, 25))):
+        v4 = stranded(TerminalView(rows=rows, cols=cols,
+                                   claude_repaints=True))
+        v4.feed(redraw)
+        v4._sel_anchor, v4._sel_end = sel
+        picked = v4.selected_text()
+        v4.feed(REPAINT_DONE)
+        check(f"redraw-back: a live selection at rows {sel[0][0]} to "
+              f"{sel[1][0]} keeps its text",
+              picked and v4.selected_text() == picked,
+              (picked, v4.selected_text()))
+
+    # a redraw that brought nothing back leaves the scrollback alone
+    v5 = TerminalView(rows=rows, cols=cols, claude_repaints=True)
+    v5.feed("".join(t + "\r\n" for t in output))
+    before = hist(v5)
+    v5.feed(redraw + REPAINT_DONE)
+    check("redraw-back: nothing brought back, nothing taken",
+          hist(v5) == before == output[:first] and screen(v5) == redrawn,
+          hist(v5)[-3:])
+
+    # only a Claude card acts on it
+    v6 = stranded(TerminalView(rows=rows, cols=cols))
+    v6.feed(redraw + REPAINT_DONE)
+    check("redraw-back: a view without claude_repaints keeps its rows",
+          hist(v6) == output[:first + k], hist(v6)[-4:])
+
+    # a full history: the rows the dropdown evicted come back in front
+    many = [f"older line {i:04d}" for i in range(tvm.HISTORY_LINES)]
+    v7 = stranded(TerminalView(rows=rows, cols=cols, claude_repaints=True),
+                  before=many)
+    full_before = (many + output[:first])[-tvm.HISTORY_LINES:]
+    v7.feed(redraw + REPAINT_DONE)
+    check("redraw-back: on a full history the evicted rows come back",
+          hist(v7) == full_before, (hist(v7)[:2], hist(v7)[-2:]))
+
+
+def test_doubled_scrollback_rows_are_reported():
+    """A Claude card says when doubled rows reach its scrollback past every
+    take-back rule (TerminalView.duplicateRowsSeen), and the agent turns that
+    into a RENDER-DUP line and a dump of its stream (note_render_dup).
+
+    The positive case is the one a user screenshotted: a reply row three
+    times over, left by request_repaint's old one-column wiggle. Claude
+    redraws one column narrower, a row that reached the last column wraps
+    onto one more, and the redraw's extra row pushes a copy of the screen's
+    top row (claude 2.1.316 at 30 and 36 rows)."""
+    import json
+    import os
+    from PySide6.QtWidgets import QApplication
+    from app import render_dump
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+    from app.widgets.terminal_card import TerminalCard
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    rows, cols = 10, 40
+    para = "The heading block reads as floaty since"     # 39 columns
+    output = ([f"reply line {i:02d} of a prose paragraph" for i in range(20)]
+              + [para, "x" * cols, "", "> ", "-- footer --"])
+    first = len(output) - (rows - 1)         # the row the screen starts at
+
+    def view(claude=True):
+        v = TerminalView(rows=rows, cols=cols, claude_repaints=claude)
+        seen = []
+        v.duplicateRowsSeen.connect(seen.append)
+        v.feed("".join(t + "\r\n" for t in output))
+        return v, seen
+
+    # the old wiggle, twice: the row that reached the last column wraps
+    # onto one more, so each narrow redraw writes one row past the bottom
+    # and pushes a copy of the screen's top row
+    wiggle = (_claude_resize_redraw(output, rows, width=cols - 1)
+              + _claude_resize_redraw(output, rows))
+    v, seen = view()
+    v.feed(wiggle)
+    check("dup-report: (fixture) one narrow redraw pushes one copy",
+          not seen and v.history_pushed() == first + 1, v.history_pushed())
+    v.feed(wiggle)
+    check("dup-report: the second copy is reported as a row repeated",
+          len(seen) == 1 and seen[0]["period"] == 1
+          and seen[0]["text"] == output[first]
+          and (seen[0]["rows"], seen[0]["cols"]) == (rows, cols), seen)
+
+    # a doubled block: three rows printed again right after themselves
+    v, seen = view()
+    block = ["first doubled reply row of prose", "second doubled reply row too",
+             "third doubled reply row as well"]
+    v.feed("\r\n" + "\r\n".join(block + block) + "\r\n" + "\r\n" * rows)
+    check("dup-report: a block repeated right after itself is reported",
+          len(seen) == 1 and seen[0]["period"] == 3, seen)
+
+    # what repeats legitimately stays quiet
+    v, seen = view()
+    todo = ["  [ ] Switch request_repaint to a height wiggle",
+            "  [ ] Pull back the rows a redraw brings back",
+            "  [ ] Report doubled rows with the stream"]
+    v.feed("\r\n" + "\r\n".join(
+        todo + ["", "  Read 3 files (ctrl+o to expand)", ""] + todo
+        + ["─" * 40, "─" * 40, "    }", "    }"] + [""] * rows))
+    check("dup-report: a list printed again further down, rules and short "
+          "lines are not reported", not seen, seen)
+
+    # a repaint's copies the take-back removes, even split across two reads
+    v, seen = view()
+    frame = ("\x1b[?25l\r\x1b[%dA" % (rows - 1)
+             + "".join(t + "\r\n" for t in output[first - 4:]) + "\x1b[?25h")
+    cut = 0
+    for _ in range(rows + 1):
+        cut = frame.index("\r\n", cut) + 2
+    v.feed(frame[:cut])
+    check("dup-report: (fixture) the first read pushed copies",
+          v.history_pushed() > first, v.history_pushed())
+    v.feed(frame[cut:])
+    check("dup-report: (fixture) the repaint's copies were taken back",
+          v.history_pushed() == first, v.history_pushed())
+    check("dup-report: copies taken back are not reported", not seen, seen)
+
+    v, seen = view(claude=False)
+    v.feed(wiggle + wiggle)
+    check("dup-report: only a Claude card watches", not seen, seen)
+
+    # the agent's side: one audit line naming the version, one dump
+    tmp = tempfile.mkdtemp(prefix="ai-hive-dup-")
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Doubled",
+                                     cwd=SCRATCH_CWD, pty=True))
+    lines, dumps = [], []
+    agent.audit = lines.append
+    agent.render_dump = lambda a, payload: (
+        dumps.append(payload),
+        render_dump.save(tmp, a.spec.name, payload))[1]
+    agent._buffer_pty("\x1b[?25lsome stream\x1b[?25h")
+    info = {"period": 1, "run": 2, "text": para, "rows": rows, "cols": cols}
+    agent.note_render_dup(info)
+    agent.note_render_dup(info)
+    check("dup-report: one RENDER-DUP line with the size and the row",
+          len(lines) == 1 and lines[0].startswith("RENDER-DUP agent=Doubled ")
+          and "size=10x40" in lines[0] and "period=1" in lines[0]
+          and "dump=" in lines[0], lines)
+    saved = [n for n in os.listdir(os.path.join(tmp, render_dump.DIR_NAME))]
+    check("dup-report: ...and one dump holding the stream",
+          len(dumps) == 1 and len(saved) == 1
+          and render_dump.load(os.path.join(tmp, render_dump.DIR_NAME,
+                                            saved[0]))["stream"]
+          == agent.pty_replay(), saved)
+    folder = os.path.join(tmp, render_dump.DIR_NAME)
+    for i in range(render_dump.KEEP + 3):
+        p = os.path.join(folder, f"old-{i}.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump({}, fh)
+        os.utime(p, (1000 + i, 1000 + i))
+    render_dump.prune(folder)
+    check("dup-report: the dump folder keeps only the newest",
+          len(os.listdir(folder)) == render_dump.KEEP, os.listdir(folder))
+
+    # the card hands live sightings on, not a projection's
+    got = []
+    agent.note_render_dup = got.append
+    card = TerminalCard(agent)
+    card.terminal.duplicateRowsSeen.emit(dict(info))
+    card._reprojecting = True
+    card.terminal.duplicateRowsSeen.emit(dict(info))
+    card._reprojecting = False
+    check("dup-report: the card passes a live sighting to its agent, not a "
+          "replayed one", len(got) == 1, got)
+    card.detach()
+    card.close()
+    agent.deleteLater()
+
+
 def test_cancelled_reflow_still_ends_in_the_stream():
     """A child that stops in the middle of a reflow's reprint still gets its
     REFLOW_END. Without it the view took everything after for reprint and

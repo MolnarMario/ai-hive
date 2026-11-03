@@ -129,6 +129,9 @@ class WorkspaceManager(QObject):
         # `arm_agent`, and unset is a no-op so a bare manager (the tests build
         # many) never depends on it.
         self.audit = None
+        # optional (set by MainWindow): the folder render dumps go under
+        # (app/render_dump.py). "" writes none, so a bare manager never does.
+        self.render_dump_dir = ""
         # path to the shared SessionStart-hook mapping file (set by MainWindow);
         # sync_live_sessions reads it for the authoritative live conversation id
         self.session_map_path = ""
@@ -585,6 +588,9 @@ class WorkspaceManager(QObject):
         # latch (see TerminalAgent._note_limit_skip). Routed through the
         # manager's own hook, so it is a no-op until MainWindow sets one.
         agent.audit = self._audit
+        # ...and save the stream when its card's scrollback doubles rows
+        # (TerminalAgent.note_render_dup), read lazily like `audit`
+        agent.render_dump = self._render_dump
         # busy/standby is TRANSIENT (not persisted): refresh the badge. The
         # one persisted thing it moves is last_active, saved to the minute
         # (see _agent_dict), so only a burst that ends in a new minute marks
@@ -1167,6 +1173,14 @@ class WorkspaceManager(QObject):
                 self.audit(message)
         except Exception:
             pass
+
+    def _render_dump(self, agent, payload: dict) -> str:
+        """Save one render dump for `agent` (app/render_dump.py). The path,
+        or "" with no folder set or on any failure."""
+        if not self.render_dump_dir:
+            return ""
+        from . import render_dump
+        return render_dump.save(self.render_dump_dir, agent.spec.name, payload)
 
     def to_session_dict(self) -> dict:
         return {

@@ -234,6 +234,9 @@ REPAINT_RESTORE_MS = 120
 REPAINT_QUIET_MS = 300
 # ...and a child that never goes quiet gets the marker after this long. ms.
 REPAINT_MAX_MS = 2000
+# At most one RENDER-DUP line and dump per agent this often
+# (see note_render_dup). Seconds.
+RENDER_DUP_REPORT_S = 600.0
 # Written into the agent's own pty stream once a `request_repaint` redraw is
 # in, like the REFLOW markers. The view takes the rows the redraw brought
 # back onto the screen out of the scrollback there
@@ -723,8 +726,13 @@ class TerminalAgent(QObject):
         self._limit_last_clock = ""
         self._limit_last_reset = 0.0
         # optional hook (set by WorkspaceManager._wire_agent): a line into
-        # session.log. Only used by _note_limit_skip; None is a no-op.
+        # session.log. None is a no-op.
         self.audit = None
+        # optional hook (set by WorkspaceManager._wire_agent): save a render
+        # dump, callable(agent, payload) -> path or "" (see note_render_dup).
+        # None is a no-op.
+        self.render_dump = None
+        self._render_dup_at = 0.0
         # last (reason, banner) reported by _note_limit_skip, so a rejection
         # that persists across hundreds of repaints is recorded ONCE
         self._limit_last_skip = None
@@ -1521,6 +1529,46 @@ class TerminalAgent(QObject):
 
     def pty_replay(self) -> str:
         return "".join(self._pty_buffer)
+
+    def note_render_dup(self, info: dict) -> None:
+        """The card's view saw doubled rows reach the scrollback
+        (TerminalView._scan_for_copies): one RENDER-DUP line in session.log,
+        naming the Claude version, and a dump of the stream with the sizes it
+        was drawn at (app/render_dump.py). At most once per
+        RENDER_DUP_REPORT_S, since a stream that doubles rows tends to keep
+        doing it, and one dump holds the bytes."""
+        now = time.time()
+        if self._render_dup_at and now - self._render_dup_at < RENDER_DUP_REPORT_S:
+            return
+        self._render_dup_at = now
+        version = (transcripts.latest_cli_version(self.spec.cwd,
+                                                  self.spec.session_id)
+                   if self.spec.provider == "claude" else "") or "?"
+        path = ""
+        if self.render_dump is not None:
+            payload = {
+                "agent": self.spec.name,
+                "provider": self.spec.provider,
+                "claude_version": version,
+                "detected": dict(info),
+                "geometry": [[off, g.rows, g.cols]
+                             for off, g in self.replay_geometry()],
+                "stream": self.pty_replay(),
+            }
+            try:
+                path = self.render_dump(self, payload) or ""
+            except Exception:
+                path = ""
+        if self.audit is not None:
+            try:
+                self.audit(
+                    f"RENDER-DUP agent={self.spec.name} claude={version} "
+                    f"size={info.get('rows')}x{info.get('cols')} "
+                    f"period={info.get('period')} run={info.get('run')} "
+                    f"text={str(info.get('text', ''))[:60]!r}"
+                    + (f" dump={path}" if path else ""))
+            except Exception:
+                pass
 
     # ------------------------------------------------- prompt milestones ---
 

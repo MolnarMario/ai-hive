@@ -1732,7 +1732,8 @@ def test_limit_recovery_reliability():
     from PySide6.QtWidgets import QApplication
     from app.process_worker import AgentKind, build_spec
     from app.session_store import SessionStore
-    from app.terminal_agent import (REPAINT_RESTORE_MS, AgentStatus,
+    from app.terminal_agent import (REPAINT_DONE, REPAINT_QUIET_MS,
+                                    REPAINT_RESTORE_MS, AgentStatus,
                                     TerminalAgent)
     from app.widgets.main_window import LIMIT_REPAINT_AFTER_WAITS
     from main import create_main_window
@@ -1829,12 +1830,44 @@ def test_limit_recovery_reliability():
     resizes: list = []
     f.worker.rows, f.worker.cols = 30, 100
     f.worker.is_running = lambda: True
-    f.worker.resize = lambda r, c: resizes.append((r, c))
+
+    def took(r, c, w=f.worker):
+        resizes.append((r, c))
+        w.rows, w.cols = r, c
+        return True
+    f.worker.resize = took
     check("repaint: accepted for a live pty agent", f.request_repaint())
-    check("repaint: narrows first", resizes == [(30, 99)])
+    # a row, never a column: one column narrower re-wraps Claude's rows and
+    # its redraw pushes copies into the scrollback (request_repaint)
+    check("repaint: takes a row first", resizes == [(29, 100)], resizes)
+    check("repaint: one in flight refuses another", not f.request_repaint())
     pump(REPAINT_RESTORE_MS + 120)
-    check("repaint: and gives the width straight back",
-          resizes == [(30, 99), (30, 100)])
+    check("repaint: and gives the row straight back",
+          resizes == [(29, 100), (30, 100)], resizes)
+    check("repaint: (fixture) no marker before the redraw settles",
+          REPAINT_DONE not in f.pty_replay())
+    f._on_pty_output("pty", "\x1b[?25l\x1b[Hredrawn\x1b[?25h")
+    pump(REPAINT_QUIET_MS + 150)
+    check("repaint: once it settles, REPAINT_DONE follows the redraw",
+          f.pty_replay().endswith("redrawn\x1b[?25h" + REPAINT_DONE),
+          f.pty_replay()[-60:])
+    check("repaint: ...and the next one is allowed", f.request_repaint())
+    f.resize(30, 100)                  # the view sized the child meanwhile
+    pump(REPAINT_RESTORE_MS + REPAINT_QUIET_MS + 150)
+    check("repaint: a size the view gave meanwhile stands, with no marker",
+          resizes[-1] == (30, 100)
+          and f.pty_replay().count(REPAINT_DONE) == 1, resizes)
+    # a reflow that starts meanwhile owns the child's size and replaces the
+    # scrollback the marker would have tidied
+    f._reflow_timer.stop()
+    f._reflow_due = False
+    check("repaint: (fixture) the next one starts", f.request_repaint())
+    f._begin_reflow()
+    pump(REPAINT_RESTORE_MS + REPAINT_QUIET_MS + 150)
+    check("repaint: a reflow that starts meanwhile cancels it, no marker",
+          f._reflow_step == "tall" and resizes[-1][0] > 30
+          and f.pty_replay().count(REPAINT_DONE) == 1, resizes[-3:])
+    f._cancel_reflow()
 
     # --- 5. the banner under Claude's own tool-result gutter ----------------
     # A 429 that lands while a tool is still running is painted as a TOOL-RESULT
