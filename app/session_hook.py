@@ -11,7 +11,9 @@ clear it, and Stop to close a lingering prompt and detect a plain free-text
 question the agent ended its turn on. A PreToolUse edge carries the call's
 tool_use_id and transcript_path, because Claude can fire that hook with no
 call in the conversation; the manager waits for the call to appear in the
-transcript before it lights the "?". These prompt events are EDGES appended to
+transcript before it lights the "?". A call from a sub-agent or fork also
+carries its agent_id, and the manager looks for it in that sub-agent's own
+transcript. These prompt events are EDGES appended to
 a separate events file and read incrementally by the manager; SessionStart
 records stay in the mapping file. See write_settings_file / read_prompt_events.
 
@@ -261,6 +263,18 @@ EV_TOOL_SET = "tool_set"
 EV_TOOL_CLEAR = "tool_clear"
 EV_TURN_SET = "turn_set"
 EV_TURN_CLEAR = "turn_clear"
+# a tool_set's key for the Claude sub-agent (or fork) that made the call.
+# Not "agent_id": every record's agent_id is the AI Hive agent's.
+EV_SUB_AGENT = "sub_agent"
+
+
+def _plain_id(value) -> bool:
+    """True for an id that is safe inside a file name: ASCII letters,
+    digits, '-' and '_' only (Claude's sub-agent ids are hex). The manager
+    builds agent-<id>.jsonl from it, so a separator or '..' must never get
+    through. Stdlib string checks, no `re`: the hook starts on every call."""
+    return (isinstance(value, str) and value.isascii()
+            and value.replace("-", "").replace("_", "").isalnum())
 
 
 def read_prompt_events(events_path: str, offset: int = 0):
@@ -756,22 +770,28 @@ def _dispatch(mapping_path, events_path, payload: dict) -> str:
         if payload.get("tool_name") in _WAITING_TOOL_SET:
             extra = {"tool": payload.get("tool_name")}
             # the manager lights the "?" only once this call is in the
-            # transcript (WorkspaceManager._confirm_tool_prompts). Not for a
-            # sub-agent's call (Claude sets agent_id only inside one): its
-            # transcript_path is the parent's, which never holds the
-            # sub-agent's calls, so the check would drop a real question.
-            # Without the id the "?" lights at once, as it did before
-            if not payload.get("agent_id"):
+            # transcript (WorkspaceManager._confirm_tool_prompts). Claude
+            # sets agent_id only inside a sub-agent or a fork, and then
+            # transcript_path is still the parent's, which never holds the
+            # call, so the manager looks in the sub-agent's own file
+            # (transcripts.subagent_transcript). An id that can't name a
+            # file records no tool id, and that "?" lights at once
+            sub = payload.get("agent_id")
+            if not sub or _plain_id(sub):
                 for key in ("tool_use_id", "transcript_path"):
                     if isinstance(payload.get(key), str) and payload[key]:
                         extra[key] = payload[key]
-            # where the transcript ended as the call ran: the search starts
-            # there, so records Claude appends later can't push the call out
-            try:
-                extra["transcript_size"] = os.path.getsize(
-                    extra["transcript_path"])
-            except (KeyError, OSError):
-                pass
+            if sub and _plain_id(sub):
+                extra[EV_SUB_AGENT] = sub
+            elif not sub:
+                # where the transcript ended as the call ran: the search
+                # starts there, so records Claude appends later can't push
+                # the call out
+                try:
+                    extra["transcript_size"] = os.path.getsize(
+                        extra["transcript_path"])
+                except (KeyError, OSError):
+                    pass
             _append_event(events_path, EV_TOOL_SET, extra)
     elif event == "PostToolUse":
         if payload.get("tool_name") in _WAITING_TOOL_SET:
