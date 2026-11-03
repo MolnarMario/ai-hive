@@ -3417,8 +3417,11 @@ class MainWindow(QMainWindow):
         # agent's log_activity note onto its workspace board. Additive and
         # guarded: if it can't listen, the app runs exactly as before (agents
         # simply can't post board notes).
+        # Its files go next to the session, never to a folder it looks up
+        # itself (orchestrator_bridge's docstring says why).
         self.bridge = OrchestratorBridge(
-            manager, active_ws=lambda: self.manager.active_id, parent=self)
+            manager, str(self.store.path.parent),
+            active_ws=lambda: self.manager.active_id, parent=self)
         self.bridge.start()
         # shared SessionStart-hook plumbing: ONE settings file (injected into
         # every Claude agent via --settings) + ONE mapping file the child hooks

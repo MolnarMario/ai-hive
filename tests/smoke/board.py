@@ -187,7 +187,8 @@ def test_board_rotation():
     # --- the log_activity tool rotates through the same serialized append ---
     mgr = WorkspaceManager()
     ws = mgr.create_workspace("Rotate", project_path=str(tmp / "bridge"))
-    bridge = OrchestratorBridge(mgr, active_ws=lambda: ws.id)
+    bridge = OrchestratorBridge(mgr, str(tmp / "appdata"),
+                                active_ws=lambda: ws.id)
     for i in range(keep + 2):
         bridge._dispatch("log_activity", {"agent": "B1", "message": note(i)},
                          ws=ws.id)
