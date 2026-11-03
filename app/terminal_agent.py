@@ -2131,14 +2131,9 @@ class TerminalAgent(QObject):
                                    if len(files) > 3 else shown)
         return row
 
-    def nudge(self, text: str, erase: str = "") -> bool:
+    def nudge(self, text: str) -> bool:
         """Type `text` at the agent's prompt and submit it, WITHOUT touching any
         persisted metadata. Returns False when the agent can't take it.
-
-        `erase` goes to the child right before the text: the keys that empty
-        its input box (TerminalView.input_erase_keys), for a request that
-        replaces whatever sits there instead of landing beside it. It is
-        sent only when the text is, so a refused nudge erases nothing.
 
         A nudge is a message inside work the agent already has (the
         auto-continue after a plan-limit reset, a scheduled send), so it never
@@ -2153,7 +2148,7 @@ class TerminalAgent(QObject):
             return False
         if not (self._prompt_ready and self.worker.is_running()):
             return False
-        self._write_task_to_pty(text, erase)
+        self._write_task_to_pty(text)
         return True
 
     # ------------------------------------------------- deferred messages ---
@@ -2287,15 +2282,11 @@ class TerminalAgent(QObject):
         if self._scheduled:
             self.scheduled_changed.emit()
 
-    def _write_task_to_pty(self, text: str, erase: str = "") -> None:
+    def _write_task_to_pty(self, text: str) -> None:
         # A reflow's reprint of the whole conversation can hold the same
         # words, and the echo watch would read them as the task drawn and
         # release the Enter early. The child gets the card's rows back first.
         self._end_reflow()
-        if erase:
-            # arrows and Backspaces with text right behind them reach Claude
-            # intact however the bytes split (TerminalView._delete_selection)
-            self.worker.write(erase)
         body = text.replace("\r\n", "\r").replace("\n", "\r")
         if "\r" in body:  # multi-line: bracketed paste, then submit
             self.worker.write("\x1b[200~" + body + "\x1b[201~")

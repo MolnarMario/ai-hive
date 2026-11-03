@@ -409,6 +409,11 @@ FIND_RESCAN_MS = 120
 # held keys then go anyway: a key that lands after an uncleared prompt
 # beats a key that is lost.
 CLEAR_HOLD_MS = 1500
+# empty_input_then (Ship finished lanes): how long Claude's output stays
+# quiet before the box is read for the next round of Backspaces, and the
+# longest the whole emptying may take
+EMPTY_SETTLE_MS = 120
+EMPTY_TIMEOUT_MS = 8000
 # Chrome's own find colors. Fixed rather than Palette reads: a match has to
 # stand out on every skin's console background, the light one included, and
 # the text on it is redrawn in FIND_INK so it stays legible whatever color
@@ -1002,6 +1007,13 @@ class TerminalView(QWidget):
         self._hold_timer.setSingleShot(True)
         self._hold_timer.setInterval(CLEAR_HOLD_MS)
         self._hold_timer.timeout.connect(self._release_held_keys)
+        # empty_input_then's state, None when no emptying runs. Its timer
+        # restarts on every chunk, so it fires once the output goes quiet.
+        self._emptying: dict | None = None
+        self._empty_timer = QTimer(self)
+        self._empty_timer.setSingleShot(True)
+        self._empty_timer.setInterval(EMPTY_SETTLE_MS)
+        self._empty_timer.timeout.connect(self._empty_step)
 
     # -------------------------------------------------------------- data ---
 
@@ -1060,6 +1072,8 @@ class TerminalView(QWidget):
         self._find_dirty()
         if self._held_keys is not None and self._prompt_cleared():
             self._release_held_keys()
+        if self._emptying is not None:
+            self._empty_timer.start()
         t0 = time.perf_counter() - t0
         if t0 > _perf_feed_s:
             _perf_feed_s, _perf_feed_len, _perf_feed_view = t0, len(data), self
@@ -1591,6 +1605,8 @@ class TerminalView(QWidget):
         absolute line ids stay monotonic (see the coordinate block below)."""
         self._held_keys = None      # meant for the old child's prompt
         self._hold_timer.stop()
+        if self._emptying is not None:      # so was this
+            self._end_emptying(self._emptying["failed"])
         rows, cols = self.screen.lines, self.screen.columns
         pushed = getattr(self.screen.history.top, "pushed", 0)
         self.screen = _new_history_screen(cols, rows)
@@ -3231,31 +3247,109 @@ class TerminalView(QWidget):
             return None
         return self._caret_keys(carets, end) + ["\x7f" * count]
 
-    def input_erase_keys(self) -> str | None:
-        """The keys that empty Claude's input box, for text that goes to
-        the child without passing through the view (Ship finished lanes,
-        MainWindow._send_ship). The caller sends them itself, right before
-        its text, so nothing it sends can wait behind _send's hold.
+    # ------------------------------------- emptying the box for a send ---
+    # Ship finished lanes types its request past the view (agent.nudge), and
+    # typed beside a leftover draft the two went in as one message. So the
+    # box is emptied first, and the request waits until Claude has DRAWN it
+    # empty. One round of Backspaces is not always enough: Claude windows a
+    # draft taller than about a third of the screen, painting only the rows
+    # around the caret with its prompt glyph on the first painted one
+    # (measured on Claude 2.1.317, 30 rows: 10 rows of a 29-row draft), so
+    # what is painted can be a slice of the draft.
 
-        "" when the box holds no typed text (Claude's hint is none), so an
-        empty box gets nothing. None when it holds text the view can't map
-        (_erase_keys), or while one of the view's own clears is still
-        landing: keys sent past the hold would arrive ahead of the ones
-        it holds. Then nothing should go in on top of the text.
+    def empty_input_then(self, done, failed, ready) -> bool:
+        """Empty Claude's input box, then call `done()` once it reads empty,
+        or `failed()` when it can't be emptied. Returns False, calling
+        neither, while an earlier emptying is still running. `ready()` is
+        asked before every round: a key on a stopped or sleeping card
+        starts or wakes its child (TerminalCard._on_key_input).
 
-        Also None when the text's first row is not Claude's prompt row. A
-        draft taller than the screen pushes that row off the top, the view
-        sees only the rows still painted, and their Backspaces would leave
-        the start of the draft in front of the request."""
-        if not self._input_text():
-            return ""
-        if self._held_keys is not None or not self._has_prompt_box():
-            return None
-        span = self._input_block_span()     # set: _input_text read the box
-        last = self._row_content(span[1])[1]
-        keys = (self._erase_keys(((span[0], 0), (span[1], last)))
-                if last >= 0 else None)
-        return None if keys is None else "".join(keys)
+        An empty box (Claude's hint is no text) calls `done` at once and
+        sends nothing. Otherwise rounds go out until the box reads empty:
+        each Backspaces whatever is painted (_erase_keys), and the next
+        reads the box only once Claude's output has been quiet for
+        EMPTY_SETTLE_MS. It fails at once on a box it can't map, or while
+        one of the view's own clears is landing (its held keys would follow
+        ours, computed for a box that is gone), and later when a round
+        can't be mapped, after EMPTY_TIMEOUT_MS, or when the child
+        restarts (reset)."""
+        if self._emptying is not None:
+            return False
+        if self._box_is_empty():
+            done()
+            return True
+        self._emptying = {"done": done, "failed": failed, "ready": ready,
+                          "erased": None, "deadline": time.monotonic()
+                          + EMPTY_TIMEOUT_MS / 1000}
+        if not self._empty_round():
+            self._end_emptying(failed)
+        return True
+
+    def is_emptying(self) -> bool:
+        return self._emptying is not None
+
+    def _caret_below_box(self) -> bool:
+        """The caret sits alone on the blank row under Claude's box, where
+        typed text that fills the box's last row to the edge leaves it
+        (_typing_span). _input_text reads nothing there."""
+        return (self._input_block_span() is None
+                and self._typing_span() is not None)
+
+    def _box_is_empty(self) -> bool:
+        """No typed text in Claude's box: _input_text reads none, and the
+        caret is not parked under the box's text either. A screen with no
+        box at all counts as empty, as it did before emptying existed."""
+        return not self._input_text() and not self._caret_below_box()
+
+    def _box_look(self) -> tuple:
+        """What a round is judged by: the box's text and the caret."""
+        return (self._input_text(), self.screen.cursor.y,
+                self.screen.cursor.x)
+
+    def _empty_round(self) -> bool:
+        """Send one round of Backspaces over the painted box. False when
+        the box can't be mapped or the child can't take keys (see
+        empty_input_then). A caret parked under the box gets one
+        Backspace: it takes the draft's last character and brings the
+        caret back onto the box's rows, where the next round maps it."""
+        if self._held_keys is not None or not self._emptying["ready"]():
+            return False
+        if self._caret_below_box():
+            keys = ["\x7f"]
+        elif not self._has_prompt_box():
+            return False
+        else:
+            span = self._input_block_span()   # set: _has_prompt_box read it
+            last = self._row_content(span[1])[1]
+            keys = (self._erase_keys(((span[0], 0), (span[1], last)))
+                    if last >= 0 else None)
+            if keys is None:
+                return False
+        self._emptying["erased"] = self._box_look()
+        self._snap_to_bottom()
+        for seq in keys:
+            self._send(seq)
+        self._empty_timer.start()
+        return True
+
+    def _empty_step(self) -> None:
+        """Claude's output went quiet: read the box again."""
+        state = self._emptying
+        if state is None:
+            return
+        if self._box_is_empty():
+            self._end_emptying(state["done"])
+        elif time.monotonic() >= state["deadline"]:
+            self._end_emptying(state["failed"])
+        elif self._box_look() == state["erased"]:
+            self._empty_timer.start()   # not redrawn yet: wait for it
+        elif not self._empty_round():
+            self._end_emptying(state["failed"])
+
+    def _end_emptying(self, then) -> None:
+        self._emptying = None
+        self._empty_timer.stop()
+        then()
 
     def _delete_and_drop_selection(self) -> None:
         """Delete a mouse or keyboard selection when _delete_selection can,

@@ -4766,7 +4766,7 @@ def test_task_done_waits_for_the_user():
         views = {}
         told, delivered, audit = [], [], []
         a.notice = lambda text: told.append(text)
-        i.nudge = lambda text, erase="": (delivered.append(text), True)[1]
+        i.nudge = lambda text: (delivered.append(text), True)[1]
         win._store_audit = audit.append
 
         def flag(agent, sha):
@@ -4942,9 +4942,8 @@ def test_ship_lanes_from_integrator_chip():
         b = laned("Agent B", "5a1e02" + "0" * 26)
         i = laned("Integrator", "5a1eee" + "0" * 26)
         app.processEvents()
-        delivered, audit, asked, erased = [], [], [], []
-        i.nudge = lambda text, erase="": (delivered.append(text),
-                                          erased.append(erase), True)[2]
+        delivered, audit, asked = [], [], []
+        i.nudge = lambda text: (delivered.append(text), True)[1]
         win._store_audit = audit.append
         answer = [False]
         win._confirm_ship = lambda agent, done: (
@@ -5007,9 +5006,9 @@ def test_ship_lanes_from_integrator_chip():
         check("ship: the request is audited",
               any(ln.startswith("LANE-SHIP") and a.spec.lane["branch"] in ln
                   for ln in audit), audit)
-        check("ship: an empty input box gets no erase keys",
-              erased == [""] and not any("cleared=" in ln for ln in audit),
-              (erased, audit))
+        check("ship: an empty input box is not cleared first",
+              not any(ln.startswith("LANE-SHIP-CLEAR") for ln in audit),
+              audit)
         delivered.clear()
 
         # the confirm dialog runs its own event loop: what changed while it
@@ -5042,40 +5041,99 @@ def test_ship_lanes_from_integrator_chip():
         check("ship: a non-integrator cannot ship", delivered == [])
 
         # text left in the integrator's input box is replaced, not typed
-        # beside: the request carries the keys that empty the box first
+        # beside: the card Backspaces it away, and the request goes in once
+        # Claude has drawn the box empty
+        from PySide6.QtCore import QEventLoop, QTimer
+        from app.widgets import terminal_view as tv
+
+        def pump(ms):
+            loop = QEventLoop()
+            QTimer.singleShot(ms, loop.quit)
+            loop.exec()
+        settle = tv.EMPTY_SETTLE_MS + 150
+        # the lane service's own polls would put the real, unflagged lanes
+        # back while this part runs the event loop
+        win.lane_service.blockSignals(True)
+        win._on_lanes_changed(ws.id, dict(views))
         win._confirm_ship = lambda agent, done: True
         term = card.terminal
         keyed = []
         term.keyInput.connect(keyed.append)
         term.feed("\x1b[2J\x1b[H❯\xa0half a thought")
-        erased.clear()
         win._ship_lanes(ws.id, i)
-        check("ship: a leftover draft is Backspaced away before the request",
-              len(delivered) == 1 and erased == ["\x7f" * len("half a thought")],
-              (delivered, erased))
-        check("ship: ...and the audit line says the box was cleared",
-              audit and "cleared=input" in audit[-1], audit[-1:])
-        check("ship: ...and the view itself sends nothing (nudge carries "
-              "the keys)", keyed == [], keyed)
+        check("ship: a leftover draft is Backspaced away first",
+              keyed == ["\x7f" * len("half a thought")], keyed)
+        check("ship: ...and the request waits for the box to be drawn empty",
+              delivered == [] and audit
+              and audit[-1].startswith("LANE-SHIP-CLEAR"),
+              (delivered, audit[-1:]))
+        act = ship_action(i)
+        check("ship: a second ship waits while the box is being cleared",
+              not act.isEnabled() and "being cleared" in act.toolTip(),
+              act.toolTip())
+        pump(settle)
+        check("ship: ...the box not redrawn yet, nothing more goes out",
+              delivered == [] and len(keyed) == 1, (delivered, keyed))
+        term.feed("\r\x1b[2K❯\xa0")         # Claude draws the emptied box
+        pump(settle)
+        check("ship: the box drawn empty, the request goes in once",
+              len(delivered) == 1 and len(keyed) == 1
+              and audit[-1].startswith("LANE-SHIP "), (delivered, audit[-1:]))
+
+        # Claude windows a tall draft: Backspacing what is painted brings
+        # the rows above it into view, and they get a round of their own
         delivered.clear()
-        erased.clear()
-        term.feed("\x1b[1;3H")          # caret parked at the box's start
+        keyed.clear()
+        term.feed("\x1b[2J\x1b[H❯\xa0the painted tail")
+        win._ship_lanes(ws.id, i)
+        term.feed("\x1b[2J\x1b[H❯\xa0the start")     # the rows above it
+        pump(settle)
+        check("ship: a windowed draft gets a round per window",
+              keyed == ["\x7f" * len("the painted tail"),
+                        "\x7f" * len("the start")] and delivered == [],
+              (keyed, delivered))
+        term.feed("\r\x1b[2K❯\xa0")
+        pump(settle)
+        check("ship: ...then the request", len(delivered) == 1, delivered)
+
+        # a caret parked at the box start walks right before Backspacing
+        delivered.clear()
+        keyed.clear()
+        term.feed("\x1b[2J\x1b[H❯\xa0half a thought\x1b[1;3H")
         win._ship_lanes(ws.id, i)
         check("ship: a caret at the box start walks right, then Backspaces",
-              erased == ["\x1b[C" * 14 + "\x7f" * 14], erased)
-        delivered.clear()
-        erased.clear()
-        term._held_keys = []            # a clear of the user's still landing
+              keyed == ["\x1b[C" * 14, "\x7f" * 14], keyed)
+        term.reset()                    # the child restarts meanwhile
+        check("ship: a restart mid-clear drops the request and says why",
+              delivered == [] and "could not clear" in told[-1]
+              and not term.is_emptying(), (delivered, told[-1:]))
+
+        keyed.clear()
         told.clear()
+        term.feed("❯\xa0half a thought")
+        term._held_keys = []            # a clear of the user's still landing
         win._ship_lanes(ws.id, i)
         term._held_keys = None
         check("ship: a box that can't be emptied gets nothing, and says why",
-              delivered == [] and erased == [] and told
+              delivered == [] and keyed == [] and told
               and "could not clear" in told[-1], (delivered, told))
+        saved = tv.EMPTY_TIMEOUT_MS
+        tv.EMPTY_TIMEOUT_MS = 300
+        try:
+            told.clear()
+            win._ship_lanes(ws.id, i)
+            pump(600)                   # Claude never redraws the box
+        finally:
+            tv.EMPTY_TIMEOUT_MS = saved
+        check("ship: a box that never empties gives up, unsent",
+              delivered == [] and told and "could not clear" in told[-1]
+              and not term.is_emptying(), (delivered, told))
+        keyed.clear()
         term.feed("\x1b[2J\x1b[H❯\xa0Try \"edit <filepath> to...\"\x1b[1;3H")
         win._ship_lanes(ws.id, i)
-        check("ship: Claude's hint in an empty box is not erased",
-              len(delivered) == 1 and erased == [""], (delivered, erased))
+        check("ship: Claude's hint in an empty box is not cleared",
+              len(delivered) == 1 and keyed == [], (delivered, keyed))
+        win.lane_service.blockSignals(False)
         for agent in list(ws.agents):
             win._close_agent(ws.id, agent.id)
         win.lane_ops.drain(60)
@@ -5150,7 +5208,7 @@ def test_ship_wakes_only_the_asleep_integrator():
         asleep(a)
         asleep(i)
         delivered, audit, told, asked = [], [], [], []
-        i.nudge = lambda text, erase="": (delivered.append(text), True)[1]
+        i.nudge = lambda text: (delivered.append(text), True)[1]
         win._store_audit = audit.append
         win._lane_message = lambda title, text: told.append(text)
         win._confirm_ship = lambda agent, done: (
@@ -5332,7 +5390,7 @@ def test_ship_confirm_dont_ask_again():
         i = laned("Integrator", "5b1eee" + "0" * 26)
         app.processEvents()
         delivered = []
-        i.nudge = lambda text, erase="": (delivered.append(text), True)[1]
+        i.nudge = lambda text: (delivered.append(text), True)[1]
         win._store_audit = lambda line: None
         state = {"is_running": True, "prompt_ready": True,
                  "is_busy": False, "is_waiting": False}

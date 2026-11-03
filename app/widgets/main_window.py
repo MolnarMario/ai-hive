@@ -6308,6 +6308,9 @@ class MainWindow(QMainWindow):
         elif not waking and agent.spec.uid in self._ship_waking:
             why = ("The integrator is waking up to take your last ship "
                    "request.")
+        elif self._emptying_for_ship(agent):
+            why = ("The integrator's input box is being cleared for your "
+                   "last ship request.")
         elif agent.is_asleep():
             why = ""
         elif not agent.is_running():
@@ -6319,6 +6322,12 @@ class MainWindow(QMainWindow):
         else:
             why = ""
         return done, why
+
+    def _emptying_for_ship(self, agent) -> bool:
+        """Ship is clearing this integrator's input box (_send_ship). The
+        card holds that state, so a closed card can't leave it stuck."""
+        card = self._card_for_agent(agent.id)
+        return card is not None and card.is_emptying_input()
 
     def _ship_offer(self, ws, agent) -> tuple:
         """(label, enabled, tooltip) for the integrator chip's Ship finished
@@ -6372,31 +6381,68 @@ class MainWindow(QMainWindow):
         self._send_ship(agent, done)
 
     def _send_ship(self, agent, done: list) -> None:
-        """Type the ship request naming `done`, the lanes the user
-        confirmed, into the integrator. The request replaces whatever sits
-        in its input box: typed beside a leftover draft, the two went in as
-        one message. A box the view can't empty gets nothing."""
+        """Send the ship request naming `done`, the lanes the user
+        confirmed, once the integrator's input box is empty. Typed beside
+        a leftover draft, the two went in as one message, so the card
+        empties the box first (TerminalCard.empty_input_then) and the
+        request follows once Claude has drawn it empty (_ship_emptied). An
+        empty box sends it at once."""
+        card = self._card_for_agent(agent.id)
+        if card is None:
+            self._type_ship(agent, done)
+            return
+        name = agent.spec.name
+
+        def failed():
+            why = (f"AI Hive could not clear the text in {name}'s input "
+                   f"box. Clear it, then ship again.")
+            self._store_audit(f"LANE-SHIP-DROP agent={name!r}: {why}")
+            self._lane_message("Nothing shipped", why)
+        if not card.empty_input_then(
+                lambda: self._ship_emptied(agent, done), failed):
+            # _ship_state turns a second click away before it gets here
+            self._lane_message("Nothing shipped",
+                               f"{name}'s input box is still being cleared "
+                               f"for your last ship request.")
+        elif card.is_emptying_input():
+            self._store_audit(f"LANE-SHIP-CLEAR agent={name!r}")
+
+    def _ship_emptied(self, agent, done: list) -> None:
+        """The integrator's input box reads empty: type the request, unless
+        what the user confirmed no longer holds. A box that needed clearing
+        took a moment, and anything may have moved meanwhile."""
+        ws = self.manager.workspace_of(agent.id)
+        if self._closing or ws is None:
+            return
+        again, why = self._ship_state(ws, agent)
+        if not why and ([(a.spec.uid, v.done) for a, v in again]
+                        != [(a.spec.uid, v.done) for a, v in done]):
+            why = ("The finished lanes changed while the integrator's input "
+                   "box was cleared. Open the menu again to see the new "
+                   "list.")
+        if not why and not self.manager.is_integrator(agent):
+            why = f"{agent.spec.name} is no longer the integrator."
+        if why:
+            self._store_audit(f"LANE-SHIP-DROP agent={agent.spec.name!r}: "
+                              f"{why}")
+            self._lane_message("Nothing shipped", why)
+            return
+        self._type_ship(agent, done)
+
+    def _type_ship(self, agent, done: list) -> None:
+        """Type the ship request naming `done` into the integrator."""
         lanes_at = ", ".join(f"{view.branch} at {view.done[:12]}"
                              for _a, view in done)
         text = (f"Ship the finished lanes now: {lanes_at}. Merge each of "
                 f"those \"Task done\" commits into one integrate/ branch and "
                 f"follow your integrator instructions through to the merge.")
-        card = self._card_for_agent(agent.id)
-        erase = card.input_erase_keys() if card is not None else ""
-        if erase is None:
-            self._lane_message("Nothing shipped",
-                               f"AI Hive could not clear the text in "
-                               f"{agent.spec.name}'s input box. Clear it, "
-                               f"then ship again.")
-            return
-        if not agent.nudge(text, erase=erase):
+        if not agent.nudge(text):
             self._lane_message("Nothing shipped",
                                f"{agent.spec.name} could not take the "
                                f"request. Try again once it is at its prompt.")
             return
         self._store_audit(f"LANE-SHIP agent={agent.spec.name!r} "
-                          f"lanes={lanes_at}"
-                          + (" cleared=input" if erase else ""))
+                          f"lanes={lanes_at}")
 
     def _wake_to_ship(self, ws_id: str, agent, done: list) -> None:
         """Ship finished lanes on an integrator asleep to free memory: wake
