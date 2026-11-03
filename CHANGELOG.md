@@ -8,6 +8,17 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.56.4
+
+- Ctrl+Z and Ctrl+Y in a card's input box restore the earlier text even
+  while Claude's '@' file list is open. Before, the old prompt stayed and
+  the restored text was added after it.
+- Undoing back to an empty prompt leaves it empty. It used to type in
+  Claude's grey "Try ..." hint as if you had written it, and Schedule
+  (Ctrl+Shift+Enter) on an empty prompt filled in that hint too.
+- Double-clicking the first word you typed selects just that word, not
+  the prompt arrow in front of it.
+
 ## 0.56.3
 
 - Characters typed with AltGr, like '@' or '{' on a Hungarian or German
