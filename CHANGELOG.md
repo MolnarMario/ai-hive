@@ -8,6 +8,16 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.56.6
+
+- Ship finished lanes clears whatever unsent text sits in the integrator's
+  input box before it types the ship request. Before, the request was
+  added after the leftover text and the two went to Claude as one message.
+  The confirm dialog says when there is text it will replace, so Cancel
+  can still keep it.
+- If you type into the integrator while AI Hive clears its box, or the box
+  can't be cleared, nothing is sent and AI Hive tells you why.
+
 ## 0.56.5
 
 - A Claude reply no longer shows up two or three times over in a card.
