@@ -3728,6 +3728,12 @@ def test_doubled_scrollback_rows_are_reported():
                                             saved[0]))["stream"]
           == agent.pty_replay(), saved)
     folder = os.path.join(tmp, render_dump.DIR_NAME)
+    twins = [render_dump.save(tmp, "Agent 1", {"stream": s})
+             for s in ("first", "second")]
+    check("dup-report: two agents of one name in one second keep two dumps",
+          all(twins) and twins[0] != twins[1]
+          and [render_dump.load(p)["stream"] for p in twins]
+          == ["first", "second"], twins)
     for i in range(render_dump.KEEP + 3):
         p = os.path.join(folder, f"old-{i}.json")
         with open(p, "w", encoding="utf-8") as fh:

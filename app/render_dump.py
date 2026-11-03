@@ -27,6 +27,7 @@ import datetime
 import json
 import os
 import re
+import uuid
 
 DIR_NAME = "render_dumps"
 KEEP = 5
@@ -44,7 +45,10 @@ def save(dir_path: str, label: str, payload: dict) -> str:
         os.makedirs(folder, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         safe = re.sub(r"[^A-Za-z0-9_-]+", "-", label or "").strip("-")[:40]
-        path = os.path.join(folder, f"{stamp}-{safe or 'agent'}.json")
+        # names repeat across workspaces ("Agent 1"), so two agents reporting
+        # in the same second must not share a file
+        path = os.path.join(folder, f"{stamp}-{safe or 'agent'}-"
+                                    f"{uuid.uuid4().hex[:8]}.json")
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(dict(payload, format=FORMAT), fh)

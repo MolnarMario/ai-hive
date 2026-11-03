@@ -57,7 +57,7 @@ A sighting writes one line to `session.log`, at most every 10 minutes per
 agent:
 
 ```
-RENDER-DUP agent=Agent 1 claude=2.1.316 size=30x155 period=1 run=2 text='The heading block reads ...' dump=...\render_dumps\20261103-024512-Agent-1.json
+RENDER-DUP agent=Agent 1 claude=2.1.316 size=30x155 period=1 run=2 text='The heading block reads ...' dump=...\render_dumps\20261103-024512-Agent-1-3f9c0a1e.json
 ```
 
 The dump in `%APPDATA%\AIHive\AI Hive\render_dumps\` holds the agent's last
