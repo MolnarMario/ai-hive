@@ -1382,6 +1382,30 @@ def scan_tool_use(path: str, tool_use_id: str, anchor: int | None = None,
     return needle in data, resume
 
 
+def subagent_transcript(parent_path: str, agent_id: str) -> str:
+    """The transcript Claude writes for sub-agent `agent_id` of the
+    conversation whose transcript is `parent_path`, or "" while there is
+    none. Claude keeps it at <conversation>/subagents/agent-<id>.jsonl,
+    beside <conversation>.jsonl, and puts some agents one or more folders
+    further down (2.1.317), so a miss at the top searches below. A fork run
+    without a transcript has none at all: Claude's prompt suggestion, which
+    can fire a PreToolUse hook for a call it then denies (see
+    WorkspaceManager._confirm_tool_prompts). `agent_id` must already be a
+    plain name (session_hook._plain_id)."""
+    stem, ext = os.path.splitext(parent_path)
+    if ext != ".jsonl" or not agent_id:
+        return ""
+    base = os.path.join(stem, "subagents")
+    name = f"agent-{agent_id}.jsonl"
+    direct = os.path.join(base, name)
+    if os.path.isfile(direct):
+        return direct
+    for root, _dirs, files in os.walk(base):
+        if name in files:
+            return os.path.join(root, name)
+    return ""
+
+
 def latest_cli_version(cwd: str, session_id: str) -> str:
     """The Claude Code version that last wrote this conversation: every record
     carries a top-level `version` ("2.1.316"). "" when there is no file or no
