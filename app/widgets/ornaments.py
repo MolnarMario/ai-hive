@@ -25,6 +25,14 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QLabel, QSizePolicy,
 from .. import ui_theme, usage_poll
 from ..ui_theme import Palette
 
+
+def _mix(a: str, b: str, t: float) -> str:
+    """The colour `t` of the way from `a` to `b` (0 is a, 1 is b), as #rrggbb."""
+    ca, cb = QColor(a), QColor(b)
+    return QColor(round(ca.red() + (cb.red() - ca.red()) * t),
+                  round(ca.green() + (cb.green() - ca.green()) * t),
+                  round(ca.blue() + (cb.blue() - ca.blue()) * t)).name()
+
 # --- lifted SVG ornament tiles (transparent grounds; colours are the design's) ---
 
 _BORDER_H = """<svg xmlns='http://www.w3.org/2000/svg' width='220' height='32'>
@@ -318,7 +326,8 @@ def working_pulse(owner: QObject, on_value) -> QVariantAnimation:
 class AgentCountBadge(QWidget):
     """A workspace's agent tally: a rounded badge showing how many agents are
     open, colour-coded by state — pulsing amber while any agent is working,
-    green when all are idle (running, no errors), red on error, dim when empty.
+    green when all are idle (running, no errors), red on error, grey when
+    every agent is asleep to free memory, and a dimmer grey when empty.
     Colours are read from the live `Palette` at paint time so the badge tracks
     every skin (no per-skin QSS needed). The pulse runs ONLY in the working
     state; every other state is static, so idle rows cost nothing. Clicking it
@@ -332,6 +341,9 @@ class AgentCountBadge(QWidget):
         "working": lambda: Palette.YELLOW,
         "idle": lambda: Palette.GREEN,
         "error": lambda: Palette.RED,
+        # 40% of the way from the empty grey toward body text: brighter
+        # than an empty row on a dark skin, stronger ink on a light one
+        "asleep": lambda: _mix(Palette.TEXT_DIM, Palette.TEXT, 0.4),
         "empty": lambda: Palette.TEXT_DIM,
     }
 

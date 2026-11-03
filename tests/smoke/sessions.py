@@ -2969,8 +2969,13 @@ def test_requested_stop_is_not_an_error():
     stats = mgr.workspace_stats(ws.id)
     check("requested-stop: a sleep's kill exit is not an error",
           calls == ["stop"] and agent.status is AgentStatus.EXITED_OK
-          and stats["error"] == 0 and ws_state(stats) == "idle",
-          (calls, agent.status, stats))
+          and stats["error"] == 0, (calls, agent.status, stats))
+    check("requested-stop: a workspace whose agents all sleep reads grey",
+          stats["asleep"] == 1 and ws_state(stats) == "asleep", stats)
+    agent._wake()
+    stats = mgr.workspace_stats(ws.id)
+    check("requested-stop: ...and green once one is awake again",
+          stats["asleep"] == 0 and ws_state(stats) == "idle", stats)
 
     # a pipe worker's kill reports a crash exit; a stop asked for it
     live["on"] = True

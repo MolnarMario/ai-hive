@@ -85,12 +85,18 @@ def ws_state(stats: dict) -> str:
     Shared by the row's count badge and the collapsed rail, so the two never
     disagree. Amber pulses ONLY when an agent is actually working; a
     running-but-quiet agent (standby, no errors) reads green. Working wins over
-    a stale error, so an active row is amber even if a sibling errored."""
-    if not stats.get("total", 0):
+    a stale error, so an active row is amber even if a sibling errored. Red is
+    only for an agent that crashed, failed or exited with an error. A row
+    whose every agent is asleep to free memory reads grey, a little brighter
+    than an empty row's."""
+    total = stats.get("total", 0)
+    if not total:
         return "empty"
     if stats.get("busy", 0) > 0:
         return "working"
-    return "error" if stats.get("error", 0) > 0 else "idle"
+    if stats.get("error", 0) > 0:
+        return "error"
+    return "asleep" if stats.get("asleep", 0) >= total else "idle"
 
 
 class WorkspaceRow(QFrame):
@@ -362,7 +368,8 @@ class WorkspaceRow(QFrame):
                 "command to finish, click to see who")
         tip = (f"{total} agent(s): {busy} working, {running} running, "
                f"{e} error, {waiting} waiting, {blocked} limit-stopped, "
-               f"{scheduled} scheduled, {bg} background-shell")
+               f"{scheduled} scheduled, {bg} background-shell, "
+               f"{stats.get('asleep', 0)} asleep")
         self.setToolTip(f"{tip}\n{self._folder}" if self._folder else tip)
         # any of the above may have changed the icon stack's visible children
         # (and so its natural width) — re-pin it to the right edge
@@ -1144,6 +1151,8 @@ class WorkspaceRail(QWidget):
             tip += f", {st['waiting']} waiting for you"
         if st.get("error", 0):
             tip += f", {st['error']} error"
+        if st.get("asleep", 0):
+            tip += f", {st['asleep']} asleep"
         return tip
 
 

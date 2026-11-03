@@ -440,6 +440,24 @@ def test_collapsed_sidebar_rail():
                        "waiting": 1})
     sb.set_stats("c", {"total": 1, "active": 0, "busy": 0, "error": 1})
 
+    # every agent asleep to free memory: grey, brighter than an empty row
+    from PySide6.QtGui import QColor
+
+    from app.widgets.ornaments import AgentCountBadge
+    check("badge: every agent asleep reads asleep, not idle or empty",
+          ws_state({"total": 2, "asleep": 2}) == "asleep"
+          and ws_state({"total": 2, "asleep": 1}) == "idle"
+          and ws_state({"total": 0, "asleep": 0}) == "empty")
+    check("badge: a working or errored agent still wins over the sleepers",
+          ws_state({"total": 2, "asleep": 1, "busy": 1}) == "working"
+          and ws_state({"total": 2, "asleep": 2, "error": 1}) == "error")
+    colors = AgentCountBadge._STATE_COLOR
+    asleep_c = QColor(colors["asleep"]())
+    empty_c = QColor(colors["empty"]())
+    check("badge: the asleep grey is brighter than the empty one",
+          asleep_c.lightness() > empty_c.lightness(),
+          (asleep_c.name(), empty_c.name()))
+
     check("rail: one entry per workspace, in sidebar order",
           [e[0] for e in rail._entries] == ["a", "b", "c"], rail._entries)
     check("rail: strips share the count badge's states",
