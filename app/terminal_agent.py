@@ -20,7 +20,8 @@ from .ansi_parser import _PARTIAL_RE as _ESC_PARTIAL_RE
 from .coordination import sanitize_text
 from .scheduled_send import MISSED, PENDING, SENT, ScheduledMessage
 from .process_worker import (AgentSpec, ProcessWorker, WorkerState,
-                             is_job_tooling, is_shell_pid, process_parent_id)
+                             describe_pid, is_job_tooling, is_shell_pid,
+                             process_parent_id)
 from .pty_worker import PtyWorker
 
 LOG_CAP = 4000  # retained (stream, text) segments per agent
@@ -223,6 +224,13 @@ BG_SHELL_WARMUP_S = 6.0
 # name (process_worker.is_hive_bridge) and the window only covers other
 # late children.
 BG_SHELL_SETTLE_S = 10.0
+
+# How long a command that just ended keeps its agent out of Free up RAM's
+# sleep, and how long after it the agent's output counts as a reply. Claude
+# answers the end of a background command on its own, so no submit moves the
+# idle clock, and an agent long past its hours would otherwise be stopped as
+# it picks the work back up. Seconds.
+SLEEP_AFTER_COMMAND_S = 120.0
 
 # How long `request_repaint` holds the child one row shorter before giving
 # the row back. Long enough that ConPTY delivers two distinct size changes
@@ -667,8 +675,9 @@ class TerminalAgent(QObject):
         self._last_input_ts = 0.0     # walltime the user last sent keystrokes
         # ...and the two stamps the idle sleep reads (last_active_at): a key
         # that is not a focus report, and output while a submitted turn is
-        # open or a Stop hook. Output outside a turn is a redraw or Claude's
-        # away recap, which nobody asked for.
+        # open or a command runs or just ended, or a Stop hook. Other output
+        # outside a turn is a redraw or Claude's away recap, which nobody
+        # asked for.
         self._last_key_ts = 0.0
         self._last_reply_ts = 0.0
         self._last_resize_ts = 0.0    # walltime the child was last resized
@@ -765,8 +774,8 @@ class TerminalAgent(QObject):
         # observed for this launch, CLI tooling left out (learned downward,
         # so a wrapper like the codex.CMD shim's cmd.exe is never mistaken
         # for "extra"); _bg_extra_since is when a count above baseline was
-        # first seen while not busy; _bg_shell is the debounced, emitted
-        # effective value.
+        # first seen, busy or not; _bg_shell is the debounced, emitted
+        # effective value, dark while the agent prints.
         self._bg_baseline: int | None = None
         # the actual PIDs seen while learning the baseline above -- identity,
         # not just a count, so a later kill (see kill_bg_shell_extras) can
@@ -780,10 +789,13 @@ class TerminalAgent(QObject):
         self._bg_submitted = False
         self._bg_extra_since: float | None = None
         self._bg_shell = False
-        # the last poll whose count sat above the baseline, debounce or not
-        # and busy or not. sleep_due reads this: _bg_shell goes dark around
-        # every burst of output while the command keeps running.
+        # the last poll that saw such a count outlast the debounce, busy or
+        # not, since _bg_shell goes dark around every burst of output while
+        # the command keeps running (SLEEP_AFTER_COMMAND_S)
         self._bg_seen_ts = 0.0
+        # the sleep's last look found a command, so one hold audits once
+        # (_job_runs_command)
+        self._sleep_held = False
         # single-shot: (re)armed on each output burst; firing = output went
         # quiet, so the agent has dropped back to standby
         self._idle_timer = QTimer(self)
@@ -1058,10 +1070,10 @@ class TerminalAgent(QObject):
         nothing is known.
 
         Not every output burst or write is activity. A focus report is not
-        a key (FOCUS_REPORTS), and output with no turn open is a redraw or
-        the recap Claude prints when the user comes back, so neither moves
-        this. Both did once, and an idle agent never reached its sleep
-        hour."""
+        a key (FOCUS_REPORTS), and output with no turn open and no command
+        around it is a redraw or the recap Claude prints when the user comes
+        back, so neither moves this. Both did once, and an idle agent never
+        reached its sleep hour."""
         return max(self._active_floor, self._last_reply_ts,
                    self._last_key_ts, self._last_submit_ts,
                    self._session_started)
@@ -1078,10 +1090,7 @@ class TerminalAgent(QObject):
         the plan limit, or holds a scheduled message: each of those needs
         the live child.
 
-        A command that just ended holds it for TURN_QUIET_S too. Claude
-        answers the end of a background command on its own, with no submit
-        to move the idle clock, so an agent long past its hours would
-        otherwise be stopped the moment it picks the work back up."""
+        A command that just ended holds it too (SLEEP_AFTER_COMMAND_S)."""
         if (not self.can_sleep() or self._asleep or self._disposing
                 or self.status is not AgentStatus.RUNNING
                 or not self._prompt_ready):
@@ -1092,23 +1101,31 @@ class TerminalAgent(QObject):
             return False
         now = time.time() if now is None else now
         return (now - self.last_active_at() >= idle_s
-                and now - self._bg_seen_ts >= TURN_QUIET_S
+                and now - self._bg_seen_ts >= SLEEP_AFTER_COMMAND_S
                 and not self._job_runs_command())
 
     def _job_runs_command(self) -> bool:
         """A fresh look at the job, for the one decision that ends whatever
         is in it: does it hold anything besides the agent and what it keeps
-        at rest? The gear can't answer that. It waits out a debounce and
-        goes dark around every burst of output, so it reads "nothing" for
-        seconds at a time while a command runs. This goes by identity, as
-        the kill menu does, so a command that arrives as a resting process
+        at rest? The gear can't answer that: it waits out a debounce and
+        goes dark while the agent prints. This goes by identity, as the
+        kill menu does, so a command that arrives as a resting process
         leaves still shows. An empty answer is a failed query
-        (WinJob.process_ids), and what can't be seen isn't stopped."""
+        (WinJob.process_ids), and what can't be seen isn't stopped. A hold
+        can last, with no gear to explain it (a job that never took the
+        process, a resting process replaced between two polls), so each one
+        leaves an audit line."""
         ids = self.worker.job_process_ids()
-        if not ids:
-            return True
-        keep = self._bg_shell_keep_pids(ids)
-        return any(p not in keep for p in ids)
+        extras = self._extras_in(ids)
+        held = bool(extras) or not ids
+        if held and not self._sleep_held and self.audit is not None:
+            try:
+                what = [describe_pid(p) for p in extras] or "unreadable"
+                self.audit(f"SLEEP-HOLD agent={self.spec.name} job={what}")
+            except Exception:
+                pass
+        self._sleep_held = held
+        return held
 
     def put_to_sleep(self) -> None:
         """Stop the child to give its memory back. The next start of any
@@ -2555,6 +2572,8 @@ class TerminalAgent(QObject):
         self._bg_baseline_pids = None
         self._bg_submitted = False
         self._bg_extra_since = None
+        self._bg_seen_ts = 0.0
+        self._sleep_held = False
         if self._bg_shell:
             self._bg_shell = False
             self.bg_shell_changed.emit(False)
@@ -2616,8 +2635,12 @@ class TerminalAgent(QObject):
             return  # query unsupported/failed -- don't flap on missing data
         tooling = self._job_tooling_pids(ids)
         count = len(ids) - len(tooling)
-        if elapsed < BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S:
-            # still settling: track the latest count outright (up or down)
+        if (elapsed < BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S
+                or self._bg_baseline_pids is None):
+            # still settling, or a launch whose polls all missed the window
+            # (a stalled GUI, a suspend): with no resting set the kill menu
+            # lists nothing and the sleep reads every MCP server as a command.
+            # Track the latest count outright (up or down)
             # rather than only ratcheting down, so a steady-state process
             # that spawns a little late (see BG_SHELL_SETTLE_S) is learned as
             # baseline instead of being locked in as "extra" forever. Same
@@ -2650,18 +2673,24 @@ class TerminalAgent(QObject):
             self._bg_baseline_pids &= set(ids)
         extra = count > self._bg_baseline
         now = time.time()
-        if extra:
+        # the clock survives a busy tick, so the gear relights on the first
+        # poll after the output ends, not a whole debounce later. Everything
+        # that reads the gear would otherwise miss a live command for 6 to 8 s
+        # after each burst (the update dialog's list, _on_reply_quiet).
+        if not extra:
+            self._bg_extra_since = None
+        elif self._bg_extra_since is None:
+            self._bg_extra_since = now
+        lasted = (self._bg_extra_since is not None
+                  and now - self._bg_extra_since >= BG_SHELL_DEBOUNCE_S)
+        if lasted:
             self._bg_seen_ts = now
         if self.is_busy() or not extra:
-            self._bg_extra_since = None
             if self._bg_shell:
                 self._bg_shell = False
                 self.bg_shell_changed.emit(False)
             return
-        if self._bg_extra_since is None:
-            self._bg_extra_since = now
-        elif (now - self._bg_extra_since >= BG_SHELL_DEBOUNCE_S
-              and not self._bg_shell):
+        if lasted and not self._bg_shell:
             self._bg_shell = True
             self.bg_shell_changed.emit(True)
             # forensic trail: if the baseline is ever wrong (a live report
@@ -2706,7 +2735,11 @@ class TerminalAgent(QObject):
         against (i.e. before poll_bg_shell has ever settled)."""
         if self._bg_baseline_pids is None:
             return []
-        ids = self.worker.job_process_ids()
+        return self._extras_in(self.worker.job_process_ids())
+
+    def _extras_in(self, ids) -> list[int]:
+        """The members of `ids` that are not safe overhead: what the gear's
+        kill menu lists and what the sleep won't stop."""
         keep = self._bg_shell_keep_pids(ids)
         return [p for p in ids if p not in keep]
 
@@ -2792,7 +2825,9 @@ class TerminalAgent(QObject):
         # a pulse left over from real work still drops on schedule instead of
         # being held alive by the typing). Genuine work outlasts the window.
         if now - self._last_input_ts >= INPUT_ECHO_S:
-            if pending:
+            # output around a command is the agent acting on it, with no
+            # submit to open a turn
+            if pending or now - self._bg_seen_ts < SLEEP_AFTER_COMMAND_S:
                 self._last_reply_ts = now
             self._last_work_ts = now
             if not self._busy:

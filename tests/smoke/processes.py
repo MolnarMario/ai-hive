@@ -211,14 +211,12 @@ def test_bg_shell_workspace_stats():
               mgr.workspace_stats(ws.id)["bg_shell"] == 0)
         agent._busy = False
 
-        # re-flag once busy clears and it's sustained again (the extra-since
-        # clock restarted while busy, so this needs its own poll to start,
-        # then a later one past the debounce), then clear the instant the
-        # extra process itself is gone
-        agent.poll_bg_shell()             # extra_since starts now
-        fake_now[0] += BG_SHELL_DEBOUNCE_S + 1
+        # re-flag on the first poll once busy clears: the command outlasted
+        # the debounce long ago, and restarting it after every burst left
+        # the gear dark for 6 to 8 s while the command ran. Then clear the
+        # instant the extra process itself is gone
         agent.poll_bg_shell()
-        check("bg shell: re-flags once busy clears and it's sustained again",
+        check("bg shell: re-flags on the first poll once busy clears",
               agent.is_bg_shell_busy())
         count[0] = 1
         agent.poll_bg_shell()
@@ -407,6 +405,18 @@ def test_bg_shell_settle_skips_commands():
               "the server, never the MCP server",
               sorted(agent.bg_shell_extra_pids()) == [bash, server],
               agent.bg_shell_extra_pids())
+
+        # a launch whose polls all missed the window (a stalled GUI, a
+        # suspend) learns its resting set late, or the menu lists nothing
+        # and the sleep reads the MCP server as a command for the whole run
+        agent._bg_baseline = agent._bg_baseline_pids = None
+        agent._bg_extra_since = None
+        agent.poll_bg_shell()
+        check("bg shell settle commands: a late first sample still learns "
+              "the resting set, and still skips the shell",
+              agent._bg_baseline == 2
+              and agent._bg_baseline_pids == {root, mcp},
+              (agent._bg_baseline, agent._bg_baseline_pids))
 
         agent._reset_bg_shell()   # a restart: nothing asked yet
         check("bg shell settle commands: a restart forgets the submit",

@@ -3729,7 +3729,8 @@ def test_sleep_spares_a_running_command():
     back after its debounce. The sleep tick looks every minute and only has
     to land in that gap once, and the stop ends the shell. Live: BG-SHELL
     relit four times in 30 minutes on one agent, count=6 baseline=1 each
-    time, with the same command running throughout."""
+    time, with the same command running throughout. The sleep now asks the
+    job itself, and a command that ended leaves the agent time to act on it."""
     import time
 
     from PySide6.QtWidgets import QApplication
@@ -3737,13 +3738,15 @@ def test_sleep_spares_a_running_command():
     import app.process_worker as process_worker_mod
     import app.terminal_agent as terminal_agent_mod
     from app.terminal_agent import (BG_SHELL_DEBOUNCE_S, BG_SHELL_SETTLE_S,
-                                    BG_SHELL_WARMUP_S, TURN_QUIET_S)
+                                    BG_SHELL_WARMUP_S, SLEEP_AFTER_COMMAND_S)
     from app.workspace_manager import WorkspaceManager
 
     QApplication.instance() or QApplication([])
     mgr = WorkspaceManager()
     ws = mgr.create_workspace("SleepShell", SCRATCH_CWD)
     agent, _calls, _live = _sleepy_claude(mgr, ws.id, "Waiting", SCRATCH_CWD)
+    audited = []
+    agent.audit = audited.append
     root, mcp, bash, server = 100, 104, 108, 112
     job = [root, mcp]
     hour = 3600.0
@@ -3775,35 +3778,67 @@ def test_sleep_spares_a_running_command():
               not agent.sleep_due(hour))
 
         # Claude's recap when the user comes back: output with no turn open.
-        # The poll drops the gear for it, and the debounce holds it dark.
+        # The poll drops the gear for it, so nothing reads it until the next
+        # poll after the output ends.
         agent._mark_busy()
         agent.poll_bg_shell()
         agent._idle_timer.stop()
         agent._on_idle_timeout()
-        agent.poll_bg_shell()
         check("sleep command: the output put the gear out (the gap)",
               not agent.is_busy() and not agent.is_bg_shell_busy())
         check("sleep command: the command still holds the sleep in the gap",
               not agent.sleep_due(hour))
-        advance(BG_SHELL_DEBOUNCE_S + 2)
-        check("sleep command: the gear comes back on its own",
-              agent.is_bg_shell_busy())
+        agent.poll_bg_shell()
+        check("sleep command: the gear is back on the next poll, not a "
+              "debounce later", agent.is_bg_shell_busy())
 
         # the end of a command is the very moment the agent acts on it, and
-        # its reply opens no turn, so the idle clock has not moved
+        # its reply opens no turn, so nothing has moved the idle clock
+        agent._last_reply_ts = 0.0
+        idle_since = agent.last_active_at()
         job[:] = [root, mcp]
         agent.poll_bg_shell()
         check("sleep command: the gear clears when the command ends",
               not agent.is_bg_shell_busy())
         check("sleep command: an agent just freed by its command gets time "
               "to react", not agent.sleep_due(hour))
-        advance(TURN_QUIET_S + 2)
+        advance(SLEEP_AFTER_COMMAND_S + 2)
         check("sleep command: an agent that did not react can sleep",
+              agent.last_active_at() == idle_since and agent.sleep_due(hour))
+
+        # ...and when it does react, a silent tool can outlast the two
+        # minutes, so the reply counts as activity like any other
+        job[:] = [root, mcp, bash]
+        advance(BG_SHELL_DEBOUNCE_S + 2)
+        job[:] = [root, mcp]
+        agent.poll_bg_shell()
+        agent._last_input_ts = 0.0
+        agent._mark_busy()              # Claude's reply, no turn open
+        agent._idle_timer.stop()
+        agent._on_idle_timeout()
+        advance(SLEEP_AFTER_COMMAND_S + 2)
+        check("sleep command: output right after a command restarts the idle "
+              "clock", agent.last_active_at() > idle_since
+              and not agent.sleep_due(hour))
+        advance(hour)
+        check("sleep command: ...for one idle period",
               agent.sleep_due(hour))
 
+        job[:] = [root, mcp, 116]       # a git a poll happens to catch
+        agent.poll_bg_shell()
+        job[:] = [root, mcp]
+        agent.poll_bg_shell()
+        check("sleep command: a process gone inside the debounce is no "
+              "command", agent.sleep_due(hour))
+
         job[:] = [root, mcp, bash]
+        audited.clear()
         check("sleep command: a command no poll has seen yet holds the sleep",
               not agent.sleep_due(hour))
+        check("sleep command: a second look at the same hold writes no "
+              "second line", not agent.sleep_due(hour)
+              and len(audited) == 1 and "SLEEP-HOLD" in audited[0]
+              and "pid 108" in audited[0], audited)
         job[:] = [root, bash]
         check("sleep command: a process swapped for a resting one holds it "
               "too, though the count looks like rest",
@@ -3812,9 +3847,12 @@ def test_sleep_spares_a_running_command():
         job[:] = [root]
         check("sleep command: a resting process leaving is no command",
               agent.sleep_due(hour))
+        audited.clear()
         job[:] = []
-        check("sleep command: a job that can't be read holds the sleep",
-              not agent.sleep_due(hour))
+        check("sleep command: a job that can't be read holds the sleep, and "
+              "says so", not agent.sleep_due(hour)
+              and audited == [f"SLEEP-HOLD agent={agent.spec.name} "
+                              "job=unreadable"], audited)
     finally:
         time.time, process_worker_mod.process_image_path = saved
 
