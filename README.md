@@ -139,10 +139,13 @@ workspaces keep executing — switching never pauses anything.
   and a click or a key resumes the same conversation with `--resume <id>`.
   Only Claude, Antigravity and Codex agents with a pinned conversation
   sleep, and never while one is working, asking you something, running a
-  background command, waiting out the plan limit, holding a scheduled
-  message or holding a prompt you typed but didn't send. AI Hive checks the
-  agent's processes right before a sleep, and a command that just ended
-  holds the sleep two more minutes so the agent can act on it. A sleeping
+  background command or background agent, waiting out the plan limit,
+  holding a scheduled message, a Claude cron job or `/loop` wakeup, or
+  holding a prompt you typed but didn't send. AI Hive checks the agent's
+  processes right before a sleep, and a command that just ended holds the
+  sleep two more minutes so the agent can act on it. An MCP server that
+  came up late doesn't hold it. Anything else that keeps an agent past its
+  idle hours awake leaves a `SLEEP-HOLD` line in `session.log`. A sleeping
   agent wakes on its own only when AI Hive has to type into it: **Ship finished
   lanes** into an asleep integrator, or a message you scheduled for it
   coming due. Lane agents sleep through a ship, because the integrator

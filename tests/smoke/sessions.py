@@ -3435,7 +3435,6 @@ def test_sleep_idle_agents():
           not agent.sleep_due(hour, now))
     agent._last_key_ts = 0.0
     for attr, label in (("_busy", "working"), ("_waiting", "asking the user"),
-                        ("_bg_shell", "running a background command"),
                         ("_limit_blocked", "cut off by the plan limit")):
         setattr(agent, attr, True)
         due = agent.sleep_due(hour, now)
@@ -3613,9 +3612,14 @@ def test_sleep_idle_agents():
     term = card.terminal
     term.feed("\x1b[2J\x1b[H> half a prompt")
     check("sleep: the view sees an unsent prompt", term.has_draft())
+    lines = []
+    idle.audit = lines.append
+    win._sleep_tick()
     win._sleep_tick()
     check("sleep: the tick leaves an agent with an unsent prompt awake",
           icalls == [] and not idle.is_asleep(), icalls)
+    check("sleep: ...and says so once, not once a minute",
+          lines == ["SLEEP-HOLD agent='Idle' unsent prompt"], lines)
     term.feed("\x1b[2J\x1b[H> ")
     check("sleep: an empty box is no draft", not term.has_draft())
     term.feed("\x1b[2J\x1b[H> Try \"fix the tests\"\x1b[1;3H")
@@ -3747,13 +3751,18 @@ def test_sleep_spares_a_running_command():
     agent, _calls, _live = _sleepy_claude(mgr, ws.id, "Waiting", SCRATCH_CWD)
     audited = []
     agent.audit = audited.append
-    root, mcp, bash, server = 100, 104, 108, 112
+    root, mcp, bash, server, git = 100, 104, 108, 112, 116
+    parents = {mcp: root, bash: root, server: bash, git: root}
     job = [root, mcp]
     hour = 3600.0
     fake_now = [1_000_000.0]
-    saved = (time.time, process_worker_mod.process_image_path)
+    saved = (time.time, process_worker_mod.process_image_path,
+             terminal_agent_mod.is_shell_pid,
+             terminal_agent_mod.process_parent_id)
     time.time = lambda: fake_now[0]
     process_worker_mod.process_image_path = lambda pid: ""
+    terminal_agent_mod.is_shell_pid = lambda pid: pid == bash
+    terminal_agent_mod.process_parent_id = lambda pid: parents.get(pid, 0)
     agent.worker.pid = lambda: root
     agent.worker.job_process_ids = lambda: list(job)
     agent._session_started = fake_now[0]
@@ -3824,8 +3833,10 @@ def test_sleep_spares_a_running_command():
         check("sleep command: ...for one idle period",
               agent.sleep_due(hour))
 
-        job[:] = [root, mcp, 116]       # a git a poll happens to catch
+        job[:] = [root, mcp, git]       # a git a poll happens to catch
         agent.poll_bg_shell()
+        check("sleep command: a git Claude runs for itself holds nothing",
+              agent.sleep_due(hour))
         job[:] = [root, mcp]
         agent.poll_bg_shell()
         check("sleep command: a process gone inside the debounce is no "
@@ -3851,10 +3862,383 @@ def test_sleep_spares_a_running_command():
         job[:] = []
         check("sleep command: a job that can't be read holds the sleep, and "
               "says so", not agent.sleep_due(hour)
-              and audited == [f"SLEEP-HOLD agent={agent.spec.name} "
-                              "job=unreadable"], audited)
+              and audited == ["SLEEP-HOLD agent='Waiting' job unreadable"],
+              audited)
     finally:
-        time.time, process_worker_mod.process_image_path = saved
+        (time.time, process_worker_mod.process_image_path,
+         terminal_agent_mod.is_shell_pid,
+         terminal_agent_mod.process_parent_id) = saved
+
+
+def test_sleep_only_real_commands_hold():
+    """An MCP server that came up after the baseline settled, or replaced a
+    resting one, kept its agent awake for good: the gear stayed lit and
+    sleep_due read the gear, and nothing said why. Claude runs every command
+    through a shell, so a process whose parents reach claude.exe with no
+    shell on the way is claude's own. Measured on 2.1.318: the Bash tool is
+    bash then bash, the PowerShell tool is cmd then powershell, and an MCP
+    server is `cmd /c npx` or a direct child. A broken line still holds: it
+    can be a server whose shell has exited. The other CLIs aren't known to
+    use a shell, so anything extra holds for them."""
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    import app.process_worker as process_worker_mod
+    import app.terminal_agent as terminal_agent_mod
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("SleepLines", SCRATCH_CWD)
+    agent, _calls, _live = _sleepy_claude(mgr, ws.id, "Lines", SCRATCH_CWD)
+    audited = []
+    agent.audit = audited.append
+    hour = 3600.0
+    root, shell, child, grand = 100, 104, 108, 112
+    parents = {}
+    shells = set()
+    job = [root]
+    saved = (process_worker_mod.process_image_path,
+             terminal_agent_mod.is_shell_pid,
+             terminal_agent_mod.process_parent_id)
+    process_worker_mod.process_image_path = lambda pid: ""
+    terminal_agent_mod.is_shell_pid = lambda pid: pid in shells
+    terminal_agent_mod.process_parent_id = lambda pid: parents.get(pid, 0)
+    agent.worker.pid = lambda: root
+    agent.worker.job_process_ids = lambda: list(job)
+    agent._session_started = time.time() - 2 * hour
+    agent._bg_baseline = 1
+    agent._bg_baseline_pids = {root}
+
+    def arrange(members, kin, shell_pids=()):
+        job[:] = [root, *members]
+        parents.clear()
+        parents.update(kin)
+        shells.clear()
+        shells.update(shell_pids)
+
+    try:
+        arrange([child], {child: root})     # the late MCP server
+        agent.poll_bg_shell()
+        agent._bg_extra_since = time.time() - 60
+        agent.poll_bg_shell()
+        check("sleep lines: a late MCP server lights the gear",
+              agent.is_bg_shell_busy())
+        check("sleep lines: ...but a lit gear no longer holds the sleep",
+              agent.sleep_due(hour))
+        check("sleep lines: ...and it is no command to wait out",
+              agent._bg_seen_ts == 0.0, agent._bg_seen_ts)
+        before = agent.last_active_at()
+        agent._last_input_ts = 0.0
+        agent._mark_busy()
+        agent._idle_timer.stop()
+        agent._on_idle_timeout()
+        check("sleep lines: ...so a redraw beside it is no reply",
+              agent.last_active_at() == before)
+
+        arrange([child, grand], {child: root, grand: child})
+        check("sleep lines: `cmd /c npx` under claude holds nothing",
+              agent.sleep_due(hour))
+        holds = lambda: [a for a in audited if "SLEEP-HOLD" in a]
+        check("sleep lines: nothing held, so nothing was written",
+              holds() == [], audited)
+
+        arrange([child, shell, grand], {child: root, shell: child,
+                                        grand: shell}, [shell])
+        check("sleep lines: the PowerShell tool's cmd, shell and command "
+              "hold it", not agent.sleep_due(hour))
+        check("sleep lines: ...and the line names what is running",
+              len(holds()) == 1 and "commands:" in holds()[0]
+              and "pid 108" not in holds()[0] and "pid 104" in holds()[0]
+              and "pid 112" in holds()[0], audited)
+
+        arrange([shell, grand], {shell: root, grand: shell}, [shell])
+        check("sleep lines: the Bash tool's shell holds it",
+              not agent.sleep_due(hour))
+
+        arrange([grand], {grand: 9999})
+        check("sleep lines: a line that breaks still holds it (a server "
+              "whose shell has exited)", not agent.sleep_due(hour))
+
+        arrange([child], {child: root})
+        agent.spec.provider = "gemini"
+        check("sleep lines: for another CLI any extra holds it",
+              not agent.sleep_due(hour))
+        agent.spec.provider = "claude"
+        check("sleep lines: for Claude that same process does not",
+              agent.sleep_due(hour))
+    finally:
+        (process_worker_mod.process_image_path,
+         terminal_agent_mod.is_shell_pid,
+         terminal_agent_mod.process_parent_id) = saved
+
+
+def test_sleep_spares_background_agents():
+    """A background sub-agent runs inside claude.exe, so the job shows
+    nothing, and it is silent on the card, so a stop ended it with no sign.
+    Claude's own record is <agent>.meta.json, which gets `"finished":true`
+    when one ends. An unfinished one needs an end too, since a crash leaves
+    it unfinished for good, and that end has to outlast the 5-hour plan
+    limit: one real sub-agent sat 7036 s on it, then carried on."""
+    import json
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from app import transcripts
+    from app.transcripts import SUBAGENT_SILENT_S
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-subagents-"))
+    grace = 120.0
+    hour = 3600.0
+    now = time.time()
+    since = now - 7 * hour              # this launch started 7 h ago
+
+    def sub_agent(parent, agent_id, age, meta, folder="subagents"):
+        where = Path(os.path.splitext(parent)[0]) / folder
+        where.mkdir(parents=True, exist_ok=True)
+        body = where / f"agent-{agent_id}.jsonl"
+        body.write_text('{"type":"user"}\n', encoding="utf-8")
+        os.utime(body, (now - age, now - age))
+        if isinstance(meta, str):
+            (where / f"agent-{agent_id}.meta.json").write_text(
+                meta, encoding="utf-8")
+        elif meta is not None:
+            (where / f"agent-{agent_id}.meta.json").write_text(
+                json.dumps(meta), encoding="utf-8")
+
+    def found(number, age, meta, **kw):
+        parent = str(tmp / f"conv{number}.jsonl")
+        sub_agent(parent, "a1", age, meta, **kw)
+        return transcripts.working_subagents(parent, since, now, grace)
+
+    running = {"description": "scan the leads", "requestShape": "background"}
+    done = {**running, "finished": True}
+    try:
+        check("sub-agents: one at work is named by its description",
+              found(1, 60, running) == ["scan the leads"])
+        check("sub-agents: one that finished long ago is not",
+              found(2, 600, done) == [])
+        check("sub-agents: one that just finished is, since Claude answers "
+              "it with no submit", found(3, 30, done) == ["scan the leads"])
+        check("sub-agents: two hours silent on a plan limit still counts",
+              found(4, 2 * hour, running) == ["scan the leads"])
+        check("sub-agents: longer than that limit's window does not, so a "
+              "crash can't hold it for good",
+              found(5, SUBAGENT_SILENT_S + 1, running) == [],
+              SUBAGENT_SILENT_S)
+        earlier = str(tmp / "conv6.jsonl")
+        sub_agent(earlier, "a1", 2 * hour, running)
+        check("sub-agents: unfinished from before this launch is dead",
+              transcripts.working_subagents(earlier, now - hour, now, grace)
+              == [])
+        check("sub-agents: an older Claude's meta with no `finished` key "
+              "reads as at work", found(7, 60, {"description": "old"})
+              == ["old"])
+        check("sub-agents: no meta at all reads as at work, by its id",
+              found(8, 60, None) == ["a1"])
+        check("sub-agents: a broken meta reads as at work",
+              found(9, 60, "{not json") == ["a1"])
+        check("sub-agents: Claude 2.1.317's deeper folders are searched",
+              found(10, 60, running, folder="subagents/workflows/w1")
+              == ["scan the leads"])
+        check("sub-agents: a conversation without any has none",
+              transcripts.working_subagents(str(tmp / "none.jsonl"), since,
+                                            now, grace) == [])
+        check("sub-agents: a path that is no transcript has none",
+              transcripts.working_subagents(str(tmp / "none"), since, now,
+                                            grace) == [])
+
+        mgr = WorkspaceManager()
+        ws = mgr.create_workspace("SleepSub", SCRATCH_CWD)
+        agent, _calls, _live = _sleepy_claude(mgr, ws.id, "Parent", SCRATCH_CWD)
+        audited = []
+        agent.audit = audited.append
+        agent._session_started = now - 3 * hour
+        parent = transcripts.transcript_path(SCRATCH_CWD,
+                                             agent.spec.session_id)
+        check("sub-agents: the agent starts due", agent.sleep_due(hour))
+        sub_agent(parent, "b2", 2 * hour, running)
+        check("sub-agents: a silent one past the idle hours holds the sleep",
+              not agent.sleep_due(hour))
+        check("sub-agents: ...and the log says which",
+              audited == ["SLEEP-HOLD agent='Parent' sub-agents: "
+                          "['scan the leads']"], audited)
+        sub_agent(parent, "b2", 2 * hour, done)
+        check("sub-agents: its finish frees the agent", agent.sleep_due(hour))
+        agent.spec.provider = "openai"
+        sub_agent(parent, "b2", 2 * hour, running)
+        check("sub-agents: only Claude writes these",
+              agent.sleep_due(hour))
+        agent.spec.provider = "claude"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(os.path.dirname(transcripts.transcript_path(
+            SCRATCH_CWD, "x")), ignore_errors=True)
+
+
+def _iso(when):
+    import datetime
+    return datetime.datetime.fromtimestamp(
+        when, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _tool_call(when, name, args, call_id, sidechain=False):
+    """A tool call as Claude writes it to the transcript (measured)."""
+    import json
+    return json.dumps({
+        "type": "assistant", "timestamp": _iso(when), "isSidechain": sidechain,
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": call_id, "name": name, "input": args}]},
+    }, separators=(",", ":")) + "\n"
+
+
+def _tool_answer(call_id, result, is_error=False):
+    import json
+    block = {"tool_use_id": call_id, "type": "tool_result",
+             "content": "Scheduled it."}
+    if is_error:
+        block["is_error"] = True
+    return json.dumps({
+        "type": "user", "toolUseResult": result,
+        "message": {"role": "user", "content": [block]},
+    }, separators=(",", ":")) + "\n"
+
+
+def test_sleep_spares_timers():
+    """Claude keeps cron jobs and `/loop` wakeups in memory only, so a sleep
+    lost them for good and silently. CronCreate's docs: "the job is gone
+    when Claude exits", and `durable` has no effect. A one-shot job holds
+    until the fire time Claude recorded, a recurring one until its 7-day
+    expiry, and a wakeup until its delay is up. What an earlier run set is
+    already gone."""
+    import time
+
+    from PySide6.QtWidgets import QApplication
+
+    from app import transcripts
+    from app.transcripts import CRON_EXPIRE_S
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-timers-"))
+    grace = 120.0
+    hour = 3600.0
+    now = time.time()
+    since = now - hour
+    made = now - 60
+    count = [0]
+
+    def pending(*lines, at=None, launch=since):
+        count[0] += 1
+        path = tmp / f"conv{count[0]}.jsonl"
+        path.write_text("".join(lines), encoding="utf-8")
+        return transcripts.pending_timers(str(path), launch,
+                                          now if at is None else at, grace)
+
+    once = _tool_call(made, "CronCreate", {"cron": "37 11 20 12 *",
+                                           "prompt": "x", "recurring": False},
+                      "t1")
+    once_done = _tool_answer("t1", {"id": "cd5ec5e5", "recurring": False,
+                                    "durable": False,
+                                    "nextFireAt": (now + 5 * hour) * 1000})
+    every = _tool_call(made, "CronCreate", {"cron": "23 */6 * * *",
+                                            "prompt": "x"}, "t2")
+    every_done = _tool_answer("t2", {"id": "7e6e5c3f", "recurring": True,
+                                     "durable": False,
+                                     "nextFireAt": (now + hour) * 1000})
+    wake = _tool_call(made, "ScheduleWakeup", {"delaySeconds": 1800,
+                                               "prompt": "x"}, "t3")
+    try:
+        check("timers: a one-shot job holds until it fires",
+              pending(once, once_done) == ["cron cd5ec5e5"])
+        check("timers: ...and a little past that",
+              pending(once, once_done, at=now + 5 * hour + grace - 1)
+              == ["cron cd5ec5e5"])
+        check("timers: ...then no longer",
+              pending(once, once_done, at=now + 5 * hour + grace + 1) == [])
+        check("timers: a recurring job holds past its next fire",
+              pending(every, every_done, at=now + 3 * hour)
+              == ["cron 7e6e5c3f"])
+        check("timers: ...until its 7 days are up",
+              pending(every, every_done, at=made + CRON_EXPIRE_S + 1) == [])
+        check("timers: a deleted job holds nothing",
+              pending(every, every_done,
+                      _tool_call(made + 5, "CronDelete", {"id": "7e6e5c3f"},
+                                 "t4"),
+                      _tool_answer("t4", {"id": "7e6e5c3f"})) == [])
+        check("timers: a job from before this launch is already gone",
+              pending(every, every_done, launch=now) == [])
+        check("timers: a failed create holds nothing",
+              pending(every, _tool_answer("t2", "bad cron", is_error=True))
+              == [])
+        check("timers: a sub-agent's line in the file is not this "
+              "conversation's", pending(_tool_call(
+                  made, "CronCreate", {"cron": "1 2 3 4 *"}, "t5",
+                  sidechain=True), _tool_answer("t5", {"id": "s"})) == [])
+        check("timers: a result it can't read still holds, by the schedule",
+              pending(every, _tool_answer("t2", "a new shape"))
+              == ["cron 23 */6 * * *"])
+        check("timers: a mention of the tool is no job",
+              pending('{"type":"attachment","x":"\\"name\\":\\"CronCreate\\"",'
+                      '"name":"CronCreate"}\n', "not json\n") == [])
+
+        check("timers: a wakeup holds until its delay is up",
+              pending(wake, at=now + 1000) == ["wakeup"])
+        check("timers: ...and a little past that",
+              pending(wake, at=made + 1800 + grace - 1) == ["wakeup"])
+        check("timers: ...then no longer",
+              pending(wake, at=made + 1800 + grace + 1) == [])
+        check("timers: the loop's own stop ends it", pending(
+            wake, _tool_call(made + 5, "ScheduleWakeup", {"stop": True},
+                             "t6")) == [])
+        check("timers: the newest wakeup replaces the last", pending(
+            wake, _tool_call(made + 5, "ScheduleWakeup",
+                             {"delaySeconds": 60}, "t7"), at=now + 1000) == [])
+        check("timers: a wakeup from before this launch is gone",
+              pending(wake, launch=now) == [])
+        check("timers: no file means none",
+              transcripts.pending_timers(str(tmp / "nope.jsonl"), since, now,
+                                         grace) == [])
+
+        path = tmp / "growing.jsonl"
+        path.write_text(once + once_done, encoding="utf-8")
+        first = transcripts.pending_timers(str(path), since, now, grace)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(_tool_call(made + 5, "CronDelete", {"id": "cd5ec5e5"},
+                                "t8"))
+        check("timers: a transcript that grew is read again",
+              first == ["cron cd5ec5e5"] and transcripts.pending_timers(
+                  str(path), since, now, grace) == [])
+
+        mgr = WorkspaceManager()
+        ws = mgr.create_workspace("SleepTimers", SCRATCH_CWD)
+        agent, _calls, _live = _sleepy_claude(
+            mgr, ws.id, "Timed", SCRATCH_CWD,
+            sid="5ee9a6e7-0000-4000-8000-00000000000c")
+        audited = []
+        agent.audit = audited.append
+        agent._session_started = now - 3 * hour
+        file = Path(transcripts.transcript_path(SCRATCH_CWD,
+                                                agent.spec.session_id))
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(once + once_done, encoding="utf-8")
+        check("timers: a job set this launch holds the sleep",
+              not agent.sleep_due(hour))
+        check("timers: ...and the log says which",
+              audited == ["SLEEP-HOLD agent='Timed' timers: "
+                          "['cron cd5ec5e5']"], audited)
+        file.write_text(once + once_done + _tool_call(
+            made + 5, "CronDelete", {"id": "cd5ec5e5"}, "t9"),
+            encoding="utf-8")
+        check("timers: its delete frees the agent", agent.sleep_due(hour))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(os.path.dirname(transcripts.transcript_path(
+            SCRATCH_CWD, "x")), ignore_errors=True)
 
 
 def test_scheduled_message_wakes_sleeping_agent():

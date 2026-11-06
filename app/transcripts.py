@@ -1406,6 +1406,154 @@ def subagent_transcript(parent_path: str, agent_id: str) -> str:
     return ""
 
 
+# How long a sub-agent may sit silent and unfinished before it stops counting
+# as running. A crash or an older Claude can leave one unfinished for good
+# (20 of 64 metas on one machine have no `finished` key), so the hold needs an
+# end, and that end has to outlast the plan's 5-hour limit: one real sub-agent
+# sat 7036 s on "You've hit your session limit", then carried on. The other
+# 63 never went quiet for more than 103 s.
+SUBAGENT_SILENT_S = 6 * 3600.0
+# Claude deletes a recurring cron job after this long (CronCreate's own docs)
+CRON_EXPIRE_S = 7 * 86400.0
+_TIMER_NEEDLES = (b'"name":"CronCreate"', b'"name":"CronDelete"',
+                  b'"name":"ScheduleWakeup"')
+_TIMER_CACHE: dict[str, tuple] = {}
+
+
+def working_subagents(parent_path: str, since: float, now: float,
+                      grace: float) -> list[str]:
+    """What a stop of Claude would end: the sub-agents of the conversation
+    at `parent_path` still at work, by description. They run inside
+    claude.exe, so the job shows no process for them, and Claude's own trace
+    is the only sign: <agent>.meta.json gets `"finished":true` when one ends.
+
+    One counts if its transcript moved in the last `grace` seconds, finished
+    or not, since Claude answers a finished one with no submit. It also
+    counts while it has not finished, wrote during this launch (`since`,
+    what an earlier run left unfinished is dead) and has not been silent for
+    SUBAGENT_SILENT_S. A missing or unreadable meta reads as not finished."""
+    stem, ext = os.path.splitext(parent_path)
+    if ext != ".jsonl":
+        return []
+    found = []
+    for root, _dirs, files in os.walk(os.path.join(stem, "subagents")):
+        for name in files:
+            if not (name.startswith("agent-") and name.endswith(".jsonl")):
+                continue
+            path = os.path.join(root, name)
+            try:
+                written = os.path.getmtime(path)
+            except OSError:
+                continue
+            age = now - written
+            if age >= grace and (written < since
+                                 or age >= SUBAGENT_SILENT_S):
+                continue
+            meta = _subagent_meta(path)
+            if age < grace or meta.get("finished") is not True:
+                found.append(str(meta.get("description") or name[6:-6]))
+    return found
+
+
+def _subagent_meta(transcript: str) -> dict:
+    try:
+        with open(transcript[:-len(".jsonl")] + ".meta.json", "r",
+                  encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def pending_timers(path: str, since: float, now: float,
+                   grace: float) -> list[str]:
+    """What a stop of Claude would cancel: the cron jobs and the wakeup the
+    conversation at `path` set during this launch (`since`) that are still
+    to fire. Claude keeps both in memory only ("gone when Claude exits",
+    CronCreate's docs, and `durable` has no effect), so a stop loses them
+    with no trace, and a resume can't bring them back. A one-shot job counts
+    until `grace` past the `nextFireAt` Claude recorded, a recurring one
+    until it expires, and a wakeup until `grace` past its delay. A job
+    whose result can't be read counts until it would expire."""
+    jobs, wakeup, deleted = _read_timers(path)
+    pending = []
+    for job in jobs:
+        if job["made"] < since or job["id"] in deleted:
+            continue
+        ends = (job["fire"] + grace if job["fire"] and not job["recurring"]
+                else job["made"] + CRON_EXPIRE_S)
+        if now < ends:
+            pending.append(f"cron {job['id'] or job['cron']}")
+    if wakeup is not None and wakeup[0] >= since and now < wakeup[1] + grace:
+        pending.append("wakeup")
+    return pending
+
+
+def _read_timers(path: str) -> tuple[list[dict], tuple | None, set]:
+    """(cron jobs, newest wakeup as (made, fire), deleted job ids) from a
+    conversation's main transcript. Reads the whole file, since a job can
+    be days back, but only when the file changed, and an agent idle enough
+    to be asked hasn't changed it. Never raises."""
+    try:
+        st = os.stat(path)
+        cached = _TIMER_CACHE.get(path)
+        if cached and cached[0] == (st.st_mtime, st.st_size):
+            return cached[1]
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return [], None, set()
+    jobs: dict = {}
+    wakeup = None
+    deleted = set()
+    needles = list(_TIMER_NEEDLES)
+    for raw in data.split(b"\n"):
+        if not any(n in raw for n in needles):
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        msg = rec.get("message") if isinstance(rec, dict) else None
+        blocks = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(blocks, list) or rec.get("isSidechain"):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_result":
+                job = jobs.get(block.get("tool_use_id"))
+                if job is None:
+                    continue
+                result = rec.get("toolUseResult")
+                if block.get("is_error"):
+                    del jobs[block.get("tool_use_id")]
+                elif isinstance(result, dict):
+                    job["id"] = str(result.get("id") or "")
+                    fire = result.get("nextFireAt")
+                    job["fire"] = (fire / 1000.0
+                                   if isinstance(fire, (int, float)) else 0.0)
+            elif block.get("type") == "tool_use":
+                args = block.get("input")
+                args = args if isinstance(args, dict) else {}
+                if block.get("name") == "CronCreate":
+                    jobs[block.get("id")] = {
+                        "made": _record_epoch(rec), "id": "", "fire": 0.0,
+                        "cron": str(args.get("cron") or ""),
+                        "recurring": args.get("recurring") is not False}
+                    needles.append(str(block.get("id")).encode("utf-8"))
+                elif block.get("name") == "CronDelete":
+                    deleted.add(args.get("id"))
+                elif block.get("name") == "ScheduleWakeup":
+                    delay = args.get("delaySeconds")
+                    delay = delay if isinstance(delay, (int, float)) else 3600
+                    made = _record_epoch(rec)
+                    wakeup = None if args.get("stop") else (made, made + delay)
+    parsed = (list(jobs.values()), wakeup, deleted)
+    _TIMER_CACHE[path] = ((st.st_mtime, st.st_size), parsed)
+    return parsed
+
+
 def latest_cli_version(cwd: str, session_id: str) -> str:
     """The Claude Code version that last wrote this conversation: every record
     carries a top-level `version` ("2.1.316"). "" when there is no file or no

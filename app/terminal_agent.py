@@ -232,6 +232,11 @@ BG_SHELL_SETTLE_S = 10.0
 # it picks the work back up. Seconds.
 SLEEP_AFTER_COMMAND_S = 120.0
 
+# Where a job member came from (TerminalAgent._job_line)
+_LINE_CLI = "cli"
+_LINE_SHELL = "shell"
+_LINE_BROKEN = "broken"
+
 # How long `request_repaint` holds the child one row shorter before giving
 # the row back. Long enough that ConPTY delivers two distinct size changes
 # rather than coalescing them into nothing, short enough that no one sees it.
@@ -793,9 +798,9 @@ class TerminalAgent(QObject):
         # not, since _bg_shell goes dark around every burst of output while
         # the command keeps running (SLEEP_AFTER_COMMAND_S)
         self._bg_seen_ts = 0.0
-        # the sleep's last look found a command, so one hold audits once
-        # (_job_runs_command)
-        self._sleep_held = False
+        # the kind of thing that last held the sleep (note_sleep_hold), so
+        # one hold writes one audit line
+        self._sleep_held = ""
         # single-shot: (re)armed on each output burst; firing = output went
         # quiet, so the agent has dropped back to standby
         self._idle_timer = QTimer(self)
@@ -1085,47 +1090,77 @@ class TerminalAgent(QObject):
 
     def sleep_due(self, idle_s: float, now: float | None = None) -> bool:
         """Has this running agent been idle for `idle_s` with nothing that
-        a stopped child would lose? Never while it works, asks the user
-        something, runs a background command, has a turn open, waits for
-        the plan limit, or holds a scheduled message: each of those needs
-        the live child.
-
-        A command that just ended holds it too (SLEEP_AFTER_COMMAND_S)."""
+        a stopped child would lose? _sleep_hold names what would be lost."""
         if (not self.can_sleep() or self._asleep or self._disposing
-                or self.status is not AgentStatus.RUNNING
-                or not self._prompt_ready):
-            return False
-        if (self._busy or self._waiting or self._bg_shell
-                or self._limit_blocked or self.turn_pending()
-                or self.pending_scheduled()):
+                or self.status is not AgentStatus.RUNNING):
             return False
         now = time.time() if now is None else now
-        return (now - self.last_active_at() >= idle_s
-                and now - self._bg_seen_ts >= SLEEP_AFTER_COMMAND_S
-                and not self._job_runs_command())
+        if now - self.last_active_at() < idle_s:
+            self._sleep_held = ""
+            return False
+        why = self._sleep_hold(now)
+        if why:
+            self.note_sleep_hold(why)
+        return not why
 
-    def _job_runs_command(self) -> bool:
-        """A fresh look at the job, for the one decision that ends whatever
-        is in it: does it hold anything besides the agent and what it keeps
-        at rest? The gear can't answer that: it waits out a debounce and
-        goes dark while the agent prints. This goes by identity, as the
-        kill menu does, so a command that arrives as a resting process
-        leaves still shows. An empty answer is a failed query
-        (WinJob.process_ids), and what can't be seen isn't stopped. A hold
-        can last, with no gear to explain it (a job that never took the
-        process, a resting process replaced between two polls), so each one
-        leaves an audit line."""
+    def _sleep_hold(self, now: float) -> str:
+        """What a stop would lose right now, "" for nothing. All of it lives
+        only in the child, and what can't be read counts as something to
+        lose: a needless hold costs memory, a wrong stop costs the work.
+
+        Commands come from a fresh look at the job, not the gear, which
+        waits out a debounce, goes dark while the agent prints, and stays lit
+        for an MCP server that came up late. An empty job is a failed query
+        (WinJob.process_ids). Sub-agents and timers run inside claude.exe,
+        so no process shows for them: only Claude's own files do
+        (transcripts.working_subagents, pending_timers)."""
+        if not self._prompt_ready:
+            return "prompt not up"
+        if self._busy:
+            return "working"
+        if self._waiting:
+            return "asking the user"
+        if self._limit_blocked:
+            return "plan limit"
+        if self.turn_pending():
+            return "turn open"
+        if self.pending_scheduled():
+            return "scheduled message"
         ids = self.worker.job_process_ids()
-        extras = self._extras_in(ids)
-        held = bool(extras) or not ids
-        if held and not self._sleep_held and self.audit is not None:
+        if not ids:
+            return "job unreadable"
+        commands = self._commands_in(ids)
+        if commands:
+            return f"commands: {[describe_pid(p) for p in commands]}"
+        if now - self._bg_seen_ts < SLEEP_AFTER_COMMAND_S:
+            return "command just ended"
+        if self.spec.provider == "claude":
+            path = transcripts.transcript_path(self.spec.cwd,
+                                               self.spec.session_id)
+            for kind, found in (
+                    ("sub-agents", transcripts.working_subagents(
+                        path, self._session_started, now,
+                        SLEEP_AFTER_COMMAND_S)),
+                    ("timers", transcripts.pending_timers(
+                        path, self._session_started, now,
+                        SLEEP_AFTER_COMMAND_S))):
+                if found:
+                    return f"{kind}: {found}"
+        return ""
+
+    def note_sleep_hold(self, why: str) -> None:
+        """Audit what keeps an agent past its idle hours awake, so "why
+        didn't it sleep" has an answer in session.log. A silent hold is how a
+        misread prompt box once kept every agent awake. One line per kind of
+        hold, not one a minute. MainWindow._sleep_tick adds the one thing
+        only the card knows: a prompt typed but not sent."""
+        kind = why.partition(":")[0]
+        if kind != self._sleep_held and self.audit is not None:
             try:
-                what = [describe_pid(p) for p in extras] or "unreadable"
-                self.audit(f"SLEEP-HOLD agent={self.spec.name} job={what}")
+                self.audit(f"SLEEP-HOLD agent={self.spec.name!r} {why}")
             except Exception:
                 pass
-        self._sleep_held = held
-        return held
+        self._sleep_held = kind
 
     def put_to_sleep(self) -> None:
         """Stop the child to give its memory back. The next start of any
@@ -2573,7 +2608,7 @@ class TerminalAgent(QObject):
         self._bg_submitted = False
         self._bg_extra_since = None
         self._bg_seen_ts = 0.0
-        self._sleep_held = False
+        self._sleep_held = ""
         if self._bg_shell:
             self._bg_shell = False
             self.bg_shell_changed.emit(False)
@@ -2592,23 +2627,47 @@ class TerminalAgent(QObject):
         still a command."""
         if not self._bg_submitted:
             return set(ids)
+        line = self._job_line(ids)
+        return {p for p in ids if line(p) != _LINE_SHELL}
+
+    def _job_line(self, ids):
+        """A function telling where a member of `ids` came from, walking up
+        its parents: _LINE_CLI when they reach the agent with no shell on the
+        way, _LINE_SHELL when one is on the way, _LINE_BROKEN when the walk
+        stops at a parent that can't be read or has left the job."""
         root = self.worker.pid()
         members = set(ids)
-        verdict: dict[int, bool] = {}
+        verdict: dict[int, str] = {}
 
-        def adoptable(pid: int, depth: int = 0) -> bool:
+        def line(pid: int, depth: int = 0) -> str:
             if pid == root:
-                return True
+                return _LINE_CLI
             if pid not in verdict:
                 if is_shell_pid(pid):
-                    verdict[pid] = False
+                    verdict[pid] = _LINE_SHELL
                 else:
                     parent = process_parent_id(pid)
-                    verdict[pid] = (parent not in members or depth > 32
-                                    or adoptable(parent, depth + 1))
+                    verdict[pid] = (_LINE_BROKEN
+                                    if parent not in members or depth > 32
+                                    else line(parent, depth + 1))
             return verdict[pid]
 
-        return {p for p in ids if adoptable(p)}
+        return line
+
+    def _commands_in(self, ids) -> list[int]:
+        """The extras in `ids` a stop would end. Claude runs every command
+        through a shell (measured on 2.1.318: bash, or cmd then PowerShell),
+        so an extra whose parents reach it with no shell on the way is its
+        own: an MCP server that came up late or got replaced. Counting those
+        kept an agent awake for good. A broken line still counts, since that
+        can be a server whose shell has exited. The other CLIs' commands
+        aren't known to go through a shell (`cmd /c` isn't one, see
+        _SHELL_IMAGES), so every extra of theirs counts."""
+        extras = self._extras_in(ids)
+        if not extras or self.spec.provider != "claude":
+            return extras
+        line = self._job_line(ids)
+        return [p for p in extras if line(p) != _LINE_CLI]
 
     def poll_bg_shell(self) -> None:
         """Externally ticked (see WorkspaceManager.poll_bg_shell_activity):
@@ -2683,7 +2742,7 @@ class TerminalAgent(QObject):
             self._bg_extra_since = now
         lasted = (self._bg_extra_since is not None
                   and now - self._bg_extra_since >= BG_SHELL_DEBOUNCE_S)
-        if lasted:
+        if lasted and self._commands_in(ids):
             self._bg_seen_ts = now
         if self.is_busy() or not extra:
             if self._bg_shell:
