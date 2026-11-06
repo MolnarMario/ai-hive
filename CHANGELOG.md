@@ -8,6 +8,15 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.56.9
+
+- Free up RAM no longer ends a command an agent is waiting on. For a few
+  seconds after an agent printed anything, like the recap Claude shows
+  when you come back to it, a running background shell didn't count, and
+  a sleep landing in that gap stopped the shell with the agent. AI Hive
+  now looks at the agent's actual processes right before a sleep, and
+  waits two minutes after a command ends so the agent can act on it.
+
 ## 0.56.8
 
 - An agent asleep to free memory, or one you stopped, no longer turns its

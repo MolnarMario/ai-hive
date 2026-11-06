@@ -780,6 +780,10 @@ class TerminalAgent(QObject):
         self._bg_submitted = False
         self._bg_extra_since: float | None = None
         self._bg_shell = False
+        # the last poll whose count sat above the baseline, debounce or not
+        # and busy or not. sleep_due reads this: _bg_shell goes dark around
+        # every burst of output while the command keeps running.
+        self._bg_seen_ts = 0.0
         # single-shot: (re)armed on each output burst; firing = output went
         # quiet, so the agent has dropped back to standby
         self._idle_timer = QTimer(self)
@@ -1072,7 +1076,12 @@ class TerminalAgent(QObject):
         a stopped child would lose? Never while it works, asks the user
         something, runs a background command, has a turn open, waits for
         the plan limit, or holds a scheduled message: each of those needs
-        the live child."""
+        the live child.
+
+        A command that just ended holds it for TURN_QUIET_S too. Claude
+        answers the end of a background command on its own, with no submit
+        to move the idle clock, so an agent long past its hours would
+        otherwise be stopped the moment it picks the work back up."""
         if (not self.can_sleep() or self._asleep or self._disposing
                 or self.status is not AgentStatus.RUNNING
                 or not self._prompt_ready):
@@ -1082,7 +1091,24 @@ class TerminalAgent(QObject):
                 or self.pending_scheduled()):
             return False
         now = time.time() if now is None else now
-        return now - self.last_active_at() >= idle_s
+        return (now - self.last_active_at() >= idle_s
+                and now - self._bg_seen_ts >= TURN_QUIET_S
+                and not self._job_runs_command())
+
+    def _job_runs_command(self) -> bool:
+        """A fresh look at the job, for the one decision that ends whatever
+        is in it: does it hold anything besides the agent and what it keeps
+        at rest? The gear can't answer that. It waits out a debounce and
+        goes dark around every burst of output, so it reads "nothing" for
+        seconds at a time while a command runs. This goes by identity, as
+        the kill menu does, so a command that arrives as a resting process
+        leaves still shows. An empty answer is a failed query
+        (WinJob.process_ids), and what can't be seen isn't stopped."""
+        ids = self.worker.job_process_ids()
+        if not ids:
+            return True
+        keep = self._bg_shell_keep_pids(ids)
+        return any(p not in keep for p in ids)
 
     def put_to_sleep(self) -> None:
         """Stop the child to give its memory back. The next start of any
@@ -2624,6 +2650,8 @@ class TerminalAgent(QObject):
             self._bg_baseline_pids &= set(ids)
         extra = count > self._bg_baseline
         now = time.time()
+        if extra:
+            self._bg_seen_ts = now
         if self.is_busy() or not extra:
             self._bg_extra_since = None
             if self._bg_shell:
