@@ -801,6 +801,11 @@ class TerminalAgent(QObject):
         # the kind of thing that last held the sleep (note_sleep_hold), so
         # one hold writes one audit line
         self._sleep_held = ""
+        # every conversation this launch has been pinned to, as session id:
+        # (transcript, where to start reading it). /clear and an in-TUI
+        # /resume move the pin while the child runs, and background work
+        # outlives them (Claude's /clear kills only what isn't backgrounded).
+        self._launch_files: dict[str, tuple[str, int]] = {}
         # single-shot: (re)armed on each output burst; firing = output went
         # quiet, so the agent has dropped back to standby
         self._idle_timer = QTimer(self)
@@ -983,6 +988,7 @@ class TerminalAgent(QObject):
             # new id once Codex has written the session metadata.
             self.spec.session_id = ""
         self._session_started = time.time()
+        self._note_conversation(launch=True)
         self.worker.start()
         # resume + verify are one-shot restore aids: a manual restart later is
         # a deliberate fresh session
@@ -1098,7 +1104,10 @@ class TerminalAgent(QObject):
         if now - self.last_active_at() < idle_s:
             self._sleep_held = ""
             return False
-        why = self._sleep_hold(now)
+        try:
+            why = self._sleep_hold(now)
+        except Exception as exc:    # a stop can't be taken back
+            why = f"check failed: {exc!r}"
         if why:
             self.note_sleep_hold(why)
         return not why
@@ -1109,11 +1118,10 @@ class TerminalAgent(QObject):
         lose: a needless hold costs memory, a wrong stop costs the work.
 
         Commands come from a fresh look at the job, not the gear, which
-        waits out a debounce, goes dark while the agent prints, and stays lit
-        for an MCP server that came up late. An empty job is a failed query
-        (WinJob.process_ids). Sub-agents and timers run inside claude.exe,
-        so no process shows for them: only Claude's own files do
-        (transcripts.working_subagents, pending_timers)."""
+        waits out a debounce and goes dark while the agent prints. An empty
+        job is a failed query (WinJob.process_ids). Sub-agents and timers
+        run inside claude.exe, so no process shows for them: only Claude's
+        own files do (transcripts.working_subagents, pending_timers)."""
         if not self._prompt_ready:
             return "prompt not up"
         if self._busy:
@@ -1129,24 +1137,38 @@ class TerminalAgent(QObject):
         ids = self.worker.job_process_ids()
         if not ids:
             return "job unreadable"
-        commands = self._commands_in(ids)
-        if commands:
-            return f"commands: {[describe_pid(p) for p in commands]}"
+        extras = self._extras_in(ids)
+        if extras:
+            return f"commands: {[describe_pid(p) for p in extras]}"
         if now - self._bg_seen_ts < SLEEP_AFTER_COMMAND_S:
             return "command just ended"
-        if self.spec.provider == "claude":
-            path = transcripts.transcript_path(self.spec.cwd,
-                                               self.spec.session_id)
-            for kind, found in (
-                    ("sub-agents", transcripts.working_subagents(
-                        path, self._session_started, now,
-                        SLEEP_AFTER_COMMAND_S)),
-                    ("timers", transcripts.pending_timers(
-                        path, self._session_started, now,
-                        SLEEP_AFTER_COMMAND_S))):
-                if found:
-                    return f"{kind}: {found}"
+        if self.spec.provider != "claude":
+            return ""
+        self._note_conversation()
+        since, grace = self._session_started, SLEEP_AFTER_COMMAND_S
+        files = list(self._launch_files.values())
+        for path, _start in files:
+            found = transcripts.working_subagents(path, since, now, grace)
+            if found:
+                return f"sub-agents: {found}"
+        for path, start in files:
+            found = transcripts.pending_timers(path, start, since, now, grace)
+            if found:
+                return f"timers: {found}"
         return ""
+
+    def _note_conversation(self, launch: bool = False) -> None:
+        """Remember the conversation this agent is pinned to now. Called at
+        every poll, since the pin has six writers. At a launch nothing it
+        wrote yet can matter, so reading starts at today's end of the file.
+        A later pin may trail the switch it reports, so that one reads from
+        the top."""
+        sid = self.spec.session_id
+        if (self.spec.provider == "claude" and sid
+                and sid not in self._launch_files):
+            path = transcripts.transcript_path(self.spec.cwd, sid)
+            self._launch_files[sid] = (
+                path, transcripts.transcript_size(path) if launch else 0)
 
     def note_sleep_hold(self, why: str) -> None:
         """Audit what keeps an agent past its idle hours awake, so "why
@@ -1214,6 +1236,7 @@ class TerminalAgent(QObject):
         elif self.spec.provider == "openai":
             self.spec.session_id = ""  # Codex chooses its own new thread id
         self._session_started = time.time()
+        self._note_conversation(launch=True)
         # a restart is a fresh conversation: the next reply worth stamping is
         # the next one somebody asks for (see _note_submit)
         self._turn_open = False
@@ -2609,6 +2632,7 @@ class TerminalAgent(QObject):
         self._bg_extra_since = None
         self._bg_seen_ts = 0.0
         self._sleep_held = ""
+        self._launch_files = {}
         if self._bg_shell:
             self._bg_shell = False
             self.bg_shell_changed.emit(False)
@@ -2654,20 +2678,22 @@ class TerminalAgent(QObject):
 
         return line
 
-    def _commands_in(self, ids) -> list[int]:
-        """The extras in `ids` a stop would end. Claude runs every command
-        through a shell (measured on 2.1.318: bash, or cmd then PowerShell),
-        so an extra whose parents reach it with no shell on the way is its
-        own: an MCP server that came up late or got replaced. Counting those
-        kept an agent awake for good. A broken line still counts, since that
-        can be a server whose shell has exited. The other CLIs' commands
-        aren't known to go through a shell (`cmd /c` isn't one, see
-        _SHELL_IMAGES), so every extra of theirs counts."""
-        extras = self._extras_in(ids)
-        if not extras or self.spec.provider != "claude":
-            return extras
-        line = self._job_line(ids)
-        return [p for p in extras if line(p) != _LINE_CLI]
+    def _job_overhead_pids(self, ids) -> set[int]:
+        """The members of `ids` that are never work: tooling, and for Claude
+        whatever its parents reach it through with no shell on the way.
+        Claude runs every command through a shell (measured on 2.1.318:
+        bash, or cmd then PowerShell), so those are its own: an MCP server
+        that came up late or got replaced, a git it runs for itself. They
+        lit the gear for good and kept the agent awake. A broken line is not
+        overhead, since that can be a server whose shell has exited. The
+        other CLIs' commands aren't known to go through a shell (`cmd /c`
+        isn't one, see _SHELL_IMAGES), so nothing extra is theirs."""
+        overhead = self._job_tooling_pids(ids)
+        if self.spec.provider == "claude":
+            root = self.worker.pid()
+            line = self._job_line(ids)
+            overhead |= {p for p in ids if p != root and line(p) == _LINE_CLI}
+        return overhead
 
     def poll_bg_shell(self) -> None:
         """Externally ticked (see WorkspaceManager.poll_bg_shell_activity):
@@ -2692,13 +2718,14 @@ class TerminalAgent(QObject):
         ids = self.worker.job_process_ids()
         if not ids:
             return  # query unsupported/failed -- don't flap on missing data
-        tooling = self._job_tooling_pids(ids)
+        tooling = self._job_overhead_pids(ids)
         count = len(ids) - len(tooling)
+        self._note_conversation()
         if (elapsed < BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S
                 or self._bg_baseline_pids is None):
             # still settling, or a launch whose polls all missed the window
             # (a stalled GUI, a suspend): with no resting set the kill menu
-            # lists nothing and the sleep reads every MCP server as a command.
+            # lists nothing and the sleep reads what rests here as a command.
             # Track the latest count outright (up or down)
             # rather than only ratcheting down, so a steady-state process
             # that spawns a little late (see BG_SHELL_SETTLE_S) is learned as
@@ -2742,7 +2769,7 @@ class TerminalAgent(QObject):
             self._bg_extra_since = now
         lasted = (self._bg_extra_since is not None
                   and now - self._bg_extra_since >= BG_SHELL_DEBOUNCE_S)
-        if lasted and self._commands_in(ids):
+        if lasted:
             self._bg_seen_ts = now
         if self.is_busy() or not extra:
             if self._bg_shell:
@@ -2784,7 +2811,7 @@ class TerminalAgent(QObject):
             keep.add(root)
         if ids is None:
             ids = self.worker.job_process_ids()
-        return keep | self._job_tooling_pids(ids)
+        return keep | self._job_overhead_pids(ids)
 
     def bg_shell_extra_pids(self) -> list[int]:
         """The actual extra processes behind the gear badge right now -- a

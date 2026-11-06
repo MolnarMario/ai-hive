@@ -3776,8 +3776,10 @@ def test_sleep_spares_a_running_command():
 
     try:
         advance(BG_SHELL_WARMUP_S + BG_SHELL_SETTLE_S + 2)
-        check("sleep command: the job at rest is learned",
-              agent._bg_baseline == 2, agent._bg_baseline)
+        check("sleep command: the job at rest is learned, Claude's own "
+              "children as overhead", agent._bg_baseline == 1
+              and agent._bg_baseline_pids == {root, mcp},
+              (agent._bg_baseline, agent._bg_baseline_pids))
 
         job[:] = [root, mcp, bash, server]   # a turn starts a long command
         advance(BG_SHELL_DEBOUNCE_S + 2)
@@ -3851,8 +3853,8 @@ def test_sleep_spares_a_running_command():
               and len(audited) == 1 and "SLEEP-HOLD" in audited[0]
               and "pid 108" in audited[0], audited)
         job[:] = [root, bash]
-        check("sleep command: a process swapped for a resting one holds it "
-              "too, though the count looks like rest",
+        check("sleep command: a command that replaced a resting process "
+              "holds it too",
               agent._bg_baseline_pids == {root, mcp}
               and not agent.sleep_due(hour))
         job[:] = [root]
@@ -3872,8 +3874,9 @@ def test_sleep_spares_a_running_command():
 
 def test_sleep_only_real_commands_hold():
     """An MCP server that came up after the baseline settled, or replaced a
-    resting one, kept its agent awake for good: the gear stayed lit and
-    sleep_due read the gear, and nothing said why. Claude runs every command
+    resting one, kept its agent awake for good: the gear stayed lit, the
+    kill menu offered the server, sleep_due read the gear, and nothing said
+    why. Claude runs every command
     through a shell, so a process whose parents reach claude.exe with no
     shell on the way is claude's own. Measured on 2.1.318: the Bash tool is
     bash then bash, the PowerShell tool is cmd then powershell, and an MCP
@@ -3923,9 +3926,11 @@ def test_sleep_only_real_commands_hold():
         agent.poll_bg_shell()
         agent._bg_extra_since = time.time() - 60
         agent.poll_bg_shell()
-        check("sleep lines: a late MCP server lights the gear",
-              agent.is_bg_shell_busy())
-        check("sleep lines: ...but a lit gear no longer holds the sleep",
+        check("sleep lines: a late MCP server lights no gear",
+              not agent.is_bg_shell_busy())
+        check("sleep lines: ...isn't in the kill menu",
+              agent.bg_shell_extra_pids() == [], agent.bg_shell_extra_pids())
+        check("sleep lines: ...and doesn't hold the sleep",
               agent.sleep_due(hour))
         check("sleep lines: ...and it is no command to wait out",
               agent._bg_seen_ts == 0.0, agent._bg_seen_ts)
@@ -3952,6 +3957,13 @@ def test_sleep_only_real_commands_hold():
               len(holds()) == 1 and "commands:" in holds()[0]
               and "pid 108" not in holds()[0] and "pid 104" in holds()[0]
               and "pid 112" in holds()[0], audited)
+        agent._bg_extra_since = time.time() - 60
+        agent.poll_bg_shell()
+        check("sleep lines: the gear lights for that, and its menu lists "
+              "the command, not the cmd above it",
+              agent.is_bg_shell_busy()
+              and sorted(agent.bg_shell_extra_pids()) == [shell, grand],
+              agent.bg_shell_extra_pids())
 
         arrange([shell, grand], {shell: root, grand: shell}, [shell])
         check("sleep lines: the Bash tool's shell holds it",
@@ -3966,6 +3978,7 @@ def test_sleep_only_real_commands_hold():
         check("sleep lines: for another CLI any extra holds it",
               not agent.sleep_due(hour))
         agent.spec.provider = "claude"
+        agent._bg_seen_ts = 0.0         # the two minutes after the shell above
         check("sleep lines: for Claude that same process does not",
               agent.sleep_due(hour))
     finally:
@@ -4067,8 +4080,40 @@ def test_sleep_spares_background_agents():
         check("sub-agents: ...and the log says which",
               audited == ["SLEEP-HOLD agent='Parent' sub-agents: "
                           "['scan the leads']"], audited)
+        agent.poll_bg_shell()
+        agent._note_conversation()
+        agent.spec.session_id = "5ee9a6e7-0000-4000-8000-00000000000d"
+        agent.poll_bg_shell()
+        agent._note_conversation()
+        check("sub-agents: /clear moves the pin, and the work outlives it",
+              not agent.sleep_due(hour) and len(agent._launch_files) == 2)
         sub_agent(parent, "b2", 2 * hour, done)
         check("sub-agents: its finish frees the agent", agent.sleep_due(hour))
+
+        saved = transcripts.working_subagents
+        transcripts.working_subagents = lambda *a: 1 / 0
+        try:
+            audited.clear()
+            check("sub-agents: a check that raises holds the sleep",
+                  not agent.sleep_due(hour))
+            check("sub-agents: ...and says so",
+                  len(audited) == 1 and "check failed" in audited[0], audited)
+        finally:
+            transcripts.working_subagents = saved
+
+        real_getmtime = transcripts.os.path.getmtime
+
+        def denied(name):
+            if name.endswith(".jsonl"):
+                raise PermissionError(13, "locked", name)
+            return real_getmtime(name)
+
+        transcripts.os.path.getmtime = denied
+        try:
+            check("sub-agents: a transcript it can't read holds the sleep",
+                  not agent.sleep_due(hour))
+        finally:
+            transcripts.os.path.getmtime = real_getmtime
         agent.spec.provider = "openai"
         sub_agent(parent, "b2", 2 * hour, running)
         check("sub-agents: only Claude writes these",
@@ -4136,7 +4181,7 @@ def test_sleep_spares_timers():
         count[0] += 1
         path = tmp / f"conv{count[0]}.jsonl"
         path.write_text("".join(lines), encoding="utf-8")
-        return transcripts.pending_timers(str(path), launch,
+        return transcripts.pending_timers(str(path), 0, launch,
                                           now if at is None else at, grace)
 
     once = _tool_call(made, "CronCreate", {"cron": "37 11 20 12 *",
@@ -4175,10 +4220,30 @@ def test_sleep_spares_timers():
         check("timers: a failed create holds nothing",
               pending(every, _tool_answer("t2", "bad cron", is_error=True))
               == [])
-        check("timers: a sub-agent's line in the file is not this "
-              "conversation's", pending(_tool_call(
-                  made, "CronCreate", {"cron": "1 2 3 4 *"}, "t5",
-                  sidechain=True), _tool_answer("t5", {"id": "s"})) == [])
+        check("timers: a denied delete leaves the job alive",
+              pending(every, every_done,
+                      _tool_call(made + 5, "CronDelete", {"id": "7e6e5c3f"},
+                                 "t4"),
+                      _tool_answer("t4", "no", is_error=True))
+              == ["cron 7e6e5c3f"])
+        check("timers: a delete with no answer yet leaves it alive too",
+              pending(every, every_done,
+                      _tool_call(made + 5, "CronDelete", {"id": "7e6e5c3f"},
+                                 "t4")) == ["cron 7e6e5c3f"])
+        check("timers: a delete with a nonsense id doesn't raise",
+              pending(every, every_done,
+                      _tool_call(made + 5, "CronDelete", {"id": ["a", "b"]},
+                                 "t4"),
+                      _tool_answer("t4", "no")) == ["cron 7e6e5c3f"])
+        check("timers: a sub-agent's job in this file lives in this process",
+              pending(_tool_call(made, "CronCreate", {"cron": "1 2 3 4 *"},
+                                 "t5", sidechain=True),
+                      _tool_answer("t5", {"id": "side1234", "recurring": True,
+                                          "nextFireAt": now * 1000}))
+              == ["cron side1234"])
+        check("timers: a record with no time still counts, by the file's",
+              pending(every.replace('"timestamp"', '"timestampX"'),
+                      every_done) == ["cron 7e6e5c3f"])
         check("timers: a result it can't read still holds, by the schedule",
               pending(every, _tool_answer("t2", "a new shape"))
               == ["cron 23 */6 * * *"])
@@ -4201,18 +4266,55 @@ def test_sleep_spares_timers():
         check("timers: a wakeup from before this launch is gone",
               pending(wake, launch=now) == [])
         check("timers: no file means none",
-              transcripts.pending_timers(str(tmp / "nope.jsonl"), since, now,
-                                         grace) == [])
+              transcripts.pending_timers(str(tmp / "nope.jsonl"), 0, since,
+                                         now, grace) == [])
+        locked = tmp / "locked.jsonl"
+        locked.mkdir()                  # exists, and open() is refused
+        check("timers: a transcript it can't read counts",
+              transcripts.pending_timers(str(locked), 0, since, now, grace)
+              == ["unreadable locked.jsonl"])
+
+        split = tmp / "split.jsonl"
+        split.write_text(every + every_done, encoding="utf-8")
+        check("timers: reading starts where the launch found the file",
+              transcripts.pending_timers(str(split), len(every + every_done),
+                                         since, now, grace) == [])
+        with open(split, "a", encoding="utf-8") as fh:
+            fh.write(once + once_done)
+        check("timers: ...so only this launch's lines are read",
+              transcripts.pending_timers(str(split), len(every + every_done),
+                                         since, now, grace)
+              == ["cron cd5ec5e5"])
+
+        parent = tmp / "family.jsonl"
+        parent.write_text("", encoding="utf-8")
+        kid = tmp / "family" / "subagents" / "agent-k1.jsonl"
+        kid.parent.mkdir(parents=True)
+        kid.write_text(every + every_done, encoding="utf-8")
+        check("timers: a sub-agent's own transcript counts",
+              transcripts.pending_timers(str(parent), 0, since, now, grace)
+              == ["cron 7e6e5c3f"])
+        with open(parent, "a", encoding="utf-8") as fh:
+            fh.write(_tool_call(made + 5, "CronDelete", {"id": "7e6e5c3f"},
+                                "t8") + _tool_answer("t8", {"id": "7e6e5c3f"}))
+        check("timers: ...and its job can be deleted from the conversation",
+              transcripts.pending_timers(str(parent), 0, since, now, grace)
+              == [])
+        old = time.time() - 2 * hour
+        os.utime(kid, (old, old))
+        check("timers: a sub-agent of an earlier launch is gone",
+              transcripts.pending_timers(str(parent), 0, since, now, grace)
+              == [])
 
         path = tmp / "growing.jsonl"
         path.write_text(once + once_done, encoding="utf-8")
-        first = transcripts.pending_timers(str(path), since, now, grace)
+        first = transcripts.pending_timers(str(path), 0, since, now, grace)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(_tool_call(made + 5, "CronDelete", {"id": "cd5ec5e5"},
-                                "t8"))
+                                "t8") + _tool_answer("t8", {"id": "cd5ec5e5"}))
         check("timers: a transcript that grew is read again",
               first == ["cron cd5ec5e5"] and transcripts.pending_timers(
-                  str(path), since, now, grace) == [])
+                  str(path), 0, since, now, grace) == [])
 
         mgr = WorkspaceManager()
         ws = mgr.create_workspace("SleepTimers", SCRATCH_CWD)
@@ -4225,15 +4327,23 @@ def test_sleep_spares_timers():
         file = Path(transcripts.transcript_path(SCRATCH_CWD,
                                                 agent.spec.session_id))
         file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("{}\n", encoding="utf-8")
+        agent._launch_files = {}
+        agent._note_conversation(launch=True)
+        check("timers: a launch reads from the end of the old conversation",
+              agent._launch_files[agent.spec.session_id][1] == 3
+              or agent._launch_files[agent.spec.session_id][1] == 4,
+              agent._launch_files)
         file.write_text(once + once_done, encoding="utf-8")
+        agent._launch_files = {}
         check("timers: a job set this launch holds the sleep",
               not agent.sleep_due(hour))
         check("timers: ...and the log says which",
               audited == ["SLEEP-HOLD agent='Timed' timers: "
                           "['cron cd5ec5e5']"], audited)
         file.write_text(once + once_done + _tool_call(
-            made + 5, "CronDelete", {"id": "cd5ec5e5"}, "t9"),
-            encoding="utf-8")
+            made + 5, "CronDelete", {"id": "cd5ec5e5"}, "t9")
+            + _tool_answer("t9", {"id": "cd5ec5e5"}), encoding="utf-8")
         check("timers: its delete frees the agent", agent.sleep_due(hour))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

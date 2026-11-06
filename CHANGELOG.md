@@ -17,8 +17,10 @@ em dashes: this text is shown in the app.
 - Free up RAM no longer cancels a Claude cron job or a `/loop` wakeup.
   Claude keeps those in memory only, so a sleep lost them for good. The
   agent now stays awake until they fire or expire.
-- An agent no longer stays awake for good because an MCP server came up
-  late or got replaced. Only real commands hold it now.
+- An agent no longer stays awake for good, or shows the gear, because an
+  MCP server came up late or got replaced. The gear's kill menu no longer
+  offers that server either. A process started through a shell still counts
+  as a command, since AI Hive can't tell it from one.
 - Whatever keeps an agent past its idle hours awake now leaves one
   `SLEEP-HOLD` line in session.log saying why.
 
