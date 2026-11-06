@@ -912,8 +912,8 @@ def test_cli_tooling_real_process():
     if sys.platform != "win32":
         skip('cli tooling real', 'non-Windows: job objects are Windows-only')
         return
-    from app.process_worker import (CREATE_NO_WINDOW, WinJob, is_cli_tooling,
-                                    process_image_path)
+    from app.process_worker import (CREATE_NO_WINDOW, WinJob, describe_pid,
+                                    is_cli_tooling, process_image_path)
     from app.terminal_agent import TerminalAgent
 
     runtime = Path(os.environ["LOCALAPPDATA"], "OpenAI", "Codex", "runtimes",
@@ -945,9 +945,12 @@ def test_cli_tooling_real_process():
               process_image_path(plain.pid))
         check("cli tooling real: an exited or unknown pid reads as no path",
               process_image_path(0) == "")
+        # a child's console host that starts after the assign lands in the
+        # job (2 of 120 spawns under load), and that is tooling too
         found = TerminalAgent._job_tooling_pids(job.process_ids())
+        hosts = {p for p in found if describe_pid(p).lower() == "conhost.exe"}
         check("cli tooling real: the job's tooling is exactly the copy",
-              found == {tool.pid}, (found, tool.pid, plain.pid))
+              found - hosts == {tool.pid}, (found, tool.pid, plain.pid))
     finally:
         job.terminate_tree()
         for p in procs:

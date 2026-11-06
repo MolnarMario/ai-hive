@@ -1502,8 +1502,9 @@ class TopBar(QFrame):
             "is stopped to give its memory back. Its card turns black with "
             "the conversation's summary, and a click resumes the same "
             "conversation. An agent that is working, asking you something, "
-            "running a background command or holding a scheduled message "
-            "is never put to sleep. A sleeping agent wakes on its own only "
+            "running a background command or background agent, or holding "
+            "a scheduled message or a cron job is never put to sleep. A "
+            "sleeping agent wakes on its own only "
             "when AI Hive has to type into it: Ship finished lanes into the "
             "integrator, or a message you scheduled for it.\nClick to turn "
             "off. Agents asleep now stay asleep until you click them, and "
@@ -5582,6 +5583,7 @@ class MainWindow(QMainWindow):
                     # sent, and Claude keeps no copy of it
                     card = page.card_for(agent.id) if page else None
                     if card is not None and card.has_draft():
+                        agent.note_sleep_hold("unsent prompt")
                         continue
                     self._audit_install(
                         f"SLEEP agent={agent.spec.name!r} idle="

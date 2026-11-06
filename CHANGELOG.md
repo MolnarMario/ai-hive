@@ -8,6 +8,22 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.56.10
+
+- Free up RAM no longer ends a background agent. These run inside Claude
+  with no process of their own, so nothing showed they were working. AI
+  Hive now reads Claude's own record of them, and one waiting out a plan
+  limit stays safe too.
+- Free up RAM no longer cancels a Claude cron job or a `/loop` wakeup.
+  Claude keeps those in memory only, so a sleep lost them for good. The
+  agent now stays awake until they fire or expire.
+- An agent no longer stays awake for good, or shows the gear, because an
+  MCP server came up late or got replaced. The gear's kill menu no longer
+  offers that server either. A process started through a shell still counts
+  as a command, since AI Hive can't tell it from one.
+- Whatever keeps an agent past its idle hours awake now leaves one
+  `SLEEP-HOLD` line in session.log saying why.
+
 ## 0.56.9
 
 - Free up RAM no longer ends a command an agent is waiting on. For a few

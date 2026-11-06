@@ -139,10 +139,13 @@ workspaces keep executing — switching never pauses anything.
   and a click or a key resumes the same conversation with `--resume <id>`.
   Only Claude, Antigravity and Codex agents with a pinned conversation
   sleep, and never while one is working, asking you something, running a
-  background command, waiting out the plan limit, holding a scheduled
-  message or holding a prompt you typed but didn't send. AI Hive checks the
-  agent's processes right before a sleep, and a command that just ended
-  holds the sleep two more minutes so the agent can act on it. A sleeping
+  background command or background agent, waiting out the plan limit,
+  holding a scheduled message, a Claude cron job or `/loop` wakeup, or
+  holding a prompt you typed but didn't send. AI Hive checks the agent's
+  processes right before a sleep, and a command that just ended holds the
+  sleep two more minutes so the agent can act on it. An MCP server that
+  came up late doesn't hold it. Anything else that keeps an agent past its
+  idle hours awake leaves a `SLEEP-HOLD` line in `session.log`. A sleeping
   agent wakes on its own only when AI Hive has to type into it: **Ship finished
   lanes** into an asleep integrator, or a message you scheduled for it
   coming due. Lane agents sleep through a ship, because the integrator
@@ -1110,7 +1113,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4659 checks drive the real app headlessly (offscreen Qt platform) with real
+4733 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1260,7 +1263,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4659 checks)
+                           (4733 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

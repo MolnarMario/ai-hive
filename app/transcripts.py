@@ -1406,6 +1406,220 @@ def subagent_transcript(parent_path: str, agent_id: str) -> str:
     return ""
 
 
+# How long a sub-agent may sit silent and unfinished before it stops counting
+# as running. A crash or an older Claude can leave one unfinished for good
+# (20 of 64 metas on one machine have no `finished` key), so the hold needs an
+# end, and that end has to outlast the plan's 5-hour limit: one real sub-agent
+# sat 7036 s on "You've hit your session limit", then carried on. The other
+# 63 never went quiet for more than 103 s.
+SUBAGENT_SILENT_S = 6 * 3600.0
+# Claude deletes a recurring cron job after this long (CronCreate's own docs)
+CRON_EXPIRE_S = 7 * 86400.0
+_TIMER_NEEDLES = (b'"name":"CronCreate"', b'"name":"CronDelete"',
+                  b'"name":"ScheduleWakeup"')
+_TIMER_CACHE: dict[str, tuple] = {}
+
+
+def transcript_size(path: str) -> int:
+    """The transcript's size now, 0 while it has none."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _subagent_files(parent_path: str) -> list[tuple[str, float | None]]:
+    """(path, last write) of every sub-agent transcript of the conversation
+    at `parent_path`, in any depth of folder (2.1.317). The time is None for
+    one that exists and can't be read. A folder or file that is simply gone
+    is no entry."""
+    stem, ext = os.path.splitext(parent_path)
+    if ext != ".jsonl":
+        return []
+    found: list[tuple[str, float | None]] = []
+
+    def failed(err: OSError) -> None:
+        if not isinstance(err, FileNotFoundError):
+            found.append((str(err.filename or stem), None))
+
+    for root, _dirs, files in os.walk(os.path.join(stem, "subagents"),
+                                      onerror=failed):
+        for name in files:
+            if name.startswith("agent-") and name.endswith(".jsonl"):
+                path = os.path.join(root, name)
+                try:
+                    found.append((path, os.path.getmtime(path)))
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    found.append((path, None))
+    return found
+
+
+def working_subagents(parent_path: str, since: float, now: float,
+                      grace: float) -> list[str]:
+    """What a stop of Claude would end: the sub-agents of the conversation
+    at `parent_path` still at work, by description. They run inside
+    claude.exe, so the job shows no process for them, and Claude's own trace
+    is the only sign: <agent>.meta.json has no `finished` key while one
+    runs, and `"finished":true` once it ends.
+
+    One counts if its transcript moved in the last `grace` seconds, finished
+    or not, since Claude answers a finished one with no submit. It also
+    counts while it has not finished, wrote during this launch (`since`,
+    what an earlier run left unfinished is dead) and has not been silent for
+    SUBAGENT_SILENT_S. A missing or unreadable meta reads as not finished,
+    and a transcript that can't be read counts."""
+    found = []
+    for path, written in _subagent_files(parent_path):
+        if written is None:
+            found.append(f"unreadable {os.path.basename(path)}")
+            continue
+        age = now - written
+        if age >= grace and (written < since or age >= SUBAGENT_SILENT_S):
+            continue
+        meta = _subagent_meta(path)
+        if age < grace or meta.get("finished") is not True:
+            found.append(str(meta.get("description")
+                             or os.path.basename(path)[6:-6]))
+    return found
+
+
+def _subagent_meta(transcript: str) -> dict:
+    try:
+        with open(transcript[:-len(".jsonl")] + ".meta.json", "r",
+                  encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def pending_timers(path: str, start: int, since: float, now: float,
+                   grace: float) -> list[str]:
+    """What a stop of Claude would cancel: the cron jobs and wakeups set
+    during this launch (`since`) that are still to fire, in the conversation
+    at `path` (read from byte `start`, where it stood at launch) or by one
+    of its sub-agents. Claude keeps them in memory only ("gone when Claude
+    exits", CronCreate's docs, and `durable` has no effect), so a stop loses
+    them with no trace, and a resume can't bring them back. A one-shot job
+    counts until `grace` past the `nextFireAt` Claude recorded, a recurring
+    one until it expires, a wakeup until `grace` past its delay. A job whose
+    result can't be read counts until it would expire, and a transcript
+    that can't be read counts as a timer."""
+    files = [(path, start)] + [
+        (sub, 0) for sub, written in _subagent_files(path)
+        if written is not None and written >= since]
+    jobs, wakeups, deleted = [], [], set()
+    for name, offset in files:
+        read = _read_timers(name, offset)
+        if read is None:
+            return [f"unreadable {os.path.basename(name)}"]
+        jobs += read[0]
+        wakeups += read[1]
+        deleted |= read[2]
+    pending = []
+    for job in jobs:
+        if job["made"] < since or job["id"] in deleted:
+            continue
+        ends = (job["fire"] + grace if job["fire"] and not job["recurring"]
+                else job["made"] + CRON_EXPIRE_S)
+        if now < ends:
+            pending.append(f"cron {job['id'] or job['cron']}")
+    if any(made >= since and now < fire + grace for made, fire in wakeups):
+        pending.append("wakeup")
+    return pending
+
+
+def _read_timers(path: str, start: int) -> tuple | None:
+    """(cron jobs, wakeups as [(made, fire)], deleted job ids) from one
+    transcript, from byte `start`, or None when it can't be read. A file
+    that isn't there yet holds none. Reads line by line from `start`, so a
+    47 MB conversation costs only what this launch added to it, and only
+    when that changed. A delete, or a wakeup replacing the last one, takes
+    effect only once its result says it worked: a failed call leaves what
+    was there alive. A wakeup with no result yet counts. Never raises."""
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return [], [], set()
+    except OSError:
+        return None
+    stamp = (start, st.st_mtime, st.st_size)
+    cached = _TIMER_CACHE.get(path)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    jobs: dict[str, dict] = {}
+    deletes: dict[str, str] = {}
+    deleted: set[str] = set()
+    calls: dict[str, tuple | None] = {}     # wakeups with no result yet
+    wakeup = None
+    needles = list(_TIMER_NEEDLES)
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            for raw in fh:
+                if not any(n in raw for n in needles):
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                msg = rec.get("message") if isinstance(rec, dict) else None
+                blocks = msg.get("content") if isinstance(msg, dict) else None
+                if not isinstance(blocks, list):
+                    continue
+                made = _record_epoch(rec) or st.st_mtime
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    call = str(block.get("tool_use_id") or block.get("id"))
+                    if block.get("type") == "tool_result":
+                        result = rec.get("toolUseResult")
+                        if call in deletes and not block.get("is_error"):
+                            deleted.add(deletes[call])
+                        elif call in calls:
+                            asked = calls.pop(call)
+                            if not block.get("is_error"):
+                                wakeup = asked
+                        elif call not in jobs:
+                            pass
+                        elif block.get("is_error"):
+                            del jobs[call]
+                        elif isinstance(result, dict):
+                            fire = result.get("nextFireAt")
+                            jobs[call]["id"] = str(result.get("id") or "")
+                            jobs[call]["fire"] = (
+                                fire / 1000.0
+                                if isinstance(fire, (int, float)) else 0.0)
+                    elif block.get("type") == "tool_use":
+                        args = block.get("input")
+                        args = args if isinstance(args, dict) else {}
+                        name = block.get("name")
+                        if name == "CronCreate":
+                            jobs[call] = {
+                                "made": made, "id": "", "fire": 0.0,
+                                "cron": str(args.get("cron") or ""),
+                                "recurring": args.get("recurring") is not False}
+                            needles.append(call.encode("utf-8"))
+                        elif name == "CronDelete":
+                            deletes[call] = str(args.get("id"))
+                            needles.append(call.encode("utf-8"))
+                        elif name == "ScheduleWakeup":
+                            delay = args.get("delaySeconds")
+                            delay = (delay if isinstance(delay, (int, float))
+                                     else 3600)
+                            calls[call] = (None if args.get("stop")
+                                           else (made, made + delay))
+                            needles.append(call.encode("utf-8"))
+    except OSError:
+        return None
+    parsed = (list(jobs.values()),
+              [w for w in (wakeup, *calls.values()) if w], deleted)
+    _TIMER_CACHE[path] = (stamp, parsed)
+    return parsed
+
+
 def latest_cli_version(cwd: str, session_id: str) -> str:
     """The Claude Code version that last wrote this conversation: every record
     carries a top-level `version` ("2.1.316"). "" when there is no file or no
