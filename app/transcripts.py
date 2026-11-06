@@ -1536,8 +1536,9 @@ def _read_timers(path: str, start: int) -> tuple | None:
     transcript, from byte `start`, or None when it can't be read. A file
     that isn't there yet holds none. Reads line by line from `start`, so a
     47 MB conversation costs only what this launch added to it, and only
-    when that changed. Keeps a delete only once its result says it worked:
-    a denied one leaves the job alive. Never raises."""
+    when that changed. A delete, or a wakeup replacing the last one, takes
+    effect only once its result says it worked: a failed call leaves what
+    was there alive. A wakeup with no result yet counts. Never raises."""
     try:
         st = os.stat(path)
     except FileNotFoundError:
@@ -1551,6 +1552,7 @@ def _read_timers(path: str, start: int) -> tuple | None:
     jobs: dict[str, dict] = {}
     deletes: dict[str, str] = {}
     deleted: set[str] = set()
+    calls: dict[str, tuple | None] = {}     # wakeups with no result yet
     wakeup = None
     needles = list(_TIMER_NEEDLES)
     try:
@@ -1576,6 +1578,10 @@ def _read_timers(path: str, start: int) -> tuple | None:
                         result = rec.get("toolUseResult")
                         if call in deletes and not block.get("is_error"):
                             deleted.add(deletes[call])
+                        elif call in calls:
+                            asked = calls.pop(call)
+                            if not block.get("is_error"):
+                                wakeup = asked
                         elif call not in jobs:
                             pass
                         elif block.get("is_error"):
@@ -1603,11 +1609,13 @@ def _read_timers(path: str, start: int) -> tuple | None:
                             delay = args.get("delaySeconds")
                             delay = (delay if isinstance(delay, (int, float))
                                      else 3600)
-                            wakeup = (None if args.get("stop")
-                                      else (made, made + delay))
+                            calls[call] = (None if args.get("stop")
+                                           else (made, made + delay))
+                            needles.append(call.encode("utf-8"))
     except OSError:
         return None
-    parsed = (list(jobs.values()), [wakeup] if wakeup else [], deleted)
+    parsed = (list(jobs.values()),
+              [w for w in (wakeup, *calls.values()) if w], deleted)
     _TIMER_CACHE[path] = (stamp, parsed)
     return parsed
 

@@ -4195,8 +4195,9 @@ def test_sleep_spares_timers():
     every_done = _tool_answer("t2", {"id": "7e6e5c3f", "recurring": True,
                                      "durable": False,
                                      "nextFireAt": (now + hour) * 1000})
-    wake = _tool_call(made, "ScheduleWakeup", {"delaySeconds": 1800,
-                                               "prompt": "x"}, "t3")
+    wake = (_tool_call(made, "ScheduleWakeup", {"delaySeconds": 1800,
+                                                "prompt": "x"}, "t3")
+            + _tool_answer("t3", {}))
     try:
         check("timers: a one-shot job holds until it fires",
               pending(once, once_done) == ["cron cd5ec5e5"])
@@ -4259,10 +4260,28 @@ def test_sleep_spares_timers():
               pending(wake, at=made + 1800 + grace + 1) == [])
         check("timers: the loop's own stop ends it", pending(
             wake, _tool_call(made + 5, "ScheduleWakeup", {"stop": True},
-                             "t6")) == [])
+                             "t6"), _tool_answer("t6", {})) == [])
         check("timers: the newest wakeup replaces the last", pending(
             wake, _tool_call(made + 5, "ScheduleWakeup",
-                             {"delaySeconds": 60}, "t7"), at=now + 1000) == [])
+                             {"delaySeconds": 60}, "t7"),
+            _tool_answer("t7", {}), at=now + 1000) == [])
+        check("timers: a failed replacement leaves the wakeup alive", pending(
+            wake, _tool_call(made + 5, "ScheduleWakeup",
+                             {"delaySeconds": 60}, "t7"),
+            _tool_answer("t7", "no", is_error=True), at=now + 1000)
+            == ["wakeup"])
+        check("timers: so does a failed stop", pending(
+            wake, _tool_call(made + 5, "ScheduleWakeup", {"stop": True}, "t6"),
+            _tool_answer("t6", "no", is_error=True)) == ["wakeup"])
+        check("timers: a wakeup with no result yet counts", pending(
+            _tool_call(made, "ScheduleWakeup", {"delaySeconds": 1800}, "t3"),
+            at=now + 1000) == ["wakeup"])
+        check("timers: a stop with no result yet ends nothing", pending(
+            wake, _tool_call(made + 5, "ScheduleWakeup", {"stop": True},
+                             "t6")) == ["wakeup"])
+        check("timers: a failed wakeup holds nothing", pending(
+            _tool_call(made, "ScheduleWakeup", {"delaySeconds": 1800}, "t3"),
+            _tool_answer("t3", "no", is_error=True)) == [])
         check("timers: a wakeup from before this launch is gone",
               pending(wake, launch=now) == [])
         check("timers: no file means none",
