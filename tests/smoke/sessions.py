@@ -4104,7 +4104,8 @@ def test_sleep_spares_background_agents():
         real_getmtime = transcripts.os.path.getmtime
 
         def denied(name):
-            if name.endswith(".jsonl"):
+            # the patch is process-wide, so only this test's own files fail
+            if str(name).startswith(os.path.dirname(parent)):
                 raise PermissionError(13, "locked", name)
             return real_getmtime(name)
 
