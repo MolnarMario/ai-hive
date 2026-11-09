@@ -1349,6 +1349,19 @@ def test_copy_of_input_box_leaves_out_the_prompt():
     v._sel_anchor, v._sel_end = (0, 0), (0, 29)
     check("copybox: a REPL's '>>>' prompt is copied as painted",
           v.selected_text() == ">>> print(1)", repr(v.selected_text()))
+    # a shell card has no input box: a quoted line printed over its
+    # prompt, or a Node REPL's '> ', is output and copies as painted
+    v = TerminalView(rows=4, cols=30, prompt_box=False)
+    v.feed("> tip\r\n    code block\r\nPS C:\\w> ")
+    v._sel_anchor, v._sel_end = (0, 0), (1, 29)
+    check("copybox: a shell card copies a '> ' line over its prompt as is",
+          v.selected_text() == "> tip\n    code block",
+          repr(v.selected_text()))
+    v = TerminalView(rows=4, cols=30, prompt_box=False)
+    v.feed("> 1+1")
+    v._sel_anchor, v._sel_end = (0, 0), (0, 29)
+    check("copybox: a shell card copies a Node '> ' prompt as is",
+          v.selected_text() == "> 1+1", repr(v.selected_text()))
 
 
 def test_terminal_selection_typing_replaces():

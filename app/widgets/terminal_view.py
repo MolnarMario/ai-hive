@@ -812,8 +812,13 @@ class TerminalView(QWidget):
     findChanged = Signal(int, int)
 
     def __init__(self, rows: int = 30, cols: int = 100, parent=None,
-                 font_px: int = 0, claude_repaints: bool = False):
+                 font_px: int = 0, claude_repaints: bool = False,
+                 prompt_box: bool = True):
         super().__init__(parent)
+        # the '> ' prompt row is an AI CLI's input box, so a copy that
+        # starts in it leaves the glyph out (_box_text_starts). A shell card
+        # passes False: there '> ' is a REPL's prompt or quoted output.
+        self._prompt_box = prompt_box
         # take back the copies a Claude repaint from the top row scrolls
         # into history (see _drop_repaint_copies). Only Claude cards: the
         # bytes can't tell that repaint from a program reprinting rows on
@@ -3697,16 +3702,18 @@ class TerminalView(QWidget):
         delete counts from, so typed leading blanks stay. A selection that
         starts above the box is a copy of the transcript and keeps the
         rows as painted. A glyph with no gap after it is not Claude's
-        prompt (a Python REPL's ">>>"), and nothing is left out then."""
+        prompt (a Python REPL's ">>>"), and nothing is left out then. A
+        shell card (prompt_box=False) keeps every row as painted: a Node
+        REPL or a quoted line there paints the same '> '."""
+        if not self._prompt_box:
+            return {}
         span = self._input_block_span()
         if span is None or not span[0] + off <= r0 <= span[1] + off:
             return {}
-        row = self.screen.buffer[span[0]]
-        first, _ = self._row_content(span[0])
-        if first < 0 or row[first].data not in _INPUT_PROMPTS \
-                or row[first + 1].data not in input_caret.PROMPT_GAP:
-            return {}
         carets = self._caret_map(span)
+        first, _ = self._row_content(span[0])
+        if carets.indent != first + 2:      # no glyph, or no gap after it
+            return {}
         return {r + off: carets.row_start(r)
                 for r in range(span[0], span[1] + 1)}
 
