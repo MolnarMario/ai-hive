@@ -425,7 +425,7 @@ def test_terminal_keys():
     view.keyInput.connect(sent.append)
     press(K.Key_A, ctrl=True)
     check("keys: Ctrl+A highlights the input line",
-          view.selected_text() == "> my prompt", view.selected_text())
+          view.selected_text() == "my prompt", view.selected_text())
     check("keys: Ctrl+A stops at the '>' prompt, not the transcript above",
           "recap" not in view.selected_text(), view.selected_text())
     check("keys: Ctrl+A is visual-only (nothing to the pty)", sent == [], sent)
@@ -450,7 +450,7 @@ def test_terminal_keys():
                                      Qt.KeyboardModifier.NoModifier, ch))
     view.feed("recap line one\r\n> my prompt")
     press(K.Key_A, ctrl=True)
-    check("keys: Ctrl+A re-highlights the input", view.selected_text() == "> my prompt")
+    check("keys: Ctrl+A re-highlights the input", view.selected_text() == "my prompt")
     sent.clear()
     type_char("x")
     check("keys: typing over the highlight Backspaces the box then sends "
@@ -509,12 +509,12 @@ def test_terminal_keys():
     view.feed("recap\r\n> copy me")
     press(K.Key_A, ctrl=True)
     check("keys: Ctrl+A re-highlights for the copy case",
-          view.selected_text() == "> copy me", view.selected_text())
+          view.selected_text() == "copy me", view.selected_text())
     sent.clear()
     QGuiApplication.clipboard().clear()
     press(K.Key_C, ctrl=True)
     check("keys: Ctrl+C over the highlight copies it",
-          QGuiApplication.clipboard().text() == "> copy me",
+          QGuiApplication.clipboard().text() == "copy me",
           QGuiApplication.clipboard().text())
     check("keys: Ctrl+C over the highlight sends NO interrupt (no 0x03)",
           "\x03" not in sent, sent)
@@ -529,7 +529,7 @@ def test_terminal_keys():
     QGuiApplication.clipboard().clear()
     press(K.Key_X, ctrl=True)
     check("keys: Ctrl+X over the highlight copies it",
-          QGuiApplication.clipboard().text() == "> cut me",
+          QGuiApplication.clipboard().text() == "cut me",
           QGuiApplication.clipboard().text())
     check("keys: Ctrl+X over the highlight empties the input box",
           sent == ["\x7f" * len("cut me")], sent)
@@ -1217,7 +1217,7 @@ def test_terminal_altgr_and_paste_replace():
     v, sent = fresh("recap\r\n> old prompt", select=False)
     key(v, K.Key_A, M.ControlModifier)
     check("paste: Ctrl+A highlights the prompt",
-          v.selected_text() == "> old prompt", v.selected_text())
+          v.selected_text() == "old prompt", v.selected_text())
     key(v, K.Key_V, M.ControlModifier)
     check("paste: Ctrl+V over the Ctrl+A highlight Backspaces the box first",
           sent == ["\x7f" * len("old prompt"), "\x1b[200~NEW\x1b[201~"], sent)
@@ -1229,7 +1229,7 @@ def test_terminal_altgr_and_paste_replace():
     v, sent = fresh("> line one\r\n  line two\x1b[1;11H", select=False)
     key(v, K.Key_A, M.ControlModifier)
     check("paste: with the caret up, the highlight covers the first row",
-          v.selected_text() == "> line one", v.selected_text())
+          v.selected_text() == "line one", v.selected_text())
     key(v, K.Key_V, M.ControlModifier)
     check("paste: ...but the replace Backspaces the whole box",
           sent[-1] == "\x1b[200~NEW\x1b[201~"
@@ -1269,6 +1269,99 @@ def test_terminal_word_stops_at_no_break_space():
           view.selected_text() == "hello", repr(view.selected_text()))
     check("word: a word step left from 'hello' stops at its start",
           view._word_col(0, 4, -1) == 2, view._word_col(0, 4, -1))
+
+
+def test_copy_of_input_box_leaves_out_the_prompt():
+    """Copying or cutting the whole input box pasted Claude's prompt glyph
+    in front of the text ("> my prompt"): the Ctrl+A highlight, like a drag
+    from the row's start, begins at column 0. The glyph, its no-break space
+    and the indent of the rows below are left out of a selection that
+    starts in the box. One that starts above it copies the rows as painted."""
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QGuiApplication, QKeyEvent
+    from PySide6.QtWidgets import QApplication
+
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    K, M = Qt.Key, Qt.KeyboardModifier
+    clip = QGuiApplication.clipboard()
+
+    def key(v, k, mods=M.NoModifier):
+        v.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, k, mods, ""))
+
+    # Claude 2.1.316's box: "❯" and a no-break space, a two-cell indent
+    # under it, a real newline (Shift+Enter) and typed leading blanks
+    box = ("● a reply above the box\r\n\r\n"
+           "❯\xa0first line\r\n  second line\r\n    indented third")
+    for claude in (True, False):
+        v = TerminalView(rows=8, cols=60, claude_repaints=claude)
+        v.feed(box)
+        sent = []
+        v.keyInput.connect(sent.append)
+        key(v, K.Key_A, M.ControlModifier)
+        clip.clear()
+        key(v, K.Key_C, M.ControlModifier)
+        check(f"copybox: Ctrl+A, Ctrl+C copies just the text (claude={claude})",
+              clip.text() == "first line\nsecond line\n  indented third",
+              repr(clip.text()))
+        key(v, K.Key_A, M.ControlModifier)
+        clip.clear()
+        key(v, K.Key_X, M.ControlModifier)
+        check(f"copybox: Ctrl+X cuts just the text (claude={claude})",
+              clip.text() == "first line\nsecond line\n  indented third",
+              repr(clip.text()))
+        check(f"copybox: ...and still empties the box (claude={claude})",
+              bool(sent) and sent[-1].startswith("\x7f"), sent)
+        v.deleteLater()
+
+    v = TerminalView(rows=8, cols=60, claude_repaints=True)
+    v.feed(box)
+    # a drag from the prompt glyph to the end of the box
+    v._sel_anchor, v._sel_end = (2, 0), (4, 59)
+    check("copybox: a drag over the whole box leaves the glyph out",
+          v.selected_text() == "first line\nsecond line\n  indented third",
+          repr(v.selected_text()))
+    v._sel_anchor, v._sel_end = (2, 0), (2, 6)
+    check("copybox: a drag over the glyph and a word copies the word",
+          v.selected_text() == "first", repr(v.selected_text()))
+    v._sel_anchor, v._sel_end = (0, 0), (4, 59)
+    check("copybox: a selection from the transcript keeps the rows as painted",
+          v.selected_text().splitlines()[2:3] == ["❯\xa0first line"],
+          repr(v.selected_text()))
+    # the old '>' prompt and a wrapped row join without the glyph
+    v = TerminalView(rows=4, cols=20, claude_repaints=True)
+    v.feed("> the quick brown\r\n  foxes jump")
+    key(v, K.Key_A, M.ControlModifier)
+    check("copybox: a wrapped prompt joins without the '>'",
+          v.selected_text() == "the quick brown foxes jump",
+          repr(v.selected_text()))
+    # scrolled back, the box's rows still map
+    v = TerminalView(rows=4, cols=30, claude_repaints=True)
+    v.feed("\r\n".join(f"line {i}" for i in range(8)) + "\r\n\r\n> typed")
+    v._sel_anchor, v._sel_end = (3, 0), (3, 29)
+    v.scroll_by(2)
+    check("copybox: a box selection carried by a scroll still drops the glyph",
+          v.selected_text() == "typed", repr(v.selected_text()))
+    # a '>' with no gap after it is not Claude's prompt
+    v = TerminalView(rows=4, cols=30)
+    v.feed(">>> print(1)")
+    v._sel_anchor, v._sel_end = (0, 0), (0, 29)
+    check("copybox: a REPL's '>>>' prompt is copied as painted",
+          v.selected_text() == ">>> print(1)", repr(v.selected_text()))
+    # a shell card has no input box: a quoted line printed over its
+    # prompt, or a Node REPL's '> ', is output and copies as painted
+    v = TerminalView(rows=4, cols=30, prompt_box=False)
+    v.feed("> tip\r\n    code block\r\nPS C:\\w> ")
+    v._sel_anchor, v._sel_end = (0, 0), (1, 29)
+    check("copybox: a shell card copies a '> ' line over its prompt as is",
+          v.selected_text() == "> tip\n    code block",
+          repr(v.selected_text()))
+    v = TerminalView(rows=4, cols=30, prompt_box=False)
+    v.feed("> 1+1")
+    v._sel_anchor, v._sel_end = (0, 0), (0, 29)
+    check("copybox: a shell card copies a Node '> ' prompt as is",
+          v.selected_text() == "> 1+1", repr(v.selected_text()))
 
 
 def test_terminal_selection_typing_replaces():

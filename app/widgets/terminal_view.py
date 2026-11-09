@@ -46,7 +46,9 @@ right behind it, Claude read the Escapes and the key as Alt+key. Navigation
 keys just drop the highlight, as an editor collapses a selection. Ctrl+C over the
 highlight COPIES it (Ctrl+X copies then clears) -- the highlight is a real
 selection, so it must reach the clipboard rather than fall through to the 0x03
-interrupt, which would clear the child's input instead. The highlight is
+interrupt, which would clear the child's input instead. A copy of the box,
+this one or any selection that starts in it, leaves out the prompt glyph
+and the indent of the rows below it (_box_text_starts). The highlight is
 anchored at Claude's '>' prompt row so it never climbs into the transcript;
 lacking the child's real buffer it's still inference from painted rows, so it
 falls back to the cursor row when no prompt glyph is found. (Home still jumps
@@ -810,8 +812,13 @@ class TerminalView(QWidget):
     findChanged = Signal(int, int)
 
     def __init__(self, rows: int = 30, cols: int = 100, parent=None,
-                 font_px: int = 0, claude_repaints: bool = False):
+                 font_px: int = 0, claude_repaints: bool = False,
+                 prompt_box: bool = True):
         super().__init__(parent)
+        # the '> ' prompt row is an AI CLI's input box, so a copy that
+        # starts in it leaves the glyph out (_box_text_starts). A shell card
+        # passes False: there '> ' is a REPL's prompt or quoted output.
+        self._prompt_box = prompt_box
         # take back the copies a Claude repaint from the top row scrolls
         # into history (see _drop_repaint_copies). Only Claude cards: the
         # bytes can't tell that repaint from a program reprinting rows on
@@ -3623,7 +3630,9 @@ class TerminalView(QWidget):
         back into one line (app/soft_wrap.py), in a Claude card on the main
         screen only: the rules read Claude's layout, and a shell or a
         full-screen program breaks lines where they look the same. The
-        find bar passes False, since its search matches row by row."""
+        find bar passes False, since its search matches row by row.
+        A selection that starts in the input box leaves out what isn't
+        typed text (_box_text_starts)."""
         rng = self._selection_range()
         if rng is None:
             return ""
@@ -3633,13 +3642,14 @@ class TerminalView(QWidget):
                 else [])
         off = min(self._scroll_offset, len(hist))
         cols = self.screen.columns
+        box = self._box_text_starts(r0, off)
         rows, texts, wide = [], [], []
         for r in range(r0, r1 + 1):
             row = self._line_at_row(r, hist, off)
             if row is None:     # history wiped under the selection
                 continue
             cells = [row[c].data for c in range(cols)]
-            start = c0 if r == r0 else 0
+            start = max(c0 if r == r0 else 0, box.get(r, 0))
             end = c1 if r == r1 else cols - 1
             rows.append(cells)
             texts.append("".join(cells[start:end + 1]).rstrip())
@@ -3678,6 +3688,34 @@ class TerminalView(QWidget):
                 # no space after a first row the selection holds none of
                 out[-1] += (sep if out[-1] else "") + text.lstrip()
         return "\n".join(out)
+
+    def _box_text_starts(self, r0: int, off: int) -> dict:
+        """{visual row: first column of typed text} for each row of the
+        live input box, when a selection that starts on visual row `r0`
+        starts inside it, else {}. `off` is the rows the view is scrolled
+        back, as selected_text maps them.
+
+        Claude's prompt glyph, the gap after it and the indent it paints
+        on the rows below are not text: Ctrl+A anchors its highlight at
+        column 0, so a copy or cut of the whole box pasted as "> my
+        prompt". The columns are CaretMap's row starts, the same ones a
+        delete counts from, so typed leading blanks stay. A selection that
+        starts above the box is a copy of the transcript and keeps the
+        rows as painted. A glyph with no gap after it is not Claude's
+        prompt (a Python REPL's ">>>"), and nothing is left out then. A
+        shell card (prompt_box=False) keeps every row as painted: a Node
+        REPL or a quoted line there paints the same '> '."""
+        if not self._prompt_box:
+            return {}
+        span = self._input_block_span()
+        if span is None or not span[0] + off <= r0 <= span[1] + off:
+            return {}
+        carets = self._caret_map(span)
+        first, _ = self._row_content(span[0])
+        if carets.indent != first + 2:      # no glyph, or no gap after it
+            return {}
+        return {r + off: carets.row_start(r)
+                for r in range(span[0], span[1] + 1)}
 
     def copy_selection(self) -> None:
         text = self.selected_text()

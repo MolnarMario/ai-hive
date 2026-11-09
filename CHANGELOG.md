@@ -8,6 +8,12 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.56.11
+
+- Copying or cutting the text you typed into an agent's input box no longer
+  pastes Claude's "> " prompt sign in front of it, and lines below the first
+  no longer come out indented.
+
 ## 0.56.10
 
 - Free up RAM no longer ends a background agent. These run inside Claude
