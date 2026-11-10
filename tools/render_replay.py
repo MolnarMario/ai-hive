@@ -14,8 +14,8 @@ it had them, the way TerminalCard._replay_with_marks rebuilds a card.
 screen). --raw replays with Claude's take-back rules off, which shows what
 the bytes do on their own. --conhost also writes the stream into a real
 conhost of the same size (the emulator Windows Terminal shares) and compares
-its screen with pyte's after every frame: a difference is a pyte emulation
-gap, not Claude's doing. docs/agents/terminal-rendering.md walks through
+its screen after every frame with the card's own pyte screen: a difference
+is an emulation gap of ours, not Claude's doing. docs/agents/terminal-rendering.md walks through
 reading the output.
 """
 
@@ -194,13 +194,28 @@ def compare_conhost(src: dict) -> int:
     t.join(timeout=300)
     with open(out_path, encoding="utf-8") as fh:
         frames = json.load(fh)
-    screen = pyte.HistoryScreen(cols, rows, history=100000)
+    sys.path.insert(0, ROOT)
+    from app.widgets.terminal_view import _PRIVATE_CSI_RE, _new_history_screen
+
+    # the card's own screen, grapheme clusters and all (app/grapheme_cells.py),
+    # fed what TerminalView.feed hands it: pyte draws the "u" of a keyboard
+    # protocol reply such as ESC[<u, so the view strips those first
+    screen = _new_history_screen(cols, rows)
     feed = pyte.Stream(screen).feed
+
+    def cell_text(data: str) -> str:
+        # conhost hands back a cluster that isn't one UTF-16 unit as U+FFFD,
+        # once for both of its cells
+        if len(data) == 1 and ord(data) <= 0xFFFF:
+            return data
+        return data and chr(0xFFFD)
+
     pos = differ = 0
     for frame in frames:
-        feed(stream[pos:frame["pos"]])
+        feed(_PRIVATE_CSI_RE.sub("", stream[pos:frame["pos"]]))
         pos = frame["pos"]
-        mine = ["".join(screen.buffer[y][x].data for x in range(cols)).rstrip()
+        mine = ["".join(cell_text(screen.buffer[y][x].data)
+                        for x in range(cols)).rstrip()
                 for y in range(rows)]
         cur = [screen.cursor.y, min(screen.cursor.x, cols - 1)]
         if mine != frame["rows"] or cur != frame["cur"]:

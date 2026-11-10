@@ -120,6 +120,28 @@ Changes in a release that would break the take-back rules without an error:
   fills the width, so this never shows. If `--conhost` ever differs right
   after such a row, this is why.
 
+## Emoji and other grapheme clusters
+
+A different symptom from doubled text: after an emoji with VS16 (`⚔️`,
+`🛡️`, `⚠️`), the rest of its row went missing and every row below it drew
+shifted right, until Claude's next redraws stacked copies of the status line.
+pyte measured each code point on its own and stopped drawing a text run at a
+VS16 or ZWJ, so the emoji took one cell where Claude and conhost count two,
+and whatever followed it in the run was dropped. `app/grapheme_cells.py`
+replaces pyte's `draw` with conhost's cluster model; its docstring has the
+rules and the two conhost quirks left out.
+
+Claude itself hides the bug: it writes each VS16 emoji between absolute
+column moves (a space, `ESC[nG` back, the emoji, `ESC[nG` past it). ConPTY
+doesn't. Its repaint from its own buffer, which follows Claude's left-arrow
+agent view and the other alternate-screen views, writes the emoji plainly
+with the rest of the row and relative moves after it. To see it, capture
+Claude drawing an Edit diff with an emoji line, then Ctrl+O twice, then the
+left arrow and Escape, and replay with `--conhost`. Since 2026-11-10,
+`--conhost` compares conhost with the card's own screen (grapheme handling
+and the private-CSI strip included), not with stock pyte. Stock pyte differed
+on 105 of 110 frames of such a capture at 64x330.
+
 ## Older evidence
 
 The screen of every agent at its last close is saved raw in

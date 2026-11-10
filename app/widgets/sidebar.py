@@ -1161,6 +1161,7 @@ class WorkspaceRail(QWidget):
 class Sidebar(QFrame):
     addRequested = Signal()
     addCategoryRequested = Signal()          # M2
+    syncRequested = Signal()                 # sync every workspace from GitHub
     workspaceSelected = Signal(str)
     renameRequested = Signal(str, str)
     agentsRequested = Signal(str)            # ws_id (count badge clicked; M3)
@@ -1261,16 +1262,32 @@ class Sidebar(QFrame):
         self.add_cat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # lambda: clicked() passes a `checked` bool that must not shadow `name`
         self.add_cat_btn.clicked.connect(lambda: self._add_category())
+        # one click pulls every workspace's folder forward from GitHub
+        # (MainWindow.sync_all_workspaces, app/workspace_sync.py)
+        self.sync_btn = QToolButton(header)
+        self.sync_btn.setObjectName("SyncBtn")
+        self.sync_btn.setText("↻")
+        self.sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sync_btn.clicked.connect(self.syncRequested)
+        self.set_sync_busy(False)
         self.add_btn = QToolButton(header)
         self.add_btn.setObjectName("AddWsBtn")
         self.add_btn.setText("+")
         self.add_btn.setToolTip("Add workspace (choose a project folder)")
         self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.add_btn.clicked.connect(self.addRequested)
+        # the header is narrower than its title plus four buttons at their
+        # natural width (about 40px each), so the glyph buttons are compact
+        # and close together, or the WORKSPACES title gets clipped
+        hl.setSpacing(2)
+        for btn in (self.search_btn, self.sync_btn, self.add_cat_btn):
+            btn.setFixedWidth(26)
         hl.addWidget(self.title)
+        hl.addSpacing(4)
         hl.addWidget(self.count_label)
         hl.addStretch(1)
         hl.addWidget(self.search_btn)
+        hl.addWidget(self.sync_btn)
         hl.addWidget(self.add_cat_btn)
         hl.addWidget(self.add_btn)
         # overlay search field: a child of the header positioned by hand (NOT in
@@ -1293,6 +1310,15 @@ class Sidebar(QFrame):
         self._anim = QPropertyAnimation(self, b"maximumWidth", self)
         self._anim.setDuration(160)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def set_sync_busy(self, busy: bool) -> None:
+        """The sync button while a sync runs: disabled, saying so."""
+        self.sync_btn.setEnabled(not busy)
+        self.sync_btn.setToolTip(
+            "Syncing every workspace with GitHub..." if busy else
+            "Sync all workspaces with GitHub: pull the newest commits into "
+            "each workspace's folder (fast-forward only, local work is "
+            "never overwritten)")
 
     # -------------------------------------------------------------- search ---
 

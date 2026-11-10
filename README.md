@@ -749,6 +749,24 @@ error dialog instead of silently closing. Packaging to a distributable
   10px rail with one strip per workspace, in sidebar order and colored like
   its count badge. The active workspace has the wide strip, hover shows the
   name, and a click opens that workspace without reopening the sidebar.
+- **Sync every workspace with GitHub in one click.** The `↻` in the sidebar
+  header fetches each workspace's folder and moves its branch forward to what
+  it tracks on GitHub, so after pushing from one computer, one click on the
+  other brings every project up to date without asking an agent in each
+  workspace to pull. A notice over each workspace says it is checking, then
+  updating its code, then turns green with what it pulled. It only ever
+  fast-forwards: a branch with local commits GitHub lacks, a branch that
+  tracks nothing (every agent lane), or local changes to files GitHub also
+  changed are left alone, and a dialog then lists what happened in each
+  workspace. Local changes to other files ride along. Workspaces on one
+  folder sync once.
+- **Sync at launch** (Options, *Sync workspaces with GitHub at launch*, off by
+  default) runs the same sync once per launch, and only after the launch has
+  settled: every restored agent started and showing its prompt, the startup
+  checks done, and a few quiet seconds more. Opening AI Hive never waits for
+  it. It is quiet: only a workspace it actually updates gets the notice (gold
+  while the code updates, then green), and one GitHub is ahead of that it
+  could not update gets an amber one saying why. Nothing pops up.
 - **Fullscreen.** `F11` hides everything but the agent grid. Rest the
   cursor on the top edge for 0.75 s and the top bar (minus the logo, version
   and update button) and workspace header float over the agents; rest it on the left edge and the sidebar floats in at its
@@ -1113,7 +1131,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4747 checks drive the real app headlessly (offscreen Qt platform) with real
+4826 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1243,6 +1261,7 @@ app/
   self_update.py           update AI Hive from GitHub main: version check, changelog, ff-only merge (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   repo_activity.py         Open repo dropdown: GitHub PRs + commits, origin URL (Qt-free)
+  workspace_sync.py        sidebar sync button: fetch + ff-only every workspace folder (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled fonts: the manuscript ones (Cinzel/EB Garamond/
                            Spectral) and the Terminal font picker's mono families,
@@ -1263,7 +1282,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4747 checks)
+                           (4826 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

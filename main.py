@@ -448,6 +448,9 @@ def main() -> int:
     # ...and Restart to update starting a new AI Hive. The suite opens and
     # closes many windows in one process and must never launch an app.
     window.arm_app_restart()
+    # ...and the sidebar's sync button and the launch sync fetching and
+    # fast-forwarding the user's workspace folders. Never in the suite.
+    window.arm_workspace_sync()
     window.refresh_install_state()
     if gate is not None:
         window.note_update_outcomes(gate.outcomes, gate.installing)
@@ -479,6 +482,10 @@ def main() -> int:
     # from now and then hourly. It fetches and fast-forwards this clone, so
     # like the version button it is armed here and never in the suite.
     window.start_app_update_checks()
+    # ...and, behind its own Options switch (default off), one sync of every
+    # workspace's folder with GitHub once the launch has settled. It moves
+    # the user's project folders, so it is armed here and never in the suite.
+    window.start_workspace_sync_at_launch()
     return app.exec()
 
 
