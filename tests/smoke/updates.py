@@ -2611,3 +2611,216 @@ def test_restart_to_update():
     win.deleteLater()
     pump(20)
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _sync_git(cwd, *args) -> str:
+    import subprocess
+    r = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                        *args], cwd=str(cwd), capture_output=True, text=True,
+                       creationflags=0x08000000)
+    if r.returncode != 0:
+        raise RuntimeError(f"git {args}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def test_workspace_sync():
+    """The sidebar's sync button (app/workspace_sync.py): every workspace's
+    folder is fetched and fast-forwarded from the branch it tracks, and
+    nothing local is ever lost. Real git against temp repos: an origin, the
+    workspace clone, and a second clone standing in for the other computer
+    that pushes."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import self_update, workspace_sync
+    from app.session_store import SessionStore
+    from app.workspace_sync import Outcome
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    run = self_update.subprocess_runner
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-wssync-"))
+    seed = tmp / "seed"
+    seed.mkdir()
+    _sync_git(seed, "init", "-q", "-b", "main")
+    (seed / "a.txt").write_text("a\n")
+    (seed / "b.txt").write_text("b\n")
+    (seed / "requirements.txt").write_text("PySide6\n")
+    _sync_git(seed, "add", ".")
+    _sync_git(seed, "commit", "-q", "-m", "init")
+    origin = tmp / "origin.git"
+    _sync_git(tmp, "clone", "-q", "--bare", str(seed), str(origin))
+    here, other = tmp / "here", tmp / "other"
+    _sync_git(tmp, "clone", "-q", str(origin), str(here))
+    _sync_git(tmp, "clone", "-q", str(origin), str(other))
+
+    def push(name, text, msg="change"):
+        _sync_git(other, "pull", "-q", "--ff-only")
+        (other / name).write_text(text)
+        _sync_git(other, "commit", "-q", "-am", msg)
+        _sync_git(other, "push", "-q", "origin", "main")
+
+    def head(repo=here):
+        return _sync_git(repo, "rev-parse", "HEAD")
+
+    def one(folder=here, app_repo=""):
+        res = workspace_sync.sync_all(run, [("W", str(folder))], app_repo)
+        return res[0] if len(res) == 1 else res
+
+    r = one()
+    check("ws-sync: a clone level with GitHub is up to date",
+          r.outcome is Outcome.UP_TO_DATE and r.names == ["W"]
+          and r.branch == "main", vars(r))
+
+    push("a.txt", "a2\n")
+    push("a.txt", "a3\n")
+    r = one()
+    check("ws-sync: commits pushed from another computer are pulled",
+          r.outcome is Outcome.UPDATED and r.pulled == 2
+          and (here / "a.txt").read_text() == "a3\n"
+          and head() == head(other) and "2 commits" in r.detail, vars(r))
+
+    (here / "b.txt").write_text("local b\n")
+    (here / "scratch.txt").write_text("untracked\n")
+    push("a.txt", "a4\n")
+    r = one()
+    check("ws-sync: local changes to other files ride along a pull",
+          r.outcome is Outcome.UPDATED
+          and (here / "a.txt").read_text() == "a4\n"
+          and (here / "b.txt").read_text() == "local b\n"
+          and (here / "scratch.txt").exists(), vars(r))
+
+    before = head()
+    push("b.txt", "github b\n")
+    r = one()
+    check("ws-sync: a local change to a file GitHub also changed stops the "
+          "pull, and the change is kept",
+          r.outcome is Outcome.SKIPPED and head() == before
+          and (here / "b.txt").read_text() == "local b\n"
+          and "local changes" in r.detail, vars(r))
+    _sync_git(here, "checkout", "--", "b.txt")
+    check("ws-sync: once the change is gone the pull goes through",
+          one().outcome is Outcome.UPDATED
+          and (here / "b.txt").read_text() == "github b\n")
+
+    (here / "a.txt").write_text("mine\n")
+    _sync_git(here, "commit", "-q", "-am", "local work")
+    mine = head()
+    r = one()
+    check("ws-sync: a local commit not on GitHub is up to date, and said",
+          r.outcome is Outcome.UP_TO_DATE and "not pushed" in r.detail
+          and head() == mine, vars(r))
+    push("b.txt", "github b2\n")
+    r = one()
+    check("ws-sync: a branch that diverged from GitHub is left alone",
+          r.outcome is Outcome.SKIPPED and head() == mine
+          and "by hand" in r.detail, vars(r))
+    _sync_git(here, "reset", "-q", "--hard", "origin/main")
+
+    _sync_git(here, "switch", "-q", "-c", "local-only")
+    r = one()
+    check("ws-sync: a branch with no upstream is skipped",
+          r.outcome is Outcome.SKIPPED and "does not track" in r.detail,
+          vars(r))
+    _sync_git(here, "switch", "-q", "--detach")
+    r = one()
+    check("ws-sync: a detached HEAD is skipped",
+          r.outcome is Outcome.SKIPPED and "detached" in r.detail, vars(r))
+    _sync_git(here, "switch", "-q", "main")
+
+    plain = tmp / "plain"
+    plain.mkdir()
+    rs = workspace_sync.sync_all(run, [("P", str(plain)),
+                                       ("Gone", str(tmp / "nope"))])
+    check("ws-sync: a folder that is not a repo, and a missing one, are "
+          "skipped with the reason",
+          [r.outcome for r in rs] == [Outcome.SKIPPED] * 2
+          and "Not a git repository" in rs[0].detail
+          and "missing" in rs[1].detail, [vars(r) for r in rs])
+
+    # a lane: a worktree of the same repo on a branch with no upstream,
+    # synced alongside its main checkout (same git dir, one after the other)
+    lane = tmp / "lane"
+    _sync_git(here, "worktree", "add", "-q", "--no-track", "-b",
+              "hive/agent-x", str(lane), "main")
+    (here / "sub").mkdir()
+    lane_head = head(lane)
+    push("a.txt", "a5\n")
+    rs = workspace_sync.sync_all(run, [("Main", str(here)),
+                                       ("Sub", str(here / "sub")),
+                                       ("Lane", str(lane))])
+    check("ws-sync: two workspaces in one checkout sync once, named "
+          "together, and a lane worktree is never moved",
+          len(rs) == 2 and rs[0].names == ["Main", "Sub"]
+          and rs[0].outcome is Outcome.UPDATED
+          and rs[1].names == ["Lane"] and rs[1].outcome is Outcome.SKIPPED
+          and head(lane) == lane_head, [vars(r) for r in rs])
+
+    push("requirements.txt", "PySide6\nrequests\n")
+    r = one(app_repo=str(here))
+    check("ws-sync: AI Hive's own folder leaves an update that needs new "
+          "packages to the version button",
+          r.outcome is Outcome.SKIPPED and "packages" in r.detail, vars(r))
+    r = one()
+    check("ws-sync: ...which any other folder just pulls",
+          r.outcome is Outcome.UPDATED, vars(r))
+
+    _sync_git(here, "remote", "set-url", "origin", str(tmp / "gone.git"))
+    r = one()
+    check("ws-sync: a fetch that fails is reported as failed",
+          r.outcome is Outcome.FAILED and r.detail.startswith("Fetching"),
+          vars(r))
+    _sync_git(here, "remote", "set-url", "origin", str(origin))
+    check("ws-sync: the summary counts each outcome",
+          workspace_sync.summary(rs) == "1 updated, 1 skipped",
+          workspace_sync.summary(rs))
+
+    # --- the sidebar button -------------------------------------------------
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win.show()
+    pump(100)
+    ws = win.manager.create_workspace("Synced", str(here))
+    push("a.txt", "a6\n")
+    calls = []
+
+    def counting(argv, timeout=None):
+        calls.append(list(argv))
+        return run(argv, timeout)
+
+    win._workspace_sync_runner = counting
+    win.sidebar.sync_btn.click()
+    busy = not win.sidebar.sync_btn.isEnabled()
+    again = win.sync_all_workspaces()
+    deadline = time.monotonic() + 30
+    while win._workspace_sync_job is not None and time.monotonic() < deadline:
+        pump(30)
+    results = getattr(win, "_last_workspace_sync", None) or []
+    mine = [r for r in results if ws.name in r.names]
+    check("ws-sync: the sidebar button syncs every workspace once, busy "
+          "meanwhile",
+          busy and again is False and win.sidebar.sync_btn.isEnabled()
+          and len(mine) == 1 and mine[0].outcome is Outcome.UPDATED
+          and (here / "a.txt").read_text() == "a6\n",
+          [vars(r) for r in results])
+    box = win._workspace_sync_box
+    check("ws-sync: a dialog lists each workspace's outcome",
+          box is not None and box.isVisible()
+          and "Synced: Pulled 1 commit" in box.informativeText(),
+          box.informativeText() if box is not None else None)
+    repo_dir = os.path.normcase(os.path.realpath(self_update.REPO_DIR))
+    check("ws-sync: the suite's sync never ran git in AI Hive's own clone",
+          not any(os.path.normcase(os.path.realpath(c[2])) == repo_dir
+                  for c in calls if len(c) > 2 and c[1] == "-C"))
+    if box is not None:
+        box.close()
+    win.close()
+    win.deleteLater()
+    pump(20)
+    _sync_git(here, "worktree", "remove", str(lane))
+    shutil.rmtree(tmp, ignore_errors=True)

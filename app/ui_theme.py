@@ -640,10 +640,18 @@ WorkspaceRow[search_hit="true"] {{
 /* sidebar search: the magnifier toggle + the overlay input it reveals */
 #SearchBtn {{
     background: transparent; border: 1px solid transparent; border-radius: 3px;
-    padding: 1px 4px; color: {p.TEXT_DIM}; font-size: 13px;
+    padding: 1px 1px; color: {p.TEXT_DIM}; font-size: 13px;
 }}
 #SearchBtn:hover {{ background: {p.BG_HOVER}; color: {p.ACCENT_GOLD};
                    border-color: {p.BORDER}; }}
+/* sidebar sync: pull every workspace forward from GitHub */
+#SyncBtn {{
+    background: transparent; border: 1px solid transparent; border-radius: 3px;
+    padding: 1px 1px; color: {p.TEXT_DIM}; font-size: 15px; font-weight: 700;
+}}
+#SyncBtn:hover {{ background: {p.BG_HOVER}; color: {p.ACCENT_GOLD};
+                 border-color: {p.BORDER}; }}
+#SyncBtn:disabled {{ color: {p.ACCENT_GOLD}; }}
 #SidebarSearch {{
     background: {p.BG_INPUT}; border: 1px solid {p.ACCENT_GOLD};
     border-radius: 3px; padding: 1px 6px; color: {p.TEXT};
@@ -653,7 +661,7 @@ WorkspaceRow[search_hit="true"] {{
 /* category headers (collapsible workspace groups) */
 #AddCatBtn {{
     background: transparent; border: 1px solid transparent; border-radius: 3px;
-    padding: 1px 4px; color: {p.ACCENT_GOLD}; font-size: 13px;
+    padding: 1px 1px; color: {p.ACCENT_GOLD}; font-size: 13px;
 }}
 #AddCatBtn:hover {{ background: {p.BG_HOVER}; border-color: {p.BORDER}; }}
 /* the primary "add workspace" action: a bold, evident gold "+" in a pill */

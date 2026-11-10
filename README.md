@@ -744,6 +744,15 @@ error dialog instead of silently closing. Packaging to a distributable
   The New Workspace dialog can also take a GitHub repository URL instead: it
   clones the repo's default branch (`main`, `master` or whatever it is
   called) into a new folder and opens the workspace there.
+- **Sync every workspace with GitHub in one click.** The `↻` in the sidebar
+  header fetches each workspace's folder and moves its branch forward to what
+  it tracks on GitHub, so after pushing from one computer, one click on the
+  other brings every project up to date without asking an agent in each
+  workspace to pull. It only ever fast-forwards: a branch with local commits
+  GitHub lacks, a branch that tracks nothing (every agent lane), or local
+  changes to files GitHub also changed are left alone, and a dialog lists
+  what happened in each workspace. Local changes to other files ride along.
+  Workspaces on one folder sync once.
   Double-click a row to rename, `✕` deletes (confirmation appears only when
   terminals are running). The top-left sidebar button (a collapse or expand icon, whichever the next click does) or `Ctrl+Shift+B` collapses the sidebar to a
   10px rail with one strip per workspace, in sidebar order and colored like
@@ -1243,6 +1252,7 @@ app/
   self_update.py           update AI Hive from GitHub main: version check, changelog, ff-only merge (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   repo_activity.py         Open repo dropdown: GitHub PRs + commits, origin URL (Qt-free)
+  workspace_sync.py        sidebar sync button: fetch + ff-only every workspace folder (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled fonts: the manuscript ones (Cinzel/EB Garamond/
                            Spectral) and the Terminal font picker's mono families,

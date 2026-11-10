@@ -3720,6 +3720,7 @@ class MainWindow(QMainWindow):
         self.manager.agentLimitBlocked.connect(self._on_agent_limit_blocked)
         self.top_bar.usageRefreshRequested.connect(self._on_usage_refresh)
         self.sidebar.addRequested.connect(self._on_add_workspace_clicked)
+        self.sidebar.syncRequested.connect(self.sync_all_workspaces)
         self.sidebar.workspaceSelected.connect(self._on_sidebar_workspace_selected)
         self.sidebar.renameRequested.connect(self.manager.rename_workspace)
         # inline agent list: the sidebar expands agents under a workspace and
@@ -8300,6 +8301,96 @@ class MainWindow(QMainWindow):
             return
         ws = self.manager.create_workspace(name, path, lanes=want_lanes)
         self.manager.set_active(ws.id)
+
+    # ------------------------------------------------- sync with GitHub ---
+    # The sidebar's sync button: fetch and fast-forward every workspace's
+    # folder from the branch it tracks (app/workspace_sync.py has the rules).
+    # Only the user's click starts it. The git calls go through
+    # `_workspace_sync_runner`, which tests may replace.
+
+    def sync_all_workspaces(self) -> bool:
+        """Start a sync of every workspace. False when one is running or
+        there is nothing to sync."""
+        from app import self_update, workspace_sync
+        from .self_update_dialog import Job
+
+        if (getattr(self, "_workspace_sync_job", None) is not None
+                or self._closing):
+            return False
+        folders = [(ws.name, ws.project_path)
+                   for ws in self.manager.workspaces]
+        if not folders:
+            return False
+        runner = (getattr(self, "_workspace_sync_runner", None)
+                  or self_update.subprocess_runner)
+        app_repo = self_update.REPO_DIR
+        job = Job(lambda: workspace_sync.sync_all(runner, folders, app_repo),
+                  self, name="ai-hive-workspace-sync")
+        job.finished.connect(self._on_workspaces_synced)
+        self._workspace_sync_job = job
+        self.sidebar.set_sync_busy(True)
+        job.start()
+        return True
+
+    def _on_workspaces_synced(self, results) -> None:
+        from app import self_update, workspace_sync
+        from app.cli_update import needs_update
+        from app.workspace_sync import Outcome
+
+        self._workspace_sync_job = None
+        self.sidebar.set_sync_busy(False)
+        if not isinstance(results, list):
+            self._audit_install(f"WS-SYNC stopped unexpectedly: {results}")
+            results = None
+        else:
+            for res in results:
+                self._audit_install(workspace_sync.audit_line(res))
+        self._last_workspace_sync = results
+        if self._closing:
+            return
+        if results and any(r.outcome is Outcome.UPDATED for r in results):
+            # the base moved under the lanes: show it without waiting a poll
+            self.lane_service.poke()
+            installed = self_update.read_installed_version()
+            if needs_update(__version__, installed):
+                self._note_app_restart_pending(installed)
+        self._show_workspace_sync_results(results)
+
+    def _show_workspace_sync_results(self, results) -> None:
+        from app import workspace_sync
+        from app.workspace_sync import Outcome
+
+        old = getattr(self, "_workspace_sync_box", None)
+        if old is not None:
+            old.close()
+        marks = {Outcome.UPDATED: "⬆", Outcome.UP_TO_DATE: "✓",
+                 Outcome.SKIPPED: "•", Outcome.FAILED: "✗"}
+        if results is None:
+            head, lines = "The sync stopped unexpectedly.", []
+        else:
+            head = workspace_sync.summary(results)
+            lines = [f"{marks[r.outcome]} {', '.join(r.names)}: {r.detail}"
+                     for r in results]
+        problem = results is None or any(
+            r.outcome in (Outcome.SKIPPED, Outcome.FAILED) for r in results)
+        box = QMessageBox(
+            QMessageBox.Icon.Warning if problem else
+            QMessageBox.Icon.Information,
+            "Sync with GitHub", head, QMessageBox.StandardButton.Ok, self)
+        box.setInformativeText("\n".join(lines))
+        box.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.setWindowModality(Qt.WindowModality.NonModal)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.destroyed.connect(lambda *_, b=box: self._forget_sync_box(b))
+        self._workspace_sync_box = box
+        box.show()
+
+    def _forget_sync_box(self, box) -> None:
+        # the box a second sync replaced is destroyed after the new one is
+        # stored: only forget the one that is current
+        if getattr(self, "_workspace_sync_box", None) is box:
+            self._workspace_sync_box = None
 
     def _on_add_terminal_clicked(self, ws_id: str = "") -> None:
         # ws_id lets an empty grid slot request an agent for its own workspace;
