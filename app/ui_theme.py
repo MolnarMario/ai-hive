@@ -431,6 +431,11 @@ def _rel_luma(hex_color: str) -> float:
     return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
 
 
+def rgba(hex_color: str, alpha: float) -> str:
+    """A QSS rgba() of a theme color at `alpha` (0..1), for washes."""
+    return "rgba({},{},{},{})".format(*_hex_rgb(hex_color), alpha)
+
+
 def _check_icon_path(fill_hex: str) -> str:
     """Write a checkmark SVG whose stroke contrasts with `fill_hex` (the checked
     indicator's fill) and return a forward-slashed file path, or "" on failure.
@@ -481,10 +486,23 @@ def build_qss(chrome_family: str = "Segoe UI", console_px: int | None = None) ->
     # skin and darkens a light one, and the group box drawn under the header
     # (sidebar.drawRow) still shows through. An opaque BG_HOVER covered that
     # box, so the hovered header looked flatter than the ones beside it
-    cat_hover = "rgba({},{},{},{})".format(*_hex_rgb(p.TEXT), CAT_HOVER_ALPHA)
+    cat_hover = rgba(p.TEXT, CAT_HOVER_ALPHA)
     # the GitHub sync notice over a workspace: its state's ink as a wash
-    sync_ok = "rgba({},{},{},0.22)".format(*_hex_rgb(p.GREEN))
-    sync_warn = "rgba({},{},{},0.22)".format(*_hex_rgb(p.ACCENT_ORANGE))
+    sync_ok = rgba(p.GREEN, 0.22)
+    sync_warn = rgba(p.ACCENT_ORANGE, 0.22)
+    # the Sync with GitHub results window (widgets/sync_results.py): each
+    # section's ink, then its badge / pill washes
+    sync_ink = {"attention": p.RED, "updated": p.GREEN,
+                "skipped": p.TEXT_DIM, "current": p.GREEN}
+    sync_sections = "".join(
+        f'QLabel#SyncSectionTitle[section="{k}"] {{ color: {c}; }}\n'
+        f'QLabel#SyncBadge[section="{k}"] {{ color: {c};'
+        f" background: {rgba(c, 0.16)}; border: 1px solid {rgba(c, 0.45)};"
+        f" }}\n"
+        f'QLabel#SyncPill[section="{k}"] {{ color: {c};'
+        f" background: {rgba(c, 0.14)}; border: 1px solid {rgba(c, 0.35)};"
+        f" }}\n"
+        for k, c in sync_ink.items())
     return f"""
 * {{
     font-family: "{chrome_family}";
@@ -1185,6 +1203,19 @@ QComboBox QAbstractItemView {{
     selection-background-color: {p.BG_ACTIVE};
 }}
 QDialog, QMessageBox, QFileDialog {{ background: {p.BG_PANEL}; }}
+QWidget#SyncBody, QScrollArea#SyncScroll {{ background: transparent; }}
+QLabel#SyncHeadline {{ color: {p.TEXT}; font-size: 17px; font-weight: 600; }}
+QLabel#SyncSectionTitle {{ font-size: 11px; font-weight: 700;
+    letter-spacing: 1px; }}
+QFrame#SyncRow {{ background: {p.BG_CARD}; border: 1px solid {p.BORDER_SOFT};
+    border-radius: 6px; }}
+QLabel#SyncRowName {{ color: {p.TEXT}; font-weight: 600; }}
+QLabel#SyncRowDetail {{ color: {p.TEXT_DIM}; }}
+QLabel#SyncNames {{ color: {p.TEXT}; }}
+QLabel#SyncBadge {{ border-radius: 11px; font-weight: 700; font-size: 13px; }}
+QLabel#SyncBadge[big="true"] {{ border-radius: 17px; font-size: 20px; }}
+QLabel#SyncPill {{ border-radius: 9px; padding: 1px 9px; font-weight: 600; }}
+{sync_sections}
 QLabel {{ background: transparent; }}
 /* Checkboxes: the platform default draws a near-invisible tick. Give it a
    clear box (empty = input surface, checked = accent-filled) and a

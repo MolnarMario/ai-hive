@@ -117,6 +117,7 @@ class Result:
     branch: str = ""
     upstream: str = ""              # what the branch tracks, "origin/main"
     behind: int = 0                 # commits GitHub had that this lacked
+    ahead: int = 0                  # commits this had that GitHub lacked
     pulled: int = 0                 # commits the fast-forward brought
     old_head: str = ""
     new_head: str = ""
@@ -305,7 +306,7 @@ def sync_folder(runner, top: str, app_repo: str = "", updating=None,
         return done(Outcome.FAILED, _git_error("Comparing with GitHub",
                                                rc, out))
     ahead, behind = int(parts[0]), int(parts[1])
-    res.behind = behind
+    res.behind, res.ahead = behind, ahead
     if behind == 0:
         if ahead:
             return done(Outcome.UP_TO_DATE,

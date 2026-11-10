@@ -3101,6 +3101,7 @@ def test_workspace_sync_results_dialog():
     folder that needs the user does not hide among the ones that are
     fine."""
     from PySide6.QtWidgets import QApplication, QFrame, QLabel
+    from app import ui_theme, workspace_sync
     from app.ui_theme import Palette
     from app.widgets import sync_results
     from app.widgets.sync_results import SyncResultsDialog
@@ -3114,13 +3115,16 @@ def test_workspace_sync_results_dialog():
 
     results = [
         res("Proverbs", Outcome.SKIPPED,
-            "The branch 'fix/gap' does not track a branch on GitHub."),
+            "The branch 'fix/gap' does not track a branch on GitHub.",
+            branch="fix/gap"),
         res("Chess", Outcome.UP_TO_DATE, "Up to date."),
-        res("Hive", Outcome.UPDATED, "Pulled 3 commits into 'main'."),
+        res("Hive", Outcome.UPDATED, "Pulled 3 commits into 'main'.",
+            branch="main"),
         res("Lift", Outcome.SKIPPED, "GitHub has 2 commits, but they "
             "change files with local changes here.", behind=2),
         res("CV", Outcome.UP_TO_DATE,
-            "Up to date. 1 commit on 'main' not pushed yet."),
+            "Up to date. 1 commit on 'main' not pushed yet.", ahead=1,
+            branch="main"),
         res("Scraper", Outcome.FAILED, "Fetching from origin failed."),
         res("Rent", Outcome.UP_TO_DATE, "Up to date."),
     ]
@@ -3133,18 +3137,42 @@ def test_workspace_sync_results_dialog():
               ["Chess", "CV", "Rent"]], groups)
     text = sync_results.plain_text(results)
     check("ws-sync dialog: the report text leads with what needs the user, "
-          "worst section first",
-          text.startswith("2 workspaces need your attention\n")
+          "its counts are the sections' own, worst section first",
+          text.startswith("2 workspaces need your attention\n2 need "
+                          "attention, 1 updated, 1 not synced, 3 up to "
+                          "date\n")
           and text.index("Needs attention (2)") < text.index("Updated (1)")
           < text.index("Not synced (1)") < text.index("Up to date (3)")
           and "  Lift: GitHub has 2 commits" in text, text)
     check("ws-sync dialog: one folder to fix says so in the singular, none "
           "says the sync finished",
-          sync_results.headline(results[:4])
+          sync_results.headline(sync_results.group(results[:4]))
           == "1 workspace needs your attention"
-          and sync_results.headline(results[:3]) == "Sync finished"
+          and sync_results.headline(sync_results.group(results[:3]))
+          == "Sync finished"
           and sync_results.headline(None)
           == "The sync stopped unexpectedly.")
+
+    # sync_folder records what the folder has that GitHub lacks: the dialog
+    # tells a plain up-to-date folder from one with news by that, never by
+    # the wording of its reason
+    def fake(args, _timeout):
+        sub = args[3]       # git -C <folder> <subcommand>
+        if sub == "symbolic-ref":
+            return 0, "main\n"
+        if sub == "config":
+            return 0, "origin\n"
+        if sub == "rev-parse" and "--abbrev-ref" in args:
+            return 0, "origin/main\n"
+        if sub == "rev-parse":
+            return 0, "a" * 40 + "\n" + "b" * 40 + "\n"
+        if sub == "rev-list":
+            return 0, "2\t0\n"
+        return 0, ""
+    got = workspace_sync.sync_folder(fake, "C:/code/x")
+    check("ws-sync dialog: sync_folder keeps the commits GitHub lacks on the "
+          "result", got.outcome is Outcome.UP_TO_DATE and got.ahead == 2
+          and got.behind == 0, vars(got))
 
     box = SyncResultsDialog(results)
     box.show()
@@ -3157,17 +3185,29 @@ def test_workspace_sync_results_dialog():
           row_names == ["Lift", "Scraper", "Hive", "Proverbs", "CV"]
           and len(names) == 1 and "Chess" in names[0].text()
           and "Rent" in names[0].text()
-          and rows[0].toolTip() == "C:/code/Lift", (row_names,
-                                                   [n.text() for n in names]))
+          and rows[0].toolTip() == "C:/code/Lift",
+          (row_names, [n.text() for n in names]))
     titles = box.findChildren(QLabel, "SyncSectionTitle")
-    check("ws-sync dialog: the attention section is red, updated green",
-          Palette.RED in titles[0].styleSheet()
+    qss = ui_theme.build_qss()
+    check("ws-sync dialog: each section's color comes from the app QSS by "
+          "its section property (so a skin change recolors it), attention "
+          "red and updated green",
+          [t.property("section") for t in titles]
+          == ["attention", "updated", "skipped", "current"]
           and titles[0].text().startswith("NEEDS ATTENTION")
-          and Palette.GREEN in titles[1].styleSheet(),
-          [(t.text(), t.styleSheet()) for t in titles])
+          and (f'QLabel#SyncSectionTitle[section="attention"] {{ color: '
+               f'{Palette.RED}; }}') in qss
+          and (f'QLabel#SyncSectionTitle[section="updated"] {{ color: '
+               f'{Palette.GREEN}; }}') in qss
+          and not any(w.styleSheet() for w in box.findChildren(QLabel)),
+          [(t.text(), t.property("section")) for t in titles])
+    check("ws-sync dialog: the window fits its list on show but can still "
+          "be made smaller", box._scroll.minimumHeight() < 100
+          and box._scroll.height() > 100,
+          (box._scroll.minimumHeight(), box._scroll.height()))
     detail = rows[3].findChildren(QLabel, "SyncRowDetail")[0].text()
-    check("ws-sync dialog: a quoted branch name is set apart in the console "
-          "font, escaped", "monospace" in detail and ">fix/gap<" in detail
+    check("ws-sync dialog: the result's branch is set apart in the console "
+          "font", "monospace" in detail and ">fix/gap<" in detail
           and "'fix/gap'" not in detail, detail)
     box.copy_btn.click()
     check("ws-sync dialog: Copy puts the report on the clipboard",
@@ -3175,8 +3215,26 @@ def test_workspace_sync_results_dialog():
           and box.copy_btn.text() == "Copied")
     visible = [w.text() for w in box.findChildren(QLabel)] + [text]
     check("ws-sync dialog: no em dash in anything it shows",
-          not any("—" in t for t in visible))
+          not any("\u2014" in t for t in visible))
     box.close()
+    app.processEvents()
+
+    odd = res("<b>Tools</b>", Outcome.SKIPPED,
+              "The branch 'mario's-fix' does not track a branch on GitHub.",
+              branch="mario's-fix")
+    html_out = sync_results.detail_html(odd)
+    check("ws-sync dialog: a branch with an apostrophe is matched whole, "
+          "the rest escaped",
+          ">mario&#x27;s-fix</span> does not track" in html_out
+          and html_out.startswith("The branch <span"), html_out)
+    weird = SyncResultsDialog([odd])
+    weird.show()
+    app.processEvents()
+    name = weird.findChild(QLabel, "SyncRowName")
+    check("ws-sync dialog: a workspace name that looks like HTML shows as "
+          "typed", name.text() == "<b>Tools</b>"
+          and name.textFormat().name == "PlainText")
+    weird.close()
     app.processEvents()
 
     stopped = SyncResultsDialog(None)
