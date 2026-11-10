@@ -119,7 +119,7 @@ class SyncNotice(QFrame):
         self.hide()
 
     def state(self) -> str:
-        return "" if not self.isVisible() else str(self.property("state"))
+        return "" if self.isHidden() else str(self.property("state"))
 
     def text(self) -> str:
         return self._text
@@ -186,18 +186,19 @@ class SyncNotice(QFrame):
             return
         top = SYNC_TOP_GAP
         header = getattr(page, "header", None)
-        if header is not None and header.isVisible():
+        if header is not None and not header.isHidden():
             top += header.geometry().bottom() + 1
         # one line when it fits, wrapped only past 70% of the page. A word
         # wrapping label's own size hint is far narrower than its text, so
-        # the width comes from the text; the busy dots are counted as all
-        # three, so the pill keeps one width while they step
+        # the width comes from the text. Busy text is measured with three
+        # figure spaces, the widest the dots' slot ever gets, so the pill
+        # keeps one width and one line while they step
         room = max(160, min(int(page.width() * 0.7), page.width() - 24))
         m = self.layout().contentsMargins()
         pad = m.left() + m.right() + 2 * self.frameWidth() + 2
         busy = self.property("state") == "busy"
         text_w = self.label.fontMetrics().horizontalAdvance(
-            self._text + ("..." if busy else "")) + 4
+            self._text + (FIGURE_SPACE * 3 if busy else "")) + 4
         width = min(room, text_w + pad)
         self.setFixedWidth(width)
         self.setFixedHeight(self.label.heightForWidth(width - pad)
@@ -205,7 +206,7 @@ class SyncNotice(QFrame):
         self.move((page.width() - width) // 2, top)
 
     def fade_out(self) -> None:
-        if not self.isVisible() or self._pending is not None:
+        if self.isHidden() or self._pending is not None:
             return
         self._dots_timer.stop()
         self._fade.stop()
@@ -666,7 +667,7 @@ class WorkspacePage(QWidget):
         super().resizeEvent(event)
         self._elide_path()
         notice = getattr(self, "sync_notice", None)
-        if notice is not None and notice.isVisible():
+        if notice is not None and not notice.isHidden():
             notice.place()
 
     def show_sync_notice(self, state: str, text: str,

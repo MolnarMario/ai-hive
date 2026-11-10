@@ -6866,6 +6866,20 @@ def test_grapheme_clusters_match_conhost():
           screen.buffer[0][39].data == " " and moved == [_SWORDS, "", "y"],
           ascii(moved))
 
+    # a clone pulled without `pip install` has pyte's older wcwidth and no
+    # grapheme API: the card must still open and draw, with pyte's own draw
+    from app import grapheme_cells
+    saved = grapheme_cells.AVAILABLE
+    grapheme_cells.AVAILABLE = False
+    try:
+        screen = _new_history_screen(40, 6)
+        pyte.Stream(screen).feed("ab\N{DRAGON}c")
+        fallback = (screen.cursor.y, screen.cursor.x)
+    finally:
+        grapheme_cells.AVAILABLE = saved
+    check("clusters: without wcwidth's grapheme API a card draws with pyte's "
+          "own draw instead of failing", fallback == (0, 5), fallback)
+
 
 def test_emoji_repaint_keeps_rows_in_place():
     """Regression: after Claude's agent view (the left arrow) ConPTY repaints

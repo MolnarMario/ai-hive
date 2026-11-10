@@ -448,6 +448,9 @@ def main() -> int:
     # ...and Restart to update starting a new AI Hive. The suite opens and
     # closes many windows in one process and must never launch an app.
     window.arm_app_restart()
+    # ...and the sidebar's sync button and the launch sync fetching and
+    # fast-forwarding the user's workspace folders. Never in the suite.
+    window.arm_workspace_sync()
     window.refresh_install_state()
     if gate is not None:
         window.note_update_outcomes(gate.outcomes, gate.installing)

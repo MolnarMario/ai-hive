@@ -1,12 +1,12 @@
 """Sync every workspace's folder with GitHub in one click: the decisions,
 with no Qt.
 
-The sidebar's sync button (`MainWindow.sync_all_workspaces`) runs `sync_all`
-on a worker thread over every workspace's folder. The point is a user who
-works from two or more computers: after pushing from one, a click on the
-other brings every project up to date, without asking an agent in each
-workspace to pull. Options > Sync workspaces with GitHub at launch (default
-off) runs the same sync once per launch, only after the launch has settled
+The sidebar's sync button (`MainWindow.sync_all_workspaces`) syncs every
+workspace's folder off the GUI thread. The point is a user who works from
+two or more computers: after pushing from one, a click on the other brings
+every project up to date, without asking an agent in each workspace to
+pull. Options > Sync workspaces with GitHub at launch (default off) runs the
+same sync once per launch, only after the launch has settled
 (`MainWindow.start_workspace_sync_at_launch`), so it never slows startup.
 `progress` events drive the notice over each workspace
 (`workspace_page.SyncNotice`).
@@ -34,19 +34,37 @@ Agent lanes are never touched: a lane branch has no upstream, and lanes
 live in their own worktrees, not in the workspace folder. The fetch does
 refresh the remote branches the lanes compare against.
 
+NOBODY IS THERE TO ANSWER
+-------------------------
+A sync nobody clicked (the launch one) must never wait on a sign-in. Git
+runs with its terminal prompt and Git Credential Manager's window both off,
+so a private repo whose token expired fails with the reason instead. Each
+git call has a timeout, and `sync_runner` kills the whole process tree when
+it runs out, then reads output from a file rather than a pipe: a pipe that
+a helper (`git-remote-https`, the credential manager) still holds would keep
+the wait going past the timeout and leave the sync button busy for good.
+
 WORKSPACES SHARING A REPOSITORY
 -------------------------------
 Two workspaces on one folder (or on two folders inside one checkout) sync
-once. Checkouts that share one git directory (worktrees of one repo) run one
-after the other, because two fetches into one repo race for the same ref
-locks; different repositories run in parallel.
+once. `plan` reads every folder in parallel and groups the checkouts by git
+directory; `run_group` syncs one group's checkouts one after the other,
+because two fetches into one repo race for the same ref locks. The window
+runs each group on that repository's lane queue (`LaneOps.submit` with
+`exclusive=False`, beside the lane service's base fetch), so a sync never
+races a lane operation's ref writes; different repositories run in
+parallel. `sync_all` is the same thing on a plain thread pool, for tests and
+callers without a window.
 
 AI HIVE'S OWN FOLDER
 --------------------
-A workspace on the clone AI Hive runs from syncs like any other, except
-that an update which changes `requirements.txt` is left for the version
-button, which installs the packages too (`self_update.apply`). The pulled
-code runs from the next launch; the version button then offers the
+A workspace on the clone AI Hive runs from follows the version button's
+rules, not the general ones: it moves only a clean `main` that GitHub's
+main is ahead of (`self_update.blocked_reason`), and an update that changes
+`requirements.txt` is left for the version button, which installs the
+packages too. It is skipped altogether while AI Hive is updating itself
+(`app_busy`), since both would fetch and merge in that one folder. The
+pulled code runs from the next launch; the version button then offers the
 restart.
 
 No em dash in any string below: `detail` is read by the user.
@@ -55,21 +73,27 @@ No em dash in any string below: `detail` is read by the user.
 from __future__ import annotations
 
 import os
+import subprocess
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 
+from . import self_update
 from .cli_update import RC_TIMEOUT
+from .self_update import _first_line, _git
 
 FETCH_TIMEOUT_S = 60.0
 GIT_TIMEOUT_S = 15.0
 MERGE_TIMEOUT_S = 60.0
-# repositories fetched at once; each fetch is one network round trip
+# folders read, and (in `sync_all`) repositories synced, at once
 MAX_PARALLEL = 4
 # a fetch that lost a ref lock to another fetch (the lane service's, an
 # agent's) is tried once more after this pause
 LOCK_RETRY_S = 1.5
+
+_CREATE_NO_WINDOW = 0x08000000
 
 
 class Outcome(str, Enum):
@@ -94,16 +118,73 @@ class Result:
     new_head: str = ""
 
 
-def _git(repo: str, *args) -> list:
-    return ["git", "-C", repo, *args]
+@dataclass
+class Plan:
+    """What `plan` found: every checkout to sync, grouped by git directory,
+    and the folders that cannot sync at all, already decided."""
+    order: list = field(default_factory=list)    # result keys, sidebar order
+    names: dict = field(default_factory=dict)    # key -> workspace names
+    ids: dict = field(default_factory=dict)      # key -> workspace ids
+    results: dict = field(default_factory=dict)  # key -> Result
+    groups: dict = field(default_factory=dict)   # git dir -> [(key, top)]
+
+    def finish(self, results=()) -> list:
+        """Every result in sidebar order, each naming its workspaces.
+        `results` are the synced groups' (key, Result) pairs."""
+        self.results.update(results)
+        for key, res in self.results.items():
+            res.names, res.ids = self.names[key], self.ids[key]
+        return [self.results[key] for key in self.order
+                if key in self.results]
 
 
-def _first_line(text) -> str:
-    for line in (text or "").splitlines():
-        if line.strip():
-            return line.strip()
-    return ""
+# --------------------------------------------------------------- runner ---
 
+def sync_runner(argv, timeout: float = GIT_TIMEOUT_S) -> tuple:
+    """Run git with nobody to answer it (see NOBODY IS THERE TO ANSWER):
+    (rc, stdout + stderr), RC_TIMEOUT when it ran out of time, never
+    raises. Never called from the smoke suite's own repo."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = _CREATE_NO_WINDOW
+    with tempfile.TemporaryFile() as out:
+        try:
+            proc = subprocess.Popen(list(argv), stdout=out,
+                                    stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, env=env,
+                                    **kwargs)
+        except FileNotFoundError:
+            return 127, ""
+        except (OSError, ValueError) as e:
+            return 127, str(e)
+        try:
+            rc = proc.wait(timeout if timeout and timeout > 0 else None)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            return RC_TIMEOUT, ""
+        out.seek(0)
+        return rc, out.read().decode("utf-8", errors="replace")
+
+
+def _kill_tree(proc) -> None:
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10,
+                           creationflags=_CREATE_NO_WINDOW)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        proc.kill()
+        proc.wait(5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+# ------------------------------------------------------------------ git ---
 
 def _git_error(what: str, rc: int, output: str) -> str:
     if rc == RC_TIMEOUT:
@@ -122,20 +203,28 @@ def _same_path(a: str, b: str) -> bool:
 
 
 def locate(runner, folder: str) -> tuple:
-    """(top folder, git common dir, why not) for a workspace folder.
-    `why not` is a sentence when the folder cannot be synced at all."""
+    """(top folder, git common dir, why not) for a workspace folder, in one
+    git call. `why not` is a sentence when the folder cannot be synced."""
     if not folder or not os.path.isdir(folder):
         return "", "", "The folder is missing."
-    rc, out = runner(_git(folder, "rev-parse", "--show-toplevel"),
+    rc, out = runner(_git(folder, "rev-parse", "--path-format=absolute",
+                          "--show-toplevel", "--git-common-dir"),
                      GIT_TIMEOUT_S)
+    if rc != 0 and "path-format" in (out or ""):
+        # git before 2.31: the same question without the option, whose
+        # common dir may come back relative to the folder
+        rc, out = runner(_git(folder, "rev-parse", "--show-toplevel",
+                              "--git-common-dir"), GIT_TIMEOUT_S)
+        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+        if rc == 0 and len(lines) > 1:
+            out = "\n".join([lines[0], os.path.join(folder, lines[1])])
     if rc == 127 or rc == RC_TIMEOUT:
         return "", "", _git_error("Reading the folder", rc, out)
-    if rc != 0:
+    lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    if rc != 0 or not lines:
         return "", "", "Not a git repository."
-    top = os.path.normpath(_first_line(out))
-    rc, out = runner(_git(top, "rev-parse", "--path-format=absolute",
-                          "--git-common-dir"), GIT_TIMEOUT_S)
-    common = os.path.normpath(_first_line(out)) if rc == 0 else top
+    top = os.path.normpath(lines[0])
+    common = os.path.normpath(lines[1]) if len(lines) > 1 else top
     return top, common, ""
 
 
@@ -148,18 +237,24 @@ def _fetch(runner, top: str, remote: str) -> tuple:
     return rc, out
 
 
-def sync_folder(runner, top: str, app_repo: str = "",
-                updating=None) -> Result:
+def sync_folder(runner, top: str, app_repo: str = "", updating=None,
+                app_busy: bool = False) -> Result:
     """Fetch and fast-forward one checkout. Never raises. `app_repo` is the
-    folder AI Hive runs from (see AI HIVE'S OWN FOLDER). `updating(res)` is
-    called right before the fast-forward, once it is known there is
-    something to pull, so the window can say so while it runs."""
+    folder AI Hive runs from and `app_busy` says AI Hive is updating itself
+    (see AI HIVE'S OWN FOLDER). `updating(res)` is called right before the
+    fast-forward, once it is known there is something to pull, so the
+    window can say so while it runs."""
     res = Result(top, Outcome.SKIPPED)
+    is_app = bool(app_repo) and _same_path(top, app_repo)
 
     def done(outcome: Outcome, detail: str) -> Result:
         res.outcome, res.detail = outcome, detail
         return res
 
+    if is_app and app_busy:
+        return done(Outcome.SKIPPED,
+                    "AI Hive is updating itself right now. Sync again once "
+                    "it is done.")
     rc, out = runner(_git(top, "symbolic-ref", "--quiet", "--short", "HEAD"),
                      GIT_TIMEOUT_S)
     if rc != 0:
@@ -183,21 +278,21 @@ def sync_folder(runner, top: str, app_repo: str = "",
         if rc != 0:
             return done(Outcome.FAILED,
                         _git_error(f"Fetching from {remote}", rc, out))
-    rc, out = runner(_git(top, "rev-parse", "--verify", "--quiet",
+    # one call for both: every read below names these commits, not the
+    # refs, so another fetch landing meanwhile cannot widen the merge
+    rc, out = runner(_git(top, "rev-parse", "HEAD^{commit}",
                           "@{upstream}^{commit}"), GIT_TIMEOUT_S)
-    target = _first_line(out) if rc == 0 else ""
-    rc, out = runner(_git(top, "rev-parse", "--verify", "--quiet",
-                          "HEAD^{commit}"), GIT_TIMEOUT_S)
-    head = _first_line(out) if rc == 0 else ""
-    if not head:
-        return done(Outcome.SKIPPED, f"The branch '{branch}' has no commits "
-                                     "yet.")
-    if not target:
+    shas = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    if rc != 0 or len(shas) != 2:
+        rc, out = runner(_git(top, "rev-parse", "--verify", "--quiet",
+                              "HEAD^{commit}"), GIT_TIMEOUT_S)
+        if rc != 0 or not _first_line(out):
+            return done(Outcome.SKIPPED, f"The branch '{branch}' has no "
+                                         "commits yet.")
         return done(Outcome.FAILED, f"Could not read {upstream} after the "
                                     "fetch.")
+    head, target = shas
     res.old_head = res.new_head = head
-    # every read below names the fetched commit, not the ref: another fetch
-    # landing meanwhile must not widen what this sync merges
     rc, out = runner(_git(top, "rev-list", "--left-right", "--count",
                           f"{head}...{target}"), GIT_TIMEOUT_S)
     parts = out.split() if rc == 0 else []
@@ -217,7 +312,10 @@ def sync_folder(runner, top: str, app_repo: str = "",
                     f"'{branch}' has {commits_text(ahead)} GitHub lacks and "
                     f"GitHub has {commits_text(behind)} it lacks. Merge them "
                     "by hand.")
-    if app_repo and _same_path(top, app_repo):
+    if is_app:
+        why = self_update.blocked_reason(runner, top, target)
+        if why:
+            return done(Outcome.SKIPPED, why)
         rc, _ = runner(_git(top, "diff", "--quiet", head, target, "--",
                             "requirements.txt"), GIT_TIMEOUT_S)
         if rc != 0:
@@ -252,71 +350,98 @@ def commits_text(n: int) -> str:
     return f"{n} commit" if n == 1 else f"{n} commits"
 
 
-def sync_all(runner, workspaces, app_repo: str = "",
-             parallel: int = MAX_PARALLEL, progress=None) -> list:
-    """Sync every workspace folder. `workspaces` is [(ws id, name, folder)]
-    in sidebar order; the results come back in that order, one per checkout
-    (workspaces sharing one carry all their names and ids). Never raises.
+# ----------------------------------------------------------- many folders ---
 
-    `progress(event, result)` runs on a worker thread: "checking" as a
-    checkout's sync starts, "updating" right before its fast-forward and
-    "done" with its final result. The window turns these into the notice
-    over each workspace."""
-    names: dict = {}            # result key -> workspace names, in order
-    ids: dict = {}              # result key -> workspace ids, in order
-    results: dict = {}          # result key -> Result
-    groups: dict = {}           # git common dir -> [(key, top folder)]
-
-    def tell(event: str, res: Result, key) -> None:
-        if progress is None:
-            return
-        res.names, res.ids = names[key], ids[key]
+def plan(runner, workspaces, parallel: int = MAX_PARALLEL) -> Plan:
+    """Read every workspace folder (in parallel) and group what can sync.
+    `workspaces` is [(ws id, name, folder)] in sidebar order. Never
+    raises."""
+    def look(folder):
         try:
-            progress(event, res)
-        except Exception:  # noqa: BLE001 - a notice never stops the sync
-            pass
-
-    for ws_id, name, folder in workspaces:
-        try:
-            top, common, why = locate(runner, folder)
+            return locate(runner, folder)
         except Exception as e:  # noqa: BLE001 - one folder never stops all
-            top, common, why = "", "", f"Could not read the folder: {e}"
+            return "", "", f"Could not read the folder: {e}"
+
+    items = list(workspaces)
+    if items:
+        with ThreadPoolExecutor(max_workers=max(1, min(parallel,
+                                                       len(items)))) as ex:
+            found = list(ex.map(look, [folder for _i, _n, folder in items]))
+    else:
+        found = []
+    p = Plan()
+    for (ws_id, name, folder), (top, common, why) in zip(items, found):
         key = (os.path.normcase(os.path.realpath(top)) if top
                else "?" + (folder or name))
-        if key not in names:
-            names[key], ids[key] = [], []
+        if key not in p.names:
+            p.order.append(key)
+            p.names[key], p.ids[key] = [], []
             if why:
-                results[key] = Result(top or folder, Outcome.SKIPPED, why)
+                p.results[key] = Result(top or folder, Outcome.SKIPPED, why)
             else:
-                groups.setdefault(common, []).append((key, top))
-        names[key].append(name)
-        ids[key].append(ws_id)
+                p.groups.setdefault(common, []).append((key, top))
+        p.names[key].append(name)
+        p.ids[key].append(ws_id)
+    return p
 
-    for key, res in list(results.items()):     # the folders that can't sync
-        tell("done", res, key)
 
-    def run_group(items) -> list:
-        out = []
-        for key, top in items:
-            tell("checking", Result(top, Outcome.SKIPPED), key)
-            try:
-                res = sync_folder(runner, top, app_repo,
-                                  lambda r, k=key: tell("updating", r, k))
-            except Exception as e:  # noqa: BLE001
-                res = Result(top, Outcome.FAILED,
-                             f"The sync stopped unexpectedly: {e}")
-            tell("done", res, key)
-            out.append((key, res))
-        return out
+def _tell(progress, p: Plan, event: str, res: Result, key) -> None:
+    if progress is None:
+        return
+    res.names, res.ids = p.names[key], p.ids[key]
+    try:
+        progress(event, res)
+    except Exception:  # noqa: BLE001 - a notice never stops the sync
+        pass
 
-    if groups:
-        workers = max(1, min(parallel, len(groups)))
+
+def tell_unsyncable(p: Plan, progress) -> None:
+    """A "done" event for each folder `plan` already decided."""
+    for key, res in list(p.results.items()):
+        _tell(progress, p, "done", res, key)
+
+
+def run_group(runner, p: Plan, items, app_repo: str = "", progress=None,
+              app_busy: bool = False) -> list:
+    """Sync one group's checkouts, one after the other: [(key, Result)].
+
+    `progress(event, result)` runs on this (worker) thread: "checking" as a
+    checkout's sync starts, "updating" right before its fast-forward and
+    "done" with its final result. The window turns these into the notice
+    over each workspace. Never raises."""
+    out = []
+    for key, top in items:
+        _tell(progress, p, "checking", Result(top, Outcome.SKIPPED), key)
+        try:
+            res = sync_folder(
+                runner, top, app_repo,
+                lambda r, k=key: _tell(progress, p, "updating", r, k),
+                app_busy)
+        except Exception as e:  # noqa: BLE001
+            res = Result(top, Outcome.FAILED,
+                         f"The sync stopped unexpectedly: {e}")
+        _tell(progress, p, "done", res, key)
+        out.append((key, res))
+    return out
+
+
+def sync_all(runner, workspaces, app_repo: str = "",
+             parallel: int = MAX_PARALLEL, progress=None,
+             app_busy: bool = False) -> list:
+    """`plan`, then every group on a thread pool: the results in sidebar
+    order, one per checkout (workspaces sharing one carry all their names
+    and ids). Never raises."""
+    p = plan(runner, workspaces, parallel)
+    tell_unsyncable(p, progress)
+    pairs = []
+    if p.groups:
+        workers = max(1, min(parallel, len(p.groups)))
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            for pairs in ex.map(run_group, groups.values()):
-                results.update(pairs)
-    for key, res in results.items():
-        res.names, res.ids = names[key], ids[key]
-    return [results[key] for key in names]
+            for got in ex.map(lambda items: run_group(
+                    runner, p, items, app_repo, progress, app_busy),
+                    p.groups.values()):
+                pairs += got
+    return p.finish(pairs)
 
 
 def needs_attention(res: Result) -> bool:

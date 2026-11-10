@@ -2638,8 +2638,28 @@ def test_workspace_sync():
 
     app = QApplication.instance() or QApplication([])
     setup_application(app)
-    run = self_update.subprocess_runner
+    run = workspace_sync.sync_runner
     tmp = Path(tempfile.mkdtemp(prefix="ai-hive-wssync-"))
+
+    # --- the runner: nobody is there to answer ------------------------------
+    import sys as _sys
+    from app.cli_update import RC_TIMEOUT
+    rc, out = run([_sys.executable, "-c", "print('hi')"], 10)
+    check("ws-sync runner: returns the exit code and the output",
+          rc == 0 and out.strip() == "hi", (rc, out))
+    # a child that hands its output handle to a grandchild and both sleep:
+    # with pipes, the wait outlived the timeout until the grandchild ended
+    sleeper = ("import subprocess, sys, time; "
+               "subprocess.Popen([sys.executable, '-c', "
+               "'import time; time.sleep(30)']); time.sleep(30)")
+    began = time.monotonic()
+    rc, _out = run([_sys.executable, "-c", sleeper], 1.0)
+    took = time.monotonic() - began
+    check("ws-sync runner: a timeout ends the whole process tree and returns "
+          "at once, even with a grandchild holding the output",
+          rc == RC_TIMEOUT and took < 12, (rc, round(took, 1)))
+    rc, _out = run(["git-that-does-not-exist-xyz"], 5)
+    check("ws-sync runner: a missing program is rc 127", rc == 127, rc)
     seed = tmp / "seed"
     seed.mkdir()
     _sync_git(seed, "init", "-q", "-b", "main")
@@ -2773,6 +2793,27 @@ def test_workspace_sync():
           r.outcome is Outcome.FAILED and r.detail.startswith("Fetching"),
           vars(r))
     _sync_git(here, "remote", "set-url", "origin", str(origin))
+
+    # AI Hive's own folder follows the version button's rules
+    one()
+    push("a.txt", "app1\n")
+    (here / "b.txt").write_text("edited by an agent\n")
+    r = one(app_repo=str(here))
+    check("ws-sync: AI Hive's own folder is not moved under local changes "
+          "to its files, though any other folder would be",
+          r.outcome is Outcome.SKIPPED and "local changes" in r.detail
+          and r.behind == 1
+          and (here / "a.txt").read_text() != "app1\n", vars(r))
+    _sync_git(here, "checkout", "--", "b.txt")
+    busy_rs = workspace_sync.sync_all(run, [("w", "W", str(here))],
+                                 str(here), app_busy=True)
+    check("ws-sync: AI Hive's own folder is skipped while AI Hive updates "
+          "itself", busy_rs[0].outcome is Outcome.SKIPPED
+          and "updating itself" in busy_rs[0].detail, vars(busy_rs[0]))
+    r = one(app_repo=str(here))
+    check("ws-sync: ...and moves on a clean main",
+          r.outcome is Outcome.UPDATED
+          and (here / "a.txt").read_text() == "app1\n", vars(r))
     check("ws-sync: the summary counts each outcome",
           workspace_sync.summary(rs) == "1 updated, 1 skipped",
           workspace_sync.summary(rs))
@@ -2847,6 +2888,22 @@ def test_workspace_sync():
     check("ws-sync notice: it fades away after its time",
           not notice.isVisible())
 
+    hidden_ws = mgr.create_workspace("Hidden", str(plain))
+    pump(60)
+    hidden_page = win._pages[hidden_ws.id]
+    hidden_page.show_sync_notice("busy", "Updating code from origin/main")
+    hidden_page.show_sync_notice("ok", "done", 0)
+    held = hidden_page.sync_notice.state()
+    pump(workspace_page.SYNC_BUSY_MIN_MS + 200)
+    hidden_page.sync_notice.show_state("ok", "bye", 50)
+    pump(80 + workspace_page.SYNC_FADE_MS + 200)
+    check("ws-sync notice: on a workspace that is not on screen it still "
+          "holds the busy text, then fades away on time",
+          not hidden_page.isVisible() and held == "busy"
+          and hidden_page.sync_notice.isHidden(), held)
+    mgr.remove_workspace(hidden_ws.id)
+    pump(60)
+
     # --- the sidebar button -------------------------------------------------
     push("a.txt", "a6\n")
     calls = []
@@ -2871,7 +2928,13 @@ def test_workspace_sync():
             pump(30)
         pump(60)        # the last queued progress events
 
-    win._workspace_sync_runner = counting
+    win.sidebar.sync_btn.click()
+    pump(50)
+    check("ws-sync: unarmed (main.py arms it, the suite never), the button "
+          "runs no git",
+          calls == [] and win.sync_all_workspaces() is False
+          and win.sidebar.sync_btn.isEnabled())
+    win.arm_workspace_sync(counting)
     win.sidebar.sync_btn.click()
     busy = not win.sidebar.sync_btn.isEnabled()
     again = win.sync_all_workspaces()
@@ -2941,6 +3004,12 @@ def test_workspace_sync():
     win2.close()
     win2.deleteLater()
     pump(20)
+
+    win._app_auto_job = object()
+    updating = win._app_updating()
+    win._app_auto_job = None
+    check("ws-sync: AI Hive updating itself is seen, so the sync leaves its "
+          "folder alone meanwhile", updating and not win._app_updating())
 
     win._launch_queue.append(("x", "y"))
     queued = win._launch_settled()

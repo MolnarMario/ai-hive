@@ -7190,7 +7190,10 @@ class MainWindow(QMainWindow):
                 or getattr(self, "_self_update_runner", None) is None
                 or getattr(self, "_app_auto_job", None) is not None
                 or getattr(self, "_app_update_job", None) is not None
-                or getattr(self, "_self_update_dialog", None) is not None):
+                or getattr(self, "_self_update_dialog", None) is not None
+                # a workspace sync may be fetching and merging in this same
+                # folder; the next hourly tick checks instead
+                or getattr(self, "_workspace_sync_job", None) is not None):
             return
         from app import self_update
         from .self_update_dialog import Job
@@ -8363,7 +8366,8 @@ class MainWindow(QMainWindow):
     # user's click on the sidebar's sync button, and, with Options > Sync
     # workspaces with GitHub at launch on, `start_workspace_sync_at_launch`
     # once the launch has settled. The git calls go through
-    # `_workspace_sync_runner`, which tests may replace.
+    # `_workspace_sync_runner`, which only main.py arms
+    # (`arm_workspace_sync`); tests arm their own.
     #
     # Each workspace gets a notice over its grid (WorkspacePage.SyncNotice):
     # gold while its code updates, then green with what it pulled. A sync
@@ -8454,23 +8458,56 @@ class MainWindow(QMainWindow):
                 and (timer is None or not timer.isActive())):
             self.sync_all_workspaces(auto=True)
 
+    def arm_workspace_sync(self, runner=None) -> None:
+        """Let the sync button and the launch sync reach GitHub. Called from
+        main.py alone, like `arm_self_update`: the suite shares the factory
+        and must never fetch or merge into a folder it did not make. Tests
+        pass a runner of their own; unarmed, the button does nothing."""
+        from app import workspace_sync
+        self._workspace_sync_runner = runner or workspace_sync.sync_runner
+
+    def _app_updating(self) -> bool:
+        """AI Hive is fetching or merging in its own folder right now: the
+        background update, the version button's check, or its dialog."""
+        return any(getattr(self, name, None) is not None for name in (
+            "_app_auto_job", "_app_update_job", "_self_update_dialog"))
+
     def sync_all_workspaces(self, auto: bool = False) -> bool:
-        """Start a sync of every workspace. False when one is running or
-        there is nothing to sync. `auto` is the launch sync: quiet notices
-        and no summary dialog."""
-        from app import self_update, workspace_sync
+        """Start a sync of every workspace. False when one is running, the
+        sync is not armed, or there is nothing to sync. `auto` is the launch
+        sync: quiet notices and no summary dialog.
+
+        Two steps. A worker reads every folder (`workspace_sync.plan`), then
+        each repository's checkouts sync on that repository's lane queue
+        (`LaneOps.submit`, not exclusive), where the lane service's base
+        fetch runs too, so the two never race for the repo's ref locks."""
+        from app import workspace_sync
         from .self_update_dialog import Job
 
         if (getattr(self, "_workspace_sync_job", None) is not None
                 or self._closing):
             return False
+        runner = getattr(self, "_workspace_sync_runner", None)
+        if runner is None:
+            return False
         folders = [(ws.id, ws.name, ws.project_path)
                    for ws in self.manager.workspaces]
         if not folders:
             return False
-        runner = (getattr(self, "_workspace_sync_runner", None)
-                  or self_update.subprocess_runner)
-        app_repo = self_update.REPO_DIR
+        state = {"auto": auto, "runner": runner, "plan": None, "left": 0,
+                 "pairs": [], "app_busy": self._app_updating()}
+        job = Job(lambda: workspace_sync.plan(runner, folders), self,
+                  name="ai-hive-workspace-sync")
+        job.finished.connect(
+            lambda p, s=state: self._on_workspace_sync_planned(s, p))
+        state["job"] = job
+        self._workspace_sync_job = state
+        self.sidebar.set_sync_busy(True)
+        job.start()
+        return True
+
+    def _workspace_sync_progress(self, auto: bool):
+        """The progress callback the sync's worker threads call."""
         signal = self.workspaceSyncProgress
 
         def progress(event, res) -> None:
@@ -8481,16 +8518,47 @@ class MainWindow(QMainWindow):
                     res, names=list(res.names), ids=list(res.ids)), auto)
             except RuntimeError:        # the window is gone
                 pass
+        return progress
 
-        job = Job(lambda: workspace_sync.sync_all(runner, folders, app_repo,
-                                                  progress=progress),
-                  self, name="ai-hive-workspace-sync")
-        job.finished.connect(
-            lambda results, a=auto: self._on_workspaces_synced(results, a))
-        self._workspace_sync_job = job
-        self.sidebar.set_sync_busy(True)
-        job.start()
-        return True
+    def _on_workspace_sync_planned(self, state: dict, plan) -> None:
+        from app import self_update, workspace_sync
+
+        if getattr(self, "_workspace_sync_job", None) is not state:
+            return
+        auto = state["auto"]
+        if not isinstance(plan, workspace_sync.Plan):
+            self._on_workspaces_synced(plan, auto)
+            return
+        state["plan"] = plan
+        progress = self._workspace_sync_progress(auto)
+        workspace_sync.tell_unsyncable(plan, progress)
+        groups = list(plan.groups.values())
+        if not groups or self._closing:
+            self._on_workspaces_synced(plan.finish(), auto)
+            return
+        state["left"] = len(groups)
+        for items in groups:
+            self.lane_ops.submit(
+                items[0][1], workspace_sync.run_group, state["runner"], plan,
+                items, self_update.REPO_DIR, progress, state["app_busy"],
+                label="ws-sync", exclusive=False,
+                callback=lambda got, err, s=state, it=items:
+                    self._on_workspace_sync_group(s, it, got, err))
+
+    def _on_workspace_sync_group(self, state: dict, items, got, err) -> None:
+        from app import workspace_sync
+        from app.workspace_sync import Outcome, Result
+
+        if err is not None or not isinstance(got, list):
+            got = [(key, Result(top, Outcome.FAILED,
+                                f"The sync stopped unexpectedly: {err}"))
+                   for key, top in items]
+        state["pairs"] += got
+        state["left"] -= 1
+        if (state["left"] <= 0
+                and getattr(self, "_workspace_sync_job", None) is state):
+            self._on_workspaces_synced(
+                state["plan"].finish(state["pairs"]), state["auto"])
 
     def _on_workspace_sync_progress(self, event: str, res, auto: bool) -> None:
         """Turn one progress event into the notice over each workspace on

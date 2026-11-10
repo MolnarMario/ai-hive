@@ -533,7 +533,8 @@ class _FastHistoryScreen(pyte.HistoryScreen):
         # run at a VS16 or ZWJ, so `⚔️` shifted every row after it (see
         # app/grapheme_cells.py). A printable ASCII run never forms a
         # cluster, and pyte's own draw is the fast path for it.
-        if data.isascii() and data.isprintable():
+        if ((data.isascii() and data.isprintable())
+                or not grapheme_cells.AVAILABLE):
             super().draw(data)
         else:
             grapheme_cells.draw(self, data)

@@ -50,7 +50,20 @@ import functools
 import unicodedata
 
 from pyte import modes as mo
-from wcwidth import grapheme_boundary_before, wcswidth, wcwidth
+from wcwidth import wcswidth, wcwidth
+
+# wcwidth comes in through pyte, which allows releases older than the one
+# requirements.txt asks for. A clone pulled without `pip install` must still
+# open (under pythonw an import error is a launch with no window at all), so
+# without the grapheme API this draw is off and pyte's own draws instead
+# (TerminalScreen.draw): emoji with VS16 shift rows again until the package
+# is updated.
+try:
+    from wcwidth import grapheme_boundary_before
+    AVAILABLE = True
+except ImportError:     # wcwidth older than 0.3.6
+    grapheme_boundary_before = None
+    AVAILABLE = False
 
 VS15 = "\uFE0E"
 VS16 = "\uFE0F"
