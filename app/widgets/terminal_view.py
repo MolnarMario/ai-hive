@@ -1988,8 +1988,10 @@ class TerminalView(QWidget):
         screen in `TerminalCard.__init__`, before the window is even shown --
         so an unguarded call here doesn't just blank one card, it takes down
         the whole app on startup with pythonw giving no console to see why.
-        Degrade to empty text instead: the caller only uses this to decide
-        compact-vs-full overlay styling, so losing it is cosmetic."""
+        _FastHistoryScreen.display joins cell text and can't hit that, but
+        any failure still degrades to empty text: the caller only uses this
+        to decide compact-vs-full overlay styling, so losing it is
+        cosmetic."""
         try:
             return "\n".join(self.screen.display)
         except Exception:

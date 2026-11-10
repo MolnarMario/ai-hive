@@ -1965,7 +1965,8 @@ def test_screen_snapshots():
     # The regression: a wide CJK character's leading cell later overwritten
     # (e.g. by an absolute-column cursor jump, common in TUI mockups) orphans
     # pyte's own zero-width stub cell (data=""). pyte's `display` property
-    # then does wcwidth(char[0]) on that empty string and raises IndexError.
+    # then does wcwidth(char[0]) on that empty string and raises IndexError
+    # (the card's screen now has a `display` that joins cell text instead).
     # screen_text() is called from TerminalCard.__init__ -> _on_status ->
     # _refresh_overlay for EVERY restored card, so one corrupted .vt snapshot
     # (app/screen_snapshot.py) crashed the whole app on startup, before the
@@ -1977,9 +1978,13 @@ def test_screen_snapshots():
     QApplication.instance() or QApplication([])
     corrupt = TerminalView(rows=3, cols=20)
     corrupt.feed("\x1b[1;1HあX\x1b[1;1HY")
-    check("screens: a corrupted pyte buffer degrades screen_text() to "
-          "empty instead of crashing the app",
-          corrupt.screen_text() == "")
+    try:
+        text = corrupt.screen_text()
+    except Exception as exc:
+        text = exc
+    check("screens: a corrupted pyte buffer still reads in screen_text() "
+          "instead of crashing the app",
+          isinstance(text, str) and text.startswith("YX"), repr(text)[:80])
 
     shutil.rmtree(tmp, ignore_errors=True)
 
