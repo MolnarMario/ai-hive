@@ -2957,6 +2957,24 @@ def test_workspace_sync():
     check("ws-sync: a clicked sync where every folder is fine opens no "
           "dialog", getattr(win, "_workspace_sync_box", None) is None)
 
+    # the fast-forward holds the repo's lane lock, like a lane create
+    push("a.txt", "a6b\n")
+    lane_lock = win.lane_ops.lock_for(str(here))
+    lane_lock.acquire()
+    try:
+        win.sync_all_workspaces()
+        pump(2500)
+        waiting = (win._workspace_sync_job is not None
+                   and (here / "a.txt").read_text() == "a6\n")
+    finally:
+        lane_lock.release()
+    wait_sync()
+    check("ws-sync: the fast-forward waits while a lane operation holds the "
+          "repository, then goes through",
+          waiting and (here / "a.txt").read_text() == "a6b\n"
+          and win._last_workspace_sync[0].outcome is Outcome.UPDATED,
+          [vars(r) for r in win._last_workspace_sync or []])
+
     seen.clear()
     plain_ws = mgr.create_workspace("Plain", str(plain))
     win.sync_all_workspaces()

@@ -8480,7 +8480,8 @@ class MainWindow(QMainWindow):
         Two steps. A worker reads every folder (`workspace_sync.plan`), then
         each repository's checkouts sync on that repository's lane queue
         (`LaneOps.submit`, not exclusive), where the lane service's base
-        fetch runs too, so the two never race for the repo's ref locks."""
+        fetch runs too, so the two never race for the repo's ref locks. The
+        fast-forward holds the repository's lane lock."""
         from app import workspace_sync
         from .self_update_dialog import Job
 
@@ -8538,9 +8539,13 @@ class MainWindow(QMainWindow):
             return
         state["left"] = len(groups)
         for items in groups:
+            repo = items[0][1]
+            # the fetch runs beside the lane service's; the fast-forward
+            # holds the lock every lane create and remove holds
             self.lane_ops.submit(
-                items[0][1], workspace_sync.run_group, state["runner"], plan,
+                repo, workspace_sync.run_group, state["runner"], plan,
                 items, self_update.REPO_DIR, progress, state["app_busy"],
+                self.lane_ops.lock_for(repo),
                 label="ws-sync", exclusive=False,
                 callback=lambda got, err, s=state, it=items:
                     self._on_workspace_sync_group(s, it, got, err))

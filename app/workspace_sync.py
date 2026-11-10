@@ -51,8 +51,11 @@ once. `plan` reads every folder in parallel and groups the checkouts by git
 directory; `run_group` syncs one group's checkouts one after the other,
 because two fetches into one repo race for the same ref locks. The window
 runs each group on that repository's lane queue (`LaneOps.submit` with
-`exclusive=False`, beside the lane service's base fetch), so a sync never
-races a lane operation's ref writes; different repositories run in
+`exclusive=False`, beside the lane service's base fetch), and the fast-
+forward itself holds the repository's lane lock (`merge_lock`, the one
+`LaneOps.lock_for` gives every lane create and remove), since it moves a
+branch and the checkout. The fetch stays outside that lock, so a slow
+network never makes a lane operation wait. Different repositories run in
 parallel. `sync_all` is the same thing on a plain thread pool, for tests and
 callers without a window.
 
@@ -72,6 +75,7 @@ No em dash in any string below: `detail` is read by the user.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import tempfile
@@ -238,12 +242,13 @@ def _fetch(runner, top: str, remote: str) -> tuple:
 
 
 def sync_folder(runner, top: str, app_repo: str = "", updating=None,
-                app_busy: bool = False) -> Result:
+                app_busy: bool = False, merge_lock=None) -> Result:
     """Fetch and fast-forward one checkout. Never raises. `app_repo` is the
     folder AI Hive runs from and `app_busy` says AI Hive is updating itself
     (see AI HIVE'S OWN FOLDER). `updating(res)` is called right before the
     fast-forward, once it is known there is something to pull, so the
-    window can say so while it runs."""
+    window can say so while it runs. `merge_lock` is held around the
+    fast-forward (see WORKSPACES SHARING A REPOSITORY)."""
     res = Result(top, Outcome.SKIPPED)
     is_app = bool(app_repo) and _same_path(top, app_repo)
 
@@ -327,8 +332,9 @@ def sync_folder(runner, top: str, app_repo: str = "", updating=None,
             updating(res)
         except Exception:  # noqa: BLE001 - a notice never stops the sync
             pass
-    rc, out = runner(_git(top, "merge", "--ff-only", "--quiet", target),
-                     MERGE_TIMEOUT_S)
+    with merge_lock if merge_lock is not None else contextlib.nullcontext():
+        rc, out = runner(_git(top, "merge", "--ff-only", "--quiet", target),
+                         MERGE_TIMEOUT_S)
     if rc != 0:
         text = out or ""
         if "would be overwritten" in text:
@@ -402,7 +408,7 @@ def tell_unsyncable(p: Plan, progress) -> None:
 
 
 def run_group(runner, p: Plan, items, app_repo: str = "", progress=None,
-              app_busy: bool = False) -> list:
+              app_busy: bool = False, merge_lock=None) -> list:
     """Sync one group's checkouts, one after the other: [(key, Result)].
 
     `progress(event, result)` runs on this (worker) thread: "checking" as a
@@ -416,7 +422,7 @@ def run_group(runner, p: Plan, items, app_repo: str = "", progress=None,
             res = sync_folder(
                 runner, top, app_repo,
                 lambda r, k=key: _tell(progress, p, "updating", r, k),
-                app_busy)
+                app_busy, merge_lock)
         except Exception as e:  # noqa: BLE001
             res = Result(top, Outcome.FAILED,
                          f"The sync stopped unexpectedly: {e}")
