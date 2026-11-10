@@ -6768,3 +6768,168 @@ def test_terminal_font_alignment_windows():
             row["cell"][0] <= row["run"] < row["cell"][2] + row["cw"] / 2)]
         check(f"align: {fid} ({family}): a 40-char run's ink ends in cell 40",
               mine and not out, out)
+
+
+_SWORDS = "\N{CROSSED SWORDS}\N{VARIATION SELECTOR-16}"
+_SHIELD = "\N{SHIELD}\N{VARIATION SELECTOR-16}"
+
+
+def test_grapheme_clusters_match_conhost():
+    """A card measures a grapheme cluster the way ConPTY's own console does.
+    pyte measured each code point alone and stopped drawing a text run at a
+    VS16 or ZWJ, so crossed swords + VS16 took one cell instead of two and
+    swallowed whatever followed it in the run (app/grapheme_cells.py). Every
+    expected cursor here was measured in OpenConsole 1.24 (pywinpty 3.0.5)
+    with GetConsoleScreenBufferInfo after the same writes, 40 columns wide;
+    the old draw got 36 of 43 such cases wrong."""
+    import pyte
+    from app.widgets.terminal_view import _new_history_screen
+
+    zwj = "\N{ZERO WIDTH JOINER}"
+    vs16 = "\N{VARIATION SELECTOR-16}"
+    dragon = "\N{DRAGON}"
+    family = zwj.join(["\N{MAN}", "\N{WOMAN}", "\N{GIRL}"])
+    flag = ("\N{REGIONAL INDICATOR SYMBOL LETTER U}"
+            "\N{REGIONAL INDICATOR SYMBOL LETTER S}")
+    cases = [
+        ("crossed swords + VS16 is two cells", ["x" + _SWORDS + "y"], (0, 4)),
+        ("shield + VS16 is two cells", ["x" + _SHIELD + "y"], (0, 4)),
+        ("a wide emoji stays two cells", ["x" + dragon + "y"], (0, 4)),
+        ("a ZWJ family is one two-cell cluster", ["x" + family + "y"], (0, 4)),
+        ("a keycap is two cells",
+         ["x1" + vs16 + "\N{COMBINING ENCLOSING KEYCAP}y"], (0, 4)),
+        ("a flag is two cells", ["x" + flag + "y"], (0, 4)),
+        ("crossed swords alone stays one cell",
+         ["x\N{CROSSED SWORDS}y"], (0, 3)),
+        ("VS15 does not narrow a wide emoji",
+         ["x\N{WATCH}\N{VARIATION SELECTOR-15}y"], (0, 4)),
+        ("VS16 widens any base, even a letter", ["xq" + vs16 + "y"], (0, 4)),
+        ("a Devanagari syllable is two cells",
+         ["x\N{DEVANAGARI LETTER KA}\N{DEVANAGARI VOWEL SIGN I}y"], (0, 4)),
+        ("Hangul jamo join into one two-cell syllable",
+         ["x\N{HANGUL CHOSEONG KIYEOK}\N{HANGUL JUNGSEONG A}y"], (0, 4)),
+        ("a combining accent joins its letter",
+         ["xe\N{COMBINING ACUTE ACCENT}y"], (0, 3)),
+        ("a skin tone joins its emoji",
+         ["x\N{THUMBS UP SIGN}\N{EMOJI MODIFIER FITZPATRICK TYPE-1-2}y"],
+         (0, 4)),
+        ("a lone regional indicator is one cell",
+         ["x\N{REGIONAL INDICATOR SYMBOL LETTER U}y"], (0, 3)),
+        ("a third regional indicator starts a new cluster",
+         ["x" + flag + "\N{REGIONAL INDICATOR SYMBOL LETTER G}y"], (0, 5)),
+        ("a zero-width space joins the cell before it",
+         ["x\N{ZERO WIDTH SPACE}y"], (0, 2)),
+        ("a lone ZWJ joins the cell before it", ["x" + zwj + "y"], (0, 2)),
+        ("VS16 after a cursor move joins the cell before the cursor",
+         ["x\N{CROSSED SWORDS}\x1b[1C\x1b[1D" + vs16 + "y"], (0, 4)),
+        ("VS16 at column 0 takes two cells of its own", [vs16 + "y"], (0, 3)),
+        ("a combining mark at column 0 takes a cell of its own",
+         ["\N{COMBINING ACUTE ACCENT}y"], (0, 2)),
+        ("a ZWJ sequence split across writes still joins",
+         ["x\N{MAN}" + zwj, "\N{WOMAN}y"], (0, 4)),
+        ("a wide emoji in the last column wraps whole",
+         ["a" * 39 + dragon + "y"], (1, 3)),
+        ("VS16 growing a cluster in the last column wraps it whole",
+         ["a" * 39 + _SWORDS + "y"], (1, 3)),
+        ("a two-cell cluster that fills the row leaves a pending wrap",
+         ["a" * 38 + _SWORDS + "y"], (1, 1)),
+        ("a control char inside a run is skipped, not the run's end",
+         ["ab\x01cd"], (0, 4)),
+    ]
+    for name, writes, want in cases:
+        screen = _new_history_screen(40, 6)
+        stream = pyte.Stream(screen)
+        for part in writes:
+            stream.feed(part)
+        got = (screen.cursor.y, screen.cursor.x)
+        check(f"clusters: {name}", got == want, got)
+
+    screen = _new_history_screen(40, 6)
+    pyte.Stream(screen).feed("x" + _SWORDS + "y")
+    row = [screen.buffer[0][c].data for c in range(4)]
+    check("clusters: the emoji keeps its VS16 in its first cell, the second "
+          "cell is the empty half of a wide character",
+          row == ["x", _SWORDS, "", "y"], ascii(row))
+
+    screen = _new_history_screen(40, 6)
+    pyte.Stream(screen).feed("z" * 40 + "\r" + "a" * 39 + dragon + "y")
+    check("clusters: a wide emoji that wraps blanks the last cell it left",
+          screen.buffer[0][39].data == " "
+          and screen.buffer[1][0].data == dragon,
+          ascii((screen.buffer[0][39].data, screen.buffer[1][0].data)))
+
+    screen = _new_history_screen(40, 6)
+    pyte.Stream(screen).feed("a" * 39 + _SWORDS + "y")
+    moved = [screen.buffer[1][c].data for c in range(3)]
+    check("clusters: crossed swords that grow in the last column move to "
+          "the next row whole",
+          screen.buffer[0][39].data == " " and moved == [_SWORDS, "", "y"],
+          ascii(moved))
+
+
+def test_emoji_repaint_keeps_rows_in_place():
+    """Regression: after Claude's agent view (the left arrow) ConPTY repaints
+    the screen from its own buffer and writes an emoji with VS16 as plain
+    text, with the rest of the row in the same run. pyte dropped everything
+    after the VS16, so a diff row ended at the emoji, and a row that reached
+    the edge left the next one to start mid-row: a card drew every row after
+    a crossed-swords line shifted right, and Claude's next redraws stacked
+    copies of the status line. The rows are from a real capture (claude
+    2.1.322 at 30x120), trimmed to ConPTY's repaint of a diff."""
+    from PySide6.QtWidgets import QApplication
+    from app.widgets.terminal_view import TerminalView
+    QApplication.instance() or QApplication([])
+
+    green = "     \x1b[38;2;80;200;80m\x1b[48;2;2;40;0m"
+    ink = "\x1b[38;2;248;248;242m"
+    data = (
+        green + "  5 +" + ink + "## [0.34.0] New map: Silver Steel "
+        + _SWORDS + "\x1b[67X\x1b[m\x1b[67C       \r\n"
+        + green + "  8 +" + ink + '- **New map "Silver Steel ' + _SWORDS
+        + '"** with plots and region quotes, hand-laid out.'
+        "\x1b[27X\x1b[m\x1b[27C       \r\n"
+        + green + "  9 +" + ink + "- The Crew " + _SHIELD
+        + "', src: IMG, seed: 80218 and a closing quote after the shield."
+        "\x1b[28X\x1b[m\x1b[28C       \r\n")
+    tv = TerminalView(rows=6, cols=120)
+    tv.feed(data)
+    scr = tv.screen
+    rows = ["".join(scr.buffer[r][c].data for c in range(scr.columns))
+            for r in range(3)]
+    check("emoji repaint: the text after crossed swords survives",
+          rows[1].rstrip().endswith(
+              '"Silver Steel ' + _SWORDS
+              + '"** with plots and region quotes, hand-laid out.'),
+          ascii(rows[1].rstrip()))
+    check("emoji repaint: the quote after the shield survives",
+          ("The Crew " + _SHIELD + "', src: IMG") in rows[2],
+          ascii(rows[2].rstrip()))
+    check("emoji repaint: each diff row's background ends where ConPTY "
+          "erased to",
+          [scr.buffer[r][112].bg != "default" for r in range(3)]
+          == [True] * 3
+          and [scr.buffer[r][113].bg for r in range(3)] == ["default"] * 3,
+          [(scr.buffer[r][112].bg, scr.buffer[r][113].bg) for r in range(3)])
+    check("emoji repaint: the cursor ends at the start of the next row",
+          (scr.cursor.y, scr.cursor.x) == (3, 0),
+          (scr.cursor.y, scr.cursor.x))
+
+    # the shape that shifted the rows: a full-width row holding the emoji
+    # and its padding in one run, with the next row following on through
+    # the wrap
+    tv = TerminalView(rows=4, cols=20)
+    tv.feed("ab" + _SWORDS + " " * 16 + "next")
+    line = "".join(tv.screen.buffer[1][c].data for c in range(20))
+    check("emoji repaint: a row the emoji fills wraps the next one to "
+          "column 0", line.startswith("next"), ascii(line))
+
+    # pyte's display asserted one code point per cell and screen_text gave
+    # up on a flag or a ZWJ emoji, which now sit in one cell each
+    family = "\N{ZERO WIDTH JOINER}".join(["\N{MAN}", "\N{WOMAN}"])
+    flag = ("\N{REGIONAL INDICATOR SYMBOL LETTER U}"
+            "\N{REGIONAL INDICATOR SYMBOL LETTER S}")
+    tv = TerminalView(rows=4, cols=20)
+    tv.feed("a" + family + "b" + flag + "c")
+    check("emoji repaint: screen_text reads a row holding a flag and a ZWJ "
+          "emoji", tv.screen_text().startswith("a" + family + "b" + flag + "c"),
+          ascii(tv.screen_text()[:12]))
