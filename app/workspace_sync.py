@@ -5,7 +5,11 @@ The sidebar's sync button (`MainWindow.sync_all_workspaces`) runs `sync_all`
 on a worker thread over every workspace's folder. The point is a user who
 works from two or more computers: after pushing from one, a click on the
 other brings every project up to date, without asking an agent in each
-workspace to pull.
+workspace to pull. Options > Sync workspaces with GitHub at launch (default
+off) runs the same sync once per launch, only after the launch has settled
+(`MainWindow.start_workspace_sync_at_launch`), so it never slows startup.
+`progress` events drive the notice over each workspace
+(`workspace_page.SyncNotice`).
 
 FAST-FORWARD OR NOTHING
 -----------------------
@@ -81,7 +85,10 @@ class Result:
     outcome: Outcome
     detail: str = ""                # one sentence for the user
     names: list = field(default_factory=list)   # workspaces on this folder
+    ids: list = field(default_factory=list)     # ...and their ids
     branch: str = ""
+    upstream: str = ""              # what the branch tracks, "origin/main"
+    behind: int = 0                 # commits GitHub had that this lacked
     pulled: int = 0                 # commits the fast-forward brought
     old_head: str = ""
     new_head: str = ""
@@ -141,9 +148,12 @@ def _fetch(runner, top: str, remote: str) -> tuple:
     return rc, out
 
 
-def sync_folder(runner, top: str, app_repo: str = "") -> Result:
+def sync_folder(runner, top: str, app_repo: str = "",
+                updating=None) -> Result:
     """Fetch and fast-forward one checkout. Never raises. `app_repo` is the
-    folder AI Hive runs from (see AI HIVE'S OWN FOLDER)."""
+    folder AI Hive runs from (see AI HIVE'S OWN FOLDER). `updating(res)` is
+    called right before the fast-forward, once it is known there is
+    something to pull, so the window can say so while it runs."""
     res = Result(top, Outcome.SKIPPED)
 
     def done(outcome: Outcome, detail: str) -> Result:
@@ -163,7 +173,7 @@ def sync_folder(runner, top: str, app_repo: str = "") -> Result:
     rc, out = runner(_git(top, "rev-parse", "--abbrev-ref",
                           "--symbolic-full-name", "@{upstream}"),
                      GIT_TIMEOUT_S)
-    upstream = _first_line(out) if rc == 0 else ""
+    res.upstream = upstream = _first_line(out) if rc == 0 else ""
     if not remote or not upstream:
         return done(Outcome.SKIPPED,
                     f"The branch '{branch}' does not track a branch on "
@@ -195,16 +205,17 @@ def sync_folder(runner, top: str, app_repo: str = "") -> Result:
         return done(Outcome.FAILED, _git_error("Comparing with GitHub",
                                                rc, out))
     ahead, behind = int(parts[0]), int(parts[1])
+    res.behind = behind
     if behind == 0:
         if ahead:
             return done(Outcome.UP_TO_DATE,
-                        f"Up to date. {_commits(ahead)} on '{branch}' "
+                        f"Up to date. {commits_text(ahead)} on '{branch}' "
                         "not pushed yet.")
         return done(Outcome.UP_TO_DATE, "Up to date.")
     if ahead:
         return done(Outcome.SKIPPED,
-                    f"'{branch}' has {_commits(ahead)} GitHub lacks and "
-                    f"GitHub has {_commits(behind)} it lacks. Merge them "
+                    f"'{branch}' has {commits_text(ahead)} GitHub lacks and "
+                    f"GitHub has {commits_text(behind)} it lacks. Merge them "
                     "by hand.")
     if app_repo and _same_path(top, app_repo):
         rc, _ = runner(_git(top, "diff", "--quiet", head, target, "--",
@@ -213,13 +224,18 @@ def sync_folder(runner, top: str, app_repo: str = "") -> Result:
             return done(Outcome.SKIPPED,
                         "This update of AI Hive needs new Python packages. "
                         "Use the update button beside the version.")
+    if updating is not None:
+        try:
+            updating(res)
+        except Exception:  # noqa: BLE001 - a notice never stops the sync
+            pass
     rc, out = runner(_git(top, "merge", "--ff-only", "--quiet", target),
                      MERGE_TIMEOUT_S)
     if rc != 0:
         text = out or ""
         if "would be overwritten" in text:
             return done(Outcome.SKIPPED,
-                        f"GitHub has {_commits(behind)}, but they change "
+                        f"GitHub has {commits_text(behind)}, but they change "
                         "files with local changes here. Commit or discard "
                         "those, then sync again.")
         if "index.lock" in text:
@@ -228,23 +244,39 @@ def sync_folder(runner, top: str, app_repo: str = "") -> Result:
                         "Sync again in a moment.")
         return done(Outcome.FAILED, _git_error("Moving forward", rc, text))
     res.new_head, res.pulled = target, behind
-    return done(Outcome.UPDATED, f"Pulled {_commits(behind)} into "
+    return done(Outcome.UPDATED, f"Pulled {commits_text(behind)} into "
                                  f"'{branch}'.")
 
 
-def _commits(n: int) -> str:
+def commits_text(n: int) -> str:
     return f"{n} commit" if n == 1 else f"{n} commits"
 
 
 def sync_all(runner, workspaces, app_repo: str = "",
-             parallel: int = MAX_PARALLEL) -> list:
-    """Sync every workspace folder. `workspaces` is [(name, folder)] in
-    sidebar order; the results come back in that order, one per checkout
-    (workspaces sharing one carry all their names). Never raises."""
+             parallel: int = MAX_PARALLEL, progress=None) -> list:
+    """Sync every workspace folder. `workspaces` is [(ws id, name, folder)]
+    in sidebar order; the results come back in that order, one per checkout
+    (workspaces sharing one carry all their names and ids). Never raises.
+
+    `progress(event, result)` runs on a worker thread: "checking" as a
+    checkout's sync starts, "updating" right before its fast-forward and
+    "done" with its final result. The window turns these into the notice
+    over each workspace."""
     names: dict = {}            # result key -> workspace names, in order
+    ids: dict = {}              # result key -> workspace ids, in order
     results: dict = {}          # result key -> Result
     groups: dict = {}           # git common dir -> [(key, top folder)]
-    for name, folder in workspaces:
+
+    def tell(event: str, res: Result, key) -> None:
+        if progress is None:
+            return
+        res.names, res.ids = names[key], ids[key]
+        try:
+            progress(event, res)
+        except Exception:  # noqa: BLE001 - a notice never stops the sync
+            pass
+
+    for ws_id, name, folder in workspaces:
         try:
             top, common, why = locate(runner, folder)
         except Exception as e:  # noqa: BLE001 - one folder never stops all
@@ -252,21 +284,28 @@ def sync_all(runner, workspaces, app_repo: str = "",
         key = (os.path.normcase(os.path.realpath(top)) if top
                else "?" + (folder or name))
         if key not in names:
-            names[key] = []
+            names[key], ids[key] = [], []
             if why:
                 results[key] = Result(top or folder, Outcome.SKIPPED, why)
             else:
                 groups.setdefault(common, []).append((key, top))
         names[key].append(name)
+        ids[key].append(ws_id)
+
+    for key, res in list(results.items()):     # the folders that can't sync
+        tell("done", res, key)
 
     def run_group(items) -> list:
         out = []
         for key, top in items:
+            tell("checking", Result(top, Outcome.SKIPPED), key)
             try:
-                res = sync_folder(runner, top, app_repo)
+                res = sync_folder(runner, top, app_repo,
+                                  lambda r, k=key: tell("updating", r, k))
             except Exception as e:  # noqa: BLE001
                 res = Result(top, Outcome.FAILED,
                              f"The sync stopped unexpectedly: {e}")
+            tell("done", res, key)
             out.append((key, res))
         return out
 
@@ -276,8 +315,16 @@ def sync_all(runner, workspaces, app_repo: str = "",
             for pairs in ex.map(run_group, groups.values()):
                 results.update(pairs)
     for key, res in results.items():
-        res.names = names[key]
+        res.names, res.ids = names[key], ids[key]
     return [results[key] for key in names]
+
+
+def needs_attention(res: Result) -> bool:
+    """A result the user should hear about even from a sync nobody clicked:
+    GitHub has commits this folder could not take, or git failed. A folder
+    that simply has nothing to track (no upstream, not a repo) is quiet."""
+    return (res.outcome is Outcome.FAILED
+            or (res.outcome is Outcome.SKIPPED and res.behind > 0))
 
 
 def summary(results) -> str:
@@ -291,10 +338,12 @@ def summary(results) -> str:
     return ", ".join(parts) or "No workspaces to sync."
 
 
-def audit_line(res: Result) -> str:
+def audit_line(res: Result, how: str = "click") -> str:
+    """The session audit line for one result. `how` is what started the
+    sync: "click" (the sidebar button) or "launch" (the Options switch)."""
     names = ", ".join(res.names) or "?"
     moved = (f" {res.old_head[:10]}..{res.new_head[:10]}"
              if res.outcome is Outcome.UPDATED else "")
-    return (f"WS-SYNC {res.outcome.value} [{names}] {res.folder}"
+    return (f"WS-SYNC {how} {res.outcome.value} [{names}] {res.folder}"
             f"{' on ' + res.branch if res.branch else ''}{moved}: "
             f"{res.detail}")

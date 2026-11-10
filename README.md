@@ -744,20 +744,29 @@ error dialog instead of silently closing. Packaging to a distributable
   The New Workspace dialog can also take a GitHub repository URL instead: it
   clones the repo's default branch (`main`, `master` or whatever it is
   called) into a new folder and opens the workspace there.
-- **Sync every workspace with GitHub in one click.** The `↻` in the sidebar
-  header fetches each workspace's folder and moves its branch forward to what
-  it tracks on GitHub, so after pushing from one computer, one click on the
-  other brings every project up to date without asking an agent in each
-  workspace to pull. It only ever fast-forwards: a branch with local commits
-  GitHub lacks, a branch that tracks nothing (every agent lane), or local
-  changes to files GitHub also changed are left alone, and a dialog lists
-  what happened in each workspace. Local changes to other files ride along.
-  Workspaces on one folder sync once.
   Double-click a row to rename, `✕` deletes (confirmation appears only when
   terminals are running). The top-left sidebar button (a collapse or expand icon, whichever the next click does) or `Ctrl+Shift+B` collapses the sidebar to a
   10px rail with one strip per workspace, in sidebar order and colored like
   its count badge. The active workspace has the wide strip, hover shows the
   name, and a click opens that workspace without reopening the sidebar.
+- **Sync every workspace with GitHub in one click.** The `↻` in the sidebar
+  header fetches each workspace's folder and moves its branch forward to what
+  it tracks on GitHub, so after pushing from one computer, one click on the
+  other brings every project up to date without asking an agent in each
+  workspace to pull. A notice over each workspace says it is checking, then
+  updating its code, then turns green with what it pulled. It only ever
+  fast-forwards: a branch with local commits GitHub lacks, a branch that
+  tracks nothing (every agent lane), or local changes to files GitHub also
+  changed are left alone, and a dialog then lists what happened in each
+  workspace. Local changes to other files ride along. Workspaces on one
+  folder sync once.
+- **Sync at launch** (Options, *Sync workspaces with GitHub at launch*, off by
+  default) runs the same sync once per launch, and only after the launch has
+  settled: every restored agent started and showing its prompt, the startup
+  checks done, and a few quiet seconds more. Opening AI Hive never waits for
+  it. It is quiet: only a workspace it actually updates gets the notice (gold
+  while the code updates, then green), and one GitHub is ahead of that it
+  could not update gets an amber one saying why. Nothing pops up.
 - **Fullscreen.** `F11` hides everything but the agent grid. Rest the
   cursor on the top edge for 0.75 s and the top bar (minus the logo, version
   and update button) and workspace header float over the agents; rest it on the left edge and the sidebar floats in at its

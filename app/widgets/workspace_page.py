@@ -31,10 +31,11 @@ with a short fade (_soften_reflow); nothing resizes during the fades.
 """
 
 import contextlib
+import time
 
 from PySide6.QtCore import (QAbstractAnimation, QEasingCurve, QEvent,
                             QParallelAnimationGroup, QPropertyAnimation, QRect,
-                            QSequentialAnimationGroup, Qt, Signal)
+                            QSequentialAnimationGroup, Qt, QTimer, Signal)
 from PySide6.QtGui import QColor, QFontMetrics, QPainter
 from PySide6.QtWidgets import (QFrame, QGraphicsOpacityEffect, QGridLayout,
                                QHBoxLayout, QLabel, QMenu, QScrollArea,
@@ -63,6 +64,165 @@ FADE_STEP_MAX_MS = 45
 FADE_BUDGET_MS = 270
 SETTLE_FROM = 0.5
 SETTLE_MS = 240
+
+# the GitHub sync notice (SyncNotice): how often the busy dots step, how long
+# the busy text stays up at least (a fast-forward takes a blink, and a notice
+# that flashed gold and green in one frame reads as a glitch), how long it
+# fades, and its gap below the header
+SYNC_DOTS_MS = 400
+SYNC_BUSY_MIN_MS = 1200
+SYNC_FADE_MS = 600
+SYNC_TOP_GAP = 10
+FIGURE_SPACE = " "     # as wide as a digit, so roughly a dot's slot
+
+
+class SyncNotice(QFrame):
+    """The small notice over a workspace while its folder syncs with GitHub
+    (MainWindow.sync_all_workspaces): gold while it works, then green with
+    what it did, or amber when GitHub has commits the folder could not take.
+
+    It floats over the top of the agent grid, outside the layout, so showing
+    it never moves or resizes a card (a resize makes every TUI redraw). It
+    lets the mouse through except on itself, where a click dismisses it."""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setObjectName("SyncNotice")
+        self.setProperty("state", "busy")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 7, 14, 7)
+        self.label = QLabel(self)
+        self.label.setObjectName("SyncNoticeText")
+        self.label.setWordWrap(True)
+        lay.addWidget(self.label)
+        self._text = ""
+        self._dots = 0
+        self._busy_since = 0.0
+        self._pending = None            # (state, text, hide_after_ms)
+        self._effect = QGraphicsOpacityEffect(self)
+        self._effect.setOpacity(1.0)
+        self.setGraphicsEffect(self._effect)
+        self._fade = QPropertyAnimation(self._effect, b"opacity", self)
+        self._fade.setDuration(SYNC_FADE_MS)
+        self._fade.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._fade.finished.connect(self._on_faded)
+        self._dots_timer = QTimer(self)
+        self._dots_timer.setInterval(SYNC_DOTS_MS)
+        self._dots_timer.timeout.connect(self._step_dots)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.fade_out)
+        self._apply_timer = QTimer(self)
+        self._apply_timer.setSingleShot(True)
+        self._apply_timer.timeout.connect(self._apply_pending)
+        self.hide()
+
+    def state(self) -> str:
+        return "" if not self.isVisible() else str(self.property("state"))
+
+    def text(self) -> str:
+        return self._text
+
+    def show_state(self, state: str, text: str,
+                   hide_after_ms: int = 0) -> None:
+        """Show `text` in `state` ("busy", "ok", "warn" or "info"). A final
+        state that arrives while the busy text is younger than
+        SYNC_BUSY_MIN_MS waits out the rest, then shows."""
+        if state != "busy" and self.state() == "busy":
+            wait = SYNC_BUSY_MIN_MS - (time.monotonic()
+                                       - self._busy_since) * 1000
+            if wait > 0:
+                self._pending = (state, text, hide_after_ms)
+                self._apply_timer.start(int(wait))
+                return
+        self._pending = None
+        self._apply_timer.stop()
+        self._hide_timer.stop()
+        self._fade.stop()
+        self._effect.setOpacity(1.0)
+        if state == "busy" and self.state() != "busy":
+            self._busy_since = time.monotonic()
+            self._dots = 0
+        self._text = text
+        self.setProperty("state", state)
+        repolish(self)
+        repolish(self.label)
+        if state == "busy":
+            self._dots_timer.start()
+        else:
+            self._dots_timer.stop()
+        self._render()
+        self.show()
+        self.raise_()
+        if hide_after_ms > 0:
+            self._hide_timer.start(hide_after_ms)
+
+    def _apply_pending(self) -> None:
+        if self._pending is not None:
+            state, text, hide_after_ms = self._pending
+            self._busy_since = 0.0
+            self.show_state(state, text, hide_after_ms)
+
+    def _step_dots(self) -> None:
+        self._dots = (self._dots + 1) % 4
+        self._render()
+
+    def _render(self) -> None:
+        dots = "." * self._dots if self.property("state") == "busy" else ""
+        # pad to three dots with figure spaces so the pill does not
+        # twitch as they step
+        if self.property("state") == "busy":
+            self.label.setText(self._text + dots
+                               + FIGURE_SPACE * (3 - len(dots)))
+        else:
+            self.label.setText(self._text)
+        self.place()
+
+    def place(self) -> None:
+        """Center it under the page header, at most 70% of the page wide."""
+        page = self.parentWidget()
+        if page is None:
+            return
+        top = SYNC_TOP_GAP
+        header = getattr(page, "header", None)
+        if header is not None and header.isVisible():
+            top += header.geometry().bottom() + 1
+        # one line when it fits, wrapped only past 70% of the page. A word
+        # wrapping label's own size hint is far narrower than its text, so
+        # the width comes from the text; the busy dots are counted as all
+        # three, so the pill keeps one width while they step
+        room = max(160, min(int(page.width() * 0.7), page.width() - 24))
+        m = self.layout().contentsMargins()
+        pad = m.left() + m.right() + 2 * self.frameWidth() + 2
+        busy = self.property("state") == "busy"
+        text_w = self.label.fontMetrics().horizontalAdvance(
+            self._text + ("..." if busy else "")) + 4
+        width = min(room, text_w + pad)
+        self.setFixedWidth(width)
+        self.setFixedHeight(self.label.heightForWidth(width - pad)
+                            + m.top() + m.bottom() + 2 * self.frameWidth())
+        self.move((page.width() - width) // 2, top)
+
+    def fade_out(self) -> None:
+        if not self.isVisible() or self._pending is not None:
+            return
+        self._dots_timer.stop()
+        self._fade.stop()
+        self._fade.setStartValue(self._effect.opacity())
+        self._fade.setEndValue(0.0)
+        self._fade.start()
+
+    def _on_faded(self) -> None:
+        if self._effect.opacity() <= 0.01:
+            self.hide()
+            self._effect.setOpacity(1.0)
+
+    def mousePressEvent(self, event) -> None:
+        if self.property("state") != "busy":
+            self._hide_timer.stop()
+            self.fade_out()
+        event.accept()
 
 
 class EmptySlot(QFrame):
@@ -505,6 +665,16 @@ class WorkspacePage(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._elide_path()
+        notice = getattr(self, "sync_notice", None)
+        if notice is not None and notice.isVisible():
+            notice.place()
+
+    def show_sync_notice(self, state: str, text: str,
+                         hide_after_ms: int = 0) -> None:
+        """The GitHub sync notice over this workspace (SyncNotice)."""
+        if getattr(self, "sync_notice", None) is None:
+            self.sync_notice = SyncNotice(self)
+        self.sync_notice.show_state(state, text, hide_after_ms)
 
     # ------------------------------------------------------------- layout ---
 

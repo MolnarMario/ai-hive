@@ -5,6 +5,7 @@ Every dialog lives here so the model API stays headless-testable.
 """
 
 import contextlib
+import dataclasses
 import os
 import json
 import re
@@ -578,6 +579,7 @@ class TopBar(QFrame):
     # "Update AI Hive in the background": the hourly check that installs a
     # newer AI Hive while the app runs (MainWindow.start_app_update_checks)
     appAutoUpdateToggled = Signal(bool)
+    workspaceAutoSyncToggled = Signal(bool)
     # "Keep the PC awake": hold off Windows sleep while AI Hive runs
     # (MainWindow._apply_keep_awake, app/keep_awake.py)
     keepAwakeToggled = Signal(bool)
@@ -768,6 +770,15 @@ class TopBar(QFrame):
         self.app_auto_update_btn.clicked.connect(
             self._on_app_auto_update_clicked)
         self._refresh_app_auto_update_btn()
+
+        # "Sync workspaces with GitHub at launch". Default OFF: it moves the
+        # user's project folders forward unattended, so the user arms it.
+        self._workspace_auto_sync = False
+        self.workspace_auto_sync_label = toggle_label("")
+        self.workspace_auto_sync_btn = ToggleSwitch(self)
+        self.workspace_auto_sync_btn.clicked.connect(
+            self._on_workspace_auto_sync_clicked)
+        self._refresh_workspace_auto_sync_btn()
 
         # "Keep the PC awake". Default OFF: it changes how the whole machine
         # behaves, so the user arms it.
@@ -1011,6 +1022,8 @@ class TopBar(QFrame):
         self.options_panel.add_switch_row(self.taskbar_label, self.taskbar_btn)
         self.options_panel.add_switch_row(self.app_auto_update_label,
                                           self.app_auto_update_btn)
+        self.options_panel.add_switch_row(self.workspace_auto_sync_label,
+                                          self.workspace_auto_sync_btn)
         self.options_panel.add_switch_row(self.auto_update_label,
                                           self.auto_update_btn)
         self.options_panel.add_row("", self.update_pill,
@@ -1623,6 +1636,38 @@ class TopBar(QFrame):
             "update.\nClick to turn on.")
         self.app_auto_update_btn.setToolTip(tip)
         self.app_auto_update_label.setToolTip(tip)
+
+    def _on_workspace_auto_sync_clicked(self) -> None:
+        self.set_workspace_auto_sync(not self._workspace_auto_sync)
+        self.workspaceAutoSyncToggled.emit(self._workspace_auto_sync)
+
+    def set_workspace_auto_sync(self, on: bool) -> None:
+        """Reflect the sync-at-launch preference (no signal)."""
+        self._workspace_auto_sync = bool(on)
+        self._refresh_workspace_auto_sync_btn()
+
+    def workspace_auto_sync(self) -> bool:
+        return self._workspace_auto_sync
+
+    def _refresh_workspace_auto_sync_btn(self) -> None:
+        self.workspace_auto_sync_btn.setChecked(self._workspace_auto_sync)
+        self.workspace_auto_sync_label.setText(
+            "↻  Sync workspaces with GitHub at launch")
+        tip = (
+            "Sync at launch: ON. Once AI Hive has finished opening and your "
+            "agents are back, it checks every workspace's folder against "
+            "GitHub and pulls newer commits into it, the way the sync "
+            "button at the top of the workspace list does. It only ever "
+            "moves a branch forward: local commits and changes to the same "
+            "files are left alone and reported. A notice over each "
+            "workspace it updates says so. Opening AI Hive never waits for "
+            "this.\nClick to turn off."
+            if self._workspace_auto_sync else
+            "Sync at launch: OFF. Workspaces sync with GitHub only when you "
+            "click the sync button at the top of the workspace list.\n"
+            "Click to turn on.")
+        self.workspace_auto_sync_btn.setToolTip(tip)
+        self.workspace_auto_sync_label.setToolTip(tip)
 
     def _on_keep_awake_clicked(self) -> None:
         self.set_keep_awake(not self._keep_awake)
@@ -3127,6 +3172,8 @@ class MainWindow(QMainWindow):
     repoActivityLoaded = Signal(str, str, object)  # ws_id, path, result
     # name, path, repo url, git's error, the dialog's Lanes box
     workspaceCloneFinished = Signal(str, str, str, str, bool)
+    # event, a workspace_sync.Result copy, launch sync? (worker -> GUI)
+    workspaceSyncProgress = Signal(str, object, bool)
 
     def __init__(self, manager: WorkspaceManager, store: SessionStore,
                  session: dict | None = None):
@@ -3145,6 +3192,7 @@ class MainWindow(QMainWindow):
         self._repo_activity_fetch = repo_activity.fetch
         self.repoActivityLoaded.connect(self._on_repo_activity_loaded)
         self.workspaceCloneFinished.connect(self._on_workspace_clone_finished)
+        self.workspaceSyncProgress.connect(self._on_workspace_sync_progress)
         self._clone_progress: QProgressDialog | None = None
         self._map_window: AgentFileMapWindow | None = None  # lazy, reused
         self._event_log_window: EventLogWindow | None = None  # lazy, reused
@@ -3252,6 +3300,7 @@ class MainWindow(QMainWindow):
         # _restore_ui_state like the rest. The check behind it starts only
         # from main.py (start_app_update_checks), never in the suite.
         self._app_auto_update = True  # user preference (persisted)
+        self._workspace_auto_sync = False  # user preference (persisted)
         # "Keep the PC awake". Default OFF, assigned here for the same reason.
         # _keep_awake_held is what this thread asked Windows for last, as
         # (system, display); the timer runs only while the display half may
@@ -3701,6 +3750,8 @@ class MainWindow(QMainWindow):
             self._on_bold_word_starts_toggled)
         self.top_bar.wordStrengthDelta.connect(self._change_word_strength)
         self.top_bar.autoUpdateToggled.connect(self._on_auto_update_toggled)
+        self.top_bar.workspaceAutoSyncToggled.connect(
+            self._on_workspace_auto_sync_toggled)
         self.top_bar.appAutoUpdateToggled.connect(
             self._on_app_auto_update_toggled)
         self.top_bar.keepAwakeToggled.connect(self._on_keep_awake_toggled)
@@ -7668,6 +7719,10 @@ class MainWindow(QMainWindow):
         # AI Hive's own background update (default ON)
         self._app_auto_update = bool(ui.get("app_auto_update", True))
         self.top_bar.set_app_auto_update(self._app_auto_update)
+        # sync workspaces with GitHub at launch (default OFF)
+        self._workspace_auto_sync = bool(ui.get("workspace_auto_sync",
+                                                False))
+        self.top_bar.set_workspace_auto_sync(self._workspace_auto_sync)
         # Keep the PC awake (default OFF), held from the moment it loads
         self._keep_awake = bool(ui.get("keep_awake", False))
         self.top_bar.set_keep_awake(self._keep_awake)
@@ -8303,36 +8358,176 @@ class MainWindow(QMainWindow):
         self.manager.set_active(ws.id)
 
     # ------------------------------------------------- sync with GitHub ---
-    # The sidebar's sync button: fetch and fast-forward every workspace's
-    # folder from the branch it tracks (app/workspace_sync.py has the rules).
-    # Only the user's click starts it. The git calls go through
+    # Fetch and fast-forward every workspace's folder from the branch it
+    # tracks (app/workspace_sync.py has the rules). Two things start it: the
+    # user's click on the sidebar's sync button, and, with Options > Sync
+    # workspaces with GitHub at launch on, `start_workspace_sync_at_launch`
+    # once the launch has settled. The git calls go through
     # `_workspace_sync_runner`, which tests may replace.
+    #
+    # Each workspace gets a notice over its grid (WorkspacePage.SyncNotice):
+    # gold while its code updates, then green with what it pulled. A sync
+    # the user clicked shows it for every workspace, from "checking" on, and
+    # opens a summary when a folder needs attention. The launch sync is
+    # quiet: only a workspace it actually updates, or one GitHub is ahead of
+    # that it could not update, gets a notice, and nothing pops up.
 
-    def sync_all_workspaces(self) -> bool:
+    # the launch sync: never sooner than this after main.py arms it (the
+    # restored agents, the repo prefetch at 8 s and the usage poll go first)
+    WS_SYNC_LAUNCH_MIN_MS = 15_000
+    WS_SYNC_LAUNCH_POLL_MS = 1000
+    # ...the launch must look settled this many polls in a row
+    WS_SYNC_LAUNCH_QUIET_POLLS = 3
+    # ...and an agent that never shows a prompt stops holding it back after
+    # this long (a stuck CLI must not cancel the sync for the whole session)
+    WS_SYNC_LAUNCH_MAX_WAIT_MS = 180_000
+    WS_SYNC_BOOT_MAX_S = 90.0
+    # how long each notice stays before it fades
+    WS_SYNC_OK_MS = 5000
+    WS_SYNC_CURRENT_MS = 3000
+    WS_SYNC_WARN_MS = 10_000
+
+    def start_workspace_sync_at_launch(self) -> None:
+        """Arm the launch sync behind the Options switch. Called by main.py
+        only, after the launch: the suite shares the factory and must never
+        fetch. Polls `_launch_settled` and syncs once it holds; the switch
+        is read when that moment comes, so turning it on meanwhile counts."""
+        if getattr(self, "_ws_sync_launch_timer", None) is not None:
+            return
+        self._ws_sync_armed = True
+        self._ws_sync_launch_from = time.monotonic()
+        self._ws_sync_quiet = 0
+        timer = QTimer(self)
+        timer.setInterval(self.WS_SYNC_LAUNCH_POLL_MS)
+        timer.timeout.connect(self._ws_sync_launch_tick)
+        self._ws_sync_launch_timer = timer
+        timer.start()
+
+    def _ws_sync_launch_tick(self) -> None:
+        timer = self._ws_sync_launch_timer
+        if self._closing:
+            timer.stop()
+            return
+        waited = (time.monotonic() - self._ws_sync_launch_from) * 1000
+        if waited < self.WS_SYNC_LAUNCH_MIN_MS:
+            return
+        late = waited >= self.WS_SYNC_LAUNCH_MAX_WAIT_MS
+        if not late and not self._launch_settled():
+            self._ws_sync_quiet = 0
+            return
+        self._ws_sync_quiet += 1
+        if not late and self._ws_sync_quiet < self.WS_SYNC_LAUNCH_QUIET_POLLS:
+            return
+        timer.stop()
+        if self._workspace_auto_sync:
+            self.sync_all_workspaces(auto=True)
+
+    def _launch_settled(self) -> bool:
+        """Nothing the launch started is still running: every queued agent
+        has started, every AI agent shows its prompt, the startup limit scan
+        is done, no layout is pending, and AI Hive's own update check is not
+        busy in its folder."""
+        if (self._launch_queue or self._startup_scan is not None
+                or self.stack.layout_pending()
+                or getattr(self, "_app_auto_job", None) is not None):
+            return False
+        now = time.time()
+        for agent in self.manager.all_agents():
+            if agent.status is AgentStatus.STARTING:
+                return False
+            if (agent.spec.kind in AI_KINDS and agent.is_running()
+                    and not agent.prompt_ready()
+                    and now - agent.session_started_at()
+                    < self.WS_SYNC_BOOT_MAX_S):
+                return False
+        return True
+
+    def _on_workspace_auto_sync_toggled(self, enabled: bool) -> None:
+        """User flipped "Sync workspaces with GitHub at launch". An additive
+        optional key under "ui" (no SESSION_VERSION bump). Switched on after
+        the launch sync's moment has passed, it syncs once now, like the
+        AI Hive update switch checks at once."""
+        self._workspace_auto_sync = bool(enabled)
+        self._schedule_save()
+        timer = getattr(self, "_ws_sync_launch_timer", None)
+        if (enabled and getattr(self, "_ws_sync_armed", False)
+                and (timer is None or not timer.isActive())):
+            self.sync_all_workspaces(auto=True)
+
+    def sync_all_workspaces(self, auto: bool = False) -> bool:
         """Start a sync of every workspace. False when one is running or
-        there is nothing to sync."""
+        there is nothing to sync. `auto` is the launch sync: quiet notices
+        and no summary dialog."""
         from app import self_update, workspace_sync
         from .self_update_dialog import Job
 
         if (getattr(self, "_workspace_sync_job", None) is not None
                 or self._closing):
             return False
-        folders = [(ws.name, ws.project_path)
+        folders = [(ws.id, ws.name, ws.project_path)
                    for ws in self.manager.workspaces]
         if not folders:
             return False
         runner = (getattr(self, "_workspace_sync_runner", None)
                   or self_update.subprocess_runner)
         app_repo = self_update.REPO_DIR
-        job = Job(lambda: workspace_sync.sync_all(runner, folders, app_repo),
+        signal = self.workspaceSyncProgress
+
+        def progress(event, res) -> None:
+            # a worker thread: the signal queues it to the GUI thread, with
+            # a copy, since the worker keeps filling the result in
+            try:
+                signal.emit(event, dataclasses.replace(
+                    res, names=list(res.names), ids=list(res.ids)), auto)
+            except RuntimeError:        # the window is gone
+                pass
+
+        job = Job(lambda: workspace_sync.sync_all(runner, folders, app_repo,
+                                                  progress=progress),
                   self, name="ai-hive-workspace-sync")
-        job.finished.connect(self._on_workspaces_synced)
+        job.finished.connect(
+            lambda results, a=auto: self._on_workspaces_synced(results, a))
         self._workspace_sync_job = job
         self.sidebar.set_sync_busy(True)
         job.start()
         return True
 
-    def _on_workspaces_synced(self, results) -> None:
+    def _on_workspace_sync_progress(self, event: str, res, auto: bool) -> None:
+        """Turn one progress event into the notice over each workspace on
+        that folder."""
+        from app import workspace_sync
+        from app.workspace_sync import Outcome
+
+        if self._closing:
+            return
+        source = res.upstream or "GitHub"
+        notice = None                   # (state, text, hide after ms)
+        if event == "checking":
+            if not auto:
+                notice = ("busy", "Checking GitHub for newer code", 0)
+        elif event == "updating":
+            notice = ("busy", f"Updating code from {source}", 0)
+        elif res.outcome is Outcome.UPDATED:
+            notice = ("ok", f"✓ Code updated: pulled "
+                            f"{workspace_sync.commits_text(res.pulled)} "
+                            f"from {source}", self.WS_SYNC_OK_MS)
+        elif workspace_sync.needs_attention(res):
+            notice = ("warn", f"Not synced. {res.detail}",
+                      self.WS_SYNC_WARN_MS)
+        elif not auto and res.outcome is Outcome.UP_TO_DATE:
+            notice = ("ok", f"✓ Up to date with {source}",
+                      self.WS_SYNC_CURRENT_MS)
+        elif not auto:
+            notice = ("info", f"Not synced. {res.detail}",
+                      self.WS_SYNC_OK_MS)
+        if notice is None:
+            return
+        for ws_id in res.ids:
+            page = self._pages.get(ws_id)
+            if page is not None:
+                page.show_sync_notice(*notice)
+
+    def _on_workspaces_synced(self, results, auto: bool = False) -> None:
         from app import self_update, workspace_sync
         from app.cli_update import needs_update
         from app.workspace_sync import Outcome
@@ -8344,7 +8539,8 @@ class MainWindow(QMainWindow):
             results = None
         else:
             for res in results:
-                self._audit_install(workspace_sync.audit_line(res))
+                self._audit_install(workspace_sync.audit_line(
+                    res, "launch" if auto else "click"))
         self._last_workspace_sync = results
         if self._closing:
             return
@@ -8354,9 +8550,16 @@ class MainWindow(QMainWindow):
             installed = self_update.read_installed_version()
             if needs_update(__version__, installed):
                 self._note_app_restart_pending(installed)
-        self._show_workspace_sync_results(results)
+        if auto:
+            return
+        if results is None or any(
+                r.outcome in (Outcome.SKIPPED, Outcome.FAILED)
+                for r in results):
+            self._show_workspace_sync_results(results)
 
     def _show_workspace_sync_results(self, results) -> None:
+        """The summary a clicked sync opens when a folder needs attention:
+        every workspace's outcome, one line each."""
         from app import workspace_sync
         from app.workspace_sync import Outcome
 
@@ -8371,12 +8574,8 @@ class MainWindow(QMainWindow):
             head = workspace_sync.summary(results)
             lines = [f"{marks[r.outcome]} {', '.join(r.names)}: {r.detail}"
                      for r in results]
-        problem = results is None or any(
-            r.outcome in (Outcome.SKIPPED, Outcome.FAILED) for r in results)
-        box = QMessageBox(
-            QMessageBox.Icon.Warning if problem else
-            QMessageBox.Icon.Information,
-            "Sync with GitHub", head, QMessageBox.StandardButton.Ok, self)
+        box = QMessageBox(QMessageBox.Icon.Warning, "Sync with GitHub", head,
+                          QMessageBox.StandardButton.Ok, self)
         box.setInformativeText("\n".join(lines))
         box.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -9028,6 +9227,7 @@ class MainWindow(QMainWindow):
             "bold_word_strength": dict(self._word_strengths),
             "auto_update": self._auto_update,
             "app_auto_update": self._app_auto_update,
+            "workspace_auto_sync": self._workspace_auto_sync,
             "keep_awake": self._keep_awake,
             "agent_lanes": self._agent_lanes,
             "ship_skip_confirm": self._ship_skip_confirm,

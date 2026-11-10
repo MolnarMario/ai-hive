@@ -2664,7 +2664,8 @@ def test_workspace_sync():
         return _sync_git(repo, "rev-parse", "HEAD")
 
     def one(folder=here, app_repo=""):
-        res = workspace_sync.sync_all(run, [("W", str(folder))], app_repo)
+        res = workspace_sync.sync_all(run, [("w", "W", str(folder))],
+                                      app_repo)
         return res[0] if len(res) == 1 else res
 
     r = one()
@@ -2730,8 +2731,8 @@ def test_workspace_sync():
 
     plain = tmp / "plain"
     plain.mkdir()
-    rs = workspace_sync.sync_all(run, [("P", str(plain)),
-                                       ("Gone", str(tmp / "nope"))])
+    rs = workspace_sync.sync_all(run, [("p", "P", str(plain)),
+                                       ("g", "Gone", str(tmp / "nope"))])
     check("ws-sync: a folder that is not a repo, and a missing one, are "
           "skipped with the reason",
           [r.outcome for r in rs] == [Outcome.SKIPPED] * 2
@@ -2746,12 +2747,13 @@ def test_workspace_sync():
     (here / "sub").mkdir()
     lane_head = head(lane)
     push("a.txt", "a5\n")
-    rs = workspace_sync.sync_all(run, [("Main", str(here)),
-                                       ("Sub", str(here / "sub")),
-                                       ("Lane", str(lane))])
+    rs = workspace_sync.sync_all(run, [("m", "Main", str(here)),
+                                       ("s", "Sub", str(here / "sub")),
+                                       ("l", "Lane", str(lane))])
     check("ws-sync: two workspaces in one checkout sync once, named "
           "together, and a lane worktree is never moved",
           len(rs) == 2 and rs[0].names == ["Main", "Sub"]
+          and rs[0].ids == ["m", "s"]
           and rs[0].outcome is Outcome.UPDATED
           and rs[1].names == ["Lane"] and rs[1].outcome is Outcome.SKIPPED
           and head(lane) == lane_head, [vars(r) for r in rs])
@@ -2775,17 +2777,77 @@ def test_workspace_sync():
           workspace_sync.summary(rs) == "1 updated, 1 skipped",
           workspace_sync.summary(rs))
 
-    # --- the sidebar button -------------------------------------------------
+    # --- progress events ----------------------------------------------------
+    events = []
+    push("a.txt", "a5b\n")
+    rs = workspace_sync.sync_all(
+        run, [("id1", "Main", str(here)), ("id2", "Plain", str(plain))],
+        progress=lambda ev, res: events.append((ev, list(res.ids),
+                                                res.outcome)))
+    check("ws-sync: progress says checking, updating and done per folder, "
+          "with the workspace ids",
+          ("checking", ["id1"], Outcome.SKIPPED) in events
+          and ("updating", ["id1"], Outcome.SKIPPED) in events
+          and ("done", ["id1"], Outcome.UPDATED) in events
+          and ("done", ["id2"], Outcome.SKIPPED) in events
+          and not any(ev == "updating" and ids == ["id2"]
+                      for ev, ids, _o in events)
+          and rs[0].ids == ["id1"], events)
+    check("ws-sync: only a folder GitHub is ahead of, or a failure, needs "
+          "attention",
+          not workspace_sync.needs_attention(rs[1])
+          and workspace_sync.needs_attention(workspace_sync.Result(
+              "x", Outcome.SKIPPED, behind=2))
+          and workspace_sync.needs_attention(workspace_sync.Result(
+              "x", Outcome.FAILED)))
+
+    # --- the notice over a workspace ----------------------------------------
     def pump(ms):
         loop = QEventLoop()
         QTimer.singleShot(ms, loop.quit)
         loop.exec()
 
+    from app.widgets import workspace_page
+    from app.widgets.workspace_page import SyncNotice
     store = SessionStore(path=tmp / "session.json")
     win = create_main_window(store)
     win.show()
     pump(100)
-    ws = win.manager.create_workspace("Synced", str(here))
+    mgr = win.manager
+    # the window keeps one workspace: it becomes the synced one
+    ws = mgr.workspaces[0]
+    for old in mgr.workspaces[1:]:
+        mgr.remove_workspace(old.id)
+    mgr.set_workspace_path(ws.id, str(here))
+    mgr.rename_workspace(ws.id, "Synced")
+    mgr.set_active(ws.id)
+    pump(60)
+    page = win._pages[ws.id]
+    page.show_sync_notice("busy", "Updating code from origin/main")
+    notice = page.sync_notice
+    busy_text = notice.label.text()
+    page.show_sync_notice("ok", "done", 0)
+    held = notice.state()
+    pump(workspace_page.SYNC_BUSY_MIN_MS + 200)
+    check("ws-sync notice: busy text shows at least SYNC_BUSY_MIN_MS before "
+          "it turns green",
+          isinstance(notice, SyncNotice)
+          and busy_text.startswith("Updating code from origin/main")
+          and held == "busy" and notice.state() == "ok"
+          and notice.text() == "done", (busy_text, held, notice.state()))
+    hdr = page.header.geometry().bottom()
+    check("ws-sync notice: it floats under the header, centered, inside "
+          "the page",
+          notice.y() > hdr and notice.x() >= 0
+          and notice.geometry().right() <= page.width()
+          and abs(notice.x() + notice.width() // 2 - page.width() // 2) <= 2,
+          (notice.geometry().getRect(), page.width(), hdr))
+    notice.show_state("ok", "bye", 50)
+    pump(80 + workspace_page.SYNC_FADE_MS + 200)
+    check("ws-sync notice: it fades away after its time",
+          not notice.isVisible())
+
+    # --- the sidebar button -------------------------------------------------
     push("a.txt", "a6\n")
     calls = []
 
@@ -2793,32 +2855,152 @@ def test_workspace_sync():
         calls.append(list(argv))
         return run(argv, timeout)
 
+    seen = []
+    orig_show = page.show_sync_notice
+
+    def spy(state, text, hide_after_ms=0):
+        seen.append((state, text))
+        orig_show(state, text, hide_after_ms)
+
+    page.show_sync_notice = spy
+
+    def wait_sync():
+        deadline = time.monotonic() + 30
+        while (win._workspace_sync_job is not None
+               and time.monotonic() < deadline):
+            pump(30)
+        pump(60)        # the last queued progress events
+
     win._workspace_sync_runner = counting
     win.sidebar.sync_btn.click()
     busy = not win.sidebar.sync_btn.isEnabled()
     again = win.sync_all_workspaces()
-    deadline = time.monotonic() + 30
-    while win._workspace_sync_job is not None and time.monotonic() < deadline:
-        pump(30)
+    wait_sync()
     results = getattr(win, "_last_workspace_sync", None) or []
-    mine = [r for r in results if ws.name in r.names]
     check("ws-sync: the sidebar button syncs every workspace once, busy "
           "meanwhile",
           busy and again is False and win.sidebar.sync_btn.isEnabled()
-          and len(mine) == 1 and mine[0].outcome is Outcome.UPDATED
+          and len(results) == 1 and results[0].outcome is Outcome.UPDATED
+          and results[0].ids == [ws.id]
           and (here / "a.txt").read_text() == "a6\n",
           [vars(r) for r in results])
+    check("ws-sync: the workspace's notice goes checking, updating, then "
+          "green with what it pulled",
+          [s for s, _t in seen] == ["busy", "busy", "ok"]
+          and seen[0][1].startswith("Checking GitHub")
+          and seen[1][1] == "Updating code from origin/main"
+          and seen[2][1] == ("✓ Code updated: pulled 1 commit from "
+                             "origin/main"), seen)
+    check("ws-sync: a clicked sync where every folder is fine opens no "
+          "dialog", getattr(win, "_workspace_sync_box", None) is None)
+
+    seen.clear()
+    plain_ws = mgr.create_workspace("Plain", str(plain))
+    win.sync_all_workspaces()
+    wait_sync()
     box = win._workspace_sync_box
-    check("ws-sync: a dialog lists each workspace's outcome",
+    check("ws-sync: a clicked sync that skips a folder lists every "
+          "workspace in a dialog",
           box is not None and box.isVisible()
-          and "Synced: Pulled 1 commit" in box.informativeText(),
+          and "Synced: Up to date." in box.informativeText()
+          and "Plain: Not a git repository." in box.informativeText(),
           box.informativeText() if box is not None else None)
+    check("ws-sync: ...and an up-to-date workspace shows a short green "
+          "notice", seen[-1] == ("ok", "✓ Up to date with origin/main"),
+          seen)
+    if box is not None:
+        box.close()
+        pump(20)
+
+    # --- the launch sync ----------------------------------------------------
+    bar = win.top_bar
+    tip = bar.workspace_auto_sync_btn.toolTip()
+    check("ws-sync switch: OFF by default, in Options, saved under "
+          "ui.workspace_auto_sync",
+          not win._workspace_auto_sync and not bar.workspace_auto_sync()
+          and not bar.workspace_auto_sync_btn.isChecked()
+          and "at launch" in bar.workspace_auto_sync_label.text()
+          and win._session_payload()["ui"]["workspace_auto_sync"] is False
+          and "—" not in tip, (bar.workspace_auto_sync_label.text(), tip))
+    seen.clear()
+    calls.clear()
+    bar.workspace_auto_sync_btn.click()
+    pump(50)
+    check("ws-sync switch: turned on, it is saved, and in the suite (never "
+          "armed by main.py) it runs no git",
+          win._workspace_auto_sync
+          and win._session_payload()["ui"]["workspace_auto_sync"] is True
+          and calls == [] and win._workspace_sync_job is None
+          and "ON" in bar.workspace_auto_sync_btn.toolTip())
+    win2_store = SessionStore(path=tmp / "session2.json")
+    payload = win._session_payload()
+    win2_store.save(payload)
+    win2 = create_main_window(win2_store)
+    check("ws-sync switch: a reopened window restores it",
+          win2._workspace_auto_sync and win2.top_bar.workspace_auto_sync())
+    win2.close()
+    win2.deleteLater()
+    pump(20)
+
+    win._launch_queue.append(("x", "y"))
+    queued = win._launch_settled()
+    win._launch_queue.clear()
+    win._startup_scan = object()
+    scanning = win._launch_settled()
+    win._startup_scan = None
+    check("ws-sync launch: the launch is not settled while agents wait to "
+          "start or the startup scan runs, and is once they are done",
+          queued is False and scanning is False and win._launch_settled())
+
+    mgr.remove_workspace(plain_ws.id)
+    push("a.txt", "a7\n")
+    win.WS_SYNC_LAUNCH_MIN_MS = 200
+    win.WS_SYNC_LAUNCH_POLL_MS = 50
+    win._launch_queue.append(("x", "y"))      # the launch is still going
+    win.start_workspace_sync_at_launch()
+    pump(600)
+    early = list(calls)
+    win._launch_queue.clear()
+    deadline = time.monotonic() + 30
+    while ((win._ws_sync_launch_timer.isActive()
+            or win._workspace_sync_job is not None)
+           and time.monotonic() < deadline):
+        pump(30)
+    pump(60)
+    results = win._last_workspace_sync or []
+    check("ws-sync launch: it waits for the launch to settle, then syncs "
+          "once with the switch on",
+          early == [] and not win._ws_sync_launch_timer.isActive()
+          and len(results) == 1 and results[0].outcome is Outcome.UPDATED
+          and (here / "a.txt").read_text() == "a7\n",
+          (early[:2], [vars(r) for r in results]))
+    check("ws-sync launch: quiet notices (updating, then green) and no "
+          "dialog",
+          [s for s, _t in seen] == ["busy", "ok"]
+          and seen[0][1] == "Updating code from origin/main"
+          and getattr(win, "_workspace_sync_box", None) is None, seen)
+
+    seen.clear()
+    win.sync_all_workspaces(auto=True)
+    wait_sync()
+    check("ws-sync launch: a folder already up to date gets no notice",
+          seen == [] and win._last_workspace_sync[0].outcome
+          is Outcome.UP_TO_DATE, seen)
+
+    (here / "a.txt").write_text("local\n")
+    push("a.txt", "a8\n")
+    win.sync_all_workspaces(auto=True)
+    wait_sync()
+    check("ws-sync launch: GitHub ahead but blocked by a local change shows "
+          "an amber notice",
+          [s for s, _t in seen] == ["busy", "warn"] if len(seen) == 2
+          else [s for s, _t in seen] == ["warn"], seen)
+    _sync_git(here, "checkout", "--", "a.txt")
+
     repo_dir = os.path.normcase(os.path.realpath(self_update.REPO_DIR))
     check("ws-sync: the suite's sync never ran git in AI Hive's own clone",
           not any(os.path.normcase(os.path.realpath(c[2])) == repo_dir
                   for c in calls if len(c) > 2 and c[1] == "-C"))
-    if box is not None:
-        box.close()
     win.close()
     win.deleteLater()
     pump(20)

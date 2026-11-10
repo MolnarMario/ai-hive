@@ -482,6 +482,9 @@ def build_qss(chrome_family: str = "Segoe UI", console_px: int | None = None) ->
     # (sidebar.drawRow) still shows through. An opaque BG_HOVER covered that
     # box, so the hovered header looked flatter than the ones beside it
     cat_hover = "rgba({},{},{},{})".format(*_hex_rgb(p.TEXT), CAT_HOVER_ALPHA)
+    # the GitHub sync notice over a workspace: its state's ink as a wash
+    sync_ok = "rgba({},{},{},0.22)".format(*_hex_rgb(p.GREEN))
+    sync_warn = "rgba({},{},{},0.22)".format(*_hex_rgb(p.ACCENT_ORANGE))
     return f"""
 * {{
     font-family: "{chrome_family}";
@@ -644,6 +647,21 @@ WorkspaceRow[search_hit="true"] {{
 }}
 #SearchBtn:hover {{ background: {p.BG_HOVER}; color: {p.ACCENT_GOLD};
                    border-color: {p.BORDER}; }}
+/* the notice over a workspace while its folder syncs with GitHub
+   (workspace_page.SyncNotice): gold while it works, green when done */
+#SyncNotice {{
+    background: {p.BG_ACTIVE}; border: 1px solid {p.ACCENT_GOLD};
+    border-radius: 6px;
+}}
+#SyncNotice[state="ok"] {{ background: {sync_ok}; border-color: {p.GREEN}; }}
+#SyncNotice[state="warn"] {{ background: {sync_warn};
+                            border-color: {p.ACCENT_ORANGE}; }}
+#SyncNotice[state="info"] {{ border-color: {p.BORDER}; }}
+#SyncNoticeText {{
+    background: transparent; color: {p.TEXT}; font-family: {BODY_FONT};
+    font-size: 13px; font-weight: 600;
+}}
+#SyncNotice[state="ok"] #SyncNoticeText {{ color: {p.GREEN}; }}
 /* sidebar sync: pull every workspace forward from GitHub */
 #SyncBtn {{
     background: transparent; border: 1px solid transparent; border-radius: 3px;
