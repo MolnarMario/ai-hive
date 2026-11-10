@@ -148,6 +148,9 @@ def _join(screen, line, start: int, span: int, prev, char: str) -> None:
     """Add `char` to the cluster at `start`, which covers `span` cells and
     ends right before the cursor."""
     cursor = screen.cursor
+    # NFC, as pyte's own draw stored a combining mark: Ctrl+F then finds
+    # the precomposed letter a keyboard types, and Hangul jamo become the
+    # syllable the font has a glyph for
     text = unicodedata.normalize("NFC", prev.data + char)
     line[start] = prev._replace(data=text)
     screen.dirty.add(cursor.y)
