@@ -2983,9 +2983,9 @@ def test_workspace_sync():
     check("ws-sync: a clicked sync that skips a folder lists every "
           "workspace in a dialog",
           box is not None and box.isVisible()
-          and "Synced: Up to date." in box.informativeText()
-          and "Plain: Not a git repository." in box.informativeText(),
-          box.informativeText() if box is not None else None)
+          and "Synced: Up to date." in box.plain_text()
+          and "Plain: Not a git repository." in box.plain_text(),
+          box.plain_text() if box is not None else None)
     check("ws-sync: ...and an up-to-date workspace shows a short green "
           "notice", seen[-1] == ("ok", "✓ Up to date with origin/main"),
           seen)
@@ -3093,3 +3093,97 @@ def test_workspace_sync():
     pump(20)
     _sync_git(here, "worktree", "remove", str(lane))
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_workspace_sync_results_dialog():
+    """The window a clicked sync opens (app/widgets/sync_results.py): the
+    results sorted into sections worst first, each its own color, so the
+    folder that needs the user does not hide among the ones that are
+    fine."""
+    from PySide6.QtWidgets import QApplication, QFrame, QLabel
+    from app.ui_theme import Palette
+    from app.widgets import sync_results
+    from app.widgets.sync_results import SyncResultsDialog
+    from app.workspace_sync import Outcome, Result
+
+    app = QApplication.instance() or QApplication([])
+
+    def res(name, outcome, detail, **kw):
+        return Result(folder=f"C:/code/{name}", outcome=outcome,
+                      detail=detail, names=[name], **kw)
+
+    results = [
+        res("Proverbs", Outcome.SKIPPED,
+            "The branch 'fix/gap' does not track a branch on GitHub."),
+        res("Chess", Outcome.UP_TO_DATE, "Up to date."),
+        res("Hive", Outcome.UPDATED, "Pulled 3 commits into 'main'."),
+        res("Lift", Outcome.SKIPPED, "GitHub has 2 commits, but they "
+            "change files with local changes here.", behind=2),
+        res("CV", Outcome.UP_TO_DATE,
+            "Up to date. 1 commit on 'main' not pushed yet."),
+        res("Scraper", Outcome.FAILED, "Fetching from origin failed."),
+        res("Rent", Outcome.UP_TO_DATE, "Up to date."),
+    ]
+    groups = sync_results.group(results)
+    check("ws-sync dialog: results sort into attention (failed, or GitHub "
+          "commits it could not take), updated, not synced, up to date",
+          [[r.names[0] for r in groups[k]] for k, _h, _g
+           in sync_results.SECTIONS]
+          == [["Lift", "Scraper"], ["Hive"], ["Proverbs"],
+              ["Chess", "CV", "Rent"]], groups)
+    text = sync_results.plain_text(results)
+    check("ws-sync dialog: the report text leads with what needs the user, "
+          "worst section first",
+          text.startswith("2 workspaces need your attention\n")
+          and text.index("Needs attention (2)") < text.index("Updated (1)")
+          < text.index("Not synced (1)") < text.index("Up to date (3)")
+          and "  Lift: GitHub has 2 commits" in text, text)
+    check("ws-sync dialog: one folder to fix says so in the singular, none "
+          "says the sync finished",
+          sync_results.headline(results[:4])
+          == "1 workspace needs your attention"
+          and sync_results.headline(results[:3]) == "Sync finished"
+          and sync_results.headline(None)
+          == "The sync stopped unexpectedly.")
+
+    box = SyncResultsDialog(results)
+    box.show()
+    app.processEvents()
+    rows = box.findChildren(QFrame, "SyncRow")
+    names = box.findChildren(QLabel, "SyncNames")
+    row_names = [r.findChild(QLabel, "SyncRowName").text() for r in rows]
+    check("ws-sync dialog: one row per folder with news, plain up-to-date "
+          "folders share one line of names",
+          row_names == ["Lift", "Scraper", "Hive", "Proverbs", "CV"]
+          and len(names) == 1 and "Chess" in names[0].text()
+          and "Rent" in names[0].text()
+          and rows[0].toolTip() == "C:/code/Lift", (row_names,
+                                                   [n.text() for n in names]))
+    titles = box.findChildren(QLabel, "SyncSectionTitle")
+    check("ws-sync dialog: the attention section is red, updated green",
+          Palette.RED in titles[0].styleSheet()
+          and titles[0].text().startswith("NEEDS ATTENTION")
+          and Palette.GREEN in titles[1].styleSheet(),
+          [(t.text(), t.styleSheet()) for t in titles])
+    detail = rows[3].findChildren(QLabel, "SyncRowDetail")[0].text()
+    check("ws-sync dialog: a quoted branch name is set apart in the console "
+          "font, escaped", "monospace" in detail and ">fix/gap<" in detail
+          and "'fix/gap'" not in detail, detail)
+    box.copy_btn.click()
+    check("ws-sync dialog: Copy puts the report on the clipboard",
+          QApplication.clipboard().text() == text
+          and box.copy_btn.text() == "Copied")
+    visible = [w.text() for w in box.findChildren(QLabel)] + [text]
+    check("ws-sync dialog: no em dash in anything it shows",
+          not any("—" in t for t in visible))
+    box.close()
+    app.processEvents()
+
+    stopped = SyncResultsDialog(None)
+    stopped.show()
+    app.processEvents()
+    check("ws-sync dialog: a sync that stopped says so and lists nothing",
+          stopped.headline_label.text() == "The sync stopped unexpectedly."
+          and not stopped.findChildren(QFrame, "SyncRow"))
+    stopped.close()
+    app.processEvents()

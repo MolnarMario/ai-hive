@@ -1278,7 +1278,8 @@ app/
                            worker thread), update_panel (the Updates panel +
                            its consent modal + its worker thread),
                            self_update_dialog (the AI Hive update dialog +
-                           its worker thread)
+                           its worker thread), sync_results (the Sync with
+                           GitHub results window)
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N

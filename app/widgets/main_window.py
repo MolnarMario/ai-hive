@@ -8632,28 +8632,14 @@ class MainWindow(QMainWindow):
 
     def _show_workspace_sync_results(self, results) -> None:
         """The summary a clicked sync opens when a folder needs attention:
-        every workspace's outcome, one line each."""
-        from app import workspace_sync
-        from app.workspace_sync import Outcome
+        every workspace's outcome, sorted into sections worst first
+        (`app/widgets/sync_results.py`)."""
+        from app.widgets.sync_results import SyncResultsDialog
 
         old = getattr(self, "_workspace_sync_box", None)
         if old is not None:
             old.close()
-        marks = {Outcome.UPDATED: "⬆", Outcome.UP_TO_DATE: "✓",
-                 Outcome.SKIPPED: "•", Outcome.FAILED: "✗"}
-        if results is None:
-            head, lines = "The sync stopped unexpectedly.", []
-        else:
-            head = workspace_sync.summary(results)
-            lines = [f"{marks[r.outcome]} {', '.join(r.names)}: {r.detail}"
-                     for r in results]
-        box = QMessageBox(QMessageBox.Icon.Warning, "Sync with GitHub", head,
-                          QMessageBox.StandardButton.Ok, self)
-        box.setInformativeText("\n".join(lines))
-        box.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse)
-        box.setWindowModality(Qt.WindowModality.NonModal)
-        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box = SyncResultsDialog(results, self)
         box.destroyed.connect(lambda *_, b=box: self._forget_sync_box(b))
         self._workspace_sync_box = box
         box.show()

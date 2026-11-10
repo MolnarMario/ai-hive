@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.57.1
+
+- The Sync with GitHub results window is easier to read. Workspaces that
+  need you come first, in red, then what was updated, what was not synced
+  and why, and a single line of the workspaces already up to date. Each
+  workspace has its own row with the reason underneath, branch names stand
+  out, and Copy puts the whole report on the clipboard.
+
 ## 0.57.0
 
 - A new sync button at the top of the workspace list brings every
