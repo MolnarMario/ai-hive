@@ -219,7 +219,7 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
                            QWheelEvent)
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
-from .. import input_caret, soft_wrap, ui_theme
+from .. import grapheme_cells, input_caret, soft_wrap, ui_theme
 from ..terminal_agent import (FOCUS_REPORTS, REFLOW_BEGIN, REFLOW_END,
                               REPAINT_DONE, _CLAUDE_READY_HINTS,
                               _NUM_OPTION_RE)
@@ -527,6 +527,24 @@ class _FastHistoryScreen(pyte.HistoryScreen):
         self.top_jumps = []
         self.history_resets = 0
         super().__init__(*args, **kwargs)
+
+    def draw(self, data: str) -> None:
+        # pyte measures code points one at a time and drops the rest of a
+        # run at a VS16 or ZWJ, so `⚔️` shifted every row after it (see
+        # app/grapheme_cells.py). A printable ASCII run never forms a
+        # cluster, and pyte's own draw is the fast path for it.
+        if data.isascii() and data.isprintable():
+            super().draw(data)
+        else:
+            grapheme_cells.draw(self, data)
+
+    @property
+    def display(self) -> list:
+        # pyte's own asserts that a cell holds one code point plus
+        # zero-width marks, which a flag or a ZWJ emoji is not. A cell's
+        # data is what it shows; the second half of a wide one holds "".
+        return ["".join(self.buffer[y][x].data for x in range(self.columns))
+                for y in range(self.lines)]
 
     def cursor_up(self, count=None) -> None:
         # only a move UP counts: a renderer erasing what it drew climbs with
