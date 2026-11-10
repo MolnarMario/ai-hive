@@ -8,6 +8,26 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.57.0
+
+- A new sync button at the top of the workspace list brings every
+  workspace's folder up to date with GitHub in one click, so after pushing
+  from one computer you don't have to ask an agent in each workspace on the
+  other to pull. A notice over each workspace says it is updating its code,
+  then turns green with what it pulled. It only moves a branch forward:
+  local commits, branches that track nothing (agent lanes included) and
+  local changes to files GitHub also changed are left alone, and a list
+  says what happened where.
+- Options > Automation > Sync workspaces with GitHub at launch (off by
+  default) runs that sync by itself once per launch, only after every
+  restored agent is back and AI Hive has finished opening, so the launch
+  never waits for it. Only a workspace it updates shows the notice.
+- An emoji drawn with an emoji style selector, such as the crossed swords
+  in Claude's agent view, no longer pushes the rest of a card's rows one
+  column to the right. AI Hive now measures such emoji the way the Windows
+  console does. This version needs one new Python package, so the update
+  button installs it.
+
 ## 0.56.11
 
 - Copying or cutting the text you typed into an agent's input box no longer
