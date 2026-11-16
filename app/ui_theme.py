@@ -1291,6 +1291,8 @@ QScrollArea {{ background: transparent; border: none; }}
 /* Open repo hovered: its right edge is the ▾'s left border (WorkspacePage
    sets seamLit), so light that too or the hover box has no right side */
 #RepoActivityMenuButton[seamLit="true"] {{ border-left-color: {p.ACCENT_BLUE}; }}
+/* greyed while the folder has no repository (Connect to repo) */
+#RepoActivityMenuButton:disabled {{ color: {p.TEXT_FAINT}; }}
 /* padding-left leaves room for the line icon header_icons paints */
 #GridButton, #MapToggle, #ActivityToggle {{
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};
