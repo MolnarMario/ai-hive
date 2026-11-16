@@ -63,7 +63,7 @@ app/lane_service.py polls it off the LaneOps queue. The same read finds the
 lane's newest commit whose message has a line saying just "Task done"
 (`DONE_GREP`): the agent's flag that its slice of work is finished. A flag
 that came in by merging another lane's branch is that lane's, not this
-one's (`_flag_merged_in`). The
+one's (`_own_flag`). The
 lane chip shows it, and the integrator ships it when the user asks.
 The integrator merges that commit, not the head, so a flagged lane's chip
 takes its conflicts from the flagged commit (`_ship_overlaps`), while the
@@ -1323,23 +1323,33 @@ def _reflog_moves(root: str, branch: str) -> tuple:
     return own, moves
 
 
-def _flag_merged_in(root: str, flag: str, reflog: tuple) -> bool:
-    """Did `flag` reach the lane through a merge, pull or reset of another
-    branch, rather than being committed there? A commit the reflog records
-    as made in the lane never did. Otherwise it did when a move's new head
-    reaches it and the head before that move did not: a fast-forward to
-    another lane's branch, or a merge commit taking it in. Without reflog
-    evidence either way it did not."""
+def _own_flag(root: str, flags: list, reflog: tuple, base: str) -> str:
+    """The first of `flags` (newest first) that did not reach the lane
+    through a merge, pull or reset of another branch, or "". A commit the
+    reflog records as made in the lane never did, so the flags after the
+    newest own one are never looked at. A flag newer than that did when
+    some move's new head reaches it and the head before that move did not
+    (`rev-list new ^old`): a fast-forward to another lane's branch, or a
+    merge commit taking it in. Without reflog evidence either way it did
+    not. One git call per move at most, however many flags there are."""
     own, moves = reflog
-    if flag in own:
-        return False
+    candidates = []
+    for f in flags:
+        if f in own:
+            break
+        candidates.append(f)
+    if not candidates:
+        return flags[0] if flags else ""
+    pending, foreign = set(candidates), set()
     for new, old in moves:
-        if not git(["merge-base", "--is-ancestor", flag, new], root).ok:
-            continue
-        if not old or not git(["merge-base", "--is-ancestor", flag, old],
-                              root).ok:
-            return True
-    return False
+        r = git(["rev-list", new, f"^{base}", *([f"^{old}"] if old else [])],
+                root)
+        if r.ok:
+            foreign |= pending & set(r.out.split())
+            pending -= foreign
+        if not pending:
+            break
+    return next((f for f in flags if f not in foreign), "")
 
 
 def _done_commit(root: str, head: str, base_ref: str, cache,
@@ -1362,7 +1372,7 @@ def _done_commit(root: str, head: str, base_ref: str, cache,
     agent that merged a finished lane's branch into its lane (instead of
     the base) showed that lane's flag as its own done mark while it was
     still working, and Ship finished lanes would have offered it. The
-    branch's reflog says how each commit arrived (`_flag_merged_in`); the
+    branch's reflog says how each commit arrived (`_own_flag`); the
     newest flag that did not arrive by a merge, pull or reset counts. With
     no reflog to tell (expired, or git without one) a flag still counts,
     the way it did before: a done lane left out of a ship loses work."""
@@ -1382,9 +1392,7 @@ def _done_commit(root: str, head: str, base_ref: str, cache,
     flags = m.out.split() if m.ok else []
     done = ""
     if flags:
-        reflog = _reflog_moves(root, branch)
-        done = next((f for f in flags
-                     if not _flag_merged_in(root, f, reflog)), "")
+        done = _own_flag(root, flags, _reflog_moves(root, branch), r.out)
     if done and _landed(root, done, r.out):
         done = ""
     if cache is not None:
