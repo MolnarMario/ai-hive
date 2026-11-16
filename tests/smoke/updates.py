@@ -3190,12 +3190,39 @@ def test_workspace_sync_connect():
     check("ws-connect: a plain sync leaves a branch that tracks nothing "
           "alone", r.outcome is Outcome.SKIPPED
           and "does not track" in r.detail, vars(r))
-    r = linked(behind)
+    fetches = []
+
+    def counting(argv, timeout=None):
+        if "fetch" in argv:
+            fetches.append(argv)
+        return run(argv, timeout)
+
+    r = workspace_sync.sync_all(counting, [("w", "W", str(behind))],
+                                link=True)[0]
     check("ws-connect: a branch with commits is tied to the remote's branch "
           "of the same name, then fast-forwarded",
           r.outcome is Outcome.UPDATED and r.pulled == 1
           and _sync_git(behind, "rev-parse", "--abbrev-ref", "@{upstream}")
           == "origin/main", vars(r))
+    check("ws-connect: ...with one fetch, not a second one in the sync",
+          len(fetches) == 1, fetches)
+
+    refused = tmp / "refused"
+    refused.mkdir()
+    _sync_git(refused, "init", "-q")
+
+    def dubious(argv, timeout=None):
+        if "rev-parse" in argv:
+            return 128, ("fatal: detected dubious ownership in repository "
+                         f"at '{refused}'")
+        return run(argv, timeout)
+
+    top, _common, why, linked_ok = workspace_sync.connection(
+        dubious, str(refused))
+    check("ws-connect: a repository git refuses to read says git's reason "
+          "and offers no Connect (Connect cannot fix it)",
+          linked_ok and "dubious ownership" in why
+          and why != workspace_sync.NOT_A_REPO_TEXT, (top, why, linked_ok))
     _sync_git(behind, "switch", "-q", "-c", "feature")
     r = linked(behind)
     check("ws-connect: a branch the remote lacks is reported, never pushed",

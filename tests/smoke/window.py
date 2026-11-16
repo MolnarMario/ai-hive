@@ -1120,6 +1120,20 @@ def test_repo_connect():
     check("repo connect: ...and the folder is left as it was",
           calls == [["ls-remote", "--heads"]]
           and not (plain / ".git").exists(), calls)
+    # a folder inside a parent's repository: Connect would have added
+    # origin to the parent, and the sync after it checked GitHub's files
+    # out into the parent folder
+    inner = bare / "inner"
+    inner.mkdir()
+    calls.clear()
+    reach.update(rc=0, out="")
+    err = repo_activity.connect_origin(str(inner), "https://github.com/o/p",
+                                       runner)
+    check("repo connect: a folder inside another repository is refused "
+          "before git, and the parent gets no origin",
+          "inside another git repository" in err and calls == []
+          and repo_activity.repo_state(str(bare)) == "none"
+          and not (inner / ".git").exists(), (err, calls))
 
     # --- the header -------------------------------------------------------
     store = SessionStore(path=tmp / "s.json")
@@ -1152,6 +1166,32 @@ def test_repo_connect():
           page.repo_btn.text() == "Connect to repo"
           and not page.repo_activity_btn.isEnabled(),
           (page.repo_btn.text(), page.repo_activity_btn.isEnabled()))
+
+    # a probe asked for while one is in flight (a Connect finishing while
+    # an activation probe still runs) is not dropped: the answer in flight
+    # predates the change and must not stick
+    import threading
+    gate = threading.Event()
+    answers_seen = []
+
+    def gated(path):
+        if not answers_seen:
+            answers_seen.append("none")
+            gate.wait(5)
+            return repo_activity.STATE_NONE
+        answers_seen.append("github")
+        return repo_activity.STATE_GITHUB
+
+    win._repo_state_probe = gated
+    win._probe_repo_state([ws.id])
+    win._probe_repo_state([ws.id])
+    gate.set()
+    settle()
+    win._repo_state_probe = repo_activity.repo_state
+    check("repo connect: a probe asked for mid-flight runs after it, so a "
+          "stale answer never sticks",
+          answers_seen == ["none", "github"]
+          and page.repo_btn.text() == "Open repo", answers_seen)
 
     mgr.set_workspace_path(ws.id, str(github))
     settle()

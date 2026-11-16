@@ -1792,6 +1792,25 @@ def test_sidebar_header_fit():
           "and gaps and shows the count; the narrowest drops the count",
           wide[3] and not narrow[3] and min(wide[4]) > max(narrow[4])
           and next(iter(wide[0]))[0] >= next(iter(narrow[0]))[0], shapes)
+    # the count going from 9 to 10 is wider: the header refits then, not
+    # only on the next resize
+    for i in range(2, 10):
+        sb.add_row(f"w{i}", f"W{i}", "p")
+    stale = []
+    for width in range(190, 260, 2):
+        sb.remove_row("w10")
+        sb.resize(width, 400)
+        pump(5)
+        sb.add_row("w10", "W10", "p")
+        after = sb._header_fit
+        sb._header_fit = None
+        sb._fit_header()
+        if sb._header_fit != after:
+            stale.append((width, after, sb._header_fit))
+    check("sidebar header: a wider workspace count refits the header at "
+          "once", not stale and sb.count_label.text() == "10", stale)
+    sb.resize(430, 400)
+    pump(30)
     sb._toggle_search()
     hidden_in_search = sb.count_label.isHidden()
     sb._close_search()

@@ -4467,12 +4467,29 @@ def test_task_done_merged_from_another_lane():
     check("foreign-flag: an own flag holds after merging the base in",
           done(eb) == b_flag, done(eb))
 
+    # E points its branch at A's with `switch -C` (reflog "branch: Reset
+    # to"), the same move as a reset
+    e = _lane_for(work, "Agent E", "f0e1e0" + "0" * 26)
+    ee = _entry("E", "Agent E", e)
+    _commit(e["root"], "fe.txt", "e\n", "e's work")
+    _git(e["root"], "switch", "-q", "-C", e["branch"], a["branch"])
+    check("foreign-flag: a branch reset to another lane's flag is not done",
+          done(ee) == "" and _git(e["root"], "rev-parse", "HEAD") == a_flag,
+          done(ee))
+
+    # the oldest reflog row read is a merge: what the branch held before it
+    # is unknown, so it is no evidence and the flag counts
+    base = _git(work, "rev-parse", "origin/main")
+    check("foreign-flag: a move with no row before it claims no flag",
+          lanes._own_flag(a["root"], [a_flag], (set(), [(a_flag, "")]),
+                          base) == a_flag)
+
     # no reflog to tell: the foreign flag counts, as before the fix
     _git(c["root"], "reflog", "expire", "--expire=all",
          f"refs/heads/{c['branch']}")
     check("foreign-flag: without a reflog the flag counts as before",
           done(ec) == a_flag, done(ec))
-    for lane in (a, b, c, d):
+    for lane in (a, b, c, d, e):
         _drop_lane_folder(lane["root"])
     shutil.rmtree(tmp, ignore_errors=True)
 

@@ -259,6 +259,11 @@ def locate(runner, folder: str) -> tuple:
         return "", "", _git_error("Reading the folder", rc, out)
     lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
     if rc != 0 or not lines:
+        from .lanes import find_repo_root
+        if rc != 0 and find_repo_root(folder):
+            # a repository git refuses to read (dubious ownership, a
+            # broken .git): not one Connect could fix, so say git's reason
+            return "", "", _git_error("Reading the folder", rc, out)
         return "", "", NOT_A_REPO
     top = os.path.normpath(lines[0])
     common = os.path.normpath(lines[1]) if len(lines) > 1 else top
@@ -275,13 +280,15 @@ def _fetch(runner, top: str, remote: str) -> tuple:
 
 
 def sync_folder(runner, top: str, app_repo: str = "", updating=None,
-                app_busy: bool = False, merge_lock=None) -> Result:
+                app_busy: bool = False, merge_lock=None,
+                fetched: bool = False) -> Result:
     """Fetch and fast-forward one checkout. Never raises. `app_repo` is the
     folder AI Hive runs from and `app_busy` says AI Hive is updating itself
     (see AI HIVE'S OWN FOLDER). `updating(res)` is called right before the
     fast-forward, once it is known there is something to pull, so the
     window can say so while it runs. `merge_lock` is held around the
-    fast-forward (see WORKSPACES SHARING A REPOSITORY)."""
+    fast-forward (see WORKSPACES SHARING A REPOSITORY). `fetched` says
+    `link_upstream` fetched the remote a moment ago: no second fetch."""
     res = Result(top, Outcome.SKIPPED)
     is_app = bool(app_repo) and _same_path(top, app_repo)
 
@@ -311,7 +318,7 @@ def sync_folder(runner, top: str, app_repo: str = "", updating=None,
         return done(Outcome.SKIPPED,
                     f"The branch '{branch}' does not track a branch on "
                     "GitHub.")
-    if remote != ".":
+    if remote != "." and not fetched:
         rc, out = _fetch(runner, top, remote)
         if rc != 0:
             return done(Outcome.FAILED,
@@ -401,11 +408,17 @@ def _has_ref(runner, top: str, ref: str) -> bool:
     return rc == 0
 
 
+# link_upstream's answer when it tied the branch and fetched its remote:
+# sync_folder carries on without fetching again
+LINKED = "linked"
+
+
 def link_upstream(runner, top: str, updating=None, merge_lock=None):
     """Tie a folder the user just connected to its remote (see A FOLDER
     JUST CONNECTED). None when `sync_folder` should carry on (the branch
-    tracks one now, or already did, or there is nothing to tie), else the
-    final Result. Never raises from git."""
+    already tracks one, or there is nothing to tie), LINKED when it should
+    carry on and the remote was just fetched, else the final Result. Never
+    raises from git."""
     res = Result(top, Outcome.SKIPPED)
 
     def done(outcome: Outcome, detail: str) -> Result:
@@ -444,7 +457,7 @@ def link_upstream(runner, top: str, updating=None, merge_lock=None):
         if rc != 0:
             return done(Outcome.FAILED,
                         _git_error(f"Tracking {remote}/{branch}", rc, out))
-        return None
+        return LINKED
     # no commits here yet: bring down the remote's branch
     target = branch
     if not _has_ref(runner, top, f"refs/remotes/{remote}/{target}"):
@@ -582,11 +595,11 @@ def run_group(runner, p: Plan, items, app_repo: str = "", progress=None,
                     runner, top,
                     lambda r, k=key: _tell(progress, p, "updating", r, k),
                     merge_lock)
-            if res is None:
+            if res is None or res is LINKED:
                 res = sync_folder(
                     runner, top, app_repo,
                     lambda r, k=key: _tell(progress, p, "updating", r, k),
-                    app_busy, merge_lock)
+                    app_busy, merge_lock, fetched=res is LINKED)
         except Exception as e:  # noqa: BLE001
             res = Result(top, Outcome.FAILED,
                          f"The sync stopped unexpectedly: {e}")

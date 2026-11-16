@@ -3246,6 +3246,8 @@ class MainWindow(QMainWindow):
         # tests (the runner, None, is workspace_sync.sync_runner)
         self._repo_state_probe = repo_activity.repo_state
         self._repo_state_busy: set[str] = set()
+        # asked again while busy: the answer in flight may predate the change
+        self._repo_state_again: set[str] = set()
         self._repo_connect_runner = None
         self._connect_progress: QProgressDialog | None = None
         # Connects started from the Sync with GitHub window: ws id -> the
@@ -8267,8 +8269,10 @@ class MainWindow(QMainWindow):
         jobs = []
         for ws_id in ws_ids:
             ws = self.manager.workspace(ws_id)
-            if (ws is None or ws_id not in self._pages
-                    or ws_id in self._repo_state_busy):
+            if ws is None or ws_id not in self._pages:
+                continue
+            if ws_id in self._repo_state_busy:
+                self._repo_state_again.add(ws_id)
                 continue
             self._repo_state_busy.add(ws_id)
             jobs.append((ws_id, ws.project_path))
@@ -8292,12 +8296,15 @@ class MainWindow(QMainWindow):
 
     def _on_repo_state_loaded(self, ws_id: str, path: str, state: str) -> None:
         self._repo_state_busy.discard(ws_id)
+        again = ws_id in self._repo_state_again
+        self._repo_state_again.discard(ws_id)
         ws = self.manager.workspace(ws_id)
         page = self._pages.get(ws_id)
         if ws is None or page is None or self._closing:
             return
-        if ws.project_path != path:
-            # the folder changed while this was in flight: ask the new one
+        if ws.project_path != path or again:
+            # the folder changed, or something (a Connect) asked again
+            # while this was in flight: this answer may be stale
             self._probe_repo_state([ws_id])
             return
         if state == repo_activity.STATE_UNKNOWN:

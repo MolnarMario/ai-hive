@@ -169,9 +169,10 @@ NO_ACCESS_TEXT = (
 def connect_origin(project_path: str, remote: str, runner) -> str:
     """Add `remote` as the folder's origin; return an error for the user,
     or "" on success. In order: the URL must name a github.com owner and
-    repository, git must reach it with the user's own sign-in (`ls-remote`),
-    a folder outside any repository is made one (`git init`), then
-    `remote add origin`. A failure before the last step leaves the folder
+    repository, the folder must not sit inside a parent folder's
+    repository (Connect would set up that one), git must reach it with the
+    user's own sign-in (`ls-remote`), a folder outside any repository is
+    made one (`git init`), then `remote add origin`. A failure before the last step leaves the folder
     as it was. `runner(argv, timeout) -> (rc, output)`: MainWindow passes
     workspace_sync.sync_runner (it imports Qt, this module doesn't)."""
     from .lanes import find_repo_root
@@ -181,12 +182,21 @@ def connect_origin(project_path: str, remote: str, runner) -> str:
                 "repository name.")
     if not project_path or not os.path.isdir(project_path):
         return "Folder not found:\n" + str(project_path)
+    root = find_repo_root(project_path)
+    if root and (os.path.normcase(os.path.realpath(root))
+                 != os.path.normcase(os.path.realpath(project_path))):
+        # the repository is a parent folder's: its origin, and the
+        # checkout a sync makes after Connect, would land there, outside
+        # the folder the dialog named
+        return ("This folder is inside another git repository:\n" + root
+                + "\n\nConnect that folder instead, or move this one out "
+                "of it.")
     rc, out = runner(["git", "ls-remote", "--heads", remote],
                      CONNECT_REACH_TIMEOUT_S)
     if rc != 0:
         detail = (out or "").strip() or "git did not answer."
         return NO_ACCESS_TEXT + "\n\n" + detail
-    if not find_repo_root(project_path):
+    if not root:
         rc, out = runner(["git", "-C", project_path, "init"],
                          CONNECT_GIT_TIMEOUT_S)
         if rc != 0:

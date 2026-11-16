@@ -1881,7 +1881,13 @@ class Sidebar(QFrame):
                     return
 
     def _update_count(self) -> None:
-        self.count_label.setText(str(len(self._ws_data)))
+        text = str(len(self._ws_data))
+        if text == self.count_label.text():
+            return
+        self.count_label.setText(text)
+        # a wider count (9 to 10) may no longer fit beside the title
+        self._header_fit = None
+        self._fit_header()
 
     # --------------------------------------------------------- reordering ---
 

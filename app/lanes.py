@@ -108,8 +108,11 @@ DONE_GREP = r"^[[:space:]]*task done[.!]?[[:space:]]*$"
 # origin/main: Fast-forward") point it at base commits nobody made there.
 OWN_COMMIT_ACTIONS = ("commit", "cherry-pick", "revert")
 # reflog actions that can bring in commits made somewhere else: a merge of
-# another lane's branch put that lane's "Task done" flag in this one
-MERGED_IN_ACTIONS = ("merge", "pull", "reset")
+# another lane's branch put that lane's "Task done" flag in this one, and
+# a reset (`branch -f`, `switch -C` and `checkout -B` log "branch: Reset
+# to") can point the branch at another lane's. A rebase is left out: it
+# rewrites the lane's own commits too, so its own flag would read as foreign
+MERGED_IN_ACTIONS = ("merge", "pull", "reset", "branch: Reset to")
 # how far back a done check reads a branch's reflog
 REFLOG_SCAN = 500
 
@@ -1342,8 +1345,11 @@ def _own_flag(root: str, flags: list, reflog: tuple, base: str) -> str:
         return flags[0] if flags else ""
     pending, foreign = set(candidates), set()
     for new, old in moves:
-        r = git(["rev-list", new, f"^{base}", *([f"^{old}"] if old else [])],
-                root)
+        if not old:
+            # the oldest row read: what the branch held before it is
+            # unknown (expired, or past REFLOG_SCAN), so it is no evidence
+            continue
+        r = git(["rev-list", new, f"^{base}", f"^{old}"], root)
         if r.ok:
             foreign |= pending & set(r.out.split())
             pending -= foreign

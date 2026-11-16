@@ -183,8 +183,10 @@ class SidebarIconButton(QToolButton):
                self.ICON)
 
 
+@lru_cache(maxsize=1)
 def _cloud_path() -> QPainterPath:
-    """The cloud on the 24px grid: three circles and a flat base, centred."""
+    """The cloud on the 24px grid: three circles and a flat base, centred.
+    Built once: the spinning button paints it about 60 times a second."""
     path = QPainterPath()
     for cx, cy, r in ((12.2, 10.9, 6.6), (5.9, 14.9, 4.2),
                       (17.7, 14.4, 4.7)):
