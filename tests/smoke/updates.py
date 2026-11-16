@@ -2753,9 +2753,9 @@ def test_workspace_sync():
     plain.mkdir()
     rs = workspace_sync.sync_all(run, [("p", "P", str(plain)),
                                        ("g", "Gone", str(tmp / "nope"))])
-    check("ws-sync: a folder that is not a repo, and a missing one, are "
-          "skipped with the reason",
-          [r.outcome for r in rs] == [Outcome.SKIPPED] * 2
+    check("ws-sync: a folder that is not a repo is not connected, and a "
+          "missing one is skipped with the reason",
+          [r.outcome for r in rs] == [Outcome.NOT_CONNECTED, Outcome.SKIPPED]
           and "Not a git repository" in rs[0].detail
           and "missing" in rs[1].detail, [vars(r) for r in rs])
 
@@ -2830,7 +2830,9 @@ def test_workspace_sync():
           ("checking", ["id1"], Outcome.SKIPPED) in events
           and ("updating", ["id1"], Outcome.SKIPPED) in events
           and ("done", ["id1"], Outcome.UPDATED) in events
-          and ("done", ["id2"], Outcome.SKIPPED) in events
+          and ("done", ["id2"], Outcome.NOT_CONNECTED) in events
+          and not any(ev == "checking" and ids == ["id2"]
+                      for ev, ids, _o in events)
           and not any(ev == "updating" and ids == ["id2"]
                       for ev, ids, _o in events)
           and rs[0].ids == ["id1"], events)
@@ -2980,11 +2982,12 @@ def test_workspace_sync():
     win.sync_all_workspaces()
     wait_sync()
     box = win._workspace_sync_box
-    check("ws-sync: a clicked sync that skips a folder lists every "
-          "workspace in a dialog",
+    check("ws-sync: a clicked sync with a folder that is not connected "
+          "lists every workspace in a dialog, that one under Not connected",
           box is not None and box.isVisible()
           and "Synced: Up to date." in box.plain_text()
-          and "Plain: Not a git repository." in box.plain_text(),
+          and "Not connected (1)\n  Plain: Not a git repository yet."
+          in box.plain_text(),
           box.plain_text() if box is not None else None)
     check("ws-sync: ...and an up-to-date workspace shows a short green "
           "notice", seen[-1] == ("ok", "✓ Up to date with origin/main"),
@@ -3095,6 +3098,229 @@ def test_workspace_sync():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_workspace_sync_connect():
+    """The sidebar sync checks only the workspaces connected to a
+    repository; the results window connects the others (Connect to repo)
+    and syncs each one alone, tying its branch to the remote
+    (workspace_sync.link_upstream). Real git against temp repos; the
+    GitHub URL the stand-in dialog gives is rewritten to a local bare repo
+    by the runner, so nothing reaches the network."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app import workspace_sync
+    from app.session_store import SessionStore
+    from app.widgets import main_window as mw_mod
+    from app.workspace_sync import Outcome
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+    run = workspace_sync.sync_runner
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-wsconn-"))
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    seed = tmp / "seed"
+    seed.mkdir()
+    _sync_git(seed, "init", "-q", "-b", "main")
+    (seed / "a.txt").write_text("a\n")
+    _sync_git(seed, "add", ".")
+    _sync_git(seed, "commit", "-q", "-m", "one")
+    (seed / "b.txt").write_text("b\n")
+    _sync_git(seed, "add", ".")
+    _sync_git(seed, "commit", "-q", "-m", "two")
+    origin = tmp / "origin.git"
+    _sync_git(tmp, "clone", "-q", "--bare", str(seed), str(origin))
+
+    # --- link_upstream, folder by folder ----------------------------------
+    def linked(folder):
+        return workspace_sync.sync_all(run, [("w", "W", str(folder))],
+                                       link=True)[0]
+
+    fresh = tmp / "fresh"
+    fresh.mkdir()
+    (fresh / "notes.md").write_text("mine\n")
+    _sync_git(fresh, "init", "-q", "-b", "master")
+    r = workspace_sync.sync_all(run, [("w", "W", str(fresh))])[0]
+    check("ws-connect: a repository with no remote is not connected, and "
+          "is never fetched", r.outcome is Outcome.NOT_CONNECTED
+          and r.detail == workspace_sync.NO_REMOTE_TEXT, vars(r))
+    _sync_git(fresh, "remote", "add", "origin", str(origin))
+    r = linked(fresh)
+    check("ws-connect: a folder with no commits brings down the remote's "
+          "default branch, tracking it, and keeps its own files",
+          r.outcome is Outcome.UPDATED and r.pulled == 2
+          and r.branch == "main" and "Brought down 'main'" in r.detail
+          and (fresh / "b.txt").read_text() == "b\n"
+          and (fresh / "notes.md").read_text() == "mine\n"
+          and _sync_git(fresh, "rev-parse", "--abbrev-ref", "@{upstream}")
+          == "origin/main", vars(r))
+
+    clash = tmp / "clash"
+    clash.mkdir()
+    (clash / "a.txt").write_text("my own a\n")
+    _sync_git(clash, "init", "-q")
+    _sync_git(clash, "remote", "add", "origin", str(origin))
+    r = linked(clash)
+    check("ws-connect: a file of the same name already there stops the "
+          "checkout before it writes anything",
+          r.outcome is Outcome.SKIPPED and "same names" in r.detail
+          and workspace_sync.needs_attention(r)
+          and (clash / "a.txt").read_text() == "my own a\n", vars(r))
+
+    behind = tmp / "behind"
+    _sync_git(tmp, "clone", "-q", str(origin), str(behind))
+    _sync_git(behind, "reset", "-q", "--hard", "HEAD~1")
+    _sync_git(behind, "branch", "--unset-upstream")
+    r = workspace_sync.sync_all(run, [("w", "W", str(behind))])[0]
+    check("ws-connect: a plain sync leaves a branch that tracks nothing "
+          "alone", r.outcome is Outcome.SKIPPED
+          and "does not track" in r.detail, vars(r))
+    r = linked(behind)
+    check("ws-connect: a branch with commits is tied to the remote's branch "
+          "of the same name, then fast-forwarded",
+          r.outcome is Outcome.UPDATED and r.pulled == 1
+          and _sync_git(behind, "rev-parse", "--abbrev-ref", "@{upstream}")
+          == "origin/main", vars(r))
+    _sync_git(behind, "switch", "-q", "-c", "feature")
+    r = linked(behind)
+    check("ws-connect: a branch the remote lacks is reported, never pushed",
+          r.outcome is Outcome.SKIPPED and "no branch 'feature'" in r.detail
+          and _sync_git(origin, "branch", "--list", "feature") == "",
+          vars(r))
+    empty = tmp / "empty.git"
+    _sync_git(tmp, "init", "-q", "--bare", str(empty))
+    blank = tmp / "blank"
+    blank.mkdir()
+    _sync_git(blank, "init", "-q")
+    _sync_git(blank, "remote", "add", "origin", str(empty))
+    r = linked(blank)
+    check("ws-connect: an empty remote is reported",
+          r.outcome is Outcome.SKIPPED and "empty" in r.detail, vars(r))
+
+    # --- the window: Connect from the results ------------------------------
+    here = tmp / "here"
+    _sync_git(tmp, "clone", "-q", str(origin), str(here))
+    plain = tmp / "plain"
+    plain.mkdir()
+    (plain / "todo.md").write_text("x\n")
+    norem = tmp / "norem"
+    norem.mkdir()
+    _sync_git(norem, "init", "-q")
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    mgr = win.manager
+    ws_here = mgr.create_workspace("Here", str(here))
+    ws_plain = mgr.create_workspace("Plain", str(plain))
+    ws_norem = mgr.create_workspace("Norem", str(norem))
+    pump(50)
+    url = "https://github.com/o/new.git"
+    calls = []
+
+    def runner(argv, timeout=None):
+        argv = [str(origin) if a == url else a for a in argv]
+        calls.append(argv)
+        return run(argv, timeout)
+
+    win.arm_workspace_sync(runner)
+    win._repo_connect_runner = runner
+    notices = []
+    for ws in (ws_plain, ws_norem):
+        page = win._pages[ws.id]
+        page.show_sync_notice = (lambda *a, i=ws.id:
+                                 notices.append((i,) + a))
+
+    def wait():
+        deadline = time.monotonic() + 30
+        while ((win._workspace_sync_job is not None
+                or win._connect_progress is not None
+                or win._ws_sync_pending)
+               and time.monotonic() < deadline):
+            pump(30)
+        pump(80)
+
+    win.sync_all_workspaces()
+    wait()
+    box = win._workspace_sync_box
+    fetched = [c for c in calls if "fetch" in c]
+    check("ws-connect: the sidebar sync fetches only the connected folder; "
+          "the others get no notice",
+          len(fetched) == 1 and str(here) in fetched[0] and notices == [],
+          (fetched, notices))
+    check("ws-connect: ...and its window lists the others to connect",
+          box is not None and box.isVisible()
+          and ws_plain.id in box.connect_buttons
+          and ws_norem.id in box.connect_buttons
+          and "  Plain: Not a git repository yet." in box.plain_text()
+          and ("  Norem: " + workspace_sync.NO_REMOTE_TEXT)
+          in box.plain_text(),
+          box.plain_text() if box is not None else None)
+
+    answers = []
+
+    class FakeDialog:
+        def __init__(self, folder, url_="", parent=None):
+            pass
+
+        def exec(self):
+            return (QDialog.DialogCode.Accepted if answers.pop(0)
+                    else QDialog.DialogCode.Rejected)
+
+        def url(self):
+            return url
+
+    real_dialog = mw_mod.ConnectRepoDialog
+    mw_mod.ConnectRepoDialog = FakeDialog
+    try:
+        answers[:] = [False]
+        box.connect_buttons[ws_norem.id].click()
+        pump(50)
+        btn = box.connect_buttons[ws_norem.id]
+        check("ws-connect: a Connect the user cancels leaves the row as it "
+              "was", btn.isEnabled() and btn.text() == "Connect"
+              and not win._connect_then_sync)
+
+        answers[:] = [True]
+        box.connect_buttons[ws_plain.id].click()
+        btn = box.connect_buttons[ws_plain.id]
+        connecting = (not btn.isEnabled(), btn.text())
+        wait()
+    finally:
+        mw_mod.ConnectRepoDialog = real_dialog
+    got = {r.ids[0]: r for r in box.results()}
+    plain_res = got.get(ws_plain.id)
+    check("ws-connect: the row says Connecting while it connects",
+          connecting == (True, "Connecting\u2026"), connecting)
+    check("ws-connect: Connect adds the remote, then syncs that folder "
+          "alone and brings its code down",
+          plain_res is not None and plain_res.outcome is Outcome.UPDATED
+          and (plain / "a.txt").read_text() == "a\n"
+          and (plain / "todo.md").read_text() == "x\n"
+          and _sync_git(plain, "rev-parse", "--abbrev-ref", "@{upstream}")
+          == "origin/main",
+          vars(plain_res) if plain_res is not None else box.plain_text())
+    check("ws-connect: ...the result replaces its row in the same window, "
+          "the others stay",
+          win._workspace_sync_box is box and ws_plain.id
+          not in box.connect_buttons and ws_norem.id in box.connect_buttons
+          and got.get(ws_here.id) is not None
+          and "Updated (1)" in box.plain_text()
+          and "  Norem: " in box.plain_text()
+          and "  Plain: Not a git" not in box.plain_text()
+          and win._last_workspace_sync == box.results(), box.plain_text())
+    check("ws-connect: ...and the workspace's notice says what it pulled",
+          any(n[0] == ws_plain.id and n[1] == "ok" for n in notices),
+          notices)
+    box.close()
+    pump(20)
+    win.close()
+    win.deleteLater()
+    pump(20)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_workspace_sync_results_dialog():
     """The window a clicked sync opens (app/widgets/sync_results.py): the
     results sorted into sections worst first, each its own color, so the
@@ -3133,7 +3359,7 @@ def test_workspace_sync_results_dialog():
           "commits it could not take), updated, not synced, up to date",
           [[r.names[0] for r in groups[k]] for k, _h, _g
            in sync_results.SECTIONS]
-          == [["Lift", "Scraper"], ["Hive"], ["Proverbs"],
+          == [["Lift", "Scraper"], ["Hive"], [], ["Proverbs"],
               ["Chess", "CV", "Rent"]], groups)
     text = sync_results.plain_text(results)
     check("ws-sync dialog: the report text leads with what needs the user, "
@@ -3194,6 +3420,7 @@ def test_workspace_sync_results_dialog():
           "red and updated green",
           [t.property("section") for t in titles]
           == ["attention", "updated", "skipped", "current"]
+          and not box.connect_buttons
           and titles[0].text().startswith("NEEDS ATTENTION")
           and (f'QLabel#SyncSectionTitle[section="attention"] {{ color: '
                f'{Palette.RED}; }}') in qss
@@ -3235,6 +3462,63 @@ def test_workspace_sync_results_dialog():
           "typed", name.text() == "<b>Tools</b>"
           and name.textFormat().name == "PlainText")
     weird.close()
+    app.processEvents()
+
+    # folders with no repository: their own section, a Connect each
+    lone = [res("Notes", Outcome.NOT_CONNECTED,
+                workspace_sync.NOT_A_REPO_TEXT, ids=["n1", "n2"]),
+            res("Draft", Outcome.NOT_CONNECTED,
+                workspace_sync.NO_REMOTE_TEXT, ids=["d1"])]
+    lone[0].names = ["Notes", "Notes 2"]
+    check("ws-sync dialog: with nothing connected the headline says so",
+          sync_results.headline(sync_results.group(lone))
+          == "No workspace is connected to GitHub yet"
+          and sync_results.headline(sync_results.group(lone + results[1:3]))
+          == "Sync finished")
+    conn = SyncResultsDialog(lone + [results[2]])
+    conn.show()
+    app.processEvents()
+    asked = []
+    conn.connectRequested.connect(asked.append)
+    btn = conn.connect_buttons.get("n1")
+    sections = [t.property("section")
+                for t in conn.findChildren(QLabel, "SyncSectionTitle")]
+    check("ws-sync dialog: not connected folders get their own section, "
+          "after updated, with a Connect button per folder",
+          sections == ["updated", "unconnected"]
+          and btn is not None and btn is conn.connect_buttons.get("n2")
+          and btn.text() == "Connect" and btn.isEnabled()
+          and conn.connect_buttons.get("d1") not in (None, btn)
+          and "Not connected (2)" in conn.plain_text()
+          and ('QLabel#SyncSectionTitle[section="unconnected"]' in qss),
+          sections)
+    btn.click()
+    check("ws-sync dialog: Connect asks for every workspace on that folder",
+          asked == [["n1", "n2"]], asked)
+    conn.set_row_busy(["n2"], "Connecting\u2026")
+    busy_btn = conn.connect_buttons["n1"]
+    check("ws-sync dialog: a row connecting is greyed and says so",
+          not busy_btn.isEnabled() and busy_btn.text() == "Connecting\u2026")
+    conn.replace_results([res("Draft", Outcome.UPDATED,
+                              "Brought down 'main' from GitHub (2 commits).",
+                              ids=["d1"], branch="main")])
+    app.processEvents()
+    rows = conn.findChildren(QFrame, "SyncRow")
+    still = conn.connect_buttons.get("n1")
+    check("ws-sync dialog: a folder's new result replaces its row in "
+          "place, and another row still connecting keeps saying so",
+          [r.names[0] for r in conn.results()] == ["Notes", "Draft", "Hive"]
+          and conn.results()[1].outcome is Outcome.UPDATED
+          and "d1" not in conn.connect_buttons
+          and still is not None and not still.isEnabled()
+          and still.text() == "Connecting\u2026"
+          and "Updated (2)" in conn.plain_text()
+          and len([r for r in rows if r.isVisible()]) == 3,
+          conn.plain_text())
+    conn.set_row_busy(["n1"], "")
+    check("ws-sync dialog: ...and gets its button back when that ends",
+          still.isEnabled() and still.text() == "Connect")
+    conn.close()
     app.processEvents()
 
     stopped = SyncResultsDialog(None)

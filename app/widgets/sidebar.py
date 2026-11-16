@@ -30,6 +30,12 @@ count (`_position_search`), and each keystroke recomputes highlight sets
 name/summary (`_agent_haystack`), a matching agent's workspace is auto-expanded
 to reveal it, and matches get a `search_hit` tint (`set_search_hit`). Search is
 transient too: it saves/restores the pre-search expansion and never persists.
+
+The header's buttons are square and the same size, with painted icons
+(`header_icons`), so they sit on one line with the title. The sidebar is
+resizable, so `_fit_header` spends the width it has: wider gaps on a wide
+rail, then smaller buttons, and on the narrowest rail it drops the count
+before it clips the WORKSPACES title.
 """
 
 import contextlib
@@ -53,6 +59,8 @@ from ..process_worker import describe_pid
 from ..terminal_agent import AgentStatus
 from ..ui_theme import Palette, repolish
 from .activity_panel import _ICON
+from .header_icons import (AddWorkspaceButton, CloudSyncButton,
+                           SidebarIconButton)
 from .ornaments import (AgentCountBadge, ElidingLabel, FadingLabel,
                         OrnamentDivider, WorkspaceSpinner,
                         close_on_anchor_press, working_pulse)
@@ -1239,57 +1247,63 @@ class Sidebar(QFrame):
         lay.setSpacing(4)
 
         header = QWidget(self)
+        header.setObjectName("SidebarHeader")
+        header.setFixedHeight(self.HEADER_H)
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(12, 0, 8, 0)
+        hl.setContentsMargins(12, 0, 10, 0)
         self.header = header
+        self._header_layout = hl
         self.title = QLabel("WORKSPACES", header)
         self.title.setObjectName("SidebarTitle")
         self.count_label = QLabel("0", header)
         self.count_label.setObjectName("WsCount")
+        self.count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         # search: a magnifier next to "add category"; clicking it expands an
         # input that OVERLAYS everything to its left (the title + count) and
         # live-highlights matching workspaces, agents, and agent summaries
-        self.search_btn = QToolButton(header)
+        self.search_btn = SidebarIconButton("search", header)
         self.search_btn.setObjectName("SearchBtn")
-        self.search_btn.setText("🔍")
         self.search_btn.setToolTip("Search workspaces & agents")
+        self.search_btn.setAccessibleName("Search workspaces and agents")
         self.search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.search_btn.clicked.connect(lambda: self._toggle_search())
-        self.add_cat_btn = QToolButton(header)
+        self.add_cat_btn = SidebarIconButton("package", header)
         self.add_cat_btn.setObjectName("AddCatBtn")
-        self.add_cat_btn.setText("📦")
         self.add_cat_btn.setToolTip("Add category (group related workspaces)")
+        self.add_cat_btn.setAccessibleName("Add category")
         self.add_cat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         # lambda: clicked() passes a `checked` bool that must not shadow `name`
         self.add_cat_btn.clicked.connect(lambda: self._add_category())
-        # one click pulls every workspace's folder forward from GitHub
-        # (MainWindow.sync_all_workspaces, app/workspace_sync.py)
-        self.sync_btn = QToolButton(header)
+        # one click pulls every connected workspace's folder forward from
+        # GitHub (MainWindow.sync_all_workspaces, app/workspace_sync.py)
+        self.sync_btn = CloudSyncButton(header)
         self.sync_btn.setObjectName("SyncBtn")
-        self.sync_btn.setText("↻")
+        self.sync_btn.setAccessibleName("Sync with GitHub")
         self.sync_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sync_btn.clicked.connect(self.syncRequested)
         self.set_sync_busy(False)
-        self.add_btn = QToolButton(header)
+        self.add_btn = AddWorkspaceButton(header)
         self.add_btn.setObjectName("AddWsBtn")
-        self.add_btn.setText("+")
         self.add_btn.setToolTip("Add workspace (choose a project folder)")
+        self.add_btn.setAccessibleName("Add workspace")
         self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.add_btn.clicked.connect(self.addRequested)
-        # the header is narrower than its title plus four buttons at their
-        # natural width (about 40px each), so the glyph buttons are compact
-        # and close together, or the WORKSPACES title gets clipped
-        hl.setSpacing(2)
-        for btn in (self.search_btn, self.sync_btn, self.add_cat_btn):
-            btn.setFixedWidth(26)
-        hl.addWidget(self.title)
-        hl.addSpacing(4)
-        hl.addWidget(self.count_label)
+        self._header_buttons = (self.search_btn, self.sync_btn,
+                                self.add_cat_btn, self.add_btn)
+        hl.setSpacing(0)
+        hl.addWidget(self.title, 0, Qt.AlignmentFlag.AlignVCenter)
+        hl.addSpacing(8)
+        hl.addWidget(self.count_label, 0, Qt.AlignmentFlag.AlignVCenter)
         hl.addStretch(1)
-        hl.addWidget(self.search_btn)
-        hl.addWidget(self.sync_btn)
-        hl.addWidget(self.add_cat_btn)
-        hl.addWidget(self.add_btn)
+        # the gaps between the buttons are spacer items _fit_header sizes
+        self._button_gaps = []
+        for i, btn in enumerate(self._header_buttons):
+            if i:
+                hl.addSpacing(0)
+                self._button_gaps.append(hl.itemAt(hl.count() - 1))
+            hl.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._header_fit = None
+        self._count_hidden_for_room = False
         # overlay search field: a child of the header positioned by hand (NOT in
         # the layout) so it can cover the title/count region exactly when shown
         self.search_edit = QLineEdit(header)
@@ -1312,13 +1326,60 @@ class Sidebar(QFrame):
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
     def set_sync_busy(self, busy: bool) -> None:
-        """The sync button while a sync runs: disabled, saying so."""
+        """The sync button while a sync runs: disabled, its arrows turning,
+        saying so."""
         self.sync_btn.setEnabled(not busy)
+        self.sync_btn.set_spinning(busy)
         self.sync_btn.setToolTip(
-            "Syncing every workspace with GitHub..." if busy else
-            "Sync all workspaces with GitHub: pull the newest commits into "
-            "each workspace's folder (fast-forward only, local work is "
-            "never overwritten)")
+            "Syncing with GitHub..." if busy else
+            "Sync with GitHub: pull the newest commits into every workspace "
+            "connected to a repository (fast-forward only, local work is "
+            "never overwritten). The results list the others, to connect.")
+
+    # the header's height, and its buttons' sizes from roomy to tight
+    HEADER_H = 38
+    # (button side, gap between buttons, extra gap before the add button)
+    HEADER_FITS = ((28, 8, 6), (28, 5, 4), (28, 3, 3), (26, 2, 2),
+                   (24, 0, 2))
+
+    def _fit_header(self) -> None:
+        """Size the header's buttons and gaps for the width it has (see the
+        module docstring): the roomiest fit that keeps the title and count
+        whole, else the roomiest that keeps the title, without the count."""
+        hl = self._header_layout
+        left, _t, right, _b = hl.getContentsMargins()
+        # the header spans the sidebar, and is laid out after this resize
+        room = self.width() - left - right
+        title = self.title.sizeHint().width()
+        count = 8 + self.count_label.sizeHint().width()
+
+        def width(fit) -> int:
+            side, gap, extra = fit
+            n = len(self._header_buttons)
+            return n * side + (n - 1) * gap + extra + 8
+
+        choice, with_count = self.HEADER_FITS[-1], False
+        for keep_count in (True, False):
+            need = title + (count if keep_count else 0)
+            fit = next((f for f in self.HEADER_FITS
+                        if need + width(f) <= room), None)
+            if fit is not None:
+                choice, with_count = fit, keep_count
+                break
+        key = (choice, with_count)
+        if key == self._header_fit:
+            return
+        self._header_fit = key
+        side, gap, extra = choice
+        for btn in self._header_buttons:
+            btn.setFixedSize(side, side)
+        for i, item in enumerate(self._button_gaps):
+            wide = gap + (extra if i == len(self._button_gaps) - 1 else 0)
+            item.changeSize(wide, 0)
+        self._count_hidden_for_room = not with_count
+        if not self._search_active:
+            self.count_label.setVisible(with_count)
+        hl.invalidate()
 
     # -------------------------------------------------------------- search ---
 
@@ -1345,7 +1406,8 @@ class Sidebar(QFrame):
         self.search_edit.hide()
         self.search_edit.clear()
         self.title.show()
-        self.count_label.show()
+        self.count_label.setVisible(
+            not getattr(self, "_count_hidden_for_room", False))
         self._search_query = ""
         self._search_ws_hits = set()
         self._search_agent_hits = set()
@@ -1406,6 +1468,7 @@ class Sidebar(QFrame):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._fit_header()
         self._position_search()   # keep the overlay aligned as the rail resizes
 
     # ------------------------------------------------------------- model ---

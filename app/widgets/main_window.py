@@ -3248,6 +3248,12 @@ class MainWindow(QMainWindow):
         self._repo_state_busy: set[str] = set()
         self._repo_connect_runner = None
         self._connect_progress: QProgressDialog | None = None
+        # Connects started from the Sync with GitHub window: ws id -> the
+        # ids on that window's row, synced once the connect succeeds
+        self._connect_then_sync: dict[str, list] = {}
+        # those syncs, waiting while another sync runs
+        self._ws_sync_pending: list[list] = []
+        self._ws_sync_running_ids: list[list] = []
         self.repoStateLoaded.connect(self._on_repo_state_loaded)
         self.repoConnectFinished.connect(self._on_repo_connect_finished)
         self.workspaceCloneFinished.connect(self._on_workspace_clone_finished)
@@ -8303,20 +8309,21 @@ class MainWindow(QMainWindow):
             page.reset_repo_activity()
         page.set_repo_connected(connected)
 
-    def _connect_workspace_repo(self, ws_id: str, url: str = "") -> None:
+    def _connect_workspace_repo(self, ws_id: str, url: str = "") -> bool:
         """Connect to repo: ask for a GitHub URL, then check it and add it
         as origin on a worker (repo_activity.connect_origin). A failure
-        says why and opens the dialog again with the same URL."""
+        says why and opens the dialog again with the same URL. True when
+        the connect started (the user did not cancel)."""
         ws = self.manager.workspace(ws_id)
         if ws is None or self._connect_progress is not None:
-            return
+            return False
         if not os.path.isdir(ws.project_path):
             QMessageBox.warning(self, "AI Hive",
                                 f"Folder not found:\n{ws.project_path}")
-            return
+            return False
         dialog = ConnectRepoDialog(ws.project_path, url, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+            return False
         url = dialog.url()
         path = ws.project_path
         runner = self._repo_connect_runner
@@ -8345,6 +8352,7 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=run, name="github-repo-connect",
                          daemon=True).start()
+        return True
 
     def _on_repo_connect_finished(self, ws_id: str, path: str, url: str,
                                   error: str) -> None:
@@ -8358,12 +8366,21 @@ class MainWindow(QMainWindow):
         # header reads the new origin either way
         self._refresh_workspace_lane_toggles(ws_id)
         self._probe_repo_state([ws_id])
-        if error:
-            QMessageBox.warning(self, "Could not connect the repository",
-                                error)
-            ws = self.manager.workspace(ws_id)
-            if ws is not None and ws.project_path == path:
-                self._connect_workspace_repo(ws_id, url)
+        # a Connect from the Sync with GitHub window syncs the folder next
+        then_sync = self._connect_then_sync.pop(ws_id, None)
+        if not error:
+            if then_sync:
+                self._sync_connected_workspaces(then_sync)
+            return
+        QMessageBox.warning(self, "Could not connect the repository",
+                            error)
+        ws = self.manager.workspace(ws_id)
+        if (ws is not None and ws.project_path == path
+                and self._connect_workspace_repo(ws_id, url)):
+            if then_sync:
+                self._connect_then_sync[ws_id] = then_sync
+        elif then_sync:
+            self._sync_box_row_busy(then_sync, "")
 
     def _load_repo_activity(self, ws_id: str) -> None:
         """The dropdown opened. It already shows the cached list (or the
@@ -8672,7 +8689,19 @@ class MainWindow(QMainWindow):
         each repository's checkouts sync on that repository's lane queue
         (`LaneOps.submit`, not exclusive), where the lane service's base
         fetch runs too, so the two never race for the repo's ref locks. The
-        fast-forward holds the repository's lane lock."""
+        fast-forward holds the repository's lane lock. Only the folders
+        connected to a repository are synced; the rest come back as
+        NOT_CONNECTED, which the results window offers to connect."""
+        folders = [(ws.id, ws.name, ws.project_path)
+                   for ws in self.manager.workspaces]
+        return self._start_workspace_sync(folders, auto)
+
+    def _start_workspace_sync(self, folders, auto: bool = False,
+                              connect: bool = False) -> bool:
+        """`sync_all_workspaces` for the given [(ws id, name, folder)].
+        `connect` is the sync of folders the user just connected from the
+        results window: it ties each to its remote first
+        (`workspace_sync.link_upstream`) and reports into that window."""
         from app import workspace_sync
         from .self_update_dialog import Job
 
@@ -8682,12 +8711,11 @@ class MainWindow(QMainWindow):
         runner = getattr(self, "_workspace_sync_runner", None)
         if runner is None:
             return False
-        folders = [(ws.id, ws.name, ws.project_path)
-                   for ws in self.manager.workspaces]
         if not folders:
             return False
         state = {"auto": auto, "runner": runner, "plan": None, "left": 0,
-                 "pairs": [], "app_busy": self._app_updating()}
+                 "pairs": [], "app_busy": self._app_updating(),
+                 "connect": connect}
         job = Job(lambda: workspace_sync.plan(runner, folders), self,
                   name="ai-hive-workspace-sync")
         job.finished.connect(
@@ -8719,14 +8747,14 @@ class MainWindow(QMainWindow):
             return
         auto = state["auto"]
         if not isinstance(plan, workspace_sync.Plan):
-            self._on_workspaces_synced(plan, auto)
+            self._on_workspaces_synced(plan, auto, state["connect"])
             return
         state["plan"] = plan
         progress = self._workspace_sync_progress(auto)
         workspace_sync.tell_unsyncable(plan, progress)
         groups = list(plan.groups.values())
         if not groups or self._closing:
-            self._on_workspaces_synced(plan.finish(), auto)
+            self._on_workspaces_synced(plan.finish(), auto, state["connect"])
             return
         state["left"] = len(groups)
         for items in groups:
@@ -8736,7 +8764,7 @@ class MainWindow(QMainWindow):
             self.lane_ops.submit(
                 repo, workspace_sync.run_group, state["runner"], plan,
                 items, self_update.REPO_DIR, progress, state["app_busy"],
-                self.lane_ops.lock_for(repo),
+                self.lane_ops.lock_for(repo), state["connect"],
                 label="ws-sync", exclusive=False,
                 callback=lambda got, err, s=state, it=items:
                     self._on_workspace_sync_group(s, it, got, err))
@@ -8754,7 +8782,8 @@ class MainWindow(QMainWindow):
         if (state["left"] <= 0
                 and getattr(self, "_workspace_sync_job", None) is state):
             self._on_workspaces_synced(
-                state["plan"].finish(state["pairs"]), state["auto"])
+                state["plan"].finish(state["pairs"]), state["auto"],
+                state["connect"])
 
     def _on_workspace_sync_progress(self, event: str, res, auto: bool) -> None:
         """Turn one progress event into the notice over each workspace on
@@ -8762,7 +8791,8 @@ class MainWindow(QMainWindow):
         from app import workspace_sync
         from app.workspace_sync import Outcome
 
-        if self._closing:
+        if self._closing or res.outcome is Outcome.NOT_CONNECTED:
+            # a folder with no repository was never synced: no notice
             return
         source = res.upstream or "GitHub"
         notice = None                   # (state, text, hide after ms)
@@ -8791,33 +8821,51 @@ class MainWindow(QMainWindow):
             if page is not None:
                 page.show_sync_notice(*notice)
 
-    def _on_workspaces_synced(self, results, auto: bool = False) -> None:
+    def _on_workspaces_synced(self, results, auto: bool = False,
+                              connect: bool = False) -> None:
         from app import self_update, workspace_sync
         from app.cli_update import needs_update
         from app.workspace_sync import Outcome
 
         self._workspace_sync_job = None
         self.sidebar.set_sync_busy(False)
+        how = "connect" if connect else "launch" if auto else "click"
         if not isinstance(results, list):
             self._audit_install(f"WS-SYNC stopped unexpectedly: {results}")
             results = None
         else:
             for res in results:
-                self._audit_install(workspace_sync.audit_line(
-                    res, "launch" if auto else "click"))
-        self._last_workspace_sync = results
+                self._audit_install(workspace_sync.audit_line(res, how))
+        box = getattr(self, "_workspace_sync_box", None)
+        if connect:
+            # the folders just connected: their rows in the results window
+            # take the outcome; a closed window leaves the notices to say it
+            if box is not None:
+                if results is None:
+                    for ids in self._ws_sync_running_ids:
+                        box.set_row_busy(ids, "")
+                else:
+                    box.replace_results(results)
+                self._last_workspace_sync = box.results()
+            elif results is not None:
+                self._last_workspace_sync = results
+        else:
+            self._last_workspace_sync = results
+        self._ws_sync_running_ids = []
         if self._closing:
             return
+        QTimer.singleShot(0, self, self._start_pending_connect_sync)
         if results and any(r.outcome is Outcome.UPDATED for r in results):
             # the base moved under the lanes: show it without waiting a poll
             self.lane_service.poke()
             installed = self_update.read_installed_version()
             if needs_update(__version__, installed):
                 self._note_app_restart_pending(installed)
-        if auto:
+        if auto or connect:
             return
         if results is None or any(
-                r.outcome in (Outcome.SKIPPED, Outcome.FAILED)
+                r.outcome in (Outcome.SKIPPED, Outcome.FAILED,
+                              Outcome.NOT_CONNECTED)
                 for r in results):
             self._show_workspace_sync_results(results)
 
@@ -8831,9 +8879,55 @@ class MainWindow(QMainWindow):
         if old is not None:
             old.close()
         box = SyncResultsDialog(results, self)
+        box.connectRequested.connect(self._connect_from_sync_results)
         box.destroyed.connect(lambda *_, b=box: self._forget_sync_box(b))
         self._workspace_sync_box = box
         box.show()
+
+    # Connect from the results window: the workspace header's Connect to
+    # repo (Agent lanes untouched: it only adds origin), then a sync of that
+    # folder alone that ties its branch to the remote
+    # (workspace_sync.link_upstream). The row says Connecting, then Syncing,
+    # then the result replaces it.
+
+    def _sync_box_row_busy(self, ids, text: str) -> None:
+        box = getattr(self, "_workspace_sync_box", None)
+        if box is not None:
+            box.set_row_busy(ids, text)
+
+    def _connect_from_sync_results(self, ids) -> None:
+        ids = [i for i in ids if self.manager.workspace(i) is not None]
+        if not ids or any(i in self._connect_then_sync for i in ids):
+            return
+        if self._connect_workspace_repo(ids[0]):
+            self._connect_then_sync[ids[0]] = ids
+            self._sync_box_row_busy(ids, "Connecting\u2026")
+
+    def _sync_connected_workspaces(self, ids) -> None:
+        """Sync the folder just connected now, or once the sync running
+        meanwhile is done."""
+        self._sync_box_row_busy(ids, "Syncing\u2026")
+        self._ws_sync_pending.append(list(ids))
+        self._start_pending_connect_sync()
+
+    def _start_pending_connect_sync(self) -> None:
+        if (not self._ws_sync_pending or self._closing
+                or getattr(self, "_workspace_sync_job", None) is not None):
+            return
+        batch, self._ws_sync_pending = self._ws_sync_pending, []
+        folders, seen = [], set()
+        for ids in batch:
+            for ws_id in ids:
+                ws = self.manager.workspace(ws_id)
+                if ws is not None and ws_id not in seen:
+                    seen.add(ws_id)
+                    folders.append((ws.id, ws.name, ws.project_path))
+        if self._start_workspace_sync(folders, connect=True):
+            self._ws_sync_running_ids = batch
+        else:
+            # not armed (the suite), or nothing left: give the rows back
+            for ids in batch:
+                self._sync_box_row_busy(ids, "")
 
     def _forget_sync_box(self, box) -> None:
         # the box a second sync replaced is destroyed after the new one is
