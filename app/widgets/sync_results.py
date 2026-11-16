@@ -9,6 +9,13 @@ into sections, worst first, each with its own color:
 - Needs attention: git failed, or GitHub has commits this folder could
   not take (`workspace_sync.needs_attention`). One row each, red.
 - Updated: what the sync pulled. One row each, green.
+- Not connected: folders with no repository or no remote, which the sync
+  leaves out (`workspace_sync.Outcome.NOT_CONNECTED`). One row each, in
+  the accent, with a Connect button: the workspace header's Connect to
+  repo dialog, then a sync of that folder alone. The row says what is
+  happening meanwhile, and the result replaces it in place
+  (`replace_results`), so the user connects one folder after another
+  without the window closing.
 - Not synced: folders with nothing to track (not a repository, a branch
   with no upstream). One row each, muted, because there is nothing to do.
 - Up to date: one wrapped line of names, since every reason would read
@@ -32,7 +39,7 @@ from __future__ import annotations
 
 import html
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QDialog, QFrame, QHBoxLayout, QLabel,
                                QPushButton, QScrollArea, QVBoxLayout,
@@ -48,18 +55,22 @@ MAX_SCREEN_SHARE = 0.6      # the list scrolls past this much of the screen
 SECTIONS = (
     ("attention", "Needs attention", "!"),
     ("updated", "Updated", "↑"),
+    ("unconnected", "Not connected", "○"),
     ("skipped", "Not synced", "•"),
     ("current", "Up to date", "✓"),
 )
 _FAILED_GLYPH = "✗"
+CONNECT_TEXT = "Connect"
+CONNECT_TIP = ("Connect this workspace's folder to a GitHub repository, "
+               "then sync it")
 _MONO = "font-family: Consolas, 'Cascadia Mono', monospace;"
 
 
 def section_of(res) -> str:
     if workspace_sync.needs_attention(res):
         return "attention"
-    return {Outcome.UPDATED: "updated", Outcome.UP_TO_DATE: "current"}.get(
-        res.outcome, "skipped")
+    return {Outcome.UPDATED: "updated", Outcome.UP_TO_DATE: "current",
+            Outcome.NOT_CONNECTED: "unconnected"}.get(res.outcome, "skipped")
 
 
 def group(results) -> dict:
@@ -78,6 +89,9 @@ def headline(groups) -> str:
     if n:
         return ("1 workspace needs your attention" if n == 1
                 else f"{n} workspaces need your attention")
+    if groups["unconnected"] and not any(
+            groups[k] for k, _h, _g in SECTIONS if k != "unconnected"):
+        return "No workspace is connected to GitHub yet"
     return "Sync finished"
 
 
@@ -150,9 +164,29 @@ def _plain_label(text: str, name: str) -> QLabel:
     return label
 
 
+def merged(old, new) -> list:
+    """`old` results with each of `new` in place of the old ones it shares a
+    workspace with (the first one's place), the rest of `new` at the end."""
+    out = list(old or ())
+    for res in new or ():
+        ids = set(res.ids)
+        at = next((i for i, r in enumerate(out) if ids & set(r.ids)), None)
+        out = [r for r in out if not ids & set(r.ids)]
+        if at is None:
+            out.append(res)
+        else:
+            out.insert(min(at, len(out)), res)
+    return out
+
+
 class SyncResultsDialog(QDialog):
     """Non-modal, deletes itself on close. Build it with the sync's results
-    (None when the sync stopped unexpectedly) and `show()` it."""
+    (None when the sync stopped unexpectedly) and `show()` it.
+    `connectRequested(ids)` asks the window to connect a Not connected
+    row's folder (the ids of the workspaces on it); `set_row_busy` and
+    `replace_results` report back."""
+
+    connectRequested = Signal(object)       # [ws id, ...]
 
     def __init__(self, results, parent=None):
         super().__init__(parent)
@@ -162,15 +196,49 @@ class SyncResultsDialog(QDialog):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setMinimumWidth(540)
         self._results = results
-        self._groups = group(results) if results is not None else None
-        self._scroll = self._body = None
+        self._groups = None
+        self._scroll = self._body = self._content = None
         self._fitted = False
+        # the Connect button per Not connected row, by its first ws id
+        self.connect_buttons: dict = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 18, 20, 16)
         root.setSpacing(12)
-        root.addLayout(self._header())
+        self._root = root
+        self._populate()
 
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.copy_btn = QPushButton("Copy")
+        self.copy_btn.setToolTip("Copy this report as text")
+        self.copy_btn.setAutoDefault(False)
+        self.copy_btn.clicked.connect(self._copy)
+        self.close_btn = QPushButton("Close")
+        self.close_btn.setDefault(True)
+        self.close_btn.clicked.connect(self.close)
+        buttons.addWidget(self.copy_btn)
+        buttons.addWidget(self.close_btn)
+        root.addLayout(buttons)
+
+    def _populate(self) -> None:
+        """The header and the sections, from `self._results`. Called again
+        by `replace_results`: the old content goes, the buttons stay."""
+        results = self._results
+        self._groups = group(results) if results is not None else None
+        busy = {k: (b.text(), b.isEnabled())
+                for k, b in self.connect_buttons.items()}
+        self.connect_buttons = {}
+        if self._content is not None:
+            self._root.removeWidget(self._content)
+            self._content.hide()
+            self._content.deleteLater()
+        content = QWidget()
+        lay = QVBoxLayout(content)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+        lay.addLayout(self._header())
+        self._scroll = self._body = None
         if self._groups is not None and results:
             body = _themed(QWidget(), "SyncBody")
             col = QVBoxLayout(body)
@@ -188,20 +256,41 @@ class SyncResultsDialog(QDialog):
                 Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             scroll.setWidget(body)
             self._scroll, self._body = scroll, body
-            root.addWidget(scroll, 1)
+            lay.addWidget(scroll, 1)
+        self._content = content
+        self._root.insertWidget(0, content, 1)
+        # a row still connecting keeps saying so after a rebuild
+        for key, (text, enabled) in busy.items():
+            btn = self.connect_buttons.get(key)
+            if btn is not None and not enabled:
+                btn.setText(text)
+                btn.setEnabled(False)
 
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        self.copy_btn = QPushButton("Copy")
-        self.copy_btn.setToolTip("Copy this report as text")
-        self.copy_btn.setAutoDefault(False)
-        self.copy_btn.clicked.connect(self._copy)
-        self.close_btn = QPushButton("Close")
-        self.close_btn.setDefault(True)
-        self.close_btn.clicked.connect(self.close)
-        buttons.addWidget(self.copy_btn)
-        buttons.addWidget(self.close_btn)
-        root.addLayout(buttons)
+    # --- what the window reports back --------------------------------------
+    def results(self) -> list:
+        return list(self._results or ())
+
+    def replace_results(self, new) -> None:
+        """A sync of some folders finished (one the user just connected):
+        their rows are replaced in place and the sections re-sorted."""
+        if self._results is None:
+            self._results = list(new or ())
+        else:
+            self._results = merged(self._results, new)
+        for res in new or ():
+            for ws_id in res.ids:
+                self.connect_buttons.pop(ws_id, None)
+        self._populate()
+
+    def set_row_busy(self, ids, text: str = "") -> None:
+        """A Not connected row's button while its folder connects or syncs:
+        greyed with `text`. An empty `text` gives the button back."""
+        for ws_id in ids or ():
+            btn = self.connect_buttons.get(ws_id)
+            if btn is not None:
+                btn.setText(text or CONNECT_TEXT)
+                btn.setEnabled(not text)
+                return
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -225,10 +314,12 @@ class SyncResultsDialog(QDialog):
     # --- pieces ------------------------------------------------------------
     def _header(self) -> QHBoxLayout:
         bad = self._groups is None or bool(self._groups["attention"])
+        glyph, section = ("!", "attention") if bad else ("✓", "current")
+        if not bad and headline(self._groups) != "Sync finished":
+            glyph, section = "○", "unconnected"     # nothing is connected
         row = QHBoxLayout()
         row.setSpacing(14)
-        row.addWidget(self._badge("!" if bad else "✓",
-                                  "attention" if bad else "current", True),
+        row.addWidget(self._badge(glyph, section, True),
                       0, Qt.AlignmentFlag.AlignTop)
         text = QVBoxLayout()
         text.setSpacing(6)
@@ -302,6 +393,18 @@ class SyncResultsDialog(QDialog):
                 Qt.TextInteractionFlag.TextSelectableByMouse)
             text.addWidget(detail)
         line.addLayout(text, 1)
+        if res.outcome is Outcome.NOT_CONNECTED and res.ids:
+            btn = QPushButton(CONNECT_TEXT)
+            btn.setObjectName("SyncConnect")
+            btn.setToolTip(CONNECT_TIP)
+            btn.setAutoDefault(False)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            ids = list(res.ids)
+            btn.clicked.connect(lambda _=False, i=ids:
+                                self.connectRequested.emit(list(i)))
+            line.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+            for ws_id in ids:
+                self.connect_buttons[ws_id] = btn
         return frame
 
     # --- actions -----------------------------------------------------------

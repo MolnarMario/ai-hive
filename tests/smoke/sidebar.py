@@ -1742,6 +1742,75 @@ def test_sidebar_search():
     sb.deleteLater()
 
 
+def test_sidebar_header_fit():
+    """The header's buttons: one square size, centred on the title's line,
+    painted icons (the emoji drew at their own sizes and baselines, so the
+    row looked off centre). On a wide rail the gaps grow; on the narrowest
+    the count gives way before the WORKSPACES title clips. The sync button
+    is the cloud, its arrows turning while a sync runs."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+    from app import ui_theme
+    from app.widgets.header_icons import CloudSyncButton
+    from app.widgets.sidebar import SIDEBAR_WIDTH, Sidebar
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    sb = Sidebar()
+    # the theme's title font and letter spacing, on this widget only
+    sb.setStyleSheet(ui_theme.build_qss())
+    sb.setMaximumWidth(10_000)
+    sb.add_row("w1", "Alpha", "p")
+    sb.show()
+    btns = sb._header_buttons
+    shapes = {}
+    for width in (190, SIDEBAR_WIDTH, 300, 430):
+        sb.resize(width, 400)
+        pump(30)
+        title = sb.title.geometry()
+        mid = title.center().y()
+        gaps = [b.geometry().left() - a.geometry().right()
+                for a, b in zip(btns, btns[1:])]
+        shapes[width] = (
+            {(b.width(), b.height()) for b in btns},
+            all(abs(b.geometry().center().y() - mid) <= 1 for b in btns),
+            title.width() >= sb.title.sizeHint().width(),
+            sb.count_label.isVisible(), gaps,
+            btns[-1].geometry().right() < sb.header.width())
+    narrow, wide = shapes[190], shapes[430]
+    check("sidebar header: every button is one square size, centred on the "
+          "title's line, at every width",
+          all(len(s[0]) == 1 and next(iter(s[0]))[0] == next(iter(s[0]))[1]
+              and s[1] and s[5] for s in shapes.values()), shapes)
+    check("sidebar header: the WORKSPACES title is never clipped",
+          all(s[2] for s in shapes.values()), shapes)
+    check("sidebar header: a wide rail spends its room on bigger buttons "
+          "and gaps and shows the count; the narrowest drops the count",
+          wide[3] and not narrow[3] and min(wide[4]) > max(narrow[4])
+          and next(iter(wide[0]))[0] >= next(iter(narrow[0]))[0], shapes)
+    sb._toggle_search()
+    hidden_in_search = sb.count_label.isHidden()
+    sb._close_search()
+    check("sidebar header: search hides the count, and closing it shows "
+          "it again on a wide rail",
+          hidden_in_search and sb.count_label.isVisible())
+    check("sidebar header: the buttons paint their icons, no emoji text",
+          isinstance(sb.sync_btn, CloudSyncButton)
+          and not any(b.text() for b in btns))
+    sb.set_sync_busy(True)
+    turning = sb.sync_btn.spinning() and not sb.sync_btn.isEnabled()
+    sb.set_sync_busy(False)
+    check("sidebar header: the cloud's arrows turn while a sync runs, and "
+          "stop after", turning and not sb.sync_btn.spinning()
+          and sb.sync_btn.isEnabled()
+          and "connected" in sb.sync_btn.toolTip())
+    sb.deleteLater()
+
+
 def test_reveal_agent():
     """_reveal_agent (shared by the map + the dropdown) switches to the agent's
     workspace and finds its terminal card."""

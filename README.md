@@ -478,11 +478,13 @@ workspaces keep executing — switching never pauses anything.
   link / Copy link address) — "Reveal in folder" opens Explorer with the file
   already selected, and "Copy path" copies the resolved **absolute** path, which
   is what pastes into an address bar.
-- **Search the sidebar** — a 🔍 next to the category button expands an input
+- **Search the sidebar** — the magnifier next to the category button expands an input
   that covers the WORKSPACES title/count; as you type it **highlights every
   match** across workspace names, agent names, and agent summaries, and
-  auto-expands a workspace to reveal a matching agent. Esc (or clicking 🔍
-  again) closes it and restores what was expanded before.
+  auto-expands a workspace to reveal a matching agent. Esc (or clicking the
+  magnifier again) closes it and restores what was expanded before. The
+  header's buttons are one square size and spread out on a wide sidebar; on
+  the narrowest one the count gives way before the title would clip.
 - **First-class folders** — every workspace header shows its full path
   (eliding only what its own buttons don't leave room for) with **Delete**,
   **Open repo**, **Open folder** and **Change folder** buttons; agents launch rooted
@@ -753,8 +755,9 @@ error dialog instead of silently closing. Packaging to a distributable
   10px rail with one strip per workspace, in sidebar order and colored like
   its count badge. The active workspace has the wide strip, hover shows the
   name, and a click opens that workspace without reopening the sidebar.
-- **Sync every workspace with GitHub in one click.** The `↻` in the sidebar
-  header fetches each workspace's folder and moves its branch forward to what
+- **Sync every workspace with GitHub in one click.** The cloud in the sidebar
+  header (its arrows turn while it works) fetches each workspace's folder
+  that is connected to a repository and moves its branch forward to what
   it tracks on GitHub, so after pushing from one computer, one click on the
   other brings every project up to date without asking an agent in each
   workspace to pull. A notice over each workspace says it is checking, then
@@ -763,7 +766,13 @@ error dialog instead of silently closing. Packaging to a distributable
   tracks nothing (every agent lane), or local changes to files GitHub also
   changed are left alone, and a dialog then lists what happened in each
   workspace. Local changes to other files ride along. Workspaces on one
-  folder sync once.
+  folder sync once. A folder with no repository or no remote is never
+  checked; the dialog lists it under **Not connected** with a **Connect**
+  button, which asks for the GitHub URL (like Connect to repo), then syncs
+  that folder alone: its branch is tied to the same branch on GitHub, and a
+  folder with no commits yet gets GitHub's default branch checked out (git
+  refuses, and the dialog says so, if a file already there has the same
+  name as one it would bring).
 - **Sync at launch** (Options, *Sync workspaces with GitHub at launch*, off by
   default) runs the same sync once per launch, and only after the launch has
   settled: every restored agent started and showing its prompt, the startup
@@ -1265,7 +1274,7 @@ app/
   self_update.py           update AI Hive from GitHub main: version check, changelog, ff-only merge (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
   repo_activity.py         Open repo dropdown: GitHub PRs + commits, origin URL, Connect to repo (Qt-free)
-  workspace_sync.py        sidebar sync button: fetch + ff-only every workspace folder (Qt-free)
+  workspace_sync.py        sidebar sync button: fetch + ff-only every connected workspace folder, tie a just-connected one to its remote (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled fonts: the manuscript ones (Cinzel/EB Garamond/
                            Spectral) and the Terminal font picker's mono families,

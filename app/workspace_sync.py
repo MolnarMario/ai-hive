@@ -70,6 +70,31 @@ packages too. It is skipped altogether while AI Hive is updating itself
 pulled code runs from the next launch; the version button then offers the
 restart.
 
+ONLY CONNECTED FOLDERS
+---------------------
+A sync checks only the workspaces connected to a repository: a folder in a
+git repository with at least one remote. `plan` reads that with the
+folder (`git remote`) and leaves every other one out as `NOT_CONNECTED`,
+with no fetch and no notice over its workspace. The results window lists
+them with a Connect button each (`widgets/sync_results.py`), which runs
+the workspace header's Connect to repo (`repo_activity.connect_origin`)
+and then syncs that folder alone with `link=True`.
+
+A FOLDER JUST CONNECTED
+-----------------------
+Connect only adds `origin`, so the folder's branch tracks nothing yet and
+a plain sync would skip it. `link_upstream`, run only for a folder the user
+connected from the results window, fetches the remote and then either:
+
+* points a branch with commits at the remote's branch of the same name
+  (`git branch --set-upstream-to`), then syncs as usual: fast-forward or
+  report. A remote without that branch is reported, never pushed to;
+* checks the remote's default branch out into a folder with no commits
+  yet (`git checkout --track`), the only time a sync writes anything but a
+  fast-forward. There are no commits to lose, and git refuses before it
+  writes anything when a file already in the folder has the name of one
+  the checkout brings. That is reported, and the folder stays as it was.
+
 No em dash in any string below: `detail` is read by the user.
 """
 
@@ -105,6 +130,13 @@ class Outcome(str, Enum):
     UP_TO_DATE = "up_to_date"
     SKIPPED = "skipped"     # deliberately left alone, with the reason
     FAILED = "failed"       # git or the network said no
+    # no repository or no remote: never synced, offered Connect instead
+    NOT_CONNECTED = "not_connected"
+
+
+NOT_A_REPO = "Not a git repository."
+NOT_A_REPO_TEXT = "Not a git repository yet."
+NO_REMOTE_TEXT = "Not connected to a repository on GitHub."
 
 
 @dataclass
@@ -227,7 +259,7 @@ def locate(runner, folder: str) -> tuple:
         return "", "", _git_error("Reading the folder", rc, out)
     lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
     if rc != 0 or not lines:
-        return "", "", "Not a git repository."
+        return "", "", NOT_A_REPO
     top = os.path.normpath(lines[0])
     common = os.path.normpath(lines[1]) if len(lines) > 1 else top
     return top, common, ""
@@ -353,21 +385,139 @@ def sync_folder(runner, top: str, app_repo: str = "", updating=None,
                                  f"'{branch}'.")
 
 
+def _remote_default(runner, top: str, remote: str) -> str:
+    """The branch the remote's HEAD names ("main"), or ""."""
+    rc, out = runner(_git(top, "ls-remote", "--symref", remote, "HEAD"),
+                     FETCH_TIMEOUT_S)
+    for line in (out or "").splitlines() if rc == 0 else ():
+        if line.startswith("ref: refs/heads/") and line.endswith("HEAD"):
+            return line[len("ref: refs/heads/"):].split()[0]
+    return ""
+
+
+def _has_ref(runner, top: str, ref: str) -> bool:
+    rc, _ = runner(_git(top, "rev-parse", "--verify", "--quiet", ref),
+                   GIT_TIMEOUT_S)
+    return rc == 0
+
+
+def link_upstream(runner, top: str, updating=None, merge_lock=None):
+    """Tie a folder the user just connected to its remote (see A FOLDER
+    JUST CONNECTED). None when `sync_folder` should carry on (the branch
+    tracks one now, or already did, or there is nothing to tie), else the
+    final Result. Never raises from git."""
+    res = Result(top, Outcome.SKIPPED)
+
+    def done(outcome: Outcome, detail: str) -> Result:
+        res.outcome, res.detail = outcome, detail
+        return res
+
+    rc, out = runner(_git(top, "symbolic-ref", "--quiet", "--short", "HEAD"),
+                     GIT_TIMEOUT_S)
+    if rc != 0:
+        return None                 # detached: sync_folder says so
+    res.branch = branch = _first_line(out)
+    rc, out = runner(_git(top, "config", "--get", f"branch.{branch}.remote"),
+                     GIT_TIMEOUT_S)
+    if rc == 0 and _first_line(out):
+        return None                 # it tracks a branch already
+    rc, out = runner(_git(top, "remote"), GIT_TIMEOUT_S)
+    remotes = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    remote = ("origin" if "origin" in remotes
+              else remotes[0] if len(remotes) == 1 else "")
+    if rc != 0 or not remote:
+        return None
+    rc, out = _fetch(runner, top, remote)
+    if rc != 0:
+        return done(Outcome.FAILED,
+                    _git_error(f"Fetching from {remote}", rc, out))
+    lock = merge_lock if merge_lock is not None else contextlib.nullcontext()
+    if _has_ref(runner, top, "HEAD^{commit}"):
+        if not _has_ref(runner, top, f"refs/remotes/{remote}/{branch}"):
+            return done(Outcome.SKIPPED,
+                        f"GitHub has no branch '{branch}' yet. Push it to "
+                        "put this folder's code there.")
+        with lock:
+            rc, out = runner(_git(top, "branch", "--quiet",
+                                  f"--set-upstream-to={remote}/{branch}",
+                                  branch), GIT_TIMEOUT_S)
+        if rc != 0:
+            return done(Outcome.FAILED,
+                        _git_error(f"Tracking {remote}/{branch}", rc, out))
+        return None
+    # no commits here yet: bring down the remote's branch
+    target = branch
+    if not _has_ref(runner, top, f"refs/remotes/{remote}/{target}"):
+        target = _remote_default(runner, top, remote)
+        if target and not _has_ref(runner, top,
+                                   f"refs/remotes/{remote}/{target}"):
+            target = ""
+    if not target:
+        return done(Outcome.SKIPPED,
+                    "The repository on GitHub is empty. Commit here and "
+                    "push to fill it.")
+    res.branch, res.upstream = target, f"{remote}/{target}"
+    rc, out = runner(_git(top, "rev-list", "--count",
+                          f"refs/remotes/{remote}/{target}"), GIT_TIMEOUT_S)
+    count = _first_line(out) if rc == 0 else ""
+    count = int(count) if count.isdigit() else 0
+    res.behind = count
+    if updating is not None:
+        try:
+            updating(res)
+        except Exception:  # noqa: BLE001 - a notice never stops the sync
+            pass
+    with lock:
+        rc, out = runner(_git(top, "checkout", "--quiet", "--track",
+                              f"{remote}/{target}"), MERGE_TIMEOUT_S)
+    if rc != 0:
+        if "would be overwritten" in (out or ""):
+            return done(Outcome.SKIPPED,
+                        "Files in this folder have the same names as files "
+                        "on GitHub. Move them aside, then sync again.")
+        return done(Outcome.FAILED,
+                    _git_error(f"Checking out {remote}/{target}", rc, out))
+    rc, out = runner(_git(top, "rev-parse", "HEAD"), GIT_TIMEOUT_S)
+    res.new_head = _first_line(out) if rc == 0 else ""
+    res.pulled, res.behind = count, 0
+    return done(Outcome.UPDATED, f"Brought down '{target}' from GitHub "
+                                 f"({commits_text(count)}).")
+
+
 def commits_text(n: int) -> str:
     return f"{n} commit" if n == 1 else f"{n} commits"
 
 
 # ----------------------------------------------------------- many folders ---
 
+def connection(runner, folder: str) -> tuple:
+    """`locate` plus whether the checkout has a remote: (top, git common
+    dir, why not, connected). A folder outside any repository, or one whose
+    repository has no remote, is not connected (see ONLY CONNECTED
+    FOLDERS); `why not` then says which. A `git remote` that fails says
+    nothing either way, so the folder counts as connected and its sync
+    gives the reason."""
+    top, common, why = locate(runner, folder)
+    if why == NOT_A_REPO:
+        return "", "", NOT_A_REPO_TEXT, False
+    if why:
+        return top, common, why, True
+    rc, out = runner(_git(top, "remote"), GIT_TIMEOUT_S)
+    if rc == 0 and not (out or "").strip():
+        return top, common, NO_REMOTE_TEXT, False
+    return top, common, "", True
+
+
 def plan(runner, workspaces, parallel: int = MAX_PARALLEL) -> Plan:
     """Read every workspace folder (in parallel) and group what can sync.
-    `workspaces` is [(ws id, name, folder)] in sidebar order. Never
+    `workspaces` is [(ws id, name, folder)] in sidebar order. A folder that
+    is not connected gets a NOT_CONNECTED result and is never synced. Never
     raises."""
     def look(folder):
         try:
-            return locate(runner, folder)
+            return connection(runner, folder)
         except Exception as e:  # noqa: BLE001 - one folder never stops all
-            return "", "", f"Could not read the folder: {e}"
+            return "", "", f"Could not read the folder: {e}", True
 
     items = list(workspaces)
     if items:
@@ -377,13 +527,17 @@ def plan(runner, workspaces, parallel: int = MAX_PARALLEL) -> Plan:
     else:
         found = []
     p = Plan()
-    for (ws_id, name, folder), (top, common, why) in zip(items, found):
+    for (ws_id, name, folder), (top, common, why, linked) in zip(items,
+                                                                 found):
         key = (os.path.normcase(os.path.realpath(top)) if top
                else "?" + (folder or name))
         if key not in p.names:
             p.order.append(key)
             p.names[key], p.ids[key] = [], []
-            if why:
+            if not linked:
+                p.results[key] = Result(top or folder, Outcome.NOT_CONNECTED,
+                                        why)
+            elif why:
                 p.results[key] = Result(top or folder, Outcome.SKIPPED, why)
             else:
                 p.groups.setdefault(common, []).append((key, top))
@@ -409,21 +563,30 @@ def tell_unsyncable(p: Plan, progress) -> None:
 
 
 def run_group(runner, p: Plan, items, app_repo: str = "", progress=None,
-              app_busy: bool = False, merge_lock=None) -> list:
+              app_busy: bool = False, merge_lock=None,
+              link: bool = False) -> list:
     """Sync one group's checkouts, one after the other: [(key, Result)].
 
     `progress(event, result)` runs on this (worker) thread: "checking" as a
     checkout's sync starts, "updating" right before its fast-forward and
     "done" with its final result. The window turns these into the notice
-    over each workspace. Never raises."""
+    over each workspace. `link` first ties a folder the user just connected
+    to its remote (`link_upstream`). Never raises."""
     out = []
     for key, top in items:
         _tell(progress, p, "checking", Result(top, Outcome.SKIPPED), key)
         try:
-            res = sync_folder(
-                runner, top, app_repo,
-                lambda r, k=key: _tell(progress, p, "updating", r, k),
-                app_busy, merge_lock)
+            res = None
+            if link:
+                res = link_upstream(
+                    runner, top,
+                    lambda r, k=key: _tell(progress, p, "updating", r, k),
+                    merge_lock)
+            if res is None:
+                res = sync_folder(
+                    runner, top, app_repo,
+                    lambda r, k=key: _tell(progress, p, "updating", r, k),
+                    app_busy, merge_lock)
         except Exception as e:  # noqa: BLE001
             res = Result(top, Outcome.FAILED,
                          f"The sync stopped unexpectedly: {e}")
@@ -434,7 +597,7 @@ def run_group(runner, p: Plan, items, app_repo: str = "", progress=None,
 
 def sync_all(runner, workspaces, app_repo: str = "",
              parallel: int = MAX_PARALLEL, progress=None,
-             app_busy: bool = False) -> list:
+             app_busy: bool = False, link: bool = False) -> list:
     """`plan`, then every group on a thread pool: the results in sidebar
     order, one per checkout (workspaces sharing one carry all their names
     and ids). Never raises."""
@@ -445,7 +608,8 @@ def sync_all(runner, workspaces, app_repo: str = "",
         workers = max(1, min(parallel, len(p.groups)))
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for got in ex.map(lambda items: run_group(
-                    runner, p, items, app_repo, progress, app_busy),
+                    runner, p, items, app_repo, progress, app_busy,
+                    None, link),
                     p.groups.values()):
                 pairs += got
     return p.finish(pairs)
@@ -465,7 +629,8 @@ def summary(results) -> str:
     for r in results:
         counts[r.outcome] += 1
     words = {Outcome.UPDATED: "updated", Outcome.UP_TO_DATE: "up to date",
-             Outcome.SKIPPED: "skipped", Outcome.FAILED: "failed"}
+             Outcome.SKIPPED: "skipped", Outcome.FAILED: "failed",
+             Outcome.NOT_CONNECTED: "not connected"}
     parts = [f"{counts[o]} {words[o]}" for o in Outcome if counts[o]]
     return ", ".join(parts) or "No workspaces to sync."
 
