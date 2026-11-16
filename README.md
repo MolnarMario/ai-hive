@@ -489,6 +489,10 @@ workspaces keep executing — switching never pauses anything.
   there. The ▾ beside Open repo lists the GitHub repository's recent pull
   requests and commits. AI Hive loads that list in the background a few
   seconds after startup and keeps it, so the menu opens already filled.
+  A folder with no origin remote shows **Connect to repo** instead, with
+  the ▾ greyed: paste a GitHub URL and AI Hive checks that your git account
+  can reach it (a private repository you can't read is refused), runs
+  `git init` if the folder isn't a repository yet and adds it as origin.
 - **Bionic reading.** ⚙ Options > Appearance > **Bionic reading** (off by
   default) draws the first half of each prose word in the agent terminals in
   bold, which some readers, dyslexic readers among them, find easier to
@@ -1260,7 +1264,7 @@ app/
   cli_install.py           how Claude Code is installed + the switch onto the self-updating build (Qt-free)
   self_update.py           update AI Hive from GitHub main: version check, changelog, ff-only merge (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
-  repo_activity.py         Open repo dropdown: GitHub PRs + commits, origin URL (Qt-free)
+  repo_activity.py         Open repo dropdown: GitHub PRs + commits, origin URL, Connect to repo (Qt-free)
   workspace_sync.py        sidebar sync button: fetch + ff-only every workspace folder (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled fonts: the manuscript ones (Cinzel/EB Garamond/

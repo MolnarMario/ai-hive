@@ -3159,6 +3159,54 @@ class NewWorkspaceDialog(QDialog):
                 "lanes": self.wants_lanes()}
 
 
+class ConnectRepoDialog(QDialog):
+    """The workspace header's Connect to repo: a GitHub URL for a folder
+    with no origin remote, laid out like New Workspace's GitHub page. The
+    button stays off until the URL names an owner and a repository; the
+    reach check and the git calls run after it closes
+    (`repo_activity.connect_origin`)."""
+
+    def __init__(self, folder: str, url: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Connect to GitHub repository")
+        self.setMinimumWidth(480)
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        folder_label = QLabel(folder, self)
+        folder_label.setWordWrap(True)
+        form.addRow("Folder", folder_label)
+        self.repo_edit = QLineEdit(url, self)
+        self.repo_edit.setPlaceholderText(
+            "https://github.com/owner/repository.git")
+        form.addRow("GitHub URL", self.repo_edit)
+        note = QLabel("AI Hive will add this repository as the folder's "
+                      "origin remote, after checking that your git account "
+                      "can reach it. A folder that is not a git repository "
+                      "yet becomes one first. Nothing is pushed or pulled.",
+                      self)
+        note.setWordWrap(True)
+        self.note = note
+        form.addRow("", note)
+        root.addLayout(form)
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel |
+            QDialogButtonBox.StandardButton.Ok, parent=self)
+        self.ok_button = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setText("Connect")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        root.addWidget(self.buttons)
+        self.repo_edit.textChanged.connect(self._revalidate)
+        self._revalidate()
+
+    def _revalidate(self) -> None:
+        self.ok_button.setEnabled(
+            bool(repo_activity.github_repo_url(self.repo_edit.text())))
+
+    def url(self) -> str:
+        return self.repo_edit.text().strip()
+
+
 class MainWindow(QMainWindow):
     # Plan-usage edges, for features that need to ACT on the account being cut
     # off rather than just display it (e.g. relaunching agents that died on a
@@ -3170,6 +3218,8 @@ class MainWindow(QMainWindow):
     planLimitReached = Signal(object)   # claude_usage.Limit
     planLimitCleared = Signal()
     repoActivityLoaded = Signal(str, str, object)  # ws_id, path, result
+    repoStateLoaded = Signal(str, str, str)  # ws_id, path, repo_state
+    repoConnectFinished = Signal(str, str, str, str)  # ws_id, path, url, error
     # name, path, repo url, git's error, the dialog's Lanes box
     workspaceCloneFinished = Signal(str, str, str, str, bool)
     # event, a workspace_sync.Result copy, launch sync? (worker -> GUI)
@@ -3191,6 +3241,15 @@ class MainWindow(QMainWindow):
         self._repo_activity_busy: set[str] = set()
         self._repo_activity_fetch = repo_activity.fetch
         self.repoActivityLoaded.connect(self._on_repo_activity_loaded)
+        # Open repo vs Connect to repo (repo_activity.repo_state), read on a
+        # worker; the probe and the connect's git runner are attributes for
+        # tests (the runner, None, is workspace_sync.sync_runner)
+        self._repo_state_probe = repo_activity.repo_state
+        self._repo_state_busy: set[str] = set()
+        self._repo_connect_runner = None
+        self._connect_progress: QProgressDialog | None = None
+        self.repoStateLoaded.connect(self._on_repo_state_loaded)
+        self.repoConnectFinished.connect(self._on_repo_connect_finished)
         self.workspaceCloneFinished.connect(self._on_workspace_clone_finished)
         self.workspaceSyncProgress.connect(self._on_workspace_sync_progress)
         self._clone_progress: QProgressDialog | None = None
@@ -7811,6 +7870,7 @@ class MainWindow(QMainWindow):
         page.deleteRequested.connect(self._confirm_delete_workspace)
         page.openFolderRequested.connect(self._open_workspace_folder)
         page.openRepoRequested.connect(self._open_workspace_repo)
+        page.connectRepoRequested.connect(self._connect_workspace_repo)
         page.repoActivityRequested.connect(self._load_repo_activity)
         page.changePathRequested.connect(self._change_workspace_folder)
         page.activityToggled.connect(self._toggle_activity)
@@ -7823,6 +7883,7 @@ class MainWindow(QMainWindow):
         page.integration_info = self._integration_info
         self._pages[ws.id] = page
         self._refresh_workspace_lane_toggles(ws.id)
+        self._read_repo_state(ws.id)
         self.stack.addWidget(page)
         # a page added while another one is current is added HIDDEN, and Qt
         # never lays a hidden page out — its cards would keep the terminal's
@@ -7875,6 +7936,8 @@ class MainWindow(QMainWindow):
         self._sync_activity_buttons()
         # agents the launch has not reached yet: the user is looking now
         self._start_queued_in(ws_id)
+        # an agent may have added or removed its folder's origin meanwhile
+        self._probe_repo_state([ws_id])
 
     # ------------------------------------------------------- activity panel ---
 
@@ -8133,6 +8196,7 @@ class MainWindow(QMainWindow):
             page.reset_repo_activity()
         # the new folder may or may not be in a git repository
         self._refresh_workspace_lane_toggles(ws_id)
+        self._read_repo_state(ws_id)
         self.sidebar.set_row_folder(ws_id, os.path.basename(path) or path)
         # the file explorer re-roots at the new folder (drop stale sub-expansion)
         self.sidebar.reset_file_tree(ws_id)
@@ -8173,6 +8237,133 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, "AI Hive",
                 f"No GitHub origin remote found for:\n{ws.project_path}")
+            # the header was out of date: offer Connect if there is no origin
+            self._probe_repo_state([ws_id])
+
+    # Open repo vs Connect to repo. The probe runs git (when the folder is
+    # in a repository at all), so it stays off the GUI thread, one worker
+    # for any number of workspaces, like the activity fetch.
+
+    def _read_repo_state(self, ws_id: str) -> None:
+        """A new page or folder: the label from the git config file at once
+        (repo_activity.config_has_origin), so the header has its final
+        width before its first layout, then git's own answer behind it."""
+        ws = self.manager.workspace(ws_id)
+        page = self._pages.get(ws_id)
+        if ws is None or page is None:
+            return
+        has_origin = repo_activity.config_has_origin(ws.project_path)
+        if has_origin is not None:
+            page.set_repo_connected(has_origin)
+        self._probe_repo_state([ws_id])
+
+    def _probe_repo_state(self, ws_ids) -> None:
+        jobs = []
+        for ws_id in ws_ids:
+            ws = self.manager.workspace(ws_id)
+            if (ws is None or ws_id not in self._pages
+                    or ws_id in self._repo_state_busy):
+                continue
+            self._repo_state_busy.add(ws_id)
+            jobs.append((ws_id, ws.project_path))
+        if not jobs:
+            return
+        probe = self._repo_state_probe
+
+        def run() -> None:
+            for ws_id, path in jobs:
+                try:
+                    state = probe(path)
+                except Exception:   # never leave a workspace "busy"
+                    state = repo_activity.STATE_UNKNOWN
+                try:
+                    self.repoStateLoaded.emit(ws_id, path, state)
+                except RuntimeError:   # the window is gone
+                    return
+
+        threading.Thread(target=run, name="github-repo-state",
+                         daemon=True).start()
+
+    def _on_repo_state_loaded(self, ws_id: str, path: str, state: str) -> None:
+        self._repo_state_busy.discard(ws_id)
+        ws = self.manager.workspace(ws_id)
+        page = self._pages.get(ws_id)
+        if ws is None or page is None or self._closing:
+            return
+        if ws.project_path != path:
+            # the folder changed while this was in flight: ask the new one
+            self._probe_repo_state([ws_id])
+            return
+        if state == repo_activity.STATE_UNKNOWN:
+            return
+        connected = state != repo_activity.STATE_NONE
+        if connected and not page.repo_connected:
+            # the cached "no origin" answer is not this repository's activity
+            self._repo_activity.pop(ws_id, None)
+            page.reset_repo_activity()
+        page.set_repo_connected(connected)
+
+    def _connect_workspace_repo(self, ws_id: str, url: str = "") -> None:
+        """Connect to repo: ask for a GitHub URL, then check it and add it
+        as origin on a worker (repo_activity.connect_origin). A failure
+        says why and opens the dialog again with the same URL."""
+        ws = self.manager.workspace(ws_id)
+        if ws is None or self._connect_progress is not None:
+            return
+        if not os.path.isdir(ws.project_path):
+            QMessageBox.warning(self, "AI Hive",
+                                f"Folder not found:\n{ws.project_path}")
+            return
+        dialog = ConnectRepoDialog(ws.project_path, url, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        url = dialog.url()
+        path = ws.project_path
+        runner = self._repo_connect_runner
+        if runner is None:
+            from app import workspace_sync
+            runner = workspace_sync.sync_runner
+        progress = QProgressDialog(
+            f"Connecting to {repo_activity.github_repo_url(url) or url}\u2026",
+            "", 0, 0, self)
+        progress.setWindowTitle("Connecting to GitHub")
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        self._connect_progress = progress
+
+        def run() -> None:
+            try:
+                error = repo_activity.connect_origin(path, url, runner)
+            except Exception as exc:
+                error = f"Could not connect the repository: {exc}"
+            try:
+                self.repoConnectFinished.emit(ws_id, path, url, error)
+            except RuntimeError:   # the window is gone
+                pass
+
+        threading.Thread(target=run, name="github-repo-connect",
+                         daemon=True).start()
+
+    def _on_repo_connect_finished(self, ws_id: str, path: str, url: str,
+                                  error: str) -> None:
+        if self._connect_progress is not None:
+            self._connect_progress.close()
+            self._connect_progress.deleteLater()
+            self._connect_progress = None
+        if self._closing:
+            return
+        # git init may have made the folder a repository (Lanes), and the
+        # header reads the new origin either way
+        self._refresh_workspace_lane_toggles(ws_id)
+        self._probe_repo_state([ws_id])
+        if error:
+            QMessageBox.warning(self, "Could not connect the repository",
+                                error)
+            ws = self.manager.workspace(ws_id)
+            if ws is not None and ws.project_path == path:
+                self._connect_workspace_repo(ws_id, url)
 
     def _load_repo_activity(self, ws_id: str) -> None:
         """The dropdown opened. It already shows the cached list (or the
@@ -8911,6 +9102,12 @@ class MainWindow(QMainWindow):
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
+        # back to the front: a remote added in a terminal meanwhile turns
+        # Connect to repo into Open repo without a restart
+        if (event.type() == QEvent.Type.ActivationChange
+                and self.isActiveWindow() and hasattr(self, "manager")
+                and not getattr(self, "_closing", True)):
+            self._probe_repo_state([self.manager.active_id])
         # left fullscreen some other way than F11 (a Windows shortcut):
         # put the chrome back
         if (event.type() == QEvent.Type.WindowStateChange
