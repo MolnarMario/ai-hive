@@ -8,6 +8,26 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.58.0
+
+- A workspace whose folder is not connected to GitHub shows Connect to
+  repo in its header. Paste the repository's address and AI Hive checks
+  that your git account can reach it, then sets the folder up (running
+  git init first if needed). A private repository you can't read is
+  refused and the folder is left as it was.
+- Sync with GitHub now checks only workspaces connected to a repository.
+  The others are listed as Not connected in the results window, each with
+  a Connect button that connects the folder and then syncs it alone, so a
+  new folder can pick up the repository's default branch in one step.
+- The buttons at the top of the workspace list are now matching icons,
+  the sync button a cloud whose arrows turn while it works, and the header
+  fits narrow sidebars without clipping the title.
+- A lane that merged another lane's finished work no longer shows as done
+  itself. Only the lane's own Task done flag turns its chip green, so Ship
+  finished lanes offers only lanes that really are finished.
+- The Activity panel's task box shows each agent's conversation title, as
+  the board does, and still takes a typed task for an agent without one.
+
 ## 0.57.1
 
 - The Sync with GitHub results window is easier to read. Workspaces that
