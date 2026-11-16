@@ -314,6 +314,18 @@ def test_activity_panel_task_matches_board():
     check("panel task: a typed task reaches the panel's signal",
           edits == [(a.id, "Fix the parser")], edits)
 
+    # a title arriving while the user types must not wipe or lock their text
+    box.hasFocus = lambda: True
+    box.setText("half typed")
+    a.set_ai_title("A late title")
+    panel.refresh(ws)
+    check("panel task: a title arriving mid-typing keeps the user's text",
+          box.text() == "half typed" and not box.isReadOnly(), box.text())
+    box.hasFocus = lambda: False
+    panel.refresh(ws)
+    check("panel task: ...and shows once the user leaves the box",
+          box.text() == "A late title" and box.isReadOnly(), box.text())
+
     panel.deleteLater()
     for agent in mgr.all_agents():
         agent.dispose()

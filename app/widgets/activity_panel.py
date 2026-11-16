@@ -72,8 +72,11 @@ class AgentRosterItem(QFrame):
         self.head.setText(f"{icon}  <b>{agent.spec.name}</b>  "
                           f"<span style='color:#8a8a8a'>{model}</span>")
         title = getattr(agent, "ai_title", lambda: "")()
-        if self.task_edit.hasFocus() and not title:
-            return  # the user is typing a task: leave their text alone
+        if self.task_edit.hasFocus() and not self.task_edit.isReadOnly():
+            # the user is typing a task: leave their text alone, even when a
+            # title arrives meanwhile. Leaving the box stores it, and the
+            # next refresh after that shows the title
+            return
         # the board's "Current task" (TerminalAgent.summary): the provider's
         # conversation title when it has one, which nothing typed here could
         # override, so the box only takes typing while there is no title
