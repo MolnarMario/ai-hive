@@ -269,6 +269,58 @@ def test_board_roster_task():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_activity_panel_task_matches_board():
+    """The Activity panel's task box shows the board's task: Claude's
+    conversation title, read-only. It showed only the typed task, which
+    nothing but the removed Assign button filled, so every box sat empty
+    while the board listed each agent's task. An agent with no title still
+    takes a typed task, and losing focus on a title never stores the title
+    as a typed task."""
+    from PySide6.QtWidgets import QApplication
+    from app.process_worker import AgentKind, build_spec
+    from app.widgets.activity_panel import ActivityPanel
+    from app.workspace_manager import WorkspaceManager
+
+    QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-panel-task-"))
+    mgr = WorkspaceManager()
+    ws = mgr.create_workspace("Panel", project_path=str(tmp))
+    a = mgr.add_terminal(ws.id, build_spec(AgentKind.CLAUDE, "Agent 1",
+                                           cwd=SCRATCH_CWD), autostart=False)
+    panel = ActivityPanel()
+    edits = []
+    panel.taskEdited.connect(lambda aid, text: edits.append((aid, text)))
+    panel.set_workspace(ws)
+    box = panel._items[a.id].task_edit
+
+    check("panel task: no title and no task leaves the box empty, editable",
+          box.text() == "" and not box.isReadOnly(), box.text())
+    a.set_ai_title("Recolor the badge")
+    panel.refresh(ws)
+    check("panel task: the conversation title shows, as on the board",
+          box.text() == "Recolor the badge" == a.roster_row()["task"],
+          box.text())
+    check("panel task: a title is read-only", box.isReadOnly())
+    box.editingFinished.emit()
+    check("panel task: leaving a title box stores no typed task",
+          edits == [] and a.current_task == "", (edits, a.current_task))
+
+    a.set_ai_title("")
+    panel.refresh(ws)
+    check("panel task: with the title gone the box takes typing again",
+          not box.isReadOnly() and box.text() == "", box.text())
+    box.setText("Fix the parser")
+    box.editingFinished.emit()
+    check("panel task: a typed task reaches the panel's signal",
+          edits == [(a.id, "Fix the parser")], edits)
+
+    panel.deleteLater()
+    for agent in mgr.all_agents():
+        agent.dispose()
+    mgr.remove_workspace(ws.id)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_board_survives_hand_edits():
     """An agent that edits board.md by hand can remove the roster markers or
     the log heading. The next roster update or append must keep every line
