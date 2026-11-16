@@ -4403,6 +4403,97 @@ def test_task_done_empty_flag_beside_other_empty_flags():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_task_done_merged_from_another_lane():
+    """A lane that merges another lane's branch takes in that lane's "Task
+    done" commit. Agent 3 fast-forwarded to Agent 2's finished lane and its
+    chip and the Activity panel showed it done while it was still working,
+    so Ship finished lanes would have offered it. Only a flag the lane made
+    itself counts (the branch's reflog says which): a fast-forward, a merge
+    commit and a merge concluded by `git commit` all bring in a foreign
+    flag. The lane's own flag still counts, after it merged the base too,
+    and with no reflog to tell a flag counts as it always did."""
+    from app import lanes
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-foreign-flag-"))
+    work = _make_repo(tmp)
+    a = _lane_for(work, "Agent A", "f0e1a0" + "0" * 26)
+    b = _lane_for(work, "Agent B", "f0e1b0" + "0" * 26)
+    c = _lane_for(work, "Agent C", "f0e1c0" + "0" * 26)
+    d = _lane_for(work, "Agent D", "f0e1d0" + "0" * 26)
+    ea, eb = _entry("A", "Agent A", a), _entry("B", "Agent B", b)
+    ec, ed = _entry("C", "Agent C", c), _entry("D", "Agent D", d)
+
+    def done(entry):
+        return lanes.lane_snap(entry, {}).done
+
+    _commit(a["root"], "fa.txt", "a\n", "a's work")
+    _git(a["root"], "commit", "-q", "--allow-empty", "-m",
+         "review clean\n\nTask done")
+    a_flag = _git(a["root"], "rev-parse", "HEAD")
+    check("foreign-flag: the lane that made the flag is done",
+          done(ea) == a_flag)
+
+    # B fast-forwards to A's branch, as Agent 3 did
+    _git(b["root"], "merge", "-q", a["branch"])
+    check("foreign-flag: a fast-forward to another lane's flag is not done",
+          done(eb) == "" and _git(b["root"], "rev-parse", "HEAD") == a_flag,
+          done(eb))
+    check("foreign-flag: ...and the lane that made it still is",
+          done(ea) == a_flag)
+    _commit(b["root"], "fb.txt", "b\n", "b's work in progress")
+    check("foreign-flag: its own unflagged work after it is not done either",
+          done(eb) == "", done(eb))
+    _git(b["root"], "commit", "-q", "--allow-empty", "-m",
+         "b reviewed\n\nTask done")
+    b_flag = _git(b["root"], "rev-parse", "HEAD")
+    check("foreign-flag: the lane's own flag counts", done(eb) == b_flag)
+
+    # C has work of its own, then merges A's branch with a merge commit
+    _commit(c["root"], "fc.txt", "c\n", "c's work")
+    _git(c["root"], "merge", "-q", "--no-ff", "--no-edit", a["branch"])
+    check("foreign-flag: a merge commit taking another lane's flag in is not "
+          "done", done(ec) == "", done(ec))
+
+    # D concludes the merge with `git commit` (the reflog's "commit (merge)")
+    _commit(d["root"], "fd.txt", "d\n", "d's work")
+    _git(d["root"], "merge", "-q", "--no-ff", "--no-commit", a["branch"])
+    _git(d["root"], "commit", "-q", "-m", "merge a by hand")
+    check("foreign-flag: a merge concluded by git commit is not done either",
+          done(ed) == "", done(ed))
+
+    # B's own flag holds after B merges the newest base in
+    _push_to_base(tmp, work, "elsewhere.txt", "x\n")
+    _git(b["root"], "fetch", "-q", "origin")
+    _git(b["root"], "merge", "-q", "--no-edit", "origin/main")
+    check("foreign-flag: an own flag holds after merging the base in",
+          done(eb) == b_flag, done(eb))
+
+    # E points its branch at A's with `switch -C` (reflog "branch: Reset
+    # to"), the same move as a reset
+    e = _lane_for(work, "Agent E", "f0e1e0" + "0" * 26)
+    ee = _entry("E", "Agent E", e)
+    _commit(e["root"], "fe.txt", "e\n", "e's work")
+    _git(e["root"], "switch", "-q", "-C", e["branch"], a["branch"])
+    check("foreign-flag: a branch reset to another lane's flag is not done",
+          done(ee) == "" and _git(e["root"], "rev-parse", "HEAD") == a_flag,
+          done(ee))
+
+    # the oldest reflog row read is a merge: what the branch held before it
+    # is unknown, so it is no evidence and the flag counts
+    base = _git(work, "rev-parse", "origin/main")
+    check("foreign-flag: a move with no row before it claims no flag",
+          lanes._own_flag(a["root"], [a_flag], (set(), [(a_flag, "")]),
+                          base) == a_flag)
+
+    # no reflog to tell: the foreign flag counts, as before the fix
+    _git(c["root"], "reflog", "expire", "--expire=all",
+         f"refs/heads/{c['branch']}")
+    check("foreign-flag: without a reflog the flag counts as before",
+          done(ec) == a_flag, done(ec))
+    for lane in (a, b, c, d, e):
+        _drop_lane_folder(lane["root"])
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_done_chip_follows_the_flagged_commit():
     """The integrator merges a lane's "Task done" commit, not its head, so a
     done lane's chip takes its conflicts from that commit: work after the

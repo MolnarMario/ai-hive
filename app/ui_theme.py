@@ -493,7 +493,8 @@ def build_qss(chrome_family: str = "Segoe UI", console_px: int | None = None) ->
     # the Sync with GitHub results window (widgets/sync_results.py): each
     # section's ink, then its badge / pill washes
     sync_ink = {"attention": p.RED, "updated": p.GREEN,
-                "skipped": p.TEXT_DIM, "current": p.GREEN}
+                "unconnected": p.ACCENT_GOLD, "skipped": p.TEXT_DIM,
+                "current": p.GREEN}
     sync_sections = "".join(
         f'QLabel#SyncSectionTitle[section="{k}"] {{ color: {c}; }}\n'
         f'QLabel#SyncBadge[section="{k}"] {{ color: {c};'
@@ -581,7 +582,8 @@ QMenu::indicator:checked {{
     color: {p.ACCENT_GOLD}; font-family: {DISPLAY_FONT}; font-size: 12px;
     letter-spacing: 2px; font-weight: 700;
 }}
-#WsCount {{ color: {p.TEXT_FAINT}; font-size: 11px; font-weight: 700; }}
+#WsCount {{ color: {p.TEXT_DIM}; font-size: 11px; font-weight: 700;
+    background: {p.BG_HOVER}; border-radius: 8px; padding: 1px 7px; }}
 #WsList {{ background: transparent; border: none; }}
 #WsList::item {{ background: transparent; border: none; padding: 0; }}
 #WsList::item:selected {{ background: transparent; }}
@@ -659,12 +661,14 @@ WorkspaceRow[search_hit="true"] {{
 #WsBgShell:hover {{ background: rgba(232,152,58,0.20); border-radius: 4px; }}
 
 /* sidebar search: the magnifier toggle + the overlay input it reveals */
-#SearchBtn {{
-    background: transparent; border: 1px solid transparent; border-radius: 3px;
-    padding: 1px 1px; color: {p.TEXT_DIM}; font-size: 13px;
+/* the sidebar header's square icon buttons (header_icons paints the icons,
+   Sidebar._fit_header sizes them): a wash and a frame on hover */
+#SearchBtn, #SyncBtn, #AddCatBtn {{
+    background: transparent; border: 1px solid transparent; border-radius: 6px;
+    padding: 0;
 }}
-#SearchBtn:hover {{ background: {p.BG_HOVER}; color: {p.ACCENT_GOLD};
-                   border-color: {p.BORDER}; }}
+#SearchBtn:hover, #SyncBtn:hover, #AddCatBtn:hover {{
+    background: {p.BG_HOVER}; border-color: {p.BORDER}; }}
 /* the notice over a workspace while its folder syncs with GitHub
    (workspace_page.SyncNotice): gold while it works, green when done */
 #SyncNotice {{
@@ -680,14 +684,6 @@ WorkspaceRow[search_hit="true"] {{
     font-size: 13px; font-weight: 600;
 }}
 #SyncNotice[state="ok"] #SyncNoticeText {{ color: {p.GREEN}; }}
-/* sidebar sync: pull every workspace forward from GitHub */
-#SyncBtn {{
-    background: transparent; border: 1px solid transparent; border-radius: 3px;
-    padding: 1px 1px; color: {p.TEXT_DIM}; font-size: 15px; font-weight: 700;
-}}
-#SyncBtn:hover {{ background: {p.BG_HOVER}; color: {p.ACCENT_GOLD};
-                 border-color: {p.BORDER}; }}
-#SyncBtn:disabled {{ color: {p.ACCENT_GOLD}; }}
 #SidebarSearch {{
     background: {p.BG_INPUT}; border: 1px solid {p.ACCENT_GOLD};
     border-radius: 3px; padding: 1px 6px; color: {p.TEXT};
@@ -695,16 +691,12 @@ WorkspaceRow[search_hit="true"] {{
 }}
 
 /* category headers (collapsible workspace groups) */
-#AddCatBtn {{
-    background: transparent; border: 1px solid transparent; border-radius: 3px;
-    padding: 1px 1px; color: {p.ACCENT_GOLD}; font-size: 13px;
-}}
-#AddCatBtn:hover {{ background: {p.BG_HOVER}; border-color: {p.BORDER}; }}
-/* the primary "add workspace" action: a bold, evident gold "+" in a pill */
+/* the primary "add workspace" action: an evident gold "+" (painted by
+   header_icons.AddWorkspaceButton) on a filled square */
 #AddWsBtn {{
     color: {p.ACCENT_GOLD}; font-size: 18px; font-weight: 800;
-    background: {p.BG_ACTIVE}; border: 1px solid {p.BORDER};
-    border-radius: 4px; padding: 0 8px; min-width: 16px;
+    background: {p.BG_ACTIVE};
+    border: 1px solid {p.BORDER}; border-radius: 6px; padding: 0;
 }}
 #AddWsBtn:hover {{
     background: {p.BG_HOVER}; border-color: {p.ACCENT_GOLD};
@@ -1215,6 +1207,11 @@ QLabel#SyncNames {{ color: {p.TEXT}; }}
 QLabel#SyncBadge {{ border-radius: 11px; font-weight: 700; font-size: 13px; }}
 QLabel#SyncBadge[big="true"] {{ border-radius: 17px; font-size: 20px; }}
 QLabel#SyncPill {{ border-radius: 9px; padding: 1px 9px; font-weight: 600; }}
+/* a Not connected row's Connect: the one action in the window, in accent */
+QPushButton#SyncConnect {{ color: {p.ACCENT_GOLD}; border-color: {p.ACCENT_GOLD};
+    padding: 3px 14px; font-weight: 600; }}
+QPushButton#SyncConnect:hover {{ background: {p.BG_HOVER}; }}
+QPushButton#SyncConnect:disabled {{ color: {p.TEXT_DIM}; border-color: {p.BORDER}; }}
 {sync_sections}
 QLabel {{ background: transparent; }}
 /* Checkboxes: the platform default draws a near-invisible tick. Give it a
@@ -1291,6 +1288,8 @@ QScrollArea {{ background: transparent; border: none; }}
 /* Open repo hovered: its right edge is the ▾'s left border (WorkspacePage
    sets seamLit), so light that too or the hover box has no right side */
 #RepoActivityMenuButton[seamLit="true"] {{ border-left-color: {p.ACCENT_BLUE}; }}
+/* greyed while the folder has no repository (Connect to repo) */
+#RepoActivityMenuButton:disabled {{ color: {p.TEXT_FAINT}; }}
 /* padding-left leaves room for the line icon header_icons paints */
 #GridButton, #MapToggle, #ActivityToggle {{
     background: {p.BG_HOVER}; border: 1px solid {p.BORDER};

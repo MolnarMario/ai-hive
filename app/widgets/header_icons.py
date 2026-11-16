@@ -1,6 +1,7 @@
 """Line icons for the workspace header: the folder and trash beside the path,
-and Layout, Map, Activity and Lanes, plus the card header's lane chip and the
-terminal find bar's arrows and close button.
+and Layout, Map, Activity and Lanes, plus the card header's lane chip, the
+terminal find bar's arrows and close button, and the sidebar header's
+search, add category, sync and add workspace buttons.
 
 Font glyphs (the old "▦", "◆", "❦", "⎇") render as colour emoji on some
 systems and never match the text weight. These are stroked SVG paths (the
@@ -9,12 +10,20 @@ button's text, so a hover, checked or dimmed state recolours both together.
 Beside text, a header button's icon goes in the room the stylesheet reserves
 with `padding-left`. A button with no text gets it centred. The lane chip
 lays out its own icon and text (`LaneChip`).
+
+The sidebar's sync button is the one filled icon (`CloudSyncButton`): a
+cloud in the theme's accent with two arrows cut out of it, so whatever is
+behind the button (its hover wash) shows through them. The arrows turn
+while a sync runs.
 """
 
+import math
 from functools import lru_cache
 
-from PySide6.QtCore import QByteArray, QRect, QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QPainter, QPalette
+from PySide6.QtCore import (QByteArray, QPointF, QRect, QRectF, QSize, Qt,
+                            QVariantAnimation)
+from PySide6.QtGui import (QColor, QImage, QPainter, QPainterPath, QPalette,
+                           QPen, QPolygonF)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QLabel, QStyle, QStyleOptionToolButton,
                                QStylePainter, QToolButton)
@@ -60,6 +69,13 @@ _BODIES = {
     "folder": ("<path d='M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 "
                "1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 "
                "0 0 2 2Z'/>"),
+    # the sidebar header: search workspaces, add a category
+    "search": "<circle cx='11' cy='11' r='7'/><path d='m20 20-4.2-4.2'/>",
+    "package": ("<path d='M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 "
+                "0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 "
+                "0 0 1 1.73z'/><path d='M12 22V12'/>"
+                "<path d='m3.3 7 7.7 4.73a2 2 0 0 0 2 0L20.7 7'/>"
+                "<path d='m7.5 4.27 9 5.15'/>"),
     "trash": ("<path d='M3 6h18'/>"
               "<path d='M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6'/>"
               "<path d='M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2'/>"
@@ -149,6 +165,139 @@ class SidebarToggleButton(QToolButton):
                (self.width() - self.ICON_SIZE) / 2, self.ICON_SIZE)
 
 
+class SidebarIconButton(QToolButton):
+    """A square, textless sidebar header button with a centred line icon:
+    dim ink, the accent on hover, like the glyphs it replaced. The emoji
+    those were drew at their own sizes and baselines, so no two lined up."""
+
+    ICON = 16
+
+    def __init__(self, icon_name: str, parent=None):
+        super().__init__(parent)
+        self._icon_name = icon_name
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        ink = Palette.ACCENT_GOLD if self.underMouse() else Palette.TEXT_DIM
+        _paint(self, self._icon_name, ink, (self.width() - self.ICON) / 2,
+               self.ICON)
+
+
+@lru_cache(maxsize=1)
+def _cloud_path() -> QPainterPath:
+    """The cloud on the 24px grid: three circles and a flat base, centred.
+    Built once: the spinning button paints it about 60 times a second."""
+    path = QPainterPath()
+    for cx, cy, r in ((12.2, 10.9, 6.6), (5.9, 14.9, 4.2),
+                      (17.7, 14.4, 4.7)):
+        circle = QPainterPath()
+        circle.addEllipse(QPointF(cx, cy), r, r)
+        path = path.united(circle)
+    base = QPainterPath()
+    base.addRect(QRectF(5.9, 13.0, 11.8, 6.1))
+    return path.united(base).simplified()
+
+
+# the arrows' circle, inside the cloud's body
+_ARROW_CENTER = (12.0, 13.3)
+_ARROW_R = 3.7
+_ARROW_PEN = 1.9
+
+
+def _arrow_head(p: QPainter, center: QPointF, r: float, deg: float,
+                sign: int) -> None:
+    """A filled head at `deg` on the circle, pointing the way the arc
+    runs (sign -1: clockwise on screen)."""
+    a = math.radians(deg)
+    tip_at = QPointF(center.x() + r * math.cos(a),
+                     center.y() - r * math.sin(a))
+    # the tangent, clockwise on screen when sign is -1
+    tx, ty = -sign * math.sin(a), -sign * math.cos(a)
+    nx, ny = math.cos(a), -math.sin(a)          # outward
+    size = 2.6
+    tip = QPointF(tip_at.x() + tx * size * 0.9, tip_at.y() + ty * size * 0.9)
+    left = QPointF(tip_at.x() + nx * size * 0.75, tip_at.y() + ny * size * 0.75)
+    right = QPointF(tip_at.x() - nx * size * 0.75,
+                    tip_at.y() - ny * size * 0.75)
+    p.drawPolygon(QPolygonF([tip, left, right]))
+
+
+class CloudSyncButton(QToolButton):
+    """The sidebar's Sync with GitHub: a filled cloud with two turning
+    arrows cut out of it. `set_spinning` turns the arrows while a sync
+    runs; the button is disabled then, and the cloud stays in the accent so
+    it reads as working, not as off."""
+
+    ICON = 22
+    SPIN_MS = 1100
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._angle = 0.0
+        self._spin = QVariantAnimation(self)
+        self._spin.setStartValue(0.0)
+        self._spin.setEndValue(360.0)
+        self._spin.setDuration(self.SPIN_MS)
+        self._spin.setLoopCount(-1)
+        self._spin.valueChanged.connect(self._turn)
+
+    def _turn(self, value) -> None:
+        self._angle = float(value)
+        self.update()
+
+    def set_spinning(self, on: bool) -> None:
+        if on:
+            self._spin.start()
+        else:
+            self._spin.stop()
+            self._angle = 0.0
+            self.update()
+
+    def spinning(self) -> bool:
+        return self._spin.state() == QVariantAnimation.State.Running
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        dpr = self.devicePixelRatioF() or 1.0
+        px = max(8, min(self.ICON, self.width() - 4, self.height() - 4))
+        img = QImage(int(px * dpr), int(px * dpr),
+                     QImage.Format.Format_ARGB32_Premultiplied)
+        img.setDevicePixelRatio(dpr)
+        img.fill(Qt.GlobalColor.transparent)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.scale(px / 24.0, px / 24.0)
+        ink = QColor(Palette.ACCENT_GOLD)
+        if self.underMouse() and self.isEnabled():
+            ink = ink.lighter(118)
+        p.fillPath(_cloud_path(), ink)
+        # the arrows are cut out: whatever is behind the button shows
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        center = QPointF(*_ARROW_CENTER)
+        r = _ARROW_R
+        p.translate(center)
+        p.rotate(-self._angle)
+        p.translate(-center)
+        pen = QPen(Qt.GlobalColor.black, _ARROW_PEN)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        p.setPen(pen)
+        box = QRectF(center.x() - r, center.y() - r, 2 * r, 2 * r)
+        for start in (160.0, -20.0):
+            arc = QPainterPath()
+            arc.arcMoveTo(box, start)
+            arc.arcTo(box, start, -110.0)
+            p.drawPath(arc)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(Qt.GlobalColor.black)
+        _arrow_head(p, center, r, 50.0, -1)
+        _arrow_head(p, center, r, -130.0, -1)
+        p.end()
+        out = QPainter(self)
+        out.drawImage(QRectF((self.width() - px) / 2,
+                             (self.height() - px) / 2, px, px), img)
+        out.end()
+
+
 class PlusButton(QToolButton):
     """The usage pill picker's "+". The stylesheet draws the frame and the
     button paints the cross itself as two filled bars: the font's "+" sits
@@ -167,7 +316,7 @@ class PlusButton(QToolButton):
         opt.text = ""
         p = QStylePainter(self)
         p.drawComplexControl(QStyle.ComplexControl.CC_ToolButton, opt)
-        ink = Palette.TEXT if self.underMouse() else Palette.TEXT_DIM
+        ink = self.ink()
         x = (self.width() - self.ARM) // 2
         y = (self.height() - self.ARM) // 2
         mid_x = (self.width() - self.THICK) // 2
@@ -175,6 +324,19 @@ class PlusButton(QToolButton):
         p.fillRect(QRect(x, mid_y, self.ARM, self.THICK), QColor(ink))
         p.fillRect(QRect(mid_x, y, self.THICK, self.ARM), QColor(ink))
         p.end()
+
+    def ink(self) -> str:
+        return Palette.TEXT if self.underMouse() else Palette.TEXT_DIM
+
+
+class AddWorkspaceButton(PlusButton):
+    """The sidebar's add workspace: the same crisp painted cross, larger,
+    in the accent `#AddWsBtn` gives it."""
+
+    ARM = 12
+
+    def ink(self) -> str:
+        return Palette.ACCENT_GOLD
 
 
 class LaneChip(QToolButton):

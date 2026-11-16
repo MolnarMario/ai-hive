@@ -2021,6 +2021,10 @@ class TerminalAgent(QObject):
         return sanitize_text(
             transcripts.latest_recap(spec.cwd, spec.session_id)).strip()
 
+    def ai_title(self) -> str:
+        """The provider's live conversation title, "" until it reports one."""
+        return self._ai_title
+
     def set_ai_title(self, text: str) -> None:
         """Adopt the provider's latest conversation summary.
         Transient — never persisted; refreshed by the manager's poll."""

@@ -478,17 +478,23 @@ workspaces keep executing — switching never pauses anything.
   link / Copy link address) — "Reveal in folder" opens Explorer with the file
   already selected, and "Copy path" copies the resolved **absolute** path, which
   is what pastes into an address bar.
-- **Search the sidebar** — a 🔍 next to the category button expands an input
+- **Search the sidebar** — the magnifier next to the category button expands an input
   that covers the WORKSPACES title/count; as you type it **highlights every
   match** across workspace names, agent names, and agent summaries, and
-  auto-expands a workspace to reveal a matching agent. Esc (or clicking 🔍
-  again) closes it and restores what was expanded before.
+  auto-expands a workspace to reveal a matching agent. Esc (or clicking the
+  magnifier again) closes it and restores what was expanded before. The
+  header's buttons are one square size and spread out on a wide sidebar; on
+  the narrowest one the count gives way before the title would clip.
 - **First-class folders** — every workspace header shows its full path
   (eliding only what its own buttons don't leave room for) with **Delete**,
   **Open repo**, **Open folder** and **Change folder** buttons; agents launch rooted
   there. The ▾ beside Open repo lists the GitHub repository's recent pull
   requests and commits. AI Hive loads that list in the background a few
   seconds after startup and keeps it, so the menu opens already filled.
+  A folder with no origin remote shows **Connect to repo** instead, with
+  the ▾ greyed: paste a GitHub URL and AI Hive checks that your git account
+  can reach it (a private repository you can't read is refused), runs
+  `git init` if the folder isn't a repository yet and adds it as origin.
 - **Bionic reading.** ⚙ Options > Appearance > **Bionic reading** (off by
   default) draws the first half of each prose word in the agent terminals in
   bold, which some readers, dyslexic readers among them, find easier to
@@ -749,8 +755,9 @@ error dialog instead of silently closing. Packaging to a distributable
   10px rail with one strip per workspace, in sidebar order and colored like
   its count badge. The active workspace has the wide strip, hover shows the
   name, and a click opens that workspace without reopening the sidebar.
-- **Sync every workspace with GitHub in one click.** The `↻` in the sidebar
-  header fetches each workspace's folder and moves its branch forward to what
+- **Sync every workspace with GitHub in one click.** The cloud in the sidebar
+  header (its arrows turn while it works) fetches each workspace's folder
+  that is connected to a repository and moves its branch forward to what
   it tracks on GitHub, so after pushing from one computer, one click on the
   other brings every project up to date without asking an agent in each
   workspace to pull. A notice over each workspace says it is checking, then
@@ -759,7 +766,13 @@ error dialog instead of silently closing. Packaging to a distributable
   tracks nothing (every agent lane), or local changes to files GitHub also
   changed are left alone, and a dialog then lists what happened in each
   workspace. Local changes to other files ride along. Workspaces on one
-  folder sync once.
+  folder sync once. A folder with no repository or no remote is never
+  checked; the dialog lists it under **Not connected** with a **Connect**
+  button, which asks for the GitHub URL (like Connect to repo), then syncs
+  that folder alone: its branch is tied to the same branch on GitHub, and a
+  folder with no commits yet gets GitHub's default branch checked out (git
+  refuses, and the dialog says so, if a file already there has the same
+  name as one it would bring).
 - **Sync at launch** (Options, *Sync workspaces with GitHub at launch*, off by
   default) runs the same sync once per launch, and only after the launch has
   settled: every restored agent started and showing its prompt, the startup
@@ -1131,7 +1144,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4839 checks drive the real app headlessly (offscreen Qt platform) with real
+4906 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1260,8 +1273,8 @@ app/
   cli_install.py           how Claude Code is installed + the switch onto the self-updating build (Qt-free)
   self_update.py           update AI Hive from GitHub main: version check, changelog, ff-only merge (Qt-free)
   file_activity.py         per-agent file attribution from transcripts (Qt-free)
-  repo_activity.py         Open repo dropdown: GitHub PRs + commits, origin URL (Qt-free)
-  workspace_sync.py        sidebar sync button: fetch + ff-only every workspace folder (Qt-free)
+  repo_activity.py         Open repo dropdown: GitHub PRs + commits, origin URL, Connect to repo (Qt-free)
+  workspace_sync.py        sidebar sync button: fetch + ff-only every connected workspace folder, tie a just-connected one to its remote (Qt-free)
   ui_theme.py              theme registry (skins) + apply_theme + the QSS stylesheet
   assets/fonts/            bundled fonts: the manuscript ones (Cinzel/EB Garamond/
                            Spectral) and the Terminal font picker's mono families,
@@ -1283,7 +1296,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4839 checks)
+                           (4906 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)

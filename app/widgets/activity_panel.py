@@ -7,6 +7,12 @@ of the shared-awareness feature; the agent-facing half is the board file
 (.aihive/board.md) that Claude agents read and write via their appended
 system prompt.
 
+Each agent's task box shows what the board's roster shows
+(`TerminalAgent.summary`): Claude's conversation title, read-only, or for an
+agent with no title, a task the user types in. The box once showed only the
+typed task, which only the long-gone Assign button filled, so it sat empty
+while the board listed every agent's task.
+
 With agent lanes (app/lanes.py) a Lanes section lists each laned agent's
 branch, commits ahead/behind, uncommitted files and overlaps, and the
 changed-files list is per checkout: the workspace folder's own `git status`,
@@ -50,8 +56,11 @@ class AgentRosterItem(QFrame):
         self.task_edit = QLineEdit(self)
         self.task_edit.setObjectName("RosterTask")
         self.task_edit.setPlaceholderText("current task…")
+        # a read-only box shows the conversation title: losing focus must not
+        # store that title as a typed task
         self.task_edit.editingFinished.connect(
-            lambda: self.taskEdited.emit(self.agent_id, self.task_edit.text()))
+            lambda: self.task_edit.isReadOnly()
+            or self.taskEdited.emit(self.agent_id, self.task_edit.text()))
         lay.addWidget(self.head)
         lay.addWidget(self.task_edit)
         self.refresh(agent)
@@ -62,8 +71,23 @@ class AgentRosterItem(QFrame):
         model = agent.spec.model or agent.spec.provider or agent.spec.kind.value
         self.head.setText(f"{icon}  <b>{agent.spec.name}</b>  "
                           f"<span style='color:#8a8a8a'>{model}</span>")
-        if not self.task_edit.hasFocus():
-            self.task_edit.setText(agent.current_task)
+        title = getattr(agent, "ai_title", lambda: "")()
+        if self.task_edit.hasFocus() and not self.task_edit.isReadOnly():
+            # the user is typing a task: leave their text alone, even when a
+            # title arrives meanwhile. Leaving the box stores it, and the
+            # next refresh after that shows the title
+            return
+        # the board's "Current task" (TerminalAgent.summary): the provider's
+        # conversation title when it has one, which nothing typed here could
+        # override, so the box only takes typing while there is no title
+        self.task_edit.setReadOnly(bool(title))
+        self.task_edit.setText(title or agent.current_task)
+        self.task_edit.setCursorPosition(0)
+        self.task_edit.setToolTip(
+            f"{title}\n\nThe conversation title, the same text the shared "
+            f"board shows as this agent's current task." if title else
+            "This agent's current task, as the shared board shows it. Type "
+            "one in for an agent that has no conversation title.")
 
 
 class ActivityPanel(QFrame):

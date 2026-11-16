@@ -303,6 +303,7 @@ class WorkspacePage(QWidget):
     deleteRequested = Signal(str)       # ws_id
     openFolderRequested = Signal(str)   # ws_id
     openRepoRequested = Signal(str)     # ws_id
+    connectRepoRequested = Signal(str)  # ws_id: the folder has no origin
     repoActivityRequested = Signal(str)  # ws_id
     changePathRequested = Signal(str)   # ws_id
     activityToggled = Signal(str)       # ws_id (wired in Phase 6)
@@ -436,6 +437,9 @@ class WorkspacePage(QWidget):
         # click shows whatever is here at once
         self._repo_activity_shown = None
         self.reset_repo_activity()
+        # Open repo until MainWindow's probe says the folder has no origin
+        # (app/repo_activity.repo_state); then Connect to repo, ▾ greyed
+        self.repo_connected = True
         self.open_btn = tool("Open folder", "Open this workspace's folder",
                              "HeaderOpenFolder")
         self.change_btn = tool("Change folder", "Change the workspace folder",
@@ -487,8 +491,7 @@ class WorkspacePage(QWidget):
             lambda: self.deleteRequested.emit(self.workspace.id))
         self.open_btn.clicked.connect(
             lambda: self.openFolderRequested.emit(self.workspace.id))
-        self.repo_btn.clicked.connect(
-            lambda: self.openRepoRequested.emit(self.workspace.id))
+        self.repo_btn.clicked.connect(self._on_repo_clicked)
         self.repo_activity_btn.clicked.connect(self._show_repo_activity_menu)
         self.change_btn.clicked.connect(
             lambda: self.changePathRequested.emit(self.workspace.id))
@@ -549,6 +552,38 @@ class WorkspacePage(QWidget):
                 seam.setProperty("seamLit", lit)
                 repolish(seam)
         return super().eventFilter(obj, event)
+
+    def _on_repo_clicked(self) -> None:
+        if self.repo_connected:
+            self.openRepoRequested.emit(self.workspace.id)
+        else:
+            self.connectRepoRequested.emit(self.workspace.id)
+
+    def set_repo_connected(self, connected: bool) -> None:
+        """Open repo (with its ▾) for a folder that has an origin remote,
+        Connect to repo (▾ greyed: there is no activity to list) for one
+        that doesn't."""
+        connected = bool(connected)
+        if connected is self.repo_connected:
+            return
+        self.repo_connected = connected
+        if connected:
+            self.repo_btn.setText("Open repo")
+            self.repo_btn.setToolTip(
+                "Open this workspace's GitHub repository in a browser")
+            self.repo_activity_btn.setToolTip(
+                "Show recent GitHub pull requests and commits")
+        else:
+            self.repo_btn.setText("Connect to repo")
+            self.repo_btn.setToolTip(
+                "This folder has no GitHub repository. Click to connect one.")
+            self.repo_activity_btn.setToolTip(
+                "Connect a GitHub repository to see its pull requests and "
+                "commits")
+            self.repo_activity_menu.hide()
+        self.repo_activity_btn.setEnabled(connected)
+        # the button's width changed: the path label gets what is left
+        self._elide_path()
 
     def _show_repo_activity_menu(self) -> None:
         menu = self.repo_activity_menu

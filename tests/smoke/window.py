@@ -1037,6 +1037,243 @@ def test_repo_activity_cache():
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_repo_connect():
+    """A folder with no origin remote gets Connect to repo with the ▾
+    greyed; Connect checks the repository can be reached (a private one the
+    user can't read is refused, the folder untouched), runs git init when
+    the folder is no repository, adds origin, and the header turns back
+    into Open repo."""
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication, QDialog
+
+    from app import repo_activity
+    from app.session_store import SessionStore
+    from app.widgets import main_window as mw_mod
+    from main import create_main_window, setup_application
+
+    app = QApplication.instance() or QApplication([])
+    setup_application(app)
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    def git(*args):
+        subprocess.run(["git", *args], capture_output=True, check=True,
+                       creationflags=0x08000000)
+
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-repoconn-"))
+    plain, bare, github, other = (tmp / n for n in
+                                  ("plain", "bare", "github", "other"))
+    for folder in (plain, bare, github, other):
+        folder.mkdir()
+    git("init", "-q", str(bare))
+    git("init", "-q", str(github))
+    git("-C", str(github), "remote", "add", "origin",
+        "git@github.com:o/r.git")
+    git("init", "-q", str(other))
+    git("-C", str(other), "remote", "add", "origin",
+        "https://gitlab.com/o/r.git")
+
+    # --- the Qt-free half -------------------------------------------------
+    check("repo connect: github_repo_url wants exactly owner/repo",
+          repo_activity.github_repo_url("https://github.com/o/r.git")
+          == "https://github.com/o/r"
+          and repo_activity.github_repo_url("https://github.com/o") == ""
+          and repo_activity.github_repo_url("https://gitlab.com/o/r") == "")
+    check("repo connect: a malformed URL typed into Connect is refused, "
+          "never raised",
+          repo_activity.github_repo_url("https://[") == ""
+          and repo_activity.browser_url("ssh://[x") == "")
+    states = {name: repo_activity.repo_state(str(tmp / name))
+              for name in ("plain", "bare", "github", "other", "missing")}
+    check("repo connect: repo_state reads each kind of folder",
+          states == {"plain": "none", "bare": "none", "github": "github",
+                     "other": "other", "missing": ""}, states)
+    quick = {name: repo_activity.config_has_origin(str(tmp / name))
+             for name in ("plain", "bare", "github", "other", "missing")}
+    check("repo connect: config_has_origin agrees, from files alone",
+          quick == {"plain": False, "bare": False, "github": True,
+                    "other": True, "missing": None}, quick)
+
+    calls = []
+    reach = {"rc": 0, "out": ""}
+
+    def runner(argv, timeout):
+        calls.append(argv[1:3] if argv[1] != "-C" else argv[3:5])
+        if argv[1] == "ls-remote":
+            return reach["rc"], reach["out"]
+        r = subprocess.run(argv, capture_output=True, text=True,
+                           creationflags=0x08000000)
+        return r.returncode, r.stdout + r.stderr
+
+    err = repo_activity.connect_origin(str(plain), "https://github.com/o",
+                                       runner)
+    check("repo connect: a URL without a repository is refused before git",
+          err and calls == [], (err, calls))
+    reach.update(rc=128, out="remote: Repository not found.")
+    err = repo_activity.connect_origin(str(plain), "https://github.com/o/p",
+                                       runner)
+    check("repo connect: an unreachable (private) repository is refused "
+          "with git's reason",
+          err.startswith(repo_activity.NO_ACCESS_TEXT)
+          and "Repository not found" in err, err)
+    check("repo connect: ...and the folder is left as it was",
+          calls == [["ls-remote", "--heads"]]
+          and not (plain / ".git").exists(), calls)
+    # a folder inside a parent's repository: Connect would have added
+    # origin to the parent, and the sync after it checked GitHub's files
+    # out into the parent folder
+    inner = bare / "inner"
+    inner.mkdir()
+    calls.clear()
+    reach.update(rc=0, out="")
+    err = repo_activity.connect_origin(str(inner), "https://github.com/o/p",
+                                       runner)
+    check("repo connect: a folder inside another repository is refused "
+          "before git, and the parent gets no origin",
+          "inside another git repository" in err and calls == []
+          and repo_activity.repo_state(str(bare)) == "none"
+          and not (inner / ".git").exists(), (err, calls))
+
+    # --- the header -------------------------------------------------------
+    store = SessionStore(path=tmp / "s.json")
+    win = create_main_window(store)
+    mgr = win.manager
+    ws = mgr.workspaces[0]
+    page = win._pages[ws.id]
+
+    def settle():
+        for _ in range(150):
+            if not win._repo_state_busy:
+                return
+            pump(20)
+
+    # a label that changed after the first layout re-laid the header out
+    # and resized every agent's terminal (the pty width test)
+    first = {name: win._pages[mgr.create_workspace(
+                 name, str(tmp / name)).id].repo_btn.text()
+             for name in ("plain", "bare", "github")}
+    check("repo connect: each page has its final label the moment it "
+          "exists, before the probe answers",
+          first == {"plain": "Connect to repo", "bare": "Connect to repo",
+                    "github": "Open repo"}, first)
+    settle()
+    mgr.set_active(ws.id)
+
+    mgr.set_workspace_path(ws.id, str(plain))
+    settle()
+    check("repo connect: a folder with no repository offers Connect to repo",
+          page.repo_btn.text() == "Connect to repo"
+          and not page.repo_activity_btn.isEnabled(),
+          (page.repo_btn.text(), page.repo_activity_btn.isEnabled()))
+
+    # a probe asked for while one is in flight (a Connect finishing while
+    # an activation probe still runs) is not dropped: the answer in flight
+    # predates the change and must not stick
+    import threading
+    gate = threading.Event()
+    answers_seen = []
+
+    def gated(path):
+        if not answers_seen:
+            answers_seen.append("none")
+            gate.wait(5)
+            return repo_activity.STATE_NONE
+        answers_seen.append("github")
+        return repo_activity.STATE_GITHUB
+
+    win._repo_state_probe = gated
+    win._probe_repo_state([ws.id])
+    win._probe_repo_state([ws.id])
+    gate.set()
+    settle()
+    win._repo_state_probe = repo_activity.repo_state
+    check("repo connect: a probe asked for mid-flight runs after it, so a "
+          "stale answer never sticks",
+          answers_seen == ["none", "github"]
+          and page.repo_btn.text() == "Open repo", answers_seen)
+
+    mgr.set_workspace_path(ws.id, str(github))
+    settle()
+    check("repo connect: a GitHub origin gets Open repo and its dropdown",
+          page.repo_btn.text() == "Open repo"
+          and page.repo_activity_btn.isEnabled())
+    mgr.set_workspace_path(ws.id, str(other))
+    settle()
+    check("repo connect: any other origin keeps Open repo (never offers to "
+          "replace it)", page.repo_btn.text() == "Open repo")
+
+    # the dialog and the warning are modal: stand-ins answer for the user
+    dialogs = []
+    answers = []
+
+    class FakeDialog:
+        def __init__(self, folder, url="", parent=None):
+            dialogs.append((folder, url))
+
+        def exec(self):
+            return (QDialog.DialogCode.Accepted if answers.pop(0)
+                    else QDialog.DialogCode.Rejected)
+
+        def url(self):
+            return "https://github.com/o/new.git"
+
+    warnings = []
+    real_dialog = mw_mod.ConnectRepoDialog
+    real_warning = mw_mod.QMessageBox.warning
+    mw_mod.ConnectRepoDialog = FakeDialog
+    mw_mod.QMessageBox.warning = staticmethod(
+        lambda *a, **k: warnings.append(a[2] if len(a) > 2 else ""))
+    win._repo_connect_runner = runner
+    try:
+        mgr.set_workspace_path(ws.id, str(plain))
+        settle()
+
+        def finish():
+            for _ in range(150):
+                if win._connect_progress is None:
+                    break
+                pump(20)
+            settle()
+
+        calls.clear()
+        reach.update(rc=128, out="remote: Repository not found.")
+        answers[:] = [True, False]
+        page.repo_btn.click()
+        finish()
+        check("repo connect: a refused connect says why and reopens the "
+              "dialog with the same URL",
+              len(warnings) == 1
+              and repo_activity.NO_ACCESS_TEXT in warnings[0]
+              and dialogs[-1] == (str(plain), "https://github.com/o/new.git"),
+              (warnings, dialogs))
+        check("repo connect: ...and the header still offers Connect",
+              page.repo_btn.text() == "Connect to repo")
+
+        calls.clear()
+        reach.update(rc=0, out="")
+        answers[:] = [True]
+        page.repo_btn.click()
+        finish()
+        check("repo connect: a reachable repository: git init, then origin",
+              calls == [["ls-remote", "--heads"], ["init"],
+                        ["remote", "add"]], calls)
+        check("repo connect: the header turns into Open repo with its dropdown",
+              page.repo_btn.text() == "Open repo"
+              and page.repo_activity_btn.isEnabled()
+              and repo_activity.origin_url(str(plain))
+              == "https://github.com/o/new")
+        check("repo connect: the new repository lights up the Lanes toggle",
+              page.lanes_box.isVisibleTo(page))
+    finally:
+        mw_mod.ConnectRepoDialog = real_dialog
+        mw_mod.QMessageBox.warning = real_warning
+
+    win.close()
+    pump(100)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 
 def test_perf_stall_probe():
     """PERF stall (app/perf_audit.py): a 50 ms timer that measures its own
