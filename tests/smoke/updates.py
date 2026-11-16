@@ -3159,6 +3159,17 @@ def test_workspace_sync_connect():
           and _sync_git(fresh, "rev-parse", "--abbrev-ref", "@{upstream}")
           == "origin/main", vars(r))
 
+    same = tmp / "same"
+    same.mkdir()
+    _sync_git(same, "init", "-q", "-b", "main")
+    _sync_git(same, "remote", "add", "origin", str(origin))
+    r = linked(same)
+    check("ws-connect: ...also when the folder's branch with no commits has "
+          "the remote's name (an unborn branch has no ref to clash with)",
+          r.outcome is Outcome.UPDATED and r.pulled == 2
+          and _sync_git(same, "rev-parse", "--abbrev-ref", "@{upstream}")
+          == "origin/main", vars(r))
+
     clash = tmp / "clash"
     clash.mkdir()
     (clash / "a.txt").write_text("my own a\n")
