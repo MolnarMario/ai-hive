@@ -5788,16 +5788,10 @@ class MainWindow(QMainWindow):
             if ws is None:
                 continue
             # a folder walk for .git, not a git process (lanes.find_repo_root)
-            in_repo = bool(lanes.find_repo_root(ws.project_path))
             page.set_lanes_state(self.lane_default(ws),
                                  forced=self._agent_lanes,
-                                 available=in_repo)
-            if not in_repo:
-                # no repository, so no origin: Connect to repo now, before
-                # the page's first layout. Left to the probe, the wider
-                # label arrived after the agents had their width and a
-                # narrow window resized every one of them
-                page.set_repo_connected(False)
+                                 available=bool(lanes.find_repo_root(
+                                     ws.project_path)))
 
     # Lane lifetime (spec "Lane lifetime"). LIVE from creation until the card
     # closes: the path never changes, a missing folder is repaired in place.
@@ -7889,7 +7883,7 @@ class MainWindow(QMainWindow):
         page.integration_info = self._integration_info
         self._pages[ws.id] = page
         self._refresh_workspace_lane_toggles(ws.id)
-        self._probe_repo_state([ws.id])
+        self._read_repo_state(ws.id)
         self.stack.addWidget(page)
         # a page added while another one is current is added HIDDEN, and Qt
         # never lays a hidden page out — its cards would keep the terminal's
@@ -8202,7 +8196,7 @@ class MainWindow(QMainWindow):
             page.reset_repo_activity()
         # the new folder may or may not be in a git repository
         self._refresh_workspace_lane_toggles(ws_id)
-        self._probe_repo_state([ws_id])
+        self._read_repo_state(ws_id)
         self.sidebar.set_row_folder(ws_id, os.path.basename(path) or path)
         # the file explorer re-roots at the new folder (drop stale sub-expansion)
         self.sidebar.reset_file_tree(ws_id)
@@ -8249,6 +8243,19 @@ class MainWindow(QMainWindow):
     # Open repo vs Connect to repo. The probe runs git (when the folder is
     # in a repository at all), so it stays off the GUI thread, one worker
     # for any number of workspaces, like the activity fetch.
+
+    def _read_repo_state(self, ws_id: str) -> None:
+        """A new page or folder: the label from the git config file at once
+        (repo_activity.config_has_origin), so the header has its final
+        width before its first layout, then git's own answer behind it."""
+        ws = self.manager.workspace(ws_id)
+        page = self._pages.get(ws_id)
+        if ws is None or page is None:
+            return
+        has_origin = repo_activity.config_has_origin(ws.project_path)
+        if has_origin is not None:
+            page.set_repo_connected(has_origin)
+        self._probe_repo_state([ws_id])
 
     def _probe_repo_state(self, ws_ids) -> None:
         jobs = []

@@ -1085,6 +1085,11 @@ def test_repo_connect():
     check("repo connect: repo_state reads each kind of folder",
           states == {"plain": "none", "bare": "none", "github": "github",
                      "other": "other", "missing": ""}, states)
+    quick = {name: repo_activity.config_has_origin(str(tmp / name))
+             for name in ("plain", "bare", "github", "other", "missing")}
+    check("repo connect: config_has_origin agrees, from files alone",
+          quick == {"plain": False, "bare": False, "github": True,
+                    "other": True, "missing": None}, quick)
 
     calls = []
     reach = {"rc": 0, "out": ""}
@@ -1125,12 +1130,15 @@ def test_repo_connect():
                 return
             pump(20)
 
-    # a label that changed after the first layout widened the header and
-    # resized every agent's terminal in a narrow window (pty width test)
-    fresh = mgr.create_workspace("Fresh", str(plain))
-    check("repo connect: a folder outside any repository says Connect to "
-          "repo the moment its page exists, before the probe answers",
-          win._pages[fresh.id].repo_btn.text() == "Connect to repo")
+    # a label that changed after the first layout re-laid the header out
+    # and resized every agent's terminal (the pty width test)
+    first = {name: win._pages[mgr.create_workspace(
+                 name, str(tmp / name)).id].repo_btn.text()
+             for name in ("plain", "bare", "github")}
+    check("repo connect: each page has its final label the moment it "
+          "exists, before the probe answers",
+          first == {"plain": "Connect to repo", "bare": "Connect to repo",
+                    "github": "Open repo"}, first)
     settle()
     mgr.set_active(ws.id)
 

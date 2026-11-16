@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import urllib.request
 from urllib.parse import urlparse, urlunparse
@@ -113,6 +114,36 @@ def repo_state(project_path: str) -> str:
     # 2: "No such remote 'origin'"; anything else (a timeout, a broken
     # repository) is not proof there is no origin
     return STATE_NONE if rc == 2 else STATE_UNKNOWN
+
+
+_ORIGIN_SECTION = re.compile(r'^\s*\[\s*remote\s+"origin"\s*\]',
+                             re.MULTILINE | re.IGNORECASE)
+
+
+def config_has_origin(project_path: str):
+    """`repo_state` from files alone, for the GUI thread while the header
+    is built: False outside any repository or when the repository's shared
+    config has no [remote "origin"], True when it has one, None when that
+    can't be read. No git process (an included config file is not read; the
+    probe that follows corrects that rare case). Without it the probe's
+    answer changed the label after the page's first layout, and the header
+    re-layout resized every agent's terminal (a width change makes Claude
+    redraw, see CLAUDE.md)."""
+    from .lanes import find_repo_root, read_common_dir
+    if not project_path or not os.path.isdir(project_path):
+        return None
+    if not find_repo_root(project_path):
+        return False
+    common = read_common_dir(project_path)
+    if not common:
+        return None
+    try:
+        with open(os.path.join(common, "config"), encoding="utf-8",
+                  errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    return bool(_ORIGIN_SECTION.search(text))
 
 
 # git gets this long to reach the repository; it never prompts (the runner
