@@ -1080,6 +1080,10 @@ def test_repo_connect():
           == "https://github.com/o/r"
           and repo_activity.github_repo_url("https://github.com/o") == ""
           and repo_activity.github_repo_url("https://gitlab.com/o/r") == "")
+    check("repo connect: a malformed URL typed into Connect is refused, "
+          "never raised",
+          repo_activity.github_repo_url("https://[") == ""
+          and repo_activity.browser_url("ssh://[x") == "")
     states = {name: repo_activity.repo_state(str(tmp / name))
               for name in ("plain", "bare", "github", "other", "missing")}
     check("repo connect: repo_state reads each kind of folder",

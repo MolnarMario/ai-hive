@@ -50,14 +50,21 @@ def browser_url(remote: str) -> str:
     if not remote:
         return ""
     # Git's SCP-like SSH syntax is not accepted by urlparse as a URL.
-    if remote.startswith("git@github.com:"):
-        path = remote.partition(":")[2]
-        parsed = urlparse(f"https://github.com/{path}")
-    else:
-        parsed = urlparse(remote)
-        if parsed.scheme in ("ssh", "git") and parsed.hostname == "github.com":
-            parsed = parsed._replace(scheme="https", netloc="github.com")
-    if parsed.scheme not in ("http", "https") or parsed.hostname != "github.com":
+    # urlparse raises on some malformed input ("https://[" while the user
+    # is still typing into Connect): that is not a GitHub URL either
+    try:
+        if remote.startswith("git@github.com:"):
+            path = remote.partition(":")[2]
+            parsed = urlparse(f"https://github.com/{path}")
+        else:
+            parsed = urlparse(remote)
+            if (parsed.scheme in ("ssh", "git")
+                    and parsed.hostname == "github.com"):
+                parsed = parsed._replace(scheme="https", netloc="github.com")
+        if (parsed.scheme not in ("http", "https")
+                or parsed.hostname != "github.com"):
+            return ""
+    except ValueError:
         return ""
     path = parsed.path.rstrip("/")
     if path.endswith(".git"):
