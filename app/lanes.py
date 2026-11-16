@@ -61,7 +61,9 @@ sides committed, a real in-memory merge (`git merge-tree --write-tree`, git
 2.38+) says whether they CONFLICT. All of it is read-only and lock-free, so
 app/lane_service.py polls it off the LaneOps queue. The same read finds the
 lane's newest commit whose message has a line saying just "Task done"
-(`DONE_GREP`): the agent's flag that its slice of work is finished. The
+(`DONE_GREP`): the agent's flag that its slice of work is finished. A flag
+that came in by merging another lane's branch is that lane's, not this
+one's (`_own_flag`). The
 lane chip shows it, and the integrator ships it when the user asks.
 The integrator merges that commit, not the head, so a flagged lane's chip
 takes its conflicts from the flagged commit (`_ship_overlaps`), while the
@@ -105,6 +107,11 @@ DONE_GREP = r"^[[:space:]]*task done[.!]?[[:space:]]*$"
 # creation ("branch: Created from") and a fast-forward to the base ("merge
 # origin/main: Fast-forward") point it at base commits nobody made there.
 OWN_COMMIT_ACTIONS = ("commit", "cherry-pick", "revert")
+# reflog actions that can bring in commits made somewhere else: a merge of
+# another lane's branch put that lane's "Task done" flag in this one
+MERGED_IN_ACTIONS = ("merge", "pull", "reset")
+# how far back a done check reads a branch's reflog
+REFLOG_SCAN = 500
 
 
 class LaneError(Exception):
@@ -1262,7 +1269,7 @@ def lane_snap(entry: dict, cache: dict | None = None) -> LaneSnap:
             snap.fork = _fork(root, snap.head, snap.base_ref, cache)
             if snap.ahead and snap.role != INTEGRATOR_ROLE:
                 snap.done = _done_commit(root, snap.head, snap.base_ref,
-                                         cache)
+                                         cache, snap.branch)
                 if snap.done == snap.head:      # the usual case
                     snap.done_paths = list(snap.committed)
                 elif snap.done:
@@ -1292,7 +1299,61 @@ def _fork(root: str, head: str, base_ref: str, cache) -> str:
     return fork
 
 
-def _done_commit(root: str, head: str, base_ref: str, cache) -> str:
+def _reflog_moves(root: str, branch: str) -> tuple:
+    """(own, moves) from the branch's reflog: `own` is the set of commits
+    made in the lane (OWN_COMMIT_ACTIONS), and `moves` lists each
+    (new head, head before) of a move that can bring in commits made
+    elsewhere: a merge, pull or reset, or a merge commit concluded with
+    `git commit` after a conflict. (set(), []) with no reflog to read."""
+    if not branch:
+        return set(), []
+    r = git(["log", "-g", f"--max-count={REFLOG_SCAN}",
+             "--format=%H%x09%gs", f"refs/heads/{branch}"], root)
+    if not r.ok or not r.out:
+        return set(), []
+    rows = [line.partition("\t") for line in r.out.splitlines()]
+    own = {sha for sha, _t, action in rows
+           if action.startswith(OWN_COMMIT_ACTIONS)}
+    moves = []
+    for i, (sha, _t, action) in enumerate(rows):
+        if (action.startswith(MERGED_IN_ACTIONS)
+                or action.startswith("commit (merge)")):
+            # the reflog lists newest first: the next row is the head before
+            moves.append((sha, rows[i + 1][0] if i + 1 < len(rows) else ""))
+    return own, moves
+
+
+def _own_flag(root: str, flags: list, reflog: tuple, base: str) -> str:
+    """The first of `flags` (newest first) that did not reach the lane
+    through a merge, pull or reset of another branch, or "". A commit the
+    reflog records as made in the lane never did, so the flags after the
+    newest own one are never looked at. A flag newer than that did when
+    some move's new head reaches it and the head before that move did not
+    (`rev-list new ^old`): a fast-forward to another lane's branch, or a
+    merge commit taking it in. Without reflog evidence either way it did
+    not. One git call per move at most, however many flags there are."""
+    own, moves = reflog
+    candidates = []
+    for f in flags:
+        if f in own:
+            break
+        candidates.append(f)
+    if not candidates:
+        return flags[0] if flags else ""
+    pending, foreign = set(candidates), set()
+    for new, old in moves:
+        r = git(["rev-list", new, f"^{base}", *([f"^{old}"] if old else [])],
+                root)
+        if r.ok:
+            foreign |= pending & set(r.out.split())
+            pending -= foreign
+        if not pending:
+            break
+    return next((f for f in flags if f not in foreign), "")
+
+
+def _done_commit(root: str, head: str, base_ref: str, cache,
+                 branch: str = "") -> str:
     """The newest commit in `head` flagged "Task done", when the base lacks
     some change the lane made up to it, or "". The flag is often an empty
     commit (`--allow-empty`, the lane prompt's last step) that stands for
@@ -1305,18 +1366,33 @@ def _done_commit(root: str, head: str, base_ref: str, cache) -> str:
     empty flag passed for landed as soon as the base held another lane's,
     and Ship finished lanes left that lane out. Only the newest flag is
     tested: an older one holds less of the lane's work. Cached by (head,
-    base sha) like `_fork`."""
+    base sha) like `_fork`.
+
+    A flag the lane took in by merging another branch is not its own: an
+    agent that merged a finished lane's branch into its lane (instead of
+    the base) showed that lane's flag as its own done mark while it was
+    still working, and Ship finished lanes would have offered it. The
+    branch's reflog says how each commit arrived (`_own_flag`); the
+    newest flag that did not arrive by a merge, pull or reset counts. With
+    no reflog to tell (expired, or git without one) a flag still counts,
+    the way it did before: a done lane left out of a ship loses work."""
     r = git(["rev-parse", base_ref], root)
     if not r.ok:
         return ""
-    key = ("done", head, r.out)
+    key = ("done", head, branch, r.out)
     if cache is not None and key in cache:
         return cache[key]
     # the cheap read first: most lanes have no flag at all, and only a
-    # flagged one is worth the patch ids and merge _landed computes
-    m = git(["log", "-1", "--format=%H", "-i", "-E", f"--grep={DONE_GREP}",
+    # flagged one is worth the reflog, patch ids and merge _landed computes
+    # --topo-order: a child before its parents even within one second, so
+    # the first flag that passes is the newest
+    m = git(["log", "--topo-order", "--format=%H", "-i", "-E",
+             f"--grep={DONE_GREP}",
              f"{r.out}..{head}"], root)
-    done = m.out if m.ok else ""
+    flags = m.out.split() if m.ok else []
+    done = ""
+    if flags:
+        done = _own_flag(root, flags, _reflog_moves(root, branch), r.out)
     if done and _landed(root, done, r.out):
         done = ""
     if cache is not None:
