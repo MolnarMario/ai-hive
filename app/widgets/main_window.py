@@ -2974,6 +2974,22 @@ def _windows_folder_path(path: str) -> str:
                                for part in rest.split(os.sep))
 
 
+def _remove_empty_folders(path: str, top: str) -> None:
+    """Remove `path` and each folder above it up to and including `top`,
+    while they are empty: the chain New Workspace made for a clone that
+    then failed. A folder something else put a file in stays."""
+    top = os.path.normcase(os.path.abspath(top))
+    path = os.path.abspath(path)
+    while True:
+        try:
+            os.rmdir(path)
+        except OSError:
+            return
+        if os.path.normcase(path) == top or os.path.dirname(path) == path:
+            return
+        path = os.path.dirname(path)
+
+
 class NewWorkspaceDialog(QDialog):
     """Choose an existing project folder or clone a GitHub repository's
     default branch (see `clone_default_branch`).
@@ -2987,8 +3003,9 @@ class NewWorkspaceDialog(QDialog):
     ticked and locked and sets nothing, so turning that switch off later
     leaves the workspace as the user left it.
 
-    A full path to a folder that does not exist yet turns the button into
-    Create folder and workspace, and the main window makes the folder
+    A full path to a folder that does not exist yet, as the project folder
+    or as the GitHub page's Clone into folder, turns the button into Create
+    folder and workspace, and the main window makes the folder
     (`MainWindow._on_add_workspace_clicked`), so a new project needs no trip
     to Explorer first. The check rides the Lanes debounce: one `exists` per
     pause, since a network path can stall each one.
@@ -3076,6 +3093,8 @@ class NewWorkspaceDialog(QDialog):
         self._lanes_timer.timeout.connect(self._refresh_folder_state)
         self.folder_edit.textChanged.connect(
             lambda _text: self._lanes_timer.start())
+        self.parent_edit.textChanged.connect(
+            lambda _text: self._lanes_timer.start())
         self._show_source(0)
 
     def _show_source(self, index: int) -> None:
@@ -3114,14 +3133,16 @@ class NewWorkspaceDialog(QDialog):
             "any missing folders above it." if missing else "")
 
     def folder_is_missing(self) -> bool:
-        """Is the Existing folder page naming a full path with nothing
-        there yet, on a drive or share that is there? A relative path would
-        land in AI Hive's own working folder, a file in the way is no folder
-        to make, and a missing drive can only fail, so all three stay plain
+        """Does the shown page's folder (the project folder, or the GitHub
+        page's Clone into) name a full path with nothing there yet, on a
+        drive or share that is there? A relative path would land in AI
+        Hive's own working folder, a file in the way is no folder to make,
+        and a missing drive can only fail, so all three stay plain
         errors."""
-        folder = self.folder_edit.text().strip()
-        if not (self.source_combo.currentIndex() == 0
-                and os.path.isabs(folder) and not os.path.exists(folder)):
+        edit = (self.folder_edit if self.source_combo.currentIndex() == 0
+                else self.parent_edit)
+        folder = edit.text().strip()
+        if not (os.path.isabs(folder) and not os.path.exists(folder)):
             return False
         drive = os.path.splitdrive(folder)[0]
         return not drive or os.path.isdir(drive + os.sep)
@@ -3211,7 +3232,8 @@ class NewWorkspaceDialog(QDialog):
         return {"mode": "github", "url": self.repo_edit.text().strip(),
                 "name": self.repo_name_edit.text().strip(),
                 "parent": self.parent_edit.text().strip(),
-                "lanes": self.wants_lanes()}
+                "lanes": self.wants_lanes(),
+                "create": self.folder_is_missing()}
 
 
 class ConnectRepoDialog(QDialog):
@@ -8613,9 +8635,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "AI Hive",
                                 "Enter a GitHub repository URL with an owner and repository name.")
             return
-        if not name or not parent or not os.path.isdir(parent):
-            QMessageBox.warning(self, "AI Hive",
-                                "Enter a workspace name and choose an existing clone folder.")
+        create = bool(data.get("create"))
+        if create:
+            # trimmed as on the folder page, so the destination below is
+            # the folder Windows really makes
+            parent = _windows_folder_path(parent)
+        if not name or not parent or not (create or os.path.isdir(parent)):
+            QMessageBox.warning(
+                self, "AI Hive",
+                f"That path is a file, not a folder:\n{parent}"
+                if name and parent and os.path.exists(parent) else
+                "Enter a workspace name and choose a clone folder: an "
+                "existing one, or the full path of a new one on a drive "
+                "that is there.")
             return
         folder_name = re.sub(r'[<>:"/\\|?*]', "_", name).rstrip(" .")
         if not folder_name or folder_name in {".", ".."}:
@@ -8627,8 +8659,24 @@ class MainWindow(QMainWindow):
                 self, "AI Hive",
                 f"The clone destination already exists:\n{destination}")
             return
+        made = ""   # the topmost folder made here, removed if the clone fails
+        if create:
+            made = parent
+            while (os.path.dirname(made) != made
+                   and not os.path.exists(os.path.dirname(made))):
+                made = os.path.dirname(made)
+            if os.path.exists(made):
+                made = ""
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError as exc:
+                QMessageBox.warning(
+                    self, "AI Hive",
+                    f"Could not create the folder:\n{parent}\n\n"
+                    f"{exc.strerror or exc}")
+                return
 
-        progress = QProgressDialog(
+        progress =QProgressDialog(
             f"Cloning {repo_url}…", "", 0, 0, self)
         progress.setWindowTitle("Creating GitHub workspace")
         progress.setCancelButton(None)
@@ -8639,6 +8687,8 @@ class MainWindow(QMainWindow):
 
         def clone() -> None:
             error = clone_default_branch(remote, destination)
+            if error and made:
+                _remove_empty_folders(parent, made)
             self.workspaceCloneFinished.emit(name, destination, repo_url,
                                              error, want_lanes)
 
