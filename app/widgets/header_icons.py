@@ -69,13 +69,14 @@ _BODIES = {
     "folder": ("<path d='M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 "
                "1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 "
                "0 0 2 2Z'/>"),
-    # the sidebar header: search workspaces, add a category
+    # the sidebar header: search workspaces, add a category. A category is
+    # a group of workspaces, and a workspace is a folder, so: a stack of
+    # folders (the 3D box it replaced read as shipping, and was the busiest
+    # icon in the row)
     "search": "<circle cx='11' cy='11' r='7'/><path d='m20 20-4.2-4.2'/>",
-    "package": ("<path d='M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 "
-                "0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 "
-                "0 0 1 1.73z'/><path d='M12 22V12'/>"
-                "<path d='m3.3 7 7.7 4.73a2 2 0 0 0 2 0L20.7 7'/>"
-                "<path d='m7.5 4.27 9 5.15'/>"),
+    "folders": ("<path d='M20 17a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3.9a2 2 0 0 "
+                "1-1.69-.9l-.81-1.2a2 2 0 0 0-1.67-.9H8a2 2 0 0 0-2 2v9a2 2 "
+                "0 0 0 2 2Z'/><path d='M2 8v11a2 2 0 0 0 2 2h14'/>"),
     "trash": ("<path d='M3 6h18'/>"
               "<path d='M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6'/>"
               "<path d='M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2'/>"
@@ -168,19 +169,24 @@ class SidebarToggleButton(QToolButton):
 class SidebarIconButton(QToolButton):
     """A square, textless sidebar header button with a centred line icon:
     dim ink, the accent on hover, like the glyphs it replaced. The emoji
-    those were drew at their own sizes and baselines, so no two lined up."""
+    those were drew at their own sizes and baselines, so no two lined up.
+    The icon is ICON px, less when `Sidebar._fit_header` shrinks the button
+    on a narrow rail, so it keeps a 4px margin to the hover frame."""
 
-    ICON = 16
+    ICON = 20
 
     def __init__(self, icon_name: str, parent=None):
         super().__init__(parent)
         self._icon_name = icon_name
 
+    def icon_px(self) -> int:
+        return max(8, min(self.ICON, self.width() - 8, self.height() - 8))
+
     def paintEvent(self, event):
         super().paintEvent(event)
         ink = Palette.ACCENT_GOLD if self.underMouse() else Palette.TEXT_DIM
-        _paint(self, self._icon_name, ink, (self.width() - self.ICON) / 2,
-               self.ICON)
+        px = self.icon_px()
+        _paint(self, self._icon_name, ink, (self.width() - px) / 2, px)
 
 
 @lru_cache(maxsize=1)
@@ -228,7 +234,7 @@ class CloudSyncButton(QToolButton):
     runs; the button is disabled then, and the cloud stays in the accent so
     it reads as working, not as off."""
 
-    ICON = 22
+    ICON = 26       # px, less on a button too small for it (icon_px)
     SPIN_MS = 1100
 
     def __init__(self, parent=None):
@@ -256,10 +262,13 @@ class CloudSyncButton(QToolButton):
     def spinning(self) -> bool:
         return self._spin.state() == QVariantAnimation.State.Running
 
+    def icon_px(self) -> int:
+        return max(8, min(self.ICON, self.width() - 4, self.height() - 4))
+
     def paintEvent(self, event):
         super().paintEvent(event)
         dpr = self.devicePixelRatioF() or 1.0
-        px = max(8, min(self.ICON, self.width() - 4, self.height() - 4))
+        px = self.icon_px()
         img = QImage(int(px * dpr), int(px * dpr),
                      QImage.Format.Format_ARGB32_Premultiplied)
         img.setDevicePixelRatio(dpr)
@@ -333,7 +342,7 @@ class AddWorkspaceButton(PlusButton):
     """The sidebar's add workspace: the same crisp painted cross, larger,
     in the accent `#AddWsBtn` gives it."""
 
-    ARM = 12
+    ARM = 14
 
     def ink(self) -> str:
         return Palette.ACCENT_GOLD
