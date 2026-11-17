@@ -6203,7 +6203,9 @@ def test_repeat_last_agent():
           all(spec_from_template(bad, "A", "") is None for bad in (
               None, {}, [], {"kind": "nope"}, {"kind": ["claude"]},
               {"kind": {}}, {"kind": "claude", "model": 3},
-              {"kind": "claude", "args": "x"}, {"kind": "custom"})))
+              {"kind": "claude", "args": "x"}, {"kind": "custom"},
+              {"kind": "claude", "lane": "false"},
+              {"kind": "claude", "pty": 0})))
 
     # --- through the window -----------------------------------------------
     app = QApplication.instance() or QApplication([])
@@ -6242,11 +6244,18 @@ def test_repeat_last_agent():
         app.processEvents()
         return [a for a in ws.agents if a not in before]
 
+    # Claude counts as installed unless a check says otherwise: an
+    # undetected CLI sends Ctrl+Shift+T to the dialog
+    from app import providers as _providers
+    orig_detected = _providers.detected
+    _providers.detected = lambda key: True
     AddTerminalDialog.exec = fake_exec
     try:
         with _stub_starts() as starts:
             check("repeat: Ctrl+Shift+T is a window shortcut",
                   "Ctrl+Shift+T" in shortcut, sorted(shortcut))
+            check("repeat: holding Ctrl+Shift+T does not auto-repeat",
+                  not shortcut["Ctrl+Shift+T"].autoRepeat())
             new = press(ws_repo)
             check("repeat: before any agent it opens the dialog",
                   len(opened) == 1 and new == []
@@ -6306,6 +6315,12 @@ def test_repeat_last_agent():
             win._restore_ui_state({"ui": {"last_agent_setup": saved}})
             check("repeat: restore reads it back",
                   win._last_agent_setup == saved)
+            _providers.detected = lambda key: False
+            gone = press(ws_plain)
+            _providers.detected = lambda key: True
+            check("repeat: a CLI no longer installed opens the dialog "
+                  "instead", len(opened) == 3 and len(gone) == 1,
+                  (len(opened), gone))
             win._restore_ui_state({"ui": {"last_agent_setup": {"kind": 1}}})
             check("repeat: restore drops a broken one",
                   win._last_agent_setup == {})
@@ -6319,6 +6334,7 @@ def test_repeat_last_agent():
             win.lane_ops.drain(60)
     finally:
         AddTerminalDialog.exec = orig_exec
+        _providers.detected = orig_detected
     win.close()
     app.processEvents()
     lanes_dir = tmp / "proj.lanes"

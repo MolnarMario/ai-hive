@@ -3865,8 +3865,10 @@ class MainWindow(QMainWindow):
 
         # Ctrl+Shift+* so plain Ctrl/Alt keys stay free for the focused
         # terminal (Claude Code, shells, readline all need them).
+        # no auto-repeat: it opens an agent (and maybe a lane) per firing,
+        # so a held key would open a burst of them up to the agent limit
         QShortcut(QKeySequence("Ctrl+Shift+T"), self,
-                  self._repeat_last_agent)
+                  self._repeat_last_agent).setAutoRepeat(False)
         QShortcut(QKeySequence("Ctrl+Shift+N"), self,
                   self._on_add_workspace_clicked)
         QShortcut(QKeySequence("Ctrl+Shift+B"), self, self._toggle_sidebar)
@@ -9051,7 +9053,10 @@ class MainWindow(QMainWindow):
         spec = spec_from_template(self._last_agent_setup,
                                   self.manager.next_agent_name(ws.id),
                                   ws.project_path)
-        if spec is None:
+        # an AI CLI that is no longer installed needs a command typed in,
+        # which only the dialog asks for (its _validate)
+        if spec is None or (spec.kind in AI_KINDS and not spec.custom_command
+                            and not providers.detected(AI_KINDS[spec.kind])):
             self._on_add_terminal_clicked(ws.id)
             return
         repo = ""

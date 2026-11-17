@@ -95,6 +95,17 @@ def _e2e_trust_options_drawn(agent) -> bool:
 
 
 _TRUST_LABELS = (("yes", "yes, i trust this folder"), ("no", "no, exit"))
+# CLI 2.1.326 asks again, after the folder's trust, for every --add-dir
+# folder a new session hasn't worked in (AI Hive adds ~/.aihive)
+_ADD_DIR_LABELS = (("yes", "yes, add it"), ("no", "no, exit"))
+
+
+def _e2e_add_dir_drawn(agent) -> bool:
+    """The --add-dir trust dialog is on the rendered screen with both of its
+    options (the raw stream would still hold an answered one)."""
+    flat = "".join("".join(_e2e_screen_rows(agent)).lower().split())
+    return ("addinganewdirectory" in flat and "yes,addit" in flat
+            and "no,exit" in flat)
 
 
 def _e2e_screen_rows(agent) -> list:
@@ -108,7 +119,7 @@ def _e2e_screen_rows(agent) -> list:
     return screen.display
 
 
-def _e2e_trust_rows(rows) -> dict:
+def _e2e_trust_rows(rows, labels=_TRUST_LABELS) -> dict:
     """{"yes"|"no": (row index, highlighted)} for the trust options drawn.
     The highlighted option has a marker in the gutter left of its label. The
     marker was "❯" in CLI 2.1.283 and is ">" in 2.1.290, so any mark there
@@ -117,7 +128,7 @@ def _e2e_trust_rows(rows) -> dict:
     found = {}
     for i, row in enumerate(rows):
         low = row.lower()
-        for key, label in _TRUST_LABELS:
+        for key, label in labels:
             at = low.find(label)
             if at >= 0:
                 gutter = _re.sub(r"[\s│┃|]|\d+\.", "", low[:at])
@@ -125,7 +136,7 @@ def _e2e_trust_rows(rows) -> dict:
     return found
 
 
-def _e2e_accept_trust(agent, pump) -> bool:
+def _e2e_accept_trust(agent, pump, labels=_TRUST_LABELS) -> bool:
     """Choose "Yes, I trust this folder". Returns False, without pressing
     Enter, when the highlight can't be put on Yes.
 
@@ -135,7 +146,7 @@ def _e2e_accept_trust(agent, pump) -> bool:
     Yes, and Enter goes only once the screen shows it on Yes."""
     for _ in range(4):
         pump(300)   # let the frame finish before reading it
-        found = _e2e_trust_rows(_e2e_screen_rows(agent))
+        found = _e2e_trust_rows(_e2e_screen_rows(agent), labels)
         marked = [k for k, (_i, on) in found.items() if on]
         if len(found) < 2 or len(marked) != 1:
             continue    # half drawn, or mid-redraw
@@ -164,6 +175,15 @@ _TRUST_DIALOG_2_1_290 = (
     "\x1b[1C\x1b[4A\x1b[>0q\x1b[?u\x1b[c")
 _TRUST_DOWN_2_1_290 = ("\x1b[1D\x1b[4B\r\x1b[1C\x1b[4A \r\x1b[1C\x1b[1B>"
                        "\r\n\n\n\x1b[1C\x1b[3A")
+# CLI 2.1.326's --add-dir dialog, after the folder's trust: cursor on No.
+# One Down erases the mark on No and draws it on Yes.
+_ADD_DIR_DIALOG_2_1_326 = (
+    "\x1b[2GAdding a new directory:\r\n\x1b[2GC:\\Users\\u\\.aihive\r\n"
+    "\x1b[2GSecurity guide\r\n"
+    "\x1b[2G❯ No, exit\r\n"
+    "\x1b[4GYes, add it\r\n"
+    "\x1b[2GEnter to confirm · Esc to cancel\r\n")
+_ADD_DIR_DOWN_2_1_326 = "\x1b[3A\x1b[2G \x1b[1B\x1b[2G❯\r\n\n"
 # the 2.1.283 shape: numbered options, "❯", Yes first
 _TRUST_DIALOG_2_1_283 = (
     "\x1b[2GDo you trust the files in this folder?\r\n\r\n"
@@ -215,6 +235,14 @@ def test_e2e_trust_dialog_accept():
     check("e2e trust: a highlight that won't reach Yes never gets Enter",
           not ok and "\r" not in stuck.writes, stuck.writes)
 
+    add = FakeAgent(_ADD_DIR_DIALOG_2_1_326,
+                    {"\x1b[B": _ADD_DIR_DOWN_2_1_326})
+    check("e2e trust: 2.1.326 --add-dir dialog is recognized",
+          _e2e_add_dir_drawn(add), _e2e_screen_rows(add))
+    ok = _e2e_accept_trust(add, pump, _ADD_DIR_LABELS)
+    check("e2e trust: 2.1.326 --add-dir, one Down moves to Yes, then Enter",
+          ok and add.writes == ["\x1b[B", "\r"], add.writes)
+
     half = FakeAgent(_TRUST_DIALOG_2_1_290.split("\x1b[4GYes")[0])
     ok = _e2e_accept_trust(half, pump)
     check("e2e trust: a half-drawn dialog gets no keys at all",
@@ -265,9 +293,19 @@ def _lifecycle_e2e_body(tmp, windows, pump, marker):
           "\n".join(r.rstrip() for r in _e2e_screen_rows(agent) if r.strip()))
     if not accepted:
         return
-    ready = wait_until(lambda: agent._prompt_ready, 45000)
+    added = []
+
+    def past_dialogs():
+        if not added and _e2e_add_dir_drawn(agent):
+            added.append(_e2e_accept_trust(agent, pump, _ADD_DIR_LABELS))
+        return agent._prompt_ready
+    ready = wait_until(past_dialogs, 45000)
+    if added:
+        check("e2e: the --add-dir dialog's highlight reached Yes", added[0],
+              "\n".join(r.rstrip() for r in _e2e_screen_rows(agent)
+                        if r.strip()))
     check("e2e: accepting trust reaches the real prompt", ready,
-          screen_text(agent)[-300:])
+          "\n".join(r.rstrip() for r in _e2e_screen_rows(agent) if r.strip()))
     if not ready:
         return
     typed = agent.nudge(ask)
@@ -317,12 +355,15 @@ def _lifecycle_e2e_body(tmp, windows, pump, marker):
     # the folder was trusted in session 1, but another claude on this machine
     # can rewrite ~/.claude.json from its own stale copy and drop that entry,
     # so the dialog may come back. Accept it again rather than fail on it.
-    accepted = []
+    accepted, added2 = [], []
 
     def resumed():
         if not accepted and _e2e_trust_options_drawn(agent2):
             accepted.append(1)
             _e2e_accept_trust(agent2, pump)
+        if not added2 and _e2e_add_dir_drawn(agent2):
+            added2.append(1)
+            _e2e_accept_trust(agent2, pump, _ADD_DIR_LABELS)
         return screen_text(agent2).count(marker.lower()) >= 2
     check("e2e: THE SAME conversation came back on the card (prompt AND "
           "reply reprinted by --resume)", wait_until(resumed, 90000),

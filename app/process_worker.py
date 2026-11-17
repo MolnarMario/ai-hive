@@ -398,6 +398,9 @@ def spec_from_template(template, name: str, cwd: str) -> AgentSpec | None:
             ("model", "effort", "permission_mode", "custom_command", "program")}
     args = template.get("args", [])
     if (not all(isinstance(v, str) for v in text.values())
+            # a "false" string is truthy: it would force a ConPTY or a lane
+            or not all(isinstance(template.get(k, False), bool)
+                       for k in ("pty", "lane"))
             or not isinstance(args, list)
             or not all(isinstance(a, str) for a in args)):
         return None
