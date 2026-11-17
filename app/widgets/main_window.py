@@ -3103,12 +3103,26 @@ class NewWorkspaceDialog(QDialog):
 
     def folder_is_missing(self) -> bool:
         """Is the Existing folder page naming a full path with nothing
-        there yet? A relative path would land in AI Hive's own working
-        folder, and a file in the way is no folder to make, so both stay
-        plain errors."""
+        there yet, on a drive or share that is there? A relative path would
+        land in AI Hive's own working folder, a file in the way is no folder
+        to make, and a missing drive can only fail, so all three stay plain
+        errors."""
         folder = self.folder_edit.text().strip()
-        return (self.source_combo.currentIndex() == 0
-                and os.path.isabs(folder) and not os.path.exists(folder))
+        if not (self.source_combo.currentIndex() == 0
+                and os.path.isabs(folder) and not os.path.exists(folder)):
+            return False
+        drive = os.path.splitdrive(folder)[0]
+        return not drive or os.path.isdir(drive + os.sep)
+
+    def accept(self) -> None:
+        """Enter inside the debounce must not create a folder under a button
+        that still says Create workspace: when settling changes what the
+        button does, the dialog stays open showing the new label."""
+        shown = self.ok_button.text()
+        self._settle_lanes()
+        if self.ok_button.text() != shown:
+            return
+        super().accept()
 
     def _refresh_lanes_check(self) -> None:
         cb = self.lanes_check
@@ -3180,7 +3194,8 @@ class NewWorkspaceDialog(QDialog):
             path = self.folder_edit.text().strip()
             return {"mode": "folder", "path": path,
                     "name": os.path.basename(os.path.normpath(path)) or "Workspace",
-                    "lanes": self.wants_lanes()}
+                    "lanes": self.wants_lanes(),
+                    "create": self.folder_is_missing()}
         return {"mode": "github", "url": self.repo_edit.text().strip(),
                 "name": self.repo_name_edit.text().strip(),
                 "parent": self.parent_edit.text().strip(),
@@ -8545,23 +8560,30 @@ class MainWindow(QMainWindow):
             return
         data = dialog.result_data()
         if data["mode"] == "folder":
-            path = data["path"]
-            if not os.path.isdir(path):
-                if not os.path.isabs(path) or os.path.exists(path):
-                    QMessageBox.warning(
-                        self, "AI Hive",
-                        "Choose an existing project folder, or type the full "
-                        "path of a new one.")
-                    return
+            path, name = data["path"], data["name"]
+            if data.get("create"):
                 try:
-                    os.makedirs(path)
+                    os.makedirs(path, exist_ok=True)
                 except OSError as exc:
                     QMessageBox.warning(
                         self, "AI Hive",
                         f"Could not create the folder:\n{path}\n\n"
                         f"{exc.strerror or exc}")
                     return
-            ws = self.manager.create_workspace(data["name"], path,
+                # Windows drops trailing dots and spaces from the folder it
+                # makes: keep the path and name of the folder that exists,
+                # since agent cwds and Claude's transcripts key on it
+                path = os.path.abspath(path)
+                name = os.path.basename(path) or "Workspace"
+            elif not os.path.isdir(path):
+                QMessageBox.warning(
+                    self, "AI Hive",
+                    f"That path is a file, not a folder:\n{path}"
+                    if os.path.exists(path) else
+                    "Choose an existing project folder, or type the full "
+                    "path of a new one on a drive that is there.")
+                return
+            ws = self.manager.create_workspace(name, path,
                                                lanes=data["lanes"])
             self.manager.set_active(ws.id)
             self.sidebar.begin_rename(ws.id)

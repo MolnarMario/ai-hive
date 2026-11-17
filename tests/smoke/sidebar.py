@@ -2491,6 +2491,27 @@ def test_new_workspace_creates_missing_folder():
     dlg._settle_lanes()
     check("new ws mkdir: a file in the way is not offered as a new folder",
           ok.text() == NewWorkspaceDialog.CREATE_TEXT, ok.text())
+    free = next((f"{letter}:" for letter in "ZYXWVUTSRQPONMLKJIHGFE"
+                 if not os.path.exists(f"{letter}:\\")), None)
+    if free:
+        dlg.folder_edit.setText(free + "\\proj")
+        dlg._settle_lanes()
+        check("new ws mkdir: a drive that is not there is not offered as a "
+              "new folder", ok.text() == NewWorkspaceDialog.CREATE_TEXT,
+              ok.text())
+    dlg.folder_edit.setText(str(existing))
+    dlg._settle_lanes()
+    accepted = []
+    dlg.accepted.connect(lambda: accepted.append(True))
+    dlg.folder_edit.setText(str(missing))   # Enter inside the debounce
+    dlg.accept()
+    check("new ws mkdir: Enter before the button caught up keeps the dialog "
+          "open, now showing create folder",
+          not accepted and ok.text() == NewWorkspaceDialog.CREATE_FOLDER_TEXT,
+          ok.text())
+    dlg.accept()
+    check("new ws mkdir: ...and the next Enter accepts",
+          accepted == [True] and dlg.result_data()["create"] is True)
     dlg.folder_edit.setText(str(missing))
     dlg.source_combo.setCurrentIndex(1)
     check("new ws mkdir: the GitHub page keeps the plain button",
@@ -2537,6 +2558,20 @@ def test_new_workspace_creates_missing_folder():
               "reason and adds no workspace",
               not new and len(warnings) == 2
               and "Could not create the folder" in warnings[-1], warnings)
+
+        new = create(str(a_file))
+        check("new ws mkdir: a file at the path says it is a file",
+              not new and len(warnings) == 3
+              and "is a file" in warnings[-1], warnings)
+
+        dotted = tmp / "Dotted"
+        new = create(str(dotted) + ". ")
+        check("new ws mkdir: a trailing dot or space Windows drops is "
+              "dropped from the saved path and name too",
+              dotted.is_dir() and len(new) == 1 and new[0].name == "Dotted"
+              and os.path.normcase(new[0].project_path)
+              == os.path.normcase(str(dotted)) and len(warnings) == 3,
+              ([(w.name, w.project_path) for w in new], warnings))
     finally:
         NewWorkspaceDialog.exec = orig_exec
         mw.QMessageBox.warning = orig_warning
