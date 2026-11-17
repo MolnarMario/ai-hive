@@ -1267,7 +1267,7 @@ class Sidebar(QFrame):
         self.search_btn.setAccessibleName("Search workspaces and agents")
         self.search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.search_btn.clicked.connect(lambda: self._toggle_search())
-        self.add_cat_btn = SidebarIconButton("package", header)
+        self.add_cat_btn = SidebarIconButton("folders", header)
         self.add_cat_btn.setObjectName("AddCatBtn")
         self.add_cat_btn.setToolTip("Add category (group related workspaces)")
         self.add_cat_btn.setAccessibleName("Add category")
@@ -1338,9 +1338,11 @@ class Sidebar(QFrame):
 
     # the header's height, and its buttons' sizes from roomy to tight
     HEADER_H = 38
-    # (button side, gap between buttons, extra gap before the add button)
-    HEADER_FITS = ((28, 8, 6), (28, 5, 4), (28, 3, 3), (26, 2, 2),
-                   (24, 0, 2))
+    # (button side, gap between buttons, extra gap before the add button).
+    # 32px leaves 3px above and below in the 38px header; the icons scale
+    # with the side (header_icons: icon_px, PlusButton.ARM fits down to 24)
+    HEADER_FITS = ((32, 8, 6), (32, 5, 4), (30, 3, 3), (28, 2, 2),
+                   (26, 0, 2), (24, 0, 2))
 
     def _fit_header(self) -> None:
         """Size the header's buttons and gaps for the width it has (see the

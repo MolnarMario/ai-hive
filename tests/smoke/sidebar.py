@@ -1820,6 +1820,29 @@ def test_sidebar_header_fit():
     check("sidebar header: the buttons paint their icons, no emoji text",
           isinstance(sb.sync_btn, CloudSyncButton)
           and not any(b.text() for b in btns))
+    # a wide rail uses the 38px header's height: 32px buttons with 20px
+    # line icons, centred top to bottom; a narrow rail shrinks the icons
+    # with the buttons instead of filling them edge to edge
+    hh = sb.header.height()
+    tall = [(b.height(), b.geometry().top(), hh - b.geometry().bottom() - 1)
+            for b in btns]
+    wide_px = (sb.search_btn.icon_px(), sb.add_cat_btn.icon_px(),
+               sb.sync_btn.icon_px())
+    sb.resize(190, 400)
+    pump(30)
+    narrow_px = (sb.search_btn.width(), sb.search_btn.icon_px(),
+                 sb.sync_btn.icon_px())
+    sb.resize(430, 400)
+    pump(30)
+    check("sidebar header: big buttons and icons on a wide rail, centred "
+          "vertically, smaller icons in a narrow rail's smaller buttons",
+          all(h == 32 and abs(top - below) <= 1 for h, top, below in tall)
+          and wide_px == (20, 20, 26)
+          and narrow_px[1] <= narrow_px[0] - 8
+          and narrow_px[2] <= narrow_px[0] - 4,
+          (hh, tall, wide_px, narrow_px))
+    check("sidebar header: add category is the stacked folders icon",
+          sb.add_cat_btn._icon_name == "folders")
     sb.set_sync_busy(True)
     turning = sb.sync_btn.spinning() and not sb.sync_btn.isEnabled()
     sb.set_sync_busy(False)
