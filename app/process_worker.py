@@ -392,7 +392,7 @@ def spec_from_template(template, name: str, cwd: str) -> AgentSpec | None:
         return None
     try:
         kind = AgentKind(template.get("kind"))
-    except ValueError:
+    except (TypeError, ValueError):    # a list or dict is unhashable
         return None
     text = {k: template.get(k, "") for k in
             ("model", "effort", "permission_mode", "custom_command", "program")}

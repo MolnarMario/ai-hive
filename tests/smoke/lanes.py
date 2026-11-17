@@ -6201,7 +6201,8 @@ def test_repeat_last_agent():
           and not copy.resume and copy.lane == {})
     check("repeat: a broken template builds nothing",
           all(spec_from_template(bad, "A", "") is None for bad in (
-              None, {}, [], {"kind": "nope"}, {"kind": "claude", "model": 3},
+              None, {}, [], {"kind": "nope"}, {"kind": ["claude"]},
+              {"kind": {}}, {"kind": "claude", "model": 3},
               {"kind": "claude", "args": "x"}, {"kind": "custom"})))
 
     # --- through the window -----------------------------------------------
