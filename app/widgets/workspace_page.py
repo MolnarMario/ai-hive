@@ -352,7 +352,7 @@ class WorkspacePage(QWidget):
         # THIS workspace has no agents; everything elsewhere is untouched
         self.empty = QLabel(
             "This workspace has no agents.\n\n"
-            "＋ Terminal (Ctrl+Shift+T) adds one, or pick a grid layout.\n"
+            "＋ Terminal (Ctrl+T) adds one, or pick a grid layout.\n"
             "Agents in your other workspaces are untouched and still\n"
             "running; see the workspace list in the sidebar.",
             self.body)

@@ -16,7 +16,10 @@ TITLE = "Keyboard shortcuts"
 # (keys, what they do). The keys of every window QShortcut appear verbatim
 # (as QKeySequence.toString() spells them) in the first column.
 WINDOW_ROWS = (
-    ("Ctrl+T or Ctrl+Shift+T", "New terminal in the active workspace"),
+    ("Ctrl+T", "New terminal in the active workspace"),
+    ("Ctrl+Shift+T",
+     "New terminal in the active workspace, set up like the last one you "
+     "opened (in any workspace), without the dialog"),
     ("Ctrl+Shift+N", "New workspace"),
     ("Ctrl+Tab",
      "Next agent: left to right along a row, then the next row down, "

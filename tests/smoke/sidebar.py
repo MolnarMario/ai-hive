@@ -1870,7 +1870,7 @@ def test_reveal_agent():
 
 
 def test_new_agent_autofocus():
-    """Opening a new agent (header '+', empty-slot '+', or Ctrl+Shift+T — all
+    """Opening a new agent (header '+', empty-slot '+', or Ctrl+T — all
     three funnel into _on_add_terminal_clicked) reveals its card right away:
     the workspace becomes active, the card scrolls into view, and keyboard
     focus lands in its terminal, so the user can start typing without an
