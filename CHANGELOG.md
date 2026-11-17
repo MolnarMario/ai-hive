@@ -8,6 +8,13 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.60.0
+
+- New Workspace can make the project folder for you: type the full path
+  of a folder that doesn't exist yet and the button becomes Create folder
+  and workspace. AI Hive creates the folder, and any missing folders
+  above it, then opens the workspace there.
+
 ## 0.59.0
 
 - Ctrl+Shift+T opens a new agent in the active workspace set up exactly

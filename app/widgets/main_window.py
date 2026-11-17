@@ -2962,6 +2962,18 @@ def _read_cut_offs(targets) -> list[tuple]:
             for agent_id, cwd, session_id in targets]
 
 
+def _windows_folder_path(path: str) -> str:
+    """`path` made absolute, with each folder name trimmed of the trailing
+    dots and spaces Windows would drop when it makes that folder. A name
+    that is nothing but dots stays as typed and fails in makedirs."""
+    path = os.path.abspath(path)
+    if os.name != "nt":
+        return path
+    drive, rest = os.path.splitdrive(path)
+    return drive + os.sep.join(part.rstrip(" .") or part
+                               for part in rest.split(os.sep))
+
+
 class NewWorkspaceDialog(QDialog):
     """Choose an existing project folder or clone a GitHub repository's
     default branch (see `clone_default_branch`).
@@ -2974,9 +2986,17 @@ class NewWorkspaceDialog(QDialog):
     With the Options switch "Lanes in every workspace" on, the box shows
     ticked and locked and sets nothing, so turning that switch off later
     leaves the workspace as the user left it.
+
+    A full path to a folder that does not exist yet turns the button into
+    Create folder and workspace, and the main window makes the folder
+    (`MainWindow._on_add_workspace_clicked`), so a new project needs no trip
+    to Explorer first. The check rides the Lanes debounce: one `exists` per
+    pause, since a network path can stall each one.
     """
 
     LANES_TEXT = "Lanes (each agent in its own git worktree)"
+    CREATE_TEXT = "Create workspace"
+    CREATE_FOLDER_TEXT = "Create folder and workspace"
 
     def __init__(self, start_dir: str, parent=None, lanes_forced: bool = False):
         super().__init__(parent)
@@ -3040,7 +3060,8 @@ class NewWorkspaceDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel |
             QDialogButtonBox.StandardButton.Ok, parent=self)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Create workspace")
+        self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setText(self.CREATE_TEXT)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
@@ -3052,7 +3073,7 @@ class NewWorkspaceDialog(QDialog):
         self._lanes_timer = QTimer(self)
         self._lanes_timer.setSingleShot(True)
         self._lanes_timer.setInterval(250)
-        self._lanes_timer.timeout.connect(self._refresh_lanes_check)
+        self._lanes_timer.timeout.connect(self._refresh_folder_state)
         self.folder_edit.textChanged.connect(
             lambda _text: self._lanes_timer.start())
         self._show_source(0)
@@ -3068,7 +3089,7 @@ class NewWorkspaceDialog(QDialog):
                 else QSizePolicy.Policy.Ignored)
         self.pages.setCurrentIndex(index)
         self.pages.updateGeometry()
-        self._refresh_lanes_check()
+        self._refresh_folder_state()
         if self.isVisible():
             self.resize(self.width(), self.sizeHint().height())
 
@@ -3081,7 +3102,39 @@ class NewWorkspaceDialog(QDialog):
         that is behind the folder field."""
         if self._lanes_timer.isActive():
             self._lanes_timer.stop()
-            self._refresh_lanes_check()
+            self._refresh_folder_state()
+
+    def _refresh_folder_state(self) -> None:
+        self._refresh_lanes_check()
+        missing = self.folder_is_missing()
+        self.ok_button.setText(
+            self.CREATE_FOLDER_TEXT if missing else self.CREATE_TEXT)
+        self.ok_button.setToolTip(
+            "This folder does not exist yet. AI Hive will create it, with "
+            "any missing folders above it." if missing else "")
+
+    def folder_is_missing(self) -> bool:
+        """Is the Existing folder page naming a full path with nothing
+        there yet, on a drive or share that is there? A relative path would
+        land in AI Hive's own working folder, a file in the way is no folder
+        to make, and a missing drive can only fail, so all three stay plain
+        errors."""
+        folder = self.folder_edit.text().strip()
+        if not (self.source_combo.currentIndex() == 0
+                and os.path.isabs(folder) and not os.path.exists(folder)):
+            return False
+        drive = os.path.splitdrive(folder)[0]
+        return not drive or os.path.isdir(drive + os.sep)
+
+    def accept(self) -> None:
+        """Enter inside the debounce must not create a folder under a button
+        that still says Create workspace: when settling changes what the
+        button does, the dialog stays open showing the new label."""
+        shown = self.ok_button.text()
+        self._settle_lanes()
+        if self.ok_button.text() != shown:
+            return
+        super().accept()
 
     def _refresh_lanes_check(self) -> None:
         cb = self.lanes_check
@@ -3153,7 +3206,8 @@ class NewWorkspaceDialog(QDialog):
             path = self.folder_edit.text().strip()
             return {"mode": "folder", "path": path,
                     "name": os.path.basename(os.path.normpath(path)) or "Workspace",
-                    "lanes": self.wants_lanes()}
+                    "lanes": self.wants_lanes(),
+                    "create": self.folder_is_missing()}
         return {"mode": "github", "url": self.repo_edit.text().strip(),
                 "name": self.repo_name_edit.text().strip(),
                 "parent": self.parent_edit.text().strip(),
@@ -8518,12 +8572,32 @@ class MainWindow(QMainWindow):
             return
         data = dialog.result_data()
         if data["mode"] == "folder":
-            path = data["path"]
-            if not os.path.isdir(path):
-                QMessageBox.warning(self, "AI Hive",
-                                    "Choose an existing project folder.")
+            path, name = data["path"], data["name"]
+            if data.get("create"):
+                # Windows drops trailing dots and spaces from each folder it
+                # makes, and makedirs then fails below a trimmed parent
+                # (leaving it behind): trim them all first, and save the
+                # folder that exists, since agent cwds and Claude's
+                # transcripts key on its path
+                path = _windows_folder_path(path)
+                name = os.path.basename(path) or "Workspace"
+                try:
+                    os.makedirs(path, exist_ok=True)
+                except OSError as exc:
+                    QMessageBox.warning(
+                        self, "AI Hive",
+                        f"Could not create the folder:\n{path}\n\n"
+                        f"{exc.strerror or exc}")
+                    return
+            elif not os.path.isdir(path):
+                QMessageBox.warning(
+                    self, "AI Hive",
+                    f"That path is a file, not a folder:\n{path}"
+                    if os.path.exists(path) else
+                    "Choose an existing project folder, or type the full "
+                    "path of a new one on a drive that is there.")
                 return
-            ws = self.manager.create_workspace(data["name"], path,
+            ws = self.manager.create_workspace(name, path,
                                                lanes=data["lanes"])
             self.manager.set_active(ws.id)
             self.sidebar.begin_rename(ws.id)

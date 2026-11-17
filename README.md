@@ -747,6 +747,9 @@ error dialog instead of silently closing. Packaging to a distributable
 
 - **Workspaces** — `+` in the sidebar (or `Ctrl+Shift+N`). Every workspace is
   tied to a project folder you pick at creation; terminals open there.
+  Type the full path of a folder that doesn't exist yet and the button
+  becomes Create folder and workspace: AI Hive makes the folder (and any
+  missing folders above it) for you.
   The New Workspace dialog can also take a GitHub repository URL instead: it
   clones the repo's default branch (`main`, `master` or whatever it is
   called) into a new folder and opens the workspace there.
@@ -1149,7 +1152,7 @@ parallel points at an order or load dependence: rerun it with
 `-k NAME -j 1`. A parallel run is CPU-bound, and Windows Defender scanning
 the suite's temp files and git processes takes about a third of the CPU.
 
-4931 checks drive the real app headlessly (offscreen Qt platform) with real
+4946 checks drive the real app headlessly (offscreen Qt platform) with real
 child processes: tiling math + applied grid geometry, live streaming, stdin
 round-trip, workspace-cwd inheritance, background retention while hidden,
 card close terminating the process, zero-orphan shutdown, save/restore round
@@ -1301,7 +1304,7 @@ app/
   fsopen.py                shared OS-open helpers (open_path/open_with/reveal)
   filetypes.py             file-type icon map (shared by map + file explorer)
 tests/smoke_test.py        suite runner: --quick, -k NAME, -m MODULE, -j N
-                           (4931 checks)
+                           (4946 checks)
 tests/smoke/harness.py     sandbox profile, check()/skip(), real-AI-launch guard
 tests/smoke/<area>.py      the tests, one module per area (sidebar, terminal,
                            sessions, limits, usage, updates, e2e, ...)
