@@ -42,7 +42,8 @@ from .. import tooltips
 from .. import transcripts
 from .. import ui_theme
 from .. import usage_poll
-from ..process_worker import (AI_KINDS, PTY_ONLY_KINDS, AgentKind, build_spec)
+from ..process_worker import (AI_KINDS, PTY_ONLY_KINDS, AgentKind, build_spec,
+                              setup_template, spec_from_template)
 from ..pty_worker import HAS_CONPTY
 from ..session_store import SessionStore
 from ..terminal_agent import AgentStatus
@@ -3386,6 +3387,10 @@ class MainWindow(QMainWindow):
         self._ship_skip_confirm = False   # user preference (persisted)
         # Close merged agents likewise, with its own switch and key.
         self._close_merged_skip_confirm = False   # user preference (persisted)
+        # the New Agent dialog's choices for the last agent the user opened
+        # (process_worker.setup_template), which Ctrl+Shift+T repeats. {}
+        # until the first one. Persisted.
+        self._last_agent_setup: dict = {}
         # Options > Free up RAM (persisted user preferences)
         self._sleep_idle = False
         self._sleep_hours = SLEEP_HOURS_DEFAULT
@@ -3860,8 +3865,10 @@ class MainWindow(QMainWindow):
 
         # Ctrl+Shift+* so plain Ctrl/Alt keys stay free for the focused
         # terminal (Claude Code, shells, readline all need them).
+        # no auto-repeat: it opens an agent (and maybe a lane) per firing,
+        # so a held key would open a burst of them up to the agent limit
         QShortcut(QKeySequence("Ctrl+Shift+T"), self,
-                  self._on_add_terminal_clicked)
+                  self._repeat_last_agent).setAutoRepeat(False)
         QShortcut(QKeySequence("Ctrl+Shift+N"), self,
                   self._on_add_workspace_clicked)
         QShortcut(QKeySequence("Ctrl+Shift+B"), self, self._toggle_sidebar)
@@ -7810,6 +7817,12 @@ class MainWindow(QMainWindow):
             ui.get("close_merged_skip_confirm", False))
         self.top_bar.set_close_merged_confirm(
             not self._close_merged_skip_confirm)
+        # one spec_from_template can't build is dropped: Ctrl+Shift+T then
+        # opens the dialog, as before any agent was opened
+        saved = ui.get("last_agent_setup")
+        self._last_agent_setup = (
+            dict(saved) if spec_from_template(saved, "Agent", "") is not None
+            else {})
         # Free up RAM (default OFF: it stops processes the user started)
         self._sleep_idle = ui.get("sleep_idle") is True
         hours = ui.get("sleep_hours")
@@ -8980,35 +8993,86 @@ class MainWindow(QMainWindow):
         new_lanes = dialog.wants_lane() and bool(repo)
         first = None
         for spec in dialog.result_specs(cwd=ws.project_path):
-            plan = None
-            if new_lanes:
-                try:
-                    plan = lanes.plan_lane(repo, ws.project_path, spec.name,
-                                           spec.uid)
-                except lanes.LaneError as exc:
-                    self._store_audit(f"LANE-FAIL {exc.code} agent="
-                                      f"{spec.name!r}: {exc}")
-                if plan is not None:
-                    # set BEFORE the add, so the add's own save carries it
-                    spec.lane = plan.lane_dict()
-                    spec.cwd = plan.cwd
-            agent = self.manager.add_terminal(ws.id, spec,
-                                              autostart=not spec.lane)
+            agent = self._add_new_agent(ws, spec, repo if new_lanes else "",
+                                        revive)
             if agent is None:
-                QMessageBox.warning(self, "AI Hive",
-                                    "This workspace is at its agent limit.")
                 break
-            if plan is not None:
-                self._create_lane(ws.id, agent, plan)
-            elif revive is not None and spec.lane:
-                self._revive_lane(ws.id, agent)
-            elif new_lanes:
-                agent.notice("[no lane: this agent works in the workspace "
-                             "folder]")
-            first = first or agent
+            if first is None:
+                first = agent
+                # what Ctrl+Shift+T repeats next, in whatever workspace
+                self._last_agent_setup = setup_template(
+                    spec, lane=dialog.wants_lane() or revive is not None)
+                self._schedule_save()
         # opening a terminal is for typing into it right away
         if first is not None:
             self._reveal_agent(ws.id, first.id)
+
+    def _add_new_agent(self, ws, spec, lane_repo: str = "", revive=None):
+        """Add one agent the user just asked for and start it, in a new
+        lane of `lane_repo` when one is given (a failed plan leaves it in
+        the workspace folder, and says so). Returns the agent, or None at
+        the workspace's agent limit."""
+        plan = None
+        if lane_repo:
+            try:
+                plan = lanes.plan_lane(lane_repo, ws.project_path, spec.name,
+                                       spec.uid)
+            except lanes.LaneError as exc:
+                self._store_audit(f"LANE-FAIL {exc.code} agent="
+                                  f"{spec.name!r}: {exc}")
+            if plan is not None:
+                # set BEFORE the add, so the add's own save carries it
+                spec.lane = plan.lane_dict()
+                spec.cwd = plan.cwd
+        agent = self.manager.add_terminal(ws.id, spec,
+                                          autostart=not spec.lane)
+        if agent is None:
+            QMessageBox.warning(self, "AI Hive",
+                                "This workspace is at its agent limit.")
+            return None
+        if plan is not None:
+            self._create_lane(ws.id, agent, plan)
+        elif revive is not None and spec.lane:
+            self._revive_lane(ws.id, agent)
+        elif lane_repo:
+            agent.notice("[no lane: this agent works in the workspace "
+                         "folder]")
+        return agent
+
+    def _repeat_last_agent(self, ws_id: str = "") -> None:
+        """Ctrl+Shift+T: open one agent in the active workspace set up like
+        the last one opened through the New Agent dialog, in any workspace,
+        without the dialog. Name and conversation are new. Its lane tick
+        carries over only into a workspace that is a git repository's top
+        folder: a folder inside a larger repository would copy all of it,
+        which the dialog lets the user choose knowingly. Before the first
+        agent it opens the dialog."""
+        ws = self.manager.workspace(ws_id or self.manager.active_id)
+        if ws is None:
+            return
+        spec = spec_from_template(self._last_agent_setup,
+                                  self.manager.next_agent_name(ws.id),
+                                  ws.project_path)
+        # an AI CLI that is no longer installed needs a command typed in,
+        # which only the dialog asks for (its _validate)
+        if spec is None or (spec.kind in AI_KINDS and not spec.custom_command
+                            and not providers.detected(AI_KINDS[spec.kind])):
+            self._on_add_terminal_clicked(ws.id)
+            return
+        repo = ""
+        if self._last_agent_setup.get("lane"):
+            # a folder walk, no git, exactly like the dialog's
+            root = lanes.find_repo_root(ws.project_path)
+            if (root and spec.kind == AgentKind.CLAUDE
+                    and lanes.same_path(root, ws.project_path)):
+                repo = root
+        agent = self._add_new_agent(ws, spec, repo)
+        if agent is None:
+            return
+        if self._last_agent_setup.get("lane") and not repo:
+            agent.notice("[no lane: this agent works in the workspace "
+                         "folder]")
+        self._reveal_agent(ws.id, agent.id)
 
     def _confirm_delete_workspace(self, ws_id: str) -> None:
         ws = self.manager.workspace(ws_id)
@@ -9589,6 +9653,9 @@ class MainWindow(QMainWindow):
             "agent_lanes": self._agent_lanes,
             "ship_skip_confirm": self._ship_skip_confirm,
             "close_merged_skip_confirm": self._close_merged_skip_confirm,
+            # what Ctrl+Shift+T repeats. Read with a check, so no
+            # SESSION_VERSION bump.
+            "last_agent_setup": dict(self._last_agent_setup),
             "sleep_idle": self._sleep_idle,
             "sleep_hours": self._sleep_hours,
             "sleep_at_startup": self._sleep_at_startup,

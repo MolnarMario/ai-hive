@@ -6162,3 +6162,183 @@ def test_lane_uncommitted_notices():
         if os.path.isdir(lane["root"]):
             _drop_lane_folder(lane["root"])
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_repeat_last_agent():
+    """Ctrl+Shift+T opens one agent set up like the last one opened through
+    the New Agent dialog, in whichever workspace is active, without the
+    dialog: same kind, model, effort, mode and extra arguments, the next
+    free name, a fresh conversation. The Own lane tick carries into a
+    repository's top folder only. Before the first agent it opens the
+    dialog, and the setup survives a restart."""
+    from PySide6.QtGui import QShortcut
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app.process_worker import (AgentKind, build_spec, setup_template,
+                                    spec_from_template)
+    from app.session_store import SessionStore
+    from app.widgets.main_window import AddTerminalDialog
+    from main import create_main_window
+
+    # --- the template itself ----------------------------------------------
+    src = build_spec(AgentKind.CLAUDE, "X", cwd="c:/a", model="opus",
+                     effort="high", permission_mode="plan",
+                     args=["--verbose"])
+    src.session_id, src.resume = "s-1", True
+    src.set_permission_mode("acceptEdits")     # a live Shift+Tab change
+    copy = spec_from_template(setup_template(src, lane=True), "Agent 7",
+                              "c:/b")
+    check("repeat: the copy keeps kind, model, effort and extra args",
+          copy.kind == AgentKind.CLAUDE and copy.model == "opus"
+          and copy.effort == "high" and copy.user_args == ["--verbose"],
+          copy)
+    check("repeat: the copy starts in the dialog's mode, not the live one",
+          copy.launch_permission_mode == "plan"
+          and copy.permission_mode == "plan"
+          and "acceptEdits" not in copy.args, copy.args)
+    check("repeat: the copy has its own name, folder, uid and no "
+          "conversation", copy.name == "Agent 7" and copy.cwd == "c:/b"
+          and copy.uid != src.uid and copy.session_id == ""
+          and not copy.resume and copy.lane == {})
+    check("repeat: a broken template builds nothing",
+          all(spec_from_template(bad, "A", "") is None for bad in (
+              None, {}, [], {"kind": "nope"}, {"kind": ["claude"]},
+              {"kind": {}}, {"kind": "claude", "model": 3},
+              {"kind": "claude", "args": "x"}, {"kind": "custom"},
+              {"kind": "claude", "lane": "false"},
+              {"kind": "claude", "pty": 0})))
+
+    # --- through the window -----------------------------------------------
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-repeat-"))
+    work = _make_repo(tmp)
+    plain_dir = tmp / "plain"
+    plain_dir.mkdir()
+    store = SessionStore(path=tmp / "session.json")
+    win = create_main_window(store)
+    win._save_timer.stop()
+    win.show()
+    mgr = win.manager
+    ws_repo = mgr.create_workspace("Repo", str(work))
+    ws_plain = mgr.create_workspace("Plain", str(plain_dir))
+    ws_sub = mgr.create_workspace("Sub", str(work / "sub"))
+    shortcut = {s.key().toString(): s for s in win.findChildren(QShortcut)}
+    opened = []
+    orig_exec = AddTerminalDialog.exec
+
+    def fake_exec(dlg):
+        resume_list_loaded(dlg)
+        opened.append(dlg)
+        if dlg.lane_check is not None and not dlg.lane_check.isChecked():
+            dlg.lane_check.click()
+        dlg.model_combo.setCurrentIndex(dlg.model_combo.findData("opus"))
+        dlg.effort_combo.setCurrentIndex(dlg.effort_combo.findData("high"))
+        dlg.mode_combo.setCurrentIndex(dlg.mode_combo.count() - 1)
+        # the first opening is cancelled, the second accepted
+        return (QDialog.DialogCode.Accepted if len(opened) > 1
+                else QDialog.DialogCode.Rejected)
+
+    def press(ws):
+        mgr.set_active(ws.id)
+        before = list(ws.agents)
+        shortcut["Ctrl+Shift+T"].activated.emit()
+        app.processEvents()
+        return [a for a in ws.agents if a not in before]
+
+    # Claude counts as installed unless a check says otherwise: an
+    # undetected CLI sends Ctrl+Shift+T to the dialog
+    from app import providers as _providers
+    orig_detected = _providers.detected
+    _providers.detected = lambda key: True
+    AddTerminalDialog.exec = fake_exec
+    try:
+        with _stub_starts() as starts:
+            check("repeat: Ctrl+Shift+T is a window shortcut",
+                  "Ctrl+Shift+T" in shortcut, sorted(shortcut))
+            check("repeat: holding Ctrl+Shift+T does not auto-repeat",
+                  not shortcut["Ctrl+Shift+T"].autoRepeat())
+            new = press(ws_repo)
+            check("repeat: before any agent it opens the dialog",
+                  len(opened) == 1 and new == []
+                  and win._last_agent_setup == {},
+                  (len(opened), win._last_agent_setup))
+            first = press(ws_repo)       # the dialog again, accepted
+            win.lane_ops.drain(60)
+            check("repeat: the dialog opened one agent in its own lane",
+                  len(opened) == 2 and len(first) == 1
+                  and bool(first[0].spec.lane.get("root")), first)
+            a = first[0]
+            check("repeat: the dialog's choices are remembered",
+                  win._last_agent_setup == setup_template(a.spec, lane=True)
+                  and (a.spec.model, a.spec.effort) == ("opus", "high")
+                  and a.spec.launch_permission_mode,
+                  win._last_agent_setup)
+
+            plain = press(ws_plain)
+            check("repeat: in another workspace, no dialog and one agent",
+                  len(opened) == 2 and len(plain) == 1, (len(opened), plain))
+            b = plain[0]
+            check("repeat: same kind, model, effort and mode",
+                  (b.spec.kind, b.spec.model, b.spec.effort,
+                   b.spec.launch_permission_mode, b.spec.user_args,
+                   b.spec.args)
+                  == (a.spec.kind, a.spec.model, a.spec.effort,
+                      a.spec.launch_permission_mode, a.spec.user_args,
+                      a.spec.args), (b.spec, a.spec))
+            check("repeat: it works in its own workspace's folder, named "
+                  "there, with a fresh conversation",
+                  b.spec.cwd == str(plain_dir) and b.spec.lane == {}
+                  and b.spec.name == "Agent 1" and not b.spec.resume
+                  and b.spec.session_id != a.spec.session_id
+                  and starts.calls[-1][:2] == (b.spec.name, str(plain_dir)),
+                  (b.spec.cwd, b.spec.name, starts.calls))
+            check("repeat: the new card is revealed",
+                  mgr.active_id == ws_plain.id
+                  and win._focused_card is not None
+                  and win._focused_card.agent is b)
+
+            again = press(ws_repo)
+            win.lane_ops.drain(60)
+            c = again[0] if again else None
+            check("repeat: in a repository it gets a lane of its own",
+                  c is not None and bool(c.spec.lane.get("root"))
+                  and c.spec.lane["root"] != a.spec.lane["root"]
+                  and starts.calls[-1][:2] == (c.spec.name, c.spec.cwd),
+                  c and (c.spec.lane, starts.calls))
+            sub = press(ws_sub)
+            check("repeat: a folder inside a repository gets no lane",
+                  len(sub) == 1 and sub[0].spec.lane == {}
+                  and sub[0].spec.cwd == str(work / "sub"), sub)
+
+            saved = win._session_payload()["ui"]["last_agent_setup"]
+            check("repeat: the setup is saved",
+                  saved == win._last_agent_setup and saved.get("lane"))
+            win._restore_ui_state({"ui": {"last_agent_setup": saved}})
+            check("repeat: restore reads it back",
+                  win._last_agent_setup == saved)
+            _providers.detected = lambda key: False
+            gone = press(ws_plain)
+            _providers.detected = lambda key: True
+            check("repeat: a CLI no longer installed opens the dialog "
+                  "instead", len(opened) == 3 and len(gone) == 1,
+                  (len(opened), gone))
+            win._restore_ui_state({"ui": {"last_agent_setup": {"kind": 1}}})
+            check("repeat: restore drops a broken one",
+                  win._last_agent_setup == {})
+            win._restore_ui_state({"ui": {}})
+            check("repeat: a session without the key has none",
+                  win._last_agent_setup == {})
+
+            for ws in (ws_repo, ws_plain, ws_sub):
+                for agent in list(ws.agents):
+                    win._close_agent(ws.id, agent.id)
+            win.lane_ops.drain(60)
+    finally:
+        AddTerminalDialog.exec = orig_exec
+        _providers.detected = orig_detected
+    win.close()
+    app.processEvents()
+    lanes_dir = tmp / "proj.lanes"
+    if lanes_dir.is_dir():
+        for lane in lanes_dir.iterdir():
+            _drop_lane_folder(str(lane))
+    shutil.rmtree(tmp, ignore_errors=True)
