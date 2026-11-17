@@ -365,6 +365,49 @@ def build_spec(kind: AgentKind, name: str, role: str = "", cwd: str = "",
     return spec
 
 
+# What Ctrl+Shift+T repeats: the choices the New Agent dialog made for the
+# last agent the user opened, never the agent itself. Name, folder, the
+# conversation it resumed and its lane's paths are left out: the copy gets
+# the next free name, the target workspace's folder, a fresh conversation
+# and (when `lane` is on) a lane of its own.
+def setup_template(spec: AgentSpec, lane: bool = False) -> dict:
+    return {
+        "kind": AgentKind(spec.kind).value,
+        "model": spec.model,
+        "effort": spec.effort,
+        # the dialog's pick, not the live Shift+Tab mode
+        "permission_mode": spec.launch_permission_mode,
+        "custom_command": spec.custom_command,
+        "program": spec.user_program,
+        "args": list(spec.user_args),
+        "pty": bool(spec.pty),
+        "lane": bool(lane),
+    }
+
+
+def spec_from_template(template, name: str, cwd: str) -> AgentSpec | None:
+    """A fresh spec from `setup_template`'s dict, or None when it is not
+    one (a hand-edited or future session file): the caller then asks."""
+    if not isinstance(template, dict):
+        return None
+    try:
+        kind = AgentKind(template.get("kind"))
+    except ValueError:
+        return None
+    text = {k: template.get(k, "") for k in
+            ("model", "effort", "permission_mode", "custom_command", "program")}
+    args = template.get("args", [])
+    if (not all(isinstance(v, str) for v in text.values())
+            or not isinstance(args, list)
+            or not all(isinstance(a, str) for a in args)):
+        return None
+    if kind in (AgentKind.PYTHON_SCRIPT, AgentKind.CUSTOM) \
+            and not text["program"]:
+        return None
+    return build_spec(kind, name, cwd=cwd, args=args,
+                      pty=bool(template.get("pty", False)), **text)
+
+
 # ---------------------------------------------------------------- decode ---
 
 class HybridDecoder:

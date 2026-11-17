@@ -786,7 +786,12 @@ error dialog instead of silently closing. Packaging to a distributable
   usual width, or as the thin rail if it was collapsed. Neither resizes a
   terminal. `F11` again brings the window back as it was. The Fullscreen
   switch under Options > Appearance does the same.
-- **Agents** — `+ Terminal` (or `Ctrl+T` / `Ctrl+Shift+T`), or click any empty grid slot.
+- **Agents** — `+ Terminal` (or `Ctrl+T`), or click any empty grid slot.
+  `Ctrl+Shift+T` skips the dialog: it opens one agent in the active
+  workspace set up exactly like the last one you opened, in any workspace
+  (kind, model, effort, mode, command, extra arguments and the Own lane
+  tick), with the next free name and a fresh conversation. Before the first
+  agent it opens the dialog.
   The dialog groups **AI agents** (Claude with model + effort + mode dropdowns —
   the **mode** picker chooses the Shift+Tab permission mode the agent starts in;
   the model list matches claude's own `/model` menu, and **Default** names what
@@ -816,7 +821,7 @@ error dialog instead of silently closing. Packaging to a distributable
   files.
 - **Font size** — per-agent `A−`/`A+` in each card header (or `Ctrl+±` while
   focused), and global `A−`/`A+` under **⚙ Options**; both persist.
-- **App shortcuts use `Ctrl+Shift+…`** (T = new terminal, N = new workspace,
+- **App shortcuts use `Ctrl+Shift+…`** (T = repeat the last new agent, N = new workspace,
   B = toggle sidebar) so every plain `Ctrl`/`Alt` key, `Tab`, and `Shift+Tab`
   goes straight to the focused terminal. The exceptions are `F11`,
   `Ctrl+T` (new terminal), `Ctrl+Up` (maximize the selected agent),
