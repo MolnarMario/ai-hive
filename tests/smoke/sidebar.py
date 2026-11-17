@@ -2453,3 +2453,96 @@ def test_workspace_clone_default_branch():
     check("clone: dialog says it clones the default branch",
           "default branch" in note and "main branch" not in note, note)
     dlg.deleteLater()
+
+
+def test_new_workspace_creates_missing_folder():
+    """New Workspace with a full path to a folder that does not exist yet:
+    the button says it will create the folder, and the window makes the
+    whole chain of folders and the workspace. A relative path or a file in
+    the way stays an error and creates nothing."""
+    import app.widgets.main_window as mw
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app.session_store import SessionStore
+    from app.widgets.main_window import NewWorkspaceDialog
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-new-ws-mkdir-"))
+    existing = tmp / "existing"
+    existing.mkdir()
+    a_file = tmp / "notes.txt"
+    a_file.write_text("x", encoding="utf-8")
+    missing = tmp / "new" / "deeper" / "Tracker"
+
+    dlg = NewWorkspaceDialog(str(existing))
+    ok = dlg.ok_button
+    check("new ws mkdir: an existing folder keeps the plain button",
+          ok.text() == NewWorkspaceDialog.CREATE_TEXT, ok.text())
+    dlg.folder_edit.setText(str(missing))
+    dlg._settle_lanes()
+    check("new ws mkdir: a missing folder turns the button into create "
+          "folder and workspace",
+          ok.text() == NewWorkspaceDialog.CREATE_FOLDER_TEXT, ok.text())
+    dlg.folder_edit.setText("relative/folder")
+    dlg._settle_lanes()
+    check("new ws mkdir: a relative path is not offered as a new folder",
+          ok.text() == NewWorkspaceDialog.CREATE_TEXT, ok.text())
+    dlg.folder_edit.setText(str(a_file))
+    dlg._settle_lanes()
+    check("new ws mkdir: a file in the way is not offered as a new folder",
+          ok.text() == NewWorkspaceDialog.CREATE_TEXT, ok.text())
+    dlg.folder_edit.setText(str(missing))
+    dlg.source_combo.setCurrentIndex(1)
+    check("new ws mkdir: the GitHub page keeps the plain button",
+          ok.text() == NewWorkspaceDialog.CREATE_TEXT, ok.text())
+    dlg.deleteLater()
+
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    seen, warnings = [], []
+    orig_exec = NewWorkspaceDialog.exec
+    orig_warning = mw.QMessageBox.warning
+
+    def create(folder):
+        def fake_exec(d):
+            seen.append(d)
+            d.folder_edit.setText(folder)
+            return QDialog.DialogCode.Accepted
+        NewWorkspaceDialog.exec = fake_exec
+        before = {w.id for w in win.manager.workspaces}
+        win._on_add_workspace_clicked()
+        app.processEvents()
+        return [w for w in win.manager.workspaces if w.id not in before]
+
+    mw.QMessageBox.warning = staticmethod(
+        lambda _parent, _title, text, *a, **k: warnings.append(text))
+    try:
+        new = create(str(missing))
+        check("new ws mkdir: the folder chain is created",
+              missing.is_dir())
+        check("new ws mkdir: ...and the workspace opens on it, named after it",
+              len(new) == 1 and new[0].name == "Tracker"
+              and os.path.normcase(os.path.normpath(new[0].project_path))
+              == os.path.normcase(str(missing)) and not warnings,
+              ([(w.name, w.project_path) for w in new], warnings))
+
+        new = create("relative/made")
+        check("new ws mkdir: a relative path warns and creates nothing",
+              not new and len(warnings) == 1
+              and not os.path.exists(os.path.join(os.getcwd(), "relative")),
+              warnings)
+
+        new = create(str(a_file / "inside"))
+        check("new ws mkdir: a folder that cannot be made warns with the "
+              "reason and adds no workspace",
+              not new and len(warnings) == 2
+              and "Could not create the folder" in warnings[-1], warnings)
+    finally:
+        NewWorkspaceDialog.exec = orig_exec
+        mw.QMessageBox.warning = orig_warning
+        for d in seen:
+            d.deleteLater()
+        win._save_timer.stop()
+        win.close()
+        app.processEvents()
+        shutil.rmtree(tmp, ignore_errors=True)

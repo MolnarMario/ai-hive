@@ -747,6 +747,9 @@ error dialog instead of silently closing. Packaging to a distributable
 
 - **Workspaces** — `+` in the sidebar (or `Ctrl+Shift+N`). Every workspace is
   tied to a project folder you pick at creation; terminals open there.
+  Type the full path of a folder that doesn't exist yet and the button
+  becomes Create folder and workspace: AI Hive makes the folder (and any
+  missing folders above it) for you.
   The New Workspace dialog can also take a GitHub repository URL instead: it
   clones the repo's default branch (`main`, `master` or whatever it is
   called) into a new folder and opens the workspace there.

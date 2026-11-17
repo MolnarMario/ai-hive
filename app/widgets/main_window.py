@@ -2974,9 +2974,17 @@ class NewWorkspaceDialog(QDialog):
     With the Options switch "Lanes in every workspace" on, the box shows
     ticked and locked and sets nothing, so turning that switch off later
     leaves the workspace as the user left it.
+
+    A full path to a folder that does not exist yet turns the button into
+    Create folder and workspace, and the main window makes the folder
+    (`MainWindow._on_add_workspace_clicked`), so a new project needs no trip
+    to Explorer first. The check rides the Lanes debounce: one `exists` per
+    pause, since a network path can stall each one.
     """
 
     LANES_TEXT = "Lanes (each agent in its own git worktree)"
+    CREATE_TEXT = "Create workspace"
+    CREATE_FOLDER_TEXT = "Create folder and workspace"
 
     def __init__(self, start_dir: str, parent=None, lanes_forced: bool = False):
         super().__init__(parent)
@@ -3040,7 +3048,8 @@ class NewWorkspaceDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Cancel |
             QDialogButtonBox.StandardButton.Ok, parent=self)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Create workspace")
+        self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.ok_button.setText(self.CREATE_TEXT)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
@@ -3052,7 +3061,7 @@ class NewWorkspaceDialog(QDialog):
         self._lanes_timer = QTimer(self)
         self._lanes_timer.setSingleShot(True)
         self._lanes_timer.setInterval(250)
-        self._lanes_timer.timeout.connect(self._refresh_lanes_check)
+        self._lanes_timer.timeout.connect(self._refresh_folder_state)
         self.folder_edit.textChanged.connect(
             lambda _text: self._lanes_timer.start())
         self._show_source(0)
@@ -3068,7 +3077,7 @@ class NewWorkspaceDialog(QDialog):
                 else QSizePolicy.Policy.Ignored)
         self.pages.setCurrentIndex(index)
         self.pages.updateGeometry()
-        self._refresh_lanes_check()
+        self._refresh_folder_state()
         if self.isVisible():
             self.resize(self.width(), self.sizeHint().height())
 
@@ -3081,7 +3090,25 @@ class NewWorkspaceDialog(QDialog):
         that is behind the folder field."""
         if self._lanes_timer.isActive():
             self._lanes_timer.stop()
-            self._refresh_lanes_check()
+            self._refresh_folder_state()
+
+    def _refresh_folder_state(self) -> None:
+        self._refresh_lanes_check()
+        missing = self.folder_is_missing()
+        self.ok_button.setText(
+            self.CREATE_FOLDER_TEXT if missing else self.CREATE_TEXT)
+        self.ok_button.setToolTip(
+            "This folder does not exist yet. AI Hive will create it, with "
+            "any missing folders above it." if missing else "")
+
+    def folder_is_missing(self) -> bool:
+        """Is the Existing folder page naming a full path with nothing
+        there yet? A relative path would land in AI Hive's own working
+        folder, and a file in the way is no folder to make, so both stay
+        plain errors."""
+        folder = self.folder_edit.text().strip()
+        return (self.source_combo.currentIndex() == 0
+                and os.path.isabs(folder) and not os.path.exists(folder))
 
     def _refresh_lanes_check(self) -> None:
         cb = self.lanes_check
@@ -8520,9 +8547,20 @@ class MainWindow(QMainWindow):
         if data["mode"] == "folder":
             path = data["path"]
             if not os.path.isdir(path):
-                QMessageBox.warning(self, "AI Hive",
-                                    "Choose an existing project folder.")
-                return
+                if not os.path.isabs(path) or os.path.exists(path):
+                    QMessageBox.warning(
+                        self, "AI Hive",
+                        "Choose an existing project folder, or type the full "
+                        "path of a new one.")
+                    return
+                try:
+                    os.makedirs(path)
+                except OSError as exc:
+                    QMessageBox.warning(
+                        self, "AI Hive",
+                        f"Could not create the folder:\n{path}\n\n"
+                        f"{exc.strerror or exc}")
+                    return
             ws = self.manager.create_workspace(data["name"], path,
                                                lanes=data["lanes"])
             self.manager.set_active(ws.id)
