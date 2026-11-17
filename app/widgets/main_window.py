@@ -2962,6 +2962,18 @@ def _read_cut_offs(targets) -> list[tuple]:
             for agent_id, cwd, session_id in targets]
 
 
+def _windows_folder_path(path: str) -> str:
+    """`path` made absolute, with each folder name trimmed of the trailing
+    dots and spaces Windows would drop when it makes that folder. A name
+    that is nothing but dots stays as typed and fails in makedirs."""
+    path = os.path.abspath(path)
+    if os.name != "nt":
+        return path
+    drive, rest = os.path.splitdrive(path)
+    return drive + os.sep.join(part.rstrip(" .") or part
+                               for part in rest.split(os.sep))
+
+
 class NewWorkspaceDialog(QDialog):
     """Choose an existing project folder or clone a GitHub repository's
     default branch (see `clone_default_branch`).
@@ -8562,6 +8574,13 @@ class MainWindow(QMainWindow):
         if data["mode"] == "folder":
             path, name = data["path"], data["name"]
             if data.get("create"):
+                # Windows drops trailing dots and spaces from each folder it
+                # makes, and makedirs then fails below a trimmed parent
+                # (leaving it behind): trim them all first, and save the
+                # folder that exists, since agent cwds and Claude's
+                # transcripts key on its path
+                path = _windows_folder_path(path)
+                name = os.path.basename(path) or "Workspace"
                 try:
                     os.makedirs(path, exist_ok=True)
                 except OSError as exc:
@@ -8570,11 +8589,6 @@ class MainWindow(QMainWindow):
                         f"Could not create the folder:\n{path}\n\n"
                         f"{exc.strerror or exc}")
                     return
-                # Windows drops trailing dots and spaces from the folder it
-                # makes: keep the path and name of the folder that exists,
-                # since agent cwds and Claude's transcripts key on it
-                path = os.path.abspath(path)
-                name = os.path.basename(path) or "Workspace"
             elif not os.path.isdir(path):
                 QMessageBox.warning(
                     self, "AI Hive",

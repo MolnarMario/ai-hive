@@ -2572,6 +2572,15 @@ def test_new_workspace_creates_missing_folder():
               and os.path.normcase(new[0].project_path)
               == os.path.normcase(str(dotted)) and len(warnings) == 3,
               ([(w.name, w.project_path) for w in new], warnings))
+
+        inner = tmp / "Inner" / "Leaf"
+        new = create(str(tmp / "Inner. ") + os.sep + "Leaf.")
+        check("new ws mkdir: ...in a folder above it too, where makedirs "
+              "used to fail and leave the trimmed parent behind",
+              inner.is_dir() and len(new) == 1 and new[0].name == "Leaf"
+              and os.path.normcase(new[0].project_path)
+              == os.path.normcase(str(inner)) and len(warnings) == 3,
+              ([(w.name, w.project_path) for w in new], warnings))
     finally:
         NewWorkspaceDialog.exec = orig_exec
         mw.QMessageBox.warning = orig_warning
