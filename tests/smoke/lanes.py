@@ -1549,6 +1549,26 @@ def test_lane_hooks():
     check("lane settings: SessionStart still never matches startup",
           lh["SessionStart"][0]["matcher"] == "resume|clear|compact"
           and bh["SessionStart"][0]["matcher"] == "resume|clear|compact")
+    # Regression: in a new workspace with Lanes on, auto mode refused the
+    # required `codex review` as "Unsanctioned Communication" because only
+    # the appended system prompt asked for it. The lane file allows it.
+    lane_doc = json.loads(lane_p.read_text())
+    allow = lane_doc.get("permissions", {}).get("allow") or []
+    check("lane settings: the lane file pre-approves codex review in both "
+          "shells", "Bash(codex review --base origin/main "
+          + session_hook.LANE_REVIEW_FLAGS + ")" in allow
+          and "PowerShell(codex review --base main "
+          + session_hook.LANE_REVIEW_FLAGS + ")" in allow,
+          lane_doc.get("permissions"))
+    # Integration review finding: a `codex review:*` prefix also matched
+    # `-c sandbox_mode=danger-full-access` (or an mcp_servers command), so
+    # auto mode's check was skipped for whatever Codex was then told to run
+    check("lane settings: only the exact read-only review is pre-approved",
+          len(allow) == 8 and all(
+              r.endswith(session_hook.LANE_REVIEW_FLAGS + ")")
+              and ":*" not in r and "*" not in r for r in allow), allow)
+    check("lane settings: the shared file pre-approves nothing",
+          "permissions" not in json.loads(base_p.read_text()))
     shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -4896,7 +4916,7 @@ def test_task_done_waits_for_the_user():
     not, and puts no notice on the flagged card: the user decides when
     there is enough to ship."""
     from PySide6.QtWidgets import QApplication
-    from app import lanes
+    from app import lanes, session_hook
     from app.process_worker import AgentKind, build_spec
     from app.session_store import SessionStore
     from main import create_main_window
@@ -4937,6 +4957,9 @@ def test_task_done_waits_for_the_user():
               and "model=gpt-6-luna" in prompt
               and "model_reasoning_effort=high" in prompt
               and "sandbox_mode=read-only" in prompt
+              # the lane settings pre-approve exactly this wording
+              and "codex review --base origin/main "
+              + session_hook.LANE_REVIEW_FLAGS in prompt
               and "review again" in prompt
               and "--allow-empty" in prompt
               and "docs/agents/integration.md" in prompt, prompt)

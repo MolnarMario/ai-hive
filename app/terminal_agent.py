@@ -342,6 +342,16 @@ def _despace(text: str) -> str:
 _WS_RE = re.compile(r"\s+")
 _READY_HINTS_DESPACED = tuple(_despace(h) for h in _CLAUDE_READY_HINTS)
 
+# A dialog Claude can draw BEFORE its prompt, which waits for the user: the
+# folder-trust dialog (every new lane is a folder Claude has not seen) and the
+# --add-dir one after it. "Enter to confirm" is their footer from 2.1.290 on,
+# "trust this folder" the option 2.1.283 drew without that footer. Lowered,
+# matched despaced like the ready hints. Not readiness: a task typed into the
+# dialog is lost (see _on_pty_output).
+_CLAUDE_BOOT_DIALOG_HINTS = ("enter to confirm", "i trust this folder")
+_BOOT_DIALOG_HINTS_DESPACED = tuple(_despace(h)
+                                    for h in _CLAUDE_BOOT_DIALOG_HINTS)
+
 # --- submitting a typed task ---
 # A task is typed, then submitted with a SEPARATE Enter. Claude Code reads a
 # CR that arrives in the same stdin chunk as the text as part of a paste: it
@@ -541,6 +551,11 @@ class TerminalAgent(QObject):
     # (re)start). Purely a VIEW signal — the card uses it to lift its boot
     # veil — and, like activity/waiting, it must never mark the session dirty.
     prompt_ready_changed = Signal(bool)
+    # the child drew a dialog that waits for the user before its prompt (the
+    # folder-trust one). Once per fresh start, never on a resume (its replay
+    # is old text, see _dialog_watch). VIEW only like prompt_ready_changed:
+    # the card lifts its boot veil so the dialog can be answered.
+    dialog_before_prompt = Signal()
     # `start_coming()` flipped: a held or queued agent that is about to start
     # (its card shows the loader) or one held for good (its card shows the
     # stopped banner). VIEW only, never persisted.
@@ -631,6 +646,10 @@ class TerminalAgent(QObject):
         self._fresh_screen = False    # a Restart's child has not started yet
         self._prompt_ready = False    # the TUI's input prompt is interactive
         self._ready_tail = ""         # rolling stripped tail (pre-ready only)
+        # this start may still send dialog_before_prompt: armed by a FRESH
+        # start, disarmed once sent. A resume replays the conversation before
+        # its prompt, and text in it can read like a dialog.
+        self._dialog_watch = False
         # typed tasks still waiting for their Enter (see TASK_SUBMIT_MS)
         self._pending_submits: list[_PendingSubmit] = []
         self._resume_attempt = False  # last start() launched with --continue
@@ -973,6 +992,7 @@ class TerminalAgent(QObject):
                 and self._verify_resume_target):
             self._recover_missing_resume_target()
         self._resume_attempt = self.spec.resume  # for the fast-fail fallback
+        self._dialog_watch = not self.spec.resume
         self._turn_open = False        # nothing asked yet, so nothing to stamp
         self._awaiting_reply = False
         self._turn_mark_uid = None
@@ -1221,6 +1241,7 @@ class TerminalAgent(QObject):
         self._wake()
         self._set_prompt_ready(False)
         self._ready_tail = ""
+        self._dialog_watch = True       # a restart is a fresh conversation
         self._screen_tail = ""
         self._esc_carry = ""
         self._reset_waiting()
@@ -2968,6 +2989,10 @@ class TerminalAgent(QObject):
         if not self._prompt_ready and self.spec.provider == "claude":
             if self._has_ready_hint(self._screen_tail):
                 self._became_prompt_ready()
+            else:
+                # the boot dialog can be missed the same way, and the child
+                # then sits quiet in it until the user answers
+                self._watch_boot_dialog(self._screen_tail)
 
     def _tail_lines(self, n: int, skip_blank: bool = False) -> str:
         """The last `n` lines of the escape-stripped screen tail, joined.
@@ -3689,6 +3714,8 @@ class TerminalAgent(QObject):
             if self.spec.provider == "claude":
                 self._ready_tail = (self._ready_tail + stripped)[-600:]
                 ready = self._has_ready_hint(self._ready_tail)
+                if not ready:
+                    self._watch_boot_dialog(self._ready_tail)
             else:
                 ready = "\x1b[?2004h" in text
             if ready:
@@ -3715,6 +3742,23 @@ class TerminalAgent(QObject):
         alt-screen renderer keeps matching exactly as before."""
         low = _despace(text)
         return any(h in low for h in _READY_HINTS_DESPACED)
+
+    def _watch_boot_dialog(self, tail: str) -> None:
+        """Announce a dialog Claude drew before its prompt, once per fresh
+        start (`_dialog_watch`). The dialog waits for the user, so the boot
+        veil must not cover it until its backstop (25 s): it did, and every
+        new lane seemed to take that long to start."""
+        if self._dialog_watch and self._has_boot_dialog_hint(tail):
+            self._dialog_watch = False
+            self.dialog_before_prompt.emit()
+
+    @staticmethod
+    def _has_boot_dialog_hint(text: str) -> bool:
+        """Whether `text` shows one of the dialogs Claude draws before its
+        prompt (_CLAUDE_BOOT_DIALOG_HINTS), matched despaced for the same
+        renderer reason as _has_ready_hint."""
+        low = _despace(text)
+        return any(h in low for h in _BOOT_DIALOG_HINTS_DESPACED)
 
     def _became_prompt_ready(self) -> None:
         """The TUI's prompt just went live: announce it."""
