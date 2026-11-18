@@ -2638,13 +2638,15 @@ def test_new_workspace_clone_creates_missing_folder():
     orig_warning = mw.QMessageBox.warning
     orig_clone = mw.clone_default_branch
     done = threading.Event()
-    fail = []
+    fail, vanish = [], []
 
     def fake_clone(remote, destination):
         clones.append(destination)
         try:
             if fail:
                 return "fatal: repository not found"
+            if vanish:
+                return ""
             os.makedirs(os.path.join(destination, ".git"))
             return ""
         finally:
@@ -2698,19 +2700,29 @@ def test_new_workspace_clone_creates_missing_folder():
               and tmp.is_dir())
         fail.clear()
 
+        vanish.append(True)
+        new = create(str(tmp / "vanished" / "deeper"),
+                     "https://github.com/owner/vanish.git")
+        check("clone mkdir: a clone git calls a success but whose folder is "
+              "missing adds no workspace and removes the folders it made",
+              not new and len(warnings) == 2
+              and "cloned folder was not found" in warnings[-1]
+              and not (tmp / "vanished").exists() and tmp.is_dir(), warnings)
+        vanish.clear()
+
         new = create(str(a_file / "inside"))
         check("clone mkdir: a clone folder that cannot be made warns with "
-              "the reason", not new and len(warnings) == 2
+              "the reason", not new and len(warnings) == 3
               and "Could not create the folder" in warnings[-1], warnings)
 
         new = create(str(a_file))
         check("clone mkdir: a file as the clone folder says it is a file",
-              not new and len(warnings) == 3
+              not new and len(warnings) == 4
               and "is a file" in warnings[-1], warnings)
 
         new = create("relative/clones")
         check("clone mkdir: a relative clone folder warns and creates nothing",
-              not new and len(warnings) == 4
+              not new and len(warnings) == 5
               and not os.path.exists(os.path.join(os.getcwd(), "relative")),
               warnings)
     finally:

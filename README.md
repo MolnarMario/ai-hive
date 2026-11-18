@@ -752,7 +752,9 @@ error dialog instead of silently closing. Packaging to a distributable
   missing folders above it) for you.
   The New Workspace dialog can also take a GitHub repository URL instead: it
   clones the repo's default branch (`main`, `master` or whatever it is
-  called) into a new folder and opens the workspace there.
+  called) into a new folder and opens the workspace there. Its Clone into
+  folder may be a new one too: AI Hive makes it, and removes the empty
+  folders it made if the clone fails.
   Double-click a row to rename, `✕` deletes (confirmation appears only when
   terminals are running). The top-left sidebar button (a collapse or expand icon, whichever the next click does) or `Ctrl+Shift+B` collapses the sidebar to a
   10px rail with one strip per workspace, in sidebar order and colored like

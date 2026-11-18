@@ -8583,6 +8583,27 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------- user flows ---
 
+    def _make_folder(self, path: str) -> str | None:
+        """Make `path` and any missing folders above it, for New Workspace.
+        Returns the topmost folder it made ("" when `path` was there
+        already), which a failed clone removes again, or None after warning
+        that the folder could not be made."""
+        made = path
+        while (os.path.dirname(made) != made
+               and not os.path.exists(os.path.dirname(made))):
+            made = os.path.dirname(made)
+        if os.path.exists(made):
+            made = ""
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "AI Hive",
+                f"Could not create the folder:\n{path}\n\n"
+                f"{exc.strerror or exc}")
+            return None
+        return made
+
     def _on_add_workspace_clicked(self) -> None:
         start_dir = os.path.expanduser("~")
         active = self.manager.workspace(self.manager.active_id)
@@ -8603,13 +8624,7 @@ class MainWindow(QMainWindow):
                 # transcripts key on its path
                 path = _windows_folder_path(path)
                 name = os.path.basename(path) or "Workspace"
-                try:
-                    os.makedirs(path, exist_ok=True)
-                except OSError as exc:
-                    QMessageBox.warning(
-                        self, "AI Hive",
-                        f"Could not create the folder:\n{path}\n\n"
-                        f"{exc.strerror or exc}")
+                if self._make_folder(path) is None:
                     return
             elif not os.path.isdir(path):
                 QMessageBox.warning(
@@ -8661,22 +8676,11 @@ class MainWindow(QMainWindow):
             return
         made = ""   # the topmost folder made here, removed if the clone fails
         if create:
-            made = parent
-            while (os.path.dirname(made) != made
-                   and not os.path.exists(os.path.dirname(made))):
-                made = os.path.dirname(made)
-            if os.path.exists(made):
-                made = ""
-            try:
-                os.makedirs(parent, exist_ok=True)
-            except OSError as exc:
-                QMessageBox.warning(
-                    self, "AI Hive",
-                    f"Could not create the folder:\n{parent}\n\n"
-                    f"{exc.strerror or exc}")
+            made = self._make_folder(parent)
+            if made is None:
                 return
 
-        progress =QProgressDialog(
+        progress = QProgressDialog(
             f"Cloning {repo_url}…", "", 0, 0, self)
         progress.setWindowTitle("Creating GitHub workspace")
         progress.setCancelButton(None)
@@ -8687,7 +8691,9 @@ class MainWindow(QMainWindow):
 
         def clone() -> None:
             error = clone_default_branch(remote, destination)
-            if error and made:
+            # a success with no folder adds no workspace either (see
+            # _on_workspace_clone_finished), so it takes the folders back too
+            if made and (error or not os.path.isdir(destination)):
                 _remove_empty_folders(parent, made)
             self.workspaceCloneFinished.emit(name, destination, repo_url,
                                              error, want_lanes)
