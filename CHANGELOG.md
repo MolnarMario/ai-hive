@@ -8,6 +8,15 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.60.2
+
+- A new agent whose Claude asks whether you trust its folder (every new
+  lane does) shows that question right away instead of hiding it behind
+  the starting loader for about 25 seconds.
+- Agents in their own lane can run the Codex review they do before
+  flagging their work as done, without Claude Code's auto mode blocking
+  it.
+
 ## 0.60.1
 
 - New Workspace's GitHub page can clone into a folder that doesn't exist
