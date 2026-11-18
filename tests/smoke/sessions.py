@@ -2213,6 +2213,82 @@ def test_boot_veil():
     lcard.detach(); live.dispose(); pump(50)
 
 
+def test_boot_veil_lifts_for_trust_dialog():
+    """A dialog Claude shows before its prompt lifts the loader at once.
+
+    The regression: every new lane is a folder Claude has never seen, so its
+    first child opens on the folder-trust dialog about 4 s after the spawn.
+    The veil only lifted on the input-box footer, which comes AFTER the user
+    answers that dialog, so the dialog sat hidden under "starting..." until
+    the 25 s backstop. It must not count as the prompt, though: readiness
+    gates task delivery, and a task typed into the dialog would be lost."""
+    from app.process_worker import AgentKind, build_spec
+    from app.terminal_agent import TerminalAgent
+
+    agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Trusting",
+                                     cwd=SCRATCH_CWD, pty=True))
+    shown, ready = [], []
+    agent.dialog_before_prompt.connect(lambda: shown.append(1))
+    agent.prompt_ready_changed.connect(ready.append)
+    agent._on_pty_output("stdout", "Claude Code is booting")
+    check("trust-veil: a booting child shows no dialog yet", shown == [])
+    # the classic renderer positions words with cursor moves, not spaces
+    agent._on_pty_output(
+        "stdout", "\x1b[1mAccessing workspace:\x1b[0m\r\n"
+        "Quick\x1b[7Gsafety\x1b[14Gcheck\r\n> No, exit\r\n"
+        "  Yes,\x1b[7GI\x1b[9Gtrust\x1b[15Gthis\x1b[20Gfolder\r\n"
+        "Enter to confirm · Esc to cancel")
+    check("trust-veil: the trust dialog is announced", shown == [1])
+    check("trust-veil: ...but it is not the prompt (a task would land in "
+          "the dialog)", ready == [] and not agent.prompt_ready())
+    agent._on_pty_output("stdout", "Enter to confirm")
+    check("trust-veil: announced once per start, not per redraw",
+          shown == [1])
+
+    class _StubWorker:
+        state = None
+        def start(self): pass
+        def restart(self): pass
+        def is_running(self): return False
+        def dispose(self): pass
+    agent.worker = _StubWorker()
+    agent.start()
+    agent._on_pty_output("stdout", "Yes, I trust this folder")
+    check("trust-veil: a new start announces its own dialog again",
+          shown == [1, 1])
+    agent._on_pty_output("stdout", "? for shortcuts")
+    agent._on_pty_output("stdout", "Enter to confirm")
+    check("trust-veil: a dialog after the prompt is live is not a boot "
+          "dialog", shown == [1, 1] and agent.prompt_ready())
+    agent.dispose()
+
+    from app.pty_worker import HAS_CONPTY
+    if not HAS_CONPTY:
+        return
+    from PySide6.QtCore import QEventLoop, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from app.terminal_agent import AgentStatus
+    from app.widgets.terminal_card import TerminalCard
+    QApplication.instance() or QApplication([])
+
+    def pump(ms):
+        loop = QEventLoop(); QTimer.singleShot(ms, loop.quit); loop.exec()
+
+    booting = TerminalAgent(build_spec(AgentKind.CLAUDE, "Boot",
+                                       cwd=SCRATCH_CWD, pty=True))
+    card = TerminalCard(booting)
+    card.resize(640, 400); card.show(); pump(150)
+    card._on_status(AgentStatus.STARTING)
+    check("trust-veil: the launching card is covered",
+          card.boot.is_active())
+    booting.dialog_before_prompt.emit()
+    pump(500)   # the fade is 260ms
+    check("trust-veil: a dialog before the prompt uncovers the card",
+          not card.boot.is_active() and not card._boot_timer.isActive())
+    card.detach(); booting.dispose(); pump(50)
+
+
 def test_autostart_skips_discarded_replay():
     """The launch autostart drops each starting card's restored screen BEFORE
     settle_layout, so the flush there projects nothing it would wipe a moment
