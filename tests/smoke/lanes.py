@@ -1549,6 +1549,16 @@ def test_lane_hooks():
     check("lane settings: SessionStart still never matches startup",
           lh["SessionStart"][0]["matcher"] == "resume|clear|compact"
           and bh["SessionStart"][0]["matcher"] == "resume|clear|compact")
+    # Regression: in a new workspace with Lanes on, auto mode refused the
+    # required `codex review` as "Unsanctioned Communication" because only
+    # the appended system prompt asked for it. The lane file allows it.
+    lane_doc = json.loads(lane_p.read_text())
+    check("lane settings: the lane file pre-approves codex review in both "
+          "shells", lane_doc.get("permissions", {}).get("allow")
+          == ["Bash(codex review:*)", "PowerShell(codex review:*)"],
+          lane_doc.get("permissions"))
+    check("lane settings: the shared file pre-approves nothing",
+          "permissions" not in json.loads(base_p.read_text()))
     shutil.rmtree(tmp, ignore_errors=True)
 
 
