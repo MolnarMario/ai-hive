@@ -523,12 +523,48 @@ class _FastHistoryScreen(pyte.HistoryScreen):
     # starts there (see TerminalView._drop_repaint_copies).
     top_jumps: list
 
+    # Cells drawn faint (SGR 2), as {row: {column: the char drawn}}. pyte's
+    # Char has no field for faint and drops it. Claude paints its prompt
+    # suggestion faint in an empty box (TerminalView._box_holds_suggestion).
+    # A cell counts as faint only while it still holds the char drawn into
+    # it faint: a later plain draw over it drops it here, and anything else
+    # that moves text (a scroll, an erase) leaves a char that no longer
+    # matches. Cleared on reset and resize.
+    faint_rows: dict
+
     def __init__(self, *args, **kwargs) -> None:
         self.top_jumps = []
         self.history_resets = 0
+        self.faint_rows = {}
+        self._faint = False
         super().__init__(*args, **kwargs)
 
+    def reset(self) -> None:
+        super().reset()
+        self.faint_rows = {}
+        self._faint = False
+
+    def select_graphic_rendition(self, *attrs, **kwargs) -> None:
+        super().select_graphic_rendition(*attrs, **kwargs)
+        if not attrs:
+            self._faint = False
+            return
+        i, n = 0, len(attrs)
+        while i < n:
+            attr = attrs[i]
+            if attr in (38, 48, 58):
+                # a colour's own parameters, 5;n or 2;r;g;b: the 2 in
+                # 38;2;153;153;153 is not faint
+                i += 3 if i + 1 < n and attrs[i + 1] == 5 else 5
+                continue
+            if attr == 2:
+                self._faint = True
+            elif attr in (0, 22):
+                self._faint = False
+            i += 1
+
     def draw(self, data: str) -> None:
+        y0, x0 = self.cursor.y, self.cursor.x
         # pyte measures code points one at a time and drops the rest of a
         # run at a VS16 or ZWJ, so `⚔️` shifted every row after it (see
         # app/grapheme_cells.py). A printable ASCII run never forms a
@@ -538,6 +574,37 @@ class _FastHistoryScreen(pyte.HistoryScreen):
             super().draw(data)
         else:
             grapheme_cells.draw(self, data)
+        if self._faint or self.faint_rows:
+            self._note_faint(y0, x0)
+
+    def _note_faint(self, y0: int, x0: int) -> None:
+        """Record the cells the last draw wrote, from (y0, x0) to the
+        cursor, as faint or no longer faint. A draw that scrolled the
+        screen is skipped: its start row has moved."""
+        y1, x1 = self.cursor.y, min(self.cursor.x, self.columns)
+        cols = self.columns
+        if y1 == y0 and x1 >= x0:
+            spans = [(y0, x0, x1)]
+        elif y1 > y0:
+            spans = ([(y0, x0, cols)]
+                     + [(y, 0, cols) for y in range(y0 + 1, y1)]
+                     + [(y1, 0, x1)])
+        else:
+            return
+        rows = self.faint_rows
+        for y, a, b in spans:
+            if self._faint:
+                line = self.buffer[y]
+                cells = rows.setdefault(y, {})
+                for x in range(a, b):
+                    cells[x] = line[x].data
+            else:
+                cells = rows.get(y)
+                if cells:
+                    for x in range(a, b):
+                        cells.pop(x, None)
+                    if not cells:
+                        del rows[y]
 
     @property
     def display(self) -> list:
@@ -573,6 +640,7 @@ class _FastHistoryScreen(pyte.HistoryScreen):
         # a jump from before a resize describes another layout
         super().resize(lines, columns)
         self.top_jumps = []
+        self.faint_rows = {}
 
     def prev_page(self) -> None:
         raise NotImplementedError(
@@ -3340,8 +3408,44 @@ class TerminalView(QWidget):
     def _box_is_empty(self) -> bool:
         """No typed text in Claude's box: _input_text reads none, and the
         caret is not parked under the box's text either. A screen with no
-        box at all counts as empty, as it did before emptying existed."""
+        box at all counts as empty, as it did before emptying existed. Nor
+        does Claude's prompt suggestion count (_box_holds_suggestion)."""
+        if self._box_holds_suggestion():
+            return True
         return not self._input_text() and not self._caret_below_box()
+
+    def _box_holds_suggestion(self) -> bool:
+        """The box holds only Claude's prompt suggestion, the next prompt
+        it guesses: every painted character behind a caret parked at the
+        box's start was drawn faint. Measured on Claude 2.1.327: Backspace
+        leaves it as it is, Right accepts it as typed text, and a box
+        Backspaced to nothing shows it again, so emptying can never read
+        the box empty and Ship finished lanes timed out. Text typed or
+        pasted over it replaces it, which is why it counts as empty."""
+        if self.has_draft():
+            return False
+        span = self._input_block_span()
+        faint = getattr(self.screen, "faint_rows", None)
+        if span is None or not faint:
+            return False
+        buf = self.screen.buffer
+        seen = False
+        for r in range(span[0], span[1] + 1):
+            first, last = self._row_content(r)
+            if last < 0:
+                continue
+            start = first
+            if r == span[0] and buf[r][first].data in _INPUT_PROMPTS:
+                start = first + 1
+            cells = faint.get(r, {})
+            for c in range(start, last + 1):
+                ch = buf[r][c].data
+                if not ch.strip():
+                    continue        # the prompt gap, a space, a wide half
+                if cells.get(c) != ch:
+                    return False
+                seen = True
+        return seen
 
     def _box_look(self) -> tuple:
         """What a round is judged by: the box's text and the caret."""
