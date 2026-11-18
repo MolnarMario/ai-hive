@@ -2225,10 +2225,19 @@ def test_boot_veil_lifts_for_trust_dialog():
     from app.process_worker import AgentKind, build_spec
     from app.terminal_agent import TerminalAgent
 
+    class _StubWorker:
+        state = None
+        def start(self): pass
+        def restart(self): pass
+        def is_running(self): return False
+        def dispose(self): pass
+
     agent = TerminalAgent(build_spec(AgentKind.CLAUDE, "Trusting",
                                      cwd=SCRATCH_CWD, pty=True))
+    agent.worker = _StubWorker()
     shown, ready = [], []
     agent.dialog_before_prompt.connect(lambda: shown.append(1))
+    agent.start()
     agent.prompt_ready_changed.connect(ready.append)
     agent._on_pty_output("stdout", "Claude Code is booting")
     check("trust-veil: a booting child shows no dialog yet", shown == [])
@@ -2245,13 +2254,6 @@ def test_boot_veil_lifts_for_trust_dialog():
     check("trust-veil: announced once per start, not per redraw",
           shown == [1])
 
-    class _StubWorker:
-        state = None
-        def start(self): pass
-        def restart(self): pass
-        def is_running(self): return False
-        def dispose(self): pass
-    agent.worker = _StubWorker()
     agent.start()
     agent._on_pty_output("stdout", "Yes, I trust this folder")
     check("trust-veil: a new start announces its own dialog again",
@@ -2260,6 +2262,23 @@ def test_boot_veil_lifts_for_trust_dialog():
     agent._on_pty_output("stdout", "Enter to confirm")
     check("trust-veil: a dialog after the prompt is live is not a boot "
           "dialog", shown == [1, 1] and agent.prompt_ready())
+    from app.process_worker import WorkerState
+    agent.restart()
+    # restart() drops output until its new child is on the way
+    agent._on_worker_state(WorkerState.STARTING)
+    agent._on_pty_output("stdout", "Enter to confirm")
+    check("trust-veil: a restart (a fresh conversation) watches for it too",
+          shown == [1, 1, 1])
+    # a resume replays the conversation before its prompt, and the old text
+    # can say anything, this very sentence included
+    agent.spec.resume = True
+    agent.spec.session_id = ""     # nothing to verify on disk
+    agent._verify_resume_target = False
+    agent.start()
+    agent._on_pty_output("stdout", "click Yes, I trust this folder, then "
+                         "Enter to confirm")
+    check("trust-veil: a resume's replayed text never lifts the veil",
+          shown == [1, 1, 1])
     agent.dispose()
 
     from app.pty_worker import HAS_CONPTY
