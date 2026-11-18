@@ -6395,3 +6395,29 @@ def test_lane_prompt_review_approval_follows_the_allowed_bases():
               ("is pre-approved" in prompt) == allowed
               and "as a command of its own" in prompt
               and "&&, ;, || or a second line" in prompt, prompt)
+
+
+def test_lane_prompt_review_forbids_cd_and_pipe():
+    """Regression: the lane prompt said a cd before the review or a pipe
+    after it was fine. The allow rules (session_hook.LANE_ALLOW_RULES)
+    match only the bare command, so `cd <lane> && codex review ...` and
+    `codex review ... 2>&1 | tail -60` went to the auto-mode check and
+    four of seven lanes in one workspace were refused as "Unsanctioned
+    Communication"."""
+    from app import coordination, session_hook
+
+    lane = {"root": "C:/p.lanes/a-1", "branch": "hive/a-1",
+            "base": "main", "repo": "C:/p"}
+    prompt = coordination.system_prompt_text(
+        "WS", "Agent 1", "C:/p/.aihive/board.md", lane=lane, aware=True)
+    check("lane-prompt: the review must run with nothing before or after",
+          "Put nothing before or after it: no cd" in prompt
+          and "no 2>&1 and no pipe" in prompt
+          and "Only that exact text is pre-approved" in prompt, prompt)
+    check("lane-prompt: never calls a cd or a pipe around the review fine",
+          "a cd before it" not in prompt and "pipe after it" not in prompt,
+          prompt)
+    review = next(cmd for cmd in session_hook.LANE_REVIEW_COMMANDS
+                  if cmd.startswith("codex review --base origin/main "))
+    check("lane-prompt: the review it names is the exact allowed text",
+          f"`{review}`" in prompt, prompt)
