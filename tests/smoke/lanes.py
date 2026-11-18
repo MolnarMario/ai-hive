@@ -4963,6 +4963,14 @@ def test_task_done_waits_for_the_user():
               and "review again" in prompt
               and "--allow-empty" in prompt
               and "docs/agents/integration.md" in prompt, prompt)
+        # Regression: lane agents ran `git commit ... && codex review ...`;
+        # the exact allow rule covers only the review alone, so auto mode
+        # refused every chained review as "Unsanctioned Communication".
+        check("task done: a lane agent runs the review as a command of its "
+              "own, never chained after a commit or tests",
+              "as a command of its own" in prompt
+              and "never chained after a commit or a test run" in prompt,
+              prompt)
         check("task done: a lane agent whose Codex fails leaves the flag "
               "off and tells the user",
               "leave the line off" in prompt
@@ -6365,3 +6373,25 @@ def test_repeat_last_agent():
         for lane in lanes_dir.iterdir():
             _drop_lane_folder(str(lane))
     shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_lane_prompt_review_approval_follows_the_allowed_bases():
+    """Regression: the lane prompt said the unchained review was
+    pre-approved for every base, but session_hook.LANE_REVIEW_COMMANDS
+    covers only main and master. A lane on `develop` was told its review
+    would pass, got refused, and read that as Codex failing."""
+    from app import coordination, session_hook
+
+    board = "C:/p/.aihive/board.md"
+    for base in ("main", "master", "develop"):
+        lane = {"root": "C:/p.lanes/a-1", "branch": "hive/a-1",
+                "base": base, "repo": "C:/p"}
+        prompt = coordination.system_prompt_text("WS", "Agent 1", board,
+                                                 lane=lane, aware=True)
+        allowed = any(cmd.startswith(f"codex review --base origin/{base} ")
+                      for cmd in session_hook.LANE_REVIEW_COMMANDS)
+        check(f"lane-prompt: base {base} is called pre-approved only when "
+              f"the lane settings allow its review",
+              ("is pre-approved" in prompt) == allowed
+              and "as a command of its own" in prompt
+              and "&&, ;, || or a second line" in prompt, prompt)
