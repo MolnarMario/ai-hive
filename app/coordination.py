@@ -173,7 +173,9 @@ def system_prompt_text(workspace_name: str, agent_name: str,
         # LANE_REVIEW_COMMANDS lists are pre-approved, so a lane on another
         # base is not told its review is.
         if lane.get("base") in ("main", "master"):
-            review_approval = "Only that exact text is pre-approved, and "
+            review_approval = (
+                "Only that exact text is pre-approved, and anything added "
+                "to it goes to the permission check, which blocks it. ")
         else:
             review_approval = ""
         text += (
@@ -192,14 +194,14 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"your lane adds, at high effort: `codex review --base "
             f"origin/{base} -c model=gpt-6-luna -c "
             f"model_reasoning_effort=high -c sandbox_mode=read-only`. Run "
-            f"that review exactly as written, as a command of its own, "
+            f"that review as written (with plain {base} in a repo with no "
+            f"origin), as a command of its own, "
             f"never chained after a commit or a test run with &&, ;, || or "
-            f"a second line. Put nothing before or after it: no cd (your "
-            f"lane is already the working folder), no 2>&1 and no pipe "
+            f"a second line. Put nothing before or after it: no cd (if an "
+            f"earlier command left your lane, cd back in a command of its "
+            f"own first), no 2>&1 and no pipe "
             f"(Claude Code saves long output to a file you can read). "
             f"{review_approval}"
-            f"anything added to it goes to the permission check, which "
-            f"blocks it. "
             f"Commit "
             f"a fix for every finding that holds up and review again, until "
             f"Luna finds nothing you accept as a real problem. Only then "

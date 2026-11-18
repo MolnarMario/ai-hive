@@ -6421,3 +6421,25 @@ def test_lane_prompt_review_forbids_cd_and_pipe():
                   if cmd.startswith("codex review --base origin/main "))
     check("lane-prompt: the review it names is the exact allowed text",
           f"`{review}`" in prompt, prompt)
+
+
+def test_lane_prompt_review_text_on_other_base_and_no_origin():
+    """Regression: on a base other than main or master the empty approval
+    left "...a file you can read). anything added to it goes to the
+    permission check", a lowercase sentence that also implied the review
+    was pre-approved. The prompt also said "exactly as written" right after
+    telling a repo with no origin to change the base."""
+    from app import coordination
+
+    lane = {"root": "C:/p.lanes/a-1", "branch": "hive/a-1",
+            "base": "develop", "repo": "C:/p"}
+    prompt = coordination.system_prompt_text(
+        "WS", "Agent 1", "C:/p/.aihive/board.md", lane=lane, aware=True)
+    check("lane-prompt: another base gets no lowercase sentence about the "
+          "permission check", ". anything added" not in prompt
+          and "anything added to it" not in prompt, prompt)
+    check("lane-prompt: the review allows plain base without origin",
+          "exactly as written" not in prompt
+          and "with plain develop in a repo with no origin" in prompt, prompt)
+    check("lane-prompt: a cd back to the lane goes in its own command",
+          "cd back in a command of its own first" in prompt, prompt)

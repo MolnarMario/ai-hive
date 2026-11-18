@@ -66,7 +66,9 @@ every other lane in the batch waits.
    If every command Luna runs fails with `setup refresh had errors`, the
    npm Codex CLI's sandbox setup hit a file an open Codex app session
    holds. Run the same review with the Codex app's own binary,
-   `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe`. A reply where Luna
+   `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe`. No rule
+   pre-approves that path, so expect a permission prompt for the user to
+   answer. A reply where Luna
    says it couldn't read the diff is not a clean review.
 5. Commit a fix for every finding that holds up, rerun the area tests and
    review again, until Luna has nothing left that you accept as a real
