@@ -2518,7 +2518,12 @@ def test_providers_grid_and_workspace():
     pump(100)
     min_before = win.minimumSizeHint().width()
     win._toggle_activity(wa.id)
-    pump(300)
+    # the 160 ms reveal ran past a fixed 300 ms pump on a loaded parallel
+    # run (width 167 of 320), so wait for it to settle, up to 5 s
+    for _ in range(100):
+        pump(50)
+        if win.activity_panel.width() == 320:
+            break
     check("v2 activity: narrow window floats the panel",
           win._activity_floating and win.activity_panel.width() == 320,
           (win._activity_floating, win.activity_panel.width()))
