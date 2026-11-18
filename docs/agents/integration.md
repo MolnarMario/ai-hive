@@ -57,6 +57,10 @@ every other lane in the batch waits.
 3. Run the area tests (Testing policy above).
 4. Review everything the lane adds:
    `codex review --base origin/main -c model=gpt-6-luna -c model_reasoning_effort=high -c sandbox_mode=read-only`.
+   Run it as a command of its own. AI Hive pre-approves exactly this
+   command, alone or with a `cd` before it or a pipe after it. Chained
+   after a commit or a test run with `&&` or `;`, it goes to Claude Code's
+   auto-mode check, which blocks it as "Unsanctioned Communication".
    If every command Luna runs fails with `setup refresh had errors`, the
    npm Codex CLI's sandbox setup hit a file an open Codex app session
    holds. Run the same review with the Codex app's own binary,

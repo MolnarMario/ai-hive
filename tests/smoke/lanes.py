@@ -4963,6 +4963,14 @@ def test_task_done_waits_for_the_user():
               and "review again" in prompt
               and "--allow-empty" in prompt
               and "docs/agents/integration.md" in prompt, prompt)
+        # Regression: lane agents ran `git commit ... && codex review ...`;
+        # the exact allow rule covers only the review alone, so auto mode
+        # refused every chained review as "Unsanctioned Communication".
+        check("task done: a lane agent runs the review as a command of its "
+              "own, never chained after a commit or tests",
+              "as a command of its own" in prompt
+              and "never chained after a commit or a test run" in prompt,
+              prompt)
         check("task done: a lane agent whose Codex fails leaves the flag "
               "off and tells the user",
               "leave the line off" in prompt

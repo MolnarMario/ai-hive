@@ -162,7 +162,11 @@ def system_prompt_text(workspace_name: str, agent_name: str,
         # findings: on the integrator's PR each fix costs a full suite run
         # and a new review, and holds up every other lane in the batch. The
         # flag may sit on an empty commit (lanes._done_commit finds it), so
-        # the reviewed content is exactly what gets flagged.
+        # the reviewed content is exactly what gets flagged. The review
+        # must run unchained: the lane settings allow only that exact
+        # command (session_hook.LANE_ALLOW_RULES), and agents chained it
+        # after `git commit ... &&`, which sent the whole line to the
+        # auto-mode check and got every review refused.
         text += (
             f" You work in your own git worktree (your lane) at {lane['root']}, "
             f"on the branch {lane['branch']}, which starts from {base}. Commit "
@@ -178,7 +182,12 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"cover what you changed. Then have GPT-6-Luna review everything "
             f"your lane adds, at high effort: `codex review --base "
             f"origin/{base} -c model=gpt-6-luna -c "
-            f"model_reasoning_effort=high -c sandbox_mode=read-only`. Commit "
+            f"model_reasoning_effort=high -c sandbox_mode=read-only`. Run "
+            f"that review as a command of its own, never chained after a "
+            f"commit or a test run with && or ;: only the review alone "
+            f"(a cd before it or a pipe after it is fine) is pre-approved, "
+            f"and a chain goes to the permission check, which blocks it. "
+            f"Commit "
             f"a fix for every finding that holds up and review again, until "
             f"Luna finds nothing you accept as a real problem. Only then "
             f"make a commit whose message ends with a line of just "
