@@ -85,8 +85,12 @@ EDIT_TOOLS = "Edit|Write|MultiEdit|NotebookEdit"
 _EDIT_TOOL_SET = set(EDIT_TOOLS.split("|"))
 # The permission rules the lane settings file pre-approves: the GPT-6-Luna
 # review every lane runs before it flags its work, exactly as the lane prompt
-# (coordination.agent_instructions) words it, for the bases lanes usually
-# have, in both of Claude Code's shells (write_settings_file says why). Exact
+# (coordination.system_prompt_text) words it, for the bases lanes usually
+# have, in both of Claude Code's shells (write_settings_file says why). The
+# rule matches the review only when it runs as its own command: chained
+# after a commit or a test run with && or ;, the whole line goes to the
+# auto-mode check, so the lane prompt tells agents to run it alone and says
+# it is pre-approved only for these bases. Exact
 # on purpose, never a `codex review:*` prefix: `-c` overrides any Codex
 # setting, and some (sandbox_mode, an mcp_servers command) undo the read-only
 # sandbox, so a prefix rule pre-approved running anything at all. A lane on

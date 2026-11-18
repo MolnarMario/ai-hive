@@ -152,6 +152,8 @@ batch of green lanes in separate areas can be larger.
    the suite's `RESULT` line.
 8. Get the review from GPT-6-Luna at high effort:
    `codex review --base origin/main -c model=gpt-6-luna -c model_reasoning_effort=high -c sandbox_mode=read-only`.
+   Run it as a command of its own, as lane agents do (step 4 of "Lane
+   agents"): chained after a push or the suite, it gets blocked.
    Fix every finding that holds up, rerun the suite, push, update the PR
    body (each finding and what you did about it) and run the review again.
    Repeat until Luna has nothing left that you accept as a real problem.

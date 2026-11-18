@@ -166,7 +166,14 @@ def system_prompt_text(workspace_name: str, agent_name: str,
         # must run unchained: the lane settings allow only that exact
         # command (session_hook.LANE_ALLOW_RULES), and agents chained it
         # after `git commit ... &&`, which sent the whole line to the
-        # auto-mode check and got every review refused.
+        # auto-mode check and got every review refused. Only the bases
+        # LANE_REVIEW_COMMANDS lists are pre-approved, so a lane on another
+        # base is not told its review is.
+        if lane.get("base") in ("main", "master"):
+            review_approval = ("only the review alone (a cd before it or a "
+                               "pipe after it is fine) is pre-approved, and ")
+        else:
+            review_approval = ""
         text += (
             f" You work in your own git worktree (your lane) at {lane['root']}, "
             f"on the branch {lane['branch']}, which starts from {base}. Commit "
@@ -184,9 +191,9 @@ def system_prompt_text(workspace_name: str, agent_name: str,
             f"origin/{base} -c model=gpt-6-luna -c "
             f"model_reasoning_effort=high -c sandbox_mode=read-only`. Run "
             f"that review as a command of its own, never chained after a "
-            f"commit or a test run with && or ;: only the review alone "
-            f"(a cd before it or a pipe after it is fine) is pre-approved, "
-            f"and a chain goes to the permission check, which blocks it. "
+            f"commit or a test run with &&, ;, || or a second line: "
+            f"{review_approval}"
+            f"a chain goes to the permission check, which blocks it. "
             f"Commit "
             f"a fix for every finding that holds up and review again, until "
             f"Luna finds nothing you accept as a real problem. Only then "
