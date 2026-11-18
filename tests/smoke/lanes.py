@@ -2145,7 +2145,9 @@ def test_lanes_retire_busy():
     finally:
         proc.kill()
         proc.wait(10)
-    deadline = time.monotonic() + 15
+    # a loaded full run took 5 s for the first retire alone, and the retry
+    # missed a 15 s wait; the loop ends as soon as the lane is gone
+    deadline = time.monotonic() + 60
     while root.exists() and time.monotonic() < deadline:
         loop = QEventLoop()
         QTimer.singleShot(100, loop.quit)
