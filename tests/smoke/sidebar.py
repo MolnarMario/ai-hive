@@ -2590,3 +2590,152 @@ def test_new_workspace_creates_missing_folder():
         win.close()
         app.processEvents()
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_new_workspace_clone_creates_missing_folder():
+    """The GitHub page's Clone into folder may not exist yet either: the
+    button says it will create it, the window makes the chain and clones
+    into it, and a clone that fails takes back the folders it made. Before,
+    a missing Clone into folder only warned "choose an existing clone
+    folder" while the folder page created its missing folder."""
+    import threading
+    import time
+    import app.widgets.main_window as mw
+    from PySide6.QtWidgets import QApplication, QDialog
+    from app.session_store import SessionStore
+    from app.widgets.main_window import NewWorkspaceDialog
+    from main import create_main_window
+
+    app = QApplication.instance() or QApplication([])
+    tmp = Path(tempfile.mkdtemp(prefix="ai-hive-new-ws-clone-mkdir-"))
+    a_file = tmp / "notes.txt"
+    a_file.write_text("x", encoding="utf-8")
+    missing = tmp / "code" / "github"
+
+    dlg = NewWorkspaceDialog(str(tmp))
+    ok = dlg.ok_button
+    dlg.source_combo.setCurrentIndex(1)
+    dlg.repo_edit.setText("https://github.com/owner/repo.git")
+    dlg._settle_lanes()
+    check("clone mkdir: an existing clone folder keeps the plain button",
+          ok.text() == NewWorkspaceDialog.CREATE_TEXT, ok.text())
+    dlg.parent_edit.setText(str(missing))
+    dlg._settle_lanes()
+    check("clone mkdir: a missing clone folder turns the button into "
+          "create folder and workspace",
+          ok.text() == NewWorkspaceDialog.CREATE_FOLDER_TEXT
+          and dlg.result_data()["create"] is True, ok.text())
+    dlg.parent_edit.setText(str(a_file))
+    dlg._settle_lanes()
+    check("clone mkdir: a file in the way is not offered as a new folder",
+          ok.text() == NewWorkspaceDialog.CREATE_TEXT, ok.text())
+    dlg.deleteLater()
+
+    win = create_main_window(SessionStore(path=tmp / "session.json"))
+    win._save_timer.stop()
+    seen, warnings, clones = [], [], []
+    orig_exec = NewWorkspaceDialog.exec
+    orig_warning = mw.QMessageBox.warning
+    orig_clone = mw.clone_default_branch
+    done = threading.Event()
+    fail, vanish = [], []
+
+    def fake_clone(remote, destination):
+        clones.append(destination)
+        try:
+            if fail:
+                return "fatal: repository not found"
+            if vanish:
+                return ""
+            os.makedirs(os.path.join(destination, ".git"))
+            return ""
+        finally:
+            done.set()
+
+    def create(parent, url="https://github.com/owner/repo.git"):
+        def fake_exec(d):
+            seen.append(d)
+            d.source_combo.setCurrentIndex(1)
+            d.repo_edit.setText(url)
+            d.parent_edit.setText(parent)
+            return QDialog.DialogCode.Accepted
+        NewWorkspaceDialog.exec = fake_exec
+        before = {w.id for w in win.manager.workspaces}
+        done.clear()
+        n = len(clones)
+        win._on_add_workspace_clicked()
+        if len(clones) > n or win._clone_progress is not None:
+            done.wait(10)
+            deadline = time.monotonic() + 10
+            while (time.monotonic() < deadline
+                   and win._clone_progress is not None):
+                app.processEvents()
+                time.sleep(0.01)
+        app.processEvents()
+        return [w for w in win.manager.workspaces if w.id not in before]
+
+    mw.QMessageBox.warning = staticmethod(
+        lambda _parent, _title, text, *a, **k: warnings.append(text))
+    mw.clone_default_branch = fake_clone
+    try:
+        new = create(str(missing))
+        dest = missing / "repo"
+        check("clone mkdir: the missing clone folder chain is created and "
+              "the clone lands inside it",
+              missing.is_dir() and len(clones) == 1
+              and os.path.normcase(clones[0]) == os.path.normcase(str(dest)))
+        check("clone mkdir: ...and the workspace opens on the clone",
+              len(new) == 1 and new[0].name == "repo"
+              and os.path.normcase(new[0].project_path)
+              == os.path.normcase(str(dest)) and not warnings,
+              ([(w.name, w.project_path) for w in new], warnings))
+
+        fail.append(True)
+        gone = tmp / "fails" / "deeper"
+        new = create(str(gone), "https://github.com/owner/missing.git")
+        check("clone mkdir: a failed clone adds no workspace and warns",
+              not new and len(warnings) == 1, warnings)
+        check("clone mkdir: ...and removes the folders it made, keeping the "
+              "one that was there", not (tmp / "fails").exists()
+              and tmp.is_dir())
+        fail.clear()
+
+        vanish.append(True)
+        new = create(str(tmp / "vanished" / "deeper"),
+                     "https://github.com/owner/vanish.git")
+        check("clone mkdir: a clone git calls a success but whose folder is "
+              "missing adds no workspace and removes the folders it made",
+              not new and len(warnings) == 2
+              and "cloned folder was not found" in warnings[-1]
+              and not (tmp / "vanished").exists() and tmp.is_dir(), warnings)
+        vanish.clear()
+
+        new = create(str(a_file / "inside"))
+        check("clone mkdir: a clone folder that cannot be made warns with "
+              "the reason", not new and len(warnings) == 3
+              and "Could not create the folder" in warnings[-1], warnings)
+
+        new = create(str(a_file))
+        check("clone mkdir: a file as the clone folder says it is a file",
+              not new and len(warnings) == 4
+              and "is a file" in warnings[-1], warnings)
+
+        new = create("relative/clones")
+        check("clone mkdir: a relative clone folder warns and creates nothing",
+              not new and len(warnings) == 5
+              and not os.path.exists(os.path.join(os.getcwd(), "relative")),
+              warnings)
+    finally:
+        # the clone thread looks the function up when it runs: put the real
+        # one back only once a started fake has run
+        if win._clone_progress is not None:
+            done.wait(10)
+        mw.clone_default_branch = orig_clone
+        NewWorkspaceDialog.exec = orig_exec
+        mw.QMessageBox.warning = orig_warning
+        for d in seen:
+            d.deleteLater()
+        win._save_timer.stop()
+        win.close()
+        app.processEvents()
+        shutil.rmtree(tmp, ignore_errors=True)
