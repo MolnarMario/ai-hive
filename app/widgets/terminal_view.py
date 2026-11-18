@@ -226,6 +226,13 @@ from ..terminal_agent import (FOCUS_REPORTS, REFLOW_BEGIN, REFLOW_END,
 from ..ui_theme import ANSI_16, Palette
 from ..word_starts import word_spans
 
+# pyte's cell, and the same cell drawn faint (SGR 2), which pyte has no field
+# for (see _FastHistoryScreen.select_graphic_rendition). Read faint with
+# getattr(cell, "faint", False): every other cell is a plain Char.
+Char = pyte.screens.Char
+_CHAR_FIELDS = len(Char._fields)
+_FaintChar = collections.namedtuple("_FaintChar", Char._fields + ("faint",))
+
 _NAMED = {
     "black": ANSI_16[0], "red": ANSI_16[1], "green": ANSI_16[2],
     "brown": ANSI_16[3], "yellow": ANSI_16[3], "blue": ANSI_16[4],
@@ -527,6 +534,37 @@ class _FastHistoryScreen(pyte.HistoryScreen):
         self.top_jumps = []
         self.history_resets = 0
         super().__init__(*args, **kwargs)
+
+    def select_graphic_rendition(self, *attrs, **kwargs) -> None:
+        """pyte's SGR, plus faint (SGR 2), which pyte's Char has no field
+        for and drops. Claude paints its prompt suggestion faint in an
+        empty box (TerminalView._input_text). A faint cursor writes
+        _FaintChar cells, so faint rides in the cell itself: pyte's draws
+        and erases copy it from the cursor, scrolls and line inserts move
+        it with the text, and DECSC/DECRC save and restore it with the
+        cursor. Cells drawn without faint stay plain pyte Chars."""
+        faint = getattr(self.cursor.attrs, "faint", False)
+        super().select_graphic_rendition(*attrs, **kwargs)
+        if not attrs:
+            faint = False
+        i, n = 0, len(attrs)
+        while i < n:
+            attr = attrs[i]
+            if attr in (38, 48, 58):
+                # a colour's own parameters, 5;n or 2;r;g;b: the 2 in
+                # 38;2;153;153;153 is not faint
+                i += 3 if i + 1 < n and attrs[i + 1] == 5 else 5
+                continue
+            if attr == 2:
+                faint = True
+            elif attr in (0, 22):
+                faint = False
+            i += 1
+        cur = self.cursor.attrs
+        if faint:
+            self.cursor.attrs = _FaintChar(*cur[:_CHAR_FIELDS], True)
+        elif getattr(cur, "faint", False):
+            self.cursor.attrs = Char(*cur[:_CHAR_FIELDS])
 
     def draw(self, data: str) -> None:
         # pyte measures code points one at a time and drops the rest of a
@@ -3924,24 +3962,39 @@ class TerminalView(QWidget):
         parked at the start of the box's first row (has_draft is False only
         there). It may wrap onto more rows in a narrow card. Read as text,
         undo pasted it back as a prompt, Schedule prefilled it, and a bare
-        Enter on an empty box filed it as a milestone."""
-        text = self._painted_input()
-        if text.startswith(_HINT_OPEN) and not self.has_draft():
+        Enter on an empty box filed it as a milestone.
+
+        Claude's prompt suggestion, its guess at the next prompt, is empty
+        too: every painted character drawn faint, behind a caret parked at
+        the start of a box with Claude's prompt glyph. Measured on Claude
+        2.1.327: Backspace leaves it as it is, Right accepts it as typed
+        text, and a box Backspaced to nothing shows it again, so emptying
+        never read the box empty and Ship finished lanes timed out. Text
+        typed or pasted over it replaces it."""
+        rows = self._painted_rows()
+        text = self._painted_input(rows)
+        if not text:
+            return text
+        hint = text.startswith(_HINT_OPEN)
+        if ((hint or (self._rows_all_faint(rows) and self._has_prompt_box()))
+                and not self.has_draft()):
             return ""
         return text
 
-    def _painted_input(self) -> str:
-        """_input_text without the hint check: every painted input row."""
+    def _painted_rows(self) -> list:
+        """(row, start, last) columns of each painted input-box row, the
+        top row's start past the prompt glyph and its gap; (row, 0, -1)
+        for a blank row. [] without a box."""
         span = self._input_block_span()
         if span is None:
-            return ""
+            return []
         top, bottom = span
         buf = self.screen.buffer
-        out = []
+        rows = []
         for r in range(top, bottom + 1):
             first, last = self._row_content(r)
             if last < 0:
-                out.append("")
+                rows.append((r, 0, -1))
                 continue
             start = first
             if r == top and buf[r][first].data in _INPUT_PROMPTS:
@@ -3950,8 +4003,33 @@ class TerminalView(QWidget):
                 while start <= last \
                         and buf[r][start].data in input_caret.PROMPT_GAP:
                     start += 1
-            out.append("".join(buf[r][c].data for c in range(start, last + 1)))
-        return "\n".join(out).strip("\n")
+            rows.append((r, start, last))
+        return rows
+
+    def _painted_input(self, rows=None) -> str:
+        """_input_text without the hint and suggestion checks: every
+        painted input row."""
+        if rows is None:
+            rows = self._painted_rows()
+        buf = self.screen.buffer
+        return "\n".join("".join(buf[r][c].data for c in range(a, b + 1))
+                         for r, a, b in rows).strip("\n")
+
+    def _rows_all_faint(self, rows) -> bool:
+        """Every visible character in `rows` (_painted_rows) was drawn
+        faint, and there is at least one."""
+        buf = self.screen.buffer
+        seen = False
+        for r, a, b in rows:
+            line = buf[r]
+            for c in range(a, b + 1):
+                cell = line[c]
+                if not cell.data.strip():
+                    continue        # a space, or a wide char's second half
+                if not getattr(cell, "faint", False):
+                    return False
+                seen = True
+        return seen
 
     def has_draft(self) -> bool:
         """Does the input box hold text typed but not sent? Read from the

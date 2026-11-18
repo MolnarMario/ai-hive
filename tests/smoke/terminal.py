@@ -1730,6 +1730,71 @@ def test_terminal_input_editor():
     check("emptybox: a restart ends it as restarted",
           got == ["failed:restarted"] and not view.is_emptying(), got)
 
+    # Claude's prompt suggestion (2.1.327 bytes): its guess at the next
+    # prompt, faint behind a caret parked at the box's start. Backspace
+    # can't erase it and an emptied box shows it again, so Ship timed out
+    # on it; typing over it replaces it, so it counts as an empty box
+    suggest = ("\x1b[38;2;153;153;153m❯\xa0\x1b[39m\r\n\x1b[1A\x1b[2C"
+               "\x1b[2mopen the PR now with what's done\x1b[22m\x1b[1;3H")
+    view = TerminalView(rows=6, cols=80)
+    view.feed(suggest)
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    check("emptybox: Claude's faint suggestion is an empty box: done at "
+          "once, nothing sent", out == [] and got == ["done"]
+          and not view.input_box_has_text(), (out, got))
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0old draft")
+    out = []
+    view.keyInput.connect(out.append)
+    started, got = emptying(view)
+    view.feed("\x1b[2J\x1b[H" + suggest)    # erased, the suggestion is back
+    view._empty_step()
+    check("emptybox: a draft erased down to the suggestion calls done",
+          len(out) == 1 and got == ["done"], (out, got))
+    # the same text drawn plain is typed text: Right accepted the
+    # suggestion, or the user typed it and pressed Home
+    view = TerminalView(rows=6, cols=80)
+    view.feed(suggest + "\x1b[1;3Hopen the PR now with what's done\x1b[1;3H")
+    check("emptybox: the suggestion redrawn plain is typed text",
+          view.input_box_has_text(), view._input_text())
+    view = TerminalView(rows=6, cols=80)
+    view.feed(suggest + "\x1b[1;3Hx\x1b[K")   # typed over it
+    check("emptybox: a key typed over the suggestion is typed text",
+          view.input_box_has_text(), view._input_text())
+    view = TerminalView(rows=6, cols=80)
+    view.feed("❯\xa0\x1b[38;2;2;2;2mreal draft\x1b[39m\x1b[1;3H")
+    check("emptybox: the 2 in a 24-bit colour is not faint",
+          view.input_box_has_text(), view._input_text())
+    view = TerminalView(rows=6, cols=80)
+    view.feed(suggest + "\x1b[1;20H")       # caret inside it: no suggestion
+    check("emptybox: faint text with the caret past its start is typed "
+          "text", view.input_box_has_text(), view._input_text())
+    # faint rides in the cell (code review of the shipping PR): a side
+    # table keyed by position missed DECSC/DECRC and text moved by a
+    # line delete, and every reader but emptying took the guess as text
+    view = TerminalView(rows=6, cols=80)
+    view.feed("\x1b7\x1b[5;1H\x1b[2mfooter\x1b8❯\xa0real draft\x1b[1;3H")
+    check("emptybox: DECRC brings back the attributes saved before a faint "
+          "footer, so the draft after it is typed text",
+          view.input_box_has_text(), view._input_text())
+    view = TerminalView(rows=6, cols=80)
+    view.feed("\x1b[2;3H\x1b[2mopen the PR\x1b[22m\x1b[3;1H❯\xa0open the PR"
+              "\x1b[2;1H\x1b[M\x1b[2;3H")
+    check("emptybox: plain text a line delete moves onto a faint row's "
+          "cells is typed text", view.input_box_has_text(),
+          view._input_text())
+    view = TerminalView(rows=6, cols=80)
+    view.feed("\x1b[2mdim status line\x1b[22m\x1b[1;1H")
+    check("emptybox: faint text with no prompt glyph is not a suggestion",
+          view.input_box_has_text(), view._input_text())
+    view = TerminalView(rows=6, cols=80)
+    view.feed(suggest)
+    check("emptybox: every reader of the box, undo and Schedule included, "
+          "reads the suggestion as no text", view._input_text() == "",
+          view._input_text())
+
     # --- approximate undo / redo --------------------------------------------
     view = TerminalView(rows=6, cols=80)
     view.feed("> ")                     # empty prompt

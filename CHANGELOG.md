@@ -8,6 +8,13 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.60.5
+
+- Ship finished lanes no longer fails with "could not clear the text"
+  when Claude shows its faint guess at your next prompt in the integrator's
+  box. AI Hive treats that guess as an empty box and types the request
+  over it.
+
 ## 0.60.4
 
 - Agents in their own lane are also told to run their Codex review with
