@@ -2279,6 +2279,15 @@ def test_boot_veil_lifts_for_trust_dialog():
                          "Enter to confirm")
     check("trust-veil: a resume's replayed text never lifts the veil",
           shown == [1, 1, 1])
+    # a burst whose dialog the 600-char tail missed is caught once the
+    # child goes quiet, from the longer screen tail, as readiness is
+    agent.spec.resume = False
+    agent.start()
+    agent._screen_tail = ("Yes, I trust this folder  Enter to confirm "
+                          + "x" * 1000)
+    agent._on_idle_timeout()
+    check("trust-veil: the idle recheck finds a dialog the burst missed",
+          shown == [1, 1, 1, 1] and not agent.prompt_ready())
     agent.dispose()
 
     from app.pty_worker import HAS_CONPTY
@@ -2298,6 +2307,7 @@ def test_boot_veil_lifts_for_trust_dialog():
                                        cwd=SCRATCH_CWD, pty=True))
     card = TerminalCard(booting)
     card.resize(640, 400); card.show(); pump(150)
+    booting.status = AgentStatus.STARTING   # as the worker's start sets it
     card._on_status(AgentStatus.STARTING)
     check("trust-veil: the launching card is covered",
           card.boot.is_active())
@@ -2305,6 +2315,21 @@ def test_boot_veil_lifts_for_trust_dialog():
     pump(500)   # the fade is 260ms
     check("trust-veil: a dialog before the prompt uncovers the card",
           not card.boot.is_active() and not card._boot_timer.isActive())
+    # the regression the integration review caught: every activity change
+    # reran _on_status, which saw a live child without a prompt and covered
+    # the dialog again 2 s later, until the 25 s backstop
+    booting.status = AgentStatus.RUNNING
+    card._on_status(AgentStatus.RUNNING)
+    card._on_activity(True)
+    card._on_activity(False)
+    check("trust-veil: an activity change leaves the dialog uncovered",
+          not card.boot.is_active() and not card._boot_timer.isActive())
+    booting.status = AgentStatus.IDLE
+    card._on_status(AgentStatus.IDLE)
+    booting.status = AgentStatus.STARTING
+    card._on_status(AgentStatus.STARTING)
+    check("trust-veil: the next child boots under the veil again",
+          card.boot.is_active())
     card.detach(); booting.dispose(); pump(50)
 
 

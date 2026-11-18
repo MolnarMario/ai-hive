@@ -84,9 +84,20 @@ _WAITING_TOOL_SET = set(WAITING_TOOLS.split("|"))
 EDIT_TOOLS = "Edit|Write|MultiEdit|NotebookEdit"
 _EDIT_TOOL_SET = set(EDIT_TOOLS.split("|"))
 # The permission rules the lane settings file pre-approves: the GPT-6-Luna
-# review every lane runs before it flags its work, in both of Claude Code's
-# shells (write_settings_file says why).
-LANE_ALLOW_RULES = ("Bash(codex review:*)", "PowerShell(codex review:*)")
+# review every lane runs before it flags its work, exactly as the lane prompt
+# (coordination.agent_instructions) words it, for the bases lanes usually
+# have, in both of Claude Code's shells (write_settings_file says why). Exact
+# on purpose, never a `codex review:*` prefix: `-c` overrides any Codex
+# setting, and some (sandbox_mode, an mcp_servers command) undo the read-only
+# sandbox, so a prefix rule pre-approved running anything at all. A lane on
+# another base, or a reworded command, gets the ordinary permission check.
+LANE_REVIEW_FLAGS = ("-c model=gpt-6-luna -c model_reasoning_effort=high"
+                     " -c sandbox_mode=read-only")
+LANE_REVIEW_COMMANDS = tuple(
+    f"codex review --base {base} {LANE_REVIEW_FLAGS}"
+    for base in ("origin/main", "origin/master", "main", "master"))
+LANE_ALLOW_RULES = tuple(f"{shell}({cmd})" for cmd in LANE_REVIEW_COMMANDS
+                         for shell in ("Bash", "PowerShell"))
 LANE_UID_ENV = "AIHIVE_AGENT_UID"        # AgentSpec.uid
 LANE_ROOT_ENV = "AIHIVE_LANE_ROOT"       # the agent's own worktree
 LANE_REPO_ENV = "AIHIVE_LANE_REPO"       # the main checkout
@@ -168,8 +179,8 @@ def write_settings_file(settings_path: str, mapping_path: str,
     without the lane env vars. Verified live on Claude Code 2.1.287: both
     reach the model, and a UserPromptSubmit hook does NOT drop the first
     delivered task (it fires after the submit, unlike SessionStart/startup).
-    The lane file also pre-approves `codex review` (LANE_ALLOW_RULES), the
-    review a laned agent must run before it flags its work.
+    The lane file also pre-approves the exact `codex review` command
+    (LANE_ALLOW_RULES) a laned agent must run before it flags its work.
     """
     cmd = _hook_command(mapping_path, events_path, python_exe)
     hooks: dict = {
@@ -217,9 +228,9 @@ def write_settings_file(settings_path: str, mapping_path: str,
         # auto-mode check doesn't count as the user's say-so, so in a repo
         # with nothing else sanctioning Codex it refused the review as
         # "Unsanctioned Communication" and every lane stalled unreviewed.
-        # Allow rules from --settings merge with the user's own; the rules
-        # are narrow (the review subcommand only), so nothing else Codex
-        # can do is pre-approved.
+        # Allow rules from --settings merge with the user's own. They match
+        # the read-only review command exactly (LANE_ALLOW_RULES), so no
+        # other use of Codex is pre-approved.
         payload["permissions"] = {"allow": list(LANE_ALLOW_RULES)}
     if tui:
         # deliberately a sibling of `hooks`, never folded into it: the matchers

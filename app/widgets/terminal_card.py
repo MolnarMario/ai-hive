@@ -846,6 +846,13 @@ class TerminalCard(QFrame):
         # did the user click Restart and the new child is not up yet? Holds
         # the veil over the old child's dying frame (see _on_restart_clicked)
         self._restarting = False
+        # the boot veil already lifted for the child now running (a dialog it
+        # drew before its prompt, a keystroke, the backstop). _on_status must
+        # not raise it again: it runs on every activity change, and the
+        # prompt is still not ready while that dialog waits, so a dialog the
+        # veil had just uncovered went back under it 2 s later. Cleared once
+        # the child leaves the live states, so the next one boots veiled.
+        self._boot_lifted = False
         # a click or key woke this sleeping card while the child the sleep
         # stopped was still exiting (see _resume_from_sleep)
         self._wake_pending = False
@@ -2227,6 +2234,7 @@ class TerminalCard(QFrame):
         the new size, and the font veil's own timers lift it."""
         self._boot_timer.stop()
         self._restarting = False
+        self._note_boot_lifted()
         if self.is_pty and not self._font_veil:
             self.boot.finish()
 
@@ -2234,9 +2242,17 @@ class TerminalCard(QFrame):
         """Drop it immediately (stopped, typed into, or timed out)."""
         self._boot_timer.stop()
         self._restarting = False
+        self._note_boot_lifted()
         self._stop_font_veil()
         if self.is_pty:
             self.boot.dismiss()
+
+    def _note_boot_lifted(self) -> None:
+        """A veil lowered while a child is live stays down for that child
+        (`_boot_lifted`). One lowered over a stopping or stopped agent says
+        nothing about the next child."""
+        if self.agent.status in (AgentStatus.STARTING, AgentStatus.RUNNING):
+            self._boot_lifted = True
 
     def begin_font_veil(self) -> None:
         """Cover the terminal while it takes a new font or letter spacing.
@@ -3235,10 +3251,13 @@ class TerminalCard(QFrame):
                 self._wake_pending = False
                 if self.agent.is_asleep():
                     QTimer.singleShot(0, self, self._resume_from_sleep)
+            if not running:
+                self._boot_lifted = False    # the next child boots veiled
             # a booting child and a stopped one are mutually exclusive states,
             # and the wake banner owns the stopped one
             if running and not self.agent.prompt_ready():
-                self._begin_boot_veil()
+                if not self._boot_lifted:
+                    self._begin_boot_veil()
             elif awaiting:
                 self._begin_boot_veil()
             elif restarting:

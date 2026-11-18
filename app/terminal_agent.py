@@ -2989,6 +2989,10 @@ class TerminalAgent(QObject):
         if not self._prompt_ready and self.spec.provider == "claude":
             if self._has_ready_hint(self._screen_tail):
                 self._became_prompt_ready()
+            else:
+                # the boot dialog can be missed the same way, and the child
+                # then sits quiet in it until the user answers
+                self._watch_boot_dialog(self._screen_tail)
 
     def _tail_lines(self, n: int, skip_blank: bool = False) -> str:
         """The last `n` lines of the escape-stripped screen tail, joined.
@@ -3710,13 +3714,8 @@ class TerminalAgent(QObject):
             if self.spec.provider == "claude":
                 self._ready_tail = (self._ready_tail + stripped)[-600:]
                 ready = self._has_ready_hint(self._ready_tail)
-                if (not ready and self._dialog_watch
-                        and self._has_boot_dialog_hint(self._ready_tail)):
-                    # the dialog waits for the user, so the boot veil must
-                    # not cover it until its backstop (25 s): it did, and
-                    # every new lane seemed to take that long to start
-                    self._dialog_watch = False
-                    self.dialog_before_prompt.emit()
+                if not ready:
+                    self._watch_boot_dialog(self._ready_tail)
             else:
                 ready = "\x1b[?2004h" in text
             if ready:
@@ -3743,6 +3742,15 @@ class TerminalAgent(QObject):
         alt-screen renderer keeps matching exactly as before."""
         low = _despace(text)
         return any(h in low for h in _READY_HINTS_DESPACED)
+
+    def _watch_boot_dialog(self, tail: str) -> None:
+        """Announce a dialog Claude drew before its prompt, once per fresh
+        start (`_dialog_watch`). The dialog waits for the user, so the boot
+        veil must not cover it until its backstop (25 s): it did, and every
+        new lane seemed to take that long to start."""
+        if self._dialog_watch and self._has_boot_dialog_hint(tail):
+            self._dialog_watch = False
+            self.dialog_before_prompt.emit()
 
     @staticmethod
     def _has_boot_dialog_hint(text: str) -> bool:
