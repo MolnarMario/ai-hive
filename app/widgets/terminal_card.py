@@ -1280,6 +1280,7 @@ class TerminalCard(QFrame):
         if self.is_pty:
             self.agent.pty_output.connect(self._on_pty_output)
             self.agent.prompt_ready_changed.connect(self._on_prompt_ready)
+            self.agent.dialog_before_prompt.connect(self._end_boot_veil)
             self.agent.start_coming_changed.connect(self._on_start_coming)
             self.agent.asleep_changed.connect(self._on_asleep)
             self.agent.summary_changed.connect(self._refresh_sleep_screen)
@@ -1396,6 +1397,8 @@ class TerminalCard(QFrame):
             pairs.append((self.agent.pty_output, self._on_pty_output))
             pairs.append((self.agent.prompt_ready_changed,
                           self._on_prompt_ready))
+            pairs.append((self.agent.dialog_before_prompt,
+                          self._end_boot_veil))
             pairs.append((self.agent.start_coming_changed,
                           self._on_start_coming))
             pairs.append((self.agent.asleep_changed, self._on_asleep))
@@ -2177,7 +2180,9 @@ class TerminalCard(QFrame):
         The veil lifts on the FIRST of: the child reporting an interactive
         prompt (`prompt_ready_changed`, which for Claude is the input-box
         footer, i.e. after any trust dialog AND after a `--resume` replay has
-        finished drawing), the user typing, the agent stopping, or
+        finished drawing), the child drawing a dialog that waits for the user
+        before that prompt (`dialog_before_prompt`: the folder-trust dialog a
+        new lane always gets), the user typing, the agent stopping, or
         `BOOT_VEIL_MAX_MS`. A terminal is never covered for good.
 
         A start held for the agent's new lane (`_awaiting_start`) keeps the
