@@ -8,6 +8,12 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.60.4
+
+- Agents in their own lane are also told to run their Codex review with
+  nothing before or after it, no cd in front and no pipe behind, since
+  Claude Code's auto mode blocked those too.
+
 ## 0.60.3
 
 - Agents in their own lane are told to run their Codex review as a
