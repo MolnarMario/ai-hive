@@ -20,12 +20,6 @@
   <a href="LICENSE">MIT license</a>
 </p>
 
-![Four agents working on one project in AI Hive](https://thebarbellengineer.com/assets/img/aihive-logo.webp)
-
-*Four agents on one project. Each card is a real terminal, the sidebar
-shows every workspace's status, and the top bar shows how much of your plan
-is left.*
-
 ## Why
 
 Running several coding agents at once usually means five terminal windows,
