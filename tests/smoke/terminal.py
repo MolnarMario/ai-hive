@@ -722,6 +722,17 @@ def test_terminal_mouse_words_links():
           v._classify_link("www.example.com/y") == ("url", "http://www.example.com/y"))
     check("mouse: wrapping paren/comma stripped from a URL",
           v._classify_link("(https://example.com),")[1] == "https://example.com")
+    check("mouse: a sentence-ending period is not part of a URL",
+          v._classify_link("https://adhd-tracker-kappa.vercel.app.")
+          == ("url", "https://adhd-tracker-kappa.vercel.app"))
+    check("mouse: trailing punctuation after a URL path is dropped",
+          v._classify_link("https://example.com/a/b?).")
+          == ("url", "https://example.com/a/b"))
+    check("mouse: a www URL loses its sentence period",
+          v._classify_link("www.example.com.") == ("url", "http://www.example.com"))
+    check("mouse: dots inside a URL stay",
+          v._classify_link("https://example.com/v1.2/x.html")
+          == ("url", "https://example.com/v1.2/x.html"))
     check("mouse: a bare word is not a link", v._classify_link("brown") is None)
     check("mouse: a relative path is not opened (no base dir)",
           v._classify_link("app/foo.py") is None)
