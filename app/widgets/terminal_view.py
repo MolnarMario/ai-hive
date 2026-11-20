@@ -61,7 +61,9 @@ compositions arrive as committed text (inputMethodEvent). That also turns on
 a CJK IME in every terminal, so the view draws the composition at the cursor
 itself (the child sees nothing until it's committed), and tells Qt after a
 repaint that moved the cursor, or panels open where the cursor was at
-focus-in.
+focus-in. Qt passes that on to Windows only during a composition, so the
+view also hands the cursor cell to the IME itself (_anchor_ime,
+app/ime_anchor.py); without it Win+V opened in the screen's corner.
 Ctrl+Z/Ctrl+Y (and Ctrl+Shift+Z) are an APPROXIMATE local undo/redo. A terminal
 keeps no local edit buffer, so this can't be a real per-keystroke history; it is
 a coarse "restore previous input" built from snapshots of the INFERRED input
@@ -219,7 +221,7 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
                            QWheelEvent)
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
-from .. import grapheme_cells, input_caret, soft_wrap, ui_theme
+from .. import grapheme_cells, ime_anchor, input_caret, soft_wrap, ui_theme
 from ..terminal_agent import (FOCUS_REPORTS, REFLOW_BEGIN, REFLOW_END,
                               REPAINT_DONE, _CLAUDE_READY_HINTS,
                               _NUM_OPTION_RE)
@@ -900,6 +902,10 @@ class TerminalView(QWidget):
         self._scroll_offset = 0  # lines scrolled back into history (0 = live)
         self._preedit = ""  # IME composition in progress, drawn at the cursor
         self._im_rect = None  # cursor rectangle Qt last heard about
+        # (hwnd, cell in window pixels) the Windows IME last heard about, and
+        # whether there is a Windows IME to tell (app/ime_anchor.py)
+        self._ime_anchor = None
+        self._ime_native = QGuiApplication.platformName() == "windows"
         # footer row _check_input_gap last asked for a repaint at, so a
         # persistent (legitimately short) gap is checked once and left alone
         # rather than re-triggering a repaint on every settle
@@ -2458,6 +2464,8 @@ class TerminalView(QWidget):
         if self._focus_reporting:  # app asked for focus events (?1004)
             self._send("\x1b[I")
         super().focusInEvent(event)
+        self._ime_anchor = None
+        self.update()  # the repaint anchors the IME at our cursor
 
     def focusOutEvent(self, event) -> None:
         if self._focus_reporting:
@@ -2467,6 +2475,7 @@ class TerminalView(QWidget):
         self._stop_drag_scroll()
         self._preedit = ""
         self._im_rect = None
+        self._ime_anchor = None
         super().focusOutEvent(event)
 
     def hideEvent(self, event) -> None:
@@ -2493,6 +2502,30 @@ class TerminalView(QWidget):
             return (Qt.InputMethodHint.ImhNoPredictiveText
                     | Qt.InputMethodHint.ImhNoAutoUppercase)
         return super().inputMethodQuery(query)
+
+    def _anchor_ime(self, rect) -> None:
+        """Hand Windows the cursor cell, so Win+V and Win+. open at it.
+
+        Qt tells the IME where the cursor is only during a composition, and
+        the panels otherwise open in the screen's bottom-right corner
+        (app/ime_anchor.py). The cell is compared in window pixels, since a
+        card moving inside the window moves the cursor without changing
+        `rect`. A composition in progress is Qt's to place."""
+        if not self._ime_native or self._preedit:
+            return
+        top = self.window()
+        handle = top.windowHandle()
+        if handle is None:
+            return
+        dpr = handle.devicePixelRatio()
+        pos = self.mapTo(top, rect.topLeft())
+        cell = (round(pos.x() * dpr), round(pos.y() * dpr),
+                round((pos.x() + rect.width()) * dpr),
+                round((pos.y() + rect.height()) * dpr))
+        key = (int(handle.winId()), cell)
+        if key != self._ime_anchor:
+            self._ime_anchor = key
+            ime_anchor.place(key[0], *cell)
 
     def inputMethodEvent(self, event) -> None:
         # Committed text (an emoji from Win+., a finished IME composition)
@@ -5084,6 +5117,7 @@ class TerminalView(QWidget):
                 self._im_rect = rect
                 QGuiApplication.inputMethod().update(
                     Qt.InputMethodQuery.ImCursorRectangle)
+            self._anchor_ime(rect)
         t0 = time.perf_counter() - t0
         if t0 > _perf_paint_s:
             _perf_paint_s, _perf_paint_view = t0, self

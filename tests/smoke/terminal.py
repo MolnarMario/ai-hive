@@ -637,6 +637,71 @@ def test_terminal_input_method():
     check("ime: a composition in progress is drawn", drawn != plain)
 
 
+def test_terminal_ime_anchor():
+    """Win+V opened in the screen's bottom-right corner over a terminal: Qt
+    tells the Windows IME where the cursor is only during a composition. A
+    focused repaint must hand it the cursor cell in window pixels, again
+    when the card moves inside the window, and leave a composition to Qt."""
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    from app import ime_anchor
+    from app.widgets import terminal_view as tv_mod
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    check("ime-anchor: a window without an IME context is a no-op",
+          ime_anchor.place(0, 1, 2, 3, 4) is False)
+
+    top = QWidget()
+    top.resize(800, 500)
+    view = TerminalView(rows=6, cols=40, parent=top)
+    view.setGeometry(30, 40, 500, 300)
+    top.winId()
+    calls = []
+    real_place = tv_mod.ime_anchor.place
+    tv_mod.ime_anchor.place = lambda *a: calls.append(a) or True
+    try:
+        view._ime_native = True
+        view.hasFocus = lambda: True
+        view.feed("one\r\ntwo> ab")
+        view.grab()
+        x0, y0, x1, y1 = view.cell_bounds(view.screen.cursor.x,
+                                          view.screen.cursor.y)
+        dpr = top.windowHandle().devicePixelRatio()
+        want = (int(top.winId()), round((30 + x0) * dpr),
+                round((40 + y0) * dpr), round((30 + x1) * dpr),
+                round((40 + y1) * dpr))
+        check("ime-anchor: a focused repaint anchors the IME at the cursor",
+              calls == [want], f"{calls} want {want}")
+
+        calls.clear()
+        view.grab()
+        check("ime-anchor: an unmoved cursor is not re-sent", calls == [],
+              calls)
+
+        view.move(130, 40)
+        view.grab()
+        check("ime-anchor: a moved card re-anchors in window pixels",
+              len(calls) == 1 and calls[0][1] == want[1] + round(100 * dpr),
+              calls)
+
+        calls.clear()
+        view._preedit = "に"
+        view.feed("\r\nthree")
+        view.grab()
+        check("ime-anchor: a composition in progress is left to Qt",
+              calls == [], calls)
+        view._preedit = ""
+
+        view._ime_native = False
+        view.feed("\r\nfour")
+        view.grab()
+        check("ime-anchor: no Windows IME, no call", calls == [], calls)
+    finally:
+        tv_mod.ime_anchor.place = real_place
+        top.deleteLater()
+
+
 def test_terminal_image_paste():
     """A clipboard image is spilled to a temp PNG and its path is pasted.
 
