@@ -3630,6 +3630,10 @@ class TerminalView(QWidget):
         t = token.strip().strip("'\"()[]{}<>,;")
         if not t:
             return None
+        if re.match(r"(?i)^(https?|ftp|file)://\S", t) or t.lower().startswith("www."):
+            # sentence punctuation right after a URL ("it's live at
+            # https://x.app.") is not part of it; keeping it opens a 404
+            t = t.rstrip(".,;:!?'\")]}>")
         if re.match(r"(?i)^(https?|ftp|file)://\S", t):
             return ("url", t)
         if re.match(r"(?i)^www\.\S+\.\S", t):
