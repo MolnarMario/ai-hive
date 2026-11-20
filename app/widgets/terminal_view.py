@@ -435,6 +435,18 @@ FIND_ACTIVE = "#ff9632"
 FIND_INK = "#141414"
 
 
+def _trim_url_tail(url: str) -> str:
+    """Drop sentence punctuation after a URL ("it's live at https://x.app."
+    opened a 404 with the period on). A closing paren stays when it closes
+    one inside the URL, as GitHub's autolinks do, so
+    .../Python_(programming_language). keeps its paren."""
+    while url and url[-1] in ".,;:!?'\")]}>":
+        if url[-1] == ")" and url.count(")") <= url.count("("):
+            break
+        url = url[:-1]
+    return url
+
+
 def _find_row_text(line, cols: int):
     """(text, colmap) of one row for find, trailing blanks dropped. colmap is
     None when string index == column; otherwise it maps each index to its
@@ -906,6 +918,7 @@ class TerminalView(QWidget):
         # whether there is a Windows IME to tell (app/ime_anchor.py)
         self._ime_anchor = None
         self._ime_native = QGuiApplication.platformName() == "windows"
+        self._ime_watched = []  # ancestors watched for moves while focused
         # footer row _check_input_gap last asked for a repaint at, so a
         # persistent (legitimately short) gap is checked once and left alone
         # rather than re-triggering a repaint on every settle
@@ -2465,6 +2478,7 @@ class TerminalView(QWidget):
             self._send("\x1b[I")
         super().focusInEvent(event)
         self._ime_anchor = None
+        self._watch_ime_ancestors(True)
         self.update()  # the repaint anchors the IME at our cursor
 
     def focusOutEvent(self, event) -> None:
@@ -2476,6 +2490,7 @@ class TerminalView(QWidget):
         self._preedit = ""
         self._im_rect = None
         self._ime_anchor = None
+        self._watch_ime_ancestors(False)
         super().focusOutEvent(event)
 
     def hideEvent(self, event) -> None:
@@ -2526,6 +2541,35 @@ class TerminalView(QWidget):
         if key != self._ime_anchor:
             self._ime_anchor = key
             ime_anchor.place(key[0], *cell)
+
+    def _watch_ime_ancestors(self, on: bool) -> None:
+        """While focused, watch the widgets between us and the window for
+        moves. Scrolling the card grid moves an ancestor and Qt scrolls the
+        pixels without repainting this (opaque, often idle) view, so the
+        paint-time anchor alone left Win+V where the cursor used to be."""
+        for w in self._ime_watched:
+            if w is not None:
+                w.removeEventFilter(self)
+        self._ime_watched = []
+        if not (on and self._ime_native):
+            return
+        top = self.window()
+        w = self.parentWidget()
+        while w is not None and w is not top:
+            w.installEventFilter(self)
+            self._ime_watched.append(w)
+            w = w.parentWidget()
+
+    def eventFilter(self, obj, event) -> bool:
+        if (event.type() == QEvent.Type.Move and self._im_rect is not None
+                and self.hasFocus()):
+            self._anchor_ime(self._im_rect)
+        return super().eventFilter(obj, event)
+
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        if self._im_rect is not None and self.hasFocus():
+            self._anchor_ime(self._im_rect)
 
     def inputMethodEvent(self, event) -> None:
         # Committed text (an emoji from Win+., a finished IME composition)
@@ -3647,7 +3691,19 @@ class TerminalView(QWidget):
                     col += 1
                 c1 = col - 1
                 token = "".join(line[i].data for i in range(c0, c1 + 1))
-                if self._maybe_link(token) and self._classify_link(token):
+                link = self._maybe_link(token) and self._classify_link(token)
+                if link:
+                    if link[0] == "url":
+                        # underline only what opens, not wrapping brackets
+                        # or the sentence's period
+                        core = link[1]
+                        if core.startswith("http://") and "http://" not in token:
+                            core = core[len("http://"):]  # a www. link
+                        i = token.find(core)
+                        # (string offsets are cell offsets only when every
+                        # cell holds one character)
+                        if i >= 0 and len(token) == c1 - c0 + 1:
+                            c0, c1 = c0 + i, c0 + i + len(core) - 1
                     spans.append((row, c0, c1))
         self._link_spans = spans
 
@@ -3660,13 +3716,13 @@ class TerminalView(QWidget):
         'app/widgets/sidebar.py'. Returns ('url'|'file', value) or None."""
         import os
 
-        t = token.strip().strip("'\"()[]{}<>,;")
+        t = token.strip().lstrip("'\"()[]{}<>,;")
+        if re.match(r"(?i)^(https?|ftp|file)://\S", t) or t.lower().startswith("www."):
+            t = _trim_url_tail(t)
+        else:
+            t = t.rstrip("'\"()[]{}<>,;")
         if not t:
             return None
-        if re.match(r"(?i)^(https?|ftp|file)://\S", t) or t.lower().startswith("www."):
-            # sentence punctuation right after a URL ("it's live at
-            # https://x.app.") is not part of it; keeping it opens a 404
-            t = t.rstrip(".,;:!?'\")]}>")
         if re.match(r"(?i)^(https?|ftp|file)://\S", t):
             return ("url", t)
         if re.match(r"(?i)^www\.\S+\.\S", t):

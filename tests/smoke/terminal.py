@@ -330,6 +330,17 @@ def test_terminal_link_underline():
     tv.grab()
     check("underline: rescans when content changes (links cleared)",
           tv._link_spans == [])
+
+    # the underline covers what a click opens: not wrapping brackets, not
+    # the sentence's period
+    tv.feed("\x1b[2J\x1b[Hlive at (https://x.app). and www.y.com.\r\n")
+    tv.grab()
+    hist, off = tv._view_state()
+    tokens = ["".join(tv._visible_line(r, hist, off)[i].data
+                      for i in range(c0, c1 + 1))
+              for (r, c0, c1) in tv._link_spans]
+    check("underline: a URL's wrapping parens and period aren't underlined",
+          tokens == ["https://x.app", "www.y.com"], tokens)
     tv.deleteLater()
 
 
@@ -682,7 +693,7 @@ def test_terminal_ime_anchor():
         view.move(130, 40)
         view.grab()
         check("ime-anchor: a moved card re-anchors in window pixels",
-              len(calls) == 1 and calls[0][1] == want[1] + round(100 * dpr),
+              len(calls) == 1 and calls[0][1] == round((130 + x0) * dpr),
               calls)
 
         calls.clear()
@@ -697,6 +708,43 @@ def test_terminal_ime_anchor():
         view.feed("\r\nfour")
         view.grab()
         check("ime-anchor: no Windows IME, no call", calls == [], calls)
+    finally:
+        tv_mod.ime_anchor.place = real_place
+        top.deleteLater()
+
+    # Scrolling the card grid moves an ancestor, and Qt scrolls the pixels
+    # without repainting the view, so the move itself must re-anchor.
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QFocusEvent
+
+    top = QWidget()
+    top.resize(800, 500)
+    host = QWidget(top)
+    host.setGeometry(0, 0, 800, 900)
+    view = TerminalView(rows=6, cols=40, parent=host)
+    view.setGeometry(30, 40, 500, 300)
+    top.show()  # Qt holds a hidden widget's move event until it is shown
+    QApplication.processEvents()
+    calls = []
+    tv_mod.ime_anchor.place = lambda *a: calls.append(a) or True
+    try:
+        view._ime_native = True
+        view.hasFocus = lambda: True
+        view.focusInEvent(QFocusEvent(QEvent.Type.FocusIn))
+        view.feed("ready> ")
+        view.grab()
+        dpr = top.windowHandle().devicePixelRatio()
+        y0 = view.cell_bounds(view.screen.cursor.x, view.screen.cursor.y)[1]
+        calls.clear()
+        host.move(0, -300)  # a scroll, no repaint
+        check("ime-anchor: scrolling the grid re-anchors without a repaint",
+              len(calls) == 1 and calls[0][2] == round((40 - 300 + y0) * dpr),
+              calls)
+        view.focusOutEvent(QFocusEvent(QEvent.Type.FocusOut))
+        calls.clear()
+        host.move(0, -100)
+        check("ime-anchor: an unfocused view stops watching for moves",
+              calls == [] and view._ime_watched == [], calls)
     finally:
         tv_mod.ime_anchor.place = real_place
         top.deleteLater()
@@ -795,6 +843,12 @@ def test_terminal_mouse_words_links():
           == ("url", "https://example.com/a/b"))
     check("mouse: a www URL loses its sentence period",
           v._classify_link("www.example.com.") == ("url", "http://www.example.com"))
+    check("mouse: a paren the URL opened stays",
+          v._classify_link("https://en.wikipedia.org/wiki/Python_(lang).")
+          == ("url", "https://en.wikipedia.org/wiki/Python_(lang)"))
+    check("mouse: a paren-wrapped URL with a paren of its own",
+          v._classify_link("(https://en.wikipedia.org/wiki/Foo_(bar))")
+          == ("url", "https://en.wikipedia.org/wiki/Foo_(bar)"))
     check("mouse: dots inside a URL stay",
           v._classify_link("https://example.com/v1.2/x.html")
           == ("url", "https://example.com/v1.2/x.html"))

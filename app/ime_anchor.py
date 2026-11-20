@@ -43,6 +43,7 @@ CFS_POINT = 0x0002
 CFS_EXCLUDE = 0x0080
 
 _imm = None
+_imm_failed = False  # imm32 failed to load once: don't retry every paint
 
 
 def _lib():
@@ -69,10 +70,15 @@ def place(hwnd: int, left: int, top: int, right: int, bottom: int) -> bool:
     The composition point is the cell's top-left corner, and the candidate
     window excludes the cell, so a panel opens just under the cursor row
     (or above it when there is no room below)."""
-    if not _IS_WIN or not hwnd:
+    global _imm_failed
+    if not _IS_WIN or not hwnd or _imm_failed:
         return False
     try:
         imm = _lib()
+    except Exception:  # noqa: BLE001 - no imm32, or one missing an export
+        _imm_failed = True
+        return False
+    try:
         himc = imm.ImmGetContext(hwnd)
         if not himc:
             return False
@@ -87,5 +93,5 @@ def place(hwnd: int, left: int, top: int, right: int, bottom: int) -> bool:
             return ok
         finally:
             imm.ImmReleaseContext(hwnd, himc)
-    except OSError:
+    except Exception:  # noqa: BLE001 - this runs inside paintEvent
         return False
