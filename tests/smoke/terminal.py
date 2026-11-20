@@ -330,6 +330,17 @@ def test_terminal_link_underline():
     tv.grab()
     check("underline: rescans when content changes (links cleared)",
           tv._link_spans == [])
+
+    # the underline covers what a click opens: not wrapping brackets, not
+    # the sentence's period
+    tv.feed("\x1b[2J\x1b[Hlive at (https://x.app). and www.y.com.\r\n")
+    tv.grab()
+    hist, off = tv._view_state()
+    tokens = ["".join(tv._visible_line(r, hist, off)[i].data
+                      for i in range(c0, c1 + 1))
+              for (r, c0, c1) in tv._link_spans]
+    check("underline: a URL's wrapping parens and period aren't underlined",
+          tokens == ["https://x.app", "www.y.com"], tokens)
     tv.deleteLater()
 
 
@@ -637,6 +648,108 @@ def test_terminal_input_method():
     check("ime: a composition in progress is drawn", drawn != plain)
 
 
+def test_terminal_ime_anchor():
+    """Win+V opened in the screen's bottom-right corner over a terminal: Qt
+    tells the Windows IME where the cursor is only during a composition. A
+    focused repaint must hand it the cursor cell in window pixels, again
+    when the card moves inside the window, and leave a composition to Qt."""
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    from app import ime_anchor
+    from app.widgets import terminal_view as tv_mod
+    from app.widgets.terminal_view import TerminalView
+
+    QApplication.instance() or QApplication([])
+    check("ime-anchor: a window without an IME context is a no-op",
+          ime_anchor.place(0, 1, 2, 3, 4) is False)
+
+    top = QWidget()
+    top.resize(800, 500)
+    view = TerminalView(rows=6, cols=40, parent=top)
+    view.setGeometry(30, 40, 500, 300)
+    top.winId()
+    calls = []
+    real_place = tv_mod.ime_anchor.place
+    tv_mod.ime_anchor.place = lambda *a: calls.append(a) or True
+    try:
+        view._ime_native = True
+        view.hasFocus = lambda: True
+        view.feed("one\r\ntwo> ab")
+        view.grab()
+        x0, y0, x1, y1 = view.cell_bounds(view.screen.cursor.x,
+                                          view.screen.cursor.y)
+        dpr = top.windowHandle().devicePixelRatio()
+        want = (int(top.winId()), round((30 + x0) * dpr),
+                round((40 + y0) * dpr), round((30 + x1) * dpr),
+                round((40 + y1) * dpr))
+        check("ime-anchor: a focused repaint anchors the IME at the cursor",
+              calls == [want], f"{calls} want {want}")
+
+        calls.clear()
+        view.grab()
+        check("ime-anchor: an unmoved cursor is not re-sent", calls == [],
+              calls)
+
+        view.move(130, 40)
+        view.grab()
+        check("ime-anchor: a moved card re-anchors in window pixels",
+              len(calls) == 1 and calls[0][1] == round((130 + x0) * dpr),
+              calls)
+
+        calls.clear()
+        view._preedit = "に"
+        view.feed("\r\nthree")
+        view.grab()
+        check("ime-anchor: a composition in progress is left to Qt",
+              calls == [], calls)
+        view._preedit = ""
+
+        view._ime_native = False
+        view.feed("\r\nfour")
+        view.grab()
+        check("ime-anchor: no Windows IME, no call", calls == [], calls)
+    finally:
+        tv_mod.ime_anchor.place = real_place
+        top.deleteLater()
+
+    # Scrolling the card grid moves an ancestor, and Qt scrolls the pixels
+    # without repainting the view, so the move itself must re-anchor.
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QFocusEvent
+
+    top = QWidget()
+    top.resize(800, 500)
+    host = QWidget(top)
+    host.setGeometry(0, 0, 800, 900)
+    view = TerminalView(rows=6, cols=40, parent=host)
+    view.setGeometry(30, 40, 500, 300)
+    top.show()  # Qt holds a hidden widget's move event until it is shown
+    QApplication.processEvents()
+    calls = []
+    tv_mod.ime_anchor.place = lambda *a: calls.append(a) or True
+    try:
+        view._ime_native = True
+        view.hasFocus = lambda: True
+        view.focusInEvent(QFocusEvent(QEvent.Type.FocusIn))
+        view.feed("ready> ")
+        view.grab()
+        dpr = top.windowHandle().devicePixelRatio()
+        y0 = view.cell_bounds(view.screen.cursor.x, view.screen.cursor.y)[1]
+        calls.clear()
+        host.move(0, -300)  # a scroll, no repaint
+        check("ime-anchor: scrolling the grid re-anchors without a repaint",
+              len(calls) == 1 and calls[0][2] == round((40 - 300 + y0) * dpr),
+              calls)
+        view.focusOutEvent(QFocusEvent(QEvent.Type.FocusOut))
+        calls.clear()
+        host.move(0, -100)
+        check("ime-anchor: an unfocused view stops watching for moves",
+              calls == [] and view._ime_watched == [], calls)
+    finally:
+        tv_mod.ime_anchor.place = real_place
+        top.deleteLater()
+
+
 def test_terminal_image_paste():
     """A clipboard image is spilled to a temp PNG and its path is pasted.
 
@@ -722,6 +835,23 @@ def test_terminal_mouse_words_links():
           v._classify_link("www.example.com/y") == ("url", "http://www.example.com/y"))
     check("mouse: wrapping paren/comma stripped from a URL",
           v._classify_link("(https://example.com),")[1] == "https://example.com")
+    check("mouse: a sentence-ending period is not part of a URL",
+          v._classify_link("https://adhd-tracker-kappa.vercel.app.")
+          == ("url", "https://adhd-tracker-kappa.vercel.app"))
+    check("mouse: trailing punctuation after a URL path is dropped",
+          v._classify_link("https://example.com/a/b?).")
+          == ("url", "https://example.com/a/b"))
+    check("mouse: a www URL loses its sentence period",
+          v._classify_link("www.example.com.") == ("url", "http://www.example.com"))
+    check("mouse: a paren the URL opened stays",
+          v._classify_link("https://en.wikipedia.org/wiki/Python_(lang).")
+          == ("url", "https://en.wikipedia.org/wiki/Python_(lang)"))
+    check("mouse: a paren-wrapped URL with a paren of its own",
+          v._classify_link("(https://en.wikipedia.org/wiki/Foo_(bar))")
+          == ("url", "https://en.wikipedia.org/wiki/Foo_(bar)"))
+    check("mouse: dots inside a URL stay",
+          v._classify_link("https://example.com/v1.2/x.html")
+          == ("url", "https://example.com/v1.2/x.html"))
     check("mouse: a bare word is not a link", v._classify_link("brown") is None)
     check("mouse: a relative path is not opened (no base dir)",
           v._classify_link("app/foo.py") is None)

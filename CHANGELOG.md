@@ -8,6 +8,14 @@ Every PR merged to `main` bumps `__version__` in `app/__init__.py` and adds a
 `## x.y.z` section here with the same number (a smoke check enforces it). No
 em dashes: this text is shown in the app.
 
+## 0.60.6
+
+- Clicking a link that ends a sentence, like "it's live at
+  https://example.app.", no longer opens the address with the period
+  stuck on the end.
+- Win+V (clipboard history) and Win+. (emoji) now open right under the
+  cursor in a terminal card, instead of in the corner of the screen.
+
 ## 0.60.5
 
 - Ship finished lanes no longer fails with "could not clear the text"

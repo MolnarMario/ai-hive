@@ -61,7 +61,9 @@ compositions arrive as committed text (inputMethodEvent). That also turns on
 a CJK IME in every terminal, so the view draws the composition at the cursor
 itself (the child sees nothing until it's committed), and tells Qt after a
 repaint that moved the cursor, or panels open where the cursor was at
-focus-in.
+focus-in. Qt passes that on to Windows only during a composition, so the
+view also hands the cursor cell to the IME itself (_anchor_ime,
+app/ime_anchor.py); without it Win+V opened in the screen's corner.
 Ctrl+Z/Ctrl+Y (and Ctrl+Shift+Z) are an APPROXIMATE local undo/redo. A terminal
 keeps no local edit buffer, so this can't be a real per-keystroke history; it is
 a coarse "restore previous input" built from snapshots of the INFERRED input
@@ -219,7 +221,7 @@ from PySide6.QtGui import (QColor, QFont, QFontMetricsF, QGuiApplication,
                            QWheelEvent)
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
-from .. import grapheme_cells, input_caret, soft_wrap, ui_theme
+from .. import grapheme_cells, ime_anchor, input_caret, soft_wrap, ui_theme
 from ..terminal_agent import (FOCUS_REPORTS, REFLOW_BEGIN, REFLOW_END,
                               REPAINT_DONE, _CLAUDE_READY_HINTS,
                               _NUM_OPTION_RE)
@@ -431,6 +433,18 @@ EMPTY_TIMEOUT_MS = 8000
 FIND_HIT = "#ffdf4a"
 FIND_ACTIVE = "#ff9632"
 FIND_INK = "#141414"
+
+
+def _trim_url_tail(url: str) -> str:
+    """Drop sentence punctuation after a URL ("it's live at https://x.app."
+    opened a 404 with the period on). A closing paren stays when it closes
+    one inside the URL, as GitHub's autolinks do, so
+    .../Python_(programming_language). keeps its paren."""
+    while url and url[-1] in ".,;:!?'\")]}>":
+        if url[-1] == ")" and url.count(")") <= url.count("("):
+            break
+        url = url[:-1]
+    return url
 
 
 def _find_row_text(line, cols: int):
@@ -900,6 +914,11 @@ class TerminalView(QWidget):
         self._scroll_offset = 0  # lines scrolled back into history (0 = live)
         self._preedit = ""  # IME composition in progress, drawn at the cursor
         self._im_rect = None  # cursor rectangle Qt last heard about
+        # (hwnd, cell in window pixels) the Windows IME last heard about, and
+        # whether there is a Windows IME to tell (app/ime_anchor.py)
+        self._ime_anchor = None
+        self._ime_native = QGuiApplication.platformName() == "windows"
+        self._ime_watched = []  # ancestors watched for moves while focused
         # footer row _check_input_gap last asked for a repaint at, so a
         # persistent (legitimately short) gap is checked once and left alone
         # rather than re-triggering a repaint on every settle
@@ -2458,6 +2477,9 @@ class TerminalView(QWidget):
         if self._focus_reporting:  # app asked for focus events (?1004)
             self._send("\x1b[I")
         super().focusInEvent(event)
+        self._ime_anchor = None
+        self._watch_ime_ancestors(True)
+        self.update()  # the repaint anchors the IME at our cursor
 
     def focusOutEvent(self, event) -> None:
         if self._focus_reporting:
@@ -2467,6 +2489,8 @@ class TerminalView(QWidget):
         self._stop_drag_scroll()
         self._preedit = ""
         self._im_rect = None
+        self._ime_anchor = None
+        self._watch_ime_ancestors(False)
         super().focusOutEvent(event)
 
     def hideEvent(self, event) -> None:
@@ -2493,6 +2517,59 @@ class TerminalView(QWidget):
             return (Qt.InputMethodHint.ImhNoPredictiveText
                     | Qt.InputMethodHint.ImhNoAutoUppercase)
         return super().inputMethodQuery(query)
+
+    def _anchor_ime(self, rect) -> None:
+        """Hand Windows the cursor cell, so Win+V and Win+. open at it.
+
+        Qt tells the IME where the cursor is only during a composition, and
+        the panels otherwise open in the screen's bottom-right corner
+        (app/ime_anchor.py). The cell is compared in window pixels, since a
+        card moving inside the window moves the cursor without changing
+        `rect`. A composition in progress is Qt's to place."""
+        if not self._ime_native or self._preedit:
+            return
+        top = self.window()
+        handle = top.windowHandle()
+        if handle is None:
+            return
+        dpr = handle.devicePixelRatio()
+        pos = self.mapTo(top, rect.topLeft())
+        cell = (round(pos.x() * dpr), round(pos.y() * dpr),
+                round((pos.x() + rect.width()) * dpr),
+                round((pos.y() + rect.height()) * dpr))
+        key = (int(handle.winId()), cell)
+        if key != self._ime_anchor:
+            self._ime_anchor = key
+            ime_anchor.place(key[0], *cell)
+
+    def _watch_ime_ancestors(self, on: bool) -> None:
+        """While focused, watch the widgets between us and the window for
+        moves. Scrolling the card grid moves an ancestor and Qt scrolls the
+        pixels without repainting this (opaque, often idle) view, so the
+        paint-time anchor alone left Win+V where the cursor used to be."""
+        for w in self._ime_watched:
+            if w is not None:
+                w.removeEventFilter(self)
+        self._ime_watched = []
+        if not (on and self._ime_native):
+            return
+        top = self.window()
+        w = self.parentWidget()
+        while w is not None and w is not top:
+            w.installEventFilter(self)
+            self._ime_watched.append(w)
+            w = w.parentWidget()
+
+    def eventFilter(self, obj, event) -> bool:
+        if (event.type() == QEvent.Type.Move and self._im_rect is not None
+                and self.hasFocus()):
+            self._anchor_ime(self._im_rect)
+        return super().eventFilter(obj, event)
+
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        if self._im_rect is not None and self.hasFocus():
+            self._anchor_ime(self._im_rect)
 
     def inputMethodEvent(self, event) -> None:
         # Committed text (an emoji from Win+., a finished IME composition)
@@ -3614,7 +3691,19 @@ class TerminalView(QWidget):
                     col += 1
                 c1 = col - 1
                 token = "".join(line[i].data for i in range(c0, c1 + 1))
-                if self._maybe_link(token) and self._classify_link(token):
+                link = self._maybe_link(token) and self._classify_link(token)
+                if link:
+                    if link[0] == "url":
+                        # underline only what opens, not wrapping brackets
+                        # or the sentence's period
+                        core = link[1]
+                        if core.startswith("http://") and "http://" not in token:
+                            core = core[len("http://"):]  # a www. link
+                        i = token.find(core)
+                        # (string offsets are cell offsets only when every
+                        # cell holds one character)
+                        if i >= 0 and len(token) == c1 - c0 + 1:
+                            c0, c1 = c0 + i, c0 + i + len(core) - 1
                     spans.append((row, c0, c1))
         self._link_spans = spans
 
@@ -3627,7 +3716,11 @@ class TerminalView(QWidget):
         'app/widgets/sidebar.py'. Returns ('url'|'file', value) or None."""
         import os
 
-        t = token.strip().strip("'\"()[]{}<>,;")
+        t = token.strip().lstrip("'\"()[]{}<>,;")
+        if re.match(r"(?i)^(https?|ftp|file)://\S", t) or t.lower().startswith("www."):
+            t = _trim_url_tail(t)
+        else:
+            t = t.rstrip("'\"()[]{}<>,;")
         if not t:
             return None
         if re.match(r"(?i)^(https?|ftp|file)://\S", t):
@@ -5084,6 +5177,7 @@ class TerminalView(QWidget):
                 self._im_rect = rect
                 QGuiApplication.inputMethod().update(
                     Qt.InputMethodQuery.ImCursorRectangle)
+            self._anchor_ime(rect)
         t0 = time.perf_counter() - t0
         if t0 > _perf_paint_s:
             _perf_paint_s, _perf_paint_view = t0, self
