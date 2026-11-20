@@ -141,8 +141,8 @@ Agent CLIs (install the ones you use; AI Hive marks any it can't find as
 |---|---|---|---|
 | **Claude Code** (best supported) | `claude` | `irm https://claude.ai/install.ps1 \| iex` in PowerShell | run `claude` once and log in |
 | **OpenAI Codex CLI** | `codex` | `npm install -g @openai/codex` (needs Node.js: `winget install OpenJS.NodeJS.LTS`) | run `codex` once and log in |
-| **Gemini** via Google's Antigravity CLI | `agy` (or `gemini`) | Google's Antigravity installer | run `agy` once and log in |
-| **Grok** via the xAI CLI | `grok` | xAI's Grok CLI installer | run `grok` once and log in |
+| **Gemini** via Google's Antigravity CLI | `agy` | `irm https://antigravity.google/cli/install.ps1 \| iex` | run `agy` once and sign in with Google |
+| **Grok** via the xAI CLI (Grok Build) | `grok` | `irm https://x.ai/cli/install.ps1 \| iex` | run `grok` once and log in (may need a paid xAI plan) |
 
 Optional, for the lane workflow:
 
@@ -165,7 +165,7 @@ In PowerShell:
 # 1. Prerequisites (skip what you already have)
 winget install Python.Python.3.13
 winget install Git.Git
-irm https://claude.ai/install.ps1 | iex      # Claude Code; or any other agent CLI
+irm https://claude.ai/install.ps1 | iex      # Claude Code; or any CLI from the table above
 # open a NEW terminal so PATH picks these up, then sign in once:
 claude
 
@@ -202,7 +202,11 @@ Install AI Hive (https://github.com/MolnarMario/ai-hive) on this Windows machine
      If missing: `winget install Python.Python.3.13`.
    - Git 2.38 or newer: `git --version`. If missing or older: `winget install Git.Git`.
    - At least one agent CLI: `claude --version`, `codex --version`, `agy --version`, `grok --version`.
-     If none: install Claude Code with `irm https://claude.ai/install.ps1 | iex`.
+     If none, ask me which ones I want, then install them in PowerShell:
+     Claude Code `irm https://claude.ai/install.ps1 | iex`,
+     Codex `npm install -g @openai/codex` (needs Node.js: `winget install OpenJS.NodeJS.LTS`),
+     Gemini (Antigravity) `irm https://antigravity.google/cli/install.ps1 | iex`,
+     Grok `irm https://x.ai/cli/install.ps1 | iex`.
    After installing anything, tell me to open a new terminal if the command is still not found.
 2. Ask me which folder AI Hive should live in (default: my user folder), then
    `git clone https://github.com/MolnarMario/ai-hive` there. Do not download a zip:
